@@ -63,6 +63,8 @@ export ANTFLY_LIGHTONOCR3_THROUGHPUT=1
 Set it in the inference server's environment. It selects sixteen physical decode
 rows and a sixteen-page request window, prepared decode workspaces, an event-driven
 executor, bounded activation reuse, batched paged attention and compact per-page KV.
+CPU image decoding, resizing and patchification run before taking the shared GPU
+lock, within each page's existing host admission.
 One shared execution epoch can serve up to 256 page joins before retiring. Every
 live page still acquires its own admission lease; the existing memory limits and
 live-memory reserve apply.
@@ -72,11 +74,16 @@ The preset retains the reader's default precision. The separate optional setting
 BF16; benchmark it separately when selecting a 4B configuration. The 4B preset also
 reserves its bounded shared immutable side-weight cache.
 
+`ANTFLY_LIGHTONOCR3_VISION_BATCH=1` additionally groups up to four compatible
+images after CPU preparation. The epoch reserves one bounded GPU workspace for
+that maximum batch; host work and retained per-page data stay additive.
+
 Individual settings override the preset, including explicit false values. For
 example, `ANTFLY_LIGHTONOCR3_BATCH_ROWS=8` limits physical cohorts to eight,
 `ANTFLY_LIGHTONOCR3_BATCH_WINDOW=8` limits active pages, and
-`ANTFLY_LIGHTONOCR3_GATE_EVENTS=0` restores polling for the backend gate. Setting
-`ANTFLY_LIGHTONOCR3_THROUGHPUT=0` restores the pre-preset defaults while preserving
+`ANTFLY_LIGHTONOCR3_GATE_EVENTS=0` restores polling for the backend gate.
+`ANTFLY_LIGHTONOCR3_CPU_PREPROCESS=0` restores image preparation inside that gate.
+Setting `ANTFLY_LIGHTONOCR3_THROUGHPUT=0` restores the pre-preset defaults while preserving
 explicit individual settings. Other hardware keeps its existing defaults.
 
 The [execution report](lightonocr3/results/throughput_engine_m4_max/README.md)

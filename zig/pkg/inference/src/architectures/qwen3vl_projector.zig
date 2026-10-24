@@ -25,6 +25,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const image = @import("../pipelines/image.zig");
+const image_work_control = @import("antfly_image").work_control;
 const ops = @import("../ops/ops.zig");
 const metal_compute_mod = @import("../ops/metal_compute.zig");
 const gguf_metadata = @import("../gguf/metadata.zig");
@@ -699,6 +700,8 @@ pub fn residentBatchGeometryKey(config: gpt_config.Config, bytes: []const u8, li
 /// Caller admits the sum of the per-image working sets before invoking this
 /// route. Every image occupies its own attention batch lane; positions reset
 /// per image. The ordinary projector remains the singleton fallback.
+/// Batch independently admitted pages. Host admission must remain additive
+/// for every image; a serial multi-image host estimate is insufficient.
 pub fn encodeProjectedImagesResidentBatched(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -712,14 +715,48 @@ pub fn encodeProjectedImagesResidentBatched(
     if (!cfg.is_qwen35 or cfg.deepstack_len != 0 or cb.kind() != .metal) return error.UnsupportedBatchedVision;
     const key = try residentBatchGeometryKey(config, images[0], limits);
     for (images[1..]) |bytes| if (try residentBatchGeometryKey(config, bytes, limits) != key) return error.VisionBatchGeometryMismatch;
-    const output = try allocator.alloc(ProjectedImages, images.len);
+    const Check = struct {
+        fn check(raw: ?*const anyopaque) !void {
+            const backend: *const ComputeBackend = @ptrCast(@alignCast(raw.?));
+            try backend.checkExecutionControl();
+        }
+    };
+    var prepared: [4]PreparedImage = undefined;
+    var initialized: usize = 0;
+    defer for (prepared[0..initialized]) |*value| value.deinit();
+    var views: [4]*const PreparedImage = undefined;
+    for (images, 0..) |bytes, index| {
+        prepared[index] = try prepareImageCpu(allocator, cfg, bytes, limits, .{ .context = cb, .check_fn = Check.check }, false);
+        initialized += 1;
+        views[index] = &prepared[index];
+    }
+    return encodePreparedProjectedImagesResidentBatched(cb, allocator, config, views[0..images.len], limits);
+}
+
+/// Encode borrowed patches from independently admitted pages under one GPU gate.
+pub fn encodePreparedProjectedImagesResidentBatched(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: gpt_config.Config,
+    prepared_images: []const *const PreparedImage,
+    limits: Limits,
+) ![]ProjectedImages {
+    try limits.validate();
+    if (prepared_images.len == 0 or prepared_images.len > 4 or prepared_images.len > limits.max_images) return error.ImageLimitExceeded;
+    const cfg = try configFromResidentModel(config);
+    if (!cfg.is_qwen35 or cfg.deepstack_len != 0 or cb.kind() != .metal) return error.UnsupportedBatchedVision;
+    for (prepared_images) |prepared| {
+        try prepared.validateFor(cfg, limits);
+        if (!std.meta.eql(prepared.geometry, prepared_images[0].geometry)) return error.VisionBatchGeometryMismatch;
+    }
+    const output = try allocator.alloc(ProjectedImages, prepared_images.len);
     var completed: usize = 0;
     errdefer {
         for (output[0..completed]) |*item| item.deinit();
         allocator.free(output);
     }
-    if (images.len == 1) {
-        output[0] = try encodeProjectedImagesResident(cb, allocator, config, images, limits);
+    if (prepared_images.len == 1) {
+        output[0] = try encodePreparedProjectedImageResident(cb, allocator, config, prepared_images[0], limits);
         return output;
     }
     var weights = WeightCache.initResident(allocator, cb, cfg);
@@ -727,18 +764,12 @@ pub fn encodeProjectedImagesResidentBatched(
     var hidden: ?CT = null;
     defer if (hidden) |value| cb.free(value);
     var geometry: Geometry = undefined;
-    for (images, 0..) |bytes, index| {
+    for (prepared_images, 0..) |prepared, index| {
         try cb.checkExecutionControl();
-        const decoded = try image.decode(allocator, bytes);
-        defer decoded.deinit(allocator);
-        if (try admissionMul(decoded.width, decoded.height) > limits.max_decoded_pixels) return error.VisionAdmissionExceeded;
-        const current = try targetGeometry(cfg, decoded.width, decoded.height, limits);
+        const current = prepared.geometry;
         if (index != 0 and (current.width != geometry.width or current.height != geometry.height)) return error.VisionBatchGeometryMismatch;
         if (index == 0) geometry = current;
-        const pixels = try image.preprocessDecodedRectScaledWithResample(allocator, decoded, @intCast(current.width), @intCast(current.height), cfg.image_mean, cfg.image_std, 1.0 / 255.0, .pillow_bicubic);
-        defer allocator.free(pixels);
-        const patches = try extractPatchesMergeMajor(allocator, pixels, cfg, current);
-        defer allocator.free(patches);
+        const patches = prepared.patch_rows;
         const patch_dim = cfg.patch_size * cfg.patch_size * 3;
         const input = try cb.fromFloat32Shape(patches, &.{ @intCast(current.patchCount()), @intCast(patch_dim) });
         defer cb.free(input);
@@ -763,19 +794,19 @@ pub fn encodeProjectedImagesResidentBatched(
         } else hidden = try cb.sliceRows2D(allocator, resident, 0, current.patchCount(), cfg.vision_hidden);
     }
     const per_image = geometry.patchCount();
-    const rows = try admissionMul(per_image, images.len);
+    const rows = try admissionMul(per_image, prepared_images.len);
     const positions_one = try visionPositions(allocator, geometry, cfg.spatial_merge);
     defer allocator.free(positions_one);
     const positions = try allocator.alloc(u32, rows * 2);
     defer allocator.free(positions);
-    for (0..2) |axis| for (0..images.len) |index| {
+    for (0..2) |axis| for (0..prepared_images.len) |index| {
         @memcpy(positions[axis * rows + index * per_image ..][0..per_image], positions_one[axis * per_image ..][0..per_image]);
     };
     for (0..cfg.block_count) |layer| {
         try cb.checkExecutionControl();
         var owns_frame = !cb.decoderRuntimeHasActiveFrame() and try cb.decoderRuntimeBeginFrame();
         defer if (owns_frame) cb.decoderRuntimeCancelFrame() catch {};
-        const next = try encoderBlock(cb, allocator, &weights, cfg, hidden.?, positions, rows, layer, images.len);
+        const next = try encoderBlock(cb, allocator, &weights, cfg, hidden.?, positions, rows, layer, prepared_images.len);
         errdefer cb.free(next);
         if (owns_frame) {
             try cb.decoderRuntimeSubmitAndWaitFrame();
@@ -1038,20 +1069,64 @@ const EncodedImage = struct {
     }
 };
 
-fn encodeSingleImage(
-    cb: *const ComputeBackend,
+pub const PreparedImage = struct {
     allocator: std.mem.Allocator,
-    weights: *WeightCache,
+    cfg: Config,
+    geometry: Geometry,
+    source_width: usize,
+    source_height: usize,
+    encoded_bytes: usize,
+    patch_rows: []f32,
+    decode_ns: u64,
+    preprocess_ns: u64,
+    patchify_ns: u64,
+
+    pub fn deinit(self: *PreparedImage) void {
+        self.allocator.free(self.patch_rows);
+    }
+
+    fn validateFor(self: *const PreparedImage, cfg: Config, limits: Limits) !void {
+        try limits.validate();
+        if (!std.meta.eql(self.cfg, cfg)) return error.InvalidPreparedImage;
+        if (self.encoded_bytes == 0 or self.encoded_bytes > limits.max_encoded_image_bytes) return error.VisionAdmissionExceeded;
+        const source_pixels = try admissionMul(self.source_width, self.source_height);
+        if (source_pixels == 0 or source_pixels > limits.max_decoded_pixels) return error.VisionAdmissionExceeded;
+        const expected = try targetGeometry(cfg, self.source_width, self.source_height, limits);
+        const patch_dim = try admissionMul(try admissionMul(cfg.patch_size, cfg.patch_size), 3);
+        if (!std.meta.eql(expected, self.geometry) or self.patch_rows.len != try admissionMul(expected.patchCount(), patch_dim)) return error.InvalidPreparedImage;
+    }
+};
+
+/// Decode, resize and patchify without accessing a shared ComputeBackend.
+/// The caller must acquire its page's full host admission before calling.
+pub fn prepareProjectedImageResident(
+    allocator: std.mem.Allocator,
+    config: gpt_config.Config,
+    bytes: []const u8,
+    limits: Limits,
+    control: image_work_control.Control,
+) !PreparedImage {
+    const cfg = try configFromResidentModel(config);
+    return prepareImageCpu(allocator, cfg, bytes, limits, control, true);
+}
+
+fn prepareImageCpu(
+    allocator: std.mem.Allocator,
     cfg: Config,
     bytes: []const u8,
     limits: Limits,
-    collect_preprocess_evidence: bool,
-) !EncodedImage {
+    control: image_work_control.Control,
+    comptime install_scope: bool,
+) !PreparedImage {
+    try limits.validate();
+    const scope: ?image_work_control.Scope = if (install_scope) image_work_control.Scope.enter(control) else null;
+    defer if (scope) |active| active.deinit();
+    try control.check();
     var zig017_return_error: ?anyerror = null;
     const profile = qwen3VlProfileEnabled();
     var stage_started_at = if (profile) monotonicNowNs() else 0;
     var failed_stage: []const u8 = "admission";
-    var failed_layer: ?usize = null;
+    const failed_layer: ?usize = null;
     errdefer if (zig017_return_error) |err| if (profile) {
         if (failed_layer) |layer|
             std.debug.print("qwen3vl-projector-error: stage={s} layer={d} error={s}\n", .{ failed_stage, layer, @errorName(err) })
@@ -1068,7 +1143,7 @@ fn encodeSingleImage(
         return zig017_err;
     });
     defer decoded.deinit(allocator);
-    (cb.checkExecutionControl() catch |zig017_err| {
+    (control.check() catch |zig017_err| {
         zig017_return_error = zig017_err;
         return zig017_err;
     });
@@ -1107,11 +1182,105 @@ fn encodeSingleImage(
         zig017_return_error = zig017_err;
         return zig017_err;
     });
-    defer allocator.free(patch_rows);
+    errdefer allocator.free(patch_rows);
     const patchify_ns = profileLap(profile, &stage_started_at);
-    const preprocess_evidence: ?PreprocessEvidence = if (collect_preprocess_evidence) .{
+    try control.check();
+    return .{
+        .allocator = allocator,
+        .cfg = cfg,
+        .geometry = geometry,
         .source_width = decoded.width,
         .source_height = decoded.height,
+        .encoded_bytes = bytes.len,
+        .patch_rows = patch_rows,
+        .decode_ns = decode_ns,
+        .preprocess_ns = preprocess_ns,
+        .patchify_ns = patchify_ns,
+    };
+}
+
+/// Encode borrowed host patches while the caller owns the shared GPU gate.
+pub fn encodePreparedProjectedImageResident(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: gpt_config.Config,
+    prepared: *const PreparedImage,
+    limits: Limits,
+) !ProjectedImages {
+    const cfg = try configFromResidentModel(config);
+    try prepared.validateFor(cfg, limits);
+    try cb.checkExecutionControl();
+    var weights = WeightCache.initResident(allocator, cb, cfg);
+    defer weights.deinit();
+    var encoded = try encodePreparedSingleImage(cb, allocator, &weights, cfg, prepared, limits, false);
+    errdefer encoded.deinit(allocator);
+    const counts = try allocator.alloc(usize, 1);
+    errdefer allocator.free(counts);
+    const grids = try allocator.alloc(qwen3vl_plan.VisionGrid, 1);
+    counts[0] = encoded.tokens;
+    grids[0] = encoded.grid;
+    return .{
+        .allocator = allocator,
+        .embeddings = encoded.embeddings,
+        .deepstack_embeddings = encoded.deepstack,
+        .tokens_per_image = counts,
+        .grids = grids,
+        .preprocess_evidence = &.{},
+        .preprocess_spatial_patches = &.{},
+        .hidden_size = cfg.text_hidden,
+        .deepstack_layer_count = cfg.deepstack_len,
+    };
+}
+
+fn encodeSingleImage(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    weights: *WeightCache,
+    cfg: Config,
+    bytes: []const u8,
+    limits: Limits,
+    collect_preprocess_evidence: bool,
+) !EncodedImage {
+    const Check = struct {
+        fn check(raw: ?*const anyopaque) !void {
+            const backend: *const ComputeBackend = @ptrCast(@alignCast(raw.?));
+            try backend.checkExecutionControl();
+        }
+    };
+    var prepared = try prepareImageCpu(allocator, cfg, bytes, limits, .{ .context = cb, .check_fn = Check.check }, false);
+    defer prepared.deinit();
+    return encodePreparedSingleImage(cb, allocator, weights, cfg, &prepared, limits, collect_preprocess_evidence);
+}
+
+fn encodePreparedSingleImage(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    weights: *WeightCache,
+    cfg: Config,
+    prepared: *const PreparedImage,
+    limits: Limits,
+    collect_preprocess_evidence: bool,
+) !EncodedImage {
+    var zig017_return_error: ?anyerror = null;
+    const profile = qwen3VlProfileEnabled();
+    var stage_started_at = if (profile) monotonicNowNs() else 0;
+    var failed_stage: []const u8 = "admission";
+    var failed_layer: ?usize = null;
+    errdefer if (zig017_return_error) |err| if (profile) {
+        if (failed_layer) |layer|
+            std.debug.print("qwen3vl-projector-error: stage={s} layer={d} error={s}\n", .{ failed_stage, layer, @errorName(err) })
+        else
+            std.debug.print("qwen3vl-projector-error: stage={s} error={s}\n", .{ failed_stage, @errorName(err) });
+    };
+    try prepared.validateFor(cfg, limits);
+    const geometry = prepared.geometry;
+    const patch_rows = prepared.patch_rows;
+    const decode_ns = prepared.decode_ns;
+    const preprocess_ns = prepared.preprocess_ns;
+    const patchify_ns = prepared.patchify_ns;
+    const preprocess_evidence: ?PreprocessEvidence = if (collect_preprocess_evidence) .{
+        .source_width = prepared.source_width,
+        .source_height = prepared.source_height,
         .resized_width = geometry.width,
         .resized_height = geometry.height,
         .grid = .{ .temporal = 1, .height = @intCast(geometry.grid_y), .width = @intCast(geometry.grid_x) },
@@ -2459,4 +2628,45 @@ test "media residency Qwen3 VL positions and prompt Metal parity" {
 test "media residency Qwen3 VL positions and prompt CUDA parity" {
     const fixture = @import("../ops/media_residency_test.zig");
     try fixture.onCuda(fixture.noWeights, checkQwen3Residency);
+}
+
+test "LightOnOCR3 CPU image preparation owns patches and binds model geometry" {
+    const a = std.testing.allocator;
+    const model = try gpt_config.parseConfig(a, @embedFile("../models/testdata/lightonocr3/config.json"));
+    const bytes = @embedFile("../models/testdata/lightonocr3/invoice.png");
+    var prepared = try prepareProjectedImageResident(a, model, bytes, .{}, .{});
+    defer prepared.deinit();
+    try prepared.validateFor(try configFromResidentModel(model), .{});
+    try std.testing.expect(prepared.patch_rows.len > 0 and prepared.geometry.tokenCount() > 0);
+    var other = prepared.cfg;
+    other.text_hidden += 1;
+    try std.testing.expectError(error.InvalidPreparedImage, prepared.validateFor(other, .{}));
+    try std.testing.expectError(error.VisionAdmissionExceeded, prepared.validateFor(prepared.cfg, .{ .max_decoded_pixels = 1 }));
+    try std.testing.expectError(error.VisionAdmissionExceeded, prepared.validateFor(prepared.cfg, .{ .max_encoded_image_bytes = 1 }));
+    const full = prepared.patch_rows;
+    prepared.patch_rows = full[0 .. full.len - 1];
+    defer prepared.patch_rows = full;
+    try std.testing.expectError(error.InvalidPreparedImage, prepared.validateFor(prepared.cfg, .{}));
+}
+
+test "LightOnOCR3 CPU image preparation cancels in kernels and restores its caller scope" {
+    const Counter = struct {
+        calls: usize = 0,
+        cancel_at: usize,
+        fn check(raw: ?*const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            if (self.calls >= self.cancel_at) return error.Cancelled;
+        }
+    };
+    var outer = Counter{ .cancel_at = std.math.maxInt(usize) };
+    const scope = image_work_control.Scope.enter(.{ .context = &outer, .check_fn = Counter.check });
+    defer scope.deinit();
+    var cancelled = Counter{ .cancel_at = 4 };
+    const a = std.testing.allocator;
+    const model = try gpt_config.parseConfig(a, @embedFile("../models/testdata/lightonocr3/config.json"));
+    try std.testing.expectError(error.Cancelled, prepareProjectedImageResident(a, model, @embedFile("../models/testdata/lightonocr3/invoice.png"), .{}, .{ .context = &cancelled, .check_fn = Counter.check }));
+    try std.testing.expect(cancelled.calls >= 4);
+    try image_work_control.check();
+    try std.testing.expectEqual(@as(usize, 1), outer.calls);
 }

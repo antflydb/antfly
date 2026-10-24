@@ -7812,6 +7812,8 @@ pub const Node = struct {
         step_mutex: std.atomic.Mutex = .unlocked,
         step_gate: execution_control_mod.ExecutionLane = .{},
         gate_events: bool = false,
+        cpu_preprocess_items: usize = 0,
+        cpu_preprocess_ns: u64 = 0,
         kv_mutex: std.atomic.Mutex = .unlocked,
         controls_mutex: std.atomic.Mutex = .unlocked,
         controls: [32]?InferenceExecutionControl = @splat(null),
@@ -7833,6 +7835,8 @@ pub const Node = struct {
 
         const ExecutionFeatures = struct {
             prepared: bool = false,
+            cpu_preprocess: bool = false,
+            vision_batch_items: u8 = 1,
             activation_pool: bool = false,
             worker: bool = false,
             epoch_auxiliary: bool = false,
@@ -7844,6 +7848,8 @@ pub const Node = struct {
             fn fromEnvironment() @This() {
                 const epoch_auxiliary = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_EPOCH_AUX");
                 return .{
+                    .cpu_preprocess = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_CPU_PREPROCESS"),
+                    .vision_batch_items = if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_VISION_BATCH")) 4 else 1,
                     .prepared = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_PREPARED_DECODE"),
                     .activation_pool = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_ACTIVATION_POOL"),
                     .worker = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_EXECUTOR"),
@@ -7937,6 +7943,7 @@ pub const Node = struct {
                 ctx.worker_io = null;
             }
             if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
+                std.debug.print("LIGHTONOCR3 cpu_preprocess={d} cpu_preprocess_items={d} cpu_preprocess_ns={d} vision_batch_limit={d}\n", .{ @intFromBool(ctx.features.cpu_preprocess), ctx.cpu_preprocess_items, ctx.cpu_preprocess_ns, ctx.features.vision_batch_items });
                 std.debug.print("LIGHTONOCR3 gate_events={d} gate_event_acquisitions={d} gate_event_waits={d}\n", .{ @intFromBool(ctx.gate_events), ctx.step_gate.acquisitions, ctx.step_gate.event_waits });
                 std.debug.print("LIGHTONOCR3 executor_steps={d}\n", .{ctx.worker_steps});
                 std.debug.print("LIGHTONOCR3 executor_tail_steps={d}\n", .{ctx.worker_tail_steps});
@@ -8211,6 +8218,11 @@ pub const Node = struct {
         for (images, 0..) |bytes, index| {
             serial[index] = try qwen3vl_projector.encodeProjectedImagesResident(&cb, a, cfg, &.{bytes}, .{});
             initialized += 1;
+            var prepared = try qwen3vl_projector.prepareProjectedImageResident(a, cfg, bytes, .{}, control.imageWorkControl());
+            defer prepared.deinit();
+            var split = try qwen3vl_projector.encodePreparedProjectedImageResident(&cb, a, cfg, &prepared, .{});
+            defer split.deinit();
+            try std.testing.expectEqualSlices(f32, serial[index].embeddings, split.embeddings);
         }
         for ([_]usize{ 2, 3 }) |count| {
             const ordering = [_]usize{ 1, 0, 1 };
@@ -8220,6 +8232,21 @@ pub const Node = struct {
                 for (result) |*value| value.deinit();
                 a.free(result);
             }
+            var prepared: [3]qwen3vl_projector.PreparedImage = undefined;
+            var views: [3]*const qwen3vl_projector.PreparedImage = undefined;
+            var ready: usize = 0;
+            defer for (prepared[0..ready]) |*value| value.deinit();
+            for (batch_images[0..count], 0..) |bytes, index| {
+                prepared[index] = try qwen3vl_projector.prepareProjectedImageResident(a, cfg, bytes, .{}, control.imageWorkControl());
+                ready += 1;
+                views[index] = &prepared[index];
+            }
+            const split_batch = try qwen3vl_projector.encodePreparedProjectedImagesResidentBatched(&cb, a, cfg, views[0..count], .{});
+            defer {
+                for (split_batch) |*value| value.deinit();
+                a.free(split_batch);
+            }
+            for (result, split_batch) |original, split| try std.testing.expectEqualSlices(f32, original.embeddings, split.embeddings);
             var worst: f32 = 0;
             for (result, 0..) |value, index| {
                 const reference = serial[ordering[index]].embeddings;
@@ -8238,10 +8265,55 @@ pub const Node = struct {
         image: []const u8,
         limits: qwen3vl_projector.Limits,
     };
+    const LightOnPreparedVisionPayload = struct {
+        prepared: *const qwen3vl_projector.PreparedImage,
+        limits: qwen3vl_projector.Limits,
+        cpu_ns: u64,
+    };
     const LightOnVisionRequest = struct {
         ctx: *LightOnStreamContext,
         io: std.Io,
         control: InferenceExecutionControl,
+
+        fn encodeCpuPrepared(raw: *anyopaque, allocator: std.mem.Allocator, images: []const []const u8, limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {
+            const request: *@This() = @ptrCast(@alignCast(raw));
+            try request.control.check();
+            const ctx = request.ctx;
+            if (images.len != 1) {
+                try ctx.lockStep(request.control);
+                defer ctx.unlockStep();
+                return qwen3vl_projector.encodeProjectedImagesResident(&ctx.cb.?, allocator, ctx.cfg, images, limits);
+            }
+            const started = platform.time.monotonicNs();
+            var prepared = try qwen3vl_projector.prepareProjectedImageResident(allocator, ctx.cfg, images[0], limits, request.control.imageWorkControl());
+            defer prepared.deinit();
+            const elapsed = platform.time.monotonicNs() -| started;
+            try request.control.check();
+            if (ctx.features.vision_batch_items > 1) {
+                const payload = LightOnPreparedVisionPayload{ .prepared = &prepared, .limits = limits, .cpu_ns = elapsed };
+                const Cancel = struct {
+                    fn check(ptr: *const anyopaque) bool {
+                        const control: *const InferenceExecutionControl = @ptrCast(@alignCast(ptr));
+                        control.check() catch return true;
+                        return false;
+                    }
+                };
+                const key = try qwen3vl_projector.residentBatchGeometryKey(ctx.cfg, images[0], limits);
+                const result = try ctx.vision_broker.submitControlled(LightOnPreparedVisionPayload, qwen3vl_projector.ProjectedImages, request.io, allocator, .{ .model = ctx.model.model_dir, .generation = ctx.execution_id, .task = .read, .transform = "lighton-prepared-vision", .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 4, .max_items = 4, .max_bytes = std.math.mul(usize, 4, limits.max_encoded_image_bytes) catch std.math.maxInt(usize), .max_wait_us = @min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_VISION_WAIT_US") orelse 2000, 100000) }, .{ .geometry_key = key, .bytes = images[0].len }, .{}, try directExecutorDeadline(request.io, request.control.deadline_ns), .{ .ptr = &request.control, .is_cancelled_fn = Cancel.check }, &payload, ctx, executeLightOnPreparedVisionBatch);
+                var projected = switch (result.result) {
+                    .value => |value| value,
+                    .item_error => |failure| return failure.cause,
+                };
+                errdefer projected.deinit();
+                try request.control.check();
+                return projected;
+            }
+            try ctx.lockStep(request.control);
+            defer ctx.unlockStep();
+            ctx.cpu_preprocess_items += 1;
+            ctx.cpu_preprocess_ns +|= elapsed;
+            return qwen3vl_projector.encodePreparedProjectedImageResident(&ctx.cb.?, allocator, ctx.cfg, &prepared, limits);
+        }
 
         fn encode(raw: *anyopaque, allocator: std.mem.Allocator, images: []const []const u8, limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {
             const request: *@This() = @ptrCast(@alignCast(raw));
@@ -8346,6 +8418,36 @@ pub const Node = struct {
         if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 prefill_batch_items={d} query_tokens={d}\n", .{ items.len, batch[0].seq_len });
     }
 
+    fn executeLightOnPreparedVisionBatch(raw: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
+        if (items.len == 0 or items.len > 4) {
+            for (items) |item| item.slot.fail(error.ImageLimitExceeded);
+            return;
+        }
+        const ctx: *LightOnStreamContext = @ptrCast(@alignCast(raw));
+        var group = executor_microbatch.ExecutionControl{ .items = items };
+        const control = InferenceExecutionControl{ .ptr = &group, .check_fn = executor_microbatch.ExecutionControl.check };
+        ctx.lockStep(control) catch |err| {
+            for (items) |item| item.slot.fail(err);
+            return;
+        };
+        defer ctx.unlockStep();
+        var prepared: [4]*const qwen3vl_projector.PreparedImage = undefined;
+        for (items, 0..) |item, index| {
+            const payload = item.payloadAs(LightOnPreparedVisionPayload);
+            prepared[index] = payload.prepared;
+            ctx.cpu_preprocess_items += 1;
+            ctx.cpu_preprocess_ns +|= payload.cpu_ns;
+        }
+        const a = std.heap.smp_allocator;
+        const results = qwen3vl_projector.encodePreparedProjectedImagesResidentBatched(&ctx.cb.?, a, ctx.cfg, prepared[0..items.len], items[0].payloadAs(LightOnPreparedVisionPayload).limits) catch |err| {
+            for (items) |item| item.slot.fail(err);
+            return;
+        };
+        defer a.free(results);
+        for (items, results) |item, result| item.slot.setValue(qwen3vl_projector.ProjectedImages, result, if (items.len > 1) .native_batch else .serial);
+        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 prepared_vision_batch_items={d}\n", .{items.len});
+    }
+
     fn executeLightOnVisionBatch(raw: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
         const ctx: *LightOnStreamContext = @ptrCast(@alignCast(raw));
         var group = executor_microbatch.ExecutionControl{ .items = items };
@@ -8411,12 +8513,12 @@ pub const Node = struct {
         // additive. Shared execution storage optionally has its own epoch lease.
         var memory = LightOnCohortMemory{ .amounts = if (features.epoch_auxiliary) .{} else features.auxiliaryAmounts() };
         try memory.add(cfg, estimate.token_count, @intCast(max_tokens), runtime.tier.memory.AdmissionAmounts.fromEstimate(resource), try model_manager_mod.projectorRunAdmissionAmounts(model.manifest, .metal, estimate.media_admission));
-        // Default vision execution is serialized by step_mutex. Reserve its
-        // maximum once for the epoch, while page-local retained state remains
-        // additive. Batched vision keeps the conservative per-page peaks.
-        const vision_batch_enabled = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_VISION_BATCH");
-        const share_vision_peak = !vision_batch_enabled and
-            !platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DISABLE_SHARED_VISION_PEAK");
+        const vision_batch_enabled = features.vision_batch_items > 1;
+        // Exactly one GPU gate owner can encode vision, with at most four
+        // images in that batch. Keep host/history/output reservations additive;
+        // the epoch owns the bounded transient GPU workspace for that batch.
+        const share_vision_peak = !platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DISABLE_SHARED_VISION_PEAK");
+        const shared_vision_bytes = try memory.visionBatchPeak(features.vision_batch_items);
         const amounts = if (share_vision_peak) memory.amounts else try memory.finish();
         const contract = try resolvedInferenceExecutorContract(self, "read", &model.manifest);
         if (image.len > @min(readInlineSourceByteCap(self), contract.batch.max_encoded_media_bytes) or
@@ -8441,7 +8543,7 @@ pub const Node = struct {
         var retry_delay_ns: u64 = std.time.ns_per_ms;
         var admission = while (true) {
             try control.check();
-            const admitted = ctx.admitPage(&factory, if (share_vision_peak) memory.vision_backend_peak else null, amounts) catch |err| {
+            const admitted = ctx.admitPage(&factory, if (share_vision_peak) shared_vision_bytes else null, amounts) catch |err| {
                 // Live-memory pressure is transient as peers retire. Keep the
                 // page queued without its per-page lease; never bypass a cap.
                 if (err != error.ResourceTemporarilyUnavailable or
@@ -8530,7 +8632,7 @@ pub const Node = struct {
         var vision_request = LightOnVisionRequest{ .ctx = ctx, .io = page_io, .control = control };
         var pipeline = generation.NativeGenerationPipeline{
             .qwen_prefill_batch = if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PREFILL_BATCH")) .{ .ptr = &vision_request, .run_fn = batchLightOnPreparedPrefill } else null,
-            .qwen_vision_batch = if (vision_batch_enabled) .{ .ptr = &vision_request, .encode_fn = LightOnVisionRequest.encode } else null,
+            .qwen_vision_batch = if (ctx.features.cpu_preprocess) .{ .ptr = &vision_request, .encode_fn = LightOnVisionRequest.encodeCpuPrepared } else if (vision_batch_enabled) .{ .ptr = &vision_request, .encode_fn = LightOnVisionRequest.encode } else null,
             .allocator = a,
             .io = page_io,
             .cb = ctx.cb.?,
@@ -8780,8 +8882,8 @@ pub const Node = struct {
         }
         fn add(self: *@This(), cfg: gpt_model_mod.Config, prompt_tokens: usize, output_tokens: usize, decoder: runtime.tier.memory.AdmissionAmounts, vision: runtime.tier.memory.AdmissionAmounts) !void {
             self.amounts = try self.amounts.merge(decoder);
-            // The execution lock excludes overlapping vision projectors. Keep
-            // their host allocations conservatively additive, but reserve one
+            // CPU image preparation may overlap across pages. Its complete
+            // host estimate remains additive. The GPU lock still reserves one
             // backend working set plus each page's retained prompt and history.
             var retained = vision;
             retained.backend_scratch_bytes = 0;
@@ -8810,6 +8912,10 @@ pub const Node = struct {
                 .backend_scratch_bytes = try product(&.{ prompt_tokens, cfg.hidden_size, @sizeOf(f32) }),
             });
             self.amounts = try self.amounts.merge(persistent);
+        }
+        fn visionBatchPeak(self: @This(), max_items: usize) !usize {
+            if (max_items == 0 or max_items > 4) return error.ResourceLimitExceeded;
+            return std.math.mul(usize, self.vision_backend_peak, max_items) catch error.ResourceLimitExceeded;
         }
         fn finish(self: @This()) !runtime.tier.memory.AdmissionAmounts {
             return self.amounts.merge(.{ .backend_scratch_bytes = self.vision_backend_peak });
@@ -41350,6 +41456,13 @@ test "LightOnOCR3 cohorts reserve one serialized vision peak and every retained 
     const single = try memory.finish();
     try memory.add(cfg, 10, 0, decoder, vision);
     const pair = try memory.finish();
+    const four_image_peak = try memory.visionBatchPeak(4);
+    try std.testing.expectEqual(@as(usize, 4000), four_image_peak);
+    try std.testing.expectError(error.ResourceLimitExceeded, memory.visionBatchPeak(0));
+    try std.testing.expectError(error.ResourceLimitExceeded, memory.visionBatchPeak(5));
+    const batched = try memory.amounts.merge(.{ .backend_scratch_bytes = four_image_peak });
+    try std.testing.expectEqual(pair.host_scratch_bytes, batched.host_scratch_bytes);
+    try std.testing.expectEqual(pair.backend_scratch_bytes + 3000, batched.backend_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 26), pair.backend_kv_bytes);
     try std.testing.expectEqual(single.host_scratch_bytes * 2, pair.host_scratch_bytes);
     try std.testing.expectEqual((single.backend_scratch_bytes - 1000) * 2 + 1000, pair.backend_scratch_bytes);
@@ -41360,6 +41473,11 @@ test "LightOnOCR3 cohorts reserve one serialized vision peak and every retained 
     try std.testing.expectError(error.ResourceLimitExceeded, admission.tryAcquire(.gpu, .{ .combined_limit_bytes = cap - 1 }, pair, false));
     var lease = try admission.tryAcquire(.gpu, .{ .combined_limit_bytes = cap }, pair, false);
     lease.release();
+    try std.testing.expectEqual(@as(usize, 0), admission.snapshot().backendTotalBytes());
+    const batch_cap = batched.hostTotalBytes() + batched.backendTotalBytes();
+    try std.testing.expectError(error.ResourceLimitExceeded, admission.tryAcquire(.gpu, .{ .combined_limit_bytes = batch_cap - 1 }, batched, false));
+    var batch_lease = try admission.tryAcquire(.gpu, .{ .combined_limit_bytes = batch_cap }, batched, false);
+    batch_lease.release();
     try std.testing.expectEqual(@as(usize, 0), admission.snapshot().backendTotalBytes());
 }
 
@@ -41518,6 +41636,7 @@ test "LightOnOCR3 throughput preset preserves explicit overrides and resource ow
         "ANTFLY_LIGHTONOCR3_SHARED_CORE_WEIGHTS", "ANTFLY_LIGHTONOCR3_WIDE_DECODE",
         "ANTFLY_LIGHTONOCR3_BATCH_ROWS",          "ANTFLY_LIGHTONOCR3_BATCH_WINDOW",
         "ANTFLY_LIGHTONOCR3_SINGLE_FRAME",        "ANTFLY_LIGHTONOCR3_STREAM_FIRST_LAYERS",
+        "ANTFLY_LIGHTONOCR3_CPU_PREPROCESS",      "ANTFLY_LIGHTONOCR3_VISION_BATCH",
     };
     var old: [names.len]?[:0]u8 = @splat(null);
     var saved: usize = 0;
@@ -41540,6 +41659,8 @@ test "LightOnOCR3 throughput preset preserves explicit overrides and resource ow
     try std.testing.expectEqual(eligible, small.prepared and small.worker and small.activation_pool and small.epoch_auxiliary and small.batch_attention);
     try std.testing.expect(!small.shared_core_weights and !small.single_frame and small.stream_first_layers == 0);
     try std.testing.expectEqual(eligible, large.shared_core_weights);
+    try std.testing.expectEqual(eligible, small.cpu_preprocess);
+    try std.testing.expectEqual(@as(u8, 1), small.vision_batch_items);
     if (eligible) {
         try std.testing.expectEqual(@as(usize, 16), effectiveLightOnReadRows());
         try std.testing.expectEqual(@as(usize, 16), effectiveLightOnReadWindow());
