@@ -251,14 +251,16 @@ fn make(a: A, schema: []const u8, name: []const u8, configuration: []const u8, i
         try columns.append(a, try a.dupe(u8, path));
     }
     const paths = try columns.toOwnedSlice(a);
-    var logical = try std.json.parseFromSlice(std.json.Value, a, schema, .{ .allocate = .alloc_always });
-    defer logical.deinit();
-    if (logical.value != .object) return error.InvalidLogicalRowIdentity;
+    var normalization = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+    defer normalization.deinit();
+    const temporary = normalization.allocator();
+    var logical = try std.json.parseFromSliceLeaky(std.json.Value, temporary, schema, .{});
+    if (logical != .object) return error.InvalidLogicalRowIdentity;
     // Ordering is bound by layout/navigation, not by payload interpretation.
-    // Consumer generations retain their own immutable coordinate spaces.
-    _ = logical.value.object.swapRemove("index_sort");
-    const input_schema = try std.json.Stringify.valueAlloc(a, logical.value, .{});
-    defer a.free(input_schema);
+    // Consumer generations retain their own immutable coordinate spaces. Keep
+    // this full-schema temporary out of the durable recipe arena.
+    _ = logical.object.swapRemove("index_sort");
+    const input_schema = try std.json.Stringify.valueAlloc(temporary, logical, .{});
     const contract = try @import("lake_index_dependencies.zig").project(a, input_schema, if (reusable) paths else null);
     defer a.free(contract);
     const encoded = try std.json.Stringify.valueAlloc(a, .{ .format = "native-lake-input-cohort-v3", .schema = contract, .columns = paths }, .{});
