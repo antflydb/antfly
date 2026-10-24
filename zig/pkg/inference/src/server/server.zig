@@ -18216,6 +18216,21 @@ pub const Node = struct {
                 return false;
             }
         };
+        if (binding.operation == .read) {
+            if (!cloudflare_provider.routing.visionModel(binding.model)) return error.DocumentCapabilityMismatch;
+            const base = try cloudflare_provider.routing.baseUrl(a, binding.account_id, null);
+            return cloudflare_provider.invokeNative(&session.client, a, .{
+                .account_id = binding.account_id.?,
+                .model = binding.model,
+                .api_key = token,
+                .gateway_id = binding.gateway_id,
+                .url = try std.fmt.allocPrint(a, "{s}/chat/completions", .{base}),
+            }, payload, .{
+                .timeout_ms = try remainingInferenceDeadlineMs(control.deadline_ns, embedTimingNowNs()),
+                .max_response_bytes = @as(usize, 16 * 1024 * 1024),
+                .cancellation = @as(?httpx.CancellationToken, .{ .ptr = &control, .is_cancelled_fn = Cancel.cancelled }),
+            });
+        }
         return cloudflare_provider.invoke(&session.client, a, .{
             .account_id = binding.account_id orelse return error.InvalidCloudflareConfig,
             .model = binding.model,

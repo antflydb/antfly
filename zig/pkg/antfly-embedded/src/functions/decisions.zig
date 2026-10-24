@@ -52,10 +52,7 @@ pub const EmbeddingOptions = struct {
     min_margin: ?f64 = null,
     calibration_id: ?[]const u8 = null,
     pub fn validate(self: @This()) !void {
-        switch (self.dimensions) {
-            128, 256, 512, 768 => {},
-            else => return error.InvalidDeciderConfig,
-        }
+        if (self.dimensions == 0) return error.InvalidDeciderConfig;
         if (self.min_similarity) |v| if (!std.math.isFinite(v) or v < -1 or v > 1) return error.InvalidDeciderConfig;
         if (self.min_margin) |v| if (!std.math.isFinite(v) or v < 0 or v > 2) return error.InvalidDeciderConfig;
         if (self.calibration_id) |id| {
@@ -68,6 +65,7 @@ pub const DeciderConfig = struct {
     provider: Provider = .antfly,
     decision_method: enum { typed, embedding_similarity, generated } = .typed,
     generator: ?generating.GeneratorConfig = null,
+    embedder: ?[]const u8 = null,
     output: constrained.Output = .auto,
     probabilities: constrained.Probabilities = .token_logprobs,
     instructions: []const u8 = "",
@@ -87,6 +85,13 @@ pub const DeciderConfig = struct {
     batch_size: u16 = 32,
     rate_limit: ?RateLimit = null,
     pub fn validate(self: @This()) !void {
+        if (self.embedder == null) if (self.embedding_options) |options| switch (options.dimensions) {
+            128, 256, 512, 768 => {},
+            else => return error.InvalidDeciderConfig,
+        };
+        if (self.embedder) |name| {
+            if (name.len == 0 or self.decision_method != .embedding_similarity or self.model.len != 0 or self.model_identity != null or self.url.len != 0 or self.api_key != null or self.rate_limit != null or (self.embedding_options != null and (self.embedding_options.?.calibration_id != null or self.embedding_options.?.task_type != .CLUSTERING))) return error.InvalidDeciderConfig;
+        }
         if (self.provider == .cloudflare) {
             if (self.account_id == null or self.decision_method != .typed) return error.InvalidDeciderConfig;
             if (!std.mem.eql(u8, self.model, "@cf/cloudflare/clef") and !std.mem.eql(u8, self.model, "@cf/cloudflare/clef-flash")) return error.UnsupportedCloudflareModel;
@@ -114,7 +119,7 @@ pub const DeciderConfig = struct {
             if (bound == 0 or (self.decision_method != .generated and (self.provider == .antfly or self.decision_method != .typed))) return error.InvalidDeciderConfig;
         }
         if (self.max_rows == 0 or self.max_input_tokens == 0 or self.batch_size == 0 or self.batch_size > 256) return error.InvalidDeciderConfig;
-        if (self.decision_method != .generated and self.provider != .jev and std.mem.trim(u8, self.model, " \r\n\t").len == 0) return error.InvalidDeciderConfig;
+        if (self.decision_method != .generated and self.provider != .jev and self.embedder == null and std.mem.trim(u8, self.model, " \r\n\t").len == 0) return error.InvalidDeciderConfig;
         if (std.mem.indexOfAny(u8, self.url, "\r\n") != null) return error.InvalidDeciderConfig;
         if (self.rate_limit) |policy| {
             inline for (.{ policy.requests_per_minute, policy.burst, policy.tokens_per_minute, policy.max_concurrency }) |value| if (value) |v| if (v == 0) return error.InvalidDeciderConfig;
@@ -138,7 +143,7 @@ pub const DeciderConfig = struct {
         return caps;
     }
     pub fn modelName(self: @This()) []const u8 {
-        return if (self.generator) |generator| generator.model else if (self.model.len != 0) self.model else "jev-latest";
+        return if (self.embedder) |name| name else if (self.generator) |generator| generator.model else if (self.model.len != 0) self.model else "jev-latest";
     }
     pub fn baseUrl(self: @This()) []const u8 {
         return if (self.url.len != 0) self.url else switch (self.provider) {
@@ -150,6 +155,8 @@ pub const DeciderConfig = struct {
     }
     pub fn clone(self: @This(), a: std.mem.Allocator) !@This() {
         var result = self;
+        result.embedder = if (self.embedder) |name| try a.dupe(u8, name) else null;
+        errdefer if (result.embedder) |name| a.free(name);
         result.account_id = if (self.account_id) |v| try a.dupe(u8, v) else null;
         errdefer if (result.account_id) |v| a.free(v);
         result.gateway_id = if (self.gateway_id) |v| try a.dupe(u8, v) else null;
@@ -172,6 +179,7 @@ pub const DeciderConfig = struct {
         return result;
     }
     pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        if (self.embedder) |name| a.free(name);
         if (self.generator) |*generator| generator.deinit(a);
         a.free(self.instructions);
         if (self.account_id) |v| a.free(v);

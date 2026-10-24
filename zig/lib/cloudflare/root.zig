@@ -17,6 +17,7 @@
 const std = @import("std");
 const A = std.mem.Allocator;
 const V = std.json.Value;
+pub const routing = @import("antfly_cloudflare_config");
 pub const Config = struct {
     account_id: []const u8,
     model: []const u8,
@@ -30,11 +31,31 @@ pub const Config = struct {
 /// cancellation. One task call is exactly one upstream attempt.
 pub fn invoke(client: anytype, a: A, config: Config, payload: V, options: anytype) !V {
     try validatePayload(a, payload);
+    return unwrap(try invokeNative(client, a, config, payload, options));
+}
+
+/// Generic Workers AI transport. Role adapters validate their own wire shape.
+pub fn invokeNative(client: anytype, a: A, config: Config, payload: V, options: anytype) !V {
+    var response = try postNative(client, a, config, payload, options);
+    defer response.deinit();
+    const body = response.body orelse return error.InvalidCloudflareResponse;
+    try responseDepth(body);
+    const parsed = std.json.parseFromSliceLeaky(V, a, body, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error", .parse_numbers = false }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidCloudflareResponse,
+    };
+    if (field(parsed, "success")) |success| if (success != .bool or !success.bool) return error.CloudflareInferenceFailed;
+    return field(parsed, "result") orelse parsed;
+}
+
+/// Native JSON and binary adapters share one bounded upstream attempt. The
+/// response retains the HTTP client's buffer until the adapter releases it.
+pub fn postNative(client: anytype, a: A, config: Config, payload: V, options: anytype) anyerror!@typeInfo(@TypeOf(client.post("", .{}))).error_union.payload {
     if (config.gateway_id) |id| {
         if (id.len == 0 or id.len > 256) return error.InvalidCloudflareConfig;
         for (id) |ch| if (ch < 0x21 or ch > 0x7e) return error.InvalidCloudflareConfig;
     }
-    const canonical = try endpoint(a, config.account_id, config.model);
+    const canonical = try routing.nativeUrl(a, config.account_id, config.model);
     const url = config.url orelse canonical;
     const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{config.api_key});
     var headers = std.ArrayList([2][]const u8).empty;
@@ -45,17 +66,47 @@ pub fn invoke(client: anytype, a: A, config: Config, payload: V, options: anytyp
         .headers = headers.items,
         .max_retries = 0,
         .cookies_enabled = false,
+        .follow_redirects = false,
         .max_response_size = options.max_response_bytes,
         .timeout_ms = options.timeout_ms,
         .cancellation = options.cancellation,
     });
-    defer response.deinit();
+    errdefer response.deinit();
     if (response.status.code == 429) return error.CloudflareRateLimited;
     if (response.status.code == 401 or response.status.code == 403) return error.CloudflareAuthenticationFailed;
     if (!response.ok()) return error.CloudflareInferenceFailed;
-    const parsed = try std.json.parseFromSliceLeaky(V, a, response.body orelse return error.InvalidCloudflareResponse, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" });
-    return unwrap(parsed);
+    return response;
 }
+
+fn responseDepth(bytes: []const u8) !void {
+    var depth: usize = 0;
+    var quoted = false;
+    var escaped = false;
+    for (bytes) |ch| {
+        if (quoted) {
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == '"') {
+                quoted = false;
+            }
+        } else switch (ch) {
+            '"' => quoted = true,
+            '{', '[' => {
+                depth += 1;
+                if (depth > 64) return error.InvalidCloudflareResponse;
+            },
+            '}', ']' => {
+                if (depth == 0) return error.InvalidCloudflareResponse;
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    if (depth != 0 or quoted) return error.InvalidCloudflareResponse;
+}
+
 pub fn string(value: []const u8) V {
     return .{ .string = value };
 }
@@ -148,6 +199,20 @@ pub fn evidenceRequest(a: A, model: []const u8, input: Evidence, fields: V) !V {
     return result;
 }
 pub fn validatePayload(a: A, payload: V) !void {
+    // Generated wire validation and task budgets are separate authorities.
+    // Decode borrowed strings without copying embedded image payloads.
+    if (field(payload, "fields") != null) {
+        _ = std.json.parseFromValueLeaky(routing.wire.types.ClairicInput, a, payload, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidCloudflareRequest,
+        };
+    } else {
+        _ = std.json.parseFromValueLeaky(routing.wire.types.ClefInput, a, payload, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidCloudflareRequest,
+        };
+    }
+
     const state = field(payload, "state") orelse return error.InvalidCloudflareRequest;
     const schema = field(payload, "fields") orelse field(payload, "questions") orelse return error.InvalidCloudflareRequest;
     if (schema != .object or schema.object.count() == 0 or schema.object.count() > 64) return error.CloudflareInputLimitExceeded;
@@ -196,7 +261,7 @@ pub fn extractionSchema(a: A, schema: V) !ExtractionPlan {
                 if (std.mem.eql(u8, key, "unit")) {
                     if (item != .string or (!std.mem.eql(u8, native, "number") and !std.mem.eql(u8, native, "estimate"))) return error.UnsupportedCloudflareSchema;
                 } else if (std.mem.eql(u8, key, "decimals")) {
-                    if (!std.mem.eql(u8, native, "number") or item != .integer or item.integer < 0 or item.integer > 15) return error.UnsupportedCloudflareSchema;
+                    if (!std.mem.eql(u8, native, "number") or (unsigned(item) catch return error.UnsupportedCloudflareSchema) > 6) return error.UnsupportedCloudflareSchema;
                 } else {
                     if (!std.mem.eql(u8, native, "estimate")) return error.UnsupportedCloudflareSchema;
                     const n = try numeric(item);
@@ -230,7 +295,7 @@ pub fn extractionResult(a: A, plan: ExtractionPlan, result: V, state: []const u8
         const kind = try text(field(plan.fields.object.get(name).?, "type").?);
         if (value != .null) {
             if ((std.mem.eql(u8, kind, "text") or std.mem.eql(u8, kind, "date")) and value != .string) return error.InvalidCloudflareResponse;
-            if ((std.mem.eql(u8, kind, "number") or std.mem.eql(u8, kind, "estimate")) and value != .integer and value != .float) return error.InvalidCloudflareResponse;
+            if ((std.mem.eql(u8, kind, "number") or std.mem.eql(u8, kind, "estimate")) and value != .integer and value != .float and value != .number_string) return error.InvalidCloudflareResponse;
             if (std.mem.eql(u8, kind, "list")) {
                 if (value != .array) return error.InvalidCloudflareResponse;
                 for (value.array.items) |item| if (item != .string) return error.InvalidCloudflareResponse;
@@ -255,11 +320,7 @@ pub fn extractionResult(a: A, plan: ExtractionPlan, result: V, state: []const u8
         }
         if (value != .null) {
             if (field(answer, "confidence")) |confidence| {
-                const p: f64 = switch (confidence) {
-                    .float => confidence.float,
-                    .integer => @floatFromInt(confidence.integer),
-                    else => return error.InvalidCloudflareResponse,
-                };
+                const p = numeric(confidence) catch return error.InvalidCloudflareResponse;
                 if (!std.math.isFinite(p) or p < 0 or p > 1) return error.InvalidCloudflareResponse;
                 try put(a, &entry, "score", confidence);
             }
@@ -313,17 +374,34 @@ fn numeric(value: V) !f64 {
     const n: f64 = switch (value) {
         .integer => @floatFromInt(value.integer),
         .float => value.float,
+        .number_string => std.fmt.parseFloat(f64, value.number_string) catch return error.UnsupportedCloudflareSchema,
         else => return error.UnsupportedCloudflareSchema,
     };
     if (!std.math.isFinite(n)) return error.UnsupportedCloudflareSchema;
     return n;
 }
+pub const Usage = struct { input_tokens: u64, output_tokens: u64 };
+pub fn nativeUsage(result: V) !Usage {
+    const usage = field(result, "usage") orelse return error.InvalidCloudflareResponse;
+    return .{
+        .input_tokens = try unsigned(field(usage, "input_tokens") orelse return error.InvalidCloudflareResponse),
+        .output_tokens = try unsigned(field(usage, "output_tokens") orelse return error.InvalidCloudflareResponse),
+    };
+}
+
+pub fn unsigned(value: V) !u64 {
+    return switch (value) {
+        .integer => if (value.integer >= 0) @intCast(value.integer) else error.InvalidCloudflareResponse,
+        .number_string => std.fmt.parseInt(u64, value.number_string, 10) catch error.InvalidCloudflareResponse,
+        else => error.InvalidCloudflareResponse,
+    };
+}
 fn characterByteOffset(state: []const u8, index: V) !usize {
-    if (index != .integer or index.integer < 0) return error.InvalidCloudflareResponse;
-    var chars: i64 = 0;
+    const wanted = try unsigned(index);
+    var chars: u64 = 0;
     var offset: usize = 0;
-    while (offset < state.len and chars < index.integer) : (chars += 1) offset += std.unicode.utf8ByteSequenceLength(state[offset]) catch return error.InvalidCloudflareResponse;
-    if (offset > state.len or chars != index.integer) return error.InvalidCloudflareResponse;
+    while (offset < state.len and chars < wanted) : (chars += 1) offset += std.unicode.utf8ByteSequenceLength(state[offset]) catch return error.InvalidCloudflareResponse;
+    if (offset > state.len or chars != wanted) return error.InvalidCloudflareResponse;
     return offset;
 }
 
@@ -416,4 +494,42 @@ test "cloudflare provider validates every estimate metric before emitting typed 
     const empty_row = field(field(empty_result, "structures").?, "r").?.array.items[0];
     try std.testing.expectEqual(V.null, field(field(empty_row, "days").?, "value").?);
     try std.testing.expectEqual(@as(usize, 0), field(field(empty_row, "days").?, "estimate").?.object.count());
+}
+
+test "cloudflare rejects malformed successful upstream JSON and preserves numeric lexemes" {
+    const Fake = struct {
+        body: []const u8,
+        const Response = struct {
+            status: struct { code: u16 = 200 } = .{},
+            body: ?[]const u8,
+            fn ok(_: @This()) bool {
+                return true;
+            }
+            fn deinit(_: *@This()) void {}
+        };
+        fn post(self: *@This(), _: []const u8, _: anytype) !Response {
+            return .{ .body = self.body };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fake = Fake{ .body = "{not-json" };
+    const cfg = Config{ .account_id = "account", .model = "@cf/cloudflare/clairic", .api_key = "fixture" };
+    const options = .{ .max_response_bytes = 4096, .timeout_ms = @as(?u64, 1000), .cancellation = @as(?u8, null) };
+    try std.testing.expectError(error.InvalidCloudflareResponse, invokeNative(&fake, a, cfg, object(), options));
+    fake.body = "{\"success\":true,\"result\":{\"value\":9007199254740993.1}}";
+    const value = try invokeNative(&fake, a, cfg, object(), options);
+    try std.testing.expectEqualStrings("9007199254740993.1", field(value, "value").?.number_string);
+}
+
+test "cloudflare Clairic decimals follow upstream zero through six bound" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "7", "15", "-1" }) |decimals| {
+        const bytes = try std.mem.concat(a, u8, &.{ "{\"structures\":{\"record\":{\"fields\":{\"value\":{\"type\":\"number\",\"decimals\":", decimals, "}}}}}" });
+        const schema = try std.json.parseFromSliceLeaky(V, a, bytes, .{ .parse_numbers = false });
+        try std.testing.expectError(error.UnsupportedCloudflareSchema, extractionSchema(a, schema));
+    }
 }

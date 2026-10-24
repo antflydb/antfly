@@ -396,6 +396,14 @@ pub fn create(config: Config) Graph {
         .optimize = optimize,
     });
     cloudflare_mod.addImport("httpx", httpx_mod);
+    const cloudflare_config_mod = b.modules.get("antfly_cloudflare_config") orelse b.addModule("antfly_cloudflare_config", .{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/cloudflare/routing.zig")) });
+    cloudflare_config_mod.addAnonymousImport("cloudflare_api", .{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/cloudflare_api/root.zig")) });
+    cloudflare_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
+    generating_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
+    reader_config_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
+    readers_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
+    transcribing_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
+    transcribing_mod.addImport("antfly_cloudflare", cloudflare_mod);
     extracting_mod.addImport("antfly_cloudflare", cloudflare_mod);
     extracting_mod.addImport("antfly_image", image_mod);
     decisions_mod.addImport("antfly_cloudflare", cloudflare_mod);

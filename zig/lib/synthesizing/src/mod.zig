@@ -175,37 +175,21 @@ pub const Registry = struct {
 };
 
 pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
-    return .{
-        .model = try dupOpt(alloc, cfg.model),
-        .api_key = try dupOpt(alloc, cfg.api_key),
-        .voice = try dupOpt(alloc, cfg.voice),
-        .base_url = try dupOpt(alloc, cfg.base_url),
-        .project_id = try dupOpt(alloc, cfg.project_id),
-        .location = try dupOpt(alloc, cfg.location),
-        .credentials_path = try dupOpt(alloc, cfg.credentials_path),
-        .language_code = try dupOpt(alloc, cfg.language_code),
-        .voice_name = try dupOpt(alloc, cfg.voice_name),
-        .voice_id = try dupOpt(alloc, cfg.voice_id),
-        .model_id = try dupOpt(alloc, cfg.model_id),
-        .stability = cfg.stability,
-        .similarity_boost = cfg.similarity_boost,
-        .style = cfg.style,
-        .provider = cfg.provider,
-    };
+    var owned = cfg;
+    inline for (@typeInfo(Config).@"struct".field_names, @typeInfo(Config).@"struct".field_types) |name, T| {
+        if (T == ?[]const u8) @field(owned, name) = null;
+    }
+    errdefer deinitConfig(alloc, &owned);
+    inline for (@typeInfo(Config).@"struct".field_names, @typeInfo(Config).@"struct".field_types) |name, T| {
+        if (T == ?[]const u8) @field(owned, name) = try dupOpt(alloc, @field(cfg, name));
+    }
+    return owned;
 }
 
 pub fn deinitConfig(alloc: Allocator, cfg: *Config) void {
-    freeOpt(alloc, cfg.model);
-    freeOpt(alloc, cfg.api_key);
-    freeOpt(alloc, cfg.voice);
-    freeOpt(alloc, cfg.base_url);
-    freeOpt(alloc, cfg.project_id);
-    freeOpt(alloc, cfg.location);
-    freeOpt(alloc, cfg.credentials_path);
-    freeOpt(alloc, cfg.language_code);
-    freeOpt(alloc, cfg.voice_name);
-    freeOpt(alloc, cfg.voice_id);
-    freeOpt(alloc, cfg.model_id);
+    inline for (@typeInfo(Config).@"struct".field_names, @typeInfo(Config).@"struct".field_types) |name, T| {
+        if (T == ?[]const u8) freeOpt(alloc, @field(cfg, name));
+    }
     cfg.* = undefined;
 }
 
@@ -231,6 +215,10 @@ pub fn synthesizeWithConfig(alloc: Allocator, http: *httpx.Client, cfg: Config, 
     if (request.text.len == 0 or request.text.len > 65536 or request.s3_output != null or request.s3_credentials != null) return error.UnsupportedSynthesisOptions;
     if (request.speed) |speed| if (!std.math.isFinite(speed) or speed < 0.25 or speed > 4) return error.UnsupportedSynthesisOptions;
     switch (cfg.provider) {
+        .cloudflare => {
+            const state: *CloudflareSynthesizerState = @ptrCast(@alignCast(synthesizer.ptr));
+            state.options = options;
+        },
         .openai => {
             const state: *OpenAiSynthesizerState = @ptrCast(@alignCast(synthesizer.ptr));
             state.options = options;
@@ -245,10 +233,62 @@ pub fn synthesizeWithConfig(alloc: Allocator, http: *httpx.Client, cfg: Config, 
 
 pub fn initSynthesizer(alloc: Allocator, http: *httpx.Client, cfg: Config) !Synthesizer {
     return switch (cfg.provider) {
+        .cloudflare => try CloudflareSynthesizerState.init(alloc, http, cfg),
         .openai => try OpenAiSynthesizerState.init(alloc, http, cfg),
         .vertex, .elevenlabs => try RemoteSynthesizerState.init(alloc, http, cfg),
     };
 }
+
+const CloudflareSynthesizerState = struct {
+    alloc: Allocator,
+    http: *httpx.Client,
+    cfg: Config,
+    options: RemoteOptions = .{},
+    const cf = @import("antfly_cloudflare");
+    fn init(a: Allocator, http: *httpx.Client, cfg: Config) !Synthesizer {
+        try cf.routing.identifier(cfg.account_id orelse return error.InvalidCloudflareConfig);
+        if (cfg.gateway_id) |id| try cf.routing.identifier(id);
+        const model = cfg.model orelse return error.UnsupportedCloudflareModel;
+        if (!std.mem.eql(u8, model, "@cf/deepgram/aura-2-en") and !std.mem.eql(u8, model, "@cf/myshell-ai/melotts")) return error.UnsupportedCloudflareModel;
+        if (cfg.voice_id != null or cfg.voice_name != null or cfg.model_id != null or cfg.stability != null or cfg.similarity_boost != null or cfg.style != null) return error.UnsupportedSynthesisOptions;
+        if (std.mem.eql(u8, model, "@cf/deepgram/aura-2-en")) if (cfg.language_code) |language| {
+            if (!std.mem.eql(u8, language, "en") and !std.mem.eql(u8, language, "en-US")) return error.UnsupportedSynthesisOptions;
+        };
+        const self = try a.create(@This());
+        errdefer a.destroy(self);
+        self.* = .{ .alloc = a, .http = http, .cfg = try cloneConfig(a, cfg) };
+        return .{ .ptr = self, .vtable = &.{ .synthesize = synthesize, .deinit = deinit } };
+    }
+    fn deinit(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        deinitConfig(self.alloc, &self.cfg);
+        self.alloc.destroy(self);
+    }
+    fn synthesize(raw: *anyopaque, a: Allocator, req: Request) anyerror!SynthesisResult {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if ((req.format orelse .mp3) != .mp3 or (req.speed orelse 1) != 1) return error.UnsupportedSynthesisOptions;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const work = arena.allocator();
+        const melo = std.mem.eql(u8, self.cfg.model.?, "@cf/myshell-ai/melotts");
+        if (melo and (req.voice != null or self.cfg.voice != null)) return error.UnsupportedSynthesisOptions;
+        const wire = if (melo) try std.json.Stringify.valueAlloc(work, cf.routing.wire.types.MelottsInput{ .prompt = req.text, .lang = self.cfg.language_code }, .{ .emit_null_optional_fields = false }) else try std.json.Stringify.valueAlloc(work, cf.routing.wire.types.Aura2EnInput{ .text = req.text, .speaker = req.voice orelse self.cfg.voice, .encoding = "mp3" }, .{ .emit_null_optional_fields = false });
+        var response = try cf.postNative(self.http, work, .{ .account_id = self.cfg.account_id.?, .model = self.cfg.model.?, .api_key = self.cfg.api_key orelse return error.CloudflareCredentialMissing, .gateway_id = self.cfg.gateway_id, .url = self.cfg.base_url }, try std.json.parseFromSliceLeaky(std.json.Value, work, wire, .{}), .{ .max_response_bytes = @as(usize, 64 << 20), .timeout_ms = self.options.timeout_ms, .cancellation = self.options.cancellation });
+        defer response.deinit();
+        const bytes = response.body orelse return error.InvalidCloudflareResponse;
+        const audio_bytes = if (std.mem.startsWith(u8, response.headers.get("content-type") orelse "", "application/json")) decoded: {
+            const result = try std.json.parseFromSliceLeaky(std.json.Value, work, bytes, .{});
+            if (cf.field(result, "success")) |success| if (success != .bool or !success.bool) return error.CloudflareInferenceFailed;
+            const value = cf.field(result, "result") orelse return error.InvalidCloudflareResponse;
+            const encoded = try cf.text(cf.field(value, "audio") orelse return error.InvalidCloudflareResponse);
+            const decoded = try a.alloc(u8, std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.InvalidCloudflareResponse);
+            errdefer a.free(decoded);
+            std.base64.standard.Decoder.decode(decoded, encoded) catch return error.InvalidCloudflareResponse;
+            break :decoded decoded;
+        } else try a.dupe(u8, bytes);
+        return .{ .audio = audio_bytes, .response = .{ .format = .mp3 } };
+    }
+};
 
 const OpenAiSynthesizerState = struct {
     alloc: Allocator,
@@ -573,4 +613,33 @@ test "synthesizing remote adapters preserve provider wire contracts and actual u
         try std.testing.expectEqual(@as(?i64, null), result.?.response.characters_used);
     }
     try std.testing.expectError(error.UnsupportedSynthesisOptions, synthesizeWithConfig(a, &client, .{ .provider = .elevenlabs, .api_key = "fixture-token", .voice_id = "fixture-voice" }, .{ .text = "hello", .format = .wav }, .{}));
+}
+
+pub fn testCloudflareSynthesis() !void {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/", .respond = .{ .body = "ID3fixture", .content_type = "audio/mpeg" } }});
+    defer server.deinit();
+    var client = httpx.Client.init(a, io);
+    defer client.deinit();
+    var failure: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(alloc: Allocator, http: *httpx.Client, url: []const u8, out: *?anyerror) std.Io.Cancelable!void {
+            var result = synthesizeWithConfig(alloc, http, .{ .provider = .cloudflare, .model = "@cf/deepgram/aura-2-en", .account_id = "account", .api_key = "fixture", .base_url = url }, .{ .text = "hello" }, .{}) catch |err| {
+                out.* = err;
+                return;
+            };
+            defer deinitResult(alloc, &result);
+            std.testing.expectEqualStrings("ID3fixture", result.audio.?) catch |err| {
+                out.* = err;
+            };
+        }
+    };
+    group.concurrent(io, Fiber.run, .{ a, &client, server.baseUrl(), &failure }) catch return;
+    try server.handleOne();
+    group.await(io) catch {};
+    if (failure) |err| return err;
 }

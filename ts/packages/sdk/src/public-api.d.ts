@@ -6737,7 +6737,7 @@ export interface components {
          * @description The embedding provider to use.
          * @enum {string}
          */
-        EmbedderProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "cohere" | "antfly";
+        EmbedderProvider: "cloudflare" | "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "cohere" | "antfly";
         /**
          * @description A unified configuration for an embedding provider.
          *
@@ -6876,7 +6876,7 @@ export interface components {
          *       "model": "text-embedding-3-small"
          *     }
          */
-        EmbedderConfig: (components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"]) & {
+        EmbedderConfig: (components["schemas"]["CloudflareEmbedderConfig"] | components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"]) & {
             /** @description This named embedder produces sparse index/value vectors. */
             sparse?: boolean;
             rate_limit?: components["schemas"]["RateLimitConfig"];
@@ -6931,7 +6931,7 @@ export interface components {
          *     canonical provider configurations; it does not define a second provider
          *     namespace.
          */
-        IndexEmbedderConfig: components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"];
+        IndexEmbedderConfig: components["schemas"]["CloudflareEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"];
         /**
          * @description Overall health status of the cluster
          * @enum {string}
@@ -13837,7 +13837,7 @@ export interface components {
          * @description The reranking provider to use.
          * @enum {string}
          */
-        RerankerProvider: "antfly" | "cohere" | "vertex";
+        RerankerProvider: "cloudflare" | "antfly" | "cohere" | "vertex";
         /**
          * @description Objective used to rank graph paths:
          *     - min_hops: Minimize the number of edges.
@@ -13846,6 +13846,26 @@ export interface components {
          * @enum {string}
          */
         GraphPathObjective: "min_hops" | "min_weight_sum" | "max_weight_product";
+        /** @description Cloudflare Workers AI embedding. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference. */
+        CloudflareEmbedderConfig: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "cloudflare";
+            account_id: string;
+            /** @description Optional AI Gateway ID, sent through cf-aig-gateway-id. */
+            gateway_id?: string;
+            /** @default @cf/baai/bge-base-en-v1.5 */
+            model: string;
+            api_key?: string;
+            /** @description Optional deployment-owned endpoint override. */
+            url?: string;
+            /** @description Expected fixed model output dimension; the adapter validates returned vectors and never requests unsupported resizing. */
+            dimensions?: number;
+            /** @description Alias of dimensions. */
+            dimension?: number;
+        };
         /**
          * @description Advanced retrieval-role overrides. Antfly assigns canonical task intent
          *     automatically: semantic-search inputs are `RETRIEVAL_QUERY`, while index
@@ -14505,6 +14525,28 @@ export interface components {
             embedding?: components["schemas"]["ChunkEmbeddingTarget"];
             policy?: components["schemas"]["MediaChunkPolicy"];
         };
+        /** @description Cloudflare Workers AI generation. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference. */
+        CloudflareGeneratorConfig: {
+            /** @enum {string} */
+            provider: "cloudflare";
+            account_id: string;
+            /** @description Optional AI Gateway ID, sent through cf-aig-gateway-id. */
+            gateway_id?: string;
+            /** @default @cf/meta/llama-3.3-70b-instruct-fp8-fast */
+            model: string;
+            api_key?: string;
+            /** @description Optional deployment-owned endpoint override. */
+            url?: string;
+            max_tokens?: number;
+            /** Format: float */
+            temperature?: number;
+            /** Format: float */
+            top_p?: number;
+            /** Format: float */
+            frequency_penalty?: number;
+            /** Format: float */
+            presence_penalty?: number;
+        };
         /** @description Configuration for the Google generative AI provider (Gemini). */
         GoogleGeneratorConfig: {
             /** @enum {string} */
@@ -14817,7 +14859,7 @@ export interface components {
          * @description Generator providers implemented by Antfly's generation runtime.
          * @enum {string}
          */
-        GeneratorProvider: "gemini" | "vertex" | "bedrock" | "anthropic" | "ollama" | "openai" | "chatgpt" | "openrouter" | "antfly" | "apple";
+        GeneratorProvider: "cloudflare" | "gemini" | "vertex" | "bedrock" | "anthropic" | "ollama" | "openai" | "chatgpt" | "openrouter" | "antfly" | "apple";
         /**
          * @description A unified configuration for a generative AI provider.
          * @example {
@@ -14827,7 +14869,7 @@ export interface components {
          *       "max_tokens": 2048
          *     }
          */
-        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["BedrockGeneratorConfig"] | components["schemas"]["AnthropicGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["ChatGPTGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"] | components["schemas"]["AppleGeneratorConfig"]) & {
+        GeneratorConfig: (components["schemas"]["CloudflareGeneratorConfig"] | components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["BedrockGeneratorConfig"] | components["schemas"]["AnthropicGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["ChatGPTGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"] | components["schemas"]["AppleGeneratorConfig"]) & {
             /**
              * Format: int64
              * @description Conservative input-token ceiling per image. Required for image calls when tokens_per_minute is configured; choose a bound valid for the model and image policy.
@@ -15454,7 +15496,7 @@ export interface components {
          * @description The STT provider to use.
          * @enum {string}
          */
-        STTProvider: "openai" | "vertex" | "antfly" | "apple";
+        STTProvider: "cloudflare" | "openai" | "vertex" | "antfly" | "apple";
         /**
          * @description Speech-to-text provider for the `transcriber` enrichment shorthand.
          *
@@ -15930,6 +15972,8 @@ export interface components {
             gateway_id?: string;
             /** @description Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity. */
             model_identity?: string;
+            /** @description Named dense embedder for provider-neutral embedding_similarity routing. Specify matching embedding_options.dimensions. Native fitted calibrations require the original Antfly model path; hosted routes use explicit thresholds and estimated token admission. */
+            embedder?: string;
             /** @description EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto each question and can be overridden per question. Other models reject these options. Raw cosine similarities never represent probabilities. */
             embedding_options?: {
                 /** @description Qualified fitted raw thresholds in model/calibrations/{id}.json. Bound to the exact asset identity, task, renderer, dimensions and category prototypes; mutually exclusive with manual thresholds. Does not produce probabilities. */
@@ -19666,6 +19710,19 @@ export interface components {
              */
             rank_constant?: number;
         };
+        /** @description Cloudflare Workers AI reranking. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference. */
+        CloudflareRerankerConfig: {
+            /** @enum {string} */
+            provider: "cloudflare";
+            account_id: string;
+            /** @description Optional AI Gateway ID, sent through cf-aig-gateway-id. */
+            gateway_id?: string;
+            /** @default @cf/baai/bge-reranker-base */
+            model: string;
+            api_key?: string;
+            /** @description Optional deployment-owned endpoint override. */
+            url?: string;
+        };
         /**
          * @description Configuration for the Antfly inference reranking provider.
          * @example {
@@ -19755,6 +19812,8 @@ export interface components {
          *     }
          */
         RerankerConfig: {
+            account_id?: string;
+            gateway_id?: string;
             rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["RerankerProvider"];
             /** @description Field name to extract from documents for reranking. */
@@ -19770,7 +19829,7 @@ export interface components {
              * @description Deprecated compatibility override for QueryRequest.limit. When present, this is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit. Cannot exceed candidate_count when both are present or the selected provider's candidate ceiling; Vertex currently accepts at most 200.
              */
             top_n?: number;
-        } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
+        } & (components["schemas"]["CloudflareRerankerConfig"] | components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
         /** @description Reads a published graph metric. Score-bearing graph metric queries on multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required instead of merging mathematically incompatible shard-local scores. */
         GraphMetricQuery: {
             /** @description Direction of query-time personalized PageRank; defaults to out. Requires seed_nodes and metric_freshness=fresh. Both treats every selected relationship as undirected, allowing entity seeds to reach documents through incoming mention edges. */

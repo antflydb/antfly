@@ -147,6 +147,12 @@ from .classification_step_config import ClassificationStepConfig
 from .classification_transformation_result import ClassificationTransformationResult
 from .close_prepared_sql_response_200 import ClosePreparedSQLResponse200
 from .close_sql_connection_response_200 import CloseSQLConnectionResponse200
+from .cloudflare_embedder_config import CloudflareEmbedderConfig
+from .cloudflare_embedder_config_provider import CloudflareEmbedderConfigProvider
+from .cloudflare_generator_config import CloudflareGeneratorConfig
+from .cloudflare_generator_config_provider import CloudflareGeneratorConfigProvider
+from .cloudflare_reranker_config import CloudflareRerankerConfig
+from .cloudflare_reranker_config_provider import CloudflareRerankerConfigProvider
 from .cluster_backup_request import ClusterBackupRequest
 from .cluster_backup_request_format import ClusterBackupRequestFormat
 from .cluster_backup_response import ClusterBackupResponse
@@ -1873,6 +1879,12 @@ __all__ = (
     "ClassificationTransformationResult",
     "ClosePreparedSQLResponse200",
     "CloseSQLConnectionResponse200",
+    "CloudflareEmbedderConfig",
+    "CloudflareEmbedderConfigProvider",
+    "CloudflareGeneratorConfig",
+    "CloudflareGeneratorConfigProvider",
+    "CloudflareRerankerConfig",
+    "CloudflareRerankerConfigProvider",
     "ClusterBackupRequest",
     "ClusterBackupRequestFormat",
     "ClusterBackupResponse",

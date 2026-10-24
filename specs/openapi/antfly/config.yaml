@@ -44,6 +44,22 @@ components:
           minLength: 1
           default: local-inference
           description: Existing inference connection identity; credentials remain on the connection.
+    RewriterConfig:
+      oneOf:
+        - $ref: '#/components/schemas/RuntimeTaskBinding'
+        - type: object
+          additionalProperties: false
+          required: [generator]
+          properties:
+            generator:
+              type: string
+              minLength: 1
+              description: Existing named generator. Uses its provider, credentials, quotas and request deadline.
+            instructions:
+              type: string
+              maxLength: 65536
+              description: Rewriting task instructions. Input text remains untrusted user content.
+
     DeciderConfig:
       type: object
       additionalProperties: false
@@ -81,6 +97,10 @@ components:
           type: string
           pattern: '^[0-9a-f]{64}$'
           description: Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity.
+        embedder:
+          type: string
+          minLength: 1
+          description: Named dense embedder for provider-neutral embedding_similarity routing. Specify matching embedding_options.dimensions. Native fitted calibrations require the original Antfly model path; hosted routes use explicit thresholds and estimated token admission.
         embedding_options:
           type: object
           additionalProperties: false
@@ -593,8 +613,8 @@ components:
         rewriters:
           type: object
           additionalProperties:
-            $ref: "#/components/schemas/RuntimeTaskBinding"
-          description: Named rewriting targets served by existing inference connections.
+            $ref: "#/components/schemas/RewriterConfig"
+          description: Named rewriting targets using an inference connection or any named generator.
         deciders:
           type: object
           additionalProperties:

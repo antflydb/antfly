@@ -351,8 +351,8 @@ pub const Config = struct {
     predictors: ?std.json.ArrayHashMap(RuntimeTaskBinding) = null,
     /// Named extraction targets served by existing inference connections.
     extractors: ?std.json.ArrayHashMap(RuntimeTaskBinding) = null,
-    /// Named rewriting targets served by existing inference connections.
-    rewriters: ?std.json.ArrayHashMap(RuntimeTaskBinding) = null,
+    /// Named rewriting targets using an inference connection or any named generator.
+    rewriters: ?std.json.ArrayHashMap(RewriterConfig) = null,
     /// Named decision providers for ai_decide and convenience functions.
     deciders: ?std.json.ArrayHashMap(DeciderConfig) = null,
     /// Named reranker configurations for search result reranking. Define named rerankers that can be referenced by indexes, search queries, and API calls. The first reranker defined becomes the default when no reranker name is specified. **Example:** ```json { "rerankers": { "cohere-english": { "provider": "cohere", "model": "rerank-english-v3.0" }, "antfly-local": { "provider": "antfly", "model": "mxbai-rerank-base-v1", "url": "http://localhost:8080" } } } ```
@@ -748,6 +748,8 @@ pub const DeciderConfig = struct {
     gateway_id: ?[]const u8 = null,
     /// Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity.
     model_identity: ?[]const u8 = null,
+    /// Named dense embedder for provider-neutral embedding_similarity routing. Specify matching embedding_options.dimensions. Native fitted calibrations require the original Antfly model path; hosted routes use explicit thresholds and estimated token admission.
+    embedder: ?[]const u8 = null,
     /// EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto each question and can be overridden per question. Other models reject these options. Raw cosine similarities never represent probabilities.
     embedding_options: ?std.json.Value = null,
     /// Provider base URL; endpoint path is selected by provider. OpenAI defaults to https://api.openai.com/v1 and appends /decisions.
@@ -774,6 +776,7 @@ pub const DeciderConfig = struct {
         .{ "account_id", "account_id", true },
         .{ "gateway_id", "gateway_id", true },
         .{ "model_identity", "model_identity", true },
+        .{ "embedder", "embedder", true },
         .{ "embedding_options", "embedding_options", true },
         .{ "url", "url", true },
         .{ "api_key", "api_key", true },
@@ -848,6 +851,10 @@ pub const DeciderConfig = struct {
         }
         if (self.model_identity) |value| {
             try jw.objectField("model_identity");
+            try jw.write(value);
+        }
+        if (self.embedder) |value| {
+            try jw.objectField("embedder");
             try jw.write(value);
         }
         if (self.embedding_options) |value| {
@@ -2387,6 +2394,8 @@ pub const QueryAdmissionConfig = struct {
         try jw.endObject();
     }
 };
+
+pub const RewriterConfig = std.json.Value;
 
 pub const RuntimeTaskBinding = struct {
     /// Backend model identity, including any owner prefix.

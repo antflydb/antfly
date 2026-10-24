@@ -178,7 +178,8 @@ pub const Definition = struct {
                 return error.DuplicateDocumentBinding;
             if (b.provider == .cloudflare) {
                 if (!self.allow_remote) return error.RemoteDocumentModelDenied;
-                if (b.account_id == null or b.token_env == null or b.operation == .read or b.model_identity != null) return error.InvalidDocumentDefinition;
+                if (b.account_id == null or b.token_env == null or b.model_identity != null) return error.InvalidDocumentDefinition;
+                if (b.operation == .read and !std.mem.eql(u8, b.model, "@cf/mistralai/mistral-small-3.1-24b-instruct")) return error.DocumentCapabilityMismatch;
                 if ((b.operation == .extract and !std.mem.eql(u8, b.model, "@cf/cloudflare/clairic")) or
                     (b.operation == .decide and !std.mem.eql(u8, b.model, "@cf/cloudflare/clef") and !std.mem.eql(u8, b.model, "@cf/cloudflare/clef-flash"))) return error.DocumentCapabilityMismatch;
                 const env = b.token_env.?;

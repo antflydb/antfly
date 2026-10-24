@@ -392,12 +392,12 @@ pub const Registry = struct {
 
 pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
     var owned = cfg;
-    inline for (.{ "model", "prompt", "api_key", "bearer_token", "capability_token", "capability_revision", "base_url", "url", "api_url", "project_id", "location", "credentials_path" }) |field| {
+    inline for (.{ "account_id", "gateway_id", "model", "prompt", "api_key", "bearer_token", "capability_token", "capability_revision", "base_url", "url", "api_url", "project_id", "location", "credentials_path" }) |field| {
         @field(owned, field) = null;
     }
     owned.recognition_languages = &.{};
     errdefer deinitConfig(alloc, &owned);
-    inline for (.{ "model", "prompt", "api_key", "bearer_token", "capability_token", "capability_revision", "base_url", "url", "api_url", "project_id", "location", "credentials_path" }) |field| {
+    inline for (.{ "account_id", "gateway_id", "model", "prompt", "api_key", "bearer_token", "capability_token", "capability_revision", "base_url", "url", "api_url", "project_id", "location", "credentials_path" }) |field| {
         @field(owned, field) = try dupOpt(alloc, @field(cfg, field));
     }
     const languages = try alloc.alloc([]const u8, cfg.recognition_languages.len);
@@ -415,6 +415,8 @@ pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
 }
 
 pub fn deinitConfig(alloc: Allocator, cfg: *Config) void {
+    freeOpt(alloc, cfg.account_id);
+    freeOpt(alloc, cfg.gateway_id);
     freeOpt(alloc, cfg.model);
     freeOpt(alloc, cfg.prompt);
     freeOpt(alloc, cfg.api_key);
@@ -451,6 +453,7 @@ fn initReaderWithOptions(alloc: Allocator, http: *httpx.Client, cfg: Config, opt
     try cfg.validate();
     return switch (cfg.provider) {
         .antfly => try AntflyReaderState.init(alloc, http, cfg, options),
+        .cloudflare => try CloudReaderState(.cloudflare).init(alloc, http, cfg, options),
         .openai => try OpenAiReaderState.init(alloc, http, cfg, options),
         .vertex => try VertexReaderState.init(alloc, http, cfg, options),
         .apple => try AppleReaderState.init(alloc, http, cfg, options),
@@ -933,6 +936,7 @@ fn CloudReaderState(comptime provider: Provider) type {
         project_id: ?[]const u8 = null,
         location: ?[]const u8 = null,
 
+        gateway_id: ?[]const u8 = null,
         options: RemoteOptions,
 
         const Self = @This();
@@ -944,12 +948,14 @@ fn CloudReaderState(comptime provider: Provider) type {
                 .alloc = alloc,
                 .http = http,
                 .options = options,
-                .base_url = try alloc.dupe(u8, cfg.base_url orelse switch (provider) {
+                .gateway_id = try dupOpt(alloc, cfg.gateway_id),
+                .base_url = if (provider == .cloudflare) try config.cloudflare.baseUrl(alloc, cfg.account_id, cfg.base_url orelse cfg.url) else try alloc.dupe(u8, cfg.base_url orelse switch (provider) {
                     .openai => "https://api.openai.com/v1",
                     .vertex => "https://aiplatform.googleapis.com/v1",
                     else => unreachable,
                 }),
                 .model = try alloc.dupe(u8, cfg.model orelse switch (provider) {
+                    .cloudflare => return error.InvalidReaderConfig,
                     .openai => "gpt-4.1-mini",
                     .vertex => "gemini-2.5-flash",
                     else => unreachable,
@@ -976,6 +982,7 @@ fn CloudReaderState(comptime provider: Provider) type {
         }
 
         fn deinitState(self: *Self) void {
+            freeOpt(self.alloc, self.gateway_id);
             self.alloc.free(self.base_url);
             self.alloc.free(self.model);
             freeOpt(self.alloc, self.prompt);
@@ -1019,7 +1026,7 @@ fn CloudReaderState(comptime provider: Provider) type {
         pub fn read(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result {
             const self: *Self = @ptrCast(@alignCast(ptr));
             return switch (provider) {
-                .openai => try self.readOpenAi(alloc, req),
+                .cloudflare, .openai => try self.readOpenAi(alloc, req),
                 .vertex => try self.readVertex(alloc, req),
                 else => unreachable,
             };
@@ -1055,6 +1062,7 @@ fn CloudReaderState(comptime provider: Provider) type {
             var minted_auth: ?[]u8 = null;
             defer if (minted_auth) |value| alloc.free(value);
             try self.appendAuthHeaders(alloc, &headers, &minted_auth, control);
+            if (self.gateway_id) |id| try headers.append(alloc, .{ "cf-aig-gateway-id", id });
             var resp = try self.http.post(url, .{
                 .json = body,
                 .headers = headers.items,

@@ -368,11 +368,13 @@ const BackendState = struct {
         else
             null;
         errdefer if (state.owned_base_url) |endpoint| alloc.free(endpoint);
+        if (cfg.provider == .cloudflare and cfg.url.len == 0) state.owned_base_url = try lib.cloudflare.baseUrl(alloc, cfg.account_id, null);
         if (cfg.provider == .bedrock and cfg.url.len == 0) {
             state.owned_base_url = try std.fmt.allocPrint(alloc, "https://bedrock-runtime.{s}.amazonaws.com", .{cfg.region orelse @import("antfly_platform").env.getenv("AWS_REGION") orelse @import("antfly_platform").env.getenv("AWS_DEFAULT_REGION") orelse "us-east-1"});
         }
         state.api_key = switch (cfg.provider) {
             .antfly => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key orelse (if (cfg.url.len == 0) inference_api_key else null), "ANTFLY_INFERENCE_API_KEY"),
+            .cloudflare => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "CLOUDFLARE_API_TOKEN"),
             .openai => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "OPENAI_API_KEY"),
             .openrouter => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "OPENROUTER_API_KEY"),
             .anthropic => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "ANTHROPIC_API_KEY"),
@@ -389,8 +391,9 @@ const BackendState = struct {
         state.execution = execution;
         state.request_context = request_context;
         state.provider = switch (cfg.provider) {
-            .openai, .openrouter, .ollama => blk: {
-                const provider = openai_provider.Provider.init(alloc, http, cfg.url);
+            .cloudflare, .openai, .openrouter, .ollama => blk: {
+                var provider = openai_provider.Provider.init(alloc, http, state.owned_base_url orelse cfg.url);
+                provider.gateway_id = cfg.gateway_id;
                 break :blk .{ .openai = provider };
             },
             .gemini => blk: {
@@ -528,6 +531,7 @@ const BackendState = struct {
                 .endpoint = endpoint,
                 .model = model,
                 .credentials = source,
+                .gateway_id = self.cfg.gateway_id orelse "",
                 .project = if (self.provider == .vertex) self.provider.vertex.project_id else if (self.provider == .anthropic) self.cfg.workspace_id orelse @import("antfly_platform").env.getenv("ANTHROPIC_WORKSPACE_ID") orelse "" else "",
                 .location = if (self.provider == .vertex) self.provider.vertex.location else if (self.provider == .bedrock) self.provider.bedrock.options.region else "",
             },
@@ -1826,7 +1830,7 @@ fn chatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, request
     defer alloc.free(url);
     const authorization = if (state.api_key) |*key| try optionalBearerAuthHeaderOwned(state, alloc, key) else null;
     defer if (authorization) |value| alloc.free(value);
-    var headers: [3][2][]const u8 = undefined;
+    var headers: [4][2][]const u8 = undefined;
     var header_count: usize = 0;
     if (authorization) |value| {
         headers[header_count] = .{ "Authorization", value };
@@ -1835,6 +1839,10 @@ fn chatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, request
     const timeout_ms = if (state.request_context) |context| try context.remainingTimeoutMs() else @as(?u64, 120_000);
     const timeout_header = try std.fmt.allocPrint(alloc, "{d}", .{timeout_ms orelse 120_000});
     defer alloc.free(timeout_header);
+    if (cfg.gateway_id) |id| {
+        headers[header_count] = .{ "cf-aig-gateway-id", id };
+        header_count += 1;
+    }
     if (cfg.provider == .antfly) {
         headers[header_count] = .{ "X-Antfly-Inference-Attempts-Remaining", "1" };
         header_count += 1;
@@ -1985,4 +1993,57 @@ test "generating remote-only default endpoint is shared with named gateway execu
 
 test "generating backend Anthropic native wire preserves images signed replay and stream lifecycle" {
     try @import("../inference/providers/anthropic_test.zig").run();
+}
+
+test "generating backend Cloudflare uses ordinary chat transport and Gateway headers" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer fixture", req.header("authorization").?);
+            try std.testing.expectEqualStrings("gateway", req.header("cf-aig-gateway-id").?);
+        }
+    };
+    var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/chat/completions", .assert_request = Check.request, .respond = .{ .body = "{\"choices\":[{\"message\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}" } }});
+    defer server.deinit();
+    var client = httpx.Client.init(a, io);
+    defer client.deinit();
+    var failure: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(alloc: std.mem.Allocator, http: *httpx.Client, url: []const u8, out: *?anyerror) std.Io.Cancelable!void {
+            var result = executeChain(alloc, http, &.{.{ .generator = .{ .provider = .cloudflare, .account_id = "account", .gateway_id = "gateway", .model = "@cf/meta/llama-3.3-70b-instruct-fp8-fast", .url = url, .api_key = "fixture" } }}, &.{.{ .role = .user, .content = .{ .text = "hello" } }}) catch |err| {
+                out.* = err;
+                return;
+            };
+            defer result.deinit();
+            std.testing.expectEqualStrings("done", result.content) catch |err| {
+                out.* = err;
+            };
+        }
+    };
+    group.concurrent(io, Fiber.run, .{ a, &client, server.baseUrl(), &failure }) catch return;
+    try server.handleOne();
+    group.await(io) catch {};
+    if (failure) |err| return err;
+}
+
+test "generating backend Cloudflare configuration owns routing through parse clone and allocation failures" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var cfg = try lib.parseConfigFromSlice(a,
+                \\{"provider":"cloudflare","account_id":"account","gateway_id":"gateway","model":"@cf/meta/llama-3.3-70b-instruct-fp8-fast","api_key":"fixture"}
+            );
+            defer cfg.deinit(a);
+            var copy = try cfg.clone(a);
+            defer copy.deinit(a);
+            try std.testing.expectEqualStrings("account", copy.account_id.?);
+            try std.testing.expectEqualStrings("gateway", copy.gateway_id.?);
+            try std.testing.expect(copy.account_id.?.ptr != cfg.account_id.?.ptr);
+            try std.testing.expect(copy.gateway_id.?.ptr != cfg.gateway_id.?.ptr);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

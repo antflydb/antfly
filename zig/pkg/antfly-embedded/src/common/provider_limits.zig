@@ -29,10 +29,11 @@ pub const EndpointIdentity = struct {
     region: []const u8 = "",
     project: []const u8 = "",
     location: []const u8 = "",
+    gateway_id: []const u8 = "",
     credentials: credentials.CredentialSourceIdentity,
 
     pub fn updateHash(self: EndpointIdentity, hasher: *std.crypto.hash.sha2.Sha256) void {
-        inline for (.{ @tagName(self.provider), std.mem.trimEnd(u8, self.endpoint, "/"), self.model, self.region, self.project, self.location }) |value|
+        inline for (.{ @tagName(self.provider), std.mem.trimEnd(u8, self.endpoint, "/"), self.model, self.region, self.project, self.location, self.gateway_id }) |value|
             credentials.updateField(hasher, value);
         self.credentials.updateHash(hasher);
     }
@@ -41,7 +42,7 @@ pub const EndpointIdentity = struct {
         return self.provider == other.provider and self.credentials.eql(other.credentials) and
             std.mem.eql(u8, std.mem.trimEnd(u8, self.endpoint, "/"), std.mem.trimEnd(u8, other.endpoint, "/")) and
             std.mem.eql(u8, self.model, other.model) and std.mem.eql(u8, self.region, other.region) and
-            std.mem.eql(u8, self.project, other.project) and std.mem.eql(u8, self.location, other.location);
+            std.mem.eql(u8, self.project, other.project) and std.mem.eql(u8, self.location, other.location) and std.mem.eql(u8, self.gateway_id, other.gateway_id);
     }
 };
 

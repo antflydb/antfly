@@ -626,11 +626,14 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     jsonschema_mod.addImport("antfly_platform", platform_mod);
     const structured_mod = b.addModule("antfly_structured", .{ .root_source_file = b.path("lib/structured/root.zig") });
     structured_mod.addImport("antfly_jsonschema", jsonschema_mod);
+    const cloudflare_config_mod = b.modules.get("antfly_cloudflare_config") orelse b.addModule("antfly_cloudflare_config", .{ .root_source_file = b.path("lib/cloudflare/routing.zig") });
+    cloudflare_config_mod.addAnonymousImport("cloudflare_api", .{ .root_source_file = b.path("pkg/antfly-embedded/src/openapi/generated/cloudflare_api/root.zig") });
     const generating_mod = b.createModule(.{
         .root_source_file = b.path("lib/generating/src/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
+    generating_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
     generating_mod.addImport("antfly-json", json_mod);
     generating_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     const chunking_mod = b.createModule(.{
@@ -646,6 +649,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .target = target,
         .optimize = optimize,
     });
+    embeddings_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
     embeddings_mod.addImport("antfly-json", json_mod);
     embeddings_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
     const scraping_mod = b.createModule(.{
@@ -666,6 +670,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .target = target,
         .optimize = optimize,
     });
+    reranking_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
     reranking_mod.addImport("antfly-json", json_mod);
     reranking_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
     const extracting_mod = b.createModule(.{
@@ -860,6 +865,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     synthesizing_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
     synthesizing_mod.addImport("httpx", httpx_mod);
+    synthesizing_mod.addImport("antfly_cloudflare", b.modules.get("antfly_cloudflare").?);
     synthesizing_mod.addImport("antfly_google", google_mod);
 
     const inference_workflow = @import("../../pkg/inference/build/context.zig").Context{

@@ -49,13 +49,18 @@ pub fn Service(comptime Node: type) type {
                 return self.operation == other.operation and std.mem.eql(u8, self.name, other.name);
             }
         };
-        const Plan = struct { key: Key, definition: c.Definition };
+        const ReadScope = struct { limits: c.Limits, deadline_ns: u64 };
+        const Plan = struct { key: Key, definition: c.Definition, read_scope: ?ReadScope = null };
         const Graph = struct {
             plans: std.ArrayList(Plan) = .empty,
             visits: usize = 0,
             snapshots: std.ArrayList(c.Snapshot) = .empty,
             fn snapshot(self: *const Graph, binding: c.Binding) ?c.Snapshot {
                 for (self.snapshots.items) |item| if (item.binding.operation == binding.operation and std.mem.eql(u8, item.binding.model, binding.model)) return item;
+                return null;
+            }
+            fn readScope(self: *const Graph, key: Key) ?ReadScope {
+                for (self.plans.items) |plan| if (plan.key.eql(key)) return plan.read_scope;
                 return null;
             }
             fn get(self: *const Graph, key: Key) ?c.Definition {
@@ -256,8 +261,10 @@ pub fn Service(comptime Node: type) type {
             for (def.models) |binding| {
                 if (binding.provider == .cloudflare) {
                     if (!remote_allowed or !def.allow_remote) return error.RemoteDocumentModelDenied;
-                    _ = try cf.endpoint(a, binding.account_id.?, binding.model);
-                    if (binding.operation == .read) return error.DocumentCapabilityMismatch;
+                    if (binding.operation == .read) {
+                        if (!cf.routing.visionModel(binding.model)) return error.DocumentCapabilityMismatch;
+                        _ = try cf.routing.nativeUrl(a, binding.account_id.?, binding.model);
+                    } else _ = try cf.endpoint(a, binding.account_id.?, binding.model);
                     continue;
                 }
                 const key = Key{ .name = binding.model, .operation = binding.operation };
@@ -276,11 +283,31 @@ pub fn Service(comptime Node: type) type {
             }
         }
 
-        fn extractionReader(def: c.Definition, name: []const u8, graph: *const Graph) !Key {
+        const ExtractionReader = struct { key: Key, limits: c.Limits, deadline_ns: u64 };
+
+        fn extractionReader(def: c.Definition, name: []const u8, graph: *Graph, run: ?*c.Run) !ExtractionReader {
+            var deadline_ns: u64 = std.math.maxInt(u64);
+            const started_ns = @import("antfly_platform").time.monotonicNs();
+            var limits = def.budget;
+            var absolute_limits = if (run) |active| active.limits else def.budget;
             var current = def;
             var current_name = name;
-            for (0..16) |_| {
-                if (current.read != null) return .{ .name = current_name, .operation = .extract };
+            for (0..16) |depth| {
+                inline for (@typeInfo(c.Limits).@"struct".field_names) |field_name| {
+                    @field(limits, field_name) = @min(@field(limits, field_name), @field(current.budget, field_name));
+                }
+                deadline_ns = @min(deadline_ns, started_ns +| current.budget.deadline_ms * std.time.ns_per_ms);
+                if (run) |active| {
+                    var current_limits = active.nestedLimits(current.budget);
+                    // Ancestor delegation calls precede entry into this scope.
+                    // Its own read calls remain inside the original allowance.
+                    current_limits.max_model_calls = @min(active.limits.max_model_calls, current_limits.max_model_calls +| depth);
+                    inline for (@typeInfo(c.Limits).@"struct".field_names) |field_name| @field(absolute_limits, field_name) = @min(@field(absolute_limits, field_name), @field(current_limits, field_name));
+                    for (graph.plans.items) |*plan| {
+                        if (plan.key.eql(.{ .name = current_name, .operation = .extract })) plan.read_scope = .{ .limits = absolute_limits, .deadline_ns = deadline_ns };
+                    }
+                }
+                if (current.read != null) return .{ .key = .{ .name = current_name, .operation = .extract }, .limits = limits, .deadline_ns = deadline_ns };
                 const task = current.extract orelse return error.DocumentCapabilityMismatch;
                 const binding = try current.binding(task.model, .extract);
                 if (binding.provider == .antfly) if (graph.get(.{ .name = binding.model, .operation = binding.operation })) |child| {
@@ -288,7 +315,7 @@ pub fn Service(comptime Node: type) type {
                     current_name = binding.model;
                     continue;
                 };
-                return .{ .name = "antfly/native-document", .operation = .read };
+                return .{ .key = .{ .name = "antfly/native-document", .operation = .read }, .limits = limits, .deadline_ns = deadline_ns };
             }
             return error.DocumentDependencyCycle;
         }
@@ -326,7 +353,7 @@ pub fn Service(comptime Node: type) type {
                 part.tables = try @import("representation.zig").cloneTables(a, part.tables, 65536);
             }
             out.inherited_parts = inherited;
-            if (page.fields) |fields| out.fields = try std.json.parseFromSliceLeaky(V, a, try std.json.Stringify.valueAlloc(a, fields, .{}), .{});
+            if (page.fields) |fields| out.fields = try std.json.parseFromSliceLeaky(V, a, try std.json.Stringify.valueAlloc(a, fields, .{}), .{ .parse_numbers = false });
             const ir = @import("representation.zig");
             out.regions = try ir.cloneRegions(a, page.regions, 65536);
             out.tables = try ir.cloneTables(a, page.tables, 65536);
@@ -338,7 +365,6 @@ pub fn Service(comptime Node: type) type {
 
         fn read(raw: *anyopaque, a: A, binding: c.Binding, _: usize, bbox: ?[4]f64, run: *c.Run) !executor.Candidate {
             const self: *Self = @ptrCast(@alignCast(raw));
-            if (binding.provider != .antfly) return error.DocumentCapabilityMismatch;
             if (std.mem.eql(u8, binding.model, "antfly/native-document")) {
                 if (bbox != null) return error.DocumentCapabilityMismatch;
                 const native = try self.source.analyze(a, self.number, run.control);
@@ -378,6 +404,29 @@ pub fn Service(comptime Node: type) type {
                 offset = .{ @floatFromInt(left), @floatFromInt(top) };
                 raster_width = right - left;
                 raster_height = bottom - top;
+            }
+            if (binding.provider == .cloudflare) {
+                if (!cf.routing.visionModel(binding.model)) return error.DocumentCapabilityMismatch;
+                const max_tokens = self.max_tokens orelse 1024;
+                const payload = try std.json.parseFromSliceLeaky(V, a, try std.json.Stringify.valueAlloc(a, .{
+                    .model = binding.model,
+                    .max_tokens = max_tokens,
+                    .messages = .{.{ .role = "user", .content = .{
+                        .{ .type = "text", .text = self.prompt orelse "Transcribe all visible document text in reading order. Preserve numbers, rows and columns. Do not invent missing content." },
+                        .{ .type = "image_url", .image_url = .{ .url = try dataUri(a, mime, data) } },
+                    } }},
+                }, .{}), .{ .parse_numbers = false });
+                run.usage.physical_model_calls += 1;
+                const result = try self.node.invokeCloudflare(a, binding, payload, self.control, run);
+                try recordUsage(run, result);
+                const choices = cf.field(result, "choices") orelse return error.InvalidCloudflareResponse;
+                if (choices != .array or choices.array.items.len != 1) return error.InvalidCloudflareResponse;
+                const choice = choices.array.items[0];
+                const message = cf.field(choice, "message") orelse return error.InvalidCloudflareResponse;
+                const text = try cf.text(cf.field(message, "content") orelse return error.InvalidCloudflareResponse);
+                const finish = cf.field(choice, "finish_reason") orelse .null;
+                const stopped = finish == .string and std.mem.eql(u8, finish.string, "stop");
+                return .{ .model = binding.model, .text = text, .origin = .interpretation, .truncated = finish == .string and std.mem.eql(u8, finish.string, "length"), .status = if (stopped) .complete else .unresolved };
             }
             if (self.graph.get(.{ .name = binding.model, .operation = binding.operation })) |child| {
                 const child_limits = try run.nestedViewLimits(child.budget, data.len, raster_width, raster_height);
@@ -449,7 +498,7 @@ pub fn Service(comptime Node: type) type {
                     region.* = .{ .id = i, .text = item.text, .bbox = box, .confidence = item.confidence, .label = item.label, .model = binding.model, .origin = binding.output_origin };
                 }
             }
-            return .{ .text = result.text, .model = binding.model, .origin = binding.output_origin, .status = if (result.completion == .unresolved) .unresolved else null, .truncated = result.completion == .length, .regions = regions, .fields = if (result.fields_json) |json| try std.json.parseFromSliceLeaky(V, a, json, .{}) else null };
+            return .{ .text = result.text, .model = binding.model, .origin = binding.output_origin, .status = if (result.completion == .unresolved) .unresolved else null, .truncated = result.completion == .length, .regions = regions, .fields = if (result.fields_json) |json| try std.json.parseFromSliceLeaky(V, a, json, .{ .parse_numbers = false }) else null };
         }
 
         fn decide(raw: *anyopaque, a: A, binding: c.Binding, observation: executor.Observation, run: *c.Run) !executor.Action {
@@ -499,7 +548,7 @@ pub fn Service(comptime Node: type) type {
             run.usage.physical_model_calls += 1;
             const bytes = try self.node.decideDirectJsonWithControl(a, request, self.control);
             _ = try self.verifyBinding(a, binding);
-            const response = try std.json.parseFromSliceLeaky(V, a, bytes, .{});
+            const response = try std.json.parseFromSliceLeaky(V, a, bytes, .{ .parse_numbers = false });
             try recordUsage(run, response);
             const answers = cf.field(response, "answers") orelse return error.InvalidDocumentModelResult;
             if (answers != .array or answers.array.items.len != 1) return error.InvalidDocumentModelResult;
@@ -582,45 +631,53 @@ pub fn Service(comptime Node: type) type {
             return inputs.toOwnedSlice();
         }
 
-        fn applyExtractionPolicy(node: *Node, a: A, def: c.Definition, graph: *const Graph, input: V, schema: V, version: u32, options: V, control: Control, run: *c.Run) anyerror!V {
+        const ExtractionPhase = enum { fresh, after_read };
+
+        fn applyExtractionPolicy(node: *Node, a: A, def: c.Definition, graph: *const Graph, input: V, schema: V, version: u32, options: V, control: Control, run: *c.Run, phase: ExtractionPhase) anyerror!V {
             const binding = try def.binding((def.extract orelse return error.DocumentCapabilityMismatch).model, .extract);
             const content = try cf.text(cf.field(input, "content") orelse return error.UnsupportedDocumentFormat);
             const policy = def.extract orelse return error.DocumentCapabilityMismatch;
-            var item = try invokeExtraction(node, a, binding, graph, input, schema, version, options, control, run);
+            var item = try invokeExtraction(node, a, binding, graph, input, schema, version, options, control, run, phase);
             const evidence = @import("evidence.zig");
             var supported = try evidence.attach(a, &item, content, cf.field(input, "metadata"), policy.require_source_support, policy.allow_derived_values);
             var corroborated = true;
             if (policy.verification_model) |name| {
                 const verifier = try def.binding(name, .extract);
-                const check = try invokeExtraction(node, a, verifier, graph, input, schema, version, options, control, run);
+                const check = try invokeExtraction(node, a, verifier, graph, input, schema, version, options, control, run, .fresh);
                 try run.emit(.{ .phase = .verification, .source_id = if (cf.field(input, "id")) |id| try cf.text(id) else "", .page_number = 0, .model = verifier.model });
                 corroborated = try evidence.sameValues(a, item, check);
             }
             if (!supported or !corroborated) {
                 const fallback = try def.binding(policy.fallback_model orelse return error.DocumentUnresolved, .extract);
-                item = try invokeExtraction(node, a, fallback, graph, input, schema, version, options, control, run);
+                item = try invokeExtraction(node, a, fallback, graph, input, schema, version, options, control, run, .fresh);
                 supported = try evidence.attach(a, &item, content, cf.field(input, "metadata"), policy.require_source_support, policy.allow_derived_values);
                 if (!supported) return error.DocumentUnresolved;
                 if (policy.verification_model) |name| {
                     const verifier = try def.binding(name, .extract);
                     if (std.mem.eql(u8, verifier.model, fallback.model)) return error.DocumentUnresolved;
-                    const check = try invokeExtraction(node, a, verifier, graph, input, schema, version, options, control, run);
+                    const check = try invokeExtraction(node, a, verifier, graph, input, schema, version, options, control, run, .fresh);
                     if (!try evidence.sameValues(a, item, check)) return error.DocumentUnresolved;
                 }
             }
             return item;
         }
 
-        fn invokeExtraction(node: *Node, a: A, binding: c.Binding, graph: *const Graph, input: V, schema: V, version: u32, options: V, control: Control, run: *c.Run) anyerror!V {
+        fn invokeExtraction(node: *Node, a: A, binding: c.Binding, graph: *const Graph, input: V, schema: V, version: u32, options: V, control: Control, run: *c.Run, phase: ExtractionPhase) anyerror!V {
             const content = try cf.text(cf.field(input, "content") orelse return error.UnsupportedDocumentFormat);
             try run.call();
             try run.emit(.{ .phase = .extracting, .source_id = if (cf.field(input, "id")) |id| try cf.text(id) else "", .page_number = 0, .model = binding.model });
             if (binding.provider == .antfly) if (graph.get(.{ .name = binding.model, .operation = binding.operation })) |child| {
                 const parent_limits = run.limits;
                 defer run.limits = parent_limits;
-                run.limits = run.nestedLimits(child.budget);
+                const scope = if (phase == .after_read) graph.readScope(.{ .name = binding.model, .operation = binding.operation }) else null;
+                if (scope) |shared_scope| {
+                    // Read and extraction are phases of one child invocation.
+                    // Retain its original absolute ceilings instead of granting
+                    // another allowance after preprocessing has consumed work.
+                    inline for (@typeInfo(c.Limits).@"struct".field_names) |field_name| @field(run.limits, field_name) = @min(@field(run.limits, field_name), @field(shared_scope.limits, field_name));
+                } else run.limits = run.nestedLimits(child.budget);
                 var nested_control = control;
-                const deadline = @import("antfly_platform").time.monotonicNs() +| child.budget.deadline_ms * std.time.ns_per_ms;
+                const deadline = if (scope) |shared_scope| shared_scope.deadline_ns else @import("antfly_platform").time.monotonicNs() +| child.budget.deadline_ms * std.time.ns_per_ms;
                 nested_control.deadline_ns = if (control.deadline_ns) |existing| @min(existing, deadline) else deadline;
                 const parent_control = run.control;
                 defer run.control = parent_control;
@@ -631,7 +688,7 @@ pub fn Service(comptime Node: type) type {
                     }
                 };
                 run.control = .{ .ptr = &nested_control, .check_fn = ChildProbe.check };
-                return applyExtractionPolicy(node, a, child, graph, input, schema, version, options, nested_control, run);
+                return applyExtractionPolicy(node, a, child, graph, input, schema, version, options, nested_control, run, phase);
             };
             var scratch = std.heap.ArenaAllocator.init(run.work_allocator orelse a);
             defer scratch.deinit();
@@ -660,7 +717,7 @@ pub fn Service(comptime Node: type) type {
                 defer response.deinit();
                 const after = try node.documentResolveBinding(work, binding);
                 if (!std.mem.eql(u8, pinned.path, after.path) or !std.mem.eql(u8, &pinned.identity, &after.identity)) return error.DocumentModelRevisionMismatch;
-                const result = try std.json.parseFromSliceLeaky(V, work, response.json, .{ .allocate = .alloc_always });
+                const result = try std.json.parseFromSliceLeaky(V, work, response.json, .{ .allocate = .alloc_always, .parse_numbers = false });
                 try recordUsage(run, result);
                 const rows = cf.field(result, "data") orelse return error.InvalidDocumentModelResult;
                 if (rows != .array or rows.array.items.len != 1) return error.InvalidDocumentModelResult;
@@ -668,14 +725,14 @@ pub fn Service(comptime Node: type) type {
             }
             const item_json = try std.json.Stringify.valueAlloc(work, item, .{});
             try run.output(item_json.len);
-            return std.json.parseFromSliceLeaky(V, a, item_json, .{ .allocate = .alloc_always });
+            return std.json.parseFromSliceLeaky(V, a, item_json, .{ .allocate = .alloc_always, .parse_numbers = false });
         }
 
         pub fn extractJson(node: *Node, backing: A, bytes: []const u8, control: Control) ![]u8 {
             var arena = std.heap.ArenaAllocator.init(backing);
             defer arena.deinit();
             const a = arena.allocator();
-            const root = try std.json.parseFromSliceLeaky(V, a, bytes, .{ .duplicate_field_behavior = .@"error" });
+            const root = try std.json.parseFromSliceLeaky(V, a, bytes, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false });
             if (root != .object) return error.InvalidDocumentSource;
             for (root.object.keys()) |key| {
                 var known = false;
@@ -688,8 +745,9 @@ pub fn Service(comptime Node: type) type {
             const forms = @as(u8, @intFromBool(cf.field(root, "documents") != null)) + @as(u8, @intFromBool(cf.field(root, "inputs") != null)) + @as(u8, @intFromBool(cf.field(root, "read_artifact") != null));
             if (forms != 1) return error.InvalidDocumentSource;
             const version: u32 = if (cf.field(root, "schema_version")) |v| version: {
-                if (v != .integer or (v.integer != 1 and v.integer != 2)) return error.UnsupportedExtractionSchemaVersion;
-                break :version @intCast(v.integer);
+                const n = jsonUnsigned(v) catch return error.UnsupportedExtractionSchemaVersion;
+                if (n != 1 and n != 2) return error.UnsupportedExtractionSchemaVersion;
+                break :version @intCast(n);
             } else 1;
             const schema = cf.field(root, "schema") orelse return error.InvalidDocumentSource;
             const definition_bytes = try node.documentDefinition(a, model, .extract);
@@ -727,7 +785,7 @@ pub fn Service(comptime Node: type) type {
                     artifact_snapshot = try node.borrowDocumentArtifact(try cf.text(handle));
                     break :cached artifact_snapshot.?.bytes();
                 } else try node.readDocumentArtifact(a, try cf.text(handle));
-                const read_result = try std.json.parseFromSliceLeaky(V, a, cached, .{});
+                const read_result = try std.json.parseFromSliceLeaky(V, a, cached, .{ .parse_numbers = false });
                 try inputs.appendSlice(try inputsFromRead(a, read_result));
             } else if (cf.field(root, "documents")) |documents| {
                 if (documents != .array or documents.array.items.len == 0) return error.InvalidDocumentSource;
@@ -738,12 +796,18 @@ pub fn Service(comptime Node: type) type {
                 // independent grouping of each source for extraction.
                 {
                     var request = cf.object();
-                    const reader = try extractionReader(def, model, &graph);
-                    try cf.put(a, &request, "model", cf.string(reader.name));
+                    const reader = try extractionReader(def, model, &graph, &run);
+                    try cf.put(a, &request, "model", cf.string(reader.key.name));
                     try cf.put(a, &request, "documents", documents);
-                    const read_bytes = try readJsonWithRun(node, backing, try std.json.Stringify.valueAlloc(a, request, .{}), extraction_control, &run, &graph, null, reader.operation);
+                    const saved_limits = run.limits;
+                    defer run.limits = saved_limits;
+                    run.limits = run.nestedLimits(reader.limits);
+                    var read_control = extraction_control;
+                    const read_deadline = reader.deadline_ns;
+                    read_control.deadline_ns = if (read_control.deadline_ns) |d| @min(d, read_deadline) else read_deadline;
+                    const read_bytes = try readJsonWithRun(node, backing, try std.json.Stringify.valueAlloc(a, request, .{}), read_control, &run, &graph, null, reader.key.operation);
                     defer backing.free(read_bytes);
-                    const read_result = try std.json.parseFromSliceLeaky(V, a, read_bytes, .{ .allocate = .alloc_always });
+                    const read_result = try std.json.parseFromSliceLeaky(V, a, read_bytes, .{ .allocate = .alloc_always, .parse_numbers = false });
                     try inputs.appendSlice(try inputsFromRead(a, read_result));
                 }
             } else {
@@ -771,7 +835,7 @@ pub fn Service(comptime Node: type) type {
             }
             var output: std.array_list.Managed(V) = .init(a);
             for (inputs.items) |input| {
-                var item = try applyExtractionPolicy(node, a, def, &graph, input, schema, version, cf.field(root, "options") orelse cf.object(), extraction_control, &run);
+                var item = try applyExtractionPolicy(node, a, def, &graph, input, schema, version, cf.field(root, "options") orelse cf.object(), extraction_control, &run, .after_read);
                 if (cf.field(input, "id")) |id| try cf.put(a, &item, "id", id);
                 if (cf.field(input, "metadata")) |metadata| try cf.put(a, &item, if (cf.field(root, "documents") != null or cf.field(root, "read_artifact") != null) "document" else "metadata", metadata);
                 try output.append(item);
@@ -807,12 +871,19 @@ fn boundedText(value: []const u8, max_bytes: usize) []const u8 {
     return value[0..end];
 }
 
+fn jsonUnsigned(value: V) !u64 {
+    return switch (value) {
+        .integer => if (value.integer >= 0) @intCast(value.integer) else error.InvalidDocumentModelResult,
+        .number_string => std.fmt.parseInt(u64, value.number_string, 10) catch error.InvalidDocumentModelResult,
+        else => error.InvalidDocumentModelResult,
+    };
+}
+
 fn recordUsage(run: *c.Run, response: V) !void {
     const usage = cf.field(response, "usage") orelse return;
     const input = cf.field(usage, "input_tokens") orelse cf.field(usage, "prompt_tokens") orelse V{ .integer = 0 };
     const output = cf.field(usage, "output_tokens") orelse cf.field(usage, "completion_tokens") orelse V{ .integer = 0 };
-    if (input != .integer or output != .integer or input.integer < 0 or output.integer < 0) return error.InvalidDocumentModelResult;
-    try run.tokens(@intCast(input.integer), @intCast(output.integer));
+    try run.tokens(try jsonUnsigned(input), try jsonUnsigned(output));
 }
 
 fn dataUri(a: A, mime: []const u8, bytes: []const u8) ![]const u8 {
@@ -831,7 +902,9 @@ test "document nested composites share one budget and one rendered view" {
         tiny_tokens: bool = false,
         fn documentDefinition(self: *@This(), a: A, name: []const u8, operation: c.Operation) !?[]const u8 {
             if (operation != .read) return null;
-            const json = if (std.mem.eql(u8, name, "parent") and self.tiny_tokens)
+            const json = if (std.mem.eql(u8, name, "cloudflare-reader"))
+                \\{"allow_remote":true,"models":[{"name":"vision","provider":"cloudflare","model":"@cf/mistralai/mistral-small-3.1-24b-instruct","operation":"read","account_id":"account","token_env":"CLOUDFLARE_API_TOKEN"}],"read":{"reader":"vision","min_confidence":0}}
+            else if (std.mem.eql(u8, name, "parent") and self.tiny_tokens)
                 \\{"models":[{"name":"child","model":"child","operation":"read"}],"read":{"reader":"child"},"budget":{"max_total_tokens":1}}
             else if (std.mem.eql(u8, name, "parent"))
                 "{\"models\":[{\"name\":\"child\",\"model\":\"child\",\"operation\":\"read\"}],\"read\":{\"reader\":\"child\"},\"budget\":{\"max_model_calls\":2}}"
@@ -860,8 +933,12 @@ test "document nested composites share one budget and one rendered view" {
             results[0] = .{ .text = "Receipt total 12.50", .completion = if (self.incomplete) .length else .complete, .prompt_tokens = if (self.measured) @as(usize, 10) else null, .completion_tokens = if (self.measured) @as(usize, 256) else null };
             return .{ .items = results, .usage = try readers.measuredUsage(results), .execution = .{ .requested_items = 1, .serial_items = 1 } };
         }
-        fn invokeCloudflare(_: *@This(), _: A, _: c.Binding, _: V, _: Control, _: *c.Run) anyerror!V {
-            return error.UnexpectedCall;
+        fn invokeCloudflare(_: *@This(), a: A, binding: c.Binding, payload: V, _: Control, _: *c.Run) anyerror!V {
+            try std.testing.expectEqual(c.Operation.read, binding.operation);
+            try std.testing.expectEqualStrings(binding.model, cf.field(payload, "model").?.string);
+            return std.json.parseFromSliceLeaky(V, a,
+                \\{"choices":[{"message":{"content":"Receipt total 12.50"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}
+            , .{ .parse_numbers = false });
         }
         fn decideDirectJsonWithControl(_: *@This(), _: A, _: []const u8, _: ?Control) anyerror![]u8 {
             return error.UnexpectedCall;
@@ -869,6 +946,12 @@ test "document nested composites share one budget and one rendered view" {
     };
     const a = std.testing.allocator;
     var fake = Fake{};
+    const remote_result = try Service(Fake).readEncodedJson(&fake, a, "cloudflare-reader", .{ .images = &.{.{ .bytes = @embedFile("testdata/one-pixel.png"), .mime_type = "image/png" }} }, .{});
+    defer a.free(remote_result);
+    var remote = try std.json.parseFromSlice(V, a, remote_result, .{});
+    defer remote.deinit();
+    try std.testing.expectEqualStrings("interpretation", remote.value.object.get("data").?.array.items[0].object.get("origin").?.string);
+    try std.testing.expectEqual(@as(i64, 15), remote.value.object.get("usage").?.object.get("total_tokens").?.integer);
     const result = try Service(Fake).readJson(&fake, a,
         \\{"model":"parent","documents":[{"id":"receipt","url":"fixture","media_type":"image/png"}]}
     , .{});
@@ -921,6 +1004,7 @@ test "document extraction keeps independent sources atomic and reuses retained r
         downloads: usize = 0,
         calls: usize = 0,
         disagree: bool = false,
+        precise: bool = false,
         family: enum { records, entities, relations, classifications } = .records,
         unsupported_relation: bool = false,
         with_fallback: bool = false,
@@ -929,12 +1013,18 @@ test "document extraction keeps independent sources atomic and reuses retained r
         fn documentDefinition(self: *@This(), a: A, name: []const u8, operation: c.Operation) !?[]const u8 {
             if (operation != .extract) return null;
             if (std.mem.eql(u8, name, "nested-parent")) return try a.dupe(u8,
-                \\{"models":[{"name":"child","model":"nested-child","operation":"extract"}],"extract":{"model":"child"}}
+                \\{"models":[{"name":"child","model":"nested-middle","operation":"extract"}],"extract":{"model":"child"}}
+            );
+            if (std.mem.eql(u8, name, "nested-middle")) return try a.dupe(u8,
+                \\{"models":[{"name":"child","model":"nested-child","operation":"extract"}],"extract":{"model":"child"},"budget":{"max_pages":1}}
             );
             if (std.mem.eql(u8, name, "nested-child")) return try a.dupe(u8,
-                \\{"models":[{"name":"native","model":"antfly/native-document","operation":"read"},{"name":"extractor","model":"leaf","operation":"extract"}],"read":{"reader":"native"},"extract":{"model":"extractor"},"budget":{"max_pages":1,"max_model_calls":1}}
+                \\{"models":[{"name":"native","model":"antfly/native-document","operation":"read"},{"name":"extractor","model":"leaf","operation":"extract"}],"read":{"reader":"native"},"extract":{"model":"extractor"},"budget":{"max_pages":2,"max_model_calls":1}}
             );
             if (!std.mem.eql(u8, name, "composite")) return null;
+            if (self.precise) return try a.dupe(u8,
+                \\{"models":[{"name":"extractor","model":"leaf","operation":"extract"},{"name":"verifier","model":"verifier","operation":"extract"}],"extract":{"model":"extractor","verification_model":"verifier"}}
+            );
             if (self.with_fallback) return try a.dupe(u8,
                 \\{"models":[{"name":"extractor","model":"leaf","operation":"extract"},{"name":"verifier","model":"verifier","operation":"extract"},{"name":"fallback","model":"fallback","operation":"extract"}],"extract":{"model":"extractor","verification_model":"verifier","fallback_model":"fallback","require_source_support":true},"budget":{"max_model_calls":4}}
             );
@@ -956,6 +1046,11 @@ test "document extraction keeps independent sources atomic and reuses retained r
         }
         fn extractDirectWithControl(self: *@This(), a: A, name: []const u8, request: extracting.Request, _: Control) !extracting.Response {
             self.calls += 1;
+            if (self.precise) return .{ .allocator = a, .json = try std.mem.concat(a, u8, &.{
+                "{\"data\":[{\"structures\":{\"record\":[{\"value\":{\"value\":",
+                if (self.disagree and std.mem.eql(u8, name, "verifier")) "9007199254740993.2" else "9007199254740993.1",
+                "}}]}}],\"usage\":{\"input_tokens\":4,\"output_tokens\":0}}",
+            }) };
             if (self.family != .records) {
                 const row_json = switch (self.family) {
                     .entities =>
@@ -971,7 +1066,7 @@ test "document extraction keeps independent sources atomic and reuses retained r
                     ,
                     .records => unreachable,
                 };
-                var row = try std.json.parseFromSliceLeaky(V, a, row_json, .{});
+                var row = try std.json.parseFromSliceLeaky(V, a, row_json, .{ .parse_numbers = false });
                 if (self.attributed_relations) {
                     row = try std.json.parseFromSliceLeaky(V, a,
                         \\{"entities":[{"label":"person","text":"Alex","start":0,"end":4,"attributes":{"role":{"label":"buyer"}}},{"label":"person","text":"Alex","start":5,"end":9,"attributes":{"role":{"label":"seller"}}},{"label":"org","text":"Antfly","start":10,"end":16}],"relations":[{"type":"works_for","source":{"entity_index":0},"target":{"entity_index":2}}]}
@@ -982,7 +1077,7 @@ test "document extraction keeps independent sources atomic and reuses retained r
                 if (std.mem.eql(u8, name, "verifier")) try row.object.getPtr(family_name).?.array.items[0].object.put(a, "score", .{ .float = 0.7 });
                 return .{ .allocator = a, .json = try std.json.Stringify.valueAlloc(a, .{ .object = "extraction", .model = name, .schema_version = request.schema_version, .data = .{row} }, .{}) };
             }
-            const content = try std.json.parseFromSliceLeaky(V, a, request.inputs[0].content_json, .{});
+            const content = try std.json.parseFromSliceLeaky(V, a, request.inputs[0].content_json, .{ .parse_numbers = false });
             const value = if (self.disagree and std.mem.eql(u8, name, "verifier")) "wrong" else content.string[0..5];
             return .{ .allocator = a, .json = try std.json.Stringify.valueAlloc(a, .{ .object = "extraction", .model = name, .schema_version = request.schema_version, .data = .{.{ .structures = .{ .record = .{.{ .value = .{ .value = value, .start = @as(u32, 0), .end = @as(u32, 5) } }} } }}, .usage = .{ .input_tokens = @as(u32, 4), .output_tokens = @as(u32, 0) } }, .{}) };
         }
@@ -1082,6 +1177,17 @@ test "document extraction keeps independent sources atomic and reuses retained r
     fake.disagree = false;
     fake.family = .records;
     fake.attributed_relations = false;
+    fake.precise = true;
+    const precise_request =
+        \\{"model":"composite","schema_version":2,"schema":{"structures":{"record":{"fields":{"value":"number"}}}},"inputs":[{"content":"9007199254740993.1"}]}
+    ;
+    const precise_result = try Service(Fake).extractJson(&fake, a, precise_request, .{});
+    defer a.free(precise_result);
+    try std.testing.expect(std.mem.indexOf(u8, precise_result, "9007199254740993.1") != null);
+    fake.disagree = true;
+    try std.testing.expectError(error.DocumentUnresolved, Service(Fake).extractJson(&fake, a, precise_request, .{}));
+    fake.disagree = false;
+    fake.precise = false;
     fake.slides = true;
     const slide_response = try Service(Fake).extractJson(&fake, a,
         \\{"model":"composite","schema_version":2,"schema":{"structures":{"record":{"fields":{"value":"str"}}}},"documents":[{"id":"slide","url":"fixture","media_type":"application/vnd.openxmlformats-officedocument.presentationml.presentation","include_notes":true}]}
@@ -1129,7 +1235,7 @@ test "document graph keys separate same named tasks and retain real cycle detect
     try std.testing.expect(graph.get(.{ .name = "shared", .operation = .read }).?.extract == null);
     // An extractor's embedded read stage must use its frozen definition,
     // rather than re-resolving the same name as an independent reader.
-    try std.testing.expect((try S.extractionReader(root, "shared", &graph)).eql(key));
+    try std.testing.expect((try S.extractionReader(root, "shared", &graph, null)).key.eql(key));
     try S.preflight(&fake, a, key, root, &graph, &.{}, false);
     try std.testing.expectEqual(@as(usize, 1), fake.definitions);
     var cyclic = S.Graph{};

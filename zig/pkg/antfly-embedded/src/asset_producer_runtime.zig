@@ -2955,6 +2955,15 @@ pub const Runtime = struct {
 
     fn readImagesWithConfigReported(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.Request) !readers.BatchResult {
         var execution_cfg = self.routedReaderConfig(cfg);
+        var cloudflare_token: ?[]u8 = null;
+        defer if (cloudflare_token) |token| alloc.free(token);
+        if (execution_cfg.provider == .cloudflare) {
+            var secret = try common_secrets.SecretValue.initConfigOrEnv(alloc, execution_cfg.bearer_token orelse execution_cfg.api_key, "CLOUDFLARE_API_TOKEN");
+            defer secret.deinit(alloc);
+            cloudflare_token = (try secret.resolveOwned(alloc, self.secret_store)) orelse return error.CloudflareCredentialMissing;
+            execution_cfg.api_key = cloudflare_token;
+            execution_cfg.bearer_token = null;
+        }
         try execution_cfg.validate();
         const local_reader = isLocalReaderProvider(execution_cfg.provider, execution_cfg.resolvedUrl());
         var capability_lease_fields = CapabilityLeaseFields{};
@@ -3342,7 +3351,7 @@ pub const Runtime = struct {
         cfg_parsed.value.max_response_bytes = self.responseLimitForTask(.transcriber, 1);
         if (request.media.len > 0) {
             if (!request.inline_media_trusted) return error.UntrustedInlineMedia;
-            if (cfg_parsed.value.provider != .apple or request.media.len != 1) return error.UnsupportedTranscriptionMedia;
+            if ((cfg_parsed.value.provider != .apple and cfg_parsed.value.provider != .cloudflare) or request.media.len != 1) return error.UnsupportedTranscriptionMedia;
         }
         const antfly_model = if (cfg_parsed.value.provider == .antfly)
             try requiredAntflyTranscriberModel(cfg_parsed.value)
@@ -3421,10 +3430,20 @@ pub const Runtime = struct {
             capability_lease_fields.apply(&cfg_parsed.value);
         }
 
+        var cloudflare_token: ?[]u8 = null;
+        defer if (cloudflare_token) |token| alloc.free(token);
+        var execution_cfg = cfg_parsed.value;
+        if (execution_cfg.provider == .cloudflare) {
+            var secret = try common_secrets.SecretValue.initConfigOrEnv(alloc, execution_cfg.bearer_token orelse execution_cfg.api_key, "CLOUDFLARE_API_TOKEN");
+            defer secret.deinit(alloc);
+            cloudflare_token = (try secret.resolveOwned(alloc, self.secret_store)) orelse return error.CloudflareCredentialMissing;
+            execution_cfg.api_key = cloudflare_token;
+            execution_cfg.bearer_token = null;
+        }
         var result = transcribing.transcribeWithConfig(
             alloc,
             self.http,
-            cfg_parsed.value,
+            execution_cfg,
             .{
                 .url = request.source_text,
                 .timestamps = cfg_parsed.value.timestamps orelse true,

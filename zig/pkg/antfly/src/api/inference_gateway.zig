@@ -470,7 +470,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             .predict => "ml/predict",
         }, encoded, fallback, observation, execution_options);
     }
-    if (task == .extract or task == .rewrite or task == .predict) {
+    if (task == .extract or task == .predict or (task == .rewrite and named.providers.rewriter_configs.get(target.configured.name).?.generator == null)) {
         const binding = if (task == .extract) named.providers.extractor_configs.get(target.configured.name).? else if (task == .rewrite) named.providers.rewriter_configs.get(target.configured.name).? else named.providers.predictor_configs.get(target.configured.name).?;
         var forwarded = request;
         try forwarded.object.put(a, "model", .{ .string = binding.model });
@@ -710,7 +710,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
                 if (executor.inference_api_url) |url| cfg.url = try gateway.apiBaseAlloc(a, url);
                 cfg.api_key = cfg.api_key orelse executor.inference_api_key;
             }
-            const scores = try @import("../reranking/mod.zig").rerankContentWithOptions(a, &client, cfg, .{
+            const scores = try @import("../reranking/mod.zig").rerankContentWithOptions(a, if (cfg.provider == .cloudflare) try server.embedding_provider_runtime.httpClient() else &client, cfg, .{
                 .antfly_provider = server.antfly_provider,
                 .secret_store = server.cfg.secret_store,
                 .execution = .{ .default_endpoint = executor.inference_api_url },
@@ -747,6 +747,13 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
                 .transcript = .{ .text = result.text orelse "", .language = result.language, .duration_ms = result.duration_ms, .segments = result.segments },
             });
             return ctx.json(.{ .object = "list", .model = model, .data = .{.{ .object = "transcription", .index = @as(usize, 0), .text = result.text orelse "", .language = result.language, .duration_ms = result.duration_ms, .segments = result.segments, .speakers = if (speakers.items.len > 0) speakers.items else null }} });
+        },
+        .rewrite => {
+            const inputs = request.object.get("inputs") orelse return error.InvalidInferenceRequest;
+            if (inputs != .array or inputs.array.items.len == 0 or inputs.array.items.len > 128) return error.InvalidInferenceRequest;
+            const texts = try a.alloc([]const u8, inputs.array.items.len);
+            for (inputs.array.items, texts) |input, *text| text.* = try string(input);
+            return ctx.json(try executor.rewrite(a, name, model, texts));
         },
         .synthesize => {
             var adapted = request;
@@ -1041,7 +1048,7 @@ fn prepareGeneration(a: std.mem.Allocator, cfg: generating.GeneratorConfig, requ
 
 fn generationAdapterSupportsImages(provider: generating.Provider) bool {
     return switch (provider) {
-        .openai, .openrouter, .ollama, .antfly, .gemini, .vertex, .bedrock, .anthropic => true,
+        .cloudflare, .openai, .openrouter, .ollama, .antfly, .gemini, .vertex, .bedrock, .anthropic => true,
         .apple, .mock, .chatgpt => false,
     };
 }
@@ -1086,7 +1093,7 @@ fn executeChain(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, requ
         const prepared = try prepareGeneration(a, link.generator_config orelse try named.providers.getGeneratorConfig(link.generator_name.?), candidate, options.operation orelse "generate");
         cfg.* = prepared.config;
         try named.capabilities(qualified).require(prepared.requirements);
-        if (cfg.provider != .openai and cfg.provider != .openrouter and cfg.provider != .ollama and cfg.provider != .antfly and cfg.provider != .gemini and cfg.provider != .vertex and cfg.provider != .bedrock and cfg.provider != .anthropic) return error.UnsupportedInferenceFeature;
+        if (cfg.provider != .cloudflare and cfg.provider != .openai and cfg.provider != .openrouter and cfg.provider != .ollama and cfg.provider != .antfly and cfg.provider != .gemini and cfg.provider != .vertex and cfg.provider != .bedrock and cfg.provider != .anthropic) return error.UnsupportedInferenceFeature;
     }
     const previous_deadline = ctx.application_deadline_ns;
     const previous_clock = ctx.application_deadline_io;

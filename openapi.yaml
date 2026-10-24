@@ -17402,6 +17402,7 @@ components:
     EmbedderProvider:
       type: string
       enum:
+        - cloudflare
         - gemini
         - vertex
         - ollama
@@ -17608,6 +17609,7 @@ components:
         - Batch processing embeddings offline before ingestion
       allOf:
         - oneOf:
+            - $ref: '#/components/schemas/CloudflareEmbedderConfig'
             - $ref: '#/components/schemas/GoogleEmbedderConfig'
             - $ref: '#/components/schemas/VertexEmbedderConfig'
             - $ref: '#/components/schemas/OllamaEmbedderConfig'
@@ -17709,6 +17711,7 @@ components:
 
         namespace.
       oneOf:
+        - $ref: '#/components/schemas/CloudflareEmbedderConfig'
         - $ref: '#/components/schemas/OllamaEmbedderConfig'
         - $ref: '#/components/schemas/OpenAIEmbedderConfig'
         - $ref: '#/components/schemas/OpenRouterEmbedderConfig'
@@ -17720,6 +17723,7 @@ components:
       discriminator:
         propertyName: provider
         mapping:
+          cloudflare: '#/components/schemas/CloudflareEmbedderConfig'
           ollama: '#/components/schemas/OllamaEmbedderConfig'
           openai: '#/components/schemas/OpenAIEmbedderConfig'
           openrouter: '#/components/schemas/OpenRouterEmbedderConfig'
@@ -28941,6 +28945,7 @@ components:
     RerankerProvider:
       type: string
       enum:
+        - cloudflare
         - antfly
         - cohere
         - vertex
@@ -28960,6 +28965,43 @@ components:
 
         - max_weight_product: Maximize the product of edge weights, requiring every traversed weight to
         be in [0,1].
+    CloudflareEmbedderConfig:
+      type: object
+      description: Cloudflare Workers AI embedding. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
+      properties:
+        provider:
+          type: string
+          enum:
+            - cloudflare
+        account_id:
+          type: string
+          minLength: 1
+        gateway_id:
+          type: string
+          minLength: 1
+          description: Optional AI Gateway ID, sent through cf-aig-gateway-id.
+        model:
+          type: string
+          default: '@cf/baai/bge-base-en-v1.5'
+        api_key:
+          type: string
+          writeOnly: true
+        url:
+          type: string
+          description: Optional deployment-owned endpoint override.
+        dimensions:
+          type: integer
+          minimum: 1
+          description: Expected fixed model output dimension; the adapter validates returned vectors and
+            never requests unsupported resizing.
+        dimension:
+          type: integer
+          minimum: 1
+          description: Alias of dimensions.
+      required:
+        - provider
+        - account_id
+        - model
     EmbeddingRetrievalConfig:
       type: object
       additionalProperties: false
@@ -29864,6 +29906,57 @@ components:
         text:
           target_tokens: 500
           overlap_tokens: 50
+    CloudflareGeneratorConfig:
+      type: object
+      description: Cloudflare Workers AI generation. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
+      properties:
+        provider:
+          type: string
+          enum:
+            - cloudflare
+        account_id:
+          type: string
+          minLength: 1
+        gateway_id:
+          type: string
+          minLength: 1
+          description: Optional AI Gateway ID, sent through cf-aig-gateway-id.
+        model:
+          type: string
+          default: '@cf/meta/llama-3.3-70b-instruct-fp8-fast'
+        api_key:
+          type: string
+          writeOnly: true
+        url:
+          type: string
+          description: Optional deployment-owned endpoint override.
+        max_tokens:
+          type: integer
+          minimum: 1
+        temperature:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 2
+        top_p:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+        frequency_penalty:
+          type: number
+          format: float
+          minimum: -2
+          maximum: 2
+        presence_penalty:
+          type: number
+          format: float
+          minimum: -2
+          maximum: 2
+      required:
+        - provider
+        - account_id
+        - model
     GoogleGeneratorConfig:
       type: object
       description: >
@@ -30302,6 +30395,7 @@ components:
     GeneratorProvider:
       type: string
       enum:
+        - cloudflare
         - gemini
         - vertex
         - bedrock
@@ -30318,6 +30412,7 @@ components:
         A unified configuration for a generative AI provider.
       allOf:
         - oneOf:
+            - $ref: '#/components/schemas/CloudflareGeneratorConfig'
             - $ref: '#/components/schemas/GoogleGeneratorConfig'
             - $ref: '#/components/schemas/VertexGeneratorConfig'
             - $ref: '#/components/schemas/BedrockGeneratorConfig'
@@ -31764,6 +31859,7 @@ components:
     STTProvider:
       type: string
       enum:
+        - cloudflare
         - openai
         - vertex
         - antfly
@@ -32698,6 +32794,12 @@ components:
           type: string
           pattern: ^[0-9a-f]{64}$
           description: Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity.
+        embedder:
+          type: string
+          minLength: 1
+          description: Named dense embedder for provider-neutral embedding_similarity routing. Specify
+            matching embedding_options.dimensions. Native fitted calibrations require the original Antfly
+            model path; hosted routes use explicit thresholds and estimated token admission.
         embedding_options:
           type: object
           additionalProperties: false
@@ -39335,6 +39437,34 @@ components:
           type: number
           format: double
           description: RRF k constant (1/(k+rank)). Defaults to 60.0.
+    CloudflareRerankerConfig:
+      type: object
+      description: Cloudflare Workers AI reranking. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference.
+      properties:
+        provider:
+          type: string
+          enum:
+            - cloudflare
+        account_id:
+          type: string
+          minLength: 1
+        gateway_id:
+          type: string
+          minLength: 1
+          description: Optional AI Gateway ID, sent through cf-aig-gateway-id.
+        model:
+          type: string
+          default: '@cf/baai/bge-reranker-base'
+        api_key:
+          type: string
+          writeOnly: true
+        url:
+          type: string
+          description: Optional deployment-owned endpoint override.
+      required:
+        - provider
+        - account_id
+        - model
     AntflyRerankerConfig:
       type: object
       description: Configuration for the Antfly inference reranking provider.
@@ -39449,12 +39579,17 @@ components:
       discriminator:
         propertyName: provider
         mapping:
+          cloudflare: '#/components/schemas/CloudflareRerankerConfig'
           antfly: '#/components/schemas/AntflyRerankerConfig'
           cohere: '#/components/schemas/CohereRerankerConfig'
           vertex: '#/components/schemas/VertexRerankerConfig'
       allOf:
         - type: object
           properties:
+            account_id:
+              type: string
+            gateway_id:
+              type: string
             rate_limit:
               x-go-type-skip-optional-pointer: false
               $ref: '#/components/schemas/RateLimitConfig'
@@ -39500,6 +39635,7 @@ components:
           required:
             - provider
         - oneOf:
+            - $ref: '#/components/schemas/CloudflareRerankerConfig'
             - $ref: '#/components/schemas/AntflyRerankerConfig'
             - $ref: '#/components/schemas/CohereRerankerConfig'
             - $ref: '#/components/schemas/VertexRerankerConfig'

@@ -907,6 +907,7 @@ pub const Config = struct {
         errdefer registry.deinit();
         inline for (.{ .{ "extractor_configs", "models.extract" }, .{ "rewriter_configs", "models.rewrite" }, .{ "predictor_configs", "models.predict" } }) |binding_kind| {
             for (@field(registry, binding_kind[0]).values()) |binding| {
+                if (binding.generator != null) continue;
                 if (std.mem.eql(u8, binding.connection, local_inference_connection_id)) continue;
                 if (std.mem.eql(u8, binding.connection, default_inference_connection_id)) {
                     const inference = root.get("inference") orelse return error.InvalidConfig;

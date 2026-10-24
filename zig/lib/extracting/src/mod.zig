@@ -512,6 +512,7 @@ const CloudflareExtractor = struct {
         if (options != .object or options.object.count() != 0) return error.UnsupportedCloudflareSchema;
         var rows: std.array_list.Managed(std.json.Value) = .init(a);
         var input_tokens: i64 = 0;
+        var output_tokens: i64 = 0;
         for (req.inputs, states) |input, state| {
             const result = try cloudflare.invoke(self.http, a, cloudflare.Config{
                 .account_id = cfg.account_id.?,
@@ -527,17 +528,16 @@ const CloudflareExtractor = struct {
             var row = try cloudflare.extractionResult(a, plan, result, state.state);
             if (input.id) |id| try cloudflare.put(a, &row, "id", cloudflare.string(id));
             try rows.append(row);
-            if (cloudflare.field(result, "usage")) |usage| if (cloudflare.field(usage, "input_tokens")) |tokens| {
-                if (tokens != .integer or tokens.integer < 0) return error.InvalidCloudflareResponse;
-                input_tokens +|= tokens.integer;
-            };
+            const usage = try cloudflare.nativeUsage(result);
+            input_tokens = std.math.add(i64, input_tokens, std.math.cast(i64, usage.input_tokens) orelse return error.InvalidCloudflareResponse) catch return error.InvalidCloudflareResponse;
+            output_tokens = std.math.add(i64, output_tokens, std.math.cast(i64, usage.output_tokens) orelse return error.InvalidCloudflareResponse) catch return error.InvalidCloudflareResponse;
         }
         const json = try std.json.Stringify.valueAlloc(backing, .{
             .object = "extraction",
             .model = cfg.model,
             .schema_version = req.schema_version orelse cfg.schema_version,
             .data = rows.items,
-            .usage = .{ .input_tokens = input_tokens, .output_tokens = @as(u32, 0) },
+            .usage = .{ .input_tokens = input_tokens, .output_tokens = output_tokens },
         }, .{});
         errdefer backing.free(json);
         if (json.len > (req.max_response_bytes orelse 16 * 1024 * 1024)) return error.ResponseTooLarge;
@@ -1439,4 +1439,52 @@ test "cloudflare extraction provider uses native typed protocol with optional ga
         try std.testing.expectEqualStrings("derived", entry.object.get("origin").?.string);
         try std.testing.expect(!entry.object.contains("start"));
     }
+}
+
+pub fn testCloudflareExtraction() !void {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/", .respond = .{ .body =
+        \\{"success":true,"result":{"model":"clairic","truncated":false,"answers":{"total":{"value":9007199254740993.1}},"usage":{"input_tokens":7,"output_tokens":2}}}
+    } }});
+    defer server.deinit();
+    var client = httpx.Client.init(a, io);
+    defer client.deinit();
+    var failure: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(alloc: Allocator, http: *httpx.Client, url: []const u8, out: *?anyerror) std.Io.Cancelable!void {
+            var response = extractWithConfig(alloc, http, .{ .provider = .cloudflare, .account_id = "account", .model = "@cf/cloudflare/clairic", .api_key = "fixture", .url = url }, .{
+                .schema_version = 2,
+                .schema_json = "{\"structures\":{\"invoice\":{\"fields\":{\"total\":\"number\"}}}}",
+                .inputs = &.{.{ .content_json = "\"9007199254740993.1\"" }},
+            }) catch |err| {
+                out.* = err;
+                return;
+            };
+            defer response.deinit();
+            const parsed = std.json.parseFromSlice(std.json.Value, alloc, response.json, .{ .parse_numbers = false }) catch |err| {
+                out.* = err;
+                return;
+            };
+            defer parsed.deinit();
+            const root = parsed.value.object;
+            std.testing.expectEqualStrings("7", root.get("usage").?.object.get("input_tokens").?.number_string) catch |err| {
+                out.* = err;
+            };
+            std.testing.expectEqualStrings("2", root.get("usage").?.object.get("output_tokens").?.number_string) catch |err| {
+                out.* = err;
+            };
+            const value = root.get("data").?.array.items[0].object.get("structures").?.object.get("invoice").?.array.items[0].object.get("total").?.object.get("value").?;
+            std.testing.expectEqualStrings("9007199254740993.1", value.number_string) catch |err| {
+                out.* = err;
+            };
+        }
+    };
+    group.concurrent(io, Fiber.run, .{ a, &client, server.baseUrl(), &failure }) catch return;
+    try server.handleOne();
+    group.await(io) catch {};
+    if (failure) |err| return err;
 }

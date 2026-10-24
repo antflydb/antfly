@@ -157,8 +157,8 @@ result. It never presents a partial document as successful extraction.
 
 ## Cloudflare providers
 
-Cloudflare is a general Antfly extraction/decision provider, shared with SQL and
-enrichment. Document composites are consumers of those provider protocols.
+Cloudflare is a general Antfly provider, shared with SQL, retrieval and
+enrichment. See [Cloudflare models](cloudflare-models.md) for coverage across model tasks. Document composites are consumers of those provider protocols.
 Workers AI hosts the models; AI Gateway is optional routing configuration.
 
 An ordinary extraction provider configuration uses:
@@ -189,8 +189,8 @@ A deployment-owned composite binding instead uses the provider/model/operation,
 containing definition. Definitions contain credential references, never tokens.
 Local-only parents cannot be widened by nested definitions.
 
-The adapter sends native `state` plus typed `fields` or `questions`, never chat
-messages. Clairic supports one named record with text, text lists, numbers, dates
+The Clairic and Clef adapters send native `state` plus typed `fields` or
+`questions`. Vision reading uses the Chat Completions protocol. Clairic supports one named record with text, text lists, numbers, dates
 and estimates. Unsupported entities, relations, nested records, field/options
 features and oversized contexts fail explicitly. Inline PNG/JPEG/WebP evidence
 is supported by the ordinary providers within checked media limits. Null values
@@ -301,3 +301,30 @@ PDFs, receipt photos, long item lists, distortions and image-heavy slides for
 quality qualification. The small smoke corpus does not establish OCR quality on
 those populations. Existing `scripts/eval_extract.py` separately evaluates
 schema-driven extraction against labelled source spans.
+
+
+Cloudflare vision can also be a remote document reading binding:
+
+```json
+{
+  "version": 1,
+  "kind": "document_agent",
+  "allow_remote": true,
+  "models": [{
+    "name": "vision",
+    "provider": "cloudflare",
+    "operation": "read",
+    "account_id": "account",
+    "token_env": "CLOUDFLARE_API_TOKEN",
+    "model": "@cf/mistralai/mistral-small-3.1-24b-instruct"
+  }],
+  "read": { "reader": "vision" }
+}
+```
+
+Remote vision uses the shared rendered page/crop cache and the Chat Completions
+finish reason. Its output has interpretation provenance without invented OCR
+geometry. Every visited extraction definition's source/page/token ceilings and
+original deadline remain active across its preprocessing and extraction phases.
+Numeric JSON lexemes survive provider decoding and ownership transfers, so
+verification does not equate distinct decimals after floating-point rounding.
