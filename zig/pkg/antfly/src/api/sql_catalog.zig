@@ -1991,7 +1991,6 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
     for ([_][]const u8{
         "ALTER TABLE items ADD COLUMN n integer DEFAULT (2+3)",
         "ALTER TABLE items ADD COLUMN g bigint GENERATED ALWAYS AS (id+1) STORED",
-        "ALTER TABLE items ALTER COLUMN id SET NOT NULL",
         "ALTER TABLE items ADD CONSTRAINT positive CHECK (id > 0 AND id < 100)",
         "ALTER TABLE items ADD CONSTRAINT unique_id UNIQUE(id)",
     }) |sql| {
@@ -2000,6 +1999,12 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
         try std.testing.expectError(error.SqlSchemaRewriteRequiresMetadataOwner, execute(&server, null, .{}, "default", "public", result_arena.allocator(), .{ .catalog_ddl = compiled.statement.catalog_ddl }));
         try std.testing.expectEqual(@as(usize, 4), source.updates);
     }
+    // SET NOT NULL uses the retained validation scan rather than a rewrite.
+    // This metadata-only fixture has no native reader or shared Io provider.
+    var not_null = try @import("antfly_local_sources").sql_compiler.compile(alloc, "ALTER TABLE items ALTER COLUMN id SET NOT NULL", .{});
+    defer not_null.deinit();
+    try std.testing.expectError(error.UnsupportedSqlExecution, execute(&server, null, .{}, "default", "public", result_arena.allocator(), .{ .catalog_ddl = not_null.statement.catalog_ddl }));
+    try std.testing.expectEqual(@as(usize, 4), source.updates);
     var path: SearchPath = .{};
     var guarded_alter = try @import("antfly_local_sources").sql_compiler.compile(alloc, "ALTER TABLE items ADD COLUMN spare TEXT", .{});
     defer guarded_alter.deinit();
