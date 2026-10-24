@@ -28,7 +28,7 @@ const Wal = @import("wal/indexed_object_store.zig").IndexedObjectStore;
 const A = std.mem.Allocator;
 
 pub const Task = struct {
-    kind: enum { manifest, facts_root, facts_page, wal_page, blob },
+    kind: enum { manifest, facts_root, facts_page, wal_page, text_root, text_page, blob },
     version: ?[]const u8 = null,
     artifact: ?struct { artifact_id: []const u8, byte_len: u64, checksum: []const u8, metadata_version: u16 = 0 } = null,
     page: ?tree.Ref = null,
@@ -140,7 +140,8 @@ pub const Context = struct {
                         if (artifact.metadata_version != facts.Root.metadata_version) return error.CollectionArtifactUnsupported;
                         try children.append(a, .{ .kind = .facts_root, .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum, .metadata_version = artifact.metadata_version } });
                     },
-                    .text_segment, .vector_segment, .sparse_segment, .document_segment, .mutation_segment, .doc_values, .stored_fields => try children.append(a, .{ .kind = .blob, .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum, .metadata_version = artifact.metadata_version } }),
+                    .text_segment => try children.append(a, .{ .kind = if (artifact.metadata_version == @import("text_segment/paged.zig").metadata_version) .text_root else .blob, .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum, .metadata_version = artifact.metadata_version } }),
+                    .vector_segment, .sparse_segment, .document_segment, .mutation_segment, .doc_values, .stored_fields => try children.append(a, .{ .kind = .blob, .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum, .metadata_version = artifact.metadata_version } }),
                     else => return error.CollectionArtifactUnsupported,
                 };
                 if (end < manifest.artifacts.len) {
@@ -156,7 +157,14 @@ pub const Context = struct {
                 key = try self.artifactKey(a, artifact.artifact_id);
                 for ([_]?tree.Ref{root.page} ++ root.pending_pages) |ref| if (ref) |page| try children.append(a, .{ .kind = .facts_page, .page = page });
             },
-            .facts_page, .wal_page => {
+            .text_root => {
+                const artifact = task.artifact orelse return error.InvalidCollectionTask;
+                const parsed = try @import("text_segment/paged.zig").loadRoot(a, &pages, .{ .kind = .text_segment, .metadata_version = artifact.metadata_version, .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum });
+                defer parsed.deinit();
+                key = try self.artifactKey(a, artifact.artifact_id);
+                for ([_]?tree.Ref{ parsed.value.docs, parsed.value.postings }) |ref| if (ref) |page| try children.append(a, .{ .kind = .text_page, .page = page });
+            },
+            .facts_page, .wal_page, .text_page => {
                 const ref = task.page orelse return error.InvalidCollectionTask;
                 var page = if (task.kind == .wal_page) try self.wal.tracePage(a, self.namespace, ref) else try tree.readPage(a, pages.store(), ref);
                 defer page.deinit(a);

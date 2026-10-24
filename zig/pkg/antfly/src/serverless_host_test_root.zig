@@ -14,6 +14,7 @@
 // limitations under the License.
 
 test {
+    _ = @import("serverless/hosted_embedding_checkpoint.zig");
     _ = @import("serverless/query/live_view.zig");
     _ = @import("serverless/query/live_overlay.zig");
     _ = @import("serverless/query/live_filter.zig");

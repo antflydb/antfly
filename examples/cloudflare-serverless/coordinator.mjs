@@ -30,12 +30,38 @@ export class CommitCoordinator extends DurableObject {
     });
   }
   ensureEmbeddingProfile(profile) {
-    if (!profile.model?.startsWith("@cf/") || !Number.isSafeInteger(profile.dimensions) || profile.dimensions < 1 || profile.dimensions > 1536) return false;
+    if (!profile.model?.startsWith("@cf/") || !Number.isSafeInteger(profile.dimensions) || profile.dimensions < 1 || profile.dimensions > 1536 || typeof (profile.revision ?? "1") !== "string" || (profile.revision ?? "1").length < 1 || (profile.revision ?? "1").length > 256) return false;
     return this.ctx.storage.transactionSync(() => {
       const encoded = JSON.stringify(profile), key = "__antfly_embedding_profile";
       const previous = this.ctx.storage.kv.get(key);
-      if (previous != null) return previous === encoded;
+      if (previous != null) {
+        const old = JSON.parse(previous);
+        return old.model === profile.model && old.dimensions === profile.dimensions && (old.revision ?? "1") === (profile.revision ?? "1");
+      }
       this.ctx.storage.kv.put(key, encoded); return true;
+    });
+  }
+  pruneEmbeddingCheckpointMetadata(namespace, today) {
+    if (typeof namespace !== "string" || !namespace.length || !Number.isSafeInteger(today) || today < 0) throw new Error("InvalidEmbeddingCheckpointSweep");
+    return this.ctx.storage.transactionSync(() => {
+      const stateKey = `__antfly_embedding_gc/${namespace}`;
+      const state = this.ctx.storage.kv.get(stateKey) ?? {};
+      const prefix = `antfly/progress/${namespace}/EMBEDDING_CACHE/`;
+      const entries = Array.from(this.ctx.storage.kv.list({prefix, startAfter: state.metadata_cursor, limit: 128}));
+      for (const [key] of entries) {
+        const day = key.slice(prefix.length).split("/")[0];
+        if (/^[a-f0-9]{8}$/.test(day) && parseInt(day, 16) + 1 < today) this.ctx.storage.kv.delete(key);
+      }
+      state.metadata_cursor = entries.length === 128 ? entries.at(-1)[0] : undefined;
+      this.ctx.storage.kv.put(stateKey, state);
+      return state.payload_cursor ?? null;
+    });
+  }
+  saveEmbeddingCheckpointCursor(namespace, expected, next) {
+    return this.ctx.storage.transactionSync(() => {
+      const key = `__antfly_embedding_gc/${namespace}`, state = this.ctx.storage.kv.get(key) ?? {};
+      if ((state.payload_cursor ?? null) !== expected) return false;
+      state.payload_cursor = next; this.ctx.storage.kv.put(key, state); return true;
     });
   }
   collection(op, args) {

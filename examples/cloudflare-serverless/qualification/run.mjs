@@ -36,6 +36,7 @@ async function call(input, path = "/api") {
   }
   throw new Error(`admission retries exhausted: ${JSON.stringify({op: input.op, last})}`);
 }
+if (process.argv.includes("--diagnostics")) { console.log(JSON.stringify(await call({}, "/_qualification/diagnostics"))); process.exit(0); }
 if (process.argv.includes("--probe") || process.argv.includes("--status")) {
   for (const op of process.argv.includes("--status") ? ["status"] : ["status", "publish", "status"]) console.log(op, JSON.stringify(await call({op})));
   process.exit(0);
@@ -43,6 +44,52 @@ if (process.argv.includes("--probe") || process.argv.includes("--status")) {
 if (process.argv.includes("--drain")) {
   for (let i = 0; i < 10000; i++) if ((await call({}, "/_qualification/drain")).done) { console.log("disposable R2 and coordinator state drained"); process.exit(0); }
   throw new Error("cleanup limit exceeded");
+}
+if (process.argv.includes("--collect-only")) {
+  const before = await call({op: "count"});
+  let job;
+  for (let i = 0; i < 1000; i++) {
+    const result = await call({op: "collect", ...(job ? {job_id: job} : {})}); job = result.job_id;
+    if (i % 25 === 0) console.log("collection progress", result.phase, i);
+    if (result.done) {
+      assert.equal((await call({op: "count"})).count, before.count);
+      assert.equal((await call({op: "search", text: "replacementneedle"})).hits[0].doc_id, "scale/000000");
+      await writeFile(`${run.dir}/scale-collection-report.json`, JSON.stringify({checks: {paged_collection: true, preserved_count: true, preserved_search: true}, measurements}, null, 2));
+      console.log("Live paged text collection passed"); process.exit(0);
+    }
+    if (result.delay_seconds) await new Promise(resolve => setTimeout(resolve, Math.min(60000, result.delay_seconds * 1000 + 100)));
+  }
+  throw new Error("Paged collection did not converge");
+}
+if (process.argv.includes("--scale")) {
+  const count = Number(process.argv.find(arg => arg.startsWith("--documents="))?.slice(12) ?? 5000);
+  assert.ok(Number.isSafeInteger(count) && count >= 300 && count <= 20000);
+  async function awaitPublished(receipt) {
+    const target = BigInt(`0x${receipt.visibility.slice(-16)}`);
+    for (let i = 0; i < 180; i++) {
+      const status = await call({op: "status"});
+      if (status.published && BigInt(status.published_lsn) >= target) return;
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    throw new Error("Queue publication did not reach the accepted watermark");
+  }
+  for (let offset = 0; offset < count; offset += 128) {
+    const receipt = await call({op: "mutate", operation_id: `${run.id}/scale/${offset}`, mutations: Array.from({length: Math.min(128, count - offset)}, (_, i) => ({kind: "upsert", doc_id: `scale/${String(offset+i).padStart(6,"0")}`, body: JSON.stringify({text: `durable searchable message ${offset+i}`})}))});
+    await awaitPublished(receipt);
+    if (offset % 1024 === 0) console.log("scale publication", Math.min(count, offset + 128));
+  }
+  assert.equal((await call({op: "count"})).count, String(count));
+  const first = await call({op: "search", text: "durable", limit: 2});
+  assert.equal(first.hits.length, 2);
+  const edited = await call({op: "mutate", operation_id: `${run.id}/scale/edit`, mutations: [{kind: "upsert", doc_id: "scale/000000", body: '{"text":"replacementneedle"}'}, {kind: "delete", doc_id: "scale/000001"}]});
+  await awaitPublished(edited);
+  assert.equal((await call({op: "count"})).count, String(count - 1));
+  assert.equal((await call({op: "search", text: "replacementneedle"})).hits[0].doc_id, "scale/000000");
+  assert.deepEqual((await call({op: "search", text: "durable", limit: 2, cursor: first.cursor})).hits.map(hit => hit.doc_id), ["scale/000002", "scale/000003"]);
+  assert.equal((await call({op: "compact"})).published, false);
+  const report = {documents: count, checks: {paged_text: true, point_edits: true, deletion: true, prior_generation_cursor: true, compaction_no_rebuild: true}, measurements};
+  await writeFile(`${run.dir}/scale-report.json`, JSON.stringify(report, null, 2));
+  console.log("Live paged text scale qualification passed", count); process.exit(0);
 }
 if (process.argv.includes("--enrichment")) {
   const windowed = process.argv.includes("--windows"), docId = windowed ? "message/windows" : "message/a";

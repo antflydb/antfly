@@ -19,9 +19,9 @@ const STATE = "__antfly_collection";
 export class CollectionJournal {
   constructor(storage, now = Date.now) {
     this.storage = storage; this.now = now;
-    storage.sql.exec("CREATE TABLE IF NOT EXISTS collection_tasks (id TEXT PRIMARY KEY, task TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)");
-    storage.sql.exec("CREATE TABLE IF NOT EXISTS collection_marks (key TEXT PRIMARY KEY)");
-    storage.sql.exec("CREATE INDEX IF NOT EXISTS collection_pending ON collection_tasks(done, id)");
+    storage.sql.exec("CREATE TABLE IF NOT EXISTS collection_tasks (id TEXT PRIMARY KEY, task TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)").toArray();
+    storage.sql.exec("CREATE TABLE IF NOT EXISTS collection_marks (key TEXT PRIMARY KEY)").toArray();
+    storage.sql.exec("CREATE INDEX IF NOT EXISTS collection_pending ON collection_tasks(done, id)").toArray();
   }
   rpc(op, args) {
     switch (op) {
@@ -64,9 +64,11 @@ export class CollectionJournal {
   release(token) {
     this.transaction(() => { const state = this.valid(token); state.expires = 0; this.save(state); });
   }
+  // Exhaust mutation cursors before issuing the next statement so the SQLite
+  // host can release statement/binding resources during a long mark pass.
   insert(task) {
     const id = JSON.stringify(task);
-    this.storage.sql.exec("INSERT OR IGNORE INTO collection_tasks(id, task) VALUES (?, ?)", id, id);
+    this.storage.sql.exec("INSERT OR IGNORE INTO collection_tasks(id, task) VALUES (?, ?)", id, id).toArray();
   }
   prepared(token, plan) {
     return this.transaction(() => {
@@ -104,10 +106,10 @@ export class CollectionJournal {
       if (!["mark_artifacts", "mark_wal"].includes(state.phase)) throw new Error("CollectionPhaseMismatch");
       const row = this.storage.sql.exec("SELECT done FROM collection_tasks WHERE id = ?", id).toArray()[0];
       if (!row || row.done) return;
-      this.storage.sql.exec("INSERT OR IGNORE INTO collection_marks(key) VALUES (?)", result.key);
+      this.storage.sql.exec("INSERT OR IGNORE INTO collection_marks(key) VALUES (?)", result.key).toArray();
       for (const child of result.children) this.insert(child);
       if (result.wal_keep_from != null && (state.wal_keep_from == null || BigInt(result.wal_keep_from) < BigInt(state.wal_keep_from))) state.wal_keep_from = result.wal_keep_from;
-      this.storage.sql.exec("UPDATE collection_tasks SET done = 1 WHERE id = ?", id);
+      this.storage.sql.exec("UPDATE collection_tasks SET done = 1 WHERE id = ?", id).toArray();
       this.save(state);
     });
   }
@@ -180,8 +182,8 @@ export class CollectionJournal {
     return this.transaction(() => {
       const state = this.valid(token);
       if (state.phase !== "cleanup") throw new Error("CollectionPhaseMismatch");
-      this.storage.sql.exec("DELETE FROM collection_tasks WHERE id IN (SELECT id FROM collection_tasks LIMIT 128)");
-      this.storage.sql.exec("DELETE FROM collection_marks WHERE key IN (SELECT key FROM collection_marks LIMIT 128)");
+      this.storage.sql.exec("DELETE FROM collection_tasks WHERE id IN (SELECT id FROM collection_tasks LIMIT 128)").toArray();
+      this.storage.sql.exec("DELETE FROM collection_marks WHERE key IN (SELECT key FROM collection_marks LIMIT 128)").toArray();
       const remaining = this.storage.sql.exec("SELECT 1 FROM collection_tasks UNION ALL SELECT 1 FROM collection_marks LIMIT 1").toArray().length;
       if (!remaining) this.storage.kv.delete(STATE);
       return !remaining;

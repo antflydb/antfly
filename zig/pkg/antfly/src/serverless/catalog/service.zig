@@ -4779,7 +4779,9 @@ test "serverless catalog service reports head publication actions for wal partia
     var status = try catalog.tableBuildStatus("docs");
     defer status.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), status.head_version);
-    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.rebuild, status.head_artifact_actions.document_segment);
+    // Unchanged vector projections and incremental text reuse the packed body cache.
+    // Authoritative changed bodies are published through document facts.
+    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, status.head_artifact_actions.document_segment);
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.rebuild, status.head_artifact_actions.full_text);
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, status.head_artifact_actions.dense_vector);
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, status.head_artifact_actions.sparse_vector);

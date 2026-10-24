@@ -25,6 +25,7 @@ Object.assign(config, { name: id, account_id: account, main: resolve("qualificat
   assets: {...config.assets, directory: resolve("public")},
   vars: {ANTFLY_INCARNATION: `qualification-${id}`, AI_MODEL: "@cf/baai/bge-small-en-v1.5", AI_GATEWAY: "default", AUTO_GC: "false"},
   version_metadata: {binding: "WORKER_VERSION"}, observability: {enabled: true, head_sampling_rate: 1} });
+if (process.argv.includes("--paged-text")) Object.assign(config.vars, {PAGED_TEXT: "true", PUBLICATION_RECORDS: "64", LOG_METRICS: "true"});
 delete config.triggers;
 config.r2_buckets[0].bucket_name = id;
 config.queues.producers[0].queue = id;

@@ -16,13 +16,25 @@
 import app, { CommitCoordinator as Coordinator } from "../worker.mjs";
 // This wrapper is bundled only by the disposable qualification configuration.
 export class CommitCoordinator extends Coordinator {
+  collection(op, args) {
+    try { return super.collection(op, args); }
+    catch (error) { throw new Error(`Collection ${op}: ${error.message}`); }
+  }
+  collectionDiagnostics() {
+    const totals = this.ctx.storage.sql.exec("SELECT COUNT(*) AS tasks, SUM(done = 0) AS pending, MAX(length(task)) AS max_task_bytes FROM collection_tasks").toArray()[0];
+    const marks = this.ctx.storage.sql.exec("SELECT COUNT(*) AS marks FROM collection_marks").toArray()[0];
+    const next = this.ctx.storage.sql.exec("SELECT task FROM collection_tasks WHERE done = 0 ORDER BY id LIMIT 1").toArray()[0];
+    return {...totals, ...marks, phase: this.journal.state()?.phase, next_kind: next ? JSON.parse(next.task).kind : null};
+  }
   async destroyQualificationState() { await this.ctx.storage.deleteAll(); }
 }
 export default {
   ...app,
   async fetch(request, env, ctx) {
-    if (new URL(request.url).pathname !== "/_qualification/drain") return app.fetch(request, env, ctx);
+    const path = new URL(request.url).pathname;
+    if (!["/_qualification/drain", "/_qualification/diagnostics"].includes(path)) return app.fetch(request, env, ctx);
     if (request.method !== "POST" || !env.ANTFLY_INCARNATION.startsWith("qualification-") || request.headers.get("Authorization") !== `Bearer ${env.API_TOKEN}`) return new Response("unauthorized", {status: 401});
+    if (path === "/_qualification/diagnostics") return Response.json(await env.COMMITS.getByName(env.ANTFLY_INCARNATION).collectionDiagnostics());
     const page = await env.DATABASE.list({limit: 128});
     if (page.objects.length) await env.DATABASE.delete(page.objects.map(item => item.key));
     if (!page.truncated && !page.objects.length) await env.COMMITS.getByName(env.ANTFLY_INCARNATION).destroyQualificationState();

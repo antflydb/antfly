@@ -134,6 +134,22 @@ pub const Compactor = struct {
         const current_head = try self.progress.getHead(namespace);
         var current = try self.manifests.getAlloc(namespace, current_head);
         defer current.deinit(self.alloc);
+        if (builder_mod.hasPagedText(current) and builder_mod.findArtifactIndex(current, .document_facts) != null and
+            builder_mod.findArtifactIndex(current, .vector_segment) == null and builder_mod.findArtifactIndex(current, .sparse_segment) == null and builder_mod.findArtifactIndex(current, .graph_segment) == null)
+        {
+            // These serving trees are already maintained by bounded COW
+            // updates. There is no flat corpus snapshot to reconstruct.
+            var bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
+            var reads: u64 = 4 * 1024 * 1024;
+            var writes: u64 = 0;
+            var pages = @import("../graph_segment/page_store.zig").PageStore{ .domain = @import("../graph_segment/page_store.zig").PageStore.namespaceDomain(namespace), .artifacts = self.artifacts, .cancellation = bridge.token(), .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+            for (current.artifacts) |ref| if (ref.kind == .text_segment) {
+                const root = try @import("../text_segment/paged.zig").loadRoot(self.alloc, &pages, ref);
+                defer root.deinit();
+                if ((if (root.value.docs) |page| page.records else 0) != current.stats.document_count) return error.DocumentFactsSourceChanged;
+            };
+            return .{ .namespace = try self.alloc.dupe(u8, namespace), .published = false, .version = current_head, .artifact_count = current.artifacts.len };
+        }
         if (self.max_documents) |maximum| if (current.stats.document_count > maximum) return error.CompactionBudgetExceeded;
         if (self.max_artifact_bytes) |maximum| {
             var bytes: u64 = 0;

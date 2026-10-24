@@ -54,3 +54,24 @@ test("expired collectors cannot checkpoint or authorize deletion", () => {
     assert.throws(() => j.deletable(old, [scoped(1)]), /LeaseLost/); j.prepared(next, plan);
   } finally { f.db.close(); }
 });
+
+
+test("embedding scratch pruning stays scoped, bounded and resumable after deleting a listed page", async () => {
+  const {Bucket} = await import("./object-fixture.mjs");
+  const {pruneEmbeddingCheckpoints} = await import("../embedding-checkpoints.mjs");
+  const bucket = new Bucket(), namespace = "checkpoint-prune";
+  const today = Math.floor(Date.now()/86400000);
+  const domain = Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(namespace))).toString("hex");
+  const prefix = `antfly/embedding-cache/${domain}/`;
+  for (let i = 0; i < 130; i++) await bucket.put(`${prefix}${(today-3).toString(16).padStart(8,"0")}/${String(i).padStart(64,"0")}`, new Uint8Array([1]));
+  const current = `${prefix}${today.toString(16).padStart(8,"0")}/${"a".repeat(64)}`;
+  const foreign = `antfly/embedding-cache/other/${"0".repeat(8)}/${"b".repeat(64)}`;
+  await bucket.put(current, new Uint8Array([2])); await bucket.put(foreign, new Uint8Array([3]));
+  let cursor = null;
+  const coordinator = {async pruneEmbeddingCheckpointMetadata(ns, day) {assert.equal(ns, namespace); assert.equal(day, today); return cursor;},
+    async saveEmbeddingCheckpointCursor(_ns, expected, next) {assert.equal(expected, cursor); cursor = next;}};
+  const env = {ANTFLY_INCARNATION: namespace, DATABASE: bucket, COMMITS: {getByName: () => coordinator}};
+  assert.equal((await pruneEmbeddingCheckpoints(env)).deleted, 128);
+  assert.equal((await pruneEmbeddingCheckpoints(env)).deleted, 2);
+  assert.deepEqual([...bucket.objects.keys()].sort(), [current, foreign].sort());
+});

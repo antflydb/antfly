@@ -59,7 +59,8 @@
         "queue": "antfly-maintenance",
         "max_batch_size": 1,
         "max_retries": 10,
-        "dead_letter_queue": "antfly-maintenance-dead"
+        "dead_letter_queue": "antfly-maintenance-dead",
+        "max_concurrency": 1
       }
     ]
   },

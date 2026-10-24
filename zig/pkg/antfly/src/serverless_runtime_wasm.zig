@@ -112,12 +112,16 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         gc_id: ?[]const u8 = null,
         gc_keep_from: []const u8 = "1",
         publication_records: usize = 16,
+        paged_text: bool = false,
         compaction_max_documents: u64 = 1000,
         compaction_max_artifact_bytes: u64 = 4 * 1024 * 1024,
         mode: @import("serverless/query/request.zig").QueryMode = .text,
         vector: ?[]f32 = null,
         enrichment: bool = false,
         embedding_dimensions: u32 = 384,
+        embedding_identity: []const u8 = "cloudflare-default",
+        embedding_checkpoints: bool = false,
+        embedding_windows: usize = 1,
         enrichment_documents: usize = 1,
         working_set_bytes: usize = 20 * 1024 * 1024,
         filters: []const @import("serverless/query/live_filter.zig").Clause = &.{},
@@ -219,19 +223,33 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         if (!req.enrichment or req.embedding_dimensions == 0 or req.embedding_dimensions > 1536) return error.HostedEnrichmentNotConfigured;
         var enricher = @import("serverless/enrichment/worker.zig").SparseEnricher.init(a, &artifacts, &manifests, &progress, &wal);
         defer enricher.deinit();
-        var context: u8 = 0;
+        if (req.embedding_windows == 0 or req.embedding_windows > 8 or req.embedding_identity.len > 1024) return error.InvalidEnrichmentBudget;
+        var context = @import("serverless/hosted_embedding.zig").Context{
+            .client = host.client(),
+            .bucket = req.bucket,
+            .prefix = req.prefix,
+            .namespace = req.namespace,
+            .identity = req.embedding_identity,
+            .day = @intCast(realtimeNs() / (std.time.ns_per_day)),
+            .enabled = req.embedding_checkpoints,
+            .max_provider_calls = if (req.embedding_checkpoints) req.embedding_windows else 8,
+            .cancellation = transport_cancellation,
+        };
         try enricher.setChunkEmbedder(.{ .ptr = &context, .dense_embed_fn = @import("serverless/hosted_embedding.zig").Dense.embed, .dense_embed_batch_fn = @import("serverless/hosted_embedding.zig").Dense.batch }, "cloudflare", req.embedding_dimensions);
         if (req.enrichment_documents == 0 or req.enrichment_documents > 4) return error.InvalidEnrichmentBudget;
-        const stats = try enricher.runNamespaceWithConfigUntil(req.namespace, .{
-            .batch_size = req.enrichment_documents,
+        const stats = enricher.runNamespaceWithConfigUntil(req.namespace, .{
+            .batch_size = if (req.embedding_checkpoints) 1 else req.enrichment_documents,
             .scan_batch_size = 32,
             .max_source_read_bytes = 4 * 1024 * 1024,
             .stage = .chunk_embeddings,
             .model_preference = .require_model,
             .failure_policy = .fail_stage,
             .cancellation = cancellation,
-        }, .{ .io = host_io, .cooperative = cancellation });
-        return std.json.Stringify.valueAlloc(a, stats, .{});
+        }, .{ .io = host_io, .cooperative = cancellation }) catch |err| switch (err) {
+            error.HostedEmbeddingYield => return std.json.Stringify.valueAlloc(a, .{ .yielded = true, .wal_appends = @as(usize, 0), .checkpoint_hits = context.hits, .checkpoint_writes = context.writes, .provider_calls = context.provider_calls }, .{}),
+            else => return err,
+        };
+        return std.json.Stringify.valueAlloc(a, .{ .yielded = false, .wal_appends = stats.wal_appends, .enriched_documents = stats.enriched_documents, .enriched_namespaces = stats.enriched_namespaces, .model_documents = stats.model_documents, .fallback_documents = stats.fallback_documents, .failed_documents = stats.failed_documents, .stage_failures = stats.stage_failures, .idle_namespaces = stats.idle_namespaces, .checkpoint_hits = context.hits, .checkpoint_writes = context.writes, .provider_calls = context.provider_calls }, .{});
     }
     if (req.op == .compact) {
         _ = progress.getHead(req.namespace) catch |err| switch (err) {
@@ -249,6 +267,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     if (req.op == .publish) {
         var builder = @import("serverless/build/builder.zig").Builder.init(a, &artifacts, &manifests, &progress, &wal);
         builder.setIo(host_io);
+        builder.paged_text = req.paged_text;
         builder.graph_metric_max_parallelism = 1;
         if (req.publication_records == 0 or req.publication_records > 256) return error.InvalidWalBatch;
         builder.max_wal_records = req.publication_records;

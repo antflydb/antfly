@@ -27,14 +27,56 @@ test("workerd persists R2 pages and coordinated commits across restart", { timeo
   const options = {
     modulesRoot: output,
     modules: [{ type: "ESModule", path: join(output, "harness.mjs"), contents: `
-      import worker from "./worker.js";
-      export { CommitCoordinator } from "./worker.js";
+      import worker, { CommitCoordinator as BaseCoordinator } from "./worker.js";
+      export class CommitCoordinator extends BaseCoordinator {
+        testJournalScale() {
+          const j = this.journal, claim = j.claim();
+          if (claim.busy) throw new Error("unexpected busy journal");
+          const token = claim.token;
+          try {
+            if (claim.state.phase === "prepare") {
+              j.prepared(token, {roots: [{kind: "manifest", version: "0"}], floor: "1", retired_before: "1", pin_prefix: "fixture/", artifact_prefix: "artifacts/", manifest_prefix: "manifests/"}); j.pins(token);
+            }
+            if (j.state().phase === "mark_artifacts") for (let i = 0; i < 32; i++) {
+              const next = j.next(token);
+              if (!next) { j.marked(token); break; }
+              let children = [], key;
+              if (next.task.kind === "manifest") {
+                const offset = Number(next.task.version); key = "frontier/" + offset;
+                children = Array.from({length: 128}, (_, n) => ({kind: "blob", artifact: {artifact_id: "a".repeat(175), checksum: "b".repeat(64), byte_len: offset+n+1, metadata_version: 0}}));
+                if (offset + 128 < 2048) children.push({kind: "manifest", version: String(offset+128)});
+              } else key = "body/" + next.task.artifact.byte_len;
+              j.traced(token, next.id, {key, children});
+            }
+            const rows = this.ctx.storage.sql.exec("SELECT COUNT(*) AS marks FROM collection_marks").toArray()[0];
+            return {done: j.state().phase === "compact_wal", ...rows};
+          } finally { j.release(token); }
+        }
+      }
       let embeddingCalls = 0;
       export default { async fetch(request, env, ctx) {
         const path = new URL(request.url).pathname;
         const sent = [];
         const localEnv = { ...env, MAINTENANCE: { async send(value) { sent.push(value); } } };
         if (path === "/test/compaction-limit") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, COMPACTION_MAX_DOCUMENTS: "0"}, ctx);
+        if (path === "/test/sql-pressure") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, COMMITS: {getByName() {return {async collection() {throw new Error("out of memory: SQLITE_NOMEM");}};}}}, ctx);
+        if (path === "/test/journal-scale") return Response.json(await env.COMMITS.getByName("test-journal-scale").testJournalScale());
+        if (path === "/test/checkpoint-gc") {
+          const namespace = "test-checkpoint-gc", stub = env.COMMITS.getByName(namespace);
+          const today = Math.floor(Date.now() / 86400000), days = [today - 3, today];
+          const domain = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(namespace))), b => b.toString(16).padStart(2, "0")).join("");
+          const keys = [];
+          for (const day of days) {
+            const part = day.toString(16).padStart(8, "0");
+            const key = "antfly/progress/" + namespace + "/EMBEDDING_CACHE/" + part + "/fixture";
+            const payload = "antfly/embedding-cache/" + domain + "/" + part + "/fixture";
+            await stub.objectCall({op: "put", key}, new Uint8Array([1])); await env.DATABASE.put(payload, "scratch");
+            keys.push({key, payload});
+          }
+          const result = await worker.fetch(new Request("https://example.test/api", {method: "POST", headers: {Authorization: "Bearer local-test"}, body: JSON.stringify({op: "prune_checkpoints"})}), {...localEnv, ANTFLY_INCARNATION: namespace}, ctx);
+          return Response.json({result: await result.json(), statuses: await Promise.all(keys.map(async ({key, payload}) => [(await stub.objectCall({op: "get", key}, new Uint8Array())).status, !!await env.DATABASE.head(payload)]))});
+        }
+        if (path === "/test/paged") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, ANTFLY_INCARNATION: "test-paged", PAGED_TEXT: "true"}, ctx);
         if (path === "/test/recycle") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, ANTFLY_INCARNATION: "test-recycle", WASM_RECYCLE_BYTES: "4194304"}, ctx);
         if (path === "/test/embedding") {
           const dimensions = new URL(request.url).searchParams.get("dimensions") ?? "4";
@@ -154,6 +196,18 @@ test("workerd persists R2 pages and coordinated commits across restart", { timeo
     assert.ok(collected, "GC must finish across coordinator and Worker restarts");
     assert.equal((await call({ op: "search", text: "queued", limit: 1 })).hits[0].doc_id, "queued/0000");
     assert.equal((await call(mutation)).visibility, committed.visibility, "GC must preserve old retry receipts");
+    const sqlPressure = await mf.dispatchFetch("https://example.test/test/sql-pressure", {method: "POST", headers: {Authorization: "Bearer local-test"}, body: JSON.stringify({op: "collect"})});
+    assert.equal(sqlPressure.status, 503); assert.equal(sqlPressure.headers.get("Retry-After"), "1");
+    let largeJournal;
+    for (let i = 0; i < 100; i++) {
+      const response = await mf.dispatchFetch("https://example.test/test/journal-scale");
+      assert.equal(response.status, 200); largeJournal = await response.json();
+      if (largeJournal.done) break;
+      if (i === 32) { await mf.dispose(); mf = new Miniflare(convertV4MiniflareOptions(options)); }
+    }
+    assert.deepEqual(largeJournal, {done: true, marks: 2064});
+    const checkpointGC = await mf.dispatchFetch("https://example.test/test/checkpoint-gc");
+    assert.deepEqual(await checkpointGC.json(), {result: {deleted: 1, has_more: false}, statuses: [[1, false], [0, true]]});
     const embeddingCall = async (body, dimensions = "4") => mf.dispatchFetch(`https://example.test/test/embedding?dimensions=${dimensions}`, {method: "POST", headers: {Authorization: "Bearer local-test"}, body: JSON.stringify(body)});
     assert.equal((await embeddingCall({op: "mutate", operation_id: "message", mutations: [{kind: "upsert", doc_id: "message/a", body: JSON.stringify({text: "mail body", owner: "alice"})}]})).status, 200);
     assert.equal((await embeddingCall({op: "publish"})).status, 200);
@@ -170,6 +224,30 @@ test("workerd persists R2 pages and coordinated commits across restart", { timeo
     const changedProfile = await embeddingCall({op: "publish"}, "8");
     assert.equal(changedProfile.status, 409);
     assert.match((await changedProfile.json()).error, /HostedEmbeddingProfileChanged/);
+    const checkpointSource = Array.from({length: 70 * 8}, (_, i) => `word${i}`).join(" ");
+    assert.equal((await embeddingCall({op: "mutate", operation_id: "checkpoint-body", mutations: [{kind: "upsert", doc_id: "message/large", body: JSON.stringify({text: checkpointSource})}]})).status, 200);
+    assert.equal((await embeddingCall({op: "publish"})).status, 200);
+    const firstWindow = await embeddingCall({op: "enrich"});
+    assert.equal((await firstWindow.json()).yielded, true);
+    await mf.dispose(); mf = new Miniflare(convertV4MiniflareOptions(options));
+    const resumedWindow = await embeddingCall({op: "enrich"});
+    const resumedStats = await resumedWindow.json();
+    assert.equal(resumedStats.wal_appends, 1); assert.equal(resumedStats.checkpoint_hits, 1);
+    assert.equal(resumedWindow.headers.get("X-Model-Calls"), "1", "restart must reuse the completed provider window");
+    assert.equal((await embeddingCall({op: "publish"})).status, 200);
+    const pagedCall = async body => {
+      const response = await mf.dispatchFetch("https://example.test/test/paged", {method: "POST", headers: {Authorization: "Bearer local-test"}, body: JSON.stringify(body)});
+      const result = await response.json(); assert.equal(response.status, 200, JSON.stringify(result)); return result;
+    };
+    await pagedCall({op: "mutate", operation_id: "paged", mutations: Array.from({length: 32}, (_, i) => ({kind: "upsert", doc_id: `doc/${i}`, body: '{"text":"paged durable"}'}))});
+    while ((await pagedCall({op: "publish"})).has_more) {}
+    await mf.dispose(); mf = new Miniflare(convertV4MiniflareOptions(options));
+    assert.equal((await pagedCall({op: "search", text: "durable"})).hits.length, 10);
+    await pagedCall({op: "mutate", operation_id: "paged-change", mutations: [{kind: "delete", doc_id: "doc/0"}, {kind: "upsert", doc_id: "doc/1", body: '{"text":"replacement"}'}]});
+    await pagedCall({op: "publish"});
+    assert.equal((await pagedCall({op: "count"})).count, "31");
+    assert.equal((await pagedCall({op: "search", text: "replacement"})).hits[0].doc_id, "doc/1");
+    assert.equal((await pagedCall({op: "compact"})).published, false);
     const recycleCall = async body => {
       const response = await mf.dispatchFetch("https://example.test/test/recycle", {method: "POST", headers: {Authorization: "Bearer local-test"}, body: JSON.stringify(body)});
       const result = await response.json(); assert.equal(response.status, 200, JSON.stringify(result)); return result;

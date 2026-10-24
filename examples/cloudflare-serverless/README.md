@@ -194,6 +194,12 @@ they do not bound every transitive body read. Exceeding them returns
 retries are safe, but a flat-index rebuild has no intra-build checkpoint; making
 the WAL input batch smaller does not make every full rebuild fit.
 
+The reference deployment has one database incarnation and one maintenance
+consumer (`max_concurrency: 1`). Native publication already serializes that
+incarnation; parallel Queue deliveries otherwise contend for the same lease
+and spend retries without useful work. Interactive requests still use their
+own lane. A multi-incarnation deployment needs a deliberate scheduling profile.
+
 The [native reuse audit](../../docs/design/cloudflare-native-audit.md) identifies
 which parts already exist and the actual remaining execution boundaries.
 
@@ -202,6 +208,33 @@ portable indexed WAL copies only affected tree paths, and indexed tail reads
 do not download historical payloads. The warm cache stores copied immutable
 bytes and plain metadata; it never retains request-owned R2/DO handles or caches
 mutable HEAD/progress records.
+
+## Larger text workloads
+
+Set `PAGED_TEXT="true"` to publish text indexes as authenticated copy-on-write
+trees, reusing the native page tree, document facts, publication fencing, and
+retention protocols. Text changes update only touched projections and posting
+paths. Text-only inserts/deletes no longer trigger vector or sparse rebuilds
+when those projections are absent. Existing flat indexes also update postings
+without re-reading unrelated document bodies, though rewriting the flat text
+artifact still grows with its size.
+
+Paged text uses text artifact metadata version 2. Deploy compatible readers
+and collectors before enabling it. The setting is sticky in subsequent WAL
+publications once a paged root exists; disabling the variable does not downgrade
+existing roots. A small flat index can migrate during publication. Migrating a
+large existing flat index still requires one admitted conversion. Definition
+changes and mixed vector/sparse workloads can still require full-view builds.
+Old ranked cursors retain their original generation and remain readable until
+normal retention expires. Collection traces both document and posting trees.
+
+For text-only paged generations, `compact` validates roots and returns a no-op;
+publication has already updated the serving trees. It does not assemble a
+full-corpus body snapshot. Common-term queries still scan matching postings and
+retain ranked candidates under request budgets; paged storage is not an
+unbounded-query guarantee. Changed vector/sparse indexes, full-corpus reindex,
+application joins, and production concurrency qualification remain separate
+work. See [capacity observations](../../docs/design/cloudflare-native-audit.md).
 
 ## Collection and format upgrade
 
@@ -253,18 +286,32 @@ which batches bounded chunk windows through the provider, captures a finite
 pending cycle, persists progress, and conditionally
 appends derived mutations only while its source WAL boundary is still current.
 The next publication makes those vectors searchable. Model failures never
-substitute deterministic vectors. Each invocation defaults to one document and
-at most eight host inference calls. `ENRICHMENT_DOCUMENTS` may admit 1–4 documents
-when their combined calls fit that allowance. Each provider window admits at
-most 64 chunks and a conservative dimension-dependent vector-output budget;
-the adapter splits a document across at most eight windows. Failed windows
-publish no partial embedding set. Retry recomputes the document under native
-source validation. Larger documents fail clearly and remain pending; they need
-a different admitted chunking profile. Derived WAL records must also fit the
-existing page-tree record bound.
-The coordinator fixes the embedding model and dimensions for the physical
-incarnation, preventing accidental reuse of vectors after a provider change.
-Changing that profile requires a new incarnation or an explicit migration.
+substitute deterministic vectors. By default each invocation completes at most
+one document and one provider window (`EMBEDDING_WINDOWS`, 1–8).
+`ENRICHMENT_DOCUMENTS` applies when checkpointing is disabled. Each window admits at most 64
+chunks and a conservative dimension-dependent vector-output budget. Completed
+windows are checkpointed as immutable, checksum-verified R2 scratch objects
+with input/provider identities held in the coordinator. A yielded invocation
+releases its native lease and re-enqueues maintenance; a replacement Worker
+loads completed windows before calling the model again. Only the complete,
+source-validated document is appended to the WAL. Missing cache objects are
+recomputed; corrupt objects fail closed. This prevents repeated completed work
+across ordinary eviction, but does not promise exactly-once model billing.
+
+Checkpoint admission is at most 4,096 chunks and 8 MiB of raw vectors per
+document. Final JSON, derived WAL records, native working memory, I/O and CPU
+limits can impose lower bounds. `EMBEDDING_CHECKPOINTS="false"` retains the
+previous bounded, non-checkpointed adapter (up to eight windows in one pass).
+The coordinator fixes model, dimensions, and `EMBEDDING_REVISION` (default `1`)
+for the physical incarnation; changing that profile requires a new incarnation
+or explicit migration. The revision identifies deployments of a mutable model.
+
+Scratch checkpoints are never referenced by serving manifests: final vectors
+are inline in the derived document. Scheduled maintenance, or the authenticated
+`prune_checkpoints` API operation, deletes expired entries in bounded batches,
+keeping the current and previous UTC day. A persisted cursor resumes sweeping
+payloads; metadata pruning has an independent cursor. Cleanup is best effort,
+and cache expiry can cause recomputation during a long job.
 
 The "Save mailbox state" action writes a separate `state/<document-id>` record
 with `text:""` and a reference to the message. It does not rewrite or embed the
@@ -303,6 +350,13 @@ before `run.mjs ... --drain`; then delete the generated Worker, Queues, and empt
 bucket. Production `worker.mjs` has no drain route. Reports contain no API token.
 A successful fixture and absence of resource-limit errors do not measure total
 isolate memory or establish all-workload production qualification.
+For live paged text qualification, prepare with `--paged-text` and run
+`run.mjs RUN_JSON HTTPS_ORIGIN --scale --documents=5000`. The runner validates
+edits, deletes, and an old generation cursor against the real services.
+After disabling the consumer, `--collect-only` checks live collection on that
+scale fixture. `--diagnostics` reports only collector counts, frontier size,
+and phase through the authenticated qualification wrapper.
+
 For a fresh incarnation with `EMBEDDING_MODEL` and `EMBEDDING_DIMENSIONS`
 configured, `run.mjs RUN_JSON HTTPS_ORIGIN --enrichment --windows` validates a
 48-chunk document across provider windows, native compaction, and fenced vector
@@ -313,12 +367,15 @@ For local capacity characterization after building, run:
 
 ```sh
 node qualification/benchmark.mjs --sizes=100,1000,5000
+node qualification/benchmark.mjs --paged-text --sizes=1000,10000,50000 --publication-records=64
+node qualification/benchmark.mjs --paged-text --sizes=1000 --body-bytes=4096
 ```
 
 This exercises actual native WASM publication, cold/warm reads, and compaction
 over the in-process R2 contract fixture. It writes memory/object counts and
 explicit admission failures to ignored `dist/qualification/local-capacity.json`.
-It does not measure deployed R2 latency or total isolate memory.
+It also checks cold point updates, deletion, and replacement compute. It does
+not measure deployed R2 latency or total isolate memory.
 Defaults match the host's 4 MiB upload cap, 16-record publication prefix,
 24 MiB recycling threshold, and 1,000-document compaction preflight. Override
 `--max-put-bytes`, `--publication-records`, `--recycle-at-bytes`, and

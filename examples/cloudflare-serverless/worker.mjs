@@ -19,6 +19,7 @@ import { createR2Transport } from "../../zig/lib/objectstore/wasm/r2.mjs";
 import { withCommitCoordinator } from "../../zig/lib/objectstore/wasm/coordinated.mjs";
 import { createImmutableReadCache } from "../../zig/lib/objectstore/wasm/cache.mjs";
 import { collect } from "./collect.mjs";
+import { pruneEmbeddingCheckpoints } from "./embedding-checkpoints.mjs";
 export { CommitCoordinator } from "./coordinator.mjs";
 const lanes = {interactive: null, maintenance: null};
 const busy = {interactive: false, maintenance: false};
@@ -36,7 +37,7 @@ async function run(env, input, signal, collection) {
     recycleAtBytes = configuredRecycle;
     if (!env.ANTFLY_INCARNATION) throw new Error("database incarnation is not configured");
     if (env.EMBEDDING_MODEL && (["publish", "compact", "enrich"].includes(input.op) || (input.op === "search" && input.mode && input.mode !== "text"))) {
-      const accepted = await env.COMMITS.getByName(env.ANTFLY_INCARNATION).ensureEmbeddingProfile({model: env.EMBEDDING_MODEL, dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 384)});
+      const accepted = await env.COMMITS.getByName(env.ANTFLY_INCARNATION).ensureEmbeddingProfile({model: env.EMBEDDING_MODEL, dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 384), revision: env.EMBEDDING_REVISION ?? "1"});
       if (!accepted) throw new Error("HostedEmbeddingProfileChanged");
     }
     if (!lane) lanes[role] = lane = await instantiateHost(module, null, {
@@ -50,6 +51,10 @@ async function run(env, input, signal, collection) {
     const publicationBudget = input.op === "publish" ? await env.COMMITS.getByName(env.ANTFLY_INCARNATION).publicationBudget(Number(env.PUBLICATION_RECORDS ?? 16)) : 16;
     const settings = input.op === "latest" ? {} : { enrichment: Boolean(env.EMBEDDING_MODEL), embedding_dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 384), publication_records: publicationBudget,
       enrichment_documents: Number(env.ENRICHMENT_DOCUMENTS ?? 1),
+      paged_text: env.PAGED_TEXT === "true",
+      embedding_checkpoints: env.EMBEDDING_CHECKPOINTS !== "false",
+      embedding_windows: Number(env.EMBEDDING_WINDOWS ?? 1),
+      embedding_identity: JSON.stringify([env.EMBEDDING_MODEL ?? "", env.EMBEDDING_REVISION ?? "1", env.AI_GATEWAY ?? ""]),
       working_set_bytes: Number(env.WORKING_SET_BYTES ?? 20 * 1024 * 1024),
       compaction_max_documents: Number(env.COMPACTION_MAX_DOCUMENTS ?? 1000),
       compaction_max_artifact_bytes: Number(env.COMPACTION_MAX_ARTIFACT_BYTES ?? 4 * 1024 * 1024) };
@@ -113,6 +118,7 @@ export default {
         if (!env.AI_MODEL?.startsWith("@cf/") || !env.AI_GATEWAY) return new Response("AI model and gateway are not configured", { status: 503 });
         return Response.json(await env.AI.run(env.AI_MODEL, args, { gateway: { id: env.AI_GATEWAY } }));
       }
+      if (args.op === "prune_checkpoints") return Response.json(await pruneEmbeddingCheckpoints(env));
       if (args.op === "collect") {
         const result = await collect(env, (input, token) => run(env, input, request.signal, token), args.job_id);
         if (result.has_more) await enqueue(env, "collect", result.job_id, result.delay_seconds);
@@ -120,7 +126,7 @@ export default {
       }
       if (!["mutate", "lookup", "list", "search", "count", "status", "publish", "compact", "enrich", "latest"].includes(args.op)) return new Response("unsupported operation", { status: 400 });
       const result = await run(env, args, request.signal);
-      if ((args.op === "mutate" && result.committed) || (args.op === "publish" && result.has_more) || (args.op === "enrich" && result.wal_appends)) {
+      if ((args.op === "mutate" && result.committed) || (args.op === "publish" && result.has_more) || (args.op === "enrich" && (result.wal_appends || result.yielded))) {
         try { result.maintenance_pending = !await enqueue(env); }
         catch (error) {
           // Preserve the accepted write's durable outcome if scheduling fails.
@@ -130,8 +136,9 @@ export default {
       }
       return Response.json(result, env.WORKER_VERSION ? {headers: {"X-Antfly-Version": env.WORKER_VERSION.id}} : undefined);
     } catch (error) {
-      return Response.json({ error: String(error.message ?? error) }, { status: error instanceof Busy ? 503 : 409,
-        headers: error instanceof Busy ? { "Retry-After": "1" } : undefined });
+      const retryable = error instanceof Busy || /\bSQLITE_NOMEM\b/.test(String(error));
+      return Response.json({ error: String(error.message ?? error) }, { status: retryable ? 503 : 409,
+        headers: retryable ? { "Retry-After": "1" } : undefined });
     }
   },
   async queue(batch, env) {
@@ -172,6 +179,7 @@ export default {
   async scheduled(controller, env) {
     await enqueue(env);
     if (env.AUTO_GC === "true" && Math.floor(controller.scheduledTime / 60000) % 15 === 0) await enqueue(env, "collect");
+    if (env.EMBEDDING_MODEL && env.EMBEDDING_CHECKPOINTS !== "false") await pruneEmbeddingCheckpoints(env);
     if (env.AUTO_COMPACT === "true" && Math.floor(controller.scheduledTime / 60000) % 60 === 0) await enqueue(env, "compact");
   },
 };

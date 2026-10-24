@@ -22,7 +22,7 @@ const result = spawnSync(process.env.ANTFLY_ZIG ?? "zig", [
   "-Mroot=zig/pkg/antfly/src/serverless_host_test_root.zig",
   "--dep", "antfly_platform", "-Mobjectstore=zig/lib/objectstore/src/root.zig",
   "-Mantfly_platform=zig/lib/platform/src/root.zig",
-  ...["serverless live", "serverless indexed", "serverless visibility", "serverless query cursors", "serverless mutation decoder"]
+  ...["serverless live", "serverless indexed", "serverless visibility", "serverless query cursors", "serverless mutation decoder", "serverless embedding checkpoints"]
     .flatMap(name => ["--test-filter", name]),
 ], { cwd: root, stdio: "inherit" });
 if (result.error) throw result.error;

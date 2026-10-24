@@ -136,6 +136,8 @@ pub const Builder = struct {
     /// Hosted invocations publish a bounded prefix. A subsequent invocation
     /// resumes from the durably published manifest's WAL watermark.
     max_wal_records: ?usize = null,
+    /// Opt-in paged text projection; existing paged publications retain it.
+    paged_text: bool = false,
     max_wal_bytes: usize = 8 * 1024 * 1024,
     graph_metric_max_parallelism: usize = lake_graph_metric.default_compute_parallelism,
     publication_lifecycle_hook: ?PublicationLifecycleHook = null,
@@ -570,7 +572,23 @@ pub const Builder = struct {
         defer query_mod.freeMaterializedDocuments(self.alloc, materialized.documents);
         try maintenance_cancellation.check(cancellation);
 
+        const use_paged_text = self.paged_text or (if (current_manifest) |prior| hasPagedText(prior) else false);
         const document_ref = blk: {
+            if (use_paged_text and materialized.partial and current_manifest != null and
+                findArtifactIndex(current_manifest.?, .vector_segment) == null and findArtifactIndex(current_manifest.?, .sparse_segment) == null and findArtifactIndex(current_manifest.?, .graph_segment) == null)
+            {
+                const payload = try document_segment_mod.encodeAlloc(self.alloc, &.{});
+                defer self.alloc.free(payload);
+                if (findArtifactIndex(current_manifest.?, .document_segment)) |position| {
+                    const cached = current_manifest.?.artifacts[position];
+                    var digest: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+                    if (cached.byte_len == payload.len and std.mem.eql(u8, cached.checksum, &std.fmt.bytesToHex(digest, .lower))) break :blk try cloneArtifactRefAlloc(self.alloc, cached);
+                }
+                var artifact = try self.artifacts.put(payload);
+                defer artifact.deinit(self.alloc);
+                break :blk try artifactRefFromMetadataAlloc(self.alloc, .document_segment, artifact);
+            }
             if (materialized.partial) {
                 const idx = findArtifactIndex(current_manifest.?, .document_segment) orelse return error.DocumentSegmentNotFound;
                 break :blk try cloneArtifactRefAlloc(self.alloc, current_manifest.?.artifacts[idx]);
@@ -587,7 +605,7 @@ pub const Builder = struct {
         try maintenance_cancellation.check(cancellation);
         const text_index_specs = try resolvePublishedTextIndexSpecsAlloc(self.alloc, plan.table_definition, plan.full_text_index_actions);
         defer full_text_indexes.freeFullTextIndexSpecs(self.alloc, text_index_specs);
-        const text_refs = try buildTextArtifactRefsForMaterializedDocsAllocUntil(
+        const text_refs = try buildTextArtifactRefsForTouchedDocsAllocUntil(
             self.alloc,
             self.artifacts,
             current_manifest,
@@ -596,6 +614,10 @@ pub const Builder = struct {
             materialized.mutations,
             text_index_specs,
             cancellation,
+            materialized.partial,
+            use_paged_text,
+            try graphPublicationAttempt(publication_guard, namespace, cancellation.?.io),
+            namespace,
         );
         defer freeArtifactRefs(self.alloc, text_refs);
         try maintenance_cancellation.check(cancellation);
@@ -2517,7 +2539,7 @@ fn materializeWalDocumentsForPublicationAlloc(
                 defer if (owned) freeMaterializerMutations(self.alloc, mutations);
                 var touched = try document_facts_builder.materializeTouchedAlloc(self.alloc, &pages, root, mutations);
                 defer if (owned) touched.deinit();
-                if (!try flatSearchProjectionChangedAlloc(self.alloc, manifest, touched.before, touched.after, mutations, plan, cancellation)) {
+                if (!try requiresFullDocumentViewAlloc(self.alloc, manifest, touched.before, touched.after, mutations, plan, cancellation)) {
                     const counts = try document_facts_builder.predictCountsAlloc(self.alloc, root, touched, plan.policy, plan.table_definition.indexes_json);
                     const count = try std.math.add(u64, std.math.sub(u64, root.document_count, touched.before.len) catch return error.InvalidDocumentFactsRoot, touched.after.len);
                     const document_count = std.math.cast(usize, count) orelse return error.LakeSidecarBuildBudgetExceeded;
@@ -2531,10 +2553,10 @@ fn materializeWalDocumentsForPublicationAlloc(
     return .{ .base_documents = full.base_documents, .documents = full.documents, .mutations = full.mutations, .document_count = full.documents.len };
 }
 
-/// Flat text/vector/sparse formats still need the complete view only when
-/// their own projection changes. Graph-only updates remain point lookups and
-/// copy-on-write page mutations even when unrelated search indexes coexist.
-fn flatSearchProjectionChangedAlloc(
+/// Text can replace touched postings in its existing format. Vector/sparse
+/// changes still require the complete view; unchanged projections and graph
+/// mutations reuse point lookups and copy-on-write facts pages.
+fn requiresFullDocumentViewAlloc(
     alloc: Allocator,
     current: manifest_mod.Manifest,
     before: []const query_mod.QueryMaterializedDocument,
@@ -2543,12 +2565,13 @@ fn flatSearchProjectionChangedAlloc(
     plan: publication_plan.TablePublicationPlan,
     cancellation: ?maintenance_cancellation.Token,
 ) !bool {
+    if (!std.mem.eql(u8, current.stats.indexes_json, plan.table_definition.indexes_json)) return true;
     const specs = try resolvePublishedTextIndexSpecsAlloc(alloc, plan.table_definition, plan.full_text_index_actions);
     defer full_text_indexes.freeFullTextIndexSpecs(alloc, specs);
     for (specs) |spec| {
         try maintenance_cancellation.check(cancellation);
-        if (!artifactAvailableForName(current, .text_segment, spec.name) or
-            try textProjectionChangedForMutationsAlloc(alloc, before, after, mutations, spec)) return true;
+        const index = findNamedArtifactIndex(current, .text_segment, spec.name) orelse return true;
+        if (!std.mem.eql(u8, current.artifacts[index].name, spec.name)) return true;
     }
     const vectors = try search_sources.listVectorSourcesAlloc(alloc, plan.targets.published_search_sources);
     defer search_sources.freeVectorSourceDescriptors(alloc, vectors);
@@ -3110,12 +3133,11 @@ fn vectorProjectionChangedAlloc(
     after_doc: ?query_mod.QueryMaterializedDocument,
     source: search_sources.VectorSourceDescriptor,
 ) !bool {
-    if ((before_doc == null) != (after_doc == null)) return true;
     if (before_doc == null and after_doc == null) return false;
 
-    var before_projection = try document_projection.parseAlloc(alloc, before_doc.?.body);
+    var before_projection = try document_projection.parseAlloc(alloc, if (before_doc) |doc| doc.body else "{}");
     defer before_projection.deinit(alloc);
-    var after_projection = try document_projection.parseAlloc(alloc, after_doc.?.body);
+    var after_projection = try document_projection.parseAlloc(alloc, if (after_doc) |doc| doc.body else "{}");
     defer after_projection.deinit(alloc);
 
     const before = search_sources.selectVectorSource(&before_projection, source);
@@ -3164,12 +3186,11 @@ fn sparseProjectionChangedAlloc(
     after_doc: ?query_mod.QueryMaterializedDocument,
     source: search_sources.SparseSourceDescriptor,
 ) !bool {
-    if ((before_doc == null) != (after_doc == null)) return true;
     if (before_doc == null and after_doc == null) return false;
 
-    var before_projection = try document_projection.parseAlloc(alloc, before_doc.?.body);
+    var before_projection = try document_projection.parseAlloc(alloc, if (before_doc) |doc| doc.body else "{}");
     defer before_projection.deinit(alloc);
-    var after_projection = try document_projection.parseAlloc(alloc, after_doc.?.body);
+    var after_projection = try document_projection.parseAlloc(alloc, if (after_doc) |doc| doc.body else "{}");
     defer after_projection.deinit(alloc);
 
     const before = search_sources.selectSparseSource(&before_projection, source);
@@ -3323,6 +3344,11 @@ pub fn findNamedArtifactIndex(manifest: manifest_mod.Manifest, kind: manifest_mo
         if (std.mem.eql(u8, artifact.name, name)) return idx;
     }
     return unnamed_match;
+}
+
+pub fn hasPagedText(source: manifest_mod.Manifest) bool {
+    for (source.artifacts) |ref| if (ref.kind == .text_segment and ref.metadata_version == @import("../text_segment/paged.zig").metadata_version) return true;
+    return false;
 }
 
 pub fn countArtifactsByKind(manifest: manifest_mod.Manifest, kind: manifest_mod.ArtifactKind) usize {
@@ -3725,6 +3751,23 @@ pub fn buildTextArtifactRefsForMaterializedDocsAllocUntil(
     text_index_specs: []const FullTextIndexSpec,
     cancellation: ?maintenance_cancellation.Token,
 ) ![]manifest_mod.ArtifactRef {
+    return buildTextArtifactRefsForTouchedDocsAllocUntil(alloc, artifacts, current, before_docs, docs, mutations, text_index_specs, cancellation, false, if (current) |source| hasPagedText(source) else false, if (artifacts.upload_scope) |scope| scope.attempt else @splat(0), if (current) |source| source.namespace else "");
+}
+
+fn buildTextArtifactRefsForTouchedDocsAllocUntil(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    current: ?manifest_mod.Manifest,
+    before_docs: []const query_mod.QueryMaterializedDocument,
+    docs: []const query_mod.QueryMaterializedDocument,
+    mutations: []const query_mod.QueryMaterializerMutation,
+    text_index_specs: []const FullTextIndexSpec,
+    cancellation: ?maintenance_cancellation.Token,
+    touched_only: bool,
+    use_paged: bool,
+    attempt: [16]u8,
+    namespace: []const u8,
+) ![]manifest_mod.ArtifactRef {
     const refs = try alloc.alloc(manifest_mod.ArtifactRef, text_index_specs.len);
     errdefer alloc.free(refs);
     var initialized: usize = 0;
@@ -3735,7 +3778,8 @@ pub fn buildTextArtifactRefsForMaterializedDocsAllocUntil(
     for (text_index_specs, 0..) |spec, idx| {
         try maintenance_cancellation.check(cancellation);
         if (current) |manifest| {
-            if (!try textProjectionChangedForMutationsAlloc(alloc, before_docs, docs, mutations, spec)) {
+            const prior_index = findNamedArtifactIndex(manifest, .text_segment, spec.name);
+            if ((!use_paged or (prior_index != null and manifest.artifacts[prior_index.?].metadata_version == @import("../text_segment/paged.zig").metadata_version)) and !try textProjectionChangedForMutationsAlloc(alloc, before_docs, docs, mutations, spec)) {
                 if (try cloneNamedArtifactRefAlloc(alloc, manifest, .text_segment, spec.name)) |artifact| {
                     refs[idx] = artifact;
                     initialized += 1;
@@ -3743,7 +3787,49 @@ pub fn buildTextArtifactRefsForMaterializedDocsAllocUntil(
                 }
             }
         }
-        const payload = try buildTextSegmentAlloc(alloc, docs, spec, cancellation);
+        if (use_paged) {
+            var bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
+            var reads: u64 = 32 * 1024 * 1024;
+            var writes: u64 = 32 * 1024 * 1024;
+            var pages = graph_page_store.PageStore{ .domain = graph_page_store.PageStore.namespaceDomain(namespace), .attempt = attempt, .artifacts = artifacts, .cancellation = bridge.token(), .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+            var delta = try allocTextSegmentAlloc(alloc, docs, spec, cancellation);
+            defer delta.deinit(alloc);
+            const ids = try alloc.alloc([]const u8, mutations.len);
+            defer alloc.free(ids);
+            for (mutations, ids) |mutation, *id| id.* = mutation.doc_id;
+            const prior_index = if (current) |source| findNamedArtifactIndex(source, .text_segment, spec.name) else null;
+            const prior = if (prior_index) |position| current.?.artifacts[position] else null;
+            if (prior != null and prior.?.metadata_version != @import("../text_segment/paged.zig").metadata_version and touched_only) {
+                const bytes = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(alloc, prior.?.artifact_id, prior.?.byte_len, prior.?.checksum, bridge.token());
+                defer alloc.free(bytes);
+                var base = try text_segment_mod.decodeAlloc(alloc, bytes);
+                defer base.deinit(alloc);
+                const combined = try @import("../text_segment/incremental.zig").encodeReplacementAlloc(alloc, base, delta, ids, bridge.token());
+                defer alloc.free(combined);
+                var full = try text_segment_mod.decodeAlloc(alloc, combined);
+                defer full.deinit(alloc);
+                refs[idx] = try @import("../text_segment/paged.zig").publishAlloc(alloc, &pages, null, full, &.{});
+            } else {
+                refs[idx] = try @import("../text_segment/paged.zig").publishAlloc(alloc, &pages, if (prior != null and prior.?.metadata_version == @import("../text_segment/paged.zig").metadata_version) prior else null, delta, ids);
+            }
+            initialized += 1;
+            continue;
+        }
+        const payload = if (touched_only) incremental: {
+            const prior = current orelse return error.DocumentFactsSourceChanged;
+            const index = findNamedArtifactIndex(prior, .text_segment, spec.name) orelse return error.TextSegmentNotFound;
+            var bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
+            const bytes = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(alloc, prior.artifacts[index].artifact_id, prior.artifacts[index].byte_len, prior.artifacts[index].checksum, bridge.token());
+            defer alloc.free(bytes);
+            var base = try text_segment_mod.decodeAlloc(alloc, bytes);
+            defer base.deinit(alloc);
+            var delta = try allocTextSegmentAlloc(alloc, docs, spec, cancellation);
+            defer delta.deinit(alloc);
+            const ids = try alloc.alloc([]const u8, mutations.len);
+            defer alloc.free(ids);
+            for (mutations, ids) |mutation, *id| id.* = mutation.doc_id;
+            break :incremental try @import("../text_segment/incremental.zig").encodeReplacementAlloc(alloc, base, delta, ids, bridge.token());
+        } else try buildTextSegmentAlloc(alloc, docs, spec, cancellation);
         defer alloc.free(payload);
         var artifact = try artifacts.put(payload);
         defer artifact.deinit(alloc);

@@ -28,7 +28,7 @@ const payloadText = record => Buffer.from(record.payload_base64, "base64").toStr
 const request = (op, args = {}) => ({ op, bucket: "database", prefix: "scope", namespace: "tenant/table/incarnation1", ...args });
 const append = (id, payload = id) => request("append", { operation_id: id, payload, timestamp_ns: "9007199254740993" });
 async function setup(bucket = new Bucket(), wrap = transport => transport, options = {}) {
-  const transport = createR2Transport({ database: bucket });
+  const transport = createR2Transport({ database: bucket }, {maxPutBytes: 4 * 1024 * 1024});
   return { bucket, transport, host: await instantiateHost(module, wrap(transport), { onLog: message => console.error("WASM:", message), ...options }) };
 }
 test("suspended WASM commits once, survives eviction, and enforces visibility and retention", async () => {
@@ -199,7 +199,7 @@ test("immutable cache is bounded and never caches mutable commit records", async
   assert.ok(cache.retainedBytes() <= 4096);
 });
 
-test("publication recovers from uploaded orphans and an ambiguous published HEAD", async () => {
+for (const paged of [false, true]) test(`publication recovers from uploaded orphans and an ambiguous published HEAD (paged=${paged})`, async () => {
   const { bucket, host } = await setup();
   await host.request(request("mutate", { operation_id: "initial", mutations: [
     { kind: "upsert", doc_id: "a", body: JSON.stringify({ text: "recoverable artifacts" }) },
@@ -213,7 +213,7 @@ test("publication recovers from uploaded orphans and an ambiguous published HEAD
     }
     return result;
   })).host;
-  await assert.rejects(interrupted.request(request("publish")), /ObjectStoreTransportFailed/);
+  await assert.rejects(interrupted.request(request("publish", {paged_text: paged})), /ObjectStoreTransportFailed/);
   let failHead = true;
   const ambiguous = (await setup(bucket, transport => async (req, body) => {
     const result = await transport(req, body);
@@ -224,9 +224,9 @@ test("publication recovers from uploaded orphans and an ambiguous published HEAD
     }
     return result;
   })).host;
-  await assert.rejects(ambiguous.request(request("publish")), /ObjectStoreTransportFailed/);
+  await assert.rejects(ambiguous.request(request("publish", {paged_text: paged})), /ObjectStoreTransportFailed/);
   const recovered = (await setup(bucket)).host;
-  await recovered.request(request("publish"));
+  await recovered.request(request("publish", {paged_text: paged}));
   assert.deepEqual((await recovered.request(request("search", { text: "recoverable" }))).hits.map(x => x.doc_id), ["a"]);
   assert.equal((await recovered.request(request("latest"))).visibility.slice(-16), "0000000000000001");
 });
@@ -246,7 +246,7 @@ test("WAL reads authenticate immutable page bytes", async () => {
 });
 
 
-test("bounded hosted GC evicts orphan and expired pages, survives restarts and preserves receipts", async () => {
+for (const paged of [false, true]) test(`bounded hosted GC evicts orphan and expired pages, survives restarts and preserves receipts (paged=${paged})`, async () => {
   const f = fixture(), bucket = new Bucket();
   try {
     let journal = f.journal();
@@ -260,7 +260,7 @@ test("bounded hosted GC evicts orphan and expired pages, survives restarts and p
       } catch (error) { return { status: error.status ?? 7 }; }
     } };
     let host = (await setup(bucket, t => withCommitCoordinator(t, coordinator), { clock: f.now })).host;
-    const execute = (input, token) => host.request(request(input.op, input), { transport: withCommitCoordinator(base, coordinator, token) });
+    const execute = (input, token) => host.request(request(input.op, {...input, paged_text: paged}), { transport: withCommitCoordinator(base, coordinator, token) });
     const first = request("mutate", { operation_id: "first", mutations: [{ kind: "upsert", doc_id: "a", body: JSON.stringify({ text: "old" }) }] });
     const receipt = await execute(first);
     for (let i = 0; i < 5; i++) {
@@ -359,7 +359,7 @@ test("hosted enrichment resumes native progress and skips empty-text state", asy
 });
 
 
-test("a model response cannot overwrite a write committed during inference", async () => {
+for (const checkpoint of [false, true]) test(`a model response cannot overwrite a write committed during inference (checkpoints=${checkpoint})`, async () => {
   const {host, bucket} = await setup(), writer = (await setup(bucket)).host;
   await host.request(request("mutate", {operation_id: "source", mutations: [{kind: "upsert", doc_id: "a", body: JSON.stringify({text: "old source"})}]}));
   await host.request(request("publish", {enrichment: true}));
@@ -367,7 +367,7 @@ test("a model response cannot overwrite a write committed during inference", asy
     await writer.request(request("mutate", {operation_id: "new-source", mutations: [{kind: "upsert", doc_id: "a", body: JSON.stringify({text: "new source", custom: true})}]}));
     return {json: {data: req.texts.map(() => Array(req.dimensions).fill(0.5))}};
   };
-  await assert.rejects(host.request(request("enrich", {enrichment: true, embedding_dimensions: 4}), {inference}), /EnrichmentProgressChanged/);
+  await assert.rejects(host.request(request("enrich", {enrichment: true, embedding_dimensions: 4, embedding_checkpoints: checkpoint}), {inference}), /EnrichmentProgressChanged/);
   const body = JSON.parse((await writer.request(request("lookup", {doc_id: "a"}))).body);
   assert.equal(body.text, "new source"); assert.equal(body.custom, true); assert.equal(body.chunk_embeddings, undefined);
 });
@@ -536,4 +536,84 @@ test("hosted embedding windows preserve chunk order and never publish partially 
   const body = JSON.parse((await host.request(request("lookup", {doc_id: "large"}))).body);
   assert.equal(body.chunk_embeddings.length, position);
   assert.deepEqual(body.chunk_embeddings.map(chunk => chunk.embedding[0]), Array.from({length: position}, (_, i) => i));
+});
+
+
+test("text-only publication replaces postings without hydrating unrelated large bodies", async () => {
+  const {host, bucket} = await setup();
+  for (let offset = 0; offset < 96; offset += 4) {
+    await host.request(request("mutate", {operation_id: `large/${offset}`, mutations: Array.from({length: 4}, (_, i) => ({kind: "upsert", doc_id: `doc/${String(offset+i).padStart(3,"0")}`, body: JSON.stringify({text: `durable message ${offset+i}`, padding: "x".repeat(32768)})}))}));
+    await host.request(request("publish"));
+  }
+  assert.equal((await host.request(request("count"))).count, "96");
+  const cold = (await setup(bucket)).host;
+  await cold.request(request("mutate", {operation_id: "edit-delete", mutations: [{kind: "upsert", doc_id: "doc/000", body: '{"text":"replacement unique"}'}, {kind: "delete", doc_id: "doc/001"}]}));
+  bucket.readBytes = 0;
+  await cold.request(request("publish"));
+  assert.ok(bucket.readBytes < 384 * 1024, `${bucket.readBytes} bytes read for a small edit over 3 MiB of unrelated bodies`);
+  assert.equal((await cold.request(request("search", {text: "replacement"}))).hits[0].doc_id, "doc/000");
+  assert.equal((await cold.request(request("count"))).count, "95");
+});
+
+test("paged text migrates a flat generation, preserves cursors and updates bounded paths", async () => {
+  const {host, bucket} = await setup();
+  await host.request(request("mutate", {operation_id: "paged-base", mutations: Array.from({length: 200}, (_, i) => ({kind: "upsert", doc_id: `doc/${String(i).padStart(4,"0")}`, body: JSON.stringify({text: "durable searchable", keep: true})}))}));
+  await host.request(request("publish", {publication_records: 256}));
+  const first = await host.request(request("search", {text: "durable", limit: 2}));
+  await host.request(request("mutate", {operation_id: "paged-edit", mutations: [{kind: "upsert", doc_id: "doc/0000", body: '{"text":"replacement"}'}, {kind: "delete", doc_id: "doc/0001"}, {kind: "upsert", doc_id: "new", body: '{"text":"durable new"}'}]}));
+  await host.request(request("publish", {paged_text: true}));
+  let reopened = (await setup(bucket)).host;
+  assert.deepEqual((await reopened.request(request("search", {text: "durable", limit: 2, cursor: first.cursor}))).hits.map(hit => hit.doc_id), ["doc/0002", "doc/0003"]);
+  assert.equal((await reopened.request(request("count"))).count, "200");
+  assert.equal((await reopened.request(request("search", {text: "replacement"}))).hits[0].doc_id, "doc/0000");
+  assert.equal((await reopened.request(request("compact", {compaction_max_documents: 1}))).published, false, "paged-only compaction must not reconstruct a corpus snapshot");
+  await reopened.request(request("mutate", {operation_id: "paged-next", mutations: [{kind: "upsert", doc_id: "later", body: '{"text":"durable later"}'}]}));
+  bucket.readBytes = 0;
+  await reopened.request(request("publish"));
+  assert.ok(bucket.readBytes < 128 * 1024, `paged update read ${bucket.readBytes} bytes`);
+  reopened = (await setup(bucket)).host;
+  assert.equal((await reopened.request(request("lookup", {doc_id: "later"}))).body, '{"text":"durable later"}');
+});
+
+test("embedding checkpoints resume beyond eight model windows across eviction", async () => {
+  const bucket = new Bucket();
+  let host = (await setup(bucket)).host, calls = 0;
+  const source = Array.from({length: 600 * 8}, (_, i) => `word${i}`).join(" ");
+  await host.request(request("mutate", {operation_id: "checkpoint-source", mutations: [{kind: "upsert", doc_id: "large", body: JSON.stringify({text: source})}]}));
+  await host.request(request("publish", {enrichment: true}));
+  const settings = request("enrich", {enrichment: true, embedding_dimensions: 4, embedding_checkpoints: true, embedding_identity: "model-v1", embedding_windows: 1});
+  let complete = false, yielded = 0;
+  for (let step = 0; step < 20; step++) {
+    const result = await host.request(settings, {inference: async req => {calls++; return {json: {data: req.texts.map(text => [Number(text.match(/word(\d+)/)[1]), 0, 0, 1])}}; }});
+    assert.ok(result.provider_calls <= 1);
+    if (!result.yielded) {assert.equal(result.wal_appends, 1); complete = true; break;}
+    yielded++;
+    assert.equal((await host.request(request("status"))).pending_embeddings, "1");
+    assert.equal(JSON.parse((await host.request(request("lookup", {doc_id: "large"}))).body).chunk_embeddings, undefined);
+    host = (await setup(bucket)).host;
+  }
+  assert.ok(complete); assert.equal(calls, 10); assert.equal(yielded, 9);
+  const body = JSON.parse((await host.request(request("lookup", {doc_id: "large"}))).body);
+  assert.equal(body.chunk_embeddings.length, 600);
+  assert.deepEqual(body.chunk_embeddings.map(chunk => chunk.embedding[0]), Array.from({length: 600}, (_, i) => i * 8));
+  await host.request(request("publish", {enrichment: true}));
+  assert.equal((await host.request(request("status"))).pending_embeddings, "0");
+});
+
+test("corrupt embedding checkpoints fail closed and missing scratch recomputes safely", async () => {
+  const {host, bucket} = await setup(); let calls = 0;
+  await host.request(request("mutate", {operation_id: "cache-source", mutations: [{kind: "upsert", doc_id: "a", body: JSON.stringify({text: Array.from({length: 70 * 8}, (_, i) => `word${i}`).join(" ")})}]}));
+  await host.request(request("publish", {enrichment: true}));
+  const settings = request("enrich", {enrichment: true, embedding_dimensions: 4, embedding_checkpoints: true, embedding_identity: "model-v1"});
+  const inference = async req => {calls++; return {json: {data: req.texts.map(() => [1, 0, 0, 0])}};};
+  assert.equal((await host.request(settings, {inference})).yielded, true);
+  const key = [...bucket.objects.keys()].find(key => key.includes("/embedding-cache/"));
+  bucket.objects.get(key).body[48] ^= 1;
+  await assert.rejects(host.request(settings, {inference}), /HostedEmbeddingCheckpointInvalid/);
+  assert.equal(calls, 1);
+  assert.equal(JSON.parse((await host.request(request("lookup", {doc_id: "a"}))).body).chunk_embeddings, undefined);
+  await bucket.delete(key);
+  assert.equal((await host.request(settings, {inference})).yielded, true);
+  assert.equal((await host.request(settings, {inference})).wal_appends, 1);
+  assert.equal(calls, 3);
 });

@@ -7,8 +7,8 @@ host integration and workload limits.
 
 | Capability | Existing native implementation | Hosted integration |
 | --- | --- | --- |
-| Incremental document state | `build/document_facts_builder.zig` updates authenticated facts and pending-work trees; the builder loads only touched rows when flat search projections are unchanged. | Used directly, including metadata-only changes. |
-| Search artifact reuse | `build/builder.zig` compares projections and reuses unchanged text, sparse, and vector artifacts. | Used directly. Changed flat projections can still require the complete view. |
+| Incremental document state | `build/document_facts_builder.zig` updates authenticated facts and pending-work trees; the builder loads touched rows when remaining vector/sparse projections are unchanged. | Used directly, including metadata-only changes. |
+| Search artifact reuse | `build/builder.zig` compares projections and reuses unchanged text, sparse, and vector artifacts. | Used directly. Text replacements now merge projections without reading unrelated bodies; changed vector/sparse projections can still require the complete view. |
 | Publication continuation | Builder publication commits a WAL watermark; subsequent passes resume from it. | Queue dispatch, bounded input prefixes, and adaptive batch admission. This checkpoints between publications, not inside a flat-index rebuild. |
 | Compaction | `build/compactor.zig` rebuilds the pinned published view, preserves document facts, reuses artifacts, fences publication, and handles retry/no-op. | Now exposed as `compact` and an optional scheduled Queue job, using host I/O and bounded preflight admission. It preserves the publication's graph families. |
 | Enrichment continuation | `enrichment/worker.zig` scans indexed pending work under a finite cycle and persists CAS-protected stage progress. Source pinning and conditional WAL append reject stale model results. | Used directly. The embedding adapter now splits a document into dimension-bounded provider windows. Only a complete document is appended. |
@@ -37,13 +37,11 @@ reads and build amplification remain subject to allocation, I/O, and deadline
 limits. An empty unpublished database is a no-op. Failed whole-pass attempts
 can be retried; compaction has no new intra-build checkpoint format.
 
-The embedding adapter previously rejected any document exceeding one response
-window. It now makes up to eight ordered provider calls under the existing
-invocation allowance. Default hosted enrichment admits one document per pass
-so that document can use the whole allowance. Native document-level progress,
-source checks, and publication remain unchanged. Failed windows publish no
-partial embedding set; their work is recomputed on retry. Larger documents
-still fail explicit admission rather than introducing untracked partial state.
+The embedding adapter uses the native pending-work cycle and source guards.
+Hosted checkpoints now retain completed provider windows across invocation
+boundaries and Worker eviction. Only the fully assembled document reaches the
+native conditional derived append. See the scale follow-up below for the
+scratch cache's authority, retention, and admission boundaries.
 
 ## Measurement and remaining boundaries
 
@@ -66,15 +64,14 @@ failures. This is a local characterization tool; in-memory fixture storage is
 outside the measured WASM budget. It does not measure Cloudflare latency, total
 isolate memory, or production throughput.
 
-The real unimplemented boundaries are checkpointing *within* a large flat
-index build or individual document, and broader deployed capacity/failure
-qualification. Additional segment or staging work should follow a measured
-workload that exceeds the admitted existing paths. Joining separate mailbox
-state into ranked search remains an application/query extension and is not a
-missing serverless persistence primitive. The reference app still makes that
-limitation explicit.
+The remaining build boundaries are large vector/sparse rebuilds, bulk index
+migrations and definition changes, plus production capacity/failure
+qualification. Paged text avoids whole-index rebuilds for ordinary WAL updates;
+embedding checkpoints avoid restarting all completed model windows. Joining
+separate mailbox state into ranked search remains an application/query
+extension. These changes reuse native persistence rather than replacing it.
 
-## Local capacity observations
+## Earlier flat-format capacity observations
 
 The same WASM module completed publication, accepted-visibility checks,
 cold/warm reads, and native compaction for 100, 1,000, and 5,000 synthetic
@@ -142,3 +139,120 @@ and collection after compaction.
 Both live incarnations were drained, and the disposable Worker, maintenance
 Queue, dead-letter Queue, and R2 bucket were deleted. Generated reports and
 private deployment files remain ignored under `dist/qualification/`.
+
+## Paged text and embedding scale follow-up
+
+Changed flat text indexes can now merge normalized projections and postings,
+remapping document ordinals without retokenizing untouched text or fetching
+untouched bodies. Native facts remain authoritative; an old packed body
+snapshot can be reused as a cache. Insert/delete projection comparison now
+checks actual vector/sparse presence, so a text-only document no longer forces
+a full rebuild merely because its document identity appeared or disappeared.
+Real vector/sparse projection changes retain the existing full-view path.
+
+For larger text collections, opt-in `PAGED_TEXT=true` stores text artifact
+metadata version 2 roots over the existing authenticated page tree. One tree
+maps document IDs to normalized text; another maps escaped term/document keys
+to term frequency. Prefix compression reduces repeated term and ID bytes.
+Only touched document projections and posting paths change during normal WAL
+publication. Manifest publication and its watermark remain the commit point.
+The normal collector traces both trees and honors retained generations and
+read pins. Text-only paged compaction validates roots and returns a no-op.
+It does not reconstruct a corpus body snapshot. Mixed vector/sparse builds
+retain their admitted whole-view path.
+
+A flat generation can convert during an admitted publication. All readers and
+collectors must understand version 2 before the flag is enabled. Normal WAL
+publication preserves the paged format once present. A large initial flat
+conversion or definition migration is still a bounded whole pass. This is not
+a resumable full-corpus reindex implementation.
+
+The local actual-WASM/R2-contract sweep completed these cases using 64-record
+publication prefixes, without raising the 20 MiB native working allocation,
+32 MiB lane, 4 MiB PUT, or 1,024-operation limits:
+
+| Documents | Publication peak requested allocations | Publication peak linear memory | Cold common-term query requested allocations | Three cold point edits: GET bytes |
+| --- | ---: | ---: | ---: | ---: |
+| 1,000 | 865,754 B | 6,291,456 B | 327,851 B | 466,876 B |
+| 10,000 | 4,082,302 B | 13,565,952 B | 1,331,162 B | 902,733 B |
+| 50,000 | 4,209,995 B | 14,155,776 B | 3,845,193 B | 1,281,535 B |
+| 100,000 | 4,229,762 B | 14,221,312 B | 8,018,078 B | 1,243,600 B |
+
+Every case also passed cold reopen, exact count, delete, lookup, replacement
+search, and no-rebuild compaction. No lane recycling was needed. The corpus
+uses ID-specific numeric terms plus repeated common terms. At 50,000 rows,
+ingestion/publication issued 77,293 fixture PUTs and read 360,751,237 bytes;
+this characterizes amplification, not a storage-price or throughput promise.
+A separate 1,000-row run with 4 KiB unrelated body padding passed, with peak
+publication working allocations 2,818,030 B and 536,416 GET bytes for three
+cold edits. The large-body regression also edits/deletes two rows across more
+than 3 MiB of unrelated bodies while keeping publication reads below 384 KiB.
+
+Paged queries retain native all/any/prefix/phrase scoring and filtering. They
+scan matching postings and rank candidates under working memory, I/O, and
+cancellation bounds. Common-term candidate state can still grow with corpus
+size; paged storage alone does not implement WAND/top-k pruning or unbounded
+query capacity. Broad phrase queries additionally fetch candidate projections.
+
+Embedding checkpoints store verified binary float windows in a disposable R2
+namespace. A coordinator pointer binds the checksum, exact input digest,
+dimensions, model/revision, and gateway identity. Payloads precede pointers;
+missing payloads recompute, while checksum/shape failures reject reuse. The
+native source lease and conditional derived WAL append still decide whether a
+completed result can commit. Final documents inline vectors and never refer
+to scratch objects. A crash after a model call but before checkpoint commit
+may repeat billing; there is no exactly-once provider-call claim.
+
+Default hosted passes admit one provider window and re-enqueue on yield.
+At most 4,096 chunks/8 MiB raw vectors are admitted before the tighter final
+WAL/JSON/working-memory limits. The 600-chunk, four-dimensional WASM regression
+needed ten model calls and nine yields, replacing the host on every pass and
+preserving chunk order. Separate tests reject corrupt cache bytes, recompute
+missing payloads, and reject a stale model result after a concurrent source
+write. Current/previous UTC-day cache buckets are retained; bounded sweeps
+prune coordinator pointers and R2 scratch independently using persisted
+cursors. This cache is computation reuse rather than a new data authority.
+
+The deployed scale trial also makes object latency visible: a sampled successful
+64-record publication used 136 object operations and took 24.4 s. Per-document
+body uploads are still serialized through the host ABI; packing or bounded
+parallel transport is a distinct throughput improvement requiring its own
+format/collector or I/O contract work. Local memory results do not remove this
+real-service limit. The live runner waits for Queue-owned watermarks rather
+than issuing competing maintenance calls on every batch.
+
+Live metrics exposed redundant parallel Queue deliveries contending for the
+same native work lease. The reference configuration now limits maintenance
+consumer concurrency to one for its single physical database. Fencing remains
+native, and interactive reads/mutations retain their own lane. This removes
+retry amplification; it does not parallelize the serialized R2 body uploads.
+
+The disposable live paged-text follow-up completed 1,024 documents through real
+R2, Durable Objects, and Queues, followed by point replacement/deletion, exact
+counts, an old generation's ranked cursor, and no-rebuild compaction. Serving
+spanned deployments `47dc4c04-d6d7-41af-b85a-35b7584c1a35` and
+`c5a57177-2775-45fd-96f8-467526f6e197`. A subsequent mark/sweep completed and
+preserved the expected 1,023 rows and replacement search result.
+
+The first live mark attempt reported `SQLITE_NOMEM` after 591 completed tasks;
+diagnostics showed 612 persisted tasks, 21 pending, with maximum task JSON size
+378 bytes. Replacement compute resumed that frontier. The HTTP adapter now returns `503` with `Retry-After` for this platform
+SQLite pressure error, allowing bounded retry against the same durable job.
+SQLite mutation cursors
+are now explicitly exhausted before the next statement, and the resumed pass
+completed after deployment replacement and cursor-lifecycle hardening. The
+workerd suite additionally passed 2,048 body marks plus 16 frontier nodes with
+a mid-run restart. This does not establish the precise cause of the transient
+host SQLite error or substitute for a long-lived Durable Object soak test.
+
+The live follow-up was fully drained. Its generated Worker, maintenance Queue,
+dead-letter Queue, and empty R2 bucket were deleted. Only ignored reports and
+private local qualification configuration remain.
+
+Final native validation passed 555 serverless tests and 28 owner tests in
+debug mode (six skipped, no leaks), including the corrected artifact-retention
+checks. Thirteen portable native contracts and 37 WASM/host tests also passed.
+Both Binaryen 132 packaging paths were checked. Persisted workerd validation
+covers paged reopen, model-window resume, scratch expiry, the 2,048-body mark
+frontier, and retryable SQLite-pressure responses. License headers, Apache
+product boundaries, and formatting checks passed.

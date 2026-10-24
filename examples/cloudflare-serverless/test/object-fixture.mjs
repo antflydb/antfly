@@ -40,9 +40,9 @@ export class Bucket {
   async delete(key) { for (const item of Array.isArray(key) ? key : [key]) this.objects.delete(item); }
   async list(options = {}) {
     const keys = [...this.objects.keys()].sort().filter(key => key.startsWith(options.prefix ?? "") && (!options.startAfter || key > options.startAfter));
-    const start = options.cursor ? Number(options.cursor) : 0;
-    const selected = keys.slice(start, start + (options.limit ?? 1000));
-    const truncated = start + selected.length < keys.length;
-    return { objects: selected.map(key => this.metadata(key, this.objects.get(key))), truncated, cursor: truncated ? String(start + selected.length) : undefined };
+    const remaining = keys.filter(key => !options.cursor || key > options.cursor);
+    const selected = remaining.slice(0, options.limit ?? 1000);
+    const truncated = selected.length < remaining.length;
+    return { objects: selected.map(key => this.metadata(key, this.objects.get(key))), truncated, cursor: truncated ? selected.at(-1) : undefined };
   }
 }

@@ -13107,7 +13107,7 @@ test "serverless http handler serves the table public lifecycle and consistency 
     try std.testing.expectEqual(@as(?catalog_types.DocumentPublishMode, .append_mutation_tail), parsed_query_default.value.publication.head_document_publish_mode);
     try std.testing.expectEqual(@as(?catalog_types.DocumentPublishMode, .append_mutation_tail), parsed_query_default.value.publication.next_document_publish_mode);
     try std.testing.expectEqual(@as(bool, false), parsed_query_default.value.publication.pending_materialization_families.full_text);
-    try std.testing.expectEqualStrings("rebuild", @tagName(parsed_query_default.value.publication.artifact_actions.dense_vector));
+    try std.testing.expectEqualStrings("reuse", @tagName(parsed_query_default.value.publication.artifact_actions.dense_vector));
     try std.testing.expectEqual(@as(usize, 1), parsed_query_default.value.publication.full_text_index_actions.len);
     try std.testing.expectEqualStrings("full_text_index_v0", parsed_query_default.value.publication.full_text_index_actions[0].name);
     try std.testing.expectEqual(@as(usize, 1), parsed_query_default.value.publication.vector_index_actions.len);
@@ -13132,7 +13132,7 @@ test "serverless http handler serves the table public lifecycle and consistency 
     try std.testing.expectEqual(@as(?catalog_types.DocumentPublishMode, .append_mutation_tail), parsed_query_latest.value.publication.head_document_publish_mode);
     try std.testing.expectEqual(@as(?catalog_types.DocumentPublishMode, .append_mutation_tail), parsed_query_latest.value.publication.next_document_publish_mode);
     try std.testing.expectEqual(@as(bool, false), parsed_query_latest.value.publication.pending_materialization_families.full_text);
-    try std.testing.expectEqualStrings("rebuild", @tagName(parsed_query_latest.value.publication.artifact_actions.dense_vector));
+    try std.testing.expectEqualStrings("reuse", @tagName(parsed_query_latest.value.publication.artifact_actions.dense_vector));
     try std.testing.expectEqual(@as(usize, 1), parsed_query_latest.value.publication.vector_index_actions.len);
     try std.testing.expectEqualStrings("semantic_idx", parsed_query_latest.value.publication.vector_index_actions[0].name);
     try std.testing.expectEqual(@as(usize, 2), parsed_query_latest.value.documents.len);

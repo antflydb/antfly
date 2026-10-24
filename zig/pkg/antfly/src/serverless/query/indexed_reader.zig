@@ -325,6 +325,7 @@ fn warmResolvedSearchPath(session: *runtime_mod.QuerySession, lanes: ResolvedSea
 
 pub fn searchTextAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, req: query_request.QueryRequest) ![]ScoredDoc {
     const text_index = try resolveTextArtifactIndex(session, req);
+    if (session.manifest.artifacts[text_index].metadata_version == @import("../text_segment/paged.zig").metadata_version) return @import("../text_segment/paged.zig").searchAlloc(alloc, session, session.manifest.artifacts[text_index], req);
     const text_payload = try session.fetchArtifactAlloc(text_index);
     defer alloc.free(text_payload);
     var text_segment = try text_segment_mod.decodeAlloc(alloc, text_payload);
@@ -477,6 +478,7 @@ fn applyTextFilterSetsAlloc(
     req: query_request.QueryRequest,
 ) ![]ScoredDoc {
     const text_index = try resolveTextArtifactIndex(session, req);
+    if (session.manifest.artifacts[text_index].metadata_version == @import("../text_segment/paged.zig").metadata_version) return applyPagedTextFilterSetsAlloc(alloc, session, text_index, hits, req);
     const text_payload = try session.fetchArtifactAlloc(text_index);
     defer alloc.free(text_payload);
     var text_segment = try text_segment_mod.decodeAlloc(alloc, text_payload);
@@ -520,6 +522,43 @@ fn applyTextFilterSetsAlloc(
         try appendOwnedScoredDocAlloc(alloc, &filtered, hit.doc_id, hit.score, hit.distance);
     }
     return try filtered.toOwnedSlice(alloc);
+}
+
+fn applyPagedTextFilterSetsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, index: usize, hits: []const ScoredDoc, req: query_request.QueryRequest) ![]ScoredDoc {
+    var allowed = std.StringHashMapUnmanaged(void).empty;
+    defer allowed.deinit(alloc);
+    var excluded = std.StringHashMapUnmanaged(void).empty;
+    defer excluded.deinit(alloc);
+    var filter_req = req;
+    filter_req.offset = 0;
+    filter_req.min_score = 0;
+    filter_req.limit = std.math.cast(usize, session.manifest.stats.document_count) orelse return error.QueryCandidateBudgetExceeded;
+    const required = if (req.filter_text) |text| blk: {
+        filter_req.text = @constCast(text);
+        filter_req.operator = req.filter_operator;
+        break :blk try @import("../text_segment/paged.zig").searchAlloc(alloc, session, session.manifest.artifacts[index], filter_req);
+    } else try alloc.alloc(ScoredDoc, 0);
+    defer freeScoredDocs(alloc, required);
+    for (required) |hit| try allowed.put(alloc, hit.doc_id, {});
+    const rejected = if (req.exclusion_text) |text| blk: {
+        filter_req.text = @constCast(text);
+        filter_req.operator = req.exclusion_operator;
+        break :blk try @import("../text_segment/paged.zig").searchAlloc(alloc, session, session.manifest.artifacts[index], filter_req);
+    } else try alloc.alloc(ScoredDoc, 0);
+    defer freeScoredDocs(alloc, rejected);
+    for (rejected) |hit| try excluded.put(alloc, hit.doc_id, {});
+    var result = std.ArrayListUnmanaged(ScoredDoc).empty;
+    errdefer {
+        for (result.items) |hit| alloc.free(hit.doc_id);
+        result.deinit(alloc);
+    }
+    for (hits) |hit| {
+        if ((req.filter_text != null and !allowed.contains(hit.doc_id)) or excluded.contains(hit.doc_id)) continue;
+        const id = try alloc.dupe(u8, hit.doc_id);
+        errdefer alloc.free(id);
+        try result.append(alloc, .{ .doc_id = id, .score = hit.score, .distance = hit.distance });
+    }
+    return result.toOwnedSlice(alloc);
 }
 
 pub fn resolveTextArtifactIndex(
