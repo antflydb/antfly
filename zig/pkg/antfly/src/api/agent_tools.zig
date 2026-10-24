@@ -54,6 +54,7 @@ pub const Conversation = struct {
         if (result.responses_output_json) |items| try self.reserve(items.len);
         if (result.google_parts_json) |parts| try self.reserve(parts.len);
         if (result.anthropic_content_json) |parts| try self.reserve(parts.len);
+        if (result.bedrock_content_json) |parts| try self.reserve(parts.len);
         const calls = try self.alloc.alloc(generating.ToolCall, result.tool_calls.len);
         for (calls, result.tool_calls) |*copy, call| copy.* = .{
             .id = try self.alloc.dupe(u8, call.id),
@@ -67,6 +68,7 @@ pub const Conversation = struct {
             .responses_output_json = if (result.responses_output_json) |items| try self.alloc.dupe(u8, items) else null,
             .google_parts_json = if (result.google_parts_json) |parts| try self.alloc.dupe(u8, parts) else null,
             .anthropic_content_json = if (result.anthropic_content_json) |parts| try self.alloc.dupe(u8, parts) else null,
+            .bedrock_content_json = if (result.bedrock_content_json) |parts| try self.alloc.dupe(u8, parts) else null,
         });
         return calls;
     }

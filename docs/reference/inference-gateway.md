@@ -125,6 +125,17 @@ override unknown model facts; they cannot implement a missing wire format or
 make a text-only model accept images. Unknown or unsupported image capabilities
 fail admission before contacting the provider.
 
+Bedrock responses retain signed reasoning blocks in
+`extra_content.bedrock.content`; preserve that array unchanged alongside the
+visible assistant text and tool calls. The adapter validates the visible projection
+before replay. Streaming reasoning deltas and stops retain their native event
+shape in `delta.extra_content.bedrock.event`, including block indices; visible
+text and tool starts identify their native position with `content_block_index`.
+Clients assembling histories must preserve signatures and concatenate decoded
+redacted bytes before base64-encoding the completed block. Native tool adapters
+supply an empty object schema for parameterless functions and preserve explicit
+strict tool enforcement.
+
 ## Direct Anthropic generation
 
 Use `provider: anthropic` for the native Claude Messages API. Named generators,

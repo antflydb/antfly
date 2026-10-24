@@ -773,6 +773,8 @@ const BackendState = struct {
         errdefer if (proof) |value| alloc.free(value);
         const google_parts = if (result.google_parts_json) |parts| try alloc.dupe(u8, parts) else null;
         errdefer if (google_parts) |parts| alloc.free(parts);
+        const anthropic_parts = if (result.anthropic_content_json) |parts| try alloc.dupe(u8, parts) else null;
+        errdefer if (anthropic_parts) |parts| alloc.free(parts);
         return .{
             .content = content,
             .finish_reason = result.finish_reason,
@@ -781,7 +783,8 @@ const BackendState = struct {
             .tool_calls_synthesized = result.tool_calls_synthesized,
             .token_logprobs_json = proof,
             .google_parts_json = google_parts,
-            .anthropic_content_json = if (result.anthropic_content_json) |parts| try alloc.dupe(u8, parts) else null,
+            .anthropic_content_json = anthropic_parts,
+            .bedrock_content_json = if (result.bedrock_content_json) |parts| try alloc.dupe(u8, parts) else null,
             .allocator = alloc,
         };
     }
@@ -1814,12 +1817,14 @@ fn chatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, request
         headers[header_count] = .{ "X-Antfly-Inference-Timeout-Ms", timeout_header };
         header_count += 1;
     }
+    const media = try generationMediaReservation(cfg, request.messages);
+    var reservation = provider_limits.TokenReservation{ .limiter = state.quota.?.limiter(), .input_tokens = media.tokens, .include_body_bytes = true, .body_bytes_discount = media.inline_bytes, .output_tokens = try generationOutputBudget(cfg, 1), .usage_observer = state.usage_observer };
     const request_options = httpx.RequestOptions{
         .json = request.body_json,
         .headers = headers[0..header_count],
         .timeout_ms = timeout_ms,
         .cancellation = if (state.request_context) |context| if (context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null else null,
-        .attempt_observer = state.quota.?.limiter().observer(try generationOutputBudget(cfg, 1)),
+        .attempt_observer = if (media.tokens > 0 or state.usage_observer != null) reservation.observer() else state.quota.?.limiter().observer(try generationOutputBudget(cfg, 1)),
         .max_retries = 0,
         .follow_redirects = false,
         .cookies_enabled = false,
@@ -1888,6 +1893,7 @@ fn googleChatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, r
         if (context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null
     else
         httpx.CancellationToken.fromCallback(state.execution.cancellation.ptr, state.execution.cancellation.is_cancelled_fn);
+    const control = if (state.request_context) |context| @import("antfly_google").RequestControl{ .deadline_ns = context.deadline_ns, .cancellation = cancellation } else @import("antfly_google").RequestControl.fromTimeout(timeout_ms, cancellation);
     var headers: std.ArrayList([2][]const u8) = .empty;
     defer headers.deinit(alloc);
     var minted_auth: ?[]u8 = null;
@@ -1900,7 +1906,6 @@ fn googleChatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, r
             break :blk try std.fmt.allocPrint(alloc, "{s}{s}/chat/completions", .{ base, if (std.mem.endsWith(u8, base, "/openai")) @as([]const u8, "") else "/openai" });
         },
         .vertex => |*provider| blk: {
-            const control = @import("antfly_google").RequestControl.fromTimeout(timeout_ms, cancellation);
             try provider.appendAuthHeaders(alloc, &headers, &minted_auth, control);
             break :blk try provider.openAiChatUrlAlloc(alloc, state.cfg.model);
         },
@@ -1912,7 +1917,7 @@ fn googleChatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, r
     return sendChatRequest(state.http, url, .{
         .json = request.body_json,
         .headers = headers.items,
-        .timeout_ms = timeout_ms,
+        .timeout_ms = try control.remainingTimeoutMs(),
         .cancellation = cancellation,
         .attempt_observer = if (media.tokens > 0 or state.usage_observer != null) reservation.observer() else state.quota.?.limiter().observer(try generationOutputBudget(state.cfg, 1)),
         .max_response_size = state.max_response_bytes,

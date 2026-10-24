@@ -85,6 +85,8 @@ pub const ChatMessage = struct {
     google_parts_json: ?[]const u8 = null,
     /// Native Anthropic content retains signed thinking blocks during replay.
     anthropic_content_json: ?[]const u8 = null,
+    /// Original Bedrock blocks preserve signed reasoning across tool turns.
+    bedrock_content_json: ?[]const u8 = null,
     /// Opaque Responses output items, replayed only by Responses adapters.
     responses_output_json: ?[]const u8 = null,
 };
@@ -132,6 +134,40 @@ test "provider registry gateway usage parses exact integer lexemes without inven
     }
 }
 
+/// An omitted OpenAI function parameter schema means a parameterless tool.
+pub fn emptyToolParameters(a: std.mem.Allocator) !std.json.Value {
+    var schema: std.json.Value = .{ .object = .empty };
+    try schema.object.put(a, "type", .{ .string = "object" });
+    try schema.object.put(a, "properties", .{ .object = .empty });
+    try schema.object.put(a, "additionalProperties", .{ .bool = false });
+    return schema;
+}
+
+/// Compare parsed tool inputs without serializing each node or depending on
+/// object key order. Replay validation never retains a second serialized tree.
+pub fn jsonValuesEqual(left: std.json.Value, right: std.json.Value) bool {
+    if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+    return switch (left) {
+        .null => true,
+        .bool => |value| value == right.bool,
+        .integer => |value| value == right.integer,
+        .float => |value| value == right.float,
+        .number_string => |value| std.mem.eql(u8, value, right.number_string),
+        .string => |value| std.mem.eql(u8, value, right.string),
+        .array => |value| blk: {
+            if (value.items.len != right.array.items.len) break :blk false;
+            for (value.items, right.array.items) |l, r| if (!jsonValuesEqual(l, r)) break :blk false;
+            break :blk true;
+        },
+        .object => |value| blk: {
+            if (value.count() != right.object.count()) break :blk false;
+            var it = value.iterator();
+            while (it.next()) |entry| if (!jsonValuesEqual(entry.value_ptr.*, right.object.get(entry.key_ptr.*) orelse break :blk false)) break :blk false;
+            break :blk true;
+        },
+    };
+}
+
 pub const GenerationFinishReason = enum { stop, length, tool_calls, content_filter };
 
 pub const GenerateResult = struct {
@@ -144,6 +180,8 @@ pub const GenerateResult = struct {
     google_parts_json: ?[]const u8 = null,
     /// Native Anthropic content retains signed thinking blocks during replay.
     anthropic_content_json: ?[]const u8 = null,
+    /// Original Bedrock blocks preserve signed reasoning across tool turns.
+    bedrock_content_json: ?[]const u8 = null,
     /// Opaque Responses output items, replayed only by Responses adapters.
     responses_output_json: ?[]const u8 = null,
     usage: ?GenerationUsage = null,
@@ -155,6 +193,7 @@ pub const GenerateResult = struct {
         if (self.responses_output_json) |items| self.allocator.free(items);
         if (self.google_parts_json) |parts| self.allocator.free(parts);
         if (self.anthropic_content_json) |parts| self.allocator.free(parts);
+        if (self.bedrock_content_json) |parts| self.allocator.free(parts);
         for (self.tool_calls) |*tool_call| tool_call.deinit(self.allocator);
         if (self.tool_calls.len > 0) self.allocator.free(self.tool_calls);
         self.* = undefined;
@@ -351,8 +390,8 @@ pub const AntflyConfig = struct {
 };
 
 pub const GeneratorConfig = struct {
-    /// Request-owned media reservation supplied by the decision adapter.
-    /// Never parsed from or serialized into generator configuration.
+    /// Conservative per-image token reservation from public generator
+    /// configuration or supplied by the request-owned decision adapter.
     image_input_token_bound: ?u64 = null,
     rate_limit: ?openapi.RateLimitConfig = null,
     provider: Provider,

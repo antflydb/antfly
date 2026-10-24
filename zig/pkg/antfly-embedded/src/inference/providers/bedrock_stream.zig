@@ -21,7 +21,7 @@ const inference = @import("antfly_inference_types");
 const Json = std.json.Value;
 
 pub const Decoder = struct {
-    const Block = struct { tool_index: ?usize = null, closed: bool = false };
+    const Block = struct { tool_index: ?usize = null, closed: bool = false, has_reasoning: bool = false };
     alloc: std.mem.Allocator,
     sink: inference.ChatStream,
     model: []const u8,
@@ -142,7 +142,7 @@ pub const Decoder = struct {
             if (start == .object) if (start.object.get("toolUse")) |tool| {
                 block.tool_index = self.tool_count;
                 self.tool_count += 1;
-                try self.delta(.{ .tool_calls = &.{.{ .index = block.tool_index.?, .id = try string(try get(tool, "toolUseId")), .type = "function", .function = .{ .name = try string(try get(tool, "name")), .arguments = "" } }} });
+                try self.delta(.{ .tool_calls = &.{.{ .index = block.tool_index.?, .id = try string(try get(tool, "toolUseId")), .type = "function", .function = .{ .name = try string(try get(tool, "name")), .arguments = "" } }}, .extra_content = .{ .bedrock = .{ .content_block_index = index } } });
             };
             try self.addBlock(index, block);
         } else if (std.mem.eql(u8, tag, "contentBlockDelta")) {
@@ -154,13 +154,15 @@ pub const Decoder = struct {
             if (content.object.get("text")) |part| {
                 if (self.blocks.get(index)) |block| if (block.tool_index != null) return error.InvalidInferenceResponse;
                 if (!self.blocks.contains(index)) try self.addBlock(index, .{});
-                try self.delta(.{ .content = try string(part) });
+                try self.delta(.{ .content = try string(part), .extra_content = .{ .bedrock = .{ .content_block_index = index } } });
             } else if (content.object.get("toolUse")) |tool| {
                 const block = self.blocks.get(index) orelse return error.InvalidInferenceResponse;
                 try self.delta(.{ .tool_calls = &.{.{ .index = block.tool_index orelse return error.InvalidInferenceResponse, .function = .{ .arguments = try string(try get(tool, "input")) } }} });
             } else if (content.object.get("reasoningContent")) |reasoning| {
+                if (reasoning != .object) return error.InvalidInferenceResponse;
                 if (!self.blocks.contains(index)) try self.addBlock(index, .{});
-                try self.delta(.{ .extra_content = .{ .bedrock = .{ .reasoning_content = reasoning } } });
+                self.blocks.getPtr(index).?.has_reasoning = true;
+                try self.delta(.{ .extra_content = .{ .bedrock = .{ .content_block_index = index, .event = .{ .contentBlockDelta = value } } } });
             } else return error.InvalidInferenceResponse;
         } else if (std.mem.eql(u8, tag, "contentBlockStop")) {
             if (!self.role_seen or self.stopped) return error.InvalidInferenceResponse;
@@ -169,6 +171,7 @@ pub const Decoder = struct {
             const block = self.blocks.getPtr(index).?;
             if (block.closed) return error.InvalidInferenceResponse;
             block.closed = true;
+            if (block.has_reasoning) try self.delta(.{ .extra_content = .{ .bedrock = .{ .event = .{ .contentBlockStop = value } } } });
         } else if (std.mem.eql(u8, tag, "messageStop")) {
             if (!self.role_seen or self.stopped) return error.InvalidInferenceResponse;
             var blocks = self.blocks.valueIterator();

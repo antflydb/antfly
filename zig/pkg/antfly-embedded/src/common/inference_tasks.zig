@@ -463,11 +463,12 @@ fn openAiMessages(a: std.mem.Allocator, messages: Json) !Json {
         if (source != .object) return error.InvalidInferenceRequest;
         // Signed Anthropic replay data is private to that native protocol.
         // Other vendor chat endpoints must not receive this extra field.
-        if (source.object.get("extra_content")) |extra| if (extra == .object and extra.object.contains("anthropic")) {
+        if (source.object.get("extra_content")) |extra| if (extra == .object and (extra.object.contains("anthropic") or extra.object.contains("bedrock"))) {
             message.object = try source.object.clone(a);
             var retained = extra;
             retained.object = try extra.object.clone(a);
             _ = retained.object.swapRemove("anthropic");
+            _ = retained.object.swapRemove("bedrock");
             if (retained.object.count() == 0) {
                 _ = message.object.swapRemove("extra_content");
             } else try message.object.put(a, "extra_content", retained);
@@ -605,12 +606,12 @@ pub fn chatMessages(a: std.mem.Allocator, request: Json) ![]generating.ChatMessa
         }
         if (value.object.get("extra_content")) |extra| {
             if (extra != .object) return error.InvalidInferenceRequest;
-            if (extra.object.get("anthropic")) |native| {
+            inline for (.{ "anthropic", "bedrock" }) |provider| if (extra.object.get(provider)) |native| {
                 if (message.role != .assistant or native != .object) return error.InvalidInferenceRequest;
                 const content = native.object.get("content") orelse return error.InvalidInferenceRequest;
                 if (content != .array) return error.InvalidInferenceRequest;
-                message.anthropic_content_json = try std.json.Stringify.valueAlloc(a, content, .{});
-            }
+                @field(message, provider ++ "_content_json") = try std.json.Stringify.valueAlloc(a, content, .{});
+            };
         }
         if (message.content == null and message.tool_calls == null) return error.InvalidInferenceRequest;
         for (value.object.keys()) |key| {

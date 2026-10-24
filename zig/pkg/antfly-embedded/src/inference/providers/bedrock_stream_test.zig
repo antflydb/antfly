@@ -78,6 +78,11 @@ pub fn testDecoder() !void {
         .{ "contentBlockDelta", "{\"contentBlockIndex\":1,\"delta\":{\"toolUse\":{\"input\":\"{\\\"x\\\":\"}}}" },
         .{ "contentBlockDelta", "{\"contentBlockIndex\":1,\"delta\":{\"toolUse\":{\"input\":\"7}\"}}}" },
         .{ "contentBlockStop", "{\"contentBlockIndex\":1}" },
+        .{ "contentBlockDelta", "{\"contentBlockIndex\":2,\"delta\":{\"reasoningContent\":{\"text\":\"private\"}}}" },
+        .{ "contentBlockDelta", "{\"contentBlockIndex\":2,\"delta\":{\"reasoningContent\":{\"signature\":\"signed\"}}}" },
+        .{ "contentBlockStop", "{\"contentBlockIndex\":2}" },
+        .{ "contentBlockDelta", "{\"contentBlockIndex\":3,\"delta\":{\"reasoningContent\":{\"redactedContent\":\"cmVkYWN0ZWQ=\"}}}" },
+        .{ "contentBlockStop", "{\"contentBlockIndex\":3}" },
         .{ "messageStop", "{\"stopReason\":\"tool_use\"}" },
         .{ "metadata", "{\"usage\":{\"inputTokens\":10,\"outputTokens\":2,\"totalTokens\":12}}" },
     };
@@ -114,6 +119,9 @@ pub fn testDecoder() !void {
         }
     }
     try std.testing.expectEqualStrings("{\"x\":7}", arguments.items);
+    try std.testing.expect(std.mem.indexOf(u8, sink.output.items, "\"signature\":\"signed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sink.output.items, "\"redactedContent\":\"cmVkYWN0ZWQ=\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sink.output.items, "\"event\":{\"contentBlockStop\":{\"contentBlockIndex\":3}}") != null);
 
     const start = try frame(a, events[0][0], events[0][1], "event");
     defer a.free(start);

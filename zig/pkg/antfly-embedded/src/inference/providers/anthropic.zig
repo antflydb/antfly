@@ -299,7 +299,9 @@ pub fn requestJsonAlloc(alloc: Allocator, cfg: lib.GeneratorConfig, model: []con
             const function = try requestGet(tool, "function");
             var native_tool = try single(a, "name", try requestGet(function, "name"));
             if (function.object.get("description")) |value| try put(a, &native_tool, "description", value);
-            try put(a, &native_tool, "input_schema", try requestGet(function, "parameters"));
+            const schema = function.object.get("parameters") orelse try lib.emptyToolParameters(a);
+            if (schema != .object) return error.InvalidInferenceRequest;
+            try put(a, &native_tool, "input_schema", schema);
             if (function.object.get("strict")) |value| try put(a, &native_tool, "strict", value);
             try native.array.append(native_tool);
         }
@@ -341,7 +343,7 @@ fn validateNativeProjection(a: Allocator, message: lib.ChatMessage, blocks: Json
             call_offset += 1;
             if (!std.mem.eql(u8, call.id, string(try requestGet(block, "id")) catch return error.InvalidInferenceRequest) or !std.mem.eql(u8, call.name, string(try requestGet(block, "name")) catch return error.InvalidInferenceRequest)) return error.InvalidInferenceRequest;
             const arguments = std.json.parseFromSliceLeaky(Json, a, call.arguments, .{}) catch return error.InvalidInferenceRequest;
-            if (!try jsonEqual(a, arguments, try requestGet(block, "input"))) return error.InvalidInferenceRequest;
+            if (!lib.jsonValuesEqual(arguments, try requestGet(block, "input"))) return error.InvalidInferenceRequest;
         } else if (std.mem.eql(u8, kind, "thinking")) {
             _ = string(try requestGet(block, "thinking")) catch return error.InvalidInferenceRequest;
             _ = string(try requestGet(block, "signature")) catch return error.InvalidInferenceRequest;
@@ -351,25 +353,6 @@ fn validateNativeProjection(a: Allocator, message: lib.ChatMessage, blocks: Json
     }
     if (text_offset != visible.len or call_offset != calls.len) return error.InvalidInferenceRequest;
 }
-fn jsonEqual(a: Allocator, left: Json, right: Json) anyerror!bool {
-    if (left == .object and right == .object) {
-        if (left.object.count() != right.object.count()) return false;
-        var it = left.object.iterator();
-        while (it.next()) |entry| if (!try jsonEqual(a, entry.value_ptr.*, right.object.get(entry.key_ptr.*) orelse return false)) return false;
-        return true;
-    }
-    if (left == .array and right == .array) {
-        if (left.array.items.len != right.array.items.len) return false;
-        for (left.array.items, right.array.items) |lv, rv| if (!try jsonEqual(a, lv, rv)) return false;
-        return true;
-    }
-    const l = try std.json.Stringify.valueAlloc(a, left, .{});
-    defer a.free(l);
-    const r = try std.json.Stringify.valueAlloc(a, right, .{});
-    defer a.free(r);
-    return std.mem.eql(u8, l, r);
-}
-
 pub fn finishReason(reason: []const u8) !lib.GenerationFinishReason {
     if (std.mem.eql(u8, reason, "end_turn") or std.mem.eql(u8, reason, "stop_sequence")) return .stop;
     if (std.mem.eql(u8, reason, "max_tokens") or std.mem.eql(u8, reason, "model_context_window_exceeded") or std.mem.eql(u8, reason, "pause_turn")) return .length;

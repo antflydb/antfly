@@ -23,6 +23,8 @@ All upstreams and credentials are local fixtures. No provider account is needed.
 from __future__ import annotations
 
 import argparse
+import base64
+import random
 import http.client
 import struct
 import json
@@ -154,6 +156,12 @@ class Upstream(BaseHTTPRequestHandler):
                 part["type"] == "text" and not part["text"].strip()
                 for part in message["content"]
             ), message
+        for tool in request.get("tools", []):
+            assert tool["input_schema"]["type"] == "object", tool
+            if tool["input_schema"].get("properties") == {}:
+                assert tool["input_schema"]["additionalProperties"] is False
+            if tool["name"] == "strict_lookup":
+                assert tool["strict"] is True, tool
         tools = bool(request.get("tools")) and not replay
         if "output_config" in request:
             assert request["output_config"]["format"]["type"] == "json_schema"
@@ -370,6 +378,8 @@ class Upstream(BaseHTTPRequestHandler):
             pass
 
     def google_chat(self, request):
+        if request["model"] == "deadline-model":
+            time.sleep(0.65)
         assert self.headers.get("Authorization") == "Bearer mock-server-key"
         if "mock-vision-busy" in request["model"]:
             self.reply({"error": "busy"}, status=503)
@@ -543,6 +553,35 @@ class Upstream(BaseHTTPRequestHandler):
             else:
                 self.reply({"error": "busy"}, status=429)
             return
+        reasoning = [
+            {
+                "reasoningContent": {
+                    "reasoningText": {
+                        "text": "private",
+                        "signature": "native-signature",
+                    }
+                }
+            },
+            {"reasoningContent": {"redactedContent": "cmVkYWN0ZWQ="}},
+        ]
+        if any(
+            "toolResult" in block
+            for turn in request["messages"]
+            for block in turn["content"]
+        ):
+            previous = next(
+                turn
+                for turn in reversed(request["messages"])
+                if turn["role"] == "assistant"
+            )
+            assert previous["content"][:2] == reasoning, previous
+        for tool in request.get("toolConfig", {}).get("tools", []):
+            spec = tool["toolSpec"]
+            assert spec["inputSchema"]["json"]["type"] == "object", spec
+            if spec["inputSchema"]["json"].get("properties") == {}:
+                assert spec["inputSchema"]["json"]["additionalProperties"] is False
+            if spec["name"] == "strict_lookup":
+                assert spec["strict"] is True, spec
         usage = {"inputTokens": 2, "outputTokens": 1, "totalTokens": 5}
         if not streaming:
             content = (
@@ -560,7 +599,9 @@ class Upstream(BaseHTTPRequestHandler):
             )
             self.reply(
                 {
-                    "output": {"message": {"role": "assistant", "content": content}},
+                    "output": {
+                        "message": {"role": "assistant", "content": reasoning + content}
+                    },
                     "stopReason": "max_tokens"
                     if "/truncated/" in self.path
                     else "content_filtered"
@@ -580,12 +621,32 @@ class Upstream(BaseHTTPRequestHandler):
                 )
             ]
         else:
+            for delta in ({"text": "private"}, {"signature": "native-signature"}):
+                packets.append(
+                    bedrock_frame(
+                        "contentBlockDelta",
+                        {"contentBlockIndex": 0, "delta": {"reasoningContent": delta}},
+                    )
+                )
+            packets.append(bedrock_frame("contentBlockStop", {"contentBlockIndex": 0}))
+            packets.append(
+                bedrock_frame(
+                    "contentBlockDelta",
+                    {
+                        "contentBlockIndex": 1,
+                        "delta": {
+                            "reasoningContent": {"redactedContent": "cmVkYWN0ZWQ="}
+                        },
+                    },
+                )
+            )
+            packets.append(bedrock_frame("contentBlockStop", {"contentBlockIndex": 1}))
             if tools:
                 packets += [
                     bedrock_frame(
                         "contentBlockStart",
                         {
-                            "contentBlockIndex": 0,
+                            "contentBlockIndex": 2,
                             "start": {
                                 "toolUse": {
                                     "toolUseId": "bedrock-call-1",
@@ -597,28 +658,28 @@ class Upstream(BaseHTTPRequestHandler):
                     bedrock_frame(
                         "contentBlockDelta",
                         {
-                            "contentBlockIndex": 0,
+                            "contentBlockIndex": 2,
                             "delta": {"toolUse": {"input": '{"id":'}},
                         },
                     ),
                     bedrock_frame(
                         "contentBlockDelta",
-                        {"contentBlockIndex": 0, "delta": {"toolUse": {"input": "7}"}}},
+                        {"contentBlockIndex": 2, "delta": {"toolUse": {"input": "7}"}}},
                     ),
                 ]
             else:
                 packets += [
                     bedrock_frame(
                         "contentBlockDelta",
-                        {"contentBlockIndex": 0, "delta": {"text": "bedrock "}},
+                        {"contentBlockIndex": 2, "delta": {"text": "bedrock "}},
                     ),
                     bedrock_frame(
                         "contentBlockDelta",
-                        {"contentBlockIndex": 0, "delta": {"text": "hello"}},
+                        {"contentBlockIndex": 2, "delta": {"text": "hello"}},
                     ),
                 ]
             packets += [
-                bedrock_frame("contentBlockStop", {"contentBlockIndex": 0}),
+                bedrock_frame("contentBlockStop", {"contentBlockIndex": 2}),
                 bedrock_frame(
                     "messageStop", {"stopReason": "tool_use" if tools else "end_turn"}
                 ),
@@ -890,6 +951,17 @@ class Upstream(BaseHTTPRequestHandler):
         return False
 
     def do_POST(self):
+        if self.path == "/mock-token":
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            time.sleep(0.65)
+            self.reply(
+                {
+                    "access_token": "mock-server-key",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                }
+            )
+            return
         if self.path.startswith(
             "/ai/v1/transcription/sessions/backend-session/stream?"
         ):
@@ -978,7 +1050,10 @@ class Upstream(BaseHTTPRequestHandler):
             "/v1/embeddings": "mock-embedding",
             "/ai/v1/read": "mock-reader",
         }
-        assert request["model"] == expected[self.path], (self.path, request)
+        assert request["model"] == expected[self.path] or (
+            self.path == "/ai/v1/chat/completions"
+            and request["model"].startswith("openai-quota-")
+        ), (self.path, request)
         self.calls.append(self.path)
         if self.path == "/ai/v1/chat/completions":
             if request.get("stream"):
@@ -1629,10 +1704,11 @@ def verify_hosted_image_streams(base_url):
                 "bedrock hello",
                 "anthropic hello",
             ), answer
-            if model == "generators/anthropic-known":
+            if model in ("generators/anthropic-known", "generators/bedrock-known"):
+                native_provider = "anthropic" if "anthropic" in model else "bedrock"
                 before = len(Upstream.requests)
                 tampered = json.loads(json.dumps(history))
-                tampered[1]["extra_content"]["anthropic"]["content"].append(
+                tampered[1]["extra_content"][native_provider]["content"].append(
                     {
                         "type": "image",
                         "source": {
@@ -1681,11 +1757,158 @@ def verify_hosted_image_streams(base_url):
         client.close()
 
 
+def verify_bedrock_stream_replay(client, messages):
+    blocks = {}
+    calls = []
+    stops = set()
+    with client.chat.completions.create(
+        model="generators/bedrock-known",
+        messages=messages,
+        tools=[{"type": "function", "function": {"name": "lookup"}}],
+        stream=True,
+    ) as stream:
+        for chunk in stream:
+            for choice in chunk.model_dump(exclude_none=True)["choices"]:
+                delta = choice["delta"]
+                metadata = delta.get("extra_content", {}).get("bedrock", {})
+                event = metadata.get("event", {})
+                if "contentBlockDelta" in event:
+                    native = event["contentBlockDelta"]
+                    reasoning = blocks.setdefault(
+                        native["contentBlockIndex"], {"reasoningContent": {}}
+                    )["reasoningContent"]
+                    part = native["delta"]["reasoningContent"]
+                    if "redactedContent" in part:
+                        reasoning["redactedContent"] = base64.b64encode(
+                            base64.b64decode(reasoning.get("redactedContent", ""))
+                            + base64.b64decode(part["redactedContent"])
+                        ).decode()
+                    else:
+                        text = reasoning.setdefault("reasoningText", {})
+                        for key, value in part.items():
+                            text[key] = text.get(key, "") + value
+                if "contentBlockStop" in event:
+                    stops.add(event["contentBlockStop"]["contentBlockIndex"])
+                for call in delta.get("tool_calls", []):
+                    if "id" in call:
+                        calls.append(
+                            {
+                                "id": call["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": call["function"]["name"],
+                                    "arguments": "",
+                                },
+                            }
+                        )
+                        blocks[metadata["content_block_index"]] = {
+                            "toolUse": {
+                                "toolUseId": call["id"],
+                                "name": call["function"]["name"],
+                                "input": None,
+                            }
+                        }
+                    calls[call["index"]]["function"]["arguments"] += call[
+                        "function"
+                    ].get("arguments", "")
+    assert stops == {0, 1}, stops
+    for call in calls:
+        block = next(
+            block["toolUse"]
+            for block in blocks.values()
+            if block.get("toolUse", {}).get("toolUseId") == call["id"]
+        )
+        block["input"] = json.loads(call["function"]["arguments"])
+    assistant = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": calls,
+        "extra_content": {
+            "bedrock": {"content": [blocks[index] for index in sorted(blocks)]}
+        },
+    }
+    answer = client.chat.completions.create(
+        model="generators/bedrock-known",
+        messages=[
+            *messages,
+            assistant,
+            {"role": "tool", "tool_call_id": calls[0]["id"], "content": "found"},
+        ],
+    )
+    assert answer.choices[0].message.content == "bedrock hello"
+
+
+def quota_image_data_uri():
+    def chunk(kind, body):
+        return (
+            struct.pack(">I", len(body))
+            + kind
+            + body
+            + struct.pack(">I", zlib.crc32(kind + body))
+        )
+
+    rng = random.Random(0)
+    scanlines = b"".join(b"\0" + rng.randbytes(64 * 3) for _ in range(64))
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 64, 64, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(scanlines))
+        + chunk(b"IEND", b"")
+    )
+    return "data:image/png;base64," + base64.b64encode(png).decode()
+
+
 def verify_hosted_generation_contracts(base_url):
     with openai.OpenAI(
         api_key="unused", base_url=base_url + "/ai/v1", max_retries=0, timeout=30
     ) as client:
         messages = [{"role": "user", "content": "continue"}]
+        verify_bedrock_stream_replay(client, messages)
+        for provider in ("anthropic", "bedrock"):
+            for streaming in (False, True):
+                for tool in (
+                    {"type": "function", "function": {"name": "lookup"}},
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "strict_lookup",
+                            "strict": True,
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"id": {"type": "integer"}},
+                                "required": ["id"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                ):
+                    result = client.chat.completions.create(
+                        model="generators/" + provider + "-known",
+                        messages=messages,
+                        tools=[tool],
+                        stream=streaming,
+                    )
+                    if streaming:
+                        with result as chunks:
+                            completed = list(chunks)
+                            assert any(
+                                choice.delta.tool_calls
+                                for chunk in completed
+                                for choice in chunk.choices
+                            )
+                    else:
+                        assert result.choices[0].message.tool_calls
+        started = time.monotonic()
+        try:
+            client.chat.completions.create(
+                model="generators/vertex-deadline",
+                messages=messages,
+                extra_headers={"X-Antfly-Inference-Timeout-Ms": "1000"},
+            )
+            raise AssertionError("credential refresh restarted the generation deadline")
+        except openai.APIStatusError as error:
+            assert error.status_code == 504, error
+        assert time.monotonic() - started < 1.8
         for model, expected in (
             ("truncated", "length"),
             ("filtered", "content_filter"),
@@ -1727,14 +1950,14 @@ def verify_hosted_generation_contracts(base_url):
                 == "google hello"
             )
         assert len(Upstream.requests) == before + 2
-        for provider in ("google", "vertex", "bedrock", "anthropic"):
+        for provider in ("google", "vertex", "bedrock", "anthropic", "openai"):
             images = [
                 {
                     "role": "user",
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+                            "image_url": {"url": quota_image_data_uri()},
                         }
                     ],
                 }
@@ -2105,6 +2328,37 @@ def main() -> None:
                     config["inference_capabilities"]["generators/" + name] = {
                         "images": "supported"
                     }
+            config["generators"]["openai-known"] = dict(
+                config["generators"]["vision-openai"]
+            )
+            for case, capacity in (("denied", 1000), ("admitted", 10000)):
+                name = "openai-quota-" + case
+                config["generators"][name] = {
+                    **config["generators"]["openai-known"],
+                    "model": name,
+                    "max_tokens": 16,
+                    "max_image_input_tokens": 2000,
+                    "rate_limit": {"tokens_per_minute": capacity},
+                }
+                config["inference_capabilities"]["generators/" + name] = {
+                    "images": "supported"
+                }
+            credentials = root / "mock-adc.json"
+            credentials.write_text(
+                json.dumps(
+                    {
+                        "type": "authorized_user",
+                        "client_id": "mock",
+                        "client_secret": "mock",
+                        "refresh_token": "mock",
+                        "token_uri": upstream_url + "/mock-token",
+                    }
+                )
+            )
+            vertex = dict(config["generators"]["vertex-known"])
+            del vertex["api_key"]
+            vertex.update(model="deadline-model", credentials_path=str(credentials))
+            config["generators"]["vertex-deadline"] = vertex
             config_path = root / "config.json"
             config_path.write_text(json.dumps(config))
             port = free_port()

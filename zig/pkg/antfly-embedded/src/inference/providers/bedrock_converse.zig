@@ -68,7 +68,11 @@ pub fn requestJsonAlloc(alloc: Allocator, messages: []const inference.ChatMessag
     var contents = array(a);
     for (messages) |message| {
         var parts = array(a);
-        if (message.role == .tool) {
+        if (message.bedrock_content_json) |native| {
+            if (message.role != .assistant) return error.InvalidInferenceRequest;
+            parts = std.json.parseFromSliceLeaky(Value, a, native, .{}) catch return error.InvalidInferenceRequest;
+            try validateNativeProjection(a, message, parts);
+        } else if (message.role == .tool) {
             const id = message.tool_call_id orelse return error.UnsupportedBedrockContentPart;
             const content = if (message.content) |value| switch (value) {
                 .text => |value_text| value_text,
@@ -100,7 +104,7 @@ pub fn requestJsonAlloc(alloc: Allocator, messages: []const inference.ChatMessag
             try system.array.appendSlice(parts.array.items);
             continue;
         }
-        if (message.tool_calls) |calls| {
+        if (message.bedrock_content_json == null) if (message.tool_calls) |calls| {
             if (message.role != .assistant) return error.UnsupportedBedrockContentPart;
             for (calls) |call| {
                 const input = std.json.parseFromSliceLeaky(Value, a, call.arguments, .{}) catch return error.InvalidGeneratorConfig;
@@ -110,7 +114,7 @@ pub fn requestJsonAlloc(alloc: Allocator, messages: []const inference.ChatMessag
                 try use.object.put(a, "input", input);
                 try parts.array.append(try single(a, "toolUse", use));
             }
-        }
+        };
         if (parts.array.items.len == 0) return error.UnsupportedBedrockContentPart;
         const role = if (message.role == .assistant) "assistant" else "user";
         // Consecutive tool results become one user turn, preserving order and
@@ -158,8 +162,13 @@ pub fn requestJsonAlloc(alloc: Allocator, messages: []const inference.ChatMessag
             const function = try requestField(item, "function");
             var spec = try single(a, "name", try requestField(function, "name"));
             if (function.object.get("description")) |description| try spec.object.put(a, "description", description);
-            const schema = function.object.get("parameters") orelse return error.InvalidGeneratorConfig;
+            const schema = function.object.get("parameters") orelse try inference.emptyToolParameters(a);
+            if (schema != .object) return error.InvalidGeneratorConfig;
             try spec.object.put(a, "inputSchema", try single(a, "json", schema));
+            if (function.object.get("strict")) |strict| {
+                if (strict != .bool) return error.InvalidGeneratorConfig;
+                try spec.object.put(a, "strict", strict);
+            }
             try tools.array.append(try single(a, "toolSpec", spec));
         }
         var tool_config = try single(a, "tools", tools);
@@ -190,6 +199,48 @@ fn imagePart(a: Allocator, mime: []const u8, bytes: []const u8) !Value {
     return single(a, "image", image);
 }
 
+// Retain native blocks only when their visible projection matches the public
+// assistant turn. No image, document or additional tool bypasses admission.
+fn validateNativeProjection(a: Allocator, message: inference.ChatMessage, blocks: Value) !void {
+    if (blocks != .array) return error.InvalidInferenceRequest;
+    const visible = if (message.content) |content| switch (content) {
+        .text => |value| value,
+        else => return error.InvalidInferenceRequest,
+    } else "";
+    const calls = message.tool_calls orelse &.{};
+    var text_offset: usize = 0;
+    var call_offset: usize = 0;
+    for (blocks.array.items) |block| {
+        if (block != .object or block.object.count() != 1) return error.InvalidInferenceRequest;
+        if (block.object.get("text")) |value| {
+            if (value != .string or !std.mem.startsWith(u8, visible[text_offset..], value.string)) return error.InvalidInferenceRequest;
+            text_offset += value.string.len;
+        } else if (block.object.get("toolUse")) |use| {
+            if (call_offset >= calls.len) return error.InvalidInferenceRequest;
+            const call = calls[call_offset];
+            call_offset += 1;
+            const id = try requestField(use, "toolUseId");
+            const name = try requestField(use, "name");
+            if (id != .string or name != .string or !std.mem.eql(u8, id.string, call.id) or !std.mem.eql(u8, name.string, call.name)) return error.InvalidInferenceRequest;
+            const input = try requestField(use, "input");
+            const arguments = std.json.parseFromSliceLeaky(Value, a, call.arguments, .{}) catch return error.InvalidInferenceRequest;
+            if (input != .object or !inference.jsonValuesEqual(arguments, input)) return error.InvalidInferenceRequest;
+        } else if (block.object.get("reasoningContent")) |reasoning| {
+            validateReasoning(reasoning) catch return error.InvalidInferenceRequest;
+        } else return error.InvalidInferenceRequest;
+    }
+    if (text_offset != visible.len or call_offset != calls.len) return error.InvalidInferenceRequest;
+}
+fn validateReasoning(reasoning: Value) !void {
+    if (reasoning != .object or reasoning.object.count() != 1) return error.InvalidBedrockResponse;
+    if (reasoning.object.get("reasoningText")) |text_| {
+        _ = try string(try field(text_, "text"));
+        _ = try string(try field(text_, "signature"));
+    } else if (reasoning.object.get("redactedContent")) |redacted| {
+        _ = try string(redacted);
+    } else return error.InvalidBedrockResponse;
+}
+
 pub fn finishReason(native: []const u8) !inference.GenerationFinishReason {
     if (std.mem.eql(u8, native, "tool_use")) return .tool_calls;
     if (std.mem.eql(u8, native, "max_tokens") or std.mem.eql(u8, native, "model_context_window_exceeded")) return .length;
@@ -208,6 +259,7 @@ pub fn responseAlloc(alloc: Allocator, body: []const u8) !inference.GenerateResu
     var output: std.ArrayListUnmanaged(u8) = .empty;
     defer output.deinit(alloc);
     var calls: std.ArrayListUnmanaged(inference.ToolCall) = .empty;
+    var has_reasoning = false;
     errdefer {
         for (calls.items) |*call| call.deinit(alloc);
         calls.deinit(alloc);
@@ -224,11 +276,17 @@ pub fn responseAlloc(alloc: Allocator, body: []const u8) !inference.GenerateResu
             const arguments = try std.json.Stringify.valueAlloc(alloc, try field(use, "input"), .{});
             errdefer alloc.free(arguments);
             try calls.append(alloc, .{ .id = id, .name = name, .arguments = arguments });
+        } else if (part.object.get("reasoningContent")) |reasoning| {
+            try validateReasoning(reasoning);
+            has_reasoning = true;
         } else return error.InvalidBedrockResponse;
     }
     const content = try output.toOwnedSlice(alloc);
     errdefer alloc.free(content);
+    const native = if (has_reasoning) try std.json.Stringify.valueAlloc(alloc, parts, .{}) else null;
+    errdefer if (native) |bytes| alloc.free(bytes);
     return .{
+        .bedrock_content_json = native,
         .content = content,
         .finish_reason = try finishReason(try string(try field(parsed.value, "stopReason"))),
         .tool_calls = try calls.toOwnedSlice(alloc),
@@ -257,13 +315,26 @@ pub fn testConverseWire() !void {
     try std.testing.expectEqualStrings("aW1hZ2U=", parts[1].object.get("image").?.object.get("source").?.object.get("bytes").?.string);
     try std.testing.expectEqualStrings("call-1", turns[2].object.get("content").?.array.items[0].object.get("toolResult").?.object.get("toolUseId").?.string);
     var result = try responseAlloc(a,
-        \\{"output":{"message":{"role":"assistant","content":[{"text":"Compared"},{"toolUse":{"toolUseId":"call-2","name":"lookup","input":{"id":8}}}]}},"stopReason":"tool_use","usage":{"inputTokens":100,"outputTokens":5,"totalTokens":105}}
+        \\{"output":{"message":{"role":"assistant","content":[{"reasoningContent":{"reasoningText":{"text":"private","signature":"signed"}}},{"reasoningContent":{"redactedContent":"cmVkYWN0ZWQ="}},{"text":"Compared"},{"toolUse":{"toolUseId":"call-2","name":"lookup","input":{"id":8}}}]}},"stopReason":"tool_use","usage":{"inputTokens":100,"outputTokens":5,"totalTokens":105}}
     );
     defer result.deinit();
     try std.testing.expectEqual(inference.GenerationFinishReason.tool_calls, result.finish_reason.?);
     try std.testing.expectEqualStrings("Compared", result.content);
     try std.testing.expectEqualStrings("call-2", result.tool_calls[0].id);
     try std.testing.expectEqual(@as(u64, 100), result.usage.?.input_tokens);
+    var replay = inference.ChatMessage{ .role = .assistant, .content = .{ .text = result.content }, .tool_calls = result.tool_calls, .bedrock_content_json = result.bedrock_content_json };
+    const replay_body = try requestJsonAlloc(a, &.{replay}, .{});
+    defer a.free(replay_body);
+    var replay_parsed = try std.json.parseFromSlice(Value, a, replay_body, .{});
+    defer replay_parsed.deinit();
+    const replay_parts = replay_parsed.value.object.get("messages").?.array.items[0].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), replay_parts.len);
+    try std.testing.expectEqualStrings("signed", replay_parts[0].object.get("reasoningContent").?.object.get("reasoningText").?.object.get("signature").?.string);
+    try std.testing.expectEqualStrings("cmVkYWN0ZWQ=", replay_parts[1].object.get("reasoningContent").?.object.get("redactedContent").?.string);
+    replay.content = .{ .text = "tampered" };
+    try std.testing.expectError(error.InvalidInferenceRequest, requestJsonAlloc(a, &.{replay}, .{}));
+    replay.bedrock_content_json = "[{\"image\":{\"format\":\"png\"}}]";
+    try std.testing.expectError(error.InvalidInferenceRequest, requestJsonAlloc(a, &.{replay}, .{}));
     // Completed and streaming adapters share the same stop-reason mapping.
     const cases = .{
         .{ "max_tokens", inference.GenerationFinishReason.length },

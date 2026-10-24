@@ -572,12 +572,19 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
             const Tool = std.meta.Elem(std.meta.Child(@FieldType(Api.GenerateMessage, "tool_calls")));
             const calls = try a.alloc(Tool, result.tool_calls.len);
             for (result.tool_calls, calls) |call, *out| out.* = .{ .id = call.id, .type = "function", .function = .{ .name = call.name, .arguments = call.arguments } };
+            var extra: ?std.json.ArrayHashMap(Json) = null;
+            if (result.bedrock_content_json) |native| {
+                var content: Json = .{ .object = .empty };
+                try content.object.put(a, "content", try std.json.parseFromSliceLeaky(Json, a, native, .{}));
+                extra = .{};
+                try extra.?.map.put(a, "bedrock", content);
+            }
             return ctx.json(Api.GenerateResponse{
                 .id = try std.fmt.allocPrint(a, "chatcmpl-{d}", .{@import("antfly_platform").time.monotonicNs()}),
                 .object = "chat.completion",
                 .created = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_s),
                 .model = model,
-                .choices = &.{.{ .index = 0, .message = .{ .role = .assistant, .content = .{ .value = result.content }, .tool_calls = if (calls.len > 0) calls else null }, .finish_reason = if (result.finish_reason) |reason| std.meta.stringToEnum(Api.FinishReason, @tagName(reason)).? else if (calls.len > 0) .tool_calls else .stop }},
+                .choices = &.{.{ .index = 0, .message = .{ .role = .assistant, .content = .{ .value = result.content }, .tool_calls = if (calls.len > 0) calls else null, .extra_content = extra }, .finish_reason = if (result.finish_reason) |reason| std.meta.stringToEnum(Api.FinishReason, @tagName(reason)).? else if (calls.len > 0) .tool_calls else .stop }},
                 .usage = if (result.usage) |usage| .{
                     .prompt_tokens = std.math.cast(i64, usage.input_tokens) orelse return error.InvalidInferenceResponse,
                     .completion_tokens = std.math.cast(i64, usage.output_tokens) orelse return error.InvalidInferenceResponse,
