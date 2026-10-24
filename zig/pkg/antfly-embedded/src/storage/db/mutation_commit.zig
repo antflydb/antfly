@@ -264,6 +264,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
             for (req.writes) |write| if (relational_index_catalog.Controller.isReservedMetadataKey(write.key)) {
                 const trusted = opts.transaction_resolution != null or opts.replication_applied_lsn_marker != null;
+                const validation = @import("relational_integrity_activation_contract.zig");
+                if (trusted and std.mem.eql(u8, write.key, validation.validation_key)) {
+                    _ = try validation.ForeignKeyValidationRecord.decode(write.value);
+                    continue;
+                }
+                if (trusted and std.mem.eql(u8, write.key, validation.validation_inputs_key)) {
+                    _ = try @import("relational_schema_owner_contract.zig").inputParts(write.value);
+                    continue;
+                }
                 if (!trusted or !maintenance_contract.isControlKey(write.key)) return error.ReservedRelationalIndexMetadataKey;
                 _ = try maintenance_contract.Control.decode(write.value);
                 maintenance_attempted = true;
@@ -1118,7 +1127,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             {
                 var topology_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
                 defer topology_read.abort();
-                try @import("relational_integrity_topology.zig").requireUnfenced(&topology_read);
+                try @import("relational_integrity_topology.zig").requireWriteUnfenced(&topology_read);
             }
 
             // A pending coalescer flush may itself run a complete nested batch and
@@ -3649,6 +3658,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (@import("retirement_set_summary.zig").isKey(key)) return true;
             if (@import("native_topology_receipt.zig").isKey(key)) return true;
             const generation_admission = @import("relational_integrity_generation_admission.zig");
+            const validation = @import("relational_integrity_activation_contract.zig");
+            if (std.mem.eql(u8, key, validation.validation_key) or std.mem.eql(u8, key, validation.validation_inputs_key)) return true;
             return std.mem.eql(u8, key, @import("restore_staging.zig").key) or std.mem.eql(u8, key, @import("restore_staging.zig").bootstrap_key) or @import("relational_integrity.zig").isKey(key) or std.mem.eql(u8, key, @import("relational_integrity_catalog.zig").key) or
                 std.mem.eql(u8, key, @import("relational_integrity_activation.zig").key) or
                 std.mem.eql(u8, key, @import("relational_integrity_topology.zig").fence_key) or
@@ -4133,7 +4144,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     else => return err,
                 });
                 const catalog = loaded.?;
-                if (std.mem.eql(u8, write.key, activation.key)) {
+                if (std.mem.eql(u8, write.key, activation.validation_key)) {
+                    const next = try activation.ValidationRecord.decode(write.value);
+                    const namespace = (try @import("doc_identity.zig").loadNamespaceTxn(txn)) orelse return error.IdentityNamespaceMismatch;
+                    if (!next.binding.fence.namespace.eql(namespace) or !next.progress.matches(catalog, try activation.ownership(txn)) or
+                        !std.mem.eql(u8, &next.binding.before_schema, &catalog.schema_digest) or next.binding.before_version != catalog.schema_version)
+                        return error.SchemaValidationJobChanged;
+                } else if (std.mem.eql(u8, write.key, activation.validation_inputs_key)) {
+                    var expected: ?[32]u8 = null;
+                    for (req.writes) |sibling| if (std.mem.eql(u8, sibling.key, activation.validation_key)) {
+                        expected = (try activation.ValidationRecord.decode(sibling.value)).binding.inputs;
+                        break;
+                    };
+                    if (expected == null) expected = (try activation.ValidationRecord.decode(try txn.get(activation.validation_key))).binding.inputs;
+                    if (!std.mem.eql(u8, &@import("relational_schema_owner_contract.zig").hash(write.value), &expected.?)) return error.SchemaValidationJobChanged;
+                    _ = try @import("relational_schema_owner_contract.zig").inputParts(write.value);
+                } else if (std.mem.eql(u8, write.key, activation.key)) {
                     const next = try activation.Progress.decode(write.value);
                     if (!next.matches(catalog, try activation.ownership(txn)) or next.schema_version != catalog.schema_version)
                         return error.IntegrityCatalogChanged;

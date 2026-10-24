@@ -69,6 +69,8 @@ pub fn completed(txn: anytype) !?Fence {
 pub fn nextEpoch(txn: anytype) !u64 {
     var epoch: u64 = 0;
     if (try current(txn)) |fence| epoch = fence.admission_epoch;
+    if (try optional(txn, @import("relational_integrity_activation_contract.zig").validation_key)) |bytes|
+        epoch = @max(epoch, (try @import("relational_integrity_activation_contract.zig").ForeignKeyValidationRecord.decode(bytes)).binding.fence.admission_epoch);
     if (try optional(txn, receipt_key)) |bytes| epoch = @max(epoch, (try Fence.decode(bytes)).admission_epoch);
     return std.math.add(u64, epoch, 1) catch error.IntegrityTopologyEpochExhausted;
 }
@@ -140,6 +142,15 @@ pub fn stagePrivateIndexCancellationIntent(txn: anytype, record: @import("relati
 
 fn stageBeginImpl(txn: anytype, fence: Fence, handoff: ?@import("relational_integrity_topology_contract.zig").GenerationHandoffIntent) !void {
     try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
+    if (try optional(txn, @import("relational_integrity_activation_contract.zig").validation_key)) |bytes| {
+        const validation = try @import("relational_integrity_activation_contract.zig").ForeignKeyValidationRecord.decode(bytes);
+        if (validation.progress.state != .invalid and fence.role != .backup_snapshot) {
+            if (validation.progress.state != .enforced or fence.role != .child_generation_source or
+                fence.transition_id != validation.binding.fence.transition_id or !fence.namespace.eql(validation.binding.fence.namespace) or
+                !std.mem.eql(u8, &fence.catalog_digest, &validation.binding.fence.catalog_digest) or
+                fence.admission_epoch <= validation.binding.fence.admission_epoch) return error.IntegrityTopologyBusy;
+        }
+    }
     if (handoff != null and fence.role != .rewrite_source) return error.InvalidGenerationHandoff;
     _ = try fence.encode();
     const abort_key = abortedKey(fence);
@@ -235,16 +246,35 @@ pub fn admitPrepare(txn: anytype, manager: *transactions.TxnManager, alloc: Allo
     if (try manager.loadSchemaBinding(alloc, txn_id) == null) return error.IntegrityTopologyBusy;
 }
 
-pub fn requireUnfenced(txn: anytype) !void {
+/// Ordinary writes keep using the existing physical write fence. Semantic FK
+/// validation pins definition/topology changes while allowing enforced DML.
+pub fn requireWriteUnfenced(txn: anytype) !void {
     try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
     if (try current(txn) != null) return error.IntegrityTopologyBusy;
+}
+
+pub fn requireNoActiveValidation(txn: anytype) !void {
+    if (try optional(txn, @import("relational_integrity_activation_contract.zig").validation_key)) |bytes| {
+        const validation = try @import("relational_integrity_activation_contract.zig").ForeignKeyValidationRecord.decode(bytes);
+        if (validation.progress.state != .invalid) return error.IntegrityTopologyBusy;
+    }
+}
+
+pub fn requireUnfenced(txn: anytype) !void {
+    try requireWriteUnfenced(txn);
+    try requireNoActiveValidation(txn);
 }
 
 /// Runtime reconciliation of an already-published identical producer catalog
 /// is harmless while frozen; delayed *changes* may not create new callbacks.
 pub fn requireUnfencedOrUnchanged(txn: anytype, key: []const u8, candidate: []const u8) !void {
     if (try @import("artifact_reconcile_intent.zig").permitCatalog(std.heap.page_allocator, txn, key, candidate)) return;
-    if (try current(txn) == null and try @import("online_integrity_shadow.zig").rawRange(txn) == null) return;
+    var validation_active = false;
+    requireNoActiveValidation(txn) catch |err| {
+        if (err != error.IntegrityTopologyBusy) return err;
+        validation_active = true;
+    };
+    if (!validation_active and try current(txn) == null and try @import("online_integrity_shadow.zig").rawRange(txn) == null) return;
     const existing = (try optional(txn, key)) orelse return error.IntegrityTopologyBusy;
     if (!std.mem.eql(u8, existing, candidate)) return error.IntegrityTopologyBusy;
 }

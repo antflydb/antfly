@@ -62,6 +62,39 @@ This closes one original case and advances the requested batch to **36/100**.
 `sql-0736` VALIDATE remains unresolved: clearing the declaration without a
 coordinated historical proof returns `0A000`; MATCH PARTIAL NOT VALID is guarded.
 
+### Online FK validation transaction checkpoint (2026-10-23)
+
+The current implementation reuses ordinary parent attachments and the existing
+2PC coordinator instead of requiring a second parent-namespace scan protocol.
+Each bounded source page prepares only the selected pending FK columns, exact
+primary version/content guards, ordinary parent attachments, and the source
+cursor CAS in one transaction. Successful attachments promote historical
+references; unchanged NOT VALID writes cannot downgrade them. Definition and
+topology changes are pinned while ordinary DML continues. Physical index build
+progress is independent of this semantic scan.
+
+Immutable validation inputs use bounded streaming base64 in the private command
+transport. Checksummed progress carries an exact predecessor and revision.
+Native records bind the physical root; Raft records use root zero so followers
+apply identical effects. Root-qualified readiness and metadata publication are
+still required before either can authorize a public validity change. Snapshot
+import of these transient records currently fails closed.
+
+The strict Debug `antfly-fk-validation-transactions-test` gate passed eight
+supporting tests and one native LSM transaction campaign, without skips or leaks.
+The campaign checks missing parents, stale children, atomic cursor/reference
+promotion after reopening a prepared transaction, preservation by ordinary
+writes, guarded orphan diagnostics, parent repair and complete rescan, and
+cancellation of ready progress. Public schema bytes remain NOT VALID throughout.
+Apache boundary and generated control-catalog checks also passed.
+
+This is a native execution checkpoint, not closure of `sql-0736`. Public
+coordinator admission/completion, parent-definition locks, current-owner
+readiness, retained-generation installation, transient restore/root recovery,
+and distributed fault qualification remain required. The earlier read-side
+witness helpers below remain available, but their full parent scan is not a
+prerequisite for this transaction-based route. Original-case counts are unchanged.
+
 ### FK VALIDATE: native preparation and read execution in progress
 
 `sql-0736` remains unresolved. Native read-side support now prepares exact

@@ -31,6 +31,7 @@ test {
     _ = @import("api/online_merge_io.zig");
     _ = @import("api/relational_ttl.zig");
     _ = @import("api/relational_activation_worker.zig");
+    _ = @import("api/fk_validation_transactions_test.zig");
     _ = @import("api/relational_retirement_worker.zig");
     _ = @import("metadata/storage/raft_apply_store.zig");
     _ = @import("antfly_local_sources").api_batch;

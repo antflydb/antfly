@@ -297,6 +297,8 @@ fn isRawMetadataIntentKey(key: []const u8) bool {
         range_protection.indexCounterDigest(key) != null or
         std.mem.startsWith(u8, key, "\x00\x00__metadata__:relational_integrity:") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_activation") or
+        std.mem.eql(u8, key, @import("db/relational_integrity_activation_contract.zig").validation_key) or
+        std.mem.eql(u8, key, @import("db/relational_integrity_activation_contract.zig").validation_inputs_key) or
         std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_retirement") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_generation_retirement") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:restore_staging_owner") or

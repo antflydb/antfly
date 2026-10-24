@@ -228,9 +228,18 @@ pub fn repairPredicate(alloc: Allocator, txn: anytype, catalog: catalog_mod.Cata
 
 pub const Command = @import("relational_integrity_activation_contract.zig").Command;
 
-pub const Prepared = struct { intent: transactions.WriteIntent, predicate: transactions.VersionPredicate };
+pub const Prepared = struct {
+    intent: transactions.WriteIntent,
+    predicate: transactions.VersionPredicate,
+    inputs: ?transactions.WriteIntent = null,
+};
 
 pub fn prepareCommand(alloc: Allocator, txn: anytype, catalog: catalog_mod.Catalog, command: Command) !Prepared {
+    return prepareCommandForOwner(alloc, txn, catalog, command, 0);
+}
+
+pub fn prepareCommandForOwner(alloc: Allocator, txn: anytype, catalog: catalog_mod.Catalog, command: Command, physical_root: u128) !Prepared {
+    if (command.validation != null) return prepareForeignKeyValidationCommand(alloc, txn, catalog, command, physical_root);
     if (!hasActive(catalog)) return error.ConstraintNotFound;
     const current = try optional(txn, key);
     if (command.expected) |expected| {
@@ -258,6 +267,82 @@ pub fn prepareCommand(alloc: Allocator, txn: anytype, catalog: catalog_mod.Catal
         if (after.state == .enforced and nextPhase(catalog, before.phase) != null) return error.InvalidConstraintActivationCommand;
     }
     return .{ .intent = .{ .key = key, .value = command.next }, .predicate = .{ .key = key, .comparison = .exact_value, .expected_value = command.expected } };
+}
+
+pub const ValidationRecord = @import("relational_integrity_activation_contract.zig").ForeignKeyValidationRecord;
+pub const validation_key = @import("relational_integrity_activation_contract.zig").validation_key;
+pub const validation_inputs_key = @import("relational_integrity_activation_contract.zig").validation_inputs_key;
+
+/// Fixed definition guards, not permission to publish. Secondary index build
+/// coverage may advance independently; validation concerns the primary layout,
+/// FK declarations and actual source ownership captured at admission.
+pub fn requireValidationDefinition(txn: anytype, binding: @import("relational_schema_owner_contract.zig").Binding) !void {
+    const actual_namespace = (try @import("doc_identity.zig").loadNamespaceTxn(txn)) orelse return error.IdentityNamespaceMismatch;
+    if (!actual_namespace.eql(binding.fence.namespace)) return error.IdentityNamespaceMismatch;
+    _ = try @import("../source_authority.zig").require(txn, binding.authority, @import("online_source_contract.zig").namespaceBytes(actual_namespace));
+    // Begin independently verifies complete schema/public bytes. Thereafter
+    // the live definition lease and atomic catalog publication let pages use
+    // the exact catalog digest and durable epoch instead of rehashing large
+    // schema blobs for every bounded transaction.
+    const table = @import("table_catalog.zig");
+    const facts = try table.Catalog.decode((try optional(txn, table.key)) orelse return error.SchemaValidationJobChanged);
+    if (facts.storage_mode != .relational or facts.active_schema_version != binding.before_version or
+        !std.mem.eql(u8, &digest((try optional(txn, catalog_mod.key)) orelse return error.SchemaValidationJobChanged), &binding.fence.catalog_digest)) return error.SchemaValidationJobChanged;
+    if (!std.mem.eql(u8, &binding.owner, &try ownership(txn))) return error.SchemaValidationJobChanged;
+}
+
+fn prepareForeignKeyValidationCommand(alloc: Allocator, txn: anytype, catalog: catalog_mod.Catalog, command: Command, physical_root: u128) !Prepared {
+    const scope = command.validation.?;
+    try scope.validate();
+    if (scope.binding.authority == .native and (physical_root == 0 or scope.physical_root != physical_root)) return error.SchemaValidationRuntimeRecoveryRequired;
+    if (command.retry or command.diagnostic) return error.InvalidConstraintActivationCommand;
+    const current_raw = if (try optional(txn, validation_key)) |raw| try alloc.dupe(u8, raw) else null;
+    defer if (current_raw) |raw| alloc.free(raw);
+    if (command.expected) |expected| {
+        if (!std.mem.eql(u8, current_raw orelse return error.ConstraintActivationChanged, expected)) return error.ConstraintActivationChanged;
+    } else if (current_raw != null) return error.ConstraintActivationChanged;
+    const after = try ValidationRecord.decode(command.next);
+    if (!std.meta.eql(after.binding, scope.binding) or after.physical_root != scope.physical_root or !after.progress.matches(catalog, scope.binding.owner)) return error.SchemaValidationJobChanged;
+    try requireValidationDefinition(txn, scope.binding);
+    const routing = try routingKey(alloc, txn);
+    defer alloc.free(routing);
+    if (!std.mem.eql(u8, command.routing_key, routing)) return error.ConstraintActivationOwnerChanged;
+    if (scope.action == .begin) {
+        try @import("relational_integrity_topology.zig").requireUnfenced(txn);
+        if (try @import("relational_integrity_topology.zig").completed(txn)) |done| if (done.admission_epoch >= scope.binding.fence.admission_epoch) return error.SchemaValidationJobChanged;
+        if (current_raw) |raw| {
+            const before = try ValidationRecord.decode(raw);
+            if (before.progress.state != .invalid or before.binding.fence.admission_epoch >= scope.binding.fence.admission_epoch or
+                std.mem.eql(u8, &before.binding.id, &scope.binding.id)) return error.SchemaValidationJobChanged;
+        }
+        if (after.revision != 1 or after.progress.state != .validating or after.progress.rows_scanned != 0 or after.progress.cursor.len != 0) return error.InvalidSchemaValidationJob;
+        try requireReady(txn, catalog);
+        try @import("relational_integrity_generation_admission.zig").requireAcknowledged(txn);
+        try @import("relational_integrity_generation_admission.zig").requireReferenceCoverageAcknowledged(txn);
+        var candidate = try @import("relational_nullability_job.zig").Candidate.fromInputs(alloc, scope.inputs.bytes, scope.binding, .{});
+        defer candidate.deinit();
+        const observed = try @import("relational_nullability_job.zig").prepareBinding(txn, &candidate, scope.binding.id, scope.binding.plan_digest, scope.binding.fence, scope.binding.authority);
+        var semantic_binding = scope.binding;
+        // The immutable source preparation records its observed index head,
+        // but FK row validation does not freeze unrelated index build progress.
+        semantic_binding.physical_catalog = observed.physical_catalog;
+        if (!std.meta.eql(observed, semantic_binding)) return error.SchemaValidationJobChanged;
+        return .{ .intent = .{ .key = validation_key, .value = command.next }, .predicate = .{ .key = validation_key, .comparison = .exact_value, .expected_value = command.expected }, .inputs = .{ .key = validation_inputs_key, .value = scope.inputs.bytes } };
+    }
+    const before = try ValidationRecord.decode(current_raw orelse return error.SchemaValidationJobRequired);
+    if (!std.meta.eql(before.binding, scope.binding) or before.physical_root != scope.physical_root or
+        after.revision != (std.math.add(u64, before.revision, 1) catch return error.InvalidSchemaValidationJob) or
+        (before.progress.state != .validating and !(scope.action == .cancel and before.progress.state == .enforced))) return error.SchemaValidationJobChanged;
+    if (after.progress.rows_scanned < before.progress.rows_scanned) return error.InvalidSchemaValidationJob;
+    if (scope.action == .cancel or after.progress.state == .invalid) {
+        if (after.progress.state != .invalid or after.progress.rows_scanned != before.progress.rows_scanned or
+            !std.mem.eql(u8, after.progress.cursor, before.progress.cursor) or
+            (scope.action == .cancel and !std.mem.eql(u8, after.progress.failure, "Canceled"))) return error.InvalidSchemaValidationJob;
+    } else if (after.progress.state == .validating) {
+        if (std.mem.order(u8, after.progress.cursor, before.progress.cursor) != .gt or
+            !@import("../internal_keys.zig").isRelationalRowKey(after.progress.cursor)) return error.InvalidSchemaValidationJob;
+    }
+    return .{ .intent = .{ .key = validation_key, .value = command.next }, .predicate = .{ .key = validation_key, .comparison = .exact_value, .expected_value = command.expected } };
 }
 
 pub const Page = struct {

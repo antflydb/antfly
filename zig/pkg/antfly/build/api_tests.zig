@@ -940,6 +940,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     test_imports.configure(b, api_transactions_docid_test_mod, true, true);
     api_transactions_docid_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const fk_validation_transactions = b.addTest(.{
+        .root_module = api_transactions_docid_test_mod,
+        .filters = &.{"foreign key validation"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const fk_validation_run = addFilteredTestRunArtifact(b, fk_validation_transactions);
+    fk_validation_run.addArg("--require-no-skips");
+    b.step("antfly-fk-validation-transactions-test", "Verify selected FK validation uses guarded ordinary attachments and durable native transactions")
+        .dependOn(&fk_validation_run.step);
     const api_table_writes_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_table_writes_test_root.zig"),
         .target = target,

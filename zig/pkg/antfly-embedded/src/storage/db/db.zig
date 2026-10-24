@@ -20950,7 +20950,7 @@ pub const DB = struct {
         if (opts.group_source_query_json.len != 0) return self.lookupGroupSource(alloc, opts.group_source_query_json);
         if (opts.relational_topology_json.len != 0) return self.lookupRelationalTopology(alloc, opts.relational_topology_json, opts);
         if (opts.relational_index_status_json.len != 0) return self.lookupRelationalIndexStatus(alloc, opts.relational_index_status_json, opts);
-        if (opts.relational_activation_json.len != 0) return self.lookupRelationalActivation(alloc, opts.relational_activation_json);
+        if (opts.relational_activation_json.len != 0) return self.lookupRelationalActivation(alloc, opts.relational_activation_json, opts);
         if (opts.relational_integrity_catalog) return self.lookupRelationalIntegrityCatalog(alloc);
         if (opts.relational_integrity_action) return self.lookupRelationalIntegrityAction(alloc, key);
         if (opts.relational_integrity_jobs_json.len != 0) return self.lookupRelationalIntegrityJobs(alloc, opts.relational_integrity_jobs_json, opts);
@@ -21202,13 +21202,55 @@ pub const DB = struct {
         return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .catalog = raw_catalog, .progress = raw_progress, .owner = try activation.ownership(&read), .range_start = serving_range.start, .range_end = serving_range.end }, .{}) };
     }
 
-    fn lookupRelationalActivation(self: *DB, alloc: Allocator, request_json: []const u8) !?types.LookupResult {
+    fn lookupRelationalActivation(self: *DB, alloc: Allocator, request_json: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         const activation = @import("relational_integrity_activation.zig");
         const catalog_mod = @import("relational_integrity_catalog.zig");
         if (request_json.len > 1024) return error.InvalidConstraintActivation;
-        var request = try std.json.parseFromSlice(struct { mode: enum { status, page, retry } = .status, max_rows: u32 = 128, schema_version: ?u32 = null }, alloc, request_json, .{});
+        var request = try std.json.parseFromSlice(struct { mode: enum { status, page, retry, validation_status, validation_page } = .status, max_rows: u32 = 128, schema_version: ?u32 = null, validation_id: ?[16]u8 = null }, alloc, request_json, .{});
         defer request.deinit();
         if (request.value.max_rows == 0 or request.value.max_rows > 128) return error.InvalidConstraintActivation;
+        const semantic = request.value.mode == .validation_page or request.value.mode == .validation_status;
+        if (semantic != (request.value.validation_id != null)) return error.InvalidSchemaValidationJob;
+        if (request.value.mode == .validation_status) {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            const raw = read.get(activation.validation_key) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+            const record = try activation.ValidationRecord.decode(raw);
+            if (!std.mem.eql(u8, &record.binding.id, &request.value.validation_id.?)) return error.SchemaValidationJobChanged;
+            if (record.binding.authority == .native and record.physical_root != self.root_incarnation) return error.SchemaValidationRuntimeRecoveryRequired;
+            const encoded = try std.json.Stringify.valueAlloc(alloc, record, .{});
+            errdefer alloc.free(encoded);
+            try activation.requireValidationDefinition(&read, record.binding);
+            return .{ .json = encoded };
+        }
+        if (request.value.mode == .validation_page) {
+            const context: @import("../../api/operation.zig").RequestContext = .{ .deadline_ns = opts.execution_deadline_ns, .deadline_io = opts.execution_io, .cancellation = opts.cancellation orelse .none };
+            const Check = struct {
+                fn active(raw: ?*anyopaque) anyerror!void {
+                    const value: *const @import("../../api/operation.zig").RequestContext = @ptrCast(@alignCast(raw.?));
+                    try value.ensureActive();
+                }
+            };
+            var page = (try @import("foreign_key_validation_page.zig").prepare(alloc, self.backend_runtime.io(), self.core, self.root_incarnation, request.value.validation_id.?, .{ .rows = request.value.max_rows, .output_bytes = 1024 * 1024, .time_ns = 100 * std.time.ns_per_ms }, .{ .context = @constCast(&context), .checkpoint = Check.active })) orelse return null;
+            defer page.deinit();
+            const Row = @import("relational_integrity_activation_contract.zig").Row;
+            const projected = try alloc.alloc(Row, page.rows.rows.len);
+            defer alloc.free(projected);
+            for (projected, page.rows.rows) |*row, source| row.* = .{ .key = source.key, .json = source.json, .version = source.version, .expected_content_digest = source.expected_content_digest, .json_null_fields = source.json_null_fields };
+            const Response = struct {
+                rows: []const Row,
+                command: activation.Command,
+                phase: activation.Phase = .foreign_key,
+                constraints: []const []const u8,
+                pub fn jsonStringify(response: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+                    try @import("relational_integrity_json.zig").write(response, stream);
+                }
+            };
+            return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .rows = projected, .command = page.command, .constraints = page.constraints }, .{}) };
+        }
         if (request.value.mode == .page) {
             var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
             defer view.release();
@@ -26690,8 +26732,9 @@ pub const DB = struct {
                 // primary rows. Its observed rows are retained read guards.
                 if (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0) return error.InvalidConstraintActivationCommand;
                 try @import("online_integrity_shadow.zig").requireServing(&integrity_read, self.core.byteRange(), command.routing_key);
-                const activation = try activation_mod.prepareCommand(preparation_alloc, &integrity_read, integrity_catalog.?, command);
+                const activation = try activation_mod.prepareCommandForOwner(preparation_alloc, &integrity_read, integrity_catalog.?, command, self.root_incarnation);
                 try intents.append(preparation_alloc, activation.intent);
+                if (activation.inputs) |inputs| try intents.append(preparation_alloc, inputs);
                 try predicates.append(preparation_alloc, activation.predicate);
             } else if (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0) {
                 try @import("relational_integrity_retirement.zig").requireMutable(&integrity_read);
@@ -30210,6 +30253,7 @@ pub const DB = struct {
     }
 
     fn requireArtifactReconcileUnfenced(self: *DB, txn: anytype, context: ?@import("artifact_reconcile_intent.zig").Context) !void {
+        try @import("relational_integrity_topology.zig").requireNoActiveValidation(txn);
         if (context) |value| {
             try @import("artifact_reconcile_intent.zig").requireContext(self.alloc, txn, value);
             if (try @import("relational_integrity_topology.zig").current(txn) != null) return error.IntegrityTopologyBusy;
@@ -52906,7 +52950,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     {
         var lifecycle = try ctx.store.beginReadTxn();
         defer lifecycle.abort();
-        try @import("relational_integrity_topology.zig").requireUnfenced(&lifecycle);
+        try @import("relational_integrity_topology.zig").requireWriteUnfenced(&lifecycle);
         try @import("relational_integrity_retirement.zig").requireMutable(&lifecycle);
         try @import("restore_staging.zig").requireScope(ctx.alloc, &lifecycle, null, false);
         const catalog_mod = @import("relational_integrity_catalog.zig");
@@ -53466,7 +53510,7 @@ fn expireDirectGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: 
     {
         var lifecycle = try ctx.store.beginReadTxn();
         defer lifecycle.abort();
-        try @import("relational_integrity_topology.zig").requireUnfenced(&lifecycle);
+        try @import("relational_integrity_topology.zig").requireWriteUnfenced(&lifecycle);
         try @import("relational_integrity_retirement.zig").requireMutable(&lifecycle);
         try @import("restore_staging.zig").requireScope(ctx.alloc, &lifecycle, null, false);
     }
@@ -53630,7 +53674,7 @@ fn expireGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: GraphT
     {
         var lifecycle = try ctx.store.beginReadTxn();
         defer lifecycle.abort();
-        try @import("relational_integrity_topology.zig").requireUnfenced(&lifecycle);
+        try @import("relational_integrity_topology.zig").requireWriteUnfenced(&lifecycle);
         try @import("relational_integrity_retirement.zig").requireMutable(&lifecycle);
         try @import("restore_staging.zig").requireScope(ctx.alloc, &lifecycle, null, false);
     }

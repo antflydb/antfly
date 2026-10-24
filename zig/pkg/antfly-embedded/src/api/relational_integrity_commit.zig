@@ -1003,6 +1003,10 @@ const Builder = struct {
     }
 
     fn bindingPlanFiltered(self: *Builder, table: *Loaded, with_unique: bool, with_foreign: bool, retirement: ?@import("../storage/db/relational_integrity_retirement_contract.zig").Progress) !planner.Plan {
+        return self.bindingPlanSelection(table, with_unique, with_foreign, retirement, null);
+    }
+
+    fn bindingPlanSelection(self: *Builder, table: *Loaded, with_unique: bool, with_foreign: bool, retirement: ?@import("../storage/db/relational_integrity_retirement_contract.zig").Progress, validation_names: ?[]const []const u8) !planner.Plan {
         const unique_defs = if (with_unique) table.uniques else &.{};
         const foreign_defs = if (with_foreign) table.foreign else &.{};
         var uniques = std.ArrayList(planner.UniqueBinding).empty;
@@ -1013,6 +1017,12 @@ const Builder = struct {
         }
         var foreign = std.ArrayList(planner.ForeignBinding).empty;
         for (foreign_defs) |definition| {
+            if (validation_names) |names| {
+                const selected = for (names) |name| {
+                    if (std.mem.eql(u8, name, definition.name)) break true;
+                } else false;
+                if (!selected) continue;
+            }
             const generation = (table.catalog.find(.foreign_key, definition.name) orelse return error.PreparedGenerationChanged).generation;
             if (retirement) |selection| if (!selection.includes(generation)) continue;
             const parent = try self.load(definition.parent_table);
@@ -1064,7 +1074,7 @@ const Builder = struct {
             } else old.expected_content_digest = digest;
             return;
         };
-        try predicates.append(self.alloc, .{ .key = key, .expected_version = version, .expected_content_digest = digest });
+        try predicates.append(self.alloc, .{ .key = try self.alloc.dupe(u8, key), .expected_version = version, .expected_content_digest = digest });
     }
 };
 
@@ -1498,11 +1508,15 @@ pub fn ensureUniqueCoverage(alloc: Allocator, source: reads.TableReadSource, met
 }
 
 fn ensureUniqueCoverageControlled(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, table_names: []const []const u8, request_control: RequestContext) !void {
-    const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .source = source, .metadata = metadata, .control = try boundedControl(request_control) };
     defer builder.deinit();
+    return requireUniqueCoverageFor(&builder, ranges, table_names);
+}
+
+fn requireUniqueCoverageFor(builder: *Builder, ranges: []const RangeRecord, table_names: []const []const u8) !void {
+    const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
     var checked = std.StringHashMapUnmanaged(void).empty;
     for (table_names) |name| {
         if ((try checked.getOrPut(builder.alloc, name)).found_existing) continue;
@@ -1883,12 +1897,38 @@ test "distributed txn activation failure guards absence and abandons repaired pa
 }
 
 fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, table_name: []const u8, rows: []const BackfillRow, phase: BackfillPhase, request: RequestContext) !Prepared {
+    return prepareBackfillMode(alloc, source, metadata, table_name, rows, phase, null, null, request);
+}
+
+/// Selected historical validation uses ordinary attachment, with the same
+/// exact primary observations and parent participants as activation. It never
+/// rewrites the child row or grants historical missing-parent exemptions.
+pub fn prepareForeignKeyValidationPage(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, table_name: []const u8, rows: []const BackfillRow, names: []const []const u8, request: RequestContext) !Prepared {
+    return prepareBackfillMode(alloc, source, metadata, table_name, rows, .foreign_key, names, ranges, request);
+}
+
+fn requireForeignKeyValidationSelection(table: *Loaded, names: []const []const u8) !void {
+    if (names.len == 0 or names.len > 256) return error.InvalidSchemaValidationJob;
+    var bytes: usize = 0;
+    for (names, 0..) |name, i| {
+        bytes = std.math.add(usize, bytes, name.len) catch return error.InvalidSchemaValidationJob;
+        if (name.len == 0 or name.len > 4096 or bytes > 1024 * 1024 or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidSchemaValidationJob;
+        for (names[0..i]) |prior| if (std.mem.eql(u8, prior, name)) return error.InvalidSchemaValidationJob;
+        const selected = for (table.foreign) |definition| {
+            if (std.mem.eql(u8, name, definition.name)) break definition;
+        } else return error.SqlConstraintNotFound;
+        if (!selected.not_valid or selected.match == .partial) return error.InvalidSchemaValidationJob;
+    }
+}
+
+fn prepareBackfillMode(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, table_name: []const u8, rows: []const BackfillRow, phase: BackfillPhase, validation_names: ?[]const []const u8, coverage_ranges: ?[]const RangeRecord, request: RequestContext) !Prepared {
     if (rows.len > 4096) return error.TransactionTooLarge;
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .source = source, .metadata = metadata, .control = try boundedControl(request) };
     defer builder.deinit();
     const table = try builder.load(table_name);
+    if (validation_names) |names| try requireForeignKeyValidationSelection(table, names);
     const row_table_index = try builder.outputIndex(table_name, table.view.version());
     // An empty native page has no claims, references, or parent observations.
     // Its source catalog is still validated above, and the caller commits the
@@ -1899,7 +1939,7 @@ fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, me
         const owned_result_tables = try builder.output.toOwnedSlice(builder.alloc);
         return .{ .arena = arena, .tables = owned_result_tables };
     }
-    var plan = try builder.bindingPlanSelected(table, phase == .unique, phase == .foreign_key);
+    var plan = try builder.bindingPlanSelection(table, phase == .unique, phase == .foreign_key, null, validation_names);
     defer plan.deinit();
     var selected_fields: std.ArrayList([]const u8) = .empty;
     for (plan.uniques) |binding| try selected_fields.appendSlice(builder.alloc, try declarations.uniqueFields(builder.alloc, table.view.tableSchema().*, table.view.physicalLayout(), binding.definition));
@@ -1954,7 +1994,8 @@ fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, me
         }
         var prepared = try mapper.PreparedRelationalProjection.init(builder.alloc, row.json, table.view.tableSchema().*, table.view.physicalLayout(), selected_fields.items);
         defer prepared.deinit();
-        const expansion = plan.expandHistorical(builder.alloc, &.{.{ .key = row.key, .after = prepared.view }}) catch |err| switch (err) {
+        const mutations = [_]planner.Mutation{.{ .key = row.key, .after = prepared.view }};
+        const expansion = (if (validation_names != null) plan.expand(builder.alloc, &mutations) else plan.expandHistorical(builder.alloc, &mutations)) catch |err| switch (err) {
             error.ForeignKeyMatchFullViolation => {
                 validation_failure = @errorName(err);
                 break;
@@ -1978,6 +2019,11 @@ fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, me
         _ = try planner.storage.validateCommandAdmission(commands.items);
         table_request.integrity_commands = if (validation_failure == null) commands.items else &.{};
         table_request.predicates = predicates.items;
+    }
+    if (coverage_ranges) |ranges| {
+        var parents: std.ArrayList([]const u8) = .empty;
+        for (builder.output.items) |table_request| if (table_request.integrity_commands.len != 0) try parents.append(builder.alloc, table_request.table_name);
+        try requireUniqueCoverageFor(&builder, ranges, parents.items);
     }
     const owned_result_tables = try builder.output.toOwnedSlice(builder.alloc);
     return .{ .arena = arena, .tables = owned_result_tables, .validation_failure = validation_failure, .backfill_partial = backfill_partial };
@@ -3293,4 +3339,82 @@ test "distributed txn MATCH PARTIAL nullable witnesses survive alternate deletio
             return error.TestExpectedError;
         }
     }
+}
+
+test "foreign key validation pages select pending constraints retain row guards and reuse parent preparation" {
+    const a = std.testing.allocator;
+    const children =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"keep","child_columns":["a"],"parent_table":"parents","parent_columns":["id"],"not_valid":true},{"name":"other","child_columns":["b","c"],"parent_table":"unavailable","parent_columns":["x","y"],"match":"full","not_valid":true}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"integer","nullable":true},"b":{"type":"integer","nullable":true},"c":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    const parents =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const F = struct {
+        child_envelope: []const u8,
+        parent_envelope: []const u8,
+        status: []const u8,
+        parent_reads: usize = 0,
+        fn lookup(ptr: *anyopaque, backing: Allocator, name: []const u8, _: []const u8, options: types.LookupOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const value = if (options.relational_integrity_catalog) block: {
+                if (std.mem.eql(u8, name, "children")) break :block self.child_envelope;
+                if (!std.mem.eql(u8, name, "parents")) return error.UnexpectedCall;
+                self.parent_reads += 1;
+                break :block self.parent_envelope;
+            } else if (std.mem.eql(u8, name, "parents") and options.relational_activation_json.len != 0) self.status else return error.UnexpectedCall;
+            return .{ .json = try backing.dupe(u8, value), .version = 0 };
+        }
+        fn run(backing: Allocator, fixture_value: @This(), tables: []const TableRecord, ranges: []const RangeRecord) !void {
+            var fixture = fixture_value;
+            const source: reads.TableReadSource = .{ .ptr = &fixture, .vtable = &.{ .lookup = lookup, .scan = undefined, .query = undefined } };
+            var row_key: [1]u8 = .{'c'};
+            var prepared = try prepareForeignKeyValidationPage(backing, source, tables, ranges, "children", &.{.{ .key = &row_key, .json = "{\"a\":7,\"b\":1,\"c\":null}", .version = 17, .expected_content_digest = @splat(9) }}, &.{"keep"}, .{});
+            defer prepared.deinit();
+            try std.testing.expectEqual(@as(usize, 2), prepared.tables.len);
+            try std.testing.expectEqual(@as(usize, 1), fixture.parent_reads);
+            const child = prepared.tables[0];
+            row_key[0] = 'x';
+            try std.testing.expectEqualStrings("c", child.predicates[0].key);
+            try std.testing.expectEqualStrings("c", prepared.tables[1].integrity_commands[0].operation.attach.child_key);
+            try std.testing.expectEqual(@as(usize, 1), child.predicates.len);
+            try std.testing.expectEqual(@as(u64, 17), child.predicates[0].expected_version);
+            try std.testing.expectEqual(@as(?[32]u8, @splat(9)), child.predicates[0].expected_content_digest);
+            try std.testing.expectEqual(@as(usize, 0), child.integrity_commands.len);
+            const parent = prepared.tables[1];
+            try std.testing.expectEqual(@as(usize, 1), parent.integrity_commands.len);
+            try std.testing.expect(parent.integrity_commands[0].operation == .attach);
+            try std.testing.expectEqualStrings("keep", parent.integrity_commands[0].operation.attach.constraint_name);
+            for (prepared.tables) |request| {
+                try std.testing.expectEqual(@as(usize, 0), request.writes.len);
+                try std.testing.expectEqual(@as(usize, 0), request.deletes.len);
+                try std.testing.expect(request.relational_activation == null);
+                try std.testing.expect(request.relational_integrity_generation_set != null);
+            }
+        }
+    };
+    const child_envelope = try testCatalogEnvelope(a, 71, children);
+    defer a.free(child_envelope);
+    const parent_envelope = try testCatalogEnvelope(a, 88, parents);
+    defer a.free(parent_envelope);
+    var parent_schema = try schema_api.PreparedSchemaDefinition.init(a, parents);
+    defer parent_schema.deinit(a);
+    var parent_catalog = try declarations.compileCatalog(a, parent_schema.public_schema, 88, null);
+    defer parent_catalog.deinit();
+    const status = try std.json.Stringify.valueAlloc(a, .{ .schema_version = @as(u32, 1), .schema_digest = parent_catalog.catalog.schema_digest, .generation_set = @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(parent_catalog.catalog), .owner = @as([32]u8, @splat(5)), .range_start = "", .range_end = "", .unique_covered = true, .state = "enforced", .phase = "foreign_key", .rows_scanned = @as(u64, 1), .failure = "" }, .{});
+    defer a.free(status);
+    const fixture: F = .{ .child_envelope = child_envelope, .parent_envelope = parent_envelope, .status = status };
+    const tables = [_]TableRecord{ .{ .table_id = 71, .name = "children", .schema_json = children }, .{ .table_id = 88, .name = "parents", .schema_json = parents } };
+    const ranges = [_]RangeRecord{.{ .table_id = 88, .group_id = 881, .start_key = "" }};
+    try F.run(a, fixture, &tables, &ranges);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, F.run, .{ fixture, &tables, &ranges });
+    var observed = fixture;
+    const source: reads.TableReadSource = .{ .ptr = &observed, .vtable = &.{ .lookup = F.lookup, .scan = undefined, .query = undefined } };
+    try std.testing.expectError(error.InvalidSchemaValidationJob, prepareForeignKeyValidationPage(a, source, &tables, &ranges, "children", &.{}, &.{}, .{}));
+    try std.testing.expectError(error.InvalidSchemaValidationJob, prepareForeignKeyValidationPage(a, source, &tables, &ranges, "children", &.{}, &.{ "keep", "keep" }, .{}));
+    try std.testing.expectError(error.SqlConstraintNotFound, prepareForeignKeyValidationPage(a, source, &tables, &ranges, "children", &.{}, &.{"missing"}, .{}));
+    try std.testing.expectError(error.MissingPrimaryObservation, prepareForeignKeyValidationPage(a, source, &tables, &ranges, "children", &.{.{ .key = "c", .json = "{\"a\":7}", .version = 17 }}, &.{"keep"}, .{}));
+    try std.testing.expectError(error.ConstraintActivationPending, prepareForeignKeyValidationPage(a, source, &tables, &.{}, "children", &.{.{ .key = "c", .json = "{\"a\":7}", .version = 17, .expected_content_digest = @splat(9) }}, &.{"keep"}, .{}));
+    var empty = try prepareForeignKeyValidationPage(a, source, &tables, &.{}, "children", &.{}, &.{"keep"}, .{});
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 1), empty.tables.len);
 }
