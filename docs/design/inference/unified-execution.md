@@ -2300,6 +2300,204 @@ was rejected by automatic approval review; a scoped check of this task's
 same 30-minute activity, three-day age and 20 GiB size limits. Other worktrees
 and user caches were left alone.
 
+
+## Next campaign: native phases and adapter ownership (T01–T48)
+
+This is an implementation plan, not an acceptance claim. Its production baseline
+is `4883bc956c9446e5660391f7df676dbd78948538`, after the completed S campaign.
+R/N/S savings are excluded. Execute it as one campaign with eight six-package
+waves, cohort commits and one final composed qualification. A package finishes
+with a qualified shared owner or a documented, measured reason to retain the
+original specialization; retention earns no deletion credit.
+
+The provisional planning envelope is **30–60 KB net authored production** after
+charging every new helper, header, contract, signature, renderer and dependency.
+This is an engineering estimate, not a deletion quota or a measured result.
+T06 replaces it with prototype-backed cohort budgets before broad migration.
+The intended outcome is fewer maintained native phases and adapter contracts;
+compiled specialization counts and image sizes may remain unchanged.
+
+### Fresh inventory and source ownership
+
+A brace-delimited audit finds **38 distinct candidate exports**: 25 CUDA exports
+with 73,887 exposed bytes and 13 Metal exports with 45,221 exposed bytes. The
+119,108-byte total is candidate declaration/body exposure, including unique
+work, not removable source. CUDA generated regions were excluded. Metal sizes
+come from the qualified, fully preprocessed shader; C string escaping, existing
+fragment owners and generated copies must be reconciled with maintained source
+before credit. The complete symbol list, source hashes and discovery pairs are
+in `.benchmark-assets/1166/next-structural-plan/{selected-exports,native-audit}.json`.
+
+Specific new groups include four CUDA scalar argmax exports (6,320 bytes), three
+Q8/Q4K/Q6K gated-down exports (4,949), three Q4K bias/activation variants (3,034),
+four Metal BF16 matrix epilogues (13,675), and two Metal expert-routing kernels
+(5,955). The corresponding pair similarities are discovery evidence, not proof
+that arithmetic, scratch or ownership can be merged.
+
+The host scan finds 191 `launch_abi.addresses` occurrences in CUDA launch code,
+and 201 `allocDeviceBuffer` / 117 `createTensor` occurrences in CUDA compute.
+These are whole-file syntactic occurrences, including helpers/tests and complex
+owners, not migration counts. `host-audit.json` retains per-function locations.
+T02 must classify production callers and exclude generated, prepared, donated,
+mirrored, multi-output and graph-lifetime allocations before selecting them.
+
+Do not mistake expanded duplicates for new maintained duplication. The S-owned
+segmented/training attention phases and grouped matrix phases already share
+source. TurboQuant fast prefill/decode already call `termite_tq_fast_online_impl`.
+CUDA E2B 6144/12288 variants already share renderer functions. These discoveries
+earn no new body-sharing credit. Older rejected full-body schedules remain
+closed unless a package proposes a materially different, narrower phase owner.
+
+| Budget owner | Provisional net authored reduction | Packages |
+| --- | ---: | --- |
+| Ordinary CUDA projection/argmax/RoPE phases | 5–9 KB | T07–T12 |
+| Metal expert/indexed/BF16/small-M phases | 6–12 KB | T13–T18 |
+| Packed and attention matching phases | 3–7 KB | T19–T24 |
+| CUDA launch ownership | 6–11 KB | T25–T30 |
+| Shared geometry and consumed descriptors | 2–5 KB | T31–T36 |
+| Compatible result ownership | 3–7 KB | T37–T40 |
+| Maintained renderer/compatibility ownership | 5–9 KB | T41–T44 |
+
+These are non-overlapping planning buckets. T02 assigns every removed byte to
+one owner. The renderer bucket has especially uncertain payoff because many
+variant bodies already have one maintained emitter. Generated-output shrinkage
+is always separate and cannot rescue a negative authored-source result.
+
+### Wave A — baseline, contracts and prototypes (T01–T06)
+
+| ID | Concrete work and completion condition |
+| --- | --- |
+| T01 | Freeze the baseline sources, all three CUDA images, decoded Metal shader, qualified Mac/Spark binaries, fixtures and route counters. Record hardware, compiler, flags, source/include closure and benchmark identities. Existing immutable fixture data may be reused by hash; its A/B baseline must be the T baseline. |
+| T02 | Build a consumed-owner graph for the 38 exports, remaining launch packs and output sites. Mark already-shared/generated text, retained schedules, each exact scratch extent, dynamic scalar inputs and transfer/borrow lifetimes. Give each candidate a unique source-budget owner; classify actual production host eligibility. |
+| T03 | Add independent projection/argmax/RoPE fixtures before editing bodies. Include codec boundaries, tail rows/columns, bias and activation modes, negative/duplicate/tied indices, all-masked and nonfinite inputs where supported. Define mathematical references independently of the candidate and assert selected routes. |
+| T04 | Add expert/routing/BF16/packed fixtures: invalid or stale slots, unequal expert widths, top-k ties, empty/partial routes, repeated experts, arena offsets, BF16 narrowing, and one-/four-/eight-row packed outputs. Check poisoned guards, exact dynamic scratch, captured scalar mutation and retained inputs/results. |
+| T05 | Prototype one CUDA ordinary projection owner (T08 or T10), one Metal BF16 matching phase (T16), and one launch/result-owner migration (T25/T37). Measure net maintained cost, host allocations, direct timing and whole-model controls. Reject abstractions that increase resource budgets or short-row overhead. |
+| T06 | Admit prototypes independently, publish measured cohort budgets and freeze the expanded fixture/timing protocol. Prioritize accepted ordinary CUDA, Metal BF16 and host cohorts. Packed multirow and attention phases follow only after their narrower extraction is shown to preserve schedules. |
+
+### Wave B — ordinary CUDA native bodies (T07–T12)
+
+| ID | Concrete work and retained specialization |
+| --- | --- |
+| T07 | Share matching `linear_f32_qkv_nobias_tiled` / `linear_bf16_weight_f32_qkv_nobias_tiled` traversal with a static weight-load leaf. Keep conversion position, three projection widths, accumulator order, guards and output offsets identical. |
+| T08 | Give `linear_q4_k_f32_tiled`, `_bias_` and `_bias_quick_gelu_` one matching dot traversal with static publication leaves. Bias addition and quick-GELU expression order stay native; no materialized intermediate or runtime epilogue dispatch. |
+| T09 | Share Q4K pair/triple bias traversal through compile-time projection arity. Pair instances retain exactly two accumulator/weight/output planes. Do not allocate a third plane or route pair calls through triple publication. |
+| T10 | Share compatible Q8/Q4K/Q6K gated-down traversal and the matching ordinary Q6K phase, with existing format codecs and static gate/no-gate publication. Keep each block width, fold, scalar load location and actual shared partial extent. Ordinary Q8/Q4K owners already shared elsewhere are reference owners, not new savings. |
+| T11 | Consolidate `argmax_rows`, `argmax_last_row` and their suppression variants using static row selection and suppression leaves. Preserve tie ordering, NaN/infinity treatment, empty/suppressed outputs and exact index/value reduction trees. Test first/last ties and suppression changes in graph replay. |
+| T12 | Extract only identical angle/pair transform leaves between Qwen3-VL MRoPE and vision RoPE. Positions/sections, indexing, dtype, row layout and parameter acquisition remain distinct. Retain bodies if the leaf adds source or registers; this does not merge all RoPE schedules. |
+
+### Wave C — Metal indexed and matrix phases (T13–T18)
+
+| ID | Concrete work and retained specialization |
+| --- | --- |
+| T13 | Share indexed Q4_0 pair-linear / pair-activation traversal with compile-time publication. Keep expert-ID mapping, bounds, weight strides, paired stores and activation order explicit. Reuse existing Q4 codec/fold owners. |
+| T14 | Reuse matching Q4 acquisition/fold phases in `moe_slot_q4_0_gate_up` and `moe_slot_q4_0_down`, relating them to existing ordinary/indexed owners. Slot lookup, private-arena addressing, fail-closed zero publication and top-k row mapping stay at their native caller. Gate/up and down keep their different live accumulator extents. |
+| T15 | Share matching selection/weight phases of `moe_route_select_tg_register` and `_v2`. Preserve their distinct reduction/publication strategy, tie behavior, normalization and register storage. No maximum expert array or generic sorting path. |
+| T16 | Extract matching BF16 vector matrix load/decode/MMA phases from `apply_bf16_gate_up_mm_m64_n32_vec4` and `apply_linear_bf16_mm_m64_n32_vec4`. Keep exact tile arrays, barrier placement, narrowing and gate/up versus linear publication in native scope. |
+| T17 | Apply the qualified phase ownership to the corresponding two non-vec4 exports, using their existing scalar schedule. Do not promote scalar loads to vec4 or combine scalar/vector scratch just to reuse T16. |
+| T18 | Share the matching small-M `dot_general_2d_f32_small_m_rows4_cols8` / `_cols16` phases with static column extent. Preserve exact accumulator counts, tail masks and reduction order; demonstrate both small shapes and model-size controls. |
+
+### Wave D — packed and attention phases (T19–T24)
+
+| ID | Concrete work and retained specialization |
+| --- | --- |
+| T19 | Extract identical packed gate/up block-dot and quantization phases from E4B `pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4` / `_rows8_c2`. Keep four-row versus eight-row/column reuse schedules, actual arrays, barriers and quantization grouping local. Prefer native-scope fragments when inline helpers change CUDA shared-address instructions. |
+| T20 | Reuse only proven matching phases in the corresponding single-row `_ffn` export. Its publication and five-warp ownership remain separate. Do not repeat the previously rejected wholesale single-/multirow schedule merge. |
+| T21 | Share matching A4B `down_rows_q8_1_f32` / `_compact` block traversal with static row-map/output leaves. Keep compact row mapping, bounds, selected-expert offsets and output accumulation semantics exact. |
+| T22 | Reuse compatible packed gate/up partials in A4B `gate_up_rows_q8_1_f32` from current qualified owners. Expert lookup and per-route input mapping remain caller work. Count only newly removed A4B source, not an existing ordinary owner's body. |
+| T23 | Audit the two TurboQuant MMA prefill schedules for exact repeated staging/score/publication fragments. The proposed change is lexical/native-scope phase sharing, with expanded per-kernel identity as the first gate; it is not another whole-body template. Retain every different fragment, fragment count, barrier and shared offset. No change proceeds on resemblance alone. |
+| T24 | Extend existing Metal source-phase ownership to matching portions of `attention_f32_dense_causal_sg_q16_f16kv_gqa2`. Keep its Q16/GQA2 storage and schedule separate from S11 scalar attention. Prefer exact expanded text; do not reintroduce S11's rejected whole-body template or count S-owned phases again. |
+
+### Wave E — CUDA launch ownership (T25–T30)
+
+Use `kernel_abi.cuh` and `launch_abi.ArgumentsFor`; native signatures remain the
+single wire owner. New names or records must remove real local packing. Keep
+unique tuples when added macros/factories cost more. T02/T06 set the eligible
+count; the initial planning envelope is 60–100 regular launch-pack occurrences,
+not all 191. Every macro, constructor and reflection helper is charged.
+
+| ID | Concrete migration group and contract |
+| --- | --- |
+| T25 | Fill/copy/conversion launchers and repeated one-/two-buffer scalar arithmetic. Share only identical named field binding and count conversion, with existing byte-width admission and zero-work checks. |
+| T26 | Dense and quantized embedding/take-row launchers. Derive index/storage pointer types from native signatures; preserve signed versus unsigned indices, BF16 widening and table-byte extents. |
+| T27 | T07–T10 projection and fused-bias launchers. Reuse native dimension validation without a second operation catalogue. The output-count checks and failure order remain before launch. |
+| T28 | T11 argmax and remaining compatible suppress/reducer launch packing. Mutable output/index slots must point into the same live named record between passes and during capture. No temporary copy of a live address pack. |
+| T29 | Compatible copy/layout/vision packs, grouped by identical native ABI. Preserve branch-specific transpose packs, 29-field broadcast and scatter tuples unless measured sharing removes more code than it adds. |
+| T30 | Compatible attention/expert packs associated with T14/T19–T24. Captured device scalar pointers, optional buffers, offsets and delayed mutation keep their lifetime. Add no generic runtime argument builder or extra launch dispatch. |
+
+### Wave F — geometry and consumed descriptors (T31–T36)
+
+| ID | Concrete work and completion condition |
+| --- | --- |
+| T31 | Introduce one checked ordinary concat-axis geometry consumed by CPU, Metal and CUDA: output extents, prefix, per-input axis span and suffix. Keep CPU source-backed/imported fallback resolution and Metal device/donation decisions local. Existing S slice/gather/transpose geometry is reused unchanged. |
+| T32 | Share compatible resolved right-aligned binary/where output-shape calculation across actual adapters. Keep CPU's loose/imported compatibility, logical rank-zero behavior and backend dtype admission outside the common record. This only resolves metadata; it must not add broadcast materialization or readbacks. |
+| T33 | Consolidate checked dense element/byte extent conversion at real allocation and launch consumers. Distinguish F32, BF16, integers and packed quantized block storage; never infer packed bytes from dense element width. Preserve overflow/admission error contracts. |
+| T34 | Add a concat descriptor only with actual lowering and Metal/CUDA assigned invocation consuming T31. CPU primitive concat consumes the same geometry while retaining its optimized views/copies. Query/decline paths remain allocation-, readback- and submission-free. |
+| T35 | Add ordinary positive-slice descriptor consumption using existing `SliceAxis`, in lowering and the assigned accelerator adapters. Preserve view versus copy, symbolic limits and Metal clipping; keep unsupported/negative-stride paths explicit. Store only logical metadata needed by real consumers. |
+| T36 | Add ordinary axis-gather descriptor consumption using existing `GatherAxis` / `gatherShape`. Preserve index wire/dtype, scalar-index shape and backend bounds behavior. CPU gather-ND remains separate; do not enable currently unsupported CUDA integer generic gather as a side effect. |
+
+### Wave G — compatible owners and renderer phases (T37–T42)
+
+| ID | Concrete work and completion condition |
+| --- | --- |
+| T37 | Migrate compatible ordinary single-F32 CUDA copy/layout/embedding outputs to existing `OwnedF32Output`. Preserve shape-before-device allocation, buffer release policy and successful `createTensor` transfer; exclude source-backed, borrowed, prepared and multi-output lifetimes. |
+| T38 | Migrate compatible single-result CUDA vision/attention adapters after T37 fault/resource qualification. Keep auxiliary workspaces separately owned and preserve optional decline before side effects. Do not generalize mirrors, saved gradients, pinned capture frames or donation into a universal owner. |
+| T39 | Extend existing CPU `OwnedDenseOutput` to compatible ordinary activation/selection/conversion allocating branches. Dense-input view acquisition/cleanup stays ordered, and alias/view returns keep their owner. Preserve short-row allocation classes and CPU hot-loop instructions. |
+| T40 | Delete superseded cleanup only after every selected T37–T39 caller uses its owner. Exercise every partial host allocation, device-budget denial, failed launch/transfer and optional fallback. Require unchanged allocation counts and no new payload copy, pool, sync or stream transition. |
+| T41 | Audit repeated maintained CUDA renderer fragments across pair/down Q8 bodies and exact-F32 bodies. Extract matching emission phases while keeping codec-specific loops and schedules separate. E2B dimension variants already use one emitter and earn no new sharing credit. Prefer byte-identical per-kernel emission; charge every new generator helper. |
+| T42 | Share identical Metal flash-prefill emission fragments between ordinary and HD512 renderers. Keep their distinct scratch partition, matrix folds and threadgroup ownership. Generated per-export text identity is the initial gate; do not merge HD256/HD512 schedules. |
+
+### Wave H — compatibility retirement and final qualification (T43–T48)
+
+| ID | Concrete work and completion condition |
+| --- | --- |
+| T43 | Reconcile handwritten Florence Q4K NR4 with the existing generated small-batch owner. Share the exact common traversal only if original export, guards, parameter order, four-row schedule and runtime selection are preserved. Edit the renderer/maintained owner, regenerate copies, and charge all helper emission. Similar generated text alone is not a saving. |
+| T44 | Audit generated-to-runtime ABI/binding compatibility declarations against existing source contracts. Remove a duplicate declaration only when both real emitter and runtime launcher consume the existing contract. Keep one-off adapters if a new schema would add a parallel catalogue. Check every generated symbol and transitive include; close renderer buckets with measured retention if they add source. |
+| T45 | Freeze final sources/binaries; close native include/JIT/watch dependencies and compiler field/ABI assertions. Regenerate/check all three pinned CUDA images and generated regions; compile all generated Metal variants and the full expanded shader with the actual runtime compiler. |
+| T46 | Run the entire current 1,332-case Metal / 443-case CUDA direct corpus plus every new moved-phase fixture. Assert forced specialization routes, guards, scratch/resources, independent references, graph scalar mutation and failure cleanup. Run final static comparison for all 439 CUDA exports on seven targets. |
+| T47 | Qualify the full composed CPU/Metal/CUDA candidate: all 19 supported model cases, CPU/Metal independent decoder logits, CPU primitive/host-encoding controls, affected backward/training/lifetime suites and seven 120-second soaks. Compare existing failing GLiNER targets to frozen baseline failures; record unavailable portable PTX/model routes explicitly. |
+| T48 | Publish per-owner net authored/source/image ledgers against T01, final source/binary identities, package outcomes and all failed prototypes/controls. Complete coherent commits with a clean worktree and scoped cache cleanup. No previous campaign savings or generated-copy bytes enter the new authored-production total. No push/deployment. |
+
+### Execution order and performance admission
+
+Start T01–T06, then execute B and C as separate source cohorts. D follows its
+specific T04/T06 prototype admission. E consumes the native contracts of B–D;
+F may proceed independently after its geometry fixtures exist. G depends on
+eligible T02 sites and F geometry, and H closes all accepted cohorts. T43/T44
+can follow T41/T42 before the final freeze. Each cohort must delete superseded
+maintained code in the same change that introduces its replacement.
+
+Prefer fewer full qualification cycles: run independent direct/resource/error
+checks after each native cohort, affected launch/adapter controls after E–G,
+then one full model/soak composition at T45–T48. Early representative CPU,
+Metal and CUDA model controls still run at T05 and after a cohort changes its
+actual dispatch/ownership path. Do not overlap builds or GPU timings on the
+same host. Independent Mac and Spark work may run concurrently.
+
+Preserve the established gates: per-case direct source effect <= 1.05, model
+P50 <= 1.05 and P95 <= 1.10, exact baseline results where current paths are exact,
+and independent tolerances fixed before editing. Metal uses both pipeline
+creation orders and preserves all raw flags; the paired metric does not replace
+correctness/resource gates in either order. Establish A/A controls for new
+fixtures before candidate timing. Diagnose unstable controls; never repeat a
+failed benchmark until it happens to pass or widen a gate after seeing results.
+
+All seven CUDA targets retain exact native scratch extents and must not
+increase registers, stack, local/shared bytes or instruction counts without
+separate performance evidence and an explicit documented design decision.
+Matching source-fragment extraction should retain normalized instructions.
+The protected CPU hot functions retain their current alignment and schedule.
+No added tensor allocation, intermediate materialization, device readback,
+synchronization or stream transition is acceptable merely to simplify a caller.
+Capture/reset, retained results beyond frame capacity, strict residency,
+allocator teardown and failed-allocation cases remain part of acceptance.
+
+The baseline limitations are carried forward honestly: Spark cannot execute
+pinned PTX 9.2 with its current driver; Tiny Llama has no supported CUDA model
+profile; legacy GLiNER targets have known failures. Reproduce these at T01 and
+compare them at T47. Any newly introduced failure blocks its cohort. Existing
+limitations are not passing tests and are not silently expanded into unrelated
+feature work.
+
 ## Original checkpoint qualification
 
 Use repository-pinned Zig 0.17.0. Real Metal tests need access to the host GPU;
