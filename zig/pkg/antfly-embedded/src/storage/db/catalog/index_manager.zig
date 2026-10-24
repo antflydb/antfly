@@ -24687,11 +24687,11 @@ pub const IndexManager = struct {
         result.peak_task_alloc_bytes = @max(result.peak_task_alloc_bytes, @as(u64, @intCast(task.deletion_state.budget.peakTaskLiveBytes())));
     }
 
-    /// Native Io cancellation and runtime-boundary cancellation have the same
-    /// retry/shutdown semantics. Neither indicates a damaged merge source.
+    /// Cancellation and invalidated source fences retire the current task and
+    /// retry from a fresh view. Neither indicates a damaged merge source.
     pub fn isTextMergeCancellation(err: anyerror) bool {
         return switch (err) {
-            error.Canceled, error.Cancelled, error.EnrichmentWaitCanceled => true,
+            error.Canceled, error.Cancelled, error.EnrichmentWaitCanceled, error.EnrichmentSourceChanged => true,
             else => false,
         };
     }
