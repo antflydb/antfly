@@ -971,6 +971,10 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                     for hit in signed
                 )
         if layout == "files":
+            # Inspect and mutate one quiescent artifact namespace. Retention
+            # maintenance can rename staging files between is_file and read,
+            # and discovery must describe the same cold cut we remove below.
+            server.pause()
             page_objects = {}
             objects = {}
             documents = {}
@@ -1084,7 +1088,6 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                 record = json.loads(b"".join(value for _, value in sorted(chunks)))
                 unrelated.append(objects[record["route"]["descriptor"]["artifact_id"]])
             assert unrelated, "Fixture must have an unrelated serving descriptor"
-            server.pause()
             for cache_root in server.root.rglob("lake-ranges"):
                 if cache_root.is_dir():
                     shutil.rmtree(cache_root)
