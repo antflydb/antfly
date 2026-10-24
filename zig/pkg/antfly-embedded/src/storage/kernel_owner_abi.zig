@@ -60,7 +60,8 @@ const failure_abi = @import("runtime_failure_abi");
 // State retirement retains partial row, tree-node, vector and arena byte ownership.
 // Pin registration retains radix traversal and detached physical ownership.
 // Reject earlier kernel/native pin capabilities before decoding their headers.
-pub const abi_version: u32 = 176;
+// Registry construction and allocation provenance retain shared quota ownership.
+pub const abi_version: u32 = 177;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

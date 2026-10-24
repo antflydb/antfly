@@ -118,7 +118,8 @@ const builtin = @import("builtin");
 // State retirement retains partial row, tree-node, vector and arena byte ownership.
 // Path pins retain radix-group, cursor and detached-allocation ownership.
 // Reject earlier opaque pin owners before interpreting their native headers.
-pub const abi_version: u32 = 116;
+// Registry allocations retain their quota owner and physical release debt.
+pub const abi_version: u32 = 117;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

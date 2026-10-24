@@ -15,12 +15,16 @@ Original source baseline: `e4d707de5634a8d758c606b4432037e1a1682052` on
 branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
-The current merge includes `origin/main` through `beb332c973eaf78876f9ef798d3d959fe41f307d`
-(merge commit `66b5522209`).
+The current merge includes `origin/main` through `3f8eeafaaf`
+(merge commit `efac6d9d49`).
 
-Native ABI 51, storage-owner ABI 109, engine descriptor 29, required preparation
-file floor 10 and data-Raft protocol 28 fence persistent binding, original cohort handoff and typed
-recovery status. New stable SQL/HTTP sessions retain their original routed
+Private native ABI 117 and kernel-owner ABI 177 fence the current manager,
+registry and quota-owner contracts. Durable reader epochs and peer feature
+barriers remain defined by `reader_versions.zig` and `topology_protocol.zig`;
+the main merge preserves main's existing wire values and assigns distinct epochs
+to branch-only preparation features. Persistent binding, original cohort
+handoff and typed recovery status are implemented. New stable SQL/HTTP sessions
+retain their original routed
 cohort before BEGIN. Required status compares actual saved mode and binding and
 represents successful absence explicitly; read errors cannot authorize a fresh
 BEGIN or follower cleanup. Legacy terminal aborts remain final.

@@ -352,6 +352,8 @@ pub const Slice = enum(u8) {
     lsm_read_working_set,
     /// Concurrent SQL execution and retained delivery state share host admission.
     sql_execution_working_set,
+    /// Persistent process-shared path-pin metadata, independent of query scratch.
+    lsm_registry_metadata,
 
     pub fn name(self: Slice) []const u8 {
         return switch (self) {
@@ -391,6 +393,7 @@ pub const Slice = enum(u8) {
             .lake_range_cache_queue => "lake.range_cache_queue",
             .lsm_read_working_set => "lsm.read_working_set",
             .sql_execution_working_set => "sql.execution_working_set",
+            .lsm_registry_metadata => "lsm.registry_metadata",
         };
     }
 };
@@ -749,6 +752,7 @@ pub const Options = struct {
             .lake_range_cache_queue = .{ .soft_limit_bytes = 384 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
             .lsm_read_working_set = .{ .soft_limit_bytes = 64 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 },
             .sql_execution_working_set = .{ .soft_limit_bytes = 256 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
+            .lsm_registry_metadata = .{}, // The aggregate host envelope applies.
         }).values;
     }
 
@@ -791,6 +795,7 @@ pub const Options = struct {
             .lake_range_cache_queue = .{ .soft_action = .report, .hard_action = .reject_work },
             .lsm_read_working_set = .{ .soft_action = .report, .hard_action = .reject_work },
             .sql_execution_working_set = .{ .soft_action = .report, .hard_action = .reject_work },
+            .lsm_registry_metadata = .{ .soft_action = .report, .hard_action = .reject_work },
         }).values;
     }
 };
@@ -4572,14 +4577,38 @@ pub const ResourceManager = struct {
         defer self.mutex.unlock();
         if (control != null and !self.pressure_change.tryLock()) return error.ParentMemoryBusy;
         defer if (control != null) self.pressure_change.unlock();
+        try self.adoptReservationUsageLocked(reservation, destination, current, added, control != null);
+    }
+
+    /// Finite prepared-ledger adoption. No allocation, reclamation, waiting or
+    /// legacy parent callback; false leaves both owners unchanged. Suitable
+    /// while a stable metadata owner serializes its observer/debt fields.
+    pub fn tryAdoptPreparedUsageWithAdmission(self: *ResourceManager, reservation: *Reservation, destination: Slice, current: *u64, added: u64, control: read_admission.Port) !bool {
+        try control.checkLifetime();
+        if (!self.mutex.tryLock()) return false;
+        defer self.mutex.unlock();
+        try control.checkLifetime();
+        if (!self.pressure_change.tryLock()) return false;
+        defer self.pressure_change.unlock();
+        if (reservation.identity == 0 or added > reservation.bytes or
+            !self.observer_identities.contains(.{ .slice = destination, .identity = @intFromPtr(current) }))
+            return error.ResourceAccountingMismatch;
+        self.adoptReservationUsageLocked(reservation, destination, current, added, true) catch |cause| {
+            if (cause == error.ParentMemoryBusy) return false;
+            return cause;
+        };
+        return true;
+    }
+
+    fn adoptReservationUsageLocked(self: *ResourceManager, reservation: *Reservation, destination: Slice, current: *u64, added: u64, bounded_parent: bool) !void {
         if (reservation.manager != self or reservation.released or !reservation.host_charge) return error.ResourceAccountingMismatch;
-        const source_owned = try self.reservationIdentityLocked(reservation, control != null);
+        const source_owned = try self.reservationIdentityLocked(reservation, bounded_parent);
         const credit = @min(reservation.bytes, added);
         const key: ObserverKey = .{ .slice = destination, .identity = @intFromPtr(current) };
         var inserted = false;
         const observed = self.observer_identities.getPtr(key) orelse blk: {
             if (current.* != 0) return error.ResourceAccountingMismatch;
-            const entry = try self.observer_identities.getOrPutWithParentPolicy(self, key, control != null);
+            const entry = try self.observer_identities.getOrPutWithParentPolicy(self, key, bounded_parent);
             entry.value_ptr.* = .{ .current = 0 };
             inserted = true;
             break :blk entry.value_ptr;
@@ -4606,7 +4635,7 @@ pub const ResourceManager = struct {
         // growth needs new capacity; admit it before publishing either owner.
         // Failure leaves the reservation and observer unchanged.
         if (added > credit) {
-            if (control != null) try self.reserveParentWithoutWaiting(added - credit) else try self.reserveParentLocked(added - credit);
+            if (bounded_parent) try self.reserveParentWithoutWaiting(added - credit) else try self.reserveParentLocked(added - credit);
         }
         source.used_bytes -= credit;
         target.used_bytes = target_next;
@@ -4618,7 +4647,7 @@ pub const ResourceManager = struct {
         observed.host_current = observed_next;
         current.* = observed_next;
         self.commitMemoryLocked(memory_next);
-        if (control != null) self.pressure_change.advanceLocked() else self.pressure_change.advance();
+        if (bounded_parent) self.pressure_change.advanceLocked() else self.pressure_change.advance();
     }
 
     pub fn adjustUsage(self: *ResourceManager, slice: Slice, current: *u64, next: u64) !void {
@@ -5548,6 +5577,14 @@ pub const ConstructionCredit = struct {
         if (bytes > credit.bytes) return error.ResourceBudgetExceeded;
         if (bytes == 0) return control.checkpoint();
         try self.manager.adoptReservationUsageWithAdmission(credit, destination, current, bytes, control);
+    }
+
+    pub fn tryAdoptPreparedUsageWithAdmission(self: *ConstructionCredit, destination: Slice, current: *u64, bytes: u64, control: read_admission.Port) !bool {
+        try control.checkLifetime();
+        const slot = self.slot orelse return error.ReservationReleased;
+        const credit = &slot.credit.?;
+        if (bytes > credit.bytes) return error.ResourceBudgetExceeded;
+        return self.manager.tryAdoptPreparedUsageWithAdmission(credit, destination, current, bytes, control);
     }
 
     /// Transfer successful construction credit to the published physical owner.

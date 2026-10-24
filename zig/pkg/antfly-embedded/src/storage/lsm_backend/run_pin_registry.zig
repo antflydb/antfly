@@ -23,6 +23,8 @@ const std = @import("std");
 const platform = @import("antfly_platform");
 const admission = @import("../../common/read_admission.zig");
 const Counter = platform.atomic.Value(u64);
+const quota = @import("pin_quota.zig");
+const resources = @import("../resource_manager.zig");
 pub const quantum = 16 * 1024;
 var default_epoch: Counter = .init(0);
 var single_allocator: std.heap.DebugAllocator(.{ .thread_safe = false }) = .init;
@@ -37,6 +39,7 @@ const Record = struct {
     previous: ?*Record = null,
     next: ?*Record = null,
     registered: bool = false, // Registry-mutex protected.
+    quota_owner: ?*quota.Owner = null,
     fn allocate(registry: *Registry, length: usize) !*Record {
         const bytes = try std.math.add(usize, @sizeOf(Record), length);
         const raw = registry.allocator.rawAlloc(bytes, .of(Record), @returnAddress()) orelse return error.OutOfMemory;
@@ -64,12 +67,14 @@ const Record = struct {
         registry: ?*Registry = null,
         bytes: ?[]u8 = null,
         offset: usize = 0,
+        quota_owner: ?*quota.Owner = null,
         fn init(pin: *Record) @This() {
             const registry = pin.registry;
+            const funding = pin.quota_owner;
             const bytes = @as([*]u8, @ptrCast(pin))[0 .. @sizeOf(Record) + pin.path_len];
             if (pin.index_refs.fetchSub(1, .acq_rel) != 1) return .{};
             std.debug.assert(!pin.registered and pin.refs.load(.acquire) == 0);
-            return .{ .registry = registry, .bytes = bytes };
+            return .{ .registry = registry, .bytes = bytes, .quota_owner = funding };
         }
         fn step(self: *@This(), original: ?admission.Port) !void {
             if (self.bytes) |bytes| {
@@ -83,6 +88,7 @@ const Record = struct {
                 const registry = self.registry.?;
                 registry.allocator.rawFree(bytes, .of(Record), @returnAddress());
                 _ = registry.live_bytes.fetchSub(bytes.len, .release);
+                if (self.quota_owner) |owner| owner.reportFreed(bytes.len);
                 self.bytes = null;
             }
         }
@@ -95,6 +101,7 @@ const Group = struct {
     generation: u64 = 0,
     head: ?*Record = null,
     registered: bool = false,
+    quota_owner: ?*quota.Owner = null,
     fn borrow(self: *Group) *Group {
         _ = self.refs.fetchAdd(1, .monotonic);
         return self;
@@ -103,12 +110,14 @@ const Group = struct {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         std.debug.assert(!self.registered and self.head == null);
         const registry = self.registry;
+        const funding = self.quota_owner;
         registry.allocator.destroy(self);
         _ = registry.live_bytes.fetchSub(@sizeOf(Group), .release);
+        if (funding) |owner| owner.reportFreed(@sizeOf(Group));
     }
 };
 const Link = union(enum) { group: *Group, branch: *Branch };
-const Branch = struct { bit: u6 = 0, children: [2]?Link = @splat(null) };
+const Branch = struct { bit: u6 = 0, children: [2]?Link = @splat(null), quota_owner: ?*quota.Owner = null };
 fn side(hash: u64, bit: u6) usize {
     return @intCast((hash >> (63 - bit)) & 1);
 }
@@ -261,6 +270,9 @@ pub const Operation = struct {
     pending_drop: ?Record.Retirement = null,
     found: bool = false,
     bound: ?u64 = null,
+    funder: ?*quota.Owner = null,
+    credit: ?resources.ConstructionCredit = null,
+    adopted: bool = false,
     new_pin: ?*Record = null,
     copy_offset: usize = 0,
     new_group: ?*Group = null,
@@ -346,10 +358,43 @@ pub const Operation = struct {
         self.bound = bytes;
         return bytes;
     }
+    /// Retains the quota authority before reserving construction. It cannot
+    /// close while this builder or any transferred allocation remains alive.
+    pub fn resumeFundedWithAdmission(self: *@This(), owner: *quota.Owner, original: admission.Port) !void {
+        try original.checkpoint();
+        if (self.retiring or self.retired or self.committed) return error.InvalidArgument;
+        const bytes = try self.planWithAdmission(original);
+        if (bytes != 0) {
+            if (self.funder == null) self.funder = try owner.acquireWithAdmission(original);
+            if (self.funder.? != owner) return error.InvalidArgument;
+            if (self.credit == null and !self.adopted) self.credit = try owner.manager.reserveConstructionWithAdmission(quota.slice, bytes, original);
+        }
+        try self.resumeWithAdmission(original);
+    }
+    pub fn publishFundedWithAdmission(self: *@This(), original: admission.Port) !void {
+        try original.checkpoint();
+        if (self.retiring or self.retired or self.committed or !self.ready) return error.InvalidArgument;
+        if (self.bound.? != 0 and !self.adopted) {
+            const owner = self.funder orelse return error.ResourceBudgetExceeded;
+            var bytes: u64 = 0;
+            if (self.new_pin) |pin| bytes += @sizeOf(Record) + pin.path_len;
+            if (self.new_group != null) bytes += @sizeOf(Group);
+            if (self.new_branch != null) bytes += @sizeOf(Branch);
+            try owner.adoptWithAdmission(&self.credit.?, bytes, original);
+            // No fallible work between adoption and allocation provenance.
+            if (self.new_pin) |pin| pin.quota_owner = owner.retainAllocation();
+            if (self.new_group) |group| group.quota_owner = owner.retainAllocation();
+            if (self.new_branch) |branch| branch.quota_owner = owner.retainAllocation();
+            self.adopted = true;
+            self.credit.?.retire();
+            self.credit = null;
+        }
+        try self.publishWithAdmission(original);
+    }
     pub fn resumeWithAdmission(self: *@This(), original: ?admission.Port) !void {
         try checkpoint(original);
         if (self.retiring or self.retired or self.committed) return error.InvalidArgument;
-        if (self.bound == null) return error.ResourceBudgetExceeded;
+        if (self.bound == null or (self.funder != null and self.credit == null and !self.adopted)) return error.ResourceBudgetExceeded;
         if (self.ready) return;
         if (self.mode == .retain and !self.found) {
             if (self.new_pin == null) {
@@ -385,6 +430,7 @@ pub const Operation = struct {
     pub fn publishWithAdmission(self: *@This(), original: ?admission.Port) !void {
         try checkpoint(original);
         if (self.retiring or self.retired or self.committed or !self.ready) return error.InvalidArgument;
+        if (self.funder != null and !self.adopted) return error.ResourceBudgetExceeded;
         while (true) {
             try self.registry.lock(original);
             {
@@ -471,8 +517,10 @@ pub const Operation = struct {
     fn freeBranch(self: *@This(), slot: *?*Branch, original: ?admission.Port) !void {
         if (slot.*) |branch| {
             try checkpoint(original);
+            const funding = branch.quota_owner;
             self.registry.allocator.destroy(branch);
             _ = self.registry.live_bytes.fetchSub(@sizeOf(Branch), .release);
+            if (funding) |owner| owner.reportFreed(@sizeOf(Branch));
             slot.* = null;
         }
     }
@@ -509,6 +557,13 @@ pub const Operation = struct {
             try checkpoint(original);
             group.release();
             self.group = null;
+        }
+        if (self.credit) |*credit| credit.retire();
+        self.credit = null;
+        if (self.funder) |owner| {
+            if (original) |port| try owner.reconcileWithAdmission(port) else owner.reconcileJoined();
+            owner.releaseBorrow();
+            self.funder = null;
         }
         self.retired = true;
     }
@@ -800,4 +855,188 @@ test "controlled physical sync pin registry lock contention uses original progre
     try operation.publishWithAdmission(original);
     (try operation.takePinWithAdmission(original)).release();
     try operation.retireWithAdmission(original);
+}
+
+const FundedWitness = struct {
+    manager: *resources.ResourceManager,
+    live: usize = 0,
+    calls: usize = 0,
+    fail_at: usize = std.math.maxInt(usize),
+    fn paid(self: *@This()) u64 {
+        return self.manager.sliceStats(quota.slice).used_bytes - @sizeOf(quota.Owner);
+    }
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+    }
+    fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.paid() >= self.live + len);
+        const at = self.calls;
+        self.calls += 1;
+        if (at == self.fail_at) return null;
+        const ptr = std.testing.allocator.rawAlloc(len, alignment, ra) orelse return null;
+        self.live += len;
+        return ptr;
+    }
+    fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.paid() >= self.live);
+        std.testing.allocator.rawFree(bytes, alignment, ra);
+        self.live -= bytes.len;
+    }
+};
+fn fundedExercise(path: []const u8, stage: enum { construct, publish, take, abort, close }, target: usize, abandon: bool) !usize {
+    const a = std.testing.allocator;
+    const manager = try resources.SharedResourceManager.create(a, .{ .identity_allocator = a });
+    var manager_owned = true;
+    defer if (manager_owned) manager.releaseOwned(a);
+    var close: quota.Close = .{};
+    defer close.deinitJoined();
+    var creator = try quota.Creation.init(a, manager, &close, null);
+    defer creator.deinitJoined();
+    var fault: Fault = .{ .failure = switch (target % 3) {
+        0 => error.Canceled,
+        1 => error.DeadlineExceeded,
+        else => error.FileNotFound,
+    } };
+    const payload = fault.payload();
+    const original = admission.Port.init(&payload);
+    try creator.resumeWithAdmission(original);
+    const owner = try creator.takeWithAdmission(original);
+    // Public/backend manager ownership ends; allocation and ledger operations
+    // must continue using the quota authority's independent retained lifetime.
+    manager.releaseOwned(a);
+    manager_owned = false;
+    var witness: FundedWitness = .{ .manager = manager };
+    var registry: Registry = .{ .allocator = witness.allocator() };
+    defer registry.deinitJoined();
+    var operation = Operation.init(&registry, path, .retain);
+    defer operation.deinit();
+    if (stage != .construct) try operation.resumeFundedWithAdmission(owner, original);
+    if (stage == .publish and target == std.math.maxInt(usize)) try std.testing.expectError(error.ResourceBudgetExceeded, operation.publishWithAdmission(original));
+    if (stage == .take or stage == .abort or stage == .close) try operation.publishFundedWithAdmission(original);
+    var pin: ?*Record = null;
+    if (stage == .close) {
+        (try operation.takePinWithAdmission(original)).release();
+        try operation.retireWithAdmission(original);
+        registry.deinitJoined();
+        try owner.reconcileWithAdmission(original);
+    }
+    fault.checks = 0;
+    fault.at = target;
+    const result: anyerror!void = switch (stage) {
+        .construct => operation.resumeFundedWithAdmission(owner, original),
+        .publish => operation.publishFundedWithAdmission(original),
+        .take => blk: {
+            pin = operation.takePinWithAdmission(original) catch |err| break :blk err;
+            break :blk {};
+        },
+        .abort => operation.retireWithAdmission(original),
+        .close => close.resumeWithAdmission(original),
+    };
+    const checks = fault.checks;
+    if (target == std.math.maxInt(usize)) try result else try std.testing.expectError(fault.failure, result);
+    if (stage == .close) {
+        try close.resumeWithAdmission(original);
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(quota.slice).used_bytes);
+        return checks;
+    }
+    if (!abandon and stage != .abort) {
+        if (!operation.committed) {
+            try operation.resumeFundedWithAdmission(owner, original);
+            try operation.publishFundedWithAdmission(original);
+        }
+        if (pin == null) pin = try operation.takePinWithAdmission(original);
+    }
+    if (pin) |output| output.release();
+    if (abandon and target % 2 == 0) operation.deinit() else try operation.retireWithAdmission(original);
+    registry.deinitJoined();
+    try owner.reconcileWithAdmission(original);
+    try std.testing.expectEqual(@as(usize, 0), witness.live);
+    try std.testing.expectEqual(@as(u64, @sizeOf(quota.Owner)), close.usage);
+    try close.resumeWithAdmission(original);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(quota.slice).used_bytes);
+    return checks;
+}
+
+test "controlled physical sync funded registry retains every original construction adoption publication and close rejection after backend release" {
+    const a = std.testing.allocator;
+    const path = try a.alloc(u8, 2 * quantum + 13);
+    defer a.free(path);
+    @memset(path, 'f');
+    inline for (.{ .construct, .publish, .take, .abort, .close }) |stage| {
+        const checks = try fundedExercise(path, stage, std.math.maxInt(usize), false);
+        for (0..checks) |at| for ([_]bool{ false, true }) |abandon| {
+            _ = try fundedExercise(path, stage, at, abandon);
+        };
+    }
+}
+
+test "controlled physical sync funded registry refuses metadata quota before allocation and cannot bypass adoption" {
+    const a = std.testing.allocator;
+    var budgets = resources.Options.defaultBudgets();
+    budgets[@backingInt(quota.slice)] = .{ .hard_limit_bytes = @sizeOf(quota.Owner) + 1 };
+    const manager = try resources.SharedResourceManager.create(a, .{ .identity_allocator = a, .budgets = budgets });
+    defer manager.releaseOwned(a);
+    var close: quota.Close = .{};
+    defer close.deinitJoined();
+    var creator = try quota.Creation.init(a, manager, &close, null);
+    defer creator.deinitJoined();
+    var fault: Fault = .{};
+    const payload = fault.payload();
+    const original = admission.Port.init(&payload);
+    try creator.resumeWithAdmission(original);
+    const owner = try creator.takeWithAdmission(original);
+    var witness: FundedWitness = .{ .manager = manager };
+    var registry: Registry = .{ .allocator = witness.allocator() };
+    defer registry.deinitJoined();
+    var operation = Operation.init(&registry, "quota-refusal", .retain);
+    defer operation.deinit();
+    try std.testing.expectError(error.ResourceBudgetExceeded, operation.resumeFundedWithAdmission(owner, original));
+    try std.testing.expectEqual(@as(usize, 0), witness.calls);
+    try std.testing.expectError(error.ResourceBudgetExceeded, operation.resumeWithAdmission(original));
+    try operation.retireWithAdmission(original);
+    try close.resumeWithAdmission(original);
+}
+
+test "controlled physical sync funded registry actual allocation failures retain prepaid cleanup through retry and abandonment" {
+    const a = std.testing.allocator;
+    const path = try a.alloc(u8, 2 * quantum + 13);
+    defer a.free(path);
+    @memset(path, 'o');
+    // Missing-key construction allocates a record/path, group, then branch.
+    for (0..3) |at| for ([_]bool{ false, true }) |abandon| {
+        const manager = try resources.SharedResourceManager.create(a, .{ .identity_allocator = a });
+        defer manager.releaseOwned(a);
+        var close: quota.Close = .{};
+        defer close.deinitJoined();
+        var creator = try quota.Creation.init(a, manager, &close, null);
+        defer creator.deinitJoined();
+        var fault: Fault = .{};
+        const payload = fault.payload();
+        const original = admission.Port.init(&payload);
+        try creator.resumeWithAdmission(original);
+        const owner = try creator.takeWithAdmission(original);
+        var witness: FundedWitness = .{ .manager = manager, .fail_at = at };
+        var registry: Registry = .{ .allocator = witness.allocator() };
+        defer registry.deinitJoined();
+        var operation = Operation.init(&registry, path, .retain);
+        defer operation.deinit();
+        try std.testing.expectError(error.OutOfMemory, operation.resumeFundedWithAdmission(owner, original));
+        try std.testing.expectEqual(at + 1, witness.calls);
+        try std.testing.expectEqual(@as(usize, 0), registry.key_count);
+        try std.testing.expect(witness.paid() >= witness.live);
+        if (!abandon) {
+            try operation.resumeFundedWithAdmission(owner, original);
+            try operation.publishFundedWithAdmission(original);
+            (try operation.takePinWithAdmission(original)).release();
+        }
+        try operation.retireWithAdmission(original);
+        registry.deinitJoined();
+        try owner.reconcileWithAdmission(original);
+        try std.testing.expectEqual(@as(usize, 0), witness.live);
+        try std.testing.expectEqual(@as(u64, @sizeOf(quota.Owner)), close.usage);
+        try close.resumeWithAdmission(original);
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(quota.slice).used_bytes);
+    };
 }

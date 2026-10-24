@@ -172,6 +172,7 @@ var obsolete_path_refs = ObsoletePathRefRegistry{};
 // borrows separately from open-manifest ownership so compaction can retire
 // each generation as soon as its own last reader exits, without waiting for a
 // backend-wide reader-free instant.
+pub const PinQuota = @import("lsm_backend/pin_quota.zig");
 const run_pin_registry = @import("lsm_backend/run_pin_registry.zig");
 const RunSnapshotRefRegistry = run_pin_registry.Registry;
 

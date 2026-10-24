@@ -27,6 +27,7 @@ test {
     _ = @import("storage/lsm_backend/run_metadata_clone.zig");
     _ = @import("storage/lsm_backend/run_snapshot_clone.zig");
     _ = @import("storage/lsm_backend/run_pin_registry.zig");
+    _ = @import("storage/lsm_backend/pin_quota.zig");
     _ = @import("storage/lsm_backend/state_clone.zig");
     _ = @import("storage/lsm_backend/directory_index_preparation.zig");
     _ = @import("storage/lsm_backend/run_comparison.zig");

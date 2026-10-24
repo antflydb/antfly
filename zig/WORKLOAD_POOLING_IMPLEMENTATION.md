@@ -27079,3 +27079,89 @@ handoff, checkpoint-location assertions, empty-group borrowing and private ABI
 116/176 guards. Full GNU qualification remains waived. Stable process/host
 quota ownership and the remaining funded/registered coordinator, cleanup,
 relief and default-design qualification remain incomplete.
+
+### Retained quota authority for registry allocation ownership
+
+`PinQuota` adds a stable quota owner, a retained construction cursor and a
+caller-prepaid close cursor. Construction retains a shared resource manager,
+reserves its owner header before allocation, and prepares the close cursor's
+observer before publishing the owner. The observer lives outside the owner
+allocation, so physical teardown needs no new accounting identity and cannot
+leave a ledger pointer into a freed header. A manager with a borrowed ancestor
+also requires an explicit matching ancestor-lifetime retention. Unretained
+managers and missing/mismatched ancestor guards are rejected before ownership
+transfer. The process/host keeps the close cursor alive through joined release.
+
+The appended `lsm.registry_metadata` slice preserves existing resource IDs and
+uses the aggregate host envelope by default; its slice limit remains separately
+configurable. Header and key construction reserve directly in that slice, so
+the retained destination's limit rejects construction before allocation.
+`resumeFundedWithAdmission` retains the quota authority and reserves the entire
+planned additional bound before invoking registry allocation. Publication
+adopts the actual private allocations into the preprepared observer, attaches
+an allocation-owned quota reference without another fallible step, and then
+performs the radix commit. Retrying a rejected publication cannot adopt twice.
+The plain CPU path refuses to bypass a started funding/adoption sequence.
+Existing-key retain/query/release/forget need no new physical allocation.
+
+Records, groups and branches carry their physical allocation's origin quota
+owner. Sharing a key across backends shares that charge; detaching an index
+entry does not release its capacity while a cursor still owns the bytes.
+Physical free reports release debt and drops the allocation reference without
+calling a parent, waiting, or destroying the manager. Reconciliation preserves
+all remaining charge across child-ledger, parent and notification contention.
+A finite prepared-adoption primitive avoids waiting, allocating or invoking a
+legacy parent callback under the quota-owner lock; cooperative progress occurs
+after releasing that lock. Original lifetime checks precede ledger effects.
+
+Close stops new builders, lets admitted builders finish or abandon, and refuses
+physical destruction while any builder/allocation reference remains. It drains
+reported debt and marks the owner header against its already prepared external
+observer. Physical header destruction runs after releasing the accounting lock,
+with its full charge retained as debt until destruction finishes. This permits
+same-manager allocator accounting during free without recursive ledger locking.
+The caller also retains the allocator authority through this cursor; arbitrary
+borrowed allocator lifetimes are not supplied by the manager guard. The shared
+manager and ancestor retention survive even that physical
+free, until explicit joined close releases them in child-to-parent order.
+Joined fallback handles a legacy parent that cannot provide bounded release;
+ordinary admitted calls preserve that debt and return the original error or
+unsupported-capability result.
+
+Private native ABI 117 and kernel-owner ABI 177 reject earlier manager, slice,
+registry and quota-owner contracts. Public C layouts and durable formats are
+unchanged. Existing joined registry drivers remain available; process/host
+binding, quota-owner/close registration in the complete retirement graph,
+funded payload assembly, coupled backend publication and default qualification
+remain required. No unretained host parent is silently accepted to enable a
+default. The full design remains incomplete and full GNU qualification remains
+waived.
+
+
+Final quota qualification (`funded-pin-registry-v4`) passes 53/53 Debug steps
+and all 127 physical-sync cases, including eight funded-registry/quota tests.
+The final-source ReleaseFast run passes 63/63 steps and all 127 physical-sync,
+171 table/codec and 74 WAL-recovery cases. Both receipts pass four Bloom and
+45/1/8 original-error companions, with no skips, failures or leaks.
+
+V3 regression qualification passes 60/60 steps and 59 directory/state, pin,
+reader, close, checkpoint, OOM and resource-manager adoption cases. V3 boundary
+qualification passes 80/80 steps, 32 owner-close, 170 table/codec, 74 recovery
+and 18 ABI checks. The only native source difference after those two runs is
+`pin_quota.zig`: V4 moves the fixed-size header free outside the accounting
+lock and adds the allocator-reentry test. The shared accounting refactor,
+registry, directory, recovery and ABI source inputs remain byte-identical to
+their V3 checks. The archived V3 quota source and V4 diff preserve that scope;
+the V3 receipts do not claim to qualify the new header-free body.
+
+All 5,633 native/schema input hashes and log digests in the V4 receipts
+match final native source. Eight tests cover original rejection and retry at
+every construction/adoption/publication/take/abort/close checkpoint, metadata
+refusal before registry allocation, actual OOM at all three registry allocations,
+constructor OOM, backend-manager release, retained ancestor/debt ownership with
+busy or unsupported bounded parent release, and raw/budgeted allocator reentry
+during charged header retirement. Formatting, whitespace and the new module's
+Apache header pass. Source snapshots include both design documents. Process/host
+binding, allocator/close registration in the complete retirement graph, funded
+payload assembly, coupled publication and full default qualification remain
+required; the full design is incomplete and full GNU qualification remains waived.
