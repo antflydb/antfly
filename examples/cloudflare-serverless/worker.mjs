@@ -142,7 +142,7 @@ export default {
       }
       return Response.json(result, env.WORKER_VERSION ? {headers: {"X-Antfly-Version": env.WORKER_VERSION.id}} : undefined);
     } catch (error) {
-      const retryable = error instanceof Busy || /\bSQLITE_NOMEM\b/.test(String(error));
+      const retryable = error instanceof Busy || /\b(SQLITE_NOMEM|ObjectStoreTransportFailed|ObjectStoreRateLimited)\b/.test(String(error));
       return Response.json({ error: String(error.message ?? error) }, { status: retryable ? 503 : 409,
         headers: retryable ? { "Retry-After": "1" } : undefined });
     }

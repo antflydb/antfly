@@ -68,6 +68,7 @@ test("workerd persists R2 pages and coordinated commits across restart", { timeo
         const sent = [];
         const localEnv = { ...env, MAINTENANCE: { async send(value) { sent.push(value); } } };
         if (path === "/test/compaction-limit") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, COMPACTION_MAX_DOCUMENTS: "0"}, ctx);
+        if (path === "/test/sql-object-pressure") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, COMMITS: {getByName() {return {async objectCall() {throw new Error("out of memory: SQLITE_NOMEM");}};}}}, ctx);
         if (path === "/test/sql-pressure") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, COMMITS: {getByName() {return {async collection() {throw new Error("out of memory: SQLITE_NOMEM");}};}}}, ctx);
         if (path === "/test/reindex") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, ANTFLY_INCARNATION: "test-reindex", PUBLICATION_RECORDS: "8"}, ctx);
         if (path === "/test/guard") return Response.json(await env.COMMITS.getByName("test-guard").testGuardedProgress());
@@ -209,6 +210,8 @@ test("workerd persists R2 pages and coordinated commits across restart", { timeo
     assert.equal((await call(mutation)).visibility, committed.visibility, "GC must preserve old retry receipts");
     const sqlPressure = await mf.dispatchFetch("https://example.test/test/sql-pressure", {method: "POST", headers: {Authorization: "Bearer local-test"}, body: JSON.stringify({op: "collect"})});
     assert.equal(sqlPressure.status, 503); assert.equal(sqlPressure.headers.get("Retry-After"), "1");
+    const sqlObjectPressure = await mf.dispatchFetch("https://example.test/test/sql-object-pressure", {method: "POST", headers: {Authorization: "Bearer local-test"}, body: JSON.stringify({op: "status"})});
+    assert.equal(sqlObjectPressure.status, 503); assert.equal(sqlObjectPressure.headers.get("Retry-After"), "1");
     let largeJournal;
     for (let i = 0; i < 100; i++) {
       const response = await mf.dispatchFetch("https://example.test/test/journal-scale");

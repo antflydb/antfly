@@ -326,3 +326,46 @@ also has database/process memory admission. Neither fact identifies the cause of
 the earlier production-host error. Keep cursor draining, bounded frontier work,
 retryable 503 responses and the new non-writing pressure diagnostics; collect
 those diagnostics if the error recurs under combined application load.
+
+The extended 10,000-row run also completed a rebuild with a fresh WASM instance
+for every step: peak native working memory 3,898,084 B, peak linear memory
+15,204,352 B, and at most 818 object operations per step. The whole local rebuild
+took 158.5 seconds; initial ingestion/publication took 227.3 seconds. These
+wall times include a shared development machine and in-memory R2-contract
+fixture, not deployed storage latency.
+
+The five held-out random-vector queries exposed a material ANN limitation:
+mean recall@10 at 10,000 rows was 0.18 with eight requested probes and 0.66 with
+32. At 1,000 rows the corresponding means were 0.78 and 0.96. These are
+small synthetic samples and do not establish recall equivalence with flat
+global clustering.
+Keep the paged vector profile opt-in. Higher probe/effort settings trade more
+cluster reads for recall; production rollout needs distribution-specific recall
+and latency targets, and a globally trained or hierarchical routing design if
+those targets cannot fit the request budget. The current shard design bounds
+updates and rebuild memory; it does not finish that ANN-quality work. A follow-up
+on the merged build measured mean raw-cosine recall@10 of 0.84 with
+`search_effort: 1`. That visits all routing clusters but retains native quantized
+candidate selection and integer score/tie ordering; it is not a brute-force
+exact-query mode. This five-query sample does not identify how much of the
+remaining difference comes from candidate selection versus score ties.
+
+Native regression validation passed 558 serverless tests (six skipped), 28
+shared engine tests and ten runtime ownership tests without failures or leaks.
+Focused page/ranking/reindex tests passed with the native testing allocator.
+The workerd restart suite also completed collection while retaining a partial
+reindex whose source had fallen behind the live head's parent, then resumed
+and published its concurrent WAL changes. Host fault tests cover checkpoint
+write failure and lost HEAD acknowledgement. Guarded metadata writes reject
+stale HEAD ETags in real coordinator transactions and unsupported providers
+fail closed.
+
+The merged-tree workerd run passed pressure injection through both collection
+RPCs and ordinary object RPCs. Native transport/rate-limit errors return 503
+with `Retry-After`, preserving retry of idempotent writes when the original
+SQLite message has been translated by the WASM ABI. Coordinator diagnostics
+cover both RPC paths. The merged tree also passed all 45 host tests, 14 focused
+native page/ranking/reindex tests with no leaks, the guarded-provider rejection
+contract, 13 portable native contracts, the storage test audit, license headers
+and Apache product boundaries. Both Binaryen 132 packaging paths built valid
+WASM; the final merged artifact was checked in real workerd.

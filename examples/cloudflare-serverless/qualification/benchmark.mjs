@@ -145,10 +145,10 @@ for (const count of sizes) {
           const query = vectorFor(count + q);
           const exact = corpus.map((v, i) => ({i, score: v.reduce((sum, value, d) => sum + value * query[d], 0)})).sort((l, r) => r.score-l.score || l.i-r.i).slice(0, 10);
           const expected = new Set(exact.map(({i}) => `doc/${String(i).padStart(6,"0")}`));
-          for (const probes of [8, 32]) {
+          for (const probes of [8, 32, "all"]) {
             await reopen();
-            const result = await call("search", {mode: "vector", vector: query, limit: 10, num_probes: probes});
-            recall.push({query: q, num_probes: probes, recall_at_10: result.hits.filter(hit => expected.has(hit.doc_id)).length / expected.size});
+            const result = await call("search", {mode: "vector", vector: query, limit: 10, num_probes: probes === "all" ? 2 : probes, search_effort: probes === "all" ? 1 : null});
+            recall.push({query: q, num_probes: probes, search_effort: probes === "all" ? 1 : null, recall_at_10: result.hits.filter(hit => expected.has(hit.doc_id)).length / expected.size});
           }
         }
       });

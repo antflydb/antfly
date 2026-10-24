@@ -62,3 +62,32 @@ before upgrading format-1 indexed WAL HEADs and enabling automatic collection.
 The older whole-log object WAL is unaffected. Retry receipts are retained
 indefinitely; their metadata grows with unique operations. This collector does
 not implement an expiring idempotency window or claim constant lifetime storage.
+
+## Active reindex checkpoints
+
+A hosted reindex publishes an immutable state artifact and a small
+`progress/<namespace>/REINDEX` pointer. Both share the native publication domain
+and fencing epoch. The pointer's conditional update compares its old ETag and
+the live `HEAD` ETag in one coordinator transaction. A preceding lease check
+followed by an ordinary pointer CAS would permit a stale worker to install
+roots after the collector's barrier; the cross-key guard closes that race.
+Providers without that transactional capability reject the write.
+
+Preparation reads the active checkpoint under the namespace work lease before
+retiring that epoch. It includes the source manifest and checkpoint artifact
+in its roots, lowers the proposed manifest retirement floor to the source
+version, and traces the checkpoint's staged facts/text/sparse/vector references.
+The source and staged manifests also preserve the required WAL prefix. A step
+that resumes after the barrier either publishes under a newer native epoch or
+fails its guarded pointer CAS. Collection may run between every pair of steps.
+
+Checkpoint expiry is ten minutes after the last successful checkpoint update.
+An expired job cannot resume old references: its status/step observes no active
+job, and a new explicit start uses the current source generation. Cancellation
+writes a conditionally guarded empty pointer. Stale Queue IDs cannot create a
+job or cancel its successor. Completed publication is acknowledged through
+bounded immutable-lineage pages, including when a committed HEAD response was
+lost and many later publications have already advanced the head.
+
+Deploy the compatible tracer and guarded coordinator together with the reindex
+runtime before admitting jobs. Older collectors do not know about job roots.

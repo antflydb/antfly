@@ -251,7 +251,12 @@ Hash sharding changes clustering topology. Qualify ANN recall and latency for
 your embedding distribution and `num_probes`/`search_effort` settings. Centroid
 routing still scans the routing tree, common sparse terms retain accumulated
 scores, and existing operation/transfer/working-memory limits apply. This does
-not establish a production capacity or recall target. Explicit flat-generation
+not establish a production capacity or recall target. In the 10,000-row random
+vector fixture, mean recall@10 was 0.18 at eight probes and 0.66 at 32; qualify
+higher probe/effort settings before using this profile in production. Visiting
+all routing clusters reached 0.84 in that small sample; native candidate
+selection and score ties still differ from a raw-cosine brute-force reference.
+Explicit flat-generation
 clustering policies are rejected in paged mode.
 
 Immutable uploads use batches of at most eight objects with at most four host
@@ -450,8 +455,10 @@ observer failures do not change a durable write's outcome.
 
 The earlier live collector `SQLITE_NOMEM` recovered after deployment replacement.
 Cursor draining and retryable HTTP 503 responses remain in place. Coordinator
-failures now emit `antfly.sqlite.pressure` with the operation, phase and
-best-effort database size; database size is not a memory measurement.
+failures now emit `antfly.sqlite.pressure` for both journal and object RPCs,
+with the operation, phase and
+best-effort database size; database size is not a memory measurement. Translated native transport errors
+and rate limits also return retryable HTTP 503 responses.
 
 `node qualification/sqlite-soak.mjs --local --rounds=32` compares intentionally
 undrained legacy mutation cursors with drained cursors in a warm SQLite Durable
@@ -460,3 +467,16 @@ A 32-cycle live run executed 1,340,160 statements across both modes without
 reproducing the error. This isolates SQLite journal work from WASM, R2 and model
 heap pressure; the original error's cause remains unconfirmed. See the
 [native audit](../../docs/design/cloudflare-native-audit.md) for the evidence.
+
+For the local dense/sparse capacity, cold-resume and recall fixture:
+
+```sh
+node qualification/benchmark.mjs --paged-projections --dimensions=384 \
+  --sizes=1000,10000 --publication-records=16 --reindex --recall-queries=5 \
+  --output=dist/qualification/projections.json
+```
+
+This fixture reports local memory, object traffic and wall time separately;
+its in-memory object store is outside the native memory budget. Recall is
+measured against brute-force cosine neighbors at eight and 32 requested probes and with `search_effort: 1` (all routing
+clusters, with native quantized candidate selection and exact reranking).

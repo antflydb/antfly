@@ -157,3 +157,12 @@ compaction/collection need further qualification. The small live fixture
 measured latency/CPU and exercised collection and Gateway; it did not measure
 total isolate memory. Large builds can exceed admitted Worker budgets and remain an
 explicit deployment limitation.
+
+
+The opt-in paged projection profile bounds dense/sparse update and rebuild
+memory. Its hash-local clustering changes ANN routing quality; the native audit
+records a low-probe recall limitation and measured results. A globally trained
+or hierarchical routing layer remains necessary where the measured
+recall/latency tradeoff does not meet application requirements. The resumable
+reindex operation rebuilds current native definitions; it does not implement
+DDL migration or graph/external-source reconstruction.

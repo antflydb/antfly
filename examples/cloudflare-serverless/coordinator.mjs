@@ -64,25 +64,24 @@ export class CommitCoordinator extends DurableObject {
       state.payload_cursor = next; this.ctx.storage.kv.put(key, state); return true;
     });
   }
+  reportPressure(error, op) {
+    if (/\bSQLITE_NOMEM\b/.test(String(error))) {
+      // Observe without writing into an already pressured SQLite instance.
+      const sample = {event: "antfly.sqlite.pressure", op, failure_code: "SQLITE_NOMEM", phase: null, database_bytes: null};
+      try { sample.phase = this.journal.state()?.phase ?? null; } catch {}
+      try { sample.database_bytes = this.ctx.storage.sql.databaseSize ?? null; } catch {}
+      try { console.error(JSON.stringify(sample)); } catch {}
+    }
+  }
   collection(op, args) {
     try { return this.journal.rpc(op, args); }
-    catch (error) {
-      if (/\bSQLITE_NOMEM\b/.test(String(error))) {
-        // Diagnose without allocating another frontier/result set or writing
-        // into a SQLite instance already under native-memory pressure.
-        const sample = {event: "antfly.sqlite.pressure", op, failure_code: "SQLITE_NOMEM", phase: null, database_bytes: null};
-        try { sample.phase = this.journal.state()?.phase ?? null; } catch {}
-        try { sample.database_bytes = this.ctx.storage.sql.databaseSize ?? null; } catch {}
-        try { console.error(JSON.stringify(sample)); } catch {}
-      }
-      throw error;
-    }
+    catch (error) { this.reportPressure(error, op); throw error; }
   }
 
   async objectCall(request, body) {
     if (!(/\/wal-v1\/[a-f0-9]{64}\/HEAD$/.test(request.key ?? "") || /\/progress\//.test(request.key ?? ""))) return { status: 3 };
     if (body.byteLength > 4096) return { status: 4 };
-    return this.ctx.storage.transactionSync(() => {
+    try { return this.ctx.storage.transactionSync(() => {
       if (request.collection != null) {
         try { this.journal.valid(request.collection); } catch { return { status: 5 }; }
       }
@@ -108,6 +107,6 @@ export class CommitCoordinator extends DurableObject {
           etag: previous.etag, content_length: previous.body.byteLength, content_type: previous.contentType }, body: request.op === "get" ? previous.body : undefined };
       }
       return { status: 3 };
-    });
+    }); } catch (error) { this.reportPressure(error, request.op); throw error; }
   }
 }
