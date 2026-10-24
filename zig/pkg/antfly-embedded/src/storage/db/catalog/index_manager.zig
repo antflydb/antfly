@@ -36930,16 +36930,22 @@ const TextProjectionProvenance = struct {
             schema_fingerprint = std.hash.Wyhash.hash(0x4154414e414c595a, &witness);
         }
         if (exclusion_revision != 0 and !try textConfigSelectsField(alloc, cfg.config_json)) {
-            if (schema) |value| changed: for (value.full_text_documents) |document| {
-                for (document.fields) |field| {
-                    const mapping = schema_mod.resolveDeclaredFieldType(value, field.path) orelse continue;
-                    if (mapping.do_index) continue;
-                    var witness: [12]u8 = undefined;
-                    std.mem.writeInt(u64, witness[0..8], schema_fingerprint, .little);
-                    std.mem.writeInt(u32, witness[8..12], exclusion_revision, .little);
-                    schema_fingerprint = std.hash.Wyhash.hash(0x4146444953580001, &witness);
-                    break :changed;
-                }
+            if (schema) |value| for (value.exact_fields) |root| {
+                if (root.mapping.do_index or !std.mem.eql(u8, root.field, root.source_field)) continue;
+                const source = for (value.full_text_documents) |document| {
+                    if (for (document.fields) |field| {
+                        if (std.mem.eql(u8, field.path, root.source_field)) break true;
+                    } else false) break true;
+                } else false;
+                const subfields = for (value.exact_fields) |field| {
+                    if (field.mapping.do_index and !std.mem.eql(u8, field.field, field.source_field) and std.mem.eql(u8, field.source_field, root.source_field)) break true;
+                } else false;
+                if (!source and !subfields) continue;
+                var witness: [12]u8 = undefined;
+                std.mem.writeInt(u64, witness[0..8], schema_fingerprint, .little);
+                std.mem.writeInt(u32, witness[8..12], exclusion_revision, .little);
+                schema_fingerprint = std.hash.Wyhash.hash(0x4146444953580001, &witness);
+                break;
             };
         }
         return .{

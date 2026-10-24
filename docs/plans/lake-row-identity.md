@@ -1222,7 +1222,10 @@ paths. The deployed logical ASCH lowering remains unchanged. Physical projection
 semantics have their own provenance revision: only an exact known prior witness
 admits a leader-owned shadow generation rebuild through the durable repair queue.
 Unknown provenance mismatches keep their existing manual policy. Active postings
-are never relabeled under new semantics, and schema binding stays strict.
+are never relabeled under new semantics. Schema binding also recognizes the exact,
+complete omitted-source encoding briefly emitted by this PR; unrelated changes,
+partial omissions and lost enabled fields remain invalid. Stored epoch bytes are
+preserved rather than rewritten under the same version.
 
 Qualification must compare projected answers on frozen Parquet bytes, including
 numeric/timestamp directions, nulls, ties, filtering, cursor continuation,
