@@ -1124,3 +1124,27 @@ bytes and 768 versus 384 allocations. One local Debug run measured 41.1 ms versu
 allocation failure release their owners correctly. These are in-memory changes
 under reader protocol 81; wire artifacts, publication authority and GC closure
 are unchanged. Archive-scale throughput and cloud latency remain unmeasured.
+
+
+### Archive qualification after the locality refinements
+
+[Lake archive qualification](../../zig/bench/lake/README.md) provides a repeatable
+real-Parquet gate for source scans, metadata lookup/filtering, skewed joins,
+numeric text sorting and broad incremental publication. Deterministic generated
+fixtures use independent answer oracles and atomic manifest commits; user-supplied
+archives are copied into isolated fixtures without rewriting originals. Frozen
+remote plans retain their declared source identity and credential references.
+
+Reports distinguish process-restarted, warm and startup work. They do not treat
+retained persistent/OS caches as empty, sampled RSS as exact request allocation,
+serving-cache counters as complete transport traces, or newly retained artifacts
+as total disk writes. SQL runtime profiles preserve their own coverage and spill
+fields. Every sample and input/binary/collector fingerprint is retained; report
+comparison requires equal answers and compatible inputs, cache conditions and
+collector/environment before reporting a ratio.
+
+This establishes the measurement path for further implementation decisions.
+Native reader protocol 81, publication authority and GC closure are unchanged.
+The initial Debug filesystem run exposes all-candidate numeric text sorting and
+publication artifact volume as targets for deeper profiling, without making
+archive-scale or live-cloud performance claims.
