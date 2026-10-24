@@ -91,7 +91,7 @@ fn put(a: A, store: *stores.ArtifactStore, value: anytype, token: Cancellation) 
 /// Descriptor payloads contain one segment's admission, and physical metadata
 /// contains no admissions. Neither hydration nor binding decodes a whole file.
 pub fn prepare(a: A, store: *stores.ArtifactStore, group: *corpus.FileGroup, token: Cancellation) !void {
-    if (group.sources.len > corpus.source_spans.page_spans and group.source_pages.len == 0) {
+    if (group.sources.len > corpus.source_spans.inline_spans and group.source_pages.len == 0) {
         group.source_pages = try corpus.source_spans.publish(a, store, group.sources, token);
         group.source_count = @intCast(group.sources.len);
     }

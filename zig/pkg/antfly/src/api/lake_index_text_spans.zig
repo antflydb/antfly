@@ -19,6 +19,7 @@ const state = @import("lake_index_native_state.zig");
 const artifacts = @import("lake_index_aggregate_artifact.zig");
 const stores = @import("../serverless/artifacts/store.zig");
 pub const max_spans = 64 * 1024;
+pub const inline_spans = 64;
 pub const page_spans = 256;
 pub const max_page_bytes = 64 * 1024;
 pub const Span = struct {
