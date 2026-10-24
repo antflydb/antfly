@@ -577,6 +577,7 @@ pub const Config = struct {
         project_id: ?[]u8 = null,
         location: ?[]u8 = null,
         credentials_path: ?[]u8 = null,
+        workspace_id: ?[]u8 = null,
         max_image_input_tokens: ?u64 = null,
         names: []const []u8 = &.{},
         configured_model_types: []const []u8 = &.{},
@@ -589,6 +590,7 @@ pub const Config = struct {
             if (self.project_id) |value| alloc.free(value);
             if (self.location) |value| alloc.free(value);
             if (self.credentials_path) |value| alloc.free(value);
+            if (self.workspace_id) |value| alloc.free(value);
             freeOwnedStringSlice(alloc, self.names);
             freeOwnedStringSlice(alloc, self.configured_model_types);
             self.* = undefined;
@@ -2089,7 +2091,7 @@ fn parseConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Confi
 
 fn parseInferenceConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.InferenceConnectionConfig {
     if (value != .object) return error.InvalidConfig;
-    if (!objectContainsOnly(value.object, &.{ "provider", "url", "api_key", "region", "project_id", "location", "credentials_path", "names", "configured_model_types", "max_image_input_tokens" })) return error.InvalidConfig;
+    if (!objectContainsOnly(value.object, &.{ "provider", "url", "api_key", "region", "project_id", "location", "credentials_path", "workspace_id", "names", "configured_model_types", "max_image_input_tokens" })) return error.InvalidConfig;
     const image_tokens = try optionalU64Field(value.object, "max_image_input_tokens");
     if (image_tokens == 0) return error.InvalidConfig;
     return .{
@@ -2101,6 +2103,7 @@ fn parseInferenceConnectionConfig(alloc: std.mem.Allocator, value: std.json.Valu
         .project_id = try optionalStringFieldDup(alloc, value.object, "project_id"),
         .location = try optionalStringFieldDup(alloc, value.object, "location"),
         .credentials_path = try optionalStringFieldDup(alloc, value.object, "credentials_path"),
+        .workspace_id = try optionalStringFieldDup(alloc, value.object, "workspace_id"),
         .names = try optionalStringArrayField(alloc, value.object, "names") orelse &.{},
         .configured_model_types = try optionalStringArrayField(alloc, value.object, "configured_model_types") orelse &.{},
     };

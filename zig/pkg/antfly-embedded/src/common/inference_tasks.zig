@@ -61,7 +61,7 @@ pub const Executor = struct {
         var cfg = try self.generatorConfig(a, name);
         if (cfg.provider == .chatgpt) return error.UnsupportedInferenceFeature;
         cfg = try withGenerationOptions(cfg, overrides);
-        const provider_http = if (cfg.provider == .bedrock or cfg.provider == .gemini or cfg.provider == .vertex) if (self.provider_runtime) |runtime| try runtime.httpClient() else self.http else self.http;
+        const provider_http = if (cfg.provider == .anthropic or cfg.provider == .bedrock or cfg.provider == .gemini or cfg.provider == .vertex) if (self.provider_runtime) |runtime| try runtime.generationHttpClient() else self.http else self.http;
         var factory = generating.BackendFactory.initWithOptions(a, provider_http, .{
             .antfly_provider = self.antfly_provider,
             .provider_runtime = self.provider_runtime,
@@ -80,7 +80,7 @@ pub const Executor = struct {
         var cfg = try self.generatorConfig(a, name);
         cfg = try withGenerationOptions(cfg, overrides);
         const body = try chatBody(a, cfg, request);
-        const provider_http = if (cfg.provider == .bedrock or cfg.provider == .gemini or cfg.provider == .vertex) if (self.provider_runtime) |runtime| try runtime.httpClient() else self.http else self.http;
+        const provider_http = if (cfg.provider == .anthropic or cfg.provider == .bedrock or cfg.provider == .gemini or cfg.provider == .vertex) if (self.provider_runtime) |runtime| try runtime.generationHttpClient() else self.http else self.http;
         var factory = generating.BackendFactory.initWithOptions(a, provider_http, .{
             .antfly_provider = self.antfly_provider,
             .provider_runtime = self.provider_runtime,
@@ -412,7 +412,7 @@ pub fn transcriptionRequest(a: std.mem.Allocator, cfg: transcribing.Config, requ
 }
 
 pub fn validateChatConfig(cfg: generating.GeneratorConfig) !void {
-    if (cfg.top_k != null and cfg.provider != .antfly and cfg.provider != .ollama) return error.UnsupportedInferenceFeature;
+    if (cfg.top_k != null and cfg.provider != .antfly and cfg.provider != .ollama and cfg.provider != .anthropic) return error.UnsupportedInferenceFeature;
     if (cfg.reasoning_effort != null and cfg.provider != .openai) return error.UnsupportedInferenceFeature;
 }
 
@@ -461,8 +461,19 @@ fn openAiMessages(a: std.mem.Allocator, messages: Json) !Json {
     for (messages.array.items) |source| {
         var message = source;
         if (source != .object) return error.InvalidInferenceRequest;
-        if (source.object.get("content")) |content| if (content == .array) {
+        // Signed Anthropic replay data is private to that native protocol.
+        // Other vendor chat endpoints must not receive this extra field.
+        if (source.object.get("extra_content")) |extra| if (extra == .object and extra.object.contains("anthropic")) {
             message.object = try source.object.clone(a);
+            var retained = extra;
+            retained.object = try extra.object.clone(a);
+            _ = retained.object.swapRemove("anthropic");
+            if (retained.object.count() == 0) {
+                _ = message.object.swapRemove("extra_content");
+            } else try message.object.put(a, "extra_content", retained);
+        };
+        if (source.object.get("content")) |content| if (content == .array) {
+            message.object = try message.object.clone(a);
             var parts: Json = .{ .array = .init(a) };
             for (content.array.items) |original| {
                 var part = original;
@@ -592,9 +603,18 @@ pub fn chatMessages(a: std.mem.Allocator, request: Json) ![]generating.ChatMessa
             }
             message.tool_calls = typed;
         }
+        if (value.object.get("extra_content")) |extra| {
+            if (extra != .object) return error.InvalidInferenceRequest;
+            if (extra.object.get("anthropic")) |native| {
+                if (message.role != .assistant or native != .object) return error.InvalidInferenceRequest;
+                const content = native.object.get("content") orelse return error.InvalidInferenceRequest;
+                if (content != .array) return error.InvalidInferenceRequest;
+                message.anthropic_content_json = try std.json.Stringify.valueAlloc(a, content, .{});
+            }
+        }
         if (message.content == null and message.tool_calls == null) return error.InvalidInferenceRequest;
         for (value.object.keys()) |key| {
-            inline for (.{ "role", "content", "tool_calls", "tool_call_id" }) |allowed| {
+            inline for (.{ "role", "content", "tool_calls", "tool_call_id", "extra_content" }) |allowed| {
                 if (std.mem.eql(u8, key, allowed)) break;
             } else return error.UnsupportedInferenceFeature;
         }

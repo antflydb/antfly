@@ -76,14 +76,14 @@ pub fn requestJsonAlloc(alloc: Allocator, messages: []const inference.ChatMessag
             } else "";
             var result = try single(a, "toolUseId", str(id));
             var results = array(a);
-            try results.array.append(try text(a, content));
+            try results.array.append(if (std.mem.trim(u8, content, " \t\r\n").len == 0) try single(a, "json", str(content)) else try text(a, content));
             try result.object.put(a, "content", results);
             try parts.array.append(try single(a, "toolResult", result));
         } else if (message.content) |content| switch (content) {
-            .text => |value| try parts.array.append(try text(a, value)),
+            .text => |value| if (std.mem.trim(u8, value, " \t\r\n").len > 0) try parts.array.append(try text(a, value)),
             .parts => |values| for (values) |part| {
                 switch (part) {
-                    .text => |value| try parts.array.append(try text(a, value)),
+                    .text => |value| if (std.mem.trim(u8, value, " \t\r\n").len > 0) try parts.array.append(try text(a, value)),
                     .image_url => |image| {
                         if (message.role != .user) return error.UnsupportedBedrockContentPart;
                         try parts.array.append(try imageDataUri(a, image.url));
@@ -190,6 +190,14 @@ fn imagePart(a: Allocator, mime: []const u8, bytes: []const u8) !Value {
     return single(a, "image", image);
 }
 
+pub fn finishReason(native: []const u8) !inference.GenerationFinishReason {
+    if (std.mem.eql(u8, native, "tool_use")) return .tool_calls;
+    if (std.mem.eql(u8, native, "max_tokens") or std.mem.eql(u8, native, "model_context_window_exceeded")) return .length;
+    if (std.mem.eql(u8, native, "guardrail_intervened") or std.mem.eql(u8, native, "content_filtered")) return .content_filter;
+    if (std.mem.eql(u8, native, "end_turn") or std.mem.eql(u8, native, "stop_sequence")) return .stop;
+    return error.InvalidBedrockResponse;
+}
+
 pub fn responseAlloc(alloc: Allocator, body: []const u8) !inference.GenerateResult {
     var parsed = try std.json.parseFromSlice(Value, alloc, body, .{});
     defer parsed.deinit();
@@ -222,6 +230,7 @@ pub fn responseAlloc(alloc: Allocator, body: []const u8) !inference.GenerateResu
     errdefer alloc.free(content);
     return .{
         .content = content,
+        .finish_reason = try finishReason(try string(try field(parsed.value, "stopReason"))),
         .tool_calls = try calls.toOwnedSlice(alloc),
         .usage = inference.GenerationUsage.fromValue(parsed.value.object.get("usage") orelse .null, "inputTokens", "outputTokens", "totalTokens"),
         .allocator = alloc,
@@ -233,7 +242,7 @@ pub fn testConverseWire() !void {
     const messages = [_]inference.ChatMessage{
         .{ .role = .system, .content = .{ .text = "Use the sheets" } },
         .{ .role = .user, .content = .{ .parts = &.{ .{ .text = "Compare" }, .{ .image_url = .{ .url = "data:image/jpeg;base64,aW1hZ2U=" } }, .{ .media = .{ .mime_type = "image/png", .data = "c2hlZXQ=" } } } } },
-        .{ .role = .assistant, .tool_calls = &.{.{ .id = "call-1", .name = "lookup", .arguments = "{\"id\":7}" }} },
+        .{ .role = .assistant, .content = .{ .text = "" }, .tool_calls = &.{.{ .id = "call-1", .name = "lookup", .arguments = "{\"id\":7}" }} },
         .{ .role = .tool, .tool_call_id = "call-1", .content = .{ .text = "found" } },
     };
     const bytes = try requestJsonAlloc(a, &messages, .{});
@@ -242,17 +251,37 @@ pub fn testConverseWire() !void {
     defer parsed.deinit();
     const turns = parsed.value.object.get("messages").?.array.items;
     try std.testing.expectEqual(@as(usize, 3), turns.len);
+    try std.testing.expectEqual(@as(usize, 1), turns[1].object.get("content").?.array.items.len);
     const parts = turns[0].object.get("content").?.array.items;
     try std.testing.expectEqualStrings("jpeg", parts[1].object.get("image").?.object.get("format").?.string);
     try std.testing.expectEqualStrings("aW1hZ2U=", parts[1].object.get("image").?.object.get("source").?.object.get("bytes").?.string);
     try std.testing.expectEqualStrings("call-1", turns[2].object.get("content").?.array.items[0].object.get("toolResult").?.object.get("toolUseId").?.string);
     var result = try responseAlloc(a,
-        \\{"output":{"message":{"role":"assistant","content":[{"text":"Compared"},{"toolUse":{"toolUseId":"call-2","name":"lookup","input":{"id":8}}}]}},"usage":{"inputTokens":100,"outputTokens":5,"totalTokens":105}}
+        \\{"output":{"message":{"role":"assistant","content":[{"text":"Compared"},{"toolUse":{"toolUseId":"call-2","name":"lookup","input":{"id":8}}}]}},"stopReason":"tool_use","usage":{"inputTokens":100,"outputTokens":5,"totalTokens":105}}
     );
     defer result.deinit();
+    try std.testing.expectEqual(inference.GenerationFinishReason.tool_calls, result.finish_reason.?);
     try std.testing.expectEqualStrings("Compared", result.content);
     try std.testing.expectEqualStrings("call-2", result.tool_calls[0].id);
     try std.testing.expectEqual(@as(u64, 100), result.usage.?.input_tokens);
+    // Completed and streaming adapters share the same stop-reason mapping.
+    const cases = .{
+        .{ "max_tokens", inference.GenerationFinishReason.length },
+        .{ "model_context_window_exceeded", inference.GenerationFinishReason.length },
+        .{ "end_turn", inference.GenerationFinishReason.stop },
+        .{ "stop_sequence", inference.GenerationFinishReason.stop },
+        .{ "tool_use", inference.GenerationFinishReason.tool_calls },
+        .{ "guardrail_intervened", inference.GenerationFinishReason.content_filter },
+        .{ "content_filtered", inference.GenerationFinishReason.content_filter },
+    };
+    inline for (cases) |case| {
+        const body = try std.fmt.allocPrint(a, "{{\"output\":{{\"message\":{{\"role\":\"assistant\",\"content\":[{{\"text\":\"partial\"}}]}}}},\"stopReason\":\"{s}\"}}", .{case[0]});
+        defer a.free(body);
+        var finished = try responseAlloc(a, body);
+        defer finished.deinit();
+        try std.testing.expectEqual(case[1], finished.finish_reason.?);
+    }
+    try std.testing.expectError(error.InvalidBedrockResponse, finishReason("unknown_future_reason"));
 }
 
 test "Bedrock Converse preserves images text tool identities and usage" {

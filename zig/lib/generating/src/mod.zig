@@ -83,6 +83,8 @@ pub const ChatMessage = struct {
     tool_call_id: ?[]const u8 = null,
     /// Opaque Google response parts, replayed only by Google adapters.
     google_parts_json: ?[]const u8 = null,
+    /// Native Anthropic content retains signed thinking blocks during replay.
+    anthropic_content_json: ?[]const u8 = null,
     /// Opaque Responses output items, replayed only by Responses adapters.
     responses_output_json: ?[]const u8 = null,
 };
@@ -130,12 +132,18 @@ test "provider registry gateway usage parses exact integer lexemes without inven
     }
 }
 
+pub const GenerationFinishReason = enum { stop, length, tool_calls, content_filter };
+
 pub const GenerateResult = struct {
+    /// Null retains inference for legacy adapters; providers should report it.
+    finish_reason: ?GenerationFinishReason = null,
     content: []const u8,
     tool_calls: []ToolCall = &.{},
     tool_calls_synthesized: bool = false,
     token_logprobs_json: ?[]const u8 = null,
     google_parts_json: ?[]const u8 = null,
+    /// Native Anthropic content retains signed thinking blocks during replay.
+    anthropic_content_json: ?[]const u8 = null,
     /// Opaque Responses output items, replayed only by Responses adapters.
     responses_output_json: ?[]const u8 = null,
     usage: ?GenerationUsage = null,
@@ -146,6 +154,7 @@ pub const GenerateResult = struct {
         if (self.token_logprobs_json) |evidence| self.allocator.free(evidence);
         if (self.responses_output_json) |items| self.allocator.free(items);
         if (self.google_parts_json) |parts| self.allocator.free(parts);
+        if (self.anthropic_content_json) |parts| self.allocator.free(parts);
         for (self.tool_calls) |*tool_call| tool_call.deinit(self.allocator);
         if (self.tool_calls.len > 0) self.allocator.free(self.tool_calls);
         self.* = undefined;
@@ -262,6 +271,7 @@ pub const Provider = enum {
     gemini,
     vertex,
     bedrock,
+    anthropic,
     openai,
     chatgpt,
     openrouter,
@@ -273,7 +283,7 @@ pub const Provider = enum {
     /// Adapter capability; the selected model must also support function calling.
     pub fn supportsTools(self: Provider) bool {
         return switch (self) {
-            .antfly, .openai, .chatgpt, .openrouter, .ollama, .gemini, .vertex, .bedrock => true,
+            .antfly, .openai, .chatgpt, .openrouter, .ollama, .gemini, .vertex, .bedrock, .anthropic => true,
             .mock, .apple => false,
         };
     }
@@ -283,12 +293,12 @@ pub const Provider = enum {
     pub fn usesChatCompletionsProtocol(self: Provider) bool {
         return switch (self) {
             .openai, .openrouter, .ollama, .antfly, .gemini, .vertex => true,
-            .bedrock, .chatgpt, .apple, .mock => false,
+            .bedrock, .anthropic, .chatgpt, .apple, .mock => false,
         };
     }
 
     pub fn supportsStreamingChat(self: Provider) bool {
-        return self.usesChatCompletionsProtocol() or self == .bedrock;
+        return self.usesChatCompletionsProtocol() or self == .bedrock or self == .anthropic;
     }
 
     pub fn validate(self: Provider) !void {
@@ -305,6 +315,7 @@ pub const OpenAIReasoningEffort = openapi.OpenAIReasoningEffort;
 
 pub const openai_default_url = "https://api.openai.com/v1";
 pub const vertex_default_url = "https://aiplatform.googleapis.com/v1";
+pub const anthropic_default_url = "https://api.anthropic.com/v1";
 pub const gemini_default_url = "https://generativelanguage.googleapis.com/v1beta";
 pub const ollama_default_url = "http://127.0.0.1:11434/v1";
 
@@ -320,6 +331,7 @@ pub fn defaultUrl(provider: Provider) []const u8 {
         .openrouter => openrouter_default_url,
         .ollama => ollama_default_url,
         .gemini => gemini_default_url,
+        .anthropic => anthropic_default_url,
         .vertex => vertex_default_url,
         // Antfly's empty URL selects embedded inference when available.
         .antfly, .mock, .apple, .chatgpt, .bedrock => "",
@@ -353,6 +365,7 @@ pub const GeneratorConfig = struct {
     project_id: ?[]const u8 = null,
     location: ?[]const u8 = null,
     region: ?[]const u8 = null,
+    workspace_id: ?[]const u8 = null,
     credentials_path: ?[]const u8 = null,
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
@@ -375,7 +388,7 @@ pub const GeneratorConfig = struct {
     }
 
     pub fn supportsStreamingChat(self: GeneratorConfig) bool {
-        return self.usesChatCompletionsProtocol() or self.provider == .bedrock;
+        return self.usesChatCompletionsProtocol() or self.provider == .bedrock or self.provider == .anthropic;
     }
 
     pub fn jsonParse(alloc: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !GeneratorConfig {
@@ -395,7 +408,7 @@ pub const GeneratorConfig = struct {
         var result = self;
         result.model = "";
         result.url = "";
-        const strings = .{ "connection_id", "api_key", "capability_token", "capability_revision", "project_id", "location", "region", "credentials_path", "tools_json", "tool_choice_json", "response_format_json" };
+        const strings = .{ "connection_id", "api_key", "capability_token", "capability_revision", "project_id", "location", "region", "workspace_id", "credentials_path", "tools_json", "tool_choice_json", "response_format_json" };
         inline for (strings) |field| @field(result, field) = null;
         errdefer result.deinit(alloc);
         if (self.model.len > 0) result.model = try alloc.dupe(u8, self.model);
@@ -416,6 +429,7 @@ pub const GeneratorConfig = struct {
         if (self.project_id) |value| alloc.free(value);
         if (self.location) |value| alloc.free(value);
         if (self.region) |value| alloc.free(value);
+        if (self.workspace_id) |value| alloc.free(value);
         if (self.credentials_path) |value| alloc.free(value);
         if (self.tools_json) |value| alloc.free(value);
         if (self.tool_choice_json) |value| alloc.free(value);
@@ -461,7 +475,12 @@ pub const GeneratorConfig = struct {
                 return error.InvalidGeneratorConfig;
         } else if (self.connection_id != null) return error.InvalidGeneratorConfig;
         if (self.model.len == 0 and self.provider != .mock and self.provider != .apple) return error.InvalidGeneratorConfig;
-        if (self.url.len == 0 and self.provider != .mock and self.provider != .antfly and self.provider != .apple and self.provider != .vertex and self.provider != .gemini and self.provider != .chatgpt and self.provider != .bedrock) return error.InvalidGeneratorConfig;
+        if (self.url.len == 0 and self.provider != .mock and self.provider != .antfly and self.provider != .apple and self.provider != .vertex and self.provider != .gemini and self.provider != .chatgpt and self.provider != .bedrock and self.provider != .anthropic) return error.InvalidGeneratorConfig;
+        if (self.workspace_id != null and self.provider != .anthropic) return error.InvalidGeneratorConfig;
+        if (self.provider == .anthropic) {
+            if (self.frequency_penalty != null or self.presence_penalty != null or self.logprobs) return error.UnsupportedInferenceFeature;
+            if (self.temperature) |value| if (value > 1) return error.InvalidGeneratorConfig;
+        }
         if (self.provider == .bedrock) {
             if (self.top_k != null or self.frequency_penalty != null or self.presence_penalty != null or self.logprobs) return error.UnsupportedBedrockGenerationOptions;
             if (self.temperature) |value| if (value > 1) return error.InvalidGeneratorConfig;
@@ -474,6 +493,7 @@ pub const GeneratorConfig = struct {
                 self.rate_limit != null or self.top_p != null or self.top_k != null or self.frequency_penalty != null or self.presence_penalty != null)
                 return error.UnsupportedAppleGenerationOptions;
         }
+        if (self.image_input_token_bound) |bound| if (bound == 0 or bound > std.math.maxInt(i64)) return error.InvalidGeneratorConfig;
         if (self.max_tokens <= 0) return error.InvalidGeneratorConfig;
         if (self.max_completion_tokens) |limit| if (limit <= 0) return error.InvalidGeneratorConfig;
         if (self.provider != .openai and self.provider != .chatgpt and (self.max_completion_tokens != null or self.reasoning_effort != null)) return error.InvalidGeneratorConfig;
@@ -580,6 +600,7 @@ pub fn configFromOpenApi(alloc: std.mem.Allocator, generated: openapi.GeneratorC
     if (generated.max_tokens != null and generated.max_completion_tokens != null) return error.InvalidGeneratorConfig;
     var cfg = GeneratorConfig{
         .rate_limit = generated.rate_limit,
+        .image_input_token_bound = if (generated.max_image_input_tokens) |bound| std.math.cast(u64, bound) orelse return error.InvalidGeneratorConfig else null,
         .provider = provider,
         .model = if (generated.model) |model| try alloc.dupe(u8, model) else "",
         .url = if (generated.url) |url|
@@ -593,6 +614,7 @@ pub fn configFromOpenApi(alloc: std.mem.Allocator, generated: openapi.GeneratorC
         .project_id = if (generated.project_id) |project_id| try alloc.dupe(u8, project_id) else null,
         .location = if (generated.location) |location| try alloc.dupe(u8, location) else null,
         .region = if (generated.region) |region| try alloc.dupe(u8, region) else null,
+        .workspace_id = if (generated.workspace_id) |workspace| try alloc.dupe(u8, workspace) else null,
         .credentials_path = if (generated.credentials_path) |credentials_path| try alloc.dupe(u8, credentials_path) else null,
         .max_tokens = generated.max_tokens orelse default_max_tokens,
         .max_completion_tokens = generated.max_completion_tokens,
@@ -611,10 +633,11 @@ pub fn configFromOpenApi(alloc: std.mem.Allocator, generated: openapi.GeneratorC
 pub fn openApiFromConfig(cfg: GeneratorConfig) openapi.GeneratorConfig {
     return .{
         .rate_limit = cfg.rate_limit,
+        .max_image_input_tokens = if (cfg.image_input_token_bound) |bound| std.math.cast(i64, bound) else null,
         .provider = providerToOpenApi(cfg.provider),
         .model = if (cfg.model.len > 0) cfg.model else null,
         .url = switch (cfg.provider) {
-            .openai, .openrouter, .ollama, .gemini, .vertex, .bedrock, .mock => if (cfg.url.len > 0) cfg.url else null,
+            .openai, .openrouter, .ollama, .gemini, .vertex, .bedrock, .anthropic, .mock => if (cfg.url.len > 0) cfg.url else null,
             .antfly, .chatgpt, .apple => null,
         },
         .api_url = switch (cfg.provider) {
@@ -626,6 +649,7 @@ pub fn openApiFromConfig(cfg: GeneratorConfig) openapi.GeneratorConfig {
         .project_id = cfg.project_id,
         .location = cfg.location,
         .region = cfg.region,
+        .workspace_id = cfg.workspace_id,
         .credentials_path = cfg.credentials_path,
         .max_tokens = if (cfg.provider != .chatgpt and cfg.max_completion_tokens == null) cfg.max_tokens else null,
         .max_completion_tokens = cfg.max_completion_tokens,
@@ -735,6 +759,20 @@ pub const ChatStream = struct {
     write: *const fn (*anyopaque, []const u8) anyerror!void,
     close: *const fn (*anyopaque) anyerror!void,
 };
+/// Emit one completion event without retaining earlier stream data. Decoders
+/// validate their native lifecycle before closing the public stream.
+pub fn writeChatStreamChunk(a: std.mem.Allocator, sink: ChatStream, started: *bool, request_id: ?[]const u8, value: anytype) !void {
+    const bytes = try std.json.Stringify.valueAlloc(a, value, .{ .emit_null_optional_fields = false });
+    defer a.free(bytes);
+    if (!started.*) {
+        try sink.start(sink.context, 200, "text/event-stream", null, request_id);
+        started.* = true;
+    }
+    try sink.write(sink.context, "data: ");
+    try sink.write(sink.context, bytes);
+    try sink.write(sink.context, "\n\n");
+}
+
 pub const ChatResponse = struct {
     allocator: std.mem.Allocator,
     status: u16,
@@ -970,6 +1008,7 @@ fn providerFromOpenApi(provider: ?[]const u8) !Provider {
     if (std.mem.eql(u8, name, "gemini")) return .gemini;
     if (std.mem.eql(u8, name, "vertex")) return .vertex;
     if (std.mem.eql(u8, name, "bedrock")) return .bedrock;
+    if (std.mem.eql(u8, name, "anthropic")) return .anthropic;
     if (std.mem.eql(u8, name, "openai")) return .openai;
     if (std.mem.eql(u8, name, "chatgpt")) return .chatgpt;
     if (std.mem.eql(u8, name, "openrouter")) return .openrouter;

@@ -58,7 +58,7 @@ pub const Decoder = struct {
             if (self.pending.items.len != required) continue;
             const frame = self.pending.items;
             const expected = std.mem.readInt(u32, frame[frame.len - 4 ..][0..4], .big);
-            if (std.hash.Crc32.hash(frame[0 .. frame.len - 4]) != expected) return error.InvalidInferenceResponse;
+            if (@import("antfly_hash").Crc32.hash(frame[0 .. frame.len - 4]) != expected) return error.InvalidInferenceResponse;
             try self.event(frame);
             self.pending.clearRetainingCapacity();
         }
@@ -66,7 +66,7 @@ pub const Decoder = struct {
 
     fn frameLength(self: *Decoder) !usize {
         const frame = self.pending.items;
-        if (std.hash.Crc32.hash(frame[0..8]) != std.mem.readInt(u32, frame[8..12], .big)) return error.InvalidInferenceResponse;
+        if (@import("antfly_hash").Crc32.hash(frame[0..8]) != std.mem.readInt(u32, frame[8..12], .big)) return error.InvalidInferenceResponse;
         const total = std.mem.readInt(u32, frame[0..4], .big);
         const headers = std.mem.readInt(u32, frame[4..8], .big);
         if (total < 16 or headers > total - 16) return error.InvalidInferenceResponse;
@@ -117,8 +117,11 @@ pub const Decoder = struct {
         }
         const tag = event_type orelse return error.InvalidInferenceResponse;
         if (!std.mem.eql(u8, message_type orelse return error.InvalidInferenceResponse, "event")) {
+            if (!std.mem.eql(u8, message_type.?, "exception")) return error.InvalidInferenceResponse;
             if (std.mem.eql(u8, tag, "throttlingException")) return error.InferenceUpstreamRateLimited;
-            return error.InferenceUpstreamUnavailable;
+            if (std.mem.eql(u8, tag, "validationException")) return error.InvalidInferenceRequest;
+            if (std.mem.eql(u8, tag, "internalServerException") or std.mem.eql(u8, tag, "serviceUnavailableException") or std.mem.eql(u8, tag, "modelStreamErrorException")) return error.InferenceUpstreamUnavailable;
+            return error.InvalidInferenceResponse;
         }
         // A fresh arena per frame prevents a request arena from retaining every
         // streamed token or fragmented tool-argument buffer until request end.
@@ -171,7 +174,7 @@ pub const Decoder = struct {
             var blocks = self.blocks.valueIterator();
             while (blocks.next()) |block| if (!block.closed) return error.InvalidInferenceResponse;
             const native = try string(try get(value, "stopReason"));
-            const reason: []const u8 = if (std.mem.eql(u8, native, "tool_use")) "tool_calls" else if (std.mem.eql(u8, native, "max_tokens") or std.mem.eql(u8, native, "model_context_window_exceeded")) "length" else if (std.mem.eql(u8, native, "guardrail_intervened") or std.mem.eql(u8, native, "content_filtered")) "content_filter" else if (std.mem.eql(u8, native, "end_turn") or std.mem.eql(u8, native, "stop_sequence")) "stop" else return error.InvalidInferenceResponse;
+            const reason = @tagName(@import("bedrock_converse.zig").finishReason(native) catch return error.InvalidInferenceResponse);
             try self.emit(.{ .id = self.id, .object = "chat.completion.chunk", .created = self.created, .model = self.model, .choices = &.{.{ .index = @as(u32, 0), .delta = Json{ .object = .empty }, .finish_reason = reason }} });
             self.stopped = true;
         } else if (std.mem.eql(u8, tag, "metadata")) {
@@ -189,15 +192,7 @@ pub const Decoder = struct {
         try self.emit(.{ .id = self.id, .object = "chat.completion.chunk", .created = self.created, .model = self.model, .choices = &.{.{ .index = @as(u32, 0), .delta = value, .finish_reason = @as(?[]const u8, null) }} });
     }
     fn emit(self: *Decoder, value: anytype) !void {
-        const bytes = try std.json.Stringify.valueAlloc(self.alloc, value, .{ .emit_null_optional_fields = false });
-        defer self.alloc.free(bytes);
-        if (!self.started) {
-            try self.sink.start(self.sink.context, 200, "text/event-stream", null, self.request_id);
-            self.started = true;
-        }
-        try self.sink.write(self.sink.context, "data: ");
-        try self.sink.write(self.sink.context, bytes);
-        try self.sink.write(self.sink.context, "\n\n");
+        try inference.writeChatStreamChunk(self.alloc, self.sink, &self.started, self.request_id, value);
     }
     pub fn finish(self: *Decoder) !void {
         if (self.pending.items.len != 0 or !self.stopped or self.usage == null) return error.InvalidInferenceResponse;

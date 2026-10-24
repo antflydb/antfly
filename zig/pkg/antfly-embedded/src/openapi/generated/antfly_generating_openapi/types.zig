@@ -78,11 +78,14 @@ pub const AntflyGeneratorConfig = struct {
 
 /// Configuration for the Anthropic generative AI provider.
 pub const AnthropicGeneratorConfig = struct {
+    provider: []const u8,
+    /// Anthropic workspace for keys not scoped to a workspace. Defaults to ANTHROPIC_WORKSPACE_ID.
+    workspace_id: ?[]const u8 = null,
     /// The full model ID of the Anthropic model to use.
     model: []const u8,
-    /// The Anthropic API key.
+    /// Anthropic API key or secret reference. Defaults to ANTHROPIC_API_KEY.
     api_key: ?[]const u8 = null,
-    /// The URL of the Anthropic API endpoint.
+    /// Messages API base URL. Defaults to https://api.anthropic.com/v1.
     url: ?[]const u8 = null,
     /// Controls randomness in generation (0.0-1.0).
     temperature: ?f32 = null,
@@ -95,6 +98,8 @@ pub const AnthropicGeneratorConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "workspace_id", "workspace_id", true },
         .{ "model", "model", false },
         .{ "api_key", "api_key", true },
         .{ "url", "url", true },
@@ -114,6 +119,12 @@ pub const AnthropicGeneratorConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.workspace_id) |value| {
+            try jw.objectField("workspace_id");
+            try jw.write(value);
+        }
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.api_key) |value| {
@@ -368,6 +379,8 @@ pub const ChatGPTGeneratorConfig = struct {
 
 /// OpenAI-compatible message in a generation/chat conversation.
 pub const ChatMessage = struct {
+    /// Opaque provider message metadata. Preserve unchanged when replaying assistant messages; native Anthropic content retains signed thinking blocks.
+    extra_content: ?std.json.ArrayHashMap(std.json.Value) = null,
     role: ChatMessageRole,
     content: ?ChatMessageContent = null,
     /// Tool calls made by the assistant (only for role=assistant).
@@ -379,6 +392,7 @@ pub const ChatMessage = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "extra_content", "extra_content", true },
         .{ "role", "role", false },
         .{ "content", "content", true },
         .{ "tool_calls", "tool_calls", true },
@@ -396,6 +410,10 @@ pub const ChatMessage = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.extra_content) |value| {
+            try jw.objectField("extra_content");
+            try jw.write(value);
+        }
         try jw.objectField("role");
         try jw.write(self.role);
         if (self.content) |value| {
@@ -783,6 +801,8 @@ pub const GeneratorConfig = struct {
     credentials_path: ?[]const u8 = null,
     /// AWS region. Defaults to AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1.
     region: ?[]const u8 = null,
+    /// Anthropic workspace for keys not scoped to a workspace. Defaults to ANTHROPIC_WORKSPACE_ID.
+    workspace_id: ?[]const u8 = null,
     /// HTTP response timeout in seconds for Ollama API calls.
     timeout: ?i64 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
@@ -796,6 +816,8 @@ pub const GeneratorConfig = struct {
     frequency_penalty: ?f32 = null,
     /// Penalty for token presence (-2.0 to 2.0).
     presence_penalty: ?f32 = null,
+    /// Conservative input-token ceiling per image. Required for image calls when tokens_per_minute is configured; choose a bound valid for the model and image policy.
+    max_image_input_tokens: ?i64 = null,
     rate_limit: ?antfly_provider_openapi.RateLimitConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -812,6 +834,7 @@ pub const GeneratorConfig = struct {
         .{ "url", "url", true },
         .{ "credentials_path", "credentials_path", true },
         .{ "region", "region", true },
+        .{ "workspace_id", "workspace_id", true },
         .{ "timeout", "timeout", true },
         .{ "api_url", "api_url", true },
         .{ "reasoning_effort", "reasoning_effort", true },
@@ -819,6 +842,7 @@ pub const GeneratorConfig = struct {
         .{ "max_completion_tokens", "max_completion_tokens", true },
         .{ "frequency_penalty", "frequency_penalty", true },
         .{ "presence_penalty", "presence_penalty", true },
+        .{ "max_image_input_tokens", "max_image_input_tokens", true },
         .{ "rate_limit", "rate_limit", false },
     };
 
@@ -880,6 +904,10 @@ pub const GeneratorConfig = struct {
             try jw.objectField("region");
             try jw.write(value);
         }
+        if (self.workspace_id) |value| {
+            try jw.objectField("workspace_id");
+            try jw.write(value);
+        }
         if (self.timeout) |value| {
             try jw.objectField("timeout");
             try jw.write(value);
@@ -908,6 +936,10 @@ pub const GeneratorConfig = struct {
             try jw.objectField("presence_penalty");
             try jw.write(value);
         }
+        if (self.max_image_input_tokens) |value| {
+            try jw.objectField("max_image_input_tokens");
+            try jw.write(value);
+        }
         if (self.rate_limit) |value| {
             try jw.objectField("rate_limit");
             try jw.write(value);
@@ -924,6 +956,7 @@ pub const GeneratorProvider = enum {
     gemini,
     vertex,
     bedrock,
+    anthropic,
     ollama,
     openai,
     chatgpt,
@@ -936,6 +969,7 @@ pub const GeneratorProvider = enum {
             .gemini => "gemini",
             .vertex => "vertex",
             .bedrock => "bedrock",
+            .anthropic => "anthropic",
             .ollama => "ollama",
             .openai => "openai",
             .chatgpt => "chatgpt",
@@ -955,6 +989,7 @@ pub const GeneratorProvider = enum {
             .{ "gemini", .gemini },
             .{ "vertex", .vertex },
             .{ "bedrock", .bedrock },
+            .{ "anthropic", .anthropic },
             .{ "ollama", .ollama },
             .{ "openai", .openai },
             .{ "chatgpt", .chatgpt },

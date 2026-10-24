@@ -32,10 +32,10 @@ fn frame(a: std.mem.Allocator, event: []const u8, payload: []const u8, kind: []c
     const result = try a.alloc(u8, 16 + headers.items.len + payload.len);
     std.mem.writeInt(u32, result[0..4], @intCast(result.len), .big);
     std.mem.writeInt(u32, result[4..8], @intCast(headers.items.len), .big);
-    std.mem.writeInt(u32, result[8..12], std.hash.Crc32.hash(result[0..8]), .big);
+    std.mem.writeInt(u32, result[8..12], @import("antfly_hash").Crc32.hash(result[0..8]), .big);
     @memcpy(result[12..][0..headers.items.len], headers.items);
     @memcpy(result[12 + headers.items.len ..][0..payload.len], payload);
-    std.mem.writeInt(u32, result[result.len - 4 ..][0..4], std.hash.Crc32.hash(result[0 .. result.len - 4]), .big);
+    std.mem.writeInt(u32, result[result.len - 4 ..][0..4], @import("antfly_hash").Crc32.hash(result[0 .. result.len - 4]), .big);
     return result;
 }
 
@@ -131,6 +131,25 @@ pub fn testDecoder() !void {
             try invalid.push(start[0..11]);
             try std.testing.expectError(error.InvalidInferenceResponse, invalid.finish());
         } else try std.testing.expectError(error.InferenceResponseTooLarge, invalid.push(start[0..12]));
+        try std.testing.expectEqual(@as(usize, 0), rejected.starts);
+        try std.testing.expect(!rejected.closed);
+    }
+    // Only the documented transient exceptions permit provider fallback.
+    for ([_]struct { tag: []const u8, failure: anyerror }{
+        .{ .tag = "validationException", .failure = error.InvalidInferenceRequest },
+        .{ .tag = "throttlingException", .failure = error.InferenceUpstreamRateLimited },
+        .{ .tag = "internalServerException", .failure = error.InferenceUpstreamUnavailable },
+        .{ .tag = "modelStreamErrorException", .failure = error.InferenceUpstreamUnavailable },
+        .{ .tag = "serviceUnavailableException", .failure = error.InferenceUpstreamUnavailable },
+        .{ .tag = "unknownFutureException", .failure = error.InvalidInferenceResponse },
+    }) |case| {
+        var rejected: Sink = .{};
+        defer rejected.output.deinit(a);
+        var invalid = stream.Decoder{ .alloc = a, .sink = rejected.view(), .model = "m" };
+        defer invalid.deinit();
+        const bytes = try frame(a, case.tag, "{\"message\":\"failed\"}", "exception");
+        defer a.free(bytes);
+        try std.testing.expectError(case.failure, invalid.push(bytes));
         try std.testing.expectEqual(@as(usize, 0), rejected.starts);
         try std.testing.expect(!rejected.closed);
     }

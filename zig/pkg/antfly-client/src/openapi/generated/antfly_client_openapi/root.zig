@@ -33,6 +33,7 @@ pub const AntflyEmbedderConfig = types.AntflyEmbedderConfig;
 pub const AntflyGeneratorConfig = types.AntflyGeneratorConfig;
 pub const AntflyRerankerConfig = types.AntflyRerankerConfig;
 pub const AntflyType = types.AntflyType;
+pub const AnthropicGeneratorConfig = types.AnthropicGeneratorConfig;
 pub const ApiKey = types.ApiKey;
 pub const ApiKeyWithSecret = types.ApiKeyWithSecret;
 pub const AppleGeneratorConfig = types.AppleGeneratorConfig;

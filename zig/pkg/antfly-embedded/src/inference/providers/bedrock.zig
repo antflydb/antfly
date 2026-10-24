@@ -174,7 +174,7 @@ pub const Provider = struct {
         defer alloc.free(body);
         var response = try self.invokeGenerationRequest(alloc, model, "converse", body, control, null);
         defer response.deinit();
-        if (!response.ok()) return inference.remoteGenerationStatusError(response.status.code);
+        if (!response.ok()) return if (response.status.code == 400) error.InvalidInferenceRequest else inference.remoteGenerationStatusError(response.status.code);
         return converse.responseAlloc(alloc, response.body orelse return error.EmptyResponse);
     }
 
@@ -248,7 +248,7 @@ pub const Provider = struct {
         const Writer = struct {
             decoder: converse_stream.Decoder,
             pub fn startResponse(self_: *@This(), response: httpx.Response) !void {
-                if (!response.ok()) return inference.remoteGenerationStatusError(response.status.code);
+                if (!response.ok()) return if (response.status.code == 400) error.InvalidInferenceRequest else inference.remoteGenerationStatusError(response.status.code);
                 const content_type = response.contentType() orelse return error.InvalidInferenceResponse;
                 var parts = std.mem.splitScalar(u8, content_type, ';');
                 if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, parts.first(), " \t"), "application/vnd.amazon.eventstream")) return error.InvalidInferenceResponse;
@@ -834,7 +834,7 @@ pub fn testConverseSignedRequest() !void {
         .method = .POST,
         .path = "/proxy/model/vision-model/converse",
         .assert_request = Check.request,
-        .respond = .{ .body = "{\"output\":{\"message\":{\"role\":\"assistant\",\"content\":[{\"text\":\"saw sheets\"}]}},\"usage\":{\"inputTokens\":2,\"outputTokens\":1,\"totalTokens\":3}}" },
+        .respond = .{ .body = "{\"output\":{\"message\":{\"role\":\"assistant\",\"content\":[{\"text\":\"saw sheets\"}]}},\"stopReason\":\"end_turn\",\"usage\":{\"inputTokens\":2,\"outputTokens\":1,\"totalTokens\":3}}" },
     }});
     defer server.deinit();
     const endpoint = try std.fmt.allocPrint(alloc, "{s}/proxy", .{server.baseUrl()});

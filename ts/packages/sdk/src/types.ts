@@ -449,6 +449,7 @@ export const indexEmbedderProviders = embedderProviders.filter(
 );
 export type GeneratorProvider = components["schemas"]["GeneratorProvider"];
 export const generatorProviderCapabilities = {
+  anthropic: {},
   antfly: {},
   bedrock: {},
   apple: {},

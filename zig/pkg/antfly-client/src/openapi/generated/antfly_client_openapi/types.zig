@@ -1991,6 +1991,85 @@ pub const AntflyType = enum {
     }
 };
 
+/// Configuration for the Anthropic generative AI provider.
+pub const AnthropicGeneratorConfig = struct {
+    provider: []const u8,
+    /// Anthropic workspace for keys not scoped to a workspace. Defaults to ANTHROPIC_WORKSPACE_ID.
+    workspace_id: ?[]const u8 = null,
+    /// The full model ID of the Anthropic model to use.
+    model: []const u8,
+    /// Anthropic API key or secret reference. Defaults to ANTHROPIC_API_KEY.
+    api_key: ?[]const u8 = null,
+    /// Messages API base URL. Defaults to https://api.anthropic.com/v1.
+    url: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-1.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate in the response.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter (0.0-1.0).
+    top_p: ?f32 = null,
+    /// Top-k sampling parameter.
+    top_k: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "workspace_id", "workspace_id", true },
+        .{ "model", "model", false },
+        .{ "api_key", "api_key", true },
+        .{ "url", "url", true },
+        .{ "temperature", "temperature", true },
+        .{ "max_tokens", "max_tokens", true },
+        .{ "top_p", "top_p", true },
+        .{ "top_k", "top_k", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.workspace_id) |value| {
+            try jw.objectField("workspace_id");
+            try jw.write(value);
+        }
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        }
+        if (self.top_k) |value| {
+            try jw.objectField("top_k");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Public metadata for an API key (secrets are never returned after creation).
 pub const ApiKey = struct {
     /// Unique identifier for the API key.
@@ -3758,6 +3837,8 @@ pub const ChatGPTOutcome = struct {
 
 /// OpenAI-compatible message in a generation/chat conversation.
 pub const ChatMessage = struct {
+    /// Opaque provider message metadata. Preserve unchanged when replaying assistant messages; native Anthropic content retains signed thinking blocks.
+    extra_content: ?std.json.ArrayHashMap(std.json.Value) = null,
     role: ChatMessageRole,
     content: ?ChatMessageContent = null,
     /// Tool calls made by the assistant (only for role=assistant).
@@ -3769,6 +3850,7 @@ pub const ChatMessage = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "extra_content", "extra_content", true },
         .{ "role", "role", false },
         .{ "content", "content", true },
         .{ "tool_calls", "tool_calls", true },
@@ -3786,6 +3868,10 @@ pub const ChatMessage = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.extra_content) |value| {
+            try jw.objectField("extra_content");
+            try jw.write(value);
+        }
         try jw.objectField("role");
         try jw.write(self.role);
         if (self.content) |value| {
@@ -18130,6 +18216,8 @@ pub const GeneratorConfig = struct {
     credentials_path: ?[]const u8 = null,
     /// AWS region. Defaults to AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1.
     region: ?[]const u8 = null,
+    /// Anthropic workspace for keys not scoped to a workspace. Defaults to ANTHROPIC_WORKSPACE_ID.
+    workspace_id: ?[]const u8 = null,
     /// HTTP response timeout in seconds for Ollama API calls.
     timeout: ?i64 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
@@ -18143,6 +18231,8 @@ pub const GeneratorConfig = struct {
     frequency_penalty: ?f32 = null,
     /// Penalty for token presence (-2.0 to 2.0).
     presence_penalty: ?f32 = null,
+    /// Conservative input-token ceiling per image. Required for image calls when tokens_per_minute is configured; choose a bound valid for the model and image policy.
+    max_image_input_tokens: ?i64 = null,
     rate_limit: ?RateLimitConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -18159,6 +18249,7 @@ pub const GeneratorConfig = struct {
         .{ "url", "url", true },
         .{ "credentials_path", "credentials_path", true },
         .{ "region", "region", true },
+        .{ "workspace_id", "workspace_id", true },
         .{ "timeout", "timeout", true },
         .{ "api_url", "api_url", true },
         .{ "reasoning_effort", "reasoning_effort", true },
@@ -18166,6 +18257,7 @@ pub const GeneratorConfig = struct {
         .{ "max_completion_tokens", "max_completion_tokens", true },
         .{ "frequency_penalty", "frequency_penalty", true },
         .{ "presence_penalty", "presence_penalty", true },
+        .{ "max_image_input_tokens", "max_image_input_tokens", true },
         .{ "rate_limit", "rate_limit", true },
     };
 
@@ -18227,6 +18319,10 @@ pub const GeneratorConfig = struct {
             try jw.objectField("region");
             try jw.write(value);
         }
+        if (self.workspace_id) |value| {
+            try jw.objectField("workspace_id");
+            try jw.write(value);
+        }
         if (self.timeout) |value| {
             try jw.objectField("timeout");
             try jw.write(value);
@@ -18255,6 +18351,10 @@ pub const GeneratorConfig = struct {
             try jw.objectField("presence_penalty");
             try jw.write(value);
         }
+        if (self.max_image_input_tokens) |value| {
+            try jw.objectField("max_image_input_tokens");
+            try jw.write(value);
+        }
         if (self.rate_limit) |value| {
             try jw.objectField("rate_limit");
             try jw.write(value);
@@ -18268,6 +18368,7 @@ pub const GeneratorProvider = enum {
     gemini,
     vertex,
     bedrock,
+    anthropic,
     ollama,
     openai,
     chatgpt,
@@ -18280,6 +18381,7 @@ pub const GeneratorProvider = enum {
             .gemini => "gemini",
             .vertex => "vertex",
             .bedrock => "bedrock",
+            .anthropic => "anthropic",
             .ollama => "ollama",
             .openai => "openai",
             .chatgpt => "chatgpt",
@@ -18299,6 +18401,7 @@ pub const GeneratorProvider = enum {
             .{ "gemini", .gemini },
             .{ "vertex", .vertex },
             .{ "bedrock", .bedrock },
+            .{ "anthropic", .anthropic },
             .{ "ollama", .ollama },
             .{ "openai", .openai },
             .{ "chatgpt", .chatgpt },
@@ -25528,6 +25631,8 @@ pub const InferenceCapacityError = struct {
 };
 
 pub const InferenceChatMessage = struct {
+    /// Opaque provider message metadata. Preserve unchanged when replaying assistant messages; native Anthropic content retains signed thinking blocks.
+    extra_content: ?std.json.ArrayHashMap(std.json.Value) = null,
     role: InferenceRole,
     content: ?ChatMessageContent = null,
     /// Tool calls made by the assistant (only for role=assistant)
@@ -25537,6 +25642,7 @@ pub const InferenceChatMessage = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "extra_content", "extra_content", true },
         .{ "role", "role", false },
         .{ "content", "content", true },
         .{ "tool_calls", "tool_calls", true },
@@ -25553,6 +25659,10 @@ pub const InferenceChatMessage = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.extra_content) |value| {
+            try jw.objectField("extra_content");
+            try jw.write(value);
+        }
         try jw.objectField("role");
         try jw.write(self.role);
         if (self.content) |value| {
@@ -28070,6 +28180,8 @@ pub const InferenceGenerateChunkChoice = struct {
 
 /// Delta content for streaming
 pub const InferenceGenerateDelta = struct {
+    /// Opaque provider stream metadata, including native Anthropic thinking and signature events. Preserve it when assembling provider-native assistant history.
+    extra_content: ?std.json.ArrayHashMap(std.json.Value) = null,
     role: ?InferenceRole = null,
     /// Token content delta
     content: OpenApiOptionalNullable([]const u8) = .absent,
@@ -28080,6 +28192,7 @@ pub const InferenceGenerateDelta = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "extra_content", "extra_content", true },
         .{ "role", "role", true },
         .{ "content", "content", false },
         .{ "reasoning_content", "reasoning_content", false },
@@ -28096,6 +28209,10 @@ pub const InferenceGenerateDelta = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.extra_content) |value| {
+            try jw.objectField("extra_content");
+            try jw.write(value);
+        }
         if (self.role) |value| {
             try jw.objectField("role");
             try jw.write(value);
@@ -28172,6 +28289,8 @@ pub const InferenceGenerateJsonSchemaConfig = struct {
 };
 
 pub const InferenceGenerateMessage = struct {
+    /// Opaque provider message metadata. Preserve unchanged when replaying assistant messages; native Anthropic content retains signed thinking blocks.
+    extra_content: ?std.json.ArrayHashMap(std.json.Value) = null,
     role: InferenceRole,
     /// The generated message content (null when tool_calls is present)
     content: OpenApiOptionalNullable([]const u8) = .absent,
@@ -28182,6 +28301,7 @@ pub const InferenceGenerateMessage = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "extra_content", "extra_content", true },
         .{ "role", "role", false },
         .{ "content", "content", false },
         .{ "reasoning_content", "reasoning_content", false },
@@ -28198,6 +28318,10 @@ pub const InferenceGenerateMessage = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.extra_content) |value| {
+            try jw.objectField("extra_content");
+            try jw.write(value);
+        }
         try jw.objectField("role");
         try jw.write(self.role);
         switch (self.content) {

@@ -542,7 +542,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
                 const native_body = try tasks.chatBody(a, configured, request);
                 return forward(server, ctx, sources.common_config.local_inference_connection_id, "chat/completions", native_body, fallback, observation, execution_options);
             }
-            if ((cfg.usesChatCompletionsProtocol() and (cfg.provider != .antfly or cfg.url.len != 0)) or (cfg.provider == .bedrock and if (request.object.get("stream")) |v| v.bool else false)) {
+            if ((cfg.usesChatCompletionsProtocol() and (cfg.provider != .antfly or cfg.url.len != 0)) or (cfg.provider == .anthropic or (cfg.provider == .bedrock and if (request.object.get("stream")) |v| v.bool else false))) {
                 var transport = @import("antfly_runtime_abi").http_bridge.Outbound{ .context = ctx };
                 const streaming = if (request.object.get("stream")) |v| v.bool else false;
                 const observed = observation.stream(transport.stream());
@@ -577,7 +577,7 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
                 .object = "chat.completion",
                 .created = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_s),
                 .model = model,
-                .choices = &.{.{ .index = 0, .message = .{ .role = .assistant, .content = .{ .value = result.content }, .tool_calls = if (calls.len > 0) calls else null }, .finish_reason = if (calls.len > 0) .tool_calls else .stop }},
+                .choices = &.{.{ .index = 0, .message = .{ .role = .assistant, .content = .{ .value = result.content }, .tool_calls = if (calls.len > 0) calls else null }, .finish_reason = if (result.finish_reason) |reason| std.meta.stringToEnum(Api.FinishReason, @tagName(reason)).? else if (calls.len > 0) .tool_calls else .stop }},
                 .usage = if (result.usage) |usage| .{
                     .prompt_tokens = std.math.cast(i64, usage.input_tokens) orelse return error.InvalidInferenceResponse,
                     .completion_tokens = std.math.cast(i64, usage.output_tokens) orelse return error.InvalidInferenceResponse,
@@ -882,11 +882,12 @@ fn executeVendorConnection(server: anytype, ctx: *httpx.Context, task: gateway.T
     inline for (.{ "api_key", "project_id", "location", "credentials_path" }) |field| if (@field(cfg, field)) |value| {
         try provider.object.put(a, field, .{ .string = value });
     };
+    if (task == .generate) if (cfg.workspace_id) |workspace| try provider.object.put(a, "workspace_id", .{ .string = workspace });
     if (task == .embed or task == .generate) {
         if (cfg.region) |value| try provider.object.put(a, "region", .{ .string = value });
         if (task == .embed) if (request.object.get("dimensions")) |value| try provider.object.put(a, "dimensions", value);
     }
-    if (task == .decide) {
+    if (task == .decide or task == .generate) {
         if (cfg.max_image_input_tokens) |bound| try provider.object.put(a, "max_image_input_tokens", .{ .integer = std.math.cast(i64, bound) orelse return error.InvalidConfig });
     }
     if (task == .rerank) try provider.object.put(a, "field", .{ .string = "text" });
@@ -1023,7 +1024,7 @@ fn prepareGeneration(a: std.mem.Allocator, cfg: generating.GeneratorConfig, requ
     if (requirements.images and !generationAdapterSupportsImages(cfg.provider)) return error.UnsupportedInferenceFeature;
     if (requirements.streaming and !cfg.supportsStreamingChat()) return error.UnsupportedInferenceFeature;
     if (!rich_adapter and requirements.audio) return error.UnsupportedInferenceFeature;
-    if (!rich_adapter and requirements.structured_output and cfg.provider != .bedrock) return error.UnsupportedInferenceFeature;
+    if (!rich_adapter and requirements.structured_output and cfg.provider != .bedrock and cfg.provider != .anthropic) return error.UnsupportedInferenceFeature;
     const messages = try tasks.chatMessages(a, request);
     const options = try generationOptions(a, request);
     const configured = try tasks.withGenerationOptions(cfg, options);
@@ -1033,7 +1034,7 @@ fn prepareGeneration(a: std.mem.Allocator, cfg: generating.GeneratorConfig, requ
 
 fn generationAdapterSupportsImages(provider: generating.Provider) bool {
     return switch (provider) {
-        .openai, .openrouter, .ollama, .antfly, .gemini, .vertex, .bedrock => true,
+        .openai, .openrouter, .ollama, .antfly, .gemini, .vertex, .bedrock, .anthropic => true,
         .apple, .mock, .chatgpt => false,
     };
 }
@@ -1078,7 +1079,7 @@ fn executeChain(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, requ
         const prepared = try prepareGeneration(a, link.generator_config orelse try named.providers.getGeneratorConfig(link.generator_name.?), candidate, options.operation orelse "generate");
         cfg.* = prepared.config;
         try named.capabilities(qualified).require(prepared.requirements);
-        if (cfg.provider != .openai and cfg.provider != .openrouter and cfg.provider != .ollama and cfg.provider != .antfly and cfg.provider != .gemini and cfg.provider != .vertex and cfg.provider != .bedrock) return error.UnsupportedInferenceFeature;
+        if (cfg.provider != .openai and cfg.provider != .openrouter and cfg.provider != .ollama and cfg.provider != .antfly and cfg.provider != .gemini and cfg.provider != .vertex and cfg.provider != .bedrock and cfg.provider != .anthropic) return error.UnsupportedInferenceFeature;
     }
     const previous_deadline = ctx.application_deadline_ns;
     const previous_clock = ctx.application_deadline_io;

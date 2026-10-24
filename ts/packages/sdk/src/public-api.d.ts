@@ -14608,6 +14608,40 @@ export interface components {
              */
             top_p?: number;
         };
+        /** @description Configuration for the Anthropic generative AI provider. */
+        AnthropicGeneratorConfig: {
+            /** @enum {string} */
+            provider: "anthropic";
+            /** @description Anthropic workspace for keys not scoped to a workspace. Defaults to ANTHROPIC_WORKSPACE_ID. */
+            workspace_id?: string;
+            /**
+             * @description The full model ID of the Anthropic model to use.
+             * @default claude-sonnet-4-5-20250929
+             * @example claude-sonnet-4-5-20250929
+             */
+            model: string;
+            /** @description Anthropic API key or secret reference. Defaults to ANTHROPIC_API_KEY. */
+            api_key?: string;
+            /**
+             * Format: uri
+             * @description Messages API base URL. Defaults to https://api.anthropic.com/v1.
+             */
+            url?: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-1.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate in the response. */
+            max_tokens?: number;
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter (0.0-1.0).
+             */
+            top_p?: number;
+            /** @description Top-k sampling parameter. */
+            top_k?: number;
+        };
         /** @description Configuration for the Ollama generative AI provider. */
         OllamaGeneratorConfig: {
             /** @enum {string} */
@@ -14783,7 +14817,7 @@ export interface components {
          * @description Generator providers implemented by Antfly's generation runtime.
          * @enum {string}
          */
-        GeneratorProvider: "gemini" | "vertex" | "bedrock" | "ollama" | "openai" | "chatgpt" | "openrouter" | "antfly" | "apple";
+        GeneratorProvider: "gemini" | "vertex" | "bedrock" | "anthropic" | "ollama" | "openai" | "chatgpt" | "openrouter" | "antfly" | "apple";
         /**
          * @description A unified configuration for a generative AI provider.
          * @example {
@@ -14793,7 +14827,12 @@ export interface components {
          *       "max_tokens": 2048
          *     }
          */
-        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["BedrockGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["ChatGPTGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"] | components["schemas"]["AppleGeneratorConfig"]) & {
+        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["BedrockGeneratorConfig"] | components["schemas"]["AnthropicGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["ChatGPTGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"] | components["schemas"]["AppleGeneratorConfig"]) & {
+            /**
+             * Format: int64
+             * @description Conservative input-token ceiling per image. Required for image calls when tokens_per_minute is configured; choose a bound valid for the model and image policy.
+             */
+            max_image_input_tokens?: number;
             rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["GeneratorProvider"];
         };
@@ -19145,6 +19184,10 @@ export interface components {
         };
         /** @description OpenAI-compatible message in a generation/chat conversation. */
         ChatMessage: {
+            /** @description Opaque provider message metadata. Preserve unchanged when replaying assistant messages; native Anthropic content retains signed thinking blocks. */
+            extra_content?: {
+                [key: string]: unknown;
+            };
             role: components["schemas"]["ChatMessageRole"];
             content?: components["schemas"]["ChatMessageContent"];
             /** @description Tool calls made by the assistant (only for role=assistant). */
@@ -22167,6 +22210,10 @@ export interface components {
          */
         InferenceFinishReason: "stop" | "length" | "tool_calls" | "content_filter" | "function_call";
         InferenceChatMessage: {
+            /** @description Opaque provider message metadata. Preserve unchanged when replaying assistant messages; native Anthropic content retains signed thinking blocks. */
+            extra_content?: {
+                [key: string]: unknown;
+            };
             role: components["schemas"]["InferenceRole"];
             content?: components["schemas"]["ChatMessageContent"];
             /** @description Tool calls made by the assistant (only for role=assistant) */
@@ -22463,6 +22510,10 @@ export interface components {
             logprobs?: Record<string, never> | null;
         };
         InferenceGenerateMessage: {
+            /** @description Opaque provider message metadata. Preserve unchanged when replaying assistant messages; native Anthropic content retains signed thinking blocks. */
+            extra_content?: {
+                [key: string]: unknown;
+            };
             role: components["schemas"]["InferenceRole"];
             /** @description The generated message content (null when tool_calls is present) */
             content?: string | null;
@@ -22504,6 +22555,10 @@ export interface components {
         };
         /** @description Delta content for streaming */
         InferenceGenerateDelta: {
+            /** @description Opaque provider stream metadata, including native Anthropic thinking and signature events. Preserve it when assembling provider-native assistant history. */
+            extra_content?: {
+                [key: string]: unknown;
+            };
             role?: components["schemas"]["InferenceRole"];
             /** @description Token content delta */
             content?: string | null;

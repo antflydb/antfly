@@ -113,6 +113,7 @@ pub const Endpoint = struct {
     project_id: []const u8 = "",
     location: []const u8 = "",
     credentials_path: []const u8 = "",
+    workspace_id: []const u8 = "",
 };
 
 const default_timeout_ms: u64 = 5_000;
@@ -192,11 +193,12 @@ fn listAnthropic(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, ti
     defer alloc.free(base);
     const url = try std.fmt.allocPrint(alloc, "{s}/models?limit=100", .{base});
     defer alloc.free(url);
-    const headers = [_][2][]const u8{
+    const headers = [3][2][]const u8{
         .{ "x-api-key", ep.api_key orelse "" },
-        .{ "anthropic-version", "2023-06-01" },
+        .{ "anthropic-version", provider_defaults.anthropic_api_version },
+        .{ "anthropic-workspace-id", ep.workspace_id },
     };
-    const body = try getBodyAlloc(alloc, http, url, &headers, timeout_ms);
+    const body = try getBodyAlloc(alloc, http, url, headers[0..if (ep.workspace_id.len > 0) @as(usize, 3) else 2], timeout_ms);
     defer alloc.free(body);
     return try parseAnthropicModels(alloc, body);
 }

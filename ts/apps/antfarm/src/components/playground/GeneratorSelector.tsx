@@ -29,6 +29,7 @@ export const GENERATOR_PROVIDER_DEFAULTS: Partial<Record<GeneratorProvider, stri
 export const GENERATOR_PROVIDER_LABELS: Partial<Record<GeneratorProvider, string>> = {
   antfly: "Antfly (Local)",
   bedrock: "Amazon Bedrock",
+  anthropic: "Anthropic (Claude)",
   apple: "Apple (On Device)",
   ollama: "Ollama (Local)",
   gemini: "Google AI (Gemini)",
@@ -47,6 +48,7 @@ export const GENERATOR_DEFAULT_CONFIG: GeneratorConfig = {
 
 /** Providers shown in the query-builder generator selectors. */
 export const QUERY_BUILDER_PROVIDERS: GeneratorProvider[] = [
+  "anthropic",
   "bedrock",
   "apple",
   "gemini",
@@ -181,6 +183,16 @@ export function GeneratorSelector({
         provider: "chatgpt",
         connection_id: id,
         model: chatgpt.models[id]?.[0]?.slug ?? "",
+      });
+      return;
+    }
+    if (nextProvider === "anthropic") {
+      // Do not inherit another vendor's credentials or sampling defaults.
+      // Current Claude models can require their native sampling defaults.
+      onChange({
+        provider: "anthropic",
+        model: liveGenerators.anthropic?.[0] ?? "",
+        ...(value.max_tokens !== undefined && { max_tokens: value.max_tokens }),
       });
       return;
     }

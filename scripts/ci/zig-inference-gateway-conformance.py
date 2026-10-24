@@ -97,12 +97,287 @@ class Upstream(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def anthropic_chat(self, request):
+        assert self.headers.get("x-api-key") == "mock-server-key"
+        assert self.headers.get("anthropic-version") == "2026-10-21"
+        if request["model"] != "new-vision-model":
+            assert self.headers.get("anthropic-workspace-id") == "fixture-workspace"
+        self.calls.append(self.path)
+        model = request["model"]
+        streaming = request.get("stream", False)
+        if model in ("anthropic-validation", "anthropic-busy"):
+            kind = (
+                "invalid_request_error"
+                if model.endswith("validation")
+                else "overloaded_error"
+            )
+            if streaming:
+                self.image_stream(
+                    [
+                        anthropic_event(
+                            {
+                                "type": "error",
+                                "error": {"type": kind, "message": "fixture"},
+                            }
+                        )
+                    ],
+                    "text/event-stream",
+                )
+            else:
+                self.reply(
+                    {"type": "error", "error": {"type": kind}},
+                    status=400 if model.endswith("validation") else 529,
+                )
+            return
+        if model == "long":
+            self.anthropic_long_stream()
+            return
+        history = request["messages"]
+        replay = any(
+            part["type"] == "tool_result"
+            for message in history
+            for part in message["content"]
+        )
+        if replay:
+            previous = next(
+                message
+                for message in reversed(history)
+                if message["role"] == "assistant"
+            )
+            assert previous["content"][0] == {
+                "type": "thinking",
+                "thinking": "private",
+                "signature": "native-signature",
+            }, previous
+        for message in history:
+            assert not any(
+                part["type"] == "text" and not part["text"].strip()
+                for part in message["content"]
+            ), message
+        tools = bool(request.get("tools")) and not replay
+        if "output_config" in request:
+            assert request["output_config"]["format"]["type"] == "json_schema"
+            assert request["output_config"]["format"]["schema"]["type"] == "object"
+        content = [
+            {"type": "thinking", "thinking": "private", "signature": "native-signature"}
+        ]
+        content += (
+            [
+                {
+                    "type": "tool_use",
+                    "id": "anthropic-call",
+                    "name": "lookup",
+                    "input": {"id": 7},
+                }
+            ]
+            if tools
+            else [
+                {
+                    "type": "text",
+                    "text": '{"compared":true}'
+                    if "output_config" in request
+                    else "anthropic hello",
+                }
+            ]
+        )
+        reason = (
+            "max_tokens"
+            if model == "anthropic-truncated"
+            else "refusal"
+            if model == "anthropic-filtered"
+            else "tool_use"
+            if tools
+            else "end_turn"
+        )
+        usage = {"input_tokens": 2, "cache_read_input_tokens": 2, "output_tokens": 1}
+        message = {
+            "id": "msg-anthropic",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": content,
+            "stop_reason": reason,
+            "usage": usage,
+        }
+        if not streaming:
+            self.reply(message)
+            return
+        start = {**message, "content": [], "stop_reason": None}
+        events = [{"type": "message_start", "message": start}]
+        if model == "anthropic-midstream":
+            events += [
+                {
+                    "type": "error",
+                    "error": {"type": "overloaded_error", "message": "failed"},
+                }
+            ]
+        else:
+            for index, block in enumerate(content):
+                initial = {**block}
+                if block["type"] == "thinking":
+                    initial = {"type": "thinking", "thinking": ""}
+                    deltas = [
+                        {"type": "thinking_delta", "thinking": block["thinking"]},
+                        {"type": "signature_delta", "signature": block["signature"]},
+                    ]
+                elif block["type"] == "tool_use":
+                    initial["input"] = {}
+                    deltas = [
+                        {"type": "input_json_delta", "partial_json": '{"id":'},
+                        {"type": "input_json_delta", "partial_json": "7}"},
+                    ]
+                else:
+                    initial["text"] = ""
+                    deltas = [{"type": "text_delta", "text": block["text"]}]
+                events.append(
+                    {
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": initial,
+                    }
+                )
+                events.extend(
+                    {"type": "content_block_delta", "index": index, "delta": delta}
+                    for delta in deltas
+                )
+                events.append({"type": "content_block_stop", "index": index})
+            events += [
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": reason},
+                    "usage": {"output_tokens": 1},
+                },
+                {"type": "message_stop"},
+            ]
+        self.image_stream(
+            [anthropic_event(event) for event in events], "text/event-stream"
+        )
+
+    def anthropic_long_stream(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            for event in (
+                {
+                    "type": "message_start",
+                    "message": {
+                        "role": "assistant",
+                        "usage": {"input_tokens": 2, "output_tokens": 0},
+                    },
+                },
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            ):
+                self.wfile.write(anthropic_event(event))
+            packet = anthropic_event(
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "x"},
+                }
+            )
+            assert len(packet) * 40000 > 4 * 1024 * 1024
+            for index in range(40000):
+                self.wfile.write(packet)
+                if index % 128 == 0:
+                    self.wfile.flush()
+            for event in (
+                {"type": "content_block_stop", "index": 0},
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "max_tokens"},
+                    "usage": {"output_tokens": 40000},
+                },
+                {"type": "message_stop"},
+            ):
+                self.wfile.write(anthropic_event(event))
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def long_chat_stream(self, bedrock=False):
+        self.send_response(200)
+        self.send_header(
+            "Content-Type",
+            "application/vnd.amazon.eventstream" if bedrock else "text/event-stream",
+        )
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        def chunk(delta, finish=None):
+            return (
+                "data: "
+                + json.dumps(
+                    {
+                        "id": "long-response",
+                        "object": "chat.completion.chunk",
+                        "created": 1,
+                        "model": "long",
+                        "choices": [
+                            {"index": 0, "delta": delta, "finish_reason": finish}
+                        ],
+                    }
+                )
+                + "\n\n"
+            ).encode()
+
+        try:
+            self.wfile.write(
+                bedrock_frame("messageStart", {"role": "assistant"})
+                if bedrock
+                else chunk({"role": "assistant"})
+            )
+            packet = (
+                bedrock_frame(
+                    "contentBlockDelta",
+                    {"contentBlockIndex": 0, "delta": {"text": "x"}},
+                )
+                if bedrock
+                else chunk({"content": "x"})
+            )
+            assert len(packet) * 40000 > 4 * 1024 * 1024
+            for index in range(40000):
+                self.wfile.write(packet)
+                if index % 128 == 0:
+                    self.wfile.flush()
+            if bedrock:
+                for tag, value in (
+                    ("contentBlockStop", {"contentBlockIndex": 0}),
+                    ("messageStop", {"stopReason": "max_tokens"}),
+                    (
+                        "metadata",
+                        {
+                            "usage": {
+                                "inputTokens": 2,
+                                "outputTokens": 40000,
+                                "totalTokens": 40002,
+                            }
+                        },
+                    ),
+                ):
+                    self.wfile.write(bedrock_frame(tag, value))
+            else:
+                self.wfile.write(chunk({}, "length") + b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def google_chat(self, request):
         assert self.headers.get("Authorization") == "Bearer mock-server-key"
         if "mock-vision-busy" in request["model"]:
             self.reply({"error": "busy"}, status=503)
             return
         self.calls.append(self.path)
+        if request["model"].endswith("long"):
+            self.long_chat_stream()
+            return
         history = request["messages"]
         replay = any(message["role"] == "tool" for message in history)
         if replay:
@@ -220,6 +495,29 @@ class Upstream(BaseHTTPRequestHandler):
         assert self.headers.get("Authorization") == "Bearer mock-server-key"
         self.calls.append(self.path)
         streaming = self.path.endswith("/converse-stream")
+        assert not any(
+            "text" in part and not part["text"].strip()
+            for message in request["messages"]
+            for part in message["content"]
+        ), request
+        if "/validation/" in self.path:
+            if streaming:
+                self.image_stream(
+                    [
+                        bedrock_frame(
+                            "validationException",
+                            {"message": "Invalid input"},
+                            "exception",
+                        )
+                    ],
+                    "application/vnd.amazon.eventstream",
+                )
+            else:
+                self.reply({"message": "Invalid input"}, status=400)
+            return
+        if "/long/" in self.path:
+            self.long_chat_stream(bedrock=True)
+            return
         structured = "outputConfig" in request
         if structured:
             fmt = request["outputConfig"]["textFormat"]
@@ -263,6 +561,13 @@ class Upstream(BaseHTTPRequestHandler):
             self.reply(
                 {
                     "output": {"message": {"role": "assistant", "content": content}},
+                    "stopReason": "max_tokens"
+                    if "/truncated/" in self.path
+                    else "content_filtered"
+                    if "/filtered/" in self.path
+                    else "tool_use"
+                    if tools
+                    else "end_turn",
                     "usage": usage,
                 }
             )
@@ -323,6 +628,22 @@ class Upstream(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0]
+        if path == "/anthropic/models":
+            assert self.headers.get("x-api-key") == "mock-server-key"
+            assert self.headers.get("anthropic-version") == "2026-10-21"
+            assert self.headers.get("anthropic-workspace-id") == "fixture-workspace"
+            self.reply(
+                {
+                    "data": [
+                        {
+                            "id": "future-claude",
+                            "display_name": "Future Claude",
+                            "created_at": "2026-10-23T00:00:00Z",
+                        }
+                    ]
+                }
+            )
+            return
         if path == "/ai/v1/models":
             time.sleep(self.model_delay_seconds)
             self.reply(
@@ -613,6 +934,9 @@ class Upstream(BaseHTTPRequestHandler):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.requests.append((self.path, request))
         self.authorizations.append(self.headers.get("Authorization"))
+        if self.path.endswith("/anthropic/messages"):
+            self.anthropic_chat(request)
+            return
         if self.path.endswith(("/converse", "/converse-stream")):
             self.bedrock_chat(request)
             return
@@ -1007,6 +1331,12 @@ def verify_session_transports(base_url: str, session_path: str) -> None:
             connection.close()
 
 
+def anthropic_event(value):
+    return (
+        "event: " + value["type"] + "\ndata: " + json.dumps(value) + "\n\n"
+    ).encode()
+
+
 def bedrock_frame(event, payload, message_type="event"):
     headers = bytearray()
     for name, value in (
@@ -1050,6 +1380,16 @@ def verify_hosted_image_inputs(base_url):
                 {"format": "jpeg", "source": {"bytes": "aW1hZ2U="}},
                 {"format": "png", "source": {"bytes": "c2hlZXQ="}},
             ], images
+        elif path.endswith("/anthropic/messages"):
+            parts = body["messages"][0]["content"]
+            assert parts[0] == {
+                "type": "text",
+                "text": "Compare the character sheets",
+            }, parts
+            assert [part["source"] for part in parts if part["type"] == "image"] == [
+                {"type": "base64", "media_type": "image/jpeg", "data": "aW1hZ2U="},
+                {"type": "base64", "media_type": "image/png", "data": "c2hlZXQ="},
+            ], parts
         elif path.endswith(":generateContent"):
             parts = body["contents"][0]["parts"]
             assert parts[0] == {"text": "Compare the character sheets"}, parts
@@ -1064,8 +1404,10 @@ def verify_hosted_image_inputs(base_url):
         "generators/google-known",
         "generators/vertex-known",
         "generators/bedrock-known",
+        "generators/anthropic-known",
         "generators/vision-openai",
         "connections/bedrock-vision/models/new-vision-model",
+        "connections/anthropic-vision/models/new-vision-model",
     ):
         body = {"model": model, "messages": [{"role": "user", "content": content}]}
         for path in (
@@ -1106,6 +1448,7 @@ def verify_hosted_image_inputs(base_url):
         "generators/google-known",
         "generators/vertex-known",
         "generators/bedrock-known",
+        "generators/anthropic-known",
     ):
         response = invoke(
             "/ai/v1/chat/completions",
@@ -1178,6 +1521,7 @@ def verify_hosted_image_streams(base_url):
             "generators/google-known",
             "generators/vertex-known",
             "generators/bedrock-known",
+            "generators/anthropic-known",
             "chains/vision-fallback",
             "chains/bedrock-stream-fallback",
         ):
@@ -1199,6 +1543,19 @@ def verify_hosted_image_streams(base_url):
                         gate.set()
                         chunks = [first, *stream]
                     assert chunks[-1].usage.total_tokens == 5, chunks[-1]
+                    if model == "generators/anthropic-known":
+                        events = [
+                            choice.delta.model_extra.get("extra_content", {})
+                            .get("anthropic", {})
+                            .get("event", {})
+                            for chunk in chunks
+                            for choice in chunk.choices
+                        ]
+                        assert any(
+                            event.get("delta", {}).get("signature")
+                            == "native-signature"
+                            for event in events
+                        ), events
                     reasons = [
                         choice.finish_reason
                         for chunk in chunks
@@ -1234,7 +1591,11 @@ def verify_hosted_image_streams(base_url):
                             for chunk in chunks
                             for choice in chunk.choices
                         )
-                        assert text in ("google hello", "bedrock hello"), text
+                        assert text in (
+                            "google hello",
+                            "bedrock hello",
+                            "anthropic hello",
+                        ), text
                 finally:
                     gate.set()
                     Upstream.image_stream_release = None
@@ -1244,6 +1605,7 @@ def verify_hosted_image_streams(base_url):
             "generators/google-known",
             "generators/vertex-known",
             "generators/bedrock-known",
+            "generators/anthropic-known",
         ):
             result = client.chat.completions.create(
                 model=model, messages=messages, tools=tools
@@ -1265,34 +1627,157 @@ def verify_hosted_image_streams(base_url):
             assert answer.choices[0].message.content in (
                 "google hello",
                 "bedrock hello",
+                "anthropic hello",
             ), answer
-        # After the first event is published, an upstream failure cannot replay
-        # the request on a different model or fabricate a successful terminator.
-        before = len(Upstream.requests)
-        request = urllib.request.Request(
-            base_url + "/ai/v1/chat/completions",
-            data=json.dumps(
-                {
-                    "model": "chains/bedrock-midstream",
-                    "messages": messages,
-                    "stream": True,
-                }
-            ).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(request, timeout=15) as response:
-            try:
-                body = response.read()
-            except http.client.IncompleteRead as error:
-                body = error.partial
-        assert b"assistant" in body and b"[DONE]" not in body, body
-        assert len(Upstream.requests) == before + 1, Upstream.requests[before:]
+            if model == "generators/anthropic-known":
+                before = len(Upstream.requests)
+                tampered = json.loads(json.dumps(history))
+                tampered[1]["extra_content"]["anthropic"]["content"].append(
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "url",
+                            "url": "https://hidden-image.invalid",
+                        },
+                    }
+                )
+                try:
+                    client.chat.completions.create(
+                        model=model, messages=tampered, tools=tools
+                    )
+                    raise AssertionError(
+                        "opaque replay bypassed visible image admission"
+                    )
+                except openai.APIStatusError as error:
+                    assert error.status_code == 400, error
+                assert len(Upstream.requests) == before
+
+        # After publication, neither native provider may replay a failure.
+        for model in ("chains/bedrock-midstream", "chains/anthropic-midstream"):
+            before = len(Upstream.requests)
+            request = urllib.request.Request(
+                base_url + "/ai/v1/chat/completions",
+                data=json.dumps(
+                    {
+                        "model": model,
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": True,
+                    }
+                ).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=15) as response:
+                try:
+                    body = response.read()
+                except http.client.IncompleteRead as error:
+                    body = error.partial
+            assert b"assistant" in body and b"[DONE]" not in body, body
+            assert len(Upstream.requests) == before + 1, Upstream.requests[before:]
         print(
             "hosted image streams, tool metadata, early delivery and fallback commit boundaries passed",
             flush=True,
         )
     finally:
         client.close()
+
+
+def verify_hosted_generation_contracts(base_url):
+    with openai.OpenAI(
+        api_key="unused", base_url=base_url + "/ai/v1", max_retries=0, timeout=30
+    ) as client:
+        messages = [{"role": "user", "content": "continue"}]
+        for model, expected in (
+            ("truncated", "length"),
+            ("filtered", "content_filter"),
+            ("anthropic-truncated", "length"),
+            ("anthropic-filtered", "content_filter"),
+        ):
+            result = client.chat.completions.create(
+                model="generators/" + model, messages=messages
+            )
+            assert result.choices[0].finish_reason == expected, result
+        for model in (
+            "generators/validation",
+            "chains/validation",
+            "generators/anthropic-validation",
+            "chains/anthropic-validation",
+        ):
+            for streaming in (False, True):
+                before = len(Upstream.requests)
+                try:
+                    client.chat.completions.create(
+                        model=model, messages=messages, stream=streaming
+                    )
+                    raise AssertionError(
+                        "validation error succeeded or selected a fallback"
+                    )
+                except openai.APIStatusError as error:
+                    assert error.status_code == 400, error
+                assert len(Upstream.requests) == before + 1, Upstream.requests[before:]
+        before = len(Upstream.requests)
+        with client.chat.completions.create(
+            model="chains/anthropic-busy", messages=messages, stream=True
+        ) as stream:
+            assert (
+                "".join(
+                    choice.delta.content or ""
+                    for chunk in stream
+                    for choice in chunk.choices
+                )
+                == "google hello"
+            )
+        assert len(Upstream.requests) == before + 2
+        for provider in ("google", "vertex", "bedrock", "anthropic"):
+            images = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+                        }
+                    ],
+                }
+            ]
+            before = len(Upstream.requests)
+            try:
+                client.chat.completions.create(
+                    model="generators/" + provider + "-quota-denied", messages=images
+                )
+                raise AssertionError("image reservation exceeded the bucket capacity")
+            except openai.APIStatusError as error:
+                assert (
+                    error.status_code == 400
+                    and "ProviderTokenBudgetExceeded" in str(error)
+                ), error
+            assert len(Upstream.requests) == before
+            client.chat.completions.create(
+                model="generators/" + provider + "-quota-admitted", messages=images
+            )
+            assert len(Upstream.requests) == before + 1
+        for provider in ("google", "vertex", "bedrock", "anthropic"):
+            print(f"checking long stream through {provider}", flush=True)
+            text_count = 0
+            finish = None
+            with client.chat.completions.create(
+                model="generators/" + provider + "-long",
+                messages=messages,
+                max_tokens=65536,
+                stream=True,
+            ) as stream:
+                for chunk in stream:
+                    for choice in chunk.choices:
+                        text_count += len(choice.delta.content or "")
+                        finish = choice.finish_reason or finish
+            assert text_count == 40000 and finish == "length", (
+                provider,
+                text_count,
+                finish,
+            )
+    print(
+        "hosted generation stop reasons, terminal validation and streams beyond embedding limits passed",
+        flush=True,
+    )
 
 
 def main() -> None:
@@ -1483,6 +1968,13 @@ def main() -> None:
                 "region": "us-east-1",
                 "api_key": "mock-server-key",
             }
+            config["generators"]["anthropic-known"] = {
+                "provider": "anthropic",
+                "model": "future-claude",
+                "url": upstream_url + "/anthropic",
+                "api_key": "mock-server-key",
+                "workspace_id": "fixture-workspace",
+            }
             config["generators"]["google-vision-busy"] = {
                 **config["generators"]["google-known"],
                 "model": "mock-vision-busy",
@@ -1503,6 +1995,16 @@ def main() -> None:
                     "api_key": "mock-server-key",
                 },
             }
+            config["connections"]["anthropic-vision"] = {
+                "kind": "inference",
+                "capabilities": ["models.generate"],
+                "inference": {
+                    "provider": "anthropic",
+                    "url": upstream_url + "/anthropic",
+                    "api_key": "mock-server-key",
+                    "workspace_id": "fixture-workspace",
+                },
+            }
             config["chains"]["vision-fallback"] = [
                 {"generator": "google-vision-busy", "condition": "on_error"},
                 {"generator": "bedrock-known"},
@@ -1511,10 +2013,12 @@ def main() -> None:
                 "generators/google-known",
                 "generators/vertex-known",
                 "generators/bedrock-known",
+                "generators/anthropic-known",
                 "generators/vision-openai",
                 "generators/google-vision-busy",
                 "chains/vision-fallback",
                 "connections/bedrock-vision/models/new-vision-model",
+                "connections/anthropic-vision/models/new-vision-model",
             ):
                 config["inference_capabilities"][target] = {
                     "images": "supported",
@@ -1547,6 +2051,60 @@ def main() -> None:
                     "streaming": "supported",
                     "tools": "supported",
                 }
+            for provider in ("google", "vertex", "bedrock", "anthropic"):
+                config["generators"][provider + "-long"] = {
+                    **config["generators"][provider + "-known"],
+                    "model": "long",
+                }
+                config["inference_capabilities"]["generators/" + provider + "-long"] = {
+                    "streaming": "supported"
+                }
+            for model in ("validation", "truncated", "filtered"):
+                config["generators"][model] = {
+                    **config["generators"]["bedrock-known"],
+                    "model": model,
+                }
+                config["inference_capabilities"]["generators/" + model] = {
+                    "streaming": "supported"
+                }
+            config["chains"]["validation"] = [
+                {"generator": "validation", "condition": "on_error"},
+                {"generator": "google-known"},
+            ]
+            config["inference_capabilities"]["chains/validation"] = {
+                "streaming": "supported"
+            }
+            for suffix in ("validation", "busy", "midstream", "truncated", "filtered"):
+                name = "anthropic-" + suffix
+                config["generators"][name] = {
+                    **config["generators"]["anthropic-known"],
+                    "model": name,
+                }
+                config["inference_capabilities"]["generators/" + name] = {
+                    "streaming": "supported"
+                }
+            for suffix in ("validation", "busy", "midstream"):
+                name = "anthropic-" + suffix
+                config["chains"][name] = [
+                    {"generator": name, "condition": "on_error"},
+                    {"generator": "google-known"},
+                ]
+                config["inference_capabilities"]["chains/" + name] = {
+                    "streaming": "supported"
+                }
+            for provider in ("google", "vertex", "bedrock", "anthropic"):
+                for case, capacity in (("denied", 1000), ("admitted", 10000)):
+                    name = provider + "-quota-" + case
+                    config["generators"][name] = {
+                        **config["generators"][provider + "-known"],
+                        "model": name,
+                        "max_tokens": 16,
+                        "max_image_input_tokens": 2000,
+                        "rate_limit": {"tokens_per_minute": capacity},
+                    }
+                    config["inference_capabilities"]["generators/" + name] = {
+                        "images": "supported"
+                    }
             config_path = root / "config.json"
             config_path.write_text(json.dumps(config))
             port = free_port()
@@ -1595,6 +2153,7 @@ def main() -> None:
                     print("remote-only gateway ready", flush=True)
                     verify_hosted_image_inputs(base_url)
                     verify_hosted_image_streams(base_url)
+                    verify_hosted_generation_contracts(base_url)
                     if args.only_images:
                         return
                     Upstream.model_delay_seconds = 0.3
@@ -1619,6 +2178,12 @@ def main() -> None:
                     ) as response:
                         catalog = json.load(response)
                     physical = {item["id"]: item for item in catalog["data"]}
+                    assert (
+                        physical["connections/anthropic-vision/models/future-claude"][
+                            "task"
+                        ]
+                        == "generate"
+                    )
                     assert (
                         physical["connections/runtime/models/mock-sparse"]["task"]
                         == "embed"

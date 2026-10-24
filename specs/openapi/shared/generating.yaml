@@ -13,6 +13,7 @@ components:
         - gemini
         - vertex
         - bedrock
+        - anthropic
         - ollama
         - openai
         - chatgpt
@@ -29,6 +30,7 @@ components:
             - $ref: "#/components/schemas/GoogleGeneratorConfig"
             - $ref: "#/components/schemas/VertexGeneratorConfig"
             - $ref: "#/components/schemas/BedrockGeneratorConfig"
+            - $ref: "#/components/schemas/AnthropicGeneratorConfig"
             - $ref: "#/components/schemas/OllamaGeneratorConfig"
             - $ref: "#/components/schemas/AntflyGeneratorConfig"
             - $ref: "#/components/schemas/ChatGPTGeneratorConfig"
@@ -36,6 +38,12 @@ components:
             - $ref: "#/components/schemas/OpenRouterGeneratorConfig"
             - $ref: "#/components/schemas/AppleGeneratorConfig"
         - properties:
+            max_image_input_tokens:
+              x-go-type-skip-optional-pointer: false
+              type: integer
+              format: int64
+              minimum: 1
+              description: Conservative input-token ceiling per image. Required for image calls when tokens_per_minute is configured; choose a bound valid for the model and image policy.
             rate_limit:
               x-go-type-skip-optional-pointer: false
               $ref: "./provider.yaml#/components/schemas/RateLimitConfig"
@@ -325,6 +333,10 @@ components:
       required:
         - role
       properties:
+        extra_content:
+          type: object
+          additionalProperties: true
+          description: Opaque provider message metadata. Preserve unchanged when replaying assistant messages; native Anthropic content retains signed thinking blocks.
         role:
           $ref: "#/components/schemas/ChatMessageRole"
         content:
@@ -634,6 +646,12 @@ components:
       description: |
         Configuration for the Anthropic generative AI provider.
       properties:
+        provider:
+          type: string
+          enum: [anthropic]
+        workspace_id:
+          type: string
+          description: Anthropic workspace for keys not scoped to a workspace. Defaults to ANTHROPIC_WORKSPACE_ID.
         model:
           type: string
           description: "The full model ID of the Anthropic model to use."
@@ -642,11 +660,11 @@ components:
         api_key:
           type: string
           writeOnly: true
-          description: "The Anthropic API key."
+          description: "Anthropic API key or secret reference. Defaults to ANTHROPIC_API_KEY."
         url:
           type: string
           format: uri
-          description: "The URL of the Anthropic API endpoint."
+          description: "Messages API base URL. Defaults to https://api.anthropic.com/v1."
         temperature:
           type: number
           format: float
@@ -666,6 +684,7 @@ components:
           type: integer
           description: "Top-k sampling parameter."
       required:
+        - provider
         - model
 
     CohereGeneratorConfig:
