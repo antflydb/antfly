@@ -27,10 +27,29 @@ export async function collect(env, execute, expected) {
       case "prepare": await call("prepared", { plan: await execute({ op: "gc_prepare" }, token) }); break;
       case "pins": await call("pins"); break;
       case "mark_artifacts": case "mark_wal": {
+        const stopAt = Date.now()+10000;
+        if (env.COORDINATOR_BACKEND === "r2") {
+          let nodes;
+          try {nodes=await call("nextBatch");} catch(error) {if(!/UnsupportedCollectionOperation/.test(String(error)))throw error;}
+          if(nodes){
+          if(!nodes.length){await call("marked");break;}
+          const flush=async entries=>{try{await call("tracedBatch",{entries});}catch(error){if(!/UnsupportedCollectionOperation/.test(String(error)))throw error;for(const entry of entries)await call("traced",entry);}};
+          let entries=[],children=0;
+          for(const node of nodes){
+            const result=await execute({op:"gc_trace",gc_task:node.task},token);
+            if(entries.length&&children+result.children.length>192){await flush(entries);entries=[];children=0;}
+            entries.push({id:node.id,result});children+=result.children.length;
+            if(Date.now()>=stopAt)break;
+          }
+          if(entries.length)await flush(entries);
+          break;
+          }
+        }
         for (let i = 0; i < 8; i++) {
           const node = await call("next");
           if (!node) { await call("marked"); break; }
           await call("traced", { id: node.id, result: await execute({ op: "gc_trace", gc_task: node.task }, token) });
+          if (Date.now() >= stopAt) break;
         }
         break;
       }

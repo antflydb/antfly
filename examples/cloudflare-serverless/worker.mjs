@@ -20,6 +20,7 @@ import { withCommitCoordinator } from "../../zig/lib/objectstore/wasm/coordinate
 import { createImmutableReadCache } from "../../zig/lib/objectstore/wasm/cache.mjs";
 import { collect } from "./collect.mjs";
 import { pruneEmbeddingCheckpoints } from "./embedding-checkpoints.mjs";
+export { R2CommitCoordinator } from "./r2-coordinator.mjs";
 export { CommitCoordinator } from "./coordinator.mjs";
 const lanes = {interactive: null, maintenance: null};
 const busy = {interactive: false, maintenance: false};
@@ -101,7 +102,7 @@ async function readJson(request) {
 }
 async function enqueue(env, kind = "publish", job_id, delaySeconds = 0) {
   if (!env.MAINTENANCE) return false;
-  await env.MAINTENANCE.send({ incarnation: env.ANTFLY_INCARNATION, ...(["collect", "reindex"].includes(kind) ? { kind, job_id } : kind === "compact" ? {kind} : {}) }, { delaySeconds });
+  await env.MAINTENANCE.send({ incarnation: env.ANTFLY_INCARNATION, ...(["collect", "reindex", "collect_metadata", "migrate_coordinator"].includes(kind) ? { kind, job_id } : kind === "compact" ? {kind} : {}) }, { delaySeconds });
   return true;
 }
 export default {
@@ -121,6 +122,12 @@ export default {
         return Response.json(await env.AI.run(env.AI_MODEL, args, { gateway: { id: env.AI_GATEWAY } }));
       }
       if (args.op === "prune_checkpoints") return Response.json(await pruneEmbeddingCheckpoints(env));
+      if (args.op === "collect_metadata" || args.op === "migrate_coordinator") {
+        const stub = env.COMMITS.getByName(env.ANTFLY_INCARNATION);
+        const result = args.op === "collect_metadata" ? await stub.collectMetadata(args.job_id) : await stub.migrateFromSqlite();
+        if (result.has_more) await enqueue(env, args.op, result.job_id, result.delay_seconds ?? 0);
+        return Response.json(result);
+      }
       if (args.op === "collect") {
         const result = await collect(env, (input, token) => run(env, input, request.signal, token), args.job_id);
         if (result.has_more) await enqueue(env, "collect", result.job_id, result.delay_seconds);
@@ -142,7 +149,7 @@ export default {
       }
       return Response.json(result, env.WORKER_VERSION ? {headers: {"X-Antfly-Version": env.WORKER_VERSION.id}} : undefined);
     } catch (error) {
-      const retryable = error instanceof Busy || /\b(SQLITE_NOMEM|ObjectStoreTransportFailed|ObjectStoreRateLimited)\b/.test(String(error));
+      const retryable = error instanceof Busy || /\b(SQLITE_NOMEM|ObjectStoreTransportFailed|ObjectStoreRateLimited|CoordinatorRecovering|ImmutableLogFenced|CoordinatorMigrationRequired|CoordinatorMigrationFrozen|CoordinatorCommitBusy|CoordinatorIoBudgetExceeded|DeadlineExceeded|WorkLeaseLost|10058)\b/.test(String(error));
       return Response.json({ error: String(error.message ?? error) }, { status: retryable ? 503 : 409,
         headers: retryable ? { "Retry-After": "1" } : undefined });
     }
@@ -152,6 +159,13 @@ export default {
       if (message.body?.incarnation !== env.ANTFLY_INCARNATION) { message.ack(); continue; }
       let publishing = !message.body.kind || message.body.kind === "reindex";
       try {
+        if (["collect_metadata", "migrate_coordinator"].includes(message.body.kind)) {
+          if (message.body.kind === "collect_metadata" && !message.body.job_id) {message.ack();continue;}
+          const stub = env.COMMITS.getByName(env.ANTFLY_INCARNATION);
+          const result = message.body.kind === "collect_metadata" ? await stub.collectMetadata(message.body.job_id) : await stub.migrateFromSqlite();
+          if (result.has_more && !await enqueue(env, message.body.kind, result.job_id, result.delay_seconds ?? 0)) throw new Error("maintenance queue is not configured");
+          message.ack(); continue;
+        }
         if (message.body.kind === "reindex") {
           const result = await run(env, {op: "reindex", reindex_action: "step", reindex_job_id: message.body.job_id});
           if (result.has_more && !await enqueue(env, "reindex", result.job_id)) throw new Error("maintenance queue is not configured");
@@ -188,7 +202,16 @@ export default {
   },
   // Recovery also covers a crash between WAL acceptance and queue admission.
   async scheduled(controller, env) {
+    if (env.COORDINATOR_MIGRATION_REQUIRED === "true") {
+      const status = await env.COMMITS.getByName(env.ANTFLY_INCARNATION).migrationStatus();
+      if (!["none", "active"].includes(status.phase)) await enqueue(env, "migrate_coordinator");
+      if (status.phase !== "active") return;
+    }
     await enqueue(env);
+    if (env.COORDINATOR_BACKEND === "r2") {
+      const metadata = await env.COMMITS.getByName(env.ANTFLY_INCARNATION).collectMetadata();
+      if (metadata.has_more) await enqueue(env, "collect_metadata", metadata.job_id, metadata.delay_seconds ?? 0);
+    }
     const reindex = await run(env, {op: "reindex", reindex_action: "status"});
     if (reindex.has_more) await enqueue(env, "reindex", reindex.job_id);
     if (env.AUTO_GC === "true" && Math.floor(controller.scheduledTime / 60000) % 15 === 0) await enqueue(env, "collect");

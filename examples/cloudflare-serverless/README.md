@@ -11,6 +11,48 @@ Node and workerd tests cover durable reopen, publication, resumable collection,
 and conditional enrichment. Live qualification uses separate disposable
 resources; local tests do not establish deployed runtime budgets.
 
+## Antfly-owned R2 coordination
+
+For a fresh database, `npm run deploy:r2` selects `wrangler.r2.jsonc` and
+`R2CommitCoordinator`. Antfly persists metadata, job state and both collectors'
+frontiers in R2 using the shared native ordered page engine and immutable
+commit log. The actor uses no application SQLite/KV storage. The example uses
+separate Worker, bucket, Queue and incarnation names to avoid changing an
+existing database's authority accidentally.
+
+The original `wrangler.jsonc` remains the SQLite compatibility profile. Existing
+data requires the frozen migration below; changing only the class binding does
+not migrate metadata.
+
+The shared Lite Zig exports are `object_database` and `object_commit_log`.
+These expose object-native transactions; local `.aflite` and SQL/LSM APIs retain
+their existing storage semantics. Full architecture and failure cases are in
+[the backend design](../../docs/design/antfly-object-storage-backend.md).
+
+`collect_metadata` drives bounded collection of the coordinator's own pages and
+commit history. Queue/cron recovery schedules it when `COORDINATOR_BACKEND=r2`.
+Application `collect` continues to trace document/index artifacts separately.
+Acknowledged writes are durable before Queue admission. R2 latency and request
+cost remain part of the commit path; qualify the target workload before rollout.
+
+For migration, preserve the old `CommitCoordinator` class, bind it as
+`LEGACY_COMMITS`, add the new R2 class with a new migration tag, and point
+`COMMITS` at it. Keep `ANTFLY_INCARNATION` and the R2 bucket unchanged. Set
+`COORDINATOR_MIGRATION_REQUIRED=true` and a stable `COORDINATOR_STORAGE_ID`.
+Then submit the authenticated request:
+
+```json
+{"op":"migrate_coordinator"}
+```
+
+It freezes the source, waits for in-flight work, imports bounded batches and
+activates the target. Queue deliveries resume it; without a Queue, repeat the
+operation until `done`. Normal target operations remain blocked until cutover.
+The source stays frozen afterward in migration-aware releases. A rollback must
+retain the freeze/authority checks; pre-migration code is not a supported rollback
+target. Its records are preserved for inspection; automatic migration does not delete them.
+
+
 ## Build and test
 
 Use the repository's pinned Zig 0.17 toolchain and Node 24:
@@ -391,6 +433,13 @@ Cloudflare provider integration is tracked separately in
 bundled with the database WASM module.
 
 
+## Native metadata scale qualification
+
+`node qualification/r2-scale.mjs 100000` checks 100,000 metadata records, cold
+reopen, a wide tree branch, deletion, three metadata collection cycles and every
+surviving value. It reports bounded native memory, object operations, transfers
+and retained storage. This local fixture does not measure R2 latency or cost.
+
 ## Live qualification
 
 See the [recorded live measurements and limits](../../docs/design/cloudflare-qualification.md).
@@ -410,6 +459,10 @@ before `run.mjs ... --drain`; then delete the generated Worker, Queues, and empt
 bucket. Production `worker.mjs` has no drain route. Reports contain no API token.
 A successful fixture and absence of resource-limit errors do not measure total
 isolate memory or establish all-workload production qualification.
+For the Antfly-native coordinator, prepare with `--r2-coordinator`. After the
+ordinary fixture, run `run.mjs RUN_JSON HTTPS_ORIGIN --collect-metadata` to check
+metadata collection, preserved counts and harmless late Queue deliveries.
+
 For live paged text qualification, prepare with `--paged-text` and run
 `run.mjs RUN_JSON HTTPS_ORIGIN --scale --documents=5000`. The runner validates
 edits, deletes, and an old generation cursor against the real services.

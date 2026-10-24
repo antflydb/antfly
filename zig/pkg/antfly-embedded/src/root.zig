@@ -18,18 +18,22 @@ const embedded = @import("embedded_surface");
 pub const db = embedded.db;
 pub const api = embedded.api;
 pub const host_environment = embedded.host_environment;
+pub const object_database = embedded.object_database;
+pub const object_commit_log = embedded.object_commit_log;
 pub const object_storage = embedded.object_storage;
 pub const lsm_backend = embedded.lsm_backend;
 pub const storage_backend = embedded.storage_backend;
 pub const db_types = embedded.db_types;
-pub const memory = @import("memory/service.zig");
-pub const memory_engine = @import("memory/engine.zig");
+pub const memory = embedded.memory;
+pub const memory_engine = embedded.memory_engine;
 
 test "pkg antfly embedded root compiles" {
     _ = db;
     _ = api;
     _ = host_environment;
     _ = object_storage;
+    _ = object_database.Context;
+    _ = object_commit_log.Log;
     _ = lsm_backend;
     _ = storage_backend;
     _ = db_types;

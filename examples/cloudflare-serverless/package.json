@@ -4,10 +4,11 @@
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
-    "test": "node --test test/host.test.mjs test/collection.test.mjs test/batch.test.mjs",
+    "test": "node --test test/host.test.mjs test/collection.test.mjs test/batch.test.mjs test/r2-coordinator.test.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "test:workerd": "wrangler deploy --dry-run --outdir dist/worker && node --test test/workerd.test.mjs",
+    "deploy:r2": "wrangler deploy --config wrangler.r2.jsonc",
+    "test:workerd": "wrangler deploy --dry-run --outdir dist/worker && node --test test/workerd.test.mjs test/r2-workerd.test.mjs",
     "test:native": "node test/native.mjs"
   },
   "devDependencies": {

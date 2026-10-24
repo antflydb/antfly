@@ -1,0 +1,73 @@
+{
+  "name": "antfly-serverless-r2",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-10-23",
+  "rules": [
+    {
+      "type": "CompiledWasm",
+      "globs": [
+        "**/*.wasm"
+      ],
+      "fallthrough": true
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "DATABASE",
+      "bucket_name": "antfly-serverless-r2"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "COMMITS",
+        "class_name": "R2CommitCoordinator"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "R2CommitCoordinator"
+      ]
+    }
+  ],
+  "vars": {
+    "ANTFLY_INCARNATION": "example-r2-v1",
+    "COORDINATOR_BACKEND": "r2"
+  },
+  "ai": {
+    "binding": "AI"
+  },
+  "limits": {
+    "cpu_ms": 30000
+  },
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "queues": {
+    "producers": [
+      {
+        "binding": "MAINTENANCE",
+        "queue": "antfly-maintenance-r2"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "antfly-maintenance-r2",
+        "max_batch_size": 1,
+        "max_retries": 10,
+        "dead_letter_queue": "antfly-maintenance-r2-dead",
+        "max_concurrency": 1
+      }
+    ]
+  },
+  "triggers": {
+    "crons": [
+      "* * * * *"
+    ]
+  }
+}

@@ -104,7 +104,8 @@ pub fn requestAdditional(raw: []const u8) ![]u8 {
 fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     @import("antfly_platform").time.installHostClocks(.{ .monotonic_ns = monotonicNs, .realtime_ns = realtimeNs, .authority_ns = authorityNs });
     const Request = struct {
-        op: enum { search, mutate, publish, compact, lookup, list, count, status, enrich, gc_prepare, gc_wal, gc_trace, reindex },
+        op: enum { search, mutate, publish, compact, lookup, list, count, status, enrich, gc_prepare, gc_wal, gc_trace, reindex, coordinate },
+        coordinate: ?@import("serverless/coordinator_store.zig").Request = null,
         bucket: []const u8,
         prefix: []const u8,
         namespace: []const u8,
@@ -151,6 +152,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     if (req.filters.len != 0 and req.op != .list and req.op != .search) return error.FilterCapabilityUnsupported;
     if (req.cursor != null and req.op != .list and !(req.op == .search and req.mode == .text)) return error.QueryCursorCapabilityUnsupported;
     var host = objects.wasm_host.Host{ .alloc = a, .transfer_allocator = wasm_allocator };
+    if (req.op == .coordinate) return (@import("serverless/coordinator_store.zig").Context{ .alloc = a, .client = host.client(), .bucket = req.bucket, .prefix = req.prefix, .namespace = req.namespace, .io = host_io, .cancellation = objects.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn) }).execute(req.coordinate orelse return error.CoordinatorRequestRequired);
     const artifact_prefix = try std.fmt.allocPrint(a, "{s}/artifacts", .{req.prefix});
     defer a.free(artifact_prefix);
     var object_artifacts = try @import("serverless/artifacts/object_store.zig").ObjectStore.initWithClient(a, host.client(), req.bucket, artifact_prefix);

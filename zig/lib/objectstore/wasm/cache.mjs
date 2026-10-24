@@ -16,10 +16,13 @@
 import { ObjectStoreError } from "./r2.mjs";
 // Cache only immutable object names, never catalog/progress/WAL HEAD records.
 // Values contain copied bytes and plain metadata, not request-owned I/O handles.
-export function createImmutableReadCache({ maxBytes = 8 * 1024 * 1024, maxEntries = 128 } = {}) {
+export function createImmutableReadCache({ maxBytes = 8 * 1024 * 1024, maxEntries = 128, includeCommitLog = false } = {}) {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || !Number.isSafeInteger(maxEntries) || maxEntries < 0) throw new TypeError("invalid cache budget");
   const entries = new Map(); let retained = 0;
-  const eligible = key => /\/wal-v1\/[a-f0-9]{64}\/pages\/(?:[a-f0-9]{32}\/)?[a-f0-9]{64}$/.test(key) ||
+  // Commit log names are immutable within the native checkpoint floor.
+  // Only the coordinator opts in; it reads that mutable floor uncached before
+  // accepting cached cursors or acknowledging a write to a retired epoch.
+  const eligible = key => (includeCommitLog && /\/coord-v1\/[a-f0-9]{64}\/epochs\/[a-f0-9]{32}\/(?:[0-9]{20}\.json|START|SEALED)$/.test(key)) || /\/wal-v1\/[a-f0-9]{64}\/pages\/(?:[a-f0-9]{32}\/)?[a-f0-9]{64}$/.test(key) ||
     /\/artifacts\/(?:sha256\/[a-f0-9]{2}\/[a-f0-9]{62}|graph\/[a-f0-9]{64}\/[a-f0-9]{32}\/[a-f0-9]{64})$/.test(key);
   function evict(key) { const item = entries.get(key); if (item) retained -= item.charge; entries.delete(key); }
   return {

@@ -2783,6 +2783,26 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const serverless_test_step = b.step("antfly-serverless-test", "Run serverless and serverless transport tests");
     serverless_test_step.dependOn(&run_serverless_tests.step);
 
+    // The page engine is shared with Lite/object-store users. Dependency
+    // module tests need their own compilation root after the extraction.
+    const ordered_tree_mod = b.createModule(.{ .root_source_file = b.path("lib/objectstore/src/ordered_tree.zig"), .target = target, .optimize = optimize });
+    test_imports.configure(b, ordered_tree_mod, true, true);
+    const ordered_tree_tests = b.addTest(.{ .root_module = ordered_tree_mod, .filters = &.{"serverless"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const run_ordered_tree_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, ordered_tree_tests, &.{"serverless"});
+    serverless_test_step.dependOn(&run_ordered_tree_tests.step);
+    b.step("antfly-ordered-tree-test", "Run shared immutable ordered page contracts").dependOn(&run_ordered_tree_tests.step);
+
+    const object_store_test_step = b.step("antfly-object-store-test", "Run shared object transaction and commit protocols");
+    object_store_test_step.dependOn(&run_ordered_tree_tests.step);
+    for ([_]struct { path: []const u8, filter: []const u8 }{ .{ .path = "lib/objectstore/src/immutable_log.zig", .filter = "immutable log" }, .{ .path = "lib/objectstore/src/transactional_store.zig", .filter = "object-native" } }) |suite| {
+        const mod = b.createModule(.{ .root_source_file = b.path(suite.path), .target = target, .optimize = optimize });
+        test_imports.configure(b, mod, true, true);
+        const tests = b.addTest(.{ .root_module = mod, .filters = &.{suite.filter}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+        const run = addFilteredTestRunArtifactWithRuntimeFilters(b, tests, &.{suite.filter});
+        object_store_test_step.dependOn(&run.step);
+        serverless_test_step.dependOn(&run.step);
+    }
+
     const document_facts_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/serverless_facts_test_root.zig"),
         .target = target,
@@ -2807,12 +2827,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     graph_page_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const graph_page_tests = b.addTest(.{
         .root_module = graph_page_test_mod,
-        .filters = selectTestFilters(b, &.{ "serverless.graph_segment.", "serverless.artifacts.fs_store.", "serverless.build.lake_build_limits." }),
+        .filters = selectTestFilters(b, &.{ "serverless.graph_segment.", "serverless graph", "serverless.artifacts.fs_store.", "serverless.build.lake_build_limits." }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const graph_test_step = b.step("antfly-graph-test", "Run graph algorithms, topology, pages, query and recovery tests");
-    b.step("antfly-graph-pages-test", "Run immutable page publication and upload admission contracts")
-        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, graph_page_tests, selectTestFilters(b, &.{ "serverless.graph_segment.", "serverless.artifacts.fs_store.", "serverless.build.lake_build_limits." })).step);
+    const graph_pages_step = b.step("antfly-graph-pages-test", "Run immutable page publication and upload admission contracts");
+    graph_pages_step.dependOn(&run_ordered_tree_tests.step);
+    graph_pages_step.dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, graph_page_tests, selectTestFilters(b, &.{ "serverless.graph_segment.", "serverless graph", "serverless.artifacts.fs_store.", "serverless.build.lake_build_limits." })).step);
 
     const serverless_manifest_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/serverless_manifest_test_root.zig"),
@@ -5949,7 +5970,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_graph_metric_unit_tests.step);
     @import("../../../build_support/antfly/test_support.zig").addOwnerTestRuns(b, graph_test_step, &.{
         .{ .artifact = graph_metric_unit_tests, .filters = &.{"graph."} },
-        .{ .artifact = graph_page_tests, .filters = &.{ "serverless.graph_segment.", "serverless.artifacts.fs_store." } },
+        .{ .artifact = graph_page_tests, .filters = &.{ "serverless.graph_segment.", "serverless graph", "serverless.artifacts.fs_store." } },
     }, &.{});
     integration_test_step.dependOn(&run_maintenance_worker_tests.step);
 

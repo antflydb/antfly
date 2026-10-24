@@ -14,6 +14,18 @@ host integration and workload limits.
 | Enrichment continuation | `enrichment/worker.zig` scans indexed pending work under a finite cycle and persists CAS-protected stage progress. Source pinning and conditional WAL append reject stale model results. | Used directly. The embedding adapter now splits a document into dimension-bounded provider windows. Only a complete document is appended. |
 | Retention and collection | Native read pins, work leases, retirement floors, manifest formats, and page validators define authority and reachability. | The durable hosted collector orchestrates these native rules over R2 and coordinated metadata. |
 
+## Antfly-owned metadata profile
+
+The object-native R2 coordinator is now implemented as a separate opt-in profile.
+It shares Antfly's ordered page engine and commit protocol with Lite, persists
+frontiers and metadata directly in R2, and supports explicit frozen migration
+from the SQLite compatibility profile. See the
+[backend design](antfly-object-storage-backend.md) and
+[current qualification evidence](cloudflare-qualification.md#antfly-native-r2-coordinator-2026-10-24).
+The SQLite pressure measurements below describe the compatibility profile;
+its recovered memory error was not root-caused. The new profile removes
+application SQL/KV queries. The ANN recall limitation remains independent.
+
 ## Adapter changes
 
 The native compactor previously instantiated a threaded fallback type even

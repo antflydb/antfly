@@ -75,3 +75,19 @@ test("embedding scratch pruning stays scoped, bounded and resumable after deleti
   assert.equal((await pruneEmbeddingCheckpoints(env)).deleted, 2);
   assert.deepEqual([...bucket.objects.keys()].sort(), [current, foreign].sort());
 });
+
+
+test("a slow object-store trace checkpoints before processing the next frontier item",async t=>{
+  const {collect}=await import("../collect.mjs");let now=1000,traced=0,released=false;
+  t.mock.method(Date,"now",()=>now);
+  const coordinator={async collection(op){if(op==="claim")return{token:{id:"job"},state:{phase:"mark_artifacts"}};if(op==="next")return{id:"node",task:{kind:"blob"}};if(op==="traced")traced++;if(op==="release")released=true;}};
+  const result=await collect({COMMITS:{getByName:()=>coordinator}},async()=>{now+=11000;return{children:[]};});
+  assert.equal(traced,1);assert.ok(released&&result.has_more);
+});
+
+
+test("rolling deployment falls back when an older coordinator lacks batch tracing",async()=>{
+ const {collect}=await import("../collect.mjs");let completed=false;
+ const coordinator={async collection(op){if(op==="claim")return{token:{id:"job"},state:{phase:"mark_artifacts"}};if(op==="nextBatch")throw new Error("UnsupportedCollectionOperation");if(op==="next")return completed?null:{id:"node",task:{kind:"blob"}};if(op==="traced")completed=true;}};
+ const result=await collect({COORDINATOR_BACKEND:"r2",COMMITS:{getByName:()=>coordinator}},async()=>({children:[]}));assert.ok(completed&&result.has_more);
+});

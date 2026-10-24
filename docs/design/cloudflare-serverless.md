@@ -7,6 +7,15 @@ configuration, API, budgets, and current limitations. This extends the
 publication protocol. It does not route the embedded local-storage engine
 through a simulated filesystem.
 
+## R2-native coordinator
+
+The Antfly-owned R2 coordinator, shared Lite engine surface, immutable commit
+protocol, self-collection and frozen SQLite migration are described in
+[the object-storage backend design](antfly-object-storage-backend.md). Fresh
+R2-native deployments use `wrangler.r2.jsonc`; the existing configuration remains
+the SQLite compatibility profile. The details below describe the original
+profile unless explicitly stated otherwise.
+
 ## Execution and storage
 
 ```text

@@ -76,3 +76,61 @@ Final local checks passed: 553 native serverless tests and 28 owner tests (six
 skipped, no failures or leaks), 12 portable native contract tests, 24 WASM/host
 tests, and the workerd restart suite. Both the native Binaryen 132 tool and the
 pinned npm Binaryen build passed the WASM suite.
+
+
+## Antfly-native R2 coordinator (2026-10-24)
+
+The separate `wrangler.r2.jsonc` profile replaces application SQLite/KV metadata
+with the shared Antfly ordered tree and immutable commit log. Its design,
+checkpoint/fencing argument and frozen migration procedure are documented in
+[the object-storage backend design](antfly-object-storage-backend.md).
+
+Local validation passed the native serverless suite (536 passed, six skipped,
+no failures or leaks), the separately registered shared ordered-tree/log/store
+contracts, the Lite public package build, 58 Node tests and the workerd restart
+and migration tests. The latter import original receipts, binary records,
+embedding profiles and an active collection frontier; they also run both
+collectors, resume reindex and erase platform storage before reopening.
+
+The 100,000-record native metadata fixture checks all 99,872 surviving values
+after deletion and three complete collections. It peaks at 1,234,266 native
+working bytes and 20 MiB WASM linear memory. Retained fixture bytes stabilize
+across repeated collection cycles; these are local admission measurements,
+not deployed latency, total isolate memory or R2 billing figures. Exact commands
+and measurements are in the backend design.
+
+The disposable live Worker and bucket were recreated for the native profile,
+using logical incarnation `qualification-antfly-1278-mvmnbmzg-f1070a-r2`.
+Native metadata collection preserved the application count and accepted a late
+job delivery without starting another collection. The deployment was then
+rebound to a fresh `ReopenedR2CommitCoordinator` namespace against the same R2
+data, preserving the original operation identities and active frontier.
+
+Live R2 coordination adds substantial latency in this fixture. Initial
+publication/racing-write attempts exceeded their deadlines; retries remained
+conditional/idempotent. Deadline and lease contention return retryable 503s.
+The implementation removes a redundant recovery walk per commit, groups queued
+metadata callbacks, batches up to sixteen frontier parents per transaction and
+bounds trace work by elapsed time. Rolling deployments fall back to individual
+traces when an older coordinator lacks the batch operation. This profile remains
+opt-in; these correctness fixtures do not establish a production latency or
+sustained-throughput target. The earlier ANN recall limitation also remains.
+
+
+The final live fixture completed on Worker version
+`bb582a87-2e29-4b0c-90b6-026190f30ae7` after the namespace replacement. It passed
+the original 300-document receipt, eight racing operation identities, fenced
+lookup, publication, compaction, application collection and a finite
+384-dimensional Gateway embedding. Native metadata collection passed alongside
+the application collector. The quick fixture's three timed lookups had a
+7,524 ms median and 10,781 ms maximum; three samples do not establish production
+percentiles. The full run took about 8 minutes 39 seconds, including contention,
+retries, maintenance and collection grace. This is correctness evidence with a
+material latency limitation, not a throughput qualification.
+
+
+After qualification, Queue delivery was paused, the consumer was explicitly
+removed, and the test storage was drained. The Worker, both Queues and R2 bucket
+were deleted. Removing a consumer from local Wrangler configuration alone does
+not remove the remote Queue consumer. The native-profile drain route avoids
+waking an empty coordinator, which would otherwise recreate authority metadata.

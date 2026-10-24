@@ -20,12 +20,13 @@ const account = process.argv[2];
 if (!/^[a-f0-9]{32}$/.test(account ?? "")) throw new Error("usage: node qualification/prepare.mjs ACCOUNT_ID");
 const id = `antfly-1278-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
 const dir = resolve("dist/qualification", id); await mkdir(dir, {recursive: true});
-const config = JSON.parse(await readFile("wrangler.jsonc", "utf8"));
+const config = JSON.parse(await readFile(process.argv.includes("--r2-coordinator") ? "wrangler.r2.jsonc" : "wrangler.jsonc", "utf8"));
 Object.assign(config, { name: id, account_id: account, main: resolve("qualification/worker.mjs"),
   assets: {...config.assets, directory: resolve("public")},
   vars: {ANTFLY_INCARNATION: `qualification-${id}`, AI_MODEL: "@cf/baai/bge-small-en-v1.5", AI_GATEWAY: "default", AUTO_GC: "false"},
   version_metadata: {binding: "WORKER_VERSION"}, observability: {enabled: true, head_sampling_rate: 1} });
 if (process.argv.includes("--paged-text")) Object.assign(config.vars, {PAGED_TEXT: "true", PUBLICATION_RECORDS: "64", LOG_METRICS: "true"});
+if (process.argv.includes("--r2-coordinator")) Object.assign(config.vars, {COORDINATOR_BACKEND: "r2", PAGED_PROJECTIONS: "true", LOG_METRICS: "true"});
 delete config.triggers;
 config.r2_buckets[0].bucket_name = id;
 config.queues.producers[0].queue = id;

@@ -1,0 +1,111 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import {openAuthority, activateR2} from "./coordinator-authority.mjs";
+import {DurableObject} from "cloudflare:workers";
+import module from "./dist/antfly-serverless.wasm";
+import {R2CoordinatorStore} from "./r2-coordinator-store.mjs";
+import {migrateCoordinator, MIGRATION} from "./r2-coordinator-migration.mjs";
+import {collectCoordinator} from "./r2-coordinator-gc.mjs";
+import {R2CollectionJournal} from "./r2-collection-journal.mjs";
+export class R2CommitCoordinator extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    if (!env.ANTFLY_INCARNATION) throw new Error("CoordinatorNamespaceRequired");
+    this.env = env;
+    this.store = new R2CoordinatorStore(module, env.DATABASE, env.COORDINATOR_STORAGE_ID ?? env.ANTFLY_INCARNATION);
+    this.serviceStore = Object.create(this.store);
+    this.serviceStore.transaction = run => this.transaction(run);
+    this.journal = new R2CollectionJournal(this.serviceStore);
+    ctx.blockConcurrencyWhile(async () => {this.authority = await openAuthority(env, "r2");});
+  }
+  transaction(run) {
+    return this.store.transaction(async tx => {
+      const migration = await tx.get(MIGRATION);
+      if ((migration && migration.phase !== "active") || (this.env.COORDINATOR_MIGRATION_REQUIRED === "true" && !migration) || this.authority.descriptor.mode !== "r2") throw new Error("CoordinatorMigrationRequired");
+      return run(tx);
+    });
+  }
+  async migrationStatus() {
+    const state = await this.store.transaction(async tx => await tx.get(MIGRATION) ?? {phase:"none"});
+    if (state.phase === "none" && this.env.LEGACY_COMMITS && await this.env.LEGACY_COMMITS.getByName(this.env.ANTFLY_INCARNATION).frozenR2Status()) return {phase:"freeze"};
+    return state.phase === "active" && this.authority.descriptor.mode !== "r2" ? {...state,phase:"cutover"} : state;
+  }
+  async migrateFromSqlite() {
+    if (!this.env.LEGACY_COMMITS || this.env.COORDINATOR_MIGRATION_REQUIRED !== "true") throw new Error("CoordinatorMigrationNotConfigured");
+    const result = await migrateCoordinator(this.store, this.env.LEGACY_COMMITS.getByName(this.env.ANTFLY_INCARNATION), this.env.ANTFLY_INCARNATION);
+    if (result.done) {
+      const state = await this.store.transaction(tx => tx.get(MIGRATION));
+      this.authority = await activateR2(this.env,this.authority,state.token);
+      if (this.authority.descriptor.mode !== "r2") return {has_more:true,phase:"cutover"};
+    }
+    return result;
+  }
+  collectMetadata(jobId) {return collectCoordinator(this.serviceStore, this.store.bucket, Date.now, jobId);}
+  publicationBudget(maximum) {
+    if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 256) throw new Error("InvalidPublicationBudget");
+    return this.transaction(async tx => Math.min(maximum, await tx.get("__antfly_publication_budget") ?? maximum));
+  }
+  lowerPublicationBudget(maximum) {
+    if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 256) throw new Error("InvalidPublicationBudget");
+    return this.transaction(async tx => {const next = Math.max(1, Math.floor(Math.min(maximum, await tx.get("__antfly_publication_budget") ?? maximum)/2)); tx.put("__antfly_publication_budget", next); return next;});
+  }
+  ensureEmbeddingProfile(profile) {
+    if (!profile.model?.startsWith("@cf/") || !Number.isSafeInteger(profile.dimensions) || profile.dimensions < 1 || profile.dimensions > 1536 || typeof (profile.revision ?? "1") !== "string" || !(profile.revision ?? "1").length || (profile.revision ?? "1").length > 256) return false;
+    return this.transaction(async tx => {
+      const key = "__antfly_embedding_profile", encoded = JSON.stringify(profile), previous = await tx.get(key);
+      if (previous != null) {const old = JSON.parse(previous); return old.model === profile.model && old.dimensions === profile.dimensions && (old.revision ?? "1") === (profile.revision ?? "1");}
+      tx.put(key, encoded); return true;
+    });
+  }
+  collection(op, args) {return this.journal.rpc(op, args);}
+  objectCall(request, body) {
+    if (!(/\/wal-v1\/[a-f0-9]{64}\/HEAD$/.test(request.key ?? "") || /\/progress\//.test(request.key ?? ""))) return {status: 3};
+    if (body.byteLength > 4096) return {status: 4};
+    return this.transaction(async tx => {
+      if (request.collection != null) {try {await this.journal.valid(tx, request.collection);} catch {return {status: 5};}}
+      const previous = await tx.get(request.key);
+      if (request.op === "put") {
+        if (request.guard_key != null || request.guard_etag != null) {
+          const parent = request.key.slice(0, request.key.lastIndexOf("/"));
+          if (!request.key.endsWith("/REINDEX") || request.guard_key !== `${parent}/HEAD` || typeof request.guard_etag !== "string") return {status: 3};
+          if ((await tx.get(request.guard_key))?.etag !== request.guard_etag) return {status: 2};
+        }
+        if ((request.if_none_match && previous) || (request.if_match_etag != null && previous?.etag !== request.if_match_etag)) return {status: 2};
+        const etag = crypto.randomUUID(); tx.put(request.key, {etag, body, contentType: request.content_type ?? null});
+        return {status: 0, json: {etag}};
+      }
+      if (request.op === "get" || request.op === "head") {
+        if (!previous) return {status: 1};
+        if (request.if_match_etag != null && request.if_match_etag !== previous.etag) return {status: 2};
+        return {status: 0, json: {bucket: request.bucket, key: request.key, etag: previous.etag, content_length: previous.body.byteLength, content_type: previous.contentType}, body: request.op === "get" ? previous.body : undefined};
+      }
+      return {status: 3};
+    });
+  }
+  pruneEmbeddingCheckpointMetadata(namespace, today) {
+    if (namespace !== this.env.ANTFLY_INCARNATION || !Number.isSafeInteger(today) || today < 0) throw new Error("InvalidEmbeddingCheckpointSweep");
+    return this.transaction(async tx => {
+      const stateKey = `__antfly_embedding_gc/${namespace}`, state = await tx.get(stateKey) ?? {};
+      const prefix = `antfly/progress/${namespace}/EMBEDDING_CACHE/`;
+      const entries = [...await tx.list({prefix, startAfter: state.metadata_cursor, limit: 128})];
+      for (const [key] of entries) {const day = key.slice(prefix.length).split("/")[0]; if (/^[a-f0-9]{8}$/.test(day) && parseInt(day,16)+1 < today) tx.delete(key);}
+      state.metadata_cursor = entries.length === 128 ? entries.at(-1)[0] : undefined; tx.put(stateKey, state); return state.payload_cursor ?? null;
+    });
+  }
+  saveEmbeddingCheckpointCursor(namespace, expected, next) {
+    return this.transaction(async tx => {const key = `__antfly_embedding_gc/${namespace}`, state = await tx.get(key) ?? {}; if ((state.payload_cursor ?? null) !== expected) return false; state.payload_cursor = next; tx.put(key,state); return true;});
+  }
+}

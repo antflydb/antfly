@@ -61,6 +61,19 @@ if (process.argv.includes("--collect-only")) {
   }
   throw new Error("Paged collection did not converge");
 }
+if (process.argv.includes("--collect-metadata")) {
+  const before = await call({op:"count"}); let job, done=false;
+  for (let i=0;i<10000;i++) {
+    const result=await call({op:"collect_metadata",...(job?{job_id:job}:{})}); job=result.job_id;
+    if (result.done) {done=true;break;}
+    if (result.delay_seconds) await new Promise(resolve=>setTimeout(resolve,Math.min(60000,result.delay_seconds*1000+100)));
+  }
+  assert.ok(done,"metadata collection did not converge");
+  assert.equal((await call({op:"count"})).count,before.count);
+  assert.equal((await call({op:"collect_metadata",job_id:job})).done,true);
+  await writeFile(`${run.dir}/metadata-report.json`,JSON.stringify({checks:{native_metadata_collection:true,preserved_count:true,late_delivery:true},measurements},null,2));
+  console.log("Live Antfly-native metadata collection passed");process.exit(0);
+}
 if (process.argv.includes("--scale")) {
   const count = Number(process.argv.find(arg => arg.startsWith("--documents="))?.slice(12) ?? 5000);
   assert.ok(Number.isSafeInteger(count) && count >= 300 && count <= 20000);
@@ -133,7 +146,7 @@ for (let i = 0; i < 180; i++) {
 assert.ok(published, "durable Queue publication did not converge");
 assert.ok((await call({op: "search", text: "durable"})).hits.length);
 await Promise.all(Array.from({length: 8}, (_, i) => call({op: "mutate", operation_id: `${run.id}/race/${i}`, mutations: [{kind: "upsert", doc_id: `race/${i}`, body: JSON.stringify({text: `racing ${i}`})}]})));
-for (let i = 0; i < 30; i++) await call({op: "lookup", doc_id: `doc/${String(i % 10).padStart(4, "0")}`});
+for (let i = 0; i < (process.argv.includes("--quick") ? 3 : 30); i++) await call({op: "lookup", doc_id: `doc/${String(i % 10).padStart(4, "0")}`});
 await call({op: "compact"});
 let job, complete = false;
 for (let i = 0; i < 1000; i++) {

@@ -91,3 +91,14 @@ lost and many later publications have already advanced the head.
 
 Deploy the compatible tracer and guarded coordinator together with the reindex
 runtime before admitting jobs. Older collectors do not know about job roots.
+
+
+## Antfly-owned metadata backend
+
+The R2-native profile stores the frontier, pending index and exact marks in
+Antfly's shared transactional ordered store. Parent completion and all child
+insertions remain one durable transaction. It also collects its own metadata
+pages and retired log objects under a checkpoint floor. The SQLite implementation
+is retained for compatibility and frozen export. See the
+[object-storage backend design](antfly-object-storage-backend.md) for commit,
+takeover, ABA prevention and migration proofs.

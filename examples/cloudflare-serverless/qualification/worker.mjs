@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import app, { CommitCoordinator as Coordinator } from "../worker.mjs";
+import app, { CommitCoordinator as Coordinator, R2CommitCoordinator as R2Coordinator } from "../worker.mjs";
 // This wrapper is bundled only by the disposable qualification configuration.
 export class CommitCoordinator extends Coordinator {
   collection(op, args) {
@@ -28,6 +28,13 @@ export class CommitCoordinator extends Coordinator {
   }
   async destroyQualificationState() { await this.ctx.storage.deleteAll(); }
 }
+export class R2CommitCoordinator extends R2Coordinator {
+  collectionDiagnostics() {
+    return this.store.transaction(async tx => ({phase: (await tx.get("__antfly_collection"))?.phase, tasks: (await tx.list({prefix:"__antfly_gc/tasks/"})).size, pending: (await tx.list({prefix:"__antfly_gc/pending/"})).size, marks: (await tx.list({prefix:"__antfly_gc/marks/"})).size, bounded: true}));
+  }
+  async destroyQualificationState() { /* Durable state was drained from R2. */ }
+}
+export class ReopenedR2CommitCoordinator extends R2CommitCoordinator {}
 export default {
   ...app,
   async fetch(request, env, ctx) {
@@ -37,7 +44,7 @@ export default {
     if (path === "/_qualification/diagnostics") return Response.json(await env.COMMITS.getByName(env.ANTFLY_INCARNATION).collectionDiagnostics());
     const page = await env.DATABASE.list({limit: 128});
     if (page.objects.length) await env.DATABASE.delete(page.objects.map(item => item.key));
-    if (!page.truncated && !page.objects.length) await env.COMMITS.getByName(env.ANTFLY_INCARNATION).destroyQualificationState();
+    if (!page.truncated && !page.objects.length && env.COORDINATOR_BACKEND !== "r2") await env.COMMITS.getByName(env.ANTFLY_INCARNATION).destroyQualificationState();
     return Response.json({done: !page.objects.length, deleted: page.objects.length});
   },
 };
