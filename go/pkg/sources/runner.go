@@ -62,6 +62,7 @@ type Runner struct {
 	Restart               bool
 }
 type runState struct {
+	RecordFormat                          int
 	Version                               int
 	Endpoint, Table, SourceID, ConfigHash string
 	Owned                                 map[string]string
@@ -267,6 +268,9 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		if persisted.Version != 1 || persisted.Endpoint != state.Endpoint || persisted.Table != s.Table || persisted.SourceID != s.ID {
 			return 0, "", fmt.Errorf("source state belongs to another destination")
 		}
+		if persisted.RecordFormat != 0 && persisted.RecordFormat != 2 {
+			return 0, "", fmt.Errorf("unsupported source record format")
+		}
 		state = persisted
 		if state.ConfigHash != hash {
 			if state.Pending != nil && !r.Restart {
@@ -350,6 +354,21 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	if err := r.Publisher.EnsureTable(ctx, s.Table); err != nil {
 		return 0, "", err
 	}
+	providerIDs := make([]string, 0, len(state.Pending.Objects))
+	for _, item := range state.Pending.Objects {
+		providerIDs = append(providerIDs, item.ID)
+	}
+	writer, err := NewSyncWriter(r.Publisher, s.Table, s.ID, providerIDs, state.Pending.Authoritative)
+	if err != nil {
+		return 0, "", err
+	}
+	legacy := []string{}
+	if state.RecordFormat == 0 {
+		for id := range state.Owned {
+			legacy = append(legacy, id)
+		}
+		sort.Strings(legacy)
+	}
 	selected := map[string]bool{}
 	var total int64
 	for _, item := range state.Pending.Objects {
@@ -381,11 +400,11 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		if len(state.Owned) > maxOwnedSourceObjects {
 			return 0, "", fmt.Errorf("source ownership exceeds budget")
 		}
-		record := map[string]any{"id": item.ID, "source_id": s.ID, "doc_type": "source_item", "grep": doc}
-		if err := r.Publisher.Batch(ctx, s.Table, map[string]any{item.ID: record}, nil); err != nil {
+		key, err := RecordKey(s.ID, item.ID)
+		if err != nil {
 			return 0, "", err
 		}
-		if err := r.Publisher.Ready(ctx, s.Table, item.ID, doc); err != nil {
+		if _, err := writer.Upsert(ctx, map[string]Document{key: doc}); err != nil {
 			return 0, "", err
 		}
 	}
@@ -399,14 +418,16 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	if err := connector.ValidateAbsentSources(ctx, request, absent); err != nil {
 		return 0, "", err
 	}
+	if _, err := writer.Finish(ctx); err != nil {
+		return 0, "", err
+	}
+	if len(legacy) > 0 {
+		if err := writer.RetireLegacy(ctx, legacy); err != nil {
+			return 0, "", err
+		}
+	}
 	for start := 0; start < len(absent); start += 100 {
 		batch := absent[start:min(start+100, len(absent))]
-		if err := r.Publisher.Batch(ctx, s.Table, nil, batch); err != nil {
-			return 0, "", err
-		}
-		if err := r.Publisher.ReadyAbsent(ctx, s.Table, batch); err != nil {
-			return 0, "", err
-		}
 		if err := journalOwnership(journalPath, ownershipEvent{Delete: batch}); err != nil {
 			return 0, "", err
 		}
@@ -421,6 +442,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		revision = hex.EncodeToString(digest[:])
 	}
 	state.Pending = nil
+	state.RecordFormat = 2
 	if err := writeJSON(statePath, state, 64<<20); err != nil {
 		return 0, "", err
 	}
