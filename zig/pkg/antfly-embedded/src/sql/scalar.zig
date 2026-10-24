@@ -271,6 +271,27 @@ const arrays = @import("array_value.zig");
 const builtin_cast = @import("builtin_cast.zig");
 const regex_functions = @import("regex_functions.zig");
 pub const NumericModifier = @import("../common/sql_builtin_type.zig").NumericModifier;
+/// Logical JSON ingress and existing timestamp casts can carry canonical RFC
+/// text. Normalize only a bound timestamp domain, never an untyped string or
+/// numeric epoch. Native row readers already supply the typed fast path.
+fn temporalArithmeticValue(datum: Datum, domain: Type) !@import("temporal_value.zig").Value {
+    if (datum.temporal()) |value| return value.*;
+    if (domain.kind != .datetime or (domain.temporal_kind orelse .timestamp_tz) != .timestamp_tz or datum.value != .string) return error.SqlTypeMismatch;
+    const ns = datetime.parseDateTimeToSignedNs(datum.value.string) orelse return error.InvalidSqlDateTime;
+    return .{ .timestamp_tz = try @import("temporal_value.zig").Timestamp.fromUnixNanoseconds(ns) };
+}
+
+/// Resolve temporal arithmetic before common-type selection: timestamp and
+/// interval have different identities despite sharing the datetime family.
+fn temporalArithmetic(op: ast.Scalar.Binary, left: Type, right: Type) !?Type {
+    if (op != .add and op != .subtract and op != .multiply and op != .divide and op != .modulo) return null;
+    if (left.kind != .datetime and right.kind != .datetime) return null;
+    const lk = if (left.kind == .datetime) left.temporal_kind orelse .timestamp_tz else null;
+    const rk = if (right.kind == .datetime) right.temporal_kind orelse .timestamp_tz else null;
+    const stamp = if ((lk == .timestamp or lk == .timestamp_tz) and rk == .interval and (op == .add or op == .subtract)) lk else if (lk == .interval and (rk == .timestamp or rk == .timestamp_tz) and op == .add) rk else return error.SqlUndefinedOperator;
+    return .{ .kind = .datetime, .temporal_kind = stamp, .nullable = left.nullable or right.nullable };
+}
+
 pub const Type = struct { kind: ?ast.ColumnType = null, temporal_kind: ?@import("temporal_value.zig").Kind = null, nullable: bool = true, element_type: ?arrays.ElementType = null, numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null };
 pub const Column = struct {
     name: []const u8,
@@ -3015,6 +3036,7 @@ const Binder = struct {
                 if (try self.arrayConcatenation(binary, depth)) |call| break :blk try self.infer(call, depth + 1);
                 const left = try self.infer(binary.left, depth + 1);
                 const right = try self.infer(binary.right, depth + 1);
+                if (try temporalArithmetic(binary.op, left, right)) |result| break :blk result;
                 if ((left.kind == .datetime and numeric(right.kind)) or (right.kind == .datetime and numeric(left.kind))) return error.SqlUndefinedFunction;
                 try arrayOperator(left, right);
                 if ((left.kind == .uuid and right.kind == .string and !uuidTextOperand(binary.right)) or
@@ -3606,6 +3628,11 @@ const Binder = struct {
                 if (binary.op == .json_get or binary.op == .json_text) break :blk .{ .binary = .{ .op = binary.op, .left = try self.compile(binary.left, .json, depth + 1), .right = try self.compile(binary.right, .string, depth + 1) } };
                 const left_type = try self.infer(binary.left, depth + 1);
                 const right_type = try self.infer(binary.right, depth + 1);
+                if (try temporalArithmetic(binary.op, left_type, right_type)) |_| break :blk .{ .binary = .{
+                    .op = binary.op,
+                    .left = try self.compileTypedContext(binary.left, left_type.kind, left_type.element_type, left_type.temporal_kind, depth + 1),
+                    .right = try self.compileTypedContext(binary.right, right_type.kind, right_type.element_type, right_type.temporal_kind, depth + 1),
+                } };
                 const merged = jsonUnknownOperandDomain(left_type, right_type, binary.left, binary.right) orelse try comparisonDomain(left_type, right_type);
                 // PostgreSQL's mixed NUMERIC/real operators use float8;
                 // CASE/COALESCE and array common types still select real.
@@ -4301,6 +4328,23 @@ const Evaluator = struct {
                 var left = try self.runDatum(binary.left, depth + 1);
                 var right = try self.runDatum(binary.right, depth + 1);
                 if (left.sql_null or right.sql_null) break :blk .{};
+                if (instruction.type.kind == .datetime) {
+                    try left.validateTemporal();
+                    try right.validateTemporal();
+                    var stamp = try temporalArithmeticValue(left, self.program.instructions[binary.left].type);
+                    var shift = try temporalArithmeticValue(right, self.program.instructions[binary.right].type);
+                    if (stamp.kind() == .interval) std.mem.swap(@import("temporal_value.zig").Value, &stamp, &shift);
+                    if (shift.kind() != .interval) return error.SqlTypeMismatch;
+                    const source = switch (stamp) {
+                        .timestamp, .timestamp_tz => |v| v,
+                        else => return error.SqlTypeMismatch,
+                    };
+                    const result = try @import("temporal_math.zig").timestamp(source, shift.interval, binary.op == .subtract);
+                    try self.charge(@sizeOf(@import("temporal_value.zig").Value));
+                    const owned = try self.alloc.create(@import("temporal_value.zig").Value);
+                    owned.* = if (stamp.kind() == .timestamp) .{ .timestamp = result } else .{ .timestamp_tz = result };
+                    break :blk Datum.typedTemporal(owned);
+                }
                 if (instruction.type.element_type == .numeric) {
                     left = try self.castDatumBuiltin(left, self.program.instructions[binary.left].type.element_type, .numeric);
                     right = try self.castDatumBuiltin(right, self.program.instructions[binary.right].type.element_type, .numeric);
@@ -8406,5 +8450,87 @@ test "SQL array navigation retains PostgreSQL int4 result identity" {
         const actual = try inferOutput(std.testing.allocator, parsed.expression, &.{}, &.{});
         try std.testing.expectEqual(@as(?ast.ColumnType, .integer), actual.kind);
         try std.testing.expectEqual(@as(?arrays.ElementType, .int32), actual.element_type);
+    }
+}
+
+test "SQL temporal arithmetic matches PostgreSQL calendar and elapsed boundaries" {
+    const a = std.testing.allocator;
+    const fixture = try std.json.parseFromSlice(struct {
+        vectors: []const struct { expression: []const u8, timestamp: []const u8, result: ?[]const u8, sqlstate: ?[]const u8 },
+    }, a, @embedFile("fixtures/sql_temporal_arithmetic_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    for (fixture.value.vectors) |vector| {
+        var binary: [8]u8 = undefined;
+        const bytes = try std.fmt.hexToBytes(&binary, vector.timestamp);
+        const timestamp = try @import("temporal_value.zig").decode(.timestamp_tz, bytes);
+        var parsed = try @import("compiler.zig").compileScalar(a, vector.expression, .{});
+        defer parsed.deinit();
+        // Disable constant preparation so these witnesses also exercise the
+        // row evaluator used for timestamp columns, not just a folding path.
+        var program = bind(a, parsed.expression, &.{.{ .name = "v", .type = .datetime }}, &.{}, .{ .constant_bytes = 0, .constant_steps = 0 }) catch |err| {
+            if (vector.sqlstate) |code| {
+                try std.testing.expectEqualStrings(code, @import("errors.zig").describe(err).code);
+                continue;
+            }
+            std.debug.print("temporal arithmetic bind {s}: {s}\n", .{ vector.expression, @errorName(err) });
+            return err;
+        };
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const datum = program.evaluate(arena.allocator(), &.{Datum.typedTemporal(&timestamp)}, &.{}, .{}) catch |err| {
+            if (vector.sqlstate) |code| {
+                try std.testing.expectEqualStrings(code, @import("errors.zig").describe(err).code);
+                continue;
+            }
+            std.debug.print("temporal arithmetic evaluate {s}: {s}\n", .{ vector.expression, @errorName(err) });
+            return err;
+        };
+        if (vector.sqlstate) |code| std.debug.print("temporal unexpected success binary={s} expression={s} expected={s}\n", .{ vector.timestamp, vector.expression, code });
+        try std.testing.expect(vector.sqlstate == null);
+        var output: [@import("temporal_text.zig").output_capacity]u8 = undefined;
+        try std.testing.expectEqualStrings(vector.result.?, try @import("temporal_text.zig").format(datum.temporal().?.*, &output));
+    }
+}
+
+test "SQL temporal arithmetic preserves overload identity nulls and execution budgets" {
+    const a = std.testing.allocator;
+    const temporal = @import("temporal_value.zig");
+    const value = try @import("temporal_text.zig").parseCanonical(.timestamp_tz, "2024-01-31 12:00:00+00");
+    for ([_][]const u8{ "v + INTERVAL '1 month'", "INTERVAL '1 month' + v", "v - INTERVAL '-1 month'" }) |query| {
+        var parsed = try @import("compiler.zig").compileScalar(a, query, .{});
+        defer parsed.deinit();
+        var program = try bind(a, parsed.expression, &.{.{ .name = "v", .type = .datetime }}, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expectEqual(temporal.Kind.timestamp_tz, program.output_type.temporal_kind.?);
+        try std.testing.expect(!@import("typed_kernel.zig").supported(&program));
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const result = try program.evaluate(arena.allocator(), &.{Datum.typedTemporal(&value)}, &.{}, .{});
+        var output: [@import("temporal_text.zig").output_capacity]u8 = undefined;
+        try std.testing.expectEqualStrings("2024-02-29 12:00:00+00", try @import("temporal_text.zig").format(result.temporal().?.*, &output));
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        try std.testing.expect((try program.evaluate(none.allocator(), &.{.{}}, &.{}, .{})).sql_null);
+        try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(arena.allocator(), &.{Datum.typedTemporal(&value)}, &.{}, .{ .output_bytes = 1 }));
+    }
+    for ([_][]const u8{ "v + 1", "1 + v", "v * INTERVAL '1 month'", "INTERVAL '1 month' - v" }) |query| {
+        var parsed = try @import("compiler.zig").compileScalar(a, query, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.SqlUndefinedOperator, bind(a, parsed.expression, &.{.{ .name = "v", .type = .datetime }}, &.{}, .{}));
+    }
+}
+
+test "SQL temporal arithmetic normalizes bound timestamp casts without implicit text operators" {
+    const a = std.testing.allocator;
+    for ([_]BindLimits{ .{}, .{ .constant_bytes = 0, .constant_steps = 0 } }) |limits| {
+        var parsed = try @import("compiler.zig").compileScalar(a, "TIMESTAMPTZ '2024-01-31T13:30:00+01:30' + INTERVAL '1 month'", .{});
+        defer parsed.deinit();
+        var program = try bind(a, parsed.expression, &.{}, &.{}, limits);
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const result = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+        var output: [@import("temporal_text.zig").output_capacity]u8 = undefined;
+        try std.testing.expectEqualStrings("2024-02-29 12:00:00+00", try @import("temporal_text.zig").format(result.temporal().?.*, &output));
     }
 }

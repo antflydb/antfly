@@ -8,19 +8,47 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 
 ## Current original-case qualification (2026-10-24)
 
-The ledger now records **767 implemented / 137 rejected / 428 superseded /
-254 unresolved**. The requested next-100 batch has closed **39 original cases**:
+The ledger now records **769 implemented / 137 rejected / 428 superseded /
+252 unresolved**. The requested next-100 batch has closed **41 original cases**:
 `sql-0011`, `sql-0014`, `sql-0570`, `sql-0580`, `sql-0586`, `sql-0591`,
-`sql-0595`, `sql-0883`, `sql-0927`, `sql-0935`, `sql-0343`–`sql-0349`,
+`sql-0593`–`sql-0595`, `sql-0883`, `sql-0927`, `sql-0935`, `sql-0343`–`sql-0349`,
 `sql-1456`, `sql-1459`, `sql-1464`, `sql-0005`, `sql-0008`, `sql-0009`,
 `sql-0010`, `sql-0142`–`sql-0143`, `sql-0146`–`sql-0147`, `sql-0311`–`sql-0317`, `sql-0669`, `sql-0734`, and `sql-0744`–`sql-0745`;
-**61 of that target remain unfinished**. Thirty-four are implementations; five are
+**59 of that target remain unfinished**. Thirty-six are implementations; five are
 PostgreSQL-invalid originals (outer recursive MERGE, 42601, and ambiguous
 `RETURNING id`, 42702, ALTER ROLE SET with an expression, 42601, and two
-index names used as constraints, 42704), not thirty-nine
+index names used as constraints, 42704), not forty-one
 newly supported forms. The earlier sixteen mutation witnesses are ten original
 cases, not sixteen completions. **162 unresolved DDL/catalog cases remain open**; the role
 default cohort does not complete that feature work.
+
+### Timestamp/interval arithmetic: two original cases closed
+
+The original `sql-0593` and `sql-0594` run unchanged with their original text
+parameter through the mounted public SQL API, then repeat after catalog,
+session and data owners cold-open. Independent PostgreSQL 18 witnesses agree
+on result labels, timestamp OID 1184, null flags and exact microseconds. The
+campaign retains complete source rows and primary identities, versions and
+digests across both queries and restart.
+
+The binder selects timestamp/interval overloads before common-type selection,
+so an interval cannot erase a timestamp's identity. Checked calendar arithmetic
+clips month ends, then applies days and elapsed microseconds; subtraction checks
+component negation even for an infinite timestamp. Typed row inputs avoid JSON
+and epoch rescaling. The pure arithmetic operation allocates nothing; the VM
+charges its owned typed result to the existing output budget. Bound timestamp
+text ingress normalizes without accepting an implicit text or numeric operator.
+
+The active execution boundary is UTC. The qualification includes 154 PostgreSQL
+binary-input vectors for leap days, month ends, BC dates, signed/mixed intervals,
+infinities, extreme components and overflow; additional scalar tests cover
+commuted addition, NULLs, typed descriptors, constant preparation and budget
+failure. The complete Debug SQL suite passes 1,361 local and 236 dependent
+tests with zero failures or leaks (four existing opt-in skips). The shared
+public-result comparator accepts canonical PostgreSQL UTC and RFC timestamp
+spellings while preserving exact nanosecond differences and infinity identity.
+This closes the two calendar query originals; it does not reclassify range
+types, date bucketing or other unactivated temporal operators.
 
 ### Schema and database comments: two original cases closed
 

@@ -977,3 +977,73 @@ test "mounted SQL original resource comments preserve identities authorization a
         });
     }
 }
+
+test "mounted SQL original calendar intervals preserve typed results and cold rows" {
+    const Case = struct { id: []const u8, sql: []const u8, columns: []const []const u8, column_oids: []const u32, rows: []const []const Json };
+    const CalendarCampaign = struct {
+        pub const native_sessions = true;
+        pub const native_auth = true;
+        pub const cold_catalog = true;
+        inner: SourceCampaign,
+        cases: []const Case,
+        fn verify(self: *@This(), ctx: *fixture.Context) !void {
+            var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
+            defer corpus.deinit();
+            for (self.cases) |case| {
+                const original = try corpus.get(case.id);
+                try std.testing.expectEqualStrings(original.sql, case.sql);
+                const parameters = try local.sql_parity_fixtures.Corpus.logicalParameters(ctx.alloc, original);
+                defer ctx.alloc.free(parameters);
+                var response = try client.executeParameters(ctx, original.sql, parameters, .read);
+                defer response.deinit(ctx.alloc);
+                if (response.status != 200) std.debug.print("calendar interval original={s} status={d} body={s}\n", .{ case.id, response.status, response.body });
+                try std.testing.expectEqual(@as(u16, 200), response.status);
+                var result = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+                defer result.deinit();
+                try std.testing.expectEqualStrings("SELECT", result.value.command_tag);
+                try std.testing.expectEqual(@as(i64, 0), result.value.rows_affected);
+                expectSourceResult(ctx.alloc, result.value, .{ .columns = case.columns, .column_oids = case.column_oids, .rows = case.rows }, true) catch |err| {
+                    std.debug.print("calendar interval result original={s} body={s}\n", .{ case.id, response.body });
+                    return err;
+                };
+            }
+        }
+        pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.inner.setup(ctx);
+            try self.verify(ctx);
+            try self.inner.verify(ctx, false);
+        }
+        pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+            _ = try fixture.waitServingSchema(ctx, "usage_records", 0);
+            try self.verify(ctx);
+            try self.inner.verify(ctx, true);
+        }
+    };
+    const a = std.testing.allocator;
+    const reference = try std.json.parseFromSlice(struct { cases: []const Case }, a, local.sql_parity_fixtures.temporal_arithmetic_reference, .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    const ids = [_][]const u8{ "sql-0593", "sql-0594" };
+    try std.testing.expectEqual(ids.len, reference.value.cases.len);
+    for (ids, reference.value.cases) |id, case| try std.testing.expectEqualStrings(id, case.id);
+    var retained = std.heap.ArenaAllocator.init(a);
+    defer retained.deinit();
+    const rows = [_][]const Json{ &.{ .{ .string = "u1" }, .{ .string = "2024-01-31T23:59:59.123456Z" } }, &.{ .{ .string = "u2" }, .{ .string = "2023-01-31T00:00:00Z" } } };
+    try fixture.runWithState(CalendarCampaign, .{
+        .cases = reference.value.cases,
+        .inner = .{ .retained = &retained, .entry = .{
+            .id = "sql-0593",
+            .profile = "UTC calendar arithmetic",
+            .sqlstate = null,
+            .command_tag = "SELECT",
+            .affected = 0,
+            .output = .{ .columns = &.{}, .column_oids = &.{}, .rows = &.{} },
+            .tables = &.{.{
+                .name = "usage_records",
+                .create = "CREATE TABLE usage_records(id TEXT PRIMARY KEY,created_at TIMESTAMPTZ)",
+                .seed = "INSERT INTO usage_records(id,created_at) VALUES ('u1',TIMESTAMPTZ '2024-01-31T23:59:59.123456Z'),('u2',TIMESTAMPTZ '2023-01-31T00:00:00Z')",
+                .read = "SELECT id,created_at FROM usage_records ORDER BY id",
+                .final = .{ .columns = &.{ "id", "created_at" }, .column_oids = &.{ 25, 1184 }, .rows = &rows },
+            }},
+        } },
+    });
+}

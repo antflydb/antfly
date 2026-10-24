@@ -178,6 +178,12 @@ pub fn executeIn(ctx: *fixture.Context, namespace: ?[]const u8, statement: []con
     return executeConnected(ctx, namespace, null, statement, retry);
 }
 
+pub fn executeParameters(ctx: *fixture.Context, statement: []const u8, parameters: []const std.json.Value, retry: Retry) !http.HttpResponse {
+    const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .statement = statement, .parameters = parameters }, .{});
+    defer ctx.alloc.free(body);
+    return executeBody(ctx, null, body, retry);
+}
+
 pub fn executeConnected(
     ctx: *fixture.Context,
     namespace: ?[]const u8,
@@ -188,6 +194,10 @@ pub fn executeConnected(
     const request = .{ .statement = statement, .namespace = namespace, .connection_id = connection };
     const body = try std.json.Stringify.valueAlloc(ctx.alloc, request, .{ .emit_null_optional_fields = false });
     defer ctx.alloc.free(body);
+    return executeBody(ctx, connection, body, retry);
+}
+
+fn executeBody(ctx: *fixture.Context, connection: ?[]const u8, body: []const u8, retry: Retry) !http.HttpResponse {
     const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
     while (true) {
         try ctx.checkDrivers();

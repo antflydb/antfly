@@ -204,10 +204,9 @@ pub fn rowMatchesWithNulls(alloc: std.mem.Allocator, columns: []const wire.SQLCo
             },
             .datetime => {
                 if (cell != .string or want != .string) return false;
-                const datetime = @import("antfly_local_sources").datetime;
-                const left = datetime.parseDateTimeToSignedNs(cell.string) orelse return false;
-                const right = datetime.parseDateTimeToSignedNs(want.string) orelse return false;
-                if (left != right) return false;
+                const left = timestampInstant(cell.string) orelse return false;
+                const right = timestampInstant(want.string) orelse return false;
+                if (!std.meta.eql(left, right)) return false;
                 continue;
             },
             .number => {
@@ -255,12 +254,30 @@ pub fn rowMatchesWithNulls(alloc: std.mem.Allocator, columns: []const wire.SQLCo
     return true;
 }
 
+// JSON timestamp ingress uses RFC text while typed SQL results use canonical
+// PostgreSQL UTC text. Compare exact instants without rounding RFC nanoseconds
+// down to the typed microsecond domain or conflating infinity with SQL NULL.
+const TimestampInstant = union(enum) { finite: i128, infinity: i8 };
+fn timestampInstant(text: []const u8) ?TimestampInstant {
+    const sources = @import("antfly_local_sources");
+    if (sources.datetime.parseDateTimeToSignedNs(text)) |ns| return .{ .finite = ns };
+    const value = sources.sql_temporal_text.parseCanonical(.timestamp_tz, text) catch return null;
+    if (value.timestamp_tz.unixNanoseconds()) |ns| return .{ .finite = ns };
+    return .{ .infinity = value.timestamp_tz.infinity() };
+}
+
 test "SQL parity timestamp comparison preserves nanoseconds and timezone offsets rather than textual spelling" {
     const columns = [_]wire.SQLColumn{.{ .name = "t", .type = .datetime }};
     const actual = [_]Json{.{ .string = "2025-06-01T12:30:00.000000001Z" }};
     try std.testing.expect(try rowMatchesWithNulls(std.testing.allocator, &columns, &actual, &.{false}, &.{.{ .string = "2025-06-01T13:30:00.000000001+01:00" }}, &.{false}));
     try std.testing.expect(!try rowMatchesWithNulls(std.testing.allocator, &columns, &actual, &.{false}, &.{.{ .string = "2025-06-01T12:30:00+00:00" }}, &.{false}));
     try std.testing.expect(!try rowMatchesWithNulls(std.testing.allocator, &columns, &actual, &.{false}, &.{.{ .string = "not a timestamp" }}, &.{false}));
+    try std.testing.expect(try rowMatchesWithNulls(std.testing.allocator, &columns, &.{.{ .string = "2024-02-29 23:59:59.123456+00" }}, &.{false}, &.{.{ .string = "2024-03-01T01:29:59.123456+01:30" }}, &.{false}));
+    try std.testing.expect(!try rowMatchesWithNulls(std.testing.allocator, &columns, &actual, &.{false}, &.{.{ .string = "2025-06-01 12:30:00+00" }}, &.{false}));
+    for ([_][]const u8{ "infinity", "-infinity", "294276-12-31 23:59:59.999999+00" }) |text| {
+        try std.testing.expect(try rowMatchesWithNulls(std.testing.allocator, &columns, &.{.{ .string = text }}, &.{false}, &.{.{ .string = text }}, &.{false}));
+    }
+    try std.testing.expect(!try rowMatchesWithNulls(std.testing.allocator, &columns, &.{.{ .string = "infinity" }}, &.{false}, &.{.{ .string = "-infinity" }}, &.{false}));
 }
 
 pub fn runArrayWireContracts(alloc: std.mem.Allocator) !void {

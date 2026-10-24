@@ -2723,6 +2723,45 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-qualified-temporal-arithmetic-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-temporal-arithmetic-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-temporal-arithmetic-scalar-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Dtest-filter=SQL temporal arithmetic",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-temporal-arithmetic-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_temporal_arithmetic_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_temporal_arithmetic_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -11478,13 +11517,47 @@
     },
     {
       "id": "sql-0593",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged calendar-month query and original text parameter execute through authenticated public SQL against native typed timestamp storage. PostgreSQL UTC labels, OID 1184, null flags and exact microsecond results agree before and after independent cold catalog/session/data owners. Primary identities, digests, versions and untouched rows remain unchanged. Shared calendar arithmetic preserves month clipping before days/time, component-wise subtraction overflow and infinities; 154 independent PostgreSQL vectors qualify boundaries without numeric epoch coercions.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original calendar intervals preserve typed results and cold rows",
+          "gate": "sql-qualified-temporal-arithmetic-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original calendar intervals preserve typed results and cold rows",
+          "gate": "sql-qualified-temporal-arithmetic-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL temporal arithmetic matches PostgreSQL calendar and elapsed boundaries",
+          "gate": "sql-qualified-temporal-arithmetic-scalar-debug"
+        }
+      ]
     },
     {
       "id": "sql-0594",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged calendar-month query and original text parameter execute through authenticated public SQL against native typed timestamp storage. PostgreSQL UTC labels, OID 1184, null flags and exact microsecond results agree before and after independent cold catalog/session/data owners. Primary identities, digests, versions and untouched rows remain unchanged. Shared calendar arithmetic preserves month clipping before days/time, component-wise subtraction overflow and infinities; 154 independent PostgreSQL vectors qualify boundaries without numeric epoch coercions.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original calendar intervals preserve typed results and cold rows",
+          "gate": "sql-qualified-temporal-arithmetic-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original calendar intervals preserve typed results and cold rows",
+          "gate": "sql-qualified-temporal-arithmetic-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL temporal arithmetic matches PostgreSQL calendar and elapsed boundaries",
+          "gate": "sql-qualified-temporal-arithmetic-scalar-debug"
+        }
+      ]
     },
     {
       "id": "sql-0595",
