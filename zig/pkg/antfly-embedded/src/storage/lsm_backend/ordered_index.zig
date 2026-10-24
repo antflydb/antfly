@@ -251,27 +251,27 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
         }
 
         pub fn prepareEdits(self: *Self, allocator: std.mem.Allocator, edits: usize) !void {
-            if (edits == 0) return;
-            if (self.account == null) self.account = try Account.create(allocator);
-            const needed = try self.preparedNodeCount(edits);
-            try self.spare.ensureTotalCapacity(allocator, needed);
-            while (self.spare.items.len < needed) {
-                const node = try allocator.create(Node);
-                self.account.?.charge(@sizeOf(Node));
-                self.spare.appendAssumeCapacity(node);
-            }
+            try self.prepareEditsControlled(allocator, edits, null);
         }
 
-        /// A single edit needs only a height-bounded pool. Retain every node
-        /// already reserved when admission or allocation rejects preparation.
-        /// Never use this inside a partially mutated tree traversal.
+        /// One insertion, or an endpoint removal followed by insertion. Retain
+        /// every prepared node/vector across refusal. Never call mid-traversal.
+        pub fn prepareEditsWithAdmission(self: *Self, allocator: std.mem.Allocator, edits: usize, original: @import("../../common/read_admission.zig").Port) !void {
+            if (edits > 2) return error.InvalidArgument;
+            try self.prepareEditsControlled(allocator, edits, original);
+        }
         pub fn prepareWithAdmission(self: *Self, allocator: std.mem.Allocator, original: @import("../../common/read_admission.zig").Port) !void {
-            try original.checkpoint();
+            try self.prepareEditsWithAdmission(allocator, 1, original);
+        }
+        fn prepareEditsControlled(self: *Self, allocator: std.mem.Allocator, edits: usize, original: ?@import("../../common/read_admission.zig").Port) !void {
+            if (original) |port| try port.checkpoint();
+            if (edits == 0) return;
+            const needed = try self.preparedNodeCount(edits);
             if (self.account == null) self.account = try Account.create(allocator);
-            const needed = try self.preparedNodeCount(1);
+            if (original) |port| try port.checkpoint();
             try self.spare.ensureTotalCapacity(allocator, needed);
             while (self.spare.items.len < needed) {
-                try original.checkpoint();
+                if (original) |port| try port.checkpoint();
                 const node = try allocator.create(Node);
                 self.account.?.charge(@sizeOf(Node));
                 self.spare.appendAssumeCapacity(node);

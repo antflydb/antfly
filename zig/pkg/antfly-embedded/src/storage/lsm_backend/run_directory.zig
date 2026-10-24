@@ -380,15 +380,66 @@ pub const Directory = struct {
         return result;
     }
 
+    /// Prepare allocation pools only. The caller separately performs admitted
+    /// key comparisons, payload/pin preparation and atomic index publication.
+    /// Candidate/root identities must remain stable until this cursor finishes.
+    pub const IndexPreparation = struct {
+        directory: *Directory,
+        level: u32,
+        ends_edits: usize,
+        phase: usize = 0,
+        pub fn init(directory: *Directory, level: u32, ends_edits: usize) !@This() {
+            if (ends_edits == 0 or ends_edits > 2) return error.InvalidArgument;
+            return .{ .directory = directory, .level = level, .ends_edits = ends_edits };
+        }
+        pub fn memoryBound(self: *const @This()) !u64 {
+            const d = self.directory;
+            var bytes = try d.tree.prepareMemoryBound(1);
+            bytes = try std.math.add(u64, bytes, try d.ids.prepareMemoryBound(1));
+            bytes = try std.math.add(u64, bytes, try d.bounds.prepareMemoryBound(1));
+            bytes = try std.math.add(u64, bytes, try d.ends.prepareMemoryBound(self.ends_edits));
+            bytes = try std.math.add(u64, bytes, try d.levels.prepareMemoryBound(1));
+            if (self.level == 0) bytes = try std.math.add(u64, bytes, try d.generations.prepareMemoryBound(1));
+            return bytes;
+        }
+        fn prepare(tree: anytype, a: std.mem.Allocator, edits: usize, original: ?@import("../../common/read_admission.zig").Port) !void {
+            if (original) |port| try tree.prepareEditsWithAdmission(a, edits, port) else try tree.prepareEdits(a, edits);
+        }
+        pub fn resumeWithAdmission(self: *@This(), a: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
+            const d = self.directory;
+            while (self.phase < 6) {
+                if (original) |port| try port.checkpoint();
+                switch (self.phase) {
+                    0 => try prepare(&d.tree, a, 1, original),
+                    1 => try prepare(&d.ids, a, 1, original),
+                    2 => try prepare(&d.bounds, a, 1, original),
+                    3 => try prepare(&d.ends, a, self.ends_edits, original),
+                    4 => try prepare(&d.levels, a, 1, original),
+                    5 => if (self.level == 0) {
+                        try prepare(&d.generations, a, 1, original);
+                    },
+                    else => unreachable,
+                }
+                self.phase += 1;
+            }
+        }
+    };
+    pub fn indexSpareBytes(self: *const Directory) u64 {
+        return (self.tree.spare.capacity + self.ids.spare.capacity + self.bounds.spare.capacity + self.ends.spare.capacity + self.levels.spare.capacity + self.generations.spare.capacity) * @sizeOf(usize);
+    }
+    pub fn indexAccountBytes(self: *const Directory) u64 {
+        var bytes: u64 = 0;
+        inline for (.{ "tree", "ids", "bounds", "ends", "levels", "generations" }) |field| {
+            if (@field(self, field).account) |account| bytes += account.bytes.load(.acquire);
+        }
+        return bytes;
+    }
+
     pub fn put(self: *Directory, backend: anytype, run: Run) !void {
         const allocator = backend.allocator;
         const previous = find(self.tree.root, .{ .run = &run });
-        try self.tree.prepare(allocator);
-        try self.ids.prepare(allocator);
-        try self.bounds.prepare(allocator);
-        try self.ends.prepareEdits(allocator, if (previous) |node| if (compareEnds(node.entry, .{ .run = &run }) != .eq) 2 else 1 else 1);
-        try self.levels.prepare(allocator);
-        if (run.level == 0) try self.generations.prepare(allocator);
+        var indexes = try IndexPreparation.init(self, run.level, if (previous) |node| if (compareEnds(node.entry, .{ .run = &run }) != .eq) 2 else 1 else 1);
+        try indexes.resumeWithAdmission(allocator, null);
         const payload = try allocator.create(Payload);
         errdefer allocator.destroy(payload);
         var owned = try repository.cloneRunCompactionSnapshot(allocator, run);
@@ -447,12 +498,8 @@ pub const Directory = struct {
         self.ends.putPrepared(allocator, entry);
     }
     pub fn remove(self: *Directory, allocator: std.mem.Allocator, run: *const Run) !void {
-        try self.tree.prepare(allocator);
-        try self.ids.prepare(allocator);
-        try self.bounds.prepare(allocator);
-        try self.ends.prepare(allocator);
-        try self.levels.prepare(allocator);
-        if (run.level == 0) try self.generations.prepare(allocator);
+        var indexes = try IndexPreparation.init(self, run.level, 1);
+        try indexes.resumeWithAdmission(allocator, null);
         const existing = find(self.tree.root, .{ .run = run }) orelse return;
         // All run indexes own this payload until their prepared edits finish.
         const entry = existing.entry.retainShared();

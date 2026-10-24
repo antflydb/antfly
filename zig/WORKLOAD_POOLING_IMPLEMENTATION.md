@@ -26280,3 +26280,69 @@ every changed native file. The v1 receipt passes the initial lifecycle tests.
 Formatting, whitespace and the new module license pass. Full GNU qualification
 remains waived. The index/pin/unshared-state rebuild phases and the broader
 default coordinator, cleanup, relief and default-gate work remain incomplete.
+
+
+### Admitted private directory index-pool construction
+
+`Directory.IndexPreparation` now retains a cursor through allocation-pool
+preparation for the read-order, ID, lower-bound, upper-endpoint, level and L0
+generation indexes. It prepares the endpoint's remove-plus-insert case as two
+edits. Each index retains every successful account/vector/node allocation
+when admission or OOM rejects a later step. The generic ordered index now
+shares one preparation implementation between legacy bulk calls and admitted
+one/two-edit calls, with original checkpoints before vector work and each node.
+Admitted bulk requests beyond two edits are refused before allocation.
+
+The existing directory put/remove paths drive this same pool cursor with a
+null original; their key comparisons, payload construction and file-pin work
+remain explicit legacy operations. This changes the real directory path while
+keeping the pool producer usable by the future admitted rebuild coordinator.
+No metadata key-size restriction substitutes for bounded preparation: this
+phase inspects heights and account counters, not keys or subtree summaries.
+
+`directory_index_preparation.Owned` reserves the complete private-fork/header
+and pool peak before allocation. It retains source account meters, prepares
+all required pools, and adopts only the actual surviving allocation delta into
+a preprepared stable caller usage identity before returning the private fork.
+The caller prepays the fixed owner header, retains source roots and allocator/
+manager authority, and fences source mutation/accounting until transfer or
+retirement. The returned directory must be registered before competing
+observation resumes. Neither roots nor file pins change during preparation.
+
+Abandonment reclaims the private fork with one structural credit per original
+checkpoint and retains its accounting through header/account destruction.
+Because source roots stay pinned and no entry edit has occurred, shared payload
+destructors and the global file-pin registry are never entered by this abort.
+Busy parent accounting leaves the exact debt in stable manager cleanup slots
+after physical memory is gone. No original admission port is stored.
+
+Qualification witnesses funding before every allocation/free, rejects every
+construction/adoption/retirement checkpoint, retries or abandons each allocation
+failure, covers both L0/all-six-index and higher-level preparation, verifies
+root identity and unchanged file-pin counts, and compares actual allocations
+with surviving observed usage. Additional cases deny construction before any
+allocation, deny adoption without transferring a ready candidate, reject an
+unsupported admitted batch, and block the parent through physical destruction.
+
+Still required for a full admitted rebuild: bounded key comparisons and
+summary/publication work, retained payload/pin registration and release, and
+unshared-memory-state handling where needed. Combined/default coordinator
+wiring, admitted durable cleanup, remaining completion/history relief and full
+default-gate evidence remain outstanding. Full GNU qualification stays waived;
+the full design remains incomplete.
+
+
+Final `directory-index-pools-v2-integrated` passes 83/83 Debug build steps,
+91 physical-IO, 32 close, 170 table/codec, 74 WAL/recovery and 18 host/ABI
+checks. `directory-index-pools-v2-fast` passes 63/63 optimized steps and all
+91/170/74 physical/table/recovery cases. `directory-index-pools-v2-legacy`
+passes 60/60 steps and four existing directory/snapshot regressions, including
+endpoint replacement, pinned epochs, allocation failures and pin ownership.
+All three pass four standalone Bloom and 45/1/8 error-identity companions
+(companions use Debug). All 5,590 native/schema inputs and log digests match
+the unchanged final source; four immutable native snapshots preserve every
+changed native file. The v1 receipt passes the initial lifecycle cases.
+Formatting, whitespace and the new module license pass. Full GNU qualification
+remains waived. Key comparison/publication, payload/pin and state preparation,
+and the broader default coordinator/cleanup/relief/default-gate work remain
+incomplete; the full design is not yet achieved.
