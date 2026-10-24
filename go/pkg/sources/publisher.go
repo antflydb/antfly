@@ -131,62 +131,7 @@ func (p *Publisher) Batch(ctx context.Context, table string, inserts map[string]
 	return nil
 }
 func (p *Publisher) Ready(ctx context.Context, table, id string, doc Document) error {
-	wait, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	for {
-		data, err := p.call(wait, "POST", tablePath(table)+"/query", map[string]any{"query": map[string]any{"ids": []string{id}}, "fields": []string{"grep.revision", "grep.metadata.sha256", "grep.permissions"}, "limit": 1, "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
-		if err != nil {
-			return err
-		}
-		var result struct {
-			Responses []struct {
-				Status   int             `json:"status"`
-				Error    json.RawMessage `json:"error"`
-				Snapshot string          `json:"remote_snapshot"`
-				Hits     struct {
-					Hits []struct {
-						ID     string `json:"_id"`
-						Source struct {
-							Grep struct {
-								Revision    string       `json:"revision"`
-								Permissions *Permissions `json:"permissions"`
-								Metadata    struct {
-									SHA string `json:"sha256"`
-								} `json:"metadata"`
-							} `json:"grep"`
-						} `json:"_source"`
-					} `json:"hits"`
-				} `json:"hits"`
-			} `json:"responses"`
-		}
-		if err := json.Unmarshal(data, &result); err != nil {
-			return err
-		}
-		if len(result.Responses) != 1 || result.Responses[0].Status != 200 || result.Responses[0].Snapshot == "" || len(result.Responses[0].Error) > 0 && string(result.Responses[0].Error) != "null" {
-			return fmt.Errorf("Antfly did not provide successful snapshot query readiness")
-		}
-		for _, hit := range result.Responses[0].Hits.Hits {
-			if hit.ID == id && hit.Source.Grep.Revision == doc.Revision && hit.Source.Grep.Metadata.SHA == doc.Metadata["sha256"] && samePermissions(hit.Source.Grep.Permissions, doc.Permissions) {
-				return nil
-			}
-		}
-		timer := time.NewTimer(100 * time.Millisecond)
-		select {
-		case <-wait.Done():
-			timer.Stop()
-			return fmt.Errorf("canonical source is not query-visible: %w", wait.Err())
-		case <-timer.C:
-		}
-	}
-}
-
-func samePermissions(actual *Permissions, expected Permissions) bool {
-	if actual == nil {
-		return false
-	}
-	left, _ := json.Marshal(actual)
-	right, _ := json.Marshal(expected)
-	return bytes.Equal(left, right)
+	return WaitForDocuments(ctx, p.Query, table, map[string]Document{id: doc})
 }
 
 // ReadyAbsent prevents publishing a complete catalog while retired rows are

@@ -236,3 +236,35 @@ func TestDriveNamesAreEncodedAsLogicalPathSegments(t *testing.T) {
 	require.Equal(t, "Design%252F2026", DrivePathSegment("Design%2F2026"))
 	require.Equal(t, "Quarterly notes", DrivePathSegment("Quarterly notes"))
 }
+
+func TestGCSStagedAccessIsBoundToPinnedGeneration(t *testing.T) {
+	for _, state := range []string{"readable", "revoked", "deleted", "wrong-generation"} {
+		t.Run(state, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				require.Equal(t, "1", r.URL.Query().Get("generation"))
+				require.Equal(t, "1", r.URL.Query().Get("ifGenerationMatch"))
+				switch state {
+				case "revoked":
+					w.WriteHeader(403)
+				case "deleted":
+					w.WriteHeader(404)
+				case "wrong-generation":
+					fmt.Fprint(w, `{"generation":"2"}`)
+				default:
+					fmt.Fprint(w, `{"generation":"1"}`)
+				}
+			}))
+			defer server.Close()
+			connector := GoogleConnector{ProviderName: ProviderGCS, APIBase: server.URL, HTTPClient: server.Client()}
+			err := connector.CheckAccess(t.Context(), Request{Config: SourceConfig(`{"bucket":"docs"}`)}, Item{Path: "private.txt", Revision: "1", Metadata: map[string]any{"bucket": "docs"}})
+			if state == "readable" {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+			require.Equal(t, 1, calls)
+		})
+	}
+}

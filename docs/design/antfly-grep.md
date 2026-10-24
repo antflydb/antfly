@@ -330,6 +330,21 @@ alongside the access proof, and sends it as a continuation precondition. Job
 attempt identity fences even a completed sync with an unchanged inventory.
 There is no cross-table transaction: interruption leaves a
 non-searchable record or a bounded prior lease, and retry repairs publication.
+Both ingestion runtimes use the shared canonical query barrier. It compares a
+canonical digest of version, URI, path, revision, indexing time, permissions and
+all metadata (including the content SHA), rather than treating a provider revision
+as the identity of normalized output. Metadata-only changes must be query-visible
+before publication. Cached GCS bytes are authorized against their selected
+`generation` with a matching generation precondition, never against the live
+replacement's ACL.
+
+MCP trusted-principal tokens retain their broad read scope and add concrete
+`table_operations` write/admin grants for allowed application tables. Reserved
+catalog/source tables receive no write grants. Wildcard writers use the current
+table catalog to bound the request's write scope; missing scope cannot become a
+wildcard grant. Older Antfly runtimes ignore the additive claim and retain only
+the read scope, so a mixed-version rollout fails closed.
+
 The ingestion runtime owns catalog writes. Server authentication and row policy
 control catalog visibility as well as content; sharing metadata is descriptive,
 not a grant. In Cloud, current connection/sharing/table policy overrides retained

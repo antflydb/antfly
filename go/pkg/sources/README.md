@@ -146,3 +146,10 @@ only its previous bounded lease. Catalog reads fail on invalid versions, missing
 publication metadata, snapshot changes, duplicates and traversal budgets. Removing
 a source from a profile retires its catalog record while retaining content/state;
 an empty source list retires all entries owned by that profile.
+
+
+Canonical readiness is shared with hosted ingestion. A snapshot must expose the
+complete normalized metadata projection, including URI/path, sharing, connection
+metadata, indexing time and content digest, before publication can complete.
+Unchanged provider revisions do not bypass this check. GCS cache access checks
+are pinned to the original object generation and enforce its current permissions.

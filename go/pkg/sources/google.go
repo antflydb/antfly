@@ -467,7 +467,6 @@ func (c *GoogleConnector) ValidateStagedSource(ctx context.Context, r Request, o
 	if err != nil {
 		return err
 	}
-	var response json.RawMessage
 	if c.ProviderName == ProviderGoogleDrive {
 		var access struct {
 			Capabilities struct {
@@ -482,8 +481,27 @@ func (c *GoogleConnector) ValidateStagedSource(ctx context.Context, r Request, o
 		}
 		return nil
 	}
-	config, _ := decodeSourceConfig[GoogleConfig](r.Config)
-	return c.get(ctx, client, "/b/"+url.PathEscape(config.Bucket)+"/o/"+url.PathEscape(o.Path), &response)
+	config, err := decodeSourceConfig[GoogleConfig](r.Config)
+	if err != nil {
+		return err
+	}
+	if o.Revision == "" || configString(o.Metadata, "bucket") != config.Bucket {
+		return fmt.Errorf("invalid pinned GCS source")
+	}
+	if _, err := strconv.ParseUint(o.Revision, 10, 64); err != nil {
+		return fmt.Errorf("invalid pinned GCS generation")
+	}
+	var object struct {
+		Generation string `json:"generation"`
+	}
+	path := "/b/" + url.PathEscape(config.Bucket) + "/o/" + url.PathEscape(o.Path) + "?generation=" + url.QueryEscape(o.Revision) + "&ifGenerationMatch=" + url.QueryEscape(o.Revision)
+	if err := c.get(ctx, client, path, &object); err != nil {
+		return err
+	}
+	if object.Generation != o.Revision {
+		return &RevisionChangedError{Expected: o.Revision, Actual: object.Generation}
+	}
+	return nil
 }
 func (*GoogleConnector) RuntimeAccess(context.Context, Request) (string, error) {
 	return "", nil

@@ -29433,17 +29433,29 @@ fn trustedPrincipalPermissionsFromPayload(alloc: std.mem.Allocator, payload: std
 
     const tables_value = payload.get("tables");
     const operations_value = payload.get("operations");
-    if (operations_value == null or operations_value.? != .array or operations_value.?.array.items.len == 0) {
-        return try out.toOwnedSlice(alloc);
+    if (operations_value != null and operations_value.? == .array and operations_value.?.array.items.len > 0) {
+        if (tables_value == null or tables_value.? != .array or tables_value.?.array.items.len == 0) {
+            try appendTrustedPrincipalPermissionsForTable(alloc, &out, "*", operations_value.?.array.items);
+        } else {
+            for (tables_value.?.array.items) |table_value| {
+                const table = jsonStringValue(table_value) orelse continue;
+                if (table.len == 0) continue;
+                try appendTrustedPrincipalPermissionsForTable(alloc, &out, table, operations_value.?.array.items);
+            }
+        }
     }
-
-    if (tables_value == null or tables_value.? != .array or tables_value.?.array.items.len == 0) {
-        try appendTrustedPrincipalPermissionsForTable(alloc, &out, "*", operations_value.?.array.items);
-    } else {
-        for (tables_value.?.array.items) |table_value| {
-            const table = jsonStringValue(table_value) orelse continue;
-            if (table.len == 0) continue;
-            try appendTrustedPrincipalPermissionsForTable(alloc, &out, table, operations_value.?.array.items);
+    // Additive grants express narrow write/admin authority alongside a wider
+    // read scope. Older runtimes ignore this claim and retain only read access.
+    if (payload.get("table_operations")) |scopes| {
+        if (scopes != .object) return error.Unauthorized;
+        var it = scopes.object.iterator();
+        while (it.next()) |entry| {
+            if (entry.key_ptr.len == 0 or std.mem.eql(u8, entry.key_ptr.*, "*") or entry.value_ptr.* != .array) return error.Unauthorized;
+            for (entry.value_ptr.array.items) |operation| {
+                const name = jsonStringValue(operation) orelse return error.Unauthorized;
+                if (!std.mem.eql(u8, name, "read") and !std.mem.eql(u8, name, "write") and !std.mem.eql(u8, name, "admin")) return error.Unauthorized;
+            }
+            try appendTrustedPrincipalPermissionsForTable(alloc, &out, entry.key_ptr.*, entry.value_ptr.array.items);
         }
     }
     return try out.toOwnedSlice(alloc);
@@ -59791,5 +59803,37 @@ test "native memory worker budgets slow semantic publication independently from 
     for (rows.rows) |row| {
         const projection = try std.json.parseFromSliceLeaky(memory.memory.types.EntityProjection, alloc, row.json, .{});
         if (projection.kind == .view and std.mem.eql(u8, projection.entity_id, "graph")) try std.testing.expect(std.mem.indexOf(u8, projection.text, "Derived graph description") != null);
+    }
+}
+
+test "trusted principal table operations preserve unrelated writes and protect reserved tables" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"tables":["*"],"operations":["read"],"table_operations":{"application":["write"],"managed":["read"]}}
+    , .{});
+    defer parsed.deinit();
+    const permissions = try trustedPrincipalPermissionsFromPayload(a, parsed.value.object);
+    defer freePermissions(a, permissions);
+    try std.testing.expect(permissionsAllow(permissions, .table, "application", .write));
+    try std.testing.expect(permissionsAllow(permissions, .table, "managed", .read));
+    try std.testing.expect(!permissionsAllow(permissions, .table, "managed", .write));
+    try std.testing.expect(!permissionsAllow(permissions, .table, "antfly_sources", .write));
+    try std.testing.expect(!permissionsAllow(permissions, .table, "future-table", .write));
+}
+test "trusted principal table operations reject malformed and wildcard grant expansions" {
+    const a = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"table_operations":[]}
+        ,
+        \\{"table_operations":{"*":["write"]}}
+        ,
+        \\{"table_operations":{"docs":"write"}}
+        ,
+        \\{"table_operations":{"docs":["unknown"]}}
+    };
+    for (cases) |raw| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.Unauthorized, trustedPrincipalPermissionsFromPayload(a, parsed.value.object));
     }
 }
