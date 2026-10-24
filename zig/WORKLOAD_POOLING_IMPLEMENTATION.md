@@ -27280,3 +27280,87 @@ Normal storage publication/retirement registration, funded entry assembly,
 coupled backend publication, relief integration and the remaining default
 integration evidence also remain open. Full GNU qualification remains waived;
 the complete design is not yet achieved.
+
+## Bounded SQL batch metadata visits (2026-10-24)
+
+Batch size admission and retained-column appends now own a synchronous metadata
+meter. Nested selection, projection, combination, mask and prepared-reader
+adapters borrow that same meter. It permits at most 64 fixed metadata units
+between original-owner checkpoints; nested visitors cannot restart the budget.
+Descriptor-name comparisons are charged in chunks, including wide names.
+Hashing/equality kernels of at most 64 bytes charge those bytes to the same
+meter. Larger byte operations retain their direct owner/chunk checks. A denied
+checkpoint leaves the meter exhausted, so a retry cannot obtain fresh work
+without checking that same owner again. The metadata counter callback returns
+only a boolean; all fallible checks still call the original execution callback.
+
+Controlled capabilities now cover encoded/frozen JSON lookup, dictionary IDs,
+dictionary extraction and decimal-column selection through the built-in views.
+One constructor binds their complete callback set. The controlled methods are
+visible to that constructor's declaration lookup, and it checks that every
+advertised legacy capability has its controlled counterpart. Unknown providers
+retain direct owner checks before invocation and their existing precise error
+boundary; representation capabilities still cannot substitute for cell-reader
+validation. Batch-local counters remain synchronous borrows. Built-in adapters do not
+retain them in payloads, leases or reader outputs.
+
+Primitive appends with spare storage and constant header updates use metadata
+credit. Growth, widening and complex payloads retain direct checks before their
+variable work. String headers can share credit because their dictionary helper
+checks the owner before data work. Small fixed-width dictionary indexes have a
+bounded probe domain; larger indexes keep a direct boundary. Dictionary flattening
+meters each copied reference. Size estimation checks the owner before returning
+its result; an append checks before publishing its new logical row count, and
+a denied partial append remains failed until ordinary physical cleanup.
+
+Fixed NUMERIC readers now check their owner before acquiring the shared arena
+mutex and poll while it is busy. Their bounded fixed-coefficient allocation runs
+without a borrowed checkpoint callback under the mutex. This avoids yielding a
+query grant while holding the shared allocator lock. A native test checks the
+actual mutex from the owner callback.
+
+Private native ABI 119 and kernel-owner ABI 179 reject older borrowed-control
+and reader layouts. Public C layouts, stored data and wire formats are unchanged.
+The five original correlated-query work thresholds remain intact. Added tests
+cover nested budgets, denied retries, wide metadata names, byte/hash parity,
+opaque-provider refusal and error identity, selected multi-column admission,
+every checkpoint's partial cleanup, and the fixed-reader mutex boundary.
+
+This advances the normal SQL execution paths shared by the supported storage
+engines. The full design remains incomplete: normal storage publication and
+retirement registration, funded entry construction, coupled backend publication,
+relief integration and the remaining default integration evidence are still
+required. Legacy conversion and allocator-growth internals also retain their
+own bounded-work audit obligations. Full GNU qualification remains waived.
+
+
+Debug qualification (`sql-metadata-quantum-v9`) passes the ten focused query
+cases, all 123 prepared-numeric/operator tests, independent runtime ABI checks,
+and all four Bloom plus 45/1/8 original-error companions. The five previously
+failing query guards pass with their original thresholds and unchanged fixture
+sources. The added query cases cover allocation faults, every cancellation,
+source capture cleanup and masked correlation behavior.
+
+At 128 input rows the cold-scope case now records 8,195 owner checks (previously
+207,724), quantified Apply 10,686 (15,795), and the row producer 3,885 (7,714).
+The 512-row bounded scalar case records 21,446 (37,641); the 128-parent LATERAL
+case records 5,555 (13,464). These are checkpoint counts, not throughput claims.
+The selected 65-column/two-row metadata fixture records 46 owner checks and
+unwinds the partial result when the owner denies each individual checkpoint.
+Earlier failed compile/binding/work-limit receipts remain preserved as evidence
+of how the missing callback bindings and direct-boundary requirements were found.
+
+Final qualification (`sql-metadata-quantum-final-debug-v1` and
+`sql-metadata-quantum-final-fast-v1`) passes in Debug and ReleaseFast with the
+partial-credit denial correction included. An insufficient chunk exhausts all
+remaining metadata credit before calling the owner; after denial, switching to
+a smaller header operation still rechecks the original owner. The regression
+covers both exhausted and partially available credit.
+
+Both final runs pass all five native commands with unchanged input hashes:
+the ten query cases, 123 operator/prepared-numeric cases, runtime ABI checks and
+the original-error companions. No test skips, failures or leaks are reported.
+ReleaseFast retains the original query bounds too; minor checkpoint-count
+variation between optimization modes stays within those bounds. Formatting,
+staged source-license checks and generated error-name checks pass. The complete
+design remains open, and full GNU qualification remains waived.

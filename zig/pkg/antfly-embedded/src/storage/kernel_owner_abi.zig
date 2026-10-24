@@ -62,7 +62,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Reject earlier kernel/native pin capabilities before decoding their headers.
 // Registry construction and allocation provenance retain shared quota ownership.
 // Host quota guards retain inline manager, allocator and ancestor lifetimes.
-pub const abi_version: u32 = 178;
+// SQL metadata visitors may borrow a bounded synchronous work meter.
+pub const abi_version: u32 = 179;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

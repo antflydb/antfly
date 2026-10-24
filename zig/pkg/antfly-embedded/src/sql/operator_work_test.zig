@@ -950,3 +950,217 @@ test "SQL grouping work shares clone quanta across object fields and retires eve
     }
     try std.testing.expectEqualStrings("small", fields.get("k0").?.string);
 }
+
+test "SQL grouping work metadata scopes share nested budgets and preserve direct byte checks and denied retries" {
+    var probe: Probe = .{};
+    var scope: Work.MetadataScope = .{ .original = probe.control() };
+    const control = scope.view();
+    try Work.poll(control);
+    var nested: Work.MetadataScope = .{ .original = control };
+    for (0..64) |_| try Work.metadataPoll(nested.view());
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try Work.metadataPoll(control);
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    // A wide byte operation cannot borrow any of the remaining metadata
+    // credit. It checks the original owner before touching its bytes.
+    probe.stop_after = 3;
+    const wide_bytes: [4097]u8 = @splat(1);
+    try std.testing.expectError(error.OwnerCanceled, Work.hashBytes(control, 0, &wide_bytes));
+    probe = .{};
+    scope.remaining = 0;
+    probe.stop_after = 1;
+    try std.testing.expectError(error.OwnerCanceled, Work.metadataPoll(control));
+    try std.testing.expectError(error.OwnerCanceled, Work.metadataPoll(control));
+    try std.testing.expectEqual(@as(usize, 0), scope.remaining);
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    // Insufficient partial credit must also be lost on denial. A caller
+    // cannot switch from a wide chunk to a smaller header visit and continue.
+    probe = .{ .stop_after = 1 };
+    scope.remaining = 17;
+    const name: [64]u8 = @splat('n');
+    try std.testing.expectError(error.OwnerCanceled, Work.equalMetadataBytes(control, &name, &name));
+    try std.testing.expectEqual(@as(usize, 0), scope.remaining);
+    try std.testing.expectError(error.OwnerCanceled, Work.metadataPoll(control));
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    // Ordinary callers without a scope keep their original per-call checks.
+    probe = .{};
+    try Work.metadataPoll(probe.control());
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+}
+
+test "SQL grouping work metadata names retain exact comparison and every chunk cancellation" {
+    const left: [4097]u8 = @splat('n');
+    var right = left;
+    var probe: Probe = .{};
+    var scope: Work.MetadataScope = .{ .original = probe.control() };
+    try Work.poll(scope.view());
+    try std.testing.expect(try Work.equalMetadataBytes(scope.view(), &left, &right));
+    const checks = probe.calls;
+    try std.testing.expect(checks > 60);
+    for (1..checks + 1) |stop| {
+        var canceled: Probe = .{ .stop_after = stop };
+        var current: Work.MetadataScope = .{ .original = canceled.control() };
+        const result = blk: {
+            Work.poll(current.view()) catch |err| break :blk @as(anyerror!bool, err);
+            break :blk Work.equalMetadataBytes(current.view(), &left, &right);
+        };
+        try std.testing.expectError(error.OwnerCanceled, result);
+    }
+    probe = .{};
+    scope.remaining = 64;
+    right[right.len - 1] = 'x';
+    try std.testing.expect(!try Work.equalMetadataBytes(scope.view(), &left, &right));
+}
+
+test "SQL grouping work batch metadata admission preserves selections and retires every denied prefix" {
+    const Store = @import("typed_store.zig").Store;
+    const Batch = @import("execution_batch.zig").Batch;
+    const cells = [_]Datum{ .{}, Datum.json(.{ .integer = 7 }) };
+    const columns: [65][]const Datum = @splat(&cells);
+    const batch: Batch = .{ .vectors = .{ .values = &columns, .count = 2 } };
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const selected = try batch.select(scratch.allocator(), &.{ 1, 0 });
+    try std.testing.expect(selected.reader.read_frozen_controlled != null);
+    try std.testing.expect(selected.reader.read_json_controlled != null);
+    try std.testing.expect(selected.reader.read_dictionary_controlled != null);
+    const Scenario = struct {
+        fn run(a: std.mem.Allocator, input: Batch, stop: usize) !usize {
+            var store = Store.init(a);
+            defer store.deinit();
+            var probe: Probe = .{ .stop_after = stop };
+            var lease = Store.JsonLease.initControlled(a, probe.control());
+            defer lease.deinit();
+            const estimate = try store.batchAppendBytesLeased(a, input, std.math.maxInt(usize), &lease);
+            try std.testing.expect(estimate > 0);
+            try store.appendBatchLeased(input, &lease);
+            try std.testing.expectEqual(@as(usize, 2), store.len);
+            for (0..input.width()) |column| {
+                try std.testing.expectEqual(@as(i64, 7), (try store.cell(a, 0, column)).value.integer);
+                try std.testing.expect((try store.cell(a, 1, column)).sql_null);
+            }
+            return probe.calls;
+        }
+    };
+    const checks = try Scenario.run(std.testing.allocator, selected, std.math.maxInt(usize));
+    // Even the capability and selection layers together use fewer owner
+    // checks than there are columns, while every denial still unwinds.
+    std.debug.print("SQL metadata admission: columns={} rows=2 owner_checks={}\n", .{ columns.len, checks });
+    try std.testing.expect(checks > 4 and checks < columns.len);
+    for (1..checks + 1) |stop| {
+        try std.testing.expectError(error.OwnerCanceled, Scenario.run(std.testing.allocator, selected, stop));
+    }
+}
+
+test "SQL grouping work tiny byte kernels spend metadata bytes without changing hashes or denial" {
+    const bytes: [64]u8 = @splat('h');
+    for (0..bytes.len + 1) |len| {
+        var probe: Probe = .{};
+        var scope: Work.MetadataScope = .{ .original = probe.control() };
+        try Work.poll(scope.view());
+        try std.testing.expectEqual(std.hash.Wyhash.hash(19, bytes[0..len]), try Work.hashBytes(scope.view(), 19, bytes[0..len]));
+        try std.testing.expect(try Work.equalBytes(scope.view(), bytes[0..len], bytes[0..len]));
+        scope.remaining = 0;
+        probe.stop_after = probe.calls + 1;
+        try std.testing.expectError(error.OwnerCanceled, Work.hashBytes(scope.view(), 19, bytes[0..len]));
+        try std.testing.expectEqual(@as(usize, 0), scope.remaining);
+    }
+}
+
+test "SQL grouping work unknown reader capabilities retain owner and provider failure boundaries" {
+    const Source = struct {
+        calls: usize = 0,
+        fn deny(raw: *anyopaque) error{InvalidSqlBackendResponse} {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.InvalidSqlBackendResponse;
+        }
+        fn read(raw: *anyopaque, _: std.mem.Allocator, _: usize, _: usize) !Datum {
+            return deny(raw);
+        }
+        fn controlled(raw: *anyopaque, _: std.mem.Allocator, _: usize, _: usize, _: ?Work.Control) !Datum {
+            return deny(raw);
+        }
+        fn dictionary(raw: *anyopaque, _: std.mem.Allocator, _: usize) !?@import("execution_batch.zig").Batch {
+            return deny(raw);
+        }
+        fn decimal(raw: *anyopaque, _: std.mem.Allocator, _: usize, _: ?[]const usize) !?@import("execution_batch.zig").DecimalColumn {
+            return deny(raw);
+        }
+        fn json(raw: *anyopaque, _: usize, _: usize) !?[]const u8 {
+            return deny(raw);
+        }
+        fn frozen(raw: *anyopaque, _: usize, _: usize) !?@import("execution_batch.zig").FrozenJson {
+            return deny(raw);
+        }
+        fn identity(raw: *anyopaque, _: usize, _: usize) !?u64 {
+            return deny(raw);
+        }
+    };
+    const Op = enum { cell, dictionary, decimal, json, frozen, identity };
+    const Invoke = struct {
+        fn call(op: Op, batch: @import("execution_batch.zig").Batch, control: ?Work.Control) !void {
+            const a = std.testing.allocator;
+            switch (op) {
+                .cell => {
+                    _ = try batch.cellControlled(a, 0, 0, control);
+                },
+                .dictionary => {
+                    _ = try batch.dictionaryColumnControlled(a, 0, control);
+                },
+                .decimal => {
+                    _ = try batch.decimalColumnSelectedControlled(a, 0, null, control);
+                },
+                .json => {
+                    _ = try batch.encodedJsonControlled(0, 0, control);
+                },
+                .frozen => {
+                    _ = try batch.frozenJsonControlled(0, 0, control);
+                },
+                .identity => {
+                    _ = try batch.dictionaryIdentityControlled(0, 0, control);
+                },
+            }
+        }
+    };
+    var source: Source = .{};
+    const batch: @import("execution_batch.zig").Batch = .{ .reader = .{ .ptr = &source, .count = 1, .width = 1, .read = Source.read, .read_controlled = Source.controlled, .read_dictionary = Source.dictionary, .read_decimal_selected = Source.decimal, .read_json = Source.json, .read_frozen = Source.frozen, .read_identity = Source.identity } };
+    for (std.enums.values(Op)) |op| {
+        source.calls = 0;
+        var probe: Probe = .{ .stop_after = 1 };
+        var scope: Work.MetadataScope = .{ .original = probe.control() };
+        try std.testing.expectError(error.OwnerCanceled, Invoke.call(op, batch, scope.view()));
+        try std.testing.expectEqual(@as(usize, 0), source.calls);
+        probe = .{};
+        scope.remaining = 64;
+        try std.testing.expectError(error.InvalidSqlBackendResponse, Invoke.call(op, batch, scope.view()));
+        try std.testing.expectEqual(@as(usize, 1), source.calls);
+    }
+}
+
+test "SQL grouping work fixed numeric read checks its owner outside the shared arena mutex" {
+    const Store = @import("typed_store.zig").Store;
+    const a = std.testing.allocator;
+    var context: @import("numeric_value.zig").Context = .{ .alloc = a };
+    var number = try @import("numeric_value.zig").parse(&context, "12.00");
+    defer number.deinit();
+    var store = Store.init(a);
+    defer store.deinit();
+    _ = try store.append(&.{Datum.typedNumeric(&number.value)});
+    try std.testing.expect(store.columns[0].fixed != null);
+    const Owner = struct {
+        store: *Store,
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (!self.store.reader_mutex.tryLock()) return error.OwnerCanceled;
+            self.store.reader_mutex.unlock();
+        }
+    };
+    var owner: Owner = .{ .store = &store };
+    var scope: Work.MetadataScope = .{ .original = .{ .ptr = &owner, .checkpoint = Owner.check } };
+    const value = try store.cellControlled(a, 0, 0, scope.view());
+    try std.testing.expectEqual(try scalar.semanticHashDatum(Datum.typedNumeric(&number.value)), try scalar.semanticHashDatum(value));
+    try std.testing.expectEqual(@as(usize, 1), owner.calls);
+}

@@ -19,12 +19,77 @@ const std = @import("std");
 pub const Control = struct {
     ptr: ?*anyopaque,
     checkpoint: *const fn (?*anyopaque) anyerror!void,
+    /// Borrowed only by synchronous, fixed-size metadata visitors. Byte work
+    /// larger than 64 bytes always checks the original owner directly.
+    metadata: ?struct {
+        ptr: *anyopaque,
+        consume: *const fn (*anyopaque, usize, bool) bool,
+    } = null,
 };
+
+/// One caller-owned metadata quantum, shared by nested visitors. Its callback
+/// transports no errors; all fallible checks still use the original owner.
+pub const MetadataScope = struct {
+    original: ?Control,
+    remaining: usize = 64,
+    pub fn view(self: *@This()) ?Control {
+        var control = self.original orelse return null;
+        if (control.metadata != null) return control;
+        control.metadata = .{ .ptr = self, .consume = consume };
+        return control;
+    }
+    fn consume(raw: *anyopaque, units: usize, reset: bool) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (reset) self.remaining = 64;
+        if (units > self.remaining) {
+            self.remaining = 0;
+            return true;
+        }
+        self.remaining -= units;
+        return false;
+    }
+};
+fn metadataCharge(control: ?Control, units: usize) !void {
+    std.debug.assert(units <= 64);
+    const owner = control orelse return;
+    const metadata = owner.metadata orelse return poll(control);
+    if (metadata.consume(metadata.ptr, units, false)) {
+        // Do not advance the meter after denial. Even a retry must first
+        // recheck this same owner instead of receiving a fresh quantum.
+        try poll(control);
+        const exhausted = metadata.consume(metadata.ptr, units, true);
+        std.debug.assert(!exhausted);
+    }
+}
+pub fn metadataPoll(control: ?Control) !void {
+    try metadataCharge(control, 1);
+}
+/// Descriptor-name lookup shares the metadata quantum too. Each comparison
+/// chunk is charged before inspecting bytes; long names cannot hide a scan.
+pub fn equalMetadataBytes(control: ?Control, left: []const u8, right: []const u8) anyerror!bool {
+    if (control == null) return std.mem.eql(u8, left, right);
+    if (control.?.metadata == null) return equalBytes(control, left, right);
+    try metadataPoll(control);
+    if (left.len != right.len) return false;
+    var offset: usize = 0;
+    while (offset < left.len) {
+        const count = @min(@as(usize, 64), left.len - offset);
+        try metadataCharge(control, count);
+        if (!std.mem.eql(u8, left[offset..][0..count], right[offset..][0..count])) return false;
+        offset += count;
+    }
+    return true;
+}
 pub fn poll(control: ?Control) !void {
     if (control) |owner| try owner.checkpoint(owner.ptr);
 }
 pub fn hashBytes(control: ?Control, seed: u64, bytes: []const u8) !u64 {
     if (control == null) return std.hash.Wyhash.hash(seed, bytes);
+    if (control.?.metadata != null and bytes.len <= 64) {
+        try metadataPoll(control);
+        try metadataCharge(control, bytes.len);
+        return std.hash.Wyhash.hash(seed, bytes);
+    }
     var hash = std.hash.Wyhash.init(seed);
     var offset: usize = 0;
     try poll(control);
@@ -52,6 +117,8 @@ pub fn orderBytes(control: ?Control, left: []const u8, right: []const u8) !std.m
 }
 pub fn equalBytes(control: ?Control, left: []const u8, right: []const u8) !bool {
     if (control == null) return std.mem.eql(u8, left, right);
+    if (control.?.metadata != null and left.len <= 64 and right.len <= 64)
+        return equalMetadataBytes(control, left, right);
     try poll(control);
     if (left.len != right.len) return false;
     return (try orderBytes(control, left, right)) == .eq;

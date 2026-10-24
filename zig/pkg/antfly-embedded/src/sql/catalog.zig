@@ -459,9 +459,9 @@ pub const ColumnPage = struct {
         return self.typedCellControlled(alloc, row, name, numeric, null);
     }
     pub fn typedCellControlled(self: ColumnPage, alloc: std.mem.Allocator, row: usize, name: []const u8, numeric: bool, control: ?@import("operator_work.zig").Control) !Row.Cell {
-        try @import("operator_work.zig").poll(control);
+        try @import("operator_work.zig").metadataPoll(control);
         if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
-        if (numeric and self.native == null) if (self.batch.findColumn(name)) |column| {
+        if (numeric and self.native == null) if (try self.findColumnControlled(name, control)) |column| {
             const index = self.selection[row];
             if (index >= self.batch.rowCount() or index >= column.rowCount()) return error.InvalidSqlBackendResponse;
             if (column.values == .decimal128 and !column.nulls.isNull(index)) {
@@ -478,16 +478,24 @@ pub const ColumnPage = struct {
         return self.cellControlled(alloc, row, name, control);
     }
     pub fn frozenJson(self: ColumnPage, row: usize, name: []const u8) !?@import("execution_batch.zig").FrozenJson {
+        return self.frozenJsonControlled(row, name, null);
+    }
+    pub fn frozenJsonControlled(self: ColumnPage, row: usize, name: []const u8, control: ?@import("operator_work.zig").Control) !?@import("execution_batch.zig").FrozenJson {
+        try @import("operator_work.zig").metadataPoll(control);
         if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
         if (self.native) |native| {
-            for (native.names, 0..) |column, ordinal| if (std.mem.eql(u8, column, name)) return native.values.frozenJson(self.selection[row], ordinal);
+            for (native.names, 0..) |column, ordinal| if (try @import("operator_work.zig").equalMetadataBytes(control, column, name)) return native.values.frozenJsonControlled(self.selection[row], ordinal, control);
         }
         return null;
     }
     pub fn encodedJson(self: ColumnPage, row: usize, name: []const u8) !?[]const u8 {
+        return self.encodedJsonControlled(row, name, null);
+    }
+    pub fn encodedJsonControlled(self: ColumnPage, row: usize, name: []const u8, control: ?@import("operator_work.zig").Control) !?[]const u8 {
+        try @import("operator_work.zig").metadataPoll(control);
         if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
         if (self.native) |native| {
-            for (native.names, 0..) |column, ordinal| if (std.mem.eql(u8, column, name)) return native.values.encodedJson(self.selection[row], ordinal);
+            for (native.names, 0..) |column, ordinal| if (try @import("operator_work.zig").equalMetadataBytes(control, column, name)) return native.values.encodedJsonControlled(self.selection[row], ordinal, control);
         }
         return null;
     }
@@ -495,23 +503,29 @@ pub const ColumnPage = struct {
         return self.cellControlled(alloc, row, name, null);
     }
     pub fn cellControlled(self: ColumnPage, alloc: std.mem.Allocator, row: usize, name: []const u8, control: ?@import("operator_work.zig").Control) !Row.Cell {
-        try @import("operator_work.zig").poll(control);
+        try @import("operator_work.zig").metadataPoll(control);
         if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
         const index = self.selection[row];
         if (self.native) |native| {
             if (index >= native.values.len() or native.names.len != native.values.width()) return error.InvalidSqlBackendResponse;
-            for (native.names, 0..) |column, ordinal| if (std.mem.eql(u8, column, name)) {
+            for (native.names, 0..) |column, ordinal| if (try @import("operator_work.zig").equalMetadataBytes(control, column, name)) {
                 const value = try native.values.cellControlled(alloc, index, ordinal, control);
                 return value;
             };
             return .{ .value = .null, .sql_null = true };
         }
         if (index >= self.batch.rowCount()) return error.InvalidSqlBackendResponse;
-        if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = try @import("../storage/rowsource/identity.zig").allocId(alloc, self.batch.rowRef(index)) }, .sql_null = false };
-        const column = self.batch.findColumn(name) orelse return .{ .value = .null, .sql_null = true };
+        if (try @import("operator_work.zig").equalMetadataBytes(control, name, "_id")) {
+            try @import("operator_work.zig").poll(control);
+            return .{ .value = .{ .string = try @import("../storage/rowsource/identity.zig").allocId(alloc, self.batch.rowRef(index)) }, .sql_null = false };
+        }
+        const column = (try self.findColumnControlled(name, control)) orelse return .{ .value = .null, .sql_null = true };
         if (column.nulls.isNull(index)) return .{ .value = .null, .sql_null = true };
         const value: std.json.Value = switch (column.values) {
-            .encoded => |values| try values.at(index),
+            .encoded => |values| blk: {
+                try @import("operator_work.zig").poll(control);
+                break :blk try values.at(index);
+            },
             .dictionary_i64 => |values| .{ .integer = values.at(index) },
             .dictionary_f64 => |values| .{ .float = values.at(index) },
             .i64 => |values| .{ .integer = values[index] },
@@ -520,10 +534,19 @@ pub const ColumnPage = struct {
             .bytes => |values| .{ .string = values[index] },
             .dictionary_bytes => |values| .{ .string = values.at(index) },
             .json => |values| try @import("controlled_json_text.zig").parseLeaky(alloc, values[index], control),
-            .decimal128 => |values| .{ .string = try values.text(alloc, index) },
+            .decimal128 => |values| blk: {
+                try @import("operator_work.zig").poll(control);
+                break :blk .{ .string = try values.text(alloc, index) };
+            },
             .vector_f32 => return error.UnsupportedSqlExecution,
         };
         return .{ .value = value, .sql_null = false };
+    }
+    pub fn findColumnControlled(self: ColumnPage, name: []const u8, control: ?@import("operator_work.zig").Control) !?@import("../storage/rowsource/types.zig").ColumnVector {
+        for (self.batch.columns) |column| {
+            if (try @import("operator_work.zig").equalMetadataBytes(control, column.name, name)) return column;
+        }
+        return null;
     }
 };
 

@@ -27,12 +27,13 @@ pub fn retainedCellBytes(value: Datum) !usize {
     return retainedCellBytesControlled(value, null);
 }
 pub fn retainedCellBytesControlled(value: Datum, control: ?Work.Control) !usize {
-    try Work.poll(control);
+    try Work.metadataPoll(control);
     if (fixedCoefficient(value) != null) return 19;
     return 1 +| (if (value.patterns != null) @sizeOf(?*scalar.PatternSet) else @as(usize, 0)) +| switch (value.value) {
         .integer, .float => @as(usize, 8),
         .bool => @as(usize, 1),
         .string, .number_string => |text| @sizeOf([]const u8) +| text.len +| 32,
+        .null => if (value.numeric == null and value.array == null) @sizeOf(Datum) else try @import("operators.zig").datumBytesWithControl(value, control),
         else => try @import("operators.zig").datumBytesWithControl(value, control),
     };
 }
@@ -74,7 +75,7 @@ const Dictionary = struct {
             errdefer flat.deinit(a);
             try flat.ensureTotalCapacity(a, self.indices.items.len + 1);
             for (self.indices.items) |index| {
-                try Work.poll(control);
+                try Work.metadataPoll(control);
                 flat.appendAssumeCapacity(self.values.items[index]);
             }
             self.values.clearAndFree(a);
@@ -103,7 +104,9 @@ const Dictionary = struct {
         return null;
     }
     fn find(self: *const Dictionary, text: []const u8, control: ?Work.Control) !?u32 {
-        try Work.poll(control);
+        // A small fixed-width index has a bounded probe domain. Larger maps
+        // retain their direct check; text hashing/equality meter their bytes.
+        if (self.lookup.capacity() <= 64) try Work.metadataPoll(control) else try Work.poll(control);
         if (self.lookup.count() == 0) return null;
         return self.findHashed(text, try Work.hashBytes(control, 0, text), control);
     }
@@ -432,7 +435,7 @@ const Column = struct {
         return self.cellControlled(a, row, null);
     }
     fn cellControlled(self: Column, a: A, row: usize, control: ?Work.Control) !Datum {
-        try Work.poll(control);
+        try Work.metadataPoll(control);
         if (self.isNull(row)) return .{};
         if (self.fixed) |fixed| return fixed.cell(a, row);
         if (self.json_bytes) |bytes| if (bytes.items[row]) |json| {
@@ -572,7 +575,7 @@ const Column = struct {
                     errdefer flat.deinit(a);
                     try flat.ensureTotalCapacity(a, v.indices.items.len);
                     for (v.indices.items) |id| {
-                        try Work.poll(control);
+                        try Work.metadataPoll(control);
                         flat.appendAssumeCapacity(if (v.values.items.len == 0) &.{} else v.values.items[id]);
                     }
                     v.values.clearAndFree(a);
@@ -603,8 +606,27 @@ const Column = struct {
         try self.append(a, owned, scratch, row, Datum.json(.null), control);
         self.json_bytes.?.items[row] = payload;
     }
+    // Only fixed-size header updates and primitive appends with spare storage
+    // share metadata credit. Growth, widening and complex payloads retain the
+    // original direct owner check before their variable work.
+    fn metadataAppend(self: Column, row: usize, value: Datum) bool {
+        if (self.fixed != null or self.json_bytes != null or value.numeric != null or value.array != null or value.patterns != null or self.numerics.items.len != 0 or self.arrays.items.len != 0 or self.patterns.items.len != 0) return false;
+        if (row % 64 == 0 and self.nulls.items.len == self.nulls.capacity and self.nulls.items.len != 0) return false;
+        return switch (self.values) {
+            .unknown => value.sql_null or (row == 0 and (value.value == .integer or value.value == .float or value.value == .bool)),
+            .integers => |v| (value.sql_null or value.value == .integer) and !v.encoded and (v.sampled or v.flat.items.len < 256) and (v.flat.items.len == 0 or v.flat.items.len < v.flat.capacity),
+            .numbers => |v| (value.sql_null or value.value == .float) and !v.encoded and (v.sampled or v.flat.items.len < 256) and (v.flat.items.len == 0 or v.flat.items.len < v.flat.capacity),
+            .booleans => |v| (value.sql_null or value.value == .bool) and (v.items.len == 0 or v.items.len < v.capacity),
+            // Dictionary.append checks the original owner before any byte
+            // copy, lookup growth or representation change. Only this fixed
+            // header prefix shares metadata credit with the enclosing batch.
+            .strings => value.sql_null or value.value == .string,
+            .decimals => value.sql_null or value.value == .number_string,
+            else => false,
+        };
+    }
     fn append(self: *Column, a: A, owned: A, scratch: A, row: usize, value: Datum, control: ?Work.Control) !void {
-        try Work.poll(control);
+        if (self.metadataAppend(row, value)) try Work.metadataPoll(control) else try Work.poll(control);
         if (self.json_bytes) |bytes| try bytes.append(a, null);
         const coefficient = fixedCoefficient(value);
         if (self.fixed == null and self.json_bytes == null and self.values == .unknown and self.numerics.items.len == 0 and self.arrays.items.len == 0 and self.patterns.items.len == 0 and coefficient != null) {
@@ -1004,6 +1026,10 @@ pub const Store = struct {
         return if (stored.isNull(row_index)) 0 else @as(u64, id) + 1;
     }
     pub fn dictionaryBatch(self: *const Store, a: A, column: usize, begin: usize, count: usize) !?@import("execution_batch.zig").Batch {
+        return self.dictionaryBatchControlled(a, column, begin, count, null);
+    }
+    pub fn dictionaryBatchControlled(self: *const Store, a: A, column: usize, begin: usize, count: usize, control: ?Work.Control) !?@import("execution_batch.zig").Batch {
+        try Work.metadataPoll(control);
         if (self.failed or column >= self.columns.len or begin > self.len or count > self.len - begin) return error.InvalidSqlBackendResponse;
         const stored = self.columns[column];
         if (stored.patterns.items.len != 0 or stored.arrays.items.len != 0 or stored.numerics.items.len != 0) return null;
@@ -1023,6 +1049,7 @@ pub const Store = struct {
         defer ids.deinit(a);
         var used: usize = 1;
         for (indices, 0..) |*id, offset| {
+            try Work.metadataPoll(control);
             const physical = (try self.dictionaryId(begin + offset, column)).?;
             if (physical == 0) {
                 id.* = 0;
@@ -1031,7 +1058,7 @@ pub const Store = struct {
             const entry = try ids.getOrPut(a, physical);
             if (!entry.found_existing) {
                 entry.value_ptr.* = @intCast(used);
-                values[used] = try stored.cell(a, begin + offset);
+                values[used] = try stored.cellControlled(a, begin + offset, control);
                 used += 1;
             }
             id.* = entry.value_ptr.*;
@@ -1054,7 +1081,7 @@ pub const Store = struct {
         return self.cellAppendBytesControlled(index, value, null);
     }
     fn cellAppendBytesControlled(self: *const Store, index: usize, value: Datum, control: ?Work.Control) !usize {
-        try Work.poll(control);
+        try Work.metadataPoll(control);
         var bytes: usize = 0;
         var repeated = false;
         if (!value.sql_null and index < self.columns.len) {
@@ -1084,6 +1111,14 @@ pub const Store = struct {
     /// gets a separate counting generation so declined prefixes cannot hide
     /// payload bytes in a later attempt.
     pub fn batchAppendBytesLeased(self: *const Store, a: A, batch: @import("execution_batch.zig").Batch, maximum: usize, lease: *JsonLease) !usize {
+        var scope: Work.MetadataScope = .{ .original = lease.control };
+        const control = scope.view();
+        try Work.poll(control);
+        const bytes = try self.batchAppendBytesInScope(a, batch, maximum, lease, control);
+        try Work.poll(control);
+        return bytes;
+    }
+    fn batchAppendBytesInScope(self: *const Store, a: A, batch: @import("execution_batch.zig").Batch, maximum: usize, lease: *JsonLease, control: ?Work.Control) !usize {
         var region = std.heap.ArenaAllocator.init(@import("memory_budget.zig").reclaimingAllocator(a));
         defer region.deinit();
         const work = region.allocator();
@@ -1093,15 +1128,18 @@ pub const Store = struct {
         lease.generation +%= 1;
         if (lease.generation == 0) {
             var entries = lease.identities.valueIterator();
-            while (entries.next()) |entry| entry.estimated = 0;
+            while (entries.next()) |entry| {
+                try Work.metadataPoll(control);
+                entry.estimated = 0;
+            }
             lease.generation = 1;
         }
         var bytes: usize = 0;
         for (0..batch.width()) |column| for (0..batch.len()) |index| {
-            try Work.poll(lease.control);
-            const payload: ?JsonPayload = if (try batch.frozenJson(index, column)) |frozen|
+            try Work.metadataPoll(control);
+            const payload: ?JsonPayload = if (try batch.frozenJsonControlled(index, column, control)) |frozen|
                 .{ .frozen = frozen }
-            else if (try batch.encodedJson(index, column)) |text|
+            else if (try batch.encodedJsonControlled(index, column, control)) |text|
                 .{ .text = text }
             else
                 null;
@@ -1123,7 +1161,7 @@ pub const Store = struct {
                 bytes +|= source.len +| @sizeOf(JsonPayload) +| 64;
             } else {
                 _ = cell_region.reset(.retain_capacity);
-                bytes +|= try self.cellAppendBytesControlled(column, try batch.cellControlled(cell_region.allocator(), index, column, lease.control), lease.control);
+                bytes +|= try self.cellAppendBytesControlled(column, try batch.cellControlled(cell_region.allocator(), index, column, control), control);
             }
             // Reject before temporary identity state can outgrow admission.
             if (bytes > maximum) return bytes;
@@ -1198,6 +1236,9 @@ pub const Store = struct {
         return self.appendBatchLeased(batch, &lease);
     }
     pub fn appendBatchLeased(self: *Store, batch: @import("execution_batch.zig").Batch, lease: *JsonLease) !void {
+        var scope: Work.MetadataScope = .{ .original = lease.control };
+        const control = scope.view();
+        try Work.poll(control);
         if (self.failed or (self.initialized and self.columns.len != batch.width())) return error.InvalidSqlBackendResponse;
         errdefer self.failed = true;
         if (!self.initialized) {
@@ -1208,41 +1249,42 @@ pub const Store = struct {
         var scratch = std.heap.ArenaAllocator.init(self.a);
         defer scratch.deinit();
         for (self.columns, 0..) |*column, ordinal| {
-            try Work.poll(lease.control);
+            try Work.metadataPoll(control);
             _ = scratch.reset(.free_all);
             if (column.fixed != null or (column.values == .unknown and column.numerics.items.len == 0 and column.arrays.items.len == 0 and column.patterns.items.len == 0)) {
-                if (try batch.decimalColumnSelected(scratch.allocator(), ordinal, null)) |decimal| {
+                if (try batch.decimalColumnSelectedControlled(scratch.allocator(), ordinal, null, control)) |decimal| {
                     for (0..batch.len()) |index| {
                         var coefficient: @import("numeric_value.zig").ScaledInteger = undefined;
                         var number: @import("numeric_value.zig").Value = undefined;
                         const value = try decimal.cell(index, &coefficient, &number);
-                        try column.append(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, value, lease.control);
+                        try column.append(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, value, control);
                     }
                     continue;
                 }
             }
-            if (try batch.dictionaryColumn(scratch.allocator(), ordinal)) |encoded| {
+            if (try batch.dictionaryColumnControlled(scratch.allocator(), ordinal, control)) |encoded| {
                 if (encoded.len() != batch.len()) return error.InvalidSqlBackendResponse;
-                if (try column.appendDictionary(self.a, self.arena.allocator(), self.len, encoded, lease.control)) continue;
+                if (try column.appendDictionary(self.a, self.arena.allocator(), self.len, encoded, control)) continue;
             }
             _ = scratch.reset(.free_all);
             for (0..batch.len()) |index| {
-                try Work.poll(lease.control);
+                try Work.metadataPoll(control);
                 _ = scratch.reset(.retain_capacity);
-                if (try batch.frozenJson(index, ordinal)) |frozen| {
+                if (try batch.frozenJsonControlled(index, ordinal, control)) |frozen| {
                     column.json_cache = try self.jsonCache();
-                    try column.appendJson(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, try self.ownJson(.{ .frozen = frozen }, lease), lease.control);
+                    try column.appendJson(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, try self.ownJson(.{ .frozen = frozen }, lease), control);
                     continue;
                 }
-                if (try batch.encodedJson(index, ordinal)) |bytes| {
+                if (try batch.encodedJsonControlled(index, ordinal, control)) |bytes| {
                     column.json_cache = try self.jsonCache();
-                    try column.appendJson(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, try self.ownJson(.{ .text = bytes }, lease), lease.control);
+                    try column.appendJson(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, try self.ownJson(.{ .text = bytes }, lease), control);
                     continue;
                 }
-                const value = try batch.cellControlled(scratch.allocator(), index, ordinal, lease.control);
-                try column.append(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, value, lease.control);
+                const value = try batch.cellControlled(scratch.allocator(), index, ordinal, control);
+                try column.append(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, value, control);
             }
         }
+        try Work.poll(control);
         self.len += batch.len();
     }
     pub fn append(self: *Store, values: []const Datum) !usize {
@@ -1317,9 +1359,15 @@ pub const Store = struct {
         if (self.failed or index >= self.len or column >= self.columns.len) return error.InvalidSqlBackendResponse;
         if (self.columns[column].fixed != null) {
             const owner = @constCast(self);
-            while (!owner.reader_mutex.tryLock()) std.atomic.spinLoopHint();
+            try Work.poll(control);
+            while (!owner.reader_mutex.tryLock()) {
+                try Work.poll(control);
+                std.atomic.spinLoopHint();
+            }
             defer owner.reader_mutex.unlock();
-            return self.columns[column].cellControlled(owner.arena.allocator(), index, control);
+            // Fixed coefficients need only bounded header/digit allocation.
+            // No borrowed owner callback may yield while this arena is locked.
+            return self.columns[column].cellControlled(owner.arena.allocator(), index, null);
         }
         return self.columns[column].cellControlled(a, index, control);
     }
