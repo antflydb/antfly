@@ -1312,6 +1312,45 @@ class CliTests(unittest.TestCase):
         self.raw_cli(*args, "--batch-size=1")
         self.assertGreater(len(self.server.requests), requests)
 
+    def test_indexed_manual_selectors_preserve_configured_alias_namespace(self):
+        tables = [
+            {"name": "physical-a", "alias": "physical-b"},
+            {"name": "physical-b", "alias": "other"},
+            {"name": "unaliased"},
+        ]
+        config = self.table_config(
+            [self.indexed_doc(content="needle\n")], tables=tables
+        )
+        for selector, physical in (
+            ("physical-b", "physical-a"),
+            ("other", "physical-b"),
+            ("unaliased", "unaliased"),
+        ):
+            with self.subTest(selector=selector):
+                self.server.index_requests.clear()
+                self.raw_cli(
+                    "--table-config",
+                    config,
+                    "--table",
+                    selector,
+                    "--table",
+                    selector,
+                    "needle",
+                )
+                self.assertEqual(len(self.server.index_requests), 2)
+                self.assertTrue(
+                    all(
+                        path == f"/api/v1/tables/{physical}/query"
+                        for path, _, _ in self.server.index_requests
+                    )
+                )
+        self.server.index_requests.clear()
+        result = self.raw_cli(
+            "--table-config", config, "--table", "physical-a", "needle", code=2
+        )
+        self.assertIn(b"UnknownTable", result.stderr)
+        self.assertEqual(self.server.index_requests, [])
+
     def test_indexed_exact_scan_cursor_provenance_and_lexical_parity(self):
         documents = [
             self.indexed_doc("a.py", "before\nhit twice hit\n"),

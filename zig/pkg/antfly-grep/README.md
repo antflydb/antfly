@@ -367,7 +367,9 @@ antfly-grep --table-config tables.json --sort path -l 'retry' ./src
 `ANTFLY_GREP_TABLE_CONFIG` can supply the configuration path. With no explicit
 filesystem paths, table searches do not read stdin or implicitly walk the current
 directory. Repeated `--table` selects configured aliases; omitted selectors scan
-all configured tables. The default `prefetch: true` overlaps one retained-snapshot page
+all configured tables. A table with an alias is selected by that alias; physical
+names remain selectable for tables without aliases. Cloud source selectors use
+source ID precedence instead. The default `prefetch: true` overlaps one retained-snapshot page
 with matching and unlimited-budget decisions using one persistent producer. At most two decoded pages are
 live (each bounded by `max_page_memory`, plus bounded HTTP response buffers). Set
 `prefetch: false` for sequential retrieval. Quiet searches and finite per-file match

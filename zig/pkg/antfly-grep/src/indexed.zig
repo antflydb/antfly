@@ -81,7 +81,8 @@ pub fn run(search: anytype) !void {
     }
 }
 // Resolve user-facing selectors once to a set of physical source identities.
-// IDs take precedence over aliases. Alias ambiguity is a selection error, not
+// Cloud IDs take precedence over aliases. Manual configs select alias-or-name
+// exclusively, preserving their existing namespace. Alias ambiguity is an error, not
 // authority to widen the search to every matching source. Keep discovery order
 // and deduplicate repeated selectors without affecting independent connections.
 fn resolveTableSelection(a: A, tables: []const Table, selectors: []const []const u8, cloud: bool) ![]bool {
@@ -90,6 +91,15 @@ fn resolveTableSelection(a: A, tables: []const Table, selectors: []const []const
     @memset(selected, selectors.len == 0);
     for (selectors) |selector| {
         var found: ?usize = null;
+        if (!cloud) {
+            for (tables, 0..) |table, i| {
+                if (!std.mem.eql(u8, selector, table.alias orelse table.name)) continue;
+                if (found != null) return error.AmbiguousTable;
+                found = i;
+            }
+            selected[found orelse return error.UnknownTable] = true;
+            continue;
+        }
         for (tables, 0..) |table, i| {
             if (!std.mem.eql(u8, selector, table.name)) continue;
             if (found != null) return if (cloud) error.AmbiguousSource else error.AmbiguousTable;
