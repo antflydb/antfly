@@ -528,7 +528,8 @@ fn preserveOtherEnrichmentOutputsAlloc(a: Allocator, original: []const u8, produ
         .rerank_terms => "rerank_terms",
     };
     for ([_][]const u8{ "embedding", "sparse_embedding", "graph_edges", "chunk_preview", "chunk_embeddings", "rerank_terms", "media_outputs", "transcript", "transcript_spans" }) |name| {
-        if (std.mem.eql(u8, name, owned) or after.value.object.contains(name)) continue;
+        const media_owned = stage == .chunk_embeddings and (std.mem.eql(u8, name, "media_outputs") or std.mem.eql(u8, name, "transcript") or std.mem.eql(u8, name, "transcript_spans"));
+        if (media_owned or std.mem.eql(u8, name, owned) or after.value.object.contains(name)) continue;
         if (before.value.object.get(name)) |value| try after.value.object.put(scratch, name, value);
     }
     const old_state = before.value.object.get("_enrichment") orelse return std.json.Stringify.valueAlloc(a, after.value, .{});
@@ -793,6 +794,9 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
     }
     try document.object.put(scratch, "chunk_embeddings", .{ .array = embeddings.toManaged(scratch) });
     try document.object.put(scratch, "chunk_preview", .{ .array = previews.toManaged(scratch) });
+    // These fields belong to this stage. Removing a configured consumer must
+    // retire its previous values along with updating the recipe fingerprint.
+    for ([_][]const u8{ "media_outputs", "transcript", "transcript_spans" }) |name| _ = document.object.swapRemove(name);
     if (output_rows.items.len != 0) {
         const projection = try media_outputs.project(scratch, output_rows.items);
         const encoded_outputs = try std.json.Stringify.valueAlloc(scratch, .{ .chunks = output_rows.items, .complete_chunks = projection.complete_chunks, .failed_chunks = projection.failed_chunks, .terminal_chunks = projection.terminal_chunks, .status = projection.status }, .{ .emit_null_optional_fields = false });
@@ -2738,9 +2742,12 @@ test "model aware media serverless chunks use the shared paged provider and reta
     defer worker.deinit();
     const Boundary = @import("antfly_runtime_abi").callback_abi.Boundary(struct { chunk_page_with_context: ?*const @TypeOf(Fake.page) = null });
     try worker.setModelChunker(.{ .provider = .antfly, .embedding = .{ .model = "model", .dimensions = 2 }, .max_chunks = 1 }, "clip", .{ .ptr = &fake, .boundary_dispatch = Boundary.local_dispatch, .chunk_page_with_context_callback = @ptrCast(&Fake.page) });
-    const result = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, "{\"clip\":{\"type\":\"source\",\"uri\":\"s3://bucket/clip.mp4\",\"mime_type\":\"video/mp4\",\"version\":\"v1\",\"version_kind\":\"s3_version_id\",\"length\":100},\"_enrichment\":{\"lexical_sparse_version\":1}}", 2, .require_model);
+    const result = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, "{\"clip\":{\"type\":\"source\",\"uri\":\"s3://bucket/clip.mp4\",\"mime_type\":\"video/mp4\",\"version\":\"v1\",\"version_kind\":\"s3_version_id\",\"length\":100},\"media_outputs\":{},\"transcript\":\"stale speech\",\"transcript_spans\":[],\"_enrichment\":{\"lexical_sparse_version\":1}}", 2, .require_model);
     defer a.free(result.body.?);
     try std.testing.expect(result.used_model);
+    var rebuilt = try std.json.parseFromSlice(std.json.Value, a, result.body.?, .{});
+    defer rebuilt.deinit();
+    for ([_][]const u8{ "media_outputs", "transcript", "transcript_spans" }) |field| try std.testing.expect(!rebuilt.value.object.contains(field));
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     var projection = try document_projection.parseAlloc(a, result.body.?);
     defer projection.deinit(a);

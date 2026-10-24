@@ -30,11 +30,15 @@ const video = @import("antfly_video");
 const audio = @import("audio.zig");
 const control_mod = @import("../execution_control.zig");
 pub const Control = control_mod.InferenceExecutionControl;
+pub const PreparedVideoOutputs = struct {
+    context: *anyopaque,
+    deinit: *const fn (*anyopaque) void,
+};
 pub const Payload = union(enum) {
     text: []const u8,
     raster: image.BorrowedRasterAttachment,
     pcm: audio.PcmAudio,
-    video: struct { audio: ?audio.PcmAudio = null, audio_start_ns: ?i64 = null, audio_failure: ?anyerror = null, webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8, reader: ?*const media.mp4.Reader = null, policy: video.sampling.TimestampPolicy, source_timestamps: bool = false, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, packet_base: usize = 0, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*@import("embedding_gemma2.zig").VideoAhead = null, prepared: ?@import("embedding_gemma2.zig").VideoPreparedHook = null },
+    video: struct { preparation_join: ?struct { context: *anyopaque, join: *const fn (*anyopaque) void } = null, prepared_outputs: ?PreparedVideoOutputs = null, audio: ?audio.PcmAudio = null, audio_start_ns: ?i64 = null, audio_failure: ?anyerror = null, webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8, reader: ?*const media.mp4.Reader = null, policy: video.sampling.TimestampPolicy, source_timestamps: bool = false, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, packet_base: usize = 0, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*@import("embedding_gemma2.zig").VideoAhead = null, prepared: ?@import("embedding_gemma2.zig").VideoPreparedHook = null },
 };
 pub const Preflight = struct { video_plan: ?@import("embedding_gemma2_video.zig").Plan = null, input_tokens: usize, picture_count: ?u32 = null, selected_pictures: ?[]const u64 = null, picture_basis: ?planning.PictureBasis = null };
 pub const Output = struct { vector: []f32, input_tokens: usize };
@@ -49,6 +53,7 @@ pub const Executor = struct {
     audio_tokens: ?*const fn (*anyopaque, usize, u32) anyerror!usize = null,
     embed: *const fn (*anyopaque, std.mem.Allocator, Payload) anyerror!Output,
     embed_video_batch: ?*const fn (*anyopaque, std.mem.Allocator, []const Payload) anyerror![]Output = null,
+    prepare_video_outputs: ?*const fn (*anyopaque, std.mem.Allocator, Payload, Preflight) anyerror!PreparedVideoOutputs = null,
     start_video: ?*const fn (*anyopaque, Payload, *media.admission.Pool) anyerror!?*@import("embedding_gemma2.zig").VideoAhead = null,
 };
 pub const Limits = @import("media_chunk_limits.zig").Limits;
@@ -219,6 +224,10 @@ pub const Runner = struct {
                 item.descriptor.input_tokens = value.input_tokens;
             }
         }
+        // Speculative preparation may borrow the same immutable range cache or
+        // decoder as secondary consumers. Join after primary model work, before
+        // audio reads and output execution, while retaining backbone overlap.
+        if (payload == .video) if (payload.video.preparation_join) |join| join.join(join.context);
         var output_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer output_arena.deinit();
         var output_payload = payload;
@@ -703,6 +712,7 @@ pub const Runner = struct {
         measured_allocator: ?std.mem.Allocator = null,
         fn deinit(self: *@This()) void {
             if (self.ahead) |ahead| ahead.deinit();
+            if (self.initialized) if (self.payload.video.prepared_outputs) |prepared| prepared.deinit(prepared.context);
             if (self.measured) |measured| if (measured.selected_pictures) |pictures| self.measured_allocator.?.free(pictures);
             if (self.window) |*window| window.deinit();
             self.* = .{};
@@ -731,14 +741,16 @@ pub const Runner = struct {
         slot.initialized = true;
     }
     fn cacheVideoPreflight(self: *Runner, slot: *VideoSlot) !void {
-        if (slot.measured != null) return;
-        if (self.executor.preflight) |preflight| {
+        if (slot.measured == null) if (self.executor.preflight) |preflight| {
             const measured = try preflight(self.executor.context, slot.payload);
             errdefer if (measured.selected_pictures) |pictures| self.allocator.free(pictures);
             if (measured.input_tokens > try self.executor.model.capacity()) return error.ChunkUnitTooLarge;
             slot.measured = measured;
             slot.measured_allocator = self.allocator;
-        }
+        };
+        if (slot.payload.video.prepared_outputs == null) if (self.executor.prepare_video_outputs) |prepare| {
+            slot.payload.video.prepared_outputs = try prepare(self.executor.context, self.allocator, slot.payload, slot.measured orelse return error.InvalidInputShape);
+        };
     }
     const VideoSchedule = struct {
         runner: *Runner,
@@ -751,6 +763,10 @@ pub const Runner = struct {
         fn join(self: *@This()) void {
             if (self.thread) |thread| thread.join();
             self.thread = null;
+        }
+        fn joinOpaque(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.join();
         }
         fn ready(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -828,7 +844,10 @@ pub const Runner = struct {
                     break;
                 };
                 slot.payload.video.ahead = slot.ahead;
-                try self.cacheVideoPreflight(slot);
+                self.cacheVideoPreflight(slot) catch |err| {
+                    if (count == 0 or !@import("embedding_gemma2.zig").videoSpeculationPressure(err)) return err;
+                    break;
+                };
                 if (slot.measured) |*measured| if (measured.video_plan) |*plan| {
                     slot.payload.video.plan = plan;
                 };
@@ -851,7 +870,11 @@ pub const Runner = struct {
             }
             var schedule = VideoSchedule{ .runner = self, .source = source, .next = if (known[following]) &slots[following] else null, .second = if (known[second]) &slots[second] else null, .cache_preflight = true };
             defer schedule.join();
-            if (self.executor.start_video != null) slots[(active + count - 1) % slots.len].payload.video.prepared = .{ .context = &schedule, .ready = VideoSchedule.ready };
+            if (self.executor.start_video != null or self.executor.prepare_video_outputs != null) {
+                slots[(active + count - 1) % slots.len].payload.video.prepared = .{ .context = &schedule, .ready = VideoSchedule.ready };
+                // Every emitted row waits before any secondary source access.
+                for (0..count) |row| slots[(active + row) % slots.len].payload.video.preparation_join = .{ .context = &schedule, .join = VideoSchedule.joinOpaque };
+            }
             var payloads: [2]Payload = undefined;
             for (payloads[0..count], 0..) |*payload, i| payload.* = slots[(active + i) % slots.len].payload;
             const outputs: ?[]Output = if (count > 1) self.executor.embed_video_batch.?(self.executor.context, self.allocator, payloads[0..count]) catch |err| blk: {
@@ -879,7 +902,10 @@ pub const Runner = struct {
             } else null;
             var between = VideoSchedule{ .runner = self, .source = source, .next = if (outputs == null and count > 1) &slots[(active + 1) % slots.len] else null, .cache_preflight = true };
             defer between.join();
-            if (outputs == null and count > 1 and self.executor.start_video != null) slots[active].payload.video.prepared = .{ .context = &between, .ready = VideoSchedule.ready };
+            if (outputs == null and count > 1 and (self.executor.start_video != null or self.executor.prepare_video_outputs != null)) {
+                slots[active].payload.video.prepared = .{ .context = &between, .ready = VideoSchedule.ready };
+                slots[active].payload.video.preparation_join = .{ .context = &between, .join = VideoSchedule.joinOpaque };
+            }
             var consumed: usize = 0;
             defer if (outputs) |values| {
                 for (values[consumed..]) |value| self.allocator.free(value.vector);
@@ -930,13 +956,19 @@ pub const Runner = struct {
             if (current.failure) |err| return err;
             if (!current.initialized) try self.prepareVideoSlot(source, current);
             current.payload.video.ahead = current.ahead;
+            if (self.executor.prepare_video_outputs != null) try self.cacheVideoPreflight(current);
             const next_shape = if (self.request.max_chunks != 0 and self.summary.emitted + 1 >= self.request.max_chunks) null else try cursor.next();
             const next = &slots[active ^ 1];
             if (next_shape) |shape| next.shape = shape;
-            var schedule = VideoSchedule{ .runner = self, .source = source, .next = if (next_shape != null) next else null };
+            var schedule = VideoSchedule{ .runner = self, .source = source, .next = if (next_shape != null) next else null, .cache_preflight = self.executor.prepare_video_outputs != null };
             defer schedule.join(); // Includes failure, cancellation and early sink termination.
-            if (self.request.execute and self.executor.start_video != null) current.payload.video.prepared = .{ .context = &schedule, .ready = VideoSchedule.ready };
-            if (!try self.emit(current.shape, current.payload, self.request.input.binary.mime_type)) break;
+            if (self.request.execute and (self.executor.start_video != null or self.executor.prepare_video_outputs != null)) {
+                current.payload.video.prepared = .{ .context = &schedule, .ready = VideoSchedule.ready };
+                current.payload.video.preparation_join = .{ .context = &schedule, .join = VideoSchedule.joinOpaque };
+            }
+            const measured = current.measured;
+            current.measured = null;
+            if (!try self.emitReady(current.shape, current.payload, self.request.input.binary.mime_type, null, measured)) break;
             current.deinit();
             if (next_shape == null) {
                 if (self.request.max_chunks != 0 and self.summary.emitted >= self.request.max_chunks and cursor.offset_ns < end) self.stopped = true;
@@ -1390,6 +1422,8 @@ test "model aware media busy provider preserves acknowledged prefix even with pa
 
 test "model aware media video backbone cohorts preserve acknowledgements and pressure fallback" {
     const Fake = struct {
+        prepared: std.atomic.Value(usize) = .init(0),
+        released: std.atomic.Value(usize) = .init(0),
         batched: usize = 0,
         serial: usize = 0,
         preflights: usize = 0,
@@ -1397,6 +1431,23 @@ test "model aware media video backbone cohorts preserve acknowledgements and pre
         accepted: usize = 0,
         deny: bool = false,
         fail_sink: bool = false,
+        fn prepare(raw: *anyopaque, a: std.mem.Allocator, _: Payload, measured: Preflight) !PreparedVideoOutputs {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 144), measured.input_tokens);
+            const Lease = struct {
+                a: std.mem.Allocator,
+                released: *std.atomic.Value(usize),
+                fn deinit(context: *anyopaque) void {
+                    const lease: *@This() = @ptrCast(@alignCast(context));
+                    _ = lease.released.fetchAdd(1, .monotonic);
+                    lease.a.destroy(lease);
+                }
+            };
+            const lease = try a.create(Lease);
+            lease.* = .{ .a = a, .released = &self.released };
+            _ = self.prepared.fetchAdd(1, .monotonic);
+            return .{ .context = lease, .deinit = Lease.deinit };
+        }
         fn count(_: *anyopaque, _: []const u8) !usize {
             return 1;
         }
@@ -1419,6 +1470,7 @@ test "model aware media video backbone cohorts preserve acknowledgements and pre
         fn embed(raw: *anyopaque, a: std.mem.Allocator, payload: Payload) !Output {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.serial += 1;
+            try std.testing.expect(payload.video.prepared_outputs != null);
             if (payload.video.prepared) |hook| try hook.ready(hook.context);
             return output(a, payload);
         }
@@ -1432,6 +1484,7 @@ test "model aware media video backbone cohorts preserve acknowledgements and pre
             var initialized: usize = 0;
             errdefer for (values[0..initialized]) |value| a.free(value.vector);
             for (values, payloads) |*value, payload| {
+                try std.testing.expect(payload.video.prepared_outputs != null);
                 value.* = try output(a, payload);
                 initialized += 1;
             }
@@ -1448,7 +1501,7 @@ test "model aware media video backbone cohorts preserve acknowledgements and pre
     const a = std.testing.allocator;
     for ([_]bool{ false, true }) |deny| {
         var fake = Fake{ .deny = deny };
-        const executor = Executor{ .context = &fake, .model = .{ .planning_identity = "test-video-batch", .context_tokens = 8192 }, .count_text = Fake.count, .preflight = Fake.preflight, .start_video = Fake.start, .embed = Fake.embed, .embed_video_batch = Fake.batch };
+        const executor = Executor{ .context = &fake, .model = .{ .planning_identity = "test-video-batch", .context_tokens = 8192 }, .count_text = Fake.count, .preflight = Fake.preflight, .prepare_video_outputs = Fake.prepare, .embed = Fake.embed, .embed_video_batch = Fake.batch };
         var runner = try Runner.init(a, .{ .input = .{ .binary = .{ .mime_type = "video/mp4", .data = &.{} } }, .policy = .{ .window_ns = std.time.ns_per_s, .step_ns = std.time.ns_per_s } }, executor, .{}, .{ .context = &fake, .accept = Fake.accept });
         try runner.videoWindows(&.{}, null, 3 * std.time.ns_per_s, 0, 1, null, null);
         try std.testing.expectEqual(@as(usize, 3), runner.summary.emitted);
@@ -1456,12 +1509,14 @@ test "model aware media video backbone cohorts preserve acknowledgements and pre
         try std.testing.expectEqual(@as(usize, 1), fake.batched);
         try std.testing.expectEqual(@as(usize, if (deny) 3 else 1), fake.serial);
         try std.testing.expectEqual(media.admission.Resources{}, runner.pool.snapshot());
+        try std.testing.expectEqual(fake.prepared.load(.monotonic), fake.released.load(.monotonic));
     }
     var fake = Fake{ .fail_sink = true };
-    const executor = Executor{ .context = &fake, .model = .{ .planning_identity = "test-video-batch", .context_tokens = 8192 }, .count_text = Fake.count, .preflight = Fake.preflight, .start_video = Fake.start, .embed = Fake.embed, .embed_video_batch = Fake.batch };
+    const executor = Executor{ .context = &fake, .model = .{ .planning_identity = "test-video-batch", .context_tokens = 8192 }, .count_text = Fake.count, .preflight = Fake.preflight, .prepare_video_outputs = Fake.prepare, .embed = Fake.embed, .embed_video_batch = Fake.batch };
     var runner = try Runner.init(a, .{ .input = .{ .binary = .{ .mime_type = "video/mp4", .data = &.{} } }, .policy = .{ .window_ns = std.time.ns_per_s, .step_ns = std.time.ns_per_s } }, executor, .{}, .{ .context = &fake, .accept = Fake.accept });
     try std.testing.expectError(error.ConsumerFailure, runner.videoWindows(&.{}, null, 3 * std.time.ns_per_s, 0, 1, null, null));
     try std.testing.expectEqual(@as(u64, 1), runner.summary.next_ordinal);
+    try std.testing.expectEqual(fake.prepared.load(.monotonic), fake.released.load(.monotonic));
     var cursor: [85]u8 = undefined;
     var request = runner.request;
     request.continuation = runner.summary.identity.cursor(1, &cursor);
@@ -1472,6 +1527,7 @@ test "model aware media video backbone cohorts preserve acknowledgements and pre
     try std.testing.expectEqual(@as(usize, 3), fake.accepted);
     try std.testing.expectEqual(@as(u64, 3), runner.summary.next_ordinal);
     try std.testing.expectEqual(media.admission.Resources{}, runner.pool.snapshot());
+    try std.testing.expectEqual(fake.prepared.load(.monotonic), fake.released.load(.monotonic));
 }
 
 test "model aware media outputs preserve boundary plans and distinguish required coverage from optional degradation" {

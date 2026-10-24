@@ -49,24 +49,84 @@ pub fn parse(alloc: Allocator, raw: []const u8) !std.json.Parsed(Config) {
 
 pub const Score = struct { label: []const u8, score: f64 };
 
-/// Returned labels borrow the immutable vocabulary; only the result slice is
-/// owned. Stable vocabulary order breaks equal-score ties across restarts.
-pub fn score(alloc: Allocator, config: Config, prompts: []const []const f32, vector: []const f32) ![]Score {
-    try config.validate();
-    if (prompts.len != config.labels.len or vector.len == 0) return error.InvalidEmbeddingResponse;
-    for (vector) |value| if (!std.math.isFinite(value)) return error.InvalidEmbeddingResponse;
-    const capacity = @min(@as(usize, config.top_k), config.labels.len);
-    const best = try alloc.alloc(Score, capacity);
-    errdefer alloc.free(best);
-    var count: usize = 0;
-    for (prompts, config.labels) |prompt, label| {
-        if (prompt.len != vector.len) return error.InvalidEmbeddingDimensions;
-        var dot: f64 = 0;
-        for (prompt, vector) |weight, value| {
-            if (!std.math.isFinite(weight)) return error.InvalidEmbeddingResponse;
-            dot += @as(f64, weight) * @as(f64, value);
+/// Vocabulary validation and prompt packing happen once per label pass. Eight
+/// labels are contiguous at each dimension; four chunk rows share each load.
+pub const Scorer = struct {
+    config: Config,
+    dimensions: usize,
+    padded_labels: usize,
+    matrix: []f32,
+    allocator: Allocator,
+
+    pub fn init(a: Allocator, config: Config, prompts: []const []const f32) !Scorer {
+        try config.validate();
+        if (prompts.len != config.labels.len or prompts.len == 0 or prompts[0].len == 0) return error.InvalidEmbeddingResponse;
+        const dimensions = prompts[0].len;
+        const padded = std.mem.alignForward(usize, prompts.len, 8);
+        const matrix = try a.alloc(f32, try std.math.mul(usize, padded, dimensions));
+        errdefer a.free(matrix);
+        @memset(matrix, 0);
+        for (prompts, 0..) |prompt, label| {
+            if (prompt.len != dimensions) return error.InvalidEmbeddingDimensions;
+            for (prompt, 0..) |weight, dimension| {
+                if (!std.math.isFinite(weight)) return error.InvalidEmbeddingResponse;
+                matrix[(label / 8 * dimensions + dimension) * 8 + label % 8] = weight;
+            }
         }
-        if (!std.math.isFinite(dot)) return error.InvalidEmbeddingResponse;
+        return .{ .config = config, .dimensions = dimensions, .padded_labels = padded, .matrix = matrix, .allocator = a };
+    }
+    pub fn deinit(self: *Scorer) void {
+        self.allocator.free(self.matrix);
+    }
+    /// Only returned slices are owned; label strings borrow the vocabulary.
+    pub fn scoreBatch(self: Scorer, a: Allocator, vectors: []const []const f32) ![][]Score {
+        const rows = try a.alloc([]Score, vectors.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (rows[0..initialized]) |row| a.free(row);
+            a.free(rows);
+        }
+        for (vectors) |vector| {
+            if (vector.len != self.dimensions) return error.InvalidEmbeddingDimensions;
+            for (vector) |value| if (!std.math.isFinite(value)) return error.InvalidEmbeddingResponse;
+        }
+        var first: usize = 0;
+        while (first < vectors.len) : (first += 4) {
+            const count = @min(@as(usize, 4), vectors.len - first);
+            const dots = try a.alloc(f64, count * self.config.labels.len);
+            defer a.free(dots);
+            var label: usize = 0;
+            while (label < self.padded_labels) : (label += 8) {
+                var sums: [4]@Vector(8, f64) = @splat(@splat(0));
+                for (0..self.dimensions) |dimension| {
+                    const weights_f32: @Vector(8, f32) = self.matrix[(label / 8 * self.dimensions + dimension) * 8 ..][0..8].*;
+                    const weights: @Vector(8, f64) = @floatCast(weights_f32);
+                    for (0..count) |row| sums[row] += weights * @as(@Vector(8, f64), @splat(vectors[first + row][dimension]));
+                }
+                for (0..count) |row| {
+                    const values: [8]f64 = sums[row];
+                    for (0..@min(@as(usize, 8), self.config.labels.len - label)) |lane| {
+                        const dot = values[lane];
+                        if (!std.math.isFinite(dot)) return error.InvalidEmbeddingResponse;
+                        dots[row * self.config.labels.len + label + lane] = dot;
+                    }
+                }
+            }
+            for (0..count) |row| {
+                rows[first + row] = try rank(a, self.config, dots[row * self.config.labels.len ..][0..self.config.labels.len]);
+                initialized += 1;
+            }
+        }
+        return rows;
+    }
+};
+
+fn rank(a: Allocator, config: Config, dots: []const f64) ![]Score {
+    const capacity = @min(@as(usize, config.top_k), config.labels.len);
+    const best = try a.alloc(Score, capacity);
+    errdefer a.free(best);
+    var count: usize = 0;
+    for (dots, config.labels) |dot, label| {
         if (config.min_score) |minimum| if (dot < minimum) continue;
         var at: usize = 0;
         while (at < count and best[at].score >= dot) : (at += 1) {}
@@ -77,9 +137,17 @@ pub fn score(alloc: Allocator, config: Config, prompts: []const []const f32, vec
         best[at] = .{ .label = label.label, .score = dot };
         count = @min(count + 1, capacity);
     }
-    const result = try alloc.dupe(Score, best[0..count]);
-    alloc.free(best);
+    const result = try a.dupe(Score, best[0..count]);
+    a.free(best);
     return result;
+}
+
+pub fn score(a: Allocator, config: Config, prompts: []const []const f32, vector: []const f32) ![]Score {
+    var scorer = try Scorer.init(a, config, prompts);
+    defer scorer.deinit();
+    const rows = try scorer.scoreBatch(a, &.{vector});
+    defer a.free(rows);
+    return rows[0];
 }
 
 test "model aware media vector labels score only stored vectors with deterministic ties and filtering" {
@@ -100,4 +168,33 @@ test "model aware media vector labels vocabulary admission rejects ambiguous and
     try std.testing.expectError(error.InvalidAssetProducerConfig, (Config{ .labels = &.{} }).validate());
     try std.testing.expectError(error.InvalidAssetProducerConfig, (Config{ .labels = &.{ .{ .label = "same" }, .{ .label = "same" } } }).validate());
     try std.testing.expectError(error.InvalidAssetProducerConfig, (Config{ .labels = &.{.{ .label = "valid" }}, .top_k = 0 }).validate());
+}
+
+test "model aware media packed label batches match scalar raw dots across tails and ties" {
+    const a = std.testing.allocator;
+    const vocabulary = [_]Label{ .{ .label = "a" }, .{ .label = "b" }, .{ .label = "c" }, .{ .label = "d" }, .{ .label = "e" }, .{ .label = "f" }, .{ .label = "g" }, .{ .label = "h" }, .{ .label = "i" } };
+    const prompts = [_][]const f32{ &.{ 1, 0, 0 }, &.{ 0, 1, 0 }, &.{ 0, 0, 1 }, &.{ -1, 2, 3 }, &.{ 1, 0, 0 }, &.{ 1, -2, 1 }, &.{ 0.5, 0.5, 0.5 }, &.{ -1, -2, -3 }, &.{ 3, 2, 1 } };
+    const vectors = [_][]const f32{ &.{ 1, 0, 0 }, &.{ 0, 1, 0 }, &.{ 0, 0, 1 }, &.{ -1, -1, -1 }, &.{ 0.25, 0.5, -0.75 } };
+    const config = Config{ .labels = &vocabulary, .top_k = 4, .min_score = -1 };
+    var scorer = try Scorer.init(a, config, &prompts);
+    defer scorer.deinit();
+    const rows = try scorer.scoreBatch(a, &vectors);
+    defer {
+        for (rows) |row| a.free(row);
+        a.free(rows);
+    }
+    for (vectors, rows) |vector, row| {
+        var dots: [9]f64 = undefined;
+        for (prompts, &dots) |prompt, *dot| {
+            dot.* = 0;
+            for (prompt, vector) |x, y| dot.* += @as(f64, x) * @as(f64, y);
+        }
+        const expected = try rank(a, config, &dots);
+        defer a.free(expected);
+        try std.testing.expectEqual(expected.len, row.len);
+        for (expected, row) |left, right| {
+            try std.testing.expectEqualStrings(left.label, right.label);
+            try std.testing.expectApproxEqAbs(left.score, right.score, 1e-12);
+        }
+    }
 }

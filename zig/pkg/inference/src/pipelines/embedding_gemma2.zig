@@ -1072,7 +1072,7 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
 /// Decode remains ordered so retained codec continuations can advance safely.
 /// No queue fill delay: callers pass only already available windows (max four).
 pub const VideoBatchResult = struct { vectors: [][]f32, input_tokens: []usize, execution: BatchExecution.Execution, shared_vision_batches: usize = 0 };
-pub const VideoBatchItem = struct { movie: SampledVideo, caption: ?[]const u8 = null, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*VideoAhead = null };
+pub const VideoBatchItem = struct { prepared_frames: ?[]const @import("embedding_gemma2_video.zig").PreparedFrame = null, movie: SampledVideo, caption: ?[]const u8 = null, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*VideoAhead = null };
 fn releaseVideoBatchPreparations(items: []const VideoBatchItem, producers: []const *@import("embedding_gemma2_video.zig").Prefetch) void {
     const Prefetch = @import("embedding_gemma2_video.zig").Prefetch;
     var owned: [4]*Prefetch = undefined;
@@ -1123,7 +1123,10 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     var vision_workspace: usize = 0;
     const preparation_context = try factory.videoPreparationContext(session, false);
     const cohort_io = control.io orelse preparation_context.io;
-    const cohort = items.len > 1 and cohort_io != null and !@import("builtin").single_threaded and !@import("builtin").cpu.arch.isWasm() and (session.backend() == .metal or session.backend() == .native);
+    const prepared_inputs = for (items) |item| {
+        if (item.prepared_frames != null) break true;
+    } else false;
+    const cohort = !prepared_inputs and items.len > 1 and cohort_io != null and !@import("builtin").single_threaded and !@import("builtin").cpu.arch.isWasm() and (session.backend() == .metal or session.backend() == .native);
     // Admission/compatibility can decline before ordinary producers start.
     // A running later row must not retain the decoder lease during fallback.
     errdefer if (cohort) releaseVideoBatchPreparations(items, &.{});
@@ -1248,6 +1251,7 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
             try validateGroup(group, self.options);
             var row_options = self.options;
             row_options.video_encoded = encoded;
+            row_options.video_prepared_frames = item.prepared_frames;
             self.rows[index] = try prepareGroupWithBudget(self.a, self.cb, self.tokenizer, group, row_options, self.control, self.pool, if (encoded == null and item.ahead != null) item.ahead.?.producer else null, self.cache);
             self.prepared[index] = true;
             if (self.options.video_composition) |owner| {
