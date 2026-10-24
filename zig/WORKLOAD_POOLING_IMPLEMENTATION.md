@@ -26144,3 +26144,79 @@ a separate final snapshot manifest preserves that comment-only correction.
 Earlier v1/v2 receipts preserve the successful incremental checks. Formatting
 and whitespace pass. Full GNU qualification remains waived; the full design
 and the default coordinator/durable-finalization integration remain incomplete.
+
+
+### Admitted checkpoint root preparation and private deadline activation
+
+`Backend.QuiescedCheckpointPreparation` now prepares the checkpoint directory,
+source ledger and future live ledger under original CPU admission. It plans
+retired manifest paths one at a time, reserves manifest wire capacity and a
+conservative construction peak before allocating, and retains every partial
+header, path, payload, vector and AVL node through cancellation/OOM. Each edit
+uses the bounded single-edit ledger preparer. The caller first establishes a
+stable observed baseline and materialized live directory, fences unrelated
+serving/mutation/maintenance/accounting, and prepays `memoryBound()` for the
+preparation and transferred input headers. No original port is retained and
+no filesystem operation or backend mutex spans preparation CPU admission.
+
+Prepared roots are registered and adopted into the backend's observed usage
+before their construction headroom retires. The source ledger owns the new
+retired-path strings and spare vectors; a second prepaid snapshot holds its
+future live root. Preparation never changes `backend.obsolete_paths`. Finite
+retention deadlines therefore cannot make old descriptor files deletable when
+preparation or publication aborts. Existing finite deadlines are preserved;
+previously indefinitely protected manifest entries receive the prepared finite
+deadline in the private ledger. Abort reclaims private partial construction
+with original checkpoints or transfers registered roots into the existing
+bounded retirement queues, preserving resident credit until physical release.
+
+`takeWithAdmission()` returns an owned input bundle only after construction
+accounting settles. The bundle preserves predecessor lineage and root identity
+and retains its manifest wire reservation. Publisher initialization validates
+it and consumes its roots, wire reservation and provider grant only on success;
+busy/stale refusal retains caller ownership. Bundle abandonment is a fixed,
+allocation-free retirement handoff. The legacy constructor remains for legacy
+callers and deliberately malformed negative fixtures.
+
+The native publisher now uses admitted preparation for its normal cases. Once
+the replacement descriptor is durable, the fixed installation receipt swaps
+both the journal and live cleanup roots into the two prepaid snapshots. Both
+superseded ledgers then enter the backend's existing retirement queues. No
+allocation, additional admission or destructor is inserted between descriptor
+durability and metadata installation. The live and durable obsolete roots now
+share the same finite-deadline ledger, and the completed wire reservation is
+released. Pre-descriptor abort keeps the previous live cleanup root unchanged;
+ambiguous descriptor completion continues to fence recovery.
+
+Qualification rejects every preparation, bundle-transfer and retirement
+checkpoint, retries/abandons every payload allocation refusal, and compares
+resident backend memory with observed usage. Additional cases cover an empty
+live ledger/new account, hard admission denial before allocation, a dirty live
+directory, and stale lineage before construction, at registration, and before
+transfer. The native fsync/reopen regression retains saturated descriptor and
+ordinary execution capacity, now funds the preparation/input headers and
+checks that live cleanup roots remain unchanged across rejection and acquire
+finite deadlines only after durable installation. The missing-retired-path
+negative case intentionally retains its legacy malformed fixture.
+
+Still required: admitted live-directory materialization/rebuild where missing
+or dirty; combined preparation/ticket/provider/grant admission before default
+WAL/publication; default retained coordinator wiring; admitted durable cleanup
+finalization/deletion; remaining completion/history relief; and full default
+gate evidence. Full GNU qualification remains waived. This is progress toward
+the full design, which remains incomplete.
+
+
+Final `checkpoint-preparation-v3-integrated` passes 83/83 Debug build steps,
+84 physical-IO, 32 close, 170 table/codec, 74 WAL/recovery and 18 host/ABI
+checks. `checkpoint-preparation-v3-fast` passes 63/63 optimized build steps
+with all 84/170/74 physical/table/recovery cases. Both pass four standalone
+Bloom and 45/1/8 error-identity companions (companions use Debug). All 5,588
+native/schema input hashes and both log digests match the unchanged final
+source. Three immutable native snapshots preserve every changed native file.
+The v1 receipt preserves the corrected allocation-failure fixture, which now
+creates a real durable lineage; v2 passes the initial complete private-root
+lifecycle. Formatting, whitespace and the new module's license header pass.
+Full GNU qualification remains waived. Live-directory rebuild, combined and
+default coordinator admission, admitted durable cleanup, remaining relief and
+full default-gate evidence remain outstanding; the full design is incomplete.

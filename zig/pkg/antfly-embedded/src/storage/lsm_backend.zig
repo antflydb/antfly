@@ -1961,6 +1961,8 @@ pub const Backend = struct {
         return progressed;
     }
 
+    pub const QuiescedCheckpointPreparation = @import("lsm_backend/checkpoint_preparation.zig").Preparation(Backend);
+
     pub const QuiescedOutputCleanup = @import("lsm_backend/prepared_output_cleanup.zig").Consumer(Backend);
 
     fn drainOutputCleanupLocked(self: *Backend) !void {
@@ -31154,4 +31156,254 @@ test "controlled physical sync output cleanup rejects queue contention without d
     try std.testing.expect(!b.obsolete_paths.contains("contended-output"));
     try std.testing.expectEqual(b.estimateInMemoryStateBytesLocked(), b.tracked_in_memory_state_bytes);
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+}
+
+const CheckpointPreparationFixture = struct {
+    memory: storage_io.MemoryStorage = undefined,
+    manager: resource_manager_mod.ResourceManager = undefined,
+    allocations: std.testing.FailingAllocator = undefined,
+    backend: Backend = undefined,
+    fn init(self: *@This()) !void {
+        const a = std.testing.allocator;
+        self.memory = storage_io.MemoryStorage.init(a);
+        errdefer self.memory.deinit();
+        self.manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+        errdefer self.manager.deinit(a);
+        self.allocations = std.testing.FailingAllocator.init(a, .{});
+        try self.backend.openInto(self.allocations.allocator(), "/admitted-checkpoint-preparation", .{ .storage = self.memory.storage(), .resource_manager = &self.manager, .wal_enabled = false, .flush_threshold = 1 });
+        errdefer self.backend.close();
+        var txn = try self.backend.beginWrite();
+        errdefer txn.abort();
+        try txn.put(.{ .name = "docs" }, "durable", "value");
+        try txn.commit();
+        _ = try self.backend.planningDirectory();
+        try std.testing.expect(self.backend.manifest_journal.descriptor != null);
+        try self.backend.obsolete_paths.append(self.backend.allocator, .{ .path = try self.backend.allocator.dupe(u8, "already-obsolete"), .delete_after_ns = 7 });
+        self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
+    }
+    fn releaseRoots(self: *@This(), inputs: *Backend.QuiescedCheckpointPreparation.Inputs) void {
+        inputs.retire(&self.backend);
+    }
+    fn verify(self: *@This()) !void {
+        try std.testing.expect(self.backend.manifest_checkpoint_directory == null);
+        try std.testing.expectEqual(self.backend.estimateInMemoryStateBytesLocked(), self.backend.tracked_in_memory_state_bytes);
+        try std.testing.expectEqual(@as(u64, 0), self.manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), self.manager.snapshot().memory.accounting_errors);
+        try std.testing.expectEqual(@as(u64, 0), self.backend.manifest_reserved_mutation_bytes);
+        try std.testing.expectEqual(@as(u64, 7), self.backend.obsolete_paths.get("already-obsolete").?.delete_after_ns);
+    }
+    fn deinit(self: *@This()) void {
+        self.allocations.fail_index = std.math.maxInt(usize);
+        self.allocations.resize_fail_index = std.math.maxInt(usize);
+        self.backend.close();
+        self.manager.deinit(std.testing.allocator);
+        self.memory.deinit();
+    }
+};
+
+test "controlled physical sync checkpoint preparation retains every original preparation transfer and retirement rejection" {
+    const Stage = enum { construct, take, retire };
+    const Fault = struct {
+        checks: usize = 0,
+        at: usize = std.math.maxInt(usize),
+        rejected: bool = false,
+        failure: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const at = self.checks;
+            self.checks += 1;
+            if (!self.rejected and at == self.at) {
+                self.rejected = true;
+                return self.failure;
+            }
+        }
+    };
+    for (std.enums.values(Stage)) |stage| {
+        var checkpoints: usize = 1;
+        var target: usize = 0;
+        while (target <= checkpoints) : (target += 1) {
+            var fixture: CheckpointPreparationFixture = undefined;
+            try fixture.init();
+            defer fixture.deinit();
+            const b = &fixture.backend;
+            const next_id = b.next_run_id;
+            const live_root = b.obsolete_paths.tree.root;
+            const files = fixture.memory.files.count();
+            var owner = try Backend.QuiescedCheckpointPreparation.init(b);
+            defer owner.deinit();
+            var fault: Fault = .{ .failure = switch (target % 3) {
+                0 => error.Canceled,
+                1 => error.DeadlineExceeded,
+                else => error.FileNotFound,
+            } };
+            const payload: read_admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+            const original = read_admission.Port.init(&payload);
+            if (stage != .construct) try owner.resumeWithAdmission(original);
+            fault.checks = 0;
+            fault.at = if (target == 0) std.math.maxInt(usize) else target - 1;
+            var snapshot: ?Backend.QuiescedCheckpointPreparation.Inputs = null;
+            const result: anyerror!void = switch (stage) {
+                .construct => owner.resumeWithAdmission(original),
+                .take => take: {
+                    snapshot = owner.takeWithAdmission(original) catch |cause| break :take cause;
+                    break :take {};
+                },
+                .retire => owner.retireWithAdmission(original),
+            };
+            if (target == 0) {
+                try result;
+                checkpoints = fault.checks;
+            } else {
+                try std.testing.expectError(fault.failure, result);
+                try std.testing.expect(fault.rejected and !owner.transferred and !owner.retired);
+            }
+            if (snapshot) |*value| fixture.releaseRoots(value) else if (stage == .retire or target % 2 == 1) {
+                try owner.retireWithAdmission(original);
+                try std.testing.expectError(error.InvalidArgument, owner.resumeWithAdmission(original));
+            } else {
+                try owner.resumeWithAdmission(original);
+                var value = try owner.takeWithAdmission(original);
+                try std.testing.expect(value.matches(b));
+                try std.testing.expect(value.live_snapshot == b.ledger_snapshots);
+                try std.testing.expect(value.snapshot.value.tree.root != b.obsolete_paths.tree.root);
+                try std.testing.expect(b.manifest_checkpoint_directory.?.tree.root == b.run_directory.?.tree.root);
+                fixture.releaseRoots(&value);
+            }
+            try std.testing.expectEqual(next_id, b.next_run_id);
+            try std.testing.expect(b.obsolete_paths.tree.root == live_root);
+            try std.testing.expectEqual(files, fixture.memory.files.count());
+            try fixture.verify();
+        }
+    }
+}
+
+test "controlled physical sync checkpoint preparation owns every allocation refusal before root publication" {
+    const Control = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    for ([_]bool{ false, true }) |abandon| {
+        var offset: usize = 0;
+        while (offset < 128) : (offset += 1) {
+            var fixture: CheckpointPreparationFixture = undefined;
+            try fixture.init();
+            defer fixture.deinit();
+            const b = &fixture.backend;
+            var marker: u8 = 0;
+            const payload: read_admission.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = Control.check } };
+            const original = read_admission.Port.init(&payload);
+            var owner = try Backend.QuiescedCheckpointPreparation.init(b);
+            defer owner.deinit();
+            const root = b.obsolete_paths.tree.root;
+            fixture.allocations.fail_index = fixture.allocations.alloc_index + offset;
+            fixture.allocations.resize_fail_index = fixture.allocations.resize_index;
+            const result = owner.resumeWithAdmission(original);
+            fixture.allocations.fail_index = std.math.maxInt(usize);
+            fixture.allocations.resize_fail_index = std.math.maxInt(usize);
+            if (result) |_| {
+                var snapshot = try owner.takeWithAdmission(original);
+                fixture.releaseRoots(&snapshot);
+                try fixture.verify();
+                try std.testing.expect(offset > 2);
+                break;
+            } else |cause| {
+                try std.testing.expectEqual(error.OutOfMemory, cause);
+                try std.testing.expect(!owner.published and owner.credit != null);
+                try std.testing.expect(b.obsolete_paths.tree.root == root and b.manifest_checkpoint_directory == null and b.ledger_snapshots == null);
+                if (abandon) try owner.retireWithAdmission(original) else {
+                    try owner.resumeWithAdmission(original);
+                    var snapshot = try owner.takeWithAdmission(original);
+                    fixture.releaseRoots(&snapshot);
+                }
+                try fixture.verify();
+            }
+        }
+        try std.testing.expect(offset < 128);
+    }
+}
+
+test "controlled physical sync checkpoint preparation keeps new accounts private and rejects stale lineage and denied admission" {
+    const Mode = enum { empty, denied, stale_before, stale_at_receipt, stale_after, dirty };
+    const Control = struct {
+        owner: ?*Backend.QuiescedCheckpointPreparation = null,
+        changed: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.owner) |owner| if (!self.changed and owner.phase == .publish) {
+                self.changed = true;
+                owner.backend.manifest_journal.next_run_id += 1;
+            };
+        }
+    };
+    for (std.enums.values(Mode)) |mode| {
+        var fixture: CheckpointPreparationFixture = undefined;
+        try fixture.init();
+        defer fixture.deinit();
+        const b = &fixture.backend;
+        if (mode == .empty) {
+            b.obsolete_paths.deinit(b.allocator);
+            b.syncTrackedInMemoryStateUsageCurrentLocked();
+        }
+        const root = b.obsolete_paths.tree.root;
+        const files = fixture.memory.files.count();
+        const baseline = b.tracked_in_memory_state_bytes;
+        const allocator_calls = fixture.allocations.alloc_index;
+        if (mode == .dirty) {
+            b.run_directory_dirty = true;
+            const result = Backend.QuiescedCheckpointPreparation.init(b);
+            b.run_directory_dirty = false;
+            try std.testing.expectError(error.ExecutionWaitUnsupported, result);
+            try std.testing.expectEqual(allocator_calls, fixture.allocations.alloc_index);
+            continue;
+        }
+        var owner = try Backend.QuiescedCheckpointPreparation.init(b);
+        defer owner.deinit();
+        var control: Control = .{};
+        const payload: read_admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check } };
+        const original = read_admission.Port.init(&payload);
+        const journal_id = b.manifest_journal.next_run_id;
+        if (mode == .stale_before) b.manifest_journal.next_run_id += 1;
+        if (mode == .stale_at_receipt) control.owner = &owner;
+        if (mode == .denied) {
+            const slice = &fixture.manager.slices[@backingInt(resource_manager_mod.Slice.lsm_table_builder_working_set)];
+            const budget = slice.budget;
+            slice.budget = .{ .hard_limit_bytes = 1 };
+            const result = owner.resumeWithAdmission(original);
+            slice.budget = budget;
+            try std.testing.expectError(error.ResourceBudgetExceeded, result);
+            try std.testing.expect(owner.credit == null and owner.candidate == null and owner.directory == null and owner.snapshot == null);
+            try std.testing.expectEqual(allocator_calls, fixture.allocations.alloc_index);
+        }
+        if (mode == .stale_before or mode == .stale_at_receipt) {
+            try std.testing.expectError(error.RecoveryRequired, owner.resumeWithAdmission(original));
+            try std.testing.expect(!owner.published);
+            try owner.retireWithAdmission(original);
+            try std.testing.expectEqual(baseline, b.tracked_in_memory_state_bytes);
+            b.manifest_journal.next_run_id = journal_id;
+        } else {
+            try owner.resumeWithAdmission(original);
+            if (mode == .stale_after) {
+                b.manifest_journal.next_run_id += 1;
+                try std.testing.expectError(error.RecoveryRequired, owner.takeWithAdmission(original));
+                try std.testing.expect(!owner.transferred);
+                try owner.retireWithAdmission(original);
+                b.manifest_journal.next_run_id = journal_id;
+            } else {
+                var inputs = try owner.takeWithAdmission(original);
+                try std.testing.expect(inputs.matches(b));
+                var buffer: [std.fs.max_path_bytes]u8 = undefined;
+                for (0..inputs.fence.retiredPathCount()) |i| {
+                    const path = try inputs.fence.retiredPathAt(b.root_dir.?, i, &buffer);
+                    try std.testing.expect(inputs.snapshot.value.get(path).?.delete_after_ns != std.math.maxInt(u64));
+                    try std.testing.expect(!b.obsolete_paths.contains(path));
+                }
+                inputs.retire(b);
+                try std.testing.expect(!inputs.matches(b));
+            }
+        }
+        try std.testing.expect(b.obsolete_paths.tree.root == root);
+        try std.testing.expectEqual(files, fixture.memory.files.count());
+        try std.testing.expectEqual(b.estimateInMemoryStateBytesLocked(), b.tracked_in_memory_state_bytes);
+        try std.testing.expectEqual(@as(u64, 0), fixture.manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), b.manifest_reserved_mutation_bytes);
+    }
 }

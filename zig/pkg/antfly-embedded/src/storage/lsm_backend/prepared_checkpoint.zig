@@ -32,7 +32,9 @@ const output_cleanup = @import("output_cleanup.zig");
 /// Checkpoint/journal cleanup tickets are admitted before physical IO. The
 /// canonical descriptor is never queued for deletion; uncertainty fences recovery.
 ///
-/// Preparation must include every retired manifest path in obsolete_paths.
+/// Legacy preparation includes retired paths in obsolete_paths. The admitted
+/// input bundle instead keeps a source ledger and future live ledger private;
+/// both become authoritative only after descriptor durability.
 /// Successful initialization consumes the prepared directory, snapshot and
 /// grant. Failed initialization leaves them with the caller. Keep this owner's
 /// address, backend, metadata and allocator authorities stable until retirement.
@@ -67,6 +69,8 @@ pub fn Publication(comptime BackendType: type) type {
         directory: ?*Directory,
         captured_directory: *Directory,
         snapshot: ?*Snapshot,
+        live_snapshot: ?*Snapshot = null,
+        metadata: ?BackendType.MetadataCredit = null,
         turn: ?BackendType.ManifestTurn = null,
         id: u64,
         next_run_id: u64,
@@ -92,6 +96,17 @@ pub fn Publication(comptime BackendType: type) type {
         /// Caller holds backend.mu. A busy publication lane returns refusal;
         /// release that mutex before waiting under the original execution.
         pub fn initInPlace(self: *Self, backend: *BackendType, snapshot: *Snapshot, resources: storage_io.DurabilityResources, original: admission.Port) !void {
+            try self.initialize(backend, snapshot, null, resources, original);
+        }
+        /// Consumes the prepared bundle/grant only on success. Finite obsolete
+        /// intent stays in registered private roots until descriptor durability.
+        pub fn initPreparedInPlace(self: *Self, backend: *BackendType, inputs: *BackendType.QuiescedCheckpointPreparation.Inputs, resources: storage_io.DurabilityResources, original: admission.Port) !void {
+            if (!inputs.matches(backend)) return error.RecoveryRequired;
+            try self.initialize(backend, inputs.snapshot, inputs.live_snapshot, resources, original);
+            self.metadata = inputs.metadata;
+            inputs.metadata = null;
+        }
+        fn initialize(self: *Self, backend: *BackendType, snapshot: *Snapshot, live_snapshot: ?*Snapshot, resources: storage_io.DurabilityResources, original: admission.Port) !void {
             if (backend.manifest_recovery_required) return error.RecoveryRequired;
             if (backend.active_readers != 0 or backend.manifest_publish_in_flight or backend.manifest_checkpoint_build_in_flight or backend.ledger_reclaim_in_flight) return error.ResourceBudgetExceeded;
             const root = backend.root_dir orelse return error.ExecutionWaitUnsupported;
@@ -99,15 +114,21 @@ pub fn Publication(comptime BackendType: type) type {
             if (queue.manager == null) return error.ExecutionWaitUnsupported;
             const directory = backend.manifest_checkpoint_directory orelse return error.InvalidArgument;
             const current = backend.run_directory orelse return error.InvalidArgument;
-            if (backend.run_directory_dirty or directory.tree.root != current.tree.root or directory.memory_run_count != 0 or snapshot.retired or snapshot.value.tree.root != backend.obsolete_paths.tree.root) return error.InvalidArgument;
+            if (backend.run_directory_dirty or directory.tree.root != current.tree.root or directory.memory_run_count != 0 or snapshot.retired or (live_snapshot == null and snapshot.value.tree.root != backend.obsolete_paths.tree.root)) return error.InvalidArgument;
             if (snapshot.active_previous) |previous| {
                 if (previous.active_next != snapshot) return error.InvalidArgument;
             } else if (backend.ledger_snapshots != snapshot) return error.InvalidArgument;
+            if (live_snapshot) |live| {
+                if (live.retired or live.value.tree.root != snapshot.value.tree.root) return error.InvalidArgument;
+                if (live.active_previous) |previous| {
+                    if (previous.active_next != live) return error.InvalidArgument;
+                } else if (backend.ledger_snapshots != live) return error.InvalidArgument;
+            }
             const id = backend.next_run_id;
             const next_run_id = std.math.add(u64, id, 1) catch return error.ResourceBudgetExceeded;
             var turn = (try backend.tryBeginManifestTurnWithAdmission(original)) orelse return error.ResourceBudgetExceeded;
             errdefer turn.deinit();
-            self.* = .{ .backend = backend, .source = .{ .cursor = directory.readCursor(), .ledger = snapshot.value.iterator(), .count = snapshot.value.count(), .root = root }, .fence = .capture(backend), .directory = directory, .captured_directory = directory, .snapshot = snapshot, .id = id, .next_run_id = next_run_id, .started = backend.writeStatsNowNs(), .covered_logical_bytes = backend.unpublished_wal_logical_bytes };
+            self.* = .{ .backend = backend, .source = .{ .cursor = directory.readCursor(), .ledger = snapshot.value.iterator(), .count = snapshot.value.count(), .root = root }, .fence = .capture(backend), .directory = directory, .captured_directory = directory, .snapshot = snapshot, .live_snapshot = live_snapshot, .id = id, .next_run_id = next_run_id, .started = backend.writeStatsNowNs(), .covered_logical_bytes = backend.unpublished_wal_logical_bytes };
             try self.physical.initInPlace(resources, root, id, 0, next_run_id, &self.source, repository.maxManifestReadBytes());
             for (&self.creations, 0..) |*creation, i| creation.* = .init(queue, self.physical.paths[i][0..self.physical.path_lens[i]]);
             self.turn = turn;
@@ -116,7 +137,7 @@ pub fn Publication(comptime BackendType: type) type {
             backend.manifest_checkpoint_build_id = id;
         }
         fn inputsMatch(self: *const Self) bool {
-            return self.turn != null and self.fence.matches(self.backend) and self.backend.manifest_checkpoint_directory == self.directory and self.backend.manifest_checkpoint_build_id == self.id and self.backend.manifest_checkpoint_build_in_flight and self.snapshot != null and !self.snapshot.?.retired;
+            return self.turn != null and self.fence.matches(self.backend) and self.backend.manifest_checkpoint_directory == self.directory and self.backend.manifest_checkpoint_build_id == self.id and self.backend.manifest_checkpoint_build_in_flight and self.snapshot != null and !self.snapshot.?.retired and (self.live_snapshot == null or !self.live_snapshot.?.retired);
         }
         fn fenceRecovery(self: *Self) void {
             self.backend.manifest_recovery_required = true;
@@ -188,6 +209,14 @@ pub fn Publication(comptime BackendType: type) type {
             }
             const descriptor: repository.manifest_set.Descriptor = .{ .checkpoint = self.id, .first_segment = self.id, .sequence = 0 };
             try self.backend.installPreparedManifestCheckpoint(&self.fence, descriptor, self.next_run_id, self.physical.encoder.total, self.directory.?, &self.snapshot.?.value, self.covered_logical_bytes, self.started);
+            // Both old ledgers move into prepaid snapshot headers. Finite
+            // cleanup deadlines become live only after descriptor durability.
+            if (self.live_snapshot) |live| {
+                std.mem.swap(repository.ObsoleteLedger, &self.backend.obsolete_paths, &live.value);
+                self.backend.obsolete_manifest_dirty = self.backend.obsolete_paths.tree.root != self.backend.manifest_journal.obsolete.tree.root;
+            }
+            if (self.metadata) |*metadata| metadata.release();
+            self.metadata = null;
             // Fixed installation receipt before any subsequent fallible work.
             self.installed = true;
             self.directory = null;
@@ -208,6 +237,10 @@ pub fn Publication(comptime BackendType: type) type {
             if (self.backend.manifest_checkpoint_directory == self.captured_directory) self.backend.manifest_checkpoint_directory = null;
             if (self.snapshot) |snapshot| snapshot.retire(self.backend);
             self.snapshot = null;
+            if (self.live_snapshot) |snapshot| snapshot.retire(self.backend);
+            self.live_snapshot = null;
+            if (self.metadata) |*metadata| metadata.release();
+            self.metadata = null;
             if (self.backend.manifest_checkpoint_build_id == self.id) {
                 self.backend.manifest_checkpoint_build_id = null;
                 self.backend.manifest_checkpoint_build_in_flight = false;
@@ -401,17 +434,13 @@ test "controlled physical sync prepared backend checkpoint installs once across 
             try txn.put(.{ .name = "docs" }, key, "durable value");
             try txn.commit();
         }
-        // This test explicitly prepares using the existing legacy admission
-        // path. The operation begins only after both roots are registered/funded.
-        const snapshot = try prepare(&backend, mode != .missing_path);
-        const candidate = backend.manifest_checkpoint_directory.?;
-        const old_directory = backend.manifest_directory;
-        const old_descriptor = backend.manifest_journal.descriptor;
-        const baseline = backend.tracked_in_memory_state_bytes;
-        const writes = backend.write_stats.manifest_writes;
-        const checkpoints = backend.write_stats.manifest_checkpoints;
+        // Live-directory materialization remains an explicit fixture boundary.
+        // The normal checkpoint roots/retired paths below use original admission.
+        _ = try backend.planningDirectory();
+        backend.syncTrackedInMemoryStateUsageCurrentLocked();
+        const malformed = if (mode == .missing_path) try prepare(&backend, false) else null;
         backend.unpublished_wal_logical_bytes = 777;
-        var fixed = try manager.reserve(.lsm_table_builder_working_set, try Job.memoryBound(native.storage()));
+        var fixed = try manager.reserve(.lsm_table_builder_working_set, (try Job.memoryBound(native.storage())) + Backend.QuiescedCheckpointPreparation.memoryBound());
         defer fixed.release();
         var scheduler = try cpu.Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 });
         defer scheduler.close();
@@ -426,6 +455,22 @@ test "controlled physical sync prepared backend checkpoint installs once across 
         var control: Control = .{ .owner = &owner, .backend = &backend, .mode = mode, .execution = &execution, .scheduler = &scheduler, .failure = ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.FileNotFound })[@min(case, 2)] };
         const payload = control.payload();
         const original = admission.Port.init(&payload);
+        var prepared: ?Backend.QuiescedCheckpointPreparation.Inputs = null;
+        defer if (prepared) |*inputs| inputs.retire(&backend);
+        const snapshot = malformed orelse snapshot: {
+            var preparation = try Backend.QuiescedCheckpointPreparation.init(&backend);
+            defer preparation.deinit();
+            try preparation.resumeWithAdmission(original);
+            prepared = try preparation.takeWithAdmission(original);
+            break :snapshot prepared.?.snapshot;
+        };
+        const candidate = backend.manifest_checkpoint_directory.?;
+        const old_directory = backend.manifest_directory;
+        const old_descriptor = backend.manifest_journal.descriptor;
+        const baseline = backend.tracked_in_memory_state_bytes;
+        const live_root = backend.obsolete_paths.tree.root;
+        const writes = backend.write_stats.manifest_writes;
+        const checkpoints = backend.write_stats.manifest_checkpoints;
         var reserved: usize = 0;
         while (pool.tryReserveDescriptorsForTest(std.testing.io, 1)) reserved += 1;
         defer pool.releaseDescriptorsForTest(std.testing.io, reserved);
@@ -438,7 +483,7 @@ test "controlled physical sync prepared backend checkpoint installs once across 
             try std.testing.expect(backend.manifest_publish_mu.tryLock());
             const next_id = backend.next_run_id;
             try std.testing.expect(backend.mu.tryLock());
-            const refused = owner.initInPlace(&backend, snapshot, grant, original);
+            const refused = if (prepared) |*inputs| owner.initPreparedInPlace(&backend, inputs, grant, original) else owner.initInPlace(&backend, snapshot, grant, original);
             backend.mu.unlock();
             backend.manifest_publish_mu.unlock(io);
             try std.testing.expectError(error.ResourceBudgetExceeded, refused);
@@ -449,7 +494,7 @@ test "controlled physical sync prepared backend checkpoint installs once across 
         defer allocations.fail_index = std.math.maxInt(usize);
         defer allocations.resize_fail_index = std.math.maxInt(usize);
         try std.testing.expect(backend.mu.tryLock());
-        const initialized = owner.initInPlace(&backend, snapshot, grant, original);
+        const initialized = if (prepared) |*inputs| owner.initPreparedInPlace(&backend, inputs, grant, original) else owner.initInPlace(&backend, snapshot, grant, original);
         backend.mu.unlock();
         try initialized;
         var owner_live = true;
@@ -473,6 +518,7 @@ test "controlled physical sync prepared backend checkpoint installs once across 
                 owner.resumeWithAdmission(original) catch |cause| {
                     try std.testing.expectEqual(control.failure, cause);
                     try std.testing.expect(backend.manifest_directory == old_directory and !owner.installed);
+                    try std.testing.expect(backend.obsolete_paths.tree.root == live_root);
                     try std.testing.expect(backend.manifest_publish_in_flight and backend.manifest_checkpoint_build_in_flight and !snapshot.retired);
                     if (owner.physical.phase == .complete) {
                         after_descriptor_calls = storage_io.NativeSyncTestControl.metadata.load(.acquire);
@@ -498,6 +544,12 @@ test "controlled physical sync prepared backend checkpoint installs once across 
             try std.testing.expect(!backend.manifest_publish_in_flight and !backend.manifest_checkpoint_build_in_flight);
             try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
             try std.testing.expectEqual(writes + 1, backend.write_stats.manifest_writes);
+            try std.testing.expect(backend.obsolete_paths.tree.root == backend.manifest_journal.obsolete.tree.root);
+            var retired_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            for (0..owner.fence.retiredPathCount()) |i| {
+                const path = try owner.fence.retiredPathAt(root, i, &retired_path_buffer);
+                try std.testing.expect(backend.obsolete_paths.get(path).?.delete_after_ns != std.math.maxInt(u64));
+            }
             try std.testing.expectEqual(checkpoints + 1, backend.write_stats.manifest_checkpoints);
             try std.testing.expectEqual(@as(u64, 0), backend.unpublished_wal_logical_bytes);
             try std.testing.expect(!backend.manifest_dirty and !backend.manifest_recovery_required);
@@ -519,6 +571,7 @@ test "controlled physical sync prepared backend checkpoint installs once across 
             };
             try std.testing.expectError(failure, owner.resumeWithAdmission(original));
             try std.testing.expect(!owner.installed and backend.manifest_directory == old_directory);
+            try std.testing.expect(backend.obsolete_paths.tree.root == live_root);
             try std.testing.expect(std.meta.eql(old_descriptor, backend.manifest_journal.descriptor));
             if (mode == .stale_before or mode == .missing_path) try std.testing.expect(!owner.physical.attempted[2]);
             const calls = storage_io.NativeSyncTestControl.metadata.load(.acquire);
