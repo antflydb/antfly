@@ -91,6 +91,8 @@ test {
     _ = @import("metadata/lake_index_lifecycle.zig");
     _ = @import("api/lake_index_aggregate_artifact.zig");
     _ = @import("api/lake_index_aggregate_rows.zig");
+    _ = @import("api/lake_index_aggregate_reductions.zig");
+    _ = @import("api/lake_index_text_forward.zig");
     _ = @import("api/lake_index_aggregate_keys.zig");
     _ = @import("api/lake_index_aggregate_record.zig");
     _ = @import("api/lake_index_aggregate_composition.zig");

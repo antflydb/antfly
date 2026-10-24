@@ -1416,6 +1416,13 @@ pub const ManagedEmbedder = struct {
         return try embedWithEntryForTask(alloc, entry, text, entry.dimensions, .retrieval_query);
     }
 
+    /// Role-aware query batching uses the same provider limits, instructions,
+    /// retry policy and admission as scalar query embeddings.
+    pub fn embedQueries(self: *const ManagedEmbedder, alloc: std.mem.Allocator, index_name: []const u8, texts: []const []const u8) ![]const []const f32 {
+        const entry = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
+        return embedBatchWithEntryForTask(alloc, entry, texts, entry.dimensions, .retrieval_query);
+    }
+
     pub fn embedQueryWithCancellation(
         self: *const ManagedEmbedder,
         alloc: std.mem.Allocator,
@@ -4854,7 +4861,7 @@ fn resolveDeclaredEmbeddingDimensions(cfg: indexes_openapi.EmbeddingsIndexConfig
     }
     if (cfg.embedder) |embedder| {
         const declared = switch (embedder) {
-            .cloudflare_embedder_config => null,
+            .cloudflare_embedder_config => |value| value.dimensions orelse value.dimension,
             .ollama_embedder_config => null,
             .open_ai_embedder_config => |value| value.dimensions,
             .open_router_embedder_config => |value| value.dimensions,
@@ -10664,4 +10671,17 @@ test "managed embedder Cloudflare configuration survives every allocation failur
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "managed embedder Cloudflare index declarations retain fixed dimensions" {
+    for ([_]bool{ true, false }) |alias| {
+        const config = indexes_openapi.EmbeddingsIndexConfig{ .embedder = .{ .cloudflare_embedder_config = .{
+            .provider = "cloudflare",
+            .account_id = "account",
+            .model = "@cf/baai/bge-base-en-v1.5",
+            .dimensions = if (alias) null else 768,
+            .dimension = if (alias) 768 else null,
+        } } };
+        try std.testing.expectEqual(@as(?u32, 768), try resolveDeclaredEmbeddingDimensions(config));
+    }
 }

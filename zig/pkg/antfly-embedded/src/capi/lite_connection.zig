@@ -56,14 +56,15 @@ fn catalogStamp(database: *h.db_mod.DB) ![32]u8 {
         }
     }.less);
     hash.update(try std.json.Stringify.valueAlloc(a, indexes, .{}));
-    const resolvers = try database.core.listResolvers(a);
-    std.mem.sort(@TypeOf(resolvers[0]), resolvers, {}, struct {
-        fn less(_: void, lhs: @TypeOf(resolvers[0]), rhs: @TypeOf(resolvers[0])) bool {
-            return std.mem.lessThan(u8, lhs.name, rhs.name);
-        }
-    }.less);
-    hash.update("resolvers\x00");
-    hash.update(try std.json.Stringify.valueAlloc(a, resolvers, .{}));
+    var txn = try database.core.store.beginReadTxn();
+    defer txn.abort();
+    inline for (.{ "\x00\x00__metadata__:resolvers", @import("../storage/db/catalog/resolver_catalog.zig").merge_catalog_key }) |key| {
+        hash.update(key);
+        if (txn.get(key)) |raw| hash.update(raw) else |err| if (err != error.NotFound) return err;
+    }
+    // Hash native immutable snapshot identities through lightweight descriptors;
+    // policy bytes remain in the storage owner.
+    if (txn.get(@import("../storage/db/resolver_projection.zig").epoch_key)) |raw| hash.update(raw) else |err| if (err != error.NotFound) return err;
     var digest: [32]u8 = undefined;
     hash.final(&digest);
     return digest;
@@ -86,6 +87,7 @@ pub const PreparedPublication = struct {
     source_read: ?*SourceRead,
     relational_rows: bool,
     index_inputs_changed: bool = false,
+    resolver_dependency: ?struct { table: []const u8, template: []const u8, table_id: ?u64, head: ?@import("resolver_authority.zig").Stamp } = null,
 
     fn current(self: *@This()) !*h.db_mod.DB {
         const root = try self.owner.refresh();
@@ -95,6 +97,15 @@ pub const PreparedPublication = struct {
         const database = try @import("tables.zig").get(root, self.name);
         if (database.root_incarnation != self.incarnation or !std.meta.eql(database.core.identity_namespace, self.identity) or
             !std.mem.eql(u8, &(try catalogStamp(database)), &self.catalog)) return error.EnrichmentSourceChanged;
+        if (self.resolver_dependency) |dependency| {
+            const destination = @import("tables.zig").get(root, dependency.table) catch |err| switch (err) {
+                error.UndefinedTable => null,
+                else => return err,
+            };
+            const table_id: ?u64 = if (destination) |db| db.core.identity_namespace.table_id else null;
+            const head = if (destination) |db| try @import("resolver_authority.zig").namespaceStamp(db, alloc, dependency.template) else null;
+            if (table_id != dependency.table_id or !std.meta.eql(head, dependency.head)) return error.EnrichmentSourceChanged;
+        }
         if (self.shadow_scopes.len != 0) {
             const jobs = try database.graphReplacementStatusAlloc(alloc);
             defer jobs.deinit();
@@ -650,7 +661,10 @@ pub const Owner = struct {
             }
             try replacement.owned_lite_backend.?.native_docstore.?.file.inheritAllocatorVerification(&previous.owned_lite_backend.?.native_docstore.?.file);
             inheritReclamationTelemetry(replacement.owned_lite_backend.?.native_docstore.?, previous.owned_lite_backend.?.native_docstore.?);
-            try self.retired.append(alloc, previous);
+            // Group continuation belongs to this connection owner and was
+            // bound above; retiring a DB wrapper cannot move or reset it.
+            try self.retired.ensureUnusedCapacity(alloc, 1);
+            self.retired.appendAssumeCapacity(previous);
             previous.lease_snapshot = true;
             // Cursor continuation can only read this generation. Make every
             // namespace's shared native store reject publication immediately.
@@ -1046,6 +1060,9 @@ pub const Owner = struct {
             for (0..ordinal) |_| selected = tables.next().?.*;
             database = &selected.?.db;
         }
+        var authority_arena = std.heap.ArenaAllocator.init(alloc);
+        defer authority_arena.deinit();
+        if (self.options.open_mode == .writer and try @import("resolver_authority.zig").hasProjectionDebt(foreground, database, authority_arena.allocator())) self.maintenance_pending = true;
         const group_state = try self.groupSourceState(database);
         const schedule_entry = try self.maintenance_schedules.getOrPut(alloc, .{
             .table_id = database.core.identity_namespace.table_id,
@@ -1183,10 +1200,14 @@ pub const Owner = struct {
         // turn before replay, whose serving-index publication invalidates the
         // broad capture. Unrelated serving writes may rebase this turn, while
         // changes to any selected shadow generation still reject publication.
-        var pending = if (run_database) database.runBackgroundTurnWithCancellation(cancellation, shadow_scopes.items.len != 0) catch |err| blk: {
+        const projected = if (run_database) @import("resolver_authority.zig").pullProjection(root, database, turn_alloc) catch |err| blk: {
+            maintenance_error = err;
+            break :blk false;
+        } else false;
+        var pending = if (run_database and !projected) database.runBackgroundTurnWithCancellation(cancellation, shadow_scopes.items.len != 0) catch |err| blk: {
             maintenance_error = err;
             break :blk true;
-        } else false;
+        } else projected;
         if (run_database) if (database.enrichment_runtime) |runtime| {
             runtime.dense_result_cache = null;
             runtime.generated_publication = null;
@@ -1235,7 +1256,7 @@ pub const Owner = struct {
         // A primary rebase may have fenced immutable index work without
         // making the replay driver itself fail. Retry on a fresh snapshot
         // even when its cached replay target looked complete this turn.
-        pending = pending or publication.index_inputs_changed;
+        pending = pending or projected or publication.index_inputs_changed;
         self.maintenance_round_pending = self.maintenance_round_pending or pending;
         const ttl_pending = self.maintenance_round_ttl_pending;
         if (self.maintenance_table_cursor == 0) {

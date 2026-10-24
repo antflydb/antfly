@@ -2976,10 +2976,16 @@ pub const TermObserver = struct {
     ptr: *anyopaque,
     begin: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
     finish: *const fn (*anyopaque, u32, ?BlockMaxInfo, ?u32) anyerror!void,
+    posting: ?*const fn (*anyopaque, u32, u32) anyerror!void = null,
 };
 fn beginObservedTerm(sink: anytype, term: []const u8) !void {
     if (comptime @hasField(@TypeOf(sink.*), "term_observer")) {
         if (sink.term_observer) |observer| try observer.begin(observer.ptr, sink.term_field, term);
+    }
+}
+fn observePosting(sink: anytype, doc: u32, frequency: u32) !void {
+    if (comptime @hasField(@TypeOf(sink.*), "term_observer")) {
+        if (sink.term_observer) |observer| if (observer.posting) |posting| try posting(observer.ptr, doc, frequency);
     }
 }
 fn finishObservedTerm(sink: anytype, frequency: u32, bounds: ?BlockMaxInfo, norm: ?u32) !void {
@@ -7085,6 +7091,7 @@ fn appendPostingStreamToSinkWithWorkspace(
         if (previous_doc) |last| if (last >= acc.storage.many.doc_ids.items[0]) return error.InvalidData;
         previous_doc = acc.storage.many.doc_ids.items[acc.storage.many.doc_ids.items.len - 1];
         for (acc.storage.many.doc_ids.items, acc.storage.many.metas.items) |id, meta| {
+            try observePosting(sink, id, meta.freq);
             try updateMergedNorm(norms, id, meta.norm);
             total_field_len.* = try std.math.add(u64, total_field_len.*, meta.freq);
             const range = id / impact_range_doc_count;
@@ -7197,6 +7204,7 @@ fn appendMergedTermToSink(
     config: IndexConfig,
     merged_doc_count: u32,
 ) !u64 {
+    for (acc.docIds(), acc.postingMetas()) |doc, meta| try observePosting(sink, doc, meta.freq);
     if (acc.docIds().len == 1 and
         acc.postingMetas()[0].freq == 1 and
         acc.postingMetas()[0].position_count == 0 and

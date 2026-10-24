@@ -75,6 +75,7 @@ pub fn storeRootEnrollmentStatus(svc: anytype, alloc: std.mem.Allocator, context
 
 pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: Request) ![]u8 {
     try context.ensureActive();
+    if (request.mutation.native_service != null and request.mutation.native_service != context.native_service) return error.Forbidden;
     if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
     var object_create = false;
     var resolver_create = false;
@@ -95,7 +96,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
             .indexes_json = create_req.indexes_json orelse tables_api.default_indexes_json,
         });
     }
-    const required_version = @max(if (resolver_create) protocol.resolver_namespaces_version else @as(u16, 0), if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version);
+    const required_version = @max(if (request.mutation.native_service != null) protocol.native_service_tables_version else @as(u16, 0), @max(if (resolver_create) protocol.resolver_namespaces_version else @as(u16, 0), if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version));
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
@@ -499,6 +500,7 @@ fn listTablesJson(svc: anytype, alloc: std.mem.Allocator, context: operation.Req
 
 pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: @import("server_call.zig").Call) anyerror![]u8 {
     return switch (input) {
+        .resolver_authority_mutate => |write| @import("../metadata/resolver_authority.zig").mutateOnService(svc, alloc, write, context),
         .resolver_catalog_read => |read| blk: {
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
@@ -650,6 +652,14 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             // A response allocation failure after the durable receipt cannot
             // become a replayable pre-admission error on the forwarding hop.
             break :blk std.json.Stringify.valueAlloc(alloc, @import("server_call.zig").RelationReplacementResult{ .schema_version = version, .stamp = stamp }, .{}) catch return error.MetadataMutationOutcomeUnknown;
+        },
+        .native_memory_create => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            var admitted = context;
+            admitted.native_service = .memory;
+            var owned = request;
+            owned.mutation.native_service = .memory;
+            break :blk mutate(svc, alloc, admitted, owned);
         },
         .mutate => |request| mutate(svc, alloc, context, request),
     };
