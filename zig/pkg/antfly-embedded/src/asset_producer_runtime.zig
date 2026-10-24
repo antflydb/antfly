@@ -50,7 +50,6 @@ const test_png_3x3 = [_]u8{
 };
 const max_asset_provider_timeout_ms: u64 = 300_000;
 const default_asset_provider_response_bytes: usize = 64 << 20;
-const max_asset_http_response_bytes: usize = 64 << 20;
 const invocation_response_resident_multiplier: usize = 4;
 // This is an enforced allocator budget for request construction and parsing,
 // not an estimate of what a particular JSON implementation happens to use.
@@ -410,10 +409,11 @@ pub const Runtime = struct {
     capability_cache: remote_capabilities.Cache,
     execution: execution_context.Context = .{},
     request_progress: ?execution_context.ProgressSink = null,
-    owned_http: ?*httpx.Client = null,
+    owned_provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     owned_default_endpoint: ?[]u8 = null,
     owned_source_table: ?[]u8 = null,
     limits: *provider_limits.Registry = &provider_limits.process_registry,
+    provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     inference_api_url: ?[]const u8 = null,
     owns_inference_api_url: bool = false,
@@ -429,6 +429,7 @@ pub const Runtime = struct {
 
     pub const Options = struct {
         limits: *provider_limits.Registry = &provider_limits.process_registry,
+        provider_runtime: ?*managed_embedder.ProviderRuntime = null,
         antfly_provider: ?managed_embedder.AntflyProvider = null,
         /// Process-isolated Antfly inference endpoint. When no local provider
         /// is installed, Antfly asset configs without their own URL inherit
@@ -459,7 +460,8 @@ pub const Runtime = struct {
                 .io = http.io,
                 .routing = .{ .source_table = options.source_table },
             },
-            .limits = options.limits,
+            .limits = if (options.provider_runtime) |shared| shared.limits else options.limits,
+            .provider_runtime = options.provider_runtime,
             .antfly_provider = options.antfly_provider,
             .inference_api_url = options.inference_api_url,
             .secret_store = options.secret_store,
@@ -473,31 +475,22 @@ pub const Runtime = struct {
         const runtime = try alloc.create(Runtime);
         errdefer alloc.destroy(runtime);
 
-        const client = try alloc.create(httpx.Client);
-        errdefer alloc.destroy(client);
-        // This runtime is the ownership boundary for remote inference
-        // transport, so its pool lives exactly as long as the producer and is
-        // reused across document windows. The httpx pools are internally
-        // synchronized; disable ambient cookies because model credentials are
-        // supplied explicitly per request.
-        var client_config = httpx.ClientConfig{
-            .keep_alive = true,
-            .cookies_enabled = false,
-            .cache_resolved_addresses = true,
+        // Standalone producers own one stable provider runtime; server callers
+        // borrow the service runtime. Both share clients and credential caches
+        // across every batch and dependency instead of constructing row pools.
+        var effective = options;
+        const owned_provider = if (options.provider_runtime == null) owned: {
+            const provider = try alloc.create(managed_embedder.ProviderRuntime);
+            provider.* = managed_embedder.ProviderRuntime.init(alloc, io);
+            provider.limits = options.limits;
+            effective.provider_runtime = provider;
+            break :owned provider;
+        } else null;
+        errdefer if (owned_provider) |provider| {
+            provider.deinit();
+            alloc.destroy(provider);
         };
-        // Operation-specific ceilings are applied on provider requests. This
-        // client-wide value is only an outer safety maximum and must not turn a
-        // catalog or a configured large extraction into an unrelated 4 MiB
-        // failure.
-        client_config.max_response_size = max_asset_http_response_bytes;
-        client_config.timeouts = httpx.Timeouts.uniform(max_asset_provider_timeout_ms);
-        client_config.timeouts.request_ms = max_asset_provider_timeout_ms;
-        // Compatibility waves and independent document workers share this
-        // transport concurrently. httpx uses its client allocator for
-        // request-local headers, URLs, and responses, so keep those allocations
-        // off a possibly arena-backed runtime owner.
-        client.* = httpx.Client.initWithConfig(std.heap.smp_allocator, io, client_config);
-        errdefer client.deinit();
+        const client = try effective.provider_runtime.?.assetHttpClient();
 
         const owned_default_endpoint = if (options.inference_api_url) |endpoint|
             try normalizeAntflyInferenceBaseUrl(alloc, endpoint)
@@ -510,8 +503,8 @@ pub const Runtime = struct {
             null;
         errdefer if (owned_source_table) |source_table| alloc.free(source_table);
 
-        runtime.* = Runtime.initWithOptions(alloc, client, options);
-        runtime.owned_http = client;
+        runtime.* = Runtime.initWithOptions(alloc, client, effective);
+        runtime.owned_provider_runtime = owned_provider;
         runtime.owned_default_endpoint = owned_default_endpoint;
         runtime.owned_source_table = owned_source_table;
         runtime.execution.default_endpoint = owned_default_endpoint;
@@ -529,10 +522,11 @@ pub const Runtime = struct {
             self.inference_api_url = null;
             self.owns_inference_api_url = false;
         }
-        if (self.owned_http) |client| {
-            client.deinit();
-            self.alloc.destroy(client);
-            self.owned_http = null;
+        if (self.owned_provider_runtime) |provider| {
+            provider.deinit();
+            self.alloc.destroy(provider);
+            self.owned_provider_runtime = null;
+            self.provider_runtime = null;
         }
         self.* = undefined;
     }
@@ -1242,6 +1236,11 @@ pub const Runtime = struct {
             .copy => .native,
             .document_extraction => .none,
             .decision => blk: {
+                if (requestsShareRoute(requests)) {
+                    var spec = try @import("functions/materialization.zig").parse(alloc, first.config_json);
+                    defer spec.deinit();
+                    if (spec.value.decider.embedder != null) break :blk .native;
+                }
                 const capabilities = (try capabilitiesForRequests(ptr, alloc, requests)) orelse break :blk .none;
                 break :blk capabilities.batch.mode;
             },
@@ -1631,13 +1630,12 @@ pub const Runtime = struct {
         const materialization = @import("functions/materialization.zig");
         var parsed = try materialization.parse(alloc, requests[0].config_json);
         defer parsed.deinit();
-        if (parsed.value.decider.decision_method != .generated) return error.BatchIncompatible;
+        if (parsed.value.decider.decision_method != .generated and parsed.value.decider.embedder == null) return error.BatchIncompatible;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        var registry = @import("common/provider_registry.zig").Registry.init(a);
+        var registry = try materialization.registry(a, parsed.value);
         defer registry.deinit();
-        try registry.registerDeciderConfig("materialized", parsed.value.decider);
         const inputs = try a.alloc(d.Request, requests.len);
         for (inputs, requests) |*input, request| {
             try validateDecisionInput(a, request);
@@ -1645,6 +1643,7 @@ pub const Runtime = struct {
         }
         var execution: @import("functions/runtime.zig").Runtime = .{
             .registry = &registry,
+            .provider_runtime = self.provider_runtime,
             .http = self.http,
             .io = self.http.io,
             .limits = self.limits,
@@ -1655,7 +1654,12 @@ pub const Runtime = struct {
             .source_table = self.execution.routing.source_table,
         };
         defer execution.deinit();
-        const results = try execution.evaluateGeneratedPartial(a, "materialized", inputs);
+        var report = inference_work.ExecutionReport{ .requested_items = requests.len, .serial_items = requests.len };
+        const results: @import("functions/runtime.zig").Runtime.PartialBatch = if (parsed.value.decider.decision_method == .generated) generated: {
+            const generated = try execution.evaluateGeneratedPartial(a, "materialized", inputs);
+            report = constrainedExecution(generated.execution, requests.len);
+            break :generated .{ .values = generated.values, .failures = generated.failures };
+        } else try execution.evaluatePartial(a, inputs);
         const items = try alloc.alloc(asset_producer.ProducedItem, requests.len);
         var initialized: usize = 0;
         errdefer {
@@ -1672,7 +1676,7 @@ pub const Runtime = struct {
             item.* = .{ .identity = .{ .item_id = request.item_id, .source_fingerprint = request.source_fingerprint, .page_number = request.page_number }, .result = if (response) |answer| .{ .value = try std.json.Stringify.valueAlloc(alloc, answer, .{}) } else .{ .item_error = .{ .cause = failure orelse error.InvalidDecisionOutput, .code = .generation_failed } } };
             initialized += 1;
         }
-        return .{ .items = items, .execution = constrainedExecution(results.execution, requests.len) };
+        return .{ .items = items, .execution = report };
     }
 
     fn decide(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
@@ -1681,13 +1685,13 @@ pub const Runtime = struct {
         const parsed = try materialization.parse(alloc, request.config_json);
         defer parsed.deinit();
         try validateDecisionInput(alloc, request);
-        var registry = @import("common/provider_registry.zig").Registry.init(alloc);
+        var registry = try materialization.registry(alloc, parsed.value);
         defer registry.deinit();
-        try registry.registerDeciderConfig("materialized", parsed.value.decider);
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         var execution: @import("functions/runtime.zig").Runtime = .{
             .registry = &registry,
+            .provider_runtime = self.provider_runtime,
             .http = self.http,
             .io = self.http.io,
             .limits = self.limits,
@@ -2747,6 +2751,7 @@ pub const Runtime = struct {
             .source_table = self.execution.routing.source_table,
             .execution = self.execution,
             .request_context = self.requestContext(),
+            .provider_runtime = self.provider_runtime,
             .limits = self.limits,
         } };
     }
@@ -2881,6 +2886,7 @@ pub const Runtime = struct {
             .source_table = self.execution.routing.source_table,
             .execution = self.execution,
             .request_context = self.requestContext(),
+            .provider_runtime = self.provider_runtime,
             .limits = self.limits,
         }, &messages) catch |err| {
             if (err == error.InferenceCapabilitiesStale)
@@ -8061,4 +8067,65 @@ test "decision functions Cloudflare extraction resolves secret references before
     );
     defer missing.deinit(a);
     try std.testing.expectError(error.SecretNotFound, runtime.routeExtractorConfig(a, &missing));
+}
+
+test "asset producer runtime borrowed pools survive producer teardown and accept bounded large responses" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var shared = managed_embedder.ProviderRuntime.init(a, io);
+    defer shared.deinit();
+    const first = try Runtime.createOwned(a, io, .{ .provider_runtime = &shared });
+    first.deinit();
+    a.destroy(first);
+    const next = try Runtime.createOwned(a, io, .{ .provider_runtime = &shared });
+    defer {
+        next.deinit();
+        a.destroy(next);
+    }
+    // The service generation pool has a smaller envelope. Asset operations
+    // with a larger explicit budget must not silently inherit that ceiling.
+    const body = try a.alloc(u8, (4 << 20) + 16);
+    defer a.free(body);
+    @memset(body, 'x');
+    var server = try httpx.TestServer.start(a, io, &.{.{ .method = .GET, .path = "/", .respond = .{ .body = body, .content_type = "application/octet-stream" } }});
+    defer server.deinit();
+    var failure: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(http: *httpx.Client, url: []const u8, expected: usize, out: *?anyerror) std.Io.Cancelable!void {
+            var response = http.get(url, .{ .max_response_size = 5 << 20, .timeout_ms = 10000 }) catch |err| {
+                out.* = err;
+                return;
+            };
+            defer response.deinit();
+            std.testing.expectEqual(expected, response.body.?.len) catch |err| {
+                out.* = err;
+            };
+        }
+    };
+    try group.concurrent(io, Fiber.run, .{ next.http, server.baseUrl(), body.len, &failure });
+    try server.handleOne();
+    group.await(io) catch {};
+    if (failure) |err| return err;
+}
+
+test "asset producer runtime provider ownership unwinds every allocation failure" {
+    const Check = struct {
+        fn run(a: Allocator) !void {
+            const owned = try Runtime.createOwned(a, std.testing.io, .{ .inference_api_url = "http://worker" });
+            defer {
+                owned.deinit();
+                a.destroy(owned);
+            }
+            var shared = managed_embedder.ProviderRuntime.init(a, std.testing.io);
+            defer shared.deinit();
+            const borrowed = try Runtime.createOwned(a, std.testing.io, .{ .provider_runtime = &shared });
+            borrowed.deinit();
+            a.destroy(borrowed);
+            _ = try shared.assetHttpClient();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

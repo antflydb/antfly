@@ -36,9 +36,17 @@ const Texts = struct {
         return id;
     }
 };
-const Question = struct { categories: []const []const usize, queries: []const usize, hash: [64]u8 };
+const Question = struct { categories: []const []const usize, queries: []const usize, hash: [64]u8, prototypes: []const []const f32 = &.{} };
 
-pub fn batch(backing: A, runtime: anytype, cfg: d.DeciderConfig, requests: []const d.Request) ![]V {
+pub const PartialBatch = struct {
+    values: []?V,
+    failures: []?anyerror,
+    input_tokens: u64 = 0,
+};
+
+/// Shared embedding work is charged once even when individual scoring fails.
+/// Only valid rows escape scratch storage; failures retain their original index.
+pub fn batchPartial(backing: A, runtime: anytype, cfg: d.DeciderConfig, requests: []const d.Request) !PartialBatch {
     var scratch = std.heap.ArenaAllocator.init(backing);
     defer scratch.deinit();
     const a = scratch.allocator();
@@ -88,65 +96,98 @@ pub fn batch(backing: A, runtime: anytype, cfg: d.DeciderConfig, requests: []con
         .inference_api_url = runtime.antfly_url,
         .inference_api_key = runtime.antfly_api_key,
     };
-    const vectors = try executor.embed(a, name, texts.values.items, dimensions);
+    const partial = PartialBatch{ .values = try backing.alloc(?V, requests.len), .failures = try backing.alloc(?anyerror, requests.len), .input_tokens = texts.bytes };
+    @memset(partial.values, null);
+    @memset(partial.failures, null);
+    // This estimate remains available when dispatch or shared prototype work
+    // fails. Admission is conservative and never presents it as measured usage.
+    const vectors = executor.embed(a, name, texts.values.items, dimensions) catch |err| {
+        @memset(partial.failures, err);
+        return partial;
+    };
     defer @import("../storage/db/enrichment/embedder.zig").freeDenseEmbeddingBatch(a, vectors);
-    const results = try a.alloc(V, requests.len);
-    for (results) |*result| {
-        result.* = d.jsonObject();
-        try d.put(a, result, "model", .{ .string = embedder.model });
-        try d.put(a, result, "answers", d.jsonObject());
-        var usage = d.jsonObject();
-        // Ordinary embedding interfaces do not expose token usage. The byte
-        // upper bound is conservative admission accounting, explicitly marked.
-        try d.put(a, &usage, "input_tokens", .{ .integer = 0 });
-        try d.put(a, &usage, "output_tokens", .{ .integer = 0 });
-        try d.put(a, &usage, "estimated", .{ .bool = true });
-        try d.put(a, result, "usage", usage);
+    preparePrototypes(a, questions, vectors, dimensions) catch |err| {
+        @memset(partial.failures, err);
+        return partial;
+    };
+    var charged = false;
+    for (requests, partial.values, partial.failures, 0..) |request, *value, *failure, row_index| {
+        executor.context.check() catch |err| {
+            for (partial.failures[row_index..]) |*pending| pending.* = err;
+            return partial;
+        };
+        // Keep validation/serialization scratch at the outer arena's tail.
+        // Owned results copy into backing, so each row can reuse this workspace
+        // without retaining another copy of the question schema per sibling.
+        var row_arena = std.heap.ArenaAllocator.init(a);
+        defer row_arena.deinit();
+        const row_allocator = row_arena.allocator();
+        const result = scoreRow(row_allocator, cfg, request, first, questions, vectors, dimensions, embedder.model, row_index) catch |err| {
+            failure.* = err;
+            continue;
+        };
+        if (!charged) {
+            try result.object.getPtr("usage").?.object.put(row_allocator, "input_tokens", .{ .integer = @intCast(texts.bytes) });
+            charged = true;
+        }
+        value.* = try std.json.parseFromSliceLeaky(V, backing, try std.json.Stringify.valueAlloc(row_allocator, result, .{}), .{ .allocate = .alloc_always });
     }
-    try results[0].object.getPtr("usage").?.object.put(a, "input_tokens", .{ .integer = @intCast(texts.bytes) });
-    for (first.inner.questions, first.policies, questions) |question, policy, plan| {
+    return partial;
+}
+
+fn preparePrototypes(a: A, questions: []Question, vectors: []const []const f32, dimensions: usize) !void {
+    for (questions) |*plan| {
         const prototypes = try a.alloc([]const f32, plan.categories.len);
         for (plan.categories, prototypes) |indices, *prototype| {
             const examples = try a.alloc([]const f32, indices.len);
             for (indices, examples) |id, *example| example.* = vectors[id];
             prototype.* = try scoring.centroid(a, examples, dimensions);
         }
-        for (results, plan.queries) |*result, query| {
-            var answer = d.jsonObject();
-            try d.put(a, &answer, "type", .{ .string = @tagName(policy.kind) });
-            try d.put(a, &answer, "decision_method", .{ .string = "embedding_similarity" });
-            try d.put(a, &answer, "similarity_metric", .{ .string = "cosine" });
-            try d.put(a, &answer, "prototype_set_hash", .{ .string = try a.dupe(u8, &plan.hash) });
-            var similarities = d.jsonObject();
-            const scores = try a.alloc(f64, prototypes.len);
-            for (question.labels, prototypes, scores) |label, prototype, *score| {
-                score.* = try scoring.cosine(vectors[query], prototype, dimensions);
-                try d.put(a, &similarities, label, .{ .float = score.* });
-            }
-            try d.put(a, &answer, "similarities", similarities);
-            if (policy.kind == .choice) {
-                const selection = try scoring.select(scores, policy.options);
-                try d.put(a, &answer, "choice", if (selection.selected) |id| .{ .string = question.labels[id] } else .null);
-                try d.put(a, &answer, "margin", .{ .float = selection.margin });
-                try d.put(a, &answer, "status", .{ .string = if (selection.selected != null) "selected" else "abstained" });
-                if (selection.reason) |reason| try d.put(a, &answer, "abstention_reason", .{ .string = reason });
-            } else {
-                const selection = try scoring.selectMulti(a, scores, policy.thresholds.?, policy.options.min_margin);
-                var labels: std.array_list.Managed(V) = .init(a);
-                var thresholds = d.jsonObject();
-                for (selection.indices) |id| try labels.append(.{ .string = question.labels[id] });
-                for (question.labels, policy.thresholds.?) |label, threshold| try d.put(a, &thresholds, label, .{ .float = threshold });
-                try d.put(a, &answer, "choices", .{ .array = labels });
-                try d.put(a, &answer, "similarity_thresholds", thresholds);
-                try d.put(a, &answer, "margin", .{ .float = selection.margin });
-                try d.put(a, &answer, "status", .{ .string = selection.status });
-                if (selection.reason) |reason| try d.put(a, &answer, "abstention_reason", .{ .string = reason });
-            }
-            try result.object.getPtr("answers").?.object.put(a, question.name, answer);
-        }
+        plan.prototypes = prototypes;
     }
-    for (results, requests) |*result, request| result.* = try d.normalizeResponseWithConfig(a, request.questions, result.*, cfg);
-    const owned = try backing.alloc(V, results.len);
-    for (results, owned) |result, *out| out.* = try std.json.parseFromSliceLeaky(V, backing, try std.json.Stringify.valueAlloc(a, result, .{}), .{ .allocate = .alloc_always });
-    return owned;
+}
+
+fn scoreRow(a: A, cfg: d.DeciderConfig, request: d.Request, first: anytype, questions: []const Question, vectors: []const []const f32, dimensions: usize, model: []const u8, row_index: usize) !V {
+    var result = d.jsonObject();
+    try d.put(a, &result, "model", .{ .string = model });
+    try d.put(a, &result, "answers", d.jsonObject());
+    var usage = d.jsonObject();
+    try d.put(a, &usage, "input_tokens", .{ .integer = 0 });
+    try d.put(a, &usage, "output_tokens", .{ .integer = 0 });
+    try d.put(a, &usage, "estimated", .{ .bool = true });
+    try d.put(a, &result, "usage", usage);
+    for (first.inner.questions, first.policies, questions) |question, policy, plan| {
+        var answer = d.jsonObject();
+        try d.put(a, &answer, "type", .{ .string = @tagName(policy.kind) });
+        try d.put(a, &answer, "decision_method", .{ .string = "embedding_similarity" });
+        try d.put(a, &answer, "similarity_metric", .{ .string = "cosine" });
+        try d.put(a, &answer, "prototype_set_hash", .{ .string = try a.dupe(u8, &plan.hash) });
+        var similarities = d.jsonObject();
+        const scores = try a.alloc(f64, plan.prototypes.len);
+        for (question.labels, plan.prototypes, scores) |label, prototype, *score| {
+            score.* = try scoring.cosine(vectors[plan.queries[row_index]], prototype, dimensions);
+            try d.put(a, &similarities, label, .{ .float = score.* });
+        }
+        try d.put(a, &answer, "similarities", similarities);
+        if (policy.kind == .choice) {
+            const selection = try scoring.select(scores, policy.options);
+            try d.put(a, &answer, "choice", if (selection.selected) |id| .{ .string = question.labels[id] } else .null);
+            try d.put(a, &answer, "margin", .{ .float = selection.margin });
+            try d.put(a, &answer, "status", .{ .string = if (selection.selected != null) "selected" else "abstained" });
+            if (selection.reason) |reason| try d.put(a, &answer, "abstention_reason", .{ .string = reason });
+        } else {
+            const selection = try scoring.selectMulti(a, scores, policy.thresholds.?, policy.options.min_margin);
+            var labels: std.array_list.Managed(V) = .init(a);
+            var thresholds = d.jsonObject();
+            for (selection.indices) |id| try labels.append(.{ .string = question.labels[id] });
+            for (question.labels, policy.thresholds.?) |label, threshold| try d.put(a, &thresholds, label, .{ .float = threshold });
+            try d.put(a, &answer, "choices", .{ .array = labels });
+            try d.put(a, &answer, "similarity_thresholds", thresholds);
+            try d.put(a, &answer, "margin", .{ .float = selection.margin });
+            try d.put(a, &answer, "status", .{ .string = selection.status });
+            if (selection.reason) |reason| try d.put(a, &answer, "abstention_reason", .{ .string = reason });
+        }
+        try result.object.getPtr("answers").?.object.put(a, question.name, answer);
+    }
+    return d.normalizeResponseWithConfig(a, request.questions, result, cfg);
 }

@@ -687,9 +687,6 @@ test "provider registry gateway generated rewriting shares task execution and pr
         \\{"generators":{"chat":{"provider":"antfly","model":"local"}},"rewriters":{"clean":{"generator":"chat","instructions":"Preserve meaning."}}}
     );
     defer registry.deinit();
-    // Exercise the linked JSON callback so finish reason and measured usage
-    // survive the same path used by remote generators.
-    registry.generator_configs.getPtr("chat").?.response_format_json = try a.dupe(u8, "{\"type\":\"text\"}");
     var client = @import("httpx").Client.initWithConfig(a, std.testing.io, .{});
     defer client.deinit();
     var state = Check{};

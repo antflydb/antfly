@@ -450,6 +450,7 @@ pub const ProviderRuntime = struct {
     http_mutex: std.atomic.Mutex = .unlocked,
     http_client: std.atomic.Value(?*httpx.Client) = .init(null),
     generation_http_client: std.atomic.Value(?*httpx.Client) = .init(null),
+    asset_http_client: std.atomic.Value(?*httpx.Client) = .init(null),
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io) ProviderRuntime {
         return .{
@@ -478,6 +479,13 @@ pub const ProviderRuntime = struct {
         return self.pooledHttpClient(&self.generation_http_client, httpx.types.default_max_body_size, 300_000, true);
     }
 
+    /// Media/task adapters apply their own operation ceilings within this
+    /// stable outer envelope. Keep large audio/read responses out of the
+    /// smaller embedding and ordinary generation pools.
+    pub fn assetHttpClient(self: *ProviderRuntime) !*httpx.Client {
+        return self.pooledHttpClient(&self.asset_http_client, 64 << 20, 300_000, true);
+    }
+
     fn pooledHttpClient(self: *ProviderRuntime, slot: *std.atomic.Value(?*httpx.Client), response_limit: usize, timeout_ms: u64, cancel_on_shutdown: bool) !*httpx.Client {
         if (slot.load(.acquire)) |client| return client;
         lockAtomic(&self.http_mutex);
@@ -497,7 +505,7 @@ pub const ProviderRuntime = struct {
     }
 
     pub fn deinit(self: *ProviderRuntime) void {
-        inline for (.{ &self.generation_http_client, &self.http_client }) |slot| if (slot.swap(null, .acq_rel)) |client| {
+        inline for (.{ &self.asset_http_client, &self.generation_http_client, &self.http_client }) |slot| if (slot.swap(null, .acq_rel)) |client| {
             client.deinit();
             self.alloc.destroy(client);
         };

@@ -232,6 +232,7 @@ pub const Runtime = struct {
     fn constrainedRuntime(self: *Runtime, cache: *remote_capabilities.Cache) constrained_runtime.Runtime {
         return .{ .http = self.http, .cache = cache, .options = .{
             .antfly_provider = self.antfly_provider,
+            .provider_runtime = self.provider_runtime,
             .secret_store = self.secret_store,
             .inference_api_key = self.antfly_api_key,
             .max_response_bytes = max_response_bytes,
@@ -359,7 +360,11 @@ pub const Runtime = struct {
                 self.usage = .{ .input_tokens = result.input_tokens, .output_tokens = result.output_tokens };
                 return result.values[0] orelse return result.failures[0] orelse error.InvalidDecisionOutput;
             }
-            if (cfg.embedder != null) return (try @import("embedding_decisions.zig").batch(a, self.runtime, cfg, &.{self.request}))[0];
+            if (cfg.embedder != null) {
+                const result = try @import("embedding_decisions.zig").batchPartial(a, self.runtime, cfg, &.{self.request});
+                self.usage = .{ .input_tokens = result.input_tokens };
+                return result.values[0] orelse return result.failures[0] orelse error.InvalidDecisionOutput;
+            }
             const payload = try requestPayload(a, self.runtime.io, cfg, self.request);
             const body = payload.body;
             const base = if (cfg.provider == .antfly and cfg.url.len == 0) if (self.runtime.antfly_url) |endpoint| try registry_mod.gateway.apiBaseAlloc(a, endpoint) else cfg.baseUrl() else cfg.baseUrl();
@@ -517,13 +522,19 @@ pub const Runtime = struct {
                 compatible = compatible and std.mem.eql(u8, request.decider, requests[0].decider) and std.mem.eql(u8, request.source_table, requests[0].source_table) and std.mem.eql(u8, bytes, question_bytes);
             }
             if (compatible and first.embedder != null) {
-                const responses = try @import("embedding_decisions.zig").batch(a, self, first, requests);
-                self.rows += requests.len;
+                const partial = try @import("embedding_decisions.zig").batchPartial(a, self, first, requests);
+                self.input_tokens +|= partial.input_tokens;
                 self.batches += 1;
-                for (responses, out, requests) |response, *dest, request| {
-                    dest.* = response;
-                    if (reportedUsage(response)) |usage| self.input_tokens +|= usage.input_tokens;
-                    try self.recordProvenance(request.decider, first, response);
+                for (partial.values, partial.failures, out, failures, requests) |value, failure, *dest, *failed, request| {
+                    if (value) |response| {
+                        dest.* = response;
+                        self.rows += 1;
+                        try self.recordProvenance(request.decider, first, response);
+                    } else {
+                        const err = failure orelse error.InvalidDecisionOutput;
+                        if (!preserve_failures or fatalItemFailure(err)) return err;
+                        failed.* = err;
+                    }
                 }
                 return .{ .values = out, .failures = failures };
             }
@@ -2120,4 +2131,164 @@ test "decision provider embedding similarity batches and deduplicates named embe
         try std.testing.expectEqualStrings("account", answer.object.get("choice").?.string);
         try std.testing.expect(!answer.object.contains("probabilities"));
     }
+}
+
+test "decision provider embedding similarity partial batches isolate invalid query vectors and retain usage" {
+    const Fake = struct {
+        calls: usize = 0,
+        texts: usize = 0,
+        invalid_prototypes: bool = false,
+        fn dense(raw: *anyopaque, a: std.mem.Allocator, _: []const u8, texts: []const []const u8) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.texts += texts.len;
+            const vectors = try a.alloc([]f32, texts.len);
+            for (texts, vectors) |text, *vector| vector.* = try a.dupe(f32, if ((self.invalid_prototypes and std.mem.indexOf(u8, text, "Category:") != null) or std.mem.indexOf(u8, text, "BAD_QUERY") != null) &.{ 0, 0 } else if (std.mem.indexOf(u8, text, "billing") != null) &.{ 0, 1 } else &.{ 1, 0 });
+            return vectors;
+        }
+        fn sparse(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]managed.SparseEmbedding {
+            return error.UnexpectedCall;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fake = Fake{};
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerEmbedderConfig("dense", .{ .provider = .antfly, .model = "test", .dimensions = 2 });
+    try registry.registerDeciderConfig("routing", .{ .decision_method = .embedding_similarity, .embedder = "dense", .embedding_options = .{ .dimensions = 2 } });
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.init(a, io_impl.io());
+    defer client.deinit();
+    var runtime = Runtime{ .registry = &registry, .http = &client, .io = io_impl.io(), .antfly_provider = .{ .ptr = &fake, .embed_dense_texts = Fake.dense, .embed_sparse_texts = Fake.sparse } };
+    defer runtime.deinit();
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, a,
+        \\{"route":{"type":"choice","instructions":"Choose category","criteria":{"account":"account","billing":"billing"}}}
+    , .{});
+    const good = decisions.Request{ .decider = "routing", .input = .{ .text = "account" }, .questions = questions };
+    const bad = decisions.Request{ .decider = "routing", .input = .{ .text = "BAD_QUERY" }, .questions = questions };
+    const result = try runtime.evaluatePartial(a, &.{ good, bad });
+    try std.testing.expect(result.values[0] != null);
+    try std.testing.expect(result.failures[0] == null);
+    try std.testing.expect(result.values[1] == null);
+    try std.testing.expectEqual(error.InvalidEmbeddingDecisionOutput, result.failures[1].?);
+    try std.testing.expectEqualStrings("account", result.values[0].?.object.get("answers").?.array.items[0].object.get("choice").?.string);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expect(runtime.input_tokens > 0);
+    try std.testing.expectEqual(@as(u64, 1), runtime.rows);
+    try std.testing.expectEqual(@as(u64, 1), runtime.batches);
+    const charged_before = runtime.input_tokens;
+    const reversed = try runtime.evaluatePartial(a, &.{ bad, good });
+    try std.testing.expect(reversed.values[0] == null);
+    try std.testing.expectEqual(error.InvalidEmbeddingDecisionOutput, reversed.failures[0].?);
+    try std.testing.expect(reversed.failures[1] == null);
+    const charged = reversed.values[1].?.object.get("usage").?.object.get("input_tokens").?.integer;
+    try std.testing.expectEqual(runtime.input_tokens - charged_before, @as(u64, @intCast(charged)));
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    fake.invalid_prototypes = true;
+    const before_shared_failure = runtime.input_tokens;
+    const failed = try runtime.evaluatePartial(a, &.{ good, good });
+    for (failed.values, failed.failures) |value, failure| {
+        try std.testing.expect(value == null);
+        try std.testing.expectEqual(error.InvalidEmbeddingDecisionOutput, failure.?);
+    }
+    try std.testing.expect(runtime.input_tokens > before_shared_failure);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+}
+
+test "decision provider rewriting requires completion aware local generation without altering model configuration" {
+    const Native = @import("antfly_inference_types");
+    const Fake = struct {
+        native_calls: usize = 0,
+        json_calls: usize = 0,
+        fn text(raw: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const Native.ChatMessage, opts: Native.GenerationOptions, _: execution.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.native_calls += 1;
+            try std.testing.expectEqual(@as(i32, 1), opts.max_tokens);
+            return a.dupe(u8, "partial");
+        }
+        fn json(raw: *anyopaque, a: std.mem.Allocator, _: []const u8, _: ?execution.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.json_calls += 1;
+            return a.dupe(u8, "{\"choices\":[{\"message\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1}}");
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var registry = try registry_mod.Registry.parseFromSlice(a,
+        \\{"generators":{"chat":{"provider":"antfly","model":"local","max_tokens":1}},"rewriters":{"clean":{"generator":"chat"}}}
+    );
+    defer registry.deinit();
+    var fake = Fake{};
+    var http = httpx.Client.init(a, std.testing.io);
+    defer http.deinit();
+    const executor = registry_mod.tasks.Executor{
+        .view = .{ .providers = &registry },
+        .http = &http,
+        .context = .{ .io = std.testing.io, .deadline_ns = null },
+        .antfly_provider = .{ .ptr = &fake, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_messages_with_context = Fake.text, .generate_json = Fake.json },
+    };
+    try std.testing.expectError(error.InferenceOutputIncomplete, executor.rewrite(a, "clean", "rewriters/clean", &.{"a long input"}));
+    try std.testing.expectEqual(@as(usize, 0), fake.native_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.json_calls);
+    var legacy = executor;
+    legacy.antfly_provider.?.generate_json = null;
+    try std.testing.expectError(error.UnsupportedInferenceFeature, legacy.rewrite(a, "clean", "rewriters/clean", &.{"a long input"}));
+    try std.testing.expectEqual(@as(usize, 0), fake.native_calls);
+}
+
+test "decision provider materialized named embedders use frozen dependencies and preserve batch failures" {
+    const Fake = struct {
+        calls: usize = 0,
+        texts: usize = 0,
+        fn dense(raw: *anyopaque, a: std.mem.Allocator, _: []const u8, texts: []const []const u8) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.texts += texts.len;
+            const vectors = try a.alloc([]f32, texts.len);
+            for (texts, vectors) |text, *vector| vector.* = try a.dupe(f32, if (std.mem.indexOf(u8, text, "BAD_QUERY") != null) &.{ 0, 0 } else if (std.mem.indexOf(u8, text, "billing") != null) &.{ 0, 1 } else &.{ 1, 0 });
+            return vectors;
+        }
+        fn sparse(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]managed.SparseEmbedding {
+            return error.UnexpectedCall;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fake = Fake{};
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.init(a, io_impl.io());
+    defer client.deinit();
+    const Assets = @import("../asset_producer_runtime.zig").Runtime;
+    var assets = Assets.initWithOptions(a, &client, .{ .antfly_provider = .{ .ptr = &fake, .owns_invocation_admission = true, .embed_dense_texts = Fake.dense, .embed_sparse_texts = Fake.sparse } });
+    defer assets.deinit();
+    const spec =
+        \\{"version":"v1","decider":{"decision_method":"embedding_similarity","embedder":"dense","embedding_options":{"dimensions":2}},"embedders":{"dense":{"provider":"antfly","model":"test","dimensions":2}},"questions":[{"name":"route","type":"choice","instructions":"Choose category","choices":[{"value":"account","description":"account"},{"value":"billing","description":"billing"}]}]}
+    ;
+    const Request = @import("../storage/db/enrichment/asset_producer.zig").Request;
+    const good = Request{ .producer_type = .decision, .config_json = spec, .source_text = "account", .item_id = "good" };
+    const bad = Request{ .producer_type = .decision, .config_json = spec, .source_text = "BAD_QUERY", .item_id = "bad" };
+    var result = try assets.producer().produceBatchReported(a, &.{ good, bad });
+    defer result.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 4), fake.texts);
+    const valid = try std.json.parseFromSliceLeaky(decisions.Json, a, result.items[0].result.value, .{});
+    try std.testing.expectEqualStrings("account", valid.object.get("answers").?.array.items[0].object.get("choice").?.string);
+    try std.testing.expectEqual(error.InvalidEmbeddingDecisionOutput, result.items[1].result.item_error.cause);
+    const provenance = valid.object.get("provenance").?.object;
+    const first_hash = provenance.get("specification_hash").?.string;
+    const snapshot = try @import("materialization.zig").parse(a, spec);
+    defer snapshot.deinit();
+    try snapshot.value.embedders.object.getPtr("dense").?.object.put(a, "model", .{ .string = "new-model" });
+    const changed = try @import("materialization.zig").provenance(a, snapshot.value, null);
+    try std.testing.expect(!std.mem.eql(u8, first_hash, changed.object.get("specification_hash").?.string));
+    const missing =
+        \\{"version":"v1","decider":{"decision_method":"embedding_similarity","embedder":"dense","embedding_options":{"dimensions":2}},"questions":[{"name":"route","type":"choice","instructions":"Route","choices":[{"value":"a"},{"value":"b"}]}]}
+    ;
+    try std.testing.expectError(error.UnknownEmbedder, @import("materialization.zig").parse(a, missing));
 }

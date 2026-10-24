@@ -210,6 +210,7 @@ pub const BackendFactory = struct {
     limits: *provider_limits.Registry = &provider_limits.process_registry,
     usage_observer: ?provider_limits.UsageObserver = null,
     provider_runtime: ?*managed_embedder.ProviderRuntime = null,
+    require_completion: bool = false,
 
     pub fn init(alloc: std.mem.Allocator, http: *httpx.Client) BackendFactory {
         return .{ .alloc = alloc, .http = http };
@@ -238,6 +239,7 @@ pub const BackendFactory = struct {
         limits: *provider_limits.Registry = &provider_limits.process_registry,
         usage_observer: ?provider_limits.UsageObserver = null,
         provider_runtime: ?*managed_embedder.ProviderRuntime = null,
+        require_completion: bool = false,
     };
 
     pub fn initWithOptions(
@@ -265,6 +267,7 @@ pub const BackendFactory = struct {
             .limits = options.limits,
             .usage_observer = options.usage_observer,
             .provider_runtime = options.provider_runtime,
+            .require_completion = options.require_completion,
         };
     }
 
@@ -285,7 +288,7 @@ pub const BackendFactory = struct {
             state.* = .{ .alloc = alloc, .provider = .{ .http = self.http, .failure = self.chatgpt_failure, .pin = self.chatgpt_pin, .registrations = manager, .owner = owner, .connection_id = cfg.connection_id.?, .tools_json = cfg.tools_json, .tool_choice_json = cfg.tool_choice_json, .reasoning_effort = if (cfg.reasoning_effort) |effort| @tagName(effort) else null, .max_response_bytes = self.max_response_bytes orelse 16 * 1024 * 1024 }, .context = self.request_context };
             return .{ .ptr = state, .vtable = &.{ .generate = ChatGPTBackend.generate, .deinit = ChatGPTBackend.deinit } };
         }
-        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.max_response_bytes, self.execution, self.request_context, self.limits, self.usage_observer, self.provider_runtime);
+        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.max_response_bytes, self.execution, self.request_context, self.limits, self.usage_observer, self.provider_runtime, self.require_completion);
     }
 };
 
@@ -323,6 +326,7 @@ const BackendState = struct {
     max_response_bytes: ?usize = null,
     execution: execution_context.Context = .{},
     request_context: ?RequestContext = null,
+    require_completion: bool = false,
     provider: union(enum) {
         openai: openai_provider.Provider,
         remote_antfly: antfly_provider.Provider,
@@ -347,12 +351,15 @@ const BackendState = struct {
         limits: *provider_limits.Registry,
         usage_observer: ?provider_limits.UsageObserver,
         provider_runtime: ?*managed_embedder.ProviderRuntime,
+        require_completion: bool,
     ) !lib.Generator {
         const state = try alloc.create(BackendState);
         errdefer alloc.destroy(state);
 
         try cfg.validate();
         if (cfg.provider == .apple) try lib.apple_native.checkAvailable();
+        state.require_completion = require_completion;
+        if (require_completion and cfg.provider == .apple) return error.UnsupportedInferenceFeature;
         state.limits = limits;
         state.usage_observer = usage_observer;
         _ = try provider_limits.Policy.fromConfig(cfg.rate_limit);
@@ -678,7 +685,8 @@ const BackendState = struct {
                 const has_tool_history = for (messages) |message| {
                     if (message.tool_calls != null or message.tool_call_id != null or message.role == .tool) break true;
                 } else false;
-                if (local.generate_json != null and (self.cfg.tools_json != null or self.cfg.tool_choice_json != null or self.cfg.response_format_json != null or has_tool_history)) {
+                if (self.require_completion and local.generate_json == null) return error.UnsupportedInferenceFeature;
+                if (local.generate_json != null and (self.require_completion or self.cfg.tools_json != null or self.cfg.tool_choice_json != null or self.cfg.response_format_json != null or has_tool_history)) {
                     const body = try inference.types.chatRequestJsonWithOptionsAlloc(alloc, model, messages, .termite_native, .{
                         .response_format_json = self.cfg.response_format_json,
                         .logprobs = self.cfg.logprobs,
@@ -764,6 +772,7 @@ const BackendState = struct {
             },
         };
         defer result.deinit();
+        if (self.require_completion and result.finish_reason != .stop) return error.InferenceOutputIncomplete;
         if (self.request_context) |context| try context.check();
 
         const content = try alloc.dupe(u8, result.content);

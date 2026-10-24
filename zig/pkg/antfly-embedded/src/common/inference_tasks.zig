@@ -47,7 +47,7 @@ pub const Executor = struct {
     source_table: []const u8 = "",
 
     fn providerHttp(self: Executor, cloudflare: bool) !*httpx.Client {
-        if (cloudflare) if (self.provider_runtime) |runtime| return runtime.generationHttpClient();
+        if (cloudflare) if (self.provider_runtime) |runtime| return runtime.assetHttpClient();
         return self.http;
     }
 
@@ -82,6 +82,7 @@ pub const Executor = struct {
             .secret_store = self.secret_store,
             .inference_api_key = self.inference_api_key,
             .request_context = self.context,
+            .source_table = self.source_table,
             .execution = .{ .default_endpoint = self.inference_api_url },
         });
     }
@@ -110,6 +111,7 @@ pub const Executor = struct {
         const cfg = try self.generatorConfig(a, generator_name);
         if (cfg.provider == .chatgpt) return error.UnsupportedInferenceFeature;
         var factory = try self.generationFactory(a, cfg);
+        factory.require_completion = true;
         var generator = try factory.factory().create(a, cfg);
         defer generator.deinit();
         const rows = try a.alloc(RewriteResult.Row, inputs.len);
@@ -131,7 +133,7 @@ pub const Executor = struct {
                 .{ .role = .user, .content = .{ .text = input } },
             });
             defer result.deinit();
-            if (result.tool_calls.len != 0 or result.finish_reason == .length or result.finish_reason == .content_filter or result.finish_reason == .tool_calls) return error.InferenceOutputIncomplete;
+            if (result.tool_calls.len != 0 or result.finish_reason != .stop) return error.InferenceOutputIncomplete;
             const texts = try a.alloc([]const u8, 1);
             errdefer a.free(texts);
             texts[0] = try a.dupe(u8, result.content);
@@ -158,6 +160,7 @@ pub const Executor = struct {
             .secret_store = self.secret_store,
             .inference_api_key = self.inference_api_key,
             .request_context = self.context,
+            .source_table = self.source_table,
             .execution = .{ .default_endpoint = self.inference_api_url },
         });
         var generator = try factory.factory().create(a, cfg);
@@ -201,6 +204,8 @@ pub const Executor = struct {
     pub fn decide(self: Executor, a: std.mem.Allocator, name: []const u8, input: decisions.Input, questions: Json) !Json {
         var runtime = decision_runtime.Runtime{
             .registry = self.view.providers,
+            .limits = if (self.provider_runtime) |shared| shared.limits else &@import("provider_limits.zig").process_registry,
+            .source_table = self.source_table,
             .provider_runtime = self.provider_runtime,
             .http = self.http,
             .io = self.http.io,
@@ -224,6 +229,8 @@ pub const Executor = struct {
         for (batch.items, requests) |item, *target| target.* = .{ .decider = name, .input = item.input, .questions = questions };
         var runtime = decision_runtime.Runtime{
             .registry = self.view.providers,
+            .limits = if (self.provider_runtime) |shared| shared.limits else &@import("provider_limits.zig").process_registry,
+            .source_table = self.source_table,
             .provider_runtime = self.provider_runtime,
             .http = self.http,
             .io = self.http.io,

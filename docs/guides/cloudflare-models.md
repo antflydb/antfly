@@ -99,3 +99,47 @@ slide and receipt sources and bounded reading/extraction policies. The provider
 wire types are generated from pinned official model schemas; transport fixtures
 exercise the adapters without consuming live model credits. Live model quality
 and account-specific availability require separate qualification.
+
+## Materialized similarity decisions
+
+Persist a named embedder's configuration with the decision producer. The
+`embedders` map freezes the dependency used for replay; it does not resolve
+against a node's current named-model configuration. Changing that dependency
+changes the specification hash and follows the normal enrichment rebuild
+lifecycle. Credentials remain secret references or provider environment defaults.
+
+```json
+{
+  "version": "v1",
+  "decider": {
+    "decision_method": "embedding_similarity",
+    "embedder": "cf-text",
+    "embedding_options": { "dimensions": 768, "min_similarity": 0.5 }
+  },
+  "embedders": {
+    "cf-text": {
+      "provider": "cloudflare",
+      "account_id": "account",
+      "model": "@cf/baai/bge-base-en-v1.5",
+      "dimensions": 768,
+      "api_key": "${secret:cloudflare.api_token}"
+    }
+  },
+  "questions": [{
+    "name": "route",
+    "type": "choice",
+    "instructions": "Choose the category that best describes the input.",
+    "choices": [{ "value": "receipt" }, { "value": "slide" }]
+  }]
+}
+```
+
+Compatible rows share bounded embedding work and category prototypes. An invalid
+query vector fails its own row; valid siblings remain available, and the batch's
+conservative token estimate is retained even if scoring or dispatch fails. SQL
+and HTTP execution borrow service-owned provider clients. Standalone enrichment
+owners retain their own provider runtime across batches.
+
+Generator-backed rewriting requires a complete generation result. Embedded
+Antfly generators use the JSON callback to preserve finish reasons and usage;
+legacy text-only callbacks are rejected before execution for this task.

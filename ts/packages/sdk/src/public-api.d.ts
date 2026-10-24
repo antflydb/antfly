@@ -16361,7 +16361,7 @@ export interface components {
             full_text_index?: boolean;
             /** @description Produced asset content type for asset enrichments. */
             content_type?: string;
-            /** @description Write-only producer configuration. Cannot be combined with producer_json or transcriber. Decision producers use type=decision and config={version, decider, questions}, where decider is a frozen Antfly or Jev DeciderConfig. Outputs include answers, usage, resolved model, specification hash, version, and source fingerprint. Change version or specification to rebuild through the enrichment lifecycle. */
+            /** @description Write-only producer configuration. Cannot be combined with producer_json or transcriber. Decision producers use type=decision and config={version, decider, questions}. A named-embedder similarity decider also requires embedders={name: frozen EmbedderConfig}; the dependency travels with the specification for deterministic replay instead of resolving mutable node configuration. Credentials use secret references or environment defaults. Outputs include answers, usage, resolved model, specification hash, version, and source fingerprint. Change version or specification to rebuild through the enrichment lifecycle. */
             producer?: components["schemas"]["EnrichmentProducerConfig"];
             /**
              * @deprecated

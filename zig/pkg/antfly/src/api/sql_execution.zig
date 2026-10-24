@@ -175,6 +175,8 @@ pub const Adapter = struct {
                 const normalized = try self.context.platformDeadline();
                 return .{
                     .registry = &config.registry,
+                    .provider_runtime = &self.server.embedding_provider_runtime,
+                    .limits = self.server.embedding_provider_runtime.limits,
                     .io = self.server.embedding_provider_runtime.io,
                     .http = try self.server.embedding_provider_runtime.httpClient(),
                     .context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation },
