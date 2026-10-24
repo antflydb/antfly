@@ -538,6 +538,13 @@ impl Database {
     }
 
     /// Resolve text or extraction mentions, including aliases and ANN, without writes.
+    /// Execute native memory policy without an HTTP server or extension.
+    pub fn memory_json(&self, space: &str, request: impl AsRef<[u8]>) -> Result<Vec<u8>> {
+        self.with_input_output(request.as_ref(), |h, input, out| unsafe {
+            sys::antfly_db_memory_json(h, borrow_slice(space.as_bytes()), input, out)
+        })
+    }
+
     pub fn resolve_query_json(&self, resolver: &str, request: impl AsRef<[u8]>) -> Result<Vec<u8>> {
         self.with_input_output(request.as_ref(), |h, input, out| unsafe {
             sys::antfly_db_resolve_query_json(h, borrow_slice(resolver.as_bytes()), input, out)

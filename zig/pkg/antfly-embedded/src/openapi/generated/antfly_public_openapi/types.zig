@@ -7760,12 +7760,14 @@ pub const Permission = struct {
 pub const PermissionType = enum {
     read,
     write,
+    curator,
     admin,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .read => "read",
             .write => "write",
+            .curator => "curator",
             .admin => "admin",
         };
         try jw.write(s);
@@ -7779,6 +7781,7 @@ pub const PermissionType = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "read", .read },
             .{ "write", .write },
+            .{ "curator", .curator },
             .{ "admin", .admin },
         });
         return map.get(s) orelse error.UnexpectedToken;

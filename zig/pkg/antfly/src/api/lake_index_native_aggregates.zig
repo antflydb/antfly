@@ -1706,7 +1706,7 @@ test "external lake partitioned aggregate trees retain unaffected groups with la
                 var retained: usize = 0;
                 for (old_pages.entries) |old| if (old.child) |prior_page| {
                     for (new_pages.entries) |fresh| if (fresh.child) |page| {
-                        if (prior_page.eql(page)) {
+                        if (prior_page.eql(page.*)) {
                             retained += 1;
                             break;
                         }

@@ -127,7 +127,12 @@ const std = @import("std");
 /// proposal queues and proposal-owned source-correction fences. Main's v37
 /// resolver floor cannot be reused: this branch already assigned that profile
 /// to earlier SQL catalog support that does not decode these resolver fields.
-pub const current_version: u16 = 68;
+/// Version 69 includes main's native service ownership and complete resolver
+/// authority/projection decoder. Its published v38/v42 profiles overlap this
+/// branch's earlier SQL work, so require this combined decoder explicitly.
+pub const current_version: u16 = 69;
+pub const native_service_tables_version: u16 = 69;
+pub const resolver_records_version: u16 = 69;
 /// Stable database/namespace annotations, without physical schema publication.
 pub const sql_resource_comments_version: u16 = 68;
 pub const fk_historical_references_version: u16 = 66;
@@ -170,6 +175,9 @@ pub const constraint_occupancy_version: u16 = 36;
 pub const resolver_namespaces_version: u16 = 63;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
+pub fn usesResolverRecords(indexes_json: []const u8) bool {
+    return std.mem.indexOf(u8, indexes_json, "_resolver_record_store") != null or std.mem.indexOf(u8, indexes_json, "projection_only") != null or std.mem.indexOf(u8, indexes_json, "authority_table_id") != null;
+}
 pub fn usesResolverNamespaces(indexes_json: []const u8) bool {
     return std.mem.indexOf(u8, indexes_json, "_resolver_namespaces") != null or std.mem.indexOf(u8, indexes_json, "namespace_owned") != null or std.mem.indexOf(u8, indexes_json, "resolvers") != null or std.mem.indexOf(u8, indexes_json, "_resolver_curation") != null or std.mem.indexOf(u8, indexes_json, "_curation_proposals") != null;
 }

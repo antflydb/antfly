@@ -3,7 +3,7 @@ import { createContext } from "react";
 export interface Permission {
   resource: string;
   resource_type: "table" | "user" | "*";
-  type: "read" | "write" | "admin";
+  type: "read" | "write" | "curator" | "admin";
 }
 
 export interface User {

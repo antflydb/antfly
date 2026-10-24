@@ -49,3 +49,9 @@ pub const antfly_sources = @import("source_owner_physical.zig");
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+
+// A named bootstrap is needed when a focused compiler filter excludes the
+// anonymous root above. The physical owner's persistence tests must be loaded.
+test "system catalog native memory ownership storage root" {
+    _ = storage.raft_apply_store;
+}

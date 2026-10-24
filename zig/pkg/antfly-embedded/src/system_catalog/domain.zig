@@ -24,6 +24,7 @@ pub const default_database_id: u64 = 1;
 pub const default_namespace_id: u64 = 2;
 pub const max_name_bytes = 128;
 pub const max_command_bytes = 3 * 1024 * 1024;
+pub const ServiceOwner = @import("../common/service_ownership.zig").Owner;
 pub const Kind = enum { database, namespace, tablespace, table, query_source, view, sequence };
 
 pub fn namespaceRelation(kind: Kind) bool {
@@ -34,6 +35,7 @@ pub fn namespaceRelation(kind: Kind) bool {
 /// tables. Read schema and index generations are captured together.
 pub const QueryDefinition = struct {
     full_text_read_index: ?[]const u8 = null,
+    native_service: ?ServiceOwner = null,
     storage_engine: @import("../common/table_storage.zig").Engine = .local,
     table_id: u64 = 0,
     object_storage_generation: u64 = 0,
@@ -43,6 +45,8 @@ pub const QueryDefinition = struct {
     lake_index_catalog_json: []const u8 = "",
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        if (self.native_service != null and self.full_text_read_index != null) return jw.write(.{ .native_service = self.native_service, .storage_engine = self.storage_engine, .table_id = self.table_id, .object_storage_generation = self.object_storage_generation, .schema_json = self.schema_json, .read_schema_json = self.read_schema_json, .indexes_json = self.indexes_json, .lake_index_catalog_json = self.lake_index_catalog_json, .full_text_read_index = self.full_text_read_index });
+        if (self.native_service != null) return jw.write(.{ .native_service = self.native_service, .storage_engine = self.storage_engine, .table_id = self.table_id, .object_storage_generation = self.object_storage_generation, .schema_json = self.schema_json, .read_schema_json = self.read_schema_json, .indexes_json = self.indexes_json, .lake_index_catalog_json = self.lake_index_catalog_json });
         if (self.full_text_read_index) |version| {
             try jw.write(.{ .table_id = self.table_id, .storage_engine = self.storage_engine, .object_storage_generation = self.object_storage_generation, .schema_json = self.schema_json, .read_schema_json = self.read_schema_json, .indexes_json = self.indexes_json, .lake_index_catalog_json = self.lake_index_catalog_json, .full_text_read_index = version });
         } else if (self.storage_engine == .object) {
@@ -66,7 +70,7 @@ pub const QueryDefinition = struct {
         errdefer alloc.free(indexes);
         const full_text_read_index = if (self.full_text_read_index) |name| try alloc.dupe(u8, name) else null;
         errdefer if (full_text_read_index) |name| alloc.free(name);
-        return .{ .full_text_read_index = full_text_read_index, .storage_engine = self.storage_engine, .table_id = self.table_id, .object_storage_generation = self.object_storage_generation, .schema_json = schema, .read_schema_json = read_schema, .indexes_json = indexes, .lake_index_catalog_json = try alloc.dupe(u8, self.lake_index_catalog_json) };
+        return .{ .native_service = self.native_service, .full_text_read_index = full_text_read_index, .storage_engine = self.storage_engine, .table_id = self.table_id, .object_storage_generation = self.object_storage_generation, .schema_json = schema, .read_schema_json = read_schema, .indexes_json = indexes, .lake_index_catalog_json = try alloc.dupe(u8, self.lake_index_catalog_json) };
     }
     pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
         if (self.full_text_read_index) |name| alloc.free(name);
@@ -80,6 +84,7 @@ pub const QueryDefinition = struct {
 /// Document operations request only identity; query admission can include a
 /// narrow definition captured in the same catalog read transaction.
 pub const ResolvedTable = struct {
+    native_service: ?ServiceOwner = null,
     table_id: u64,
     name: []const u8,
     query_definition: ?QueryDefinition = null,
@@ -88,7 +93,11 @@ pub const ResolvedTable = struct {
         return .{ .table_id = table.table_id, .name = table.name };
     }
 
+    pub fn requireAccess(self: @This(), capability: ?ServiceOwner) !void {
+        try @import("../common/service_ownership.zig").requireAccess(self.native_service, capability);
+    }
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        if (self.native_service != null) return jw.write(.{ .table_id = self.table_id, .name = self.name, .native_service = self.native_service, .query_definition = self.query_definition });
         if (self.query_definition) |definition| {
             try jw.write(.{ .table_id = self.table_id, .name = self.name, .query_definition = definition });
         } else {
@@ -99,7 +108,7 @@ pub const ResolvedTable = struct {
     pub fn clone(self: @This(), alloc: std.mem.Allocator) !@This() {
         const name = try alloc.dupe(u8, self.name);
         errdefer alloc.free(name);
-        return .{ .table_id = self.table_id, .name = name, .query_definition = if (self.query_definition) |definition| try definition.clone(alloc) else null };
+        return .{ .native_service = self.native_service, .table_id = self.table_id, .name = name, .query_definition = if (self.query_definition) |definition| try definition.clone(alloc) else null };
     }
 
     pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
@@ -124,6 +133,7 @@ pub const PlacementPolicy = struct {
 };
 
 pub const Resource = struct {
+    native_service: ?ServiceOwner = null,
     kind: Kind,
     id: u64,
     parent_id: u64 = 0,
@@ -139,7 +149,7 @@ pub const Resource = struct {
     description: ?[]const u8 = null,
 
     pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
-        return std.mem.eql(u8, field, "description") and self.description == null;
+        return (std.mem.eql(u8, field, "native_service") and self.native_service == null) or (std.mem.eql(u8, field, "description") and self.description == null);
     }
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
@@ -249,6 +259,8 @@ pub const TableScope = struct {
 
 pub const Action = enum { create, drop, rename, set_tablespace, alter, comment };
 pub const Mutation = struct {
+    /// Only native service admission can set this immutable ownership binding.
+    native_service: ?ServiceOwner = null,
     action: Action,
     kind: Kind,
     name: []const u8,
@@ -266,7 +278,7 @@ pub const Mutation = struct {
     description: ?[]const u8 = null,
 
     pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
-        return std.mem.eql(u8, field, "description") and self.description == null;
+        return (std.mem.eql(u8, field, "native_service") and self.native_service == null) or (std.mem.eql(u8, field, "description") and self.description == null);
     }
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
@@ -744,6 +756,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
     if (request.new_name) |name| try validateResourceName(request.kind, name);
     if (request.tablespace) |name| try validateName(name);
     try request.placement_policy.validate();
+    if (request.native_service != null and (request.kind != .table or request.action != .create)) return error.InvalidCatalogMutation;
     if (request.kind == .query_source and request.action == .create) try validateQuerySource(alloc, request.source_json) else if (!std.mem.eql(u8, request.source_json, "null")) return error.InvalidCatalogMutation;
     if (request.location_json.len > 64 * 1024) return error.InvalidTablespaceLocation;
     var location = std.json.parseFromSlice(std.json.Value, alloc, request.location_json, .{}) catch |err| switch (err) {
@@ -783,7 +796,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
             if (request.new_name != null) return error.InvalidCatalogMutation;
             const binding = if (request.tablespace) |name| ((try reader.lookup(.tablespace, 0, name)) orelse return error.TablespaceNotFound).id else 0;
             if (request.kind == .tablespace and binding != 0) return error.InvalidCatalogMutation;
-            var resource: Resource = .{ .kind = request.kind, .id = next_id, .parent_id = parent_id, .name = request.name, .tablespace_id = binding, .placement_policy = request.placement_policy, .location_json = request.location_json, .source_json = request.source_json };
+            var resource: Resource = .{ .native_service = request.native_service, .kind = request.kind, .id = next_id, .parent_id = parent_id, .name = request.name, .tablespace_id = binding, .placement_policy = request.placement_policy, .location_json = request.location_json, .source_json = request.source_json };
             if (request.kind == .table) {
                 if (request.table_id == 0 or request.storage_name.len == 0) return error.InvalidCatalogMutation;
                 if (try reader.byId(.table, request.table_id) != null or try reader.bindingForStorage(request.storage_name) != null or
@@ -803,6 +816,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
         },
         .drop, .rename, .set_tablespace => {
             const existing = found orelse return error.CatalogNotFound;
+            if (existing.native_service != null) return error.Forbidden;
             if (request.action == .set_tablespace) {
                 if (existing.kind == .tablespace or request.new_name != null) return error.InvalidCatalogMutation;
                 var updated = existing;
@@ -1841,4 +1855,23 @@ test "system catalog resource comments preserve identities normalize removal and
             try std.testing.expectEqualStrings("owned Ω", state_owned.index.byId(.database, 3).?.description.?);
         }
     }.run, .{});
+}
+
+test "system catalog native memory ownership is durable identity and cannot be renamed away" {
+    const a = std.testing.allocator;
+    const owned: Resource = .{ .kind = .table, .id = 42, .parent_id = default_namespace_id, .name = "memory_team", .storage_name = "table:42", .native_service = .memory };
+    const bytes = try std.json.Stringify.valueAlloc(a, owned, .{});
+    defer a.free(bytes);
+    var decoded = try std.json.parseFromSlice(Resource, a, bytes, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqual(ServiceOwner.memory, decoded.value.native_service.?);
+    const resources = [_]Resource{owned};
+    try std.testing.expectError(error.Forbidden, plan(a, .{ .resources = &resources }, .{ .action = .rename, .kind = .table, .name = "memory_team", .new_name = "public_copy" }, &.{}));
+    try std.testing.expectError(error.Forbidden, plan(a, .{ .resources = &resources }, .{ .action = .drop, .kind = .table, .name = "memory_team" }, &.{}));
+    const identity: ResolvedTable = .{ .table_id = 42, .name = "table:42", .native_service = .memory };
+    try std.testing.expectError(error.Forbidden, identity.requireAccess(null));
+    try identity.requireAccess(.memory);
+    const copy = try identity.clone(a);
+    defer copy.deinit(a);
+    try std.testing.expectEqual(ServiceOwner.memory, copy.native_service.?);
 }

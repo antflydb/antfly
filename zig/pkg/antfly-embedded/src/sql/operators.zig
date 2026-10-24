@@ -1157,45 +1157,58 @@ test "SQL hash batch admission respects enclosing quota before retained mutation
 /// from one native page; only the build relation occupies retained memory.
 pub const HashJoin = struct {
     const PayloadCache = struct { block: *@import("spill.zig").Sequential.OwnedBlock, offset: u64 };
+    const KeyCache = struct {
+        const Slot = struct { arena: std.heap.ArenaAllocator, decoded: @import("spill.zig").Decoded, offset: u64, used: u64 };
+        slots: [8]?Slot = @splat(null),
+        clock: u64 = 0,
+        bytes: usize = 0,
+        fn evict(self: *KeyCache) bool {
+            var oldest: ?usize = null;
+            for (self.slots, 0..) |slot, i| if (slot) |value| {
+                if (oldest == null or value.used < self.slots[oldest.?].?.used) oldest = i;
+            };
+            const index = oldest orelse return false;
+            self.bytes -= self.slots[index].?.arena.queryCapacity();
+            self.slots[index].?.arena.deinit();
+            self.slots[index] = null;
+            return true;
+        }
+        fn deinit(self: *KeyCache) void {
+            while (self.evict()) {}
+        }
+    };
     const Buckets = struct {
         flat: []u64 = &.{},
-        paged: ?@import("execution_pager.zig").Array(u64) = null,
+        partitioned: ?@import("join_spill_index.zig").Index = null,
         len: usize = 0,
         fn init(a: Allocator, manager: *@import("spill.zig").Manager, count: usize) !Buckets {
             var result: Buckets = .{ .len = count };
             errdefer result.deinit(a);
             if (count >= 8192 and manager.page_residency_bytes >= @import("execution_pager.zig").page_bytes) {
-                result.paged = .{ .pager = try manager.pager() };
-                try result.paged.?.appendRepeated(@import("spill.zig").none, count);
+                result.partitioned = try @import("join_spill_index.zig").Index.init(manager);
             } else {
                 result.flat = try a.alloc(u64, count);
                 @memset(result.flat, @import("spill.zig").none);
             }
             return result;
         }
-        fn get(self: Buckets, index: usize) !u64 {
-            return if (self.paged) |array| try array.get(index) else self.flat[index];
+        fn get(self: *const Buckets, hash: u64) !u64 {
+            return if (self.partitioned) |*index| try index.get(hash) else self.flat[@intCast(hash & (self.len - 1))];
         }
-        fn set(self: Buckets, index: usize, value: u64) !void {
-            if (self.paged) |array| try array.set(index, value) else self.flat[index] = value;
+        fn set(self: *Buckets, hash: u64, value: u64) !void {
+            if (self.partitioned) |*index| try index.set(hash, value) else self.flat[@intCast(hash & (self.len - 1))] = value;
         }
-        fn seedProbes(self: Buckets, hashes: []const ?u64, probes: []Probe) !void {
+        fn seedProbes(self: *const Buckets, hashes: []const ?u64, probes: []Probe) !void {
             var begin: usize = 0;
             while (begin < hashes.len) {
                 const end = @min(hashes.len, begin + 128);
-                var indices: [128]usize = undefined;
-                var positions: [128]usize = undefined;
-                var values: [128]u64 = undefined;
-                var count: usize = 0;
-                for (hashes[begin..end], begin..) |hash, i| if (hash) |value| {
-                    indices[count] = value & (self.len - 1);
-                    positions[count] = i;
-                    count += 1;
-                };
-                if (self.paged) |array| try array.getMany(indices[0..count], values[0..count]) else {
-                    for (indices[0..count], values[0..count]) |index, *value| value.* = self.flat[index];
+                var values: [128]u64 = @splat(@import("spill.zig").none);
+                if (self.partitioned) |*index| try index.getMany(hashes[begin..end], values[0 .. end - begin]) else {
+                    for (hashes[begin..end], values[0 .. end - begin]) |hash, *value| if (hash) |key| {
+                        value.* = self.flat[@intCast(key & (self.len - 1))];
+                    };
                 }
-                for (values[0..count], positions[0..count]) |head, index| probes[index].cursor = if (head == @import("spill.zig").none) null else @intCast(head);
+                for (values[0 .. end - begin], probes[begin..end]) |head, *probe_| probe_.cursor = if (head == @import("spill.zig").none) null else @intCast(head);
                 begin = end;
             }
         }
@@ -1203,7 +1216,7 @@ pub const HashJoin = struct {
             return self.flat.len * @sizeOf(u64);
         }
         fn deinit(self: *Buckets, a: Allocator) void {
-            if (self.paged) |*array| array.deinit();
+            if (self.partitioned) |*index| index.deinit();
             a.free(self.flat);
         }
     };
@@ -1217,6 +1230,8 @@ pub const HashJoin = struct {
         transient: bool = false,
         owner: ?*HashJoin = null,
         native: ?NativeMatch = null,
+        /// Primed disk candidates retain coordinates, never decode-arena data.
+        key_record: ?struct { join: *HashJoin, offset: u64 } = null,
         pub const NativeMatch = struct {
             join: *HashJoin,
             offset: u64,
@@ -1232,6 +1247,12 @@ pub const HashJoin = struct {
         /// Reconstruct row-boundary values from stable typed columns. Disk
         /// candidates are copied before the next probe reuses decode storage.
         pub fn materializeKeys(self: Match, alloc: Allocator) ![]const Datum {
+            if (self.key_record) |source| {
+                const row = try source.join.readDiskKey(&source.join.disk.?, source.offset);
+                const result = try alloc.alloc(Datum, row.row.keys.len);
+                for (row.row.keys, result) |key, *value| value.* = try cloneDatum(alloc, key);
+                return result;
+            }
             return if (self.owner) |owner| owner.key_columns.row(alloc, self.index) else self.keys;
         }
         /// Keep build payloads encoded when transferring into another operator.
@@ -1274,7 +1295,7 @@ pub const HashJoin = struct {
                 return match;
             }
             if (self.owner.disk) |*file| while (self.cursor) |index| {
-                const decoded = try self.owner.readDiskKey(file, index);
+                const decoded = try self.owner.readProbeKey(file, index);
                 self.cursor = if (decoded.next == @import("spill.zig").none) null else @intCast(decoded.next);
                 self.owner.probes += 1;
                 if (decoded.row.keys.len != self.keys.len) return error.InvalidSqlSpill;
@@ -1283,7 +1304,7 @@ pub const HashJoin = struct {
                     equal = false;
                     break;
                 };
-                if (equal) return try self.owner.diskMatch(index, decoded);
+                if (equal) return try self.owner.probeMatch(index, decoded);
             };
             if (self.owner.disk != null) return null;
             while (self.cursor) |index| {
@@ -1315,6 +1336,10 @@ pub const HashJoin = struct {
     disk_payloads: [4]?PayloadCache = @splat(null),
     next_payload: usize = 0,
     payload_reads: usize = 0,
+    disk_key_decodes: usize = 0,
+    disk_keys: ?*KeyCache = null,
+    key_probation: [8]u64 = @splat(@import("spill.zig").none),
+    key_cache_bytes: usize = 64 * 1024,
     disk_arena: std.heap.ArenaAllocator = undefined,
     row_count: usize = 0,
     fn clearPayloadCache(self: *HashJoin) void {
@@ -1339,6 +1364,7 @@ pub const HashJoin = struct {
     }
     fn evictPayload(raw: *anyopaque) bool {
         const self: *HashJoin = @ptrCast(@alignCast(raw));
+        if (self.disk_keys) |keys| if (keys.evict()) return true;
         // Build-side dedup entries are colder than decoded probe pages.
         if (self.disk_values) |payloads| if (payloads.evictOne()) return true;
         for (0..self.disk_payloads.len) |step| {
@@ -1385,6 +1411,15 @@ pub const HashJoin = struct {
         const row = std.math.cast(usize, decoded.row.values[1].value.integer) orelse return error.InvalidSqlSpill;
         if (width > 1024 or row >= @import("spill.zig").JoinPayloads.page_rows) return error.InvalidSqlSpill;
         return .{ .index = index, .keys = decoded.row.keys, .transient = true, .native = .{ .join = self, .offset = decoded.row.ordinal & ~native_payload_bit, .width = width, .row = row } };
+    }
+    fn probeMatch(self: *HashJoin, index: usize, decoded: @import("spill.zig").Decoded) !Match {
+        var match = try self.diskMatch(index, decoded);
+        if (match.native != null) {
+            match.keys = &.{};
+            match.transient = false;
+            match.key_record = .{ .join = self, .offset = index };
+        }
+        return match;
     }
     /// Tiny scalar rows retain the single-record path. Native JSON and larger
     /// payloads split from the key chain, preserving encoded source capabilities
@@ -1510,7 +1545,7 @@ pub const HashJoin = struct {
     /// One bounded producer cohort. Native rows share immutable payload pages;
     /// narrow rows keep the single-file path. Only page offsets and lane IDs
     /// enter key records, so source identities retire before the next pull.
-    fn writeDiskCohort(manager: *@import("spill.zig").Manager, file: *@import("spill.zig").File, payloads: *?*@import("spill.zig").JoinPayloads, heads: Buckets, values: @import("execution_batch.zig").Batch, keys: []const []const Datum, ordinal: usize, inline_budget: usize) !void {
+    fn writeDiskCohort(manager: *@import("spill.zig").Manager, file: *@import("spill.zig").File, payloads: *?*@import("spill.zig").JoinPayloads, heads: *Buckets, values: @import("execution_batch.zig").Batch, keys: []const []const Datum, ordinal: usize, inline_budget: usize) !void {
         const Payloads = @import("spill.zig").JoinPayloads;
         if (values.len() == 0 or values.len() > Payloads.page_rows or keys.len != values.len()) return error.InvalidSqlBackendResponse;
         if (ordinal >= native_payload_bit or values.len() > native_payload_bit - ordinal) return error.SqlProgramLimitExceeded;
@@ -1563,7 +1598,7 @@ pub const HashJoin = struct {
         for (keys, 0..) |key, row| {
             _ = row_scratch.reset(.{ .retain_with_limit = 8192 });
             const hashed = try keyHash(key);
-            const bucket = if (hashed) |hash| hash & (heads.len - 1) else 0;
+            const bucket = if (hashed) |hash| hash else 0;
             const link = if (hashed != null) try heads.get(bucket) else @import("spill.zig").none;
             const offset = if (native[row]) |id| blk: {
                 const ref = refs[id];
@@ -1593,7 +1628,7 @@ pub const HashJoin = struct {
             if (self.entries.items[ordinal].width != self.value_columns.columns.len) {
                 const values = try (Match{ .owner = self, .index = ordinal }).valuesBatch(a);
                 const keys = try self.key_columns.row(a, ordinal);
-                try writeDiskCohort(manager, &file, &payloads, heads, values, &.{keys}, ordinal, self.budget.limit -| heads.residentCharge());
+                try writeDiskCohort(manager, &file, &payloads, &heads, values, &.{keys}, ordinal, self.budget.limit -| heads.residentCharge());
                 ordinal += 1;
                 continue;
             }
@@ -1602,7 +1637,7 @@ pub const HashJoin = struct {
             const keys = try a.alloc([]const Datum, end - ordinal);
             for (keys, ordinal..) |*key, index| key.* = try self.key_columns.row(a, index);
             const values: @import("execution_batch.zig").Batch = .{ .retained = .{ .store = &self.value_columns, .begin = ordinal, .count = end - ordinal } };
-            try writeDiskCohort(manager, &file, &payloads, heads, values, keys, ordinal, self.budget.limit -| heads.residentCharge());
+            try writeDiskCohort(manager, &file, &payloads, &heads, values, keys, ordinal, self.budget.limit -| heads.residentCharge());
             ordinal = end;
         }
         self.value_columns.deinit();
@@ -1621,7 +1656,7 @@ pub const HashJoin = struct {
     fn appendDiskBatch(self: *HashJoin, values: @import("execution_batch.zig").Batch, keys: []const Datum) !void {
         if (keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
         const hashed = try keyHash(keys);
-        const bucket = if (hashed) |value| value & (self.disk_heads.len - 1) else 0;
+        const bucket = if (hashed) |value| value else 0;
         const offset = try writeDiskRecord(self.limits.spill.?, &self.disk.?, &self.disk_values, values, keys, self.row_count, if (hashed != null) try self.disk_heads.get(bucket) else @import("spill.zig").none, self.budget.limit -| self.disk_heads.residentCharge());
         if (hashed != null) try self.disk_heads.set(bucket, offset);
         self.key_count = keys.len;
@@ -1643,6 +1678,10 @@ pub const HashJoin = struct {
             self.limits.spill.?.allocator().destroy(file);
         }
         if (self.disk) |*file| file.close();
+        if (self.disk_keys) |keys| {
+            keys.deinit();
+            alloc.destroy(keys);
+        }
         self.disk_arena.deinit();
         self.disk_heads.deinit(alloc);
         self.value_columns.deinit();
@@ -1777,7 +1816,7 @@ pub const HashJoin = struct {
                 for (positions, begin..) |*position, index| position.* = index;
                 const selected = try batch.select(region.allocator(), positions);
                 if (self.key_count != null and keys[begin].len != self.key_count.?) return error.InvalidSqlBackendResponse;
-                try writeDiskCohort(self.limits.spill.?, &self.disk.?, &self.disk_values, self.disk_heads, selected, keys[begin..end], self.row_count, self.budget.limit -| self.disk_heads.residentCharge());
+                try writeDiskCohort(self.limits.spill.?, &self.disk.?, &self.disk_values, &self.disk_heads, selected, keys[begin..end], self.row_count, self.budget.limit -| self.disk_heads.residentCharge());
                 self.key_count = keys[begin].len;
                 self.row_count += end - begin;
                 begin = end;
@@ -1827,7 +1866,7 @@ pub const HashJoin = struct {
         self.sealed = true;
         if (self.key_count != null and self.key_count.? != keys.len) return error.InvalidSqlBackendResponse;
         if (self.disk != null) {
-            const bucket = if (try keyHash(keys)) |hashed| try self.disk_heads.get(hashed & (self.disk_heads.len - 1)) else @import("spill.zig").none;
+            const bucket = if (try keyHash(keys)) |hashed| try self.disk_heads.get(hashed) else @import("spill.zig").none;
             return .{ .owner = self, .keys = keys, .cursor = if (bucket == @import("spill.zig").none) null else @intCast(bucket) };
         }
         return .{ .owner = self, .keys = keys, .cursor = if (try keyHash(keys)) |hashed| self.heads.get(hashed) else null };
@@ -1848,7 +1887,10 @@ pub const HashJoin = struct {
                 if (self.disk == null) probe_.cursor = self.heads.get(value);
             }
         }
-        if (self.disk != null) try self.disk_heads.seedProbes(hashes, probes);
+        if (self.disk != null) {
+            try self.disk_heads.seedProbes(hashes, probes);
+            if (self.disk_values != null) try self.primeDiskProbes(probes);
+        }
         if (self.disk == null) {
             // Interleave chain traversal across lanes. Keep the first exact
             // match in the probe and leave remaining duplicates lazy.
@@ -1868,6 +1910,60 @@ pub const HashJoin = struct {
         }
         return probes;
     }
+    /// Reusable/recursive builds keep their full-hash directory. Stage native
+    /// candidate metadata in file-offset order within a bounded partition wave;
+    /// output lanes retain input order and duplicate chains remain lazy.
+    fn primeDiskProbes(self: *HashJoin, probes: []Probe) !void {
+        var begin: usize = 0;
+        while (begin < probes.len) {
+            const cohort = probes[begin..@min(probes.len, begin + 512)];
+            var active: [512]bool = @splat(true);
+            while (true) {
+                var lanes: [512]usize = undefined;
+                var count: usize = 0;
+                for (cohort, 0..) |probe_, i| if (active[i] and probe_.cursor != null and probe_.first == null) {
+                    lanes[count] = i;
+                    count += 1;
+                };
+                if (count == 0) break;
+                std.mem.sort(usize, lanes[0..count], cohort, struct {
+                    fn less(values: []Probe, l: usize, r: usize) bool {
+                        return values[l].cursor.? < values[r].cursor.?;
+                    }
+                }.less);
+                var at: usize = 0;
+                while (at < count) {
+                    const index = cohort[lanes[at]].cursor.?;
+                    var end = at + 1;
+                    while (end < count and cohort[lanes[end]].cursor.? == index) : (end += 1) {}
+                    const decoded = try self.readProbeKey(&self.disk.?, index);
+                    // One decode serves every lane reaching this immutable
+                    // record. Equality and remaining duplicate chains stay local
+                    // to each probe; no decoded pointer escapes this group.
+                    for (lanes[at..end]) |lane| {
+                        const probe_ = &cohort[lane];
+                        if (decoded.row.ordinal & native_payload_bit == 0) {
+                            active[lane] = false;
+                            continue;
+                        }
+                        probe_.cursor = if (decoded.next == @import("spill.zig").none) null else @intCast(decoded.next);
+                        self.probes += 1;
+                        if (decoded.row.keys.len != probe_.keys.len) return error.InvalidSqlSpill;
+                        var equal = true;
+                        for (decoded.row.keys, probe_.keys) |l, r| if (l.sql_null or r.sql_null or (try scalar.compareDatums(l, r)) != .eq) {
+                            equal = false;
+                            break;
+                        };
+                        if (equal) {
+                            probe_.first = try self.probeMatch(index, decoded);
+                        }
+                    }
+                    at = end;
+                }
+            }
+            begin += cohort.len;
+        }
+    }
     /// Mark only after the complete ON residual accepts this candidate.
     pub fn markMatched(self: *HashJoin, index: usize) !void {
         if (self.disk) |*file| {
@@ -1877,6 +1973,7 @@ pub const HashJoin = struct {
         self.entries.items[index].matched = true;
     }
     fn readDiskKey(self: *HashJoin, file: *@import("spill.zig").File, offset: u64) !@import("spill.zig").Decoded {
+        self.disk_key_decodes += 1;
         _ = self.disk_arena.reset(.free_all);
         const stable = self.budget.allocator();
         var pressure: @import("spill.zig").CachePressure = .{ .manager = file.manager, .context = self, .evict = evictPayload, .backing = stable };
@@ -1884,6 +1981,51 @@ pub const HashJoin = struct {
         self.disk_arena.child_allocator = pressure.allocator();
         defer self.disk_arena.child_allocator = stable;
         return file.read(self.disk_arena.allocator(), offset);
+    }
+    /// Only sealed native key/coordinate records are reusable. Matched flags
+    /// are mutable and deliberately bypass this cache in unmatched(). Moving
+    /// the decode arena admits metadata without cloning keys or payloads.
+    fn readProbeKey(self: *HashJoin, file: *@import("spill.zig").File, offset: u64) !@import("spill.zig").Decoded {
+        if (self.disk_keys) |cache| {
+            cache.clock +|= 1;
+            for (&cache.slots) |*slot| if (slot.*) |*value| if (value.offset == offset) {
+                try file.manager.check();
+                value.used = cache.clock;
+                return value.decoded;
+            };
+        }
+        const decoded = try self.readDiskKey(file, offset);
+        if (!self.sealed or self.key_cache_bytes == 0 or decoded.row.ordinal & native_payload_bit == 0) return decoded;
+        // A bounded exact-offset probation filter avoids retaining one-pass
+        // records. Hash collisions decline admission, never claim equality.
+        const tag: usize = @intCast((offset *% 0x9e3779b97f4a7c15) >> 61);
+        if (self.key_probation[tag] != offset) {
+            self.key_probation[tag] = offset;
+            return decoded;
+        }
+        const capacity = self.disk_arena.queryCapacity();
+        const limit = @min(self.key_cache_bytes, self.budget.limit / 8);
+        // Preserve scratch space and the existing small-budget scalar path.
+        const available = @import("memory_budget.zig").headroom(self.budget.allocator()) orelse 0;
+        if (capacity > limit or available < 128 * 1024) return decoded;
+        if (self.disk_keys == null) {
+            const cache = try self.budget.allocator().create(KeyCache);
+            cache.* = .{};
+            self.disk_keys = cache;
+        }
+        const cache = self.disk_keys.?;
+        while (capacity > limit -| cache.bytes) _ = cache.evict();
+        const slot = for (&cache.slots) |*value| {
+            if (value.* == null) break value;
+        } else blk: {
+            _ = cache.evict();
+            for (&cache.slots) |*value| if (value.* == null) break :blk value;
+            unreachable;
+        };
+        slot.* = .{ .arena = self.disk_arena, .decoded = decoded, .offset = offset, .used = cache.clock };
+        cache.bytes += capacity;
+        self.disk_arena = std.heap.ArenaAllocator.init(self.budget.allocator());
+        return decoded;
     }
     pub fn unmatched(self: *HashJoin, next: *usize) !?Match {
         if (self.disk) |*file| {
@@ -3930,7 +4072,7 @@ test "SQL execution pager restores join buckets and grouped transitions through 
     const join = try HashJoin.create(a, .{ .bytes = 1024 * 1024, .spill = &manager });
     defer join.deinit();
     try join.startSpill();
-    try std.testing.expect(join.disk_heads.paged != null);
+    try std.testing.expect(join.disk_heads.partitioned != null);
     for (0..1500) |i| try join.add(&.{Datum.json(.{ .integer = @intCast(i + 100) })}, &.{Datum.json(.{ .integer = @intCast(i) })});
     const grouped = try Grouped.create(a, &.{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer } }, .{ .bytes = 8 * 1024 * 1024, .spill = &manager });
     defer grouped.deinit();
@@ -6125,4 +6267,298 @@ test "SQL finalized aggregate streams bypass hash retention and fence ownership 
         try std.testing.expectError(error.SqlProgramLimitExceeded, group.nextResultBatch(page.allocator(), 2, false));
     }
     try std.testing.expectEqual(@as(usize, 1), source.closes);
+}
+
+test "SQL spilled joins reject full hash misses before decoding keys and preserve duplicate matches" {
+    const a = std.testing.allocator;
+    var marker: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .page_residency_bytes = 3 * @import("execution_pager.zig").page_bytes, .async_writes = false };
+    defer manager.deinit();
+    const join = try HashJoin.create(a, .{ .bytes = 1024 * 1024, .spill = &manager });
+    defer join.deinit();
+    try join.startSpill();
+    try std.testing.expect(join.disk_heads.partitioned != null);
+    for (0..1024) |i| try join.add(&.{Datum.json(.{ .integer = @intCast(i) })}, &.{Datum.json(.{ .integer = @intCast(i) })});
+    try join.add(&.{Datum.json(.{ .integer = 9001 })}, &.{Datum.json(.{ .integer = 17 })});
+    try join.add(&.{Datum.json(.{ .integer = 9002 })}, &.{Datum.json(.{ .integer = 17 })});
+    var cells: [129]Datum = undefined;
+    var keys: [129][]const Datum = undefined;
+    for (&cells, &keys, 0..) |*cell, *key, i| {
+        cell.* = Datum.json(.{ .integer = if (i == 128) 999999 else @intCast(i) });
+        key.* = @as([*]Datum, @ptrCast(cell))[0..1];
+    }
+    const probes = try join.probeBatch(a, &keys);
+    defer a.free(probes);
+    var matches: usize = 0;
+    for (probes, 0..) |*probe_, i| {
+        var count: usize = 0;
+        while (try probe_.next()) |match| {
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            const value = (try match.materializeValues(scratch.allocator()))[0].value.integer;
+            try std.testing.expect(value == @as(i64, @intCast(i)) or (i == 17 and (value == 9001 or value == 9002)));
+            try join.markMatched(match.index);
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, if (i == 128) 0 else if (i == 17) 3 else 1), count);
+        matches += count;
+    }
+    try std.testing.expectEqual(@as(u64, @intCast(matches)), join.probes);
+    var next: usize = 0;
+    var unmatched: usize = 0;
+    while (try join.unmatched(&next)) |_| unmatched += 1;
+    try std.testing.expectEqual(@as(usize, 1024 - 128), unmatched);
+}
+
+test "SQL native disk probe waves preserve key and duplicate ownership without hydrating payloads" {
+    const a = std.testing.allocator;
+    var marker: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    const join = try HashJoin.create(a, .{ .bytes = 1024 * 1024, .spill = &manager });
+    defer join.deinit();
+    try join.startSpill();
+    const payload: [2048]u8 = @splat('p');
+    const count = 513;
+    for (0..count) |i| try join.add(&.{ Datum.json(.{ .integer = @intCast(i) }), Datum.json(.{ .string = &payload }) }, &.{Datum.json(.{ .integer = @intCast(i) })});
+    try join.add(&.{ Datum.json(.{ .integer = 9999 }), Datum.json(.{ .string = &payload }) }, &.{Datum.json(.{ .integer = 7 })});
+    var cells: [count]Datum = undefined;
+    var keys: [count][]const Datum = undefined;
+    for (&cells, &keys, 0..) |*cell, *key_, i| {
+        cell.* = Datum.json(.{ .integer = @intCast(count - 1 - i) });
+        key_.* = @as([*]Datum, @ptrCast(cell))[0..1];
+    }
+    const probes = try join.probeBatch(a, &keys);
+    defer a.free(probes);
+    try std.testing.expectEqual(@as(usize, 0), join.payload_reads);
+    for (probes, 0..) |*probe_, i| {
+        try std.testing.expect(probe_.first != null and probe_.first.?.key_record != null);
+        const match = (try probe_.next()).?;
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const key_ = try match.materializeKeys(scratch.allocator());
+        try std.testing.expectEqual(@as(i64, @intCast(count - 1 - i)), key_[0].value.integer);
+        const values = try match.materializeValues(scratch.allocator());
+        try std.testing.expectEqual(@as(i64, if (count - 1 - i == 7) 9999 else @intCast(count - 1 - i)), values[0].value.integer);
+        try std.testing.expectEqualSlices(u8, &payload, values[1].value.string);
+        if (count - 1 - i == 7) try std.testing.expect((try probe_.next()) != null);
+        try std.testing.expect((try probe_.next()) == null);
+    }
+}
+
+test "SQL repeated native probe cohorts decode each candidate once without hydrating payloads" {
+    try repeatedProbeScenario(std.testing.allocator, 1025);
+    // Repeat without SafeAllocator stack capture so the timing comparison also
+    // reflects normal backing allocation; the budget still verifies cleanup.
+    var budget: MemoryBudget = .{ .backing = std.heap.smp_allocator, .limit = 32 * 1024 * 1024 };
+    try repeatedProbeScenario(budget.allocator(), 8193);
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+}
+fn repeatedProbeScenario(a: Allocator, comptime count: usize) !void {
+    const Baseline = struct {
+        fn prime(join: *HashJoin, probe_alloc: Allocator, keys: []const []const Datum) ![]HashJoin.Probe {
+            const probes = try probe_alloc.alloc(HashJoin.Probe, keys.len);
+            errdefer probe_alloc.free(probes);
+            const hashes = try @import("batch_hash.zig").rows(probe_alloc, keys, false);
+            defer probe_alloc.free(hashes);
+            for (keys, probes) |row, *probe_| probe_.* = .{ .owner = join, .keys = row, .cursor = null };
+            try join.disk_heads.seedProbes(hashes, probes);
+            // Equal offsets already have the old wave's physical ordering.
+            // This oracle performs one exact scalar decode per candidate lane.
+            for (probes) |*probe_| if (try probe_.next()) |value| {
+                var match = value;
+                match.keys = &.{};
+                match.transient = false;
+                match.key_record = .{ .join = join, .offset = match.index };
+                probe_.first = match;
+            };
+            return probes;
+        }
+    };
+    var marker: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    const join = try HashJoin.create(a, .{ .bytes = 1024 * 1024, .spill = &manager });
+    defer join.deinit();
+    try join.startSpill();
+    const payload: [2048]u8 = @splat('p');
+    const key = Datum.json(.{ .string = "shared-key" });
+    try join.add(&.{ Datum.json(.{ .integer = 1 }), Datum.json(.{ .string = &payload }) }, &.{key});
+    try join.add(&.{ Datum.json(.{ .integer = 2 }), Datum.json(.{ .string = &payload }) }, &.{key});
+    var keys: [count + 1][]const Datum = @splat(&.{key});
+    keys[count] = &.{.{}};
+    const clock_ = @import("antfly_platform").time;
+    const before_scalar = join.disk_key_decodes;
+    join.key_cache_bytes = 0;
+    const scalar_start = clock_.monotonicNs();
+    const scalar_probes = try Baseline.prime(join, a, &keys);
+    const scalar_ns = clock_.monotonicNs() - scalar_start;
+    defer a.free(scalar_probes);
+    const scalar_decodes = join.disk_key_decodes - before_scalar;
+    const scalar_first = scalar_probes[0].first.?.index;
+    const scalar_next = scalar_probes[0].cursor;
+    const scalar_tail_start = clock_.monotonicNs();
+    for (scalar_probes[0..count]) |*probe_| {
+        try std.testing.expect((try probe_.next()) != null);
+        try std.testing.expect((try probe_.next()) != null);
+        try std.testing.expect((try probe_.next()) == null);
+    }
+    const scalar_tail_ns = clock_.monotonicNs() - scalar_tail_start;
+    const scalar_tail_decodes = join.disk_key_decodes - before_scalar - scalar_decodes;
+    join.key_cache_bytes = 64 * 1024;
+    const before_batch = join.disk_key_decodes;
+    const batch_start = clock_.monotonicNs();
+    const batch = try join.probeBatch(a, &keys);
+    const batch_ns = clock_.monotonicNs() - batch_start;
+    defer a.free(batch);
+    const batch_decodes = join.disk_key_decodes - before_batch;
+    try std.testing.expectEqual(@as(usize, count), scalar_decodes);
+    try std.testing.expectEqual(@as(usize, 2), batch_decodes);
+    try std.testing.expectEqual(@as(usize, 0), join.payload_reads);
+    for (batch[0..count]) |actual| {
+        try std.testing.expectEqual(scalar_next, actual.cursor);
+        try std.testing.expectEqual(scalar_first, actual.first.?.index);
+    }
+    try std.testing.expect(batch[count].first == null and batch[count].cursor == null);
+    // Keep stable coordinates across subsequent decoding, eviction and payload
+    // reads. The scalar traversal above already consumed its lazy duplicates.
+    const saved = batch[0].first.?;
+    const before_tail = join.disk_key_decodes;
+    const tail_start = clock_.monotonicNs();
+    for (batch[0..count], 0..) |*probe_, lane| {
+        const first = (try probe_.next()).?;
+        const second = (try probe_.next()).?;
+        try std.testing.expect(first.index != second.index);
+        try std.testing.expect((try probe_.next()) == null);
+        if (lane == 0) {
+            // Residual rejection of the first duplicate must leave it unmatched.
+            try join.markMatched(second.index);
+        }
+    }
+    const tail_ns = clock_.monotonicNs() - tail_start;
+    const tail_decodes = join.disk_key_decodes - before_tail;
+    try std.testing.expectEqual(@as(usize, count), scalar_tail_decodes);
+    try std.testing.expectEqual(@as(usize, 2), tail_decodes);
+    try std.testing.expect((try batch[count].next()) == null);
+    while (join.disk_keys.?.evict()) {}
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const restored = try saved.materializeKeys(scratch.allocator());
+    try std.testing.expectEqualStrings("shared-key", restored[0].value.string);
+    try std.testing.expectEqual(@as(i64, 2), (try saved.materializeValues(scratch.allocator()))[0].value.integer);
+    var position: usize = 0;
+    try std.testing.expect((try join.unmatched(&position)) != null);
+    try std.testing.expect((try join.unmatched(&position)) == null);
+    std.debug.print("native repeated probes: lanes={} scalar_decodes={} shared_decodes={} scalar_ns={} shared_ns={} scalar_tail_decodes={} shared_tail_decodes={} scalar_tail_ns={} shared_tail_ns={}\n", .{ count, scalar_decodes, batch_decodes, scalar_ns, batch_ns, scalar_tail_decodes, tail_decodes, scalar_tail_ns, tail_ns });
+}
+
+test "SQL native key metadata cache preserves cancellation matched flags and allocation failure cleanup" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            var canceled = false;
+            var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &canceled, .checkpoint = struct {
+                fn check(raw: *anyopaque) !void {
+                    if (@as(*bool, @ptrCast(@alignCast(raw))).*) return error.Canceled;
+                }
+            }.check, .async_writes = false };
+            defer manager.deinit();
+            const join = try HashJoin.create(a, .{ .bytes = 1024 * 1024, .spill = &manager });
+            defer join.deinit();
+            try join.startSpill();
+            const payload: [2048]u8 = @splat('p');
+            const key = Datum.json(.{ .integer = 7 });
+            for (0..10) |i| try join.add(&.{ Datum.json(.{ .integer = @intCast(i) }), Datum.json(.{ .string = &payload }) }, &.{key});
+            var probe_ = try join.probe(&.{key});
+            const saved = (try probe_.next()).?;
+            try std.testing.expect(join.disk_keys == null);
+            try join.markMatched(saved.index);
+            var repeated = try join.probe(&.{key});
+            try std.testing.expectEqual(saved.index, (try repeated.next()).?.index);
+            try std.testing.expect(join.disk_keys != null);
+            var replay = try join.probe(&.{key});
+            const before = join.disk_key_decodes;
+            canceled = true;
+            try std.testing.expectError(error.Canceled, replay.next());
+            canceled = false;
+            try std.testing.expectEqual(saved.index, (try replay.next()).?.index);
+            try std.testing.expectEqual(before, join.disk_key_decodes);
+            // Evict the retained first record by traversing a longer chain.
+            var count: usize = 1;
+            while (try probe_.next()) |_| count += 1;
+            try std.testing.expectEqual(@as(usize, 10), count);
+            while (try repeated.next()) |_| {}
+            try std.testing.expect(join.disk_keys.?.bytes <= join.key_cache_bytes);
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            try std.testing.expectEqual(@as(i64, 7), (try saved.materializeKeys(scratch.allocator()))[0].value.integer);
+            try std.testing.expectEqual(@as(usize, 0), join.payload_reads);
+            var position: usize = 0;
+            count = 0;
+            while (try join.unmatched(&position)) |_| count += 1;
+            try std.testing.expectEqual(@as(usize, 9), count);
+            // Local pressure reclaims metadata even with an unbounded manager.
+            var pressure: @import("spill.zig").CachePressure = .{ .manager = &manager, .context = join, .evict = HashJoin.evictPayload, .backing = join.budget.allocator() };
+            pressure.prepare(join.budget.limit);
+            try std.testing.expectEqual(@as(usize, 0), join.disk_keys.?.bytes);
+        }
+    };
+    try Case.run(std.testing.allocator);
+    var deterministic = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(deterministic.allocator(), Case.run, .{});
+}
+
+test "SQL native key metadata cache keeps distinct probe work bounded" {
+    var budget: MemoryBudget = .{ .backing = std.heap.smp_allocator, .limit = 32 * 1024 * 1024 };
+    {
+        const a = budget.allocator();
+        var marker: u8 = 0;
+        var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = struct {
+            fn check(_: *anyopaque) !void {}
+        }.check, .async_writes = false };
+        defer manager.deinit();
+        const join = try HashJoin.create(a, .{ .bytes = 1024 * 1024, .spill = &manager });
+        defer join.deinit();
+        try join.startSpill();
+        const count = 2049;
+        const payload: [2048]u8 = @splat('p');
+        var cells: [count]Datum = undefined;
+        var keys: [count][]const Datum = undefined;
+        for (&cells, &keys, 0..) |*cell, *key_, i| {
+            cell.* = Datum.json(.{ .integer = @intCast(i) });
+            key_.* = @as([*]Datum, @ptrCast(cell))[0..1];
+            try join.add(&.{ Datum.json(.{ .integer = @intCast(i) }), Datum.json(.{ .string = &payload }) }, key_.*);
+        }
+        var timings: [2][3]i128 = undefined;
+        var decodes: [2]usize = @splat(0);
+        const clock_ = @import("antfly_platform").time;
+        for (&timings, 0..) |*samples, mode| {
+            join.key_cache_bytes = if (mode == 0) 0 else 64 * 1024;
+            for (samples) |*sample| {
+                if (join.disk_keys) |cache| cache.deinit();
+                join.key_probation = @splat(@import("spill.zig").none);
+                const before = join.disk_key_decodes;
+                const start = clock_.monotonicNs();
+                const probes = try join.probeBatch(a, &keys);
+                defer a.free(probes);
+                for (probes) |*probe_| {
+                    try std.testing.expect((try probe_.next()) != null);
+                    try std.testing.expect((try probe_.next()) == null);
+                }
+                sample.* = clock_.monotonicNs() - start;
+                decodes[mode] += join.disk_key_decodes - before;
+                if (join.disk_keys) |cache| try std.testing.expect(cache.bytes <= join.key_cache_bytes);
+            }
+            std.mem.sort(i128, samples, {}, std.sort.asc(i128));
+        }
+        try std.testing.expect(decodes[1] <= decodes[0]);
+        try std.testing.expectEqual(@as(usize, 0), join.payload_reads);
+        std.debug.print("native distinct probes: lanes={} scalar_decodes={} cached_decodes={} scalar_median_ns={} cached_median_ns={}\n", .{ count, decodes[0], decodes[1], timings[0][1], timings[1][1] });
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
 }

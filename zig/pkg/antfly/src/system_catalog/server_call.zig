@@ -70,6 +70,7 @@ pub const RelationDescriptionMutation = struct {
 };
 
 pub const Call = union(enum) {
+    resolver_authority_mutate: @import("../metadata/resolver_authority.zig").Write,
     lake_index_lifecycle_read: u64,
     lake_index_lifecycle_work: ?u64,
     lake_index_lifecycle_mutate: @import("../metadata/lake_index_lifecycle.zig").Write,
@@ -145,6 +146,9 @@ pub const Call = union(enum) {
     relation_schema_mutate: RelationSchemaMutation,
     relation_description_mutate: RelationDescriptionMutation,
     query_definition: []const u8,
+    /// Private body-bound native service provisioning. Old metadata peers
+    /// reject this tag before any table or private source is published.
+    native_memory_create: Request,
     mutate: Request,
     // A distinct operation makes older peers reject unsupported point reads.
     table_status: TableStatusTarget,
@@ -165,7 +169,7 @@ pub const Call = union(enum) {
             .mutate => |request| request.mutation.action == .comment,
             .schema_validation_prepare, .schema_validation_status => true,
             .schema_validation_submit => |bytes| @import("../metadata/schema_validation_ledger.zig").requiresAdmissionAuthority(bytes),
-            .sql_sequence_prepare, .sql_sequence_counter_mutate, .sql_sequence_counter_outcome, .sql_view_mutate, .sql_sequence_snapshot, .sql_sequence_admission_head, .sql_sequence_mutate, .sql_sequence_outcome, .relation_replace, .relation_schema_mutate, .relation_description_mutate, .constraint_name_prepare, .constraint_name_check, .relational_index_status, .relational_index_prepare, .relational_index_begin => true,
+            .sql_sequence_prepare, .sql_sequence_counter_mutate, .sql_sequence_counter_outcome, .sql_view_mutate, .sql_sequence_snapshot, .sql_sequence_admission_head, .sql_sequence_mutate, .sql_sequence_outcome, .relation_replace, .relation_schema_mutate, .relation_description_mutate, .constraint_name_prepare, .constraint_name_check, .relational_index_status, .relational_index_prepare, .relational_index_begin, .native_memory_create => true,
             .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };

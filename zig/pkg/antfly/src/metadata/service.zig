@@ -3509,7 +3509,18 @@ test "relation mutation admission projects naming capability without materializi
 }
 
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
-    return @max(resolverRequiredCoordinatedDecoderVersion(command), baseRequiredCoordinatedDecoderVersion(command), clockReadersRequiredDecoderVersion(command));
+    return @max(resolverRequiredCoordinatedDecoderVersion(command), baseRequiredCoordinatedDecoderVersion(command), clockReadersRequiredDecoderVersion(command), nativeServiceRequiredDecoderVersion(command));
+}
+
+fn nativeServiceRequiredDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    // Service ownership belongs to logical catalog resources, not physical
+    // topology TableRecords. Only envelopes carrying that fact need its floor.
+    const required = switch (command) {
+        .apply_system_catalog, .apply_fk_initial_create, .apply_fk_generation_publication, .apply_restore_staging, .begin_relational_index_publication => |bytes| @import("schema_reader_wire.zig").requiresNativeService(bytes),
+        .create_restore_job_with_staging => |request| @import("schema_reader_wire.zig").requiresNativeService(request.plan_json),
+        else => false,
+    };
+    return if (required) metadata_topology_protocol.native_service_tables_version else 0;
 }
 
 fn clockReadersRequiredDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
@@ -3602,10 +3613,13 @@ fn resolverRequiredCoordinatedDecoderVersion(command: metadata_storage.Transitio
         },
         else => "",
     };
+    if (metadata_topology_protocol.usesResolverRecords(namespace_indexes)) return metadata_topology_protocol.resolver_records_version;
     if (metadata_topology_protocol.usesResolverNamespaces(namespace_indexes)) return metadata_topology_protocol.resolver_namespaces_version;
     switch (command) {
-        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| for (delta.upsert_tables) |table| {
-            if (resolverRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }) >= metadata_topology_protocol.resolver_namespaces_version) return metadata_topology_protocol.resolver_namespaces_version;
+        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| {
+            var required: u16 = 0;
+            for (delta.upsert_tables) |table| required = @max(required, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
+            return required;
         },
         else => {},
     }
@@ -3613,6 +3627,7 @@ fn resolverRequiredCoordinatedDecoderVersion(command: metadata_storage.Transitio
 }
 
 fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    if (command == .apply_resolver_authority) return metadata_topology_protocol.resolver_records_version;
     if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresResourceComments(command.apply_system_catalog)) return metadata_topology_protocol.sql_resource_comments_version;
     if (command == .apply_fk_generation_publication and @import("schema_reader_wire.zig").requiresHistoricalReferences(command.apply_fk_generation_publication)) return metadata_topology_protocol.fk_historical_references_version;
     if (command == .apply_fk_initial_create and @import("schema_reader_wire.zig").requiresHistoricalReferences(command.apply_fk_initial_create)) return metadata_topology_protocol.fk_historical_references_version;
@@ -3709,6 +3724,12 @@ fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCom
         },
         else => false,
     };
+    const has_native_resolver_records = switch (command) {
+        .upsert_table => |table| std.mem.indexOf(u8, table.indexes_json, "_resolver_record_store") != null,
+        .compare_and_replace_table => |cas| std.mem.indexOf(u8, cas.replacement.indexes_json, "_resolver_record_store") != null,
+        else => false,
+    };
+    if (has_native_resolver_records) return metadata_topology_protocol.resolver_records_version;
     if (object_engine) return metadata_topology_protocol.object_table_engine_version;
     switch (command) {
         .mutate_lake_index_lifecycle, .remove_table => return metadata_topology_protocol.lake_index_catalog_version,
@@ -3884,7 +3905,7 @@ test "system catalog USING rewrite decoder barrier precedes lower schema reader 
     try std.testing.expectEqual(metadata_topology_protocol.sql_column_transform_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = bytes }));
     // A malformed envelope must retain the strongest possible requirement,
     // not let a weaker transform projection bypass text-generation binding.
-    try std.testing.expectEqual(metadata_topology_protocol.schema_validation_publication_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = "{" }));
+    try std.testing.expectEqual(metadata_topology_protocol.current_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = "{" }));
 }
 
 test "system catalog CHECK identity decoder barrier covers admission and planless owner ACKs" {
@@ -14040,6 +14061,8 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     vector_storage.storage.dense_embeddings = .vector_store;
     const legacy: metadata_storage.TransitionCommand = .{ .upsert_table = plain };
     const commands = [_]metadata_storage.TransitionCommand{
+        .{ .apply_system_catalog = "{\"mutation\":{\"action\":\"create\",\"kind\":\"table\",\"name\":\"native_owned\",\"native_service\":\"memory\"}}" },
+        .{ .apply_resolver_authority = "{}" },
         .{ .apply_system_catalog = "{\"mutation\":{\"action\":\"comment\",\"kind\":\"namespace\",\"name\":\"public\",\"description\":null}}" },
         .{ .apply_restore_staging = "{}" },
         .{ .create_restore_job_with_staging = .{ .key = "\x00\x00__api_restore_jobs__:0000000000000001", .value = "{}", .plan_json = "{}" } },
@@ -23975,4 +23998,13 @@ test "FK historical reference decoder protects new writers without widening lega
 test "system catalog resource comments require decoder activation for annotation removal too" {
     try std.testing.expectEqual(metadata_topology_protocol.sql_resource_comments_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = "{\"mutation\":{\"action\":\"comment\",\"description\":null}}" }));
     try std.testing.expect(transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = "{\"mutation\":{\"action\":\"rename\",\"description\":null}}" }) < metadata_topology_protocol.sql_resource_comments_version);
+}
+
+test "system catalog merged service ownership retains independent SQL and resolver decoder floors" {
+    const plain: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "rows" };
+    const owned: metadata_storage.TransitionCommand = .{ .apply_system_catalog = "{\"mutation\":{\"native_service\":\"memory\"}}" };
+    try std.testing.expectEqual(@as(u16, 0), transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = plain }));
+    try std.testing.expectEqual(metadata_topology_protocol.native_service_tables_version, transitionRequiredCoordinatedDecoderVersion(owned));
+    try std.testing.expectEqual(metadata_topology_protocol.resolver_records_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_resolver_authority = "{}" }));
+    try std.testing.expectEqual(metadata_topology_protocol.sql_resource_comments_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = "{\"mutation\":{\"action\":\"comment\",\"description\":null}}" }));
 }

@@ -28325,6 +28325,7 @@ const RemoteMetadataSource = struct {
                 .supports_sql_views = true,
                 .supports_sql_sequences = true,
                 .supports_resolver_catalog_read = true,
+                .supports_resolver_authority = true,
                 .status = remoteStatus,
                 .admin_snapshot = remoteAdminSnapshot,
                 .control_snapshot = remoteControlSnapshot,

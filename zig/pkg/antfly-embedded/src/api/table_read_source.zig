@@ -817,6 +817,47 @@ pub const TableReadSource = struct {
         return try BoundaryAbi.call("query", self.boundary_dispatch, self.vtable.query, .{ self.ptr, alloc, table_name, req, consistency });
     }
 
+    pub const HydratedDocuments = struct {
+        arena: std.heap.ArenaAllocator,
+        rows: []const ?[]const u8,
+        pub fn deinit(self: *HydratedDocuments) void {
+            self.arena.deinit();
+        }
+    };
+
+    /// Bounded exact-ID hydration through the shared routed query/read fence.
+    /// Results align with input IDs; missing records are null. These are data
+    /// snapshots, not version/digest tokens for compare-and-swap publication.
+    pub fn hydrateDocuments(self: TableReadSource, alloc: std.mem.Allocator, table_name: []const u8, req: db_types.SearchRequest, consistency: read_gate.ReadConsistency) !?HydratedDocuments {
+        if (req.document_authority_mode != .lookup or req.query != .match_all or !req.filter_doc_ids_positive or req.filter_doc_ids.len == 0 or req.filter_doc_ids.len > 64 or !req.include_stored or req.limit != req.filter_doc_ids.len) return error.InvalidArgument;
+        var response = (try self.query(alloc, table_name, req, consistency)) orelse return null;
+        defer response.deinit(alloc);
+        if (response.json.len > 32 * 1024 * 1024) return error.OutOfMemory;
+        // Typed wrappers borrow exact source bytes, without building a DOM of
+        // document payloads. Own the response before releasing the transport.
+        const Wire = struct { responses: []const struct { hits: struct { hits: []const struct { _id: []const u8, _source: @import("antfly-json").BorrowedValue } } } };
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        const owned = arena.allocator();
+        const parsed = try std.json.parseFromSliceLeaky(Wire, owned, try owned.dupe(u8, response.json), .{ .ignore_unknown_fields = true });
+        if (parsed.responses.len != 1) return error.UnexpectedToken;
+        if (parsed.responses[0].hits.hits.len > req.filter_doc_ids.len) return error.UnexpectedToken;
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(alloc);
+        const result = try owned.alloc(?[]const u8, req.filter_doc_ids.len);
+        @memset(result, null);
+        for (parsed.responses[0].hits.hits) |hit| {
+            if ((try seen.getOrPut(alloc, hit._id)).found_existing) return error.UnexpectedToken;
+            var found = false;
+            for (req.filter_doc_ids, result) |id, *out| if (std.mem.eql(u8, id, hit._id)) {
+                out.* = hit._source.json;
+                found = true;
+            };
+            if (!found) return error.UnexpectedToken;
+        }
+        return .{ .arena = arena, .rows = result };
+    }
+
     pub fn preflightQuery(
         self: TableReadSource,
         alloc: std.mem.Allocator,

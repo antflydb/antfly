@@ -1,7 +1,7 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
-at `fd329daaf9` (verified 2026-10-24). Earlier implementation and
+at `3f8eeafaaf` (verified 2026-10-24). Earlier implementation and
 qualification checkpoints are retained below with their exact scope.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
@@ -45,10 +45,43 @@ Tests cover stable IDs through rename, removal on drop/recreate, exact retries,
 all three write positions before/after failures, snapshot restoration and cold
 reopening. Mounted SQL independently reopens catalog, session and data owners,
 retaining annotations and every user-row value, identity, version and digest.
-The Debug SQL suite passes 1,349 local and 236 dependent tests (four existing
+The Debug SQL suite passes 1,358 local and 236 dependent tests (four existing
 opt-in skips); strict catalog and mounted comment gates have no skips or leaks.
 This closes two original cases; other COMMENT targets and transactional DDL
 remain independently qualified work.
+
+### Main integration after the comment cohort
+
+The native-memory/resolver changes from main retain their ownership checks,
+scoped permission semantics, projection caches and portable resolver exports.
+SQL delegated-view authorization, prepared schema publication, cancellation,
+sequence admission history and checkpoint-dependent export guards remain in
+place. Native checkpoint manifests retain exact table definitions; only portable
+exports materialize resolver projections. Standby barriers cover resolver
+mutations through the same shared catalog mutation lane.
+
+Published main transition tag 78 remains `apply_resolver_authority`. This
+branch's conflicting unpublished index-admission tag moves to 88; older private
+PR journals are unsupported. Combined decoder 69 gates service ownership and
+complete resolver authority independently of SQL comment decoder 68. The storage
+engine descriptor/accessors move to version 34 for the combined request/table
+layouts. All 768 published main failure-status identities and 782 runtime detail
+identities retain their numeric values. Mixed-member single/batch decoder tests
+include owned tables, resolver deltas and SQL comment removal.
+
+Portable resolver export leaves ordinary index bytes unchanged, including values
+which merely resemble resolver markers. Propagation uses main's coalesced dirty
+jobs from the committed table-write phase; preparation never enqueues effects.
+Native callback validation uses `@hasField` instead of a linear reflection scan
+which exhausted Zig's default evaluation budget on the combined interface.
+
+Post-merge Debug qualification passes production compilation, both original
+mounted comment cases, 26 catalog/decoder checks, native-memory ownership,
+48 callback ABI checks and 10 resolver propagation/snapshot/restart tests.
+The complete SQL gate passes 1,358 local and 236 dependent tests with its four
+existing opt-in skips. Strict mounted, catalog, callback and resolver gates have
+no skips or leaks. API generation, repository formatting, the PostgreSQL oracle,
+license checks, the Apache boundary and inventory integrity also pass.
 
 ### Combined table declaration and transaction-owned defaults
 

@@ -946,7 +946,9 @@ test "mounted SQL original resource comments preserve identities authorization a
     try std.testing.expectEqual(@as(usize, 2), parsed.value.cases.len);
     var corpus = try local.sql_parity_fixtures.Corpus.init(a);
     defer corpus.deinit();
-    for (parsed.value.cases) |reference| {
+    const original_ids = [_][]const u8{ "sql-0146", "sql-0147" };
+    for (parsed.value.cases, original_ids) |reference, original_id| {
+        try std.testing.expectEqualStrings(original_id, reference.id);
         try std.testing.expectEqualStrings((try corpus.get(reference.id)).sql, reference.steps[0].sql);
         try std.testing.expect(reference.rename_preserves_identity and reference.recreate_clears_description);
         var retained = std.heap.ArenaAllocator.init(a);

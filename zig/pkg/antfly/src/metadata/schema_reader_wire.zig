@@ -35,6 +35,10 @@ pub fn requiresHistoricalReferences(bytes: []const u8) bool {
     return requiresMarker(bytes, "historical_reference_coverage") or requiresMarker(bytes, "reference_coverage_ready");
 }
 
+pub fn requiresNativeService(bytes: []const u8) bool {
+    return requiresMarker(bytes, "native_service");
+}
+
 pub fn requiresResourceComments(bytes: []const u8) bool {
     return requiresMarker(bytes, "@catalog-resource-comments");
 }

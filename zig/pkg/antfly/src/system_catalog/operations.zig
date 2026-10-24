@@ -452,6 +452,7 @@ test "system catalog table create preparation owns one validated request across 
 pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: Request) ![]u8 {
     if (request.mutation.action == .comment and !context.setting_admin) return error.Forbidden;
     try context.ensureActive();
+    if (request.mutation.native_service != null and request.mutation.native_service != context.native_service) return error.Forbidden;
     if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
     if (request.generated_constraint_names.len != 0 and (request.mutation.kind != .table or request.mutation.action != .create)) return error.InvalidCatalogMutation;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -469,7 +470,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
             .indexes_json = req.indexes_json orelse tables_api.default_indexes_json,
         });
     }
-    const required_version = @max(if (resolver_create) protocol.resolver_namespaces_version else @as(u16, 0), if (request.generated_constraint_names.len != 0) @max(ordinary_version, protocol.constraint_occupancy_version) else ordinary_version);
+    const required_version = @max(if (request.mutation.native_service != null) protocol.native_service_tables_version else @as(u16, 0), @max(if (resolver_create) protocol.resolver_namespaces_version else @as(u16, 0), if (request.generated_constraint_names.len != 0) @max(ordinary_version, protocol.constraint_occupancy_version) else ordinary_version));
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
@@ -1934,6 +1935,7 @@ fn listTablesJson(svc: anytype, alloc: std.mem.Allocator, context: operation.Req
 
 pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: @import("server_call.zig").Call) anyerror![]u8 {
     return switch (input) {
+        .resolver_authority_mutate => |write| @import("../metadata/resolver_authority.zig").mutateOnService(svc, alloc, write, context),
         .resolver_catalog_read => |read| blk: {
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
@@ -2196,6 +2198,14 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             const result = try store.sqlSequenceCounterOutcome(alloc, svc.metadata_group_id, request);
             try context.ensureActive();
             break :blk std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .native_memory_create => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            var admitted = context;
+            admitted.native_service = .memory;
+            var owned = request;
+            owned.mutation.native_service = .memory;
+            break :blk mutate(svc, alloc, admitted, owned);
         },
         .mutate => |request| mutate(svc, alloc, context, request),
     };

@@ -587,6 +587,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi inference pulls a model with progress",
         "capi inference streaming reports request errors without a model",
         "capi get edges json does not double free a non-empty edge slice",
+        "capi native memory",
         "capi native text queries",
         "capi native replacement wait",
         "capi native resolver maintenance retries",
@@ -607,6 +608,10 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "inline resolver replacement",
         "capi lite AddIndexJSON restores the enrichment catalog when admission rejects the index",
     };
+    const memory_capi_check = b.addTest(.{ .name = "memory-capi-check", .root_module = capi_root_mod, .filters = &.{"capi native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("memory-capi-check", "Compile native memory C ABI persistence tests").dependOn(&memory_capi_check.step);
+    const memory_capi_tests = b.addTest(.{ .root_module = capi_root_mod, .filters = &.{"capi native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("memory-capi-test", "Verify native memory persistence through the public C ABI").dependOn(&addFilteredTestRunArtifact(b, memory_capi_tests).step);
     const capi_tests = b.addTest(.{
         .root_module = capi_root_mod,
         // Merged native macOS Debug SQL C API codegen peaked at 16,480,550,912

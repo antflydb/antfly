@@ -42,7 +42,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_metadata_test_step = b.step("antfly-metadata-test", "Run root-module metadata tests only");
     const presentation_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "SQL COMMENT table descriptions", "SQL COMMENT column", "system catalog resource comments", "system catalog definite naming diagnostics", "relational topology admission rejects lifecycle proposals before encoding on mixed metadata versions", "metadata module compiles", "metadata storage module compiles" },
+        .filters = &.{ "SQL COMMENT table descriptions", "SQL COMMENT column", "system catalog resource comments", "system catalog merged service ownership", "system catalog definite naming diagnostics", "system catalog USING rewrite decoder", "system catalog schema reader publication", "schema validation publication text binding", "catalog projection schema reader facts", "relational topology admission rejects lifecycle proposals before encoding on mixed metadata versions", "metadata module compiles", "metadata storage module compiles" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const presentation_run = addFilteredTestRunArtifact(b, presentation_tests);
