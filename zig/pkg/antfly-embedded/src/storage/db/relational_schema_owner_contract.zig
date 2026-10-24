@@ -84,6 +84,133 @@ fn writeFields(value: anytype, writer: anytype) @TypeOf(writer.*).Error!void {
 }
 
 pub const Purpose = enum { not_null, foreign_key_source, foreign_key_parent, foreign_key_dual };
+pub const ForeignKeyParent = struct {
+    constraint_name: []const u8,
+    declared_parent: []const u8,
+    parent_table: []const u8,
+    parent_table_id: u64,
+    parent_schema_version: u32,
+    parent_schema: [32]u8,
+    parent_public: [32]u8,
+    parent_catalog: [32]u8,
+    parent_unique: []const u8,
+    parent_generation: @import("relational_integrity_contract.zig").Generation,
+    /// Public admission pins only the selected UNIQUE definition, permitting
+    /// unrelated parent schema epochs while the validation job is active.
+    parent_definition: ?Digest = null,
+
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "parent_definition") and self.parent_definition == null;
+    }
+    pub fn jsonStringify(self: @This(), writer: anytype) @TypeOf(writer.*).Error!void {
+        return writeFields(self, writer);
+    }
+};
+pub const ForeignKeySource = struct {
+    purpose: Purpose = .foreign_key_source,
+    table_name: []const u8,
+    parents: []const ForeignKeyParent,
+
+    pub fn validate(self: @This()) !void {
+        if (self.purpose != .foreign_key_source or self.parents.len == 0 or self.parents.len > 256 or self.table_name.len == 0 or self.table_name.len > 4096 or std.mem.indexOfScalar(u8, self.table_name, 0) != null) return error.InvalidSchemaValidationJob;
+        var name_bytes: usize = self.table_name.len;
+        for (self.parents, 0..) |scope, i| {
+            if (scope.parent_table_id == 0 or scope.parent_schema_version == 0 or std.mem.allEqual(u8, &scope.parent_generation, 0)) return error.InvalidSchemaValidationJob;
+            inline for (.{ "parent_schema", "parent_public", "parent_catalog" }) |field| if (std.mem.allEqual(u8, &@field(scope, field), 0)) return error.InvalidSchemaValidationJob;
+            if (scope.parent_definition) |fingerprint| if (std.mem.allEqual(u8, &fingerprint, 0)) return error.InvalidSchemaValidationJob;
+            inline for (.{ "constraint_name", "declared_parent", "parent_table", "parent_unique" }) |field| {
+                const name = @field(scope, field);
+                name_bytes = std.math.add(usize, name_bytes, name.len) catch return error.InvalidSchemaValidationJob;
+                if (name.len == 0 or name.len > 4096 or name_bytes > 1024 * 1024 or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidSchemaValidationJob;
+            }
+            for (self.parents[0..i]) |prior| if (std.mem.eql(u8, prior.constraint_name, scope.constraint_name)) return error.InvalidSchemaValidationJob;
+        }
+    }
+};
+
+/// Logical selection supplied by ingress; physical parent generations are
+/// captured separately through the read-only owner preparation boundary.
+pub const Selection = union(enum) {
+    not_null: []const []const u8,
+    foreign_keys: []const []const u8,
+
+    pub fn names(self: @This()) []const []const u8 {
+        return switch (self) {
+            inline else => |value| value,
+        };
+    }
+    pub fn validate(self: @This()) !void {
+        if (self == .foreign_keys and self.foreign_keys.len > 256) return error.InvalidSchemaValidationJob;
+        var projection = ProjectionHasher.init();
+        for (self.names(), 0..) |name, i| {
+            try projection.add(name);
+            for (self.names()[0..i]) |prior| if (std.mem.eql(u8, prior, name)) return error.InvalidSchemaValidationJob;
+        }
+        _ = try projection.finish();
+    }
+};
+
+/// Discriminated immutable inputs. NOT NULL hashes its typed column names;
+/// FK projection identity additionally binds the real claim generations.
+pub const InputSelection = union(enum) {
+    not_null: []const []const u8,
+    foreign_keys: ForeignKeySource,
+
+    pub fn validate(self: @This()) !void {
+        switch (self) {
+            .not_null => |names| try (Selection{ .not_null = names }).validate(),
+            .foreign_keys => |source| try source.validate(),
+        }
+    }
+    pub fn count(self: @This()) usize {
+        return switch (self) {
+            .not_null => |names| names.len,
+            .foreign_keys => |source| source.parents.len,
+        };
+    }
+    pub fn purpose(self: @This()) Purpose {
+        return switch (self) {
+            .not_null => .not_null,
+            .foreign_keys => .foreign_key_source,
+        };
+    }
+    pub fn name(self: @This(), index: usize) []const u8 {
+        return switch (self) {
+            .not_null => |names| names[index],
+            .foreign_keys => |source| source.parents[index].constraint_name,
+        };
+    }
+    pub fn requireSelection(self: @This(), selection: Selection) !void {
+        try self.validate();
+        try selection.validate();
+        if ((self == .not_null) != (selection == .not_null) or self.count() != selection.names().len) return error.InvalidSchemaValidationJob;
+        for (selection.names(), 0..) |selected, i| if (!std.mem.eql(u8, self.name(i), selected)) return error.InvalidSchemaValidationJob;
+    }
+    pub fn logical(self: @This(), a: A) !Selection {
+        const names = try a.alloc([]const u8, self.count());
+        for (names, 0..) |*value, i| value.* = self.name(i);
+        return switch (self) {
+            .not_null => .{ .not_null = names },
+            .foreign_keys => .{ .foreign_keys = names },
+        };
+    }
+    pub fn encodePayload(self: @This(), a: A) ![]u8 {
+        try self.validate();
+        var count_writer = std.Io.Writer.Discarding.init(&.{});
+        switch (self) {
+            inline else => |value| try std.json.Stringify.value(value, .{}, &count_writer.writer),
+        }
+        if (count_writer.fullCount() > max_names) return error.InvalidSchemaValidationJob;
+        const bytes = try a.alloc(u8, @intCast(count_writer.fullCount()));
+        errdefer a.free(bytes);
+        var writer = std.Io.Writer.fixed(bytes);
+        switch (self) {
+            inline else => |value| try std.json.Stringify.value(value, .{}, &writer),
+        }
+        return bytes;
+    }
+};
+
 pub const ReferenceCoverage = struct {
     expected: @import("relational_reference_witness.zig").Witness = .{},
     observed: @import("relational_reference_witness.zig").Witness = .{},

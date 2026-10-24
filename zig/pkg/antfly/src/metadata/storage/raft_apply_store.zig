@@ -23138,7 +23138,7 @@ pub const RaftApplyStore = struct {
             error.NotFound => return error.CatalogGenerationChanged,
             else => return err,
         });
-        const after = try @import("../../api/tables.zig").prepareNullabilityPublicationRecord(a, &before, request.columns);
+        const after = try @import("../../api/tables.zig").prepareSchemaValidationPublicationRecord(a, &before, request.selection);
         try self.validateRelationMutationTxn(&txn, group, request.guard, before, after);
         if (try @import("../table_lifecycle_lock.zig").read(&txn, group, before.table_id) != null) return error.GenerationPublicationChanged;
         if (!try self.policyTopologyMutationAllowedTxn(&txn, group, before.table_id)) return error.RowPolicyUnsupported;
@@ -23287,6 +23287,38 @@ pub const RaftApplyStore = struct {
             for (plan.owners, ranges) |owner, *range| range.* = owner.range;
             try self.store.validateFkGenerationTableTxn(txn, self.group, expected, ranges);
             if (!try self.store.policyTopologyMutationAllowedTxn(txn, self.group, expected.table_id)) return error.RowPolicyUnsupported;
+            try self.requireForeignKeyTargets(txn, plan);
+        }
+
+        fn requireForeignKeyTargets(self: @This(), txn: *docstore.DocStore.Txn, plan: @import("../schema_validation_plan.zig").Plan) !void {
+            if (plan.selection != .foreign_keys) return;
+            const local = @import("antfly_local_sources");
+            const parents = plan.selection.foreign_keys.parents;
+            var scratch = std.heap.ArenaAllocator.init(self.store.alloc);
+            defer scratch.deinit();
+            parent_loop: for (parents, 0..) |scope, ordinal| {
+                for (parents[0..ordinal]) |prior| if (prior.parent_table_id == scope.parent_table_id) continue :parent_loop;
+                _ = scratch.reset(.retain_capacity);
+                const a = scratch.allocator();
+                var buf: [192]u8 = undefined;
+                const parent = try decodeTableRecord(a, try txn.get(try tableKeyForGroup(&buf, self.group, scope.parent_table_id)));
+                if (parent.table_id != scope.parent_table_id or parent.storage.engine != .local or parent.restore_backup_id.len != 0) return error.CatalogGenerationChanged;
+                var public = try local.schema_mod.parseValidatedTableSchema(a, parent.schema_json);
+                defer public.deinit(a);
+                const runtime = try local.schema_mod.deriveRelationalCheckLayout(a, public);
+                defer local.storage_schema.freeSchema(a, runtime);
+                const definitions = try local.schema_relational_declarations.definitionFingerprints(a, public, runtime);
+                defer local.schema_relational_declarations.freeDefinitions(a, definitions);
+                for (parents) |selected| {
+                    if (selected.parent_table_id != scope.parent_table_id) continue;
+                    if (!std.mem.eql(u8, selected.parent_table, parent.name) or !std.mem.eql(u8, selected.declared_parent, selected.parent_table)) return error.CatalogGenerationChanged;
+                    const fingerprint = selected.parent_definition orelse return error.InvalidGenerationPublication;
+                    const retained = for (definitions) |definition| {
+                        if (definition.kind == .unique and std.mem.eql(u8, definition.name, selected.parent_unique) and std.mem.eql(u8, &definition.fingerprint, &fingerprint)) break true;
+                    } else false;
+                    if (!retained) return error.CatalogGenerationChanged;
+                }
+            }
         }
         pub fn admit(self: @This(), txn: *docstore.DocStore.Txn, plan: @import("../schema_validation_plan.zig").Plan, preparations: []const @import("../schema_validation_attestation.zig").SignedPreparation) !void {
             try self.requireCut(txn, plan, false);
@@ -27574,6 +27606,7 @@ pub const RaftApplyStore = struct {
         sql_column_identities,
         sql_sequence_counters,
         schema_validation,
+        schema_validation_dependency,
     };
     const MetadataSnapshotKey = union(enum) {
         prefix: MetadataSnapshotKeyFn,
@@ -27585,6 +27618,7 @@ pub const RaftApplyStore = struct {
     };
     const metadata_snapshot_projections = [_]MetadataSnapshotProjectionDescriptor{
         .{ .projection = .schema_validation, .key = .{ .prefix = schema_validation.prefix } },
+        .{ .projection = .schema_validation_dependency, .key = .{ .prefix = @import("../schema_validation_dependencies.zig").prefixForGroup } },
         .{ .projection = .sql_column_identities, .key = .{ .prefix = column_identities.prefixForGroup } },
         .{ .projection = .sql_sequence_counters, .key = .{ .prefix = sql_sequences.journal.prefixForGroup } },
         .{ .projection = .secret_collection, .key = .{ .prefix = secret_store.prefixForGroup } },
@@ -27678,7 +27712,7 @@ pub const RaftApplyStore = struct {
                 metadataSnapshotProjectionBit(.relation_names) | metadataSnapshotProjectionBit(.relation_candidates) | metadataSnapshotProjectionBit(.relation_live),
             .decide_relational_index_publication => metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_active) | metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.lake_index_lifecycle),
             .cancel_relational_index_publication => metadataSnapshotProjectionBit(.index_publication_head),
-            .apply_schema_validation => metadataSnapshotProjectionBit(.schema_validation) | metadataSnapshotProjectionBit(.fk_generation_table_lock) |
+            .apply_schema_validation => metadataSnapshotProjectionBit(.schema_validation) | metadataSnapshotProjectionBit(.schema_validation_dependency) | metadataSnapshotProjectionBit(.fk_generation_table_lock) |
                 metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.relation_source) |
                 metadataSnapshotProjectionBit(.relation_names) | metadataSnapshotProjectionBit(.relation_candidates) | metadataSnapshotProjectionBit(.relation_live),
             .apply_relation_reconciliation => metadataSnapshotProjectionBit(.relation_source) | metadataSnapshotProjectionBit(.relation_reconciliation) |
@@ -33175,6 +33209,7 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         table: metadata.TableRecord,
     ) !bool {
+        try @import("../schema_validation_dependencies.zig").requireUnleased(txn, group_id, table.table_id);
         if (try sql_views.firstDependent(txn, group_id, .table, table.table_id, null)) |dependent| {
             const attributes: column_identities.Store(docstore.DocStore.Txn) = .{ .txn = txn, .group_id = group_id };
             var state = (try attributes.load(self.alloc, table.table_id)) orelse return error.InvalidSqlViewRecord;
@@ -33906,6 +33941,8 @@ pub const RaftApplyStore = struct {
             const existing = try decodeTableRecord(self.alloc, encoded);
             defer metadata_table_manager.freeTable(self.alloc, existing);
             if (source_tracked) previous_digest = relationTableSourceDigest(existing.table_id, existing.name, existing.schema_json);
+            if (!std.mem.eql(u8, existing.schema_json, record.schema_json))
+                try @import("../schema_validation_dependencies.zig").requireDefinitionsRetained(self.alloc, txn, group_id, record.table_id, record.schema_json);
             const lock_kind = if (!published_fk_generation and !metadata_table_manager.tableDefinitionsEqual(existing, record))
                 try self.fkTableLockKindTxn(txn, group_id, record.table_id)
             else
@@ -42481,7 +42518,11 @@ fn validateSchemaReaderSnapshotCut(alloc: std.mem.Allocator, group_id: u64, rows
     var required_version: u16 = 0;
     for (rows) |row| {
         if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
-        if (std.mem.startsWith(u8, row.key, schema_validation.all_prefix)) {
+        if (std.mem.startsWith(u8, row.key, @import("../schema_validation_dependencies.zig").all_prefix)) {
+            const record = (try @import("../schema_validation_dependencies.zig").Key.parse(row.key)) orelse return error.InvalidMetadataSnapshot;
+            if (record.group != group_id) return error.InvalidMetadataSnapshot;
+            required_version = @max(required_version, topology_protocol.schema_validation_publication_version);
+        } else if (std.mem.startsWith(u8, row.key, schema_validation.all_prefix)) {
             const record = (try schema_validation.Key.parse(row.key)) orelse return error.InvalidMetadataSnapshot;
             if (record.group != group_id) return error.InvalidMetadataSnapshot;
             required_version = @max(required_version, topology_protocol.schema_validation_publication_version);
@@ -43152,6 +43193,41 @@ fn verifySchemaValidationCheckpointTxn(alloc: std.mem.Allocator, txn: *docstore.
         if (previous_group != key.group) {
             try schema_validation.verifyGroup(alloc, txn, key.group, SchemaValidationCheckpoint{ .alloc = alloc, .group = key.group });
             previous_group = key.group;
+        }
+    }
+    const dependencies = @import("../schema_validation_dependencies.zig");
+    row = try cursor.seekAtOrAfter(dependencies.all_prefix);
+    while (row) |item| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, item.key, dependencies.all_prefix)) break;
+        const key = (try dependencies.Key.parse(item.key)) orelse return error.InvalidCatalogRecord;
+        var head_buf: [192]u8 = undefined;
+        const head_key: schema_validation.Key = .{ .group = key.group, .table = key.child, .id = key.id, .kind = .head };
+        const head = try @import("../schema_validation_publication.zig").Head.decode(try txn.get(try head_key.encode(&head_buf)));
+        if (head.metadata_group_id != key.group or head.table_id != key.child or !std.mem.eql(u8, &head.id, &key.id) or
+            head.phase == .succeeded or head.phase == .canceled) return error.InvalidCatalogRecord;
+        const owner = try schema_validation.readOwner(txn, head, 0);
+        if (owner.binding.purpose != .foreign_key_source or key.ordinal >= owner.binding.columns) return error.InvalidCatalogRecord;
+        if (key.parent != null) {
+            const record = try dependencies.Record.decode(item.value);
+            if (!std.meta.eql(record.key, key) or !std.mem.eql(u8, &record.plan_digest, &head.plan_digest) or
+                !std.mem.eql(u8, &record.metadata_incarnation, &head.metadata_incarnation)) return error.InvalidCatalogRecord;
+            const expected = @import("antfly_local_sources").storage_db_relational_schema_owner_contract.hash(item.value);
+            var index_key = key;
+            index_key.parent = null;
+            var index_buf: [256]u8 = undefined;
+            const index = try txn.get(try index_key.encode(&index_buf));
+            if (index.len != 40 or std.mem.readInt(u64, index[0..8], .little) != key.parent.? or !std.mem.eql(u8, index[8..40], &expected)) return error.InvalidCatalogRecord;
+        } else {
+            if (item.value.len != 40) return error.InvalidCatalogRecord;
+            var parent_key = key;
+            parent_key.parent = std.mem.readInt(u64, item.value[0..8], .little);
+            const expected = item.value[8..40].*;
+            var parent_buf: [256]u8 = undefined;
+            const bytes = try txn.get(try parent_key.encode(&parent_buf));
+            if (!std.mem.eql(u8, &@import("antfly_local_sources").storage_db_relational_schema_owner_contract.hash(bytes), &expected)) return error.InvalidCatalogRecord;
+            const record = try dependencies.Record.decode(bytes);
+            if (!std.meta.eql(record.key, parent_key) or !std.mem.eql(u8, &record.metadata_incarnation, &head.metadata_incarnation) or
+                !std.mem.eql(u8, &record.plan_digest, &head.plan_digest)) return error.InvalidCatalogRecord;
         }
     }
     // The forward cohort audit requires every live job's shared lock. Also
@@ -46955,6 +47031,7 @@ test "schema validation publication command codec and snapshot registry require 
     try std.testing.expectError(error.InvalidGenerationPublication, store.schemaValidationOwnerInputBytes(a, 22, lookup, 0));
     const mask = RaftApplyStore.transitionCommandProjectionMask(.apply_schema_validation);
     const expected = RaftApplyStore.metadataSnapshotProjectionBit(.schema_validation) |
+        RaftApplyStore.metadataSnapshotProjectionBit(.schema_validation_dependency) |
         RaftApplyStore.metadataSnapshotProjectionBit(.table) | RaftApplyStore.metadataSnapshotProjectionBit(.fk_generation_table_lock);
     try std.testing.expectEqual(expected, mask & expected);
     var buf: [192]u8 = undefined;
@@ -46969,6 +47046,15 @@ test "schema validation publication command codec and snapshot registry require 
     try std.testing.expect(!metadataSnapshotKeyBelongsToGroup(22, parent_storage_key));
     parent_key.grant = null;
     try std.testing.expectError(error.InvalidGenerationPublication, parent_key.encode(&buf));
+    const dependencies = @import("../schema_validation_dependencies.zig");
+    const dependency_key: dependencies.Key = .{ .group = 21, .child = 7, .parent = 8, .id = @splat(1), .ordinal = 0 };
+    var dependency_buf: [256]u8 = undefined;
+    const dependency_bytes = try dependency_key.encode(&dependency_buf);
+    try std.testing.expect(metadataSnapshotKeyBelongsToGroup(21, dependency_bytes));
+    try std.testing.expect(!metadataSnapshotKeyBelongsToGroup(22, dependency_bytes));
+    var source_index = dependency_key;
+    source_index.parent = null;
+    try std.testing.expect(metadataSnapshotKeyBelongsToGroup(21, try source_index.encode(&dependency_buf)));
     var txn = try store.store.beginReadTxn();
     defer txn.abort();
     try std.testing.expectError(error.GenerationPublicationNotFound, schema_validation.readHead(&txn, .{

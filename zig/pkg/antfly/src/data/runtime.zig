@@ -6973,6 +6973,12 @@ pub const DataServer = struct {
                 error.GenerationPublicationChanged,
                 error.SchemaValidationRuntimeRecoveryRequired,
                 error.SchemaValidationNotReady,
+                error.ConstraintActivationChanged,
+                error.PreparedGenerationChanged,
+                error.VersionConflict,
+                error.IntentConflict,
+                error.IntegrityTopologyBusy,
+                error.ConstraintActivationPending,
                 error.IndexOwnerReceiptChanged,
                 error.StoreRootEnrollmentChanged,
                 error.StorageBusy,
@@ -7410,7 +7416,7 @@ pub const DataServer = struct {
             if (work == .idle) return false;
             inputs = try call(self.status_source.ptr, a, context, .{ .schema_validation_owner_read = .{ .lookup = lookup, .ordinal = control.owner.ordinal, .projection = .replay_inputs, .source_owner = .fromBinding(binding) } });
             const signer: antfly.public_api.ProvisionedKernelOwnerSource.SchemaPreparationSigner = if (native) .{ .identity = native_scope.?.signing.identity, .reporter_incarnation = native_scope.?.signing.reporter_incarnation, .authority = .{ .native = native_scope.?.signing.binding_digest } } else .{ .identity = raft_scope.?.identity, .reporter_incarnation = raft_scope.?.reporter_incarnation, .authority = .{ .raft = raft_scope.?.replica_id } };
-            const prepared = try source.attestSchemaPreparationAtRoot(job.group, job.table, .{ .id = binding.id, .provisional_plan = binding.plan_digest, .fence = binding.fence, .authority = binding.authority }, inputs.?, signer, root, context);
+            const prepared = try source.attestSchemaPreparationAtRoot(job.group, job.table, .{ .purpose = binding.purpose, .id = binding.id, .provisional_plan = binding.plan_digest, .fence = binding.fence, .authority = binding.authority }, inputs.?, signer, root, context);
             try prepared.verifyFor(binding, discovered.state.physical_root_incarnation);
             if (prepared.proof.root_generation != discovered.root_generation) return error.SchemaValidationRuntimeRecoveryRequired;
             witness = .{ .preparation = prepared };
@@ -7431,6 +7437,18 @@ pub const DataServer = struct {
         try permission.requireFor(request);
         if (permission.owner.physical_root_incarnation != discovered.state.physical_root_incarnation or permission.owner.root_epoch != control.owner.root_epoch) return error.SchemaValidationRuntimeRecoveryRequired;
         if (permission.disposition == .acknowledged) return false;
+        const matching_header = header != null and std.meta.eql(header.?.binding, binding);
+        if (binding.purpose == .foreign_key_source and !matching_header and (action == .begin or action == .cancel)) {
+            var snapshot = (try self.adminSnapshotForMaintenance()) orelse return error.MetadataUnavailable;
+            defer self.status_source.freeAdminSnapshot(&snapshot);
+            const selected = for (snapshot.ranges) |range| {
+                if (range.table_id == binding.fence.namespace.table_id and range.group_id == job.group and
+                    @import("../metadata/table_manager.zig").rangeDocIdentityShardId(range) == binding.fence.namespace.shard_id and
+                    @import("../metadata/table_manager.zig").rangeDocIdentityRangeId(range) == binding.fence.namespace.range_id) break range;
+            } else return error.GenerationPublicationChanged;
+            const result = try @import("../api/schema_validation_rows.zig").step(a, self.read_source.source(), self.write_source.source(), snapshot.tables, snapshot.ranges, selected, binding, inputs orelse return error.SchemaValidationJobRequired, discovered.state.physical_root_incarnation, action == .cancel, context);
+            if (result == .pending) return true;
+        }
         if (@import("builtin").is_test) {
             // Pause only after real metadata permission and root checks. The
             // test does not create receipts, bypass a fence or fake progress.
@@ -12984,7 +13002,7 @@ pub const DataServer = struct {
                 !std.mem.eql(u8, &registration.identity.public_key, &root.public_key)) return error.StoreRootEnrollmentChanged;
             break :native .{ .identity = registration.identity, .reporter_incarnation = registration.reporter_incarnation, .authority = .{ .native = try registration.binding().digest() } };
         };
-        var prepared = source.captureSchemaPreparationAtRoot(owner_alloc, group, table, .{ .id = request.id, .provisional_plan = request.provisional_plan, .transition_id = request.transition_id, .namespace = request.namespace }, request.before_schema, request.after_schema, request.columns, signer, root, context) catch |err| {
+        var prepared = source.captureSchemaPreparationAtRoot(owner_alloc, group, table, .{ .id = request.id, .provisional_plan = request.provisional_plan, .transition_id = request.transition_id, .namespace = request.namespace }, request.before_schema, request.after_schema, request.selection, signer, root, context) catch |err| {
             if (working.denied()) return error.ResourceBudgetExceeded;
             return err;
         };

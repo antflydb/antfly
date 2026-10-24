@@ -18614,7 +18614,7 @@ test "httpx private schema preparation requires service authority a bounded budg
     var handler = AntflyApiHandler{ .api_server = &api_server };
     var req = try httpx.Request.init(a, .POST, "http://localhost/internal/v1/groups/7/tables/docs/schema-validation-prepare");
     defer req.deinit();
-    var value: preparation.Request = .{ .group_id = 7, .metadata_incarnation = @splat('1'), .id = @splat(2), .provisional_plan = @splat(3), .transition_id = 4, .namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 }, .before_schema = "{}", .after_schema = "{}", .columns = &.{"n"} };
+    var value: preparation.Request = .{ .group_id = 7, .metadata_incarnation = @splat('1'), .id = @splat(2), .provisional_plan = @splat(3), .transition_id = 4, .namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 }, .before_schema = "{}", .after_schema = "{}", .selection = .{ .not_null = &.{"n"} } };
     const body = try std.json.Stringify.valueAlloc(a, value, .{});
     defer a.free(body);
     try req.setBody(body);

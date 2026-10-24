@@ -90,6 +90,7 @@ pub fn read(txn: anytype, group_id: u64, table_id: u64) !?Lock {
 /// revision, never by guessing that an equal lock means begin was completed.
 pub fn acquire(txn: anytype, group_id: u64, table_id: u64, lock: Lock) !void {
     const bytes = try lock.encode();
+    if (lock.kind == .generation) try @import("schema_validation_dependencies.zig").requireUnleased(txn, group_id, table_id);
     if (try read(txn, group_id, table_id) != null) return error.GenerationPublicationChanged;
     var buf: [160]u8 = undefined;
     try txn.put(try key(&buf, group_id, table_id), &bytes);
@@ -132,6 +133,16 @@ test "table lifecycle lock point CAS rejects cross kind release and preserves st
         reads: usize = 0,
         writes: usize = 0,
         failed: bool = false,
+        const Cursor = struct {
+            pub fn close(_: *@This()) void {}
+            pub fn seekAtOrAfter(_: *@This(), _: []const u8) !?struct { key: []const u8 } {
+                return null;
+            }
+        };
+        pub fn openCursor(self: *@This()) !Cursor {
+            if (self.failed) return error.StorageFailure;
+            return .{};
+        }
         fn get(self: *@This(), _: []const u8) ![]const u8 {
             self.reads += 1;
             if (self.failed) return error.StorageFailure;

@@ -32,6 +32,18 @@ pub const Transport = struct {
         self.* = undefined;
     }
 
+    pub fn captureForeignKeys(self: *@This(), a: std.mem.Allocator, before: local.common_topology_records.TableRecord, names: []const []const u8, context: local.api_operation.RequestContext) !local.api_relational_integrity_commit.ForeignKeyValidationSource {
+        try context.ensureActive();
+        const reader = self.server.table_reads orelse return error.ForeignKeyValidationRequired;
+        var snapshot = (try self.server.source.adminSnapshot()) orelse return error.IntegrityCatalogUnavailable;
+        defer self.server.source.freeAdminSnapshot(&snapshot);
+        const actual = for (snapshot.tables) |table| {
+            if (table.table_id == before.table_id) break table;
+        } else return error.CatalogGenerationChanged;
+        if (!std.mem.eql(u8, actual.name, before.name) or !std.mem.eql(u8, actual.schema_json, before.schema_json)) return error.CatalogGenerationChanged;
+        return local.api_relational_integrity_commit.captureForeignKeyValidationSource(a, reader, snapshot.tables, before.name, names, context);
+    }
+
     pub fn prepareCohort(self: *@This(), ranges: []const local.common_topology_records.RangeRecord, context: local.api_operation.RequestContext) !void {
         try context.ensureActive();
         if (self.groups.len != 0) return error.InvalidGenerationPublication;

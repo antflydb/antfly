@@ -169,6 +169,7 @@ const Loaded = struct {
     name: []const u8,
     view: registry.SchemaView,
     catalog: catalog.Catalog,
+    catalog_digest: [32]u8,
     uniques: []const native.UniqueConstraint,
     foreign: []const native.ForeignKey,
     plan: ?planner.Plan = null,
@@ -1033,6 +1034,7 @@ const Builder = struct {
             .name = try self.alloc.dupe(u8, record.name),
             .view = view,
             .catalog = bindings,
+            .catalog_digest = @import("../storage/db/relational_schema_owner_contract.zig").hash(bytes),
             .uniques = try view.validator().?.schema.relationalUniqueDefinitions(self.alloc),
             .foreign = try view.validator().?.schema.relationalForeignKeyDefinitions(self.alloc),
         };
@@ -1951,6 +1953,60 @@ fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, me
 /// Selected historical validation uses ordinary attachment, with the same
 /// exact primary observations and parent participants as activation. It never
 /// rewrites the child row or grants historical missing-parent exemptions.
+pub const ForeignKeyValidationSource = struct {
+    arena: std.heap.ArenaAllocator,
+    value: @import("../storage/db/relational_schema_owner_contract.zig").ForeignKeySource,
+    pub fn deinit(self: *@This()) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Capture selected live parent generations through the same typed catalog and
+/// comparison checks used by ordinary mutations. One pinned route view and the
+/// builder cache amortize reads across constraints sharing a parent. This is
+/// preparation only: each later parent effect still has its ordinary 2PC guard.
+pub fn captureForeignKeyValidationSource(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, table_name: []const u8, names: []const []const u8, request: RequestContext) !ForeignKeyValidationSource {
+    const owner = @import("../storage/db/relational_schema_owner_contract.zig");
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    var builder: Builder = .{ .alloc = scratch.allocator(), .scratch_alloc = alloc, .source = source, .metadata = metadata, .control = try boundedControl(request) };
+    defer builder.deinit();
+    const child = try builder.load(table_name);
+    try requireForeignKeyValidationSelection(child, names);
+    var plan = try builder.bindingPlanSelection(child, false, true, null, names);
+    defer plan.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const parents = try a.alloc(owner.ForeignKeyParent, names.len);
+    for (names, parents) |name, *target| {
+        try builder.control.ensureActive();
+        const binding = for (plan.foreign) |foreign| {
+            if (std.mem.eql(u8, foreign.definition.name, name)) break foreign;
+        } else return error.InvalidSchemaValidationJob;
+        const parent = try builder.load(binding.definition.parent_table);
+        const record = try builder.metadataTable(parent.name);
+        const unique = parent.catalog.findGeneration(binding.parent_generation) orelse return error.PreparedGenerationChanged;
+        target.* = .{
+            .constraint_name = try a.dupe(u8, name),
+            .declared_parent = try a.dupe(u8, binding.definition.parent_table),
+            .parent_table = try a.dupe(u8, parent.name),
+            .parent_table_id = record.table_id,
+            .parent_schema_version = parent.view.version(),
+            .parent_schema = parent.catalog.schema_digest,
+            .parent_public = owner.hash(record.schema_json),
+            .parent_catalog = parent.catalog_digest,
+            .parent_unique = try a.dupe(u8, unique.definition.name),
+            .parent_generation = binding.parent_generation,
+            .parent_definition = unique.definition.fingerprint,
+        };
+    }
+    const value: owner.ForeignKeySource = .{ .table_name = try a.dupe(u8, table_name), .parents = parents };
+    try value.validate();
+    return .{ .arena = arena, .value = value };
+}
+
 pub fn prepareForeignKeyValidationPage(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, table_name: []const u8, rows: []const BackfillRow, names: []const []const u8, request: RequestContext) !Prepared {
     return prepareBackfillMode(alloc, source, metadata, table_name, rows, .foreign_key, names, ranges, request);
 }

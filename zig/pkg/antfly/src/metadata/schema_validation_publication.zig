@@ -25,7 +25,16 @@ const evidence = @import("schema_validation_attestation.zig");
 pub const Digest = [32]u8;
 pub const max_owners = 4096;
 pub const Phase = enum { validating, validated, installing, installed, releasing, succeeded, canceling, canceled };
-pub const Failure = enum { none, requested, not_null_violation, owner_failed };
+pub const Failure = enum {
+    none,
+    requested,
+    not_null_violation,
+    foreign_key_violation,
+    owner_failed,
+    pub fn isConstraintViolation(self: @This()) bool {
+        return self == .not_null_violation or self == .foreign_key_violation;
+    }
+};
 pub const Stage = enum(u3) { ready, installed, released, canceled, failed };
 const stage_count = @typeInfo(Stage).@"enum".field_names.len;
 
@@ -88,7 +97,7 @@ pub const Head = struct {
             self.install_revision > self.revision or self.publication_revision > self.revision or self.cancellation_revision > self.revision or
             (self.ready != 0) != nonzero(&self.ready_chain) or (self.installed != 0) != nonzero(&self.installed_chain) or
             (self.released != 0 or self.canceled != 0) != nonzero(&self.terminal_chain) or
-            (self.failure == .not_null_violation) != nonzero(&self.failure_digest))
+            self.failure.isConstraintViolation() != nonzero(&self.failure_digest))
             return error.InvalidGenerationPublication;
         const canceling = self.phase == .canceling or self.phase == .canceled;
         const installing = self.phase == .installing or self.phase == .installed or self.phase == .releasing or self.phase == .succeeded;
@@ -168,7 +177,7 @@ pub const Head = struct {
     }
     pub fn cancel(self: Head, expected_revision: u64, failure: Failure) !Head {
         try self.validate();
-        if (self.revision != expected_revision or failure == .none or failure == .not_null_violation) return error.GenerationPublicationChanged;
+        if (self.revision != expected_revision or failure == .none or failure.isConstraintViolation()) return error.GenerationPublicationChanged;
         if (self.phase != .validating and self.phase != .validated) return error.SchemaValidationPublicationRequired;
         var next = self;
         next.revision = try nextRevision(self.revision);
@@ -418,6 +427,10 @@ pub fn acknowledge(head: Head, owner: Owner, expected_revision: u64, observed: e
         .failed => .failed,
         else => return error.SchemaValidationNotReady,
     };
+    if (owner.binding.purpose == .foreign_key_source and (stage == .ready or stage == .installed or stage == .released or stage == .failed)) {
+        const coverage = observed.header.transaction_coverage orelse return error.ForeignKeyValidationRequired;
+        if (owner.binding.authority == .native and coverage.physical_root != observed.physical_root_incarnation) return error.SchemaValidationRuntimeRecoveryRequired;
+    }
     const index = @backingInt(stage);
     const header_digest = try observed.header.digest();
     if (owner.has(stage)) {
@@ -470,7 +483,7 @@ pub fn acknowledge(head: Head, owner: Owner, expected_revision: u64, observed: e
         },
         .failed => {
             if (head.phase != .validating or owner.has(.ready) or owner.has(.canceled)) return error.GenerationPublicationChanged;
-            next.failure = .not_null_violation;
+            next.failure = if (owner.binding.purpose == .foreign_key_source) .foreign_key_violation else .not_null_violation;
             next.failure_digest = try appendChain("antfly/schema-validation-failed-owner/v1", @splat(0), owner, header_digest);
             next.cancellation_revision = next.revision;
             next.phase = .canceling;
@@ -534,7 +547,7 @@ pub fn validateCohort(head: Head, owners: []const Owner) !void {
             .installed => head.installed,
             .released => head.released,
             .canceled => head.canceled,
-            .failed => @intFromBool(head.failure == .not_null_violation),
+            .failed => @intFromBool(head.failure.isConstraintViolation()),
         };
         if (count != expected_count) return error.InvalidGenerationPublication;
         const expected_chain: Digest = switch (stage) {
@@ -894,4 +907,31 @@ test "schema validation publication 4096 owner barriers keep ACK state and recov
     const original_decision = try (try head.decideInstall(head.revision)).installDecision();
     const foreign_decision = try (try foreign.decideInstall(foreign.revision)).installDecision();
     try std.testing.expect(!eq(original_decision, foreign_decision));
+}
+
+// Reducer-only evidence fixtures: native signatures and enrolled source cuts
+// are qualified by the ledger and transaction campaigns.
+test "schema validation publication foreign keys require transaction coverage and classify violations" {
+    var head = Fixture.head();
+    var owner = Fixture.owner(0);
+    owner.binding.purpose = .foreign_key_source;
+    var ready = Fixture.ready(owner);
+    ready.reference_coverage = .{};
+    try std.testing.expectError(error.ForeignKeyValidationRequired, acknowledge(head, owner, head.revision, try Fixture.proof(owner, ready)));
+    ready.reference_coverage = null;
+    ready.transaction_coverage = .{ .record = @splat(41), .physical_root = owner.physical_root_incarnation };
+    var wrong_root = ready;
+    wrong_root.transaction_coverage.?.physical_root += 1;
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, acknowledge(head, owner, head.revision, try Fixture.proof(owner, wrong_root)));
+    const accepted = try acknowledge(head, owner, head.revision, try Fixture.proof(owner, ready));
+    try std.testing.expectEqual(@as(u16, 1), accepted.head.ready);
+    try std.testing.expectEqual(Phase.validating, accepted.head.phase);
+    var failed = ready;
+    failed.phase = .failed;
+    failed.failure_column = 0;
+    try Fixture.apply(&head, &owner, failed);
+    try std.testing.expectEqual(Failure.foreign_key_violation, head.failure);
+    try std.testing.expectEqual(Phase.canceling, head.phase);
+    try std.testing.expectError(error.GenerationPublicationChanged, head.decideInstall(head.revision));
+    try std.testing.expectError(error.GenerationPublicationChanged, Fixture.head().cancel(Fixture.head().revision, .foreign_key_violation));
 }

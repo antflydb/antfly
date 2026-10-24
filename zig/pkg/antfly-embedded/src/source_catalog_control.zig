@@ -140,6 +140,7 @@ pub const schema_mod = @import("schema/mod.zig");
 pub const schema_relational_declarations = @import("schema/relational_declarations.zig");
 pub const schema_json_shape = @import("schema/json_shape.zig");
 pub const schema_column_nullability = @import("schema/column_nullability.zig");
+pub const schema_foreign_key_validation = @import("schema/foreign_key_validation.zig");
 pub const storage_db_relational_index_candidate = @import("storage/db/relational_index_candidate.zig");
 pub const storage_db_relational_index_owner_job = @import("storage/db/relational_index_owner_job.zig");
 pub const storage_db_relational_index_owner_control = @import("storage/db/relational_index_owner_control.zig");

@@ -146,8 +146,9 @@ pub const Candidate = struct {
         try control.ensureActive();
         return .{ .alloc = a, .inputs = inputs, .native_before = native_before, .native_after = native_after, .catalog_after = catalog_after, .plan = plan, .before_version = before.runtime_schema.version, .after_version = after.runtime_schema.version };
     }
-    /// Exact child-side preparation. Parent descriptors remain untrusted
-    /// until metadata joins them to the full signed parent-owner cohort.
+    /// Exact child-side preparation. Parent descriptors bind tuple encoding;
+    /// ordinary 2PC attachments establish parent validity, while metadata
+    /// leases retain the selected target definitions through publication.
     pub fn initForeignKeySource(a: A, table_id: u64, before_json: []const u8, after_json: []const u8, predecessor: []const u8, config: foreign_validation.SourceConfig, control: projection.Control) !Candidate {
         try control.ensureActive();
         try config.validate();
@@ -762,11 +763,16 @@ pub fn protectedOwnerCatalog(a: A, txn: anytype, namespace: @import("doc_identit
 /// does not authenticate a physical root; the receiving DB checks that root
 /// before preparing the control, while this helper checks the durable cut.
 fn requireTransactionCoverage(txn: anytype, binding: Binding, expected: ?Digest) !activation.ValidationRecord {
+    const record = try requireTerminalTransactionRecord(txn, binding, expected);
+    if (record.progress.state != .enforced) return error.SchemaValidationNotReady;
+    return record;
+}
+fn requireTerminalTransactionRecord(txn: anytype, binding: Binding, expected: ?Digest) !activation.ValidationRecord {
     const bytes = (try optional(txn, activation.validation_key)) orelse return error.SchemaValidationNotReady;
     if (expected) |value| if (!eq(hash(bytes), value)) return error.SchemaValidationJobChanged;
     const record = try activation.ValidationRecord.decode(bytes);
     if (!std.meta.eql(record.binding, binding)) return error.SchemaValidationJobChanged;
-    if (record.progress.state != .enforced) return error.SchemaValidationNotReady;
+    if (record.progress.state == .validating) return error.SchemaValidationNotReady;
     return record;
 }
 
@@ -789,8 +795,8 @@ pub fn stageBegin(a: A, txn: anytype, binding: Binding, candidate: *const Candid
     if (try topology.current(txn) != null) return error.IntegrityTopologyBusy;
     const position = try nextPosition(txn, binding, entry);
     var header: Header = .{ .binding = binding, .phase = .fencing, .admitted = position, .updated = position, .cursor_digest = hash(""), .chain = hash(candidate.inputs), .last_effect = hash("schema-validation-begin/v1"), .reference_coverage = if (binding.purpose == .not_null) null else .{} };
-    if (binding.purpose == .foreign_key_source and try optional(txn, activation.validation_key) != null) {
-        const record = try requireTransactionCoverage(txn, binding, null);
+    if (binding.purpose == .foreign_key_source) {
+        const record = try requireTerminalTransactionRecord(txn, binding, null);
         header.reference_coverage = null;
         header.transaction_coverage = .{ .record = try digestAt(txn, activation.validation_key), .physical_root = record.physical_root };
     }
@@ -835,16 +841,19 @@ pub fn stageFrozen(a: A, txn: anytype, manager: *transactions.TxnManager, bindin
     header.phase = .scanning;
     header.last_effect = hash("schema-validation-freeze/v1");
     if (header.transaction_coverage) |coverage| {
-        const record = try requireTransactionCoverage(txn, binding, coverage.record);
+        const record = try requireTerminalTransactionRecord(txn, binding, coverage.record);
         // Every page joined guarded child observations, real parent effects,
         // and this exact progress CAS in 2PC. New writes enforce the FK and
         // validated references cannot revert to historical references. Drain
         // outstanding transactions before turning that cut into readiness.
-        header.phase = .ready;
+        header.phase = if (record.progress.state == .enforced) .ready else .failed;
+        header.failure_column = if (record.progress.state == .invalid) 0 else null;
         header.records = record.progress.rows_scanned;
         header.rows_scanned = record.progress.rows_scanned;
+        header.cursor_digest = hash(record.progress.cursor);
         header.chain = coverage.record;
         header.last_effect = hash("schema-validation-transaction-freeze/v1");
+        try txn.put(cursor_key, record.progress.cursor);
     }
     header.revision = try std.math.add(u64, header.revision, 1);
     try save(a, txn, header);
@@ -1206,6 +1215,8 @@ pub fn stageCancel(a: A, txn: anytype, manager: *transactions.TxnManager, bindin
                 if (record.progress.state != .invalid or record.binding.fence.admission_epoch >= binding.fence.admission_epoch)
                     return error.SchemaValidationJobChanged;
             } else {
+                if (record.progress.state != .invalid and (header.admitted == null or record.progress.state == .validating))
+                    return error.SchemaValidationCancellationRequired;
                 record.revision = try std.math.add(u64, record.revision, 1);
                 record.progress.state = .invalid;
                 record.progress.failure = "Canceled";

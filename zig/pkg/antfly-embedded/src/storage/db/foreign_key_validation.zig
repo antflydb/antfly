@@ -667,38 +667,8 @@ test "foreign key validation repeated historical rows retain scratch without hea
 /// preparations. A child owner proves its own schema/catalog and tuple codec;
 /// it does not copy every parent's complete catalog into every child input.
 /// These descriptors alone grant no parent or publication authority.
-pub const ParentScope = struct {
-    constraint_name: []const u8,
-    declared_parent: []const u8,
-    parent_table: []const u8,
-    parent_table_id: u64,
-    parent_schema_version: u32,
-    parent_schema: [32]u8,
-    parent_public: [32]u8,
-    parent_catalog: [32]u8,
-    parent_unique: []const u8,
-    parent_generation: contract.Generation,
-};
-pub const SourceConfig = struct {
-    purpose: @import("relational_schema_owner_contract.zig").Purpose = .foreign_key_source,
-    table_name: []const u8,
-    parents: []const ParentScope,
-
-    pub fn validate(self: @This()) !void {
-        if (self.purpose != .foreign_key_source or self.parents.len == 0 or self.parents.len > 256 or self.table_name.len == 0 or self.table_name.len > 4096 or std.mem.indexOfScalar(u8, self.table_name, 0) != null) return error.InvalidSchemaValidationJob;
-        var name_bytes: usize = self.table_name.len;
-        for (self.parents, 0..) |scope, i| {
-            if (scope.parent_table_id == 0 or scope.parent_schema_version == 0 or std.mem.allEqual(u8, &scope.parent_generation, 0)) return error.InvalidSchemaValidationJob;
-            inline for (.{ "parent_schema", "parent_public", "parent_catalog" }) |field| if (std.mem.allEqual(u8, &@field(scope, field), 0)) return error.InvalidSchemaValidationJob;
-            inline for (.{ "constraint_name", "declared_parent", "parent_table", "parent_unique" }) |field| {
-                const name = @field(scope, field);
-                name_bytes = std.math.add(usize, name_bytes, name.len) catch return error.InvalidSchemaValidationJob;
-                if (name.len == 0 or name.len > 4096 or name_bytes > 1024 * 1024 or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidSchemaValidationJob;
-            }
-            for (self.parents[0..i]) |prior| if (std.mem.eql(u8, prior.constraint_name, scope.constraint_name)) return error.InvalidSchemaValidationJob;
-        }
-    }
-};
+pub const ParentScope = @import("relational_schema_owner_contract.zig").ForeignKeyParent;
+pub const SourceConfig = @import("relational_schema_owner_contract.zig").ForeignKeySource;
 
 /// Child identities are hints until metadata joins independently signed source
 /// and parent preparations. The parent verifies its own UNIQUE declaration and

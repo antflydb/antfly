@@ -101,7 +101,7 @@ test "native index owner adapter rejects cancellation deadline and foreign group
         try std.testing.expectError(expected, source.nativeIndexOwnerState(std.testing.allocator, 7, "rows", identity, context));
         try std.testing.expectError(expected, source.nativeSchemaOwnerObservationAtRoot(7, "rows", undefined, context));
         try std.testing.expectError(expected, source.attestSchemaPreparationAtRoot(7, "rows", undefined, undefined, undefined, undefined, context));
-        try std.testing.expectError(expected, source.captureSchemaPreparationAtRoot(std.testing.failing_allocator, 7, "rows", undefined, "", "", &.{}, undefined, undefined, context));
+        try std.testing.expectError(expected, source.captureSchemaPreparationAtRoot(std.testing.failing_allocator, 7, "rows", undefined, "", "", .{ .not_null = &.{} }, undefined, undefined, context));
         try std.testing.expectError(expected, source.attestNativeSchemaOwnerAtRoot(7, "rows", undefined, undefined, undefined, context));
         try std.testing.expectError(expected, source.raftSchemaOwnerObservationAtRoot(7, "rows", undefined, context));
         try std.testing.expectError(expected, source.stepSchemaOwnerAuditAtRoot(7, "rows", undefined, "", undefined, .{}, context));
@@ -3881,7 +3881,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// Native preparation independently rechecks the resulting ASVI against a
     /// retained cut before signing. A concurrent catalog change rejects before
     /// admission; it cannot silently produce a different candidate or fence.
-    pub fn captureSchemaPreparationAtRoot(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, group_id: u64, table_name: []const u8, intent: SchemaPreparationIntent, before_json: []const u8, after_json: []const u8, columns: []const []const u8, signer: SchemaPreparationSigner, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: request_operation.RequestContext) !CapturedSchemaPreparation {
+    pub fn captureSchemaPreparationAtRoot(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, group_id: u64, table_name: []const u8, intent: SchemaPreparationIntent, before_json: []const u8, after_json: []const u8, selection: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.InputSelection, signer: SchemaPreparationSigner, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: request_operation.RequestContext) !CapturedSchemaPreparation {
         const local = @import("antfly_local_sources");
         const contract = local.storage_db_relational_schema_owner_contract;
         try context.ensureActive();
@@ -3892,12 +3892,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             const binding: @import("../metadata/standalone_native_owner.zig").Binding = .{ .metadata_incarnation = signer.identity.metadata_incarnation, .node_id = signer.identity.node_id, .store_id = signer.identity.store_id, .root_incarnation = signer.identity.root_incarnation };
             if (!std.mem.eql(u8, &try binding.digest(), &signer.authority.native)) return error.SchemaValidationJobChanged;
         }
-        var projection = contract.ProjectionHasher.init();
-        for (columns) |column| try projection.add(column);
-        _ = try projection.finish();
-        const column_bytes = try std.json.Stringify.valueAlloc(a, columns, .{});
+        try selection.validate();
+        if (selection == .foreign_keys and !std.mem.eql(u8, selection.foreign_keys.table_name, table_name)) return error.SchemaValidationJobChanged;
+        const column_bytes = try selection.encodePayload(a);
         defer a.free(column_bytes);
-        if (column_bytes.len > contract.max_names) return error.InvalidNullabilityProjection;
         var lease = try self.acquireSchemaBoundOwner(group_id, table_name, intent.namespace, context);
         defer lease.deinit();
         const normalized = try platformDeadlineContext(context);
@@ -3931,7 +3929,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (!std.mem.eql(u8, &contract.hash(physical), &identity.value.catalog_digest)) return error.IntegrityCatalogChanged;
         const inputs = try contract.encodeInputs(a, .{ before_json, after_json, physical, column_bytes });
         errdefer a.free(inputs);
-        const descriptor: contract.PreparationDescriptor = .{ .id = intent.id, .provisional_plan = intent.provisional_plan, .authority = if (signer.authority == .native) .native else .raft, .fence = .{ .role = .schema_validation, .transition_id = intent.transition_id, .attempt = 1, .admission_epoch = identity.value.next_epoch, .owner_group_id = group_id, .peer_group_id = group_id, .namespace = intent.namespace, .catalog_digest = identity.value.catalog_digest } };
+        const descriptor: contract.PreparationDescriptor = .{ .purpose = selection.purpose(), .id = intent.id, .provisional_plan = intent.provisional_plan, .authority = if (signer.authority == .native) .native else .raft, .fence = .{ .role = .schema_validation, .transition_id = intent.transition_id, .attempt = 1, .admission_epoch = identity.value.next_epoch, .owner_group_id = group_id, .peer_group_id = group_id, .namespace = intent.namespace, .catalog_digest = identity.value.catalog_digest } };
         try descriptor.validate();
         const signed = try attestSchemaPreparationAtLease(&lease, table_name, descriptor, inputs, signer, root, context);
         return .{ .alloc = a, .inputs = inputs, .signed = signed };

@@ -42,7 +42,7 @@ pub const Effect = union(enum) {
             .installation, .publication => |decision| try requireDecision(decision),
             .cancellation => |cancel| {
                 try requireDecision(cancel.decision);
-                if (cancel.failure == .none or cancel.failure == .not_null_violation) return error.InvalidGenerationPublication;
+                if (cancel.failure == .none or cancel.failure.isConstraintViolation()) return error.InvalidGenerationPublication;
             },
         }
     }
@@ -86,7 +86,7 @@ pub const Observation = struct {
                     .installed => head.installed != 0,
                     .released => head.released != 0,
                     .canceled => head.canceled != 0,
-                    .failed => head.failure == .not_null_violation,
+                    .failed => head.failure.isConstraintViolation(),
                 };
                 if (!present) return error.InvalidGenerationPublication;
             },

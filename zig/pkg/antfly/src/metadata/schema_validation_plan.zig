@@ -35,21 +35,21 @@ pub const OwnerIntent = struct {
 };
 
 pub const Plan = struct {
-    version: u16 = 1,
+    version: u16 = 2,
     metadata_group_id: u64,
     metadata_incarnation: local.metadata_incarnation.MetadataClusterIncarnation,
     id: [16]u8,
     table_guard: ?local.system_catalog_domain.RelationMutationGuard = null,
     before: records.TableRecord,
     after: records.TableRecord,
-    columns: []const []const u8,
+    selection: contract.InputSelection,
     owners: []const OwnerIntent,
 
     fn requireBoundedShape(self: Plan) !void {
-        if (self.version != 1 or self.metadata_group_id == 0 or
+        if (self.version != 2 or self.metadata_group_id == 0 or
             !local.metadata_incarnation.isValid(self.metadata_incarnation) or std.mem.allEqual(u8, &self.id, 0) or
             self.owners.len == 0 or self.owners.len > barriers.max_owners or
-            self.columns.len == 0 or self.columns.len > contract.max_columns or
+            self.selection.count() == 0 or self.selection.count() > contract.max_columns or
             self.before.schema_json.len > contract.max_schema or self.after.schema_json.len > contract.max_schema or
             self.before.indexes_json.len > contract.max_schema or self.after.indexes_json.len > contract.max_schema or
             self.before.storage_migration != null or self.after.storage_migration != null)
@@ -64,8 +64,7 @@ pub const Plan = struct {
             }
             if (table.full_text_read_index) |name| if (name.len == 0 or name.len > 1024) return error.InvalidGenerationPublication;
         }
-        var projection = contract.ProjectionHasher.init();
-        for (self.columns) |column| try projection.add(column);
+        try self.selection.validate();
         for (self.owners) |owner| {
             inline for (@typeInfo(records.RangeRecord).@"struct".field_names) |field| {
                 if (comptime @TypeOf(@field(owner.range, field)) == []const u8) {
@@ -93,7 +92,7 @@ pub const Plan = struct {
     pub fn digest(self: Plan) !Digest {
         try self.requireBoundedShape();
         var hash = std.crypto.hash.Blake3.init(.{});
-        hash.update("antfly/schema-validation-immutable-plan/v1");
+        hash.update("antfly/schema-validation-immutable-plan/v2");
         var writer = std.Io.Writer.Hashing(std.crypto.hash.Blake3).initHasher(hash, &.{});
         try std.json.Stringify.value(.{
             .version = self.version,
@@ -103,7 +102,7 @@ pub const Plan = struct {
             .table_guard = self.table_guard,
             .before = self.before,
             .after = self.after,
-            .columns = self.columns,
+            .selection = self.selection,
             .owner_count = self.owners.len,
         }, .{}, &writer.writer);
         for (self.owners) |owner| {
@@ -119,10 +118,18 @@ pub const Plan = struct {
 
     pub fn validate(self: Plan, alloc: A) !barriers.Head {
         try self.requireBoundedShape();
-        var projection = contract.ProjectionHasher.init();
-        for (self.columns) |column| try projection.add(column);
-        const projection_digest = try projection.finish();
-        const replacement = try api.prepareNullabilityPublicationRecord(alloc, &self.before, self.columns);
+        const logical = try self.selection.logical(alloc);
+        defer alloc.free(logical.names());
+        const projection_digest: ?Digest = if (self.selection == .not_null) block: {
+            var projection = contract.ProjectionHasher.init();
+            for (self.selection.not_null) |column| try projection.add(column);
+            break :block try projection.finish();
+        } else null;
+        if (self.selection == .foreign_keys) {
+            if (!std.mem.eql(u8, self.selection.foreign_keys.table_name, self.before.name)) return error.InvalidGenerationPublication;
+            for (self.selection.foreign_keys.parents) |parent| if (parent.parent_definition == null) return error.InvalidGenerationPublication;
+        }
+        const replacement = try api.prepareSchemaValidationPublicationRecord(alloc, &self.before, logical);
         defer tables.freeTable(alloc, replacement);
         if (!tables.tableDefinitionsEqual(replacement, self.after)) return error.InvalidGenerationPublication;
         var before = try local.schema_mod.PreparedSchemaDefinition.init(alloc, self.before.schema_json);
@@ -163,16 +170,16 @@ pub const Plan = struct {
             const binding = intent.binding;
             ranges[i] = intent.range;
             try binding.validate();
-            if (binding.purpose != .not_null) return error.InvalidGenerationPublication;
+            if (binding.purpose != self.selection.purpose()) return error.InvalidGenerationPublication;
             if (intent.range.group_id != binding.fence.owner_group_id or intent.range.table_id != self.before.table_id or
                 binding.fence.namespace.shard_id != tables.rangeDocIdentityShardId(intent.range) or
                 binding.fence.namespace.range_id != tables.rangeDocIdentityRangeId(intent.range) or
                 binding.before_version != before.runtime_schema.version or binding.after_version != after.runtime_schema.version or
-                binding.columns != self.columns.len or !std.mem.eql(u8, &binding.before_schema, &before_schema_hash) or
+                binding.columns != self.selection.count() or !std.mem.eql(u8, &binding.before_schema, &before_schema_hash) or
                 !std.mem.eql(u8, &binding.after_schema, &after_schema_hash) or
                 !std.mem.eql(u8, &binding.before_public, &before_public_hash) or
                 !std.mem.eql(u8, &binding.after_public, &after_public_hash) or
-                !std.mem.eql(u8, &binding.projection_identity, &projection_digest))
+                (if (projection_digest) |expected| !std.mem.eql(u8, &binding.projection_identity, &expected) else false))
                 return error.InvalidGenerationPublication;
             const input = try input_ordinals.getOrPut(alloc, binding.inputs);
             if (!input.found_existing) input.value_ptr.* = @intCast(input_ordinals.count() - 1);
@@ -318,7 +325,7 @@ const Fixture = struct {
         return .{ .alloc = a, .after = after, .intents = intents };
     }
     pub fn plan(self: *const Fixture) Plan {
-        return .{ .metadata_group_id = 21, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .id = @splat(1), .before = before, .after = self.after, .columns = &.{"id"}, .owners = &self.intents };
+        return .{ .metadata_group_id = 21, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .id = @splat(1), .before = before, .after = self.after, .selection = .{ .not_null = &.{"id"} }, .owners = &self.intents };
     }
     pub fn deinit(self: Fixture) void {
         tables.freeTable(self.alloc, self.after);
@@ -357,7 +364,7 @@ test "schema validation publication immutable plan binds exact successor cohort 
     changed.after.indexes_json = "{}";
     try std.testing.expectError(error.InvalidGenerationPublication, changed.validate(a));
     changed = decoded.value;
-    changed.columns = &.{"n"};
+    changed.selection = .{ .not_null = &.{"n"} };
     try std.testing.expectError(error.InvalidGenerationPublication, changed.validate(a));
     const duplicate = [_]OwnerIntent{ decoded.value.owners[0], decoded.value.owners[0] };
     changed = decoded.value;
@@ -426,7 +433,7 @@ test "schema validation publication immutable plan preparation and canonical dec
     defer prepared.deinit();
     try std.testing.checkAllAllocationFailures(no_resize.allocator(), Faults.decode, .{prepared.encoded});
     var oversized = fixture.plan();
-    oversized.columns = &.{""};
+    oversized.selection = .{ .not_null = &.{""} };
     try std.testing.expectError(error.InvalidNullabilityProjection, Prepared.init(a, oversized));
     oversized = fixture.plan();
     oversized.before.schema_json = @as([*]const u8, @ptrFromInt(1))[0 .. contract.max_schema + 1];
@@ -461,7 +468,7 @@ test "schema validation publication immutable plan prepares the maximum owner co
     try barriers.validateCohort(prepared.head, prepared.owners);
 }
 
-test "schema validation publication rejects FK role substitution before complete parent cohort admission" {
+test "schema validation publication rejects FK role substitution under a NOT NULL selection" {
     const a = std.testing.allocator;
     var fixture = try Fixture.init(a);
     defer fixture.deinit();

@@ -12282,7 +12282,7 @@ test "relational index system foreign key validation parent preparation cannot a
     try std.testing.expectEqualStrings(predecessor, try read.get(cat.key));
 }
 
-test "relational index system foreign key validation source job persists witnesses replays pages and cancels after cold reopen" {
+test "relational index system foreign key validation source requires transactional coverage before owner admission" {
     const F = NullabilityJobFixture;
     const job = F.job;
     const validation = @import("foreign_key_validation.zig");
@@ -12293,103 +12293,24 @@ test "relational index system foreign key validation source job persists witness
     const after =
         \\{"version":2,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["tenant","n"],"parent_table":"parents","parent_columns":["tenant","id"],"match":"full","not_valid":false}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant":{"type":"string","nullable":true},"n":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
     ;
-    const Driver = struct {
-        fn apply(database: *db_mod.DB, command: db_mod.DB.NativeSchemaOwnerControl.Command) !job.Header {
-            var prepared = try database.prepareNativeSchemaOwnerControl(command, .{});
-            defer prepared.deinit();
-            const outcome = try database.applyPreparedNativeSchemaOwnerControl(&prepared, null);
-            try std.testing.expect(outcome.error_name == null);
-            return F.current(database);
-        }
-    };
-    for ([_]bool{ false, true }) |violation| {
-        var directory = try @import("../../common/test_directory.zig").TestDirectory.init("fk-source-job");
-        defer directory.cleanup();
-        var database = try db_mod.DB.open(alloc, directory.path(), F.options);
-        var live = true;
-        defer if (live) database.close();
-        try database.setSchemaJson(alloc, before);
-        const predecessor = try database.core.store.get(alloc, cat.key);
-        defer alloc.free(predecessor);
-        var catalog = try cat.decode(alloc, predecessor);
-        defer catalog.deinit();
-        // Native owner fixture: the outer coordinator normally constructs these
-        // historical rows and reverse references. This tests source coverage;
-        // sentinel parent facts deliberately grant no parent validation proof.
-        const transaction = try database.beginTransactionWithId(@splat(95), 100);
-        try database.writeTransaction(transaction, .{ .relational_schema_version = 1, .relational_integrity_generation_set = @import("relational_integrity_activation.zig").generationSet(catalog), .writes = &.{
-            .{ .key = "a", .value = "{\"tenant\":\"Acme\",\"n\":1}" },
-            .{ .key = "b", .value = if (violation) "{\"tenant\":\"Acme\",\"n\":null}" else "{\"tenant\":\"Acme\",\"n\":2}" },
-            .{ .key = "c", .value = "{\"tenant\":null,\"n\":null}" },
-        } });
-        try database.commitTransaction(transaction, 200);
-        var candidate = try job.Candidate.initForeignKeySource(alloc, F.namespace.table_id, before, after, predecessor, validation.SourceConfig{ .table_name = "children", .parents = &.{.{ .constraint_name = "fk", .declared_parent = "parents", .parent_table = "parents", .parent_table_id = 88, .parent_schema_version = 1, .parent_schema = @splat(1), .parent_public = @splat(2), .parent_catalog = @splat(3), .parent_unique = "pk", .parent_generation = @splat(4) }} }, .{});
-        defer candidate.deinit();
-        const binding = try F.binding(&database, &candidate, 96);
-        try std.testing.expectEqual(@import("relational_schema_owner_contract.zig").Purpose.foreign_key_source, binding.purpose);
-        try std.testing.expectEqual(@as(u16, 1), binding.columns);
-        _ = try Driver.apply(&database, .{ .binding = binding, .action = .begin, .payload = candidate.inputs });
-        _ = try Driver.apply(&database, .{ .binding = binding, .action = .freeze });
-        {
-            var page = try database.prepareNativeSchemaOwnerPage(binding, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{});
-            defer page.deinit();
-            const first = try database.applyPreparedNativeSchemaOwnerControl(&page, null);
-            try std.testing.expectEqual(@as(u64, 1), first.header.?.reference_coverage.?.expected.count);
-            const duplicate = try Driver.apply(&database, page.command);
-            try std.testing.expectEqualDeep(first.header.?, duplicate);
-        }
-        database.close();
-        live = false;
-        database = try db_mod.DB.open(alloc, directory.path(), F.options);
-        live = true;
-        try std.testing.expectEqual(@as(u64, 1), (try F.current(&database)).reference_coverage.?.expected.count);
-        for (0..8) |_| {
-            var page = try database.prepareNativeSchemaOwnerPage(binding, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{});
-            defer page.deinit();
-            const result = try database.applyPreparedNativeSchemaOwnerControl(&page, null);
-            if (result.header.?.phase != .scanning) break;
-        } else return error.ValidationJobDidNotComplete;
-        const completed = try F.current(&database);
-        try std.testing.expectEqual(if (violation) job.Phase.failed else .ready, completed.phase);
-        try std.testing.expectEqual(@as(u64, if (violation) 1 else 2), completed.reference_coverage.?.expected.count);
-        var audit = try job.RowAudit.init(alloc, database.core, binding, candidate.inputs, .{});
-        defer audit.deinit();
-        try std.testing.expect(!try audit.step(null, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{}));
-        var checkpoint = try audit.checkpoint(alloc);
-        defer checkpoint.deinit();
-        var continued = try job.RowAudit.init(alloc, database.core, binding, candidate.inputs, .{});
-        defer continued.deinit();
-        try continued.resumeAuthenticatedCheckpoint(&checkpoint, .{});
-        while (!try continued.step(null, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{})) {}
-        const proof = try continued.summary();
-        // The surrounding checkpoint protocol normally rejects this forged
-        // value by signature. Independent completion also refuses its false
-        // reference witness; it cannot be recovered as an empty successful EOF.
-        var forged = checkpoint;
-        forged.summary.reference_coverage.?.expected.sum[0] ^= 1;
-        var invalid = try job.RowAudit.init(alloc, database.core, binding, candidate.inputs, .{});
-        defer invalid.deinit();
-        try invalid.resumeAuthenticatedCheckpoint(&forged, .{});
-        var rejected = false;
-        for (0..8) |_| {
-            _ = invalid.step(null, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{}) catch |err| {
-                try std.testing.expectEqual(error.SchemaValidationRuntimeRecoveryRequired, err);
-                rejected = true;
-                break;
-            };
-        }
-        try std.testing.expect(rejected);
-        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, invalid.summary());
-        try proof.validate();
-        try std.testing.expectEqualDeep(completed.reference_coverage, proof.reference_coverage);
-        if (!violation) {
-            var payload: [64]u8 = @splat(1);
-            @memcpy(payload[32..64], &try completed.digest());
-            try std.testing.expectError(error.ForeignKeyValidationRequired, database.prepareNativeSchemaOwnerControl(.{ .binding = binding, .action = .install, .payload = &payload }, .{}));
-        }
-        _ = try Driver.apply(&database, .{ .binding = binding, .action = .cancel });
-        const retained = try database.core.store.get(alloc, "\x00\x00__metadata__:schema_json");
-        defer alloc.free(retained);
-        try std.testing.expectEqualStrings(before, retained);
-    }
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("fk-source-admission");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(alloc, directory.path(), F.options);
+    defer database.close();
+    try database.setSchemaJson(alloc, before);
+    const predecessor = try database.core.store.get(alloc, cat.key);
+    defer alloc.free(predecessor);
+    var candidate = try job.Candidate.initForeignKeySource(alloc, F.namespace.table_id, before, after, predecessor, validation.SourceConfig{ .table_name = "children", .parents = &.{.{ .constraint_name = "fk", .declared_parent = "parents", .parent_table = "parents", .parent_table_id = 88, .parent_schema_version = 1, .parent_schema = @splat(1), .parent_public = @splat(2), .parent_catalog = @splat(3), .parent_unique = "pk", .parent_generation = @splat(4) }} }, .{});
+    defer candidate.deinit();
+    const binding = try F.binding(&database, &candidate, 96);
+    var prepared = try database.prepareNativeSchemaOwnerControl(.{ .binding = binding, .action = .begin, .payload = candidate.inputs }, .{});
+    defer prepared.deinit();
+    try std.testing.expectError(error.SchemaValidationNotReady, database.applyPreparedNativeSchemaOwnerControl(&prepared, null));
+    var read = try database.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect((try job.load(&read)) == null);
+    try @import("relational_integrity_topology.zig").requireUnfenced(&read);
+    const retained = try database.core.store.get(alloc, "\x00\x00__metadata__:schema_json");
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings(before, retained);
 }

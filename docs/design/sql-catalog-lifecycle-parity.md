@@ -173,6 +173,55 @@ rerun after the first run timed out at the existing fifteen-second release ACK
 pause. No assertion or timeout was relaxed. Inventory integrity, Apache source
 boundaries, license headers, formatting and diff checks passed.
 
+### FK coordinator inputs and shared target leases (2026-10-24)
+
+Admission now carries a typed NOT NULL or FK selection through the existing
+read-only preparation transport and immutable metadata plan. FK preparation
+captures actual native parent UNIQUE generations through the ordinary mutation
+binder; it does not invent parent generations from public declaration hashes.
+The metadata writer compares the selected public UNIQUE definitions in its
+current transaction. Shared parent-indexed leases and source-indexed checksums
+commit atomically with job admission and are released only by the final owner
+ACK. Unrelated parent columns may evolve, while target replacement, parent drop
+and generation changes stay guarded. The no-lease DDL path allocates nothing;
+active checks compile definitions once and use name/fingerprint lookups.
+
+Both directions of the dependency index participate in the existing metadata
+snapshot and transition rollback registry. Forward recovery requires each
+immutable expected lease; reverse checkpoint checks reject orphan, extra,
+wrong-incarnation or mismatched records. Final ACK cleanup walks at most 256
+source-index entries, closes the cursor before deletion, and neither loads the
+full immutable plan nor parses schema JSON. A real metadata LSM fault campaign
+checks admission rollback, cold recovery after the first cancellation ACK, and
+failure before/after every final-ACK write; leases survive every failed attempt.
+
+The existing data-owner worker now dispatches source scan quanta before the
+short generic publication fence. Begin, page and pre-fence cancellation all
+use the progress key's ordinary 2PC lock, preventing cancellation from overtaking
+a prepared parent attachment. Caller deadlines and cancellation reach the
+bounded worker without restarting the absolute quantum deadline on a smaller
+page retry. Terminal source failures use the same fence/drain protocol and
+produce the generated public `foreign_key_violation` failure. Inert old-root
+failure history can be canceled but cannot attest current-root readiness.
+The former witness-only source-job admission is rejected: read helpers remain,
+but generic FK publication requires the terminal transaction record.
+
+Debug qualification passes fifteen supporting FK tests, the native LSM
+transaction/publication campaign, four native FK scan/admission tests and
+forty-four metadata publication/lifecycle-lock tests in both server
+configurations, without skips or leaks. The native campaign includes actual
+coordinator begin/page/cancel, a cancel racing a prepared parent attachment,
+failed fence/drain/cleanup and a subsequent successful retry. All six mounted
+NOT NULL SQL recovery campaigns pass. Public generation, generated-source
+checks, formatting, inventory, source-boundary and license checks pass.
+
+This integrates coordinator execution and metadata dependency durability; it
+does not close `sql-0736`. The public SQL guard remains until transient snapshot
+import, current-root transaction requalification, standby replay, and the
+unchanged original SQL plus distributed fault campaign are qualified together.
+Original-case counts remain **765 implemented / 137 rejected / 428 superseded /
+256 unresolved**, including **164 unresolved DDL/catalog cases**.
+
 ### FK VALIDATE: native preparation and read execution in progress
 
 `sql-0736` remains unresolved. Native read-side support now prepares exact

@@ -80,8 +80,25 @@ pub fn build(owners: anytype, alloc: std.mem.Allocator, io: std.Io, context: ope
     guard.target.namespace = try a.dupe(u8, guard.target.namespace);
     guard.target.name = try a.dupe(u8, guard.target.name);
     guard.logical_table = try a.dupe(u8, guard.logical_table);
-    const columns = try a.alloc([]const u8, request.columns.len);
-    for (request.columns, columns) |column, *owned| owned.* = try a.dupe(u8, column);
+    const selection: contract.InputSelection = switch (request.selection) {
+        .not_null => |names| block: {
+            const columns = try a.alloc([]const u8, names.len);
+            for (names, columns) |column, *owned| owned.* = try a.dupe(u8, column);
+            break :block .{ .not_null = columns };
+        },
+        .foreign_keys => |names| block: {
+            if (comptime @hasDecl(@typeInfo(@TypeOf(owners)).pointer.child, "captureForeignKeys")) {
+                var captured = try owners.captureForeignKeys(a, cut.before, names, context);
+                defer captured.deinit();
+                // The returned plan owns all configuration strings after the
+                // transient route/catalog capture has been released.
+                const bytes = try std.json.Stringify.valueAlloc(a, captured.value, .{});
+                const value = try std.json.parseFromSliceLeaky(contract.ForeignKeySource, a, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+                break :block .{ .foreign_keys = value };
+            } else return error.ForeignKeyValidationRequired;
+        },
+    };
+    try selection.requireSelection(request.selection);
     const intents = try a.alloc(plans.OwnerIntent, cut.ranges.len);
     const preparations = try a.alloc(attest.SignedPreparation, cut.ranges.len);
     var inputs: std.ArrayList([]const u8) = .empty;
@@ -101,7 +118,7 @@ pub fn build(owners: anytype, alloc: std.mem.Allocator, io: std.Io, context: ope
             .namespace = .{ .table_id = before.table_id, .shard_id = manager.rangeDocIdentityShardId(range), .range_id = manager.rangeDocIdentityRangeId(range) },
             .before_schema = before.schema_json,
             .after_schema = after.schema_json,
-            .columns = columns,
+            .selection = selection,
             .known_inputs = known[0..known_len],
         };
         const frame = try owners.prepare(alloc, range.group_id, before.name, query, context);
@@ -126,7 +143,7 @@ pub fn build(owners: anytype, alloc: std.mem.Allocator, io: std.Io, context: ope
         signed.* = value.signed;
         intent.* = .{ .range = try manager.cloneRange(a, range), .binding = value.signed.value.binding, .physical_root_incarnation = value.signed.value.physical_root_incarnation };
     }
-    const plan: plans.Plan = .{ .metadata_group_id = cut.metadata_group_id, .metadata_incarnation = cut.metadata_incarnation, .id = id, .table_guard = guard, .before = before, .after = after, .columns = columns, .owners = intents };
+    const plan: plans.Plan = .{ .metadata_group_id = cut.metadata_group_id, .metadata_incarnation = cut.metadata_incarnation, .id = id, .table_guard = guard, .before = before, .after = after, .selection = selection, .owners = intents };
     var prepared = try plans.Prepared.init(alloc, plan);
     errdefer prepared.deinit();
     // Preparation signatures intentionally normalize only the provisional plan

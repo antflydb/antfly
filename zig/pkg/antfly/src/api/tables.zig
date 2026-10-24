@@ -1703,8 +1703,15 @@ pub fn prepareForeignKeyPublicationRecord(alloc: std.mem.Allocator, table: *cons
 /// unchanged. The metadata owner must authenticate the complete owner cohort,
 /// durably decide installation, and collect installed ACKs before publishing.
 pub fn prepareNullabilityPublicationRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, columns: []const []const u8) !metadata_table_manager.TableRecord {
+    return prepareSchemaValidationPublicationRecord(alloc, table, .{ .not_null = columns });
+}
+
+/// Shared declaration-only successor. Both kinds retain physical row and index
+/// identity; historical proof belongs to the coordinated owner installation.
+pub fn prepareSchemaValidationPublicationRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, selection: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Selection) !metadata_table_manager.TableRecord {
     const contract = @import("antfly_local_sources").storage_db_relational_schema_owner_contract;
     const nullability = @import("antfly_local_sources").schema_column_nullability;
+    const columns = selection.names();
     if (columns.len == 0 or columns.len > contract.max_columns or table.table_id == 0 or
         table.schema_json.len == 0 or table.schema_json.len > contract.max_schema or
         table.storage.engine != .local or table.storage_migration != null or
@@ -1714,13 +1721,27 @@ pub fn prepareNullabilityPublicationRecord(alloc: std.mem.Allocator, table: *con
     defer arena.deinit();
     const scratch = arena.allocator();
     const before = try std.json.parseFromSliceLeaky(std.json.Value, scratch, table.schema_json, .{ .parse_numbers = false });
-    const changes = try scratch.alloc(nullability.Change, columns.len);
-    for (columns, changes) |name, *change| change.* = .{ .column = name, .nullable = false };
-    var candidate = try nullability.prepareBorrowed(&arena, before, changes, .{});
-    if (candidate.summary.changed != columns.len or candidate.summary.tightened != columns.len) return error.InvalidSchemaValidationJob;
+    try selection.validate();
+    var foreign: ?@import("antfly_local_sources").schema_foreign_key_validation.Prepared = null;
+    defer if (foreign) |*value| value.deinit();
+    var candidate: std.json.Value = switch (selection) {
+        .not_null => block: {
+            const changes = try scratch.alloc(nullability.Change, columns.len);
+            for (columns, changes) |name, *change| change.* = .{ .column = name, .nullable = false };
+            const prepared = try nullability.prepareBorrowed(&arena, before, changes, .{});
+            if (prepared.summary.changed != columns.len or prepared.summary.tightened != columns.len) return error.InvalidSchemaValidationJob;
+            break :block prepared.schema;
+        },
+        .foreign_keys => block: {
+            foreign = try @import("antfly_local_sources").schema_foreign_key_validation.prepare(scratch, before, columns);
+            if (foreign.?.summary.changed != columns.len) return error.InvalidSchemaValidationJob;
+            break :block foreign.?.schema;
+        },
+    };
     const next_version = std.math.add(u32, try schemaVersion(table.schema_json), 1) catch return error.SchemaVersionExhausted;
-    try candidate.schema.object.put(scratch, "version", .{ .integer = next_version });
-    const schema_json = try std.json.Stringify.valueAlloc(alloc, candidate.schema, .{});
+    const candidate_alloc = if (foreign) |*value| value.arena.allocator() else scratch;
+    try candidate.object.put(candidate_alloc, "version", .{ .integer = next_version });
+    const schema_json = try std.json.Stringify.valueAlloc(alloc, candidate, .{});
     var schema_owned = true;
     defer if (schema_owned) alloc.free(schema_json);
     var compiled = try schema_mod.PreparedSchemaDefinition.init(alloc, schema_json);

@@ -1851,7 +1851,7 @@ components:
       enum: [validating, validated, installing, installed, releasing, succeeded, canceling, canceled]
     SchemaValidationFailure:
       type: string
-      enum: [requested, not_null_violation, owner_failed]
+      enum: [requested, not_null_violation, foreign_key_violation, owner_failed]
     SchemaValidationStatus:
       type: object
       additionalProperties: false

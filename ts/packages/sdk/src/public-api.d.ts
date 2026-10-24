@@ -6151,7 +6151,7 @@ export interface components {
         /** @enum {string} */
         SchemaValidationPhase: "validating" | "validated" | "installing" | "installed" | "releasing" | "succeeded" | "canceling" | "canceled";
         /** @enum {string} */
-        SchemaValidationFailure: "requested" | "not_null_violation" | "owner_failed";
+        SchemaValidationFailure: "requested" | "not_null_violation" | "foreign_key_violation" | "owner_failed";
         /** @description Historical job completion, not an authorization or promise that a later DDL has not superseded this schema. Success requires all owner installation, metadata publication and fence release barriers. Current table ownership is checked atomically with the job observation. */
         SchemaValidationStatus: {
             schema_validation_token: components["schemas"]["SchemaValidationToken"];

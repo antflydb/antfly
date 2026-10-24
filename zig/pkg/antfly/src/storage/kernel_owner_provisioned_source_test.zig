@@ -392,7 +392,7 @@ test "native index owner adapter inspects cold native ownership and rejects fore
         source.read_safety_barrier = original_barrier;
         {
             const before_capture = try source.schemaOwnerStateAtRoot(7501, "items", .{});
-            var captured = try source.captureSchemaPreparationAtRoot(alloc, 7501, "items", .{ .id = actual_binding.id, .provisional_plan = actual_binding.plan_digest, .transition_id = actual_binding.fence.transition_id, .namespace = actual_binding.fence.namespace }, before_json, tightened, &.{"id"}, .{ .identity = bootstrap_scope.identity, .reporter_incarnation = bootstrap_scope.reporter_incarnation, .authority = .{ .raft = bootstrap_scope.replica_id } }, bootstrap_root, .{});
+            var captured = try source.captureSchemaPreparationAtRoot(alloc, 7501, "items", .{ .id = actual_binding.id, .provisional_plan = actual_binding.plan_digest, .transition_id = actual_binding.fence.transition_id, .namespace = actual_binding.fence.namespace }, before_json, tightened, .{ .not_null = &.{"id"} }, .{ .identity = bootstrap_scope.identity, .reporter_incarnation = bootstrap_scope.reporter_incarnation, .authority = .{ .raft = bootstrap_scope.replica_id } }, bootstrap_root, .{});
             defer captured.deinit();
             try std.testing.expectEqualSlices(u8, inputs, captured.inputs);
             try std.testing.expectEqualDeep(actual_binding, captured.signed.value.binding);
@@ -414,14 +414,14 @@ test "native index owner adapter inspects cold native ownership and rejects fore
                     calls: usize = 0,
                     pub fn prepare(self: *@This(), a: std.mem.Allocator, group: u64, table: []const u8, query: @import("../api/schema_validation_preparation.zig").Request, context: local.api_operation.RequestContext) ![]u8 {
                         self.calls += 1;
-                        var value = try self.source.captureSchemaPreparationAtRoot(a, group, table, .{ .id = query.id, .provisional_plan = query.provisional_plan, .transition_id = query.transition_id, .namespace = query.namespace }, query.before_schema, query.after_schema, query.columns, self.signer, self.root, context);
+                        var value = try self.source.captureSchemaPreparationAtRoot(a, group, table, .{ .id = query.id, .provisional_plan = query.provisional_plan, .transition_id = query.transition_id, .namespace = query.namespace }, query.before_schema, query.after_schema, query.selection, self.signer, self.root, context);
                         defer value.deinit();
                         return @import("../api/schema_validation_preparation.zig").encode(a, value.signed, value.inputs);
                     }
                 };
                 var actual_owners: Owners = .{ .source = &source, .signer = .{ .identity = bootstrap_scope.identity, .reporter_incarnation = bootstrap_scope.reporter_incarnation, .authority = .{ .raft = bootstrap_scope.replica_id } }, .root = bootstrap_root };
                 const context: local.api_operation.RequestContext = .{ .setting_admin = true, .schema_validation_authority = true };
-                var built = try builder.build(&actual_owners, alloc, std.testing.io, context, cut, .{ .guard = guard, .columns = &.{"id"} });
+                var built = try builder.build(&actual_owners, alloc, std.testing.io, context, cut, .{ .guard = guard, .selection = .{ .not_null = &.{"id"} } });
                 defer built.deinit();
                 try std.testing.expectEqual(@as(usize, 1), actual_owners.calls);
                 try std.testing.expectEqualDeep(before_capture, try source.schemaOwnerStateAtRoot(7501, "items", .{}));
@@ -433,16 +433,16 @@ test "native index owner adapter inspects cold native ownership and rejects fore
                 try std.testing.expectEqual(built.lookup.plan_digest, try command.value.begin.plan.digest());
                 try std.testing.expectEqualDeep(built.lookup, try @import("../api/schema_validation_recovery.zig").Token.decode(&built.recovery_token));
                 try std.testing.expect(command.value.begin.plan.before.schema_json.ptr != before.schema_json.ptr);
-                try std.testing.expectError(error.Forbidden, builder.build(&actual_owners, alloc, std.testing.io, .{}, cut, .{ .guard = guard, .columns = &.{"id"} }));
+                try std.testing.expectError(error.Forbidden, builder.build(&actual_owners, alloc, std.testing.io, .{}, cut, .{ .guard = guard, .selection = .{ .not_null = &.{"id"} } }));
                 try std.testing.expectEqual(@as(usize, 1), actual_owners.calls);
-                try std.testing.expectError(error.DeadlineExceeded, builder.build(&actual_owners, alloc, std.testing.io, .{ .setting_admin = true, .schema_validation_authority = true, .deadline_ns = 0 }, cut, .{ .guard = guard, .columns = &.{"id"} }));
+                try std.testing.expectError(error.DeadlineExceeded, builder.build(&actual_owners, alloc, std.testing.io, .{ .setting_admin = true, .schema_validation_authority = true, .deadline_ns = 0 }, cut, .{ .guard = guard, .selection = .{ .not_null = &.{"id"} } }));
                 var foreign = cut;
                 foreign.authority = .native;
-                try std.testing.expectError(error.SchemaValidationJobChanged, builder.build(&actual_owners, alloc, std.testing.io, context, foreign, .{ .guard = guard, .columns = &.{"id"} }));
+                try std.testing.expectError(error.SchemaValidationJobChanged, builder.build(&actual_owners, alloc, std.testing.io, context, foreign, .{ .guard = guard, .selection = .{ .not_null = &.{"id"} } }));
                 try std.testing.expectEqualDeep(before_capture, try source.schemaOwnerStateAtRoot(7501, "items", .{}));
             }
             const transport = @import("../api/schema_validation_preparation.zig");
-            var request: transport.Request = .{ .group_id = 7501, .metadata_incarnation = bootstrap_scope.metadata_incarnation, .id = actual_binding.id, .provisional_plan = actual_binding.plan_digest, .transition_id = actual_binding.fence.transition_id, .namespace = actual_binding.fence.namespace, .before_schema = before_json, .after_schema = tightened, .columns = &.{"id"} };
+            var request: transport.Request = .{ .group_id = 7501, .metadata_incarnation = bootstrap_scope.metadata_incarnation, .id = actual_binding.id, .provisional_plan = actual_binding.plan_digest, .transition_id = actual_binding.fence.transition_id, .namespace = actual_binding.fence.namespace, .before_schema = before_json, .after_schema = tightened, .selection = .{ .not_null = &.{"id"} } };
             const frame = try transport.encode(alloc, captured.signed, captured.inputs);
             defer alloc.free(frame);
             const decoded = try transport.decode(frame);

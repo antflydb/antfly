@@ -47,28 +47,35 @@ pub fn runPage(
     ranges: []const records.RangeRecord,
     owner: records.RangeRecord,
 ) !bool {
-    return runPageMode(alloc, reader, writer, tables, ranges, owner, null);
+    return runPageMode(alloc, reader, writer, tables, ranges, owner, null, .{});
 }
 
 pub fn runForeignKeyValidationPage(alloc: Allocator, reader: reads.TableReadSource, writer: writes.TableWriteSource, tables: []const records.TableRecord, ranges: []const records.RangeRecord, owner: records.RangeRecord, id: [16]u8) !bool {
-    return runPageMode(alloc, reader, writer, tables, ranges, owner, id);
+    return runPageMode(alloc, reader, writer, tables, ranges, owner, id, .{});
 }
 
-fn runPageMode(alloc: Allocator, reader: reads.TableReadSource, writer: writes.TableWriteSource, tables: []const records.TableRecord, ranges: []const records.RangeRecord, owner: records.RangeRecord, validation_id: ?[16]u8) !bool {
+pub fn runForeignKeyValidationPageControlled(alloc: Allocator, reader: reads.TableReadSource, writer: writes.TableWriteSource, tables: []const records.TableRecord, ranges: []const records.RangeRecord, owner: records.RangeRecord, id: [16]u8, request: RequestContext) !bool {
+    return runPageMode(alloc, reader, writer, tables, ranges, owner, id, request);
+}
+
+fn runPageMode(alloc: Allocator, reader: reads.TableReadSource, writer: writes.TableWriteSource, tables: []const records.TableRecord, ranges: []const records.RangeRecord, owner: records.RangeRecord, validation_id: ?[16]u8, request: RequestContext) !bool {
+    var control = try request.platformDeadline();
+    try control.ensureActive();
     const table = for (tables) |table| {
         if (table.table_id == owner.table_id) break table;
     } else return false;
     if (owner.restore_backup_id.len != 0 or !try planner.requiresActivation(alloc, table.schema_json)) return false;
-    const deadline = time.monotonicNs() +| 5 * std.time.ns_per_s;
-    const control: RequestContext = .{
-        .deadline_ns = deadline,
-        .cancellation = .{ .ptr = &deadline, .is_cancelled_fn = struct {
-            fn expired(ptr: *const anyopaque) bool {
-                const value: *const u64 = @ptrCast(@alignCast(ptr));
-                return time.monotonicNs() >= value.*;
-            }
-        }.expired },
+    const Deadline = struct {
+        parent: CancellationToken,
+        at: u64,
+        fn expired(ptr: *const anyopaque) bool {
+            const value: *const @This() = @ptrCast(@alignCast(ptr));
+            return value.parent.isCancelled() or time.monotonicNs() >= value.at;
+        }
     };
+    const deadline: Deadline = .{ .parent = control.cancellation, .at = @min(control.deadline_ns orelse std.math.maxInt(u64), time.monotonicNs() +| 5 * std.time.ns_per_s) };
+    control.deadline_ns = deadline.at;
+    control.cancellation = .{ .ptr = &deadline, .is_cancelled_fn = Deadline.expired };
     var budget: AdaptiveBudget = .{};
     // At most seven reductions reach a one-row page. Every attempt retains
     // the same absolute deadline; no cursor advances until its complete 2PC.

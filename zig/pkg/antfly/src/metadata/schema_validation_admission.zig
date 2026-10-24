@@ -27,14 +27,12 @@ pub const max_wire_bytes = @import("schema_validation_plan.zig").max_bytes;
 
 pub const Request = struct {
     guard: domain.RelationMutationGuard,
-    columns: []const []const u8,
+    selection: contract.Selection,
 
     pub fn validate(self: @This()) !void {
         try self.guard.validate();
         if (self.guard.owner.kind != .table or self.guard.constraint_name_admission != null) return error.InvalidCatalogMutation;
-        var projection = contract.ProjectionHasher.init();
-        for (self.columns) |column| try projection.add(column);
-        _ = try projection.finish();
+        try self.selection.validate();
     }
 };
 
@@ -100,7 +98,7 @@ pub const Cut = struct {
             if ((try owners.getOrPut(a, address.digest())).found_existing) return error.GenerationPublicationChanged;
         }
         try tables.validateCompleteKeyspaceRanges(self.ranges);
-        const replacement = try schema_api.prepareNullabilityPublicationRecord(a, &self.before, request.columns);
+        const replacement = try schema_api.prepareSchemaValidationPublicationRecord(a, &self.before, request.selection);
         defer tables.freeTable(a, replacement);
         if (!tables.tableDefinitionsEqual(replacement, self.after)) return error.InvalidGenerationPublication;
     }

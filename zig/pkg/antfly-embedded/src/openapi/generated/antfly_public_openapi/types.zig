@@ -14498,12 +14498,14 @@ pub const ScanKeysRequest = struct {
 pub const SchemaValidationFailure = enum {
     requested,
     not_null_violation,
+    foreign_key_violation,
     owner_failed,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .requested => "requested",
             .not_null_violation => "not_null_violation",
+            .foreign_key_violation => "foreign_key_violation",
             .owner_failed => "owner_failed",
         };
         try jw.write(s);
@@ -14517,6 +14519,7 @@ pub const SchemaValidationFailure = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "requested", .requested },
             .{ "not_null_violation", .not_null_violation },
+            .{ "foreign_key_violation", .foreign_key_violation },
             .{ "owner_failed", .owner_failed },
         });
         return map.get(s) orelse error.UnexpectedToken;

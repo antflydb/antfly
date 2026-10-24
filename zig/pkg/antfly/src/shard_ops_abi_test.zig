@@ -198,7 +198,7 @@ test "shard adapter archive boundary schema preparation retains actual admission
         .namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 19 },
         .before_schema = "{}",
         .after_schema = "{}",
-        .columns = &.{"status"},
+        .selection = .{ .not_null = &.{"status"} },
     };
     try request.validate(17);
     var distinct = false;

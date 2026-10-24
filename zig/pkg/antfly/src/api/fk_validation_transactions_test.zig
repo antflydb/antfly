@@ -165,15 +165,19 @@ test "foreign key validation native transaction preserves atomic pages and publi
     try db.core.store.put(&child_key, child_bytes);
     try db.core.store.put(&orphan_key, orphan_bytes);
     var fixture: Fixture = .{ .db = &db };
-    const native_before = try local.storage_schema.serializeSchema(a, view.tableSchema().*);
-    defer a.free(native_before);
+    var selected = try planner.captureForeignKeyValidationSource(a, fixture.source(), &tables, "rows", &.{"fk"}, .{});
+    defer selected.deinit();
+    try std.testing.expectEqualStrings("rows", selected.value.table_name);
+    try std.testing.expectEqualStrings("fk", selected.value.parents[0].constraint_name);
+    try std.testing.expectEqualStrings("pk", selected.value.parents[0].parent_unique);
+    try std.testing.expectEqualDeep(bindings.find(.unique, "pk").?.generation, selected.value.parents[0].parent_generation);
+    try std.testing.expectEqualDeep(local.storage_db_relational_schema_owner_contract.hash(raw_catalog), selected.value.parents[0].parent_catalog);
     const versioned = try std.mem.replaceOwned(u8, a, declaration, "\"version\":1", "\"version\":2");
     defer a.free(versioned);
     const after_schema = try std.mem.replaceOwned(u8, a, versioned, "\"not_valid\":true", "\"not_valid\":false");
     defer a.free(after_schema);
     const job = local.storage_db_relational_nullability_job;
-    const hash = local.storage_db_relational_schema_owner_contract.hash;
-    var candidate = try job.Candidate.initForeignKeySource(a, 300, declaration, after_schema, raw_catalog, .{ .table_name = "rows", .parents = &.{.{ .constraint_name = "fk", .declared_parent = "rows", .parent_table = "rows", .parent_table_id = 300, .parent_schema_version = 1, .parent_schema = hash(native_before), .parent_public = hash(declaration), .parent_catalog = hash(raw_catalog), .parent_unique = "pk", .parent_generation = bindings.find(.unique, "pk").?.generation }} }, .{});
+    var candidate = try job.Candidate.initForeignKeySource(a, 300, declaration, after_schema, raw_catalog, selected.value, .{});
     defer candidate.deinit();
     const identity = try db.relationalTopologyIdentity();
     var source_read = try db.core.store.beginReadTxn();
@@ -183,12 +187,38 @@ test "foreign key validation native transaction preserves atomic pages and publi
     };
     source_read.abort();
     const record: activation.ForeignKeyValidationRecord = .{ .binding = source_binding, .physical_root = db.root_incarnation, .revision = 1, .progress = .{ .generation_set = generation_set, .owner = source_binding.owner, .schema_version = 1, .phase = .foreign_key } };
+    {
+        const selection: local.storage_db_relational_schema_owner_contract.InputSelection = .{ .foreign_keys = selected.value };
+        const payload = try selection.encodePayload(a);
+        defer a.free(payload);
+        const parts = try local.storage_db_relational_schema_owner_contract.inputParts(candidate.inputs);
+        try std.testing.expectEqualStrings(parts[3], payload);
+        const metadata_tables = @import("tables.zig");
+        const metadata_plans = @import("../metadata/schema_validation_plan.zig");
+        const before_record: local.common_topology_records.TableRecord = .{ .table_id = 300, .name = "rows", .schema_json = declaration, .indexes_json = "{}" };
+        const after_record = try metadata_tables.prepareSchemaValidationPublicationRecord(a, &before_record, .{ .foreign_keys = &.{"fk"} });
+        defer @import("../metadata/table_manager.zig").freeTable(a, after_record);
+        try std.testing.expectEqualStrings(after_schema, after_record.schema_json);
+        const intents = [_]metadata_plans.OwnerIntent{.{ .range = .{ .table_id = 300, .group_id = 301, .range_id = 302, .doc_identity_shard_id = 301, .doc_identity_range_id = 302, .start_key = "" }, .binding = source_binding, .physical_root_incarnation = db.root_incarnation }};
+        var cohort = try metadata_plans.Prepared.init(a, .{ .metadata_group_id = 21, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .id = source_binding.id, .before = before_record, .after = after_record, .selection = selection, .owners = &intents });
+        defer cohort.deinit();
+        try std.testing.expectEqual(@as(u16, 1), cohort.head.owner_count);
+        try std.testing.expectEqual(local.storage_db_relational_schema_owner_contract.Purpose.foreign_key_source, cohort.owners[0].binding.purpose);
+        var decoded_plan = try metadata_plans.parse(a, cohort.encoded);
+        defer decoded_plan.deinit();
+        try decoded_plan.value.requireProgress(a, cohort.head, cohort.owners);
+        var wrong_selection = decoded_plan.value;
+        wrong_selection.selection = .{ .not_null = &.{"parent_id"} };
+        try std.testing.expectError(error.InvalidGenerationPublication, wrong_selection.validate(a));
+    }
     const initial_record = try record.encode(a);
     defer a.free(initial_record);
     const scope: activation.ForeignKeyValidationScope = .{ .binding = source_binding, .physical_root = db.root_incarnation, .action = .page };
-    const begin = try db.beginTransactionWithId(@splat(8), 800);
-    try db.writeTransaction(begin, .{ .relational_schema_version = 1, .relational_integrity_generation_set = generation_set, .relational_activation = .{ .routing_key = "", .expected = null, .next = initial_record, .validation = .{ .binding = source_binding, .physical_root = db.root_incarnation, .action = .begin, .inputs = .{ .bytes = candidate.inputs } } } });
-    try db.commitTransaction(begin, 801);
+    const rows = @import("schema_validation_rows.zig");
+    try std.testing.expectEqual(rows.Result.pending, try rows.step(a, fixture.source(), fixture.writer(), &tables, &ranges, ranges[0], source_binding, candidate.inputs, db.root_incarnation, false, .{}));
+    try expectCheckpoint(&db, initial_record);
+    // Control-plane cancellation cannot bypass the progress key's 2PC lock.
+    try std.testing.expectError(error.SchemaValidationCancellationRequired, applyControl(&db, .{ .binding = source_binding, .action = .cancel }));
     try expectCheckpoint(&db, initial_record);
     // Root mismatches fail before any validation intent can be accepted.
     const wrong_root_txn = try db.beginTransactionWithId(@splat(12), 1200);
@@ -238,6 +268,7 @@ test "foreign key validation native transaction preserves atomic pages and publi
     const coverage = (try db.core.getStoreValue(a, activation.key)).?;
     defer a.free(coverage);
     const promoted = try fixture.prepare(&checked, 5);
+    try std.testing.expectError(error.IntentConflict, rows.step(a, fixture.source(), fixture.writer(), &tables, &ranges, ranges[0], source_binding, candidate.inputs, db.root_incarnation, true, .{}));
     try expectHistorical(&db, &child_key, true);
     try expectCheckpoint(&db, initial_record);
     db.close();
@@ -280,6 +311,21 @@ test "foreign key validation native transaction preserves atomic pages and publi
     try std.testing.expectEqualStrings("ForeignKeyParentMissing", failed.progress.failure);
     try std.testing.expectEqual(@as(u64, 1), failed.progress.rows_scanned);
     try std.testing.expectEqualSlices(u8, cursor, failed.progress.cursor);
+    try std.testing.expectEqual(rows.Result.failed, try rows.step(a, fixture.source(), fixture.writer(), &tables, &ranges, ranges[0], source_binding, candidate.inputs, db.root_incarnation, false, .{}));
+    const replacement_root = if (db.root_incarnation == 1) 2 else db.root_incarnation ^ 1;
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, rows.step(a, fixture.source(), fixture.writer(), &tables, &ranges, ranges[0], source_binding, candidate.inputs, replacement_root, false, .{}));
+    try std.testing.expectEqual(rows.Result.failed, try rows.step(a, fixture.source(), fixture.writer(), &tables, &ranges, ranges[0], source_binding, candidate.inputs, replacement_root, true, .{}));
+    try expectCheckpoint(&db, failed_raw);
+    // A terminal failed page joins the same fencing/drain/ACK protocol as
+    // success. It cannot install, and cleanup retains the public declaration.
+    _ = try applyControl(&db, .{ .binding = source_binding, .action = .begin, .payload = candidate.inputs });
+    const failed_header = try applyControl(&db, .{ .binding = source_binding, .action = .freeze });
+    try std.testing.expectEqual(job.Phase.failed, failed_header.phase);
+    try std.testing.expectEqual(@as(?u16, 0), failed_header.failure_column);
+    try std.testing.expectEqual(db.root_incarnation, failed_header.transaction_coverage.?.physical_root);
+    try std.testing.expectEqual(@as(u64, 1), failed_header.rows_scanned);
+    const canceled_failure = try applyControl(&db, .{ .binding = source_binding, .action = .cancel });
+    try std.testing.expectEqual(job.Phase.canceled, canceled_failure.phase);
     var repair = try planner.prepareWithCoverageControlled(a, fixture.source(), &tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{.{ .key = "repaired_parent", .value = "{\"id\":99,\"parent_id\":null,\"payload\":\"repair\"}" }} }}, .{});
     defer repair.deinit();
     try fixture.commit(&repair, 9);
@@ -293,11 +339,10 @@ test "foreign key validation native transaction preserves atomic pages and publi
     const retry_record: activation.ForeignKeyValidationRecord = .{ .binding = retry_binding, .physical_root = db.root_incarnation, .revision = 1, .progress = .{ .generation_set = generation_set, .owner = retry_binding.owner, .schema_version = 1, .phase = .foreign_key } };
     const retry_initial = try retry_record.encode(a);
     defer a.free(retry_initial);
-    const retry_begin = try db.beginTransactionWithId(@splat(10), 1000);
-    try db.writeTransaction(retry_begin, .{ .relational_schema_version = 1, .relational_integrity_generation_set = generation_set, .relational_activation = .{ .routing_key = "", .expected = failed_raw, .next = retry_initial, .validation = .{ .binding = retry_binding, .physical_root = db.root_incarnation, .action = .begin, .inputs = .{ .bytes = candidate.inputs } } } });
-    try db.commitTransaction(retry_begin, 1001);
+    try std.testing.expectEqual(rows.Result.pending, try rows.step(a, fixture.source(), fixture.writer(), &tables, &ranges, ranges[0], retry_binding, candidate.inputs, db.root_incarnation, false, .{}));
+    try expectCheckpoint(&db, retry_initial);
     for (0..16) |_| {
-        if (!try worker.runForeignKeyValidationPage(a, fixture.source(), fixture.writer(), &tables, &ranges, ranges[0], retry_binding.id)) break;
+        if (try rows.step(a, fixture.source(), fixture.writer(), &tables, &ranges, ranges[0], retry_binding, candidate.inputs, db.root_incarnation, false, .{}) == .ready) break;
     } else return error.ValidationDidNotConverge;
     const ready_raw = (try db.core.getStoreValue(a, activation.validation_key)).?;
     defer a.free(ready_raw);
@@ -315,9 +360,9 @@ test "foreign key validation native transaction preserves atomic pages and publi
     canceled.progress.failure = "Canceled";
     const canceled_raw = try canceled.encode(a);
     defer a.free(canceled_raw);
-    const cancel = try db.beginTransactionWithId(@splat(11), 1100);
-    try db.writeTransaction(cancel, .{ .relational_schema_version = 1, .relational_integrity_generation_set = generation_set, .relational_activation = .{ .routing_key = "", .expected = ready_raw, .next = canceled_raw, .validation = .{ .binding = retry_binding, .physical_root = db.root_incarnation, .action = .cancel } } });
-    try db.commitTransaction(cancel, 1101);
+    try std.testing.expectEqual(rows.Result.pending, try rows.step(a, fixture.source(), fixture.writer(), &tables, &ranges, ranges[0], retry_binding, candidate.inputs, db.root_incarnation, true, .{}));
+    try expectCheckpoint(&db, canceled_raw);
+    try std.testing.expectEqual(rows.Result.failed, try rows.step(a, fixture.source(), fixture.writer(), &tables, &ranges, ranges[0], retry_binding, candidate.inputs, db.root_incarnation, true, .{}));
     {
         var released = try db.core.store.beginReadTxn();
         defer released.abort();

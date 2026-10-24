@@ -9844,7 +9844,7 @@ pub const DB = struct {
             return err;
         };
         const record = try @import("relational_integrity_activation_contract.zig").ForeignKeyValidationRecord.decode(raw);
-        if (record.physical_root != self.root_incarnation) return error.SchemaValidationRuntimeRecoveryRequired;
+        if (record.progress.state != .invalid and record.physical_root != self.root_incarnation) return error.SchemaValidationRuntimeRecoveryRequired;
     }
 
     pub fn applyPreparedNativeSchemaOwnerControl(self: *DB, prepared: *NativeSchemaOwnerControl.Prepared, replay: ?NativeIndexReplay) !NativeSchemaOwnerControl.Outcome {
@@ -21255,7 +21255,7 @@ pub const DB = struct {
         defer request.deinit();
         if (request.value.max_rows == 0 or request.value.max_rows > 128) return error.InvalidConstraintActivation;
         const semantic = request.value.mode == .validation_page or request.value.mode == .validation_status;
-        if (semantic != (request.value.validation_id != null)) return error.InvalidSchemaValidationJob;
+        if ((!semantic and request.value.validation_id != null) or (request.value.mode == .validation_page and request.value.validation_id == null)) return error.InvalidSchemaValidationJob;
         if (request.value.mode == .validation_status) {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
@@ -21264,11 +21264,13 @@ pub const DB = struct {
                 else => return err,
             };
             const record = try activation.ValidationRecord.decode(raw);
-            if (!std.mem.eql(u8, &record.binding.id, &request.value.validation_id.?)) return error.SchemaValidationJobChanged;
-            if (record.binding.authority == .native and record.physical_root != self.root_incarnation) return error.SchemaValidationRuntimeRecoveryRequired;
+            if (request.value.validation_id) |id| if (!std.mem.eql(u8, &record.binding.id, &id)) return error.SchemaValidationJobChanged;
+            if (record.progress.state != .invalid and record.binding.authority == .native and record.physical_root != self.root_incarnation) return error.SchemaValidationRuntimeRecoveryRequired;
             const encoded = try std.json.Stringify.valueAlloc(alloc, record, .{});
             errdefer alloc.free(encoded);
-            try activation.requireValidationDefinition(&read, record.binding);
+            // Inert canceled/failed history can be observed for an exact CAS
+            // replacement after unrelated DDL. It grants no coverage reuse.
+            if (record.progress.state != .invalid) try activation.requireValidationDefinition(&read, record.binding);
             return .{ .json = encoded };
         }
         if (request.value.mode == .validation_page) {

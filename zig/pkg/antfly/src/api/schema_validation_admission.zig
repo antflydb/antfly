@@ -78,6 +78,7 @@ fn terminal(input: catalog.DdlReceipt, head: barriers.Head) !?catalog.DdlOutcome
         },
         .canceled => switch (head.failure) {
             .not_null_violation => error.SqlNotNullViolation,
+            .foreign_key_violation => error.ForeignKeyParentMissing,
             .requested => error.Canceled,
             .owner_failed, .none => error.SchemaValidationJobChanged,
         },

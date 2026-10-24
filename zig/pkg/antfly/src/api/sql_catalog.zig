@@ -221,7 +221,7 @@ fn beginSchemaValidation(server: *server_mod.ApiHttpServer, context: operation.R
     private.schema_validation_authority = true;
     var transport: @import("schema_validation_owner_transport.zig").Transport = .{ .server = server, .alloc = allocators.scratch };
     defer transport.deinit();
-    var owned = @import("schema_validation_plan_builder.zig").prepare(server.source, &transport, allocators.scratch, io, private, .{ .guard = guard, .columns = columns }) catch |err| switch (err) {
+    var owned = @import("schema_validation_plan_builder.zig").prepare(server.source, &transport, allocators.scratch, io, private, .{ .guard = guard, .selection = .{ .not_null = columns } }) catch |err| switch (err) {
         error.MetadataReplicationPending => return error.CatalogPublicationProofPending,
         else => return err,
     };

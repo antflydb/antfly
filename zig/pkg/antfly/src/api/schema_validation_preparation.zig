@@ -39,7 +39,7 @@ pub const Request = struct {
     namespace: local.storage_db_doc_identity_namespace.Namespace,
     before_schema: []const u8,
     after_schema: []const u8,
-    columns: []const []const u8,
+    selection: contract.InputSelection,
     known_inputs: []const [32]u8 = &.{},
 
     pub fn validate(self: @This(), group: u64) !void {
@@ -48,9 +48,7 @@ pub const Request = struct {
             self.namespace.table_id == 0 or self.namespace.shard_id == 0 or self.namespace.range_id == 0 or
             self.before_schema.len == 0 or self.before_schema.len > contract.max_schema or
             self.after_schema.len == 0 or self.after_schema.len > contract.max_schema or self.known_inputs.len > max_known_inputs) return error.InvalidSchemaValidationJob;
-        var projection = contract.ProjectionHasher.init();
-        for (self.columns) |column| try projection.add(column);
-        _ = try projection.finish();
+        try self.selection.validate();
         for (self.known_inputs, 0..) |digest, i| {
             if (std.mem.allEqual(u8, &digest, 0)) return error.InvalidSchemaValidationJob;
             for (self.known_inputs[0..i]) |prior| if (std.mem.eql(u8, &prior, &digest)) return error.InvalidSchemaValidationJob;
@@ -74,21 +72,35 @@ pub const Response = struct {
         try request.validate(group);
         const binding = self.signed.value.binding;
         try self.signed.verifyFor(binding, self.signed.value.physical_root_incarnation);
-        var projection = contract.ProjectionHasher.init();
-        for (request.columns) |column| try projection.add(column);
+
         if (!std.mem.eql(u8, &self.signed.proof.identity.metadata_incarnation, &request.metadata_incarnation) or
             !std.mem.eql(u8, &binding.id, &request.id) or !std.mem.eql(u8, &binding.plan_digest, &request.provisional_plan) or
             !binding.fence.namespace.eql(request.namespace) or binding.fence.owner_group_id != group or
-            binding.fence.transition_id != request.transition_id or binding.columns != request.columns.len or
+            binding.fence.transition_id != request.transition_id or binding.columns != request.selection.count() or
             !std.mem.eql(u8, &binding.before_public, &contract.hash(request.before_schema)) or
             !std.mem.eql(u8, &binding.after_public, &contract.hash(request.after_schema)) or
-            !std.mem.eql(u8, &binding.projection_identity, &try projection.finish())) return error.SchemaValidationJobChanged;
+            binding.purpose != request.selection.purpose()) return error.SchemaValidationJobChanged;
+        if (request.selection == .not_null) {
+            var projection = contract.ProjectionHasher.init();
+            for (request.selection.not_null) |column| try projection.add(column);
+            if (!std.mem.eql(u8, &binding.projection_identity, &try projection.finish())) return error.SchemaValidationJobChanged;
+        }
         if (self.inputs.len == 0) {
             if (!request.hasInput(binding.inputs)) return error.SchemaValidationJobChanged;
         } else {
             const parts = try contract.inputParts(self.inputs);
             if (!std.mem.eql(u8, &binding.inputs, &contract.hash(self.inputs)) or
                 !std.mem.eql(u8, parts[0], request.before_schema) or !std.mem.eql(u8, parts[1], request.after_schema)) return error.SchemaValidationJobChanged;
+            const payload_hash = switch (request.selection) {
+                inline else => |value| blk: {
+                    var state = std.Io.Writer.Hashing(std.crypto.hash.Blake3).initHasher(std.crypto.hash.Blake3.init(.{}), &.{});
+                    try std.json.Stringify.value(value, .{}, &state.writer);
+                    var result: [32]u8 = undefined;
+                    state.hasher.final(&result);
+                    break :blk result;
+                },
+            };
+            if (!std.mem.eql(u8, &contract.hash(parts[3]), &payload_hash)) return error.SchemaValidationJobChanged;
         }
     }
 };

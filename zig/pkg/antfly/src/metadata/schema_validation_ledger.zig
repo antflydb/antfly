@@ -82,7 +82,7 @@ pub const ParsedCommand = struct {
 
 pub fn encodeBegin(alloc: A, request: Begin) ![]u8 {
     if (request.inputs.len == 0 or request.inputs.len > barriers.max_owners or request.plan.owners.len == 0 or request.plan.owners.len > barriers.max_owners or
-        request.plan.columns.len == 0 or request.plan.columns.len > contract.max_columns or request.preparations.len != request.plan.owners.len) return error.InvalidGenerationPublication;
+        request.plan.selection.count() == 0 or request.plan.selection.count() > contract.max_columns or request.preparations.len != request.plan.owners.len) return error.InvalidGenerationPublication;
     var count = std.Io.Writer.Discarding.init(&.{});
     try std.json.Stringify.value(Command{ .begin = request }, .{}, &count.writer);
     if (count.fullCount() > plan_mod.max_bytes * 2) return error.InvalidGenerationPublication;
@@ -140,7 +140,7 @@ pub fn parseCommand(alloc: A, bytes: []const u8) !ParsedCommand {
             try request.validateShape();
         },
         .install, .publish => |decision| if (framed or decision.revision == 0) return error.InvalidGenerationPublication,
-        .cancel => |request| if (framed or request.decision.revision == 0 or request.failure == .none or request.failure == .not_null_violation) return error.InvalidGenerationPublication,
+        .cancel => |request| if (framed or request.decision.revision == 0 or request.failure == .none or request.failure.isConstraintViolation()) return error.InvalidGenerationPublication,
     }
     var input_views: []const []const u8 = &.{};
     if (framed) {
@@ -318,10 +318,12 @@ fn writeHead(txn: anytype, head: barriers.Head) !void {
     var buf: [192]u8 = undefined;
     try txn.put(try storageKey(Lookup.fromHead(head), .head, 0, .ready).encode(&buf), encoded.slice());
 }
-fn stageTerminal(txn: anytype, head: barriers.Head) !void {
+fn stageTerminal(txn: anytype, head: barriers.Head, foreign_constraints: u16) !void {
     if (!terminal(head)) return;
     try requireLock(txn, head);
     var buf: [192]u8 = undefined;
+    if (foreign_constraints != 0)
+        try @import("schema_validation_dependencies.zig").releaseJob(txn, head, foreign_constraints);
     try txn.delete(try storageKey(Lookup.fromHead(head), .active, 0, .ready).encode(&buf));
     try lifecycle.release(txn, head.metadata_group_id, head.table_id, .{ .kind = .schema_validation, .id = head.id });
 }
@@ -340,7 +342,7 @@ pub fn checkBegin(alloc: A, txn: anytype, prepared: *const plan_mod.Prepared, pr
     defer alloc.free(input_digests);
     const catalog_digests = try alloc.alloc([32]u8, inputs.len);
     defer alloc.free(catalog_digests);
-    const columns = try std.json.Stringify.valueAlloc(alloc, decoded.value.columns, .{});
+    const columns = try decoded.value.selection.encodePayload(alloc);
     defer alloc.free(columns);
     for (inputs, input_digests, catalog_digests) |input, *input_digest, *catalog_digest| {
         const parts = try contract.inputParts(input);
@@ -383,6 +385,12 @@ pub fn begin(alloc: A, txn: anytype, prepared: *const plan_mod.Prepared, prepara
     var buf: [192]u8 = undefined;
     // No expected admission/CAS rejection may be swallowed after this point.
     try lifecycle.acquire(txn, lookup.group, lookup.table, .{ .kind = .schema_validation, .id = lookup.id });
+    if (prepared.owners[0].binding.purpose == .foreign_key_source) {
+        const parts = try contract.inputParts(inputs[0]);
+        var source = try std.json.parseFromSlice(contract.ForeignKeySource, alloc, parts[3], .{ .ignore_unknown_fields = false });
+        defer source.deinit();
+        try @import("schema_validation_dependencies.zig").acquire(alloc, txn, prepared.head, source.value);
+    }
     try txn.put(try storageKey(lookup, .plan, 0, .ready).encode(&buf), prepared.encoded);
     for (inputs, 0..) |input, ordinal| try txn.put(try storageKey(lookup, .input, @intCast(ordinal), .ready).encode(&buf), input);
     for (prepared.owners, preparations) |owner, signed| {
@@ -931,7 +939,7 @@ pub fn observeReceipt(txn: anytype, request: @import("schema_validation_receipt.
         .publication => if (head.publication_revision != 0) {
             result.observed = .{ .publication = .{ .revision = head.publication_revision - 1, .digest = try head.publicationDecision() } };
         },
-        .cancellation => if (head.cancellation_revision != 0 and head.failure != .not_null_violation) {
+        .cancellation => if (head.cancellation_revision != 0 and !head.failure.isConstraintViolation()) {
             result.observed = .{ .cancellation = .{ .decision = .{ .revision = head.cancellation_revision - 1, .digest = try head.cancellationDecision() }, .failure = head.failure } };
         },
     }
@@ -962,7 +970,7 @@ pub fn verified(signed: evidence.SignedObservation, owner: barriers.Owner) !evid
 pub const PreparedAcknowledgement = struct {
     lookup: Lookup,
     head: barriers.Head,
-    changed: ?struct { owner: barriers.OwnerRecord, proof: ProofRecord, ordinal: u16, stage: barriers.Stage } = null,
+    changed: ?struct { owner: barriers.OwnerRecord, proof: ProofRecord, ordinal: u16, stage: barriers.Stage, foreign_constraints: u16 } = null,
 
     /// Stage only in the SAME writer snapshot that authenticated this value.
     /// Preflight callers discard it; consensus application prepares it afresh.
@@ -972,7 +980,7 @@ pub const PreparedAcknowledgement = struct {
         try txn.put(try storageKey(self.lookup, .proof, changed.ordinal, changed.stage).encode(&buf), changed.proof.slice());
         try txn.put(try storageKey(self.lookup, .owner, changed.ordinal, .ready).encode(&buf), changed.owner.slice());
         try writeHead(txn, self.head);
-        try stageTerminal(txn, self.head);
+        try stageTerminal(txn, self.head, changed.foreign_constraints);
         return self.head;
     }
 };
@@ -1008,7 +1016,7 @@ pub fn prepareAcknowledgement(txn: anytype, lookup: Lookup, ordinal: u16, expect
     // Retain the complete signed evidence with BOTH compact postimages. A
     // failed put or terminal delete is fatal to the whole writer, never a
     // recoverable stale-ACK result after partial progress has been staged.
-    return .{ .lookup = lookup, .head = update.head, .changed = .{ .owner = encoded_owner, .proof = proof, .ordinal = ordinal, .stage = stage } };
+    return .{ .lookup = lookup, .head = update.head, .changed = .{ .owner = encoded_owner, .proof = proof, .ordinal = ordinal, .stage = stage, .foreign_constraints = if (owner.binding.purpose == .foreign_key_source) owner.binding.columns else 0 } };
 }
 
 pub fn acknowledge(txn: anytype, lookup: Lookup, ordinal: u16, expected_revision: u64, signed: evidence.SignedObservation, context: anytype) !barriers.Head {
@@ -1073,7 +1081,7 @@ pub fn recover(alloc: A, txn: anytype, lookup: Lookup) !Recovery {
     defer alloc.free(input_digests);
     const catalog_digests = try alloc.alloc([32]u8, head.input_count);
     defer alloc.free(catalog_digests);
-    const columns = try std.json.Stringify.valueAlloc(alloc, plan.value.columns, .{});
+    const columns = try plan.value.selection.encodePayload(alloc);
     defer alloc.free(columns);
     for (input_digests, catalog_digests, 0..) |*input_digest, *catalog_digest, ordinal| {
         const bytes = try txn.get(try storageKey(lookup, .input, @intCast(ordinal), .ready).encode(&buf));
@@ -1130,6 +1138,7 @@ pub fn recover(alloc: A, txn: anytype, lookup: Lookup) !Recovery {
         }
     }
     try plan.value.requireProgress(alloc, head, owners);
+    if (plan.value.selection == .foreign_keys) try @import("schema_validation_dependencies.zig").requireSource(alloc, txn, head, plan.value.selection.foreign_keys, terminal(head));
     if (!terminal(head)) {
         try requireLock(txn, head);
     } else {
@@ -1586,6 +1595,9 @@ const FaultTxn = struct {
             self.plan_reads += 1;
         };
         return self.base.get(key);
+    }
+    pub fn openCursor(self: *@This()) !local.storage_docstore.DocStore.Txn.CursorAdapter {
+        return self.base.openCursor();
     }
     fn checkpoint(self: *@This()) !void {
         self.writes += 1;
@@ -3293,4 +3305,129 @@ test "schema validation publication cancellation is durable before owner admissi
     try std.testing.expectEqual(@as(usize, 0), counted.writes);
     const late = try TestProofs.parentRequest(head, try readOwner(&read, head, 1), null);
     try std.testing.expectError(error.GenerationPublicationChanged, prepareParentAuthorization(&read, late, &context));
+}
+
+test "schema validation publication FK dependency admission and final cancellation ACK are atomic across cold faults" {
+    // Real metadata LSM/fault campaign with fixture catalog and signer
+    // callbacks. Real FK row/parent preparation is tested by the native
+    // transaction campaign; this test qualifies ledger atomicity only.
+    const a = std.testing.allocator;
+    const deps = @import("schema_validation_dependencies.zig");
+    var directory = try local.common_test_directory.TestDirectory.init("fk-validation-ledger");
+    defer directory.cleanup();
+    const path = try a.dupeSentinel(u8, directory.path(), 0);
+    defer a.free(path);
+    var fixture = try plan_mod.test_support.PlanFixture.init(a);
+    defer fixture.deinit();
+    var plan = fixture.plan();
+    plan.before.schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"fk","child_columns":["parent_id"],"parent_table":"rows","parent_columns":["id"],"not_valid":true}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    plan.after = try @import("../api/tables.zig").prepareSchemaValidationPublicationRecord(a, &plan.before, .{ .foreign_keys = &.{"fk"} });
+    defer @import("table_manager.zig").freeTable(a, plan.after);
+    var before = try local.schema_mod.PreparedSchemaDefinition.init(a, plan.before.schema_json);
+    defer before.deinit(a);
+    var after = try local.schema_mod.PreparedSchemaDefinition.init(a, plan.after.schema_json);
+    defer after.deinit(a);
+    const before_native = try local.storage_schema.serializeSchema(a, before.runtime_schema);
+    defer a.free(before_native);
+    const after_native = try local.storage_schema.serializeSchema(a, after.runtime_schema);
+    defer a.free(after_native);
+    const source: contract.ForeignKeySource = .{ .table_name = "rows", .parents = &.{.{ .constraint_name = "fk", .declared_parent = "rows", .parent_table = "rows", .parent_table_id = 7, .parent_schema_version = 1, .parent_schema = contract.hash(before_native), .parent_public = contract.hash(plan.before.schema_json), .parent_catalog = contract.hash("fixture-catalog"), .parent_unique = "pk", .parent_generation = @splat(4), .parent_definition = @splat(41) }} };
+    plan.selection = .{ .foreign_keys = source };
+    const payload = try plan.selection.encodePayload(a);
+    defer a.free(payload);
+    const input = try contract.encodeInputs(a, .{ plan.before.schema_json, plan.after.schema_json, "fixture-catalog", payload });
+    defer a.free(input);
+    var intents = fixture.intents;
+    for (&intents) |*intent| {
+        intent.binding.purpose = .foreign_key_source;
+        intent.binding.before_schema = contract.hash(before_native);
+        intent.binding.after_schema = contract.hash(after_native);
+        intent.binding.before_public = contract.hash(plan.before.schema_json);
+        intent.binding.after_public = contract.hash(plan.after.schema_json);
+        intent.binding.inputs = contract.hash(input);
+        intent.binding.fence.catalog_digest = contract.hash("fixture-catalog");
+    }
+    plan.owners = &intents;
+    var prepared = try plan_mod.Prepared.init(a, plan);
+    defer prepared.deinit();
+    const lookup = Lookup.fromHead(prepared.head);
+    const preps = [_]evidence.SignedPreparation{ try TestProofs.preparation(prepared.head, prepared.owners[0]), try TestProofs.preparation(prepared.head, prepared.owners[1]) };
+    var context: TestContext = .{};
+    const Store = local.storage_docstore.DocStore;
+    var store = try Store.open(a, path, .{});
+    var live = true;
+    defer if (live) store.close();
+    try store.put(TestContext.table_key, plan.before.schema_json);
+    for (1..14) |fail_write| for ([_]bool{ false, true }) |after_write| {
+        var write = try store.beginWriteTxn();
+        var failing: FaultTxn = .{ .base = &write, .fail_write = fail_write, .after = after_write };
+        try std.testing.expectError(error.InjectedStorageFailure, begin(a, &failing, &prepared, &preps, &.{input}, &context));
+        write.abort();
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try deps.requireUnleased(&read, lookup.group, 7);
+        try std.testing.expectError(error.GenerationPublicationNotFound, readHead(&read, lookup));
+    };
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        try begin(a, &write, &prepared, &preps, &.{input}, &context);
+        var head = try readHead(&write, lookup);
+        head = try cancel(&write, lookup, head.revision, .requested);
+        const owner = try readOwner(&write, head, 0);
+        var canceled = TestProofs.ready(owner);
+        canceled.reference_coverage = .{};
+        canceled.phase = .canceled;
+        _ = try acknowledge(&write, lookup, owner.ordinal, head.revision, try TestProofs.signed(head, owner, canceled), &context);
+        try write.commit();
+    }
+    store.close();
+    live = false;
+    store = try Store.open(a, path, .{});
+    live = true;
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try deps.requireSource(a, &read, try readHead(&read, lookup), source, false);
+        var recovered = try recover(a, &read, lookup);
+        defer recovered.deinit();
+        try std.testing.expectEqual(@as(u16, 1), recovered.head.canceled);
+        try verifyGroup(a, &read, lookup.group, &context);
+    }
+    for (1..8) |fail_write| for ([_]bool{ false, true }) |after_write| {
+        var write = try store.beginWriteTxn();
+        var failing: FaultTxn = .{ .base = &write, .fail_write = fail_write, .after = after_write };
+        const head = try readHead(&failing, lookup);
+        const owner = try readOwner(&failing, head, 1);
+        var canceled = TestProofs.ready(owner);
+        canceled.reference_coverage = .{};
+        canceled.phase = .canceled;
+        try std.testing.expectError(error.InjectedStorageFailure, acknowledge(&failing, lookup, 1, head.revision, try TestProofs.signed(head, owner, canceled), &context));
+        write.abort();
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const retained = try readHead(&read, lookup);
+        try std.testing.expectEqual(@as(u16, 1), retained.canceled);
+        try deps.requireSource(a, &read, retained, source, false);
+    };
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        const head = try readHead(&write, lookup);
+        const owner = try readOwner(&write, head, 1);
+        var canceled = TestProofs.ready(owner);
+        canceled.reference_coverage = .{};
+        canceled.phase = .canceled;
+        _ = try acknowledge(&write, lookup, 1, head.revision, try TestProofs.signed(head, owner, canceled), &context);
+        try write.commit();
+    }
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    const terminal_head = try readHead(&read, lookup);
+    try std.testing.expectEqual(barriers.Phase.canceled, terminal_head.phase);
+    try deps.requireSource(a, &read, terminal_head, source, true);
+    try deps.requireUnleased(&read, lookup.group, 7);
+    try verifyGroup(a, &read, lookup.group, &context);
 }

@@ -16476,6 +16476,7 @@ components:
       enum:
         - requested
         - not_null_violation
+        - foreign_key_violation
         - owner_failed
     SchemaValidationStatus:
       type: object
