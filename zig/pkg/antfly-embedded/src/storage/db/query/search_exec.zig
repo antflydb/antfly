@@ -8253,18 +8253,18 @@ fn sortedSegmentSeekStartDocWithTiesAlloc(
         return if (reverse) @as(i64, @intCast(doc_count)) - 1 else 0;
     }
 
-    if (plan.sorted_segment_bounds_available and !inclusive) {
+    if (plan.sorted_segment_bounds_available) {
         if (try segment.reader.indexSortBoundsAlloc(alloc)) |bounds| {
             var owned_bounds = bounds;
             defer owned_bounds.deinit(alloc);
-            const first_order = try compareSortedSegmentBoundToCursor(req, plan, owned_bounds.first, cursor);
-            const last_order = try compareSortedSegmentBoundToCursor(req, plan, owned_bounds.last, cursor);
+            const first_order = try compareSortedSegmentBoundToCursor(req, plan, owned_bounds.first[0..req.order_by.len], cursor);
+            const last_order = try compareSortedSegmentBoundToCursor(req, plan, owned_bounds.last[0..req.order_by.len], cursor);
             if (!reverse) {
-                if (last_order != .gt) return @intCast(doc_count);
-                if (first_order == .gt) return 0;
+                if (last_order == .lt or (!inclusive and last_order == .eq)) return @intCast(doc_count);
+                if (first_order == .gt or (inclusive and first_order == .eq)) return 0;
             } else {
-                if (first_order != .lt) return -1;
-                if (last_order == .lt) return @as(i64, @intCast(doc_count)) - 1;
+                if (first_order == .gt or (!inclusive and first_order == .eq)) return -1;
+                if (last_order == .lt or (inclusive and last_order == .eq)) return @as(i64, @intCast(doc_count)) - 1;
             }
         }
     }
@@ -11648,6 +11648,8 @@ const SortedPrimaryCandidates = struct {
     iterators: std.ArrayListUnmanaged(SortedSegmentIterator) = .empty,
     heap: std.PriorityQueue(SortedSegmentHead, SortedSegmentHeadHeapContext, sortedSegmentHeadOrder),
     scanned: u64 = 0,
+    cursor_req: types.SearchRequest,
+    unopened: std.ArrayListUnmanaged(bool) = .empty,
     primed: bool = false,
     fn unavailable(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!?[]u8 {
         return error.UnsupportedExactSort;
@@ -11663,15 +11665,52 @@ const SortedPrimaryCandidates = struct {
         primary.order_by = req.order_by[0 .. req.order_by.len - 1];
         if (primary.search_after.len != 0) primary.search_after = primary.search_after[0..primary.order_by.len];
         if (primary.search_before.len != 0) primary.search_before = primary.search_before[0..primary.order_by.len];
-        self.* = .{ .a = a, .req = primary, .snapshot = snapshot, .plan = plan, .values = .{ .snapshot = snapshot }, .heap = .initContext(.{ .req = primary, .reverse = req.search_before.len != 0 }) };
+        self.* = .{ .a = a, .req = primary, .snapshot = snapshot, .plan = plan, .cursor_req = primary, .values = .{ .snapshot = snapshot }, .heap = .initContext(.{ .req = primary, .reverse = req.search_before.len != 0 }) };
         errdefer close(self);
         var base: u32 = 0;
         for (snapshot.segments, 0..) |*segment, index| {
             defer base += segment.reader.doc_count;
             if (segment.liveDocCount() == 0) continue;
-            var iterator: SortedSegmentIterator = .{ .segment_index = index, .doc_base = base, .next_doc = 0 };
-            iterator.next_doc = try sortedSegmentSeekStartDocWithTiesAlloc(a, primary, plan, snapshot, iterator, self.loader(), null, unavailable, req.search_before.len != 0, true);
-            if (!sortedSegmentIteratorDone(snapshot, iterator, req.search_before.len != 0)) try self.iterators.append(a, iterator);
+            const iterator: SortedSegmentIterator = .{ .segment_index = index, .doc_base = base, .next_doc = 0 };
+            const run = self.iterators.items.len;
+            try self.iterators.append(a, iterator);
+            try self.unopened.append(a, false);
+            if (plan.sorted_segment_bounds_available) {
+                var lease = try snapshot.leaseSegment(index);
+                defer lease.deinit();
+                if (try lease.entry.reader.indexSortBoundsAlloc(a)) |bounds_| {
+                    var bounds = bounds_;
+                    defer bounds.deinit(a);
+                    const reverse = req.search_before.len != 0;
+                    const bound = (if (reverse) bounds.last else bounds.first)[0..primary.order_by.len];
+                    const opposite = (if (reverse) bounds.first else bounds.last)[0..primary.order_by.len];
+                    const cursor = activeSortCursor(primary);
+                    if (cursor.len != 0) {
+                        const order = try compareSortedSegmentBoundToCursor(primary, plan, opposite, cursor);
+                        if ((!reverse and order == .lt) or (reverse and order == .gt)) {
+                            self.iterators.items[run].next_doc = if (reverse) -1 else segment.reader.doc_count;
+                            continue;
+                        }
+                    }
+                    const keys = try a.alloc(SortValue, primary.order_by.len);
+                    var initialized: usize = 0;
+                    errdefer {
+                        for (keys[0..initialized]) |key| key.deinit(a);
+                        a.free(keys);
+                    }
+                    for (keys, bound) |*key, value| {
+                        key.* = sortValueFromSegmentBoundValue(value);
+                        if (key.* == .string) key.* = .{ .string = try a.dupe(u8, key.string) };
+                        initialized += 1;
+                    }
+                    const id = try a.dupe(u8, "");
+                    errdefer a.free(id);
+                    try self.heap.push(a, .{ .iterator_index = run, .decorated = .{ .hit = .{ .id = id, .score = 0 }, .keys = keys } });
+                    self.unopened.items[run] = true;
+                    continue;
+                }
+            }
+            self.iterators.items[run].next_doc = try sortedSegmentSeekStartDocWithTiesAlloc(a, primary, plan, snapshot, iterator, self.loader(), null, unavailable, req.search_before.len != 0, true);
         }
         // Seek kept the entire public boundary tie. Do not reject its members
         // using private identities while traversing the native runs.
@@ -11702,20 +11741,38 @@ const SortedPrimaryCandidates = struct {
         if (remaining == 0) return error.OrderedCandidateBudgetExceeded;
         const budget = self.scanned +| remaining;
         if (!self.primed) {
-            for (self.iterators.items, 0..) |_, i| try self.pull(i, budget);
+            for (self.iterators.items, 0..) |_, i| if (!self.unopened.items[i] and !sortedSegmentIteratorDone(self.snapshot, self.iterators.items[i], self.heap.context.reverse)) try self.pull(i, budget);
             self.primed = true;
         }
-        var head = self.heap.pop() orelse return null;
-        defer head.decorated.deinit(self.a);
-        const doc = head.decorated.hit.native_text_doc_id orelse return error.InvalidSegment;
-        try self.pull(head.iterator_index, budget);
-        return doc;
+        while (self.heap.peek()) |best| {
+            const boundary = self.req.competitive_sort_boundary;
+            if (boundary.len != 0) {
+                if (boundary.len != self.req.order_by.len + 1) return error.InvalidQueryRequest;
+                const order = try compareDecoratedHitToCursor(self.req, self.plan, best.decorated, boundary[0..self.req.order_by.len]);
+                if (order == (if (self.heap.context.reverse) std.math.Order.lt else .gt)) return null;
+            }
+            const value = self.heap.pop().?;
+            var head = value;
+            defer head.decorated.deinit(self.a);
+            const index = head.iterator_index;
+            if (self.unopened.items[index]) {
+                self.iterators.items[index].next_doc = try sortedSegmentSeekStartDocWithTiesAlloc(self.a, self.cursor_req, self.plan, self.snapshot, self.iterators.items[index], self.loader(), null, unavailable, self.heap.context.reverse, true);
+                self.unopened.items[index] = false;
+                try self.pull(index, budget);
+                continue;
+            }
+            const doc = head.decorated.hit.native_text_doc_id orelse return error.InvalidSegment;
+            try self.pull(index, budget);
+            return doc;
+        }
+        return null;
     }
     fn close(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         deinitSortedSegmentHeads(self.a, self.heap.items);
         self.heap.deinit(self.a);
         self.iterators.deinit(self.a);
+        self.unopened.deinit(self.a);
         self.values.deinit();
         self.a.destroy(self);
     }
@@ -35888,8 +35945,8 @@ test "native public ordering seeks complete ties through sorted segment streams"
     for (docs, 0..) |*doc, i| doc.* = .{ .id = try std.fmt.allocPrint(ca, "native-{d:0>2}", .{i}), .price = @floatFromInt(i / 4), .ordinal = @intCast(i + 1) };
     var writer = try index_mod.IndexWriter.init(a);
     defer writer.deinit();
-    for (0..2) |part| {
-        const bytes = try buildTestSortedPriceSegmentAlloc(a, docs[part * 32 ..][0..32]);
+    for (0..16) |part| {
+        const bytes = try buildTestSortedPriceSegmentAlloc(a, docs[part * 4 ..][0..4]);
         defer a.free(bytes);
         try writer.addSegment(bytes);
     }
@@ -35924,6 +35981,29 @@ test "native public ordering seeks complete ties through sorted segment streams"
     const bounded = (try SortedPrimaryCandidates.open(a, req, writer.snapshot(), plan)).?;
     defer bounded.close(bounded.ptr);
     try std.testing.expectError(error.OrderedCandidateBudgetExceeded, bounded.next(bounded.ptr, 1));
+    const lazy = (try SortedPrimaryCandidates.open(a, req, writer.snapshot(), plan)).?;
+    defer lazy.close(lazy.ptr);
+    _ = try lazy.next(lazy.ptr, 64);
+    const producer: *SortedPrimaryCandidates = @ptrCast(@alignCast(lazy.ptr));
+    try std.testing.expectEqual(@as(usize, 15), std.mem.count(bool, producer.unopened.items, &.{true}));
+    try std.testing.expectEqual(@as(u64, 2), lazy.scanned_count.?(lazy.ptr));
+    var pruned_req = req;
+    pruned_req.competitive_sort_boundary = &.{ .{ .integer = -1 }, .{ .string = "ignored-public-tie" } };
+    const pruned = (try SortedPrimaryCandidates.open(a, pruned_req, writer.snapshot(), plan)).?;
+    defer pruned.close(pruned.ptr);
+    try std.testing.expect(try pruned.next(pruned.ptr, 64) == null);
+    try std.testing.expectEqual(@as(u64, 0), pruned.scanned_count.?(pruned.ptr));
+    var all_pruned = try sortAndPageTextDocValueFilterAlloc(a, pruned_req, writer.snapshot(), .{ .match_all = {} }, executor, plan);
+    defer all_pruned.deinit();
+    try std.testing.expectEqual(@as(u32, 63), all_pruned.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, all_pruned.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 0), all_pruned.hits.len);
+    try std.testing.expectEqual(@as(u64, 0), all_pruned.sort_profile.?.ordered_scanned_count);
+    var equal_req = req;
+    equal_req.competitive_sort_boundary = first.hits[2].sort_values;
+    var equal = try sortAndPageTextDocValueFilterAlloc(a, equal_req, writer.snapshot(), .{ .match_all = {} }, executor, plan);
+    defer equal.deinit();
+    for (first.hits, equal.hits) |left, right| try std.testing.expectEqualStrings(left.id, right.id);
     // Local reads retain the exact collector as a control oracle.
     var control = executor;
     control.native_count_visibility_exact = false;

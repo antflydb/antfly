@@ -1151,11 +1151,11 @@ archive-scale or live-cloud performance claims.
 
 ### Qualification integrity and native physical ordering
 
-Archive qualification version 2 binds the executable, effective configuration
+Archive qualification version 3 binds the executable, effective configuration
 (including the generated default), collector, harness and runtime-environment
 digest before startup. It rejects changes around restarts and measurements and
 verifies content before completing a report. Comparison requires complete,
-matching provenance. Environment values and configuration contents are not
+matching provenance, including the generated refresh recipe, rewritten-source hash and changed-row count. Version-2 reports remain historical observations and are not comparable through the current collector. Environment values and configuration contents are not
 included in reports. Readiness includes embedded table indexes, additional index
 declarations and schema relational indexes. A declared identity field controls
 the exact ID oracle and answer normalization independently of physical source
@@ -1168,8 +1168,12 @@ native key comparator, with at most 8,192 rows per fragment and the existing
 scheduler, memory and spill admission. Only changed input fragments are sorted. Incremental verification can omit a
 complete payload capture; those fragments gather only ordering columns at their
 authenticated physical row coordinates instead of abandoning native layout.
-Sort inputs participate in every consumer cohort, including field-only text
-indexes, so a non-key sort update cannot escape layout invalidation. Missing,
+Sort inputs live in one internal authenticated input cohort, separate from text,
+vector, relational and aggregate consumer cohorts. Only membership and that
+ordering cohort invalidate physical layout. A payload-only edit no longer sorts
+unchanged keys, and a rank-only edit can retain a field-only text/vector generation
+in its original coordinate space. Ordering configuration is bound by navigation,
+not by consumer payload interpretation. Missing,
 null or unsupported keys retain canonical coordinates and the exact
 doc-values top-N fallback. Failed admission retains the physical-source fallback. Reversed or leading
 `_id` sort components retain the exact fallback; private coordinate IDs can close
@@ -1188,17 +1192,24 @@ never silently rearrange documents after source ordinals have been assigned.
 Public-ID projection uses a bounded k-way merge of native primary sort tuples.
 Cursor seeks retain the complete primary boundary tie, then the existing exact
 collector applies public identities and final cursor comparisons. The stream
-holds one head per leased segment and shares the candidate-probe budget; skewed
+uses authenticated endpoint bounds as lazy heap entries, opening sort-value streams
+only when their bound becomes competitive. Inclusive seeks retain complete primary
+ties. Publication-wide winners pass a trusted primary boundary to later routing
+windows; strictly worse runs need no sort-key probes, while exact matching bitmap
+totals and equal-key public-ID candidates remain intact. It shares the candidate-probe budget; skewed
 membership resumes the original compressed membership iterator after discarding
 the partial window. Metadata coverage alone is insufficient qualification:
 profiles must show positive ordered work and fewer decorated candidates.
 
 Append compaction preserves ordering only when all input metadata and bounds
-prove the concatenation monotone. Lake serving compaction retains sorted runs
-individually when their coordinates would interleave; it does not discard the
-ordering proof to reduce fan-out. A future merge that combines overlapping runs
-must compose an explicit segment-to-coordinate permutation. This is a remaining
-tradeoff, not a reason to add per-row JSON source metadata. Existing maps,
+prove the concatenation monotone. Lake serving compaction also merges overlapping
+ordered runs using the native merge's explicit source map, then composes that
+permutation with original-file ranges. Adjacent output/source coordinates coalesce
+into authenticated ranges. Existing eight-way, byte, workspace and source-range
+limits apply; highly fragmented mappings split into smaller packs instead of
+publishing unbounded row metadata. This bounds amplification, but a compact binary
+permutation representation could improve fan-out for very large, heavily
+interleaved runs beyond the range cap. Existing maps,
 publication certificates, reader leases and GC closure own all dependencies;
 no new artifact family or reader format is introduced.
 
@@ -1206,6 +1217,12 @@ Detailed `x-antfly-field.index: false` suppresses that field's text postings.
 Stored source, explicitly enabled named subfields and independently requested
 typed doc values retain their own policies. This avoids generating dictionaries
 and statistics for large payload fields that the schema excluded from indexing.
+Named subfields are scoped to the selected document schema and honor its unindexed
+paths. The deployed logical ASCH lowering remains unchanged. Physical projection
+semantics have their own provenance revision: only an exact known prior witness
+admits a leader-owned shadow generation rebuild through the durable repair queue.
+Unknown provenance mismatches keep their existing manual policy. Active postings
+are never relabeled under new semantics, and schema binding stays strict.
 
 Qualification must compare projected answers on frozen Parquet bytes, including
 numeric/timestamp directions, nulls, ties, filtering, cursor continuation,

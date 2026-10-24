@@ -1959,6 +1959,13 @@ const Execution = struct {
             request.highlight = null;
             request.text_navigation_plan = if (frontier orelse preparation) |value| value.plan else null;
             if (scoreFrontierEligible(req, if (ordering) |*order| order else null)) request.minimum_competitive_score = competitive_cutoff;
+            if (!req.count_only and !req.evaluation_matches and winners.limit != 0 and winners.heap.items.len == winners.limit) {
+                if (ordering) |*order| if (order.effective.req.order_by.len > 1 and
+                    std.mem.eql(u8, order.effective.req.order_by[order.effective.req.order_by.len - 1].field, "_id"))
+                {
+                    request.competitive_sort_boundary = winners.heap.peek().?.hit.sort_values;
+                };
+            }
             const previous_cutoff = winners.cutoff();
             var page = postings: {
                 const posting_started = @import("antfly_platform").time.monotonicNs();

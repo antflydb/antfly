@@ -109,10 +109,6 @@ const Builder = struct {
         // A bounded posting delta retains its physical base for one cut. The
         // next affected refresh compacts it; never merge unrelated work here.
         if (input.masked) return self.emit(&.{input}, 0);
-        for (input.admission.fields) |field| {
-            if (!std.mem.eql(u8, field.name, local.segment.index_sort_field)) continue;
-            for (field.sections) |section| if (section.kind == .index_sort_bounds) return self.emit(&.{input}, 0);
-        }
         var level: usize = 0;
         var threshold: usize = 8;
         while (level < 3 and input.sources.len >= threshold) : (level += 1) threshold *= 8;
@@ -189,7 +185,7 @@ const Builder = struct {
                 const retained = inputs[0].staged.?;
                 retained.retain();
                 break :blk retained;
-            } else self.merge(a, inputs)) catch |err| switch (err) {
+            } else self.mergeMapped(a, out, inputs, &sources)) catch |err| switch (err) {
                 error.OutOfMemory, error.NativeLakeTextCorpusTooLarge, error.SqlProgramLimitExceeded => {
                     if (inputs.len == 1) return err;
                     arena.deinit();
@@ -276,6 +272,9 @@ const Builder = struct {
         if (self.serving_metadata_bytes) |bytes| self.serving_metadata_bytes = try std.math.add(u64, bytes, metadataBytes(group, manifest));
     }
     fn merge(self: *@This(), a: A, inputs: []const Input) !*LocalSegment {
+        return self.mergeMapped(a, a, inputs, null);
+    }
+    fn mergeMapped(self: *@This(), a: A, out: A, inputs: []const Input, sources: ?*std.ArrayList(Span)) !*LocalSegment {
         var data: [8]local.index.SegmentData = undefined;
         var readers: [8]local.segment.SegmentReader = undefined;
         var deleted: [8]local.encoding_roaring.RoaringBitmap = undefined;
@@ -309,12 +308,75 @@ const Builder = struct {
         staged.captureStatistics(self.summary_staging);
         // Serving packs publish summaries and lineage, not canonical forwards.
         if (staged.statistics) |captured| captured.disableForward();
+        const order = try local.segment.commonIndexSortForMergeInputsAlloc(a, merged[0..inputs.len]);
+        defer local.segment.freeIndexSortFields(a, order);
+        var counts: [8]u32 = undefined;
+        var live: u32 = 0;
+        for (inputs, 0..) |input, i| {
+            counts[i] = input.original_docs;
+            for (input.sources) |span| live = try std.math.add(u32, live, span.count);
+        }
+        // The native merge owns the permutation. Never infer output positions
+        // from input order once an ordered merge can interleave source runs.
+        var mapping = if (order.len != 0) try local.segment.MergeSourceMap.init(a, counts[0..inputs.len]) else null;
+        defer if (mapping) |*value| value.deinit();
         var sink = staged.sink();
-        try local.segment.writeMergedSegmentToSink(a, &sink, merged[0..inputs.len]);
+        try local.segment.writeMergedSegmentToSinkWithOptions(a, &sink, merged[0..inputs.len], .{ .index_sort = order, .source_map = if (mapping) |*value| value else null });
         try staged.seal();
+        if (mapping) |*value| if (sources) |destination| {
+            try value.finishOutput(live);
+            const mapped = try composeSpans(self, a, out, inputs, value, live);
+            destination.* = mapped;
+        };
         return staged;
     }
 };
+/// Compose native merge provenance with authenticated original-file ranges.
+/// Use compact ranges on wire. Highly fragmented merges split into smaller
+/// packs through emit's existing admission fallback instead of unbounded JSON.
+fn composeSpans(self: *Builder, a: A, out: A, inputs: []const Input, mapping: *local.segment.MergeSourceMap, live: u32) !std.ArrayList(Span) {
+    const Row = struct { output: u32, input: u8, span: u16, rank: u32 };
+    const rows = try a.alloc(Row, live);
+    defer a.free(rows);
+    var count: usize = 0;
+    for (inputs, 0..) |input, i| for (input.sources, 0..) |span, j| {
+        for (0..span.count) |offset| {
+            if (count % 1024 == 0) try self.check();
+            const location = (try mapping.lookupRead(i, span.pack_lower + @as(u32, @intCast(offset)))) orelse return error.InvalidNativeLakeTextCorpus;
+            if (location.segment != 0 or count == rows.len) return error.InvalidNativeLakeTextCorpus;
+            rows[count] = .{ .output = location.doc, .input = @intCast(i), .span = @intCast(j), .rank = span.file_lower + @as(u32, @intCast(offset)) };
+            count += 1;
+        }
+    };
+    if (count != rows.len) return error.InvalidNativeLakeTextCorpus;
+    std.mem.sort(Row, rows, {}, struct {
+        fn less(_: void, l: Row, r: Row) bool {
+            return l.output < r.output;
+        }
+    }.less);
+    var result: std.ArrayList(Span) = .empty;
+    errdefer result.deinit(out);
+    for (rows, 0..) |row, ordinal| {
+        if (ordinal % 1024 == 0) try self.check();
+        if (row.output != ordinal) return error.InvalidNativeLakeTextCorpus;
+        const original = inputs[row.input].sources[row.span];
+        if (result.items.len != 0) {
+            const last = &result.items[result.items.len - 1];
+            if (last.file_lower + last.count == row.rank and std.mem.eql(u8, last.file.id, original.file.id) and std.mem.eql(u8, last.physical.artifact_id, original.physical.artifact_id)) {
+                last.count += 1;
+                continue;
+            }
+        }
+        if (result.items.len == corpus.source_spans.max_spans) return error.NativeLakeTextCorpusTooLarge;
+        var span = original;
+        span.pack_lower = row.output;
+        span.file_lower = row.rank;
+        span.count = 1;
+        try result.append(out, span);
+    }
+    return result;
+}
+
 fn metadataBytes(group: corpus.FileGroup, manifest: Chunk) u64 {
     var bytes = corpus.source_spans.metadataBytes(group.sources, group.source_pages) +| manifest.byte_len;
     for (group.descriptors) |descriptor| bytes +|= descriptor.byte_len;
@@ -1025,6 +1087,73 @@ test "external lake global frontier summary scratch exhaustion preserves a fitti
         try std.testing.expect(staged.statistics.?.disabled);
         const actual = try staged.materialize(out);
         try std.testing.expectEqualSlices(u8, expected, actual);
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+    try std.testing.expectEqual(@as(usize, 0), manager.files);
+}
+
+test "external lake global frontier ordered compaction composes interleaved original coordinates" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("compaction-ordered-lineage");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(72), 1, std.testing.io);
+    var inputs: [2]Input = undefined;
+    var readers: [2]local.segment.SegmentReader = undefined;
+    var merges: [2]local.segment.MergeInput = undefined;
+    const prefix: [200]u8 = @splat('a');
+    for (&inputs, &readers, &merges, 0..) |*input, *reader, *merge_, i| {
+        const docs = try out.alloc(local.introducer.TextDocument, 512);
+        for (docs, 0..) |*doc, j| doc.* = .{
+            .id = try std.fmt.allocPrint(out, "{d:0>8}", .{j * 2 + i}),
+            .stored_data = "{}",
+            .text_fields = try out.dupe(local.introducer.TextField, &.{.{ .field_name = "body", .text = try std.fmt.allocPrint(out, "{s}{d:0>8}", .{ prefix, j * 2 + i }) }}),
+        };
+        var memory = local.segment.MemorySegmentSink.init(out);
+        defer memory.deinit();
+        var sink = memory.sink();
+        try local.storage_db_document_mapper.writeTextSegmentFromProjectionBatchToSink(out, .{ .docs = docs }, .{}, .{ .index_sort = &.{.{ .field = "_id", .desc = false }} }, &sink);
+        const bytes = try memory.finishOwned();
+        reader.* = try local.segment.SegmentReader.init(out, bytes);
+        merge_.* = .{ .reader = reader };
+        input.* = .{ .ref = try @import("lake_index_seekable_text.zig").publish(out, out, &store, bytes, .none), .admission = try reader.admission(out), .sources = try out.dupe(Span, &.{.{ .file = .{ .id = try std.fmt.allocPrint(out, "source-{d}", .{i}), .digest = @splat(1) }, .physical = try @import("lake_index_seekable_text.zig").publish(out, out, &store, bytes, .none), .file_rows = 512, .file_lower = 0, .pack_lower = 0, .count = 512 }}), .original_docs = 512, .summary = null };
+    }
+    defer for (&readers) |*reader| reader.deinit();
+    const expected = try local.segment.mergeSegmentInputsWithOptions(out, &merges, .{ .index_sort = &.{.{ .field = "_id", .desc = false }} });
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var check: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &check, .checkpoint = Check.call, .max_bytes = expected.len + 8192, .async_writes = false };
+    defer manager.deinit();
+    var summaries: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &check, .checkpoint = Check.call, .max_bytes = 1, .async_writes = false };
+    defer summaries.deinit();
+    var builder: Builder = .{ .a = a, .out = out, .store = &store, .context = .{ .io = std.testing.io }, .token = .none, .pages = undefined, .terms = undefined, .ownership = undefined, .source_routes = undefined, .ties = undefined, .metadata = undefined, .staging = &manager, .summary_staging = &summaries, .pending_arena = undefined };
+    {
+        var sources: std.ArrayList(Span) = .empty;
+        const staged = try builder.mergeMapped(a, out, &inputs, &sources);
+        defer staged.release();
+        const actual = try staged.materialize(out);
+        try std.testing.expectEqualSlices(u8, expected, actual);
+        try std.testing.expectEqual(@as(usize, 1024), sources.items.len);
+        for (sources.items, 0..) |span, rank| {
+            try std.testing.expectEqual(@as(u32, @intCast(rank)), span.pack_lower);
+            try std.testing.expectEqual(@as(u32, @intCast(rank / 2)), span.file_lower);
+            try std.testing.expectEqual(@as(u32, 1), span.count);
+            try std.testing.expectEqualStrings(inputs[rank % 2].sources[0].file.id, span.file.id);
+            try std.testing.expectEqualStrings(inputs[rank % 2].sources[0].physical.artifact_id, span.physical.artifact_id);
+        }
+        var merged_reader = try local.segment.SegmentReader.init(out, actual);
+        defer merged_reader.deinit();
+        var bounds = (try merged_reader.indexSortBoundsAlloc(out)).?;
+        defer bounds.deinit(out);
+        try std.testing.expectEqualStrings("00000000", bounds.first[0].id);
+        try std.testing.expectEqualStrings("00001023", bounds.last[0].id);
     }
     try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
     try std.testing.expectEqual(@as(usize, 0), manager.files);

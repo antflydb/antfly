@@ -79,6 +79,9 @@ def test_real_parquet_archive_qualification_preserves_cache_and_refresh_contract
         )
     assert completed.returncode == 0, log.read_text()
     report = json.loads((output / "report.json").read_text())
+    assert report["version"] == 3
+    assert report["refresh_workload"]["refresh_every"] == 10
+    assert report["refresh"]["input"]["sha256"] != report["source_identity"]
     assert report["complete"] is True
     assert report["server_config_sha256"]
     assert report["harness_sha256"]

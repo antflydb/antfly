@@ -2834,6 +2834,15 @@ fn appendSchemaTextFields(
         try collectFieldValues(alloc, &values, root, field.path);
         if (values.items.len == 0) continue;
 
+        // ASCH describes potential sources; immutable logical epochs must keep
+        // their deployed lowering. Physical policy belongs to the versioned
+        // projection, so exclusions never invalidate an existing schema epoch.
+        if (runtime_schema.resolveDeclaredFieldType(schema, field.path)) |mapping| if (!mapping.do_index) {
+            if (std.mem.eql(u8, field.path, field.emitted_name)) {
+                for (values.items) |text| try appendMappedSubfieldTextFields(alloc, fields, field.path, text, schema, text_analysis, observed_field_analyzers);
+            }
+            continue;
+        };
         const analyzer = introducer_mod.resolveAnalyzerName(field.analyzer, text_analysis);
         for (values.items) |text| {
             try fields.append(alloc, .{
@@ -2861,6 +2870,14 @@ fn appendSchemaTextFields(
     // Its source remains available even though the root emits no postings.
     for (schema.exact_fields) |field| {
         if (field.mapping.do_index or !std.mem.eql(u8, field.field, field.source_field)) continue;
+        if (!runtime_schema.containsPath(document_schema.declared_paths, field.source_field) or
+            runtime_schema.pathFallsUnderAnyPrefix(document_schema.unindexed_paths, field.source_field)) continue;
+        // Current ASCH contains the source and the loop above handled it.
+        // Keep this path for epochs emitted by the short-lived omitted-source
+        // producer, without indexing another document type's declarations.
+        if (for (document_schema.fields) |declared| {
+            if (std.mem.eql(u8, declared.path, field.source_field) and std.mem.eql(u8, declared.path, declared.emitted_name)) break true;
+        } else false) continue;
         var values: std.ArrayListUnmanaged([]const u8) = .empty;
         defer values.deinit(alloc);
         try collectFieldValues(alloc, &values, root, field.source_field);
@@ -7119,6 +7136,11 @@ test "disabled physical text mappings retain source and independently indexed su
     defer parsed.deinit(a);
     const schema = try schema_api.deriveRuntimeTableSchema(a, parsed);
     defer runtime_schema.freeSchema(a, schema);
+    // Deployed ASCH epochs include this logical source. Physical exclusion
+    // must not change that immutable lowering during a binary upgrade.
+    try std.testing.expect(for (schema.full_text_documents[0].fields) |field| {
+        if (std.mem.eql(u8, field.path, "payload") and std.mem.eql(u8, field.emitted_name, "payload")) break true;
+    } else false);
     const source = "{\"body\":\"quasar\",\"payload\":\"stored-only-long-payload\",\"label\":\"Exact Label\",\"amount\":42}";
     const bytes = (try buildTextSegmentFromDocuments(a, &.{.{ .key = "doc", .value = source }}, .{}, schema)).?;
     defer a.free(bytes);
@@ -7132,4 +7154,26 @@ test "disabled physical text mappings retain source and independently indexed su
     const stored = (try reader.storedDocDecompressed(a, 0)).?;
     defer a.free(stored.data);
     try std.testing.expectEqualStrings(source, stored.data);
+}
+
+test "disabled named subfields stay within their selected document schema" {
+    const a = std.testing.allocator;
+    const schema_json =
+        \\{"default_type":"alpha","document_schemas":{"alpha":{"schema":{"type":"object","properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"payload":{"type":"string","x-antfly-index":false}}}},"beta":{"schema":{"type":"object","properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"payload":{"type":"string","x-antfly-field":{"type":"text","index":false,"fields":{"exact":{"type":"keyword"}}}}}}}}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(a, schema_json);
+    defer parsed.deinit(a);
+    const schema = try schema_api.deriveRuntimeTableSchema(a, parsed);
+    defer runtime_schema.freeSchema(a, schema);
+    const bytes = (try buildTextSegmentFromDocuments(a, &.{
+        .{ .key = "alpha", .value = "{\"_type\":\"alpha\",\"body\":\"first\",\"payload\":\"hiddenvalue\"}" },
+        .{ .key = "beta", .value = "{\"_type\":\"beta\",\"body\":\"second\",\"payload\":\"hiddenvalue\"}" },
+    }, .{}, schema)).?;
+    defer a.free(bytes);
+    var reader = try segment_mod.SegmentReader.init(a, bytes);
+    defer reader.deinit();
+    var inverted = (try reader.invertedIndexScoped(a, "payload.exact")).?;
+    defer inverted.deinit();
+    const postings = (try inverted.lookup("hiddenvalue")).?;
+    try std.testing.expectEqual(@as(u32, 1), postings.docFreq());
 }

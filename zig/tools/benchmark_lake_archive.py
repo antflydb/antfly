@@ -851,8 +851,8 @@ def summaries(samples):
 
 def compare_reports(baseline, candidate):
     for report in (baseline, candidate):
-        if report.get("version") != 2 or report.get("complete") is not True:
-            raise ValueError("Only complete version-2 reports can be compared")
+        if report.get("version") != 3 or report.get("complete") is not True:
+            raise ValueError("Only complete version-3 reports can be compared")
         for key in (
             "binary_sha256",
             "tool_sha256",
@@ -868,7 +868,20 @@ def compare_reports(baseline, candidate):
             raise ValueError(
                 "Comparison requires a frozen source fingerprint and workload identity"
             )
+        if "refresh_workload" not in report:
+            raise ValueError("Comparison requires refresh_workload provenance")
+        if report["refresh_workload"] is not None:
+            refresh = report.get("refresh", {})
+            if not refresh.get("input", {}).get("sha256") or not isinstance(
+                refresh.get("changed_rows"), int
+            ):
+                raise ValueError(
+                    "Comparison requires complete refresh input provenance"
+                )
+        elif report.get("refresh") is not None:
+            raise ValueError("Unexpected refresh without refresh_workload provenance")
     for key in (
+        "refresh_workload",
         "source_identity",
         "source_identity_assurance",
         "workload_sha256",
@@ -881,6 +894,14 @@ def compare_reports(baseline, candidate):
     ):
         if baseline.get(key) != candidate.get(key):
             raise ValueError(f"Incompatible benchmark reports: {key}")
+
+    if baseline["refresh_workload"] is not None:
+        for key in ("changed_rows", "input"):
+            before, after = baseline["refresh"][key], candidate["refresh"][key]
+            if key == "input":
+                before, after = before["sha256"], after["sha256"]
+            if before != after:
+                raise ValueError(f"Incompatible benchmark reports: refresh {key}")
 
     def indexed(report):
         seen, answers = set(), {}
@@ -918,7 +939,7 @@ def compare_reports(baseline, candidate):
             }
         )
     return {
-        "version": 2,
+        "version": 3,
         "timing_qualified": all(r["minimum_sample_count_met"] for r in results),
         "environment_scope": "same declared platform and collector; sequential runs are observational, not randomized paired trials",
         "comparisons": results,
@@ -1059,8 +1080,22 @@ def main(argv=None):
     )
     config = config_input.path
 
+    refresh_workload = (
+        {
+            "kind": "generated_parquet_v1",
+            "rows": args.rows,
+            "files": args.files,
+            "row_group": args.row_group,
+            "payload_bytes": args.payload_bytes,
+            "refresh_every": args.refresh_every,
+            "generation": 1,
+        }
+        if fixture is not None and not args.plan
+        else None
+    )
     report = {
-        "version": 2,
+        "version": 3,
+        "refresh_workload": refresh_workload,
         "binary_sha256": binary_input.sha256,
         "tool_sha256": collector_input.sha256,
         "server_config_sha256": config_input.sha256,
@@ -1112,6 +1147,7 @@ def main(argv=None):
         "plan_sha256": digest(plan),
         "workload_sha256": digest(
             {
+                "refresh_workload": refresh_workload,
                 "cases": plan["cases"],
                 "indexes": plan.get("indexes", {}),
                 "source": fixture["sha256"]

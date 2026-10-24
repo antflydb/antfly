@@ -663,12 +663,13 @@ fn completeNativeReuse(a: A, configs_json: []const u8, desired: []const @import(
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const configs = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), configs_json, .{});
-    if (!@import("lake_row_input_recipes.zig").nativeFragmentsEligible(configs) or desired.len != retained.len) return false;
+    const consumers = try @import("lake_row_input_recipes.zig").consumers(arena.allocator(), desired);
+    if (!@import("lake_row_input_recipes.zig").nativeFragmentsEligible(configs) or consumers.len != retained.len) return false;
     var names: std.StringHashMapUnmanaged(void) = .empty;
     defer names.deinit(a);
     for (retained) |declaration| try names.put(a, declaration.name, {});
-    for (desired) |recipe| if (!names.contains(recipe.name)) return false;
-    return names.count() == desired.len;
+    for (consumers) |recipe| if (!names.contains(recipe.name)) return false;
+    return names.count() == consumers.len;
 }
 
 /// Relocation cannot keep a root whose serving/build format has advanced.

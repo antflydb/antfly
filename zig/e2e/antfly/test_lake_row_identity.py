@@ -424,6 +424,14 @@ def test_logical_identity_reuses_reordered_native_indexes(
                     != original_spaces["all_text"]["navigation"]
                 ), current
                 assert "dense_native" in reused and "sparse_native" in reused, current
+                if native_ordering:
+                    # A rank mutation can move the shared native layout without
+                    # rebuilding unchanged vector inputs in their old space.
+                    for name in ("dense_native", "sparse_native"):
+                        assert (
+                            reused[name]["navigation"]
+                            == original_spaces[name]["navigation"]
+                        ), current
                 text_after_body_update = reused["text"]
             elif step == 6:
                 assert "text" in reused and "dense_native" in reused, current

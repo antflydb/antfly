@@ -284,7 +284,8 @@ class QualificationTest(unittest.TestCase):
             for i in range(count)
         ]
         return {
-            "version": 2,
+            "version": 3,
+            "refresh_workload": None,
             "complete": True,
             "source_identity": "archive-hash",
             "source_identity_assurance": "verified_local_file_bytes",
@@ -468,6 +469,34 @@ class QualificationTest(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 bench.compare_reports(base, broken)
+
+    def test_comparison_binds_refresh_recipe_and_actual_rewritten_source(self):
+        base = self.report()
+        base["refresh_workload"] = {"refresh_every": 10, "generation": 1}
+        base["refresh"] = {"input": {"sha256": "rewritten"}, "changed_rows": 13}
+        self.assertTrue(
+            bench.compare_reports(base, copy.deepcopy(base))["timing_qualified"]
+        )
+        for key, value in (("refresh_every", 2), ("generation", 2)):
+            changed = copy.deepcopy(base)
+            changed["refresh_workload"][key] = value
+            with self.assertRaisesRegex(ValueError, "refresh_workload"):
+                bench.compare_reports(base, changed)
+        for key in ("input", "changed_rows"):
+            changed = copy.deepcopy(base)
+            changed["refresh"][key] = {"sha256": "other"} if key == "input" else 2
+            with self.assertRaisesRegex(ValueError, "refresh " + key):
+                bench.compare_reports(base, changed)
+            del changed["refresh"][key]
+            with self.assertRaisesRegex(ValueError, "refresh input provenance"):
+                bench.compare_reports(base, changed)
+        for changed in (self.report(), {**base, "refresh_workload": None}):
+            with self.assertRaises(ValueError):
+                bench.compare_reports(base, changed)
+        query_only = self.report()
+        del query_only["refresh_workload"]
+        with self.assertRaisesRegex(ValueError, "refresh_workload"):
+            bench.compare_reports(self.report(), query_only)
 
     def test_comparison_rejects_duplicate_or_mismatched_case_coverage(self):
         base = self.report()

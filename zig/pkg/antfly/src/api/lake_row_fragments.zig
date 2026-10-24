@@ -245,20 +245,22 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
         };
         var changed: Changes = .{ .owner = self, .fragments = old_fragments };
         try tree.visitDifferences(a, pages.store(), previous.?.current.by_id, self.root.current.by_id, &changed);
-        // Compact identity maps omit values. Ordering also depends on the
-        // authenticated input cohorts, so data-only edits must reach the layout.
+        // Compact identity maps omit values. Only the dedicated ordering
+        // cohort can invalidate the coordinate layout on a payload-only edit.
         if (order.len != 0) {
             const InputChanges = struct {
                 owner: *Build,
                 fragments: []Fragment,
+                ordering_digest: ?[32]u8,
                 pub fn change(v: *@This(), left: ?tree.Cursor.Record, right: ?tree.Cursor.Record) !void {
                     try Build.check(v.owner);
                     const key = (right orelse left.?).key;
                     if (key.len != 64) return error.InvalidLogicalRowIdentity;
-                    v.fragments[try fragmentFor(v.fragments, key[32..64])].dirty = true;
+                    const digest = v.ordering_digest orelse return;
+                    if (std.mem.eql(u8, key[0..32], &digest)) v.fragments[try fragmentFor(v.fragments, key[32..64])].dirty = true;
                 }
             };
-            var input_changes: InputChanges = .{ .owner = self, .fragments = old_fragments };
+            var input_changes: InputChanges = .{ .owner = self, .fragments = old_fragments, .ordering_digest = @import("lake_row_input_recipes.zig").orderingDigest(self.root.current.input_recipes) };
             try tree.visitDifferences(a, pages.store(), previous.?.current.input_versions, self.root.current.input_versions, &input_changes);
         }
 
@@ -373,9 +375,11 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
     var prospective = self.root;
     prospective.version = identity.metadata_version;
     prospective.native_space = self.space;
-    const bindings = try a.alloc(identity.ReusedIndex, self.root.current.input_recipes.len);
+    const consumer_recipes = try @import("lake_row_input_recipes.zig").consumers(a, self.root.current.input_recipes);
+    defer a.free(consumer_recipes);
+    const bindings = try a.alloc(identity.ReusedIndex, consumer_recipes.len);
     defer a.free(bindings);
-    for (bindings, self.root.current.input_recipes) |*binding, recipe| binding.* = .{ .name = recipe.name, .space = indexSpace(self, recipe.name), .translation = if (self.space.by_id) |ref| .{ .forward = ref, .reverse = ref, .ranked = false } else null };
+    for (bindings, consumer_recipes) |*binding, recipe| binding.* = .{ .name = recipe.name, .space = indexSpace(self, recipe.name), .translation = if (self.space.by_id) |ref| .{ .forward = ref, .reverse = ref, .ranked = false } else null };
     prospective.reused = bindings;
     prospective.certificate = @splat(255);
     const encoded = try std.json.Stringify.valueAlloc(a, prospective, .{});
@@ -634,7 +638,7 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, in
     var configs = try std.json.parseFromSlice(std.json.Value, a, indexes_json, .{});
     defer configs.deinit();
     const out = self.arena.allocator();
-    const recipes = self.root.current.input_recipes;
+    const recipes = try @import("lake_row_input_recipes.zig").consumers(out, self.root.current.input_recipes);
     const prior_commitments = if (self.prior_navigation != null and previous != null and previous.?.native_space != null) previous.?.native_space.?.input_commitments else null;
     var manager: local.sql_spill.Manager = .{ .alloc = a, .io = self.context.io.?, .context = self, .checkpoint = Build.check, .max_bytes = self.provider.identity_spill_bytes };
     defer manager.deinit();
@@ -710,6 +714,7 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, in
         defer versions.deinit(a);
         if (previous) |prior| if (self.prior_navigation != null) {
             const prior_name = for (prior.current.input_recipes) |candidate| {
+                if (@import("lake_row_input_recipes.zig").isOrdering(candidate)) continue;
                 if (std.mem.eql(u8, &candidate.digest, &recipe.digest) and vectorRecipe(configs.value, candidate.name) == vectorRecipe(configs.value, recipe.name)) break candidate.name;
             } else recipe.name;
             const space = prior.spaceForIndex(prior_name);
@@ -785,6 +790,7 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, in
     // Retire commitments only when cohort membership or radix layout changes;
     // ordinary sparse refreshes never replay this metadata census.
     const prune = if (previous) |prior| prior.native_space != null and (prior.native_space.?.liveFiles() != self.fragments.len or for (prior.current.input_recipes) |old_recipe| {
+        if (@import("lake_row_input_recipes.zig").isOrdering(old_recipe)) continue;
         if (for (recipes) |recipe| {
             if (std.mem.eql(u8, &recipe.digest, &old_recipe.digest)) break false;
         } else true) break true;

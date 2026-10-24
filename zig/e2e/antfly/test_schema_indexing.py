@@ -156,3 +156,49 @@ def test_additional_properties_false_rejects_undeclared_fields(stateful_api):
     assert _hits(stateful_api, table, "body") == 1
     assert _hits(stateful_api, table, "stored_only") == 0
     assert _hits(stateful_api, table, "attachment") == 0
+
+
+def test_disabled_root_subfields_are_scoped_to_document_type(stateful_api):
+    table = f"schema_disabled_subfields_{time.time_ns()}"
+    body = {"type": "string", "x-antfly-field": {"type": "text"}}
+    payload = {
+        "type": "string",
+        "x-antfly-field": {
+            "type": "text",
+            "index": False,
+            "fields": {"exact": {"type": "keyword"}},
+        },
+    }
+    _create_table_with_schema(
+        stateful_api,
+        table,
+        {
+            "default_type": "alpha",
+            "document_schemas": {
+                name: {
+                    "schema": {
+                        "type": "object",
+                        "properties": {"body": body, "payload": mapping},
+                    }
+                }
+                for name, mapping in (
+                    ("alpha", {"type": "string", "x-antfly-index": False}),
+                    ("beta", payload),
+                )
+            },
+        },
+    )
+    stateful_api.batch_write(
+        table,
+        inserts={
+            name: {"_type": name, "body": "quasar", "payload": "hiddenvalue"}
+            for name in ("alpha", "beta")
+        },
+        sync_level="full_text",
+    )
+    for field, expected in (("payload.exact", ["beta"]), ("payload", [])):
+        response = stateful_api.query_table(
+            table,
+            {"full_text_search": {"match": "hiddenvalue", "field": field}, "limit": 5},
+        )
+        assert [h["_id"] for h in response["responses"][0]["hits"]["hits"]] == expected

@@ -2180,11 +2180,6 @@ fn deriveRuntimeFullTextLeaf(
     include_in_all_fields: []const []const u8,
     fields: *std.ArrayListUnmanaged(storage_schema.FullTextField),
 ) !void {
-    // Detailed physical mappings must not be re-enabled by the shorthand
-    // inference path. Named subfields and doc values have independent policies.
-    const mapping = property.antfly_field orelse if (item) |child| child.antfly_field else null;
-    if (mapping) |declared| if (declared.do_index != null and !declared.do_index.?) return;
-
     const types = effectiveAntflyTypes(property, item);
     if (types.len == 0) return;
 

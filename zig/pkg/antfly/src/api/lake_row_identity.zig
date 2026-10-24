@@ -101,7 +101,11 @@ pub const Space = struct {
             }
         } else if (self.by_file != null or self.by_order != null) return error.InvalidLogicalRowIdentity;
         if (self.input_commitments) |ref| try ref.validate();
-        if (self.input_recipes.len > local.metadata_lake_index_catalog.max_directory_artifacts) return error.InvalidLogicalRowIdentity;
+        var ordering_count: usize = 0;
+        for (self.input_recipes) |recipe| if (@import("lake_row_input_recipes.zig").isOrdering(recipe)) {
+            ordering_count += 1;
+        };
+        if (ordering_count > 1 or self.input_recipes.len - ordering_count > local.metadata_lake_index_catalog.max_directory_artifacts) return error.InvalidLogicalRowIdentity;
         const inputs = try std.math.mul(u64, self.rows, @import("lake_row_input_recipes.zig").count(self.input_recipes));
         if (self.input_versions) |ref| {
             try ref.validate();

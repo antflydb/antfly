@@ -65,6 +65,7 @@ test {
     _ = @import("api/lake_row_identity_reader.zig");
     _ = @import("api/lake_row_identity.zig");
     _ = @import("api/lake_row_fragments.zig");
+    _ = @import("api/lake_row_input_recipes.zig");
     _ = @import("api/lake_row_payloads.zig");
     _ = @import("api/lake_index_page_ranges.zig");
     _ = @import("api/lake_index_navigation_pages.zig");

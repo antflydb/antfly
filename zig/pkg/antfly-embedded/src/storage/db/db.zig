@@ -14968,10 +14968,20 @@ pub const DB = struct {
                 },
                 .rebuild_from_artifacts => {},
             }
-            // Both allowlisted publication failures are currently HBC dense
-            // index failures. Do not let future reuse of either error name
-            // silently broaden automatic reconstruction.
-            if (cfg.kind != .dense_vector) {
+            // Re-audit the exact producer/kind pair before admitting durable
+            // mutation work. A verified text projection upgrade uses the same
+            // leader-owned shadow generation machinery as dense recovery.
+            const failure = self.core.index_manager.failedIndexLoadSnapshot(cfg.name) orelse {
+                result.automatic_deferred += 1;
+                result.automatic_sweep_complete = false;
+                continue;
+            };
+            if (!failure.token.eql(candidate.token)) {
+                result.automatic_deferred += 1;
+                result.automatic_sweep_complete = false;
+                continue;
+            }
+            if (!index_manager_mod.IndexManager.automaticLoadRebuildSupported(cfg.kind, failure.err_name)) {
                 result.terminal += 1;
                 candidate.classified = true;
                 continue;

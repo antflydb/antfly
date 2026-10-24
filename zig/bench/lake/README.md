@@ -35,8 +35,11 @@ New immutable files and a manifest chunk become visible through one atomic head
 replacement. Readers cannot observe a partly rewritten fixture. The runner waits
 for a new queryable text publication and independently verifies both changed-row
 counts and SQL revision totals. Reports separate fixture encoding/commit time
-from publication/readiness/verification time. Imported or remote source data is
-never refreshed by this tool.
+from publication/readiness/verification time. The refresh recipe (rows, files, row groups, payload bytes, interval and generation)
+is part of workload identity. Comparison also verifies the actual rewritten-file
+hash and changed-row count. Imported or remote source data is never refreshed by
+this tool; its report explicitly records no refresh workload. Earlier version-2
+reports cannot qualify a version-3 comparison.
 
 ## Existing Parquet and remote sources
 
@@ -73,7 +76,7 @@ without copying its contents into the report; the managed server uses isolated
 data/replica paths. Configuration must be suitable for a qualification server. Live cloud
 query/retention qualification is separate from the filesystem fixture run.
 
-Qualification report version 2 binds the executable, effective configuration
+Qualification report version 3 binds the executable, effective configuration
 (including a generated default), collector and harness to file identities before
 starting the server. It also hashes relevant runtime environment settings without
 reporting their values. Checks around every restart and
@@ -132,7 +135,7 @@ uv run --project zig/e2e/antfly python zig/tools/benchmark_lake_archive.py compa
   --output .benchmark-results/lake/comparison.json
 ```
 
-Comparison requires complete version-2 provenance and rejects different source
+Comparison requires complete version-3 provenance and rejects different source
 identity/assurance, workload, collector, effective configuration, harness, runtime
 environment, platform, cache contract, case coverage or answers. It rejects incomplete runs
 and duplicate samples. Fewer than three samples cannot qualify timing. Ratios
