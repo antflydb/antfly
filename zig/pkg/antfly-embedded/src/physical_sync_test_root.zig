@@ -23,6 +23,7 @@ test {
     _ = @import("storage/lsm_backend/atomic_temporary.zig");
     _ = @import("storage/lsm_backend/owned_manifest_set.zig");
     _ = @import("storage/lsm_backend/prepared_checkpoint.zig");
+    _ = @import("storage/lsm_backend/output_cleanup.zig");
     _ = @import("storage/lsm_backend/wal.zig");
     _ = @import("storage/lsm_backend.zig");
 }

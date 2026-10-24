@@ -3735,15 +3735,25 @@ pub const ResourceManager = struct {
     /// buffers. Physical destruction precedes accounting release, and a busy
     /// parent leaves credit in fixed manager metadata after destruction.
     pub fn drainPayloadRetirementWithAdmission(self: *ResourceManager, control: read_admission.Port) !usize {
+        return self.drainPayloadRetirement(control);
+    }
+
+    /// Explicit quiesced fallback only. Owners must remain alive until their
+    /// callbacks finish; no application execution or IO-wait authority is used.
+    pub fn drainPayloadRetirementQuiesced(self: *ResourceManager) usize {
+        return self.drainPayloadRetirement(null) catch unreachable;
+    }
+
+    fn drainPayloadRetirement(self: *ResourceManager, control: ?read_admission.Port) !usize {
         var retired: usize = 0;
         for (0..64) |_| {
-            try @import("../common/bounded_mutex.zig").lockAtomic(&self.payload_retirement_mutex, control);
+            if (control) |original| try @import("../common/bounded_mutex.zig").lockAtomic(&self.payload_retirement_mutex, original) else lockAtomic(&self.payload_retirement_mutex);
             var registry_held = true;
             defer if (registry_held) self.payload_retirement_mutex.unlock();
             // lockAtomic checkpoints before acquisition. A cooperative yield
             // here could park while excluding every unrelated registration.
             // This fixed-size ledger pass uses lifetime checks under the guard.
-            try control.checkLifetime();
+            if (control) |original| try original.checkLifetime();
             _ = self.tryDrainIdentityMetadataRetirement();
             const node = self.payload_retirement_cursor orelse break;
             self.payload_retirement_cursor = node.next orelse self.payload_retirement_head;
@@ -3751,7 +3761,7 @@ pub const ResourceManager = struct {
             // Own stable retirement debt before destroying embedded metadata.
             var debt: ?ConstructionCredit = null;
             for (&self.construction_cleanup) |*slot| {
-                try control.checkLifetime();
+                if (control) |original| try original.checkLifetime();
                 _ = self.tryDrainConstructionSlot(slot);
                 if (slot.state.cmpxchgStrong(.free, .active, .acquire, .monotonic) == null) {
                     slot.credit = node.credit.?.*;

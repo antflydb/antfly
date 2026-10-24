@@ -26011,3 +26011,78 @@ digest and all 5,586 native/schema input hashes match the unchanged final source
 and preserved snapshots. Formatting and whitespace pass. Existing ABI layouts
 are unchanged. Full GNU qualification remains waived; the full default-adoption
 design and the explicit caller-preparation/cleanup requirements remain open.
+
+
+## Prepaid cleanup tickets and retained manifest abandonment
+
+`output_cleanup.Creation` retains reserve/allocate/copy/register progress under
+the original caller. Construction credit precedes both physical allocations.
+Path/header bounds keep each CPU/destruction turn below 16 KiB. Failed allocation
+or rejected registration retains the same private allocations and credit;
+retirement fences further construction and refunds only after physical release.
+Successful registration transfers the unchanged credit into an embedded manager
+retirement record before another fallible operation. Input and allocator/queue/
+manager lifetimes are explicit; no application port survives the call.
+
+Registered ticket destruction publishes ready ownership to the manager rather
+than taking raw accounting locks on the application execution. Physical path
+and header destruction precedes accounting release, including parent contention
+that leaves exact debt in fixed manager metadata. Queue lifetime joins its final
+physical-release counter before freeing allocator authority. Admitted joining
+uses original CPU for foreground collection or lends capacity while the joined
+cleanup consumer works. The shared collector also has an explicit quiesced
+driver for legacy teardown; it does not manufacture a no-op admission port.
+Legacy ticket upgrade registers its existing charge without another payload
+reservation. Legacy raw destruction now also frees physical memory before
+returning credit.
+
+`QuiescedPreparedCheckpoint` constructs two registered deletion tickets before
+any private-file IO. Checkpoint/journal abandonment transfers those tickets to
+the existing backend cleanup queue under original bounded mutex admission.
+Rejected queue waiting retains both ticket and operation ownership; the retry
+cannot duplicate the handoff. Successful installation retires unused tickets
+through the manager. The canonical `manifest.bin` pointer is never a deletion
+ticket: uncertainty there remains a recovery fence. The operation no longer
+requires an external caller to retain its fresh manifest-file cleanup tickets.
+
+The operation memoryBound covers its fixed header/provider grant; ticket peaks
+are separately admitted through Creation.memoryBound before their allocations.
+Combined metadata/ticket/grant admission before default publication/WAL phases,
+and the admitted durable-obsolete-ledger consumer, remain integration work. The
+existing consumer is exercised explicitly as legacy work outside the original
+execution in qualification; it is not relabeled as admitted IO.
+
+The default internal maintenance wake callback now stores an atomic latch and
+signals its event without waiting on the worker mutex. The worker checks the
+latch before and after event reset, retaining concurrent notifications. Stop
+and drain preserve the latch; statistics read the atomic wake counter. Native
+ABI 114 and storage-owner ABI 174 fence the changed ticket/wake layouts.
+
+Tests independently witness prepaid allocation/free, reject every construction
+checkpoint with Canceled/DeadlineExceeded/FileNotFound, recover/abandon each
+allocation refusal, refuse unfunded construction, reject queue-lock waiting,
+upgrade legacy tickets without new payload credit and retain accounting after
+physical destruction when the parent is busy. Native backend tests now include
+registered ticket preparation, unused-ticket retirement, interrupted queue
+handoff, canonical-pointer protection and a real abort-to-cleanup-to-reopen
+case. Four existing real-worker regressions cover deferred flush wake, final
+drain join, soft compaction and idle reclamation. Default caller wiring, admitted
+root/ledger preparation, remaining completion/history relief and default-gate
+evidence remain required. Full GNU qualification is waived; the full design
+remains incomplete.
+
+`cleanup-tickets-v3-fast` passes 63/63 optimized physical/table/WAL steps with
+77/170/74 cases. `cleanup-tickets-v3-worker` passes 60/60 steps and all four
+existing real-worker regressions. Both pass four standalone Bloom and 45/1/8
+error-identity companions. All 5,586 native/schema inputs and log digests match
+the unchanged final source; seven immutable snapshots preserve every changed
+native file. The earlier v1 receipt preserves the corrected nested-loop test
+syntax; v2 passes the initial complete lifecycle suite.
+
+Final `cleanup-tickets-v3-integrated` passes 83/83 build steps, 77 physical-IO,
+32 embedded close, 170 table/codec, 74 WAL/recovery and 18 host/ABI checks, plus
+the same four Bloom and 45/1/8 error companions. All 5,586 native/schema inputs
+and log digests match the final source and preserved snapshots. Formatting and
+whitespace pass. Full GNU qualification remains waived; admitted metadata and
+durable cleanup consumption, combined/default caller admission and the other
+full-design requirements above remain incomplete.

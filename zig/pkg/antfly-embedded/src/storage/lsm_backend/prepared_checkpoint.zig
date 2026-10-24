@@ -22,14 +22,15 @@ const Snapshot = @import("ledger_reclamation.zig").Snapshot;
 const Directory = @import("run_directory.zig").Directory;
 const storage_io = @import("storage_io.zig");
 const bounded = @import("../../common/bounded_mutex.zig");
+const output_cleanup = @import("output_cleanup.zig");
 
 /// Caller permanently fences unrelated serving, mutation and accounting for
 /// this continuation. Prepared directory/snapshot are already registered in
 /// the backend and funded by its existing observer; no heap allocation or new
 /// application budget occurs here. The caller also prepays memoryBound() and
 /// retains provider funding through resource retirement or grant transfer.
-/// The caller retains cleanup tickets for every possibly published final path
-/// reported by physical.attempted/paths, including after abort/retirement.
+/// Checkpoint/journal cleanup tickets are admitted before physical IO. The
+/// canonical descriptor is never queued for deletion; uncertainty fences recovery.
 ///
 /// Preparation must include every retired manifest path in obsolete_paths.
 /// Successful initialization consumes the prepared directory, snapshot and
@@ -79,6 +80,10 @@ pub fn Publication(comptime BackendType: type) type {
         retired: bool = false,
         failure: ?anyerror = null,
         path: [std.fs.max_path_bytes]u8 = undefined,
+        creations: [2]output_cleanup.Creation = undefined,
+        tickets: [2]?*output_cleanup.Ticket = @splat(null),
+        creation_index: usize = 0,
+        ticket_cleanup_index: usize = 0,
 
         const Self = @This();
         pub fn memoryBound(storage: storage_io.Storage) !u64 {
@@ -90,6 +95,8 @@ pub fn Publication(comptime BackendType: type) type {
             if (backend.manifest_recovery_required) return error.RecoveryRequired;
             if (backend.active_readers != 0 or backend.manifest_publish_in_flight or backend.manifest_checkpoint_build_in_flight or backend.ledger_reclaim_in_flight) return error.ResourceBudgetExceeded;
             const root = backend.root_dir orelse return error.ExecutionWaitUnsupported;
+            const queue = backend.options.unpublished_outputs orelse return error.ExecutionWaitUnsupported;
+            if (queue.manager == null) return error.ExecutionWaitUnsupported;
             const directory = backend.manifest_checkpoint_directory orelse return error.InvalidArgument;
             const current = backend.run_directory orelse return error.InvalidArgument;
             if (backend.run_directory_dirty or directory.tree.root != current.tree.root or directory.memory_run_count != 0 or snapshot.retired or snapshot.value.tree.root != backend.obsolete_paths.tree.root) return error.InvalidArgument;
@@ -102,6 +109,7 @@ pub fn Publication(comptime BackendType: type) type {
             errdefer turn.deinit();
             self.* = .{ .backend = backend, .source = .{ .cursor = directory.readCursor(), .ledger = snapshot.value.iterator(), .count = snapshot.value.count(), .root = root }, .fence = .capture(backend), .directory = directory, .captured_directory = directory, .snapshot = snapshot, .id = id, .next_run_id = next_run_id, .started = backend.writeStatsNowNs(), .covered_logical_bytes = backend.unpublished_wal_logical_bytes };
             try self.physical.initInPlace(resources, root, id, 0, next_run_id, &self.source, repository.maxManifestReadBytes());
+            for (&self.creations, 0..) |*creation, i| creation.* = .init(queue, self.physical.paths[i][0..self.physical.path_lens[i]]);
             self.turn = turn;
             backend.next_run_id = next_run_id;
             backend.manifest_checkpoint_build_in_flight = true;
@@ -126,6 +134,18 @@ pub fn Publication(comptime BackendType: type) type {
             }
             return cause;
         }
+        /// Separately drivable construction keeps admission refusal and partial
+        /// allocation owned before any private file is created. Caller must
+        /// not hold backend.mu across this admitted construction.
+        pub fn prepareTicketsWithAdmission(self: *Self, original: admission.Port) !void {
+            if (self.aborting or self.retired) return error.InvalidArgument;
+            while (self.creation_index < self.creations.len) {
+                const index = self.creation_index;
+                try self.creations[index].resumeWithAdmission(original);
+                self.tickets[index] = try self.creations[index].take();
+                self.creation_index += 1;
+            }
+        }
         pub fn resumeWithAdmission(self: *Self, original: admission.Port) !void {
             if (self.aborting or self.retired) return error.InvalidArgument;
             if (self.installed) return original.checkpoint();
@@ -146,6 +166,7 @@ pub fn Publication(comptime BackendType: type) type {
                 }
                 self.checked_paths += 1;
             }
+            try self.prepareTicketsWithAdmission(original);
             if (!self.descriptor_permitted) {
                 self.physical.prepareDescriptorWithAdmission(original) catch |cause| return self.notePhysicalFailure(cause, original);
                 try bounded.lockAtomic(&self.backend.mu, original);
@@ -170,6 +191,11 @@ pub fn Publication(comptime BackendType: type) type {
             // Fixed installation receipt before any subsequent fallible work.
             self.installed = true;
             self.directory = null;
+            // Registered memory retirement is an infallible ownership handoff.
+            for (&self.tickets) |*ticket| {
+                if (ticket.*) |owned| owned.destroy();
+                ticket.* = null;
+            }
             self.detach(false);
         }
         /// Under backend.mu. Input roots move to existing bounded retirement
@@ -205,6 +231,15 @@ pub fn Publication(comptime BackendType: type) type {
             if (self.retired) return;
             self.aborting = true;
             try self.physical.abortWithAdmission(original);
+            while (self.ticket_cleanup_index < self.creations.len) {
+                const index = self.ticket_cleanup_index;
+                if (self.tickets[index]) |ticket| {
+                    if (!self.installed and self.physical.attempted[index]) try ticket.abandonWithAdmission(original) else ticket.destroy();
+                    self.tickets[index] = null;
+                }
+                try self.creations[index].retireWithAdmission(original);
+                self.ticket_cleanup_index += 1;
+            }
             if (!self.detached) {
                 try bounded.lockAtomic(&self.backend.mu, original);
                 defer self.backend.mu.unlock();
@@ -217,6 +252,13 @@ pub fn Publication(comptime BackendType: type) type {
         pub fn deinit(self: *Self) void {
             const uncertain = self.physical.attempted[2];
             self.physical.deinit();
+            for (&self.tickets, 0..) |*ticket, i| {
+                if (ticket.*) |owned| {
+                    if (!self.installed and self.physical.attempted[i]) owned.abandon() else owned.destroy();
+                    ticket.* = null;
+                }
+                self.creations[i].deinit();
+            }
             if (!self.detached) {
                 @import("antfly_platform").sync.lockYielding(&self.backend.mu);
                 defer self.backend.mu.unlock();
@@ -229,7 +271,7 @@ pub fn Publication(comptime BackendType: type) type {
 const Backend = @import("../lsm_backend.zig").Backend;
 const Job = Publication(Backend);
 const cpu = @import("../../common/runnable_scheduler.zig");
-const Mode = enum { retry, stale_before, stale_after, ambiguous, missing_path, busy };
+const Mode = enum { retry, stale_before, stale_after, ambiguous, missing_path, busy, abort_output };
 const Control = struct {
     owner: *Job,
     backend: *Backend,
@@ -274,6 +316,10 @@ const Control = struct {
         if (!self.changed and self.mode == .ambiguous and owner.physical.phase == .descriptor and owner.physical.fixed_written and owner.physical.file.phase == .ready) {
             storage_io.NativeSyncTestControl.control_failure_after_rename.store(true, .release);
             self.changed = true;
+        }
+        if (!self.changed and self.mode == .abort_output and owner.physical.phase == .segment and owner.physical.file.phase == .writing) {
+            self.changed = true;
+            return self.failure;
         }
     }
     fn lifetime(raw: *anyopaque) !void {
@@ -333,7 +379,7 @@ test "controlled physical sync prepared backend checkpoint installs once across 
     if (comptime @import("builtin").os.tag == .freestanding or @import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) return error.SkipZigTest;
     const resources = @import("../resource_manager.zig");
     const a = std.testing.allocator;
-    for ([_]Mode{ .retry, .retry, .retry, .stale_before, .stale_after, .ambiguous, .missing_path, .busy }, 0..) |mode, case| {
+    for ([_]Mode{ .retry, .retry, .retry, .stale_before, .stale_after, .ambiguous, .missing_path, .busy, .abort_output }, 0..) |mode, case| {
         var manager = resources.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 64 * 1024 * 1024 } });
         defer manager.deinit(a);
         var allocations = std.testing.FailingAllocator.init(a, .{});
@@ -400,9 +446,6 @@ test "controlled physical sync prepared backend checkpoint installs once across 
             try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
             try std.testing.expect(!snapshot.retired and backend.manifest_checkpoint_directory == candidate);
         }
-        const allocator_calls = allocations.alloc_index;
-        allocations.fail_index = allocator_calls;
-        allocations.resize_fail_index = allocations.resize_index;
         defer allocations.fail_index = std.math.maxInt(usize);
         defer allocations.resize_fail_index = std.math.maxInt(usize);
         try std.testing.expect(backend.mu.tryLock());
@@ -411,6 +454,12 @@ test "controlled physical sync prepared backend checkpoint installs once across 
         try initialized;
         var owner_live = true;
         defer if (owner_live) owner.deinit();
+        try owner.prepareTicketsWithAdmission(original);
+        const queue = backend.options.unpublished_outputs.?;
+        try std.testing.expectEqual(@as(usize, 2), queue.live.load(.acquire));
+        const allocator_calls = allocations.alloc_index;
+        allocations.fail_index = allocator_calls;
+        allocations.resize_fail_index = allocations.resize_index;
         control.enabled = true;
         storage_io.NativeSyncTestControl.pause.store(true, .release);
         storage_io.NativeSyncTestControl.release.store(false, .release);
@@ -456,12 +505,16 @@ test "controlled physical sync prepared backend checkpoint installs once across 
             try std.testing.expectEqual(writes + 1, backend.write_stats.manifest_writes);
             try std.testing.expectEqual(held, pool.snapshotStats().fd_admitted_descriptors);
             try owner.retireWithAdmission(original);
+            try std.testing.expectEqual(@as(usize, 0), queue.pending.load(.acquire));
+            try queue.joinRetirementsWithAdmission(std.testing.io, original);
+            try std.testing.expectEqual(@as(usize, 0), queue.live.load(.acquire));
             try std.testing.expect(control.waits > 5);
         } else {
             const failure: anyerror = switch (mode) {
                 .stale_before, .stale_after => error.RecoveryRequired,
                 .ambiguous => error.InputOutput,
                 .missing_path => error.InvalidManifest,
+                .abort_output => control.failure,
                 else => unreachable,
             };
             try std.testing.expectError(failure, owner.resumeWithAdmission(original));
@@ -469,8 +522,10 @@ test "controlled physical sync prepared backend checkpoint installs once across 
             try std.testing.expect(std.meta.eql(old_descriptor, backend.manifest_journal.descriptor));
             if (mode == .stale_before or mode == .missing_path) try std.testing.expect(!owner.physical.attempted[2]);
             const calls = storage_io.NativeSyncTestControl.metadata.load(.acquire);
-            try std.testing.expectError(failure, owner.resumeWithAdmission(original));
-            try std.testing.expectEqual(calls, storage_io.NativeSyncTestControl.metadata.load(.acquire));
+            if (mode != .abort_output) {
+                try std.testing.expectError(failure, owner.resumeWithAdmission(original));
+                try std.testing.expectEqual(calls, storage_io.NativeSyncTestControl.metadata.load(.acquire));
+            }
             storage_io.NativeSyncTestControl.control_failure_after_rename.store(false, .release);
             control.reject_abort = true;
             try std.testing.expectError(control.failure, owner.abortWithAdmission(original));
@@ -479,9 +534,22 @@ test "controlled physical sync prepared backend checkpoint installs once across 
             try std.testing.expectEqual(baseline, backend.tracked_in_memory_state_bytes);
             try owner.abortWithAdmission(original);
             try std.testing.expect(snapshot.retired and backend.manifest_checkpoint_directory == null);
-            try std.testing.expectEqual(mode != .missing_path, backend.manifest_recovery_required);
+            try std.testing.expectEqual(mode != .missing_path and mode != .abort_output, backend.manifest_recovery_required);
             try std.testing.expectEqual(writes, backend.write_stats.manifest_writes);
             try std.testing.expectEqual(@as(u64, 777), backend.unpublished_wal_logical_bytes);
+            const pending: usize = if (mode == .missing_path) 0 else if (mode == .abort_output) 1 else 2;
+            try std.testing.expectEqual(pending, queue.pending.load(.acquire));
+            if (pending == 0) try queue.joinRetirementsWithAdmission(std.testing.io, original) else {
+                try std.testing.expectError(error.ResourceBudgetExceeded, queue.joinRetirementsWithAdmission(std.testing.io, original));
+                var ticket = queue.head;
+                var index: usize = 0;
+                while (ticket) |item| : (ticket = item.next) {
+                    try std.testing.expectEqualStrings(owner.physical.paths[index][0..owner.physical.path_lens[index]], item.path);
+                    try std.testing.expect(!std.mem.endsWith(u8, item.path, "manifest.bin"));
+                    index += 1;
+                }
+                try std.testing.expectEqual(pending, index);
+            }
         }
         try std.testing.expectEqual(baseline, backend.tracked_in_memory_state_bytes);
         try std.testing.expectEqual(allocator_calls, allocations.alloc_index);
@@ -494,6 +562,16 @@ test "controlled physical sync prepared backend checkpoint installs once across 
         pool.releaseDescriptorsForTest(std.testing.io, reserved);
         reserved = 0;
         fixed.release();
+        if (mode == .abort_output) {
+            // Exercise the existing real consumer outside an admitted execution.
+            // Its admitted replacement remains part of default caller adoption.
+            execution.finish();
+            query.finish();
+            try backend.finalizeDeferredStorageWork();
+            try std.testing.expectEqual(@as(usize, 0), queue.pending.load(.acquire));
+            while (queue.live.load(.acquire) != 0) _ = manager.drainPayloadRetirementQuiesced();
+            try std.testing.expectError(error.FileNotFound, native.storage().readFileAlloc(a, owner.physical.paths[0][0..owner.physical.path_lens[0]], 4096));
+        }
         // No legacy close publication may mask what this operation persisted.
         backend.abandonAfterCrash();
         backend_live = false;

@@ -311,6 +311,7 @@ const MutableSnapshotReaderRef = struct {
 
 pub const MaintenanceWaker = struct {
     ptr: *anyopaque,
+    /// Nonblocking notification only; callers may hold publication ownership.
     wake_fn: *const fn (ptr: *anyopaque) void,
 
     pub fn wake(self: MaintenanceWaker) void {
@@ -10074,8 +10075,8 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
     future: ?std.Io.Future(void) = null,
     stop_requested: bool = false,
     drain_on_stop: bool = false,
-    wake_requested: bool = false,
-    wakeups: u64 = 0,
+    wake_requested: std.atomic.Value(bool) = .init(false),
+    wakeups: std.atomic.Value(u64) = .init(0),
     maintenance_steps: u64 = 0,
     errors: u64 = 0,
     joined: bool = false,
@@ -10115,7 +10116,7 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
         self.mutex.lockUncancelable(self.io());
         self.stop_requested = true;
         self.drain_on_stop = self.drain_on_stop or drain;
-        self.wake_requested = true;
+        self.wake_requested.store(true, .release);
         self.mutex.unlock(self.io());
 
         self.wake_event.set(self.io());
@@ -10132,18 +10133,16 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
 
     fn wake(ptr: *anyopaque) void {
         const self: *InternalFlushWorker = @ptrCast(@alignCast(ptr));
-        self.mutex.lockUncancelable(self.io());
-        self.wake_requested = true;
-        self.wakeups +|= 1;
+        self.wake_requested.store(true, .release);
+        _ = self.wakeups.fetchAdd(1, .monotonic);
         self.wake_event.set(self.io());
-        self.mutex.unlock(self.io());
     }
 
     fn snapshotStats(self: *InternalFlushWorker) Stats {
         self.mutex.lockUncancelable(self.io());
         defer self.mutex.unlock(self.io());
         return .{
-            .wakeups = self.wakeups,
+            .wakeups = self.wakeups.load(.monotonic),
             .maintenance_steps = self.maintenance_steps,
             .errors = self.errors,
             .joined = self.joined,
@@ -10174,14 +10173,17 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
                 self.mutex.unlock(io_ctx);
                 return work;
             }
-            if (self.wake_requested) {
-                self.wake_requested = false;
+            if (self.wake_requested.swap(false, .acq_rel)) {
                 self.mutex.unlock(io_ctx);
                 return .run;
             }
-            // Reset under the same mutex used to publish wakes. A wake
-            // arriving before wait remains latched and cannot be lost.
+            // Wakes never take this mutex. Check the atomic latch again after
+            // resetting the event so a concurrent set/reset cannot lose work.
             self.wake_event.reset();
+            if (self.wake_requested.swap(false, .acq_rel)) {
+                self.mutex.unlock(io_ctx);
+                return .run;
+            }
             self.mutex.unlock(io_ctx);
             if (deadline_ns) |deadline| {
                 const now = platform.time.monotonicNs();
@@ -10209,9 +10211,7 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
             if (!progressed) return self.backend.nextMaintenanceWakeDelayNsBestEffort();
             self.recordStep();
         }
-        self.mutex.lockUncancelable(self.io());
-        self.wake_requested = true;
-        self.mutex.unlock(self.io());
+        self.wake_requested.store(true, .release);
         return null;
     }
 
@@ -30910,4 +30910,23 @@ test "controlled physical sync writer recovery inventories both atomic schemes w
         defer txn.abort();
         try std.testing.expectEqualStrings("durable value", try txn.get(.{}, "key"));
     }
+}
+
+test "controlled physical sync cleanup wake never waits on the maintenance mutex and preserves the atomic latch" {
+    if (comptime builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    var backend = Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    var worker = InternalFlushWorker.init(&backend, std.testing.io);
+    defer worker.deinit();
+    try std.testing.expect(worker.mutex.tryLock());
+    worker.waker().wake();
+    worker.mutex.unlock(worker.io());
+    try std.testing.expectEqual(@as(u64, 1), worker.snapshotStats().wakeups);
+    // Even if an event reset races the set, the independent latch carries it.
+    worker.wake_event.reset();
+    try std.testing.expectEqual(InternalFlushWorker.Work.run, worker.waitForWork(null));
+    try std.testing.expect(!worker.wake_requested.load(.acquire));
+    worker.waker().wake();
+    try std.testing.expectEqual(InternalFlushWorker.Work.run, worker.waitForWork(null));
+    try std.testing.expectEqual(@as(u64, 2), worker.snapshotStats().wakeups);
 }
