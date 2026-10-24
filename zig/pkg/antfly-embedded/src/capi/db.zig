@@ -10715,6 +10715,10 @@ test "capi native memory supersession uses filtered lexical indexes and durable 
     var claims: [3]t.Assertion = undefined;
     for (&claims, 0..) |*claim, i| claim.* = .{ .id = try std.fmt.allocPrint(a, "claim-{d}", .{i}), .subject = if (i < 2) "production" else "unrelated", .predicate = "deploys", .value = try std.fmt.allocPrint(a, "value-{d}", .{i}), .statement = "Deployment uses Helm", .evidence = &.{.{ .id = "e" }} };
     _ = try nativeMemoryTestCall(handle, a, "alice", .observe, t.ObservationRequest{ .evidence = &.{.{ .id = "e", .source_id = "fixture", .source_version = "1", .text = "Deployment uses Helm" }}, .assertions = &claims }, "observe", "");
+    // Draining database workers does not run memory policy maintenance.
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
+    const before = try std.json.parseFromSliceLeaky(t.SupersessionCandidatePage, a, try nativeMemoryTestCall(handle, a, "alice", .supersession_candidates, t.SupersessionCandidateRequest{ .mode = .lexical }, "", "claim-0"), .{});
+    try std.testing.expectEqual(.not_ready, before.retrieval);
     for (0..16) |step| _ = try nativeMemoryTestCall(handle, a, "alice", .advance, .{}, try std.fmt.allocPrint(a, "index-{d}", .{step}), "");
     const candidates = try std.json.parseFromSliceLeaky(t.SupersessionCandidatePage, a, try nativeMemoryTestCall(handle, a, "alice", .supersession_candidates, t.SupersessionCandidateRequest{ .mode = .lexical }, "", "claim-0"), .{});
     try std.testing.expectEqual(.indexed, candidates.retrieval);

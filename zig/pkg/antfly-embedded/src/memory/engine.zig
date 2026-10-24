@@ -82,30 +82,36 @@ fn neighborRequest(input: service.NeighborRequest) !db_types.SearchRequest {
 }
 
 fn assertionSearchRequest(a: A, input: service.RecallSearchRequest) !db_types.SearchRequest {
-    if (input.limit == 0 or input.limit > 4096 or input.offset + input.limit > 4096 or input.text_indexes.len > 2 or input.vector_indexes.len > 2) return error.InvalidMemoryRequest;
+    _ = try searchLanes(input);
+    if (input.text_indexes.len > 1 or input.vector_indexes.len > 1) return error.InvalidMemoryRequest;
     var text: std.ArrayList(db_types.NamedFullTextQuery) = .empty;
     var dense: std.ArrayList(db_types.NamedDenseQuery) = .empty;
     for (input.text_indexes) |name| {
         if (!std.mem.startsWith(u8, name, "memory_recall_text_")) return error.InvalidMemoryRequest;
-        if (input.query.len != 0) try text.append(a, .{ .name = name, .index_name = name, .query = .{ .match = .{ .field = name, .text = input.query } } });
+        if (input.query.len != 0) try text.append(a, .{ .name = "$full_text_results", .index_name = name, .query = .{ .match = .{ .field = name, .text = input.query } } });
     }
     if (input.embedding) |vector| for (input.vector_indexes) |name| {
         if (!std.mem.startsWith(u8, name, "memory_recall_vector_")) return error.InvalidMemoryRequest;
         try dense.append(a, .{ .name = name, .index_name = name, .query = .{ .vector = vector, .k = input.offset + input.limit } });
     };
     if (text.items.len + dense.items.len == 0) return error.InvalidMemoryRequest;
+    if (!input.filters.empty() and input.text_indexes.len != 1) return error.InvalidMemoryRequest;
     const filter = if (input.filters.empty()) "" else try @import("recall_filters.zig").query(a, input.text_indexes[0], input.filters);
     return .{ .full_text_queries = text.items, .dense_queries = dense.items, .primary_text_index_name = if (filter.len > 0) input.text_indexes[0] else null, .filter_query_json = filter, .merge_config = .{ .window_size = input.offset + input.limit }, .limit = input.offset + input.limit, .include_stored = false };
 }
 
-fn searchLanes(input: service.RecallSearchRequest) usize {
-    return if (input.filters.empty()) 1 else input.text_indexes.len;
+fn searchLanes(input: service.RecallSearchRequest) !usize {
+    if (input.limit == 0 or input.limit > 4096 or input.offset > 4096 - input.limit or input.text_indexes.len > 2 or input.vector_indexes.len > 2) return error.InvalidMemoryRequest;
+    if (!input.filters.empty() and input.embedding != null and input.vector_indexes.len > input.text_indexes.len) return error.InvalidMemoryRequest;
+    // Each audience is an independent bounded retrieval lane. The owner wire
+    // admits one named full-text result per request; do not depend on native
+    // multi-query support that is unavailable across a compiled-owner boundary.
+    return @max(@as(usize, 1), @max(input.text_indexes.len, if (input.embedding != null) input.vector_indexes.len else 0));
 }
 fn laneRequest(input: service.RecallSearchRequest, lane: usize) service.RecallSearchRequest {
-    if (input.filters.empty()) return input;
     var result = input;
-    result.text_indexes = input.text_indexes[lane..][0..1];
-    result.vector_indexes = if (input.embedding != null) input.vector_indexes[lane..][0..1] else &.{};
+    result.text_indexes = if (lane < input.text_indexes.len) input.text_indexes[lane..][0..1] else &.{};
+    result.vector_indexes = if (input.embedding != null and lane < input.vector_indexes.len) input.vector_indexes[lane..][0..1] else &.{};
     return result;
 }
 fn searchPage(a: A, input: service.RecallSearchRequest, hits: []service.Neighbor, truncated: bool) !service.RecallSearchPage {
@@ -160,7 +166,7 @@ pub const Routed = struct {
         try self.context.check();
         var hits: std.ArrayList(service.Neighbor) = .empty;
         var truncated = false;
-        for (0..searchLanes(input)) |lane| {
+        for (0..try searchLanes(input)) |lane| {
             var request = try assertionSearchRequest(a, laneRequest(input, lane));
             request.execution_deadline_ns = self.request.deadline_ns;
             request.cancellation = self.request.cancellation;
@@ -289,7 +295,7 @@ pub fn Native(comptime DB: type) type {
             try self.context.check();
             var hits: std.ArrayList(service.Neighbor) = .empty;
             var truncated = false;
-            for (0..searchLanes(input)) |lane| {
+            for (0..try searchLanes(input)) |lane| {
                 const request = try assertionSearchRequest(a, laneRequest(input, lane));
                 var response = try self.db.search(a, request);
                 defer response.deinit();
@@ -383,4 +389,24 @@ fn prefixEnd(a: A, prefix: []const u8) ![]const u8 {
     const end = try a.dupe(u8, prefix);
     end[end.len - 1] += 1;
     return end;
+}
+
+test "capi native memory audience lanes retain the compiled owner text identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const input: service.RecallSearchRequest = .{ .text_indexes = &.{ "memory_recall_text_team", "memory_recall_text_private" }, .query = "Deployment", .limit = 8 };
+    try std.testing.expectEqual(@as(usize, 2), try searchLanes(input));
+    for (0..try searchLanes(input)) |lane| {
+        const request = try assertionSearchRequest(a, laneRequest(input, lane));
+        const wire = try @import("../api/query_execution_contract.zig").encodeStorageKernelQueryRequest(a, request);
+        const json = try std.json.parseFromSliceLeaky(std.json.Value, a, wire, .{});
+        try std.testing.expectEqualStrings(input.text_indexes[lane], json.object.get("full_text_index").?.string);
+    }
+    var oversized = input;
+    oversized.offset = std.math.maxInt(u32);
+    try std.testing.expectError(error.InvalidMemoryRequest, searchLanes(oversized));
+    oversized = input;
+    oversized.text_indexes = &.{ "memory_recall_text_a", "memory_recall_text_b", "memory_recall_text_c" };
+    try std.testing.expectError(error.InvalidMemoryRequest, searchLanes(oversized));
 }
