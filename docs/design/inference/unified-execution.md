@@ -1553,22 +1553,22 @@ Metal toolchain availability separately from real GPU runtime compilation;
 compile the full generated/rendered shader set through the available path and
 do not report an unavailable AIR compiler as a passing offline check.
 
-## Proposed residual-kernel and ABI consolidation campaign
+## Completed residual-kernel and ABI consolidation campaign
 
-This is a new planning baseline at
+This campaign uses the independent baseline
 `fdb6d7252f4d55ed8a9d1ef48869ad88dc0b0fc6`, after the completed N01–N36
 campaign. The earlier 197,348-byte authored reduction and its whole-tree
-ledger are frozen results at that revision. This section authorizes no claim
-of further savings until implementation and qualification measure them.
+ledger remain frozen at that revision and are excluded from the figures below.
+All R01–R36 packages are complete: 28 implementation/qualification packages and
+eight native-body audits retaining distinct schedules or existing shared leaves.
 
-The next campaign should tackle **36 packages in six integrated waves**, with
-kernel-body consolidation as the first deliverable. The provisional budget is
+The original plan covered **36 packages in six integrated waves**, with
+kernel-body consolidation as the first deliverable. Its provisional budget was
 **40–80 KB net authored production reduction**, comprising roughly 25–50 KB
-of native kernel bodies and 15–30 KB of host/ABI scaffolding. These are planning
-ranges, not additive per-package promises. R01/R02 must replace the ranges
-with measured owner/prototype budgets before broad migration. CPU ownership
-changes may add code when allocation/performance improvements justify it;
-charge those additions against the campaign total.
+of native kernel bodies and 15–30 KB of host/ABI scaffolding. The retained
+inventory, package contracts and acceptance gates below document that plan;
+the final implementation record replaces the estimates with measured results.
+All new CPU ownership code, helpers and contracts count against the total.
 
 ### Current-source inventory and exclusions
 
@@ -1768,6 +1768,178 @@ report decoded Metal/native CUDA bodies, host code, CPU ownership, generator
 owners, generated copies, tests/tooling, docs and images separately. The final
 ledger is against `fdb6d7252f`, with no reuse of either earlier campaign's
 savings.
+
+### Residual campaign implementation and acceptance record
+
+The implementation uses the existing five ownership layers. Format-specific
+folds, native schedules and lifetimes remain explicit; the new shared owners
+remove repeated traversal and binding code. Package evidence, immutable inputs,
+failed prototypes and final receipts live under
+`.benchmark-assets/1166/residual/`; `packages.json` maps all R01–R36 packages
+to their owners or audited retention decisions. Final composition qualification
+is complete. `qualification-index.json` checks the final model/direct/soak
+receipts and the identical 1,192-file shipping source closure across Mac and
+Spark; baseline-confirmed broader test failures remain explicit below.
+
+| Packages | Final ownership boundary |
+| --- | --- |
+| R03–R06 | Static Metal scalar projection traversal with format-specific block folds; exact NR2/NR4 and NSG2/NSG4 reduction geometry. Q4_K/Q5_K generic consumers join that owner; distinct reduce/v2 schedules remain. |
+| R07 | Shared ternary scalar codec and three matching traversals; pair-I8 retains its original loop after slower generic/vector prototypes. |
+| R08–R10 | Existing RMS tree extended for precomputed statistics and F16 input, preserving original expression order; shared SIMD4 statistics/inverse leaf with original triple vector stores. |
+| R11/R12 | Actual row/projection extents in the extended Q8 owner; shared sequential layer-norm dg/db row contribution with distinct direct/chunk/final reductions. |
+| R14/R16 | Shared CUDA activation-slice partials and ordinary QKV schedule; exported activation epilogues and native warp counts remain explicit. |
+| R19/R24 | Static TurboQuant split-stage traversal with codec/mapping leaves; shared live suffix-start calculation with distinct dense/paged/TQ publication. |
+| R21/R22 | One native body per matching attention family, directly included in the exported kernels with compile-time schedule constants. Relative-product/MMA phases retain their original folds, barriers and exact scratch. |
+| R26–R28 | Named host value records derived at compile time from native parameter macros; mutable/reducer slots point into the same live record. Generated or unique tuples retain their existing owners. |
+| R29/R34 | Forced-inline two-/four-/five-buffer Metal binding owners at 166 sites; native/MSL parameter field lists with compiler layout assertions. Constants, offsets, scratch, encoder boundaries and retention remain at callers. |
+| R30–R33 | Consumed row/copy/convolution geometry, existing inline dense-output ownership, and existing dense-input views with shared cleanup. No new runtime operation interpreter or input bundle. |
+| R01/R02/R35/R36 | Immutable baseline and matched benchmark instrumentation; independent references, device replay/failure tests, native include/cache closure and composition accounting. |
+
+R13, R15, R17, R18, R20, R23, R25 and R33 finish their native-body audits by
+retaining distinct schedules or reusing owners already present at the baseline.
+They earn no new kernel-body deletion credit. Direct/im2col/grouped convolution,
+scalar-F32 versus packed-Q8 DP4A, multirow/warp-specific reuse, 8/6/5-warp argmax,
+HD256/HD512 prefill, saved-score backward, generic versus coalesced transpose,
+and CPU views versus Metal device/F16 slices have different arithmetic,
+scratch or lifetime contracts. R18 still gains native ABI ownership under R26;
+R13/R33 consume the geometry shared under R30. The activation-slice kernel
+called “packed-output” in R15 actually consumes packed Q8 and publishes F32.
+
+The attention prototypes exposed a CUDA compiler constraint: a forced-inline
+device function containing shared arrays can increase SM100/110/120 address
+instructions and registers. Bundling arrays into an exact-sized workspace did
+not consistently solve that. The final body includes keep shared declarations
+inside the native kernel while owning the arithmetic once; they deliberately
+have no include guard. Both headers participate in JIT qualification identity
+and the generic transitive-include closure check. This is authored sharing,
+with the entire added header cost charged against the removed export bodies.
+
+The Metal scalar prototype also preserves branch-selected row accumulators and
+performs all SIMD reductions before publication. Direct array indexing slowed
+Q4_1. RMS callers retain their original expression epilogue after a staged
+rewrite changed one bit. Pair-I8 keeps its original scalar schedule after
+both generic and vector-decoder versions slowed it. These rejected experiments
+remain in the receipts; none are credited as accepted kernel consolidation.
+
+CPU primitive qualification also caught a 5 ns P50 regression at 1×8, despite
+identical adapter instructions. Entry alignment and static-width packing
+prototypes were slower and were rejected. The retained implementation keeps
+its original short-row allocation classes and loops, with an explicit
+`noalias` contract on the fresh backward-output planes. Both callers allocate
+those planes separately from inputs; packed output subranges are disjoint.
+All five primitive cases pass the original protocol, and the three short-row
+cases also pass longer-warmup controls. The output/error behavior is unchanged.
+
+### Residual source accounting
+
+The complete authored production reduction against `fdb6d7252f` is
+**55,668 bytes / 1,040 lines**, including every replacement owner, native ABI
+macro, body header and shared contract. Previous campaign savings are excluded.
+The original 40–80 KB planning range is replaced by these measured figures.
+
+| Authored production region | Net bytes removed |
+| --- | ---: |
+| Metal shader source as stored in the C translation unit | 9,808 |
+| CUDA device source, including ABI and both body headers | 17,819 |
+| Metal host bindings | 21,980 |
+| CUDA host launch ownership | 6,681 |
+| CPU arithmetic/result ownership | 1,075 |
+| Shared contracts, geometry and build identity | −1,695 |
+| **Total** | **55,668** |
+
+The decoded Metal shader separately shrinks from 948,535 to 936,666 bytes
+(11,869 bytes), while growing from 7,508 to 7,642 physical lines. That decoded
+measurement is not added to the authored total: C literal escaping and shared
+field emission have different source costs. CUDA body moves receive credit
+only after charging the entire added headers. Generator owners/generated
+copies have zero new reduction. Inline tests, benchmark/qualification tooling
+and documentation are reported separately in the complete source ledger.
+
+Generated GPU image size is effectively unchanged: fatbin −552 bytes,
+portable PTX +1,556 bytes and an identical SM89 cubin, for 1,004 bytes added
+in total. Source sharing preserves native machine code; it does not claim a
+corresponding GPU binary-size reduction. The final per-file hashes and complete
+source/image ledger are retained in `.benchmark-assets/1166/residual/`.
+
+### Residual qualification results
+
+Final Mac binaries use `ReleaseFast`, Metal enabled and CUDA disabled, matching
+the platform defaults. Both immutable-baseline and candidate benchmarks include
+the same setup instrumentation outside timed loops. Results below use the final
+CPU alias contract; earlier whole-model passes remain separate receipts.
+
+| Final Mac check | Result |
+| --- | --- |
+| 13 encoder/reranker cases, 32 arms | Finite byte-identical outputs; maximum P50 ratio 1.0031, P95 1.0146. Actual backend and command-count profiles match. |
+| CPU/Metal decoder cases, 32 arms | Exact A/B outputs; maximum P50 ratio 1.0004 and P95 0.9992. |
+| Independent decoder oracle | All 160,000 logits per backend pass at `0.002`; maximum absolute error below `0.000759`. |
+| Five CPU backward primitives | Exact outputs; maximum P50 ratio 1.0159 and P95 1.0118. Three longer-warmup controls also pass, maximum P50 1.0417. |
+| Three separate host-encoding probes | Same submit/compute/blit profiles; maximum warmed host-encode CPU ratio 1.0026. Trace probes are separate from ordinary model timing. |
+| Five 120-second soaks | Finite independent output probes, alternating/retained output checks, stable warmed payload/RSS counters and zero tracked host allocations at teardown. |
+| Native hot-body protection | Both GEMM bodies and attention retain their 64-byte entries and identical non-relocation instructions. |
+
+The 1,150 Metal cases all pass byte parity, guards and resource checks in both math profiles. Their identical-source control passes. Three
+short-batch timing flags (one empty-row Q8 launch and two unchanged AdamW
+profiles) are retained explicitly. Seventeen targeted cases using longer timed
+batches pass identical-source, reversed and ordinary comparisons under the same
+5% ceiling; maximum ordinary ratio is 1.0122. The original failed receipts are
+not rewritten as passes.
+
+All four final Spark model cases pass finite byte-identical outputs and
+balanced 32-arm timing: maximum P50 ratio 1.0162 and P95 1.0030. Requested
+backend and command profiles match. Three CUDA prepared-frame/request-reset
+lifetime tests also pass without skips.
+Both 120-second CUDA soaks pass finite probes, alternating/retained outputs,
+stable warmed counters and zero tracked host allocations at teardown: 43,338
+encoder iterations and 10,668 reranker iterations. Together with the Mac runs,
+all seven required soaks pass.
+
+All 360 direct CUDA cases pass exact A/B output, guards, captured replay and
+the 5% timing gate. These include independent staged-F16 attention references,
+changed device-position/value KV replay and the full packed-argmax schedule
+fixtures. Nine native-fatbin ABI tests, three CPU backward checks and two
+pinned Torch CUDA optimizer/clipping/resume tests pass without skips.
+
+All seven CUDA architecture profiles expose the same 439 kernels with no register, shared,
+stack or local-memory increase. GLiNER, DeBERTa, activation-slice and ordinary
+QKV exports have baseline-identical SASS on every target. Two TurboQuant
+split-stage exports and the dense KV suffix writer have changed SASS hashes on
+some targets, with identical instruction counts and resources. Actual Spark
+execution uses packaged SM120 code on GB10/SM121. The bad-reference and
+missing-write controls both fail as intended before timing; A/B and replay
+comparisons remain byte-exact even where independent staged-F16 oracles have an
+explicit rounding tolerance.
+
+The broader legacy training suites retain confirmed baseline failures. Legacy
+GLiNER2 selects seven tests: three pass and four fail on unsupported integer
+indices through the generic gather route, identically on the frozen baseline.
+The required-hardware GLiNER2.5 selection has 78 passes, two skips and six
+failures on both revisions, with identical failed test names: budget-error
+mapping, three BLAS-counter expectations, fused-attention availability and
+fused-trainer graph admission. These broader suites are not claimed as green;
+the consolidation preserves their existing admission envelope.
+
+Portable PTX runtime qualification is blocked by a pre-existing host/toolkit
+mismatch: both the frozen baseline and candidate emit PTX 9.2, while Spark's
+CUDA 13.0 driver reports support through PTX 9.0. Both direct load controls fail
+with `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`. Native fatbin execution is qualified
+separately; this limitation is not recorded as a passing portable runtime test.
+All three artifacts pass pinned `regen-cuda-artifacts.sh --check --all`.
+The artifact contract remains pinned to CUDA 13.2. CUDA model admission also
+retains its existing envelope, including the unadmitted TinyLlama fixture.
+
+The final CPU/Metal training and lifetime selection has 46 passes and three
+skips: two optional published GLiNER checkpoint fixtures are absent and the
+CUDA-only frame check is disabled in this build. Both pinned TinyLlama resident
+Metal encoder and decoder lifetime tests execute and pass.
+
+All 67 generated-source checks and 54 generated/rendered Metal shader
+compilations pass. The Metal result is actual device runtime compilation through
+the retained bridge; offline AIR tools are unavailable. Native product and
+browser WASM checks, all 15 artifact/accounting/qualification script tests, and
+18 final allocation/geometry/native-binding consumer tests pass. Sampling,
+large penalty histories, convolution and metadata/error paths run on their real
+consumers rather than inferred wrappers.
 
 ## Original checkpoint qualification
 
