@@ -52,6 +52,9 @@ class RegenCudaArtifactsTest(unittest.TestCase):
     def test_preference_training_ptx_matches_source_launch_abi(self) -> None:
         source = (ARTIFACTS / "inference_cuda_kernels.cu").read_text()
         ptx = (ARTIFACTS / "inference_cuda_kernels.ptx").read_text()
+        header = (ARTIFACTS.parent / "kernels" / "kernel_abi.cuh").read_text()
+        macros = dict(re.findall(r"^#define (ANTFLY_CUDA_\w+_PARAMS) (.*)$",
+                                 header.replace("\\\n", ""), re.MULTILINE))
         # These entrypoints changed with preference training. A stale artifact
         # can load successfully yet interpret launch arguments using the old
         # layout (batched dot silently ignored lhs_contract_last in CI).
@@ -72,11 +75,42 @@ class RegenCudaArtifactsTest(unittest.TestCase):
                 )
                 self.assertIsNotNone(declaration, f"missing CUDA source: {symbol}")
                 self.assertIsNotNone(entry, f"missing compiled PTX: {symbol}")
+                signature = declaration.group(1).strip()
+                if signature.startswith("ANTFLY_CUDA_"):
+                    self.assertIn(signature, macros, f"missing native signature: {symbol}")
+                    signature = macros[signature]
                 self.assertEqual(
-                    len(declaration.group(1).split(",")),
+                    len(signature.split(",")),
                     len(re.findall(r"\.param\b", entry.group(1))),
                     f"stale launch ABI for {symbol}; regenerate CUDA artifacts",
                 )
+
+    def test_native_scalar_parameter_macros_match_ptx_wire_layouts(self) -> None:
+        source = (ARTIFACTS / "inference_cuda_kernels.cu").read_text()
+        header = (ARTIFACTS.parent / "kernels" / "kernel_abi.cuh").read_text()
+        macros = dict(re.findall(r"^#define (ANTFLY_CUDA_\w+_PARAMS) (.*)$",
+                                 header.replace("\\\n", ""), re.MULTILINE))
+        ptx = (ARTIFACTS / "inference_cuda_kernels.ptx").read_text()
+        signatures = re.findall(r'extern "C" __global__ (?:__launch_bounds__\([^)]*\) )?void (\w+)\((ANTFLY_CUDA_\w+_PARAMS)\)', source)
+        self.assertGreater(len(signatures), 20)
+        checked = 0
+        for symbol, macro in signatures:
+            self.assertIn(macro, macros)
+            parameters = macros[macro].split(",")
+            # By-value native structs have their own size/offset contracts;
+            # these launch records admit only scalar wires and device addresses.
+            if any("*" not in parameter and not re.match(r"\s*(?:unsigned int|int|float)\s+\w+\s*$", parameter)
+                   for parameter in parameters):
+                continue
+            checked += 1
+            with self.subTest(symbol=symbol):
+                entry = re.search(rf"\.visible \.entry {symbol}\((.*?)\)", ptx, re.DOTALL)
+                self.assertIsNotNone(entry, f"missing compiled PTX: {symbol}")
+                native = ["u64" if "*" in parameter else "f32" if "float" in parameter else "u32"
+                          for parameter in parameters]
+                wires = re.findall(r"\.param\s+\.(\w+)", entry.group(1))
+                self.assertEqual(native, wires, f"stale native wire layout: {symbol}")
+        self.assertGreater(checked, 20)
 
     def test_artifact_modes_require_fresh_codegen_before_nvcc(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -12775,6 +12775,33 @@ fn debugCudaDeviceWarmup(ctx: *anyopaque, bytes: usize, iterations: usize) !bool
     return true;
 }
 
+/// Ordinary F32 result storage. Allocation and failed-launch cleanup keep the
+/// same cache, pinned-slot and audio-arena policies as the individual adapters.
+const OwnedF32Output = struct {
+    compute: *CudaCompute,
+    shape: ?[]i64,
+    buffer: buffer_mod.DeviceBuffer,
+    count: usize,
+
+    inline fn alloc(compute: *CudaCompute, shape: []const i64, count: usize) !@This() {
+        const owned_shape = try dupeShape(compute.allocator, shape);
+        errdefer compute.allocator.free(owned_shape);
+        return .{ .compute = compute, .shape = owned_shape, .buffer = try allocDeviceBuffer(compute, count * @sizeOf(f32)), .count = count };
+    }
+    inline fn deinit(output: *@This()) void {
+        if (output.shape) |shape| {
+            output.buffer.free(&output.compute.ctx);
+            output.compute.allocator.free(shape);
+            output.shape = null;
+        }
+    }
+    inline fn intoTensor(output: *@This()) !CT {
+        const result = try createTensor(output.compute, output.buffer, output.shape.?, output.count);
+        output.shape = null;
+        return result;
+    }
+};
+
 fn createTensor(
     self: *CudaCompute,
     device: buffer_mod.DeviceBuffer,
@@ -13220,13 +13247,11 @@ fn primitiveReduceF32(
         for (input.shape, 0..) |dim, idx| shape_buf[idx] = @intCast(dim);
         return (try cloneTensorShapeOp(ctx, input_ct, shape_buf[0..rank])) orelse error.InvalidShape;
     }
-    const output_shape = try dupeShape(self.allocator, geometry.output_dims[0..rank]);
-    errdefer self.allocator.free(output_shape);
     const output_count = geometry.output_count;
-    var device = try allocDeviceBuffer(self, output_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
-    try self.kernels.launchPrimitiveReduceF32(&self.ctx, device, input.buffer, geometry.input_count, output_count, geometry.dims, rank, geometry.mask, @backingInt(mode), geometry.reduce_count);
-    return createTensor(self, device, output_shape, output_count);
+    var output = try OwnedF32Output.alloc(self, geometry.output_dims[0..rank], output_count);
+    defer output.deinit();
+    try self.kernels.launchPrimitiveReduceF32(&self.ctx, output.buffer, input.buffer, geometry.input_count, output_count, geometry.dims, rank, geometry.mask, @backingInt(mode), geometry.reduce_count);
+    return output.intoTensor();
 }
 
 fn primReduceSumOp(ctx: *anyopaque, input: CT, axes: []const u8, input_shape: []const i64) anyerror!CT {
@@ -13274,23 +13299,8 @@ fn primBroadcastInDimOp(ctx: *anyopaque, input_ct: CT, target_shape: []const i64
 
     const output_shape = try self.allocator.alloc(i64, output_rank);
     errdefer self.allocator.free(output_shape);
-    var output_count: usize = 1;
-    for (0..output_rank) |idx| {
-        var dim = target_shape[idx];
-        if (dim <= 0) {
-            for (0..input_rank) |in_idx| {
-                if (axes[in_idx] == idx) {
-                    dim = @intCast(input_dims[in_idx]);
-                    break;
-                }
-            }
-        }
-        if (dim <= 0) dim = 1;
-        if (dim > std.math.maxInt(u32)) return error.InvalidShape;
-        output_shape[idx] = dim;
-        output_dims[idx] = @intCast(dim);
-        output_count = try checkedMul(output_count, @intCast(dim));
-    }
+    const output_count = try ops.kernel_descriptor.kernel_geometry.resolveBroadcastOutputBounded(u32, std.math.maxInt(u32), input_dims[0..input_rank], target_shape, broadcast_axes, output_shape);
+    for (output_shape, 0..) |dim, idx| output_dims[idx] = @intCast(dim);
     for (0..input_rank) |idx| {
         const target_dim = output_dims[axes[idx]];
         if (input_dims[idx] != 1 and (target_dim < input_dims[idx] or target_dim % input_dims[idx] != 0)) return error.InvalidShape;
@@ -13504,12 +13514,10 @@ fn primitiveSoftmaxOp(ctx: *anyopaque, input_ct: CT, last_dim: u32, log_softmax:
     const input = tensorFromCt(input_ct);
     try ensureF32(input);
     if (last_dim == 0 or input.elem_count % last_dim != 0) return error.InvalidShape;
-    const shape = try dupeShape(self.allocator, input.shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, input.elem_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
-    try self.kernels.launchPrimitiveSoftmaxF32(&self.ctx, device, input.buffer, input.elem_count, last_dim, log_softmax);
-    return createTensor(self, device, shape, input.elem_count);
+    var output = try OwnedF32Output.alloc(self, input.shape, input.elem_count);
+    defer output.deinit();
+    try self.kernels.launchPrimitiveSoftmaxF32(&self.ctx, output.buffer, input.buffer, input.elem_count, last_dim, log_softmax);
+    return output.intoTensor();
 }
 
 fn primSoftmaxOp(ctx: *anyopaque, input: CT, last_dim: u32) anyerror!CT {
@@ -14028,15 +14036,8 @@ fn transposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []cons
     }
     if (numel != input_tensor.elem_count) return error.InvalidShape;
 
-    var seen = @as([8]bool, @splat(false));
-    var out_shape_usize: [8]usize = undefined;
     var out_shape_i64: [8]i64 = undefined;
-    for (perm, 0..) |axis, i| {
-        if (axis >= input_shape.len or seen[axis]) return error.InvalidShape;
-        seen[axis] = true;
-        out_shape_usize[i] = resolved_shape[axis];
-        out_shape_i64[i] = @intCast(out_shape_usize[i]);
-    }
+    try ops.kernel_descriptor.kernel_geometry.transposeShape(input_shape, perm, &out_shape_i64);
 
     var dims = @as([8]u32, @splat(1));
     var perm_u32 = @as([8]u32, @splat(0));
@@ -14063,20 +14064,10 @@ fn primGatherOp(ctx: *anyopaque, input_ct: CT, indices_ct: CT, axis: u8, input_s
     const axis_index: usize = axis;
     if (rank == 0 or rank > 8 or input_shape.len != rank or axis_index >= rank or indices.shape.len > 8) return error.InvalidShape;
 
-    var prefix_count: usize = 1;
-    for (input.shape[0..axis_index]) |dim| {
-        if (dim <= 0) return error.InvalidShape;
-        prefix_count = try checkedMul(prefix_count, @intCast(dim));
-    }
-    const axis_extent_i64 = input.shape[axis_index];
-    if (axis_extent_i64 <= 0 or axis_extent_i64 > std.math.maxInt(u32)) return error.InvalidShape;
-    const axis_extent: usize = @intCast(axis_extent_i64);
-    var suffix_size: usize = 1;
-    for (input.shape[axis_index + 1 ..]) |dim| {
-        if (dim <= 0) return error.InvalidShape;
-        suffix_size = try checkedMul(suffix_size, @intCast(dim));
-    }
-    const expected_input_count = try checkedMul(try checkedMul(prefix_count, axis_extent), suffix_size);
+    const geometry = try ops.kernel_descriptor.kernel_geometry.GatherAxis.init(std.math.maxInt(u32), input.shape, axis_index);
+    const axis_extent = geometry.extent;
+    const suffix_size = geometry.suffix;
+    const expected_input_count = try geometry.count(axis_extent);
     if (expected_input_count != input.elem_count or indices.elem_count == 0) return error.InvalidShape;
 
     var normalize_scalar_indices = indices.shape.len > 1 and indices.elem_count == 1;
@@ -14093,27 +14084,11 @@ fn primGatherOp(ctx: *anyopaque, input_ct: CT, indices_ct: CT, axis: u8, input_s
     if (output_rank == 0 or output_rank > 8) return error.UnsupportedShape;
     const output_shape = try self.allocator.alloc(i64, output_rank);
     errdefer self.allocator.free(output_shape);
-    var out_dim: usize = 0;
-    for (input.shape[0..axis_index]) |dim| {
-        output_shape[out_dim] = dim;
-        out_dim += 1;
-    }
-    if (normalize_scalar_indices) {
-        output_shape[out_dim] = 1;
-        out_dim += 1;
-    } else {
-        for (indices.shape) |dim| {
-            if (dim <= 0) return error.InvalidShape;
-            output_shape[out_dim] = dim;
-            out_dim += 1;
-        }
-    }
-    for (input.shape[axis_index + 1 ..]) |dim| {
-        output_shape[out_dim] = dim;
-        out_dim += 1;
-    }
+    const index_shape: []const i64 = if (normalize_scalar_indices) &.{1} else indices.shape;
+    for (index_shape) |dim| if (dim <= 0) return error.InvalidShape;
+    _ = try ops.kernel_descriptor.kernel_geometry.gatherShape(input.shape, index_shape, axis_index, output_shape);
 
-    const output_count = try checkedMul(try checkedMul(prefix_count, indices.elem_count), suffix_size);
+    const output_count = try geometry.count(indices.elem_count);
     var device = try allocDeviceBuffer(self, output_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
     switch (input_route) {
@@ -14237,21 +14212,15 @@ fn primSliceOp(ctx: *anyopaque, input_ct: CT, starts_raw: []const i64, limits_ra
         const dim = input.shape[idx];
         const stride = strides_raw[idx];
         if (dim <= 0 or dim > std.math.maxInt(u32) or stride <= 0 or stride > std.math.maxInt(u32)) return error.UnsupportedShape;
-        var start = starts_raw[idx];
-        var limit = limits_raw[idx];
-        if (start < 0) start += dim;
-        if (limit < 0) limit += dim;
-        start = std.math.clamp(start, 0, dim);
-        limit = std.math.clamp(limit, 0, dim);
-        const size = if (limit <= start) 0 else @divTrunc(limit - start + stride - 1, stride);
-        if (size <= 0 or size > std.math.maxInt(u32)) return error.UnsupportedShape;
+        const slice = try ops.kernel_descriptor.kernel_geometry.SliceAxis.init(true, dim, starts_raw[idx], limits_raw[idx], stride, false);
+        if (slice.size <= 0 or slice.size > std.math.maxInt(u32)) return error.UnsupportedShape;
         input_dims[idx] = @intCast(dim);
-        output_dims[idx] = @intCast(size);
-        starts[idx] = @intCast(start);
-        strides[idx] = @intCast(stride);
-        output_shape[idx] = size;
+        output_dims[idx] = @intCast(slice.size);
+        starts[idx] = @intCast(slice.start);
+        strides[idx] = @intCast(slice.stride);
+        output_shape[idx] = slice.size;
         input_count = try checkedMul(input_count, @intCast(dim));
-        output_count = try checkedMul(output_count, @intCast(size));
+        output_count = try checkedMul(output_count, @intCast(slice.size));
     }
     if (input_count != input.elem_count) return error.InvalidShape;
     var device = try allocDeviceBuffer(self, output_count * @sizeOf(f32));
@@ -14826,17 +14795,15 @@ fn addWeightedEmbeddingTensor(ctx: *anyopaque, weight: CT, ids: CT, rhs: CT, tot
         else => return null,
     }
 
-    const shape = try dupeShape(self.allocator, rhs_tensor.shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, rhs_tensor.elem_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
+    var output = try OwnedF32Output.alloc(self, rhs_tensor.shape, rhs_tensor.elem_count);
+    defer output.deinit();
     // PLE per-layer embedding gather (weighted add). Attributed to `.embedding`.
     var embedding_profile_scope = beginPrefillProfile(self, .embedding, total);
     defer if (embedding_profile_scope) |*scope| scope.end();
-    try self.kernels.launchEmbeddingAddWeightedI32Q6KF32(&self.ctx, device, weight_tensor.buffer, ids_tensor.buffer, rhs_tensor.buffer, total, dim, lhs_scale, rhs_scale);
+    try self.kernels.launchEmbeddingAddWeightedI32Q6KF32(&self.ctx, output.buffer, weight_tensor.buffer, ids_tensor.buffer, rhs_tensor.buffer, total, dim, lhs_scale, rhs_scale);
     self.stats.launch_elementwise += 1;
     self.stats.add_mul_scalar_fused += 1;
-    return createTensor(self, device, shape, rhs_tensor.elem_count);
+    return output.intoTensor();
 }
 
 fn rmsNormAddWeightedEmbeddingTensor(
@@ -18933,14 +18900,12 @@ fn layerNorm(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps: f
     if (dim == 0 or input_tensor.elem_count % dim != 0) return error.InvalidShape;
     try ensureCount(gamma_tensor, dim);
     try ensureCount(beta_tensor, dim);
-    const shape = try dupeShape(self.allocator, input_tensor.shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
-    try self.kernels.launchLayerNormF32(&self.ctx, device, input_tensor.buffer, gamma_tensor.buffer, beta_tensor.buffer, input_tensor.elem_count / dim, dim, eps);
+    var output = try OwnedF32Output.alloc(self, input_tensor.shape, input_tensor.elem_count);
+    defer output.deinit();
+    try self.kernels.launchLayerNormF32(&self.ctx, output.buffer, input_tensor.buffer, gamma_tensor.buffer, beta_tensor.buffer, input_tensor.elem_count / dim, dim, eps);
     self.stats.launch_norm += 1;
     self.stats.launch_norm_layer += 1;
-    return createTensor(self, device, shape, input_tensor.elem_count);
+    return output.intoTensor();
 }
 
 fn addLayerNorm(ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT {
@@ -19033,14 +18998,12 @@ fn rmsNormAddMultiplyScalarTensor(ctx: *anyopaque, input: CT, weight: CT, residu
     try ensureCount(weight_tensor, dim);
     try ensureCount(scalar_tensor, 1);
 
-    const shape = try dupeShape(self.allocator, input_tensor.shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
-    try self.kernels.launchRmsNormAddMulScalarF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, residual_tensor.buffer, scalar_tensor.buffer, input_tensor.elem_count / dim, dim, eps);
+    var output = try OwnedF32Output.alloc(self, input_tensor.shape, input_tensor.elem_count);
+    defer output.deinit();
+    try self.kernels.launchRmsNormAddMulScalarF32(&self.ctx, output.buffer, input_tensor.buffer, weight_tensor.buffer, residual_tensor.buffer, scalar_tensor.buffer, input_tensor.elem_count / dim, dim, eps);
     self.stats.launch_norm += 1;
     self.stats.launch_norm_rms_add_mul_scalar += 1;
-    return createTensor(self, device, shape, input_tensor.elem_count);
+    return output.intoTensor();
 }
 
 fn rmsNormAddOutputScaleTensor(ctx: *anyopaque, input: CT, weight: CT, residual: CT, scalar: CT, dim: usize, eps: f32) anyerror!?CT {
@@ -19148,17 +19111,15 @@ fn rmsNormBare(ctx: *anyopaque, input: CT, dim: usize, eps: f32) anyerror!?CT {
     try ensureF32(input_tensor);
     if (dim == 0 or input_tensor.elem_count % dim != 0) return error.InvalidShape;
 
-    const shape = try dupeShape(self.allocator, input_tensor.shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
+    var output = try OwnedF32Output.alloc(self, input_tensor.shape, input_tensor.elem_count);
+    defer output.deinit();
     var norm_profile_scope = beginPrefillProfile(self, .norm, input_tensor.elem_count / dim);
     defer if (norm_profile_scope) |*scope| scope.end();
-    try self.kernels.launchRmsNormBareF32(&self.ctx, device, input_tensor.buffer, input_tensor.elem_count / dim, dim, eps);
+    try self.kernels.launchRmsNormBareF32(&self.ctx, output.buffer, input_tensor.buffer, input_tensor.elem_count / dim, dim, eps);
     self.stats.rms_norm_bare_calls += 1;
     self.stats.launch_norm += 1;
     self.stats.launch_norm_rms_bare += 1;
-    return createTensor(self, device, shape, input_tensor.elem_count);
+    return output.intoTensor();
 }
 
 fn rmsNormTripleOp(
@@ -19267,13 +19228,11 @@ fn parallelFfnPostResidualOp(
     const rows = shared.elem_count / request.dim;
     if (rows == 0 or rows > max_a4b_prefill_rows) return null;
 
-    const shape = try dupeShape(self.allocator, shared.shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, shared.elem_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
+    var output = try OwnedF32Output.alloc(self, shared.shape, shared.elem_count);
+    defer output.deinit();
     try self.kernels.launchGemma4A4BParallelFfnPostResidualF32(
         &self.ctx,
-        device,
+        output.buffer,
         shared.buffer,
         shared_weight.buffer,
         routed.buffer,
@@ -19285,7 +19244,7 @@ fn parallelFfnPostResidualOp(
         request.eps,
     );
     self.stats.launch_norm += 1;
-    return createTensor(self, device, shape, shared.elem_count);
+    return output.intoTensor();
 }
 const UnaryOp = enum { gelu, relu, quick_gelu, sigmoid, tanh };
 
@@ -19293,10 +19252,8 @@ fn unaryHost(ctx: *anyopaque, input: CT, op: UnaryOp) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
     try ensureF32(input_tensor);
-    const shape = try dupeShape(self.allocator, input_tensor.shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
+    var output = try OwnedF32Output.alloc(self, input_tensor.shape, input_tensor.elem_count);
+    defer output.deinit();
     const kernel_op: kernels_mod.ElementwiseOp = switch (op) {
         .gelu => .gelu,
         .relu => .relu,
@@ -19304,9 +19261,9 @@ fn unaryHost(ctx: *anyopaque, input: CT, op: UnaryOp) anyerror!CT {
         .sigmoid => .sigmoid,
         .tanh => .tanh,
     };
-    try self.kernels.launchElementwiseF32(&self.ctx, device, input_tensor.buffer, .{}, input_tensor.elem_count, kernel_op);
+    try self.kernels.launchElementwiseF32(&self.ctx, output.buffer, input_tensor.buffer, .{}, input_tensor.elem_count, kernel_op);
     self.stats.launch_elementwise += 1;
-    return createTensor(self, device, shape, input_tensor.elem_count);
+    return output.intoTensor();
 }
 
 fn gelu(ctx: *anyopaque, input: CT) anyerror!CT {
@@ -19532,13 +19489,11 @@ fn primitiveUnaryElementwise(ctx: *anyopaque, input_ct: CT, op: kernels_mod.Elem
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input = tensorFromCt(input_ct);
     try ensureF32(input);
-    const shape = try dupeShape(self.allocator, input.shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, input.elem_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
-    try self.kernels.launchElementwiseF32(&self.ctx, device, input.buffer, .{}, input.elem_count, op);
+    var output = try OwnedF32Output.alloc(self, input.shape, input.elem_count);
+    defer output.deinit();
+    try self.kernels.launchElementwiseF32(&self.ctx, output.buffer, input.buffer, .{}, input.elem_count, op);
     self.stats.launch_elementwise += 1;
-    return createTensor(self, device, shape, input.elem_count);
+    return output.intoTensor();
 }
 
 fn primSubtractOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
@@ -19646,20 +19601,18 @@ fn primWhereSelectOp(ctx: *anyopaque, cond_ct: CT, true_ct: CT, false_ct: CT) an
         break :blk broadcast_false.?;
     };
 
-    const shape = try dupeShape(self.allocator, target_shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, output_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
+    var output = try OwnedF32Output.alloc(self, target_shape, output_count);
+    defer output.deinit();
     try self.kernels.launchPrimitiveWhereF32(
         &self.ctx,
-        device,
+        output.buffer,
         tensorFromCt(launch_cond).buffer,
         tensorFromCt(launch_true).buffer,
         tensorFromCt(launch_false).buffer,
         output_count,
     );
     self.stats.launch_elementwise += 1;
-    return createTensor(self, device, shape, output_count);
+    return output.intoTensor();
 }
 
 fn multiplyScalar(ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT {
@@ -19667,14 +19620,12 @@ fn multiplyScalar(ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT {
     const input_tensor = tensorFromCt(input);
     try ensureF32(input_tensor);
 
-    const shape = try dupeShape(self.allocator, input_tensor.shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
-    try self.kernels.launchScaleF32(&self.ctx, device, input_tensor.buffer, input_tensor.elem_count, scale);
+    var output = try OwnedF32Output.alloc(self, input_tensor.shape, input_tensor.elem_count);
+    defer output.deinit();
+    try self.kernels.launchScaleF32(&self.ctx, output.buffer, input_tensor.buffer, input_tensor.elem_count, scale);
     self.stats.launch_scalar += 1;
     self.stats.launch_scalar_multiply_immediate += 1;
-    return createTensor(self, device, shape, input_tensor.elem_count);
+    return output.intoTensor();
 }
 
 fn clampScalar(ctx: *anyopaque, input: CT, lower: ?f32, upper: ?f32) anyerror!?CT {
@@ -19682,13 +19633,11 @@ fn clampScalar(ctx: *anyopaque, input: CT, lower: ?f32, upper: ?f32) anyerror!?C
     if (self.capability_profile == .embedding_gemma2) return gemma4AudioClampScalarOp(ctx, input, lower, upper);
     const tensor = tensorFromCt(input);
     try ensureF32(tensor);
-    const shape = try dupeShape(self.allocator, tensor.shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, tensor.elem_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
-    try self.scalar_clamp_kernel.launch(&self.ctx, tensor.buffer.ptr, device.ptr, tensor.elem_count, lower, upper);
+    var output = try OwnedF32Output.alloc(self, tensor.shape, tensor.elem_count);
+    defer output.deinit();
+    try self.scalar_clamp_kernel.launch(&self.ctx, tensor.buffer.ptr, output.buffer.ptr, tensor.elem_count, lower, upper);
     self.stats.launch_elementwise += 1;
-    return createTensor(self, device, shape, tensor.elem_count);
+    return output.intoTensor();
 }
 
 fn addScalar(ctx: *anyopaque, input: CT, value: f32) anyerror!?CT {
@@ -19696,15 +19645,13 @@ fn addScalar(ctx: *anyopaque, input: CT, value: f32) anyerror!?CT {
     const input_tensor = tensorFromCt(input);
     try ensureF32(input_tensor);
 
-    const shape = try dupeShape(self.allocator, input_tensor.shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
-    try self.kernels.launchAddScalarF32(&self.ctx, device, input_tensor.buffer, input_tensor.elem_count, value);
+    var output = try OwnedF32Output.alloc(self, input_tensor.shape, input_tensor.elem_count);
+    defer output.deinit();
+    try self.kernels.launchAddScalarF32(&self.ctx, output.buffer, input_tensor.buffer, input_tensor.elem_count, value);
     self.stats.add_scalar_calls += 1;
     self.stats.launch_scalar += 1;
     self.stats.launch_scalar_add_immediate += 1;
-    return createTensor(self, device, shape, input_tensor.elem_count);
+    return output.intoTensor();
 }
 
 fn siluMultiply(ctx: *anyopaque, gate: CT, up: CT) anyerror!?CT {
@@ -20177,14 +20124,12 @@ fn addMultiplyScalarTensor(ctx: *anyopaque, a: CT, b: CT, scalar: CT) anyerror!?
     if (a_tensor.elem_count != b_tensor.elem_count or !sameShape(a_tensor.shape, b_tensor.shape)) return error.InvalidShape;
     try ensureCount(scalar_tensor, 1);
 
-    const shape = try dupeShape(self.allocator, a_tensor.shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, a_tensor.elem_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
-    try self.kernels.launchAddMulScalarF32(&self.ctx, device, a_tensor.buffer, b_tensor.buffer, scalar_tensor.buffer, a_tensor.elem_count);
+    var output = try OwnedF32Output.alloc(self, a_tensor.shape, a_tensor.elem_count);
+    defer output.deinit();
+    try self.kernels.launchAddMulScalarF32(&self.ctx, output.buffer, a_tensor.buffer, b_tensor.buffer, scalar_tensor.buffer, a_tensor.elem_count);
     self.stats.launch_elementwise += 1;
     self.stats.add_mul_scalar_fused += 1;
-    return createTensor(self, device, shape, a_tensor.elem_count);
+    return output.intoTensor();
 }
 
 fn addWeightedScalars(ctx: *anyopaque, a: CT, b: CT, scale_a: f32, scale_b: f32) anyerror!?CT {
@@ -20196,14 +20141,12 @@ fn addWeightedScalars(ctx: *anyopaque, a: CT, b: CT, scale_a: f32, scale_b: f32)
     try ensureF32(b_tensor);
     if (a_tensor.elem_count != b_tensor.elem_count or !sameShape(a_tensor.shape, b_tensor.shape)) return error.InvalidShape;
 
-    const shape = try dupeShape(self.allocator, a_tensor.shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, a_tensor.elem_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
-    try self.kernels.launchAddWeightedScalarsF32(&self.ctx, device, a_tensor.buffer, b_tensor.buffer, scale_a, scale_b, a_tensor.elem_count);
+    var output = try OwnedF32Output.alloc(self, a_tensor.shape, a_tensor.elem_count);
+    defer output.deinit();
+    try self.kernels.launchAddWeightedScalarsF32(&self.ctx, output.buffer, a_tensor.buffer, b_tensor.buffer, scale_a, scale_b, a_tensor.elem_count);
     self.stats.launch_elementwise += 1;
     self.stats.add_mul_scalar_fused += 1;
-    return createTensor(self, device, shape, a_tensor.elem_count);
+    return output.intoTensor();
 }
 
 fn silu(ctx: *anyopaque, input: CT) anyerror!CT {
@@ -20211,13 +20154,11 @@ fn silu(ctx: *anyopaque, input: CT) anyerror!CT {
     const input_tensor = tensorFromCt(input);
     try ensureF32(input_tensor);
 
-    const shape = try dupeShape(self.allocator, input_tensor.shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
-    try self.kernels.launchElementwiseF32(&self.ctx, device, input_tensor.buffer, .{}, input_tensor.elem_count, .silu);
+    var output = try OwnedF32Output.alloc(self, input_tensor.shape, input_tensor.elem_count);
+    defer output.deinit();
+    try self.kernels.launchElementwiseF32(&self.ctx, output.buffer, input_tensor.buffer, .{}, input_tensor.elem_count, .silu);
     self.stats.launch_elementwise += 1;
-    return createTensor(self, device, shape, input_tensor.elem_count);
+    return output.intoTensor();
 }
 fn layaWarpEligible(self: *const CudaCompute, batch: usize, seq: usize, dim: usize) bool {
     return self.laya_optimizations and self.ctx.info.compute_major == 8 and
@@ -20327,28 +20268,26 @@ fn encoderLocalAttention(ctx: *anyopaque, q: CT, k: CT, v: CT, mask: []const i64
     }
     if (mask.len != try checkedMul(batch, seq)) return error.InvalidShape;
     const mask_device = try uploadCachedAttentionMaskI64(self, mask);
-    const shape = try dupeShape(self.allocator, tensorFromCt(q).shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
+    var output = try OwnedF32Output.alloc(self, tensorFromCt(q).shape, count);
+    defer output.deinit();
     var profile = beginPrefillProfile(self, .attention, batch * seq);
     defer if (profile) |*scope| scope.end();
     if ((self.gliner_mixed_attention and dim == 64) or glinerQ8F16AttentionEligible(self, batch, seq, heads, dim)) {
-        try self.kernels.launchGlinerEncoderAttentionTcF16(&self.ctx, device, tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, mask_device, batch, seq, heads, dim, radius);
+        try self.kernels.launchGlinerEncoderAttentionTcF16(&self.ctx, output.buffer, tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, mask_device, batch, seq, heads, dim, radius);
         self.stats.gliner_encoder_f16_attention_launches += 1;
         if (seq >= 2048 and radius >= seq and self.kernels.gliner_encoder_attention_tc_f16_m64 != null)
             self.stats.gliner_encoder_wide_attention_launches += 1;
     } else if (self.gliner_encoder_attention) {
-        try self.kernels.launchGlinerEncoderAttentionF32(&self.ctx, device, tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, mask_device, batch, seq, heads, dim, radius);
+        try self.kernels.launchGlinerEncoderAttentionF32(&self.ctx, output.buffer, tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, mask_device, batch, seq, heads, dim, radius);
         self.stats.gliner_encoder_f32_attention_launches += 1;
     } else if (layaWarpEligible(self, batch, seq, dim)) {
-        try self.kernels.launchLayaAttentionWarpF32(&self.ctx, device, tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, mask_device, batch, seq, heads, dim, radius);
+        try self.kernels.launchLayaAttentionWarpF32(&self.ctx, output.buffer, tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, mask_device, batch, seq, heads, dim, radius);
         self.stats.laya_warp_attention += 1;
     } else {
-        try self.kernels.launchLayaLocalAttentionF32(&self.ctx, device, tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, mask_device, batch, seq, heads, dim, radius);
+        try self.kernels.launchLayaLocalAttentionF32(&self.ctx, output.buffer, tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, mask_device, batch, seq, heads, dim, radius);
     }
     self.stats.launch_attention += 1;
-    return createTensor(self, device, shape, count);
+    return output.intoTensor();
 }
 
 fn layaActionFeatures(ctx: *anyopaque, r: *const ops.LayaActionFeaturesRequest) anyerror!CT {
@@ -21161,13 +21100,11 @@ fn sdpaGemma4Vision(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize,
     try ensureCount(q, count);
     try ensureCount(k, count);
     try ensureCount(v, count);
-    const shape = try dupeShape(self.allocator, q.shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
-    try self.kernels.launchGlinerEncoderAttentionF32(&self.ctx, device, q.buffer, k.buffer, v.buffer, .{}, batch, seq_len, num_heads, head_dim, seq_len);
+    var output = try OwnedF32Output.alloc(self, q.shape, count);
+    defer output.deinit();
+    try self.kernels.launchGlinerEncoderAttentionF32(&self.ctx, output.buffer, q.buffer, k.buffer, v.buffer, .{}, batch, seq_len, num_heads, head_dim, seq_len);
     self.stats.launch_attention += 1;
-    return createTensor(self, device, shape, count);
+    return output.intoTensor();
 }
 
 fn causalSelfAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias_ct: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
@@ -21191,15 +21128,13 @@ fn causalSelfAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias_
         break :blk if (bt.elem_count == batched) 2 else if (bt.elem_count == shared) 1 else return error.InvalidShape;
     } else 0;
 
-    const shape = try dupeShape(self.allocator, q_tensor.shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
+    var output = try OwnedF32Output.alloc(self, q_tensor.shape, count);
+    defer output.deinit();
     var prefill_profile_scope = beginPrefillProfile(self, .attention, seq_len);
     defer if (prefill_profile_scope) |*scope| scope.end();
-    try self.kernels.launchAttentionF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, .{}, bias_buffer, batch, seq_len, num_heads, head_dim, true, false, bias_mode, false);
+    try self.kernels.launchAttentionF32(&self.ctx, output.buffer, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, .{}, bias_buffer, batch, seq_len, num_heads, head_dim, true, false, bias_mode, false);
     self.stats.launch_attention += 1;
-    return createTensor(self, device, shape, count);
+    return output.intoTensor();
 }
 
 fn cudaAllowHostAttentionFallback() bool {
@@ -22435,13 +22370,11 @@ fn crossAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, enc_mask: []con
 
     const mask_values = enc_mask[0 .. batch * enc_seq];
     const mask_device = if (allOnesI64(mask_values)) buffer_mod.DeviceBuffer{} else try uploadTempI64(self, mask_values);
-    const shape = try dupeShape(self.allocator, q_tensor.shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, q_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
-    try self.kernels.launchCrossAttentionF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, batch, dec_seq, enc_seq, num_heads, head_dim);
+    var output = try OwnedF32Output.alloc(self, q_tensor.shape, q_count);
+    defer output.deinit();
+    try self.kernels.launchCrossAttentionF32(&self.ctx, output.buffer, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, batch, dec_seq, enc_seq, num_heads, head_dim);
     self.stats.launch_attention += 1;
-    return createTensor(self, device, shape, q_count);
+    return output.intoTensor();
 }
 fn relativePositionBias(_: *anyopaque, _: CT, _: usize, _: usize, _: usize, _: usize, _: usize, _: bool) anyerror!CT {
     return unsupportedCt();
@@ -23213,15 +23146,13 @@ fn mropeWithDevicePositions(
     const input_tensor = tensorFromCt(input);
     const layout = try mropeLayout(input_tensor, token_count, head_dim, theta, sections);
     if (positions_device.len < try checkedMul(try checkedMul(3, token_count), @sizeOf(u32))) return error.InvalidShape;
-    const shape = try dupeShape(self.allocator, input_tensor.shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
+    var output = try OwnedF32Output.alloc(self, input_tensor.shape, input_tensor.elem_count);
+    defer output.deinit();
     var rope_profile_scope = beginPrefillProfile(self, .rope, token_count);
     defer if (rope_profile_scope) |*scope| scope.end();
     try self.kernels.launchQwen3VlMropeF32(
         &self.ctx,
-        device,
+        output.buffer,
         input_tensor.buffer,
         positions_device,
         layout.total_chunks,
@@ -23234,7 +23165,7 @@ fn mropeWithDevicePositions(
     );
     self.stats.launch_rope += 1;
     self.stats.launch_qwen3vl_mrope += 1;
-    return createTensor(self, device, shape, input_tensor.elem_count);
+    return output.intoTensor();
 }
 
 fn mropeLayout(input_tensor: *const CudaTensor, token_count: usize, head_dim: usize, theta: f32, sections: [3]u32) !struct { total_chunks: usize, chunks_per_token: usize } {
@@ -23271,15 +23202,13 @@ fn visionRope(
     if (heads_per_token == 0) return error.InvalidShape;
 
     const positions_device = try uploadTempU32(self, positions);
-    const shape = try dupeShape(self.allocator, input_tensor.shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
+    var output = try OwnedF32Output.alloc(self, input_tensor.shape, input_tensor.elem_count);
+    defer output.deinit();
     var rope_profile_scope = beginPrefillProfile(self, .rope, token_count);
     defer if (rope_profile_scope) |*scope| scope.end();
     try self.kernels.launchQwen3VlVisionRopeF32(
         &self.ctx,
-        device,
+        output.buffer,
         input_tensor.buffer,
         positions_device,
         total_chunks,
@@ -23290,7 +23219,7 @@ fn visionRope(
     );
     self.stats.launch_rope += 1;
     self.stats.launch_qwen3vl_vision_rope += 1;
-    return createTensor(self, device, shape, input_tensor.elem_count);
+    return output.intoTensor();
 }
 
 fn rmsNormHeadsRope(ctx: *anyopaque, input: CT, weight: CT, rows: usize, total_dim: usize, head_dim: usize, rope_dim: usize, eps: f32, theta: f32, freq_scale: f32, position_offset: usize, seq_len: usize, consecutive_pairs: bool, scale: f32) anyerror!?CT {
@@ -27478,13 +27407,11 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
     const a = tensorFromCt(request.inputs[0]);
     switch (descriptor.operation) {
         .transpose, .broadcast => |layout| {
-            var input_dims: [8]u32 = @splat(1);
-            var output_dims: [8]u32 = @splat(1);
-            for (descriptor.input_shapes[0].dims[0..layout.input_rank], 0..) |dim, axis| input_dims[axis] = @intCast(dim);
+            const input_dims = ops.kernel_descriptor.nativeDimensions(u32, descriptor.input_shapes[0]);
             if (descriptor.operation == .transpose) {
                 try self.kernels.launchPrimitiveTransposeF32(&self.ctx, output.buffer, a.buffer, a.elem_count, input_dims, layout.axes, layout.input_rank);
             } else {
-                for (descriptor.output_shape.dims[0..layout.output_rank], 0..) |dim, axis| output_dims[axis] = @intCast(dim);
+                const output_dims = ops.kernel_descriptor.nativeDimensions(u32, descriptor.output_shape);
                 try self.kernels.launchPrimitiveBroadcastF32(&self.ctx, output.buffer, a.buffer, a.elem_count, output.elem_count, input_dims, output_dims, layout.axes, layout.input_rank, layout.output_rank);
             }
             return true;
@@ -27925,4 +27852,39 @@ test "CUDA owned output construction preserves caller resources on allocation fa
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "CUDA ordinary F32 output releases partial host allocations and device budget failures" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    // Exercise the ordinary allocator without environment-selected pinned plans.
+    compute.temp_slot_config = .{};
+    const Check = struct {
+        fn run(a: std.mem.Allocator, self: *CudaCompute) !void {
+            const previous = self.allocator;
+            self.allocator = a;
+            defer self.allocator = previous;
+            const live = self.ctx.device_allocations.snapshot().live;
+            defer std.debug.assert(live == self.ctx.device_allocations.snapshot().live);
+            var output = try OwnedF32Output.alloc(self, &.{ 2, 4 }, 8);
+            defer output.deinit();
+            const result = try output.intoTensor();
+            const tensor = tensorFromCt(result);
+            defer {
+                tensor.buffer.free(&self.ctx);
+                a.free(tensor.shape);
+                a.destroy(tensor);
+            }
+            try std.testing.expect(output.shape == null);
+            try std.testing.expectEqual(@as(usize, 8), tensor.elem_count);
+            try std.testing.expectEqualSlices(i64, &.{ 2, 4 }, tensor.shape);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&compute});
+    const before = compute.ctx.device_allocations.snapshot();
+    try compute.ctx.device_allocations.setLimit(@max(before.live, 1));
+    defer compute.ctx.device_allocations.setLimit(before.limit) catch unreachable;
+    try std.testing.expectError(error.ResourceLimitExceeded, OwnedF32Output.alloc(&compute, &.{8}, 8));
+    try std.testing.expectEqual(before.live, compute.ctx.device_allocations.snapshot().live);
 }

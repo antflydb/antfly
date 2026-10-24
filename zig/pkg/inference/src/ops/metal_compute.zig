@@ -8947,16 +8947,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .reduction => |reduction| (try metal_runtime.decoderRuntimeReduceLastDimDeviceInto(self.provider_impl, input, reduction.geometry.output_count, reduction.geometry.reduce_count, @backingInt(reduction.mode), &.{@intCast(reduction.geometry.output_count)}, out_tensor)) != null,
             .transpose => |layout| blk: {
                 var axes: [8]u8 = undefined;
-                var shape: [8]i32 = undefined;
-                for (0..layout.input_rank) |axis| {
-                    axes[axis] = @intCast(layout.axes[axis]);
-                    shape[axis] = @intCast(descriptor.output_shape.dims[axis]);
-                }
+                const shape = ops.kernel_descriptor.nativeDimensions(i32, descriptor.output_shape);
+                for (0..layout.input_rank) |axis| axes[axis] = @intCast(layout.axes[axis]);
                 break :blk (try metal_runtime.decoderRuntimeTransposeF32DeviceInto(self.provider_impl, input, descriptor.input_shapes[0].dims[0..layout.input_rank], axes[0..layout.input_rank], shape[0..layout.output_rank], out_tensor)) != null;
             },
             .broadcast => |layout| blk: {
-                var shape: [8]i32 = undefined;
-                for (0..layout.output_rank) |axis| shape[axis] = @intCast(descriptor.output_shape.dims[axis]);
+                const shape = ops.kernel_descriptor.nativeDimensions(i32, descriptor.output_shape);
                 const in_dim: usize = @intCast(descriptor.input_shapes[0].dims[layout.input_rank - 1]);
                 const out_dim: usize = @intCast(descriptor.output_shape.dims[layout.output_rank - 1]);
                 break :blk (try metal_runtime.decoderRuntimeBroadcastLastDimDeviceInto(self.provider_impl, input, descriptor.elements() / out_dim, in_dim, out_dim, shape[0..layout.output_rank], out_tensor)) != null;
@@ -12565,10 +12561,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const in_shape = resolved_in[0..input_shape.len];
 
         var out_shape: [metal_tensor_mod.max_dims]i64 = undefined;
-        for (perm, 0..) |axis, i| {
-            if (axis >= input_shape.len) return error.UnsupportedShape;
-            out_shape[i] = in_shape[axis];
-        }
+        kernel_geometry.transposeShape(in_shape, perm, &out_shape) catch return error.UnsupportedShape;
 
         if (try self.tryStaticWeightTransposeCache(input, in_shape, perm, out_shape[0..perm.len])) |cached| {
             return cached;
@@ -12718,22 +12711,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const in_shape = resolved_in[0..input_shape.len];
 
         var resolved_target: [metal_tensor_mod.max_dims]i64 = undefined;
-        for (target_shape, 0..) |dim, i| {
-            var resolved_dim = dim;
-            if (resolved_dim <= 0) {
-                for (broadcast_axes, 0..) |ax, in_axis| {
-                    if (ax == i and in_axis < in_shape.len) {
-                        resolved_dim = in_shape[in_axis];
-                        break;
-                    }
-                }
-            }
-            if (resolved_dim <= 0) resolved_dim = 1;
-            resolved_target[i] = resolved_dim;
-        }
-
+        const out_numel = try kernel_geometry.resolveBroadcastOutput(in_shape, target_shape, broadcast_axes, &resolved_target);
         const out_shape = resolved_target[0..target_shape.len];
-        const out_numel = try shapeNumel(out_shape);
         const trace = getenvBool("TERMITE_METAL_TRACE_BROADCAST_PRIM");
         if (trace) {
             const is_device = if (input_buf.metal_tensor) |mt| mt.isDevice() else false;
@@ -12990,8 +12969,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const in_shape = resolved_in[0..input_shape.len];
 
         if (axis == 0 and in_shape.len == 2) {
-            const rows: usize = @intCast(in_shape[0]);
-            const cols: usize = @intCast(in_shape[1]);
+            const geometry = try kernel_geometry.GatherAxis.init(std.math.maxInt(usize), in_shape, 0);
+            const rows = geometry.extent;
+            const cols = geometry.suffix;
             if (input_buf.metal_tensor) |*input_metal| {
                 if (indices_buf.metal_tensor) |*indices_metal| {
                     if (input_metal.isDevice() and indices_metal.isDevice()) {
@@ -13134,26 +13114,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const stride = strides[i];
             if (stride <= 0) return error.UnsupportedShape;
 
-            var start = starts[i];
-            var limit = limits[i];
             const dim = in_shape[i];
             if (dim <= 0) return error.UnsupportedShape;
-
-            if (start < 0) start += dim;
-            if (limit < 0) {
-                limit = if (input_shape[i] < 0 and start == 0 and stride == 1)
-                    dim
-                else
-                    limit + dim;
-            }
-            if (start < 0) start = 0;
-            if (limit > dim) limit = dim;
-            if (start > limit) limit = start;
-
-            const span = limit - start;
-            out_shape[i] = if (span <= 0) 0 else @intCast(@divFloor(span + stride - 1, stride));
-            normalized_starts[i] = @intCast(start);
-            normalized_strides[i] = @intCast(stride);
+            const slice = try kernel_geometry.SliceAxis.init(false, dim, starts[i], limits[i], stride, input_shape[i] < 0);
+            out_shape[i] = slice.size;
+            normalized_starts[i] = slice.start;
+            normalized_strides[i] = slice.stride;
         }
 
         const out_numel = try shapeNumel(out_shape[0..input_shape.len]);

@@ -300,3 +300,231 @@ unsigned int log_softmax
     float* dst, \
     Gliner25BoundaryParams p, \
     unsigned int work_items
+
+// Forward normalization and selected rotary/index contracts. Names, widths and order are native-owned.
+
+#define ANTFLY_CUDA_RMS_NORM_PARAMS \
+    float* dst, \
+    const float* input, \
+    const float* weight, \
+    unsigned int rows, \
+    unsigned int dim, \
+    float eps
+
+#define ANTFLY_CUDA_RMS_NORM_F32_BF16_PARAMS \
+    float* dst, \
+    unsigned short* dst_bf16, \
+    const float* input, \
+    const float* weight, \
+    unsigned int rows, \
+    unsigned int dim, \
+    float eps
+
+#define ANTFLY_CUDA_RMS_NORM_ADD_F32_BF16_PARAMS \
+    float* dst, \
+    unsigned short* dst_bf16, \
+    const float* input, \
+    const float* weight, \
+    const float* residual, \
+    unsigned int rows, \
+    unsigned int dim, \
+    float eps
+
+#define ANTFLY_CUDA_RMS_NORM_ADD_PARAMS \
+    float* dst, \
+    const float* input, \
+    const float* weight, \
+    const float* residual, \
+    unsigned int rows, \
+    unsigned int dim, \
+    float eps
+
+#define ANTFLY_CUDA_RMS_NORM_ADD_MUL_SCALAR_PARAMS \
+    float* dst, \
+    const float* input, \
+    const float* weight, \
+    const float* residual, \
+    const float* scalar, \
+    unsigned int rows, \
+    unsigned int dim, \
+    float eps
+
+#define ANTFLY_CUDA_RMS_NORM_BARE_PARAMS \
+    float* dst, \
+    const float* input, \
+    unsigned int rows, \
+    unsigned int dim, \
+    float eps
+
+#define ANTFLY_CUDA_GEMMA4_A4B_RMS_NORM_TRIPLE_PARAMS \
+    float* first, \
+    float* second, \
+    float* third, \
+    const float* input, \
+    const float* first_weight, \
+    const float* second_weight, \
+    const float* third_weight, \
+    unsigned int rows, \
+    unsigned int dim, \
+    float eps
+
+#define ANTFLY_CUDA_LAYER_NORM_PARAMS \
+    float* dst, \
+    const float* input, \
+    const float* gamma, \
+    const float* beta, \
+    unsigned int rows, \
+    unsigned int dim, \
+    float eps
+
+#define ANTFLY_CUDA_ADD_LAYER_NORM_PARAMS \
+    float* dst, \
+    const float* a, \
+    const float* b, \
+    const float* gamma, \
+    const float* beta, \
+    unsigned int rows, \
+    unsigned int dim, \
+    float eps
+
+#define ANTFLY_CUDA_ROPE_PARAMS \
+    float* dst, \
+    const float* input, \
+    unsigned int total_chunks, \
+    unsigned int head_dim, \
+    unsigned int rope_dim, \
+    float theta, \
+    float freq_scale, \
+    unsigned int position_offset, \
+    unsigned int seq_len, \
+    unsigned int chunks_per_position, \
+    unsigned int consecutive_pairs
+
+#define ANTFLY_CUDA_ROPE_DECODE_SCALARS_PARAMS \
+    float* dst, \
+    const float* input, \
+    unsigned int total_chunks, \
+    unsigned int head_dim, \
+    unsigned int rope_dim, \
+    float theta, \
+    float freq_scale, \
+    unsigned int position_offset, \
+    unsigned int seq_len, \
+    unsigned int chunks_per_position, \
+    unsigned int consecutive_pairs, \
+    const unsigned int* decode_scalars
+
+#define ANTFLY_CUDA_ROPE_SCALED_PARAMS \
+    float* dst, \
+    const float* input, \
+    unsigned int total_chunks, \
+    unsigned int head_dim, \
+    unsigned int rope_dim, \
+    float theta, \
+    float freq_scale, \
+    unsigned int position_offset, \
+    unsigned int seq_len, \
+    unsigned int chunks_per_position, \
+    unsigned int consecutive_pairs, \
+    float scale
+
+#define ANTFLY_CUDA_ROPE_SCALED_DECODE_SCALARS_PARAMS \
+    float* dst, \
+    const float* input, \
+    unsigned int total_chunks, \
+    unsigned int head_dim, \
+    unsigned int rope_dim, \
+    float theta, \
+    float freq_scale, \
+    unsigned int position_offset, \
+    unsigned int seq_len, \
+    unsigned int chunks_per_position, \
+    unsigned int consecutive_pairs, \
+    float scale, \
+    const unsigned int* decode_scalars
+
+#define ANTFLY_CUDA_ROPE_PER_ITEM_PARAMS \
+    float* dst, \
+    const float* input, \
+    const unsigned int* query_lengths, \
+    const unsigned int* position_offsets, \
+    unsigned int batch, \
+    unsigned int max_seq_len, \
+    unsigned int num_heads, \
+    unsigned int head_dim, \
+    unsigned int rope_dim, \
+    float theta, \
+    float freq_scale, \
+    unsigned int consecutive_pairs
+
+#define ANTFLY_CUDA_QWEN3VL_VISION_ROPE_PARAMS \
+    float* dst, \
+    const float* input, \
+    const unsigned int* positions, \
+    unsigned int total_chunks, \
+    unsigned int token_count, \
+    unsigned int heads_per_token, \
+    unsigned int head_dim, \
+    float theta
+
+#define ANTFLY_CUDA_RMS_NORM_HEADS_ROPE_PARAMS \
+    float* dst, \
+    const float* input, \
+    const float* weight, \
+    unsigned int total_chunks, \
+    unsigned int head_dim, \
+    unsigned int rope_dim, \
+    float eps, \
+    float theta, \
+    float freq_scale, \
+    unsigned int position_offset, \
+    unsigned int seq_len, \
+    unsigned int chunks_per_position, \
+    unsigned int consecutive_pairs, \
+    float output_scale
+
+#define ANTFLY_CUDA_RMS_NORM_HEADS_ROPE_DECODE_SCALARS_PARAMS \
+    float* dst, \
+    const float* input, \
+    const float* weight, \
+    unsigned int total_chunks, \
+    unsigned int head_dim, \
+    unsigned int rope_dim, \
+    float eps, \
+    float theta, \
+    float freq_scale, \
+    unsigned int position_offset, \
+    unsigned int seq_len, \
+    unsigned int chunks_per_position, \
+    unsigned int consecutive_pairs, \
+    float output_scale, \
+    const unsigned int* decode_scalars
+
+#define ANTFLY_CUDA_PRIMITIVE_BATCHED_DOT_PARAMS \
+    float* output, \
+    const float* lhs, \
+    const float* rhs, \
+    unsigned int batch_count, \
+    unsigned int m, \
+    unsigned int n, \
+    unsigned int k, \
+    unsigned int lhs_contract_last, \
+    unsigned int rhs_contract_last
+
+#define ANTFLY_CUDA_PRIMITIVE_GATHER_PARAMS \
+    float* output, \
+    const float* input, \
+    const float* indices, \
+    unsigned int output_count, \
+    unsigned int index_count, \
+    unsigned int axis_extent, \
+    unsigned int suffix_size
+
+#define ANTFLY_CUDA_PRIMITIVE_GATHER_BF16_PARAMS \
+    float* output, \
+    const unsigned short* input, \
+    const float* indices, \
+    unsigned int output_count, \
+    unsigned int index_count, \
+    unsigned int axis_extent, \
+    unsigned int suffix_size

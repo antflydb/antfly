@@ -179,3 +179,162 @@ test "shared row and convolution geometry preserve empty bounds and overflow" {
     try std.testing.expectError(error.InvalidShape, convolutionOutput(1, 1, 0, 0));
     try std.testing.expectError(error.Overflow, convolutionOutput(1, 1, 1, std.math.maxInt(usize)));
 }
+
+/// Resolve the shared target-shape convention after callers resolve their input.
+/// Mapping legality, storage layout and dtype admission stay with each adapter.
+/// Unmapped/nonpositive target extents become one; the first mapped input wins.
+pub inline fn resolveBroadcastOutput(input: []const i64, target: []const i64, mapping: []const u8, output: []i64) !usize {
+    return resolveBroadcastOutputBounded(i64, std.math.maxInt(i64), input, target, mapping, output);
+}
+
+/// Scalar-width admission belongs to the caller and occurs before each product.
+pub inline fn resolveBroadcastOutputBounded(comptime Input: type, comptime max_dim: i64, input: []const Input, target: []const i64, mapping: []const u8, output: []i64) !usize {
+    if (target.len > output.len) return error.InvalidShape;
+    var count: usize = 1;
+    for (target, 0..) |extent, axis| {
+        var dim = extent;
+        if (dim <= 0) {
+            for (mapping[0..@min(mapping.len, input.len)], 0..) |mapped, in_axis| {
+                if (mapped == axis) {
+                    dim = @intCast(input[in_axis]);
+                    break;
+                }
+            }
+        }
+        if (dim <= 0) dim = 1;
+        if (dim > max_dim) return error.InvalidShape;
+        output[axis] = dim;
+        count = try std.math.mul(usize, count, std.math.cast(usize, dim) orelse return error.Overflow);
+    }
+    return count;
+}
+
+test "resolved broadcast geometry preserves scalar inferred tiled and bounded output" {
+    var output: [8]i64 = undefined;
+    try std.testing.expectEqual(@as(usize, 6), try resolveBroadcastOutput(&.{}, &.{ 2, 3 }, &.{}, &output));
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, output[0..2]);
+    try std.testing.expectEqual(@as(usize, 6), try resolveBroadcastOutput(&.{ 2, 3 }, &.{ -1, 0, -1 }, &.{ 0, 2 }, &output));
+    try std.testing.expectEqualSlices(i64, &.{ 2, 1, 3 }, output[0..3]);
+    // Tiling validation stays with the caller; no implicit singleton rewrite.
+    try std.testing.expectEqual(@as(usize, 12), try resolveBroadcastOutput(&.{ 2, 3 }, &.{ 2, 6 }, &.{ 0, 1 }, &output));
+    try std.testing.expectEqualSlices(i64, &.{ 2, 6 }, output[0..2]);
+    try std.testing.expectEqual(@as(usize, 1), try resolveBroadcastOutput(&.{}, &.{}, &.{}, &output));
+    try std.testing.expectError(error.InvalidShape, resolveBroadcastOutput(&.{}, &.{ 1, 2 }, &.{}, output[0..1]));
+    try std.testing.expectError(error.Overflow, resolveBroadcastOutput(&.{}, &.{ std.math.maxInt(i64), 3 }, &.{}, &output));
+}
+
+/// Permute an already resolved shape. Storage, strides and aliasing remain
+/// backend decisions. Writing into caller scratch avoids a second shape owner.
+pub inline fn transposeShape(input: []const i64, permutation: []const u8, output: []i64) !void {
+    if (input.len > 8 or permutation.len != input.len or output.len < input.len) return error.InvalidShape;
+    var seen: u8 = 0;
+    for (permutation, 0..) |axis, i| {
+        if (axis >= input.len) return error.InvalidShape;
+        const bit = @as(u8, 1) << @intCast(axis);
+        if (seen & bit != 0) return error.InvalidShape;
+        seen |= bit;
+        output[i] = input[axis];
+    }
+}
+
+/// Positive-step slice normalization. Metal's historical host path permits
+/// starts beyond the dimension; bounded CPU/CUDA maps clip both endpoints.
+pub const SliceAxis = struct {
+    start: usize,
+    stride: usize,
+    size: i64,
+    pub inline fn init(comptime bounded: bool, dim: i64, raw_start: i64, raw_limit: i64, step: i64, symbolic: bool) !SliceAxis {
+        if (dim < 0 or step <= 0) return error.UnsupportedShape;
+        var start = raw_start;
+        var limit = raw_limit;
+        if (start < 0) start += dim;
+        if (limit < 0) limit = if (symbolic and start == 0 and step == 1) dim else limit + dim;
+        start = if (bounded) std.math.clamp(start, 0, dim) else @max(start, 0);
+        limit = if (bounded) std.math.clamp(limit, 0, dim) else @max(start, @min(limit, dim));
+        const size = if (limit <= start) 0 else @divTrunc(limit - start - 1, step) + 1;
+        return .{ .start = std.math.cast(usize, start) orelse return error.Overflow, .stride = std.math.cast(usize, step) orelse return error.Overflow, .size = size };
+    }
+};
+
+test "resolved transpose rejects duplicate axes and preserves rank zero and rank eight" {
+    var output: [8]i64 = undefined;
+    try transposeShape(&.{ 2, 3, 4 }, &.{ 2, 0, 1 }, &output);
+    try std.testing.expectEqualSlices(i64, &.{ 4, 2, 3 }, output[0..3]);
+    try transposeShape(&.{}, &.{}, &output);
+    try transposeShape(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 7, 6, 5, 4, 3, 2, 1, 0 }, &output);
+    try std.testing.expectEqualSlices(i64, &.{ 8, 7, 6, 5, 4, 3, 2, 1 }, &output);
+    try std.testing.expectError(error.InvalidShape, transposeShape(&.{ 2, 3 }, &.{ 1, 1 }, &output));
+    try std.testing.expectError(error.InvalidShape, transposeShape(&.{2}, &.{1}, &output));
+    try std.testing.expectError(error.InvalidShape, transposeShape(&.{2}, &.{}, &output));
+    try std.testing.expectError(error.InvalidShape, transposeShape(&.{2}, &.{0}, output[0..0]));
+}
+
+test "positive slice axis preserves clipping symbolic limits and empty maps without rounding overflow" {
+    try std.testing.expectEqual(SliceAxis{ .start = 1, .stride = 2, .size = 2 }, try SliceAxis.init(true, 5, -4, -1, 2, false));
+    try std.testing.expectEqual(@as(i64, 5), (try SliceAxis.init(true, 5, 0, -1, 1, true)).size);
+    try std.testing.expectEqual(@as(i64, 4), (try SliceAxis.init(true, 5, 0, -1, 1, false)).size);
+    try std.testing.expectEqual(@as(usize, 5), (try SliceAxis.init(true, 5, 99, 100, 1, false)).start);
+    try std.testing.expectEqual(@as(usize, 99), (try SliceAxis.init(false, 5, 99, 100, 1, false)).start);
+    try std.testing.expectEqual(@as(i64, 0), (try SliceAxis.init(false, 5, 0, -99, 1, false)).size);
+    try std.testing.expectEqual(@as(i64, 0), (try SliceAxis.init(true, 0, 0, 0, 1, false)).size);
+    try std.testing.expectEqual(@as(i64, 1), (try SliceAxis.init(true, std.math.maxInt(i64), 0, std.math.maxInt(i64), std.math.maxInt(i64), false)).size);
+    try std.testing.expectError(error.UnsupportedShape, SliceAxis.init(true, 3, 0, 3, 0, false));
+}
+
+/// Dense gather's three physical regions, independent of index dtype and
+/// the backend's decision to execute on a device or materialize on the host.
+pub const GatherAxis = struct {
+    prefix: usize,
+    extent: usize,
+    suffix: usize,
+    pub inline fn init(comptime max_extent: usize, input: []const i64, axis: usize) !GatherAxis {
+        if (axis >= input.len) return error.InvalidShape;
+        var prefix: usize = 1;
+        for (input[0..axis]) |dim| {
+            if (dim <= 0) return error.InvalidShape;
+            prefix = try std.math.mul(usize, prefix, std.math.cast(usize, dim) orelse return error.Overflow);
+        }
+        const extent = std.math.cast(usize, input[axis]) orelse return error.InvalidShape;
+        if (extent == 0 or extent > max_extent) return error.InvalidShape;
+        var suffix: usize = 1;
+        for (input[axis + 1 ..]) |dim| {
+            if (dim <= 0) return error.InvalidShape;
+            suffix = try std.math.mul(usize, suffix, std.math.cast(usize, dim) orelse return error.Overflow);
+        }
+        return .{ .prefix = prefix, .extent = extent, .suffix = suffix };
+    }
+    pub inline fn count(self: GatherAxis, indices: usize) !usize {
+        return std.math.mul(usize, try std.math.mul(usize, self.prefix, indices), self.suffix);
+    }
+};
+
+/// Insert the logical index shape at the selected input axis. Scalar index
+/// normalization, concrete-dimension admission and gather-ND remain callers'
+/// policies. The output storage belongs to the caller.
+pub inline fn gatherShape(input: []const i64, indices: []const i64, axis: usize, output: []i64) !usize {
+    if (axis >= input.len) return error.InvalidShape;
+    const rank = try std.math.add(usize, input.len - 1, indices.len);
+    if (rank > output.len) return error.InvalidShape;
+    @memcpy(output[0..axis], input[0..axis]);
+    @memcpy(output[axis..][0..indices.len], indices);
+    @memcpy(output[axis + indices.len ..][0 .. input.len - axis - 1], input[axis + 1 ..]);
+    return rank;
+}
+
+test "resolved gather geometry covers prefixes scalar indices rank bounds and overflow" {
+    const geometry = try GatherAxis.init(std.math.maxInt(usize), &.{ 2, 3, 4 }, 1);
+    try std.testing.expectEqual(GatherAxis{ .prefix = 2, .extent = 3, .suffix = 4 }, geometry);
+    try std.testing.expectEqual(@as(usize, 16), try geometry.count(2));
+    try std.testing.expectEqual(@as(usize, 0), try geometry.count(0));
+    var output: [8]i64 = undefined;
+    const rank = try gatherShape(&.{ 2, 3, 4 }, &.{ 5, 6 }, 1, &output);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 5, 6, 4 }, output[0..rank]);
+    try std.testing.expectEqual(@as(usize, 2), try gatherShape(&.{ 2, 3, 4 }, &.{}, 1, &output));
+    try std.testing.expectEqualSlices(i64, &.{ 2, 4 }, output[0..2]);
+    try std.testing.expectError(error.InvalidShape, gatherShape(&.{ 2, 3 }, &.{ 4, 5 }, 0, output[0..2]));
+    try std.testing.expectError(error.InvalidShape, GatherAxis.init(2, &.{3}, 0));
+    try std.testing.expectError(error.InvalidShape, GatherAxis.init(8, &.{0}, 0));
+    try std.testing.expectError(error.InvalidShape, GatherAxis.init(8, &.{3}, 1));
+    const huge = GatherAxis{ .prefix = std.math.maxInt(usize), .extent = 1, .suffix = 2 };
+    try std.testing.expectError(error.Overflow, huge.count(1));
+}

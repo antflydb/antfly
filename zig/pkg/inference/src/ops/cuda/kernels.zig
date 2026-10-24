@@ -5723,13 +5723,8 @@ pub const KernelModule = struct {
         try checkBytes(weight, dim);
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight.ptr;
-        var rows_u32 = try toU32(total_rows);
-        var dim_u32 = try toU32(dim);
-        var eps_value = eps;
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &dim_u32, &eps_value });
+        var arguments = try normArguments("RMS_NORM", .{ .dst = dst.ptr, .input = input.ptr, .weight = weight.ptr }, total_rows, dim, eps);
+        var params = launch_abi.fieldsFor("RMS_NORM", &arguments);
         try launchRows(self.rms_norm_f32, ctx, total_rows, &params);
     }
 
@@ -5752,14 +5747,8 @@ pub const KernelModule = struct {
         if (count == 0) return;
 
         const function = self.rms_norm_f32_bf16 orelse return error.CudaKernelUnavailable;
-        var dst_ptr = dst.ptr;
-        var dst_bf16_ptr = dst_bf16.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight.ptr;
-        var rows_u32 = try toU32(total_rows);
-        var dim_u32 = try toU32(dim);
-        var eps_value = eps;
-        var params = launch_abi.addresses(.{ &dst_ptr, &dst_bf16_ptr, &input_ptr, &weight_ptr, &rows_u32, &dim_u32, &eps_value });
+        var arguments = try normArguments("RMS_NORM_F32_BF16", .{ .dst = dst.ptr, .dst_bf16 = dst_bf16.ptr, .input = input.ptr, .weight = weight.ptr }, total_rows, dim, eps);
+        var params = launch_abi.fieldsFor("RMS_NORM_F32_BF16", &arguments);
         try launchRows(function, ctx, total_rows, &params);
     }
 
@@ -5784,15 +5773,8 @@ pub const KernelModule = struct {
         if (count == 0) return;
 
         const function = self.rms_norm_add_f32_bf16 orelse return error.CudaKernelUnavailable;
-        var dst_ptr = dst.ptr;
-        var dst_bf16_ptr = dst_bf16.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight.ptr;
-        var residual_ptr = residual.ptr;
-        var rows_u32 = try toU32(total_rows);
-        var dim_u32 = try toU32(dim);
-        var eps_value = eps;
-        var params = launch_abi.addresses(.{ &dst_ptr, &dst_bf16_ptr, &input_ptr, &weight_ptr, &residual_ptr, &rows_u32, &dim_u32, &eps_value });
+        var arguments = try normArguments("RMS_NORM_ADD_F32_BF16", .{ .dst = dst.ptr, .dst_bf16 = dst_bf16.ptr, .input = input.ptr, .weight = weight.ptr, .residual = residual.ptr }, total_rows, dim, eps);
+        var params = launch_abi.fieldsFor("RMS_NORM_ADD_F32_BF16", &arguments);
         try launchRows(function, ctx, total_rows, &params);
     }
 
@@ -5814,14 +5796,8 @@ pub const KernelModule = struct {
         try checkBytes(residual, count);
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight.ptr;
-        var residual_ptr = residual.ptr;
-        var rows_u32 = try toU32(total_rows);
-        var dim_u32 = try toU32(dim);
-        var eps_value = eps;
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &residual_ptr, &rows_u32, &dim_u32, &eps_value });
+        var arguments = try normArguments("RMS_NORM_ADD", .{ .dst = dst.ptr, .input = input.ptr, .weight = weight.ptr, .residual = residual.ptr }, total_rows, dim, eps);
+        var params = launch_abi.fieldsFor("RMS_NORM_ADD", &arguments);
         try launchRows(self.rms_norm_add_f32, ctx, total_rows, &params);
     }
 
@@ -5845,15 +5821,8 @@ pub const KernelModule = struct {
         try checkBytes(scalar, 1);
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight.ptr;
-        var residual_ptr = residual.ptr;
-        var scalar_ptr = scalar.ptr;
-        var rows_u32 = try toU32(total_rows);
-        var dim_u32 = try toU32(dim);
-        var eps_value = eps;
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &residual_ptr, &scalar_ptr, &rows_u32, &dim_u32, &eps_value });
+        var arguments = try normArguments("RMS_NORM_ADD_MUL_SCALAR", .{ .dst = dst.ptr, .input = input.ptr, .weight = weight.ptr, .residual = residual.ptr, .scalar = scalar.ptr }, total_rows, dim, eps);
+        var params = launch_abi.fieldsFor("RMS_NORM_ADD_MUL_SCALAR", &arguments);
         try launchRows(self.rms_norm_add_mul_scalar_f32, ctx, total_rows, &params);
     }
 
@@ -5877,16 +5846,9 @@ pub const KernelModule = struct {
         try checkBytes(scalar, 1);
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight.ptr;
-        var residual_ptr = residual.ptr;
-        var scalar_ptr = scalar.ptr;
         const function = self.rms_norm_add_output_scale_f32 orelse return error.CudaKernelUnavailable;
-        var rows_u32 = try toU32(total_rows);
-        var dim_u32 = try toU32(dim);
-        var eps_value = eps;
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &residual_ptr, &scalar_ptr, &rows_u32, &dim_u32, &eps_value });
+        var arguments = try normArguments("RMS_NORM_ADD_MUL_SCALAR", .{ .dst = dst.ptr, .input = input.ptr, .weight = weight.ptr, .residual = residual.ptr, .scalar = scalar.ptr }, total_rows, dim, eps);
+        var params = launch_abi.fieldsFor("RMS_NORM_ADD_MUL_SCALAR", &arguments);
         try launchRows(function, ctx, total_rows, &params);
     }
 
@@ -5904,12 +5866,8 @@ pub const KernelModule = struct {
         try checkBytes(input, count);
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var rows_u32 = try toU32(total_rows);
-        var dim_u32 = try toU32(dim);
-        var eps_value = eps;
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &rows_u32, &dim_u32, &eps_value });
+        var arguments = try normArguments("RMS_NORM_BARE", .{ .dst = dst.ptr, .input = input.ptr }, total_rows, dim, eps);
+        var params = launch_abi.fieldsFor("RMS_NORM_BARE", &arguments);
         try launchRows(self.rms_norm_bare_f32, ctx, total_rows, &params);
     }
 
@@ -5938,17 +5896,8 @@ pub const KernelModule = struct {
         if (count == 0) return;
 
         const function = self.gemma4_a4b_rms_norm_triple_f32 orelse return error.CudaKernelUnavailable;
-        var first_ptr = first.ptr;
-        var second_ptr = second.ptr;
-        var third_ptr = third.ptr;
-        var input_ptr = input.ptr;
-        var first_weight_ptr = first_weight.ptr;
-        var second_weight_ptr = second_weight.ptr;
-        var third_weight_ptr = third_weight.ptr;
-        var rows_u32 = try toU32(total_rows);
-        var dim_u32 = try toU32(dim);
-        var eps_value = eps;
-        var params = launch_abi.addresses(.{ &first_ptr, &second_ptr, &third_ptr, &input_ptr, &first_weight_ptr, &second_weight_ptr, &third_weight_ptr, &rows_u32, &dim_u32, &eps_value });
+        var arguments = try normArguments("GEMMA4_A4B_RMS_NORM_TRIPLE", .{ .first = first.ptr, .second = second.ptr, .third = third.ptr, .input = input.ptr, .first_weight = first_weight.ptr, .second_weight = second_weight.ptr, .third_weight = third_weight.ptr }, total_rows, dim, eps);
+        var params = launch_abi.fieldsFor("GEMMA4_A4B_RMS_NORM_TRIPLE", &arguments);
         try launchRows(function, ctx, total_rows, &params);
     }
 
@@ -6100,16 +6049,18 @@ pub const KernelModule = struct {
         try checkBytes(rhs, rhs_count);
         if (output_count == 0) return;
 
-        var output_ptr = output.ptr;
-        var lhs_ptr = lhs.ptr;
-        var rhs_ptr = rhs.ptr;
-        var batch_count_u32 = try toU32(batch_count);
-        var m_u32 = try toU32(m);
-        var n_u32 = try toU32(n);
-        var k_u32 = try toU32(k);
-        var lhs_contract_last_u32: u32 = @intFromBool(lhs_contract_last);
-        var rhs_contract_last_u32: u32 = @intFromBool(rhs_contract_last);
-        var params = launch_abi.addresses(.{ &output_ptr, &lhs_ptr, &rhs_ptr, &batch_count_u32, &m_u32, &n_u32, &k_u32, &lhs_contract_last_u32, &rhs_contract_last_u32 });
+        var arguments: launch_abi.ArgumentsFor("PRIMITIVE_BATCHED_DOT") = .{
+            .output = output.ptr,
+            .lhs = lhs.ptr,
+            .rhs = rhs.ptr,
+            .batch_count = try toU32(batch_count),
+            .m = try toU32(m),
+            .n = try toU32(n),
+            .k = try toU32(k),
+            .lhs_contract_last = @intFromBool(lhs_contract_last),
+            .rhs_contract_last = @intFromBool(rhs_contract_last),
+        };
+        var params = launch_abi.fieldsFor("PRIMITIVE_BATCHED_DOT", &arguments);
         try launch1d(function, ctx, output_count, &params);
     }
 
@@ -6131,14 +6082,8 @@ pub const KernelModule = struct {
         try checkBytes(beta, dim);
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var gamma_ptr = gamma.ptr;
-        var beta_ptr = beta.ptr;
-        var rows_u32 = try toU32(rows);
-        var dim_u32 = try toU32(dim);
-        var eps_value = eps;
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &gamma_ptr, &beta_ptr, &rows_u32, &dim_u32, &eps_value });
+        var arguments = try normArguments("LAYER_NORM", .{ .dst = dst.ptr, .input = input.ptr, .gamma = gamma.ptr, .beta = beta.ptr }, rows, dim, eps);
+        var params = launch_abi.fieldsFor("LAYER_NORM", &arguments);
         try launchBlocks(self.layer_norm_f32, ctx, rows, f32_tiled_threads, &params);
     }
 
@@ -6162,15 +6107,8 @@ pub const KernelModule = struct {
         try checkBytes(beta, dim);
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var a_ptr = a.ptr;
-        var b_ptr = b.ptr;
-        var gamma_ptr = gamma.ptr;
-        var beta_ptr = beta.ptr;
-        var rows_u32 = try toU32(rows);
-        var dim_u32 = try toU32(dim);
-        var eps_value = eps;
-        var params = launch_abi.addresses(.{ &dst_ptr, &a_ptr, &b_ptr, &gamma_ptr, &beta_ptr, &rows_u32, &dim_u32, &eps_value });
+        var arguments = try normArguments("ADD_LAYER_NORM", .{ .dst = dst.ptr, .a = a.ptr, .b = b.ptr, .gamma = gamma.ptr, .beta = beta.ptr }, rows, dim, eps);
+        var params = launch_abi.fieldsFor("ADD_LAYER_NORM", &arguments);
         try launchBlocks(self.add_layer_norm_f32, ctx, rows, f32_tiled_threads, &params);
     }
 
@@ -7642,33 +7580,35 @@ pub const KernelModule = struct {
         try checkBytes(input, count);
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var total_chunks_u32 = try toU32(total_chunks);
-        var head_dim_u32 = try toU32(head_dim);
-        var rope_dim_u32 = try toU32(rope_dim);
-        var theta_f32 = theta;
-        var freq_scale_f32 = freq_scale;
-        var position_offset_u32 = try toU32(position_offset);
-        var seq_len_u32 = try toU32(seq_len);
-        var chunks_per_position_u32 = try toU32(chunks_per_position);
-        var consecutive_pairs_u32: u32 = if (consecutive_pairs) 1 else 0;
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &total_chunks_u32, &head_dim_u32, &rope_dim_u32, &theta_f32, &freq_scale_f32, &position_offset_u32, &seq_len_u32, &chunks_per_position_u32, &consecutive_pairs_u32 });
+        var arguments: launch_abi.ArgumentsFor("ROPE") = .{
+            .dst = dst.ptr,
+            .input = input.ptr,
+            .total_chunks = try toU32(total_chunks),
+            .head_dim = try toU32(head_dim),
+            .rope_dim = try toU32(rope_dim),
+            .theta = theta,
+            .freq_scale = freq_scale,
+            .position_offset = try toU32(position_offset),
+            .seq_len = try toU32(seq_len),
+            .chunks_per_position = try toU32(chunks_per_position),
+            .consecutive_pairs = if (consecutive_pairs) 1 else 0,
+        };
+        var params = launch_abi.fieldsFor("ROPE", &arguments);
         if (captureParamTraceIndex(ctx)) |trace_index| {
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=rope dst=0x{x} input=0x{x} total_chunks={d} head_dim={d} rope_dim={d} theta={d:.6} freq_scale={d:.6} position_offset={d} seq_len={d} chunks_per_position={d} consecutive_pairs={d}", .{
                 ctx.debug_graph_capture_id,
                 trace_index,
-                dst_ptr,
-                input_ptr,
-                total_chunks_u32,
-                head_dim_u32,
-                rope_dim_u32,
-                theta_f32,
-                freq_scale_f32,
-                position_offset_u32,
-                seq_len_u32,
-                chunks_per_position_u32,
-                consecutive_pairs_u32,
+                arguments.dst,
+                arguments.input,
+                arguments.total_chunks,
+                arguments.head_dim,
+                arguments.rope_dim,
+                arguments.theta,
+                arguments.freq_scale,
+                arguments.position_offset,
+                arguments.seq_len,
+                arguments.chunks_per_position,
+                arguments.consecutive_pairs,
             });
         }
         try launch1d(function, ctx, count, &params);
@@ -7729,15 +7669,17 @@ pub const KernelModule = struct {
         try checkRawBytes(positions, try checkedTensorElements(try checkedTensorElements(2, token_count), @sizeOf(u32)));
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var positions_ptr = positions.ptr;
-        var total_chunks_u32 = try toU32(total_chunks);
-        var token_count_u32 = try toU32(token_count);
-        var heads_per_token_u32 = try toU32(heads_per_token);
-        var head_dim_u32 = try toU32(head_dim);
-        var theta_f32 = theta;
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &positions_ptr, &total_chunks_u32, &token_count_u32, &heads_per_token_u32, &head_dim_u32, &theta_f32 });
+        var arguments: launch_abi.ArgumentsFor("QWEN3VL_VISION_ROPE") = .{
+            .dst = dst.ptr,
+            .input = input.ptr,
+            .positions = positions.ptr,
+            .total_chunks = try toU32(total_chunks),
+            .token_count = try toU32(token_count),
+            .heads_per_token = try toU32(heads_per_token),
+            .head_dim = try toU32(head_dim),
+            .theta = theta,
+        };
+        var params = launch_abi.fieldsFor("QWEN3VL_VISION_ROPE", &arguments);
         try launch1d(function, ctx, count, &params);
     }
 
@@ -7764,28 +7706,30 @@ pub const KernelModule = struct {
         try checkRawBytes(decode_scalars, 5 * @sizeOf(u32));
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var total_chunks_u32 = try toU32(total_chunks);
-        var head_dim_u32 = try toU32(head_dim);
-        var rope_dim_u32 = try toU32(rope_dim);
-        var theta_f32 = theta;
-        var freq_scale_f32 = freq_scale;
-        var position_offset_u32 = try toU32(position_offset);
-        var seq_len_u32 = try toU32(seq_len);
-        var chunks_per_position_u32 = try toU32(chunks_per_position);
-        var consecutive_pairs_u32: u32 = if (consecutive_pairs) 1 else 0;
-        var decode_scalars_ptr = decode_scalars.ptr;
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &total_chunks_u32, &head_dim_u32, &rope_dim_u32, &theta_f32, &freq_scale_f32, &position_offset_u32, &seq_len_u32, &chunks_per_position_u32, &consecutive_pairs_u32, &decode_scalars_ptr });
+        var arguments: launch_abi.ArgumentsFor("ROPE_DECODE_SCALARS") = .{
+            .dst = dst.ptr,
+            .input = input.ptr,
+            .total_chunks = try toU32(total_chunks),
+            .head_dim = try toU32(head_dim),
+            .rope_dim = try toU32(rope_dim),
+            .theta = theta,
+            .freq_scale = freq_scale,
+            .position_offset = try toU32(position_offset),
+            .seq_len = try toU32(seq_len),
+            .chunks_per_position = try toU32(chunks_per_position),
+            .consecutive_pairs = if (consecutive_pairs) 1 else 0,
+            .decode_scalars = decode_scalars.ptr,
+        };
+        var params = launch_abi.fieldsFor("ROPE_DECODE_SCALARS", &arguments);
         if (captureParamTraceIndex(ctx)) |trace_index| {
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=rope_decode_scalars dst=0x{x} input=0x{x} scalars=0x{x} fallback_position_offset={d} seq_len={d}", .{
                 ctx.debug_graph_capture_id,
                 trace_index,
-                dst_ptr,
-                input_ptr,
-                decode_scalars_ptr,
-                position_offset_u32,
-                seq_len_u32,
+                arguments.dst,
+                arguments.input,
+                arguments.decode_scalars,
+                arguments.position_offset,
+                arguments.seq_len,
             });
         }
         try launch1d(function, ctx, count, &params);
@@ -7851,19 +7795,21 @@ pub const KernelModule = struct {
         try checkBytes(input, count);
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var total_chunks_u32 = try toU32(total_chunks);
-        var head_dim_u32 = try toU32(head_dim);
-        var rope_dim_u32 = try toU32(rope_dim);
-        var theta_f32 = theta;
-        var freq_scale_f32 = freq_scale;
-        var position_offset_u32 = try toU32(position_offset);
-        var seq_len_u32 = try toU32(seq_len);
-        var chunks_per_position_u32 = try toU32(chunks_per_position);
-        var consecutive_pairs_u32: u32 = if (consecutive_pairs) 1 else 0;
-        var scale_f32 = scale;
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &total_chunks_u32, &head_dim_u32, &rope_dim_u32, &theta_f32, &freq_scale_f32, &position_offset_u32, &seq_len_u32, &chunks_per_position_u32, &consecutive_pairs_u32, &scale_f32 });
+        var arguments: launch_abi.ArgumentsFor("ROPE_SCALED") = .{
+            .dst = dst.ptr,
+            .input = input.ptr,
+            .total_chunks = try toU32(total_chunks),
+            .head_dim = try toU32(head_dim),
+            .rope_dim = try toU32(rope_dim),
+            .theta = theta,
+            .freq_scale = freq_scale,
+            .position_offset = try toU32(position_offset),
+            .seq_len = try toU32(seq_len),
+            .chunks_per_position = try toU32(chunks_per_position),
+            .consecutive_pairs = if (consecutive_pairs) 1 else 0,
+            .scale = scale,
+        };
+        var params = launch_abi.fieldsFor("ROPE_SCALED", &arguments);
         try launch1d(function, ctx, count, &params);
     }
 
@@ -7891,29 +7837,31 @@ pub const KernelModule = struct {
         try checkRawBytes(decode_scalars, 5 * @sizeOf(u32));
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var total_chunks_u32 = try toU32(total_chunks);
-        var head_dim_u32 = try toU32(head_dim);
-        var rope_dim_u32 = try toU32(rope_dim);
-        var theta_f32 = theta;
-        var freq_scale_f32 = freq_scale;
-        var position_offset_u32 = try toU32(position_offset);
-        var seq_len_u32 = try toU32(seq_len);
-        var chunks_per_position_u32 = try toU32(chunks_per_position);
-        var consecutive_pairs_u32: u32 = if (consecutive_pairs) 1 else 0;
-        var scale_f32 = scale;
-        var decode_scalars_ptr = decode_scalars.ptr;
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &total_chunks_u32, &head_dim_u32, &rope_dim_u32, &theta_f32, &freq_scale_f32, &position_offset_u32, &seq_len_u32, &chunks_per_position_u32, &consecutive_pairs_u32, &scale_f32, &decode_scalars_ptr });
+        var arguments: launch_abi.ArgumentsFor("ROPE_SCALED_DECODE_SCALARS") = .{
+            .dst = dst.ptr,
+            .input = input.ptr,
+            .total_chunks = try toU32(total_chunks),
+            .head_dim = try toU32(head_dim),
+            .rope_dim = try toU32(rope_dim),
+            .theta = theta,
+            .freq_scale = freq_scale,
+            .position_offset = try toU32(position_offset),
+            .seq_len = try toU32(seq_len),
+            .chunks_per_position = try toU32(chunks_per_position),
+            .consecutive_pairs = if (consecutive_pairs) 1 else 0,
+            .scale = scale,
+            .decode_scalars = decode_scalars.ptr,
+        };
+        var params = launch_abi.fieldsFor("ROPE_SCALED_DECODE_SCALARS", &arguments);
         if (captureParamTraceIndex(ctx)) |trace_index| {
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=rope_scaled_decode_scalars dst=0x{x} input=0x{x} scalars=0x{x} fallback_position_offset={d} seq_len={d}", .{
                 ctx.debug_graph_capture_id,
                 trace_index,
-                dst_ptr,
-                input_ptr,
-                decode_scalars_ptr,
-                position_offset_u32,
-                seq_len_u32,
+                arguments.dst,
+                arguments.input,
+                arguments.decode_scalars,
+                arguments.position_offset,
+                arguments.seq_len,
             });
         }
         try launch1d(function, ctx, count, &params);
@@ -7944,19 +7892,21 @@ pub const KernelModule = struct {
         try checkRawBytes(position_offsets, batch * @sizeOf(u32));
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var query_lengths_ptr = query_lengths.ptr;
-        var position_offsets_ptr = position_offsets.ptr;
-        var batch_u32 = try toU32(batch);
-        var max_seq_len_u32 = try toU32(max_seq_len);
-        var num_heads_u32 = try toU32(num_heads);
-        var head_dim_u32 = try toU32(head_dim);
-        var rope_dim_u32 = try toU32(rope_dim);
-        var theta_f32 = theta;
-        var freq_scale_f32 = freq_scale;
-        var consecutive_pairs_u32: u32 = if (consecutive_pairs) 1 else 0;
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &query_lengths_ptr, &position_offsets_ptr, &batch_u32, &max_seq_len_u32, &num_heads_u32, &head_dim_u32, &rope_dim_u32, &theta_f32, &freq_scale_f32, &consecutive_pairs_u32 });
+        var arguments: launch_abi.ArgumentsFor("ROPE_PER_ITEM") = .{
+            .dst = dst.ptr,
+            .input = input.ptr,
+            .query_lengths = query_lengths.ptr,
+            .position_offsets = position_offsets.ptr,
+            .batch = try toU32(batch),
+            .max_seq_len = try toU32(max_seq_len),
+            .num_heads = try toU32(num_heads),
+            .head_dim = try toU32(head_dim),
+            .rope_dim = try toU32(rope_dim),
+            .theta = theta,
+            .freq_scale = freq_scale,
+            .consecutive_pairs = if (consecutive_pairs) 1 else 0,
+        };
+        var params = launch_abi.fieldsFor("ROPE_PER_ITEM", &arguments);
         try launch1d(function, ctx, count, &params);
     }
 
@@ -7987,39 +7937,41 @@ pub const KernelModule = struct {
         try checkBytes(input, total);
         try checkBytes(weight, head_dim);
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight.ptr;
-        var total_chunks_u32 = try toU32(total_chunks);
-        var head_dim_u32 = try toU32(head_dim);
-        var rope_dim_u32 = try toU32(rope_dim);
-        var eps_value = eps;
-        var theta_value = theta;
-        var freq_scale_value = freq_scale;
-        var position_offset_u32 = try toU32(position_offset);
-        var seq_len_u32 = try toU32(seq_len);
-        var chunks_per_position_u32 = try toU32(chunks_per_position);
-        var consecutive_pairs_u32: u32 = if (consecutive_pairs) 1 else 0;
-        var output_scale_value = output_scale;
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &total_chunks_u32, &head_dim_u32, &rope_dim_u32, &eps_value, &theta_value, &freq_scale_value, &position_offset_u32, &seq_len_u32, &chunks_per_position_u32, &consecutive_pairs_u32, &output_scale_value });
+        var arguments: launch_abi.ArgumentsFor("RMS_NORM_HEADS_ROPE") = .{
+            .dst = dst.ptr,
+            .input = input.ptr,
+            .weight = weight.ptr,
+            .total_chunks = try toU32(total_chunks),
+            .head_dim = try toU32(head_dim),
+            .rope_dim = try toU32(rope_dim),
+            .eps = eps,
+            .theta = theta,
+            .freq_scale = freq_scale,
+            .position_offset = try toU32(position_offset),
+            .seq_len = try toU32(seq_len),
+            .chunks_per_position = try toU32(chunks_per_position),
+            .consecutive_pairs = if (consecutive_pairs) 1 else 0,
+            .output_scale = output_scale,
+        };
+        var params = launch_abi.fieldsFor("RMS_NORM_HEADS_ROPE", &arguments);
         if (captureParamTraceIndex(ctx)) |trace_index| {
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=rms_norm_heads_rope dst=0x{x} input=0x{x} weight=0x{x} total_chunks={d} head_dim={d} rope_dim={d} eps={d:.8} theta={d:.6} freq_scale={d:.6} position_offset={d} seq_len={d} chunks_per_position={d} consecutive_pairs={d} output_scale={d:.6}", .{
                 ctx.debug_graph_capture_id,
                 trace_index,
-                dst_ptr,
-                input_ptr,
-                weight_ptr,
-                total_chunks_u32,
-                head_dim_u32,
-                rope_dim_u32,
-                eps_value,
-                theta_value,
-                freq_scale_value,
-                position_offset_u32,
-                seq_len_u32,
-                chunks_per_position_u32,
-                consecutive_pairs_u32,
-                output_scale_value,
+                arguments.dst,
+                arguments.input,
+                arguments.weight,
+                arguments.total_chunks,
+                arguments.head_dim,
+                arguments.rope_dim,
+                arguments.eps,
+                arguments.theta,
+                arguments.freq_scale,
+                arguments.position_offset,
+                arguments.seq_len,
+                arguments.chunks_per_position,
+                arguments.consecutive_pairs,
+                arguments.output_scale,
             });
         }
         try launchBlocks(function, ctx, total_chunks, f32_tiled_threads, &params);
@@ -8054,32 +8006,34 @@ pub const KernelModule = struct {
         try checkBytes(input, total);
         try checkBytes(weight, head_dim);
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight.ptr;
-        var total_chunks_u32 = try toU32(total_chunks);
-        var head_dim_u32 = try toU32(head_dim);
-        var rope_dim_u32 = try toU32(rope_dim);
-        var eps_value = eps;
-        var theta_value = theta;
-        var freq_scale_value = freq_scale;
-        var position_offset_u32 = try toU32(position_offset);
-        var seq_len_u32 = try toU32(seq_len);
-        var chunks_per_position_u32 = try toU32(chunks_per_position);
-        var consecutive_pairs_u32: u32 = if (consecutive_pairs) 1 else 0;
-        var output_scale_value = output_scale;
-        var decode_scalars_ptr = decode_scalars.ptr;
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &total_chunks_u32, &head_dim_u32, &rope_dim_u32, &eps_value, &theta_value, &freq_scale_value, &position_offset_u32, &seq_len_u32, &chunks_per_position_u32, &consecutive_pairs_u32, &output_scale_value, &decode_scalars_ptr });
+        var arguments: launch_abi.ArgumentsFor("RMS_NORM_HEADS_ROPE_DECODE_SCALARS") = .{
+            .dst = dst.ptr,
+            .input = input.ptr,
+            .weight = weight.ptr,
+            .total_chunks = try toU32(total_chunks),
+            .head_dim = try toU32(head_dim),
+            .rope_dim = try toU32(rope_dim),
+            .eps = eps,
+            .theta = theta,
+            .freq_scale = freq_scale,
+            .position_offset = try toU32(position_offset),
+            .seq_len = try toU32(seq_len),
+            .chunks_per_position = try toU32(chunks_per_position),
+            .consecutive_pairs = if (consecutive_pairs) 1 else 0,
+            .output_scale = output_scale,
+            .decode_scalars = decode_scalars.ptr,
+        };
+        var params = launch_abi.fieldsFor("RMS_NORM_HEADS_ROPE_DECODE_SCALARS", &arguments);
         if (captureParamTraceIndex(ctx)) |trace_index| {
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=rms_norm_heads_rope_decode_scalars dst=0x{x} input=0x{x} weight=0x{x} scalars=0x{x} fallback_position_offset={d} seq_len={d}", .{
                 ctx.debug_graph_capture_id,
                 trace_index,
-                dst_ptr,
-                input_ptr,
-                weight_ptr,
-                decode_scalars_ptr,
-                position_offset_u32,
-                seq_len_u32,
+                arguments.dst,
+                arguments.input,
+                arguments.weight,
+                arguments.decode_scalars,
+                arguments.position_offset,
+                arguments.seq_len,
             });
         }
         try launchBlocks(function, ctx, total_chunks, f32_tiled_threads, &params);
@@ -10663,14 +10617,16 @@ pub const KernelModule = struct {
         try checkBytes(indices, index_count);
         if (output_count == 0) return;
         if (index_count == 0 or axis_extent == 0 or suffix_size == 0) return error.InvalidCudaState;
-        var output_ptr = output.ptr;
-        var input_ptr = input.ptr;
-        var indices_ptr = indices.ptr;
-        var output_count_u32 = try toU32(output_count);
-        var index_count_u32 = try toU32(index_count);
-        var axis_extent_u32 = try toU32(axis_extent);
-        var suffix_size_u32 = try toU32(suffix_size);
-        var params = launch_abi.addresses(.{ &output_ptr, &input_ptr, &indices_ptr, &output_count_u32, &index_count_u32, &axis_extent_u32, &suffix_size_u32 });
+        var arguments: launch_abi.ArgumentsFor("PRIMITIVE_GATHER") = .{
+            .output = output.ptr,
+            .input = input.ptr,
+            .indices = indices.ptr,
+            .output_count = try toU32(output_count),
+            .index_count = try toU32(index_count),
+            .axis_extent = try toU32(axis_extent),
+            .suffix_size = try toU32(suffix_size),
+        };
+        var params = launch_abi.fieldsFor("PRIMITIVE_GATHER", &arguments);
         try launch1d(function, ctx, output_count, &params);
     }
 
@@ -10692,14 +10648,16 @@ pub const KernelModule = struct {
         try checkBytes(indices, index_count);
         if (output_count == 0) return;
         if (index_count == 0 or axis_extent == 0 or suffix_size == 0) return error.InvalidCudaState;
-        var output_ptr = output.ptr;
-        var input_ptr = input.ptr;
-        var indices_ptr = indices.ptr;
-        var output_count_u32 = try toU32(output_count);
-        var index_count_u32 = try toU32(index_count);
-        var axis_extent_u32 = try toU32(axis_extent);
-        var suffix_size_u32 = try toU32(suffix_size);
-        var params = launch_abi.addresses(.{ &output_ptr, &input_ptr, &indices_ptr, &output_count_u32, &index_count_u32, &axis_extent_u32, &suffix_size_u32 });
+        var arguments: launch_abi.ArgumentsFor("PRIMITIVE_GATHER_BF16") = .{
+            .output = output.ptr,
+            .input = input.ptr,
+            .indices = indices.ptr,
+            .output_count = try toU32(output_count),
+            .index_count = try toU32(index_count),
+            .axis_extent = try toU32(axis_extent),
+            .suffix_size = try toU32(suffix_size),
+        };
+        var params = launch_abi.fieldsFor("PRIMITIVE_GATHER_BF16", &arguments);
         try launch1d(function, ctx, output_count, &params);
     }
 
@@ -15136,6 +15094,21 @@ fn quantQkvArguments(comptime packed_input: bool, dst_q: buffer_mod.DeviceBuffer
     result.in_dim = try toU32(in_dim);
     result.q_out_dim = try toU32(q_out_dim);
     result.kv_out_dim = try toU32(kv_out_dim);
+    return result;
+}
+
+// Shared scalar validation plus named native pointer bindings; no second ABI catalogue.
+inline fn normArguments(comptime family: []const u8, pointers: anytype, rows: usize, dim: usize, eps: f32) driver_mod.Error!launch_abi.ArgumentsFor(family) {
+    const Result = launch_abi.ArgumentsFor(family);
+    if (comptime @typeInfo(@TypeOf(pointers)).@"struct".field_names.len + 3 != @typeInfo(Result).@"struct".field_names.len) @compileError("incomplete native normalization arguments");
+    var result: Result = undefined;
+    inline for (@typeInfo(@TypeOf(pointers)).@"struct".field_names) |name| {
+        if (comptime @FieldType(Result, name) != u64) @compileError("normalization binding must name a native device address");
+        @field(result, name) = @field(pointers, name);
+    }
+    result.rows = try toU32(rows);
+    result.dim = try toU32(dim);
+    result.eps = eps;
     return result;
 }
 
@@ -22071,4 +22044,307 @@ test "CUDA launch ABI quantized preflight preserves empty and malformed extents"
     try std.testing.expectError(error.InvalidCudaState, checkedQuantLinearOutput(32, 34, empty, input, weights, 1, 32, 1));
     try std.testing.expectError(error.InvalidCudaState, checkedQuantLinearOutput(32, 34, empty, empty, empty, 0, 32, 1));
     try std.testing.expectError(error.InvalidCudaState, quantLinearArguments(empty, empty, empty, @as(usize, std.math.maxInt(u32)) + 1, 32, 1));
+}
+
+test "CUDA dense fast attention scalar replay rereads positions lengths and values" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    if (fastGqaDecodeDisabled()) return error.SkipZigTest;
+    var ctx = context_mod.CudaContext.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+    try std.testing.expect(module.gqa_attention_decode_scalars_fast_f32 != null);
+    const graph_mod = @import("graph.zig");
+    const heads = 4;
+    const kv_heads = 2;
+    const dim = 32;
+    const capacity = 8;
+    const count = heads * dim;
+    var query = try buffer_mod.DeviceBuffer.alloc(&ctx, count * 4);
+    defer query.free(&ctx);
+    var key = try buffer_mod.DeviceBuffer.alloc(&ctx, capacity * kv_heads * dim * 4);
+    defer key.free(&ctx);
+    var value = try buffer_mod.DeviceBuffer.alloc(&ctx, key.len);
+    defer value.free(&ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(&ctx, (count + 16) * 4);
+    defer output.free(&ctx);
+    var scalars = try buffer_mod.DeviceBuffer.alloc(&ctx, 5 * 4);
+    defer scalars.free(&ctx);
+    try module.launchFillF32(&ctx, query, count, 0);
+    try module.launchFillF32(&ctx, key, capacity * kv_heads * dim, 0);
+    try ctx.synchronize();
+    try graph_mod.beginCapture(&ctx);
+    var capturing = true;
+    errdefer if (capturing) {
+        const abandoned = ctx.endStreamCapture() catch null;
+        if (abandoned != null) ctx.destroyGraph(abandoned);
+    };
+    // HD32 deliberately selects the native fast route, rather than generated
+    // HD256/512 schedules. Host fallbacks stay fixed while device scalars vary.
+    const route = try module.launchGqaAttentionDecodeScalarsF32(&ctx, output, query, key, value, .{}, .{}, scalars, 1, 1, capacity, heads, kv_heads, dim, capacity - 1, 0, 0, capacity, 0, 0);
+    try std.testing.expectEqual(GqaAttentionLaunchKind.decode_fast, route);
+    var graph = try graph_mod.endCapture(&ctx);
+    capturing = false;
+    defer graph.deinit(&ctx);
+    for ([_]u32{ 1, 4 }) |total| {
+        var values: [capacity * kv_heads * dim]f32 = undefined;
+        for (&values, 0..) |*v, index| {
+            v.* = @as(f32, @floatFromInt(total)) +
+                @as(f32, @floatFromInt(index / (kv_heads * dim))) * 0.25 +
+                @as(f32, @floatFromInt((index / dim) % kv_heads)) * 0.125 +
+                @as(f32, @floatFromInt(index % dim)) * 0.03125;
+        }
+        const words = [_]u32{ 0, total - 1, total, total, 0 };
+        try value.copyFromHost(&ctx, std.mem.sliceAsBytes(&values));
+        try scalars.copyFromHost(&ctx, std.mem.sliceAsBytes(&words));
+        try module.launchFillF32(&ctx, output, count + 16, -777);
+        try graph.launch(&ctx);
+        var actual: [count + 16]f32 = undefined;
+        try output.copyToHost(&ctx, std.mem.sliceAsBytes(&actual));
+        try ctx.synchronize();
+        for (0..heads) |head| for (0..dim) |d| {
+            const expected = @as(f32, @floatFromInt(total)) +
+                @as(f32, @floatFromInt(total - 1)) * 0.125 +
+                @as(f32, @floatFromInt(head / (heads / kv_heads))) * 0.125 +
+                @as(f32, @floatFromInt(d)) * 0.03125;
+            try std.testing.expectEqual(expected, actual[head * dim + d]);
+        };
+        for (actual[count..]) |guard| try std.testing.expectEqual(@as(f32, -777), guard);
+    }
+}
+
+test "CUDA named argument records preserve empty contracts across all migrated launchers" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    var ctx = context_mod.CudaContext.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+    var scratch = try buffer_mod.DeviceBuffer.alloc(&ctx, 4096);
+    defer scratch.free(&ctx);
+    var zero: usize = 0;
+    std.mem.doNotOptimizeAway(&zero);
+    const before = ctx.stats.kernel_launches;
+    try module.launchRmsNormF32(&ctx, scratch, scratch, scratch, zero, 32, 0.125);
+    try module.launchRmsNormF32Bf16(&ctx, scratch, scratch, scratch, scratch, zero, 32, 0.125);
+    try module.launchRmsNormAddF32Bf16(&ctx, scratch, scratch, scratch, scratch, scratch, zero, 32, 0.125);
+    try module.launchRmsNormAddF32(&ctx, scratch, scratch, scratch, scratch, zero, 32, 0.125);
+    try module.launchRmsNormAddMulScalarF32(&ctx, scratch, scratch, scratch, scratch, scratch, zero, 32, 0.125);
+    try module.launchRmsNormAddOutputScaleF32(&ctx, scratch, scratch, scratch, scratch, scratch, zero, 32, 0.125);
+    try module.launchRmsNormBareF32(&ctx, scratch, scratch, zero, 32, 0.125);
+    try module.launchGemma4A4BRmsNormTripleF32(&ctx, scratch, scratch, scratch, scratch, scratch, scratch, scratch, zero, 32, 0.125);
+    try module.launchLayerNormF32(&ctx, scratch, scratch, scratch, scratch, zero, 32, 0.125);
+    try module.launchAddLayerNormF32(&ctx, scratch, scratch, scratch, scratch, scratch, zero, 32, 0.125);
+    try module.launchRopeF32(&ctx, scratch, scratch, zero, 32, 32, 10000, 1, zero, 1, 1, false);
+    try module.launchRopeDecodeScalarsF32(&ctx, scratch, scratch, scratch, zero, 32, 32, 10000, 1, zero, 1, 1, false);
+    try module.launchRopeScaledF32(&ctx, scratch, scratch, zero, 32, 32, 10000, 1, zero, 1, 1, false, 1);
+    try module.launchRopeScaledDecodeScalarsF32(&ctx, scratch, scratch, scratch, zero, 32, 32, 10000, 1, zero, 1, 1, false, 1);
+    try module.launchRopePerItemF32(&ctx, scratch, scratch, scratch, scratch, zero, 1, 1, 32, 32, 10000, 1, false);
+    try module.launchQwen3VlVisionRopeF32(&ctx, scratch, scratch, scratch, zero, 1, 1, 32, 10000);
+    try std.testing.expectError(error.InvalidCudaState, module.launchRmsNormHeadsRopeF32(&ctx, scratch, scratch, scratch, zero, 32, 32, 32, 0.125, 10000, 1, zero, 1, false, 1));
+    try std.testing.expectError(error.InvalidCudaState, module.launchRmsNormHeadsRopeDecodeScalarsF32(&ctx, scratch, scratch, scratch, scratch, zero, 32, 32, 32, 0.125, 10000, 1, zero, 1, false, 1));
+    try module.launchPrimitiveBatchedDotF32(&ctx, scratch, scratch, scratch, 1, zero, zero, 32, false, false);
+    try module.launchPrimitiveGatherF32(&ctx, scratch, scratch, scratch, zero, zero, zero, 1, 1);
+    try module.launchPrimitiveGatherBf16F32(&ctx, scratch, scratch, scratch, zero, zero, zero, 1, 1);
+    try std.testing.expectEqual(before, ctx.stats.kernel_launches);
+}
+
+test "CUDA named normalization arguments preserve every scalar pointer and mirror output" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    var ctx = context_mod.CudaContext.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+    const rows = 2;
+    const dim = 32;
+    const count = rows * dim;
+    var input = try buffer_mod.DeviceBuffer.alloc(&ctx, count * 4);
+    defer input.free(&ctx);
+    var residual = try buffer_mod.DeviceBuffer.alloc(&ctx, count * 4);
+    defer residual.free(&ctx);
+    var w1 = try buffer_mod.DeviceBuffer.alloc(&ctx, dim * 4);
+    defer w1.free(&ctx);
+    var w2 = try buffer_mod.DeviceBuffer.alloc(&ctx, dim * 4);
+    defer w2.free(&ctx);
+    var w3 = try buffer_mod.DeviceBuffer.alloc(&ctx, dim * 4);
+    defer w3.free(&ctx);
+    var scalar = try buffer_mod.DeviceBuffer.alloc(&ctx, 4);
+    defer scalar.free(&ctx);
+    var first = try buffer_mod.DeviceBuffer.alloc(&ctx, (count + 16) * 4);
+    defer first.free(&ctx);
+    var second = try buffer_mod.DeviceBuffer.alloc(&ctx, first.len);
+    defer second.free(&ctx);
+    var third = try buffer_mod.DeviceBuffer.alloc(&ctx, first.len);
+    defer third.free(&ctx);
+    var mirror = try buffer_mod.DeviceBuffer.alloc(&ctx, (count + 16) * 2);
+    defer mirror.free(&ctx);
+    try module.launchFillF32(&ctx, input, count, 1);
+    try module.launchFillF32(&ctx, residual, count, 0.5);
+    try module.launchFillF32(&ctx, w1, dim, 2);
+    try module.launchFillF32(&ctx, w2, dim, 3);
+    try module.launchFillF32(&ctx, w3, dim, 4);
+    try module.launchFillF32(&ctx, scalar, 1, 2);
+    const Check = struct {
+        fn output(context: *context_mod.CudaContext, device: buffer_mod.DeviceBuffer, want: f32) !void {
+            var actual: [count + 16]f32 = undefined;
+            try device.copyToHost(context, std.mem.sliceAsBytes(&actual));
+            try context.synchronize();
+            for (actual[0..count]) |value| try std.testing.expectEqual(want, value);
+            for (actual[count..]) |guard| try std.testing.expectEqual(@as(f32, -777), guard);
+        }
+    };
+    const Mode = enum { rms, bf16, residual, residual_bf16, scalar_before, scalar_after, bare, triple, layer, add_layer };
+    inline for (std.meta.tags(Mode)) |mode| {
+        try module.launchFillF32(&ctx, first, count + 16, -777);
+        try module.launchFillF32(&ctx, second, count + 16, -777);
+        try module.launchFillF32(&ctx, third, count + 16, -777);
+        const initial: [(count + 16) * 2]u8 = @splat(0xa5);
+        try mirror.copyFromHost(&ctx, &initial);
+        const want: f32 = switch (mode) {
+            .rms => value: {
+                try module.launchRmsNormF32(&ctx, first, input, w1, rows, dim, 0);
+                break :value 2;
+            },
+            .bf16 => value: {
+                try module.launchRmsNormF32Bf16(&ctx, first, mirror, input, w1, rows, dim, 0);
+                break :value 2;
+            },
+            .residual => value: {
+                try module.launchRmsNormAddF32(&ctx, first, input, w1, residual, rows, dim, 0);
+                break :value 2.5;
+            },
+            .residual_bf16 => value: {
+                try module.launchRmsNormAddF32Bf16(&ctx, first, mirror, input, w1, residual, rows, dim, 0);
+                break :value 2.5;
+            },
+            .scalar_before => value: {
+                try module.launchRmsNormAddMulScalarF32(&ctx, first, input, w1, residual, scalar, rows, dim, 0);
+                break :value 4.5;
+            },
+            .scalar_after => value: {
+                try module.launchRmsNormAddOutputScaleF32(&ctx, first, input, w1, residual, scalar, rows, dim, 0);
+                break :value 5;
+            },
+            .bare => value: {
+                try module.launchRmsNormBareF32(&ctx, first, input, rows, dim, 0);
+                break :value 1;
+            },
+            .triple => value: {
+                try module.launchGemma4A4BRmsNormTripleF32(&ctx, first, second, third, input, w1, w2, w3, rows, dim, 0);
+                try Check.output(&ctx, second, 3);
+                try Check.output(&ctx, third, 4);
+                break :value 2;
+            },
+            .layer => value: {
+                try module.launchLayerNormF32(&ctx, first, input, w1, w2, rows, dim, 1);
+                break :value 3;
+            },
+            .add_layer => value: {
+                try module.launchAddLayerNormF32(&ctx, first, input, residual, w1, w2, rows, dim, 1);
+                break :value 3;
+            },
+        };
+        try Check.output(&ctx, first, want);
+        if (mode == .bf16 or mode == .residual_bf16) {
+            var bits: [count + 16]u16 = undefined;
+            try mirror.copyToHost(&ctx, std.mem.sliceAsBytes(&bits));
+            try ctx.synchronize();
+            const expected: u16 = @intCast(@as(u32, @bitCast(want)) >> 16);
+            for (bits[0..count]) |value| try std.testing.expectEqual(expected, value);
+            for (bits[count..]) |guard| try std.testing.expectEqual(@as(u16, 0xa5a5), guard);
+        }
+    }
+}
+
+test "CUDA named gather arguments preserve BF16 widening prefix strides and negative indices" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    var ctx = context_mod.CudaContext.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+    var values: [24]f32 = undefined;
+    var bf16: [24]u16 = undefined;
+    for (&values, &bf16, 0..) |*value, *bits, i| {
+        value.* = @floatFromInt(i);
+        bits.* = @intCast(@as(u32, @bitCast(value.*)) >> 16);
+    }
+    var input = try buffer_mod.DeviceBuffer.alloc(&ctx, 24 * 4);
+    defer input.free(&ctx);
+    var packed_input = try buffer_mod.DeviceBuffer.alloc(&ctx, 24 * 2);
+    defer packed_input.free(&ctx);
+    var indices = try buffer_mod.DeviceBuffer.alloc(&ctx, 2 * 4);
+    defer indices.free(&ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(&ctx, 32 * 4);
+    defer output.free(&ctx);
+    const selections = [_]f32{ -1, 0 };
+    try input.copyFromHost(&ctx, std.mem.sliceAsBytes(&values));
+    try packed_input.copyFromHost(&ctx, std.mem.sliceAsBytes(&bf16));
+    try indices.copyFromHost(&ctx, std.mem.sliceAsBytes(&selections));
+    inline for (.{ false, true }) |narrow| {
+        try module.launchFillF32(&ctx, output, 32, -777);
+        if (narrow) try module.launchPrimitiveGatherBf16F32(&ctx, output, packed_input, indices, 16, 24, 2, 3, 4) else try module.launchPrimitiveGatherF32(&ctx, output, input, indices, 16, 24, 2, 3, 4);
+        var actual: [32]f32 = undefined;
+        try output.copyToHost(&ctx, std.mem.sliceAsBytes(&actual));
+        try ctx.synchronize();
+        try std.testing.expectEqualSlices(f32, &.{ 8, 9, 10, 11, 0, 1, 2, 3, 20, 21, 22, 23, 12, 13, 14, 15 }, actual[0..16]);
+        for (actual[16..]) |guard| try std.testing.expectEqual(@as(f32, -777), guard);
+    }
+}
+
+test "CUDA named RoPE arguments reread captured device positions" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    var ctx = context_mod.CudaContext.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+    const graph_mod = @import("graph.zig");
+    var input = try buffer_mod.DeviceBuffer.alloc(&ctx, 8 * 4);
+    defer input.free(&ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(&ctx, 24 * 4);
+    defer output.free(&ctx);
+    var scalars = try buffer_mod.DeviceBuffer.alloc(&ctx, 5 * 4);
+    defer scalars.free(&ctx);
+    try ctx.synchronize();
+    try graph_mod.beginCapture(&ctx);
+    var capturing = true;
+    errdefer if (capturing) {
+        const abandoned = ctx.endStreamCapture() catch null;
+        if (abandoned != null) ctx.destroyGraph(abandoned);
+    };
+    try module.launchRopeDecodeScalarsF32(&ctx, output, input, scalars, 1, 8, 8, 1, 1, 777, 1, 1, false);
+    var graph = try graph_mod.endCapture(&ctx);
+    capturing = false;
+    defer graph.deinit(&ctx);
+    for ([_]u32{ 0, 1, 3 }) |position| {
+        var values: [8]f32 = undefined;
+        for (&values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i + position)) * 0.125;
+        const words = [_]u32{ position, 0, 0, 0, 0 };
+        try input.copyFromHost(&ctx, std.mem.sliceAsBytes(&values));
+        try scalars.copyFromHost(&ctx, std.mem.sliceAsBytes(&words));
+        try module.launchFillF32(&ctx, output, 24, -777);
+        try graph.launch(&ctx);
+        var actual: [24]f32 = undefined;
+        try output.copyToHost(&ctx, std.mem.sliceAsBytes(&actual));
+        try ctx.synchronize();
+        const angle: f32 = @floatFromInt(position);
+        for (0..4) |i| {
+            try std.testing.expectApproxEqAbs(values[i] * @cos(angle) - values[i + 4] * @sin(angle), actual[i], 0.00001);
+            try std.testing.expectApproxEqAbs(values[i] * @sin(angle) + values[i + 4] * @cos(angle), actual[i + 4], 0.00001);
+        }
+        for (actual[8..]) |guard| try std.testing.expectEqual(@as(f32, -777), guard);
+    }
 }

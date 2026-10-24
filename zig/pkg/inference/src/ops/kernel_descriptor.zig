@@ -45,7 +45,28 @@ pub const ReductionMode = kernel_geometry.ReductionMode;
 pub const ReductionGeometry = kernel_geometry.ReductionGeometry;
 pub const Dot = kernel_geometry.BatchedDotGeneralPlan;
 pub const Reduction = struct { mode: ReductionMode, geometry: ReductionGeometry };
-pub const Layout = struct { axes: [8]u32, input_rank: u8, output_rank: u8 };
+pub const Layout = struct {
+    axes: [8]u32,
+    input_rank: u8,
+    output_rank: u8,
+
+    pub fn transpose(input: []const i64, output: []const i64, permutation: []const u8) !Layout {
+        var resolved: [8]i64 = undefined;
+        try kernel_geometry.transposeShape(input, permutation, &resolved);
+        if (!std.mem.eql(i64, resolved[0..input.len], output)) return error.InvalidShape;
+        var result = Layout{ .axes = @splat(0), .input_rank = @intCast(input.len), .output_rank = @intCast(output.len) };
+        for (permutation, 0..) |axis, i| result.axes[i] = axis;
+        return result;
+    }
+};
+
+/// Convert admitted descriptor dimensions at the native API boundary. Keep
+/// only logical shapes in descriptors; no cached copy of every target's wires.
+pub inline fn nativeDimensions(comptime T: type, shape: ml.graph.Shape) [8]T {
+    var dimensions: [8]T = @splat(1);
+    for (shape.dims[0..shape.rank()], 0..) |dim, axis| dimensions[axis] = @intCast(dim);
+    return dimensions;
+}
 pub const Operation = union(enum) { transpose: Layout, broadcast: Layout, unary: Unary, binary: Binary, linear: Linear, norm: Norm, softmax: Softmax, reduction: Reduction, dot: Dot };
 pub const Descriptor = struct {
     operation: Operation,
@@ -124,14 +145,7 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
             if (node.op == .transpose) {
                 const attrs = node.op.transpose;
                 if (attrs.num_axes != input.rank() or shape.rank() != input.rank()) return null;
-                for (attrs.perm[0..attrs.num_axes], 0..) |axis, index| {
-                    if (axis >= input.rank()) return null;
-                    const bit = @as(u16, 1) << @intCast(axis);
-                    if (seen & bit != 0 or shape.dims[index] != input.dims[axis]) return null;
-                    seen |= bit;
-                    layout.axes[index] = axis;
-                }
-                break :blk .{ .transpose = layout };
+                break :blk .{ .transpose = Layout.transpose(input.dims[0..input.rank()], shape.dims[0..shape.rank()], attrs.perm[0..attrs.num_axes]) catch return null };
             }
             const attrs = node.op.broadcast_in_dim;
             if (attrs.num_axes != input.rank()) return null;

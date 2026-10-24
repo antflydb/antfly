@@ -39272,7 +39272,7 @@ fn primTransposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []
     };
     // Compute output shape and strides.
     var out_shape: [8]i64 = undefined;
-    for (0..rank) |d| out_shape[d] = resolved_shape[resolved_perm[d]];
+    kernel_geometry.transposeShape(resolved_shape, resolved_perm, &out_shape) catch return error.UnsupportedShape;
     const numel = if (safeShapeNumel(out_shape[0..rank])) |resolved_numel| resolved_numel else input_buf.data.len;
 
     var in_strides: [8]usize = undefined;
@@ -39299,9 +39299,9 @@ fn primTransposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []
     const in_view = try denseWeightView(self, input);
     defer in_view.deinit(self.allocator);
     const in_data = in_view.data;
-    const output = try self.allocator.alloc(f32, numel);
-    var raw_output: ?[]f32 = output;
-    errdefer if (raw_output) |raw| self.allocator.free(raw);
+    var owned_output = try OwnedDenseOutput.alloc(self, numel);
+    defer owned_output.deinit();
+    const output = owned_output.storage.?;
     for (0..numel) |flat_out| {
         // Decompose output flat index.
         var remaining = flat_out;
@@ -39313,8 +39313,7 @@ fn primTransposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []
         }
         output[flat_out] = in_data[flat_in];
     }
-    const result = try self.makeBuf(output, true);
-    raw_output = null;
+    const result = try owned_output.intoResult();
     if (!should_attach_shape) return result;
     errdefer freeTensor(self, result);
     return self.withLogicalShape(result, out_shape[0..rank]);
@@ -39353,20 +39352,7 @@ fn primBroadcastInDimOp(ctx: *anyopaque, input: CT, target_shape: []const i64, b
         break :blk resolved_input_shape_buf[0..in_rank];
     };
     var resolved_target_shape: [8]i64 = undefined;
-    for (0..out_rank) |d| {
-        var resolved_dim = target_shape[d];
-        if (resolved_dim <= 0) {
-            for (broadcast_axes[0..axis_count], 0..) |ax, in_d| {
-                if (ax == d and resolved_input_shape[in_d] >= 0) {
-                    resolved_dim = resolved_input_shape[in_d];
-                    break;
-                }
-            }
-        }
-        if (resolved_dim <= 0) resolved_dim = 1;
-        resolved_target_shape[d] = resolved_dim;
-    }
-    const out_numel = shapeNumel(resolved_target_shape[0..out_rank]);
+    const out_numel = try kernel_geometry.resolveBroadcastOutput(resolved_input_shape, target_shape, broadcast_axes, &resolved_target_shape);
     if (axis_count == in_rank and out_numel == shapeNumel(resolved_input_shape)) {
         var can_alias = true;
         for (0..out_rank) |d| {
@@ -40730,26 +40716,15 @@ fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: 
                 break :blk idx_shape;
             };
 
-            var prefix_count: usize = 1;
-            for (resolved_input_shape[0..axis_index]) |dim| {
-                if (dim <= 0) return error.UnsupportedShape;
-                prefix_count *= @as(usize, @intCast(dim));
-            }
-
-            const axis_extent_i64 = resolved_input_shape[axis_index];
-            if (axis_extent_i64 <= 0) return error.UnsupportedShape;
-            const axis_extent = @as(usize, @intCast(axis_extent_i64));
-
-            var suffix_size: usize = 1;
-            for (resolved_input_shape[axis_index + 1 ..]) |dim| {
-                if (dim <= 0) return error.UnsupportedShape;
-                suffix_size *= @as(usize, @intCast(dim));
-            }
+            const geometry = kernel_geometry.GatherAxis.init(std.math.maxInt(usize), resolved_input_shape, axis_index) catch return error.UnsupportedShape;
+            const prefix_count = geometry.prefix;
+            const axis_extent = geometry.extent;
+            const suffix_size = geometry.suffix;
 
             const index_count = idx_data.len;
-            const output = try self.allocator.alloc(f32, prefix_count * index_count * suffix_size);
-            var raw_output: ?[]f32 = output;
-            errdefer if (raw_output) |raw| self.allocator.free(raw);
+            var owned_output = try OwnedDenseOutput.alloc(self, try geometry.count(index_count));
+            defer owned_output.deinit();
+            const output = owned_output.storage.?;
             for (0..prefix_count) |prefix_idx| {
                 for (0..index_count) |idx_pos| {
                     var gather_index = @as(i64, @intFromFloat(idx_data[idx_pos]));
@@ -40764,22 +40739,9 @@ fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: 
             }
 
             var out_shape_buf: [8]i64 = undefined;
-            var out_rank: usize = 0;
-            for (resolved_input_shape[0..axis_index]) |dim| {
-                out_shape_buf[out_rank] = dim;
-                out_rank += 1;
-            }
-            for (normalized_idx_shape) |dim| {
-                out_shape_buf[out_rank] = dim;
-                out_rank += 1;
-            }
-            for (resolved_input_shape[axis_index + 1 ..]) |dim| {
-                out_shape_buf[out_rank] = dim;
-                out_rank += 1;
-            }
+            const out_rank = try kernel_geometry.gatherShape(resolved_input_shape, normalized_idx_shape, axis_index, &out_shape_buf);
 
-            const result = try self.makeBuf(output, true);
-            raw_output = null;
+            const result = try owned_output.intoResult();
             errdefer freeTensor(self, result);
             return self.withLogicalShape(result, out_shape_buf[0..out_rank]);
         }
@@ -40829,9 +40791,9 @@ fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: 
                     }
 
                     const output_len = idx_prefix_count * slice_size;
-                    const output = try self.allocator.alloc(f32, output_len);
-                    var raw_output: ?[]f32 = output;
-                    errdefer if (raw_output) |raw| self.allocator.free(raw);
+                    var owned_output = try OwnedDenseOutput.alloc(self, output_len);
+                    defer owned_output.deinit();
+                    const output = owned_output.storage.?;
 
                     var coord_strides: [8]usize = undefined;
                     for (0..k) |dim_idx| {
@@ -40882,8 +40844,7 @@ fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: 
                         out_rank += 1;
                     }
 
-                    const result = try self.makeBuf(output, true);
-                    raw_output = null;
+                    const result = try owned_output.intoResult();
                     errdefer freeTensor(self, result);
                     return self.withLogicalShape(result, out_shape_buf[0..out_rank]);
                 }
@@ -40917,9 +40878,9 @@ fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: 
         const gather_pos = @as(usize, @intCast(gather_index));
 
         const in_data = getData(input);
-        const output = try self.allocator.alloc(f32, prefix_count * suffix_size);
-        var raw_output: ?[]f32 = output;
-        errdefer if (raw_output) |raw| self.allocator.free(raw);
+        var owned_output = try OwnedDenseOutput.alloc(self, prefix_count * suffix_size);
+        defer owned_output.deinit();
+        const output = owned_output.storage.?;
         for (0..prefix_count) |prefix_idx| {
             const src_offset = (prefix_idx * axis_extent + gather_pos) * suffix_size;
             const dst_offset = prefix_idx * suffix_size;
@@ -40935,8 +40896,7 @@ fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: 
             out_rank += 1;
         }
 
-        const result = try self.makeBuf(output, true);
-        raw_output = null;
+        const result = try owned_output.intoResult();
         errdefer freeTensor(self, result);
         return self.withLogicalShape(result, out_shape_buf[0..out_rank]);
     }
@@ -40977,9 +40937,9 @@ fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: 
             break :blk in_data.len / rows;
         };
         const n = idx_data.len;
-        const output = try self.allocator.alloc(f32, n * d);
-        var raw_output: ?[]f32 = output;
-        errdefer if (raw_output) |raw| self.allocator.free(raw);
+        var owned_output = try OwnedDenseOutput.alloc(self, n * d);
+        defer owned_output.deinit();
+        const output = owned_output.storage.?;
         var out_shape_buf: [8]i64 = @splat(0);
         var out_rank: usize = 0;
         if (indices_shape) |idx_shape| {
@@ -41025,8 +40985,7 @@ fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: 
                 }
                 try convertTensorRowsToF32(tensor, row, 1, d, output[i * d ..][0..d]);
             }
-            const result = try self.makeBuf(output, true);
-            raw_output = null;
+            const result = try owned_output.intoResult();
             errdefer freeTensor(self, result);
             return self.withLogicalShape(result, out_shape_buf[0..out_rank]);
         }
@@ -41057,8 +41016,7 @@ fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: 
             }
             @memcpy(output[i * d ..][0..d], in_data[row * d ..][0..d]);
         }
-        const result = try self.makeBuf(output, true);
-        raw_output = null;
+        const result = try owned_output.intoResult();
         errdefer freeTensor(self, result);
         return self.withLogicalShape(result, out_shape_buf[0..out_rank]);
     }
@@ -41115,8 +41073,9 @@ fn primSliceOp(ctx: *anyopaque, input: CT, starts: []const i64, limits: []const 
         return aliasDenseBufWithShape(self, input, effective_input_shape) catch blk: {
             const dense_view = try denseWeightView(self, input);
             defer dense_view.deinit(self.allocator);
-            const output = try self.allocator.dupe(f32, dense_view.data);
-            const result = try self.makeOwnedBuf(output);
+            var owned_output = try OwnedDenseOutput.copy(self, dense_view.data);
+            defer owned_output.deinit();
+            const result = try owned_output.intoResult();
             errdefer freeTensor(self, result);
             break :blk self.withLogicalShape(result, effective_input_shape);
         };
@@ -41139,32 +41098,20 @@ fn primSliceOp(ctx: *anyopaque, input: CT, starts: []const i64, limits: []const 
     for (0..rank) |d| {
         const dim = resolved_input_shape[d];
         if (dim < 0 or strides[d] <= 0) return error.UnsupportedShape;
-        var start = starts[d];
-        var limit = limits[d];
-        if (start < 0) start += dim;
-        if (limit < 0) {
-            limit = if (d < input_shape.len and input_shape[d] < 0 and start == 0 and strides[d] == 1)
-                dim
-            else
-                limit + dim;
-        }
-        start = std.math.clamp(start, 0, dim);
-        limit = std.math.clamp(limit, 0, dim);
-
-        const size = if (limit <= start) 0 else @divTrunc(limit - start + strides[d] - 1, strides[d]);
-        out_shape[d] = size;
-        out_numel = std.math.mul(usize, out_numel, @as(usize, @intCast(size))) catch return error.UnsupportedShape;
-        normalized_starts[d] = @intCast(start);
-        normalized_strides[d] = @intCast(strides[d]);
+        const slice = kernel_geometry.SliceAxis.init(true, dim, starts[d], limits[d], strides[d], input_shape[d] < 0) catch return error.UnsupportedShape;
+        out_shape[d] = slice.size;
+        out_numel = std.math.mul(usize, out_numel, @as(usize, @intCast(slice.size))) catch return error.UnsupportedShape;
+        normalized_starts[d] = slice.start;
+        normalized_strides[d] = slice.stride;
     }
     var in_strides: [8]usize = undefined;
     computeStrides(resolved_input_shape, in_strides[0..rank]);
     var out_strides: [8]usize = undefined;
     computeStrides(out_shape[0..rank], out_strides[0..rank]);
 
-    const output = try self.allocator.alloc(f32, out_numel);
-    var raw_output: ?[]f32 = output;
-    errdefer if (raw_output) |raw| self.allocator.free(raw);
+    var owned_output = try OwnedDenseOutput.alloc(self, out_numel);
+    defer owned_output.deinit();
+    const output = owned_output.storage.?;
     for (0..out_numel) |flat_out| {
         var remaining = flat_out;
         var flat_in: usize = 0;
@@ -41177,8 +41124,7 @@ fn primSliceOp(ctx: *anyopaque, input: CT, starts: []const i64, limits: []const 
         if (flat_in >= in_data.len) return error.ShapeMismatch;
         output[flat_out] = in_data[flat_in];
     }
-    const result = try self.makeBuf(output, true);
-    raw_output = null;
+    const result = try owned_output.intoResult();
     errdefer freeTensor(self, result);
     return self.withLogicalShape(result, out_shape[0..rank]);
 }
@@ -41214,13 +41160,12 @@ fn primConcatPrimOp(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i6
     const rank = resolved_a_shape.len;
 
     if (rank == 1 and axis == 0) {
-        const out = try self.allocator.alloc(f32, a_data.len + b_data.len);
-        var raw_output: ?[]f32 = out;
-        errdefer if (raw_output) |raw| self.allocator.free(raw);
+        var owned_output = try OwnedDenseOutput.alloc(self, a_data.len + b_data.len);
+        defer owned_output.deinit();
+        const out = owned_output.storage.?;
         @memcpy(out[0..a_data.len], a_data);
         @memcpy(out[a_data.len..][0..b_data.len], b_data);
-        const result = try self.makeBuf(out, true);
-        raw_output = null;
+        const result = try owned_output.intoResult();
         errdefer freeTensor(self, result);
         const out_shape = [_]i64{@intCast(a_data.len + b_data.len)};
         return self.withLogicalShape(result, &out_shape);
@@ -41247,13 +41192,12 @@ fn primConcatPrimOp(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i6
         if (inner == 0) return error.UnsupportedShape;
         if (a_data.len % inner != 0 or b_data.len % inner != 0) return error.UnsupportedShape;
         out_shape[0] = @intCast((a_data.len + b_data.len) / inner);
-        const out = try self.allocator.alloc(f32, a_data.len + b_data.len);
-        var raw_output: ?[]f32 = out;
-        errdefer if (raw_output) |raw| self.allocator.free(raw);
+        var owned_output = try OwnedDenseOutput.alloc(self, a_data.len + b_data.len);
+        defer owned_output.deinit();
+        const out = owned_output.storage.?;
         @memcpy(out[0..a_data.len], a_data);
         @memcpy(out[a_data.len..][0..b_data.len], b_data);
-        const result = try self.makeBuf(out, true);
-        raw_output = null;
+        const result = try owned_output.intoResult();
         errdefer freeTensor(self, result);
         return self.withLogicalShape(result, out_shape[0..rank]);
     }
@@ -41291,17 +41235,16 @@ fn primConcatPrimOp(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i6
             const a_chunk = a_layout.axis_size * a_layout.inner;
             const b_chunk = b_layout.axis_size * b_layout.inner;
             const out_chunk = (a_layout.axis_size + b_layout.axis_size) * a_layout.inner;
-            const output = try self.allocator.alloc(f32, outer * out_chunk);
-            var raw_output: ?[]f32 = output;
-            errdefer if (raw_output) |raw| self.allocator.free(raw);
+            var owned_output = try OwnedDenseOutput.alloc(self, outer * out_chunk);
+            defer owned_output.deinit();
+            const output = owned_output.storage.?;
             for (0..outer) |o| {
                 const a_src = if (a_layout.outer == 1) 0 else o * a_chunk;
                 const b_src = if (b_layout.outer == 1) 0 else o * b_chunk;
                 @memcpy(output[o * out_chunk ..][0..a_chunk], a_data[a_src..][0..a_chunk]);
                 @memcpy(output[o * out_chunk + a_chunk ..][0..b_chunk], b_data[b_src..][0..b_chunk]);
             }
-            const result = try self.makeBuf(output, true);
-            raw_output = null;
+            const result = try owned_output.intoResult();
             errdefer freeTensor(self, result);
             if (resolveShapeFromDataLen(out_shape[0..rank], output.len)) |resolved_out_shape| {
                 return self.withLogicalShape(result, resolved_out_shape[0..rank]);
@@ -41309,13 +41252,12 @@ fn primConcatPrimOp(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i6
             return self.withLogicalShape(result, out_shape[0..rank]);
         }
         if (allKnownDimsAreOne(resolved_a_shape) and allKnownDimsAreOne(resolved_b_shape)) {
-            const out = try self.allocator.alloc(f32, a_data.len + b_data.len);
-            var raw_output: ?[]f32 = out;
-            errdefer if (raw_output) |raw| self.allocator.free(raw);
+            var owned_output = try OwnedDenseOutput.alloc(self, a_data.len + b_data.len);
+            defer owned_output.deinit();
+            const out = owned_output.storage.?;
             @memcpy(out[0..a_data.len], a_data);
             @memcpy(out[a_data.len..][0..b_data.len], b_data);
-            const result = try self.makeBuf(out, true);
-            raw_output = null;
+            const result = try owned_output.intoResult();
             errdefer freeTensor(self, result);
             const flat_out_shape = [_]i64{@intCast(a_data.len + b_data.len)};
             return self.withLogicalShape(result, &flat_out_shape);
@@ -41340,9 +41282,9 @@ fn primConcatPrimOp(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i6
     const a_axis = a_layout.axis_size;
     const b_axis = b_layout.axis_size;
 
-    const output = try self.allocator.alloc(f32, out_numel);
-    var raw_output: ?[]f32 = output;
-    errdefer if (raw_output) |raw| self.allocator.free(raw);
+    var owned_output = try OwnedDenseOutput.alloc(self, out_numel);
+    defer owned_output.deinit();
+    const output = owned_output.storage.?;
     for (0..outer) |o| {
         const a_chunk = a_axis * inner;
         const b_chunk = b_axis * inner;
@@ -41350,8 +41292,7 @@ fn primConcatPrimOp(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i6
         @memcpy(output[o * out_chunk ..][0..a_chunk], a_data[o * a_chunk ..][0..a_chunk]);
         @memcpy(output[o * out_chunk + a_chunk ..][0..b_chunk], b_data[o * b_chunk ..][0..b_chunk]);
     }
-    const result = try self.makeBuf(output, true);
-    raw_output = null;
+    const result = try owned_output.intoResult();
     errdefer freeTensor(self, result);
     if (resolveShapeFromDataLen(out_shape[0..rank], out_numel)) |resolved_out_shape| {
         return self.withLogicalShape(result, resolved_out_shape[0..rank]);
@@ -54102,4 +54043,47 @@ test "CPU shared descriptors execute resident operations with strict transfer ad
     defer context.deinit(a);
     var cb = context.computeBackend();
     try @import("testing/assigned_kernel_conformance.zig").run(&cb, false);
+}
+
+test "native allocating layout adapters release every partial output allocation" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+            defer store.deinitOwned();
+            var compute = NativeCompute.init(a, &store, null);
+            defer compute.deinit();
+            var values = [_]f32{ 0, 1, 2, 3, 4, 5 };
+            var selections = [_]f32{ -1, 0 };
+            const input = try compute.makeBuf(&values, false);
+            defer freeTensor(&compute, input);
+            _ = try compute.withLogicalShape(input, &.{ 2, 3 });
+            const indices = try compute.makeBuf(&selections, false);
+            defer freeTensor(&compute, indices);
+            _ = try compute.withLogicalShape(indices, &.{2});
+            {
+                const result = try primSliceOp(&compute, input, &.{ 0, 1 }, &.{ 2, 3 }, &.{ 1, 1 }, &.{ 2, 3 });
+                defer freeTensor(&compute, result);
+                try std.testing.expectEqualSlices(f32, &.{ 1, 2, 4, 5 }, getData(result));
+            }
+            {
+                const result = try primGatherOp(&compute, input, indices, 1, &.{ 2, 3 });
+                defer freeTensor(&compute, result);
+                try std.testing.expectEqualSlices(f32, &.{ 2, 0, 5, 3 }, getData(result));
+            }
+            inline for (.{ @as(u8, 0), @as(u8, 1) }) |axis| {
+                const result = try primConcatPrimOp(&compute, input, input, axis, &.{ 2, 3 }, &.{ 2, 3 });
+                defer freeTensor(&compute, result);
+                const expected: []const f32 = if (axis == 0) &.{ 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5 } else &.{ 0, 1, 2, 0, 1, 2, 3, 4, 5, 3, 4, 5 };
+                try std.testing.expectEqualSlices(f32, expected, getData(result));
+            }
+            {
+                const result = try primTransposeOp(&compute, input, &.{ 1, 0 }, &.{ 2, 3 });
+                defer freeTensor(&compute, result);
+                const view = try denseTensorView(&compute, result);
+                defer view.deinit(a);
+                try std.testing.expectEqualSlices(f32, &.{ 0, 3, 1, 4, 2, 5 }, view.data);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
