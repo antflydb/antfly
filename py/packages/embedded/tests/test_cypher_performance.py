@@ -182,6 +182,7 @@ def test_property_seeks_use_indexes_and_preserve_paging(graph_db):
     db = graph_db
     populate(db, 2000)
     db.sql("CREATE INDEX docs_id ON docs(id)")
+    db.run_until_idle()
     for condition in ("{id:'n1999'}", ""):
         suffix = "" if condition else " WHERE n.id='n1999'"
         result = db.cypher_json(
@@ -213,6 +214,7 @@ def test_property_seeks_use_indexes_and_preserve_paging(graph_db):
     # key. Continuations must retain that native order across multiple pages.
     db.sql("DROP INDEX docs_id ON docs")
     db.sql("CREATE INDEX docs_id_score ON docs(id,score)")
+    db.run_until_idle()
     db.sql("UPDATE docs SET id='same' WHERE score<400")
     result = db.cypher_json(
         "g", {"query": "MATCH (n:D {id:'same'}) RETURN count(*),sum(n.score)", "limits": {"scanned_anchors": 450}}
@@ -285,6 +287,7 @@ def test_indexed_ranges_and_sparse_sets_keep_exact_cypher_residuals(graph_db):
     db = graph_db
     populate(db, 2000)
     db.sql("CREATE INDEX docs_score ON docs(score)")
+    db.run_until_idle()
     for predicate, anchors, expected in (
         ("n.score>=1999", 1, [1999]),
         ("1999<=n.score", 1, [1999]),
@@ -465,6 +468,7 @@ def test_dag_count_reports_overflow_only_for_qualifying_endpoints(graph_db):
 def test_selective_right_endpoint_drives_traversal(graph_db):
     db = graph_db
     db.sql("CREATE INDEX docs_id ON docs(id)")
+    db.run_until_idle()
     patterns = [f"(n{i}:D {{id:'n{i}'}})" for i in range(201)]
     patterns += [f"(n{i})-[:R]->(n{i + 1})" for i in range(200)]
     key = db.cypher_json("g", {"query": "CREATE " + ",".join(patterns) + " RETURN antfly.documentKey(n200)"})["rows"][
@@ -647,6 +651,7 @@ def test_pattern_equality_joins_use_indexes_or_bounded_hash_lookups(graph_db):
     for indexed in (False, True):
         if indexed:
             db.sql("CREATE INDEX docs_score ON docs(score)")
+            db.run_until_idle()
         result = db.cypher_json(
             "g",
             {
@@ -944,6 +949,7 @@ def test_native_or_and_required_label_predicates_seek_the_index(graph_db):
     db = graph_db
     populate(db, 3000)
     db.sql("CREATE INDEX docs_score ON docs(score)")
+    db.run_until_idle()
     for predicate in (
         "n.score=2998 OR n.score=2999",
         "n.score=2998 OR n.score IN [2999,null]",
@@ -1143,6 +1149,7 @@ def test_all_path_product_states_preserve_endpoint_constraints_and_bags(graph_db
 def test_indexed_bulk_merge_has_linear_staged_work(graph_db):
     db = graph_db
     db.sql("CREATE INDEX docs_id ON docs(id)")
+    db.run_until_idle()
     previous = 0
     for count in (200, 400, 800):
         result = db.cypher_json(
@@ -1174,6 +1181,7 @@ def test_foldable_negative_predicates_seek_indexes(graph_db):
     populate(db, 1000)
     db.sql("UPDATE docs SET score=-score-1")
     db.sql("CREATE INDEX docs_score ON docs(score)")
+    db.run_until_idle()
     for expression in ("-1", "1-2", "-$positive", "$zero-1"):
         result = db.cypher_json(
             "g",
@@ -1754,6 +1762,7 @@ def test_multi_anchor_reductions_share_work_across_bounded_batches(graph_db):
     for indexed in (False, True):
         if indexed:
             db.sql("CREATE INDEX docs_score ON docs(score)")
+            db.run_until_idle()
         for predicate, expected in (
             ("a.score>=0", sum(i * i for i in range(size))),
             ("b.score>=0", sum(i * i for i in range(size))),
@@ -7430,6 +7439,7 @@ def test_qualified_element_ids_seek_only_their_table_and_keep_exact_residuals(gr
 def test_indexed_node_order_reads_only_the_requested_window(graph_db):
     populate(graph_db, 13000)
     graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
     for order, page, expected, reads in (
         ("n.score DESC", "LIMIT 5", list(range(12999, 12994, -1)), 5),
         ("s DESC", "SKIP 2 LIMIT 3", list(range(12997, 12994, -1)), 5),
@@ -7466,6 +7476,7 @@ def test_indexed_node_order_reads_only_the_requested_window(graph_db):
 def test_indexed_node_order_preserves_nulls_ties_in_both_directions(graph_db):
     graph_db.sql("INSERT INTO docs (_id,id,score) VALUES ('a','a',5),('b','b',NULL),('c','c',5),('d','d',2)")
     graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
     for direction, expected in (("DESC", ["b", "a", "c", "d"]), ("ASC", ["d", "a", "c", "b"])):
         result = graph_db.cypher_json(
             "g",
@@ -7534,6 +7545,7 @@ def test_node_order_declines_indexes_with_different_complete_order(graph_db, def
 def test_composite_node_order_certifies_the_entire_requested_tuple(graph_db):
     graph_db.sql("INSERT INTO docs (_id,id,score) VALUES ('a','z',5),('b','b',NULL),('c','a',5),('d','d',2)")
     graph_db.sql("CREATE INDEX ranked ON docs(score DESC,id)")
+    graph_db.run_until_idle()
     result = graph_db.cypher_json(
         "g",
         {"query": "MATCH (n:D) RETURN n.id ORDER BY n.score DESC,n.id LIMIT 2", "limits": {"scanned_anchors": 2}},
@@ -7544,6 +7556,7 @@ def test_composite_node_order_certifies_the_entire_requested_tuple(graph_db):
 
 def test_empty_indexed_order_preserves_a_zero_anchor_budget(graph_db):
     graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
     result = graph_db.cypher_json(
         "g",
         {"query": "MATCH (n:D) RETURN n.score ORDER BY n.score DESC LIMIT 5", "limits": {"scanned_anchors": 0}},
@@ -7564,7 +7577,9 @@ def test_empty_indexed_order_preserves_a_zero_anchor_budget(graph_db):
 def test_ordered_node_reads_preserve_selective_access_paths(graph_db, predicate, expected, budget):
     populate(graph_db, 13000)
     graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
     graph_db.sql("CREATE INDEX by_id ON docs(id)")
+    graph_db.run_until_idle()
     result = graph_db.cypher_json(
         "g",
         {
@@ -7634,7 +7649,9 @@ def test_composite_ordered_seeks_merge_disjoint_in_domains(graph_db):
         )
     # Both candidate orders must be considered regardless of catalog ordering.
     graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
     graph_db.sql("CREATE INDEX bucket_score ON docs(id,score DESC)")
+    graph_db.run_until_idle()
     for predicate, expected, ceiling in (
         ("n.id='a'", list(range(12998, 12989, -2)), 5),
         ("n.id IN ['b','a','b',null]", list(range(12999, 12994, -1)), 12),
@@ -7665,6 +7682,7 @@ def test_composite_ordered_seeks_merge_disjoint_in_domains(graph_db):
 def test_order_lineage_survives_total_cypher_with_stages(graph_db):
     populate(graph_db, 13000)
     graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
     for query in (
         "MATCH (n:D) WITH n RETURN n.score ORDER BY n.score DESC LIMIT 5",
         "MATCH (n:D) WITH n AS m WITH m.score AS s RETURN s AS v ORDER BY v DESC LIMIT 5",
@@ -7735,6 +7753,7 @@ def test_ordered_in_partitions_keep_required_conditions_on_storage_coercion(grap
         graph_db.sql(f"CREATE TABLE {name} (id {column_type},score BIGINT)")
         graph_db.sql(f"INSERT INTO {name} (_id,id,score) VALUES ('a',{repr(first)},40),('b',{repr(second)},30)")
         graph_db.sql(f"CREATE INDEX {name}_rank ON {name}(score DESC)")
+        graph_db.run_until_idle()
         with closing(graph_db.open_table(name)) as table:
             table.add_index({"name": "links", "kind": "graph", "config_json": "{}"})
         graph_db.graph_catalog_json(
@@ -7762,6 +7781,7 @@ def test_ordered_in_partitions_keep_required_conditions_on_storage_coercion(grap
             )
             assert result["rows"] == [[{"type": "integer", "value": "40"}]]
         graph_db.sql(f"CREATE INDEX {name}_prefix ON {name}(id,score DESC)")
+        graph_db.run_until_idle()
         bounded = graph_db.cypher_json(
             name,
             {
@@ -7781,6 +7801,7 @@ def test_wide_ordered_in_domains_keep_bounded_planning_cost(graph_db):
             + ",".join(f"('n{i:05}','b{i % 256}',{i})" for i in range(start, start + 500))
         )
     graph_db.sql("CREATE INDEX bucket_score ON docs(id,score DESC)")
+    graph_db.run_until_idle()
     result = graph_db.cypher_json(
         "g",
         {
@@ -7797,7 +7818,9 @@ def test_wide_ordered_in_domains_keep_bounded_planning_cost(graph_db):
 def test_transparent_with_predicates_reach_native_seeks(graph_db):
     populate(graph_db, 13000)
     graph_db.sql("CREATE INDEX docs_id ON docs(id)")
+    graph_db.run_until_idle()
     graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
     for query in (
         "MATCH (n:D) WITH n WHERE n.id=$key RETURN n.score ORDER BY n.score DESC LIMIT 1",
         "MATCH (n:D) WITH n.id AS k,n.score AS s WHERE k=$key RETURN s ORDER BY s DESC LIMIT 1",
@@ -7854,7 +7877,9 @@ def test_transparent_with_predicates_reach_native_seeks(graph_db):
 def test_ordered_distinct_streams_entities_and_adjacent_scalar_keys(graph_db):
     populate(graph_db, 13000)
     graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
     graph_db.sql("CREATE INDEX ranked_asc ON docs(score)")
+    graph_db.run_until_idle()
     plain = graph_db.cypher_json("g", {"query": "MATCH (n:D) RETURN n ORDER BY n.score DESC LIMIT 5"})
     distinct = graph_db.cypher_json(
         "g",
@@ -7897,6 +7922,7 @@ def test_ordered_distinct_streams_entities_and_adjacent_scalar_keys(graph_db):
 def test_constant_sort_keys_preserve_bounded_reads_and_primary_ties(graph_db):
     populate(graph_db, 13000)
     graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
     for order in ("1,n.score DESC", "$constant,n.score DESC,n.score", "n.id,n.score DESC"):
         predicate = "WHERE n.id='n12999'" if order.startswith("n.id") else ""
         result = graph_db.cypher_json(
@@ -7929,6 +7955,7 @@ def test_constant_sort_keys_preserve_bounded_reads_and_primary_ties(graph_db):
 def test_partial_order_distinct_retains_only_the_distinct_window(graph_db):
     populate(graph_db, 13000)
     graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
     for projection in ("n.id,n.score", "n.score,n.id IS NULL"):
         actual = graph_db.cypher_json(
             "g",
@@ -7959,6 +7986,7 @@ def test_partial_order_distinct_retains_only_the_distinct_window(graph_db):
 def test_redundant_with_distinct_preserves_source_identity_and_bounded_reads(graph_db):
     populate(graph_db, 13000)
     graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
     for stage in ("WITH DISTINCT n", "WITH n AS m WITH DISTINCT m WITH m AS n", "WITH DISTINCT *"):
         actual = graph_db.cypher_json(
             "g",
@@ -7987,6 +8015,7 @@ def test_redundant_with_distinct_preserves_source_identity_and_bounded_reads(gra
 def test_composite_index_prefixes_refine_boundary_ties_once(graph_db):
     populate(graph_db, 13000)
     graph_db.sql("CREATE INDEX covering ON docs(score DESC,id)")
+    graph_db.run_until_idle()
     for stage in ("", "WITH DISTINCT n", "WITH n AS m WITH DISTINCT m WITH m AS n"):
         actual = graph_db.cypher_json(
             "g",
@@ -8029,6 +8058,7 @@ def test_composite_index_prefixes_refine_boundary_ties_once(graph_db):
 def test_certified_ordered_offsets_retire_skipped_rows(graph_db):
     populate(graph_db, 13000)
     graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
     for stage, projection in (("", "n.score"), ("WITH DISTINCT n", "n.score"), ("WITH n AS m", "m.score")):
         actual = graph_db.cypher_json(
             "g",
@@ -8054,6 +8084,7 @@ def test_reverse_index_windows_preserve_ties_nulls_and_bounds(graph_db):
     populate(graph_db, 13000)
     for index_direction, direction, expected in (("DESC", "ASC", range(5)), ("ASC", "DESC", range(12999, 12994, -1))):
         graph_db.sql(f"CREATE INDEX ranked ON docs(score {index_direction})")
+        graph_db.run_until_idle()
         actual = graph_db.cypher_json(
             "g",
             {
@@ -8064,6 +8095,7 @@ def test_reverse_index_windows_preserve_ties_nulls_and_bounds(graph_db):
         assert [int(row[0]["value"]) for row in actual["rows"]] == list(expected)
         graph_db.sql("DROP INDEX ranked ON docs")
     graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
     graph_db.sql("UPDATE docs SET score=-1 WHERE score<64")
     graph_db.sql("UPDATE docs SET score=NULL WHERE score>=12990")
     for direction in ("ASC", "DESC"):
@@ -8077,6 +8109,7 @@ def test_reverse_index_windows_preserve_ties_nulls_and_bounds(graph_db):
             assert actual["rows"] == control["rows"]
     graph_db.sql("DROP INDEX ranked ON docs")
     graph_db.sql("CREATE INDEX covering ON docs(score DESC,id DESC)")
+    graph_db.run_until_idle()
     actual = graph_db.cypher_json(
         "g", {"query": "MATCH (n:D) RETURN n ORDER BY n.score ASC SKIP 2 LIMIT 5", "limits": {"scanned_anchors": 96}}
     )
@@ -8086,6 +8119,7 @@ def test_reverse_index_windows_preserve_ties_nulls_and_bounds(graph_db):
     graph_db.sql("DROP INDEX covering ON docs")
     graph_db.sql("UPDATE docs SET id='bucket' WHERE score>=100 AND score<200")
     graph_db.sql("CREATE INDEX prefixed ON docs(id,score DESC)")
+    graph_db.run_until_idle()
     prefix = graph_db.cypher_json(
         "g",
         {
@@ -8099,6 +8133,7 @@ def test_reverse_index_windows_preserve_ties_nulls_and_bounds(graph_db):
 def test_indexed_extrema_use_authorized_nonnull_boundaries(graph_db):
     populate(graph_db, 13000)
     graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
     for stage, arg in (("", "n.score"), ("WITH DISTINCT n", "n.score"), ("WITH n.score AS s", "s")):
         actual = graph_db.cypher_json(
             "g",
@@ -8146,6 +8181,7 @@ def test_indexed_extrema_use_authorized_nonnull_boundaries(graph_db):
 def test_ordered_distinct_seeks_past_confirmed_duplicate_groups(graph_db):
     populate(graph_db, 13000)
     graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
     for start in range(0, 12000, 1000):
         graph_db.sql(f"UPDATE docs SET score=20000 WHERE score>={start} AND score<{start + 1000}")
     for stage, arg in (("", "n.score"), ("WITH n.score AS s", "s")):
@@ -8211,12 +8247,14 @@ def test_ordered_group_seeks_preserve_string_and_boolean_keys(graph_db):
     populate(graph_db, 1000)
     graph_db.sql("UPDATE docs SET id='東京',enabled=true WHERE score<900")
     graph_db.sql("CREATE INDEX text_ranked ON docs(id DESC)")
+    graph_db.run_until_idle()
     text = graph_db.cypher_json(
         "g", {"query": "MATCH (n:D) RETURN DISTINCT n.id ORDER BY n.id DESC LIMIT 5", "limits": {"scanned_anchors": 16}}
     )
     assert [row[0]["value"] for row in text["rows"]] == ["東京", "n999", "n998", "n997", "n996"]
     graph_db.sql("DROP INDEX text_ranked ON docs")
     graph_db.sql("CREATE INDEX bool_ranked ON docs(enabled DESC)")
+    graph_db.run_until_idle()
     for direction, expected in (("ASC", [False, True]), ("DESC", [True, False])):
         boolean = graph_db.cypher_json(
             "g",
@@ -8248,6 +8286,7 @@ def test_tuple_distinct_and_singleton_domains_skip_duplicate_runs(graph_db):
     for start in range(0, 12000, 1000):
         graph_db.sql(f"UPDATE docs SET score=20000,id='same' WHERE score>={start} AND score<{start + 1000}")
     graph_db.sql("CREATE INDEX tuples ON docs(score DESC,id)")
+    graph_db.run_until_idle()
     for stage, score, identity in (("", "n.score", "n.id"), ("WITH n.score AS s,n.id AS k", "s", "k")):
         result = graph_db.cypher_json(
             "g",
@@ -8294,6 +8333,7 @@ def test_tuple_distinct_and_singleton_domains_skip_duplicate_runs(graph_db):
 def test_ordered_group_aggregates_only_observe_selected_domains(graph_db):
     populate(graph_db, 13000)
     graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
+    graph_db.run_until_idle()
     for observers, anchors in (
         ("count(*)", 16),
         ("max(n.score)", 16),
@@ -8426,6 +8466,7 @@ def test_unbounded_key_domains_and_cardinality_skip_duplicate_runs(graph_db):
     for start in range(0, 13000, 1000):
         graph_db.sql(f"UPDATE docs SET score=score%3 WHERE score>={start} AND score<{start + 1000}")
     graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
     partial = "MATCH (n:D) RETURN DISTINCT n.id,n.score ORDER BY n.score DESC LIMIT 5"
     assert (
         graph_db.cypher_json("g", {"query": partial})["rows"]

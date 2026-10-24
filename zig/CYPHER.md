@@ -3308,3 +3308,45 @@ and typed hash membership bounds normalization work. The surviving equality
 partitions remain disjoint and reuse the pinned read and continuation protocol.
 Independent property domains retain their existing cost barrier. This keeps
 repeated admission hints from disabling sparse ordered SQL/Cypher observers.
+
+
+The final public-boundary measurements use 64,000 documents on Lite and
+Directory, with native indexes fully published. The grouped fixture has eight
+`id` keys and three `score` values, indexed by `(id, score DESC)` and
+`(score DESC)`. The bounded-group fixture has one distinct `id` per document.
+Every measurement checks its exact result.
+
+| First five ordered groups | Previous result at 64,000 documents | Final anchors / states, both backends |
+| --- | --- | --- |
+| COUNT(DISTINCT score) + 1 | State budget exceeded | 6 / 192 |
+| COUNT(DISTINCT score), aggregate-output WHERE c > 0 | State budget exceeded | 6 / 257 |
+
+The arithmetic and filtered-group plans retain 44,964 and 41,620 bytes respectively.
+Their public regressions use a 256-anchor, 2 MiB ceiling, including offset
+windows. Overlapping native membership predicates followed by COUNT(DISTINCT),
+MIN and MAX use eight anchors, 787 states and 97,388 bytes on both backends.
+
+SQL latency is a warmed median after one warmup and three measured executions:
+
+| SQL aggregate over GRAPH_TABLE, 64,000 documents | Previous result | Lite | Directory |
+| --- | --- | --- | --- |
+| COUNT(DISTINCT score), MIN, MAX; outer score >= 1 | Operator limit exceeded | 0.36 ms | 1.03 ms |
+| Same observers; outer score = 0 OR score = 2 | Operator limit exceeded | 0.65 ms | 2.30 ms |
+| Same observers grouped by id | Operator limit exceeded | 2.05 ms | 3.11 ms |
+| Grouped observers inside COLUMNS, outer ORDER BY id | Operator limit exceeded | 1.89 ms | 3.12 ms |
+
+Additional 64,000-row checks cover filtering on a different projected field,
+filtered groups, derived aliases and invocation parameters. Nullable keys and
+arguments, source ordinals, provider declines, losing-group errors, weighted
+counts and arithmetic overflow retain their original results and diagnostics.
+Index-budget fixtures wait for publication before asserting bounded indexed
+work, so background build timing cannot select their ordinary scan fallback.
+
+
+Final validation after merging origin/main (`60a70f8399`): 469 native Cypher
+tests, 1,081 SQL tests, 226 catalog-related tests and four transport checks;
+all 1,142 public Python Cypher/performance tests on the final optimized library;
+and the six new public regressions plus 66 publication-ready index-budget
+fixture cases in separate focused runs. The C API build and its 137-function
+export boundary, generated engine-error inventory, Zig/Python formatting and
+whitespace checks pass.
