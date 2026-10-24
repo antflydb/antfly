@@ -2911,7 +2911,7 @@ fn openPrimaryStore(alloc: Allocator, path: []const u8, opts: db_config.CoreOpen
             backend.* = mem_backend_mod.Backend.init(alloc, mem_opts);
             errdefer backend.close();
 
-            var runtime_store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+            var runtime_store = try backend.runtimeStore(alloc, .{ .name = db_config.primary_namespace_name });
             errdefer runtime_store.deinit();
 
             break :mem_blk .{
@@ -2923,7 +2923,7 @@ fn openPrimaryStore(alloc: Allocator, path: []const u8, opts: db_config.CoreOpen
             var handle = try lsm_backend_mod.BackendHandle.init(alloc, lsm_opts);
             errdefer handle.close();
 
-            var runtime_store = try handle.backend.runtimeStore(alloc, .{ .name = "docs" });
+            var runtime_store = try handle.backend.runtimeStore(alloc, .{ .name = db_config.primary_namespace_name });
             errdefer runtime_store.deinit();
 
             break :lsm_mem_blk .{
@@ -2938,7 +2938,7 @@ fn openPrimaryStore(alloc: Allocator, path: []const u8, opts: db_config.CoreOpen
             var handle = try lsm_backend_mod.BackendHandle.open(alloc, path, lsm_opts);
             errdefer handle.close();
 
-            var runtime_store = try handle.backend.runtimeStore(alloc, .{ .name = "docs" });
+            var runtime_store = try handle.backend.runtimeStore(alloc, .{ .name = db_config.primary_namespace_name });
             errdefer runtime_store.deinit();
 
             break :lsm_blk .{
@@ -6338,7 +6338,9 @@ pub const DB = struct {
             // Status capture may borrow primary-store read epochs. Detach its
             // final cache only after capture, retaining all retired payloads
             // in backend ownership while accounting walks bounded CPU slices.
-            try program.store_preflight.resumeWithAdmission(backend, cache_io, original);
+            if (self.open_mode.allowsIndexWorkers() and @import("close_index_status.zig").Program.supportsOwnedAppend(backend)) {
+                try program.commitWithAdmission(backend, cache_io, original);
+            } else try program.store_preflight.resumeWithAdmission(backend, cache_io, original);
         }
     }
 
@@ -6445,10 +6447,13 @@ pub const DB = struct {
             // human-facing lifecycle/status view once at graceful shutdown;
             // a failure cannot invalidate the authoritative posting WAL and
             // will be repaired from it on the next open.
+            self.local_execution.close_index_status.abandonWriteOwner();
             self.persistCloseIndexStatus() catch |err| {
                 std.log.warn("index status snapshot persistence deferred during close err={s}", .{@errorName(err)});
             };
-            self.core.syncStore(true) catch |err| {
+            // The owned append already forced its WAL. Preserve deferred run
+            // finalization here while avoiding a second durability barrier.
+            self.core.syncStore(!self.local_execution.close_index_status.owned_wal_durable) catch |err| {
                 std.log.warn("index status snapshot sync deferred during close err={s}", .{@errorName(err)});
             };
         }
@@ -37483,6 +37488,9 @@ pub const DB = struct {
         try program.acquire(io, original);
         defer program.release();
         if (program.complete) return;
+        // The owned append addresses the same namespace as primary DocStore.
+        // This static label outlives the DB-owned capture continuation.
+        program.namespace_name = db_config.primary_namespace_name;
         planning: while (!program.planning_complete and program.plan_group < 4) {
             try original.checkpoint();
             inline for (.{ "text_indexes", "dense_indexes", "sparse_indexes", "graph_indexes" }, 0..) |field, group| {
@@ -37547,6 +37555,7 @@ pub const DB = struct {
 
     fn persistCloseIndexStatus(self: *DB) !void {
         const program = &self.local_execution.close_index_status;
+        if (program.status_persisted) return;
         if (!program.complete) return self.saveAllLiveIndexStatusSnapshots(self.alloc);
         if (program.row_count == 0) return;
         var status_batch = try self.core.store.beginWriteBatch();
@@ -57654,7 +57663,7 @@ fn openSplitDestinationStore(self: *DB, dest_dir: []const u8) !OpenedSplitDestin
             var handle = try lsm_backend_mod.BackendHandle.open(self.alloc, dest_dir, dest_opts);
             errdefer handle.close();
 
-            var runtime_store = try handle.backend.runtimeStore(self.alloc, .{ .name = "docs" });
+            var runtime_store = try handle.backend.runtimeStore(self.alloc, .{ .name = db_config.primary_namespace_name });
             errdefer runtime_store.deinit();
 
             break :blk .{

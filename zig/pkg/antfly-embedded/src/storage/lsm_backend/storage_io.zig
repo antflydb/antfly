@@ -361,6 +361,7 @@ pub const DurabilityResources = struct {
         begin_read: *const fn (*anyopaque, []const u8, usize, read_admission.Port) anyerror!ControlFileReadOperation,
         begin_sync: *const fn (*anyopaque, []const u8, bool, read_admission.Port) anyerror!SyncOperation,
         deinit: *const fn (*anyopaque) void,
+        retire_with_admission: ?*const fn (*anyopaque, read_admission.Port) anyerror!void = null,
         begin_append: ?*const fn (*anyopaque, []const u8, bool, read_admission.Port) anyerror!SyncOperation = null,
         begin_control_replace: ?*const fn (*anyopaque, []const u8, []const u8, read_admission.Port) anyerror!SyncOperation = null,
         begin_create_directory: ?*const fn (*anyopaque, []const u8, read_admission.Port) anyerror!SyncOperation = null,
@@ -400,6 +401,12 @@ pub const DurabilityResources = struct {
     pub fn beginSyncParent(self: *DurabilityResources, path: []const u8, original: read_admission.Port) !SyncOperation {
         return BoundaryAbi.call("begin_sync", self.boundary_dispatch, self.vtable.begin_sync, .{ self.ptr, path, true, original });
     }
+    pub fn retireWithAdmission(self: *DurabilityResources, original: read_admission.Port) !void {
+        const retire = self.vtable.retire_with_admission orelse return error.ExecutionWaitUnsupported;
+        try BoundaryAbi.call("retire_with_admission", self.boundary_dispatch, retire, .{ self.ptr, original });
+        self.* = undefined;
+    }
+
     /// Mandatory quiesced join, including any accepted phase. Never cancel a
     /// durability operation or release its publication lease before this join.
     pub fn deinit(self: *DurabilityResources) void {
@@ -804,6 +811,7 @@ pub const Storage = struct {
         begin_control_file_read_with_admission: ?*const fn (*anyopaque, []const u8, usize, read_admission.Port) anyerror!ControlFileReadOperation = null,
         try_prepare_durability_with_admission: ?*const fn (*anyopaque, read_admission.Port) anyerror!?DurabilityResources = null,
         try_prepare_append_with_admission: ?*const fn (*anyopaque, []const u8, read_admission.Port) anyerror!?DurabilityResources = null,
+        append_resource_bytes: ?*const fn (*anyopaque, usize) anyerror!u64 = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -1093,6 +1101,13 @@ pub const Storage = struct {
     /// Freeze encoded bytes on admitted caller CPU before acquiring publication.
     /// This grant owns their allocation, descriptor and worker until retirement.
     /// Null or error holds no tentative resources and performs no write.
+    /// Additional frozen bytes and grant header, excluding the service's
+    /// separately governed executor heap/stacks and descriptor pool.
+    pub fn appendResourceBytes(self: Storage, len: usize) !u64 {
+        const bytes = self.vtable.append_resource_bytes orelse return error.ExecutionWaitUnsupported;
+        return BoundaryAbi.call("append_resource_bytes", self.boundary_dispatch, bytes, .{ self.ptr, len });
+    }
+
     pub fn tryPrepareAppendWithAdmission(self: Storage, bytes: []const u8, original: read_admission.Port) !?DurabilityResources {
         try original.checkpoint();
         const prepare = self.vtable.try_prepare_append_with_admission orelse return error.ExecutionWaitUnsupported;
@@ -3153,6 +3168,11 @@ const NativePhysicalOperation = if (!supports_native_storage or builtin.os.tag =
 /// Owns a bounded mailbox and an already admitted worker. The physical worker
 /// invokes no allocator, descriptor admission, task dispatcher or original
 /// control callback. Callers prepare inputs and observe results on admitted CPU.
+fn nativeAppendResourceBytes(_: *anyopaque, len: usize) !u64 {
+    if (comptime !supports_native_storage or builtin.os.tag == .freestanding) return error.ExecutionWaitUnsupported;
+    return std.math.add(u64, @sizeOf(NativeDurabilityResources), len) catch error.ResourceBudgetExceeded;
+}
+
 const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag == .freestanding) struct {} else struct {
     const Phase = enum(u8) { idle, queued, completed, stopping };
     const Kind = enum { control_read, contents, directory, append, control_replace, create_directory };
@@ -3162,6 +3182,7 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
     wake: std.Io.Event = .unset,
     phase: std.atomic.Value(Phase) = .init(.idle),
     active: bool = false, // Serialized caller ownership; never read by worker.
+    joined: bool = false,
     kind: Kind = .contents,
     path: [std.fs.max_path_bytes]u8 = undefined,
     path_len: usize = 0,
@@ -3175,7 +3196,7 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
     append_create: bool = false,
     invalidation_pending: bool = false,
 
-    const vtable: DurabilityResources.VTable = .{ .begin_read = beginRead, .begin_sync = beginSync, .deinit = deinit, .begin_append = beginAppend, .begin_control_replace = beginControlReplace, .begin_create_directory = beginCreateDirectory };
+    const vtable: DurabilityResources.VTable = .{ .begin_read = beginRead, .begin_sync = beginSync, .deinit = deinit, .retire_with_admission = retireWithAdmission, .begin_append = beginAppend, .begin_control_replace = beginControlReplace, .begin_create_directory = beginCreateDirectory };
     const sync_vtable: SyncOperation.VTable = .{ .wait_with_admission = wait, .deinit = retireOperation };
     const read_vtable: ControlFileReadOperation.VTable = .{ .wait_with_admission = waitRead, .deinit = retireOperation };
 
@@ -3225,7 +3246,7 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
 
     fn prepareCommand(self: *NativeDurabilityResources, path: []const u8, kind: Kind, limit: usize, create_if_missing: bool, original: read_admission.Port) !void {
         try requireControl(original);
-        if (self.active) return error.ResourceBudgetExceeded;
+        if (self.active or self.joined or self.phase.load(.acquire) == .stopping) return error.ResourceBudgetExceeded;
         if (path.len >= self.path.len) return error.NameTooLong;
         if (kind == .control_read and (limit == 0 or limit > self.buffer.len)) return error.ResourceBudgetExceeded;
         std.debug.assert(self.phase.load(.acquire) == .idle);
@@ -3439,17 +3460,41 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
         self.phase.store(.idle, .release);
     }
 
+    fn retireWithAdmission(raw: *anyopaque, original: read_admission.Port) !void {
+        const self: *NativeDurabilityResources = @ptrCast(@alignCast(raw));
+        try requireControl(original);
+        if (self.active) return error.ResourceBudgetExceeded;
+        self.phase.store(.stopping, .release);
+        self.wake.set(self.permit.io);
+        if (!self.joined) {
+            const boundary = (try original.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+            try boundary.begin(boundary.ptr);
+            self.future.await(self.permit.io);
+            self.joined = true; // Commit the join before fallible reentry.
+            try boundary.end(boundary.ptr);
+        }
+        try original.checkpoint();
+        // The caller retains the storage owner until this grant retires, so
+        // permit release cannot tear down the executor under admitted CPU.
+        if (self.permit.state.refs.load(.acquire) <= 1) return error.ExecutionWaitUnsupported;
+        self.destroy();
+    }
+
+    fn destroy(self: *NativeDurabilityResources) void {
+        const allocator = self.allocator;
+        var permit = self.permit;
+        if (self.append_bytes) |bytes| allocator.free(bytes);
+        allocator.destroy(self);
+        permit.release();
+    }
+
     fn deinit(raw: *anyopaque) void {
         const self: *NativeDurabilityResources = @ptrCast(@alignCast(raw));
         if (self.active) retireOperation(self);
         self.phase.store(.stopping, .release);
         self.wake.set(self.permit.io);
-        self.future.await(self.permit.io);
-        const allocator = self.allocator;
-        var permit = self.permit;
-        if (self.append_bytes) |bytes| allocator.free(bytes);
-        allocator.destroy(self);
-        permit.release(); // Last; may destroy the retained executor/allocator.
+        if (!self.joined) self.future.await(self.permit.io);
+        self.destroy();
     }
 };
 
@@ -3545,6 +3590,7 @@ const EventedNativeStorage = struct {
         .begin_control_file_read_with_admission = beginControlRead,
         .try_prepare_durability_with_admission = tryPrepareDurability,
         .try_prepare_append_with_admission = tryPrepareAppend,
+        .append_resource_bytes = nativeAppendResourceBytes,
     };
 
     pub fn init(allocator: Allocator, kind: RuntimeKind) !NativeStorage {
@@ -3939,6 +3985,7 @@ const ThreadedNativeStorage = struct {
         .begin_control_file_read_with_admission = beginControlRead,
         .try_prepare_durability_with_admission = tryPrepareDurability,
         .try_prepare_append_with_admission = tryPrepareAppend,
+        .append_resource_bytes = nativeAppendResourceBytes,
     };
 
     pub fn init(allocator: Allocator, kind: RuntimeKind) !NativeStorage {

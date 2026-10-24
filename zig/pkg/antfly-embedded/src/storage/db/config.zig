@@ -66,6 +66,9 @@ pub const PrimaryBackend = union(enum) {
     lsm: lsm_backend_mod.Options,
 };
 
+/// Physical namespace shared by primary DocStore bindings and close publication.
+pub const primary_namespace_name = "docs";
+
 /// Compaction domains must be contiguous key ranges, even in a metadata-only
 /// flush: no domain may jump across an absent payload family.
 pub fn primaryRunPartition(key: []const u8) []const u8 {
@@ -82,6 +85,12 @@ pub fn primaryRunPartition(key: []const u8) []const u8 {
     }
     if (key.len != 0 and key[0] == 0) return if (std.mem.order(u8, key, columns) == .lt) "\x00before-columns" else "\x00after-columns";
     return key[0..@min(key.len, 1)];
+}
+
+fn primaryRunPartitionWithAdmission(key: []const u8, original: @import("../../common/read_admission.zig").Port) ![]const u8 {
+    try original.checkpoint();
+    // Only the fixed family header and fixed comparison prefix are inspected.
+    return primaryRunPartition(key);
 }
 
 test "primary LSM isolates relational payload generations from metadata" {
@@ -146,6 +155,7 @@ pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .max_compaction_input_bytes = 2 * gib,
     .run_partition_prefix_bytes = 1,
     .run_partition_key = primaryRunPartition,
+    .run_partition_key_with_admission = primaryRunPartitionWithAdmission,
     .wal_soft_limit_segments = primary_wal_soft_limit_segments,
     .wal_hard_limit_segments = primary_wal_hard_limit_segments,
     .wal_soft_limit_bytes = primary_wal_soft_limit_bytes,

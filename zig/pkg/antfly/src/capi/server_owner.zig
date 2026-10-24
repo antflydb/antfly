@@ -7041,6 +7041,7 @@ test "controlled owner close preflight C entry drains a real DB with the origina
             return cause;
         };
         defer closeHandleId(id);
+        try handle.db.addIndex(.{ .name = "close_status", .kind = .full_text, .config_json = "{}" });
         const recovery = @import("../storage/server_transaction_recovery.zig");
         const Resolver = struct {
             fn resolve(_: *anyopaque, _: @import("antfly_local_sources").storage_transactions.TxnId, _: []const u8, _: @import("antfly_local_sources").storage_transactions.TxnStatus, _: u64) !void {}
@@ -7152,8 +7153,20 @@ test "controlled owner close preflight C entry drains a real DB with the origina
         try std.testing.expectEqual(@as(usize, 0), backend_probes[2].retirements.load(.acquire));
         try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerDrainClose(id, &request));
         if (handle.db.core.primary_store_owner.lsmBackend()) |backend| {
-            try std.testing.expect(handle.db.local_execution.close_index_status.store_preflight.phase == .done);
+            const program = &handle.db.local_execution.close_index_status;
+            try std.testing.expect(program.store_preflight.phase == .done);
             try std.testing.expect(backend.mutable_read_snapshot == null);
+            if (@TypeOf(program.*).supportsOwnedAppend(backend) and handle.db.open_mode.allowsIndexWorkers()) {
+                try std.testing.expect(program.commit_complete and program.status_persisted and program.owned_wal_durable);
+                try std.testing.expect(program.row_count != 0);
+                const projection = @import("antfly_local_sources").storage_db_status_projection;
+                const key = try projection.indexStatusKeyAlloc(a, "close_status");
+                defer a.free(key);
+                const raw = try handle.db.core.store.get(a, key);
+                defer a.free(raw);
+                try std.testing.expect((try projection.decodeIndexStatusSnapshot(raw)).kind == .full_text);
+                try std.testing.expect(backend.mutable_read_snapshot == null);
+            }
         }
         try std.testing.expect(!handle.db.isClosed());
         try std.testing.expect(text_merge.producer_closing.load(.acquire));

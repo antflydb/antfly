@@ -445,6 +445,9 @@ pub const Options = struct {
     /// compaction input domains, never entry ordering or the persisted format.
     /// Namespace isolation still applies. Overrides the fixed prefix.
     run_partition_key: ?*const fn ([]const u8) []const u8 = null,
+    /// Equivalent extraction under original admission; labels borrow the pinned
+    /// key or stable backend storage. Required for admitted custom planning.
+    run_partition_key_with_admission: ?*const fn ([]const u8, read_admission.Port) anyerror![]const u8 = null,
     bloom: bloom.Config = lsm_table_file.default_filter_config,
     table_block_compression: lsm_table_file.CompressionPolicy = .snappy_adaptive,
     table_prefix_extractor: lsm_table_file.PrefixExtractor = lsm_table_file.default_prefix_extractor,
@@ -6308,6 +6311,60 @@ pub const Backend = struct {
         self.manifest_reserved_mutation_bytes += wire;
         return .{ .backend = self, .bytes = wire };
     }
+
+    /// Allocation-free planning and no-flush admission for a quiesced sorted
+    /// successor. Its complete mutable epoch conservatively covers incoming
+    /// output without charging one descriptor for each unsorted source row.
+    pub const QuiescedCommitPreparation = struct {
+        planner: @import("lsm_backend/manifest_credit.zig").SortedEstimate = .{},
+        generation: usize = 0,
+        recovered: u64 = 0,
+        baseline_done: bool = false,
+        input_index: usize = 0,
+        input_bytes: u64 = 0,
+
+        pub fn resumeWithAdmission(self: *@This(), backend: *Backend, candidate: *const ActiveMemTable, input: *const State, original: read_admission.Port) !CommitAdmission {
+            try original.checkpoint();
+            if (backend.manifest_recovery_required) return error.RecoveryRequired;
+            const root = backend.root_dir orelse return error.ExecutionWaitUnsupported;
+            if (!self.baseline_done) {
+                if (!backend.manifest_credit_reconciled) {
+                    while (self.generation <= backend.activeImmutableMemtableCount()) {
+                        const wire = if (self.generation == 0)
+                            try self.planner.resumeWithAdmission(backend.options, root.len, &backend.mutable, original)
+                        else
+                            try self.planner.resumeWithAdmission(backend.options, root.len, backend.activeImmutableMemtables()[self.generation - 1], original);
+                        self.recovered +|= wire;
+                        self.planner = .{};
+                        self.generation += 1;
+                    }
+                    try original.checkpoint();
+                    backend.manifest_unpublished_wire_bytes = self.recovered;
+                    backend.manifest_credit_reconciled = true;
+                }
+                self.baseline_done = true;
+            }
+            const wire = try self.planner.resumeWithAdmission(backend.options, root.len, candidate, original);
+            while (self.input_index < input.entryCount()) {
+                try original.checkpoint();
+                const entry = input.entryAt(self.input_index);
+                self.input_bytes +|= @as(u64, @sizeOf(state_mod.OwnedEntry)) +| entry.key.len +| entry.value.len +| if (entry.namespace_name) |name| name.len else @as(usize, 0);
+                self.input_index += 1;
+            }
+            try original.checkpoint();
+            const bytes = self.input_bytes;
+            if (backend.manifest_admitted_commits >= backend.options.manifest_publication_max_waiters +| 1 or
+                bytes > backend.options.manifest_commit_backlog_bytes -| backend.manifest_admitted_bytes) return error.ResourceBudgetExceeded;
+            backend.reconcileManifestCredit();
+            const credit = std.math.mul(u64, 2, wire) catch return error.ResourceBudgetExceeded;
+            // History pressure refuses before WAL. No hidden flush or IO.
+            if (!backend.manifestCreditFits(credit)) return error.ResourceBudgetExceeded;
+            backend.manifest_admitted_commits += 1;
+            backend.manifest_admitted_bytes += bytes;
+            backend.manifest_admitted_wire_bytes += credit;
+            return .{ .backend = backend, .bytes = bytes, .wire_bytes = wire, .counted = true };
+        }
+    };
 
     pub fn admitPreparedCommit(self: *Backend, incoming: *const ActiveMemTable, bulk: *const State, wire: u64) !CommitAdmission {
         if (self.manifest_recovery_required) return error.RecoveryRequired;
@@ -30250,5 +30307,76 @@ test "controlled physical sync backend WAL append owns actual publication and a 
         try preparation.retireWithAdmission(original);
         try std.testing.expectEqual(backend.estimateInMemoryStateBytesLocked(), backend.tracked_in_memory_state_bytes);
         try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+    }
+}
+
+test "controlled physical sync sorted manifest planning resumes every rejection without allocation" {
+    const admission = @import("../common/read_admission.zig");
+    const manifest = @import("lsm_backend/manifest_credit.zig");
+    const Control = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        failure: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const call = self.calls;
+            self.calls += 1;
+            if (call == self.stop) return self.failure;
+        }
+        fn partition(key: []const u8) []const u8 {
+            return key;
+        }
+        fn admitted(key: []const u8, original: admission.Port) ![]const u8 {
+            try original.checkpoint();
+            return partition(key);
+        }
+    };
+    const a = std.testing.allocator;
+    var data: State = .{};
+    defer data.deinit(a);
+    const name = try a.alloc(u8, 70 * 1024);
+    defer a.free(name);
+    @memset(name, 'n');
+    const key = try a.alloc(u8, 70 * 1024);
+    defer a.free(key);
+    @memset(key, 'k');
+    for ([_]?[]const u8{ null, "", name }) |namespace| {
+        for ([_]u8{ 'a', 'b' }) |last| {
+            key[key.len - 1] = last;
+            try data.upsert(a, .{ .name = namespace }, key, "value", false);
+        }
+    }
+    for (0..4) |mode| {
+        var options: Options = .{};
+        if (mode == 1) options.run_partition_prefix_bytes = key.len;
+        if (mode == 2) {
+            options.run_partition_key = Control.partition;
+            options.run_partition_key_with_admission = Control.admitted;
+        }
+        if (mode == 3) {
+            options.run_partition_prefix_bytes = 1;
+            options.max_run_file_physical_bytes = 64 * 1024;
+            options.max_run_file_entries = 2;
+        }
+        const expected = try manifest.estimate(a, options, 71, &data, &@as(State, .{}));
+        var calls: usize = 0;
+        for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.FileNotFound }) |failure| {
+            var stop: usize = 0;
+            while (stop <= calls) : (stop += 1) {
+                var control: Control = .{ .stop = if (stop == 0) std.math.maxInt(usize) else stop - 1, .failure = failure };
+                const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check } };
+                const original = admission.Port.init(&payload);
+                var plan: manifest.SortedEstimate = .{};
+                const actual = plan.resumeWithAdmission(options, 71, &data, original) catch |cause| blk: {
+                    try std.testing.expectEqual(failure, cause);
+                    control.stop = std.math.maxInt(usize);
+                    break :blk try plan.resumeWithAdmission(options, 71, &data, original);
+                };
+                try std.testing.expectEqual(expected, actual);
+                try std.testing.expect(plan.complete and plan.index == data.entryCount());
+                if (stop == 0) calls = control.calls;
+                try std.testing.expectEqual(expected, try plan.resumeWithAdmission(options, 71, &data, original));
+            }
+        }
     }
 }

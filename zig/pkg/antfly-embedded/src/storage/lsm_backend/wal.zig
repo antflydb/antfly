@@ -3295,6 +3295,19 @@ pub fn CurrentStateAppend(comptime Publication: type) type {
             return cause;
         }
 
+        /// Retire a terminal append's worker on the original wait boundary.
+        /// A failed reentry leaves the grant, frozen bytes and their charge
+        /// reachable for retry, including when physical join already finished.
+        pub fn retireWithAdmission(self: *Self, original: @import("../../common/read_admission.zig").Port) !void {
+            try original.checkpoint();
+            if (self.stage != .published and self.stage != .failed) return error.ResourceBudgetExceeded;
+            std.debug.assert(self.pending == .none and self.publication == null);
+            if (self.resources) |*resources| {
+                try resources.retireWithAdmission(original);
+                self.resources = null;
+            }
+        }
+
         /// Mandatory quiesced destruction joins only accepted physical work.
         /// Unpublished possible writes require recovery before releasing the
         /// guard. It never starts missing barriers or publishes caller state.

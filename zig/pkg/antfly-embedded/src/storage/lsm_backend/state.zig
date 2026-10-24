@@ -581,6 +581,10 @@ pub const ActiveMemTable = struct {
     ordered: OrderedIndex = .{},
     ordered_enabled: bool = true,
 
+    pub fn supportsQuiescedPublication(self: *const ActiveMemTable) bool {
+        return self.ordered_enabled and self.entries.capacity == 0 and self.index.estimatedMemoryBytes() == 0 and self.arena_owner == null;
+    }
+
     pub fn entryCount(self: *const ActiveMemTable) usize {
         return if (self.ordered_enabled) (if (self.ordered.root) |root| root.count else 0) else self.entries.items.len;
     }
@@ -893,11 +897,8 @@ pub const ActiveMemTable = struct {
         /// Move the immutable input and retain the live root in constant time.
         /// The live table must remain quiesced through publication/abandonment.
         pub fn init(live: *const ActiveMemTable, source: *State) @This() {
-            std.debug.assert(live.ordered_enabled);
-            // Ordered writers own a tree and its node pool exclusively. A
-            // legacy flat/arena generation must be normalized before using
-            // this tree-only publication and retirement protocol.
-            std.debug.assert(live.entries.capacity == 0 and live.index.estimatedMemoryBytes() == 0 and live.arena_owner == null);
+            // Legacy flat/arena generations require prior normalization.
+            std.debug.assert(live.supportsQuiescedPublication());
             const out = @This(){ .source = source.*, .candidate = .{ .ordered = live.ordered.fork(), .logical_bytes = live.logical_bytes } };
             source.* = .{};
             return out;

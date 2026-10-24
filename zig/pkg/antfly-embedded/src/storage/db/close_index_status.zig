@@ -22,6 +22,7 @@ const Snapshot = @import("../../index.zig").IndexSnapshot;
 const state = @import("../lsm_backend/state.zig");
 const wal = @import("../lsm_backend/wal.zig");
 const resources = @import("../resource_manager.zig");
+const Backend = @import("../lsm_backend.zig").Backend;
 
 /// Only this fixed metadata remains after Program frees its payloads. Keeping
 /// retained credit here releases the bounded construction slot immediately;
@@ -54,7 +55,16 @@ pub const Program = struct {
     const Row = state.OwnedEntry;
     const Chunk = struct { next: ?*Chunk = null, used: usize = 0, rows: [32]Row = undefined };
     busy: std.atomic.Value(bool) = .init(false),
-    store_preflight: @import("../lsm_backend.zig").Backend.QuiescedClosePreflight = .{},
+    store_preflight: Backend.QuiescedClosePreflight = .{},
+    mutable_publication: ?Backend.QuiescedMutablePublication = null,
+    manifest_preparation: Backend.QuiescedCommitPreparation = .{},
+    manifest_ticket: ?Backend.CommitAdmission = null,
+    append_credit: ?*Credit = null,
+    operation: ?Backend.QuiescedWalAppend(Publication) = null,
+    status_persisted: bool = false,
+    owned_wal_durable: bool = false,
+    commit_complete: bool = false,
+    retire_row: usize = 0,
     complete: bool = false,
     group: usize = 0,
     index: usize = 0,
@@ -67,7 +77,11 @@ pub const Program = struct {
     planned_bytes: u64 = 0,
     record_size: wal.StateRecordSize = .{},
     planning_complete: bool = false,
+    /// Borrowed immutable namespace label, pinned for the capture lifetime.
+    namespace_name: ?[]const u8 = null,
+    namespace_copied: usize = 0,
     capture_reserved: bool = false,
+    capture_allocator: ?std.mem.Allocator = null,
     capture_manager: ?*resources.ResourceManager = null,
     capture_credit: ?*Credit = null,
     input: state.State = .{},
@@ -112,13 +126,13 @@ pub const Program = struct {
     pub fn planName(self: *Program, name: []const u8) !void {
         std.debug.assert(!self.planning_complete);
         const key_len = std.math.add(usize, projection.index_status_prefix.len, name.len) catch return error.ResourceBudgetExceeded;
-        const payload = try state.sharedEntryAllocationBytes(null, key_len, projection.index_status_encoded_len);
+        const payload = try state.sharedEntryAllocationBytes(if (self.namespace_name) |name_| name_.len else null, key_len, projection.index_status_encoded_len);
         var bytes = std.math.add(u64, self.planned_bytes, payload) catch return error.ResourceBudgetExceeded;
         if (self.planned_count == 0) bytes = std.math.add(u64, bytes, @sizeOf(Credit)) catch return error.ResourceBudgetExceeded;
         bytes = std.math.add(u64, bytes, @sizeOf(Row)) catch return error.ResourceBudgetExceeded;
         if (self.planned_count % 32 == 0) bytes = std.math.add(u64, bytes, @sizeOf(Chunk)) catch return error.ResourceBudgetExceeded;
         var size = self.record_size;
-        try size.add(0, key_len, projection.index_status_encoded_len);
+        try size.add(if (self.namespace_name) |name_| name_.len else 0, key_len, projection.index_status_encoded_len);
         self.planned_count += 1;
         self.planned_bytes = bytes;
         self.record_size = size;
@@ -140,7 +154,9 @@ pub const Program = struct {
 
     pub fn ensureRow(self: *Program, allocator: std.mem.Allocator) !void {
         if (self.tail) |tail| if (tail.used != tail.rows.len) return;
+        if (self.capture_allocator) |owned| std.debug.assert(owned.ptr == allocator.ptr and owned.vtable == allocator.vtable);
         const chunk = try allocator.create(Chunk);
+        self.capture_allocator = allocator;
         chunk.* = .{};
         if (self.tail) |tail| tail.next = chunk else self.head = chunk;
         self.tail = chunk;
@@ -155,11 +171,17 @@ pub const Program = struct {
         const prefix = projection.index_status_prefix;
         if (self.pending_key == null) {
             const size = std.math.add(usize, prefix.len, name.len) catch return error.ResourceBudgetExceeded;
-            self.pending_entry = try state.allocateSharedEntry(allocator, null, size, projection.index_status_encoded_len, false);
+            self.pending_entry = try state.allocateSharedEntry(allocator, if (self.namespace_name) |name_| name_.len else null, size, projection.index_status_encoded_len, false);
             self.pending_key = self.pending_entry.?.key;
             @memcpy(self.pending_key.?[0..prefix.len], prefix);
             self.copied = prefix.len;
         }
+        if (self.namespace_name) |namespace| while (self.namespace_copied < namespace.len) {
+            try original.checkpoint();
+            const end = self.namespace_copied + @min(namespace.len - self.namespace_copied, 16 * 1024);
+            @memcpy(self.pending_entry.?.namespace_name.?[self.namespace_copied..end], namespace[self.namespace_copied..end]);
+            self.namespace_copied = end;
+        };
         const key = self.pending_key.?;
         while (self.copied < key.len) {
             try original.checkpoint();
@@ -177,6 +199,7 @@ pub const Program = struct {
         self.pending_key = null;
         self.pending_entry = null;
         self.pending_value = null;
+        self.namespace_copied = 0;
         self.copied = 0;
         self.releaseText();
         self.index += 1;
@@ -247,9 +270,125 @@ pub const Program = struct {
         return std.math.add(u64, self.record_size.total(), @sizeOf(Credit)) catch return error.ResourceBudgetExceeded;
     }
 
+    const Publication = struct {
+        program: *Program,
+        backend: *Backend,
+        pub fn publish(self: *@This(), _: wal.AppendResult) void {
+            self.program.mutable_publication.?.publish();
+            // Serving is permanently fenced. Leave cached read metadata owned
+            // by the backend for its final retirement; never run its variable
+            // destructors in the infallible WAL publication callback.
+            self.backend.markManifestDirty();
+            self.program.status_persisted = true;
+            self.program.owned_wal_durable = true;
+            self.program.manifest_ticket.?.retainDebt();
+        }
+        pub fn requireRecovery(self: *@This()) void {
+            self.backend.markManifestDirty();
+            // A possible WAL mutation retains its future manifest obligation
+            // even when publication is abandoned or physical append fails.
+            self.program.manifest_ticket.?.retainDebt();
+        }
+        pub fn release(self: *@This()) void {
+            if (self.program.manifest_ticket) |ticket| ticket.release();
+            self.program.manifest_ticket = null;
+        }
+    };
+
+    pub fn supportsOwnedAppend(backend: *const Backend) bool {
+        const storage = backend.storage orelse return false;
+        return backend.root_dir != null and backend.options.wal_enabled and
+            !backend.options.backend.read_only and backend.mutable.supportsQuiescedPublication() and
+            storage.supportsNativePathLocks() and storage.vtable.append_resource_bytes != null and
+            storage.vtable.try_prepare_append_with_admission != null and
+            (backend.options.run_partition_key == null or backend.options.run_partition_key_with_admission != null);
+    }
+
+    /// The caller permanently fences serving, producers and unrelated backend
+    /// mutation before entry. Every continuation and accepted physical phase
+    /// remains DB-owned across rejection; only the original finite execution
+    /// is borrowed for each resume. No backend mutex spans an IO wait.
+    pub fn commitWithAdmission(self: *Program, backend: *Backend, io: std.Io, original: admission.Port) !void {
+        std.debug.assert(self.complete and self.capture_reserved);
+        try original.checkpoint();
+        if (self.commit_complete) return;
+        try self.store_preflight.resumeWithAdmission(backend, io, original);
+        if (self.row_count == 0) {
+            self.status_persisted = true;
+            self.commit_complete = true;
+            return; // No append barrier: legacy final sync is still required.
+        }
+        if (!self.status_persisted) {
+            if (self.operation == null) {
+                try self.prepareWalRecordWithAdmission(backend.allocator, original);
+                if (self.mutable_publication == null) self.mutable_publication = .init(backend, &self.input);
+                try self.mutable_publication.?.resumeWithAdmission(original);
+                if (self.manifest_ticket == null) self.manifest_ticket = try self.manifest_preparation.resumeWithAdmission(backend, &self.mutable_publication.?.cpu.candidate, &self.mutable_publication.?.cpu.source, original);
+                if (self.append_credit == null) if (backend.options.resource_manager orelse self.capture_manager) |manager| {
+                    const bytes = try backend.storage.?.appendResourceBytes(self.wal_record.?.len);
+                    const bound = std.math.add(u64, bytes, @sizeOf(Credit)) catch return error.ResourceBudgetExceeded;
+                    self.append_credit = try Credit.create(manager, .lsm_wal_write_working_set, bound, original);
+                };
+                if (self.operation == null) self.operation = try backend.beginQuiescedWalAppendWithAdmission(io, self.wal_record.?, Publication{ .program = self, .backend = backend }, original);
+            }
+            _ = try self.operation.?.publishWithAdmission(original);
+        }
+        // The receipt is installed before any fallible retirement. Reentry
+        // after successful fsync/publication cannot stage or append it again.
+        if (self.operation) |*operation| {
+            try operation.retireWithAdmission(original);
+            operation.deinit();
+            self.operation = null;
+        }
+        if (self.append_credit) |credit| credit.retirement.publish();
+        self.append_credit = null;
+        if (self.mutable_publication) |*publication| {
+            try publication.retireWithAdmission(original);
+            self.mutable_publication = null;
+        }
+        try original.checkpoint();
+        if (self.wal_record) |bytes| self.wal_allocator.?.free(bytes);
+        self.wal_record = null;
+        if (self.wal_credit) |credit| credit.retirement.publish();
+        self.wal_credit = null;
+        // The moved input has retired with the successor owner. Release the
+        // remaining producer references in fixed row/chunk CPU quanta.
+        while (self.head) |chunk| {
+            try original.checkpoint();
+            if (self.retire_row < chunk.used) {
+                chunk.rows[self.retire_row].deinit(self.capture_allocator.?);
+                self.retire_row += 1;
+            } else {
+                self.head = chunk.next;
+                self.capture_allocator.?.destroy(chunk);
+                self.retire_row = 0;
+            }
+        }
+        self.tail = null;
+        if (self.capture_credit) |credit| credit.retirement.publish();
+        self.capture_credit = null;
+        self.commit_complete = true;
+    }
+
+    /// Mandatory fallback for explicit legacy physical destruction after an
+    /// interrupted controlled close. Join accepted work and release publication
+    /// before legacy persistence can attempt the same filesystem lock. A
+    /// possibly mutated unpublished WAL poisons the backend for reopen/recovery.
+    pub fn abandonWriteOwner(self: *Program) void {
+        if (self.operation) |*operation| operation.deinit();
+        self.operation = null;
+        if (self.append_credit) |credit| credit.retirement.publish();
+        self.append_credit = null;
+        if (self.manifest_ticket) |ticket| ticket.release();
+        self.manifest_ticket = null;
+        if (self.mutable_publication) |*publication| publication.deinit();
+        self.mutable_publication = null;
+    }
+
     /// Physical owner retirement is quiesced and occurs before index teardown.
     pub fn deinit(self: *Program, allocator: std.mem.Allocator) void {
         std.debug.assert(!self.busy.load(.acquire));
+        self.abandonWriteOwner();
         if (self.wal_record) |bytes| self.wal_allocator.?.free(bytes);
         if (self.wal_credit) |credit| credit.retirement.publish();
         if (self.input_allocator) |allocator_| self.input.deinit(allocator_);
@@ -258,7 +397,8 @@ pub const Program = struct {
         var next = self.head;
         while (next) |chunk| {
             next = chunk.next;
-            for (chunk.rows[0..chunk.used]) |*row| row.deinit(allocator);
+            for (chunk.rows[self.retire_row..chunk.used]) |*row| row.deinit(allocator);
+            self.retire_row = 0;
             allocator.destroy(chunk);
         }
         if (self.capture_credit) |credit| credit.retirement.publish();
@@ -583,5 +723,157 @@ test "controlled close status program preserves metadata through allocation reje
         program.deinit(backing.allocator());
         live = false;
         try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+    }
+}
+
+const CommitControl = struct {
+    program: *Program,
+    mode: enum { none, before_append, after_publish, join_end } = .none,
+    failure: anyerror = error.Canceled,
+    rejected: bool = false,
+    fn check(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (!self.rejected and ((self.mode == .before_append and self.program.operation != null and !self.program.status_persisted) or
+            (self.mode == .after_publish and self.program.status_persisted)))
+        {
+            self.rejected = true;
+            return self.failure;
+        }
+    }
+    fn lifetime(_: *anyopaque) !void {}
+    fn deadline(_: *anyopaque) !?u64 {
+        return std.math.maxInt(u64);
+    }
+    fn begin(_: *anyopaque) !void {}
+    fn end(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (!self.rejected and self.mode == .join_end and self.program.status_persisted) {
+            self.rejected = true;
+            return self.failure;
+        }
+    }
+    fn payload(self: *@This()) admission.Payload {
+        return .{ .ptr = self, .vtable = &.{ .checkpoint = check, .check_lifetime = lifetime, .deadline_ns = deadline }, .execution_wait = .{ .ptr = self, .begin = begin, .end = end } };
+    }
+};
+
+test "controlled close status owning append retains rejected waits and retirement without replay and reopens durably" {
+    if (comptime @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+    const io_mod = @import("../lsm_backend/storage_io.zig");
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.FileNotFound }) |failure| {
+        for ([_]@FieldType(CommitControl, "mode"){ .before_append, .after_publish, .join_end }) |mode| {
+            const a = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+            defer a.free(root);
+            var pool = io_mod.NativeStoragePool.initWithCapacityForTest(a, 16);
+            defer pool.deinit();
+            var manager = resources.ResourceManager.init(.{ .identity_allocator = a });
+            defer manager.deinit(a);
+            var backend: Backend = undefined;
+            try backend.openInto(a, root, .{ .native_storage_pool = &pool, .resource_manager = &manager });
+            var live = true;
+            defer if (live) backend.abandonAfterCrash();
+            try backend.mutable.upsert(a, .{ .name = @import("config.zig").primary_namespace_name }, "previous", "prior", false);
+            const previous_wire = try backend.prepareManifestCredit(&backend.mutable, &@as(state.State, .{}));
+            var program: Program = .{ .namespace_name = @import("config.zig").primary_namespace_name };
+            defer program.deinit(a);
+            var control: CommitControl = .{ .program = &program, .failure = failure };
+            const payload = control.payload();
+            const original = admission.Port.init(&payload);
+            try program.planName("status");
+            try program.reserveCaptureWithAdmission(&manager, original);
+            program.pending_value = .{ .kind = .graph, .doc_count = 7 };
+            try program.appendPending(a, "status", original);
+            program.complete = true;
+            control.mode = mode;
+            const fds = pool.snapshotStats().fd_admitted_descriptors;
+            try std.testing.expectError(failure, program.commitWithAdmission(&backend, std.testing.io, original));
+            try std.testing.expect(control.rejected and program.operation != null);
+            try std.testing.expectEqual(mode != .before_append, program.status_persisted);
+            try std.testing.expect(program.append_credit != null);
+            try std.testing.expectEqual(fds + 1, pool.snapshotStats().fd_admitted_descriptors);
+            try program.commitWithAdmission(&backend, std.testing.io, original);
+            try std.testing.expect(program.commit_complete and program.owned_wal_durable and program.status_persisted);
+            try std.testing.expect(program.operation == null and program.mutable_publication == null and program.head == null);
+            try std.testing.expectEqual(@as(u64, 1), backend.write_stats.wal_append_records);
+            try std.testing.expectEqual(@as(u64, 0), backend.manifest_admitted_commits);
+            try std.testing.expectEqual(previous_wire + program.manifest_preparation.planner.bytes, backend.manifest_unpublished_wire_bytes);
+            try std.testing.expectEqual(fds, pool.snapshotStats().fd_admitted_descriptors);
+            try std.testing.expectEqual(@as(u64, 7), (try projection.decodeIndexStatusSnapshot(try backend.mutable.get(.{ .name = @import("config.zig").primary_namespace_name }, projection.index_status_prefix ++ "status"))).doc_count);
+            try program.commitWithAdmission(&backend, std.testing.io, original);
+            try std.testing.expectEqual(@as(u64, 1), backend.write_stats.wal_append_records);
+            program.deinit(a);
+            backend.abandonAfterCrash(); // No legacy batch, flush, or sync.
+            live = false;
+            while (manager.cleanupPending()) {
+                _ = try manager.drainPayloadRetirementWithAdmission(original);
+                try manager.drainConstructionCleanupWithAdmission(original);
+            }
+            try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_wal_write_working_set).used_bytes);
+            try backend.openInto(a, root, .{ .native_storage_pool = &pool, .resource_manager = &manager });
+            live = true;
+            var transaction = try backend.beginRead();
+            defer transaction.abort();
+            const raw = try transaction.get(.{ .name = @import("config.zig").primary_namespace_name }, projection.index_status_prefix ++ "status");
+            try std.testing.expectEqual(@as(u64, 7), (try projection.decodeIndexStatusSnapshot(raw)).doc_count);
+            try std.testing.expectError(error.NotFound, transaction.get(.{}, projection.index_status_prefix ++ "status"));
+            try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+        }
+    }
+}
+
+test "controlled close status owning append denies manifest and frozen capacity before IO and preserves partial failure" {
+    if (comptime @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+    const io_mod = @import("../lsm_backend/storage_io.zig");
+    const Mode = enum { manifest, frozen, partial };
+    for (std.enums.values(Mode)) |mode| {
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer a.free(root);
+        var pool = io_mod.NativeStoragePool.initWithCapacityForTest(a, 16);
+        defer pool.deinit();
+        var manager = resources.ResourceManager.init(.{ .identity_allocator = a });
+        defer manager.deinit(a);
+        var backend: Backend = undefined;
+        try backend.openInto(a, root, .{ .native_storage_pool = &pool, .resource_manager = &manager });
+        defer backend.abandonAfterCrash();
+        var program: Program = .{ .namespace_name = @import("config.zig").primary_namespace_name };
+        defer program.deinit(a);
+        var control: CommitControl = .{ .program = &program };
+        const payload = control.payload();
+        const original = admission.Port.init(&payload);
+        try program.planName("status");
+        try program.reserveCaptureWithAdmission(&manager, original);
+        program.pending_value = .{ .kind = .graph, .doc_count = 9 };
+        try program.appendPending(a, "status", original);
+        program.complete = true;
+        const backlog = backend.options.manifest_commit_backlog_bytes;
+        const fds = pool.snapshotStats().fd_admitted_descriptors;
+        if (mode == .manifest) backend.options.manifest_commit_backlog_bytes = 1;
+        if (mode == .frozen) manager.slices[@backingInt(resources.Slice.lsm_wal_write_working_set)].budget.hard_limit_bytes = try program.walReservationBytes();
+        if (mode != .partial) {
+            try std.testing.expectError(error.ResourceBudgetExceeded, program.commitWithAdmission(&backend, std.testing.io, original));
+            try std.testing.expect(program.operation == null and !program.status_persisted);
+            try std.testing.expectEqual(@as(u64, 0), backend.write_stats.wal_append_records);
+            try std.testing.expectEqual(fds, pool.snapshotStats().fd_admitted_descriptors);
+            backend.options.manifest_commit_backlog_bytes = backlog;
+            manager.slices[@backingInt(resources.Slice.lsm_wal_write_working_set)].budget.hard_limit_bytes = 0;
+            try program.commitWithAdmission(&backend, std.testing.io, original);
+            try std.testing.expect(program.commit_complete);
+        } else {
+            io_mod.NativeSyncTestControl.append_failure_after.store(3, .release);
+            defer io_mod.NativeSyncTestControl.append_failure_after.store(std.math.maxInt(usize), .release);
+            try std.testing.expectError(error.NoSpaceLeft, program.commitWithAdmission(&backend, std.testing.io, original));
+            try std.testing.expect(!program.status_persisted and backend.manifest_recovery_required);
+            try std.testing.expectEqual(@as(u64, 0), backend.manifest_admitted_commits);
+            try std.testing.expect(backend.manifest_unpublished_wire_bytes != 0);
+            try std.testing.expectError(error.NoSpaceLeft, program.commitWithAdmission(&backend, std.testing.io, original));
+            program.abandonWriteOwner();
+            try std.testing.expectEqual(fds, pool.snapshotStats().fd_admitted_descriptors);
+        }
     }
 }

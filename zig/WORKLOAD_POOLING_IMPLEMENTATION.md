@@ -25030,3 +25030,87 @@ leaks, and all 5,550 recorded native/spec inputs remained unchanged. In
 particular, the 80-database retained-credit guard assertion and original
 cancellation/pressure cleanup tests pass. Source snapshots and both failure
 receipts are retained alongside the final successful receipt.
+
+
+### Default native close owns final status WAL publication
+
+Controlled close on a native WAL-backed primary now runs the retained status
+program through actual WAL publication on its original finite cleanup execution.
+Serving, catalogue mutation, preparation and producer admission remain permanently
+fenced throughout. Supported native owners no longer leave this status batch to
+the later raw wrapper destructor. Other providers and legacy flat/arena mutable
+generations retain the existing path pending their own admitted adoption.
+
+Primary DocStore bindings and capture use the same `primary_namespace_name`
+constant. Packed capture rows retain/copy that namespace in bounded CPU slices,
+and both their residency and canonical WAL size include its bytes. This matters
+because the primary namespace is `docs`, not the default namespace. The native
+crash/reopen regression explicitly checks the named value and absence from the
+default namespace; the C-entry fixture creates a full-text index and reads its
+nonempty final status through DocStore after controlled drain.
+
+Manifest preparation is allocation-free over stable sorted generations. Custom
+partition functions provide an equivalent original-admitted extractor. Names,
+prefixes and domain labels compare in at most 16 KiB CPU slices, retaining field
+and byte cursors across rejection. Contiguous partition identities are the same
+contract already required by run layout. The planner shares the established wire
+calculation and reconstructs cold unflushed debt one generation at a time.
+Incoming admission conservatively prices the prepared complete mutable epoch,
+while backlog bytes count the actual input. History/capacity refusal occurs
+before WAL and never hides a raw flush, checkpoint or filesystem operation.
+
+Encoded and frozen representations have separate retained credits. Native
+storage reports its additional grant header/frozen-buffer bound before grant
+allocation and dispatch; the service's executor heap/stacks and shared FD pool
+remain separately governed. Successor memory is prepared/adopted before WAL.
+The publication ticket follows the owning append, preserving future manifest debt
+on success or possible unpublished mutation. The fixed, infallible publication
+swaps the prepared root and installs its receipt before any fallible retirement.
+Cached read metadata remains backend-owned for final teardown, since serving is
+permanently fenced; its variable destructors never run in that callback.
+
+Terminal append resources now retire on the original wait boundary. Physical
+worker join is recorded before fallible reentry, so a rejected resume retains
+frozen bytes, the FD permit and their charge without joining twice. Admitted
+retirement requires the storage owner to remain live; last-owner executor teardown
+still belongs to mandatory physical destruction. Old-state/input retirement uses
+the bounded successor reclaimer, then producer rows/chunks retire under original
+checkpoints. Charges publish for independent cleanup only after their payloads
+are physically gone. Original rejection retains every unfinished owner.
+
+A completed receipt suppresses legacy status staging and the wrapper's redundant
+forced WAL sync, while retaining the wrapper's deferred run finalization through
+`syncStore(false)`. Empty status captures retain the old final-sync obligation.
+An explicit legacy destructor first joins/abandons any interrupted append before
+trying raw persistence, preventing a self-deadlock on its retained publication
+lock. Unpublished possible writes poison the backend and retain manifest debt;
+they cannot silently replay a failed append or publish a speculative root.
+
+Native ABI 107 and storage-owner ABI 167 fence the new continuations, partition
+capability and admitted grant-retirement vtable. The v1 receipt preserves the
+initial transaction-cleanup test compilation failure; v2 passes 76/76 build steps,
+36 physical/manifest cases, 30 embedded close cases, 32 read-admission cases,
+2 host close cases, 16 archive cases and 45/1/8 identity cases. Its new cases cover
+original rejection before publication and after publication/join, capacity refusal
+before IO, partial append poisoning, repeated completion without replay, namespace
+preservation and recovery without any legacy batch/flush/sync. The final v3 run
+strengthens real C-entry adoption with nonempty status and DocStore readback;
+it also passed all 76 build steps with unchanged inputs.
+
+Merged latest `origin/main` (`91a85fed15`, merge `1dce702fc8`) in the same
+worktree/branch. Review retained the wrapper's deferred storage finalization:
+only its already-completed WAL barrier is skipped, via `syncStore(false)`.
+Post-merge v4 passes all 36 physical, 30 embedded close, 32 read-admission,
+2 host close and 45/1/8 identity cases. Its combined build reports 74/76 steps
+because two archive cases could not bind localhost sockets under the sandbox
+(`EPERM`). The v5-localhost rerun passes all 16 archive cases (28/28 steps)
+and the 45/1/8 identity cases with localhost access. Both receipts have identical
+native input hashes and report unchanged inputs. Logs, hash records and final
+native source snapshots remain in the cumulative integration receipt directory.
+Formatting and diff whitespace checks pass.
+
+This does not finish the full design. Final backend flush and physical retirement
+still need admitted ownership; completion resources and history relief under
+overload, remaining provider/legacy-generation adoption, compound tentative-grant
+retirement and full default-gate qualification remain open. No complete pooling
+gate is enabled. Full GNU qualification remains waived; the full goal stays active.
