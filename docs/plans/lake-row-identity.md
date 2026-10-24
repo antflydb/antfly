@@ -1148,3 +1148,39 @@ Native reader protocol 81, publication authority and GC closure are unchanged.
 The initial Debug filesystem run exposes all-candidate numeric text sorting and
 publication artifact volume as targets for deeper profiling, without making
 archive-scale or live-cloud performance claims.
+
+### Qualification integrity and outstanding physical ordering
+
+Archive qualification binds binary, configuration and collector identity before
+startup, rejects changes around restarts and measurements, and verifies content
+before completing the report. The managed lifetime covers provenance/client
+failures, interruptions, log collection and temporary-root cleanup. Readiness
+includes embedded table indexes, additional index declarations and schema
+relational indexes. A custom declared identity field controls the exact ID oracle
+as well as result normalization; it never changes the physical source coordinates.
+
+A declared `schema.index_sort` is not currently sufficient to create physically
+sorted native lake text segments. The canonical producer omits the build sort,
+patch merges currently restore `_id` order, and serving compaction concatenates
+runs. Thus an exact doc-values top-N fallback remains necessary. The fixed
+qualification runner can expose this through `missing_segment_index_sort`; a
+schema-only setting must not be presented as a performance improvement.
+
+The outstanding implementation needs an authenticated, compact, paged mapping
+between native segment ordinals and canonical file-local live ranks, in both
+directions. Sorting must preserve the physical `(file, row_group, row)` coordinate
+and public stable identity independently. Fresh encoding, delete/patch merges,
+forward-statistics transfer and cross-file serving compaction must compose the
+same mapping, with existing resource admission and reader/GC publication closure.
+Per-row JSON source spans are not a substitute: their metadata size and bounded
+span limits defeat the intended efficiency. Shared schema validation, bounded
+external sorting and a reader-version fence belong in that implementation.
+
+Qualification must compare exact projected answers on the same frozen Parquet
+bytes, including numeric/timestamp directions, nulls and ties, filtering, cursor
+continuation, deleted rows, file rewrites and restarts after serving compaction.
+Only reduced candidate work and repeated timing improvements with bounded build
+memory/publication cost qualify the engine change as a win. The current experiment
+is a configuration comparison, not a prototype or qualification of that missing
+engine implementation. Native reader protocol 81 is unchanged by these runner
+fixes.

@@ -3880,3 +3880,12 @@ new publication revisions and exact changed-row results, and reports sampled
 memory, scoped cache counters, and newly retained artifact volume. Retained-file
 ratios exclude temporary spills and reclaimed files; real provider write traces
 remain necessary for cloud amplification claims.
+
+Archive qualification now pins executable/configuration/collector identity across
+restarts and closes its managed server/session on initialization, interruption
+and finalization errors. Publication readiness covers the complete embedded,
+additional and schema-relational index set. Custom logical identity fields drive
+the exact result oracle without altering physical source coordinates. Declared
+native text ordering remains [an explicit outstanding engine task](lake-row-identity.md#qualification-integrity-and-outstanding-physical-ordering):
+its implementation must preserve ordinal lineage through every producer and
+compactor before a performance claim can be accepted.

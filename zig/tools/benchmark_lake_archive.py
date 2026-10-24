@@ -25,6 +25,7 @@ No user source is rewritten; refresh runs apply only to generated fixtures.
 from __future__ import annotations
 
 import argparse
+from contextlib import closing, contextmanager
 import decimal
 import hashlib
 import json
@@ -58,6 +59,90 @@ def file_digest(path):
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             hasher.update(block)
     return hasher.hexdigest()
+
+
+class VerifiedInput:
+    """Bind one run to immutable executable/config/collector contents.
+
+    Cheap identity checks bracket launches and measurements. A final content
+    check also rejects in-place changes on filesystems with coarse timestamps.
+    Nothing is relocated, so native executable-relative resources still resolve.
+    """
+
+    def __init__(self, path):
+        self.path = Path(path).resolve(strict=True)
+        self.identity = self.signature()
+        self.sha256 = file_digest(self.path)
+        self.verify()
+
+    def signature(self):
+        stat = self.path.stat()
+        return (
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+        )
+
+    def verify(self, *, content=False):
+        try:
+            changed = self.signature() != self.identity
+            if content:
+                changed = changed or file_digest(self.path) != self.sha256
+            changed = changed or self.signature() != self.identity
+        except OSError as error:
+            raise RuntimeError(
+                f"Qualification input unavailable: {self.path}"
+            ) from error
+        if changed:
+            raise RuntimeError(
+                f"Qualification input changed during the run: {self.path}"
+            )
+
+
+def verify_inputs(inputs, *, content=False):
+    for value in inputs:
+        value.verify(content=content)
+
+
+@contextmanager
+def managed_server(factory, binary, config, output):
+    server = factory(str(binary), "127.0.0.1", 0, metrics=True, config_path=config)
+    try:
+        yield server
+    finally:
+        try:
+            server.stop(cleanup_root=False)
+        finally:
+            try:
+                if server.log_path.exists():
+                    shutil.copyfile(server.log_path, output / "server.log")
+            finally:
+                server.tempdir.cleanup()
+
+
+def effective_indexes(plan):
+    """Resolve one declaration set without submitting duplicate index DDL."""
+    embedded = plan["definition"].get("indexes", {})
+    additional = plan.get("indexes", {})
+    if not isinstance(embedded, dict) or not isinstance(additional, dict):
+        raise ValueError("Index declarations must be objects keyed by index name")
+    for name in embedded.keys() & additional.keys():
+        if embedded[name] != additional[name]:
+            raise ValueError(
+                f"Conflicting embedded/additional index declaration: {name}"
+            )
+    return {**embedded, **additional}
+
+
+def readiness_indexes(plan):
+    # Relational indexes are schema declarations, rather than index DDL, but
+    # queries can require their published revision just as they require text.
+    names = dict.fromkeys(effective_indexes(plan))
+    for index in plan["definition"].get("schema", {}).get("relational_indexes", []):
+        names[index["name"]] = None
+    return tuple(names)
 
 
 def put_object(objects, name, source):
@@ -314,6 +399,7 @@ def validate_plan(plan):
         or not source.get("uri")
     ):
         raise ValueError("Plan requires an external Parquet/Iceberg base_source")
+    effective_indexes(plan)
     names = set()
     if not plan.get("cases"):
         raise ValueError("Plan requires at least one case")
@@ -382,7 +468,8 @@ def verify_case(case, response):
             f"Incorrect SQL result for {case['name']}: {response.get('rows')}"
         )
     if "expected_ids" in case:
-        actual = [h["_source"]["id"] for h in response["hits"]["hits"]]
+        field = case.get("identity_field", "id")
+        actual = [h["_source"][field] for h in response["hits"]["hits"]]
         if actual != case["expected_ids"]:
             raise ValueError(f"Incorrect logical IDs for {case['name']}: {actual}")
     return digest(result_value(response, case.get("identity_field")))
@@ -625,11 +712,12 @@ def measured(client, operation):
     }
 
 
-def run_queries(client, plan, samples, output):
+def run_queries(client, plan, samples, output, inputs=()):
     rows = []
     for case in plan["cases"]:
         expected = None
         for sample in range(samples):
+            verify_inputs(inputs)
             boot = time.perf_counter_ns()
             old_pid = client.server.proc.pid if client.server.proc else None
             with MemorySample(
@@ -640,6 +728,7 @@ def run_queries(client, plan, samples, output):
                 )
             ) as startup_memory:
                 client.server.restart()
+                verify_inputs(inputs)
                 # Health is a distinct listener and may lag public readiness.
                 deadline = time.monotonic() + 15
                 while True:
@@ -652,7 +741,9 @@ def run_queries(client, plan, samples, output):
                         time.sleep(0.1)
             restart_ns = time.perf_counter_ns() - boot
             for mode in ("process_restarted", "warm"):
+                verify_inputs(inputs)
                 response, measurement = measured(client, lambda: client.query(case))
+                verify_inputs(inputs)
                 checksum = verify_case(case, response)
                 answer = result_value(response, case.get("identity_field"))
                 if expected is None:
@@ -685,11 +776,13 @@ def run_queries(client, plan, samples, output):
         if "statement" in case:
             # A separate diagnostic execution does not change a timed sample's
             # cache preparation or imply provider/parallel profile coverage.
+            verify_inputs(inputs)
             response = client.call(
                 "POST",
                 "/sql",
                 {"statement": "EXPLAIN (ANALYZE, FORMAT JSON) " + case["statement"]},
             )
+            verify_inputs(inputs)
             (output / (case["name"] + "-explain.json")).write_text(
                 json.dumps(response, indent=2)
             )
@@ -873,6 +966,13 @@ def main(argv=None):
     binary = args.binary.resolve()
     if not binary.is_file():
         parser.error("Build the Antfly binary first")
+    binary_input = VerifiedInput(binary)
+    collector_input = VerifiedInput(__file__)
+    config_input = VerifiedInput(args.server_config) if args.server_config else None
+    inputs = tuple(
+        v for v in (binary_input, collector_input, config_input) if v is not None
+    )
+    config = config_input.path if config_input else None
     args.output_dir.mkdir(parents=True, exist_ok=False)
     output = args.output_dir.resolve()
     fixture = None
@@ -908,21 +1008,12 @@ def main(argv=None):
     sys.path.insert(0, str(ROOT / "e2e" / "antfly"))
     from conftest import StandaloneAntflyServer
 
-    server = StandaloneAntflyServer(
-        str(binary),
-        "127.0.0.1",
-        0,
-        metrics=True,
-        config_path=args.server_config.resolve() if args.server_config else None,
-    )
-    client = Client(server, args.timeout)
     report = {
         "version": 1,
-        "binary_sha256": file_digest(binary),
-        "tool_sha256": file_digest(__file__),
-        "server_config_sha256": file_digest(args.server_config)
-        if args.server_config
-        else None,
+        "binary_sha256": binary_input.sha256,
+        "tool_sha256": collector_input.sha256,
+        "server_config_sha256": config_input.sha256 if config_input else None,
+        "input_identity_contract": "identity checked around launches/measurements and content verified before completion",
         "git_head": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
         ).strip(),
@@ -990,75 +1081,87 @@ def main(argv=None):
         "profile_scope": "EXPLAIN ANALYZE is a separate execution; its own coverage fields are authoritative",
     }
     try:
-        start = time.perf_counter_ns()
-        client.call("POST", f"/tables/{TABLE}", plan["definition"])
-        indexes = plan.get("indexes", {})
-        for name, definition in indexes.items():
-            client.call("POST", f"/tables/{TABLE}/indexes/{name}", definition)
-        revisions = client.ready(indexes)
-        report["initial_publication_ns"] = time.perf_counter_ns() - start
-        report["samples"] = run_queries(client, plan, args.samples, output)
-        report["summary"] = summaries(report["samples"])
-        if fixture is not None and not args.plan:
-            before = artifact_inventory(server.root)
+        verify_inputs(inputs)
+        with managed_server(StandaloneAntflyServer, binary, config, output) as server:
+            verify_inputs(inputs)
+            client = Client(server, args.timeout)
+            with closing(client.session):
+                start = time.perf_counter_ns()
+                client.call("POST", f"/tables/{TABLE}", plan["definition"])
+                indexes = effective_indexes(plan)
+                embedded = plan["definition"].get("indexes", {})
+                for name, definition in indexes.items():
+                    if name not in embedded:
+                        client.call(
+                            "POST", f"/tables/{TABLE}/indexes/{name}", definition
+                        )
+                required_indexes = readiness_indexes(plan)
+                revisions = client.ready(required_indexes)
+                report["initial_publication_ns"] = time.perf_counter_ns() - start
+                report["initial_index_revisions"] = revisions
+                report["samples"] = run_queries(
+                    client, plan, args.samples, output, inputs
+                )
+                report["summary"] = summaries(report["samples"])
+                if fixture is not None and not args.plan:
+                    before = artifact_inventory(server.root)
 
-            def refresh():
-                fixture_start = time.perf_counter_ns()
-                updated = generate_fixture(
-                    output / "fixture",
-                    args.rows,
-                    args.files,
-                    args.row_group,
-                    args.payload_bytes,
-                    args.refresh_every,
-                    1,
-                )
-                commit_ns = time.perf_counter_ns() - fixture_start
-                publication_start = time.perf_counter_ns()
-                changed = (args.rows + args.refresh_every - 1) // args.refresh_every
-                current = client.ready(
-                    indexes, after=revisions, expected_updated=changed
-                )
-                answer = client.call(
-                    "POST", "/sql", {"statement": f"SELECT sum(revision) FROM {TABLE}"}
-                )
-                if answer["rows"] != [[str(changed)]]:
-                    raise ValueError(
-                        "Refresh result differs from the generated row oracle"
+                    def refresh():
+                        fixture_start = time.perf_counter_ns()
+                        updated = generate_fixture(
+                            output / "fixture",
+                            args.rows,
+                            args.files,
+                            args.row_group,
+                            args.payload_bytes,
+                            args.refresh_every,
+                            1,
+                        )
+                        commit_ns = time.perf_counter_ns() - fixture_start
+                        publication_start = time.perf_counter_ns()
+                        changed = (
+                            args.rows + args.refresh_every - 1
+                        ) // args.refresh_every
+                        current = client.ready(
+                            required_indexes, after=revisions, expected_updated=changed
+                        )
+                        answer = client.call(
+                            "POST",
+                            "/sql",
+                            {"statement": f"SELECT sum(revision) FROM {TABLE}"},
+                        )
+                        if answer["rows"] != [[str(changed)]]:
+                            raise ValueError(
+                                "Refresh result differs from the generated row oracle"
+                            )
+                        return {
+                            "input": updated,
+                            "changed_rows": changed,
+                            "revisions": current,
+                            "fixture_and_commit_ns": commit_ns,
+                            "publication_and_verify_ns": time.perf_counter_ns()
+                            - publication_start,
+                        }
+
+                    refreshed, timing = measured(client, refresh)
+                    timing.update(refreshed)
+                    timing["artifacts"] = artifact_growth(
+                        before, artifact_inventory(server.root)
                     )
-                return {
-                    "input": updated,
-                    "changed_rows": changed,
-                    "revisions": current,
-                    "fixture_and_commit_ns": commit_ns,
-                    "publication_and_verify_ns": time.perf_counter_ns()
-                    - publication_start,
-                }
-
-            refreshed, timing = measured(client, refresh)
-            timing.update(refreshed)
-            timing["artifacts"] = artifact_growth(
-                before, artifact_inventory(server.root)
-            )
-            timing["retained_artifact_over_rewritten_parquet"] = (
-                timing["artifacts"]["new_retained_bytes"]
-                / refreshed["input"]["parquet_bytes"]
-            )
-            timing["includes_fixture_encoding_and_commit"] = True
-            report["refresh"] = timing
+                    timing["retained_artifact_over_rewritten_parquet"] = (
+                        timing["artifacts"]["new_retained_bytes"]
+                        / refreshed["input"]["parquet_bytes"]
+                    )
+                    timing["includes_fixture_encoding_and_commit"] = True
+                    report["refresh"] = timing
+        verify_inputs(inputs, content=True)
         report["complete"] = True
     except BaseException as error:
+        report["complete"] = False
         report["error"] = {"type": type(error).__name__, "message": str(error)}
         raise
     finally:
-        try:
-            client.session.close()
-            server.stop(cleanup_root=False)
-            if server.log_path.exists():
-                shutil.copyfile(server.log_path, output / "server.log")
-        finally:
-            server.tempdir.cleanup()
-            (output / "report.json").write_text(json.dumps(report, indent=2))
+        (output / "report.json").write_text(json.dumps(report, indent=2))
     print(
         json.dumps(
             {

@@ -97,3 +97,119 @@ def test_real_parquet_archive_qualification_preserves_cache_and_refresh_contract
     assert report["refresh"]["includes_fixture_encoding_and_commit"] is True
     assert report["refresh"]["artifacts"]["new_retained_bytes"] > 0
     assert (output / "server.log").is_file()
+
+
+@pytest.mark.parametrize("additional_declarations", [False, True])
+def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
+    tmp_path, additional_declarations
+):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    binary = Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))).resolve()
+    if not binary.is_file():
+        pytest.skip("Build the Antfly binary first")
+    root = Path(__file__).resolve().parents[2]
+    archive = tmp_path / "archive.parquet"
+    pq.write_table(
+        pa.table({"hn_id": list(range(128)), "body": ["quasar"] * 128}),
+        archive,
+        row_group_size=32,
+    )
+    text_index = {"type": "full_text", "store_source": True}
+    plan = {
+        "version": 1,
+        "definition": {
+            "schema": {
+                "storage_mode": "relational",
+                "default_type": "row",
+                "base_source": {
+                    "kind": "external",
+                    "format": "parquet",
+                    "table_id": "hn",
+                    "object_mutability": "immutable",
+                    "uri": "file:///replaced",
+                    "row_identity": {"key_columns": ["hn_id"]},
+                },
+                "document_schemas": {
+                    "row": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "hn_id": {
+                                    "type": "integer",
+                                    "x-antfly-field": {
+                                        "type": "number",
+                                        "sortable": True,
+                                    },
+                                },
+                                "body": {
+                                    "type": "string",
+                                    "x-antfly-field": {"type": "text"},
+                                },
+                            },
+                        }
+                    }
+                },
+                "relational_indexes": [
+                    {"name": "hn_key", "keys": [{"column": "hn_id"}]}
+                ],
+            },
+            "indexes": {"text": text_index},
+        },
+        # Identical declarations must not issue duplicate DDL.
+        "indexes": {"text": text_index},
+        "cases": [
+            {
+                "name": "custom_identity",
+                "identity_field": "hn_id",
+                "expected_ids": list(range(20)),
+                "request": {
+                    "full_text_search": {"match": "quasar", "field": "body"},
+                    "fields": ["hn_id"],
+                    "order_by": [{"field": "hn_id"}],
+                    "limit": 20,
+                },
+            }
+        ],
+    }
+    if not additional_declarations:
+        del plan["indexes"]
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan))
+    config = _write_remote_content_e2e_config(tmp_path)
+    output = tmp_path / "qualification"
+    log = tmp_path / "qualification.log"
+    with log.open("w") as stream:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(root / "tools" / "benchmark_lake_archive.py"),
+                "run",
+                "--binary",
+                str(binary),
+                "--server-config",
+                str(config),
+                "--output-dir",
+                str(output),
+                "--plan",
+                str(plan_path),
+                "--parquet",
+                str(archive),
+                "--samples",
+                "1",
+                "--timeout",
+                "120",
+            ],
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            timeout=180,
+        )
+    assert result.returncode == 0, log.read_text()
+    report = json.loads((output / "report.json").read_text())
+    assert report["complete"] is True
+    assert set(report["initial_index_revisions"]) == {"text", "hn_key"}
+    assert all(report["initial_index_revisions"].values())
+    assert len(report["samples"]) == 2
+    assert len({s["result_sha256"] for s in report["samples"]}) == 1
+    answer = json.loads((output / "custom_identity-answer.json").read_text())
+    assert [h["_source"]["hn_id"] for h in answer["hits"]["hits"]] == list(range(20))

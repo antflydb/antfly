@@ -18,17 +18,164 @@
 
 import copy
 import hashlib
+import json
+import os
 import sqlite3
 import struct
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import benchmark_lake_archive as bench
 
 
 class QualificationTest(unittest.TestCase):
+    def test_input_identity_rejects_replacement_in_place_edits_and_removal(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "binary"
+            for mutation in ("replace", "edit", "remove"):
+                path.write_bytes(b"versionA")
+                identity = bench.VerifiedInput(path)
+                identity.verify(content=True)
+                if mutation == "replace":
+                    replacement = path.with_suffix(".new")
+                    replacement.write_bytes(b"versionB")
+                    os.replace(replacement, path)
+                elif mutation == "edit":
+                    path.write_bytes(b"versionB")
+                else:
+                    path.unlink()
+                with self.assertRaisesRegex(RuntimeError, "Qualification input"):
+                    identity.verify()
+
+    def test_restart_cannot_accept_samples_from_a_replaced_binary(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "binary"
+            path.write_bytes(b"versionA")
+            identity = bench.VerifiedInput(path)
+            client = mock.Mock()
+            client.server.restart.side_effect = lambda: path.write_bytes(b"versionB")
+            with mock.patch.object(bench, "MemorySample"):
+                with self.assertRaisesRegex(RuntimeError, "input changed"):
+                    bench.run_queries(
+                        client,
+                        {"cases": [{"name": "scan", "statement": "SELECT 1"}]},
+                        3,
+                        Path(root),
+                        (identity,),
+                    )
+            client.query.assert_not_called()
+            self.assertFalse((Path(root) / "samples.json").exists())
+
+    def test_main_owns_resources_through_initialization_interrupt_and_shutdown(self):
+        for failure in ("provenance", "client", "query", "stop", "identity"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as root:
+                root = Path(root)
+                binary = root / "binary"
+                binary.write_bytes(b"binary")
+                plan = bench.generated_plan({"manifest_uri": "file:///source"}, 16, 8)
+                plan_path = root / "plan.json"
+                plan_path.write_text(json.dumps(plan))
+                output = root / "output"
+                server = mock.Mock()
+                server.log_path = root / "server.log"
+                server.log_path.write_text("diagnostics")
+                factory = mock.Mock(return_value=server)
+                client = mock.Mock()
+                client.ready.return_value = {
+                    "text": "revision",
+                    "archive_id": "revision",
+                }
+                if failure == "stop":
+                    server.stop.side_effect = RuntimeError("stop failure")
+                elif failure == "identity":
+                    server.stop.side_effect = lambda **_: binary.write_bytes(b"changed")
+                with (
+                    mock.patch.dict(
+                        sys.modules,
+                        {"conftest": SimpleNamespace(StandaloneAntflyServer=factory)},
+                    ),
+                    mock.patch.object(
+                        bench.platform, "platform", return_value="test-machine"
+                    ),
+                    mock.patch.object(
+                        bench.subprocess,
+                        "check_output",
+                        side_effect=RuntimeError("provenance failure")
+                        if failure == "provenance"
+                        else None,
+                        return_value="git-head\n",
+                    ),
+                    mock.patch.object(
+                        bench,
+                        "Client",
+                        return_value=client,
+                        side_effect=RuntimeError("client failure")
+                        if failure == "client"
+                        else None,
+                    ),
+                    mock.patch.object(
+                        bench,
+                        "run_queries",
+                        return_value=[],
+                        side_effect=KeyboardInterrupt() if failure == "query" else None,
+                    ),
+                    self.assertRaisesRegex(
+                        KeyboardInterrupt if failure == "query" else RuntimeError,
+                        ""
+                        if failure == "query"
+                        else (
+                            "input changed"
+                            if failure == "identity"
+                            else f"{failure} failure"
+                        ),
+                    ),
+                ):
+                    bench.main(
+                        [
+                            "run",
+                            "--binary",
+                            str(binary),
+                            "--plan",
+                            str(plan_path),
+                            "--output-dir",
+                            str(output),
+                        ]
+                    )
+                if failure == "provenance":
+                    factory.assert_not_called()
+                else:
+                    server.stop.assert_called_once_with(cleanup_root=False)
+                    server.tempdir.cleanup.assert_called_once()
+                    self.assertEqual((output / "server.log").read_text(), "diagnostics")
+                    report = json.loads((output / "report.json").read_text())
+                    self.assertFalse(report["complete"])
+                    if failure != "client":
+                        client.session.close.assert_called_once()
+
+    def test_embedded_indexes_and_schema_indexes_are_all_awaited(self):
+        plan = bench.generated_plan({"manifest_uri": "file:///source"}, 16, 8)
+        plan["definition"]["indexes"] = copy.deepcopy(plan["indexes"])
+        bench.validate_plan(plan)
+        self.assertEqual(set(bench.effective_indexes(plan)), {"text"})
+        self.assertEqual(set(bench.readiness_indexes(plan)), {"text", "archive_id"})
+        del plan["indexes"]
+        self.assertEqual(set(bench.effective_indexes(plan)), {"text"})
+        plan["indexes"] = {"text": {"type": "full_text", "field": "body"}}
+        with self.assertRaisesRegex(ValueError, "Conflicting"):
+            bench.validate_plan(plan)
+
+    def test_custom_identity_field_controls_the_result_oracle(self):
+        case = {"name": "top", "identity_field": "hn_id", "expected_ids": [123]}
+        response = {"hits": {"hits": [{"_id": "opaque", "_source": {"hn_id": 123}}]}}
+        bench.verify_case(case, response)
+        response["hits"]["hits"][0]["_source"]["hn_id"] = 456
+        with self.assertRaisesRegex(ValueError, "Incorrect logical IDs"):
+            bench.verify_case(case, response)
+
     def report(self, count=3):
         rows = [
             {

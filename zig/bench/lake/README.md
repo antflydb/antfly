@@ -73,6 +73,21 @@ without copying its contents into the report; the managed server uses isolated
 data/replica paths. Configuration must be suitable for a qualification server. Live cloud
 query/retention qualification is separate from the filesystem fixture run.
 
+Qualification binds the executable, supplied configuration, and collector to one
+file identity before starting the server. Checks around every restart and
+measurement reject replacements and edits; final content checks run before a
+report can be marked complete. Executables stay at their original resolved path
+so executable-relative resources continue to work. Provenance is collected before
+startup, and server/session cleanup also covers initialization errors,
+interruptions, and failed report finalization.
+
+Plans accept indexes embedded in `definition.indexes` and additional `indexes`.
+Identical declarations are created once; conflicting definitions fail validation.
+Initial readiness waits for the union plus `schema.relational_indexes`, recording
+their published revisions. `identity_field` selects both the logical-ID oracle
+and normalized answer identity, and must match the declared single-column row
+identity. Omit it to retain the default `id` oracle and physical hit identities.
+
 ## Cache and measurement contracts
 
 Each case/sample restarts the process, measures the first query, then immediately
@@ -128,6 +143,18 @@ refresh retained substantial new artifact data. Those observations identify
 places for further CPU/producer profiling. They do not establish an archive-scale
 speedup or justify a cache-limit increase. The 142,577-row HN fixture is not
 bundled; the raw-Parquet import path supports qualifying it when available.
+
+
+A repeated [declared-ordering configuration probe](declared-ordering-observation.json)
+used the same frozen 16,384-row, eight-file source and binary, with three samples
+per cache mode. Adding `schema.index_sort` (`id ASC, _id ASC`) preserved every
+answer, but both configurations examined 16,384 candidates for 20 results. Warm
+medians were 949 ms without the declaration and 980 ms with it; these local Debug
+numbers establish no speedup. The declared case reported
+`missing_segment_index_sort`. This tests the existing configuration path, not an
+implementation of the missing encoder/compactor support. The
+[remaining ordinal-lineage design](../../../docs/plans/lake-row-identity.md#qualification-integrity-and-outstanding-physical-ordering)
+is explicit; changing schema metadata alone cannot qualify that engine work.
 
 Tests:
 
