@@ -167,6 +167,7 @@ _arguments -s \
  '--sort-files[sort-files]' \
  '--sortr[sortr]:value:(none path modified accessed created)' \
  '--source[source]:value:' \
+ '--source-catalog[source-catalog]:value:_files' \
  '--stats[stats]' \
  '--stdin[stdin]' \
  '--stop-on-nonmatch[stop-on-nonmatch]' \

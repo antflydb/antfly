@@ -61,6 +61,7 @@ const help =
     \\      --engine ENGINE       default, pcre2, auto
     \\  -z, --search-zip           Native streaming compressed-file search
     \\      --dictionary PATH     Brotli/LZ4/Zstandard external dictionary
+    \\      --source-catalog FILE Portable source profile (no Cloud dependency)
     \\      --cloud              Search authorized sources from antfly-cloud login
     \\      --source NAME        Select connected source alias/ID (repeatable)
     \\      --cloud-cli PATH     Cloud CLI executable (default antfly-cloud)
@@ -213,6 +214,10 @@ fn run(init: std.process.Init) !u8 {
         o.table_token = session.token();
         o.table_config_json = try session.discover(persistent, o.timeout_ms);
     }
+
+    if (!o.help and !o.version and o.generate == null) if (o.source_catalog) |path| {
+        o.table_config_json = try grep.catalog.load(persistent, init.io, path);
+    };
 
     inline for (.{ "types", "types_not" }) |field| for (@field(o, field).items) |name| if (!grep.filetypes.known(&o, name)) return error.UnknownFileType;
     if (o.type_list) {

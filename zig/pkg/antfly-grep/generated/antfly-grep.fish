@@ -167,6 +167,7 @@ complete -c antfly-grep -l sort -r -f -a 'none path modified accessed created'
 complete -c antfly-grep -l sort-files
 complete -c antfly-grep -l sortr -r -f -a 'none path modified accessed created'
 complete -c antfly-grep -l source -r
+complete -c antfly-grep -l source-catalog -r
 complete -c antfly-grep -l stats
 complete -c antfly-grep -l stdin
 complete -c antfly-grep -l stop-on-nonmatch

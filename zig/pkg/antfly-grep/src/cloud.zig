@@ -94,7 +94,8 @@ pub const Session = struct {
         const Discovery = struct {
             subject: []const u8,
             version: u32,
-            tables: []const std.json.Value,
+            endpoint: []const u8,
+            sources: []const @import("catalog.zig").Source,
             principals: []const []const u8,
             page_size: usize = 128,
             discovery_id: ?[]const u8 = null,
@@ -145,32 +146,26 @@ pub const Session = struct {
             if (self.subject) |expected| {
                 if (!std.mem.eql(u8, expected, page.subject)) return error.CloudIdentityChanged;
             } else self.subject = try self.arena.allocator().dupe(u8, page.subject);
-            if (page.version != 1 and page.version != 2) return error.UnsupportedCloudSourceVersion;
+            if (page.version != 2) return error.UnsupportedCloudSourceVersion;
+            if (!std.mem.eql(u8, page.endpoint, "db/v1")) return error.CloudContextChanged;
             if (version) |expected| {
                 if (expected != page.version or query_page_size != page.page_size) return error.CloudDiscoveryChanged;
             } else {
                 version = page.version;
                 query_page_size = page.page_size;
             }
-            if (page.version == 2) {
-                const id = page.discovery_id orelse return error.InvalidCloudSourceDiscovery;
-                if (id.len == 0 or id.len > 128) return error.InvalidCloudSourceDiscovery;
-                if (generation) |expected| {
-                    if (!std.mem.eql(u8, expected, id)) return error.CloudDiscoveryChanged;
-                } else generation = id;
-            } else if (page.next_cursor != null) return error.InvalidCloudSourceDiscovery;
-            if (tables.items.len + page.tables.len > 1000) return error.CloudDiscoveryBudgetExceeded;
-            for (page.tables) |table| {
-                if (table != .object) return error.InvalidCloudSourceDiscovery;
-                const name = table.object.get("name") orelse return error.InvalidCloudSourceDiscovery;
-                if (name != .string or name.string.len == 0) return error.InvalidCloudSourceDiscovery;
-                if (page.version == 2) {
-                    const access = table.object.get("access_id") orelse return error.InvalidCloudSourceDiscovery;
-                    if (access != .string or access.string.len == 0 or access.string.len > 128) return error.InvalidCloudSourceDiscovery;
-                    for (access.string) |char| if (!std.ascii.isAlphanumeric(char) and char != '_' and char != '-') return error.InvalidCloudSourceDiscovery;
-                }
-                if ((try source_ids.getOrPut(name.string)).found_existing) return error.DuplicateSourceID;
-                try tables.append(state, table);
+            const id = page.discovery_id orelse return error.InvalidCloudSourceDiscovery;
+            if (id.len == 0 or id.len > 128) return error.InvalidCloudSourceDiscovery;
+            if (generation) |expected| {
+                if (!std.mem.eql(u8, expected, id)) return error.CloudDiscoveryChanged;
+            } else generation = id;
+            if (tables.items.len + page.sources.len > 1000) return error.CloudDiscoveryBudgetExceeded;
+            for (page.sources) |source| {
+                if (source.access_id == null) return error.InvalidCloudSourceDiscovery;
+                const binding = @import("catalog.zig").table(source) catch return error.InvalidCloudSourceDiscovery;
+                if ((try source_ids.getOrPut(source.id)).found_existing) return error.DuplicateSourceID;
+                const encoded = try std.json.Stringify.valueAlloc(state, binding, .{});
+                try tables.append(state, try std.json.parseFromSliceLeaky(std.json.Value, state, encoded, .{}));
             }
             for (page.principals) |reader| {
                 if (!(try reader_ids.getOrPut(reader)).found_existing) {
@@ -179,7 +174,7 @@ pub const Session = struct {
                 }
             }
             if (page.next_cursor) |next| {
-                if (page.tables.len == 0 or next.len == 0 or next.len > 256) return error.InvalidCloudSourceDiscovery;
+                if (page.sources.len == 0 or next.len == 0 or next.len > 256) return error.InvalidCloudSourceDiscovery;
                 for (next) |char| if (!std.ascii.isAlphanumeric(char) and char != '_' and char != '-') return error.InvalidCloudSourceDiscovery;
                 if ((try cursors.getOrPut(next)).found_existing) return error.InvalidCloudSourceDiscovery;
                 cursor = next;
@@ -189,13 +184,13 @@ pub const Session = struct {
         }
         if (tables.items.len == 0) return error.NoConnectedSources;
         // Discovery v2 is independent of the existing indexed-table config v1.
-        return std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 1), .endpoint = endpoint, .tables = tables.items, .principals = principals.items, .page_size = query_page_size }, .{});
+        return std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 1), .endpoint = try std.fmt.allocPrint(state, "{s}/db/v1", .{std.mem.trimEnd(u8, self.context.url, "/")}), .tables = tables.items, .principals = principals.items, .page_size = query_page_size }, .{});
     }
 };
 
 // The public Cloud CLI context is the instance proxy root, shared with the
-// inference API. Resolve the versioned database route identically for discovery
+// inference API. Resolve the Cloud catalog route identically for discovery
 // and identity verification during refresh; neither accepts server-supplied URLs.
 fn sourceEndpoint(a: A, instance_url: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(a, "{s}/db/v1/sources", .{std.mem.trimEnd(u8, instance_url, "/")});
+    return std.fmt.allocPrint(a, "{s}/sources", .{std.mem.trimEnd(u8, instance_url, "/")});
 }

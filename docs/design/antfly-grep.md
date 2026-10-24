@@ -274,15 +274,71 @@ numbers, bounding boxes, OCR precision, or detection confidence. Model scores ar
 relevance estimates, not proof. In image mode counts refer to matching units.
 An error after a successful unit preserves its completed output as partial results.
 
-### Colony / Antfly Cloud delivery
+### Portable sources and Cloud delivery
 
-Cloud work is specified in [Colony #790](https://github.com/antflydb/colony/issues/790),
-not implemented in this repository. Colony owns OAuth/refresh secrets, Drive change
-cursors, effective ACL normalization, group membership, sync/reconciliation,
-private original/export/render storage, atomic publication and deletion/retention.
-`antfly-cloud` owns login, connections, source discovery and short-lived scoped
-sessions; `antfly-grep` consumes those authorized tables and the inference gateway.
-Users should not copy Drive tokens or manually reconstruct table schemas.
+Sources are first-class Cloud control-plane resources under Cloud's existing API
+versioning. A source binds a reusable connection, provider selection, destination,
+sharing policy and sync/run state. It is not a new Antfly database query resource.
+[Colony #790](https://github.com/antflydb/colony/issues/790) tracks the hosted
+experience and the remaining phase-one qualification.
+
+The public [sources module](../../go/pkg/sources/README.md) owns acquisition,
+revision-bound export/normalization, stable identities and provider absence
+checks. It supports GitHub code/collaboration, Drive Docs/Slides text exports,
+GCS and S3. Colony injects its credential/installation adapters and supplies
+PostgreSQL jobs, scheduling, private staging, access policy and hosted retention.
+The standalone `antfly-source sync` runtime uses the same providers and normalizer
+with a durable filesystem inventory and ownership journal; it needs no Colony or
+Cloud account. It can run from an external scheduler independently of grep.
+
+| Responsibility | Hosted runtime | Self-hosted runtime |
+| --- | --- | --- |
+| Connection/source management | Cloud API/UI/CLI | Source profile or application API |
+| Secret resolution | Encrypted Cloud credentials/current installation access | Injected resolver; runner references environment variables |
+| Acquisition and canonical text | Shared sources module | Shared sources module |
+| Jobs/checkpoints/reconciliation | Colony jobs, staging and ownership ledger | Runner lock, pinned inventory and ownership journal |
+| Storage/query | Ordinary Antfly tables and query snapshots | Ordinary Antfly tables and query snapshots |
+| Search configuration | Cloud discovery/session adapter | Portable catalog file and data-plane credentials |
+
+Grep owns catalog/profile loading, source aliases and selection, authentication
+adapters, exact matching and evidence evaluation. It does not own provider refresh
+secrets, background synchronization, or Cloud source-management state. A convenient
+indexing command delegates to the shared ingestion runtime rather than embedding
+a second connector/extraction pipeline into the search process.
+
+The portable catalog is version 2, independently of table configuration/document
+versions. It contains an Antfly API `endpoint`, `sources` with stable `id`, `alias`,
+physical `table`, `document_field`, selection `filter`, readiness `status` and
+optional `valid_until`/`access_id`, plus reader identities for grep's additional
+local check. [The schema](../../zig/pkg/antfly-grep/schema/sources-v2.json) is shared
+by local profiles and hosted discovery. It contains no provider or query tokens.
+A local catalog uses an absolute endpoint; the Cloud adapter accepts only the
+origin-pinned `db/v1` binding relative to its authenticated instance context.
+
+Cloud serves catalog discovery at `/cloud/v1/{instance}/sources`, outside the
+database API namespace. Its continuation pages additionally carry authenticated
+`subject`, `discovery_id` and optional `next_cursor`; traversal reauthorizes and
+fails explicitly on a changed view. `antfly-cloud` owns login and returns the
+instance context through its public `context --json` interface. Self-hosted
+`--source-catalog FILE --source NAME` does not execute `antfly-cloud`.
+
+All searches and parent/asset projections use the existing Antfly table-query
+route. Cloud accepts `X-Antfly-Source-ID` and optional `X-Antfly-Source-Access` as
+preconditions on that route, checks the table binding, current sharing/readiness
+and authenticated reader view, and adds a trusted source cut through the ordinary
+gateway. These headers grant no authority. A source mismatch, permission change
+or stale source fails explicitly. There is no `/sources/tables/.../query` API.
+Self-hosted deployments retain their normal Antfly authentication/row-policy
+boundary; catalogs and permission metadata cannot replace server authorization.
+
+Colony retains effective ACL normalization, group membership, private
+original/export/render storage, atomic publication and deletion/retention. The
+standalone text runner does not implement browser consent, provider-native ACL
+mirroring, distributed scheduling, binary/visual extraction or Cloud enrollment.
+Use separate tables/keys or a trusted row-policy gateway when self-hosting shared
+private content. Both runtimes keep provider, data-plane and inference credentials
+separate. Live-provider and visual qualification remain required before claiming
+all of #790's acceptance criteria.
 
 Drive stable file IDs survive moves. A source revision must bind the native
 provider version and exact exported bytes; derived pages/slides bind renderer

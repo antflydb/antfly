@@ -1312,6 +1312,63 @@ class CliTests(unittest.TestCase):
         self.raw_cli(*args, "--batch-size=1")
         self.assertGreater(len(self.server.requests), requests)
 
+    def test_portable_catalog_uses_normal_tables_without_cloud_login(self):
+        self.table_config([self.indexed_doc(content="needle\n")])
+        source = {
+            "id": "source-one",
+            "alias": "manuals",
+            "table": "source files",
+            "document_field": "grep",
+            "status": "searchable",
+            "filter": {"equals": "source-one", "field": "source_id"},
+        }
+        catalog = {
+            "version": 2,
+            "endpoint": f"http://127.0.0.1:{self.server.server_port}/api/v1",
+            "sources": [source],
+            "principals": [],
+        }
+        path = str(self.write("catalog.json", json.dumps(catalog)))
+        result = self.raw_cli(
+            "--source-catalog",
+            path,
+            "--source",
+            "manuals",
+            "--source",
+            "source-one",
+            "needle",
+        )
+        self.assertIn(b"needle", result.stdout)
+        self.assertEqual(len(self.server.index_requests), 1)
+        for request_path, token, body in self.server.index_requests:
+            self.assertEqual(request_path, "/api/v1/tables/source%20files/query")
+            self.assertEqual(token, "Bearer independent-table-token")
+            self.assertIn("source-one", json.dumps(body["filter_query"]))
+        for state in ("stale", "syncing", "pending"):
+            source["status"] = state
+            self.write("catalog.json", json.dumps(catalog))
+            before = len(self.server.index_requests)
+            result = self.raw_cli("--source-catalog", path, "needle", code=2)
+            self.assertIn(b"SourceNotSearchable", result.stderr)
+            self.assertEqual(len(self.server.index_requests), before)
+        source["status"] = "searchable"
+        source["valid_until"] = 1
+        self.write("catalog.json", json.dumps(catalog))
+        result = self.raw_cli("--source-catalog", path, "needle", code=2)
+        self.assertIn(b"SourceNotSearchable", result.stderr)
+        result = self.raw_cli("--source-catalog", path, "--cloud", "needle", code=2)
+        self.assertIn(b"ConflictingCloudSourceOptions", result.stderr)
+        self.raw_cli("--source-catalog", "missing.json", "--help")
+        source.pop("valid_until")
+        for missing in ("filter", "status", "document_field"):
+            incomplete = dict(source)
+            incomplete.pop(missing)
+            catalog["sources"] = [incomplete]
+            self.write("catalog.json", json.dumps(catalog))
+            before = len(self.server.index_requests)
+            self.raw_cli("--source-catalog", path, "needle", code=2)
+            self.assertEqual(len(self.server.index_requests), before)
+
     def test_indexed_manual_selectors_preserve_configured_alias_namespace(self):
         tables = [
             {"name": "physical-a", "alias": "physical-b"},

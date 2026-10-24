@@ -44,6 +44,7 @@ class CloudTests(unittest.TestCase):
         self.identity_changed = False
         self.discovery_requests = []
         self.source_aliases = ["engineering", "work-drive"]
+        self.selected_ids = []
         self.paginate = False
         self.discovery_failure = None
         self.discovery_refresh = False
@@ -69,7 +70,7 @@ class CloudTests(unittest.TestCase):
             def do_GET(self):
                 test.discovery_requests.append(self.path)
                 parsed = urlsplit(self.path)
-                if parsed.path != "/cloud/v1/instance/db/v1/sources":
+                if parsed.path != "/cloud/v1/instance/sources":
                     self.reply(404)
                     return
                 cursor = parse_qs(parsed.query).get("cursor", [None])[0]
@@ -93,14 +94,18 @@ class CloudTests(unittest.TestCase):
                     subject = "user:bob"
                 tables = [
                     {
-                        "name": "repo-one",
+                        "id": "repo-one",
+                        "table": "shared-sources",
+                        "filter": {"equals": "repo-one", "field": "source_id"},
                         "alias": test.source_aliases[0],
                         "document_field": "grep",
                         "status": "searchable",
                         "access_id": "repo-access",
                     },
                     {
-                        "name": "drive-two",
+                        "id": "drive-two",
+                        "table": "shared-sources",
+                        "filter": {"equals": "drive-two", "field": "source_id"},
                         "alias": test.source_aliases[1],
                         "document_field": "grep",
                         "status": "searchable",
@@ -115,15 +120,18 @@ class CloudTests(unittest.TestCase):
                     "subject": subject,
                     "page_size": 1,
                     "principals": ["user:alice"],
-                    "tables": tables,
+                    "sources": tables,
+                    "endpoint": "db/v1",
                     "discovery_id": generation,
                 }
+                if cursor and test.discovery_failure == "unsafe-endpoint":
+                    response["endpoint"] = "https://other-host.example/db/v1"
                 if test.too_many_sources:
-                    response["tables"] = [
-                        dict(tables[0], name=f"source-{n}") for n in range(1001)
+                    response["sources"] = [
+                        dict(tables[0], id=f"source-{n}") for n in range(1001)
                     ]
                 if test.paginate:
-                    response["tables"] = [tables[1] if cursor else tables[0]]
+                    response["sources"] = [tables[1] if cursor else tables[0]]
                     if cursor:
                         response["principals"].append("group:drive-reader")
                     if not cursor or test.discovery_failure == "loop":
@@ -131,13 +139,13 @@ class CloudTests(unittest.TestCase):
                     if not cursor and test.discovery_failure == "unsafe-cursor":
                         response["next_cursor"] = "https://other-host.example/steal"
                     if cursor and test.discovery_failure == "duplicate":
-                        response["tables"] = [tables[0]]
+                        response["sources"] = [tables[0]]
                 if cursor and test.discovery_failure == "missing-access":
-                    response["tables"][0].pop("access_id", None)
+                    response["sources"][0].pop("access_id", None)
                 if cursor and test.discovery_failure == "unsafe-access":
-                    response["tables"][0]["access_id"] = "bad\r\nheader"
+                    response["sources"][0]["access_id"] = "bad\r\nheader"
                 if test.legacy_discovery:
-                    for table in response["tables"]:
+                    for table in response["sources"]:
                         table.pop("access_id", None)
                 self.reply(200, response)
 
@@ -146,7 +154,11 @@ class CloudTests(unittest.TestCase):
                 test.requests.append(
                     (self.path, self.headers.get("Authorization"), body)
                 )
-                source = self.path.split("/")[-2]
+                source = self.headers.get("X-Antfly-Source-ID")
+                test.selected_ids.append(source)
+                test.assertEqual(
+                    self.path, "/cloud/v1/instance/db/v1/tables/shared-sources/query"
+                )
                 test.assertEqual(
                     self.headers.get("X-Antfly-Source-Access"),
                     None
@@ -283,7 +295,7 @@ class CloudTests(unittest.TestCase):
         self.assertIn(b"repo-one/item.txt", result.stdout)
         self.assertIn(b"drive-two/item.txt", result.stdout)
         self.assertNotIn(b"secret.txt", result.stdout)
-        self.assertTrue(all("/sources/tables/" in path for path, _, _ in self.requests))
+        self.assertTrue(all("/db/v1/tables/" in path for path, _, _ in self.requests))
 
     def test_instance_root_with_trailing_slash_and_refresh_uses_same_route(self):
         (self.directory / "trailing-slash").touch()
@@ -293,8 +305,7 @@ class CloudTests(unittest.TestCase):
         self.assertGreaterEqual(len(self.discovery_requests), 2)
         self.assertTrue(
             all(
-                path == "/cloud/v1/instance/db/v1/sources"
-                for path in self.discovery_requests
+                path == "/cloud/v1/instance/sources" for path in self.discovery_requests
             )
         )
 
@@ -331,16 +342,14 @@ class CloudTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.count(b"a shared retry budget"), 1)
-        self.assertTrue(all("repo-one" in path for path, _, _ in self.requests))
+        self.assertTrue(all(source == "repo-one" for source in self.selected_ids))
 
     def test_source_id_takes_precedence_over_another_sources_alias(self):
         self.source_aliases[0] = "drive-two"
         result = self.run_cli("--source", "drive-two", "retry")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(self.requests)
-        self.assertTrue(
-            all("/tables/drive-two/" in path for path, _, _ in self.requests)
-        )
+        self.assertTrue(all(source == "drive-two" for source in self.selected_ids))
         self.assertNotIn(b"repo-one/item.txt", result.stdout)
 
     def test_ambiguous_alias_fails_before_any_query_but_ids_still_work(self):
@@ -352,9 +361,7 @@ class CloudTests(unittest.TestCase):
         result = self.run_cli("--source", "repo-one", "retry")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(self.requests)
-        self.assertTrue(
-            all("/tables/repo-one/" in path for path, _, _ in self.requests)
-        )
+        self.assertTrue(all(source == "repo-one" for source in self.selected_ids))
 
     def test_refresh_keeps_snapshot_and_cursor(self):
         self.refresh = True
@@ -420,6 +427,7 @@ class CloudTests(unittest.TestCase):
             ("loop", b"InvalidCloudSourceDiscovery"),
             ("revoked", b"CloudSourceAccessDenied"),
             ("unsafe-cursor", b"InvalidCloudSourceDiscovery"),
+            ("unsafe-endpoint", b"CloudContextChanged"),
             ("missing-access", b"InvalidCloudSourceDiscovery"),
             ("unsafe-access", b"InvalidCloudSourceDiscovery"),
         ):
@@ -446,11 +454,12 @@ class CloudTests(unittest.TestCase):
         self.assertIn(b"repo-one/item.txt", result.stdout)
         self.assertNotIn(b"drive-two/item.txt", result.stdout)
 
-    def test_legacy_single_page_discovery_remains_supported(self):
+    def test_unsupported_catalog_versions_fail_before_querying(self):
         self.legacy_discovery = True
         result = self.run_cli("retry")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(b"drive-two/item.txt", result.stdout)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"UnsupportedCloudSourceVersion", result.stderr)
+        self.assertEqual(self.requests, [])
 
     def test_unknown_source_and_conflicting_local_scope_fail_explicitly(self):
         result = self.run_cli("--source", "missing", "retry")

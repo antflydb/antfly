@@ -4644,3 +4644,22 @@ separate `access_id` for each source. Queries send that source's access ID in
 An unrelated source's sync or rename does not invalidate a selected-source
 query. A change to the selected source's reader policy or authenticated reader
 identities ends the search explicitly as incomplete; rerun discovery to retry.
+
+
+Portable source profiles use [sources-v2.json](schema/sources-v2.json), independently
+of Cloud login. `antfly-grep --source-catalog catalog.json --source manuals PATTERN`
+loads an explicit endpoint, physical table bindings, source filters and readiness;
+`ANTFLY_GREP_TABLE_TOKEN` supplies its separate data-plane credential. This path
+never invokes `antfly-cloud`. Pending, syncing, stale and expired bindings fail
+explicitly. A catalog configures search and does not grant server access.
+
+The public [ingestion module and standalone runner](../../../go/pkg/sources/README.md)
+can produce this catalog from GitHub, Drive Docs/Slides, S3 or GCS without Colony.
+It uses the same provider/normalization components as hosted imports and can run
+from cron or another scheduler; synchronization is not embedded in grep.
+
+Cloud catalog discovery lives at the authenticated instance root plus `/sources`.
+Both Cloud and self-hosted search use ordinary `/tables/{table}/query` requests.
+Cloud applies `X-Antfly-Source-ID` and `X-Antfly-Source-Access` preconditions on that
+route to enforce the current binding, access and readiness. These are Cloud
+preconditions, not new Antfly database APIs or authorization capabilities.

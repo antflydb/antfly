@@ -17,6 +17,7 @@ const std = @import("std");
 pub const interrupt = @import("interrupt.zig");
 pub const concurrency = @import("concurrency.zig");
 pub const cloud = @import("cloud.zig");
+pub const catalog = @import("catalog.zig");
 pub const setup = @import("setup.zig");
 pub const tooling = @import("tooling.zig");
 pub const workspace = @import("workspace.zig");
