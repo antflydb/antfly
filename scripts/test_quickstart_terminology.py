@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -22,6 +21,36 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts import test_quickstart_docs as docs
+
+
+class RecordingWaitTests(unittest.TestCase):
+    tape = (
+        "Type@75ms `antfly index wait -t wikipedia -i title_body "
+        "--until source-covered=10% --timeout 45m`\n"
+        "Enter\n# Follow the cursor after scrolling output.\nWait@2700s /❯/\n"
+        "Type `antfly query -t wikipedia`\nEnter\n"
+    )
+
+    def test_cursor_prompt_wait_accepts_short_and_long_flags(self):
+        docs.check_recording_coverage_wait(self.tape)
+        docs.check_recording_coverage_wait(
+            self.tape.replace("-t wikipedia", "--table wikipedia")
+            .replace("-i title_body", "--index title_body")
+            .replace("Wait@", "Wait+Line@")
+        )
+
+    def test_unrelated_timeout_or_prompt_cannot_satisfy_wait(self):
+        for old, new in (
+            ("--timeout 45m", "--timeout 1s"),
+            ("source-covered=10%", "searchable-artifacts=1"),
+            ("Wait@2700s /❯/", "Wait+Screen@2700s /❯/"),
+            ("Wait@2700s /❯/", "Sleep 1s"),
+        ):
+            with self.subTest(old=old), self.assertRaises(AssertionError):
+                docs.check_recording_coverage_wait(
+                    self.tape.replace(old, new)
+                    + "Type `echo --timeout 45m source-covered=10%`\nEnter\nWait@2700s /❯/\n"
+                )
 
 
 class TerminologyTests(unittest.TestCase):
@@ -55,6 +84,6 @@ class TerminologyTests(unittest.TestCase):
             with (
                 patch.object(docs, "REPO", root),
                 patch.object(docs, "DOCS_DIR", pages),
+                self.assertRaisesRegex(AssertionError, "history.md:1.*capital I"),
             ):
-                with self.assertRaisesRegex(AssertionError, "history.md:1.*capital I"):
-                    docs.check_terminology()
+                docs.check_terminology()

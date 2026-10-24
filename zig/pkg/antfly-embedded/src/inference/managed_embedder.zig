@@ -448,6 +448,7 @@ pub const ProviderRuntime = struct {
     bedrock_credentials: BedrockCredentialPool,
     http_mutex: std.atomic.Mutex = .unlocked,
     http_client: std.atomic.Value(?*httpx.Client) = .init(null),
+    generation_http_client: std.atomic.Value(?*httpx.Client) = .init(null),
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io) ProviderRuntime {
         return .{
@@ -458,33 +459,47 @@ pub const ProviderRuntime = struct {
         };
     }
 
+    pub fn bedrockCredentialsForRegion(self: *ProviderRuntime, region: []const u8) !*bedrock_provider.CredentialCache {
+        return self.bedrock_credentials.cacheForRegion(region);
+    }
+
     /// Lazily publish one service-scoped transport. Provider request objects
     /// retain per-request URLs, authentication, cancellation, and deadlines;
     /// the client owns only reusable DNS/TLS/connection state.
     pub fn httpClient(self: *ProviderRuntime) !*httpx.Client {
-        if (self.http_client.load(.acquire)) |client| return client;
+        return self.pooledHttpClient(&self.http_client, remote_embedding_max_response_bytes, max_embedding_request_timeout_ms, false);
+    }
+
+    /// A client's response ceiling is a hard transport cap, even when a caller
+    /// supplies a larger request limit. Generation therefore has its own
+    /// reusable pool, while embedding retains its smaller family safeguards.
+    pub fn generationHttpClient(self: *ProviderRuntime) !*httpx.Client {
+        return self.pooledHttpClient(&self.generation_http_client, httpx.types.default_max_body_size, 300_000, true);
+    }
+
+    fn pooledHttpClient(self: *ProviderRuntime, slot: *std.atomic.Value(?*httpx.Client), response_limit: usize, timeout_ms: u64, cancel_on_shutdown: bool) !*httpx.Client {
+        if (slot.load(.acquire)) |client| return client;
         lockAtomic(&self.http_mutex);
         defer self.http_mutex.unlock();
-        if (self.http_client.load(.acquire)) |client| return client;
+        if (slot.load(.acquire)) |client| return client;
         const client = try self.alloc.create(httpx.Client);
         errdefer self.alloc.destroy(client);
-        // Request-local URL/header/response allocations happen concurrently;
-        // keep them off a possibly arena-backed service owner allocator.
         client.* = httpx.Client.initWithConfig(std.heap.smp_allocator, self.io, .{
             .keep_alive = true,
             .cookies_enabled = false,
-            .max_response_size = remote_embedding_max_response_bytes,
-            .timeouts = httpx.Timeouts.uniform(max_embedding_request_timeout_ms),
+            .max_response_size = response_limit,
+            .timeouts = httpx.Timeouts.uniform(timeout_ms),
+            .cancel_in_flight_on_shutdown = cancel_on_shutdown,
         });
-        self.http_client.store(client, .release);
+        slot.store(client, .release);
         return client;
     }
 
     pub fn deinit(self: *ProviderRuntime) void {
-        if (self.http_client.swap(null, .acq_rel)) |client| {
+        inline for (.{ &self.generation_http_client, &self.http_client }) |slot| if (slot.swap(null, .acq_rel)) |client| {
             client.deinit();
             self.alloc.destroy(client);
-        }
+        };
         self.bedrock_credentials.deinit();
         self.google_credentials.deinit();
         self.* = undefined;
