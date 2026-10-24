@@ -213,7 +213,10 @@ pub const Cache = struct {
             if (!std.mem.eql(u8, value.bytes[24..56], &self.underlying.domain)) return error.GraphPageDomainMismatch;
             return self.borrow(i);
         };
-        var original = try readPage(a, self.underlying, ref);
+        return self.adopt(a, ref, try readPage(a, self.underlying, ref));
+    }
+    fn adopt(self: *Cache, a: Allocator, ref: Ref, input: Page) !Page {
+        var original = input;
         errdefer original.deinit(a);
         const size = original.bytes.len + original.entries.len * @sizeOf(Entry) + original.expanded_keys.len;
         const index = self.room(size) orelse return original;
@@ -227,11 +230,48 @@ pub const Cache = struct {
         return self.borrow(index);
     }
     fn readMany(raw: *anyopaque, a: Allocator, refs_: []const Ref, output: []Page) !void {
-        var initialized: usize = 0;
-        errdefer for (output[0..initialized]) |*page| page.deinit(a);
-        for (refs_, output) |ref, *page| {
-            page.* = try getDecoded(raw, a, ref);
-            initialized += 1;
+        const self: *Cache = @ptrCast(@alignCast(raw));
+        if (refs_.len != output.len or refs_.len > max_read_batch) return error.InvalidGraphPage;
+        var initialized: [max_read_batch]bool = @splat(false);
+        errdefer for (output, initialized[0..output.len]) |*page, live| if (live) page.deinit(a);
+        var misses: [max_read_batch]Ref = undefined;
+        var positions: [max_read_batch]usize = undefined;
+        var count: usize = 0;
+        for (refs_, 0..) |ref, position| {
+            try check(raw);
+            try ref.validate();
+            self.clock +|= 1;
+            const hit = for (self.slots, 0..) |slot, index| {
+                if (slot) |value| if (value.page != null and value.ref.eql(ref)) break index;
+            } else null;
+            if (hit) |index| {
+                if (!std.mem.eql(u8, self.slots[index].?.bytes[24..56], &self.underlying.domain)) return error.GraphPageDomainMismatch;
+                output[position] = self.borrow(index);
+                initialized[position] = true;
+            } else {
+                misses[count] = ref;
+                positions[count] = position;
+                count += 1;
+            }
+        }
+        if (count == 0) return;
+        var pages: [max_read_batch]Page = undefined;
+        if (self.underlying.read_many) |many| {
+            try many.read(many.ptr, a, misses[0..count], pages[0..count]);
+        } else {
+            var read: usize = 0;
+            errdefer for (pages[0..read]) |*page| page.deinit(a);
+            for (misses[0..count], pages[0..count]) |ref, *page| {
+                page.* = try readPage(a, self.underlying, ref);
+                read += 1;
+            }
+        }
+        var consumed: usize = 0;
+        defer for (pages[consumed..count]) |*page| page.deinit(a);
+        for (misses[0..count], positions[0..count], pages[0..count]) |ref, position, page| {
+            consumed += 1;
+            output[position] = try self.adopt(a, ref, page);
+            initialized[position] = true;
         }
     }
     fn put(ptr: *anyopaque, ref: Ref, bytes: []const u8) !void {
@@ -3662,14 +3702,18 @@ test "external lake decoded operation cache pins leases bounds eviction and chec
     try std.testing.expectError(error.GraphPageDomainMismatch, readPage(a, cache.store(), first));
     cache.underlying.domain[0] = 0;
     const Failure = struct {
-        fn run(failing: Allocator, store_: Store, root: Ref) !void {
+        fn run(failing: Allocator, store_: Store, root: Ref, other: Ref) !void {
             var owner: Cache = .{ .alloc = failing, .underlying = store_, .decoded = true };
             defer owner.deinit();
             var page = try readPage(failing, owner.store(), root);
             defer page.deinit(failing);
             var again = try readPage(failing, owner.store(), root);
             defer again.deinit(failing);
+            var batch: [2]Page = undefined;
+            const capability = owner.store().read_many.?;
+            try capability.read(capability.ptr, failing, &.{ root, other }, &batch);
+            defer for (&batch) |*item| item.deinit(failing);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Failure.run, .{ memory.store(), first });
+    try std.testing.checkAllAllocationFailures(a, Failure.run, .{ memory.store(), first, second });
 }

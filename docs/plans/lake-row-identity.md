@@ -990,3 +990,47 @@ summary capture without forward capture because they do not publish canonical
 forward trees. This removes the otherwise unnecessary posting decode from copied
 sections. Existing protocol 80 representations, closure edges and public UX apply
 unchanged; no new wire format is needed.
+
+
+### Publication read waves and projected reductions (reader protocol 81)
+
+Publication maintenance uses the existing execution I/O phase to admit bounded
+read waves. The coordinator validates references, reserves read bytes, and groups
+adjacent or overlapping ranges from the same immutable pack, attempt and size.
+A combined range never exceeds one maximum page; at most eight page references
+enter a batch. There is no speculative gap overfetch. The phase bounds concurrent
+range requests; workers borrow immutable jobs and a synchronized allocator,
+without sharing counters, cache slots or the mutable phase. Every worker joins
+before CPU admission resumes, errors escape or storage capabilities retire.
+Authentication and decoding run after resumption, independently for every page.
+Query read budgets retain their cumulative semantics; streaming construction
+admits each bounded batch. Stores with a separate read-cache capability retain
+its established serial admission path.
+
+The decoded operation cache separates pinned hits from misses and forwards only
+misses to the backing batch capability. Adoption and eviction remain serial;
+failed reads or allocations release all partial pages and hit leases. A mixed
+six-page fixture retains two warm pages, reads the remaining packed pairs in one
+bounded wave, and requires three total range reads rather than six. Backend
+failure and cancellation on resumption must leave no readers or phase active.
+
+Append compaction streams remapped forward evidence into the existing presorted
+spill representation. Source maps concatenate disjoint document ranges, and the
+consumer verifies strict key order across source boundaries. This retains bounded
+spilling while eliminating sort and merge rewrites for that path. Deleting or
+arbitrarily reordered merges keep the general sorter. Regression coverage compares
+both paths against the same authenticated forward tree and checks zero merge work
+for the ordered stream.
+
+Reduction state version 2 projects summary records to the reducers that require a
+reduction tree. COUNT, integer SUM and indexed extrema remain in contribution and
+result state, but no longer occupy or merge at every summary level. Slot order is
+derived from the authenticated cohort recipe; original-to-summary lookups are
+constant-time. Projection copies portable transition bytes, including NUMERIC
+coefficients and display scale, without decoding them. All-reduction recipes reuse
+their existing record bytes. Legacy reduction layouts rebuild once from the verified contribution tree,
+without rereading unchanged Parquet rows; subsequent repairs reuse version 2
+summaries. Protocol 81 prevents older readers from interpreting the new layout. Publication, certificate, lease and GC dependencies remain the same.
+
+These are structural work and correctness contracts. Archive-scale throughput,
+cold cloud latency and live-provider retention qualification remain unmeasured.

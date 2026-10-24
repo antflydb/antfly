@@ -169,6 +169,7 @@ pub const Captured = struct {
     forward_manager: ?local.sql_spill.Manager = null,
     forward_disabled: bool = false,
     reused_forward_entries: u64 = 0,
+    forward_last: std.ArrayList(u8) = .empty,
     forward_budget: local.sql_memory_budget = undefined,
     pub fn create(a: A, manager: *local.sql_spill.Manager) !*Captured {
         const self = try a.create(Captured);
@@ -204,6 +205,8 @@ pub const Captured = struct {
         };
     }
     fn discardForward(self: *Captured) void {
+        self.forward_last.deinit(self.forward_budget.allocator());
+        self.forward_last = .empty;
         if (self.forward_sort) |*sort| sort.deinit();
         self.forward_sort = null;
         if (self.forward_manager) |*manager| manager.deinit();
@@ -237,8 +240,21 @@ pub const Captured = struct {
         sort.parallel_runs = false;
         self.forward_sort = sort;
     }
+    /// Append merge maps concatenate disjoint, ordered document ranges.
+    /// Validate the promise while streaming; arbitrary maps keep normal sorting.
+    pub fn orderedForward(self: *Captured) void {
+        std.debug.assert(self.forward_sort == null);
+        if (!self.hasForward()) return;
+        self.ensureForward();
+        self.forward_sort.?.presorted = true;
+    }
     fn addForward(self: *Captured, key: []const u8, value: []const u8) !void {
         self.ensureForward();
+        if (self.forward_sort.?.presorted) {
+            if (self.forward_last.items.len != 0 and std.mem.order(u8, self.forward_last.items, key) != .lt) return error.InvalidNativeLakeTextStatistics;
+            self.forward_last.clearRetainingCapacity();
+            try self.forward_last.appendSlice(self.forward_budget.allocator(), key);
+        }
         try self.forward_sort.?.add(.{ .keys = &.{local.sql_scalar.Datum.json(.{ .string = key })}, .values = &.{local.sql_scalar.Datum.json(.{ .string = value })}, .ordinal = self.forward_sort.?.total });
     }
     pub const ForwardInput = union(enum) { captured: *Captured, tree: ?Ref };

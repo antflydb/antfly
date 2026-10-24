@@ -3848,3 +3848,10 @@ uses bulk reduction construction, bounded authenticated decoded-page reuse,
 scoped forward spill admission and verified merge-map evidence transfer. Serving
 pack writers request summaries alone; canonical forward trees remain owned by
 canonical maintenance groups and their existing publication/GC closure.
+
+
+Reader protocol 81 adds [publication read waves and projected reductions](lake-row-identity.md#publication-read-waves-and-projected-reductions-reader-protocol-81).
+Maintenance cache misses share bounded, phase-admitted packed range reads; append
+forward transfer preserves verified order without merge rewrites. Reduction state
+version 2 stores only reducers that need tree maintenance and rebuilds older state
+once. These refinements retain the existing publication and reclamation boundary.

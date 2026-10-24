@@ -222,6 +222,31 @@ test "external lake forward text retractions seek changed terms and match comple
         try std.testing.expect(try tree.equivalent(a, pages.store(), oracle_forward, rewritten, .{}));
         try std.testing.expect(reused.forward_budget.peak <= reused.forward_budget.limit);
     }
+    // Append maps preserve ordering across producer boundaries, including a
+    // reused source sort that was rewound after the preceding arbitrary merge.
+    var append = try local.segment.MergeSourceMap.init(a, &.{ count, count });
+    defer append.deinit();
+    try append.recordRange(0, 0, count, 0);
+    try append.recordRange(1, 0, count, count);
+    try append.finishOutput(count * 2);
+    const ordered = try stats.Captured.create(a, &manager);
+    defer ordered.deinit();
+    ordered.orderedForward();
+    const sorted = try stats.Captured.create(a, &manager);
+    defer sorted.deinit();
+    for (0..2) |index| {
+        try ordered.reuseForward(&store, .{ .captured = captured }, index, &append, .none);
+        try sorted.reuseForward(&store, .{ .tree = forward }, index, &append, .none);
+    }
+    const merge_rows = manager.merged_rows;
+    const ordered_root = try ordered.publishForward(&store, .none);
+    try std.testing.expectEqual(merge_rows, manager.merged_rows);
+    try std.testing.expect(ordered.forward_sort.?.presorted);
+    const sorted_root = try sorted.publishForward(&store, .none);
+    reads = 8 * 1024 * 1024;
+    try std.testing.expect(try tree.equivalent(a, pages.store(), sorted_root, ordered_root, .{}));
+    // Reusing the same output document range violates the ordered contract.
+    try std.testing.expectError(error.InvalidNativeLakeTextStatistics, ordered.reuseForward(&store, .{ .tree = forward }, 0, &append, .none));
     const FailureCase = struct {
         fn run(failing: A, backend: *stores.ArtifactStore, evidence: ?tree.Ref, original: ?tree.Ref, retired: *const local.encoding_roaring.RoaringBitmap) !void {
             var failure_token: u8 = 0;

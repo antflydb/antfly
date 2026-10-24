@@ -2461,6 +2461,7 @@ const Compactor = struct {
             var count: u32 = 0;
             for (counts[0..self.count]) |value| count = try std.math.add(u32, count, value);
             try mapping.?.finishOutput(count);
+            staged.statistics.?.orderedForward();
             for (self.pending[0..self.count], 0..) |owned, i| try staged.statistics.?.reuseForward(self.store, .{ .captured = owned.?.captured.? }, i, &mapping.?, self.cancellation);
         }
         return staged;

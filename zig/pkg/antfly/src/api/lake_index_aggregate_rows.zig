@@ -65,9 +65,7 @@ const GroupDelta = struct {
         target.* = merged;
     }
 };
-fn direct(input: local.sql_aggregate_materialization.Input) bool {
-    return input.spec.kind == .count or (input.spec.kind == .sum and input.spec.input_type == .integer) or input.spec.kind == .min or input.spec.kind == .max;
-}
+const direct = reductions.direct;
 fn needsReductions(recipe: Recipe) bool {
     for (recipe.inputs) |input| if (!direct(input)) return true;
     return false;
@@ -106,11 +104,13 @@ fn adjust(a: A, previous: ?[]const u8, delta: GroupDelta, layout: *const record.
     const removed = if (delta.removed) |value| try record.View.init(value, layout) else null;
     const added = if (delta.added) |value| try record.View.init(value, layout) else null;
     if (before == null and removed != null) return error.InvalidNativeAggregateArtifact;
-    const reduced = if (needsReductions(recipe)) try reductions.lookup(sa, storage, rows.reductions, group, row_count, layout) else null;
+    const projection = try reductions.Projection.init(sa, layout);
+    defer projection.deinit(sa);
+    const reduced = if (needsReductions(recipe)) try reductions.lookup(sa, storage, rows.reductions, group, row_count, &projection.layout) else null;
     const states = try sa.alloc(local.sql_operators.Aggregate, layout.slots.len);
     for (states, recipe.inputs, 0..) |*state, input, slot| {
         if (!direct(input)) {
-            state.* = try reduced.?.read(sa, slot);
+            state.* = try reduced.?.read(sa, try projection.slot(slot));
             continue;
         }
         state.* = try local.sql_operators.Aggregate.initTyped(sa, input.spec.kind, input.spec.input_type, input.spec.input_element);
@@ -168,7 +168,7 @@ fn buildInner(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, b
     defer arena.deinit();
     const ca = arena.allocator();
     const seed = if (prior) |ref| try artifact.rowSeed(ca, store.*, ref, recipe, token) else null;
-    const selected = if (seed != null and (!hasExtrema(recipe) or seed.?.rows.extrema_version == 1) and (!needsReductions(recipe) or seed.?.rows.reductions_version == 1)) provider.rowsForFile(file) else null;
+    const selected = if (seed != null and (!hasExtrema(recipe) or seed.?.rows.extrema_version == 1)) provider.rowsForFile(file) else null;
     const old = if (selected != null) seed else null;
     var reads: u64 = 0;
     var writes: u64 = 0;
@@ -294,8 +294,8 @@ fn buildInner(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, b
     var row_state: artifact.RowState = .{ .rows = try changes.finish(if (old) |seed_| seed_.rows.rows else null), .reverse = try reverse.finish(if (old) |seed_| seed_.rows.reverse else null), .extrema_version = 1, .extrema = try extrema.finish(if (old) |seed_| seed_.rows.extrema else null) };
     if ((if (row_state.rows) |root| root.records else 0) != provider.source.inventory.files[file].row_count or (if (row_state.reverse) |root| root.records else 0) != provider.source.inventory.files[file].row_count) return error.InvalidNativeAggregateArtifact;
     if (needsReductions(recipe)) {
-        row_state.reductions = try reductions.repair(a, &manager, storage, row_state.rows, if (old) |before| before.rows.reductions else null, &dirty, provider.source.inventory.files[file].row_count, &layout, store.io_phase);
-        row_state.reductions_version = 1;
+        row_state.reductions = try reductions.repair(a, &manager, storage, row_state.rows, if (old) |before| (if (before.rows.reductions_version == reductions.version) before.rows.reductions else null) else null, &dirty, provider.source.inventory.files[file].row_count, &layout, store.io_phase);
+        row_state.reductions_version = reductions.version;
     }
     var result_changes = Mutations.init(a, &manager, storage);
     defer result_changes.deinit();
@@ -435,8 +435,33 @@ fn aggregateRowScenario(comptime mode: enum { integer, string, numeric, boolean 
         const layout = try record.Layout.init(a, recipe);
         defer layout.deinit(a);
         var previous: ?Ref = null;
-        for (0..4) |step| {
+        const names: []const []const u8 = if (fixed_only) &.{ "count", "sum" } else if (mode == .integer) &.{ "count", "sum", "min", "max" } else if (mode == .string) &.{ "count", "min", "max" } else &.{ "count", "min", "max", "reduce", "reduce2" };
+        for (0..@as(usize, if (needsReductions(recipe)) 5 else 4)) |step| {
             fixture.visited = 0;
+            if (step == 4) {
+                const legacy = (try artifact.rowSeed(out, store, previous.?, recipe, .none)).?;
+                var old_rows = legacy.rows;
+                // The four-row fixture has one leaf block per group. Rebuild
+                // genuine version-1 summaries with every full-recipe slot;
+                // their bytes cannot be interpreted as the projected layout.
+                var legacy_reads: u64 = 0;
+                var legacy_writes: u64 = 0;
+                var legacy_pages: Pages = .{ .domain = domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &legacy_reads, .remaining_write_bytes = &legacy_writes, .streaming = true };
+                var legacy_builder: tree.SortedBuilder = .{ .alloc = a, .store = legacy_pages.store() };
+                defer legacy_builder.deinit();
+                var legacy_groups = try tree.Cursor.init(a, legacy_pages.store(), legacy.index.page, "", null);
+                defer legacy_groups.deinit();
+                while (try legacy_groups.next()) |group| {
+                    const lower = try prefix(out, group.key);
+                    const key = try out.alloc(u8, lower.len + 9);
+                    @memcpy(key[0..lower.len], lower);
+                    @memset(key[lower.len..], 0);
+                    try legacy_builder.add(key, group.value);
+                }
+                old_rows.reductions = try legacy_builder.finish();
+                old_rows.reductions_version = 1;
+                previous = (try artifact.publishTreeWithRows(a, out, &store, names, recipe, legacy.index, old_rows, .none))[0];
+            }
             if (step != 0) provider.changed_rows = &.{if (step == 2) &.{0} else &.{1}};
             if (step == 1) {
                 fixture.keys[1] = "b";
@@ -448,7 +473,7 @@ fn aggregateRowScenario(comptime mode: enum { integer, string, numeric, boolean 
                 fixture.values[1] = -7;
             }
             var budget = try @import("../serverless/build/lake_build_limits.zig").Budget.init(.{});
-            const references = (try build(a, out, &store, &provider, binding, recipe, (if (fixed_only) &.{ "count", "sum" } else if (mode == .integer) &.{ "count", "sum", "min", "max" } else if (mode == .string) &.{ "count", "min", "max" } else &.{ "count", "min", "max", "reduce", "reduce2" }), 0, previous, &budget, .none)).?;
+            const references = (try build(a, out, &store, &provider, binding, recipe, names, 0, previous, &budget, .none)).?;
             try std.testing.expectEqual(@as(usize, if (step == 0) 4 else 1), fixture.visited);
             previous = references[0];
             const seed = (try artifact.rowSeed(out, store, references[0], recipe, .none)).?;
@@ -525,7 +550,7 @@ fn aggregateRowScenario(comptime mode: enum { integer, string, numeric, boolean 
             try std.testing.expect(collector.marked.contains(&try Pages.identity(domain, seed.rows.rows.?)));
             try std.testing.expect(collector.marked.contains(&try Pages.identity(domain, seed.rows.reverse.?)));
             if (mode == .numeric or mode == .boolean) {
-                try std.testing.expectEqual(@as(u8, 1), seed.rows.reductions_version);
+                try std.testing.expectEqual(@as(u8, reductions.version), seed.rows.reductions_version);
                 try std.testing.expect(collector.marked.contains(&try Pages.identity(domain, seed.rows.reductions.?)));
             }
             if (!fixed_only) {

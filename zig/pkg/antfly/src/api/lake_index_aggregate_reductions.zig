@@ -24,6 +24,43 @@ const record = artifact.state_tree.record;
 const Mutations = @import("lake_index_page_mutations.zig").Mutations;
 const keys = @import("lake_index_aggregate_keys.zig");
 const A = std.mem.Allocator;
+pub const version = 2;
+pub fn direct(input: local.sql_aggregate_materialization.Input) bool {
+    return input.spec.kind == .count or (input.spec.kind == .sum and input.spec.input_type == .integer) or input.spec.kind == .min or input.spec.kind == .max;
+}
+pub const Projection = struct {
+    layout: record.Layout,
+    indices: []usize,
+    inverse: [256]?u8 = @splat(null),
+    pub fn init(a: A, source: *const record.Layout) !Projection {
+        var count: usize = 0;
+        for (source.recipe.inputs) |input| if (!direct(input)) {
+            count += 1;
+        };
+        const inputs = try a.alloc(local.sql_aggregate_materialization.Input, count);
+        errdefer a.free(inputs);
+        const indices = try a.alloc(usize, count);
+        errdefer a.free(indices);
+        var next: usize = 0;
+        for (source.recipe.inputs, 0..) |input, index| if (!direct(input)) {
+            inputs[next] = input;
+            indices[next] = index;
+            next += 1;
+        };
+        var result: Projection = .{ .layout = try record.Layout.init(a, .{ .keys = source.recipe.keys, .inputs = inputs }), .indices = indices };
+        for (indices, 0..) |original, slot_| result.inverse[original] = @intCast(slot_);
+        return result;
+    }
+    pub fn deinit(self: Projection, a: A) void {
+        self.layout.deinit(a);
+        a.free(self.layout.recipe.inputs);
+        a.free(self.indices);
+    }
+    pub fn slot(self: Projection, original: usize) !usize {
+        if (original >= self.inverse.len) return error.InvalidNativeAggregateArtifact;
+        return self.inverse[original] orelse error.InvalidNativeAggregateArtifact;
+    }
+};
 pub const Dirty = std.StringHashMapUnmanaged(void);
 pub fn levels(rows: u64) u8 {
     var last = (rows -| 1) >> 6;
@@ -66,7 +103,9 @@ pub fn repair(a: A, manager: *local.sql_spill.Manager, storage: tree.Store, rows
     return repairMeasured(a, manager, storage, rows, prior, dirty, row_count, layout, phase, null);
 }
 pub fn repairMeasured(a: A, manager: *local.sql_spill.Manager, storage: tree.Store, rows: ?tree.Ref, prior: ?tree.Ref, dirty: *const Dirty, row_count: u64, layout: *const record.Layout, phase: ?*const @import("../serverless/artifacts/store.zig").IoPhase, metrics: ?*Metrics) !?tree.Ref {
-    if (prior == null) return buildFresh(a, manager, storage, rows, row_count, layout, metrics);
+    const projection = try Projection.init(a, layout);
+    defer projection.deinit(a);
+    if (prior == null) return buildFresh(a, manager, storage, rows, row_count, layout, &projection, metrics);
     var cache: tree.Cache = .{ .decoded = true, .alloc = local.sql_memory_budget.reclaimingAllocator(a), .underlying = storage };
     defer cache.deinit();
     const cached = if (storage.decoded_page != null) storage else cache.store();
@@ -111,7 +150,8 @@ pub fn repairMeasured(a: A, manager: *local.sql_spill.Manager, storage: tree.Sto
                 if (metrics) |value| {
                     if (level == 0) value.leaf_rows += 1 else value.child_summaries += 1;
                 }
-                merged = if (merged) |previous| try record.merge(sa, previous, contribution.value, layout) else try sa.dupe(u8, contribution.value);
+                const value = if (level == 0 and projection.indices.len != layout.slots.len) try record.project(sa, contribution.value, layout, &projection.layout, projection.indices) else contribution.value;
+                merged = if (merged) |previous| try record.merge(sa, previous, value, &projection.layout) else try sa.dupe(u8, value);
             }
             try changes.addRecord(entry.*, merged);
             try parents.put(ca, try key(ca, group, level + 1, block >> 4), {});
@@ -124,7 +164,7 @@ pub fn repairMeasured(a: A, manager: *local.sql_spill.Manager, storage: tree.Sto
 
 /// Fresh cohorts traverse contributions once. A bounded carry stack folds each
 /// ordinal block in order; only compact summaries enter the external sort.
-fn buildFresh(a: A, manager: *local.sql_spill.Manager, storage: tree.Store, rows: ?tree.Ref, row_count: u64, layout: *const record.Layout, metrics: ?*Metrics) !?tree.Ref {
+fn buildFresh(a: A, manager: *local.sql_spill.Manager, storage: tree.Store, rows: ?tree.Ref, row_count: u64, layout: *const record.Layout, projection: *const Projection, metrics: ?*Metrics) !?tree.Ref {
     const Builder = struct {
         a: A,
         layout: *const record.Layout,
@@ -165,7 +205,7 @@ fn buildFresh(a: A, manager: *local.sql_spill.Manager, storage: tree.Store, rows
     sort.shared_runs = true;
     sort.encoded_bytes = true;
     defer sort.deinit();
-    var builder: Builder = .{ .a = a, .layout = layout, .depth = levels(row_count), .sort = &sort, .metrics = metrics };
+    var builder: Builder = .{ .a = a, .layout = &projection.layout, .depth = levels(row_count), .sort = &sort, .metrics = metrics };
     defer builder.deinit();
     var cursor = try tree.Cursor.init(a, storage, rows, "", null);
     defer cursor.deinit();
@@ -182,7 +222,9 @@ fn buildFresh(a: A, manager: *local.sql_spill.Manager, storage: tree.Store, rows
             builder.group = next;
         }
         if (metrics) |m| m.leaf_rows += 1;
-        try builder.add(0, ordinal >> 6, row.value);
+        const projected = if (projection.indices.len != layout.slots.len) try record.project(a, row.value, layout, &projection.layout, projection.indices) else null;
+        defer if (projected) |value| a.free(value);
+        try builder.add(0, ordinal >> 6, projected orelse row.value);
     }
     try builder.finishGroup();
     const Source = struct {

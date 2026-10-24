@@ -163,6 +163,28 @@ pub fn encodeWithLayout(a: A, group: ops.GroupResult, layout: Layout) ![]u8 {
     }
     return finishRecord(a, &bytes);
 }
+/// Project portable transition bytes without decoding NUMERIC coefficients.
+/// The enclosing versioned recipe supplies the immutable source-slot mapping.
+pub fn project(a: A, value: []const u8, source: *const Layout, target: *const Layout, indices: []const usize) ![]u8 {
+    if (indices.len != target.slots.len) return error.InvalidNativeAggregateArtifact;
+    const view = try View.init(value, source);
+    var bytes = try beginRecord(a, target.*, view.field(0));
+    errdefer bytes.deinit(a);
+    for (target.slots, indices, 0..) |slot, index, position| {
+        if (position != 0 and indices[position - 1] >= index) return error.InvalidNativeAggregateArtifact;
+        if (index >= source.slots.len) return error.InvalidNativeAggregateArtifact;
+        const original = source.slots[index];
+        if (slot.kind != original.kind or !std.meta.eql(slot.spec, original.spec)) return error.InvalidNativeAggregateArtifact;
+        const end = if (index + 1 < source.slots.len) source.slots[index + 1].offset else source.fixed_bytes;
+        const start = target.header() + slot.offset;
+        @memcpy(bytes.items[start..][0 .. end - original.offset], value[source.header() + original.offset .. source.header() + end]);
+        if (slot.variable) |variable| {
+            try bytes.appendSlice(a, view.field(original.variable.?));
+            offset(bytes.items, variable + 1, bytes.items.len);
+        }
+    }
+    return finishRecord(a, &bytes);
+}
 /// Fixed transition kernels work in stack lanes. Variable/exact reducers retain
 /// the shared validated merge semantics in one reclaimable slot workspace.
 /// A fixed cohort needs only its output record allocation, regardless of width.
@@ -435,4 +457,43 @@ fn mergeFaultScenario(a: A, left: []const u8, right: []const u8, layout: *const 
     const value = try merge(a, left, right, layout);
     defer a.free(value);
     try std.testing.expectEqualSlices(u8, expected, value);
+}
+
+test "external lake aggregate projection copies selected transitions and unwinds allocation faults" {
+    const Case = struct {
+        fn run(a: A, source: *const Layout, target: *const Layout, value: []const u8, expected: []const u8) !void {
+            const projected = try project(a, value, source, target, &.{ 1, 3 });
+            defer a.free(projected);
+            try std.testing.expectEqualSlices(u8, expected, projected);
+            try std.testing.expect(projected.len < value.len);
+        }
+    };
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    const inputs = [_]local.sql_aggregate_materialization.Input{
+        .{ .spec = .{ .kind = .count }, .column = null },
+        .{ .spec = .{ .kind = .sum, .input_type = .number, .input_element = .numeric }, .column = null },
+        .{ .spec = .{ .kind = .min, .input_type = .string }, .column = null },
+        .{ .spec = .{ .kind = .bool_or, .input_type = .boolean }, .column = null },
+    };
+    const source = try Layout.init(a, .{ .keys = &.{}, .inputs = &inputs });
+    defer source.deinit(a);
+    const target = try Layout.init(a, .{ .keys = &.{}, .inputs = &.{ inputs[1], inputs[3] } });
+    defer target.deinit(a);
+    var states: [4]ops.Aggregate = undefined;
+    var initialized: usize = 0;
+    defer for (states[0..initialized]) |*state| state.deinit();
+    var work: local.sql_array_value.Budget = .{};
+    const values = [_]Datum{ Datum.json(.{ .integer = 1 }), try local.sql_scalar.numericTextLeaky(out, "123.4500", &work), Datum.json(.{ .string = "irrelevant extremum" }), Datum.json(.{ .bool = true }) };
+    for (inputs, &states, values) |input, *state, value| {
+        state.* = try ops.Aggregate.initTyped(a, input.spec.kind, input.spec.input_type, input.spec.input_element);
+        initialized += 1;
+        try state.update(value);
+    }
+    const encoded = try encodeWithLayout(out, .{ .keys = &.{}, .aggregates = &.{}, .typed_states = &states, .ordinal = 0 }, source);
+    const expected = try encodeWithLayout(out, .{ .keys = &.{}, .aggregates = &.{}, .typed_states = &.{ states[1], states[3] }, .ordinal = 0 }, target);
+    var fixed_growth = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(fixed_growth.allocator(), Case.run, .{ &source, &target, encoded, expected });
 }
