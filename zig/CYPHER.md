@@ -3300,3 +3300,11 @@ fallible predicates remain barriers. Identity frames carry and rename the
 entire predicate obligation and its dependencies. Catalog retention uses a
 typed clone, preserving the internal representation and ownership of label
 predicate values independently of their wire JSON form.
+
+
+Repeated or overlapping IN predicates over one primitive property intersect
+before native ordered partitioning. NULL members create no true-row partition,
+and typed hash membership bounds normalization work. The surviving equality
+partitions remain disjoint and reuse the pinned read and continuation protocol.
+Independent property domains retain their existing cost barrier. This keeps
+repeated admission hints from disabling sparse ordered SQL/Cypher observers.

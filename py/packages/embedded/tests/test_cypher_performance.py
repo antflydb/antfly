@@ -8800,6 +8800,14 @@ def test_bounded_group_obligations_stop_after_accepted_groups(graph_db):
 
 def test_sql_group_and_filter_observers_scale_with_index_domains(graph_db):
     scope_domains(graph_db, 64000)
+    membership = graph_db.cypher_json(
+        "g",
+        {
+            "query": "MATCH(n:D) WHERE n.score IN [0,1,2] AND n.score IN [2,0] RETURN count(DISTINCT n.score),min(n.score),max(n.score)",
+            "limits": {"scanned_anchors": 256, "memory_bytes": 2 << 20},
+        },
+    )
+    assert [cell["value"] for cell in membership["rows"][0]] == ["2", "0", "2"]
     source = "GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.id AS id,n.score AS score)) q"
     groups = [[f"g{i}", "3", "0", "2"] for i in range(8)]
     for query, expected in (

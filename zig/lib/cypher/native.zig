@@ -21,6 +21,64 @@ const v = root.value;
 const b = root.backend;
 const A = std.mem.Allocator;
 
+/// Intersect one exact scalar membership domain before building disjoint
+/// ordered partitions. Repeated SQL admission hints are idempotent; independent
+/// properties still need a separately costed Cartesian access proof.
+fn orderedMembershipDomain(a: A, work: *@import("value_work.zig").Work, filters: []const b.PropertyFilter, chosen: usize, kind: std.meta.Tag(v.Value)) !?[]const v.Value {
+    if (kind != .integer and kind != .string and kind != .boolean) return null;
+    const first = filters[chosen];
+    for (filters) |filter| if (filter.op == .in) {
+        if (!std.mem.eql(u8, first.property, filter.property) or filter.value != .list or filter.value.list.len > 256) return null;
+    };
+    var unique: std.ArrayList(v.Value) = .empty;
+    var distinct: @import("value_work.zig").Index = .{};
+    for (first.value.list) |value| {
+        try work.charge(work.ptr, 1);
+        if (value == .null) continue;
+        if (std.meta.activeTag(value) != kind) return null;
+        const hash = (try work.info(value)).hash;
+        var duplicate = false;
+        var candidate = distinct.head(hash);
+        while (candidate) |position| {
+            const link = distinct.links.items[position];
+            if (try work.eql(unique.items[link.index], value)) {
+                duplicate = true;
+                break;
+            }
+            candidate = link.next;
+        }
+        if (!duplicate) {
+            try distinct.insert(a, hash, unique.items.len);
+            try unique.append(a, value);
+        }
+    }
+    for (filters, 0..) |filter, index| {
+        if (index == chosen or filter.op != .in) continue;
+        var membership: @import("value_work.zig").Index = .{};
+        for (filter.value.list, 0..) |value, position| {
+            try work.charge(work.ptr, 1);
+            if (value == .null) continue;
+            if (std.meta.activeTag(value) != kind) return null;
+            try membership.insert(a, (try work.info(value)).hash, position);
+        }
+        var retained: usize = 0;
+        for (unique.items) |value| {
+            var candidate = membership.head((try work.info(value)).hash);
+            while (candidate) |position| {
+                const link = membership.links.items[position];
+                if (try work.eql(value, filter.value.list[link.index])) {
+                    unique.items[retained] = value;
+                    retained += 1;
+                    break;
+                }
+                candidate = link.next;
+            }
+        }
+        unique.items.len = retained;
+    }
+    return try unique.toOwnedSlice(a);
+}
+
 pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCursor: type) type {
     return struct {
         const Self = @This();
@@ -287,9 +345,6 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 if (filter.op == .in) break index;
             } else return scanOrderedScalar(ptr, a, table, filters, order, encoded, limit, max_examined, false);
             // A bounded disjoint union, never the hull of sparse values.
-            // Multiple independent IN domains retain the ordinary native
-            // planner until their Cartesian product can be costed safely.
-            for (filters[chosen + 1 ..]) |filter| if (filter.op == .in) return null;
             const operand = filters[chosen].value;
             if (operand != .list or operand.list.len > 256) return null;
             var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
@@ -303,49 +358,30 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             } else return null;
             // Exact scalar domains keep partitions disjoint after storage
             // conversion. Mixed and floating operands remain runtime residuals.
-            switch (column_type) {
-                .integer, .string, .boolean => {},
+            const kind: std.meta.Tag(v.Value) = switch (column_type) {
+                .integer => .integer,
+                .string => .string,
+                .boolean => .boolean,
                 else => return null,
-            }
-            var unique: std.ArrayList(v.Value) = .empty;
-            var distinct: @import("value_work.zig").Index = .{};
+            };
             var work = self.valueWork(temporary);
-            for (operand.list) |value| {
-                if (value == .null) continue;
-                if (!filterCompatible(column_type, value)) return null;
-                const hash = (try work.info(value)).hash;
-                var duplicate = false;
-                var candidate = distinct.head(hash);
-                while (candidate) |position| {
-                    const link = distinct.links.items[position];
-                    if (try work.eql(unique.items[link.index], value)) {
-                        duplicate = true;
-                        break;
-                    }
-                    candidate = link.next;
-                }
-                if (!duplicate) {
-                    try distinct.insert(temporary, hash, unique.items.len);
-                    try unique.append(temporary, value);
-                }
-            }
+            const unique = (try orderedMembershipDomain(temporary, &work, filters, chosen, kind)) orelse return null;
             // Per-item continuations retain every partition position for
             // nested RPC paging. Admit only a small fanout: wider domains
             // keep sparse seeks/top-k instead of multiplying cursor work by
             // the output cardinality and exhausting the default state budget.
-            if (unique.items.len == 0 or unique.items.len > 8) return null;
+            if (unique.len == 0 or unique.len > 8) return null;
             // Preserve the sparse-seek plan when the global ceiling cannot
             // cover even the merge's required owner heads and lookahead.
-            if (encoded == null and limit != 0 and max_examined < limit +| (unique.items.len - 1)) return null;
-            const partitions = try temporary.alloc(OrderedPartition, unique.items.len);
-            const targets = try temporary.alloc(root.distributed.Target, unique.items.len);
-            const snapshots = try temporary.alloc(root.distributed.Snapshot, unique.items.len);
-            for (partitions, targets, snapshots, unique.items, 0..) |*partition, *target, *snapshot, value, index| {
-                const conditions = try temporary.dupe(b.PropertyFilter, filters);
-                conditions[chosen].op = .eq;
-                conditions[chosen].value = value;
-                std.mem.swap(b.PropertyFilter, &conditions[0], &conditions[chosen]);
-                partition.* = .{ .parent = self, .filters = conditions };
+            if (encoded == null and limit != 0 and max_examined < limit +| (unique.len - 1)) return null;
+            const partitions = try temporary.alloc(OrderedPartition, unique.len);
+            const targets = try temporary.alloc(root.distributed.Target, unique.len);
+            const snapshots = try temporary.alloc(root.distributed.Snapshot, unique.len);
+            for (partitions, targets, snapshots, unique, 0..) |*partition, *target, *snapshot, value, index| {
+                var conditions: std.ArrayList(b.PropertyFilter) = .empty;
+                try conditions.append(temporary, .{ .property = filters[chosen].property, .op = .eq, .value = value });
+                for (filters) |filter| if (filter.op != .in) try conditions.append(temporary, filter);
+                partition.* = .{ .parent = self, .filters = conditions.items };
                 target.* = .{ .table = table, .table_id = 1, .group_id = index + 1 };
                 snapshot.* = .{ .backend = partition.backend(), .ptr = partition, .validate = OrderedPartition.check, .close = OrderedPartition.close };
             }
@@ -780,4 +816,45 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             _ = GraphIndex;
         }
     };
+}
+
+test "ordered membership domains intersect repeated scalar admissions" {
+    const Counter = struct {
+        units: usize = 0,
+        fn charge(ptr: *anyopaque, amount: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.units += amount;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var counter: Counter = .{};
+    var work: @import("value_work.zig").Work = .{ .a = a, .ptr = &counter, .charge = Counter.charge };
+    const filters = [_]b.PropertyFilter{
+        .{ .property = "score", .op = .in, .value = .{ .list = &.{ .{ .integer = 2 }, .{ .integer = 0 }, .{ .integer = 0 }, .null } } },
+        .{ .property = "score", .op = .in, .value = .{ .list = &.{ .{ .integer = 0 }, .{ .integer = 1 }, .{ .integer = 2 } } } },
+        .{ .property = "score", .op = .in, .value = .{ .list = &.{ .{ .integer = 0 }, .{ .integer = 2 }, .null } } },
+    };
+    const domain = (try orderedMembershipDomain(a, &work, &filters, 0, .integer)).?;
+    try std.testing.expectEqual(@as(usize, 2), domain.len);
+    try std.testing.expectEqual(@as(i64, 2), domain[0].integer);
+    try std.testing.expectEqual(@as(i64, 0), domain[1].integer);
+    var changed = filters;
+    changed[2].value = .{ .list = &.{.{ .integer = 1 }} };
+    try std.testing.expectEqual(@as(usize, 0), (try orderedMembershipDomain(a, &work, &changed, 0, .integer)).?.len);
+    changed[2] = filters[2];
+    changed[2].property = "other";
+    try std.testing.expect(try orderedMembershipDomain(a, &work, &changed, 0, .integer) == null);
+    changed[2].property = "score";
+    changed[2].value = .{ .list = &.{.{ .number = 2 }} };
+    try std.testing.expect(try orderedMembershipDomain(a, &work, &changed, 0, .integer) == null);
+    const strings = [_]b.PropertyFilter{
+        .{ .property = "id", .op = .in, .value = .{ .list = &.{ .{ .string = "β" }, .{ .string = "a" } } } },
+        .{ .property = "id", .op = .in, .value = .{ .list = &.{ .{ .string = "a" }, .{ .string = "β" } } } },
+    };
+    const text_domain = (try orderedMembershipDomain(a, &work, &strings, 0, .string)).?;
+    try std.testing.expectEqualStrings("β", text_domain[0].string);
+    try std.testing.expectEqualStrings("a", text_domain[1].string);
+    try std.testing.expect(counter.units < 256);
 }
