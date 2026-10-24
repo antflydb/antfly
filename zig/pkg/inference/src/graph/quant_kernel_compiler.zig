@@ -5111,6 +5111,8 @@ pub fn renderCudaRuntimeAttentionRegion(allocator: std.mem.Allocator) ![]u8 {
     var emitted: usize = 0;
     var flash_common_emitted = false;
     var splitk_common_emitted = false;
+    var serial_common_emitted: [first_generated_attention_artifacts.len]cuda_renderer.AttentionSerialIdentity = undefined;
+    var serial_common_count: usize = 0;
     for (first_generated_attention_artifacts) |artifact| {
         if (!cudaAttentionArtifactRuntimeWired(artifact)) continue;
         if (emitted != 0) try out.append(allocator, '\n');
@@ -5144,7 +5146,20 @@ pub fn renderCudaRuntimeAttentionRegion(allocator: std.mem.Allocator) ![]u8 {
             const plan = cudaAttentionRenderPlanForArtifact(artifact) orelse return error.MissingCudaAttentionRenderPlan;
             const plan_id = try cuda_renderer.attentionPlanId(plan, allocator);
             defer allocator.free(plan_id);
-            const body = try cuda_renderer.renderAttentionBodyAlloc(allocator, plan);
+            if (plan.lowering.reduction != .parallel_scores_then_serial) {
+                const identity = cuda_renderer.attentionSerialIdentity(plan);
+                const already_emitted = for (serial_common_emitted[0..serial_common_count]) |previous| {
+                    if (std.meta.eql(previous, identity)) break true;
+                } else false;
+                if (!already_emitted) {
+                    const common = try cuda_renderer.renderAttentionSerialCommonAlloc(allocator, plan);
+                    defer allocator.free(common);
+                    try out.appendSlice(allocator, common);
+                    serial_common_emitted[serial_common_count] = identity;
+                    serial_common_count += 1;
+                }
+            }
+            const body = try cuda_renderer.renderAttentionInstantiationAlloc(allocator, plan);
             defer allocator.free(body);
             try appendFmt(allocator, &out, "// kernel_id={s} plan_id={s}\n", .{ plan.kernel_id, plan_id });
             try out.appendSlice(allocator, body);
@@ -8054,7 +8069,7 @@ test "quant kernel compiler renders the runtime-wired CUDA attention region dete
             const metadata = try std.fmt.allocPrint(std.testing.allocator, "kernel_id={s} plan_id={s}", .{ plan.kernel_id, plan_id });
             defer std.testing.allocator.free(metadata);
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, metadata));
-            const body = try cuda_renderer.renderAttentionBodyAlloc(std.testing.allocator, plan);
+            const body = try cuda_renderer.renderAttentionInstantiationAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, body));
         }
@@ -8144,9 +8159,18 @@ test "quant kernel compiler CUDA attention candidate stays in sync with the runt
             const bundle_metadata = try std.fmt.allocPrint(std.testing.allocator, "kernel_id={s} plan_id={s}", .{ plan.kernel_id, route_id });
             defer std.testing.allocator.free(bundle_metadata);
             try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, bundle_metadata));
-            const body = try cuda_renderer.renderAttentionBodyAlloc(std.testing.allocator, plan);
+            const body = try cuda_renderer.renderAttentionInstantiationAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
             try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, body));
+            if (plan.lowering.reduction != .parallel_scores_then_serial) {
+                const common = try cuda_renderer.renderAttentionSerialCommonAlloc(std.testing.allocator, plan);
+                defer std.testing.allocator.free(common);
+                try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bundle, common));
+                const standalone = try cuda_renderer.renderAttentionKernel(std.testing.allocator, plan);
+                defer std.testing.allocator.free(standalone);
+                try std.testing.expect(std.mem.containsAtLeast(u8, standalone, 1, common));
+                try std.testing.expect(std.mem.containsAtLeast(u8, standalone, 1, body));
+            }
         }
     }
     try std.testing.expectEqual(@as(usize, 12), runtime_cuda_attention_count);
@@ -13925,5 +13949,22 @@ test "quant kernel compiler rendered bodies carry their schedule cols marker" {
             },
             .simdgroup_matrix => try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "simdgroup_multiply_accumulate")),
         }
+    }
+}
+
+test "quant kernel compiler serial schedules emit one owner and retain every export" {
+    const source = try renderCudaRuntimeAttentionRegion(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    for ([_][]const u8{ "antfly_serial_attention_hd256_t256_g16_impl", "antfly_serial_attention_hd512_t512_g16_impl" }) |name| {
+        const definition = try std.fmt.allocPrint(std.testing.allocator, "__device__ __forceinline__ void {s}(", .{name});
+        defer std.testing.allocator.free(definition);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, definition));
+    }
+    for (first_generated_attention_artifacts) |artifact| {
+        if (!cudaAttentionArtifactRuntimeWired(artifact)) continue;
+        const plan = cudaAttentionRenderPlanForArtifact(artifact) orelse continue;
+        const declaration = try std.fmt.allocPrint(std.testing.allocator, "extern \"C\" __global__ void {s}(", .{plan.serial_kernel_id});
+        defer std.testing.allocator.free(declaration);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, declaration));
     }
 }

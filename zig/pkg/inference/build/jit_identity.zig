@@ -71,12 +71,39 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
             "src/gguf/tensor_types.zig",
         },
     };
-    run.addArg(b.fmt("{d}", .{qualification.len}));
+    const contracts = [_][]const u8{
+        "src/ops/kernel_descriptor.zig",
+        "src/ops/kernel_geometry.zig",
+        "src/ops/kernel_math.zig",
+        "src/ops/kernel_reduction.zig",
+    };
+    // Native includes and host ABI consumers affect qualification even when
+    // the translation-unit text is unchanged. Declare the complete local
+    // include closure so Zig's watch/cache graph sees those edits as well.
+    const cuda_dependencies = [_][]const u8{
+        "src/ops/cuda/launch_abi.zig",
+        "src/ops/cuda/kernels/kernel_abi.cuh",
+        "src/ops/cuda/kernels/embedding_gemma2.cuh",
+        "src/ops/cuda/kernels/embedding_gemma2_training_rope.cuh",
+        "src/ops/cuda/kernels/embedding_gemma2_optimized.cuh",
+        "src/ops/cuda/kernels/gliner25_boundary.cuh",
+        "src/ops/cuda/kernels/training_validation.cuh",
+        "src/ops/cuda/kernels/gliner25_layer_norm.cuh",
+        "src/ops/cuda/kernels/gliner25_softmax.cuh",
+        "src/ops/cuda/kernels/gliner25_attention.cuh",
+    };
+    run.addArg(b.fmt("{d}", .{qualification.len + contracts.len + if (backend == .cuda) cuda_dependencies.len else @as(usize, 0)}));
     for (qualification) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
+    for (contracts) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
+    if (backend == .cuda) for (cuda_dependencies) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
     if (backend == .cuda) {
-        run.addArgs(&.{ "dispatch", "4" });
+        run.addArgs(&.{ "dispatch", "8" });
         for ([_][]const u8{
             "src/ops/cuda/cuda_compute.zig",
+            "src/ops/cuda/launch_abi.zig",
+            "src/ops/cuda/kernels/kernel_abi.cuh",
+            "src/ops/kernel_descriptor.zig",
+            "src/ops/kernel_geometry.zig",
             "src/graph/quant_kernel_compiler.zig",
             "src/graph/quant_matmul.zig",
             "src/gguf/tensor_types.zig",

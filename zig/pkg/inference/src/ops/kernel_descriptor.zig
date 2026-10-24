@@ -21,7 +21,23 @@ const CT = @import("../graph/backend_contracts.zig").CT;
 
 pub const Unary = enum { negate, sqrt, rsqrt, exp, log, sin, cos, tanh, erf, abs, gelu, gelu_exact, relu, silu };
 pub const Binary = enum { add, subtract, multiply, divide };
-pub const Linear = struct { rows: u32, in_dim: u32, out_dim: u32, bias: bool };
+pub const Linear = struct {
+    rows: u32,
+    in_dim: u32,
+    out_dim: u32,
+    bias: bool,
+
+    /// Logical dimensions shared with native launch adapters. Empty-tensor
+    /// policy and storage/codec byte extents remain the caller's contract.
+    pub fn init(rows: usize, in_dim: usize, out_dim: usize, bias: bool) error{DimensionOverflow}!Linear {
+        return .{
+            .rows = std.math.cast(u32, rows) orelse return error.DimensionOverflow,
+            .in_dim = std.math.cast(u32, in_dim) orelse return error.DimensionOverflow,
+            .out_dim = std.math.cast(u32, out_dim) orelse return error.DimensionOverflow,
+            .bias = bias,
+        };
+    }
+};
 pub const Norm = struct { kind: enum { layer, rms }, dim: u32, eps: f32 };
 pub const Softmax = struct { width: u32, logarithmic: bool };
 pub const kernel_geometry = @import("kernel_geometry.zig");

@@ -2583,6 +2583,177 @@ pub const KernelModule = struct {
     rms_norm_add_weighted_embedding_i32_q6_k_f32: driver_mod.CUfunction = null,
     slice_last_dim_f32: driver_mod.CUfunction = null,
 
+    // Typed fields are the symbol registry. Only native-name exceptions and
+    // requiredness need metadata; loading and clearing consume the same fields.
+    fn bundledSymbol(comptime field: []const u8) ?[:0]const u8 {
+        if (std.mem.eql(u8, field, "linear_q4_0_q8_1_argmax_rows_stage1_tile8_e2b")) return quant_kernel_compiler.first_e2b_cuda_q4_0_q8_1_argmax_kernel_id;
+        if (std.mem.eql(u8, field, "linear_q6_k_q8_1_argmax_generated_k2560")) return quant_kernel_compiler.first_cuda_q6_k_q8_1_argmax_k2560_kernel_id;
+        if (std.mem.eql(u8, field, "linear_q6_k_q8_1_argmax_generated_k3840")) return quant_kernel_compiler.first_cuda_q6_k_q8_1_argmax_k3840_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_scalars_generated_hd256_f32")) return cuda_kernel_renderer.generated_attention_hd256_serial_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_split_kv_hd256_stage1_f32")) return cuda_kernel_renderer.generated_attention_hd256_stage1_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_split_kv_hd256_stage2_f32")) return cuda_kernel_renderer.generated_attention_hd256_stage2_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_scalars_generated_hd512_f32")) return cuda_kernel_renderer.generated_attention_hd512_serial_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_split_kv_hd512_stage1_f32")) return cuda_kernel_renderer.generated_attention_hd512_stage1_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_split_kv_hd512_stage2_f32")) return cuda_kernel_renderer.generated_attention_hd512_stage2_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_split2_kv_hd256_stage1_f32")) return cuda_kernel_renderer.generated_attention_hd256_split2_stage1_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_split2_kv_hd256_stage2_f32")) return cuda_kernel_renderer.generated_attention_hd256_split2_stage2_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_split2_kv_hd512_stage1_f32")) return cuda_kernel_renderer.generated_attention_hd512_split2_stage1_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_split2_kv_hd512_stage2_f32")) return cuda_kernel_renderer.generated_attention_hd512_split2_stage2_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_split4_kv_hd256_stage1_f32")) return cuda_kernel_renderer.generated_attention_hd256_split4_stage1_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_split4_kv_hd256_stage2_f32")) return cuda_kernel_renderer.generated_attention_hd256_split4_stage2_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_split4_kv_hd512_stage1_f32")) return cuda_kernel_renderer.generated_attention_hd512_split4_stage1_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_split4_kv_hd512_stage2_f32")) return cuda_kernel_renderer.generated_attention_hd512_split4_stage2_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_score_prework_hd256_f32")) return cuda_kernel_renderer.generated_attention_hd256_score_prework_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_score_prework_consume_hd256_f32")) return cuda_kernel_renderer.generated_attention_hd256_score_prework_serial_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_score_prework_tiled64_hd256_f32")) return cuda_kernel_renderer.generated_attention_hd256_score_prework_tiled64_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_score_prework_hd512_f32")) return cuda_kernel_renderer.generated_attention_hd512_score_prework_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_score_prework_consume_hd512_f32")) return cuda_kernel_renderer.generated_attention_hd512_score_prework_serial_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_score_prework_tiled64_hd512_f32")) return cuda_kernel_renderer.generated_attention_hd512_score_prework_tiled64_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_prefill_flash_sm89_hd256_f32")) return cuda_kernel_renderer.generated_flash_prefill_hd256_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_prefill_flash_sm89_hd512_f32")) return cuda_kernel_renderer.generated_flash_prefill_hd512_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_splitk_online_sm89_hd256_f32")) return cuda_kernel_renderer.generated_splitk_online_decode_hd256_kernel_id;
+        if (std.mem.eql(u8, field, "gqa_attention_decode_splitk_online_sm89_hd512_f32")) return cuda_kernel_renderer.generated_splitk_online_decode_hd512_kernel_id;
+        if (std.mem.eql(u8, field, "quantize_f32_ggml_q8_1_rows")) return cuda_kernel_renderer.ggml_q8_1_quantize_rows_kernel_id;
+        if (std.mem.eql(u8, field, "linear_q4_0_generated_mmv")) return quant_kernel_compiler.first_general_cuda_q4_0_mmv_kernel_id;
+        if (std.mem.eql(u8, field, "linear_q4_0_generated_mm")) return quant_kernel_compiler.first_general_cuda_q4_0_mm_kernel_id;
+        if (std.mem.eql(u8, field, "linear_q4_0_generated_pair")) return quant_kernel_compiler.first_general_cuda_q4_0_pair_kernel_id;
+        if (std.mem.eql(u8, field, "linear_q4_0_generated_pair_q8")) return quant_kernel_compiler.first_general_cuda_q4_0_pair_q8_kernel_id;
+        if (std.mem.eql(u8, field, "linear_q4_0_generated_down_q8")) return quant_kernel_compiler.first_general_cuda_q4_0_down_q8_kernel_id;
+        if (std.mem.eql(u8, field, "linear_q4_0_generated_pair_q8_e2b_6144")) return quant_kernel_compiler.first_e2b_cuda_q4_0_pair_q8_6144_kernel_id;
+        if (std.mem.eql(u8, field, "linear_q4_0_generated_pair_q8_e2b_12288")) return quant_kernel_compiler.first_e2b_cuda_q4_0_pair_q8_12288_kernel_id;
+        if (std.mem.eql(u8, field, "linear_q4_0_generated_down_q8_e2b_6144")) return quant_kernel_compiler.first_e2b_cuda_q4_0_down_q8_6144_kernel_id;
+        if (std.mem.eql(u8, field, "linear_q4_0_generated_down_q8_e2b_12288")) return quant_kernel_compiler.first_e2b_cuda_q4_0_down_q8_12288_kernel_id;
+        if (std.mem.eql(u8, field, "linear_q4_0_generated_pair_ggml_q8_1_e2b_6144")) return quant_kernel_compiler.first_e2b_cuda_q4_0_pair_ggml_q8_1_6144_kernel_id;
+        if (std.mem.eql(u8, field, "linear_q4_0_generated_pair_ggml_q8_1_e2b_12288")) return quant_kernel_compiler.first_e2b_cuda_q4_0_pair_ggml_q8_1_12288_kernel_id;
+        if (std.mem.eql(u8, field, "linear_q4_0_generated_down_ggml_q8_1_e2b_6144")) return quant_kernel_compiler.first_e2b_cuda_q4_0_down_ggml_q8_1_6144_kernel_id;
+        if (std.mem.eql(u8, field, "linear_q4_0_generated_down_ggml_q8_1_e2b_12288")) return quant_kernel_compiler.first_e2b_cuda_q4_0_down_ggml_q8_1_12288_kernel_id;
+        if (std.mem.eql(u8, field, "linear_q4_0_generated_pair_f32_e2b_6144_exact")) return quant_kernel_compiler.first_e2b_cuda_q4_0_pair_f32_6144_exact_kernel_id;
+        if (std.mem.eql(u8, field, "linear_q4_0_generated_pair_f32_e2b_12288_exact")) return quant_kernel_compiler.first_e2b_cuda_q4_0_pair_f32_12288_exact_kernel_id;
+        if (std.mem.eql(u8, field, "linear_q4_0_generated_down_f32_e2b_6144_exact")) return quant_kernel_compiler.first_e2b_cuda_q4_0_down_f32_6144_exact_kernel_id;
+        if (std.mem.eql(u8, field, "linear_q4_0_generated_down_f32_e2b_12288_exact")) return quant_kernel_compiler.first_e2b_cuda_q4_0_down_f32_12288_exact_kernel_id;
+        if (std.mem.eql(u8, field, "linear_q4_k_generated_mmv")) return null;
+        if (std.mem.eql(u8, field, "linear_q4_k_generated_bias_gelu")) return null;
+        return "termite_" ++ field;
+    }
+
+    const BundledRequirement = enum { optional, required, required_after_profiles };
+    fn bundledSymbolRequirement(comptime field: []const u8) BundledRequirement {
+        const required = .{
+            "fill_f32",
+            "scale_f32",
+            "add_scalar_f32",
+            "binary_scalar_f32",
+            "add_mul_scalar_f32",
+            "add_weighted_scalars_f32",
+            "linear_f32",
+            "argmax_last_row_f32",
+            "linear_bias_f32",
+            "add_bias_rows_f32",
+            "linear_bias_f32_tile4_r2",
+            "linear_bias_relu_f32_tile4_r2",
+            "linear_bias_gelu_f32_tile4_r2",
+            "linear_bias_add_f32_tile4_r2",
+            "linear_pair_bias_f32_tile4_r2",
+            "linear_triple_bias_f32_tile4_r2",
+            "rms_norm_f32",
+            "rms_norm_add_f32",
+            "rms_norm_add_mul_scalar_f32",
+            "rms_norm_bare_f32",
+            "layer_norm_f32",
+            "add_layer_norm_f32",
+            "elementwise_f32",
+            "silu_multiply_f32",
+            "activation_multiply_f32",
+            "embedding_lookup_f32",
+            "embedding_lookup_i32_f32",
+            "take_rows_f32",
+            "gliner_word_embeddings_f32",
+            "repeat_first_row_f32",
+            "gliner_gru_combine_f32",
+            "concat_lastdim_f32",
+            "conv2d_f32",
+            "attention_f32",
+            "attention_f32_block",
+        };
+        inline for (required) |name| {
+            if (std.mem.eql(u8, field, name)) return .required;
+        }
+        const required_after_profiles = .{
+            "deberta_attention_f32",
+            "split_last_dim3_f32",
+            "linear_q4_k_f32",
+            "linear_q4_k_bias_f32",
+            "linear_q4_k_f32_tiled",
+            "linear_q4_k_bias_f32_tiled",
+            "linear_q4_k_bias_quick_gelu_f32_tiled",
+            "linear_q4_k_f32_tile4",
+            "linear_q4_k_bias_f32_tile4",
+            "linear_q4_k_bias_f32_tile4_r2",
+            "linear_q4_k_bias_quick_gelu_f32_tile4",
+            "linear_q4_k_bias_relu_f32_tile4",
+            "linear_q4_k_bias_relu_f32_tile4_r2",
+            "linear_q4_k_bias_add_f32_tile4",
+            "linear_q4_k_f32_tile8",
+            "linear_q4_k_triple_bias_f32",
+            "linear_q4_k_triple_bias_f32_tiled",
+            "linear_q4_k_pair_bias_f32_tiled",
+            "embedding_lookup_q8_0_f32",
+            "embedding_lookup_i32_q8_0_f32",
+            "embedding_lookup_q4_0_f32",
+            "embedding_lookup_i32_q4_0_f32",
+            "embedding_lookup_q4_k_f32",
+            "embedding_lookup_i32_q4_k_f32",
+            "embedding_lookup_q6_k_f32",
+            "embedding_lookup_i32_q6_k_f32",
+            "embedding_add_weighted_i32_q6_k_f32",
+            "slice_last_dim_f32",
+        };
+        inline for (required_after_profiles) |name| {
+            if (std.mem.eql(u8, field, name)) return .required_after_profiles;
+        }
+        return .optional;
+    }
+
+    fn bundledSymbolRequired(comptime field: []const u8) bool {
+        return bundledSymbolRequirement(field) != .optional;
+    }
+
+    fn isBundledFunction(comptime name: []const u8, comptime T: type) bool {
+        // CUmodule and CUfunction are aliases in the driver ABI.
+        return T == driver_mod.CUfunction and !std.mem.eql(u8, name, "module");
+    }
+
+    fn loadBundledFunctions(self: *KernelModule, ctx: *context_mod.CudaContext, comptime after_profiles: bool) driver_mod.Error!void {
+        @setEvalBranchQuota(100000);
+        const info = @typeInfo(KernelModule).@"struct";
+        inline for (info.field_names, info.field_types) |name, T| {
+            if (comptime isBundledFunction(name, T)) {
+                const symbol = comptime bundledSymbol(name) orelse continue;
+                const requirement = comptime bundledSymbolRequirement(name);
+                // Preserve the old profile-gate versus required-symbol error
+                // precedence for incomplete/older artifact bundles.
+                if (comptime after_profiles != (requirement == .required_after_profiles)) continue;
+                const enabled = if (comptime std.mem.eql(u8, name, "linear_q4_0_f32_tc_hmma_bf16")) bundledQ4_0TcHmmaBf16Supported(ctx.info.compute_major, ctx.info.compute_minor) else true;
+                if (enabled) {
+                    if (comptime requirement != .optional) {
+                        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&@field(self, name), self.module, symbol));
+                    } else {
+                        @field(self, name) = loadOptionalFunction(ctx, self.module, symbol);
+                    }
+                }
+            }
+        }
+    }
+
+    fn clearBundledFunctions(self: *KernelModule) void {
+        @setEvalBranchQuota(100000);
+        const info = @typeInfo(KernelModule).@"struct";
+        inline for (info.field_names, info.field_types) |name, T| {
+            if (comptime isBundledFunction(name, T)) @field(self, name) = null;
+        }
+        self.gliner25_attention = @splat(null);
+    }
+
     fn generatedFunctionMapping(
         self: *KernelModule,
         artifact: quant_kernel_compiler.GeneratedArtifact,
@@ -3262,323 +3433,76 @@ pub const KernelModule = struct {
         try loadModuleWithJitLog(ctx, &module);
         errdefer _ = ctx.driver.fns.cuModuleUnload(module);
 
-        var fill_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&fill_f32, module, "termite_fill_f32"));
-        const copy_f32 = loadOptionalFunction(ctx, module, "termite_copy_f32");
-        const copy_u8 = loadOptionalFunction(ctx, module, "termite_copy_u8");
-        const f32_to_bf16 = loadOptionalFunction(ctx, module, "termite_f32_to_bf16");
-        const f32_to_f16 = loadOptionalFunction(ctx, module, "termite_f32_to_f16");
-        const f32_to_i32 = loadOptionalFunction(ctx, module, "termite_f32_to_i32");
-        const round_f32 = loadOptionalFunction(ctx, module, "termite_round_f32");
-        const dequant_q4_0_bf16 = loadOptionalFunction(ctx, module, "termite_dequant_q4_0_bf16");
-        const pack_q8_0_tensor_core = loadOptionalFunction(ctx, module, "termite_pack_q8_0_tensor_core");
-        var scale_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&scale_f32, module, "termite_scale_f32"));
-        var add_scalar_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&add_scalar_f32, module, "termite_add_scalar_f32"));
-        var binary_scalar_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&binary_scalar_f32, module, "termite_binary_scalar_f32"));
-        var add_mul_scalar_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&add_mul_scalar_f32, module, "termite_add_mul_scalar_f32"));
-        var add_weighted_scalars_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&add_weighted_scalars_f32, module, "termite_add_weighted_scalars_f32"));
-        var linear_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_f32, module, "termite_linear_f32"));
-        const linear_f32_tiled = loadOptionalFunction(ctx, module, "termite_linear_f32_tiled");
-        const linear_bf16_weight_f32_tiled = loadOptionalFunction(ctx, module, "termite_linear_bf16_weight_f32_tiled");
-        const linear_f16_weight_f32_tiled = loadOptionalFunction(ctx, module, "termite_linear_f16_weight_f32_tiled");
-        var argmax_last_row_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&argmax_last_row_f32, module, "termite_argmax_last_row_f32"));
-        const argmax_rows_f32 = loadOptionalFunction(ctx, module, "termite_argmax_rows_f32");
-        const argmax_rows_suppress_f32 = loadOptionalFunction(ctx, module, "termite_argmax_rows_suppress_f32");
-        const argmax_last_row_suppress_f32 = loadOptionalFunction(ctx, module, "termite_argmax_last_row_suppress_f32");
-        const linear_q8_0_argmax_stage1_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_argmax_stage1_tile4");
-        const linear_q4_k_argmax_stage1_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_argmax_stage1_tile4");
-        const argmax_reduce_pairs_f32 = loadOptionalFunction(ctx, module, "termite_argmax_reduce_pairs_f32");
-        const linear_q8_0_argmax_rows_stage1_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_argmax_rows_stage1_tile4");
-        const linear_q4_0_argmax_rows_stage1_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_argmax_rows_stage1_tile4");
-        const linear_q4_0_argmax_rows_stage1_tile16 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_argmax_rows_stage1_tile16");
-        const linear_q4_0_q8_1_argmax_rows_stage1_tile8_e2b = loadOptionalFunction(
-            ctx,
-            module,
-            quant_kernel_compiler.first_e2b_cuda_q4_0_q8_1_argmax_kernel_id,
-        );
-        const linear_q4_k_argmax_rows_stage1_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_argmax_rows_stage1_tile4");
-        const linear_q6_k_argmax_rows_stage1_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q6_k_argmax_rows_stage1_tile4");
-        const linear_q6_k_argmax_rows_stage1_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q6_k_argmax_rows_stage1_tile8");
-        const linear_q6_k_argmax_rows_stage1_tile16 = loadOptionalFunction(ctx, module, "termite_linear_q6_k_argmax_rows_stage1_tile16");
-        const linear_q6_k_q8_1_argmax_rows_stage1_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8");
-        const linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b = loadOptionalFunction(ctx, module, "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b");
-        const linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b = loadOptionalFunction(ctx, module, "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b");
-        const linear_q6_k_q8_1_argmax_generated_k2560 = loadOptionalFunction(
-            ctx,
-            module,
-            quant_kernel_compiler.first_cuda_q6_k_q8_1_argmax_k2560_kernel_id,
-        );
-        const linear_q6_k_q8_1_argmax_generated_k3840 = loadOptionalFunction(
-            ctx,
-            module,
-            quant_kernel_compiler.first_cuda_q6_k_q8_1_argmax_k3840_kernel_id,
-        );
-        const linear_q6_k_q8_1_f32_tile8_e4b = loadOptionalFunction(ctx, module, "termite_linear_q6_k_q8_1_f32_tile8_e4b");
-        const argmax_reduce_rows_pairs_f32 = loadOptionalFunction(ctx, module, "termite_argmax_reduce_rows_pairs_f32");
-        const argmax_reduce_rows_pairs_f32_w16 = loadOptionalFunction(ctx, module, "termite_argmax_reduce_rows_pairs_f32_w16");
-        const gemma4_mtp_preproject_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_mtp_preproject_f32");
-        const gemma4_mtp_masked_select_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_mtp_masked_select_f32");
-        const gemma4_mtp_masked_select_hidden_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_mtp_masked_select_hidden_f32");
-        const gemma4_mtp_centroid_scores_hidden_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_mtp_centroid_scores_hidden_f32");
-        const gemma4_mtp_centroid_topk_u32 = loadOptionalFunction(ctx, module, "termite_gemma4_mtp_centroid_topk_u32");
-        const gemma4_mtp_restricted_lm_head_scores_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_mtp_restricted_lm_head_scores_f32");
-        const gemma4_mtp_reduce_token_scores_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_mtp_reduce_token_scores_f32");
-        const gemma4_mtp_masked_argmax_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_mtp_masked_argmax_f32");
-        const gemma4_mtp_verify_commit_u32 = loadOptionalFunction(ctx, module, "termite_gemma4_mtp_verify_commit_u32");
-        var linear_bias_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_bias_f32, module, "termite_linear_bias_f32"));
-        var add_bias_rows_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&add_bias_rows_f32, module, "termite_add_bias_rows_f32"));
+        var loaded = KernelModule{ .module = module };
+        try loaded.loadBundledFunctions(ctx, false);
         // Optional: absent from CUDA artifact bundles that predate the FP16
         // GLiNER2 epilogue; callers decline the fused route instead.
-        const add_bias_relu_rows_f32 = loadOptionalFunction(ctx, module, "termite_add_bias_relu_rows_f32");
-        var linear_bias_f32_tile4_r2: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_bias_f32_tile4_r2, module, "termite_linear_bias_f32_tile4_r2"));
-        var linear_bias_relu_f32_tile4_r2: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_bias_relu_f32_tile4_r2, module, "termite_linear_bias_relu_f32_tile4_r2"));
-        var linear_bias_gelu_f32_tile4_r2: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_bias_gelu_f32_tile4_r2, module, "termite_linear_bias_gelu_f32_tile4_r2"));
-        var linear_bias_add_f32_tile4_r2: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_bias_add_f32_tile4_r2, module, "termite_linear_bias_add_f32_tile4_r2"));
-        var linear_pair_bias_f32_tile4_r2: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_pair_bias_f32_tile4_r2, module, "termite_linear_pair_bias_f32_tile4_r2"));
-        var linear_triple_bias_f32_tile4_r2: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_triple_bias_f32_tile4_r2, module, "termite_linear_triple_bias_f32_tile4_r2"));
-        var rms_norm_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&rms_norm_f32, module, "termite_rms_norm_f32"));
-        const rms_norm_f32_bf16 = loadOptionalFunction(ctx, module, "termite_rms_norm_f32_bf16");
-        const rms_norm_add_f32_bf16 = loadOptionalFunction(ctx, module, "termite_rms_norm_add_f32_bf16");
-        var rms_norm_add_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&rms_norm_add_f32, module, "termite_rms_norm_add_f32"));
-        var rms_norm_add_mul_scalar_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&rms_norm_add_mul_scalar_f32, module, "termite_rms_norm_add_mul_scalar_f32"));
-        const rms_norm_add_output_scale_f32 = loadOptionalFunction(ctx, module, "termite_rms_norm_add_output_scale_f32");
-        var rms_norm_bare_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&rms_norm_bare_f32, module, "termite_rms_norm_bare_f32"));
-        const gemma4_a4b_rms_norm_triple_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_a4b_rms_norm_triple_f32");
-        const gemma4_a4b_parallel_ffn_post_residual_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_a4b_parallel_ffn_post_residual_f32");
-        var layer_norm_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&layer_norm_f32, module, "termite_layer_norm_f32"));
-        var add_layer_norm_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&add_layer_norm_f32, module, "termite_add_layer_norm_f32"));
-        var elementwise_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&elementwise_f32, module, "termite_elementwise_f32"));
-        const elementwise_broadcast_f32 = loadOptionalFunction(ctx, module, "termite_elementwise_broadcast_f32");
-        const primitive_where_f32 = loadOptionalFunction(ctx, module, "termite_primitive_where_f32");
-        const primitive_batched_dot_f32 = loadOptionalFunction(ctx, module, "termite_primitive_batched_dot_f32");
-        var silu_multiply_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&silu_multiply_f32, module, "termite_silu_multiply_f32"));
-        var activation_multiply_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&activation_multiply_f32, module, "termite_activation_multiply_f32"));
-        const activation_multiply_slice_last_dim_f32 = loadOptionalFunction(ctx, module, "termite_activation_multiply_slice_last_dim_f32");
-        var embedding_lookup_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_f32, module, "termite_embedding_lookup_f32"));
-        const embedding_lookup_bf16_weight_f32 = loadOptionalFunction(ctx, module, "termite_embedding_lookup_bf16_weight_f32");
-        const embedding_lookup_f16_weight_f32 = loadOptionalFunction(ctx, module, "termite_embedding_lookup_f16_weight_f32");
-        var embedding_lookup_i32_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_i32_f32, module, "termite_embedding_lookup_i32_f32"));
-        const embedding_lookup_i32_bf16_weight_f32 = loadOptionalFunction(ctx, module, "termite_embedding_lookup_i32_bf16_weight_f32");
-        const embedding_lookup_i32_f16_weight_f32 = loadOptionalFunction(ctx, module, "termite_embedding_lookup_i32_f16_weight_f32");
-        var take_rows_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&take_rows_f32, module, "termite_take_rows_f32"));
-        const gemma4_a4b_topk_rows_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_a4b_topk_rows_f32");
-        const gemma4_a4b_q4_0_gate_up_rows_q8_1_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_a4b_q4_0_gate_up_rows_q8_1_f32");
-        const gemma4_a4b_q4_0_down_rows_q8_1_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_a4b_q4_0_down_rows_q8_1_f32");
-        const gemma4_a4b_q4_0_down_rows_q8_1_f32_compact = loadOptionalFunction(ctx, module, "termite_gemma4_a4b_q4_0_down_rows_q8_1_f32_compact");
-        const gemma4_a4b_combine_rows_f32 = loadOptionalFunction(ctx, module, "termite_gemma4_a4b_combine_rows_f32");
-        const gliner_gather_concat_relu_f32 = loadOptionalFunction(ctx, module, "termite_gliner_gather_concat_relu_f32");
-        var gliner_word_embeddings_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&gliner_word_embeddings_f32, module, "termite_gliner_word_embeddings_f32"));
-        var repeat_first_row_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&repeat_first_row_f32, module, "termite_repeat_first_row_f32"));
-        var gliner_gru_combine_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&gliner_gru_combine_f32, module, "termite_gliner_gru_combine_f32"));
-        var concat_lastdim_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&concat_lastdim_f32, module, "termite_concat_lastdim_f32"));
-        var conv2d_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&conv2d_f32, module, "termite_conv2d_f32"));
-        var attention_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32, module, "termite_attention_f32"));
-        var attention_f32_block: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32_block, module, "termite_attention_f32_block"));
-        const laya_local_attention_f32 = loadOptionalFunction(ctx, module, "termite_laya_local_attention_f32");
-        const laya_packed_geglu_f32 = loadOptionalFunction(ctx, module, "termite_laya_packed_geglu_f32");
-        const gliner_qkv_rope_f32 = loadOptionalFunction(ctx, module, "termite_gliner_qkv_rope_f32");
-        const gliner_encoder_attention_f32 = loadOptionalFunction(ctx, module, "termite_gliner_encoder_attention_f32");
-        const gliner_encoder_attention_tc_f16 = loadOptionalFunction(ctx, module, "termite_gliner_encoder_attention_tc_f16");
-        const gliner_encoder_attention_tc_f16_m64 = loadOptionalFunction(ctx, module, "termite_gliner_encoder_attention_tc_f16_m64");
-        const gliner_boundary_attention_f32 = loadOptionalFunction(ctx, module, "termite_gliner_boundary_attention_f32");
-        const gliner_boundary_attention_tc_f16 = loadOptionalFunction(ctx, module, "termite_gliner_boundary_attention_tc_f16");
-        const gliner_boundary_attention_tc_f16_m64 = loadOptionalFunction(ctx, module, "termite_gliner_boundary_attention_tc_f16_m64");
-        const gliner_boundary_attention_tc_f16_compact = loadOptionalFunction(ctx, module, "termite_gliner_boundary_attention_tc_f16_compact");
-        const laya_attention_warp_f32 = loadOptionalFunction(ctx, module, "termite_laya_attention_warp_f32");
-        const laya_action_features_f32 = loadOptionalFunction(ctx, module, "termite_laya_action_features_f32");
-        const qwen3vl_vision_attention_tc_bf16_m32n16 = loadOptionalFunction(ctx, module, "termite_qwen3vl_vision_attention_tc_bf16_m32n16");
-        const attention_f32_bert_prefill_s256_hd64 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64");
-        const attention_f32_bert_prefill_s256_hd64_q8 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64_q8");
-        const attention_f32_bert_prefill_s256_hd64_q16 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64_q16");
-        const attention_f32_bert_prefill_s256_hd64_mma = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64_mma");
-        const cross_attention_f32 = loadOptionalFunction(ctx, module, "termite_cross_attention_f32");
-        const cross_attention_q1_f32 = loadOptionalFunction(ctx, module, "termite_cross_attention_q1_f32");
-        const token_to_nchw_f32 = loadOptionalFunction(ctx, module, "termite_token_to_nchw_f32");
-        const nchw_to_token_f32 = loadOptionalFunction(ctx, module, "termite_nchw_to_token_f32");
-        const pack_windows_f32 = loadOptionalFunction(ctx, module, "termite_pack_windows_f32");
-        const unpad_windows_f32 = loadOptionalFunction(ctx, module, "termite_unpad_windows_f32");
-        const channel_scores_softmax_f32 = loadOptionalFunction(ctx, module, "termite_channel_scores_softmax_f32");
-        const channel_apply_f32 = loadOptionalFunction(ctx, module, "termite_channel_apply_f32");
-        const florence_vision_tail_sources_f32 = loadOptionalFunction(ctx, module, "termite_florence_vision_tail_sources_f32");
-        const rope_f32 = loadOptionalFunction(ctx, module, "termite_rope_f32");
-        const qwen3vl_mrope_f32 = loadOptionalFunction(ctx, module, "termite_qwen3vl_mrope_f32");
-        const qwen3vl_vision_rope_f32 = loadOptionalFunction(ctx, module, "termite_qwen3vl_vision_rope_f32");
-        const rope_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_rope_decode_scalars_f32");
-        const decode_scalars_advance = loadOptionalFunction(ctx, module, "termite_decode_scalars_advance");
-        const rope_scaled_f32 = loadOptionalFunction(ctx, module, "termite_rope_scaled_f32");
-        const rope_scaled_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_rope_scaled_decode_scalars_f32");
-        const rope_per_item_f32 = loadOptionalFunction(ctx, module, "termite_rope_per_item_f32");
-        const rms_norm_heads_rope_f32 = loadOptionalFunction(ctx, module, "termite_rms_norm_heads_rope_f32");
-        const rms_norm_heads_rope_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_rms_norm_heads_rope_decode_scalars_f32");
-        const gqa_attention_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_f32");
-        const gqa_attention_decode_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_f32");
-        const gqa_attention_decode_scalars_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_scalars_fast_f32");
-        const gqa_attention_prefill_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_fast_f32");
-        const gqa_attention_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_scalars_f32");
-        const gqa_attention_decode_scalars_generated_hd256_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_serial_kernel_id);
-        const gqa_attention_decode_split_kv_hd256_stage1_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_stage1_kernel_id);
-        const gqa_attention_decode_split_kv_hd256_stage2_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_stage2_kernel_id);
-        const gqa_attention_decode_scalars_generated_hd512_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_serial_kernel_id);
-        const gqa_attention_decode_split_kv_hd512_stage1_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_stage1_kernel_id);
-        const gqa_attention_decode_split_kv_hd512_stage2_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_stage2_kernel_id);
-        const gqa_attention_decode_split2_kv_hd256_stage1_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_split2_stage1_kernel_id);
-        const gqa_attention_decode_split2_kv_hd256_stage2_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_split2_stage2_kernel_id);
-        const gqa_attention_decode_split2_kv_hd512_stage1_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_split2_stage1_kernel_id);
-        const gqa_attention_decode_split2_kv_hd512_stage2_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_split2_stage2_kernel_id);
-        const gqa_attention_decode_split4_kv_hd256_stage1_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_split4_stage1_kernel_id);
-        const gqa_attention_decode_split4_kv_hd256_stage2_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_split4_stage2_kernel_id);
-        const gqa_attention_decode_split4_kv_hd512_stage1_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_split4_stage1_kernel_id);
-        const gqa_attention_decode_split4_kv_hd512_stage2_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_split4_stage2_kernel_id);
-        const gqa_attention_decode_score_prework_hd256_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_score_prework_kernel_id);
-        const gqa_attention_decode_score_prework_consume_hd256_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_score_prework_serial_kernel_id);
-        const gqa_attention_decode_score_prework_tiled64_hd256_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd256_score_prework_tiled64_kernel_id);
-        const gqa_attention_decode_score_prework_hd512_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_score_prework_kernel_id);
-        const gqa_attention_decode_score_prework_consume_hd512_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_score_prework_serial_kernel_id);
-        const gqa_attention_decode_score_prework_tiled64_hd512_f32 = loadOptionalFunction(ctx, module, cuda_kernel_renderer.generated_attention_hd512_score_prework_tiled64_kernel_id);
         const generated_split_functions_available = switch (generatedGqaDecodeSplitVariant()) {
-            .split2 => gqa_attention_decode_split2_kv_hd256_stage1_f32 != null and
-                gqa_attention_decode_split2_kv_hd256_stage2_f32 != null and
-                gqa_attention_decode_split2_kv_hd512_stage1_f32 != null and
-                gqa_attention_decode_split2_kv_hd512_stage2_f32 != null,
-            .split4 => gqa_attention_decode_split4_kv_hd256_stage1_f32 != null and
-                gqa_attention_decode_split4_kv_hd256_stage2_f32 != null and
-                gqa_attention_decode_split4_kv_hd512_stage1_f32 != null and
-                gqa_attention_decode_split4_kv_hd512_stage2_f32 != null,
-            .split8 => gqa_attention_decode_split_kv_hd256_stage1_f32 != null and
-                gqa_attention_decode_split_kv_hd256_stage2_f32 != null and
-                gqa_attention_decode_split_kv_hd512_stage1_f32 != null and
-                gqa_attention_decode_split_kv_hd512_stage2_f32 != null,
+            .split2 => loaded.gqa_attention_decode_split2_kv_hd256_stage1_f32 != null and
+                loaded.gqa_attention_decode_split2_kv_hd256_stage2_f32 != null and
+                loaded.gqa_attention_decode_split2_kv_hd512_stage1_f32 != null and
+                loaded.gqa_attention_decode_split2_kv_hd512_stage2_f32 != null,
+            .split4 => loaded.gqa_attention_decode_split4_kv_hd256_stage1_f32 != null and
+                loaded.gqa_attention_decode_split4_kv_hd256_stage2_f32 != null and
+                loaded.gqa_attention_decode_split4_kv_hd512_stage1_f32 != null and
+                loaded.gqa_attention_decode_split4_kv_hd512_stage2_f32 != null,
+            .split8 => loaded.gqa_attention_decode_split_kv_hd256_stage1_f32 != null and
+                loaded.gqa_attention_decode_split_kv_hd256_stage2_f32 != null and
+                loaded.gqa_attention_decode_split_kv_hd512_stage1_f32 != null and
+                loaded.gqa_attention_decode_split_kv_hd512_stage2_f32 != null,
             .score_prework => false,
         };
         if (generatedGqaDecodeEnabled() and
-            (gqa_attention_decode_scalars_generated_hd256_f32 == null or
-                gqa_attention_decode_scalars_generated_hd512_f32 == null or
+            (loaded.gqa_attention_decode_scalars_generated_hd256_f32 == null or
+                loaded.gqa_attention_decode_scalars_generated_hd512_f32 == null or
                 !generated_split_functions_available))
         {
             return error.CudaKernelUnavailable;
         }
         if (gqa_score_prework_mode == .explicit and
-            (gqa_attention_decode_score_prework_hd256_f32 == null or
-                gqa_attention_decode_score_prework_consume_hd256_f32 == null or
-                gqa_attention_decode_score_prework_hd512_f32 == null or
-                gqa_attention_decode_score_prework_consume_hd512_f32 == null))
+            (loaded.gqa_attention_decode_score_prework_hd256_f32 == null or
+                loaded.gqa_attention_decode_score_prework_consume_hd256_f32 == null or
+                loaded.gqa_attention_decode_score_prework_hd512_f32 == null or
+                loaded.gqa_attention_decode_score_prework_consume_hd512_f32 == null))
         {
             return error.CudaKernelUnavailable;
         }
         if (gqa_score_prework_consumer_mode.requiresTiled64() and
-            (gqa_attention_decode_score_prework_hd256_f32 == null or
-                gqa_attention_decode_score_prework_tiled64_hd256_f32 == null or
-                gqa_attention_decode_score_prework_hd512_f32 == null or
-                gqa_attention_decode_score_prework_tiled64_hd512_f32 == null))
+            (loaded.gqa_attention_decode_score_prework_hd256_f32 == null or
+                loaded.gqa_attention_decode_score_prework_tiled64_hd256_f32 == null or
+                loaded.gqa_attention_decode_score_prework_hd512_f32 == null or
+                loaded.gqa_attention_decode_score_prework_tiled64_hd512_f32 == null))
         {
             return error.CudaKernelUnavailable;
         }
-        const kv_write_suffix_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_kv_write_suffix_decode_scalars_f32");
-        const gqa_attention_decode_turboquant_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_fast_f32");
-        const gqa_attention_prefill_turboquant_fast_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_turboquant_fast_f32");
-        const gqa_attention_prefill_turboquant_tiled_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_turboquant_tiled_f32");
-        const gqa_attention_prefill_turboquant_mma_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_turboquant_mma_f32");
-        const gqa_attention_prefill_turboquant_mma_m32_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_turboquant_mma_m32_f32");
-        const gqa_attention_prefill_tiled_f16_exact_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_tiled_f16_exact_f32");
-        const gqa_attention_prefill_tiled_f16_warp_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_prefill_tiled_f16_warp_f32");
-        const gqa_attention_prefill_flash_sm89_hd256_f32 = loadOptionalFunction(
-            ctx,
-            module,
-            cuda_kernel_renderer.generated_flash_prefill_hd256_kernel_id,
-        );
-        const gqa_attention_prefill_flash_sm89_hd512_f32 = loadOptionalFunction(
-            ctx,
-            module,
-            cuda_kernel_renderer.generated_flash_prefill_hd512_kernel_id,
-        );
-        const gqa_attention_decode_splitk_online_sm89_hd256_f32 = loadOptionalFunction(
-            ctx,
-            module,
-            cuda_kernel_renderer.generated_splitk_online_decode_hd256_kernel_id,
-        );
-        const gqa_attention_decode_splitk_online_sm89_hd512_f32 = loadOptionalFunction(
-            ctx,
-            module,
-            cuda_kernel_renderer.generated_splitk_online_decode_hd512_kernel_id,
-        );
         if (gqa_decode_profile.failClosed() and
-            (gqa_attention_decode_splitk_online_sm89_hd256_f32 == null or
-                gqa_attention_decode_splitk_online_sm89_hd512_f32 == null))
+            (loaded.gqa_attention_decode_splitk_online_sm89_hd256_f32 == null or
+                loaded.gqa_attention_decode_splitk_online_sm89_hd512_f32 == null))
         {
             std.log.err(
                 "cuda_gqa_decode_profile: status=rejected profile={s} reason=required-symbol-set-unavailable hd256_available={} hd512_available={}",
                 .{
                     gqa_decode_profile.name(),
-                    gqa_attention_decode_splitk_online_sm89_hd256_f32 != null,
-                    gqa_attention_decode_splitk_online_sm89_hd512_f32 != null,
+                    loaded.gqa_attention_decode_splitk_online_sm89_hd256_f32 != null,
+                    loaded.gqa_attention_decode_splitk_online_sm89_hd512_f32 != null,
                 },
             );
             return error.CudaKernelUnavailable;
         }
         if (gqa_prefill_profile_config.profile == .required_flash_f16_sm89 and
-            (gqa_attention_prefill_flash_sm89_hd256_f32 == null or
-                gqa_attention_prefill_flash_sm89_hd512_f32 == null))
+            (loaded.gqa_attention_prefill_flash_sm89_hd256_f32 == null or
+                loaded.gqa_attention_prefill_flash_sm89_hd512_f32 == null))
         {
             std.log.err(
                 "cuda_gqa_prefill_profile: status=rejected profile={s} reason=required-symbol-set-unavailable hd256_available={} hd512_available={}",
                 .{
                     gqa_prefill_profile_config.profile.name(),
-                    gqa_attention_prefill_flash_sm89_hd256_f32 != null,
-                    gqa_attention_prefill_flash_sm89_hd512_f32 != null,
+                    loaded.gqa_attention_prefill_flash_sm89_hd256_f32 != null,
+                    loaded.gqa_attention_prefill_flash_sm89_hd512_f32 != null,
                 },
             );
             return error.CudaKernelUnavailable;
         }
-        const gqa_attention_decode_turboquant_split_stage1_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_split_stage1_f32");
-        const gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32");
-        const gqa_attention_decode_turboquant_split_stage2_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_split_stage2_f32");
-        const gqa_attention_decode_turboquant_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_f32");
-        const kv_write_suffix_turboquant_f32 = loadOptionalFunction(ctx, module, "termite_kv_write_suffix_turboquant_f32");
-        var deberta_attention_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&deberta_attention_f32, module, "termite_deberta_attention_f32"));
-        const deberta_attention_fused_f32 = loadOptionalFunction(ctx, module, "termite_deberta_attention_fused_f32");
-        const deberta_attention_stream_f16 = loadOptionalFunction(ctx, module, "termite_deberta_attention_stream_f16");
-        const deberta_attention_tc_f16_m16n32 = loadOptionalFunction(ctx, module, "termite_deberta_attention_tc_f16_m16n32");
-        const deberta_attention_tc_f16_m32n16 = loadOptionalFunction(ctx, module, "termite_deberta_attention_tc_f16_m32n16");
-        const deberta_pack_heads_f16 = loadOptionalFunction(ctx, module, "termite_deberta_pack_heads_f16");
-        const deberta_scores_softmax_f32 = loadOptionalFunction(ctx, module, "termite_deberta_scores_softmax_f32");
-        const deberta_unpack_heads_f32 = loadOptionalFunction(ctx, module, "termite_deberta_unpack_heads_f32");
-        const deberta_attention_backward_scores_f32 = loadOptionalFunction(ctx, module, "termite_deberta_attention_backward_scores_f32");
-        const deberta_attention_backward_f32 = loadOptionalFunction(ctx, module, "termite_deberta_attention_backward_f32");
         const gliner25_attention = [8]driver_mod.CUfunction{
             loadOptionalFunction(ctx, module, "termite_gliner25_dt_validate_f32"),
             loadOptionalFunction(ctx, module, "termite_gliner25_dt_validate_control"),
@@ -3589,223 +3513,8 @@ pub const KernelModule = struct {
             loadOptionalFunction(ctx, module, "termite_gliner25_dt_dkdv"),
             loadOptionalFunction(ctx, module, "termite_gliner25_dt_relative"),
         };
-        const gliner25_boundary_f32 = loadOptionalFunction(ctx, module, "termite_gliner25_boundary_f32");
-        const gliner25_layer_norm_f32 = loadOptionalFunction(ctx, module, "termite_gliner25_layer_norm_f32");
-        const gliner25_softmax_f32 = loadOptionalFunction(ctx, module, "termite_gliner25_softmax_f32");
-        const training_accumulate_f32 = loadOptionalFunction(ctx, module, "termite_training_accumulate_f32");
-        const training_adamw_f32 = loadOptionalFunction(ctx, module, "termite_training_adamw_f32");
-        const training_sum_squares_f32 = loadOptionalFunction(ctx, module, "termite_training_sum_squares_f32");
-        const masked_bce_accumulate_f32 = loadOptionalFunction(ctx, module, "termite_masked_bce_accumulate_f32");
-        const masked_bce_finalize_f32 = loadOptionalFunction(ctx, module, "termite_masked_bce_finalize_f32");
-        const masked_bce_backward_f32 = loadOptionalFunction(ctx, module, "termite_masked_bce_backward_f32");
-        const primitive_reduce_f32 = loadOptionalFunction(ctx, module, "termite_primitive_reduce_f32");
-        const primitive_broadcast_f32 = loadOptionalFunction(ctx, module, "termite_primitive_broadcast_f32");
-        const layer_norm_backward_f32 = loadOptionalFunction(ctx, module, "termite_layer_norm_backward_f32");
-        const primitive_softmax_f32 = loadOptionalFunction(ctx, module, "termite_primitive_softmax_f32");
-        const selected_token_logprobs_f32 = loadOptionalFunction(ctx, module, "termite_selected_token_logprobs_f32");
-        const primitive_gather_f32 = loadOptionalFunction(ctx, module, "termite_primitive_gather_f32");
-        const primitive_gather_bf16_f32 = loadOptionalFunction(ctx, module, "termite_primitive_gather_bf16_f32");
-        const primitive_scatter_add_axis0_f32 = loadOptionalFunction(ctx, module, "termite_primitive_scatter_add_axis0_f32");
-        const primitive_transpose_f32 = loadOptionalFunction(ctx, module, "termite_primitive_transpose_f32");
-        const primitive_transpose_2d_f32 = loadOptionalFunction(ctx, module, "termite_primitive_transpose_2d_f32");
-        const primitive_concat_f32 = loadOptionalFunction(ctx, module, "termite_primitive_concat_f32");
-        const primitive_slice_f32 = loadOptionalFunction(ctx, module, "termite_primitive_slice_f32");
-        var split_last_dim3_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&split_last_dim3_f32, module, "termite_split_last_dim3_f32"));
-        var linear_q8_0_f32: driver_mod.CUfunction = null;
-        const q8_result = ctx.driver.fns.cuModuleGetFunction(&linear_q8_0_f32, module, "termite_linear_q8_0_f32");
-        if (q8_result != driver_mod.CUDA_SUCCESS) {
-            linear_q8_0_f32 = null;
-        } else {
-            try ctx.driver.check(q8_result);
-        }
-        const linear_q8_0_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_f32_tile4");
-        const linear_q8_0_gated_down_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_gated_down_f32_tile4");
 
-        const linear_q8_0_f32_tile4_r2 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_f32_tile4_r2");
-        const linear_q8_0_bias_f32_tile4_r2 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_bias_f32_tile4_r2");
-        const linear_q8_0_bias_gelu_f32_tile4_r2 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_bias_gelu_f32_tile4_r2");
-        const linear_q8_0_bias_add_f32_tile4_r2 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_bias_add_f32_tile4_r2");
-        const linear_q8_0_f32_fast_r2c8 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_f32_fast_r2c8");
-        const linear_q8_0_bias_f32_fast_r2c8 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_bias_f32_fast_r2c8");
-        const linear_q8_0_bias_gelu_f32_fast_r2c8 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_bias_gelu_f32_fast_r2c8");
-        const linear_q8_0_bias_add_f32_fast_r2c8 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_bias_add_f32_fast_r2c8");
-        const linear_q8_0_f32_fast_r4c4 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_f32_fast_r4c4");
-        const linear_q8_0_bias_f32_fast_r4c4 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_bias_f32_fast_r4c4");
-        const linear_q8_0_bias_gelu_f32_fast_r4c4 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_bias_gelu_f32_fast_r4c4");
-        const linear_q8_0_bias_add_f32_fast_r4c4 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_bias_add_f32_fast_r4c4");
-        const linear_q8_0_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q8_0_f32_tc_hmma");
-        const linear_q8_0_bias_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q8_0_bias_f32_tc_hmma");
-        const linear_q8_0_bias_gelu_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q8_0_bias_gelu_f32_tc_hmma");
-        const linear_q8_0_bias_add_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q8_0_bias_add_f32_tc_hmma");
-        const linear_q4_0_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_0_f32_tc_hmma");
-        const linear_q4_0_f32_tc_hmma_bf16 = if (bundledQ4_0TcHmmaBf16Supported(ctx.info.compute_major, ctx.info.compute_minor))
-            loadOptionalFunction(ctx, module, "termite_linear_q4_0_f32_tc_hmma_bf16")
-        else
-            null;
-        const linear_q4_0_bias_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_0_bias_f32_tc_hmma");
-        const linear_q4_0_bias_gelu_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_0_bias_gelu_f32_tc_hmma");
-        const linear_q4_0_bias_add_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_0_bias_add_f32_tc_hmma");
-        const activation_multiply_fused_gate_up_f32 = loadOptionalFunction(ctx, module, "termite_activation_multiply_fused_gate_up_f32");
-        const quantize_f32_q8_1_rows = loadOptionalFunction(ctx, module, "termite_quantize_f32_q8_1_rows");
-        const quantize_gated_f32_q8_1_rows = loadOptionalFunction(ctx, module, "termite_quantize_gated_f32_q8_1_rows");
-        const quantize_f32_ggml_q8_1_rows = loadOptionalFunction(ctx, module, cuda_kernel_renderer.ggml_q8_1_quantize_rows_kernel_id);
-        var linear_q4_0_f32: driver_mod.CUfunction = null;
-        const q4_result = ctx.driver.fns.cuModuleGetFunction(&linear_q4_0_f32, module, "termite_linear_q4_0_f32");
-        if (q4_result != driver_mod.CUDA_SUCCESS) {
-            linear_q4_0_f32 = null;
-        } else {
-            try ctx.driver.check(q4_result);
-        }
-        const linear_q4_0_generated_mmv = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_general_cuda_q4_0_mmv_kernel_id);
-        const linear_q4_0_generated_mm = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_general_cuda_q4_0_mm_kernel_id);
-        const linear_q4_0_generated_pair = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_general_cuda_q4_0_pair_kernel_id);
-        const linear_q4_0_generated_pair_q8 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_general_cuda_q4_0_pair_q8_kernel_id);
-        const linear_q4_0_generated_down_q8 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_general_cuda_q4_0_down_q8_kernel_id);
-        const linear_q4_0_generated_pair_q8_e2b_6144 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_pair_q8_6144_kernel_id);
-        const linear_q4_0_generated_pair_q8_e2b_12288 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_pair_q8_12288_kernel_id);
-        const linear_q4_0_generated_down_q8_e2b_6144 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_down_q8_6144_kernel_id);
-        const linear_q4_0_generated_down_q8_e2b_12288 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_down_q8_12288_kernel_id);
-        const linear_q4_0_generated_pair_ggml_q8_1_e2b_6144 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_pair_ggml_q8_1_6144_kernel_id);
-        const linear_q4_0_generated_pair_ggml_q8_1_e2b_12288 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_pair_ggml_q8_1_12288_kernel_id);
-        const linear_q4_0_generated_down_ggml_q8_1_e2b_6144 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_down_ggml_q8_1_6144_kernel_id);
-        const linear_q4_0_generated_down_ggml_q8_1_e2b_12288 = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_down_ggml_q8_1_12288_kernel_id);
-        const linear_q4_0_generated_pair_f32_e2b_6144_exact = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_pair_f32_6144_exact_kernel_id);
-        const linear_q4_0_generated_pair_f32_e2b_12288_exact = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_pair_f32_12288_exact_kernel_id);
-        const linear_q4_0_generated_down_f32_e2b_6144_exact = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_down_f32_6144_exact_kernel_id);
-        const linear_q4_0_generated_down_f32_e2b_12288_exact = loadOptionalFunction(ctx, module, quant_kernel_compiler.first_e2b_cuda_q4_0_down_f32_12288_exact_kernel_id);
-        const linear_q4_0_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_f32_tile4");
-        const linear_q4_0_f32_tile4_w4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_f32_tile4_w4");
-        const linear_q4_0_q8_1_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4");
-        const linear_q4_0_q8_1_f32_tile4_e4b_attn_2048 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_e4b_attn_2048");
-        const linear_q4_0_q8_1_f32_tile4_e4b_attn_4096 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_e4b_attn_4096");
-        const linear_q4_0_q8_1_f32_tile4_w8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_w8");
-        const linear_q4_0_q8_1_f32_tile4_w8_rows2 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_w8_rows2");
-        const linear_q4_0_q8_1_f32_tile4_w8_rows4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_w8_rows4");
-        const linear_q4_0_q8_1_f32_tile4_w8_rows8_c4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_w8_rows8_c4");
-        const linear_q4_0_q8_1_f32_tile4_w8_e4b_down = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down");
-        const linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows");
-        const linear_q4_0_q8_1_f32_tile4_w10_e4b_down = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile4_w10_e4b_down");
-        const linear_q4_0_q8_1_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_q8_1_f32_tile8");
-        const linear_q4_0_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_f32_tile8");
-        const linear_q4_0_activation_slice_last_dim_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_activation_slice_last_dim_f32_tile4");
-        const linear_q4_0_activation_slice_last_dim_f32_tile4_w4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_activation_slice_last_dim_f32_tile4_w4");
-        const linear_q4_0_activation_slice_last_dim_q8_1_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_activation_slice_last_dim_q8_1_f32_tile4");
-        const linear_q4_0_gated_down_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_gated_down_f32_tile4");
-        const linear_q4_0_gated_down_f32_tile4_w4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_gated_down_f32_tile4_w4");
-        const linear_q4_0_gated_down_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_gated_down_f32_tile8");
-        const linear_q4_0_gated_down_f32_tile16 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_gated_down_f32_tile16");
-        var linear_q4_k_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_f32, module, "termite_linear_q4_k_f32"));
-        var linear_q4_k_bias_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_bias_f32, module, "termite_linear_q4_k_bias_f32"));
-        var linear_q4_k_f32_tiled: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_f32_tiled, module, "termite_linear_q4_k_f32_tiled"));
-        var linear_q4_k_bias_f32_tiled: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_bias_f32_tiled, module, "termite_linear_q4_k_bias_f32_tiled"));
-        var linear_q4_k_bias_quick_gelu_f32_tiled: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_bias_quick_gelu_f32_tiled, module, "termite_linear_q4_k_bias_quick_gelu_f32_tiled"));
-        var linear_q4_k_f32_tile4: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_f32_tile4, module, "termite_linear_q4_k_f32_tile4"));
-        const linear_q6_k_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q6_k_f32_tile4");
-        const linear_q4_k_gated_down_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_gated_down_f32_tile4");
-        const linear_q6_k_gated_down_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q6_k_gated_down_f32_tile4");
-        var linear_q4_k_bias_f32_tile4: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_bias_f32_tile4, module, "termite_linear_q4_k_bias_f32_tile4"));
-        var linear_q4_k_bias_f32_tile4_r2: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_bias_f32_tile4_r2, module, "termite_linear_q4_k_bias_f32_tile4_r2"));
-        var linear_q4_k_bias_quick_gelu_f32_tile4: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_bias_quick_gelu_f32_tile4, module, "termite_linear_q4_k_bias_quick_gelu_f32_tile4"));
-        var linear_q4_k_bias_relu_f32_tile4: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_bias_relu_f32_tile4, module, "termite_linear_q4_k_bias_relu_f32_tile4"));
-        var linear_q4_k_bias_relu_f32_tile4_r2: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_bias_relu_f32_tile4_r2, module, "termite_linear_q4_k_bias_relu_f32_tile4_r2"));
-        var linear_q4_k_bias_add_f32_tile4: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_bias_add_f32_tile4, module, "termite_linear_q4_k_bias_add_f32_tile4"));
-
-        const linear_q4_k_bias_gelu_f32_tile4_r2 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_bias_gelu_f32_tile4_r2");
-        const linear_q4_k_bias_add_f32_tile4_r2 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_bias_add_f32_tile4_r2");
-        const linear_q4_k_bias_f32_fast_r2c8 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_bias_f32_fast_r2c8");
-        const linear_q4_k_bias_gelu_f32_fast_r2c8 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_bias_gelu_f32_fast_r2c8");
-        const linear_q4_k_bias_add_f32_fast_r2c8 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_bias_add_f32_fast_r2c8");
-        const linear_q4_k_bias_f32_fast_r4c4 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_bias_f32_fast_r4c4");
-        const linear_q4_k_bias_gelu_f32_fast_r4c4 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_bias_gelu_f32_fast_r4c4");
-        const linear_q4_k_bias_add_f32_fast_r4c4 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_bias_add_f32_fast_r4c4");
-        const linear_q4_k_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_k_f32_tc_hmma");
-        const linear_q4_k_bias_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_k_bias_f32_tc_hmma");
-        const linear_q4_k_bias_gelu_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_k_bias_gelu_f32_tc_hmma");
-        const linear_q4_k_bias_add_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_k_bias_add_f32_tc_hmma");
-        const linear_q4_k_bias_quick_gelu_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_k_bias_quick_gelu_f32_tc_hmma");
-        const linear_q4_k_bias_relu_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_k_bias_relu_f32_tc_hmma");
-        const linear_q4_k_triple_bias_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_k_triple_bias_f32_tc_hmma");
-        const linear_q4_k_pair_bias_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_k_pair_bias_f32_tc_hmma");
-        const linear_q4_k_span_bias_f32_tile8_r2 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_span_bias_f32_tile8_r2");
-        const linear_q4_k_span_bias_relu_f32_tile8_r2 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_span_bias_relu_f32_tile8_r2");
-        const linear_q4_k_span_bias_f32_tile4_r8 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_span_bias_f32_tile4_r8");
-        const linear_q4_k_span_bias_relu_f32_tile4_r8 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_span_bias_relu_f32_tile4_r8");
-        const linear_q4_k_span_pair_bias_f32_tile8_r2 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_span_pair_bias_f32_tile8_r2");
-        const linear_q4_k_span_pair_bias_relu_f32_tile8_r2 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_span_pair_bias_relu_f32_tile8_r2");
-        const linear_q4_k_span_pair2_bias_f32_tile8_r2 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_span_pair2_bias_f32_tile8_r2");
-        var linear_q4_k_f32_tile8: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_f32_tile8, module, "termite_linear_q4_k_f32_tile8"));
-        var linear_q4_k_triple_bias_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_triple_bias_f32, module, "termite_linear_q4_k_triple_bias_f32"));
-        var linear_q4_k_triple_bias_f32_tiled: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_triple_bias_f32_tiled, module, "termite_linear_q4_k_triple_bias_f32_tiled"));
-        var linear_q4_k_pair_bias_f32_tiled: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_pair_bias_f32_tiled, module, "termite_linear_q4_k_pair_bias_f32_tiled"));
-        const linear_q8_0_pair_nobias_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_pair_nobias_f32_tile4");
-        const linear_q4_0_pair_nobias_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_nobias_f32_tile4");
-        const linear_q4_0_pair_nobias_f32_tile4_w4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_nobias_f32_tile4_w4");
-        const linear_q4_0_pair_nobias_q8_1_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_nobias_q8_1_f32_tile4");
-        const linear_q4_0_pair_nobias_q8_1_f32_tile4_w8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_nobias_q8_1_f32_tile4_w8");
-        const linear_q4_0_pair_nobias_q8_1_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_nobias_q8_1_f32_tile8");
-        const linear_q4_0_pair_activation_f32_tile4_w4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_f32_tile4_w4");
-        const linear_q4_0_pair_activation_q8_1_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_f32_tile4");
-        const linear_q4_0_pair_activation_q8_1_f32_tile4_w8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w8");
-        const linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn");
-        const linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn");
-        const linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn");
-        const linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2");
-        const linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4");
-        const linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2");
-        const linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1");
-        const linear_q4_0_pair_activation_q8_1_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_activation_q8_1_f32_tile8");
-        const linear_q4_0_pair_nobias_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_pair_nobias_f32_tile8");
-        const linear_q4_k_pair_nobias_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_pair_nobias_f32_tile4");
-        const linear_f32_qkv_nobias_tiled = loadOptionalFunction(ctx, module, "termite_linear_f32_qkv_nobias_tiled");
-        const linear_bf16_weight_f32_qkv_nobias_tiled = loadOptionalFunction(ctx, module, "termite_linear_bf16_weight_f32_qkv_nobias_tiled");
-        const linear_q8_0_qkv_nobias_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q8_0_qkv_nobias_f32_tile4");
-        const linear_q4_0_qkv_nobias_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_qkv_nobias_f32_tile4");
-        const linear_q4_0_qkv_nobias_f32_tile4_w4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_qkv_nobias_f32_tile4_w4");
-        const linear_q4_0_qkv_nobias_q8_1_f32_tile4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_qkv_nobias_q8_1_f32_tile4");
-        const linear_q4_0_qkv_nobias_q8_1_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8");
-        const linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4");
-        const linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8");
-        const linear_q4_0_qkv_nobias_f32_tile8 = loadOptionalFunction(ctx, module, "termite_linear_q4_0_qkv_nobias_f32_tile8");
-        const linear_q4_k_qkv_nobias_f32_tiled = loadOptionalFunction(ctx, module, "termite_linear_q4_k_qkv_nobias_f32_tiled");
-        const linear_q4_k_q4_k_f32_qkv_nobias_tiled = loadOptionalFunction(ctx, module, "termite_linear_q4_k_q4_k_f32_qkv_nobias_tiled");
-        var embedding_lookup_q8_0_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_q8_0_f32, module, "termite_embedding_lookup_q8_0_f32"));
-        var embedding_lookup_i32_q8_0_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_i32_q8_0_f32, module, "termite_embedding_lookup_i32_q8_0_f32"));
-        var embedding_lookup_q4_0_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_q4_0_f32, module, "termite_embedding_lookup_q4_0_f32"));
-        var embedding_lookup_i32_q4_0_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_i32_q4_0_f32, module, "termite_embedding_lookup_i32_q4_0_f32"));
-        var embedding_lookup_q4_k_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_q4_k_f32, module, "termite_embedding_lookup_q4_k_f32"));
-        var embedding_lookup_i32_q4_k_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_i32_q4_k_f32, module, "termite_embedding_lookup_i32_q4_k_f32"));
-        var embedding_lookup_q6_k_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_q6_k_f32, module, "termite_embedding_lookup_q6_k_f32"));
-        var embedding_lookup_i32_q6_k_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_i32_q6_k_f32, module, "termite_embedding_lookup_i32_q6_k_f32"));
-        var embedding_add_weighted_i32_q6_k_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_add_weighted_i32_q6_k_f32, module, "termite_embedding_add_weighted_i32_q6_k_f32"));
-        const rms_norm_add_weighted_embedding_i32_q6_k_f32 = loadOptionalFunction(ctx, module, "termite_rms_norm_add_weighted_embedding_i32_q6_k_f32");
-        var slice_last_dim_f32: driver_mod.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&slice_last_dim_f32, module, "termite_slice_last_dim_f32"));
+        try loaded.loadBundledFunctions(ctx, true);
 
         // Reserve the fixed split-KV workspace for every CUDA module. Keeping
         // this allocation independent of the candidate gate makes baseline
@@ -3832,376 +3541,14 @@ pub const KernelModule = struct {
         }
         errdefer gqa_attention_decode_splitk_online_workspace.free(ctx);
 
-        return .{
-            .module = module,
-            .fill_f32 = fill_f32,
-            .copy_f32 = copy_f32,
-            .copy_u8 = copy_u8,
-            .f32_to_bf16 = f32_to_bf16,
-            .f32_to_f16 = f32_to_f16,
-            .f32_to_i32 = f32_to_i32,
-            .round_f32 = round_f32,
-            .dequant_q4_0_bf16 = dequant_q4_0_bf16,
-            .pack_q8_0_tensor_core = pack_q8_0_tensor_core,
-            .scale_f32 = scale_f32,
-            .add_scalar_f32 = add_scalar_f32,
-            .binary_scalar_f32 = binary_scalar_f32,
-            .add_mul_scalar_f32 = add_mul_scalar_f32,
-            .add_weighted_scalars_f32 = add_weighted_scalars_f32,
-            .linear_f32 = linear_f32,
-            .linear_f32_tiled = linear_f32_tiled,
-            .linear_bf16_weight_f32_tiled = linear_bf16_weight_f32_tiled,
-            .linear_f16_weight_f32_tiled = linear_f16_weight_f32_tiled,
-            .argmax_last_row_f32 = argmax_last_row_f32,
-            .argmax_rows_f32 = argmax_rows_f32,
-            .argmax_rows_suppress_f32 = argmax_rows_suppress_f32,
-            .argmax_last_row_suppress_f32 = argmax_last_row_suppress_f32,
-            .linear_q8_0_argmax_stage1_tile4 = linear_q8_0_argmax_stage1_tile4,
-            .linear_q4_k_argmax_stage1_tile4 = linear_q4_k_argmax_stage1_tile4,
-            .argmax_reduce_pairs_f32 = argmax_reduce_pairs_f32,
-            .linear_q8_0_argmax_rows_stage1_tile4 = linear_q8_0_argmax_rows_stage1_tile4,
-            .linear_q4_0_argmax_rows_stage1_tile4 = linear_q4_0_argmax_rows_stage1_tile4,
-            .linear_q4_0_argmax_rows_stage1_tile16 = linear_q4_0_argmax_rows_stage1_tile16,
-            .linear_q4_0_q8_1_argmax_rows_stage1_tile8_e2b = linear_q4_0_q8_1_argmax_rows_stage1_tile8_e2b,
-            .linear_q4_k_argmax_rows_stage1_tile4 = linear_q4_k_argmax_rows_stage1_tile4,
-            .linear_q6_k_argmax_rows_stage1_tile4 = linear_q6_k_argmax_rows_stage1_tile4,
-            .linear_q6_k_argmax_rows_stage1_tile8 = linear_q6_k_argmax_rows_stage1_tile8,
-            .linear_q6_k_argmax_rows_stage1_tile16 = linear_q6_k_argmax_rows_stage1_tile16,
-            .linear_q6_k_q8_1_argmax_rows_stage1_tile8 = linear_q6_k_q8_1_argmax_rows_stage1_tile8,
-            .linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b = linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b,
-            .linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b = linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b,
-            .linear_q6_k_q8_1_argmax_generated_k2560 = linear_q6_k_q8_1_argmax_generated_k2560,
-            .linear_q6_k_q8_1_argmax_generated_k3840 = linear_q6_k_q8_1_argmax_generated_k3840,
-            .linear_q6_k_q8_1_f32_tile8_e4b = linear_q6_k_q8_1_f32_tile8_e4b,
-            .argmax_reduce_rows_pairs_f32 = argmax_reduce_rows_pairs_f32,
-            .argmax_reduce_rows_pairs_f32_w16 = argmax_reduce_rows_pairs_f32_w16,
-            .gemma4_mtp_preproject_f32 = gemma4_mtp_preproject_f32,
-            .gemma4_mtp_masked_select_f32 = gemma4_mtp_masked_select_f32,
-            .gemma4_mtp_masked_select_hidden_f32 = gemma4_mtp_masked_select_hidden_f32,
-            .gemma4_mtp_centroid_scores_hidden_f32 = gemma4_mtp_centroid_scores_hidden_f32,
-            .gemma4_mtp_centroid_topk_u32 = gemma4_mtp_centroid_topk_u32,
-            .gemma4_mtp_restricted_lm_head_scores_f32 = gemma4_mtp_restricted_lm_head_scores_f32,
-            .gemma4_mtp_reduce_token_scores_f32 = gemma4_mtp_reduce_token_scores_f32,
-            .gemma4_mtp_masked_argmax_f32 = gemma4_mtp_masked_argmax_f32,
-            .gemma4_mtp_verify_commit_u32 = gemma4_mtp_verify_commit_u32,
-            .linear_bias_f32 = linear_bias_f32,
-            .add_bias_rows_f32 = add_bias_rows_f32,
-            .add_bias_relu_rows_f32 = add_bias_relu_rows_f32,
-            .linear_bias_f32_tile4_r2 = linear_bias_f32_tile4_r2,
-            .linear_bias_relu_f32_tile4_r2 = linear_bias_relu_f32_tile4_r2,
-            .linear_bias_gelu_f32_tile4_r2 = linear_bias_gelu_f32_tile4_r2,
-            .linear_bias_add_f32_tile4_r2 = linear_bias_add_f32_tile4_r2,
-            .linear_pair_bias_f32_tile4_r2 = linear_pair_bias_f32_tile4_r2,
-            .linear_triple_bias_f32_tile4_r2 = linear_triple_bias_f32_tile4_r2,
-            .rms_norm_f32 = rms_norm_f32,
-            .rms_norm_f32_bf16 = rms_norm_f32_bf16,
-            .rms_norm_add_f32_bf16 = rms_norm_add_f32_bf16,
-            .rms_norm_add_f32 = rms_norm_add_f32,
-            .rms_norm_add_mul_scalar_f32 = rms_norm_add_mul_scalar_f32,
-            .rms_norm_add_output_scale_f32 = rms_norm_add_output_scale_f32,
-            .rms_norm_bare_f32 = rms_norm_bare_f32,
-            .gemma4_a4b_rms_norm_triple_f32 = gemma4_a4b_rms_norm_triple_f32,
-            .gemma4_a4b_parallel_ffn_post_residual_f32 = gemma4_a4b_parallel_ffn_post_residual_f32,
-            .layer_norm_f32 = layer_norm_f32,
-            .add_layer_norm_f32 = add_layer_norm_f32,
-            .elementwise_f32 = elementwise_f32,
-            .elementwise_broadcast_f32 = elementwise_broadcast_f32,
-            .primitive_where_f32 = primitive_where_f32,
-            .primitive_batched_dot_f32 = primitive_batched_dot_f32,
-            .silu_multiply_f32 = silu_multiply_f32,
-            .activation_multiply_f32 = activation_multiply_f32,
-            .activation_multiply_slice_last_dim_f32 = activation_multiply_slice_last_dim_f32,
-            .embedding_lookup_f32 = embedding_lookup_f32,
-            .embedding_lookup_bf16_weight_f32 = embedding_lookup_bf16_weight_f32,
-            .embedding_lookup_f16_weight_f32 = embedding_lookup_f16_weight_f32,
-            .embedding_lookup_i32_f32 = embedding_lookup_i32_f32,
-            .embedding_lookup_i32_bf16_weight_f32 = embedding_lookup_i32_bf16_weight_f32,
-            .embedding_lookup_i32_f16_weight_f32 = embedding_lookup_i32_f16_weight_f32,
-            .take_rows_f32 = take_rows_f32,
-            .gemma4_a4b_topk_rows_f32 = gemma4_a4b_topk_rows_f32,
-            .gemma4_a4b_q4_0_gate_up_rows_q8_1_f32 = gemma4_a4b_q4_0_gate_up_rows_q8_1_f32,
-            .gemma4_a4b_q4_0_down_rows_q8_1_f32 = gemma4_a4b_q4_0_down_rows_q8_1_f32,
-            .gemma4_a4b_q4_0_down_rows_q8_1_f32_compact = gemma4_a4b_q4_0_down_rows_q8_1_f32_compact,
-            .gemma4_a4b_combine_rows_f32 = gemma4_a4b_combine_rows_f32,
-            .gliner_gather_concat_relu_f32 = gliner_gather_concat_relu_f32,
-            .gliner_word_embeddings_f32 = gliner_word_embeddings_f32,
-            .repeat_first_row_f32 = repeat_first_row_f32,
-            .gliner_gru_combine_f32 = gliner_gru_combine_f32,
-            .concat_lastdim_f32 = concat_lastdim_f32,
-            .conv2d_f32 = conv2d_f32,
-            .attention_f32 = attention_f32,
-            .attention_f32_block = attention_f32_block,
-            .laya_action_features_f32 = laya_action_features_f32,
-            .laya_local_attention_f32 = laya_local_attention_f32,
-            .laya_packed_geglu_f32 = laya_packed_geglu_f32,
-            .laya_attention_warp_f32 = laya_attention_warp_f32,
-            .gliner_qkv_rope_f32 = gliner_qkv_rope_f32,
-            .gliner_encoder_attention_f32 = gliner_encoder_attention_f32,
-            .gliner_encoder_attention_tc_f16 = gliner_encoder_attention_tc_f16,
-            .gliner_encoder_attention_tc_f16_m64 = gliner_encoder_attention_tc_f16_m64,
-            .gliner_boundary_attention_f32 = gliner_boundary_attention_f32,
-            .gliner_boundary_attention_tc_f16 = gliner_boundary_attention_tc_f16,
-            .gliner_boundary_attention_tc_f16_m64 = gliner_boundary_attention_tc_f16_m64,
-            .gliner_boundary_attention_tc_f16_compact = gliner_boundary_attention_tc_f16_compact,
-            .qwen3vl_vision_attention_tc_bf16_m32n16 = qwen3vl_vision_attention_tc_bf16_m32n16,
-            .attention_f32_bert_prefill_s256_hd64 = attention_f32_bert_prefill_s256_hd64,
-            .attention_f32_bert_prefill_s256_hd64_q8 = attention_f32_bert_prefill_s256_hd64_q8,
-            .attention_f32_bert_prefill_s256_hd64_q16 = attention_f32_bert_prefill_s256_hd64_q16,
-            .attention_f32_bert_prefill_s256_hd64_mma = attention_f32_bert_prefill_s256_hd64_mma,
-            .cross_attention_f32 = cross_attention_f32,
-            .cross_attention_q1_f32 = cross_attention_q1_f32,
-            .token_to_nchw_f32 = token_to_nchw_f32,
-            .nchw_to_token_f32 = nchw_to_token_f32,
-            .pack_windows_f32 = pack_windows_f32,
-            .unpad_windows_f32 = unpad_windows_f32,
-            .channel_scores_softmax_f32 = channel_scores_softmax_f32,
-            .channel_apply_f32 = channel_apply_f32,
-            .florence_vision_tail_sources_f32 = florence_vision_tail_sources_f32,
-            .rope_f32 = rope_f32,
-            .qwen3vl_mrope_f32 = qwen3vl_mrope_f32,
-            .qwen3vl_vision_rope_f32 = qwen3vl_vision_rope_f32,
-            .rope_decode_scalars_f32 = rope_decode_scalars_f32,
-            .decode_scalars_advance = decode_scalars_advance,
-            .rope_scaled_f32 = rope_scaled_f32,
-            .rope_scaled_decode_scalars_f32 = rope_scaled_decode_scalars_f32,
-            .rope_per_item_f32 = rope_per_item_f32,
-            .rms_norm_heads_rope_f32 = rms_norm_heads_rope_f32,
-            .rms_norm_heads_rope_decode_scalars_f32 = rms_norm_heads_rope_decode_scalars_f32,
-            .gqa_attention_f32 = gqa_attention_f32,
-            .gqa_attention_decode_f32 = gqa_attention_decode_f32,
-            .gqa_attention_decode_scalars_fast_f32 = gqa_attention_decode_scalars_fast_f32,
-            .gqa_attention_prefill_fast_f32 = gqa_attention_prefill_fast_f32,
-            .gqa_attention_decode_scalars_f32 = gqa_attention_decode_scalars_f32,
-            .gqa_attention_decode_scalars_generated_hd256_f32 = gqa_attention_decode_scalars_generated_hd256_f32,
-            .gqa_attention_decode_split_kv_hd256_stage1_f32 = gqa_attention_decode_split_kv_hd256_stage1_f32,
-            .gqa_attention_decode_split_kv_hd256_stage2_f32 = gqa_attention_decode_split_kv_hd256_stage2_f32,
-            .gqa_attention_decode_scalars_generated_hd512_f32 = gqa_attention_decode_scalars_generated_hd512_f32,
-            .gqa_attention_decode_split_kv_hd512_stage1_f32 = gqa_attention_decode_split_kv_hd512_stage1_f32,
-            .gqa_attention_decode_split_kv_hd512_stage2_f32 = gqa_attention_decode_split_kv_hd512_stage2_f32,
-            .gqa_attention_decode_split2_kv_hd256_stage1_f32 = gqa_attention_decode_split2_kv_hd256_stage1_f32,
-            .gqa_attention_decode_split2_kv_hd256_stage2_f32 = gqa_attention_decode_split2_kv_hd256_stage2_f32,
-            .gqa_attention_decode_split2_kv_hd512_stage1_f32 = gqa_attention_decode_split2_kv_hd512_stage1_f32,
-            .gqa_attention_decode_split2_kv_hd512_stage2_f32 = gqa_attention_decode_split2_kv_hd512_stage2_f32,
-            .gqa_attention_decode_split4_kv_hd256_stage1_f32 = gqa_attention_decode_split4_kv_hd256_stage1_f32,
-            .gqa_attention_decode_split4_kv_hd256_stage2_f32 = gqa_attention_decode_split4_kv_hd256_stage2_f32,
-            .gqa_attention_decode_split4_kv_hd512_stage1_f32 = gqa_attention_decode_split4_kv_hd512_stage1_f32,
-            .gqa_attention_decode_split4_kv_hd512_stage2_f32 = gqa_attention_decode_split4_kv_hd512_stage2_f32,
-            .gqa_attention_decode_score_prework_hd256_f32 = gqa_attention_decode_score_prework_hd256_f32,
-            .gqa_attention_decode_score_prework_consume_hd256_f32 = gqa_attention_decode_score_prework_consume_hd256_f32,
-            .gqa_attention_decode_score_prework_tiled64_hd256_f32 = gqa_attention_decode_score_prework_tiled64_hd256_f32,
-            .gqa_attention_decode_score_prework_hd512_f32 = gqa_attention_decode_score_prework_hd512_f32,
-            .gqa_attention_decode_score_prework_consume_hd512_f32 = gqa_attention_decode_score_prework_consume_hd512_f32,
-            .gqa_attention_decode_score_prework_tiled64_hd512_f32 = gqa_attention_decode_score_prework_tiled64_hd512_f32,
-            .gqa_attention_generated_workspace = gqa_attention_generated_workspace,
-            .gqa_attention_decode_splitk_online_sm89_hd256_f32 = gqa_attention_decode_splitk_online_sm89_hd256_f32,
-            .gqa_attention_decode_splitk_online_sm89_hd512_f32 = gqa_attention_decode_splitk_online_sm89_hd512_f32,
-            .gqa_attention_decode_splitk_online_workspace = gqa_attention_decode_splitk_online_workspace,
-            .gqa_decode_profile = gqa_decode_profile,
-            .kv_write_suffix_decode_scalars_f32 = kv_write_suffix_decode_scalars_f32,
-            .gqa_attention_decode_turboquant_fast_f32 = gqa_attention_decode_turboquant_fast_f32,
-            .gqa_attention_prefill_turboquant_fast_f32 = gqa_attention_prefill_turboquant_fast_f32,
-            .gqa_attention_prefill_turboquant_tiled_f32 = gqa_attention_prefill_turboquant_tiled_f32,
-            .gqa_attention_prefill_turboquant_mma_f32 = gqa_attention_prefill_turboquant_mma_f32,
-            .gqa_attention_prefill_turboquant_mma_m32_f32 = gqa_attention_prefill_turboquant_mma_m32_f32,
-            .gqa_attention_prefill_tiled_f16_exact_f32 = gqa_attention_prefill_tiled_f16_exact_f32,
-            .gqa_attention_prefill_tiled_f16_warp_f32 = gqa_attention_prefill_tiled_f16_warp_f32,
-            .gqa_attention_prefill_flash_sm89_hd256_f32 = gqa_attention_prefill_flash_sm89_hd256_f32,
-            .gqa_attention_prefill_flash_sm89_hd512_f32 = gqa_attention_prefill_flash_sm89_hd512_f32,
-            .gqa_prefill_profile = gqa_prefill_profile_config.profile,
-            .gqa_score_prework_mode = gqa_score_prework_mode,
-            .gqa_score_prework_consumer_mode = gqa_score_prework_consumer_mode,
-            .gqa_attention_decode_turboquant_split_stage1_f32 = gqa_attention_decode_turboquant_split_stage1_f32,
-            .gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 = gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32,
-            .gqa_attention_decode_turboquant_split_stage2_f32 = gqa_attention_decode_turboquant_split_stage2_f32,
-            .gqa_attention_decode_turboquant_f32 = gqa_attention_decode_turboquant_f32,
-            .kv_write_suffix_turboquant_f32 = kv_write_suffix_turboquant_f32,
-            .deberta_attention_f32 = deberta_attention_f32,
-            .deberta_attention_fused_f32 = deberta_attention_fused_f32,
-            .deberta_attention_stream_f16 = deberta_attention_stream_f16,
-            .deberta_attention_tc_f16_m16n32 = deberta_attention_tc_f16_m16n32,
-            .deberta_attention_tc_f16_m32n16 = deberta_attention_tc_f16_m32n16,
-            .deberta_pack_heads_f16 = deberta_pack_heads_f16,
-            .deberta_scores_softmax_f32 = deberta_scores_softmax_f32,
-            .deberta_unpack_heads_f32 = deberta_unpack_heads_f32,
-            .deberta_attention_backward_scores_f32 = deberta_attention_backward_scores_f32,
-            .deberta_attention_backward_f32 = deberta_attention_backward_f32,
-            .gliner25_boundary_f32 = gliner25_boundary_f32,
-            .training_validate_f32 = loadOptionalFunction(ctx, module, "termite_training_validate_f32"),
-            .training_validate_finish = loadOptionalFunction(ctx, module, "termite_training_validate_finish"),
-            .gliner25_layer_norm_f32 = gliner25_layer_norm_f32,
-            .gliner25_softmax_f32 = gliner25_softmax_f32,
-            .gliner25_attention = gliner25_attention,
-            .training_accumulate_f32 = training_accumulate_f32,
-            .training_adamw_f32 = training_adamw_f32,
-            .training_sum_squares_f32 = training_sum_squares_f32,
-            .masked_bce_accumulate_f32 = masked_bce_accumulate_f32,
-            .masked_bce_finalize_f32 = masked_bce_finalize_f32,
-            .masked_bce_backward_f32 = masked_bce_backward_f32,
-            .primitive_reduce_f32 = primitive_reduce_f32,
-            .primitive_broadcast_f32 = primitive_broadcast_f32,
-            .layer_norm_backward_f32 = layer_norm_backward_f32,
-            .primitive_softmax_f32 = primitive_softmax_f32,
-            .selected_token_logprobs_f32 = selected_token_logprobs_f32,
-            .primitive_gather_f32 = primitive_gather_f32,
-            .primitive_gather_bf16_f32 = primitive_gather_bf16_f32,
-            .primitive_scatter_add_axis0_f32 = primitive_scatter_add_axis0_f32,
-            .primitive_transpose_f32 = primitive_transpose_f32,
-            .primitive_transpose_2d_f32 = primitive_transpose_2d_f32,
-            .primitive_concat_f32 = primitive_concat_f32,
-            .primitive_slice_f32 = primitive_slice_f32,
-            .split_last_dim3_f32 = split_last_dim3_f32,
-            .linear_q8_0_f32 = linear_q8_0_f32,
-            .linear_q8_0_f32_tile4 = linear_q8_0_f32_tile4,
-            .linear_q8_0_gated_down_f32_tile4 = linear_q8_0_gated_down_f32_tile4,
-            .linear_q8_0_f32_tile4_r2 = linear_q8_0_f32_tile4_r2,
-            .linear_q8_0_bias_f32_tile4_r2 = linear_q8_0_bias_f32_tile4_r2,
-            .linear_q8_0_bias_gelu_f32_tile4_r2 = linear_q8_0_bias_gelu_f32_tile4_r2,
-            .linear_q8_0_bias_add_f32_tile4_r2 = linear_q8_0_bias_add_f32_tile4_r2,
-            .linear_q8_0_f32_fast_r2c8 = linear_q8_0_f32_fast_r2c8,
-            .linear_q8_0_bias_f32_fast_r2c8 = linear_q8_0_bias_f32_fast_r2c8,
-            .linear_q8_0_bias_gelu_f32_fast_r2c8 = linear_q8_0_bias_gelu_f32_fast_r2c8,
-            .linear_q8_0_bias_add_f32_fast_r2c8 = linear_q8_0_bias_add_f32_fast_r2c8,
-            .linear_q8_0_f32_fast_r4c4 = linear_q8_0_f32_fast_r4c4,
-            .linear_q8_0_bias_f32_fast_r4c4 = linear_q8_0_bias_f32_fast_r4c4,
-            .linear_q8_0_bias_gelu_f32_fast_r4c4 = linear_q8_0_bias_gelu_f32_fast_r4c4,
-            .linear_q8_0_bias_add_f32_fast_r4c4 = linear_q8_0_bias_add_f32_fast_r4c4,
-            .linear_q8_0_f32_tc_hmma = linear_q8_0_f32_tc_hmma,
-            .linear_q8_0_bias_f32_tc_hmma = linear_q8_0_bias_f32_tc_hmma,
-            .linear_q8_0_bias_gelu_f32_tc_hmma = linear_q8_0_bias_gelu_f32_tc_hmma,
-            .linear_q8_0_bias_add_f32_tc_hmma = linear_q8_0_bias_add_f32_tc_hmma,
-            .linear_q4_0_f32_tc_hmma = linear_q4_0_f32_tc_hmma,
-            .linear_q4_0_f32_tc_hmma_bf16 = linear_q4_0_f32_tc_hmma_bf16,
-            .linear_q4_0_bias_f32_tc_hmma = linear_q4_0_bias_f32_tc_hmma,
-            .linear_q4_0_bias_gelu_f32_tc_hmma = linear_q4_0_bias_gelu_f32_tc_hmma,
-            .linear_q4_0_bias_add_f32_tc_hmma = linear_q4_0_bias_add_f32_tc_hmma,
-            .activation_multiply_fused_gate_up_f32 = activation_multiply_fused_gate_up_f32,
-            .quantize_f32_q8_1_rows = quantize_f32_q8_1_rows,
-            .quantize_gated_f32_q8_1_rows = quantize_gated_f32_q8_1_rows,
-            .quantize_f32_ggml_q8_1_rows = quantize_f32_ggml_q8_1_rows,
-            .linear_q4_0_f32 = linear_q4_0_f32,
-            .linear_q4_0_generated_mmv = linear_q4_0_generated_mmv,
-            .linear_q4_0_generated_mm = linear_q4_0_generated_mm,
-            .linear_q4_0_generated_pair = linear_q4_0_generated_pair,
-            .linear_q4_0_generated_pair_q8 = linear_q4_0_generated_pair_q8,
-            .linear_q4_0_generated_down_q8 = linear_q4_0_generated_down_q8,
-            .linear_q4_0_generated_pair_q8_e2b_6144 = linear_q4_0_generated_pair_q8_e2b_6144,
-            .linear_q4_0_generated_pair_q8_e2b_12288 = linear_q4_0_generated_pair_q8_e2b_12288,
-            .linear_q4_0_generated_down_q8_e2b_6144 = linear_q4_0_generated_down_q8_e2b_6144,
-            .linear_q4_0_generated_down_q8_e2b_12288 = linear_q4_0_generated_down_q8_e2b_12288,
-            .linear_q4_0_generated_pair_ggml_q8_1_e2b_6144 = linear_q4_0_generated_pair_ggml_q8_1_e2b_6144,
-            .linear_q4_0_generated_pair_ggml_q8_1_e2b_12288 = linear_q4_0_generated_pair_ggml_q8_1_e2b_12288,
-            .linear_q4_0_generated_down_ggml_q8_1_e2b_6144 = linear_q4_0_generated_down_ggml_q8_1_e2b_6144,
-            .linear_q4_0_generated_down_ggml_q8_1_e2b_12288 = linear_q4_0_generated_down_ggml_q8_1_e2b_12288,
-            .linear_q4_0_generated_pair_f32_e2b_6144_exact = linear_q4_0_generated_pair_f32_e2b_6144_exact,
-            .linear_q4_0_generated_pair_f32_e2b_12288_exact = linear_q4_0_generated_pair_f32_e2b_12288_exact,
-            .linear_q4_0_generated_down_f32_e2b_6144_exact = linear_q4_0_generated_down_f32_e2b_6144_exact,
-            .linear_q4_0_generated_down_f32_e2b_12288_exact = linear_q4_0_generated_down_f32_e2b_12288_exact,
-            .linear_q4_0_f32_tile4 = linear_q4_0_f32_tile4,
-            .linear_q4_0_f32_tile4_w4 = linear_q4_0_f32_tile4_w4,
-            .linear_q4_0_q8_1_f32_tile4 = linear_q4_0_q8_1_f32_tile4,
-            .linear_q4_0_q8_1_f32_tile4_e4b_attn_2048 = linear_q4_0_q8_1_f32_tile4_e4b_attn_2048,
-            .linear_q4_0_q8_1_f32_tile4_e4b_attn_4096 = linear_q4_0_q8_1_f32_tile4_e4b_attn_4096,
-            .linear_q4_0_q8_1_f32_tile4_w8 = linear_q4_0_q8_1_f32_tile4_w8,
-            .linear_q4_0_q8_1_f32_tile4_w8_rows2 = linear_q4_0_q8_1_f32_tile4_w8_rows2,
-            .linear_q4_0_q8_1_f32_tile4_w8_rows4 = linear_q4_0_q8_1_f32_tile4_w8_rows4,
-            .linear_q4_0_q8_1_f32_tile4_w8_rows8_c4 = linear_q4_0_q8_1_f32_tile4_w8_rows8_c4,
-            .linear_q4_0_q8_1_f32_tile4_w8_e4b_down = linear_q4_0_q8_1_f32_tile4_w8_e4b_down,
-            .linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows = linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows,
-            .linear_q4_0_q8_1_f32_tile4_w10_e4b_down = linear_q4_0_q8_1_f32_tile4_w10_e4b_down,
-            .linear_q4_0_q8_1_f32_tile8 = linear_q4_0_q8_1_f32_tile8,
-            .linear_q4_0_f32_tile8 = linear_q4_0_f32_tile8,
-            .linear_q4_0_activation_slice_last_dim_f32_tile4 = linear_q4_0_activation_slice_last_dim_f32_tile4,
-            .linear_q4_0_activation_slice_last_dim_f32_tile4_w4 = linear_q4_0_activation_slice_last_dim_f32_tile4_w4,
-            .linear_q4_0_activation_slice_last_dim_q8_1_f32_tile4 = linear_q4_0_activation_slice_last_dim_q8_1_f32_tile4,
-            .linear_q4_0_gated_down_f32_tile4 = linear_q4_0_gated_down_f32_tile4,
-            .linear_q4_0_gated_down_f32_tile4_w4 = linear_q4_0_gated_down_f32_tile4_w4,
-            .linear_q4_0_gated_down_f32_tile8 = linear_q4_0_gated_down_f32_tile8,
-            .linear_q4_0_gated_down_f32_tile16 = linear_q4_0_gated_down_f32_tile16,
-            .linear_q4_k_f32 = linear_q4_k_f32,
-            .linear_q4_k_bias_f32 = linear_q4_k_bias_f32,
-            .linear_q4_k_f32_tiled = linear_q4_k_f32_tiled,
-            .linear_q4_k_bias_f32_tiled = linear_q4_k_bias_f32_tiled,
-            .linear_q4_k_bias_quick_gelu_f32_tiled = linear_q4_k_bias_quick_gelu_f32_tiled,
-            .linear_q4_k_f32_tile4 = linear_q4_k_f32_tile4,
-            .linear_q6_k_f32_tile4 = linear_q6_k_f32_tile4,
-            .linear_q4_k_gated_down_f32_tile4 = linear_q4_k_gated_down_f32_tile4,
-            .linear_q6_k_gated_down_f32_tile4 = linear_q6_k_gated_down_f32_tile4,
-            .linear_q4_k_bias_f32_tile4 = linear_q4_k_bias_f32_tile4,
-            .linear_q4_k_bias_f32_tile4_r2 = linear_q4_k_bias_f32_tile4_r2,
-            .linear_q4_k_bias_quick_gelu_f32_tile4 = linear_q4_k_bias_quick_gelu_f32_tile4,
-            .linear_q4_k_bias_relu_f32_tile4 = linear_q4_k_bias_relu_f32_tile4,
-            .linear_q4_k_bias_relu_f32_tile4_r2 = linear_q4_k_bias_relu_f32_tile4_r2,
-            .linear_q4_k_bias_add_f32_tile4 = linear_q4_k_bias_add_f32_tile4,
-            .linear_q4_k_bias_gelu_f32_tile4_r2 = linear_q4_k_bias_gelu_f32_tile4_r2,
-            .linear_q4_k_bias_add_f32_tile4_r2 = linear_q4_k_bias_add_f32_tile4_r2,
-            .linear_q4_k_bias_f32_fast_r2c8 = linear_q4_k_bias_f32_fast_r2c8,
-            .linear_q4_k_bias_gelu_f32_fast_r2c8 = linear_q4_k_bias_gelu_f32_fast_r2c8,
-            .linear_q4_k_bias_add_f32_fast_r2c8 = linear_q4_k_bias_add_f32_fast_r2c8,
-            .linear_q4_k_bias_f32_fast_r4c4 = linear_q4_k_bias_f32_fast_r4c4,
-            .linear_q4_k_bias_gelu_f32_fast_r4c4 = linear_q4_k_bias_gelu_f32_fast_r4c4,
-            .linear_q4_k_bias_add_f32_fast_r4c4 = linear_q4_k_bias_add_f32_fast_r4c4,
-            .linear_q4_k_f32_tc_hmma = linear_q4_k_f32_tc_hmma,
-            .linear_q4_k_bias_f32_tc_hmma = linear_q4_k_bias_f32_tc_hmma,
-            .linear_q4_k_bias_gelu_f32_tc_hmma = linear_q4_k_bias_gelu_f32_tc_hmma,
-            .linear_q4_k_bias_add_f32_tc_hmma = linear_q4_k_bias_add_f32_tc_hmma,
-            .linear_q4_k_bias_quick_gelu_f32_tc_hmma = linear_q4_k_bias_quick_gelu_f32_tc_hmma,
-            .linear_q4_k_bias_relu_f32_tc_hmma = linear_q4_k_bias_relu_f32_tc_hmma,
-            .linear_q4_k_triple_bias_f32_tc_hmma = linear_q4_k_triple_bias_f32_tc_hmma,
-            .linear_q4_k_pair_bias_f32_tc_hmma = linear_q4_k_pair_bias_f32_tc_hmma,
-            .linear_q4_k_span_bias_f32_tile8_r2 = linear_q4_k_span_bias_f32_tile8_r2,
-            .linear_q4_k_span_bias_relu_f32_tile8_r2 = linear_q4_k_span_bias_relu_f32_tile8_r2,
-            .linear_q4_k_span_bias_f32_tile4_r8 = linear_q4_k_span_bias_f32_tile4_r8,
-            .linear_q4_k_span_bias_relu_f32_tile4_r8 = linear_q4_k_span_bias_relu_f32_tile4_r8,
-            .linear_q4_k_span_pair_bias_f32_tile8_r2 = linear_q4_k_span_pair_bias_f32_tile8_r2,
-            .linear_q4_k_span_pair_bias_relu_f32_tile8_r2 = linear_q4_k_span_pair_bias_relu_f32_tile8_r2,
-            .linear_q4_k_span_pair2_bias_f32_tile8_r2 = linear_q4_k_span_pair2_bias_f32_tile8_r2,
-            .linear_q4_k_f32_tile8 = linear_q4_k_f32_tile8,
-            .linear_q4_k_triple_bias_f32 = linear_q4_k_triple_bias_f32,
-            .linear_q4_k_triple_bias_f32_tiled = linear_q4_k_triple_bias_f32_tiled,
-            .linear_q4_k_pair_bias_f32_tiled = linear_q4_k_pair_bias_f32_tiled,
-            .linear_q8_0_pair_nobias_f32_tile4 = linear_q8_0_pair_nobias_f32_tile4,
-            .linear_q4_0_pair_nobias_f32_tile4 = linear_q4_0_pair_nobias_f32_tile4,
-            .linear_q4_0_pair_nobias_f32_tile4_w4 = linear_q4_0_pair_nobias_f32_tile4_w4,
-            .linear_q4_0_pair_nobias_q8_1_f32_tile4 = linear_q4_0_pair_nobias_q8_1_f32_tile4,
-            .linear_q4_0_pair_nobias_q8_1_f32_tile4_w8 = linear_q4_0_pair_nobias_q8_1_f32_tile4_w8,
-            .linear_q4_0_pair_nobias_q8_1_f32_tile8 = linear_q4_0_pair_nobias_q8_1_f32_tile8,
-            .linear_q4_0_pair_activation_f32_tile4_w4 = linear_q4_0_pair_activation_f32_tile4_w4,
-            .linear_q4_0_pair_activation_q8_1_f32_tile4 = linear_q4_0_pair_activation_q8_1_f32_tile4,
-            .linear_q4_0_pair_activation_q8_1_f32_tile4_w8 = linear_q4_0_pair_activation_q8_1_f32_tile4_w8,
-            .linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn = linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn,
-            .linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn = linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn,
-            .linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn = linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn,
-            .linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2 = linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2,
-            .linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4 = linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4,
-            .linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2 = linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2,
-            .linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1 = linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1,
-            .linear_q4_0_pair_activation_q8_1_f32_tile8 = linear_q4_0_pair_activation_q8_1_f32_tile8,
-            .linear_q4_0_pair_nobias_f32_tile8 = linear_q4_0_pair_nobias_f32_tile8,
-            .linear_q4_k_pair_nobias_f32_tile4 = linear_q4_k_pair_nobias_f32_tile4,
-            .linear_f32_qkv_nobias_tiled = linear_f32_qkv_nobias_tiled,
-            .linear_bf16_weight_f32_qkv_nobias_tiled = linear_bf16_weight_f32_qkv_nobias_tiled,
-            .linear_q8_0_qkv_nobias_f32_tile4 = linear_q8_0_qkv_nobias_f32_tile4,
-            .linear_q4_0_qkv_nobias_f32_tile4 = linear_q4_0_qkv_nobias_f32_tile4,
-            .linear_q4_0_qkv_nobias_f32_tile4_w4 = linear_q4_0_qkv_nobias_f32_tile4_w4,
-            .linear_q4_0_qkv_nobias_q8_1_f32_tile4 = linear_q4_0_qkv_nobias_q8_1_f32_tile4,
-            .linear_q4_0_qkv_nobias_q8_1_f32_tile8 = linear_q4_0_qkv_nobias_q8_1_f32_tile8,
-            .linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4 = linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4,
-            .linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8 = linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8,
-            .linear_q4_0_qkv_nobias_f32_tile8 = linear_q4_0_qkv_nobias_f32_tile8,
-            .linear_q4_k_qkv_nobias_f32_tiled = linear_q4_k_qkv_nobias_f32_tiled,
-            .linear_q4_k_q4_k_f32_qkv_nobias_tiled = linear_q4_k_q4_k_f32_qkv_nobias_tiled,
-            .embedding_lookup_q8_0_f32 = embedding_lookup_q8_0_f32,
-            .embedding_lookup_i32_q8_0_f32 = embedding_lookup_i32_q8_0_f32,
-            .embedding_lookup_q4_0_f32 = embedding_lookup_q4_0_f32,
-            .embedding_lookup_i32_q4_0_f32 = embedding_lookup_i32_q4_0_f32,
-            .embedding_lookup_q4_k_f32 = embedding_lookup_q4_k_f32,
-            .embedding_lookup_i32_q4_k_f32 = embedding_lookup_i32_q4_k_f32,
-            .embedding_lookup_q6_k_f32 = embedding_lookup_q6_k_f32,
-            .embedding_lookup_i32_q6_k_f32 = embedding_lookup_i32_q6_k_f32,
-            .embedding_add_weighted_i32_q6_k_f32 = embedding_add_weighted_i32_q6_k_f32,
-            .rms_norm_add_weighted_embedding_i32_q6_k_f32 = rms_norm_add_weighted_embedding_i32_q6_k_f32,
-            .slice_last_dim_f32 = slice_last_dim_f32,
-        };
+        loaded.gqa_attention_generated_workspace = gqa_attention_generated_workspace;
+        loaded.gqa_attention_decode_splitk_online_workspace = gqa_attention_decode_splitk_online_workspace;
+        loaded.gqa_decode_profile = gqa_decode_profile;
+        loaded.gqa_prefill_profile = gqa_prefill_profile_config.profile;
+        loaded.gqa_score_prework_mode = gqa_score_prework_mode;
+        loaded.gqa_score_prework_consumer_mode = gqa_score_prework_consumer_mode;
+        loaded.gliner25_attention = gliner25_attention;
+        return loaded;
     }
 
     pub fn unload(self: *KernelModule, ctx: *context_mod.CudaContext) void {
@@ -4224,170 +3571,8 @@ pub const KernelModule = struct {
             ctx.makeCurrent() catch {};
             _ = ctx.driver.fns.cuModuleUnload(self.module);
             self.module = null;
-            self.fill_f32 = null;
-            self.f32_to_bf16 = null;
-            self.f32_to_f16 = null;
-            self.f32_to_i32 = null;
-            self.round_f32 = null;
-            self.dequant_q4_0_bf16 = null;
-            self.pack_q8_0_tensor_core = null;
-            self.scale_f32 = null;
-            self.add_scalar_f32 = null;
-            self.binary_scalar_f32 = null;
-            self.add_mul_scalar_f32 = null;
-            self.add_weighted_scalars_f32 = null;
-            self.linear_f32 = null;
-            self.linear_f32_tiled = null;
-            self.linear_bf16_weight_f32_tiled = null;
-            self.linear_f16_weight_f32_tiled = null;
-            self.argmax_last_row_f32 = null;
-            self.argmax_rows_f32 = null;
-            self.argmax_rows_suppress_f32 = null;
-            self.argmax_last_row_suppress_f32 = null;
-            self.linear_q8_0_argmax_stage1_tile4 = null;
-            self.linear_q4_k_argmax_stage1_tile4 = null;
-            self.argmax_reduce_pairs_f32 = null;
-            self.linear_q8_0_argmax_rows_stage1_tile4 = null;
-            self.linear_q4_0_argmax_rows_stage1_tile4 = null;
-            self.linear_q4_0_argmax_rows_stage1_tile16 = null;
-            self.linear_q4_0_q8_1_argmax_rows_stage1_tile8_e2b = null;
-            self.linear_q4_k_argmax_rows_stage1_tile4 = null;
-            self.linear_q6_k_argmax_rows_stage1_tile4 = null;
-            self.linear_q6_k_argmax_rows_stage1_tile8 = null;
-            self.linear_q6_k_argmax_rows_stage1_tile16 = null;
-            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8 = null;
-            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b = null;
-            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b = null;
-            self.linear_q6_k_q8_1_argmax_generated_k2560 = null;
-            self.linear_q6_k_q8_1_argmax_generated_k3840 = null;
-            self.linear_q6_k_q8_1_f32_tile8_e4b = null;
-            self.argmax_reduce_rows_pairs_f32 = null;
-            self.argmax_reduce_rows_pairs_f32_w16 = null;
-            self.gemma4_mtp_preproject_f32 = null;
-            self.gemma4_mtp_masked_select_f32 = null;
-            self.gemma4_mtp_masked_select_hidden_f32 = null;
-            self.gemma4_mtp_centroid_scores_hidden_f32 = null;
-            self.gemma4_mtp_centroid_topk_u32 = null;
-            self.gemma4_mtp_restricted_lm_head_scores_f32 = null;
-            self.gemma4_mtp_reduce_token_scores_f32 = null;
-            self.gemma4_mtp_masked_argmax_f32 = null;
-            self.gemma4_mtp_verify_commit_u32 = null;
-            self.linear_bias_f32 = null;
-            self.add_bias_rows_f32 = null;
-            self.add_bias_relu_rows_f32 = null;
-            self.linear_bias_f32_tile4_r2 = null;
-            self.linear_bias_relu_f32_tile4_r2 = null;
-            self.linear_bias_gelu_f32_tile4_r2 = null;
-            self.linear_bias_add_f32_tile4_r2 = null;
-            self.linear_pair_bias_f32_tile4_r2 = null;
-            self.linear_triple_bias_f32_tile4_r2 = null;
-            self.rms_norm_f32 = null;
-            self.rms_norm_f32_bf16 = null;
-            self.rms_norm_add_f32_bf16 = null;
-            self.rms_norm_add_mul_scalar_f32 = null;
-            self.rms_norm_add_output_scale_f32 = null;
-            self.rms_norm_bare_f32 = null;
-            self.gemma4_a4b_rms_norm_triple_f32 = null;
-            self.gemma4_a4b_parallel_ffn_post_residual_f32 = null;
-            self.layer_norm_f32 = null;
-            self.add_layer_norm_f32 = null;
-            self.elementwise_f32 = null;
-            self.elementwise_broadcast_f32 = null;
-            self.primitive_where_f32 = null;
-            self.primitive_batched_dot_f32 = null;
-            self.silu_multiply_f32 = null;
-            self.activation_multiply_f32 = null;
-            self.activation_multiply_slice_last_dim_f32 = null;
-            self.embedding_lookup_f32 = null;
-            self.embedding_lookup_bf16_weight_f32 = null;
-            self.embedding_lookup_f16_weight_f32 = null;
-            self.embedding_lookup_i32_f32 = null;
-            self.embedding_lookup_i32_bf16_weight_f32 = null;
-            self.embedding_lookup_i32_f16_weight_f32 = null;
-            self.take_rows_f32 = null;
-            self.gemma4_a4b_topk_rows_f32 = null;
-            self.gemma4_a4b_q4_0_gate_up_rows_q8_1_f32 = null;
-            self.gemma4_a4b_q4_0_down_rows_q8_1_f32 = null;
-            self.gemma4_a4b_q4_0_down_rows_q8_1_f32_compact = null;
-            self.gemma4_a4b_combine_rows_f32 = null;
-            self.gliner_gather_concat_relu_f32 = null;
-            self.gliner_word_embeddings_f32 = null;
-            self.repeat_first_row_f32 = null;
-            self.gliner_gru_combine_f32 = null;
-            self.concat_lastdim_f32 = null;
-            self.conv2d_f32 = null;
-            self.attention_f32 = null;
-            self.attention_f32_block = null;
-            self.qwen3vl_vision_attention_tc_bf16_m32n16 = null;
-            self.gliner_qkv_rope_f32 = null;
-            self.gliner_encoder_attention_f32 = null;
-            self.gliner_encoder_attention_tc_f16 = null;
-            self.gliner_encoder_attention_tc_f16_m64 = null;
-            self.gliner_boundary_attention_f32 = null;
-            self.gliner_boundary_attention_tc_f16 = null;
-            self.gliner_boundary_attention_tc_f16_m64 = null;
-            self.gliner_boundary_attention_tc_f16_compact = null;
-            self.attention_f32_bert_prefill_s256_hd64 = null;
-            self.attention_f32_bert_prefill_s256_hd64_q8 = null;
-            self.attention_f32_bert_prefill_s256_hd64_q16 = null;
-            self.attention_f32_bert_prefill_s256_hd64_mma = null;
-            self.cross_attention_f32 = null;
-            self.cross_attention_q1_f32 = null;
-            self.token_to_nchw_f32 = null;
-            self.nchw_to_token_f32 = null;
-            self.pack_windows_f32 = null;
-            self.unpad_windows_f32 = null;
-            self.channel_scores_softmax_f32 = null;
-            self.channel_apply_f32 = null;
-            self.florence_vision_tail_sources_f32 = null;
-            self.rope_f32 = null;
-            self.qwen3vl_mrope_f32 = null;
-            self.qwen3vl_vision_rope_f32 = null;
-            self.rope_decode_scalars_f32 = null;
-            self.rope_scaled_f32 = null;
-            self.rope_scaled_decode_scalars_f32 = null;
-            self.rope_per_item_f32 = null;
-            self.rms_norm_heads_rope_f32 = null;
-            self.rms_norm_heads_rope_decode_scalars_f32 = null;
-            self.gqa_attention_f32 = null;
-            self.gqa_attention_decode_f32 = null;
-            self.gqa_attention_decode_scalars_fast_f32 = null;
-            self.gqa_attention_prefill_fast_f32 = null;
-            self.gqa_attention_decode_scalars_f32 = null;
-            self.gqa_attention_decode_scalars_generated_hd256_f32 = null;
-            self.gqa_attention_decode_split_kv_hd256_stage1_f32 = null;
-            self.gqa_attention_decode_split_kv_hd256_stage2_f32 = null;
-            self.gqa_attention_decode_scalars_generated_hd512_f32 = null;
-            self.gqa_attention_decode_split_kv_hd512_stage1_f32 = null;
-            self.gqa_attention_decode_split_kv_hd512_stage2_f32 = null;
-            self.gqa_attention_decode_split2_kv_hd256_stage1_f32 = null;
-            self.gqa_attention_decode_split2_kv_hd256_stage2_f32 = null;
-            self.gqa_attention_decode_split2_kv_hd512_stage1_f32 = null;
-            self.gqa_attention_decode_split2_kv_hd512_stage2_f32 = null;
-            self.gqa_attention_decode_split4_kv_hd256_stage1_f32 = null;
-            self.gqa_attention_decode_split4_kv_hd256_stage2_f32 = null;
-            self.gqa_attention_decode_split4_kv_hd512_stage1_f32 = null;
-            self.gqa_attention_decode_split4_kv_hd512_stage2_f32 = null;
-            self.gqa_attention_decode_score_prework_hd256_f32 = null;
-            self.gqa_attention_decode_score_prework_consume_hd256_f32 = null;
-            self.gqa_attention_decode_score_prework_tiled64_hd256_f32 = null;
-            self.gqa_attention_decode_score_prework_hd512_f32 = null;
-            self.gqa_attention_decode_score_prework_consume_hd512_f32 = null;
-            self.gqa_attention_decode_score_prework_tiled64_hd512_f32 = null;
-            self.gqa_attention_decode_splitk_online_sm89_hd256_f32 = null;
-            self.gqa_attention_decode_splitk_online_sm89_hd512_f32 = null;
             self.gqa_decode_profile = .off;
             self.gqa_splitk_online_decode_telemetry_word.store(0, .monotonic);
-            self.kv_write_suffix_decode_scalars_f32 = null;
-            self.gqa_attention_decode_turboquant_fast_f32 = null;
-            self.gqa_attention_prefill_turboquant_fast_f32 = null;
-            self.gqa_attention_prefill_turboquant_tiled_f32 = null;
-            self.gqa_attention_prefill_turboquant_mma_f32 = null;
-            self.gqa_attention_prefill_turboquant_mma_m32_f32 = null;
-            self.gqa_attention_prefill_tiled_f16_exact_f32 = null;
-            self.gqa_attention_prefill_tiled_f16_warp_f32 = null;
-            self.gqa_attention_prefill_flash_sm89_hd256_f32 = null;
-            self.gqa_attention_prefill_flash_sm89_hd512_f32 = null;
             self.gqa_prefill_profile = .automatic;
             self.qwen3vl_automatic_prefill = false;
             self.gqa_score_prework_mode = .automatic;
@@ -4396,200 +3581,8 @@ pub const KernelModule = struct {
             self.gqa_flash_prefill_telemetry_word.store(0, .monotonic);
             self.gqa_prefill_mma_smem_opted_in = false;
             self.gqa_prefill_mma_m32_smem_opted_in = false;
-            self.gqa_attention_decode_turboquant_split_stage1_f32 = null;
-            self.gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 = null;
-            self.gqa_attention_decode_turboquant_split_stage2_f32 = null;
-            self.gqa_attention_decode_turboquant_f32 = null;
-            self.kv_write_suffix_turboquant_f32 = null;
-            self.deberta_attention_f32 = null;
-            self.deberta_attention_fused_f32 = null;
-            self.deberta_attention_stream_f16 = null;
-            self.deberta_attention_tc_f16_m16n32 = null;
-            self.deberta_attention_tc_f16_m32n16 = null;
-            self.deberta_pack_heads_f16 = null;
-            self.deberta_scores_softmax_f32 = null;
-            self.deberta_unpack_heads_f32 = null;
-            self.deberta_attention_backward_scores_f32 = null;
-            self.deberta_attention_backward_f32 = null;
-            self.gliner25_boundary_f32 = null;
-            self.training_validate_f32 = null;
-            self.training_validate_finish = null;
-            self.gliner25_layer_norm_f32 = null;
-            self.gliner25_softmax_f32 = null;
-            self.gliner25_attention = @splat(null);
-            self.training_accumulate_f32 = null;
-            self.training_adamw_f32 = null;
-            self.training_sum_squares_f32 = null;
-            self.masked_bce_accumulate_f32 = null;
-            self.masked_bce_finalize_f32 = null;
-            self.masked_bce_backward_f32 = null;
-            self.primitive_reduce_f32 = null;
-            self.primitive_broadcast_f32 = null;
-            self.layer_norm_backward_f32 = null;
-            self.primitive_softmax_f32 = null;
-            self.selected_token_logprobs_f32 = null;
-            self.primitive_gather_f32 = null;
-            self.primitive_gather_bf16_f32 = null;
-            self.primitive_scatter_add_axis0_f32 = null;
-            self.primitive_transpose_f32 = null;
-            self.primitive_transpose_2d_f32 = null;
-            self.primitive_concat_f32 = null;
-            self.primitive_slice_f32 = null;
-            self.split_last_dim3_f32 = null;
-            self.linear_q8_0_f32 = null;
-            self.linear_q8_0_f32_tile4 = null;
-            self.linear_q8_0_gated_down_f32_tile4 = null;
-            self.linear_q8_0_f32_tile4_r2 = null;
-            self.linear_q8_0_bias_f32_tile4_r2 = null;
-            self.linear_q8_0_bias_gelu_f32_tile4_r2 = null;
-            self.linear_q8_0_bias_add_f32_tile4_r2 = null;
-            self.linear_q8_0_f32_fast_r2c8 = null;
-            self.linear_q8_0_bias_f32_fast_r2c8 = null;
-            self.linear_q8_0_bias_gelu_f32_fast_r2c8 = null;
-            self.linear_q8_0_bias_add_f32_fast_r2c8 = null;
-            self.linear_q8_0_f32_fast_r4c4 = null;
-            self.linear_q8_0_bias_f32_fast_r4c4 = null;
-            self.linear_q8_0_bias_gelu_f32_fast_r4c4 = null;
-            self.linear_q8_0_bias_add_f32_fast_r4c4 = null;
-            self.linear_q8_0_f32_tc_hmma = null;
-            self.linear_q8_0_bias_f32_tc_hmma = null;
-            self.linear_q8_0_bias_gelu_f32_tc_hmma = null;
-            self.linear_q8_0_bias_add_f32_tc_hmma = null;
-            self.linear_q4_0_f32_tc_hmma = null;
-            self.linear_q4_0_f32_tc_hmma_bf16 = null;
-            self.linear_q4_0_bias_f32_tc_hmma = null;
-            self.linear_q4_0_bias_gelu_f32_tc_hmma = null;
-            self.linear_q4_0_bias_add_f32_tc_hmma = null;
-            self.activation_multiply_fused_gate_up_f32 = null;
-            self.quantize_f32_q8_1_rows = null;
-            self.quantize_gated_f32_q8_1_rows = null;
-            self.quantize_f32_ggml_q8_1_rows = null;
-            self.linear_q4_k_generated_bias_gelu = null;
-            self.linear_q4_k_generated_mmv = null;
-            self.linear_q4_0_f32 = null;
-            self.linear_q4_0_generated_mmv = null;
-            self.linear_q4_0_generated_mm = null;
-            self.linear_q4_0_generated_pair = null;
-            self.linear_q4_0_generated_pair_q8 = null;
-            self.linear_q4_0_generated_down_q8 = null;
-            self.linear_q4_0_generated_pair_q8_e2b_6144 = null;
-            self.linear_q4_0_generated_pair_q8_e2b_12288 = null;
-            self.linear_q4_0_generated_down_q8_e2b_6144 = null;
-            self.linear_q4_0_generated_down_q8_e2b_12288 = null;
-            self.linear_q4_0_generated_pair_ggml_q8_1_e2b_6144 = null;
-            self.linear_q4_0_generated_pair_ggml_q8_1_e2b_12288 = null;
-            self.linear_q4_0_generated_down_ggml_q8_1_e2b_6144 = null;
-            self.linear_q4_0_generated_down_ggml_q8_1_e2b_12288 = null;
-            self.linear_q4_0_generated_pair_f32_e2b_6144_exact = null;
-            self.linear_q4_0_generated_pair_f32_e2b_12288_exact = null;
-            self.linear_q4_0_generated_down_f32_e2b_6144_exact = null;
-            self.linear_q4_0_generated_down_f32_e2b_12288_exact = null;
-            self.linear_q4_0_f32_tile4 = null;
-            self.linear_q4_0_f32_tile4_w4 = null;
-            self.linear_q4_0_q8_1_f32_tile4 = null;
-            self.linear_q4_0_q8_1_f32_tile4_e4b_attn_2048 = null;
-            self.linear_q4_0_q8_1_f32_tile4_e4b_attn_4096 = null;
-            self.linear_q4_0_q8_1_f32_tile4_w8 = null;
-            self.linear_q4_0_q8_1_f32_tile4_w8_rows2 = null;
-            self.linear_q4_0_q8_1_f32_tile4_w8_rows4 = null;
-            self.linear_q4_0_q8_1_f32_tile4_w8_rows8_c4 = null;
-            self.linear_q4_0_q8_1_f32_tile4_w8_e4b_down = null;
-            self.linear_q4_0_q8_1_f32_tile4_w8_e4b_down_rows = null;
-            self.linear_q4_0_q8_1_f32_tile4_w10_e4b_down = null;
-            self.linear_q4_0_q8_1_f32_tile8 = null;
-            self.linear_q4_0_f32_tile8 = null;
-            self.linear_q4_0_activation_slice_last_dim_f32_tile4 = null;
-            self.linear_q4_0_activation_slice_last_dim_f32_tile4_w4 = null;
-            self.linear_q4_0_activation_slice_last_dim_q8_1_f32_tile4 = null;
-            self.linear_q4_0_gated_down_f32_tile4 = null;
-            self.linear_q4_0_gated_down_f32_tile4_w4 = null;
-            self.linear_q4_0_gated_down_f32_tile8 = null;
-            self.linear_q4_0_gated_down_f32_tile16 = null;
-            self.linear_q4_k_f32 = null;
-            self.linear_q4_k_bias_f32 = null;
-            self.linear_q4_k_f32_tiled = null;
-            self.linear_q4_k_bias_f32_tiled = null;
-            self.linear_q4_k_bias_quick_gelu_f32_tiled = null;
-            self.linear_q4_k_f32_tile4 = null;
-            self.linear_q6_k_f32_tile4 = null;
-            self.linear_q4_k_gated_down_f32_tile4 = null;
-            self.linear_q6_k_gated_down_f32_tile4 = null;
-            self.linear_q4_k_bias_f32_tile4 = null;
-            self.linear_q4_k_bias_f32_tile4_r2 = null;
-            self.linear_q4_k_bias_quick_gelu_f32_tile4 = null;
-            self.linear_q4_k_bias_relu_f32_tile4 = null;
-            self.linear_q4_k_bias_relu_f32_tile4_r2 = null;
-            self.linear_q4_k_bias_add_f32_tile4 = null;
-            self.linear_q4_k_bias_gelu_f32_tile4_r2 = null;
-            self.linear_q4_k_bias_add_f32_tile4_r2 = null;
-            self.linear_q4_k_bias_f32_fast_r2c8 = null;
-            self.linear_q4_k_bias_gelu_f32_fast_r2c8 = null;
-            self.linear_q4_k_bias_add_f32_fast_r2c8 = null;
-            self.linear_q4_k_bias_f32_fast_r4c4 = null;
-            self.linear_q4_k_bias_gelu_f32_fast_r4c4 = null;
-            self.linear_q4_k_bias_add_f32_fast_r4c4 = null;
-            self.linear_q4_k_f32_tc_hmma = null;
-            self.linear_q4_k_bias_f32_tc_hmma = null;
-            self.linear_q4_k_bias_gelu_f32_tc_hmma = null;
-            self.linear_q4_k_bias_add_f32_tc_hmma = null;
-            self.linear_q4_k_bias_quick_gelu_f32_tc_hmma = null;
-            self.linear_q4_k_bias_relu_f32_tc_hmma = null;
-            self.linear_q4_k_triple_bias_f32_tc_hmma = null;
-            self.linear_q4_k_pair_bias_f32_tc_hmma = null;
-            self.linear_q4_k_span_bias_f32_tile8_r2 = null;
-            self.linear_q4_k_span_bias_relu_f32_tile8_r2 = null;
-            self.linear_q4_k_span_bias_f32_tile4_r8 = null;
-            self.linear_q4_k_span_bias_relu_f32_tile4_r8 = null;
-            self.linear_q4_k_span_pair_bias_f32_tile8_r2 = null;
-            self.linear_q4_k_span_pair_bias_relu_f32_tile8_r2 = null;
-            self.linear_q4_k_span_pair2_bias_f32_tile8_r2 = null;
-            self.linear_q4_k_f32_tile8 = null;
-            self.linear_q4_k_triple_bias_f32 = null;
-            self.linear_q4_k_triple_bias_f32_tiled = null;
-            self.linear_q4_k_pair_bias_f32_tiled = null;
-            self.linear_q8_0_pair_nobias_f32_tile4 = null;
-            self.linear_q4_0_pair_nobias_f32_tile4 = null;
-            self.linear_q4_0_pair_nobias_f32_tile4_w4 = null;
-            self.linear_q4_0_pair_nobias_q8_1_f32_tile4 = null;
-            self.linear_q4_0_pair_nobias_q8_1_f32_tile4_w8 = null;
-            self.linear_q4_0_pair_nobias_q8_1_f32_tile8 = null;
-            self.linear_q4_0_pair_activation_f32_tile4_w4 = null;
-            self.linear_q4_0_pair_activation_q8_1_f32_tile4 = null;
-            self.linear_q4_0_pair_activation_q8_1_f32_tile4_w8 = null;
-            self.linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn = null;
-            self.linear_q4_0_pair_activation_q8_1_f32_tile4_w5_e4b_ffn = null;
-            self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn = null;
-            self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows2 = null;
-            self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows4 = null;
-            self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows8_c2 = null;
-            self.linear_q4_0_pair_activation_q8_1_q8_1_tile32_w5_e4b_ffn_rows16_c1 = null;
-            self.linear_q4_0_pair_activation_q8_1_f32_tile8 = null;
-            self.linear_q4_0_pair_nobias_f32_tile8 = null;
-            self.linear_q4_k_pair_nobias_f32_tile4 = null;
-            self.linear_f32_qkv_nobias_tiled = null;
-            self.linear_bf16_weight_f32_qkv_nobias_tiled = null;
-            self.linear_q8_0_qkv_nobias_f32_tile4 = null;
-            self.linear_q4_0_qkv_nobias_f32_tile4 = null;
-            self.linear_q4_0_qkv_nobias_f32_tile4_w4 = null;
-            self.linear_q4_0_qkv_nobias_q8_1_f32_tile4 = null;
-            self.linear_q4_0_qkv_nobias_q8_1_f32_tile8 = null;
-            self.linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4 = null;
-            self.linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8 = null;
-            self.linear_q4_0_qkv_nobias_f32_tile8 = null;
-            self.linear_q4_k_qkv_nobias_f32_tiled = null;
-            self.linear_q4_k_q4_k_f32_qkv_nobias_tiled = null;
-            self.embedding_lookup_q8_0_f32 = null;
-            self.embedding_lookup_i32_q8_0_f32 = null;
-            self.embedding_lookup_q4_0_f32 = null;
-            self.embedding_lookup_i32_q4_0_f32 = null;
-            self.embedding_lookup_q4_k_f32 = null;
-            self.embedding_lookup_i32_q4_k_f32 = null;
-            self.embedding_lookup_q6_k_f32 = null;
-            self.embedding_lookup_i32_q6_k_f32 = null;
-            self.embedding_add_weighted_i32_q6_k_f32 = null;
-            self.rms_norm_add_weighted_embedding_i32_q6_k_f32 = null;
-            self.slice_last_dim_f32 = null;
         }
+        self.clearBundledFunctions();
     }
 
     pub fn hasGemma4DecoderPrimitives(self: *const KernelModule) bool {
@@ -12400,15 +11393,10 @@ pub const KernelModule = struct {
         in_dim: usize,
         out_dim: usize,
     ) driver_mod.Error!void {
-        if (in_dim == 0 or in_dim % q8_0_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q8_0_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        try checkBytes(dst, out_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q8_0_block_bytes));
+        const out_count = try checkedQuantLinearOutput(q8_0_values_per_block, q8_0_block_bytes, dst, input, weight_raw, rows, in_dim, out_dim);
         if (out_count == 0) return;
 
-        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var arguments = try quantLinearArguments(dst, input, weight_raw, rows, in_dim, out_dim);
         var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launch1d(self.linear_q8_0_f32, ctx, out_count, &params);
     }
@@ -12424,15 +11412,10 @@ pub const KernelModule = struct {
         out_dim: usize,
     ) driver_mod.Error!void {
         const function = self.linear_q8_0_f32_tile4 orelse return error.CudaKernelUnavailable;
-        if (in_dim == 0 or in_dim % q8_0_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q8_0_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        try checkBytes(dst, out_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q8_0_block_bytes));
+        const out_count = try checkedQuantLinearOutput(q8_0_values_per_block, q8_0_block_bytes, dst, input, weight_raw, rows, in_dim, out_dim);
         if (out_count == 0) return;
 
-        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var arguments = try quantLinearArguments(dst, input, weight_raw, rows, in_dim, out_dim);
         var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launch2d(function, ctx, (out_dim + q8_0_col_tile - 1) / q8_0_col_tile, rows, q8_0_tiled_threads, &params);
     }
@@ -12981,15 +11964,10 @@ pub const KernelModule = struct {
         in_dim: usize,
         out_dim: usize,
     ) driver_mod.Error!void {
-        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_0_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        try checkBytes(dst, out_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        const out_count = try checkedQuantLinearOutput(q4_0_values_per_block, q4_0_block_bytes, dst, input, weight_raw, rows, in_dim, out_dim);
         if (out_count == 0) return;
 
-        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var arguments = try quantLinearArguments(dst, input, weight_raw, rows, in_dim, out_dim);
         var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launch1d(self.linear_q4_0_f32, ctx, out_count, &params);
     }
@@ -13005,15 +11983,10 @@ pub const KernelModule = struct {
         out_dim: usize,
     ) driver_mod.Error!void {
         const function = self.linear_q4_0_f32_tile4 orelse return error.CudaKernelUnavailable;
-        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_0_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        try checkBytes(dst, out_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        const out_count = try checkedQuantLinearOutput(q4_0_values_per_block, q4_0_block_bytes, dst, input, weight_raw, rows, in_dim, out_dim);
         if (out_count == 0) return;
 
-        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var arguments = try quantLinearArguments(dst, input, weight_raw, rows, in_dim, out_dim);
         var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads, &params);
     }
@@ -13030,12 +12003,7 @@ pub const KernelModule = struct {
     ) driver_mod.Error!void {
         const function = self.linear_q4_0_generated_mmv orelse return error.CudaKernelUnavailable;
         if (rows != 1) return error.InvalidCudaState;
-        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_0_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        try checkBytes(dst, out_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        const out_count = try checkedQuantLinearOutput(q4_0_values_per_block, q4_0_block_bytes, dst, input, weight_raw, rows, in_dim, out_dim);
         if (out_count == 0) return;
 
         var dst_ptr = dst.ptr;
@@ -13097,12 +12065,7 @@ pub const KernelModule = struct {
     ) driver_mod.Error!void {
         const function = self.linear_q4_0_generated_mm orelse return error.CudaKernelUnavailable;
         if (rows < 9 or rows > 64) return error.InvalidCudaState;
-        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_0_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        try checkBytes(dst, out_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        const out_count = try checkedQuantLinearOutput(q4_0_values_per_block, q4_0_block_bytes, dst, input, weight_raw, rows, in_dim, out_dim);
         if (out_count == 0) return;
 
         var dst_ptr = dst.ptr;
@@ -13126,15 +12089,10 @@ pub const KernelModule = struct {
         out_dim: usize,
     ) driver_mod.Error!void {
         const function = self.linear_q4_0_f32_tile4_w4 orelse return error.CudaKernelUnavailable;
-        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_0_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        try checkBytes(dst, out_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        const out_count = try checkedQuantLinearOutput(q4_0_values_per_block, q4_0_block_bytes, dst, input, weight_raw, rows, in_dim, out_dim);
         if (out_count == 0) return;
 
-        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var arguments = try quantLinearArguments(dst, input, weight_raw, rows, in_dim, out_dim);
         var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads_w4, &params);
     }
@@ -13379,15 +12337,10 @@ pub const KernelModule = struct {
         out_dim: usize,
     ) driver_mod.Error!void {
         const function = self.linear_q4_0_f32_tile8 orelse return error.CudaKernelUnavailable;
-        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_0_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        try checkBytes(dst, out_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        const out_count = try checkedQuantLinearOutput(q4_0_values_per_block, q4_0_block_bytes, dst, input, weight_raw, rows, in_dim, out_dim);
         if (out_count == 0) return;
 
-        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var arguments = try quantLinearArguments(dst, input, weight_raw, rows, in_dim, out_dim);
         var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launch2d(function, ctx, (out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8, rows, q4_0_tiled_threads, &params);
     }
@@ -13519,15 +12472,10 @@ pub const KernelModule = struct {
         in_dim: usize,
         out_dim: usize,
     ) driver_mod.Error!void {
-        if (in_dim == 0 or in_dim % q4_k_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_k_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        try checkBytes(dst, out_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_k_block_bytes));
+        const out_count = try checkedQuantLinearOutput(q4_k_values_per_block, q4_k_block_bytes, dst, input, weight_raw, rows, in_dim, out_dim);
         if (out_count == 0) return;
 
-        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var arguments = try quantLinearArguments(dst, input, weight_raw, rows, in_dim, out_dim);
         var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launch1d(self.linear_q4_k_f32, ctx, out_count, &params);
     }
@@ -13542,15 +12490,10 @@ pub const KernelModule = struct {
         in_dim: usize,
         out_dim: usize,
     ) driver_mod.Error!void {
-        if (in_dim == 0 or in_dim % q4_k_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_k_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        try checkBytes(dst, out_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_k_block_bytes));
+        const out_count = try checkedQuantLinearOutput(q4_k_values_per_block, q4_k_block_bytes, dst, input, weight_raw, rows, in_dim, out_dim);
         if (out_count == 0) return;
 
-        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var arguments = try quantLinearArguments(dst, input, weight_raw, rows, in_dim, out_dim);
         var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launchBlocks(self.linear_q4_k_f32_tiled, ctx, out_count, q4_k_tiled_threads, &params);
     }
@@ -13579,15 +12522,10 @@ pub const KernelModule = struct {
         out_dim: usize,
     ) driver_mod.Error!void {
         const function = self.linear_q6_k_f32_tile4 orelse return error.CudaKernelUnavailable;
-        if (in_dim == 0 or in_dim % q6_k_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q6_k_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        try checkBytes(dst, out_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q6_k_block_bytes));
+        const out_count = try checkedQuantLinearOutput(q6_k_values_per_block, q6_k_block_bytes, dst, input, weight_raw, rows, in_dim, out_dim);
         if (out_count == 0) return;
 
-        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var arguments = try quantLinearArguments(dst, input, weight_raw, rows, in_dim, out_dim);
         var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launch2d(function, ctx, (out_dim + q4_k_col_tile - 1) / q4_k_col_tile, rows, q4_k_tiled_threads, &params);
     }
@@ -13793,12 +12731,7 @@ pub const KernelModule = struct {
         out_dim: usize,
     ) driver_mod.Error!void {
         const function = self.linear_q4_k_bias_add_f32_tile4_r2 orelse return error.CudaSymbolMissing;
-        if (in_dim == 0 or in_dim % q4_k_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_k_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        try checkBytes(dst, out_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_k_block_bytes));
+        const out_count = try checkedQuantLinearOutput(q4_k_values_per_block, q4_k_block_bytes, dst, input, weight_raw, rows, in_dim, out_dim);
         try checkBytes(bias, out_dim);
         try checkBytes(residual, out_count);
         if (out_count == 0) return;
@@ -14351,12 +13284,7 @@ pub const KernelModule = struct {
         mode: Tile4Mode,
     ) driver_mod.Error!void {
         _ = self;
-        if (in_dim == 0 or in_dim % q4_k_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_k_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        try checkBytes(dst, out_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_k_block_bytes));
+        const out_count = try checkedQuantLinearOutput(q4_k_values_per_block, q4_k_block_bytes, dst, input, weight_raw, rows, in_dim, out_dim);
         if (mode == .bias or mode == .bias_residual) try checkBytes(bias, out_dim);
         if (mode == .bias_residual) try checkBytes(residual, out_count);
         if (out_count == 0) return;
@@ -14422,7 +13350,7 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_k_block_bytes));
         if (out_count == 0) return;
 
-        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var arguments = try quantLinearArguments(dst, input, weight_raw, rows, in_dim, out_dim);
         var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launch2d(function, ctx, (out_dim + col_tile - 1) / col_tile, rows, q4_k_tiled_threads, &params);
     }
@@ -15231,7 +14159,7 @@ pub const KernelModule = struct {
         try checkBytes(input, try checkedTensorElements(rows, in_dim));
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
 
-        var arguments = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var arguments = try quantLinearArguments(dst, input, weight_raw, rows, in_dim, out_dim);
         var params = launch_abi.fieldsFor("QUANT_LINEAR", &arguments);
         try launchBlocks(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, generated_q4_0_exact_ffn_down_threads, &params);
     }
@@ -16481,6 +15409,24 @@ const f32_row_tile: usize = 2;
 const q_tc_hmma_threads: usize = 256;
 const q_tc_hmma_rows: usize = 64;
 const q_tc_hmma_cols: usize = 32;
+
+// Semantic dimensions come from the descriptor; native wire order is still
+// checked against kernel_abi.cuh by fieldsFor at the actual launch site.
+const QuantLinearArguments = struct { dst: u64, input: u64, weight: u64, rows: u32, in_dim: u32, out_dim: u32 };
+fn quantLinearArguments(dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) driver_mod.Error!QuantLinearArguments {
+    const shape = @import("../kernel_descriptor.zig").Linear.init(rows, in_dim, out_dim, false) catch return error.InvalidCudaState;
+    return .{ .dst = dst.ptr, .input = input.ptr, .weight = weight.ptr, .rows = shape.rows, .in_dim = shape.in_dim, .out_dim = shape.out_dim };
+}
+
+fn checkedQuantLinearOutput(comptime values_per_block: usize, comptime block_bytes: usize, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) driver_mod.Error!usize {
+    if (in_dim == 0 or in_dim % values_per_block != 0) return error.InvalidCudaState;
+    const row_blocks = in_dim / values_per_block;
+    const out_count = try checkedTensorElements(rows, out_dim);
+    try checkBytes(dst, out_count);
+    try checkBytes(input, try checkedTensorElements(rows, in_dim));
+    try checkRawBytes(weight, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), block_bytes));
+    return out_count;
+}
 
 fn checkedTensorElements(a: usize, b: usize) driver_mod.Error!usize {
     return std.math.mul(usize, a, b) catch error.InvalidCudaState;
@@ -23189,4 +22135,36 @@ test "CUDA launch ABI typed slots and native records survive captured replay" {
         try std.testing.expectEqual(@as(f32, -777), actual[6]);
         try std.testing.expectEqual(@as(f32, -777), actual[7]);
     }
+}
+
+test "CUDA launch ABI symbol registry clears every typed export" {
+    @setEvalBranchQuota(100000);
+    var module = KernelModule{};
+    const info = @typeInfo(KernelModule).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| {
+        if (comptime KernelModule.isBundledFunction(name, T)) @field(module, name) = @ptrFromInt(16);
+    }
+    module.gliner25_attention = @splat(@ptrFromInt(16));
+    module.clearBundledFunctions();
+    inline for (info.field_names, info.field_types) |name, T| {
+        if (comptime KernelModule.isBundledFunction(name, T)) try std.testing.expect(@field(module, name) == null);
+    }
+    for (module.gliner25_attention) |function| try std.testing.expect(function == null);
+    try std.testing.expect(KernelModule.bundledSymbolRequired("fill_f32"));
+    try std.testing.expectEqual(KernelModule.BundledRequirement.required, KernelModule.bundledSymbolRequirement("fill_f32"));
+    try std.testing.expectEqual(KernelModule.BundledRequirement.required_after_profiles, KernelModule.bundledSymbolRequirement("linear_q4_k_f32"));
+    try std.testing.expect(!KernelModule.bundledSymbolRequired("copy_f32"));
+    try std.testing.expectEqualStrings("termite_fill_f32", KernelModule.bundledSymbol("fill_f32").?);
+}
+
+test "CUDA launch ABI quantized preflight preserves empty and malformed extents" {
+    const empty = buffer_mod.DeviceBuffer{};
+    const input = buffer_mod.DeviceBuffer{ .len = 32 * @sizeOf(f32) };
+    const weights = buffer_mod.DeviceBuffer{ .len = 34 };
+    try std.testing.expectEqual(@as(usize, 0), try checkedQuantLinearOutput(32, 34, empty, empty, weights, 0, 32, 1));
+    try std.testing.expectError(error.InvalidCudaState, checkedQuantLinearOutput(32, 34, empty, input, weights, 1, 0, 1));
+    try std.testing.expectError(error.InvalidCudaState, checkedQuantLinearOutput(32, 34, empty, input, weights, 1, 31, 1));
+    try std.testing.expectError(error.InvalidCudaState, checkedQuantLinearOutput(32, 34, empty, input, weights, 1, 32, 1));
+    try std.testing.expectError(error.InvalidCudaState, checkedQuantLinearOutput(32, 34, empty, empty, empty, 0, 32, 1));
+    try std.testing.expectError(error.InvalidCudaState, quantLinearArguments(empty, empty, empty, @as(usize, std.math.maxInt(u32)) + 1, 32, 1));
 }

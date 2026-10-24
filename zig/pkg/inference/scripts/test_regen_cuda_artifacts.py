@@ -31,6 +31,24 @@ FLASH_SYMBOLS = (
 
 
 class RegenCudaArtifactsTest(unittest.TestCase):
+    def test_jit_identity_covers_transitive_local_headers_and_launch_contracts(self) -> None:
+        inference = SCRIPT.parent.parent
+        identity = (inference / "build" / "jit_identity.zig").read_text()
+        pending = [ARTIFACTS / "inference_cuda_kernels.cu"]
+        visited = set()
+        while pending:
+            source = pending.pop().resolve()
+            if source in visited:
+                continue
+            visited.add(source)
+            for include in re.findall(r'^\s*#include\s+"([^"\n]+)"', source.read_text(), re.MULTILINE):
+                header = (source.parent / include).resolve()
+                relative = header.relative_to(inference.resolve()).as_posix()
+                self.assertIn('"' + relative + '"', identity, f"untracked native include: {relative}")
+                pending.append(header)
+        for dependency in ("src/ops/cuda/launch_abi.zig", "src/ops/kernel_descriptor.zig", "src/ops/kernel_geometry.zig"):
+            self.assertIn('"' + dependency + '"', identity)
+
     def test_preference_training_ptx_matches_source_launch_abi(self) -> None:
         source = (ARTIFACTS / "inference_cuda_kernels.cu").read_text()
         ptx = (ARTIFACTS / "inference_cuda_kernels.ptx").read_text()

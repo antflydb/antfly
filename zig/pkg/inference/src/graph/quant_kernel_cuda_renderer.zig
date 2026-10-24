@@ -2067,7 +2067,7 @@ pub fn renderAttentionKernel(allocator: std.mem.Allocator, plan: AttentionRender
             try out.appendSlice(allocator, "\n\n");
         }
     }
-    try renderAttentionBody(allocator, &out, plan);
+    try renderAttentionBody(allocator, &out, plan, true);
     if (out.items.len == 0 or out.items[out.items.len - 1] != '\n') try out.append(allocator, '\n');
     return out.toOwnedSlice(allocator);
 }
@@ -2722,10 +2722,18 @@ pub fn renderRuntimeSharedHelpers(allocator: std.mem.Allocator) ![]u8 {
 }
 
 pub fn renderAttentionBodyAlloc(allocator: std.mem.Allocator, plan: AttentionRenderPlan) ![]u8 {
+    return renderAttentionPartsAlloc(allocator, plan, true);
+}
+
+pub fn renderAttentionInstantiationAlloc(allocator: std.mem.Allocator, plan: AttentionRenderPlan) ![]u8 {
+    return renderAttentionPartsAlloc(allocator, plan, false);
+}
+
+fn renderAttentionPartsAlloc(allocator: std.mem.Allocator, plan: AttentionRenderPlan, include_common: bool) ![]u8 {
     try plan.validate();
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
-    try renderAttentionBody(allocator, &out, plan);
+    try renderAttentionBody(allocator, &out, plan, include_common);
     return out.toOwnedSlice(allocator);
 }
 
@@ -2733,11 +2741,12 @@ fn renderAttentionBody(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     plan: AttentionRenderPlan,
+    include_common: bool,
 ) !void {
     if (plan.lowering.reduction == .parallel_scores_then_serial) {
         return renderAttentionScorePreworkBody(allocator, out, plan);
     }
-    try renderAttentionSerialBody(allocator, out, plan);
+    try renderAttentionSerialBody(allocator, out, plan, include_common);
     try out.appendSlice(allocator, "\n\n");
     const head_dim = plan.lowering.head_dim;
     const warps = plan.launch.threads_per_block / 32;
@@ -3002,35 +3011,83 @@ fn renderAttentionBody(
     );
 }
 
-fn renderAttentionSerialBody(
+const attention_serial_parameters =
+    \\    float* dst,
+    \\    const float* q,
+    \\    const float* k,
+    \\    const float* v,
+    \\    const unsigned char* attn_or_mask,
+    \\    const float* bias,
+    \\    unsigned int batch,
+    \\    unsigned int q_seq_len,
+    \\    unsigned int kv_seq_len,
+    \\    unsigned int num_heads,
+    \\    unsigned int num_kv_heads,
+    \\    unsigned int head_dim,
+    \\    unsigned int query_position_offset,
+    \\    unsigned int kv_position_offset,
+    \\    unsigned int sliding_window,
+    \\    unsigned int total_sequence_len,
+    \\    unsigned int mask_len,
+    \\    unsigned int bias_mode,
+    \\    unsigned int split_kv_min_tokens,
+    \\    const unsigned int* decode_scalars
+    \\
+;
+
+pub const AttentionSerialIdentity = struct { head_dim: u16, threads: u16, query_heads: u16 };
+pub fn attentionSerialIdentity(plan: AttentionRenderPlan) AttentionSerialIdentity {
+    return .{ .head_dim = plan.lowering.head_dim, .threads = plan.serial_launch.threads_per_block, .query_heads = plan.lowering.query_heads_per_kv_head };
+}
+
+fn attentionSerialName(allocator: std.mem.Allocator, plan: AttentionRenderPlan) ![]u8 {
+    const identity = attentionSerialIdentity(plan);
+    return std.fmt.allocPrint(allocator, "antfly_serial_attention_hd{d}_t{d}_g{d}_impl", .{ identity.head_dim, identity.threads, identity.query_heads });
+}
+
+/// Standalone sources retain their own implementation; bundled split-count
+/// variants share one exact serial schedule for each head geometry.
+pub fn renderAttentionSerialCommonAlloc(allocator: std.mem.Allocator, plan: AttentionRenderPlan) ![]u8 {
+    try plan.validate();
+    const name = try attentionSerialName(allocator, plan);
+    defer allocator.free(name);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try renderAttentionSerialImplementation(allocator, &out, plan, name);
+    return out.toOwnedSlice(allocator);
+}
+
+fn renderAttentionSerialBody(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), plan: AttentionRenderPlan, include_common: bool) !void {
+    const name = try attentionSerialName(allocator, plan);
+    defer allocator.free(name);
+    if (include_common) try renderAttentionSerialImplementation(allocator, out, plan, name);
+    try appendFmt(allocator, out, "extern \"C\" __global__ void {s}(\n", .{plan.serial_kernel_id});
+    try out.appendSlice(allocator, attention_serial_parameters);
+    try appendFmt(allocator, out, ") {{\n    {s}(", .{name});
+    var declarations = std.mem.splitScalar(u8, attention_serial_parameters, '\n');
+    var first = true;
+    while (declarations.next()) |declaration| {
+        const parameter = std.mem.trim(u8, declaration, " \t\r,");
+        if (parameter.len == 0) continue;
+        const begin = std.mem.lastIndexOfScalar(u8, parameter, ' ').? + 1;
+        if (!first) try out.appendSlice(allocator, ", ");
+        try out.appendSlice(allocator, parameter[begin..]);
+        first = false;
+    }
+    try out.appendSlice(allocator, ");\n}\n");
+}
+
+fn renderAttentionSerialImplementation(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     plan: AttentionRenderPlan,
+    name: []const u8,
 ) !void {
     const head_dim = plan.lowering.head_dim;
     const threads = plan.serial_launch.threads_per_block;
-    try appendFmt(allocator, out, "extern \"C\" __global__ void {s}(\n", .{plan.serial_kernel_id});
+    try appendFmt(allocator, out, "__device__ __forceinline__ void {s}(\n", .{name});
+    try out.appendSlice(allocator, attention_serial_parameters);
     try out.appendSlice(allocator,
-        \\    float* dst,
-        \\    const float* q,
-        \\    const float* k,
-        \\    const float* v,
-        \\    const unsigned char* attn_or_mask,
-        \\    const float* bias,
-        \\    unsigned int batch,
-        \\    unsigned int q_seq_len,
-        \\    unsigned int kv_seq_len,
-        \\    unsigned int num_heads,
-        \\    unsigned int num_kv_heads,
-        \\    unsigned int head_dim,
-        \\    unsigned int query_position_offset,
-        \\    unsigned int kv_position_offset,
-        \\    unsigned int sliding_window,
-        \\    unsigned int total_sequence_len,
-        \\    unsigned int mask_len,
-        \\    unsigned int bias_mode,
-        \\    unsigned int split_kv_min_tokens,
-        \\    const unsigned int* decode_scalars
         \\) {
         \\    if (decode_scalars != 0) {
         \\        kv_position_offset = decode_scalars[4];
@@ -3119,6 +3176,7 @@ fn renderAttentionSerialBody(
         \\    (void)total_sequence_len;
         \\}
     );
+    try out.appendSlice(allocator, "\n\n");
 }
 
 /// Emits an exact two-kernel candidate for decode attention. The score stage

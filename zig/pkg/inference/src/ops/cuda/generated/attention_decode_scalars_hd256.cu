@@ -45,7 +45,7 @@ __device__ __forceinline__ float termite_block_reduce_sum_f32(float value, float
     return value;
 }
 
-extern "C" __global__ void antfly_gqa_attention_decode_scalars_hd256_f32_v1(
+__device__ __forceinline__ void antfly_serial_attention_hd256_t256_g16_impl(
     float* dst,
     const float* q,
     const float* k,
@@ -145,6 +145,32 @@ extern "C" __global__ void antfly_gqa_attention_decode_scalars_hd256_f32_v1(
     (void)bias;
     (void)total_sequence_len;
 }
+
+extern "C" __global__ void antfly_gqa_attention_decode_scalars_hd256_f32_v1(
+    float* dst,
+    const float* q,
+    const float* k,
+    const float* v,
+    const unsigned char* attn_or_mask,
+    const float* bias,
+    unsigned int batch,
+    unsigned int q_seq_len,
+    unsigned int kv_seq_len,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int query_position_offset,
+    unsigned int kv_position_offset,
+    unsigned int sliding_window,
+    unsigned int total_sequence_len,
+    unsigned int mask_len,
+    unsigned int bias_mode,
+    unsigned int split_kv_min_tokens,
+    const unsigned int* decode_scalars
+) {
+    antfly_serial_attention_hd256_t256_g16_impl(dst, q, k, v, attn_or_mask, bias, batch, q_seq_len, kv_seq_len, num_heads, num_kv_heads, head_dim, query_position_offset, kv_position_offset, sliding_window, total_sequence_len, mask_len, bias_mode, split_kv_min_tokens, decode_scalars);
+}
+
 
 extern "C" __global__ void antfly_gqa_attention_decode_split_kv_hd256_f32_stage1_v1(
     float* partial_values,
