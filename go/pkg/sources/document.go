@@ -52,6 +52,13 @@ func Normalize(sourceID string, item Item, data []byte, permissions Permissions,
 		return fail("source_text_extraction_required", "Source must have bounded canonical UTF-8 text; binary documents require revision-bound text extraction before publication.")
 	}
 	uri := configString(item.Metadata, "canonical_url")
+	// Pinned inventories may contain a URL emitted before S3 key escaping was
+	// fixed. Repair only canonical metadata; retain the selected key/revision.
+	if item.SourceKind == ProviderS3 && item.Path != "" {
+		if bucket := configString(item.Metadata, "bucket"); bucket != "" {
+			uri = canonicalS3URI(bucket, item.Path)
+		}
+	}
 	if uri == "" {
 		uri = item.URL
 	}

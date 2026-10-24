@@ -27,3 +27,9 @@ func escapeSourcePath(path string) string {
 	}
 	return strings.Join(parts, "/")
 }
+
+// Canonical URI identity is derived from literal provider keys, including when
+// replaying a manifest written by a runner that did not yet escape S3 URLs.
+func canonicalS3URI(bucket, key string) string {
+	return "s3://" + bucket + "/" + escapeSourcePath(key)
+}

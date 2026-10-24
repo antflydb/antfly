@@ -53,6 +53,12 @@ func TestS3ObjectKeysRemainDistinctCanonicalURIs(t *testing.T) {
 			t.Errorf("legal S3 key %q cannot be normalized: %v", key, err)
 			continue
 		}
+		legacy := inventory.Objects[0]
+		legacy.URL = "s3://docs/" + key
+		replayed, err := Normalize(testSourceID, legacy, []byte("x"), Permissions{Public: true}, time.Now())
+		if err != nil || replayed.URI != doc.URI {
+			t.Errorf("legacy pinned key %q cannot recover canonical identity: %q %v", key, replayed.URI, err)
+		}
 		parsed, err := url.Parse(doc.URI)
 		if err != nil || parsed.Path != "/"+key || parsed.RawQuery != "" || parsed.Fragment != "" {
 			t.Errorf("canonical URI %q does not preserve literal key %q", doc.URI, key)
