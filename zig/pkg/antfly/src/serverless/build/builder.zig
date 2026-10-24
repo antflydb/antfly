@@ -2581,7 +2581,8 @@ fn materializeWalDocumentsAlloc(
     errdefer query_mod.freeMaterializedDocuments(self.alloc, base_docs);
 
     try maintenance_cancellation.check(cancellation);
-    const next_docs = try query_mod.materializeDocumentsOverBaseAlloc(self.alloc, base_docs, mutations);
+    var body_bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
+    const next_docs = try query_mod.materializeDocumentsWithBodiesAlloc(self.alloc, base_docs, mutations, .{ .artifacts = self.artifacts, .namespace = namespace, .cancellation = body_bridge.token() });
     errdefer query_mod.freeMaterializedDocuments(self.alloc, next_docs);
 
     const graph_changed = if (check_graph_impact)
@@ -2748,7 +2749,8 @@ fn loadPublishedDocumentsAlloc(self: *Builder, namespace: []const u8, current_he
         defer segment_mod.freeEntries(self.alloc, mutation_entries);
         const overlay = try allocQueryMutationsFromSegmentEntries(self.alloc, mutation_entries);
         defer freeQueryMutations(self.alloc, overlay);
-        const materialized = try query_mod.materializeDocumentsOverBaseAlloc(self.alloc, base_docs, overlay);
+        var body_bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
+        const materialized = try query_mod.materializeDocumentsWithBodiesAlloc(self.alloc, base_docs, overlay, .{ .artifacts = self.artifacts, .namespace = namespace, .cancellation = body_bridge.token() });
         query_mod.freeMaterializedDocuments(self.alloc, base_docs);
         return materialized;
     }
@@ -2794,7 +2796,7 @@ fn rebuildPublishedDocumentsFromMutationHistoryAlloc(self: *Builder, namespace: 
         }
     }
 
-    return try query_mod.materializeDocumentsAlloc(self.alloc, mutations.items);
+    return try query_mod.materializeDocumentsWithBodiesAlloc(self.alloc, &.{}, mutations.items, .{ .artifacts = self.artifacts, .namespace = namespace });
 }
 
 fn allocQueryMutationsFromSegmentEntries(alloc: Allocator, entries: []const segment_mod.Entry) ![]query_mod.QueryMaterializerMutation {

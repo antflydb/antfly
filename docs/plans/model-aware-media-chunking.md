@@ -102,6 +102,36 @@ spans rather than copying a whole transcript into every window.
 
 ## Efficient execution and ownership
 
+Serverless media checkpoints use internal WAL mutation kind 3, rejected by public
+mutation admission. Each incomplete page carries an `AFDCP001` output patch and
+a reference to one already published source body. Fact roots at version 6 retain
+both that source and the authenticated output ancestry; readers still accept
+versions 3–5. Query reads and WAL overlays reconstruct ordinary JSON, while
+closure and retention read only output pages. Ancestry reconstruction charges
+the independent finite replay budget; logical source, output, and working
+allocation limits remain separate. Completion publishes a complete
+ordinary document snapshot and retires the dependency chain through normal GC.
+
+Retained text batches capture the provider revision before cache lookup and
+execution. Native dispatch validates that revision against the loaded executor;
+HTTP dispatch retains the planned route token and descriptor revision. Published
+hashes and memo keys include the captured revision. Terminal scalar embedding
+receipts delete stale vectors and acknowledge failed coverage without model
+replay, while a different deployed revision can start a new computation.
+
+The deterministic 64-page fixture with a 256 KiB source closes within a 2 MiB
+read allowance. Compact records reduce cumulative derived-body bytes from
+3,386,363 to 767,343 across eleven commits, including the identical 526,644-byte
+final document. Each of the three fake consumers still executes exactly 64
+times. This measures serialized WAL/body payloads, not model throughput.
+
+Container index reuse uses hashed lookup and LRU eviction under the 64 MiB host
+admission budget, with a 4096-entry metadata ceiling. Active leases remain pinned
+through memory pressure. The deterministic 32-source MP3 regression halves
+encoded input reads on its second pass; this measures codec/cache I/O, not live
+model throughput.
+
+
 One source owner pins the version and retains admitted indexes and dependency
 proofs across windows. Reuse authenticated ranges, metadata and source hashing;
 never key reusable results only by a mutable URL. Source-backed MP4/WebM readers

@@ -916,6 +916,7 @@ fn mutationKindString(kind: serverless.MutationKind) []const u8 {
     return switch (kind) {
         .upsert => "upsert",
         .delete => "delete",
+        .checkpoint => "checkpoint",
     };
 }
 

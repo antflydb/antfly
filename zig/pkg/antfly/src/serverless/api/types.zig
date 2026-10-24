@@ -23,6 +23,8 @@ const vector_types = @import("antfly_vector").vector;
 pub const MutationKind = enum(u8) {
     upsert = 1,
     delete = 2,
+    /// Internal output-only media checkpoint; never accepted by public ingestion.
+    checkpoint = 3,
 };
 
 pub const DocumentMutation = struct {
@@ -131,6 +133,7 @@ pub const TableIngestMutation = union(enum) {
 
     fn fromInput(input: TableIngestMutationInput) error{UnexpectedToken}!@This() {
         return switch (input.kind) {
+            .checkpoint => error.UnexpectedToken,
             .upsert => switch (input.document) {
                 .object => |document| .{ .upsert = .{
                     .doc_id = input.doc_id,

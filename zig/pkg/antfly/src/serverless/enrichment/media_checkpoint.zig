@@ -79,7 +79,7 @@ pub fn expand(a: std.mem.Allocator, context: Context, document: *std.json.Value)
         // Parse each body with the admitted backing allocator, not the
         // result arena. Original source fields can dwarf this page's outputs
         // and must retire before reading the next ancestor.
-        const bytes = try facts.readBodyAlloc(context.allocator, context.pages, parent);
+        const bytes = try facts.readCheckpointPageAlloc(context.allocator, context.pages, parent);
         defer context.allocator.free(bytes);
         var previous = try std.json.parseFromSlice(std.json.Value, context.allocator, bytes, .{});
         defer previous.deinit();

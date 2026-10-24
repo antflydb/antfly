@@ -268,14 +268,15 @@ pub fn publishAlloc(
 
 fn makeFact(alloc: Allocator, pages: *page_store.PageStore, store: tree.Store, prior: ?facts.Root, doc: materializer.Document, context: *const Context) !facts.Fact {
     const flags = try context.flags(doc);
-    const digest = facts.bodyDigest(doc.body);
+    const physical = doc.stored_body orelse doc.body;
+    const digest = facts.bodyDigest(physical);
     const old = if (prior) |root| try facts.lookup(alloc, store, root, doc.doc_id) else null;
-    const encoded_len = std.math.add(usize, doc.body.len, facts.body_header_bytes) catch return error.ArtifactTooLarge;
+    const encoded_len = std.math.add(usize, physical.len, facts.body_header_bytes) catch return error.ArtifactTooLarge;
     const body = if (old != null and old.?.body.bytes == encoded_len and std.mem.eql(u8, &old.?.body.digest, &digest))
         old.?.body
     else
-        try facts.putBody(alloc, pages, doc.body);
-    return .{ .body = body, .body_has_dependencies = flags.body_has_dependencies, .last_lsn = doc.last_lsn, .last_timestamp_ns = doc.last_timestamp_ns, .present = flags.present, .pending = flags.pending };
+        try facts.putBody(alloc, pages, physical);
+    return .{ .body = body, .body_has_dependencies = doc.stored_body != null or flags.body_has_dependencies, .last_lsn = doc.last_lsn, .last_timestamp_ns = doc.last_timestamp_ns, .present = flags.present, .pending = flags.pending };
 }
 
 fn findDocument(docs: []const materializer.Document, id: []const u8) ?materializer.Document {
@@ -339,7 +340,7 @@ pub fn materializeTouchedAlloc(alloc: Allocator, pages: *page_store.PageStore, r
             return std.mem.order(u8, a.doc_id, b.doc_id) == .lt;
         }
     }.less);
-    return .{ .alloc = alloc, .source = root, .before_counts = before_counts, .before = before, .after = try materializer.materializeOverBaseAlloc(alloc, before, mutations) };
+    return .{ .alloc = alloc, .source = root, .before_counts = before_counts, .before = before, .after = try materializer.materializeWithBodiesAlloc(alloc, before, mutations, .{ .pages = pages, .artifacts = pages.artifacts, .domain = pages.domain, .namespace = "", .cancellation = pages.cancellation }) };
 }
 
 /// Explicit full-view operations (bootstrap, policy rebuild, compaction) use

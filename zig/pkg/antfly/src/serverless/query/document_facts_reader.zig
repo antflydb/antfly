@@ -105,13 +105,13 @@ pub const Reader = struct {
             try self.session.checkCancellation();
             if (initialized >= count or record.key.len == 0) return error.InvalidDocumentFactsRoot;
             const fact = try Fact.decode(record.value);
-            const body_len = std.math.cast(usize, fact.body.bytes) orelse return error.QueryCandidateBudgetExceeded;
-            const doc_bytes = std.math.add(usize, record.key.len, body_len) catch return error.QueryCandidateBudgetExceeded;
+            const body = try self.readBodyAlloc(fact);
+            errdefer self.alloc.free(body);
+            const doc_bytes = std.math.add(usize, record.key.len, body.len) catch return error.QueryCandidateBudgetExceeded;
             owned_bytes = std.math.add(usize, owned_bytes, doc_bytes) catch return error.QueryCandidateBudgetExceeded;
             if (owned_bytes > max_materialized_bytes) return error.QueryCandidateBudgetExceeded;
             const id = try self.alloc.dupe(u8, record.key);
             errdefer self.alloc.free(id);
-            const body = try self.readBodyAlloc(fact);
             documents[initialized] = .{ .doc_id = id, .body = body, .last_lsn = fact.last_lsn, .last_timestamp_ns = fact.last_timestamp_ns };
             initialized += 1;
         }

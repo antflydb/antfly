@@ -4659,17 +4659,32 @@ pub const Node = struct {
         task_type_name: ?[]const u8,
         instruction: ?[]const u8,
     ) ![][]f32 {
+        return self.embedDenseTextsDirectWithExecutionControlAndTaskRevision(allocator, io, supplied_control, model_name, texts, task_type_name, instruction, null);
+    }
+
+    pub fn embedDenseTextsDirectWithExecutionControlAndTaskRevision(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        supplied_control: InferenceExecutionControl,
+        model_name: []const u8,
+        texts: []const []const u8,
+        task_type_name: ?[]const u8,
+        instruction: ?[]const u8,
+        expected_revision: ?[32]u8,
+    ) ![][]f32 {
         const control = self.bindExecutionControl(io, supplied_control);
         try control.check();
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
         defer self.allocator.free(model_path);
-        return self.embedDenseTextsFromPathWithExecutionControlAndTask(
+        return self.embedDenseTextsFromPathWithExecutionControlAndTaskRevision(
             allocator,
             control,
             model_path,
             texts,
             task_type_name,
             instruction,
+            expected_revision,
         );
     }
 
@@ -4695,6 +4710,19 @@ pub const Node = struct {
         texts: []const []const u8,
         task_type_name: ?[]const u8,
         instruction: ?[]const u8,
+    ) ![][]f32 {
+        return self.embedDenseTextsFromPathWithExecutionControlAndTaskRevision(allocator, supplied_control, model_path, texts, task_type_name, instruction, null);
+    }
+
+    pub fn embedDenseTextsFromPathWithExecutionControlAndTaskRevision(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        supplied_control: InferenceExecutionControl,
+        model_path: []const u8,
+        texts: []const []const u8,
+        task_type_name: ?[]const u8,
+        instruction: ?[]const u8,
+        expected_revision: ?[32]u8,
     ) ![][]f32 {
         const control = self.bindExecutionControl(null, supplied_control);
         if (texts.len == 0) return try allocator.alloc([]f32, 0);
@@ -4741,10 +4769,15 @@ pub const Node = struct {
             instruction: ?[]const u8,
             trace: ?*embedding_trace.Trace,
             node: *Node,
+            expected_revision: ?[32]u8,
             vectors: ?[][]f32 = null,
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
+                if (attempt.expected_revision) |expected| {
+                    const actual = model.resolution_revision orelse return error.InferenceCapabilitiesStale;
+                    if (!std.mem.eql(u8, &expected, &actual)) return error.InferenceCapabilitiesStale;
+                }
                 if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
                 const input_tokens = try maxTokenizerTextTokens(
                     attempt.allocator,
@@ -4784,6 +4817,7 @@ pub const Node = struct {
             }
         };
         var attempt = Attempt{
+            .expected_revision = expected_revision,
             .allocator = allocator,
             .io = request_io,
             .control = control,

@@ -41,6 +41,10 @@ pub const Service = struct {
             .end_lsn = 0,
         };
 
+        for (req.mutations) |mutation| {
+            if (mutation.kind == .checkpoint) return error.InvalidDocumentMutation;
+            if (mutation.body) |bytes| if (@import("../build/document_facts.zig").isCheckpointBody(bytes)) return error.InvalidDocumentMutation;
+        }
         var start_lsn: u64 = 0;
         var end_lsn: u64 = 0;
         for (req.mutations, 0..) |mutation, idx| {
@@ -226,4 +230,14 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "model aware media serverless public ingestion rejects internal checkpoint payloads before any WAL append" {
+    var service = Service{ .alloc = std.testing.allocator, .wal = undefined, .builder = undefined };
+    for ([_]api_types.DocumentMutation{
+        .{ .kind = .checkpoint, .doc_id = "private", .body = "AFDCP001{}" },
+        .{ .kind = .upsert, .doc_id = "private", .body = "AFDCP001{}" },
+    }) |private| {
+        try std.testing.expectError(error.InvalidDocumentMutation, service.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 1, .mutations = &.{ .{ .kind = .upsert, .doc_id = "valid", .body = "{}" }, private } }));
+    }
 }

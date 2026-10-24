@@ -100,6 +100,7 @@ pub const DenseEmbedder = struct {
     /// dimensions. Opaque custom providers opt out by leaving this null.
     computation_key_fn: ?*const fn (*anyopaque, []const u8, []const u8, u32) anyerror!?[32]u8 = null,
     dense_embed_batch_fn: ?DenseEmbedBatchFn = null,
+    dense_embed_batch_planned_fn: ?*const fn (*anyopaque, Allocator, []const u8, []const []const u8, u32, ?RequestContext, inference_work.CapabilityLease) anyerror![]const []const f32 = null,
     dense_embed_parts_fn: ?DenseEmbedPartsFn = null,
     dense_embed_part_items_fn: ?DenseEmbedPartItemsFn = null,
     dense_embed_raster_items_fn: ?DenseEmbedRasterItemsFn = null,
@@ -133,6 +134,36 @@ pub const DenseEmbedder = struct {
     /// remains source-compatible.
     foreground_bounded: bool = false,
 
+    pub const TextGeneration = struct { revision: ?[32]u8 = null, lease: ?inference_work.CapabilityLease = null };
+
+    /// Resolve before execution. Managed Antfly providers carry this immutable
+    /// lease through native/HTTP execution, rather than observing a later alias.
+    pub fn captureTextGeneration(self: DenseEmbedder, a: Allocator, name: []const u8) !TextGeneration {
+        if (self.dense_embed_batch_planned_fn != null and self.resolve_part_lease_fn != null) {
+            const lease = self.part_lease orelse try self.resolvePartLease(a, name);
+            return .{ .revision = if (lease.capabilities) |caps| caps.model_revision else null, .lease = lease };
+        }
+        const caps = self.capabilities(a, name) catch |err| switch (err) {
+            error.EmbeddingCapabilitiesUnavailable => return .{},
+            else => return err,
+        };
+        return .{ .revision = caps.model_revision, .lease = .{ .capabilities = caps } };
+    }
+    pub fn withTextGeneration(self: DenseEmbedder, generation: TextGeneration) DenseEmbedder {
+        return if (generation.lease) |lease| self.withPartLease(lease) else self;
+    }
+    pub fn requireTextGeneration(self: DenseEmbedder, a: Allocator, name: []const u8, generation: TextGeneration) !void {
+        const current = self.capabilities(a, name) catch |err| switch (err) {
+            error.EmbeddingCapabilitiesUnavailable => null,
+            else => return err,
+        };
+        const revision = if (current) |caps| caps.model_revision else null;
+        if (!std.meta.eql(generation.revision, revision)) return error.EnrichmentSourceChanged;
+    }
+    fn embedLeasedTexts(self: DenseEmbedder, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+        return self.dense_embed_batch_planned_fn.?(self.ptr, a, name, texts, dims, self.part_request_context, self.part_lease.?);
+    }
+
     pub fn embedDense(self: DenseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) ![]f32 {
         var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "dense embedder");
         defer sanitized.deinit(alloc);
@@ -149,6 +180,7 @@ pub const DenseEmbedder = struct {
         var sanitized = try sanitizeUtf8BatchForEmbeddingAlloc(alloc, texts);
         defer sanitized.deinit(alloc);
         const safe_texts = sanitized.texts();
+        if (self.part_lease != null and self.dense_embed_batch_planned_fn != null) return self.embedLeasedTexts(alloc, embedding_name, safe_texts, dims);
         const dense_embed_batch_fn = self.dense_embed_batch_fn orelse return try fallbackDenseBatch(self, alloc, embedding_name, safe_texts, dims);
         return try dense_embed_batch_fn(self.ptr, alloc, embedding_name, safe_texts, dims);
     }
@@ -185,7 +217,11 @@ pub const DenseEmbedder = struct {
         var sanitized = try sanitizeUtf8BatchForEmbeddingAlloc(alloc, texts);
         defer sanitized.deinit(alloc);
         const safe_texts = sanitized.texts();
-        const vectors = if (self.dense_embed_batch_with_context_fn) |embed_batch|
+        var planned = self;
+        planned.part_request_context = context;
+        const vectors = if (self.part_lease != null and self.dense_embed_batch_planned_fn != null)
+            try planned.embedLeasedTexts(alloc, embedding_name, safe_texts, dims)
+        else if (self.dense_embed_batch_with_context_fn) |embed_batch|
             try embed_batch(self.ptr, alloc, embedding_name, safe_texts, dims, context)
         else if (self.dense_embed_with_context_fn != null)
             try fallbackDenseBatchWithContext(self, alloc, embedding_name, safe_texts, dims, context)

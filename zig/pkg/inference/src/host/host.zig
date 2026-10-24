@@ -226,6 +226,7 @@ test "standalone provider ABI rejects cancellation before dispatch" {
 
 const ModelTextsRequest = struct {
     model_identity: ?[]const u8 = null,
+    model_revision: ?[32]u8 = null,
     dimensions: ?u32 = null,
     model: []const u8,
     texts: []const []const u8,
@@ -1050,7 +1051,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             var identity_handle = if (parsed.value.model_identity) |expected| try state.node.pinEmbeddingModelIdentity(alloc, state.io, parsed.value.model, expected, execution_control) else null;
             defer if (identity_handle) |*handle| handle.release();
             const result = if (operation == .embed_dense_texts_with_context)
-                try state.node.embedDenseTextsDirectWithExecutionControlAndTask(
+                try state.node.embedDenseTextsDirectWithExecutionControlAndTaskRevision(
                     state.alloc,
                     state.io,
                     execution_control,
@@ -1058,6 +1059,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                     parsed.value.texts,
                     parsed.value.task_type,
                     parsed.value.instruction,
+                    parsed.value.model_revision,
                 )
             else
                 try state.node.embedDenseTextsDirectWithExecutionControl(
@@ -2494,7 +2496,7 @@ fn localAntflyEmbedDenseTextsWithContext(
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     var adapter = LocalInferenceControlAdapter{ .context = context };
-    const result = try node.embedDenseTextsDirectWithExecutionControlAndTask(
+    const result = try node.embedDenseTextsDirectWithExecutionControlAndTaskRevision(
         alloc,
         context.request.io,
         adapter.control(),
@@ -2502,6 +2504,7 @@ fn localAntflyEmbedDenseTextsWithContext(
         texts,
         context.task_type.canonical(),
         context.instruction,
+        context.model_revision,
     );
     errdefer {
         for (result) |vector| alloc.free(vector);

@@ -622,6 +622,7 @@ pub const ManagedEmbeddingEntry = struct {
     document_input_type: []u8 = "",
     query_instruction: []u8 = "",
     model_identity: []u8 = "",
+    planned_text_lease: ?inference_work.CapabilityLease = null,
     truncate: []u8 = "",
     /// Borrowed from the service ProviderRuntime, or from the owning
     /// ManagedEmbedder's standalone fallback. Service-scoped managers keep
@@ -1282,6 +1283,7 @@ pub const ManagedEmbedder = struct {
             .dense_embed_fn = embedDense,
             .computation_key_fn = documentComputationKey,
             .dense_embed_batch_fn = embedDenseBatch,
+            .dense_embed_batch_planned_fn = embedDenseBatchPlanned,
             .dense_embed_parts_fn = embedDenseParts,
             .dense_embed_part_items_fn = embedDensePartItems,
             .dense_embed_raster_items_fn = embedDenseRasterItems,
@@ -1700,6 +1702,21 @@ pub const ManagedEmbedder = struct {
         defer entry.auth_header_cache.deinit(alloc);
         applyRequestContext(&entry, context, &cancellation);
         return try embedBatchWithEntry(alloc, &entry, texts, dims);
+    }
+
+    fn embedDenseBatchPlanned(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?RequestContext, lease: inference_work.CapabilityLease) ![]const []const f32 {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
+        if (configured.sparse) return error.UnsupportedEmbeddingProvider;
+        var cancellation = CombinedCancellation.init(configured.cancellation, if (context) |value| value.cancellation else null);
+        var entry = configured.requestOverlay(alloc);
+        defer entry.auth_header_cache.deinit(alloc);
+        if (context) |value| {
+            try value.check();
+            applyRequestContext(&entry, value, &cancellation);
+        }
+        entry.planned_text_lease = lease;
+        return embedBatchWithEntry(alloc, &entry, texts, dims);
     }
 
     fn embedDenseParts(
@@ -2270,6 +2287,7 @@ fn embeddingRequestContext(entry: *const ManagedEmbeddingEntry, task_type: Embed
         },
         .task_type = task_type,
         .model_identity = if (entry.model_identity.len > 0) entry.model_identity else null,
+        .model_revision = if (entry.planned_text_lease) |lease| if (lease.capabilities) |caps| caps.model_revision else null else null,
         .dimensions = if (entry.dimensions > 0) entry.dimensions else null,
         .instruction = if (task_type == .retrieval_query and entry.query_instruction.len > 0) entry.query_instruction else null,
     };
@@ -5605,6 +5623,19 @@ fn acquireRemoteEmbeddingLease(
     headers: []const [2][]const u8,
     operation_deadline_ns: u64,
 ) !remote_capabilities.CapabilityLease {
+    if (entry.planned_text_lease) |planned| {
+        if (planned.scope_digest) |scope| {
+            const actual = try remote_capabilities.scopeDigest(provider.allocator, entry.base_url, entry.model, .embed, headers);
+            if (!std.mem.eql(u8, &scope, &actual)) return error.InferenceCapabilitiesStale;
+        }
+        // Keep the coordinator's route and descriptor through every retry.
+        // Discovering another lease here could stamp its vectors with the old
+        // generation captured before execution.
+        provider.setFramedAttachments(if (planned.capabilities) |caps| caps.framed_attachments else false);
+        if (planned.routing_token) |token| try provider.setCapabilityToken(token.slice());
+        if (planned.descriptor_revision) |revision| try provider.setCapabilityRevision(revision.slice());
+        return planned;
+    }
     const cache = entry.capabilityCache() orelse return error.InferenceCapabilitiesUnavailable;
     const lease = try cache.getOrDiscoverLeaseWithContext(
         http,
@@ -6795,7 +6826,7 @@ fn embedBatchWithEntryForTaskOnce(
                 try checkEntryDispatchDeadline(entry);
                 const context = embeddingRequestContext(entry, task_type);
                 try context.check();
-                if (context.model_identity != null and local.embed_dense_texts_with_context == null) return error.InvalidEmbeddingIdentity;
+                if ((context.model_identity != null or context.model_revision != null) and local.embed_dense_texts_with_context == null) return error.InvalidEmbeddingIdentity;
                 if (trace_batch) provider_started = monotonicNowNs();
                 const vectors = (if (local.embed_dense_texts_with_context) |embed_with_context|
                     AntflyProviderBoundary.call("embed_dense_texts_with_context", local.boundary_dispatch, embed_with_context, .{ local.ptr, alloc, entry.model, texts, context })
@@ -10599,4 +10630,49 @@ test "managed embedder endpoint access denial survives HTTP probing and runtime 
     }
     const abi = @import("antfly_runtime_abi").error_abi;
     try std.testing.expectEqual(error.InferenceEndpointAccessDenied, abi.errorFromStatus(abi.statusFromError(error.InferenceEndpointAccessDenied)));
+}
+
+pub fn testRetainedTextGenerationLease() !void {
+    const a = std.testing.allocator;
+    const Local = struct {
+        revision: u8 = 7,
+        calls: usize = 0,
+        fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn sparse(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+        fn capabilities(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, task: inference_work.Task) anyerror!inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .task = task, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .item, .output = .embedding, .model_revision = @as([32]u8, @splat(self.revision)) };
+        }
+        fn controlled(raw: *anyopaque, alloc: std.mem.Allocator, _: []const u8, texts: []const []const u8, context: EmbeddingRequestContext) anyerror![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as([32]u8, @splat(7)), context.model_revision.?);
+            try std.testing.expect(context.model_identity == null);
+            try std.testing.expectEqual(EmbeddingTaskType.retrieval_document, context.task_type);
+            try std.testing.expectEqual(@as(?u32, 1), context.dimensions);
+            try std.testing.expectEqualStrings("hello", texts[0]);
+            if (self.revision != 7) return error.InferenceCapabilitiesStale;
+            const rows = try alloc.alloc([]f32, 1);
+            errdefer alloc.free(rows);
+            rows[0] = try alloc.dupe(f32, &.{7});
+            self.calls += 1;
+            self.revision = 9;
+            return rows;
+        }
+    };
+    var local: Local = .{};
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(a, "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":1,\"embedder\":{\"provider\":\"antfly\",\"model\":\"local-model\"}}}", .{ .ptr = &local, .embed_dense_texts = Local.dense, .embed_sparse_texts = Local.sparse, .embed_dense_texts_with_context = Local.controlled, .model_capabilities = Local.capabilities });
+    defer managed.deinit();
+    const provider = managed.denseInterface();
+    const generation = try provider.captureTextGeneration(a, "semantic_idx");
+    const leased = provider.withTextGeneration(generation);
+    const vectors = try leased.embedDenseBatch(a, "semantic_idx", &.{"hello"}, 1);
+    defer db_embedder.freeDenseEmbeddingBatch(a, vectors);
+    try std.testing.expectEqual(@as(f32, 7), vectors[0][0]);
+    try std.testing.expectError(error.EnrichmentSourceChanged, provider.requireTextGeneration(a, "semantic_idx", generation));
+    try std.testing.expectError(error.InferenceCapabilitiesStale, leased.embedDenseBatch(a, "semantic_idx", &.{"hello"}, 1));
+    try std.testing.expectEqual(@as(usize, 1), local.calls);
 }

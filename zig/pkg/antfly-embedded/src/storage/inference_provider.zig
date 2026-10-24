@@ -982,6 +982,7 @@ pub fn inferenceProviderEmbedDenseTextsWithContext(
         .texts = texts,
         .task_type = context.task_type.canonical(),
         .model_identity = context.model_identity,
+        .model_revision = context.model_revision,
         .dimensions = context.dimensions,
         .instruction = context.instruction,
     }, context.request.deadline_ns, context.request.cancellation orelse .none);

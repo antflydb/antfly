@@ -1840,3 +1840,43 @@ test "model aware media generation observation reads no audio source bytes" {
         try std.testing.expectEqual(@as(usize, 1), first.seen);
     }
 }
+
+test "model aware media admitted audio indexes retain a 32 source working set" {
+    const Cache = @import("media_index_cache.zig").Cache;
+    const memory = @import("../runtime/tier/memory.zig");
+    const Provider = struct {
+        bytes: []const u8,
+        read_bytes: usize = 0,
+        controller: memory.AdmissionController = .{},
+        fn acquire(raw: *anyopaque, bytes: usize) !memory.AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.controller.tryAcquire(.cpu, .{ .host_limit_bytes = Cache.max_bytes }, .{ .host_scratch_bytes = bytes }, false);
+        }
+        fn read(raw: *anyopaque, offset: u64, out: []u8, control: media.source.Control) !usize {
+            try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const first: usize = @intCast(offset);
+            const count = @min(out.len, self.bytes.len - first);
+            @memcpy(out[0..count], self.bytes[first..][0..count]);
+            self.read_bytes += count;
+            return count;
+        }
+    };
+    const a = std.testing.allocator;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "../../lib/audio/testdata/tone.mp3", a, .limited(1024 * 1024));
+    defer a.free(bytes);
+    var cache: Cache = .{};
+    defer cache.deinit();
+    var provider = Provider{ .bytes = bytes };
+    for (0..2) |_| for (0..32) |i| {
+        const binding: [32]u8 = @splat(@as(u8, @intCast(i + 1)));
+        const identity = std.fmt.bytesToHex(binding, .lower);
+        var source = media.source.Source{ .allocator = a, .identity = &identity, .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = bytes.len, .immutable_binding = binding } } };
+        var first = Qualification{};
+        const request = Request{ .input = .{ .binary = .{ .mime_type = "audio/mpeg", .data = &.{} } }, .native_source = &source, .source_version = "v1", .index_cache = &cache, .index_cache_admission = .{ .context = &provider, .acquire = Provider.acquire }, .policy = .{ .window_ns = 100 * std.time.ns_per_ms, .step_ns = 100 * std.time.ns_per_ms }, .max_chunks = 1 };
+        var runner = try Runner.init(a, request, first.executor(), .{}, .{ .context = &first, .accept = Qualification.accept });
+        _ = try runner.run();
+    };
+    std.debug.print("32-source cache reads={d} cold_once={d} retained_bytes={d} byte_budget={d} estimated_32_source_bytes={d}\n", .{ provider.read_bytes, bytes.len * 32, cache.bytes, Cache.max_bytes, cache.bytes });
+    try std.testing.expectEqual(bytes.len * 32, provider.read_bytes);
+}

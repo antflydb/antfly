@@ -24,11 +24,15 @@ const video_owner = @import("media_chunking_video.zig");
 const admitted = @import("../backends/admitted_allocator.zig");
 pub const Cache = struct {
     pub const max_bytes = 64 * 1024 * 1024;
-    pub const max_entries = 8;
+    // A metadata-abuse ceiling; admitted bytes normally bound occupancy first.
+    pub const max_entries = 4096;
+    const bucket_count = 1024;
     mutex: std.atomic.Mutex = .unlocked,
-    entries: [max_entries]?*Entry = @splat(null),
+    buckets: [bucket_count]?*Entry = @splat(null),
+    oldest: ?*Entry = null,
+    newest: ?*Entry = null,
+    count: usize = 0,
     bytes: usize = 0,
-    clock: u64 = 0,
     pub const Admission = struct {
         context: *anyopaque,
         acquire: *const fn (*anyopaque, usize) anyerror!@import("../runtime/tier/memory.zig").AdmissionLease,
@@ -78,18 +82,22 @@ pub const Cache = struct {
     pub const Planning = union(enum) { mp4: *const video_owner.Owner, webm: WebmSnapshot };
     pub const Entry = struct {
         allocation: admitted.AdmittedAllocator,
+        header_lease: @import("../runtime/tier/memory.zig").AdmissionLease,
         arena: std.heap.ArenaAllocator,
         key: [32]u8,
         data: Data,
         mp4_plan: ?video_owner.Snapshot = null,
         webm_plan: ?WebmSnapshot = null,
         refs: usize = 1,
-        used: u64 = 0,
+        hash_next: ?*Entry = null,
+        older: ?*Entry = null,
+        newer: ?*Entry = null,
         bytes: usize = 0,
         fn destroy(self: *Entry) void {
             const a = self.allocation.backing;
             self.arena.deinit();
             self.allocation.deinit();
+            self.header_lease.release();
             a.destroy(self);
         }
     };
@@ -133,18 +141,53 @@ pub const Cache = struct {
     fn lock(self: *Cache) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
+    fn bucket(identity: [32]u8) usize {
+        return @intCast(std.hash.Wyhash.hash(0, &identity) % bucket_count);
+    }
+    fn find(self: *Cache, identity: [32]u8) ?*Entry {
+        var next = self.buckets[bucket(identity)];
+        while (next) |entry| : (next = entry.hash_next) {
+            if (std.mem.eql(u8, &identity, &entry.key)) return entry;
+        }
+        return null;
+    }
+    fn unlinkLru(self: *Cache, entry: *Entry) void {
+        if (entry.older) |older| older.newer = entry.newer else self.oldest = entry.newer;
+        if (entry.newer) |newer| newer.older = entry.older else self.newest = entry.older;
+    }
+    fn touch(self: *Cache, entry: *Entry) void {
+        entry.older = self.newest;
+        entry.newer = null;
+        if (self.newest) |previous| previous.newer = entry else self.oldest = entry;
+        self.newest = entry;
+    }
+    fn evictable(self: *Cache) ?*Entry {
+        var next = self.oldest;
+        while (next) |entry| : (next = entry.newer) if (entry.refs == 0) return entry;
+        return null;
+    }
+    fn remove(self: *Cache, entry: *Entry) void {
+        var link = &self.buckets[bucket(entry.key)];
+        while (link.*) |candidate| {
+            if (candidate == entry) {
+                link.* = entry.hash_next;
+                break;
+            }
+            link = &candidate.hash_next;
+        }
+        self.unlinkLru(entry);
+        self.bytes -= entry.bytes;
+        self.count -= 1;
+        entry.destroy();
+    }
     pub fn get(self: *Cache, identity: [32]u8) ?*Entry {
         self.lock();
         defer self.mutex.unlock();
-        for (self.entries) |slot| if (slot) |entry| {
-            if (std.mem.eql(u8, &identity, &entry.key)) {
-                entry.refs += 1;
-                self.clock +%= 1;
-                entry.used = self.clock;
-                return entry;
-            }
-        };
-        return null;
+        const entry = self.find(identity) orelse return null;
+        entry.refs += 1;
+        self.unlinkLru(entry);
+        self.touch(entry);
+        return entry;
     }
     /// Best-effort retention after admitted parsing. The cache holds its own
     /// node host-memory reservation rather than borrowing a request's permit.
@@ -159,8 +202,12 @@ pub const Cache = struct {
             .webm => |r| (std.math.mul(usize, r.packets.len, @sizeOf(media.webm.Packet)) catch return) +| (std.math.mul(usize, r.cues.len, @sizeOf(media.webm.Cue)) catch return),
         };
         if (estimate > max_bytes) return;
-        const entry = a.create(Entry) catch return;
-        entry.* = .{ .allocation = .{ .backing = a, .admission_context = admission.context, .admit = admission.acquire }, .arena = undefined, .key = identity, .data = undefined, .refs = 0 };
+        var header_lease = admission.acquire(admission.context, @sizeOf(Entry)) catch return;
+        const entry = a.create(Entry) catch {
+            header_lease.release();
+            return;
+        };
+        entry.* = .{ .header_lease = header_lease, .allocation = .{ .backing = a, .admission_context = admission.context, .admit = admission.acquire }, .arena = undefined, .key = identity, .data = undefined, .refs = 0 };
         entry.arena = .init(entry.allocation.allocator());
         self.copy(entry, data) catch {
             entry.destroy();
@@ -186,36 +233,23 @@ pub const Cache = struct {
         }
         self.lock();
         defer self.mutex.unlock();
-        for (self.entries) |slot| if (slot) |old| {
-            if (std.mem.eql(u8, &old.key, &identity)) {
-                entry.destroy();
-                return;
-            }
-        };
-        while (true) {
-            var empty: ?usize = null;
-            var victim: ?usize = null;
-            for (self.entries, 0..) |slot, i| {
-                if (slot) |old| {
-                    if (old.refs == 0 and (victim == null or old.used < self.entries[victim.?].?.used)) victim = i;
-                } else empty = i;
-            }
-            if (empty != null and entry.bytes <= max_bytes - self.bytes) {
-                self.clock +%= 1;
-                entry.used = self.clock;
-                self.entries[empty.?] = entry;
-                self.bytes += entry.bytes;
-                return;
-            }
-            const index = victim orelse {
+        if (self.find(identity) != null) {
+            entry.destroy();
+            return;
+        }
+        while (self.count >= max_entries or entry.bytes > max_bytes - self.bytes) {
+            const victim = self.evictable() orelse {
                 entry.destroy();
                 return;
             };
-            const old = self.entries[index].?;
-            self.bytes -= old.bytes;
-            self.entries[index] = null;
-            old.destroy();
+            self.remove(victim);
         }
+        const index = bucket(identity);
+        entry.hash_next = self.buckets[index];
+        self.buckets[index] = entry;
+        self.touch(entry);
+        self.count += 1;
+        self.bytes += entry.bytes;
     }
     fn copy(_: *Cache, entry: *Entry, data: Input) !void {
         const a = entry.arena.allocator();
@@ -243,16 +277,9 @@ pub const Cache = struct {
         defer self.mutex.unlock();
         var released: usize = 0;
         while (released < target_bytes) {
-            var victim: ?usize = null;
-            for (self.entries, 0..) |slot, index| if (slot) |entry| {
-                if (entry.refs == 0 and (victim == null or entry.used < self.entries[victim.?].?.used)) victim = index;
-            };
-            const index = victim orelse break;
-            const entry = self.entries[index].?;
-            self.entries[index] = null;
-            self.bytes -= entry.bytes;
+            const entry = self.evictable() orelse break;
             released += entry.bytes;
-            entry.destroy();
+            self.remove(entry);
         }
         return released;
     }
@@ -263,12 +290,10 @@ pub const Cache = struct {
         entry.refs -= 1;
     }
     pub fn deinit(self: *Cache) void {
-        for (self.entries) |slot| if (slot) |entry| {
+        while (self.oldest) |entry| {
             std.debug.assert(entry.refs == 0);
-            entry.destroy();
-        };
-        self.entries = @splat(null);
-        self.bytes = 0;
+            self.remove(entry);
+        }
     }
 };
 
@@ -395,4 +420,47 @@ test "model aware media audio index clones own payloads and release admission un
         try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) > 0);
         try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
     }
+}
+
+test "model aware media hashed LRU resolves collisions and preserves pinned entries under pressure" {
+    const a = std.testing.allocator;
+    const Provider = struct {
+        controller: @import("../runtime/tier/memory.zig").AdmissionController = .{},
+        fn acquire(raw: *anyopaque, bytes: usize) !@import("../runtime/tier/memory.zig").AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.controller.tryAcquire(.cpu, .{ .host_limit_bytes = Cache.max_bytes }, .{ .host_scratch_bytes = bytes }, false);
+        }
+    };
+    var provider: Provider = .{};
+    var source = media.source.Source{ .allocator = a, .identity = "unused", .storage = .{ .borrowed = "" } };
+    const reader = media.mp4.Reader{ .allocator = a, .input = &source, .metadata = .{ .bytes = &.{}, .source = null }, .track = .{ .id = 1, .timescale = 1, .width = 1, .height = 1, .avcc = "config", .nal_length_bytes = 4, .display_matrix = @splat(0) }, .packets = &.{}, .limits = .{} };
+    var cache: Cache = .{};
+    defer cache.deinit();
+    var keys: [32][32]u8 = undefined;
+    var candidate: u64 = 0;
+    for (&keys) |*key_| {
+        while (true) : (candidate += 1) {
+            key_.* = @splat(0);
+            std.mem.writeInt(u64, key_[0..8], candidate, .little);
+            if (Cache.bucket(key_.*) == 0) break;
+        }
+        candidate += 1;
+        cache.remember(a, key_.*, .{ .mp4 = reader }, .{ .context = &provider, .acquire = Provider.acquire });
+    }
+    try std.testing.expectEqual(@as(usize, 32), cache.count);
+    const pinned = cache.get(keys[1]).?;
+    const touched = cache.get(keys[0]).?;
+    cache.release(touched);
+    // 0 was touched, 1 is pinned: 2 is the oldest reclaimable entry.
+    try std.testing.expect(Cache.reclaim(&cache, 1) > 0);
+    try std.testing.expect(cache.get(keys[2]) == null);
+    const still_present = cache.get(keys[0]).?;
+    cache.release(still_present);
+    _ = Cache.reclaim(&cache, Cache.max_bytes);
+    try std.testing.expectEqual(@as(usize, 1), cache.count);
+    try std.testing.expectEqualStrings("config", pinned.data.mp4.track.avcc);
+    cache.release(pinned);
+    _ = Cache.reclaim(&cache, Cache.max_bytes);
+    try std.testing.expectEqual(@as(usize, 0), cache.count);
+    try std.testing.expectEqual(@as(usize, 0), provider.controller.snapshot().hostTotalBytes());
 }
