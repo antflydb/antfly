@@ -1124,3 +1124,63 @@ bytes and 768 versus 384 allocations. One local Debug run measured 41.1 ms versu
 allocation failure release their owners correctly. These are in-memory changes
 under reader protocol 81; wire artifacts, publication authority and GC closure
 are unchanged. Archive-scale throughput and cloud latency remain unmeasured.
+
+
+### Archive qualification after the locality refinements
+
+[Lake archive qualification](../../zig/bench/lake/README.md) provides a repeatable
+real-Parquet gate for source scans, metadata lookup/filtering, skewed joins,
+numeric text sorting and broad incremental publication. Deterministic generated
+fixtures use independent answer oracles and atomic manifest commits; user-supplied
+archives are copied into isolated fixtures without rewriting originals. Frozen
+remote plans retain their declared source identity and credential references.
+
+Reports distinguish process-restarted, warm and startup work. They do not treat
+retained persistent/OS caches as empty, sampled RSS as exact request allocation,
+serving-cache counters as complete transport traces, or newly retained artifacts
+as total disk writes. SQL runtime profiles preserve their own coverage and spill
+fields. Every sample and input/binary/collector fingerprint is retained; report
+comparison requires equal answers and compatible inputs, cache conditions and
+collector/environment before reporting a ratio.
+
+This establishes the measurement path for further implementation decisions.
+Native reader protocol 81, publication authority and GC closure are unchanged.
+The initial Debug filesystem run exposes all-candidate numeric text sorting and
+publication artifact volume as targets for deeper profiling, without making
+archive-scale or live-cloud performance claims.
+
+### Qualification integrity and outstanding physical ordering
+
+Archive qualification binds binary, configuration and collector identity before
+startup, rejects changes around restarts and measurements, and verifies content
+before completing the report. The managed lifetime covers provenance/client
+failures, interruptions, log collection and temporary-root cleanup. Readiness
+includes embedded table indexes, additional index declarations and schema
+relational indexes. A custom declared identity field controls the exact ID oracle
+as well as result normalization; it never changes the physical source coordinates.
+
+A declared `schema.index_sort` is not currently sufficient to create physically
+sorted native lake text segments. The canonical producer omits the build sort,
+patch merges currently restore `_id` order, and serving compaction concatenates
+runs. Thus an exact doc-values top-N fallback remains necessary. The fixed
+qualification runner can expose this through `missing_segment_index_sort`; a
+schema-only setting must not be presented as a performance improvement.
+
+The outstanding implementation needs an authenticated, compact, paged mapping
+between native segment ordinals and canonical file-local live ranks, in both
+directions. Sorting must preserve the physical `(file, row_group, row)` coordinate
+and public stable identity independently. Fresh encoding, delete/patch merges,
+forward-statistics transfer and cross-file serving compaction must compose the
+same mapping, with existing resource admission and reader/GC publication closure.
+Per-row JSON source spans are not a substitute: their metadata size and bounded
+span limits defeat the intended efficiency. Shared schema validation, bounded
+external sorting and a reader-version fence belong in that implementation.
+
+Qualification must compare exact projected answers on the same frozen Parquet
+bytes, including numeric/timestamp directions, nulls and ties, filtering, cursor
+continuation, deleted rows, file rewrites and restarts after serving compaction.
+Only reduced candidate work and repeated timing improvements with bounded build
+memory/publication cost qualify the engine change as a win. The current experiment
+is a configuration comparison, not a prototype or qualification of that missing
+engine implementation. Native reader protocol 81 is unchanged by these runner
+fixes.

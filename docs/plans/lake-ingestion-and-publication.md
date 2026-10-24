@@ -3871,3 +3871,21 @@ admission requires observed offset reuse and remains bounded by the existing
 request budget. Matched flags stay fresh, saved matches retain coordinates, and
 borrowed pages keep independent ownership. Publication, reader protocol 81 and
 reclamation semantics remain unchanged.
+
+
+[Archive qualification](../../zig/bench/lake/README.md) now exercises broad refresh
+through immutable generated Parquet files and one atomic manifest-head commit.
+It separates fixture encoding/commit time from readiness/verification, checks
+new publication revisions and exact changed-row results, and reports sampled
+memory, scoped cache counters, and newly retained artifact volume. Retained-file
+ratios exclude temporary spills and reclaimed files; real provider write traces
+remain necessary for cloud amplification claims.
+
+Archive qualification now pins executable/configuration/collector identity across
+restarts and closes its managed server/session on initialization, interruption
+and finalization errors. Publication readiness covers the complete embedded,
+additional and schema-relational index set. Custom logical identity fields drive
+the exact result oracle without altering physical source coordinates. Declared
+native text ordering remains [an explicit outstanding engine task](lake-row-identity.md#qualification-integrity-and-outstanding-physical-ordering):
+its implementation must preserve ordinal lineage through every producer and
+compactor before a performance claim can be accepted.
