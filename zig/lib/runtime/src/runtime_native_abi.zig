@@ -116,7 +116,9 @@ const builtin = @import("builtin");
 // Durability grants own private file writes, publication and discard.
 // Cleanup tickets embed registered retirement ownership across cancellation.
 // State retirement retains partial row, tree-node, vector and arena byte ownership.
-pub const abi_version: u32 = 115;
+// Path pins retain radix-group, cursor and detached-allocation ownership.
+// Reject earlier opaque pin owners before interpreting their native headers.
+pub const abi_version: u32 = 116;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

@@ -26991,3 +26991,91 @@ corrected parameter-shadowing compiler error; v4 includes coallocation and
 joined test cleanup. Full GNU qualification remains waived. Registry
 registration/accounting and the remaining coordinated/default design are
 incomplete.
+
+### Retained radix registration and allocation-free pin removal
+
+The production path registry now drives retained radix operations instead of
+hash-table lookup/growth under its mutex. Streaming hashing, collision-list
+comparison, path copying and last-reference byte retirement check the current
+original in 16 KiB turns outside the mutex. A radix branch selects one of the
+64 hash bits; navigation visits at most 64 branches. Publishing a new hash
+performs at most two such walks and fixed pointer/header changes. No path-byte
+comparison, allocation or cooperative checkpoint occurs in those critical
+sections; acquired-lock validation uses the original lifetime check.
+
+Hash collisions retain ordinary path equality rather than limiting supported
+paths. A cursor borrows one hash-group header and its current key, preserving
+both across rejection. A missing-key publication validates the group's list
+generation, and an exact-match publication validates current index membership.
+Concurrent inserts/removals therefore cannot turn a stale comparison into a
+duplicate key or a pin on a removed owner. Unrelated hashes do not invalidate
+the cursor. Configuration used by qualification can force every key into one
+collision group, exercising the full retained-list path.
+
+`Operation.planWithAdmission` allocates nothing and returns the conservative
+additional bound before construction: a coallocated key/counter, and, for a
+new hash, a group and speculative branch header. Existing-key retain, query,
+path release and forget allocate nothing. Construction retains every partial
+allocation on OOM or admission refusal. The shared threaded registry uses a
+small-object allocator for fixed headers; single-threaded builds use a general
+allocator. This avoids a separate page allocation for each tiny radix header.
+Fixed registry/cursor headers remain the caller's prepaid responsibility.
+
+Forget unlinks a zero-file-reference key in constant work after lookup. It
+transfers the list's ownership, any detached branch and the final group's
+index ownership into the operation. Key/header physical retirement then runs
+outside the mutex. Index borrows keep an unlinked key and an empty group alive
+until their final cursor exits. The separate atomic file-pin drop still reads
+no key/header fields after decrementing the file count. `live_bytes` tracks
+all unique record, group and branch allocations, including private construction
+and logically removed owners, and decreases only after physical free.
+
+Existing joined retain/query/release/forget callers and ordinary directory
+preparation drive this same implementation with a null port. The backend also
+exposes retained registry operations and an admitted directory handoff. Handoff
+checks the issuing registry, operation kind, target run's path identity and
+pin flag before taking the owned file pin, with no fallible gap before marking
+the run. An incompatible/stale target leaves the result owned by the operation
+for retry or registered retirement. Memory runs need no file registration.
+
+These metrics and planning bounds do not install a process-global quota owner.
+The caller must fund the complete additional bound and retain that charge until
+all transferred allocations have a stable global accounting/retirement owner.
+A backend-local manager cannot be used after that backend closes. Attaching the
+process/host quota ledger, funding/retirement registration, final payload
+assembly, coupled RunStore/directory/view/generation/durability publication,
+relief and default overload/fairness qualification remain required. The full
+design remains incomplete and full GNU qualification remains waived.
+
+Private runtime native ABI 116 and kernel-owner ABI 176 reject earlier opaque
+pin layouts/ownership contracts before native decoding. Public C layouts and
+durable formats are unchanged.
+
+Final-source `retained-pin-registry-v2`, `-regressions`, `-boundaries` and
+`-fast` receipts pass all five native commands each. Debug physical-sync passes
+53/53 steps and 119 cases. Original-error sweeps cover planning, construction,
+publication, take and retirement for present/missing keys with normal and
+forced-collision hashes, retry and joined abandonment. Allocation witnesses
+verify the planned additional bound, exact physical accounting through partial
+cleanup and all actual OOM points. Allocation-disabled query/release/forget
+reclaims the complete index. Collision publication rejects stale membership,
+and borrowed removed keys and empty groups stay charged until physical free.
+Cooperative checkpoint assertions verify the registry mutex is free, while
+lifetime failure after acquisition releases it. Handoff rejects expired control,
+foreign registries, stale paths and an already-pinned target before consuming
+its result. Existing stable-pin held-mutex, backend-close, growth and concurrent
+drop/forget tests run against the new production registry.
+
+Regressions pass 60/60 steps and 55 directory/state/OOM, immutable-pin,
+merge/arena/overlay, ledger/dependency/GC, cross-handle reader, close,
+checkpoint and obsolete-file cases. Debug boundaries pass 80/80 steps,
+32 owner-close, 170 table/codec, 74 WAL recovery and 18 ABI checks. ReleaseFast
+passes 63/63 steps and all 119/170/74 physical/table/recovery cases. Each receipt
+also passes four Bloom and 45/1/8 error-identity companions (companions use
+Debug). All 5,595 recorded native/schema input hashes and log digests match
+final source. Formatting, whitespace and the new module's license pass. V1
+preserves the initial successful radix implementation; v2 includes backend
+handoff, checkpoint-location assertions, empty-group borrowing and private ABI
+116/176 guards. Full GNU qualification remains waived. Stable process/host
+quota ownership and the remaining funded/registered coordinator, cleanup,
+relief and default-design qualification remain incomplete.

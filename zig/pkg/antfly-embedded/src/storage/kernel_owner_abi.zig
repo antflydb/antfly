@@ -58,7 +58,9 @@ const failure_abi = @import("runtime_failure_abi");
 // Durability grants own private file writes, publication and discard.
 // Output tickets carry registered physical/accounting retirement ownership.
 // State retirement retains partial row, tree-node, vector and arena byte ownership.
-pub const abi_version: u32 = 175;
+// Pin registration retains radix traversal and detached physical ownership.
+// Reject earlier kernel/native pin capabilities before decoding their headers.
+pub const abi_version: u32 = 176;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

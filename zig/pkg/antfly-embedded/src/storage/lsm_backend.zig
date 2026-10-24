@@ -172,94 +172,10 @@ var obsolete_path_refs = ObsoletePathRefRegistry{};
 // borrows separately from open-manifest ownership so compaction can retire
 // each generation as soon as its own last reader exits, without waiting for a
 // backend-wide reader-free instant.
-const RunSnapshotRefRegistry = struct {
-    // A live pin owns one count. Rehash moves only pointers; zero-count records
-    // stay cached until the path owner explicitly forgets the generation.
-    const Pin = struct {
-        refs: platform.atomic.Value(u64) = .init(1),
-        path_len: usize,
-        fn create(allocator: Allocator, source_path: []const u8) !*Pin {
-            const bytes = try std.math.add(usize, @sizeOf(Pin), source_path.len);
-            const raw = allocator.rawAlloc(bytes, .of(Pin), @returnAddress()) orelse return error.OutOfMemory;
-            const pin: *Pin = @ptrCast(@alignCast(raw));
-            pin.* = .{ .path_len = source_path.len };
-            @memcpy(pin.path(), source_path);
-            return pin;
-        }
-        fn path(self: *Pin) []u8 {
-            return @as([*]u8, @ptrCast(self))[@sizeOf(Pin)..][0..self.path_len];
-        }
-        fn destroy(self: *Pin, allocator: Allocator) void {
-            const bytes = @as([*]u8, @ptrCast(self))[0 .. @sizeOf(Pin) + self.path_len];
-            allocator.rawFree(bytes, .of(Pin), @returnAddress());
-        }
-        fn release(self: *Pin) void {
-            const previous = self.refs.fetchSub(1, .acq_rel);
-            std.debug.assert(previous != 0);
-            // Nothing below may access self: concurrent forget may already
-            // have freed this zero-count record after the atomic decrement.
-            if (previous == 1) _ = file_pin_release_epoch.fetchAdd(1, .release);
-        }
-    };
-    mutex: std.atomic.Mutex = .unlocked,
-    allocator: Allocator = std.heap.page_allocator,
-    refs: std.StringHashMapUnmanaged(*Pin) = .empty,
+const run_pin_registry = @import("lsm_backend/run_pin_registry.zig");
+const RunSnapshotRefRegistry = run_pin_registry.Registry;
 
-    /// Legacy registration driver: path hashing, allocation and rehash still
-    /// require separate retained preparation before admitted callers use it.
-    fn retainPin(self: *RunSnapshotRefRegistry, path: []const u8) !*Pin {
-        lockWorkerMutex(&self.mutex);
-        defer self.mutex.unlock();
-        if (self.refs.get(path)) |pin| {
-            var count = pin.refs.load(.acquire);
-            while (true) {
-                if (count == std.math.maxInt(u64)) return error.Overflow;
-                count = pin.refs.cmpxchgWeak(count, count + 1, .acq_rel, .acquire) orelse return pin;
-            }
-        }
-        // Keep the header in the existing path allocation; a second page
-        // allocation per cached run would erase much of the pooling benefit.
-        const pin = try Pin.create(self.allocator, path);
-        errdefer pin.destroy(self.allocator);
-        try self.refs.put(self.allocator, pin.path(), pin);
-        return pin;
-    }
-    fn retain(self: *RunSnapshotRefRegistry, path: []const u8) !void {
-        _ = try self.retainPin(path);
-    }
-
-    /// Compatibility for path-only owners. Stable-handle owners bypass both
-    /// this lookup and the registry mutex when releasing their own pin.
-    fn release(self: *RunSnapshotRefRegistry, path: []const u8) void {
-        lockWorkerMutex(&self.mutex);
-        defer self.mutex.unlock();
-        const pin = self.refs.get(path) orelse return;
-        var count = pin.refs.load(.acquire);
-        while (count != 0) {
-            count = pin.refs.cmpxchgWeak(count, count - 1, .acq_rel, .acquire) orelse {
-                if (count == 1) _ = file_pin_release_epoch.fetchAdd(1, .release);
-                return;
-            };
-        }
-    }
-
-    fn isRetained(self: *RunSnapshotRefRegistry, path: []const u8) bool {
-        lockWorkerMutex(&self.mutex);
-        defer self.mutex.unlock();
-        return if (self.refs.get(path)) |pin| pin.refs.load(.acquire) > 0 else false;
-    }
-
-    fn forget(self: *RunSnapshotRefRegistry, path: []const u8) void {
-        lockWorkerMutex(&self.mutex);
-        defer self.mutex.unlock();
-        const pin = self.refs.get(path) orelse return;
-        if (pin.refs.load(.acquire) != 0) return;
-        const removed = self.refs.fetchRemove(path) orelse return;
-        removed.value.destroy(self.allocator);
-    }
-};
-
-var run_snapshot_refs = RunSnapshotRefRegistry{};
+var run_snapshot_refs = RunSnapshotRefRegistry{ .epoch = &file_pin_release_epoch };
 
 fn writeCheckpointBytes(io: std.Io, path: []const u8, bytes: []const u8, sink: ?native_artifact_sink.Sink) !u64 {
     if (std.fs.path.dirname(path)) |parent| try fs_paths.createDirPathPortable(io, parent);
@@ -7382,9 +7298,40 @@ pub const Backend = struct {
     pub fn retainDirectoryRunSnapshotPin(_: *Backend, run: *Run) !RunDirectory.EntryPin {
         if (run.version_ref_pinned) return error.InvalidArgument;
         const path = run.path orelse return .{ .owner = &run_snapshot_refs, .release = releaseDirectorySnapshotPin };
-        const pin = try run_snapshot_refs.retainPin(path);
+        while (true) {
+            var registration = prepareRunSnapshotRefOperation(path, .retain);
+            defer registration.deinit();
+            _ = registration.planWithAdmission(null) catch |cause| {
+                if (cause == error.CompactionPlanningStale) continue;
+                return cause;
+            };
+            try registration.resumeWithAdmission(null);
+            registration.publishWithAdmission(null) catch |cause| {
+                if (cause == error.CompactionPlanningStale) continue;
+                return cause;
+            };
+            return completeDirectorySnapshotPin(&registration, run, null);
+        }
+    }
+    /// Caller prepays the operation header and planned additional allocation,
+    /// pins input, and registers physical retirement before running this cursor.
+    pub fn prepareRunSnapshotRefOperation(path: []const u8, mode: run_pin_registry.Mode) run_pin_registry.Operation {
+        return .init(&run_snapshot_refs, path, mode);
+    }
+    fn completeDirectorySnapshotPin(registration: *run_pin_registry.Operation, run: *Run, original: ?@import("../common/read_admission.zig").Port) !RunDirectory.EntryPin {
+        if (original) |port| try port.checkpoint();
+        if (registration.registry != &run_snapshot_refs or registration.mode != .retain) return error.InvalidArgument;
+        if (run.version_ref_pinned) return error.InvalidArgument;
+        const path = run.path orelse return error.CompactionPlanningStale;
+        if (path.ptr != registration.path.ptr or path.len != registration.path.len) return error.CompactionPlanningStale;
+        const pin = try registration.takePinWithAdmission(null);
+        // The checked original cannot reject between taking the owned file
+        // pin and marking its immutable run. No allocation or callback here.
         run.version_ref_pinned = true;
         return .{ .owner = pin, .release = releaseDirectorySnapshotPin };
+    }
+    pub fn completeDirectorySnapshotPinWithAdmission(registration: *run_pin_registry.Operation, run: *Run, original: @import("../common/read_admission.zig").Port) !RunDirectory.EntryPin {
+        return completeDirectorySnapshotPin(registration, run, original);
     }
     fn releaseDirectorySnapshotPin(owner: *anyopaque, run: *Run) void {
         if (!run.version_ref_pinned) return;
@@ -31553,7 +31500,7 @@ test "controlled physical sync stable directory pin release retires under held r
                 if (quiesced) retirement.?.deinit(a) else try retirement.?.retireWithAdmission(a, original);
                 try std.testing.expectEqual(baseline, account.bytes.load(.acquire));
                 try std.testing.expectEqual(epoch + 1, file_pin_release_epoch.load(.acquire));
-                try std.testing.expectEqual(@as(u64, 0), run_snapshot_refs.refs.get(path).?.refs.load(.acquire));
+                try std.testing.expectEqual(@as(u64, 0), run_snapshot_refs.findLockedJoined(path).?.refs.load(.acquire));
                 fault.at = fault.checks;
                 try std.testing.expectError(fault.failure, retirement.?.retireWithAdmission(a, original));
                 try retirement.?.retireWithAdmission(a, original);
@@ -31577,7 +31524,7 @@ test "controlled physical sync stable directory pin release retires under held r
         defer run_snapshot_refs.mutex.unlock();
         directory.destroy(a);
         directory_alive = false;
-        try std.testing.expectEqual(@as(u64, 1), run_snapshot_refs.refs.get(path).?.refs.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 1), run_snapshot_refs.findLockedJoined(path).?.refs.load(.acquire));
     }
     run_snapshot_refs.forget(path);
     try std.testing.expect(run_snapshot_refs.isRetained(path));
@@ -31628,16 +31575,11 @@ test "controlled physical sync production pin retirement rejects legacy capabili
     try std.testing.expectEqual(@as(usize, 0), fixture.pins);
 }
 
-test "controlled physical sync stable snapshot pins survive rehash concurrent release forget and allocation failure" {
+test "controlled physical sync stable snapshot pins survive radix growth concurrent release forget and allocation failure" {
     const Fixture = struct {
         fn close(registry: *RunSnapshotRefRegistry) void {
             // Test-only joined cleanup: no pin consumer survives this fixture.
-            var iterator = registry.refs.iterator();
-            while (iterator.next()) |entry| {
-                entry.value_ptr.*.destroy(registry.allocator);
-            }
-            registry.refs.deinit(registry.allocator);
-            registry.refs = .empty;
+            registry.deinitJoined();
         }
         fn allocationFailures(a: Allocator) !void {
             var registry: RunSnapshotRefRegistry = .{ .allocator = a };
@@ -31650,11 +31592,11 @@ test "controlled physical sync stable snapshot pins survive rehash concurrent re
             try std.testing.expect(registry.isRetained("/stable/oom.sst"));
             same.release();
             registry.forget("/stable/oom.sst");
-            try std.testing.expectEqual(@as(usize, 0), registry.refs.count());
+            try std.testing.expectEqual(@as(usize, 0), registry.key_count);
             const empty = try registry.retainPin("");
             empty.release();
             registry.forget("");
-            try std.testing.expectEqual(@as(usize, 0), registry.refs.count());
+            try std.testing.expectEqual(@as(usize, 0), registry.key_count);
         }
         fn drop(pin: *RunSnapshotRefRegistry.Pin, count: usize) void {
             for (0..count) |_| pin.release();
@@ -31667,8 +31609,8 @@ test "controlled physical sync stable snapshot pins survive rehash concurrent re
         defer Fixture.close(&packed_registry);
         const path = "/stable/one-allocation.sst";
         const pin = try packed_registry.retainPin(path);
-        // One allocation for header+path, one for the initial hash table.
-        try std.testing.expectEqual(@as(usize, 2), measured.allocations);
+        // Header+path, hash group, and one speculative branch header.
+        try std.testing.expectEqual(@as(usize, 3), measured.allocations);
         try std.testing.expectEqual(@intFromPtr(pin) + @sizeOf(RunSnapshotRefRegistry.Pin), @intFromPtr(pin.path().ptr));
         try std.testing.expectEqualStrings(path, pin.path());
         pin.release();
@@ -31680,15 +31622,15 @@ test "controlled physical sync stable snapshot pins survive rehash concurrent re
     defer Fixture.close(&registry);
     const anchor = try registry.retainPin("/stable/anchor.sst");
     defer anchor.release();
-    const capacity = registry.refs.capacity();
+    const branches = registry.branch_count;
     for (0..512) |i| {
         var buffer: [64]u8 = undefined;
         const path = try std.fmt.bufPrint(&buffer, "/stable/rehash/{d}.sst", .{i});
         const pin = try registry.retainPin(path);
         pin.release();
     }
-    try std.testing.expect(registry.refs.capacity() > capacity);
-    try std.testing.expect(anchor == registry.refs.get("/stable/anchor.sst").?);
+    try std.testing.expect(registry.branch_count > branches);
+    try std.testing.expect(anchor == registry.findLockedJoined("/stable/anchor.sst").?);
     const same = try registry.retainPin("/stable/anchor.sst");
     try std.testing.expect(anchor == same);
     {
@@ -31715,9 +31657,56 @@ test "controlled physical sync stable snapshot pins survive rehash concurrent re
         thread.* = null;
     }
     registry.forget(concurrent_path);
-    try std.testing.expect(!registry.refs.contains(concurrent_path));
+    try std.testing.expect(registry.findLockedJoined(concurrent_path) == null);
     // Path-only releases coexist with direct handles and tolerate cached zero.
     try registry.retain("/stable/anchor.sst");
     registry.release("/stable/anchor.sst");
     try std.testing.expectEqual(@as(u64, 1), anchor.refs.load(.acquire));
+}
+
+test "controlled physical sync directory registration handoff validates run and registry before transferring file ownership" {
+    const a = std.testing.allocator;
+    const admission = @import("../common/read_admission.zig");
+    const Control = struct {
+        failure: ?anyerror = error.DeadlineExceeded,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.failure) |failure| {
+                self.failure = null;
+                return failure;
+            }
+        }
+    };
+    var control: Control = .{};
+    const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check } };
+    const original = admission.Port.init(&payload);
+    const path = "/pin-registration-handoff.sst";
+    defer run_snapshot_refs.forget(path);
+    var registration = Backend.prepareRunSnapshotRefOperation(path, .retain);
+    defer registration.deinit();
+    _ = try registration.planWithAdmission(null);
+    try registration.resumeWithAdmission(null);
+    try registration.publishWithAdmission(null);
+    var run: Run = .{ .id = 934, .level = 0, .size_bytes = 1, .path = @constCast("/wrong.sst"), .smallest_namespace_name = null, .smallest_key = @constCast("a"), .largest_namespace_name = null, .largest_key = @constCast("z"), .entry_count = 1, .bloom_filter = null, .state = null, .owns_metadata = false };
+    try std.testing.expectError(error.DeadlineExceeded, Backend.completeDirectorySnapshotPinWithAdmission(&registration, &run, original));
+    try std.testing.expectError(error.CompactionPlanningStale, Backend.completeDirectorySnapshotPinWithAdmission(&registration, &run, original));
+    try std.testing.expect(!registration.taken and !run.version_ref_pinned);
+    run.path = @constCast(path);
+    run.version_ref_pinned = true;
+    try std.testing.expectError(error.InvalidArgument, Backend.completeDirectorySnapshotPinWithAdmission(&registration, &run, original));
+    run.version_ref_pinned = false;
+    const pin = try Backend.completeDirectorySnapshotPinWithAdmission(&registration, &run, original);
+    try std.testing.expect(run.version_ref_pinned and registration.taken);
+    pin.release(pin.owner, &run);
+    try std.testing.expect(!run.version_ref_pinned);
+    try std.testing.expectError(error.InvalidArgument, Backend.completeDirectorySnapshotPinWithAdmission(&registration, &run, original));
+    var other: RunSnapshotRefRegistry = .{ .allocator = a };
+    defer other.deinitJoined();
+    var foreign = run_pin_registry.Operation.init(&other, path, .retain);
+    defer foreign.deinit();
+    _ = try foreign.planWithAdmission(null);
+    try foreign.resumeWithAdmission(null);
+    try foreign.publishWithAdmission(null);
+    try std.testing.expectError(error.InvalidArgument, Backend.completeDirectorySnapshotPinWithAdmission(&foreign, &run, original));
+    try std.testing.expect(!foreign.taken and !run.version_ref_pinned);
 }
