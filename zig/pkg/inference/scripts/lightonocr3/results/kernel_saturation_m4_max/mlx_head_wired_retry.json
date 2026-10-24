@@ -1,0 +1,244 @@
+{
+  "created_at": "2026-10-22T17:31:35.653120+00:00",
+  "mlx": "0.32.2",
+  "device": {
+    "device_name": "Apple M4 Max",
+    "max_recommended_working_set_size": 30150672384,
+    "memory_size": 38654705664,
+    "architecture": "applegpu_g16s",
+    "max_buffer_length": 22613000192,
+    "resource_limit": 499000
+  },
+  "wired_limit_bytes": 30150672384,
+  "observer_sha256": "1e342d967b5d3e102bed03e4d412e76df44b55bf249f98ea2f3bfb8bf0a344e5",
+  "scope": "Isolated random-weight matrices, not checkpoint or page throughput; one GPU process at a time. GPU times sum committed command buffers. Native checker uses the same LCG/BF16 weight bits; inputs/outputs differ in precision.",
+  "activation": "bf16",
+  "weights": "bf16",
+  "accumulation": "f32",
+  "output": "bf16",
+  "warmup": 8,
+  "trials": 20,
+  "status": "ok",
+  "results": [
+    {
+      "rows": 1,
+      "in": 1024,
+      "out": 248320,
+      "expanded_weight_sha256": "5fdc1a9bd5a88a22adac24dc2ca86c4c9099a9fa7963ae39c1766e2afdab2d63",
+      "gpu_mean_us": 1788.0869,
+      "gpu_median_us": 1775.6455,
+      "gpu_min_us": 1618.416,
+      "gpu_max_us": 2059.999,
+      "wall_mean_us": 4387.4271,
+      "command_counts": [
+        1,
+        2
+      ],
+      "empty_command_counts": [
+        0,
+        1
+      ]
+    },
+    {
+      "rows": 2,
+      "in": 1024,
+      "out": 248320,
+      "expanded_weight_sha256": "5fdc1a9bd5a88a22adac24dc2ca86c4c9099a9fa7963ae39c1766e2afdab2d63",
+      "gpu_mean_us": 1847.24295,
+      "gpu_median_us": 1770.02,
+      "gpu_min_us": 1678.541,
+      "gpu_max_us": 2647.165,
+      "wall_mean_us": 2956.05815,
+      "command_counts": [
+        1,
+        2
+      ],
+      "empty_command_counts": [
+        0,
+        1
+      ]
+    },
+    {
+      "rows": 4,
+      "in": 1024,
+      "out": 248320,
+      "expanded_weight_sha256": "5fdc1a9bd5a88a22adac24dc2ca86c4c9099a9fa7963ae39c1766e2afdab2d63",
+      "gpu_mean_us": 2598.3494,
+      "gpu_median_us": 2608.312,
+      "gpu_min_us": 1921.082,
+      "gpu_max_us": 4063.291,
+      "wall_mean_us": 3749.70195,
+      "command_counts": [
+        1,
+        2
+      ],
+      "empty_command_counts": [
+        0,
+        1
+      ]
+    },
+    {
+      "rows": 8,
+      "in": 1024,
+      "out": 248320,
+      "expanded_weight_sha256": "5fdc1a9bd5a88a22adac24dc2ca86c4c9099a9fa7963ae39c1766e2afdab2d63",
+      "gpu_mean_us": 2112.7013,
+      "gpu_median_us": 2104.603,
+      "gpu_min_us": 1870.583,
+      "gpu_max_us": 2740.291,
+      "wall_mean_us": 3388.31875,
+      "command_counts": [
+        1,
+        2
+      ],
+      "empty_command_counts": [
+        0,
+        1
+      ]
+    },
+    {
+      "rows": 1,
+      "in": 2560,
+      "out": 248320,
+      "expanded_weight_sha256": "a6830a9ade367478b694be6c3a4c048af258b347e9ab9c8a24acc874c897ad0c",
+      "gpu_mean_us": 4062.10555,
+      "gpu_median_us": 4042.916,
+      "gpu_min_us": 3901.916,
+      "gpu_max_us": 4372.499,
+      "wall_mean_us": 4544.1395999999995,
+      "command_counts": [
+        1,
+        2
+      ],
+      "empty_command_counts": [
+        0,
+        1
+      ]
+    },
+    {
+      "rows": 2,
+      "in": 2560,
+      "out": 248320,
+      "expanded_weight_sha256": "a6830a9ade367478b694be6c3a4c048af258b347e9ab9c8a24acc874c897ad0c",
+      "gpu_mean_us": 3948.9993,
+      "gpu_median_us": 3951.02,
+      "gpu_min_us": 3795.415,
+      "gpu_max_us": 4121.749,
+      "wall_mean_us": 5930.477,
+      "command_counts": [
+        1,
+        2
+      ],
+      "empty_command_counts": [
+        0,
+        1
+      ]
+    },
+    {
+      "rows": 4,
+      "in": 2560,
+      "out": 248320,
+      "expanded_weight_sha256": "a6830a9ade367478b694be6c3a4c048af258b347e9ab9c8a24acc874c897ad0c",
+      "gpu_mean_us": 3971.98485,
+      "gpu_median_us": 3963.3325,
+      "gpu_min_us": 3806.625,
+      "gpu_max_us": 4197.875,
+      "wall_mean_us": 4845.23125,
+      "command_counts": [
+        1,
+        2
+      ],
+      "empty_command_counts": [
+        0,
+        1
+      ]
+    },
+    {
+      "rows": 8,
+      "in": 2560,
+      "out": 248320,
+      "expanded_weight_sha256": "a6830a9ade367478b694be6c3a4c048af258b347e9ab9c8a24acc874c897ad0c",
+      "gpu_mean_us": 4457.2973999999995,
+      "gpu_median_us": 4464.8745,
+      "gpu_min_us": 4328.75,
+      "gpu_max_us": 4571.666,
+      "wall_mean_us": 5740.42495,
+      "command_counts": [
+        1,
+        2
+      ],
+      "empty_command_counts": [
+        0,
+        1
+      ]
+    },
+    {
+      "rows": 1,
+      "in": 2560,
+      "out": 9216,
+      "expanded_weight_sha256": "1a835d275f19b6ffa3d6c4f62761eb9ed21798cfd1734157626267be7b3b5ef5",
+      "gpu_mean_us": 145.5724,
+      "gpu_median_us": 144.6245,
+      "gpu_min_us": 133.833,
+      "gpu_max_us": 162.916,
+      "wall_mean_us": 510.2541,
+      "command_counts": [
+        1
+      ],
+      "empty_command_counts": [
+        0
+      ]
+    },
+    {
+      "rows": 2,
+      "in": 2560,
+      "out": 9216,
+      "expanded_weight_sha256": "1a835d275f19b6ffa3d6c4f62761eb9ed21798cfd1734157626267be7b3b5ef5",
+      "gpu_mean_us": 153.8806,
+      "gpu_median_us": 154.20749999999998,
+      "gpu_min_us": 147.375,
+      "gpu_max_us": 159.291,
+      "wall_mean_us": 414.5813,
+      "command_counts": [
+        1
+      ],
+      "empty_command_counts": [
+        0
+      ]
+    },
+    {
+      "rows": 4,
+      "in": 2560,
+      "out": 9216,
+      "expanded_weight_sha256": "1a835d275f19b6ffa3d6c4f62761eb9ed21798cfd1734157626267be7b3b5ef5",
+      "gpu_mean_us": 150.72875,
+      "gpu_median_us": 149.3745,
+      "gpu_min_us": 142.124,
+      "gpu_max_us": 168.833,
+      "wall_mean_us": 467.27915,
+      "command_counts": [
+        1
+      ],
+      "empty_command_counts": [
+        0
+      ]
+    },
+    {
+      "rows": 8,
+      "in": 2560,
+      "out": 9216,
+      "expanded_weight_sha256": "1a835d275f19b6ffa3d6c4f62761eb9ed21798cfd1734157626267be7b3b5ef5",
+      "gpu_mean_us": 154.94335,
+      "gpu_median_us": 152.8125,
+      "gpu_min_us": 145.791,
+      "gpu_max_us": 174.541,
+      "wall_mean_us": 638.1335,
+      "command_counts": [
+        1
+      ],
+      "empty_command_counts": [
+        0
+      ]
+    }
+  ]
+}

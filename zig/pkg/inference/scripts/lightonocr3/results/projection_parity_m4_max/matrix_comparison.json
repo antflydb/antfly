@@ -1,0 +1,248 @@
+{
+  "scope": "Successive shared-machine GPU timings; same LCG/BF16 weight bits. Native F32 activations/output versus MLX BF16. MLX microbenchmark uses default unwired policy; vLLM page reference uses its normal wired limit. Representative projections only, excluding vocabulary head. Not an end-to-end parity claim.",
+  "native_build_report": "native_08/report.json",
+  "within_20_percent_or_faster": 29,
+  "total": 30,
+  "results": [
+    {
+      "rows": 1,
+      "in_dim": 1024,
+      "out_dim": 6144,
+      "native_gpu_mean_us": 26.32,
+      "mlx_gpu_mean_us": 73.27726666666666,
+      "native_over_mlx": 0.3591837031767015
+    },
+    {
+      "rows": 4,
+      "in_dim": 1024,
+      "out_dim": 6144,
+      "native_gpu_mean_us": 63.7,
+      "mlx_gpu_mean_us": 103.56756666666666,
+      "native_over_mlx": 0.6150574166236727
+    },
+    {
+      "rows": 8,
+      "in_dim": 1024,
+      "out_dim": 6144,
+      "native_gpu_mean_us": 44.62,
+      "mlx_gpu_mean_us": 126.01613333333333,
+      "native_over_mlx": 0.3540816466886251
+    },
+    {
+      "rows": 128,
+      "in_dim": 1024,
+      "out_dim": 6144,
+      "native_gpu_mean_us": 502.86,
+      "mlx_gpu_mean_us": 707.5731333333333,
+      "native_over_mlx": 0.7106827214185728
+    },
+    {
+      "rows": 512,
+      "in_dim": 1024,
+      "out_dim": 6144,
+      "native_gpu_mean_us": 969.38,
+      "mlx_gpu_mean_us": 1113.3383333333334,
+      "native_over_mlx": 0.8706966884879259
+    },
+    {
+      "rows": 1,
+      "in_dim": 1024,
+      "out_dim": 3584,
+      "native_gpu_mean_us": 15.97,
+      "mlx_gpu_mean_us": 15.663366666666667,
+      "native_over_mlx": 1.0195764639785827
+    },
+    {
+      "rows": 4,
+      "in_dim": 1024,
+      "out_dim": 3584,
+      "native_gpu_mean_us": 22.46,
+      "mlx_gpu_mean_us": 23.639833333333332,
+      "native_over_mlx": 0.9500913007000896
+    },
+    {
+      "rows": 8,
+      "in_dim": 1024,
+      "out_dim": 3584,
+      "native_gpu_mean_us": 24.35,
+      "mlx_gpu_mean_us": 35.5091,
+      "native_over_mlx": 0.6857397117921886
+    },
+    {
+      "rows": 128,
+      "in_dim": 1024,
+      "out_dim": 3584,
+      "native_gpu_mean_us": 115.67,
+      "mlx_gpu_mean_us": 470.4537666666667,
+      "native_over_mlx": 0.24586900604402287
+    },
+    {
+      "rows": 512,
+      "in_dim": 1024,
+      "out_dim": 3584,
+      "native_gpu_mean_us": 420.33,
+      "mlx_gpu_mean_us": 1542.8384666666666,
+      "native_over_mlx": 0.2724394089733395
+    },
+    {
+      "rows": 1,
+      "in_dim": 3584,
+      "out_dim": 1024,
+      "native_gpu_mean_us": 17.63,
+      "mlx_gpu_mean_us": 47.930033333333334,
+      "native_over_mlx": 0.3678278268114425
+    },
+    {
+      "rows": 4,
+      "in_dim": 3584,
+      "out_dim": 1024,
+      "native_gpu_mean_us": 19.39,
+      "mlx_gpu_mean_us": 58.3842,
+      "native_over_mlx": 0.3321103997314342
+    },
+    {
+      "rows": 8,
+      "in_dim": 3584,
+      "out_dim": 1024,
+      "native_gpu_mean_us": 19.54,
+      "mlx_gpu_mean_us": 72.34663333333333,
+      "native_over_mlx": 0.27008858739798536
+    },
+    {
+      "rows": 128,
+      "in_dim": 3584,
+      "out_dim": 1024,
+      "native_gpu_mean_us": 147.2,
+      "mlx_gpu_mean_us": 466.37033333333335,
+      "native_over_mlx": 0.3156289958409304
+    },
+    {
+      "rows": 512,
+      "in_dim": 3584,
+      "out_dim": 1024,
+      "native_gpu_mean_us": 560.97,
+      "mlx_gpu_mean_us": 577.6245,
+      "native_over_mlx": 0.9711672548515515
+    },
+    {
+      "rows": 1,
+      "in_dim": 2560,
+      "out_dim": 8192,
+      "native_gpu_mean_us": 142.69,
+      "mlx_gpu_mean_us": 177.63276666666667,
+      "native_over_mlx": 0.8032864807412596
+    },
+    {
+      "rows": 4,
+      "in_dim": 2560,
+      "out_dim": 8192,
+      "native_gpu_mean_us": 244.79,
+      "mlx_gpu_mean_us": 238.35926666666666,
+      "native_over_mlx": 1.0269791622673785
+    },
+    {
+      "rows": 8,
+      "in_dim": 2560,
+      "out_dim": 8192,
+      "native_gpu_mean_us": 264.68,
+      "mlx_gpu_mean_us": 333.5411666666667,
+      "native_over_mlx": 0.7935452245524914
+    },
+    {
+      "rows": 128,
+      "in_dim": 2560,
+      "out_dim": 8192,
+      "native_gpu_mean_us": 513.86,
+      "mlx_gpu_mean_us": 794.6106333333333,
+      "native_over_mlx": 0.6466815046816011
+    },
+    {
+      "rows": 512,
+      "in_dim": 2560,
+      "out_dim": 8192,
+      "native_gpu_mean_us": 1925.69,
+      "mlx_gpu_mean_us": 1921.5369,
+      "native_over_mlx": 1.0021613428292737
+    },
+    {
+      "rows": 1,
+      "in_dim": 2560,
+      "out_dim": 9216,
+      "native_gpu_mean_us": 148.26,
+      "mlx_gpu_mean_us": 138.03283333333334,
+      "native_over_mlx": 1.0740922751470965
+    },
+    {
+      "rows": 4,
+      "in_dim": 2560,
+      "out_dim": 9216,
+      "native_gpu_mean_us": 185.41,
+      "mlx_gpu_mean_us": 141.0703,
+      "native_over_mlx": 1.3143092486512042
+    },
+    {
+      "rows": 8,
+      "in_dim": 2560,
+      "out_dim": 9216,
+      "native_gpu_mean_us": 166.47,
+      "mlx_gpu_mean_us": 142.76756666666665,
+      "native_over_mlx": 1.1660211341184634
+    },
+    {
+      "rows": 128,
+      "in_dim": 2560,
+      "out_dim": 9216,
+      "native_gpu_mean_us": 563.07,
+      "mlx_gpu_mean_us": 574.2786666666667,
+      "native_over_mlx": 0.9804821817050491
+    },
+    {
+      "rows": 512,
+      "in_dim": 2560,
+      "out_dim": 9216,
+      "native_gpu_mean_us": 2175.8,
+      "mlx_gpu_mean_us": 2075.868933333333,
+      "native_over_mlx": 1.048139391202412
+    },
+    {
+      "rows": 1,
+      "in_dim": 9216,
+      "out_dim": 2560,
+      "native_gpu_mean_us": 142.39,
+      "mlx_gpu_mean_us": 133.3426,
+      "native_over_mlx": 1.067850784370486
+    },
+    {
+      "rows": 4,
+      "in_dim": 9216,
+      "out_dim": 2560,
+      "native_gpu_mean_us": 156.14,
+      "mlx_gpu_mean_us": 145.95643333333334,
+      "native_over_mlx": 1.0697712764973475
+    },
+    {
+      "rows": 8,
+      "in_dim": 9216,
+      "out_dim": 2560,
+      "native_gpu_mean_us": 150.04,
+      "mlx_gpu_mean_us": 144.28416666666666,
+      "native_over_mlx": 1.0398923420795767
+    },
+    {
+      "rows": 128,
+      "in_dim": 9216,
+      "out_dim": 2560,
+      "native_gpu_mean_us": 595.29,
+      "mlx_gpu_mean_us": 730.5828333333334,
+      "native_over_mlx": 0.8148152034779537
+    },
+    {
+      "rows": 512,
+      "in_dim": 9216,
+      "out_dim": 2560,
+      "native_gpu_mean_us": 2212.7,
+      "mlx_gpu_mean_us": 2211.7244666666666,
+      "native_over_mlx": 1.0004410736274052
+    }
+  ]
+}

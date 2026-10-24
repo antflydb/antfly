@@ -1,0 +1,309 @@
+{
+  "created_at": "2026-10-22T23:32:24.776354+00:00",
+  "hardware": {
+    "processor": "Apple M4 Max",
+    "physical_memory_bytes": 38654705664
+  },
+  "versions": {
+    "mlx": "0.32.2",
+    "mlx-vlm": "0.7.6",
+    "mlx-lm": "0.32.0",
+    "transformers": "5.19.0"
+  },
+  "model": {
+    "directory": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/florence-fp16",
+    "weight_bytes": 463221266,
+    "weight_files": [
+      {
+        "name": "model.safetensors",
+        "bytes": 463221266
+      }
+    ],
+    "metadata": {
+      "config.json": {
+        "_name_or_path": "florence2",
+        "architectures": [
+          "Florence2ForConditionalGeneration"
+        ],
+        "auto_map": {
+          "AutoConfig": "configuration_florence2.Florence2Config",
+          "AutoModelForCausalLM": "modeling_florence2.Florence2ForConditionalGeneration"
+        },
+        "bos_token_id": 0,
+        "eos_token_id": 2,
+        "ignore_index": -100,
+        "model_type": "florence2",
+        "pad_token_id": 1,
+        "projection_dim": 768,
+        "text_config": {
+          "vocab_size": 51289,
+          "activation_dropout": 0.1,
+          "activation_function": "gelu",
+          "add_bias_logits": false,
+          "add_final_layer_norm": false,
+          "attention_dropout": 0.1,
+          "bos_token_id": 0,
+          "classif_dropout": 0.1,
+          "classifier_dropout": 0.0,
+          "d_model": 768,
+          "decoder_attention_heads": 12,
+          "decoder_ffn_dim": 3072,
+          "decoder_layerdrop": 0.0,
+          "decoder_layers": 6,
+          "decoder_start_token_id": 2,
+          "dropout": 0.1,
+          "early_stopping": true,
+          "encoder_attention_heads": 12,
+          "encoder_ffn_dim": 3072,
+          "encoder_layerdrop": 0.0,
+          "encoder_layers": 6,
+          "eos_token_id": 2,
+          "forced_eos_token_id": 2,
+          "forced_bos_token_id": 0,
+          "gradient_checkpointing": false,
+          "init_std": 0.02,
+          "is_encoder_decoder": true,
+          "label2id": {
+            "LABEL_0": 0,
+            "LABEL_1": 1,
+            "LABEL_2": 2
+          },
+          "max_position_embeddings": 1024,
+          "no_repeat_ngram_size": 3,
+          "normalize_before": false,
+          "num_hidden_layers": 6,
+          "pad_token_id": 1,
+          "scale_embedding": false,
+          "num_beams": 3
+        },
+        "vision_config": {
+          "model_type": "davit",
+          "drop_path_rate": 0.1,
+          "patch_size": [
+            7,
+            3,
+            3,
+            3
+          ],
+          "patch_stride": [
+            4,
+            2,
+            2,
+            2
+          ],
+          "patch_padding": [
+            3,
+            1,
+            1,
+            1
+          ],
+          "patch_prenorm": [
+            false,
+            true,
+            true,
+            true
+          ],
+          "enable_checkpoint": false,
+          "dim_embed": [
+            128,
+            256,
+            512,
+            1024
+          ],
+          "num_heads": [
+            4,
+            8,
+            16,
+            32
+          ],
+          "num_groups": [
+            4,
+            8,
+            16,
+            32
+          ],
+          "depths": [
+            1,
+            1,
+            9,
+            1
+          ],
+          "window_size": 12,
+          "projection_dim": 768,
+          "visual_temporal_embedding": {
+            "type": "COSINE",
+            "max_temporal_embeddings": 100
+          },
+          "image_pos_embed": {
+            "type": "learned_abs_2d",
+            "max_pos_embeddings": 50
+          },
+          "image_feature_source": [
+            "spatial_avg_pool",
+            "temporal_avg_pool"
+          ]
+        },
+        "vocab_size": 51289,
+        "torch_dtype": "float16",
+        "transformers_version": "4.41.0.dev0",
+        "is_encoder_decoder": true
+      },
+      "preprocessor_config.json": {
+        "auto_map": {
+          "AutoProcessor": "processing_florence2.Florence2Processor"
+        },
+        "_valid_processor_keys": [
+          "images",
+          "do_resize",
+          "size",
+          "resample",
+          "do_rescale",
+          "rescale_factor",
+          "do_normalize",
+          "image_mean",
+          "image_std",
+          "return_tensors",
+          "data_format",
+          "input_data_format",
+          "do_convert_rgb"
+        ],
+        "do_convert_rgb": null,
+        "do_normalize": true,
+        "do_rescale": true,
+        "do_resize": true,
+        "do_center_crop": false,
+        "image_processor_type": "CLIPImageProcessor",
+        "image_seq_length": 577,
+        "image_mean": [
+          0.485,
+          0.456,
+          0.406
+        ],
+        "image_std": [
+          0.229,
+          0.224,
+          0.225
+        ],
+        "processor_class": "Florence2Processor",
+        "resample": 3,
+        "size": {
+          "height": 768,
+          "width": 768
+        },
+        "crop_size": {
+          "height": 768,
+          "width": 768
+        }
+      }
+    }
+  },
+  "images": [
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/src/models/testdata/lightonocr3/invoice.png",
+      "sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e"
+    },
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/corpus/receipt.png",
+      "sha256": "4ccfc5a949e85643492606a95832a3f7630877fd334fece0b4fe4dc6a3291e03"
+    },
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/corpus/shipping.png",
+      "sha256": "3bfab6d55f212b14fcd91a4663e2a7aa9e031ccd1242fd236728af99836d0007"
+    }
+  ],
+  "scope": "MLX-VLM Florence-2, original full precision checkpoint, greedy <OCR>, 256-token limit, repeated mixed pages. Offline batches include preprocessing, inference and text decoding; exclude loading and serial reference reads. No vision/prefix cache supplied. Other machine workloads uncontrolled. Separate reference: vLLM Metal 0.32.0 has no Florence-2 adapter.",
+  "results": [
+    {
+      "batch_size": 1,
+      "completed": 16,
+      "elapsed_seconds": 3.8347809160040924,
+      "pages_per_second": 4.172337442596922,
+      "serial_reference_parity": true,
+      "outputs": [
+        {
+          "image_index": 0,
+          "text": "Antify local OCRInvoice 12345Total USD 42.00"
+        },
+        {
+          "image_index": 1,
+          "text": "ANTFLY MARKETReceipt 4087EDate: 2026-10-21CoffeeUSD 4.50NotebookUSD 7.25SubtotalUSD 11.75TaxUSD 0.94TotalUSD 12.69"
+        },
+        {
+          "image_index": 2,
+          "text": "EXPRESS DELIVERYSHIP TO:Avery Chen184 Cedar StreetPortland OR 97205Tracking: 987654321012Weight: 2.40 kgService: NEXT DAY"
+        },
+        {
+          "image_index": 0,
+          "text": "Antify local OCRInvoice 12345Total USD 42.00"
+        },
+        {
+          "image_index": 1,
+          "text": "ANTFLY MARKETReceipt 4087EDate: 2026-10-21CoffeeUSD 4.50NotebookUSD 7.25SubtotalUSD 11.75TaxUSD 0.94TotalUSD 12.69"
+        },
+        {
+          "image_index": 2,
+          "text": "EXPRESS DELIVERYSHIP TO:Avery Chen184 Cedar StreetPortland OR 97205Tracking: 987654321012Weight: 2.40 kgService: NEXT DAY"
+        },
+        {
+          "image_index": 0,
+          "text": "Antify local OCRInvoice 12345Total USD 42.00"
+        },
+        {
+          "image_index": 1,
+          "text": "ANTFLY MARKETReceipt 4087EDate: 2026-10-21CoffeeUSD 4.50NotebookUSD 7.25SubtotalUSD 11.75TaxUSD 0.94TotalUSD 12.69"
+        },
+        {
+          "image_index": 2,
+          "text": "EXPRESS DELIVERYSHIP TO:Avery Chen184 Cedar StreetPortland OR 97205Tracking: 987654321012Weight: 2.40 kgService: NEXT DAY"
+        },
+        {
+          "image_index": 0,
+          "text": "Antify local OCRInvoice 12345Total USD 42.00"
+        },
+        {
+          "image_index": 1,
+          "text": "ANTFLY MARKETReceipt 4087EDate: 2026-10-21CoffeeUSD 4.50NotebookUSD 7.25SubtotalUSD 11.75TaxUSD 0.94TotalUSD 12.69"
+        },
+        {
+          "image_index": 2,
+          "text": "EXPRESS DELIVERYSHIP TO:Avery Chen184 Cedar StreetPortland OR 97205Tracking: 987654321012Weight: 2.40 kgService: NEXT DAY"
+        },
+        {
+          "image_index": 0,
+          "text": "Antify local OCRInvoice 12345Total USD 42.00"
+        },
+        {
+          "image_index": 1,
+          "text": "ANTFLY MARKETReceipt 4087EDate: 2026-10-21CoffeeUSD 4.50NotebookUSD 7.25SubtotalUSD 11.75TaxUSD 0.94TotalUSD 12.69"
+        },
+        {
+          "image_index": 2,
+          "text": "EXPRESS DELIVERYSHIP TO:Avery Chen184 Cedar StreetPortland OR 97205Tracking: 987654321012Weight: 2.40 kgService: NEXT DAY"
+        },
+        {
+          "image_index": 0,
+          "text": "Antify local OCRInvoice 12345Total USD 42.00"
+        }
+      ]
+    }
+  ],
+  "status": "ok",
+  "weight_dtypes": [
+    "mlx.core.float16"
+  ],
+  "prompt": "<OCR>",
+  "references": [
+    {
+      "text": "Antify local OCRInvoice 12345Total USD 42.00",
+      "generation_tokens": 16
+    },
+    {
+      "text": "ANTFLY MARKETReceipt 4087EDate: 2026-10-21CoffeeUSD 4.50NotebookUSD 7.25SubtotalUSD 11.75TaxUSD 0.94TotalUSD 12.69",
+      "generation_tokens": 50
+    },
+    {
+      "text": "EXPRESS DELIVERYSHIP TO:Avery Chen184 Cedar StreetPortland OR 97205Tracking: 987654321012Weight: 2.40 kgService: NEXT DAY",
+      "generation_tokens": 38
+    }
+  ]
+}

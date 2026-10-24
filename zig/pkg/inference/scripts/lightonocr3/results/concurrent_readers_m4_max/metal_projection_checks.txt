@@ -1,0 +1,75 @@
+projection rows=6 in=1024 out=6144 input_offset=0 bf16_input=0 max_abs=4.17233e-07
+projection rows=7 in=2560 out=8192 input_offset=0 bf16_input=0 max_abs=7.7486e-07
+projection rows=2 in=9216 out=2560 input_offset=0 bf16_input=0 max_abs=1.78814e-06
+projection rows=3 in=9216 out=2560 input_offset=0 bf16_input=0 max_abs=2.6226e-06
+projection rows=4 in=2560 out=9216 input_offset=0 bf16_input=0 max_abs=7.15256e-07
+projection rows=5 in=1024 out=6144 input_offset=0 bf16_input=0 max_abs=4.17233e-07
+projection rows=5 in=2560 out=248320 input_offset=0 bf16_input=0 max_abs=8.34465e-07
+projection rows=8 in=1024 out=248320 input_offset=0 bf16_input=0 max_abs=4.76837e-07
+projection rows=8 in=1024 out=3584 input_offset=0 bf16_input=0 max_abs=4.17233e-07
+projection rows=8 in=1024 out=6144 input_offset=0 bf16_input=0 max_abs=2.5034e-06
+projection rows=8 in=2560 out=8192 input_offset=0 bf16_input=0 max_abs=7.51019e-06
+projection rows=8 in=2560 out=9216 input_offset=0 bf16_input=0 max_abs=7.7486e-07
+projection rows=8 in=9216 out=2560 input_offset=0 bf16_input=0 max_abs=2.6226e-06
+projection rows=1 in=1024 out=16 input_offset=0 bf16_input=0 max_abs=5.36442e-07
+projection rows=1 in=1024 out=512 input_offset=0 bf16_input=0 max_abs=2.38419e-07
+projection rows=1 in=1024 out=6144 input_offset=0 bf16_input=0 max_abs=3.57628e-07
+projection rows=1 in=3584 out=1024 input_offset=0 bf16_input=0 max_abs=7.15256e-07
+projection rows=1 in=2048 out=1024 input_offset=0 bf16_input=0 max_abs=4.76837e-07
+projection rows=1 in=1024 out=248320 input_offset=0 bf16_input=0 max_abs=3.57628e-07
+projection rows=33 in=768 out=2304 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=768 out=2304 input_offset=0 bf16_input=1 max_abs=0
+projection rows=33 in=768 out=3072 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=768 out=3072 input_offset=0 bf16_input=1 max_abs=0
+projection rows=33 in=3072 out=768 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=3072 out=768 input_offset=0 bf16_input=1 max_abs=0
+projection rows=33 in=3072 out=3072 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=3072 out=3072 input_offset=0 bf16_input=1 max_abs=0
+projection rows=33 in=3072 out=1024 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=3072 out=1024 input_offset=0 bf16_input=1 max_abs=0
+projection rows=33 in=1024 out=3584 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=1024 out=3584 input_offset=0 bf16_input=1 max_abs=0
+projection rows=33 in=3584 out=1024 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=3584 out=1024 input_offset=0 bf16_input=1 max_abs=0
+projection rows=8 in=2560 out=248320 input_offset=0 bf16_input=0 max_abs=8.34465e-07
+projection rows=2 in=1024 out=3584 input_offset=0 bf16_input=0 max_abs=3.57628e-07
+projection rows=3 in=1024 out=128 input_offset=16 bf16_input=0 max_abs=2.38419e-07
+projection rows=4 in=3584 out=1024 input_offset=0 bf16_input=0 max_abs=8.34465e-07
+projection rows=5 in=2560 out=1024 input_offset=0 bf16_input=0 max_abs=5.96046e-07
+projection rows=8 in=4096 out=2560 input_offset=16 bf16_input=0 max_abs=1.07288e-06
+projection rows=4 in=2560 out=64 input_offset=0 bf16_input=0 max_abs=2.6226e-06
+projection rows=4 in=1024 out=3584 input_offset=4 bf16_input=0 max_abs=0
+projection rows=1 in=2560 out=32 input_offset=0 bf16_input=0 max_abs=1.54972e-06
+projection rows=1 in=2560 out=64 input_offset=0 bf16_input=0 max_abs=1.66893e-06
+projection rows=1 in=2560 out=1024 input_offset=0 bf16_input=0 max_abs=4.76837e-07
+projection rows=1 in=4096 out=2560 input_offset=16 bf16_input=0 max_abs=1.01328e-06
+projection rows=1 in=9216 out=2560 input_offset=0 bf16_input=0 max_abs=1.80304e-06
+projection rows=1 in=2560 out=1024 input_offset=4 bf16_input=0 max_abs=0
+projection rows=33 in=2560 out=1024 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=2560 out=1024 input_offset=0 bf16_input=1 max_abs=0
+projection rows=65 in=4096 out=2560 input_offset=16 bf16_input=0 max_abs=0
+projection rows=65 in=4096 out=2560 input_offset=16 bf16_input=1 max_abs=0
+projection rows=33 in=1024 out=3072 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=1024 out=3072 input_offset=0 bf16_input=1 max_abs=0
+projection rows=31 in=2560 out=1024 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=2560 out=1024 input_offset=4 bf16_input=0 max_abs=0
+projection rows=33 in=2560 out=1024 input_offset=4 bf16_input=1 max_abs=0
+fused gate/up max_abs=2.38419e-06
+fused gate/up max_abs=7.15256e-07
+BF16 pack edges: 11 values passed
+parallel norm rows=1 hidden=1024 max_abs=0
+parallel norm rows=1 hidden=128 max_abs=3.57628e-07
+parallel norm rows=2 hidden=1024 max_abs=0
+parallel norm rows=8 hidden=1024 max_abs=7.15256e-07
+parallel norm rows=4 hidden=128 max_abs=3.57628e-07
+parallel norm rows=1 hidden=2560 max_abs=8.34465e-07
+parallel norm rows=4 hidden=256 max_abs=3.57628e-07
+parallel norm rows=16 hidden=256 max_abs=3.57628e-07
+parallel norm rows=1 hidden=512 max_abs=0
+parallel norm rows=33 hidden=2560 max_abs=0
+projection rows=33 in=2560 out=1024 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=2560 out=1024 input_offset=0 bf16_input=1 max_abs=0
+projection rows=4 in=1024 out=3584 input_offset=0 bf16_input=0 max_abs=0
+projection rows=8 in=1024 out=248320 input_offset=0 bf16_input=0 max_abs=4.76837e-07
+projection rows=5 in=1024 out=6144 input_offset=0 bf16_input=0 max_abs=3.57628e-07
+All projection checks passed

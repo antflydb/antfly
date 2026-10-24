@@ -1,0 +1,180 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Benchmark-only bridge. Calls production dispatchers; never linked into Antfly.
+#include "../../src/backends/metal_kernels.m"
+#ifndef OCR_PAIR_RUNTIME_SHA
+#define OCR_PAIR_RUNTIME_SHA "unknown"
+#endif
+#ifndef OCR_PAIR_BRIDGE_SHA
+#define OCR_PAIR_BRIDGE_SHA "unknown"
+#endif
+static termite_metal_decode_runtime *pair_runtime;
+@interface OCRPairCase : NSObject {
+  @public
+    size_t kind, rows, in_dim, out_dim;
+    void *weight_storage;
+    id<MTLBuffer> input, output, gates, state;
+}
+@end
+@implementation OCRPairCase
+- (void)dealloc {
+    if (weight_storage) {
+        if (pair_runtime) {
+            (void)termite_metal_decode_runtime_clear_linear_slot(pair_runtime, 0);
+            if (kind == 3)
+                (void)termite_metal_decode_runtime_clear_linear_slot(pair_runtime, 1);
+        }
+        free(weight_storage);
+    }
+}
+@end
+const char *ocr_pair_runtime_sha(void) { return OCR_PAIR_RUNTIME_SHA; }
+const char *ocr_pair_bridge_sha(void) { return OCR_PAIR_BRIDGE_SHA; }
+void *ocr_pair_create(size_t kind, size_t rows, size_t in_dim, size_t out_dim, const uint16_t *weights,
+                      const float *values, const float *norm, const float *gates) {
+    @autoreleasepool {
+        if (!pair_runtime) {
+            pair_runtime = termite_metal_decode_runtime_create();
+            if (!pair_runtime)
+                return NULL;
+            termite_metal_decode_runtime_set_lightonocr3_projections(pair_runtime, 1);
+            termite_metal_decode_runtime_set_qwen35_ocr_vector_loads(pair_runtime, 1);
+        }
+        termite_metal_decode_runtime *r = pair_runtime;
+        if (rows == 0 || rows > 2048 || in_dim == 0 || in_dim > 32768 || out_dim == 0 || out_dim > 248320 ||
+            kind > 3)
+            return NULL;
+        OCRPairCase *c = [OCRPairCase new];
+        c->kind = kind;
+        c->rows = rows;
+        c->in_dim = in_dim;
+        c->out_dim = out_dim;
+        c->input = [r->device newBufferWithBytes:values
+                                          length:rows * in_dim * 4
+                                         options:MTLResourceStorageModeShared];
+        size_t output_count = rows * (kind == 1 ? in_dim : kind == 2 ? out_dim * 128 : out_dim);
+        c->output = [r->device newBufferWithLength:output_count * 4 options:MTLResourceStorageModeShared];
+        if (!c->input || !c->output)
+            return NULL;
+        if (kind == 0 || kind == 3) {
+            if (!weights)
+                return NULL;
+            const size_t matrix_bytes = in_dim * out_dim * 2;
+            const size_t total_bytes = matrix_bytes * (kind == 3 ? 2 : 1);
+            const size_t page_bytes = (size_t)getpagesize();
+            if (matrix_bytes % page_bytes != 0 || posix_memalign(&c->weight_storage, page_bytes, total_bytes))
+                return NULL;
+            memcpy(c->weight_storage, weights, total_bytes);
+            weights = c->weight_storage;
+            float *bias = calloc(out_dim, 4);
+            if (!bias)
+                return NULL;
+            int rc = termite_metal_decode_runtime_prepare_linear_bf16_no_copy(
+                r, 0, (const uint8_t *)weights, in_dim * out_dim * 2, bias, in_dim, out_dim);
+            if (!rc && kind == 3)
+                rc = termite_metal_decode_runtime_prepare_linear_bf16_no_copy(
+                    r, 1, (const uint8_t *)(weights + in_dim * out_dim), in_dim * out_dim * 2, bias, in_dim,
+                    out_dim);
+            free(bias);
+            if (rc)
+                return NULL;
+            if (kind == 3 &&
+                !termite_metal_decode_runtime_should_apply_bf16_gate_up(r, 0, 1, 0, rows, in_dim, out_dim))
+                return NULL;
+        } else if (kind == 1) {
+            if (!norm || termite_metal_decode_runtime_prepare_rms_norm(r, 0, norm, in_dim))
+                return NULL;
+        } else {
+            if (!gates || rows < 128 || (out_dim != 16 && out_dim != 32) || in_dim != (32 + out_dim) * 128)
+                return NULL;
+            c->gates = [r->device newBufferWithBytes:gates
+                                              length:rows * out_dim * 2 * 4
+                                             options:MTLResourceStorageModeShared];
+            c->state = [r->device newBufferWithLength:out_dim * 128 * 128 * 4
+                                              options:MTLResourceStorageModeShared];
+            if (!c->gates || !c->state || !r->qwen35_recurrent_columns4_pipeline)
+                return NULL;
+        }
+        return (__bridge_retained void *)c;
+    }
+}
+uint64_t ocr_pair_run(void *handle) {
+    @autoreleasepool {
+        OCRPairCase *c = (__bridge OCRPairCase *)handle;
+        termite_metal_decode_runtime *r = pair_runtime;
+        if (!c || !r || termite_metal_decode_runtime_begin_frame(r))
+            return 0;
+        int rc = 0;
+        if (c->kind == 0)
+            rc = c->rows == 1
+                     ? termite_metal_decode_runtime_apply_linear_device(r, 0, (__bridge void *)c->input, 0,
+                                                                        c->in_dim, c->out_dim,
+                                                                        (__bridge void *)c->output, 0)
+                     : termite_metal_decode_runtime_apply_linear_multi_row_device(
+                           r, 0, (__bridge void *)c->input, 0, c->rows, c->in_dim, c->out_dim,
+                           (__bridge void *)c->output, 0);
+        else if (c->kind == 1)
+            rc = termite_metal_decode_runtime_apply_rms_norm_rows_device(
+                r, 0, (__bridge void *)c->input, 0, c->rows, c->in_dim, 1e-6f, (__bridge void *)c->output, 0);
+        else if (c->kind == 3)
+            rc = termite_metal_decode_runtime_apply_bf16_gate_up_device(r, 0, 1, (__bridge void *)c->input, 0,
+                                                                        c->rows, c->in_dim, c->out_dim,
+                                                                        (__bridge void *)c->output, 0);
+        else {
+            // Same production kernel and launch used by the qualified prefill
+            // selector; compare the recurrent stage independently of its core.
+            uint32_t p[6] = {(uint32_t)c->rows, 16, (uint32_t)c->out_dim, 128, 4, 0};
+            id<MTLComputeCommandEncoder> e = termite_metal_tracked_compute_command_encoder_for(
+                r->active_frame_cb, TERMITE_METAL_COMPUTE_SOURCE_OTHER);
+            if (!e)
+                rc = -1;
+            else {
+                [e setComputePipelineState:r->qwen35_recurrent_columns4_pipeline];
+                [e setBuffer:c->state offset:0 atIndex:8];
+                [e setBuffer:c->input offset:0 atIndex:9];
+                [e setBuffer:c->gates offset:0 atIndex:10];
+                [e setBuffer:c->output offset:0 atIndex:11];
+                [e setBytes:p length:24 atIndex:15];
+                [e dispatchThreads:MTLSizeMake(c->out_dim * 128 * 8, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                [e endEncoding];
+            }
+        }
+        if (rc) {
+            (void)termite_metal_decode_runtime_cancel_frame(r);
+            return 0;
+        }
+        if (termite_metal_decode_runtime_submit_frame(r) || termite_metal_decode_runtime_wait_frame(r))
+            return 0;
+        return r->last_frame_gpu_nanos;
+    }
+}
+const float *ocr_pair_output(void *handle) {
+    OCRPairCase *c = (__bridge OCRPairCase *)handle;
+    return c ? c->output.contents : NULL;
+}
+void ocr_pair_release(void *handle) {
+    if (handle) {
+        id c = CFBridgingRelease(handle);
+        (void)c;
+    }
+}
+void ocr_pair_shutdown(void) {
+    if (pair_runtime) {
+        termite_metal_decode_runtime_destroy(pair_runtime);
+        pair_runtime = NULL;
+    }
+}

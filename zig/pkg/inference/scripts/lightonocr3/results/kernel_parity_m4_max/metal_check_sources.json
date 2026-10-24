@@ -1,0 +1,4 @@
+{
+  "zig/pkg/inference/src/backends/metal_kernels.m": "df45afc1126870df10599794c086b7dfb569a193be464e344c95ddb3308f525c",
+  "zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m": "0cbec5b2f389f88c14f6b0cea2dd2d048f3d1e718178807356c6469f741d8641"
+}

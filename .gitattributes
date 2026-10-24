@@ -25,3 +25,10 @@ zig/lib/syntax/src/grammars/*.bin binary
 # CLI tooling and benchmark evidence are generated artifacts; keep source diffs readable.
 zig/pkg/antfly-grep/generated/** linguist-generated=true
 zig/pkg/antfly-grep/bench/results/** linguist-generated=true
+
+# OCR timing samples and captured benchmark logs are generated evidence.
+zig/pkg/inference/scripts/lightonocr3/results/throughput_parity_m4_max/** linguist-generated=true
+zig/pkg/inference/scripts/lightonocr3/results/throughput_parity_m4_max/README.md linguist-generated=false
+
+zig/pkg/inference/scripts/lightonocr3/results/throughput_recurrent_m4_max/** linguist-generated=true
+zig/pkg/inference/scripts/lightonocr3/results/throughput_recurrent_m4_max/README.md linguist-generated=false

@@ -1,0 +1,14 @@
+{
+  "log": "native_08_planned_profile/lighton08-batch-c8.txt",
+  "original_log_sha256": "88a26b3d4882f8f92918b80e51e08c5236a44fc6114fe0984446b04b357e0eed",
+  "gate_split_dispatches_including_warmup": {
+    "2": 72,
+    "3": 3240,
+    "4": 120,
+    "5": 912,
+    "6": 48,
+    "7": 96,
+    "8": 384
+  },
+  "scope": "Instrumented actual reader dispatches, including untimed warmup; not a throughput control."
+}

@@ -1,0 +1,12 @@
+{
+  "runtime_files_sha256": {
+    "zig/pkg/inference/src/backends/metal_kernels.m": "7f4b930ffd18cb8c77999d130142846ed000757746588c0829d7a14cfffbf488",
+    "zig/pkg/inference/src/architectures/gpt.zig": "a0fb00852ec520a83dacd1f5b56c65c7ee843c30eb0fc3cfae51f693ed668311",
+    "zig/pkg/inference/src/ops/metal_compute.zig": "a63af7ea9fe75c546ec215f6ea6a3c5acbc1887309d7b4c88ed34bcd93beca39",
+    "zig/pkg/inference/src/server/server.zig": "db2f82582e3414790a41660bad0684c64867b252285f7fa9c0aec91508b2559b"
+  },
+  "base_commit": "514dcf443bd9537445fc34480773ad0a540145fb",
+  "runtime_diff_sha256": "3d7fbee27ef84a2de5d5cb27ff9fdda592e07c3295428eb129fabb088a345c2f",
+  "binary_sha256": "bd964574655903d1fca29c10660d63c6c81fc00559761a23f2e6e45d55e6d63e",
+  "build": "stripped ReleaseFast; Zig 0.17.0; worktree-local .zig-cache"
+}

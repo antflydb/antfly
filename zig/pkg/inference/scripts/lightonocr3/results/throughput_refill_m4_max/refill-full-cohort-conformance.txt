@@ -1,0 +1,342 @@
+batch_gate_up rows=4 in=2560 out=9216 offset=16 max_abs=2.6226e-06 cpu_samples=3.80667e-07 fallback=pass
+batch_gate_up rows=5 in=1024 out=3584 offset=16 max_abs=6.55651e-07 cpu_samples=2.36447e-07 fallback=pass
+batch_gate_up rows=5 in=2560 out=9216 offset=16 max_abs=2.38419e-07 cpu_samples=3.28678e-07 fallback=pass
+batch_gate_up rows=6 in=1024 out=3584 offset=16 max_abs=6.55651e-07 cpu_samples=1.15942e-07 fallback=pass
+batch_gate_up rows=6 in=2560 out=9216 offset=16 max_abs=2.38419e-07 cpu_samples=1.54512e-07 fallback=pass
+batch_gate_up rows=7 in=1024 out=3584 offset=16 max_abs=2.98023e-06 cpu_samples=2.54026e-07 fallback=pass
+batch_gate_up rows=7 in=2560 out=9216 offset=16 max_abs=2.38419e-07 cpu_samples=9.77161e-08 fallback=pass
+batch_gate_up rows=8 in=1024 out=3584 offset=16 max_abs=2.98023e-06 cpu_samples=7.9872e-08 fallback=pass
+batch_gate_up rows=8 in=2560 out=9216 offset=16 max_abs=2.38419e-07 cpu_samples=3.9646e-08 fallback=pass
+prefill_columns seq=127 value_heads=16 cold_continue_missing=pass canaries=pass offset=16 max_abs=0
+prefill_columns seq=127 value_heads=32 cold_continue_missing=pass canaries=pass offset=16 max_abs=0
+prefill_columns seq=128 value_heads=16 cold_continue_missing=pass canaries=pass offset=16 max_abs=1.86265e-09
+prefill_columns seq=128 value_heads=32 cold_continue_missing=pass canaries=pass offset=16 max_abs=1.11759e-08
+prefill_columns seq=432 value_heads=16 cold_continue_missing=pass canaries=pass offset=16 max_abs=2.79397e-09
+prefill_columns seq=432 value_heads=32 cold_continue_missing=pass canaries=pass offset=16 max_abs=1.30385e-08
+prefill_columns seq=554 value_heads=16 cold_continue_missing=pass canaries=pass offset=16 max_abs=2.79397e-09
+prefill_columns seq=554 value_heads=32 cold_continue_missing=pass canaries=pass offset=16 max_abs=1.11759e-08
+prefill_columns seq=662 value_heads=16 cold_continue_missing=pass canaries=pass offset=16 max_abs=2.79397e-09
+prefill_columns seq=662 value_heads=32 cold_continue_missing=pass canaries=pass offset=16 max_abs=1.11759e-08
+ocr_weight_residency_check tied_buffers=pass mapped_alias=pass clear_replace=pass cap=pass disable=pass release=pass
+f16_encoder_check rows=129 in=128 out=128 offset=16 max_abs=0 cpu_max_abs=2.27857e-08
+f16_encoder_check rows=129 in=128 out=384 offset=16 max_abs=0 cpu_max_abs=2.27857e-08
+f16_encoder_check rows=129 in=128 out=512 offset=16 max_abs=0 cpu_max_abs=2.27857e-08
+f16_encoder_check rows=129 in=512 out=128 offset=16 max_abs=0 cpu_max_abs=9.77508e-08
+f16_encoder_check rows=129 in=256 out=256 offset=16 max_abs=0 cpu_max_abs=8.91954e-08
+f16_encoder_check rows=129 in=256 out=768 offset=16 max_abs=0 cpu_max_abs=3.89911e-08
+f16_encoder_check rows=129 in=256 out=1024 offset=16 max_abs=0 cpu_max_abs=1.44326e-07
+f16_encoder_check rows=129 in=1024 out=256 offset=16 max_abs=0 cpu_max_abs=5.28276e-07
+f16_encoder_check rows=129 in=512 out=512 offset=16 max_abs=0 cpu_max_abs=3.33199e-07
+f16_encoder_check rows=129 in=512 out=1536 offset=16 max_abs=0 cpu_max_abs=2.04946e-07
+f16_encoder_check rows=129 in=512 out=2048 offset=16 max_abs=0 cpu_max_abs=1.0311e-07
+f16_encoder_check rows=129 in=2048 out=512 offset=16 max_abs=0 cpu_max_abs=6.85407e-07
+f16_encoder_check rows=129 in=1024 out=1024 offset=16 max_abs=0 cpu_max_abs=3.5134e-07
+f16_encoder_check rows=129 in=1024 out=3072 offset=16 max_abs=0 cpu_max_abs=3.5134e-07
+f16_encoder_check rows=129 in=1024 out=4096 offset=16 max_abs=0 cpu_max_abs=3.5134e-07
+f16_encoder_check rows=129 in=4096 out=1024 offset=16 max_abs=0 cpu_max_abs=6.61418e-07
+f16_encoder_check rows=578 in=768 out=768 offset=16 max_abs=0 cpu_max_abs=1.22786e-07
+f16_encoder_check rows=578 in=3072 out=768 offset=16 max_abs=0 cpu_max_abs=8.53213e-07
+f16_encoder_check rows=129 in=1024 out=768 offset=16 max_abs=0 cpu_max_abs=7.2532e-07
+f16_encoder_check rows=127 in=128 out=512 offset=16 max_abs=0 cpu_max_abs=3.33187e-08
+f16_encoder_check rows=129 in=128 out=512 offset=4 max_abs=0 cpu_max_abs=2.27857e-08
+f16_encoder_check rows=25088 in=128 out=512 offset=16 max_abs=0 cpu_max_abs=3.85163e-08
+f16_encoder_check rows=578 in=768 out=3072 offset=16 max_abs=0 cpu_max_abs=2.15431e-07
+f16_encoder_check rows=2304 in=512 out=2048 offset=16 max_abs=0 cpu_max_abs=1.0311e-07
+projection rows=4 in=1024 out=3584 input_offset=16 bf16_input=0 max_abs=4.76837e-07
+projection rows=4 in=2560 out=8192 input_offset=16 bf16_input=0 max_abs=1.49012e-06
+projection rows=4 in=2560 out=9216 input_offset=16 bf16_input=0 max_abs=1.57952e-06
+projection rows=4 in=1024 out=3584 input_offset=16 bf16_input=0 max_abs=4.76837e-07
+projection rows=4 in=2560 out=8192 input_offset=16 bf16_input=0 max_abs=1.49012e-06
+projection rows=4 in=2560 out=9216 input_offset=16 bf16_input=0 max_abs=1.57952e-06
+projection rows=4 in=1024 out=3584 input_offset=16 bf16_input=0 max_abs=4.76837e-07
+projection rows=4 in=2560 out=8192 input_offset=16 bf16_input=0 max_abs=1.49012e-06
+projection rows=4 in=2560 out=9216 input_offset=16 bf16_input=0 max_abs=1.57952e-06
+prefill_conv_check seq=2 value_heads=16 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=2 value_heads=16 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=2 value_heads=32 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=2 value_heads=32 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=3 value_heads=16 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=3 value_heads=16 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=3 value_heads=32 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=3 value_heads=32 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=4 value_heads=16 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=4 value_heads=16 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=4 value_heads=32 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=4 value_heads=32 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=17 value_heads=16 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=17 value_heads=16 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=17 value_heads=32 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=17 value_heads=32 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=432 value_heads=16 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=432 value_heads=16 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=432 value_heads=32 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=432 value_heads=32 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=554 value_heads=16 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=554 value_heads=16 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=554 value_heads=32 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=554 value_heads=32 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+metal_pipelined_decode_frame: enabled=1 owner=executor rollback=TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME
+gate_split_frame_check in=1024 out=3584 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=2.08616e-06
+gate_split_frame_check in=1024 out=3584 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=3.09944e-06
+gate_split_frame_check in=1024 out=3584 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=3.33786e-06
+gate_split_frame_check in=2560 out=9216 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=6.55651e-06
+gate_split_frame_check in=2560 out=9216 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=6.67572e-06
+gate_split_frame_check in=1024 out=3584 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=4.29153e-06
+gate_split_frame_check in=1024 out=3584 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=5.00679e-06
+gate_split_frame_check in=1024 out=3584 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=5.00679e-06
+gate_split_frame_check in=1024 out=3584 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=5.00679e-06
+gate_split_frame_check in=2560 out=9216 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=1.66893e-05
+down_split_frame_check in=3584 out=1024 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=1.07288e-06
+down_split_frame_check in=3584 out=1024 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=1.07288e-06
+down_split_frame_check in=3584 out=1024 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=1.07288e-06
+down_split_frame_check in=1024 out=6144 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=2.98023e-06
+down_split_frame_check in=1024 out=6144 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=2.98023e-06
+down_split_frame_check in=1024 out=6144 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=2.98023e-06
+down_split_frame_check in=3584 out=1024 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=1.43051e-06
+down_split_frame_check in=9216 out=2560 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=3.69549e-06
+down_split_frame_check in=1024 out=6144 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=2.14577e-06
+down_split_frame_check in=1024 out=3584 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=4.76837e-07
+down_split_frame_check in=2560 out=8192 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=6.19888e-06
+down_split_frame_check in=2560 out=9216 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=6.19888e-06
+down_split_frame_check in=9216 out=2560 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=3.69549e-06
+projection rows=2 in=3584 out=1024 input_offset=16 bf16_input=0 max_abs=8.34465e-07
+projection rows=2 in=9216 out=2560 input_offset=16 bf16_input=0 max_abs=1.78814e-06
+projection rows=3 in=3584 out=1024 input_offset=16 bf16_input=0 max_abs=8.34465e-07
+projection rows=3 in=9216 out=2560 input_offset=16 bf16_input=0 max_abs=2.6226e-06
+projection rows=4 in=3584 out=1024 input_offset=16 bf16_input=0 max_abs=8.34465e-07
+projection rows=4 in=9216 out=2560 input_offset=16 bf16_input=0 max_abs=4.17233e-06
+projection rows=5 in=3584 out=1024 input_offset=16 bf16_input=0 max_abs=1.13249e-06
+projection rows=5 in=9216 out=2560 input_offset=16 bf16_input=0 max_abs=4.88758e-06
+projection rows=6 in=3584 out=1024 input_offset=16 bf16_input=0 max_abs=1.13249e-06
+projection rows=6 in=9216 out=2560 input_offset=16 bf16_input=0 max_abs=4.88758e-06
+projection rows=7 in=3584 out=1024 input_offset=16 bf16_input=0 max_abs=1.54972e-06
+projection rows=7 in=9216 out=2560 input_offset=16 bf16_input=0 max_abs=4.88758e-06
+projection rows=8 in=3584 out=1024 input_offset=16 bf16_input=0 max_abs=1.72853e-06
+projection rows=8 in=9216 out=2560 input_offset=16 bf16_input=0 max_abs=4.88758e-06
+ocr_gqa_check kv=128 heads=8 kv_heads=2 amplitude=1 offset=16 max_abs=0 cpu_max_abs=3.70232e-09
+ocr_gqa_check kv=128 heads=16 kv_heads=4 amplitude=1 offset=16 max_abs=0 cpu_max_abs=1.50301e-08
+ocr_gqa_check kv=192 heads=8 kv_heads=2 amplitude=8 offset=16 max_abs=4.6242e-05 cpu_max_abs=1.09203e-05
+ocr_gqa_check kv=192 heads=16 kv_heads=4 amplitude=8 offset=16 max_abs=6.13183e-05 cpu_max_abs=2.33881e-05
+ocr_gqa_check kv=432 heads=8 kv_heads=2 amplitude=1 offset=16 max_abs=1.17458e-05 cpu_max_abs=6.82966e-06
+ocr_gqa_check kv=432 heads=16 kv_heads=4 amplitude=1 offset=16 max_abs=1.36655e-05 cpu_max_abs=3.8573e-06
+ocr_gqa_check kv=554 heads=8 kv_heads=2 amplitude=8 offset=16 max_abs=3.06482e-05 cpu_max_abs=1.22081e-05
+ocr_gqa_check kv=554 heads=16 kv_heads=4 amplitude=8 offset=16 max_abs=3.05921e-05 cpu_max_abs=6.19492e-06
+ocr_gqa_check kv=662 heads=8 kv_heads=2 amplitude=1 offset=16 max_abs=8.73394e-06 cpu_max_abs=2.65685e-06
+ocr_gqa_check kv=662 heads=16 kv_heads=4 amplitude=1 offset=16 max_abs=1.13137e-05 cpu_max_abs=3.017e-06
+ocr_gqa_check kv=1024 heads=8 kv_heads=2 amplitude=8 offset=16 max_abs=2.64477e-05 cpu_max_abs=1.51329e-05
+ocr_gqa_check kv=1024 heads=16 kv_heads=4 amplitude=8 offset=16 max_abs=2.27256e-05 cpu_max_abs=2.89929e-06
+ocr_gqa_check kv=2048 heads=8 kv_heads=2 amplitude=1 offset=16 max_abs=5.48689e-06 cpu_max_abs=2.65141e-06
+ocr_gqa_check kv=2048 heads=16 kv_heads=4 amplitude=1 offset=16 max_abs=6.07222e-06 cpu_max_abs=1.55673e-06
+ocr_gqa_check kv=2056 heads=8 kv_heads=2 amplitude=8 offset=16 max_abs=0 cpu_max_abs=8.14029e-09
+ocr_gqa_check kv=2056 heads=16 kv_heads=4 amplitude=8 offset=16 max_abs=0 cpu_max_abs=9.86706e-09
+projection rows=4 in=1024 out=6144 input_offset=0 bf16_input=0 max_abs=5.96046e-07
+projection rows=4 in=2560 out=8192 input_offset=0 bf16_input=0 max_abs=1.49012e-06
+projection rows=5 in=1024 out=6144 input_offset=0 bf16_input=0 max_abs=5.96046e-07
+projection rows=5 in=2560 out=8192 input_offset=0 bf16_input=0 max_abs=7.51019e-06
+projection rows=6 in=1024 out=6144 input_offset=0 bf16_input=0 max_abs=5.96046e-07
+projection rows=6 in=2560 out=8192 input_offset=0 bf16_input=0 max_abs=7.51019e-06
+projection rows=7 in=1024 out=6144 input_offset=0 bf16_input=0 max_abs=5.96046e-07
+projection rows=7 in=2560 out=8192 input_offset=0 bf16_input=0 max_abs=7.51019e-06
+projection rows=8 in=1024 out=6144 input_offset=0 bf16_input=0 max_abs=2.5034e-06
+projection rows=8 in=2560 out=8192 input_offset=0 bf16_input=0 max_abs=7.51019e-06
+projection rows=4 in=1024 out=6144 input_offset=0 bf16_input=0 max_abs=5.96046e-07
+projection rows=8 in=2560 out=8192 input_offset=0 bf16_input=0 max_abs=7.51019e-06
+projection rows=4 in=1024 out=6144 input_offset=0 bf16_input=0 max_abs=5.96046e-07
+projection rows=8 in=2560 out=8192 input_offset=0 bf16_input=0 max_abs=7.51019e-06
+projection rows=8 in=1024 out=3584 input_offset=0 bf16_input=0 max_abs=4.17233e-07
+projection rows=4 in=2560 out=9216 input_offset=0 bf16_input=0 max_abs=1.57952e-06
+projection rows=8 in=1024 out=3584 input_offset=0 bf16_input=0 max_abs=4.17233e-07
+projection rows=4 in=2560 out=9216 input_offset=0 bf16_input=0 max_abs=1.57952e-06
+florence_window_check batch=2 seq=1 heads=3 layout=0 mode=0 max_abs=0 cpu_max_abs=0
+florence_window_check batch=2 seq=1 heads=3 layout=0 mode=1 max_abs=0 cpu_max_abs=0
+florence_window_check batch=2 seq=1 heads=3 layout=0 mode=2 max_abs=0 cpu_max_abs=0
+florence_window_check batch=2 seq=1 heads=3 layout=1 mode=0 max_abs=0 cpu_max_abs=0
+florence_window_check batch=2 seq=1 heads=3 layout=1 mode=1 max_abs=0 cpu_max_abs=0
+florence_window_check batch=2 seq=1 heads=3 layout=1 mode=2 max_abs=0 cpu_max_abs=0
+florence_window_check batch=2 seq=31 heads=3 layout=0 mode=0 max_abs=0 cpu_max_abs=8.93553e-07
+florence_window_check batch=2 seq=31 heads=3 layout=0 mode=1 max_abs=1.78814e-07 cpu_max_abs=9.53157e-07
+florence_window_check batch=2 seq=31 heads=3 layout=0 mode=2 max_abs=0 cpu_max_abs=8.93553e-07
+florence_window_check batch=2 seq=31 heads=3 layout=1 mode=0 max_abs=0 cpu_max_abs=6.09632e-06
+florence_window_check batch=2 seq=31 heads=3 layout=1 mode=1 max_abs=1.19209e-07 cpu_max_abs=6.06652e-06
+florence_window_check batch=2 seq=31 heads=3 layout=1 mode=2 max_abs=0 cpu_max_abs=6.09632e-06
+florence_window_check batch=2 seq=49 heads=3 layout=0 mode=0 max_abs=0 cpu_max_abs=2.11165e-06
+florence_window_check batch=2 seq=49 heads=3 layout=0 mode=1 max_abs=1.78814e-07 cpu_max_abs=2.05204e-06
+florence_window_check batch=2 seq=49 heads=3 layout=0 mode=2 max_abs=0 cpu_max_abs=2.11165e-06
+florence_window_check batch=2 seq=49 heads=3 layout=1 mode=0 max_abs=0 cpu_max_abs=2.29541e-06
+florence_window_check batch=2 seq=49 heads=3 layout=1 mode=1 max_abs=1.19209e-07 cpu_max_abs=2.29541e-06
+florence_window_check batch=2 seq=49 heads=3 layout=1 mode=2 max_abs=0 cpu_max_abs=2.29541e-06
+florence_window_check batch=2 seq=64 heads=3 layout=0 mode=0 max_abs=0 cpu_max_abs=1.85774e-06
+florence_window_check batch=2 seq=64 heads=3 layout=0 mode=1 max_abs=1.49012e-07 cpu_max_abs=1.86519e-06
+florence_window_check batch=2 seq=64 heads=3 layout=0 mode=2 max_abs=0 cpu_max_abs=1.85774e-06
+florence_window_check batch=2 seq=64 heads=3 layout=1 mode=0 max_abs=0 cpu_max_abs=2.54898e-06
+florence_window_check batch=2 seq=64 heads=3 layout=1 mode=1 max_abs=1.78814e-07 cpu_max_abs=2.54898e-06
+florence_window_check batch=2 seq=64 heads=3 layout=1 mode=2 max_abs=0 cpu_max_abs=2.54898e-06
+florence_window_check batch=2 seq=128 heads=3 layout=0 mode=0 max_abs=0 cpu_max_abs=6.38651e-07
+florence_window_check batch=2 seq=128 heads=3 layout=0 mode=1 max_abs=1.04308e-07 cpu_max_abs=6.38418e-07
+florence_window_check batch=2 seq=128 heads=3 layout=0 mode=2 max_abs=0 cpu_max_abs=6.38651e-07
+florence_window_check batch=2 seq=128 heads=3 layout=1 mode=0 max_abs=0 cpu_max_abs=2.09997e-06
+florence_window_check batch=2 seq=128 heads=3 layout=1 mode=1 max_abs=2.23517e-08 cpu_max_abs=2.09997e-06
+florence_window_check batch=2 seq=128 heads=3 layout=1 mode=2 max_abs=0 cpu_max_abs=2.09997e-06
+florence_window_check batch=2 seq=256 heads=3 layout=0 mode=0 max_abs=0 cpu_max_abs=1.08566e-06
+florence_window_check batch=2 seq=256 heads=3 layout=0 mode=1 max_abs=8.19564e-08 cpu_max_abs=1.07821e-06
+florence_window_check batch=2 seq=256 heads=3 layout=0 mode=2 max_abs=0 cpu_max_abs=1.08566e-06
+florence_window_check batch=2 seq=256 heads=3 layout=1 mode=0 max_abs=0 cpu_max_abs=8.54541e-07
+florence_window_check batch=2 seq=256 heads=3 layout=1 mode=1 max_abs=3.72529e-08 cpu_max_abs=8.54541e-07
+florence_window_check batch=2 seq=256 heads=3 layout=1 mode=2 max_abs=0 cpu_max_abs=8.54541e-07
+florence_channel_check batch=1 seq=1 dim=64 groups=2 mode=0 max_abs=0 cpu_max_abs=4.30492e-08
+florence_channel_check batch=1 seq=1 dim=64 groups=2 mode=1 max_abs=0 cpu_max_abs=4.30492e-08
+florence_channel_check batch=1 seq=1 dim=64 groups=2 mode=2 max_abs=0 cpu_max_abs=4.30492e-08
+florence_channel_check batch=1 seq=65 dim=48 groups=3 mode=0 max_abs=0 cpu_max_abs=6.0961e-08
+florence_channel_check batch=1 seq=65 dim=48 groups=3 mode=1 max_abs=0 cpu_max_abs=6.0961e-08
+florence_channel_check batch=1 seq=65 dim=48 groups=3 mode=2 max_abs=0 cpu_max_abs=6.0961e-08
+florence_channel_check batch=2 seq=49 dim=96 groups=3 mode=0 max_abs=0 cpu_max_abs=8.35152e-08
+florence_channel_check batch=2 seq=49 dim=96 groups=3 mode=1 max_abs=0 cpu_max_abs=8.35152e-08
+florence_channel_check batch=2 seq=49 dim=96 groups=3 mode=2 max_abs=0 cpu_max_abs=8.35152e-08
+florence_channel_check batch=1 seq=196 dim=192 groups=6 mode=0 max_abs=0 cpu_max_abs=5.21867e-08
+florence_channel_check batch=1 seq=196 dim=192 groups=6 mode=1 max_abs=1.49012e-07 cpu_max_abs=5.21867e-08
+florence_channel_check batch=1 seq=196 dim=192 groups=6 mode=2 max_abs=0 cpu_max_abs=5.21867e-08
+florence_channel_check batch=2 seq=784 dim=384 groups=12 mode=0 max_abs=0 cpu_max_abs=7.25371e-08
+florence_channel_check batch=2 seq=784 dim=384 groups=12 mode=1 max_abs=1.78814e-07 cpu_max_abs=7.25371e-08
+florence_channel_check batch=2 seq=784 dim=384 groups=12 mode=2 max_abs=0 cpu_max_abs=7.25371e-08
+florence_channel_check batch=1 seq=3136 dim=192 groups=6 mode=0 max_abs=0 cpu_max_abs=6.13898e-08
+florence_channel_check batch=1 seq=3136 dim=192 groups=6 mode=1 max_abs=2.38419e-07 cpu_max_abs=8.67939e-08
+florence_channel_check batch=1 seq=3136 dim=192 groups=6 mode=2 max_abs=0 cpu_max_abs=6.13898e-08
+fused_core_check key_heads=1 value_heads=2 step=0 fallback=0 max_abs=0
+fused_core_check key_heads=1 value_heads=2 step=1 fallback=0 max_abs=1.86265e-09
+fused_core_check key_heads=1 value_heads=2 step=2 fallback=0 max_abs=4.65661e-09
+fused_core_check key_heads=1 value_heads=2 step=3 fallback=0 max_abs=4.47035e-08
+fused_core_check key_heads=1 value_heads=2 step=4 fallback=1 max_abs=3.72529e-09
+fused_core_check key_heads=16 value_heads=16 step=0 fallback=0 max_abs=2.98023e-08
+fused_core_check key_heads=16 value_heads=16 step=1 fallback=0 max_abs=2.98023e-08
+fused_core_check key_heads=16 value_heads=16 step=2 fallback=0 max_abs=2.98023e-08
+fused_core_check key_heads=16 value_heads=16 step=3 fallback=0 max_abs=2.98023e-08
+fused_core_check key_heads=16 value_heads=16 step=4 fallback=1 max_abs=7.45058e-09
+fused_core_check key_heads=16 value_heads=32 step=0 fallback=0 max_abs=2.98023e-08
+fused_core_check key_heads=16 value_heads=32 step=1 fallback=0 max_abs=2.98023e-08
+fused_core_check key_heads=16 value_heads=32 step=2 fallback=0 max_abs=2.98023e-08
+fused_core_check key_heads=16 value_heads=32 step=3 fallback=0 max_abs=2.98023e-08
+fused_core_check key_heads=16 value_heads=32 step=4 fallback=1 max_abs=5.58794e-09
+fused_batch_core_check pages=2 key_heads=16 value_heads=16 offset=16 step=0 fallback=0 max_abs=2.98023e-08
+fused_batch_core_check pages=2 key_heads=16 value_heads=16 offset=16 step=1 fallback=0 max_abs=2.98023e-08
+fused_batch_core_check pages=2 key_heads=16 value_heads=16 offset=16 step=2 fallback=0 max_abs=2.98023e-08
+fused_batch_core_check pages=2 key_heads=16 value_heads=16 offset=16 step=3 fallback=1 max_abs=5.58794e-09
+fused_batch_core_check pages=2 key_heads=16 value_heads=32 offset=16 step=0 fallback=0 max_abs=2.98023e-08
+fused_batch_core_check pages=2 key_heads=16 value_heads=32 offset=16 step=1 fallback=0 max_abs=2.98023e-08
+fused_batch_core_check pages=2 key_heads=16 value_heads=32 offset=16 step=2 fallback=0 max_abs=2.98023e-08
+fused_batch_core_check pages=2 key_heads=16 value_heads=32 offset=16 step=3 fallback=1 max_abs=5.58794e-09
+projection rows=2216 in=768 out=2304 input_offset=0 bf16_input=0 max_abs=0
+projection rows=2216 in=768 out=2304 input_offset=0 bf16_input=1 max_abs=0
+projection rows=2216 in=768 out=2304 input_offset=0 bf16_input=2 max_abs=0
+projection rows=4096 in=1024 out=4096 input_offset=0 bf16_input=0 max_abs=0
+projection rows=4096 in=1024 out=4096 input_offset=0 bf16_input=1 max_abs=0
+projection rows=4096 in=1024 out=4096 input_offset=0 bf16_input=2 max_abs=0
+projection rows=8192 in=768 out=768 input_offset=16 bf16_input=0 max_abs=0
+projection rows=8192 in=768 out=768 input_offset=16 bf16_input=1 max_abs=0
+projection rows=8192 in=768 out=768 input_offset=16 bf16_input=2 max_abs=0
+projection rows=16384 in=768 out=768 input_offset=0 bf16_input=0 max_abs=0
+projection rows=16384 in=768 out=768 input_offset=0 bf16_input=1 max_abs=0
+projection rows=16384 in=768 out=768 input_offset=0 bf16_input=2 max_abs=0
+projection rows=5 in=1024 out=3584 input_offset=0 bf16_input=0 max_abs=4.17233e-07
+projection rows=6 in=1024 out=3584 input_offset=0 bf16_input=0 max_abs=4.17233e-07
+projection rows=7 in=1024 out=3584 input_offset=0 bf16_input=0 max_abs=2.02656e-06
+projection rows=4 in=2560 out=9216 input_offset=0 bf16_input=0 max_abs=1.57952e-06
+projection rows=5 in=2560 out=9216 input_offset=0 bf16_input=0 max_abs=7.51019e-06
+projection rows=6 in=2560 out=9216 input_offset=0 bf16_input=0 max_abs=7.51019e-06
+projection rows=7 in=2560 out=9216 input_offset=0 bf16_input=0 max_abs=7.51019e-06
+projection rows=6 in=1024 out=6144 input_offset=0 bf16_input=0 max_abs=5.96046e-07
+projection rows=7 in=2560 out=8192 input_offset=0 bf16_input=0 max_abs=7.51019e-06
+projection rows=2 in=9216 out=2560 input_offset=0 bf16_input=0 max_abs=1.78814e-06
+projection rows=3 in=9216 out=2560 input_offset=0 bf16_input=0 max_abs=2.6226e-06
+projection rows=4 in=2560 out=9216 input_offset=0 bf16_input=0 max_abs=1.57952e-06
+projection rows=5 in=1024 out=6144 input_offset=0 bf16_input=0 max_abs=5.96046e-07
+projection rows=5 in=2560 out=248320 input_offset=0 bf16_input=0 max_abs=8.34465e-07
+projection rows=8 in=1024 out=248320 input_offset=0 bf16_input=0 max_abs=4.76837e-07
+projection rows=8 in=1024 out=3584 input_offset=0 bf16_input=0 max_abs=2.02656e-06
+projection rows=8 in=1024 out=6144 input_offset=0 bf16_input=0 max_abs=2.5034e-06
+projection rows=8 in=2560 out=8192 input_offset=0 bf16_input=0 max_abs=7.51019e-06
+projection rows=8 in=2560 out=9216 input_offset=0 bf16_input=0 max_abs=7.51019e-06
+projection rows=8 in=9216 out=2560 input_offset=0 bf16_input=0 max_abs=4.88758e-06
+projection rows=1 in=1024 out=16 input_offset=0 bf16_input=0 max_abs=5.36442e-07
+projection rows=1 in=1024 out=512 input_offset=0 bf16_input=0 max_abs=2.38419e-07
+projection rows=1 in=1024 out=6144 input_offset=0 bf16_input=0 max_abs=3.57628e-07
+projection rows=1 in=3584 out=1024 input_offset=0 bf16_input=0 max_abs=7.15256e-07
+projection rows=1 in=2048 out=1024 input_offset=0 bf16_input=0 max_abs=4.76837e-07
+projection rows=1 in=1024 out=248320 input_offset=0 bf16_input=0 max_abs=3.57628e-07
+projection rows=33 in=768 out=2304 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=768 out=2304 input_offset=0 bf16_input=1 max_abs=0
+projection rows=33 in=768 out=2304 input_offset=0 bf16_input=2 max_abs=0
+projection rows=33 in=768 out=3072 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=768 out=3072 input_offset=0 bf16_input=1 max_abs=0
+projection rows=33 in=768 out=3072 input_offset=0 bf16_input=2 max_abs=0
+projection rows=33 in=3072 out=768 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=3072 out=768 input_offset=0 bf16_input=1 max_abs=0
+projection rows=33 in=3072 out=768 input_offset=0 bf16_input=2 max_abs=0
+projection rows=33 in=3072 out=3072 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=3072 out=3072 input_offset=0 bf16_input=1 max_abs=0
+projection rows=33 in=3072 out=3072 input_offset=0 bf16_input=2 max_abs=0
+projection rows=33 in=3072 out=1024 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=3072 out=1024 input_offset=0 bf16_input=1 max_abs=0
+projection rows=33 in=3072 out=1024 input_offset=0 bf16_input=2 max_abs=0
+projection rows=33 in=1024 out=3584 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=1024 out=3584 input_offset=0 bf16_input=1 max_abs=0
+projection rows=33 in=1024 out=3584 input_offset=0 bf16_input=2 max_abs=0
+projection rows=33 in=3584 out=1024 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=3584 out=1024 input_offset=0 bf16_input=1 max_abs=0
+projection rows=33 in=3584 out=1024 input_offset=0 bf16_input=2 max_abs=0
+projection rows=8 in=2560 out=248320 input_offset=0 bf16_input=0 max_abs=8.34465e-07
+projection rows=2 in=1024 out=3584 input_offset=0 bf16_input=0 max_abs=3.57628e-07
+projection rows=3 in=1024 out=128 input_offset=16 bf16_input=0 max_abs=2.38419e-07
+projection rows=4 in=3584 out=1024 input_offset=0 bf16_input=0 max_abs=8.34465e-07
+projection rows=5 in=2560 out=1024 input_offset=0 bf16_input=0 max_abs=5.96046e-07
+projection rows=8 in=4096 out=2560 input_offset=16 bf16_input=0 max_abs=1.07288e-06
+projection rows=4 in=2560 out=64 input_offset=0 bf16_input=0 max_abs=2.6226e-06
+projection rows=4 in=1024 out=3584 input_offset=4 bf16_input=0 max_abs=0
+projection rows=1 in=2560 out=32 input_offset=0 bf16_input=0 max_abs=1.54972e-06
+projection rows=1 in=2560 out=64 input_offset=0 bf16_input=0 max_abs=1.66893e-06
+projection rows=1 in=2560 out=1024 input_offset=0 bf16_input=0 max_abs=4.76837e-07
+projection rows=1 in=4096 out=2560 input_offset=16 bf16_input=0 max_abs=1.01328e-06
+projection rows=1 in=9216 out=2560 input_offset=0 bf16_input=0 max_abs=1.80304e-06
+projection rows=1 in=2560 out=1024 input_offset=4 bf16_input=0 max_abs=0
+projection rows=33 in=2560 out=1024 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=2560 out=1024 input_offset=0 bf16_input=1 max_abs=0
+projection rows=33 in=2560 out=1024 input_offset=0 bf16_input=2 max_abs=0
+projection rows=65 in=4096 out=2560 input_offset=16 bf16_input=0 max_abs=0
+projection rows=65 in=4096 out=2560 input_offset=16 bf16_input=1 max_abs=0
+projection rows=65 in=4096 out=2560 input_offset=16 bf16_input=2 max_abs=0
+projection rows=33 in=1024 out=3072 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=1024 out=3072 input_offset=0 bf16_input=1 max_abs=0
+projection rows=33 in=1024 out=3072 input_offset=0 bf16_input=2 max_abs=0
+projection rows=31 in=2560 out=1024 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=2560 out=1024 input_offset=4 bf16_input=0 max_abs=0
+projection rows=33 in=2560 out=1024 input_offset=4 bf16_input=1 max_abs=0
+projection rows=33 in=2560 out=1024 input_offset=4 bf16_input=2 max_abs=0
+fused gate/up max_abs=2.38419e-06
+fused gate/up max_abs=7.15256e-07
+BF16 pack edges: 11 values passed
+cached_norm_views hidden=1024 aligned_scalar_offsets_missing_pipeline=pass cpu_all_outputs=pass canaries=pass
+cached_norm_views hidden=2560 aligned_scalar_offsets_missing_pipeline=pass cpu_all_outputs=pass canaries=pass
+parallel norm rows=1 hidden=1024 max_abs=0
+parallel norm rows=1 hidden=128 max_abs=3.57628e-07
+parallel norm rows=2 hidden=1024 max_abs=0
+parallel norm rows=8 hidden=1024 max_abs=7.15256e-07
+parallel norm rows=4 hidden=128 max_abs=3.57628e-07
+parallel norm rows=1 hidden=2560 max_abs=8.34465e-07
+parallel norm rows=4 hidden=256 max_abs=3.57628e-07
+parallel norm rows=16 hidden=256 max_abs=3.57628e-07
+parallel norm rows=1 hidden=512 max_abs=0
+parallel norm rows=33 hidden=2560 max_abs=1.66893e-06
+parallel norm rows=33 hidden=256 max_abs=4.76837e-07
+parallel norm rows=9 hidden=1024 max_abs=7.15256e-07
+parallel norm rows=33 hidden=128 max_abs=4.76837e-07
+parallel norm rows=128 hidden=1024 max_abs=9.53674e-07
+parallel norm rows=432 hidden=1024 max_abs=9.53674e-07
+parallel norm rows=554 hidden=2560 max_abs=1.90735e-06
+parallel norm rows=662 hidden=2560 max_abs=1.90735e-06
+parallel norm rows=554 hidden=512 max_abs=0
+projection rows=33 in=2560 out=1024 input_offset=0 bf16_input=0 max_abs=0
+projection rows=33 in=2560 out=1024 input_offset=0 bf16_input=1 max_abs=0
+projection rows=33 in=2560 out=1024 input_offset=0 bf16_input=2 max_abs=0
+projection rows=4 in=1024 out=3584 input_offset=0 bf16_input=0 max_abs=4.76837e-07
+projection rows=8 in=1024 out=248320 input_offset=0 bf16_input=0 max_abs=4.76837e-07
+projection rows=5 in=1024 out=6144 input_offset=0 bf16_input=0 max_abs=5.96046e-07
+All OCR Metal kernel checks passed

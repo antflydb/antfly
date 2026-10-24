@@ -1,0 +1,59 @@
+1/60 server.server.test.LightOnOCR3 real checkpoint transcribes the invoice fixture...
+LIGHTONOCR3 backend=metal
+
+LIGHTONOCR3 cold_request_ms=2311 text=# Delivery confirmation
+
+**Reference:** ORDER-76291
+
+The replacement parts will arrive on Friday.  
+Please leave the package at reception.
+
+**Contact:** Morgan Lee  
+**Telephone:** 555-0148
+LIGHTONOCR3 warm_run=0 ms=1902 text=# Delivery confirmation
+
+**Reference:** ORDER-76291
+
+The replacement parts will arrive on Friday.  
+Please leave the package at reception.
+
+**Contact:** Morgan Lee  
+**Telephone:** 555-0148
+LIGHTONOCR3 warm_run=1 ms=1906 text=# Delivery confirmation
+
+**Reference:** ORDER-76291
+
+The replacement parts will arrive on Friday.  
+Please leave the package at reception.
+
+**Contact:** Morgan Lee  
+**Telephone:** 555-0148
+LIGHTONOCR3 warm_run=2 ms=1931 text=# Delivery confirmation
+
+**Reference:** ORDER-76291
+
+The replacement parts will arrive on Friday.  
+Please leave the package at reception.
+
+**Contact:** Morgan Lee  
+**Telephone:** 555-0148
+OK
+1 selected; 1 passed; 0 skipped.
+        8.07 real         1.01 user         1.21 sys
+           282722304  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              101330  page reclaims
+                   7  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   6  signals received
+                   5  voluntary context switches
+               20968  involuntary context switches
+         19346378563  instructions retired
+          8634577152  cycles elapsed
+          1301153928  peak memory footprint

@@ -1,0 +1,75 @@
+florence_window_check batch=2 seq=1 heads=3 layout=0 mode=0 max_abs=0 cpu_max_abs=0
+florence_window_check batch=2 seq=1 heads=3 layout=0 mode=1 max_abs=0 cpu_max_abs=0
+florence_window_check batch=2 seq=1 heads=3 layout=0 mode=2 max_abs=0 cpu_max_abs=0
+florence_window_check batch=2 seq=1 heads=3 layout=1 mode=0 max_abs=0 cpu_max_abs=0
+florence_window_check batch=2 seq=1 heads=3 layout=1 mode=1 max_abs=0 cpu_max_abs=0
+florence_window_check batch=2 seq=1 heads=3 layout=1 mode=2 max_abs=0 cpu_max_abs=0
+florence_window_check batch=2 seq=31 heads=3 layout=0 mode=0 max_abs=0 cpu_max_abs=8.93553e-07
+florence_window_check batch=2 seq=31 heads=3 layout=0 mode=1 max_abs=1.78814e-07 cpu_max_abs=9.53157e-07
+florence_window_check batch=2 seq=31 heads=3 layout=0 mode=2 max_abs=0 cpu_max_abs=8.93553e-07
+florence_window_check batch=2 seq=31 heads=3 layout=1 mode=0 max_abs=0 cpu_max_abs=6.09632e-06
+florence_window_check batch=2 seq=31 heads=3 layout=1 mode=1 max_abs=1.19209e-07 cpu_max_abs=6.06652e-06
+florence_window_check batch=2 seq=31 heads=3 layout=1 mode=2 max_abs=0 cpu_max_abs=6.09632e-06
+florence_window_check batch=2 seq=49 heads=3 layout=0 mode=0 max_abs=0 cpu_max_abs=2.11165e-06
+florence_window_check batch=2 seq=49 heads=3 layout=0 mode=1 max_abs=1.78814e-07 cpu_max_abs=2.05204e-06
+florence_window_check batch=2 seq=49 heads=3 layout=0 mode=2 max_abs=0 cpu_max_abs=2.11165e-06
+florence_window_check batch=2 seq=49 heads=3 layout=1 mode=0 max_abs=0 cpu_max_abs=2.29541e-06
+florence_window_check batch=2 seq=49 heads=3 layout=1 mode=1 max_abs=1.19209e-07 cpu_max_abs=2.29541e-06
+florence_window_check batch=2 seq=49 heads=3 layout=1 mode=2 max_abs=0 cpu_max_abs=2.29541e-06
+florence_window_check batch=2 seq=64 heads=3 layout=0 mode=0 max_abs=0 cpu_max_abs=1.85774e-06
+florence_window_check batch=2 seq=64 heads=3 layout=0 mode=1 max_abs=1.49012e-07 cpu_max_abs=1.86519e-06
+florence_window_check batch=2 seq=64 heads=3 layout=0 mode=2 max_abs=0 cpu_max_abs=1.85774e-06
+florence_window_check batch=2 seq=64 heads=3 layout=1 mode=0 max_abs=0 cpu_max_abs=2.54898e-06
+florence_window_check batch=2 seq=64 heads=3 layout=1 mode=1 max_abs=1.78814e-07 cpu_max_abs=2.54898e-06
+florence_window_check batch=2 seq=64 heads=3 layout=1 mode=2 max_abs=0 cpu_max_abs=2.54898e-06
+florence_window_check batch=2 seq=128 heads=3 layout=0 mode=0 max_abs=0 cpu_max_abs=6.38651e-07
+florence_window_check batch=2 seq=128 heads=3 layout=0 mode=1 max_abs=1.04308e-07 cpu_max_abs=6.38418e-07
+florence_window_check batch=2 seq=128 heads=3 layout=0 mode=2 max_abs=0 cpu_max_abs=6.38651e-07
+florence_window_check batch=2 seq=128 heads=3 layout=1 mode=0 max_abs=0 cpu_max_abs=2.09997e-06
+florence_window_check batch=2 seq=128 heads=3 layout=1 mode=1 max_abs=2.23517e-08 cpu_max_abs=2.09997e-06
+florence_window_check batch=2 seq=128 heads=3 layout=1 mode=2 max_abs=0 cpu_max_abs=2.09997e-06
+florence_window_check batch=2 seq=256 heads=3 layout=0 mode=0 max_abs=0 cpu_max_abs=1.08566e-06
+florence_window_check batch=2 seq=256 heads=3 layout=0 mode=1 max_abs=8.19564e-08 cpu_max_abs=1.07821e-06
+florence_window_check batch=2 seq=256 heads=3 layout=0 mode=2 max_abs=0 cpu_max_abs=1.08566e-06
+florence_window_check batch=2 seq=256 heads=3 layout=1 mode=0 max_abs=0 cpu_max_abs=8.54541e-07
+florence_window_check batch=2 seq=256 heads=3 layout=1 mode=1 max_abs=3.72529e-08 cpu_max_abs=8.54541e-07
+florence_window_check batch=2 seq=256 heads=3 layout=1 mode=2 max_abs=0 cpu_max_abs=8.54541e-07
+florence_channel_check batch=1 seq=1 dim=64 groups=2 mode=0 max_abs=0 cpu_max_abs=4.30492e-08
+florence_channel_check batch=1 seq=1 dim=64 groups=2 mode=1 max_abs=0 cpu_max_abs=4.30492e-08
+florence_channel_check batch=1 seq=1 dim=64 groups=2 mode=2 max_abs=0 cpu_max_abs=4.30492e-08
+florence_channel_check batch=1 seq=65 dim=48 groups=3 mode=0 max_abs=0 cpu_max_abs=6.0961e-08
+florence_channel_check batch=1 seq=65 dim=48 groups=3 mode=1 max_abs=0 cpu_max_abs=6.0961e-08
+florence_channel_check batch=1 seq=65 dim=48 groups=3 mode=2 max_abs=0 cpu_max_abs=6.0961e-08
+florence_channel_check batch=2 seq=49 dim=96 groups=3 mode=0 max_abs=0 cpu_max_abs=8.35152e-08
+florence_channel_check batch=2 seq=49 dim=96 groups=3 mode=1 max_abs=0 cpu_max_abs=8.35152e-08
+florence_channel_check batch=2 seq=49 dim=96 groups=3 mode=2 max_abs=0 cpu_max_abs=8.35152e-08
+florence_channel_check batch=1 seq=196 dim=192 groups=6 mode=0 max_abs=0 cpu_max_abs=5.21867e-08
+florence_channel_check batch=1 seq=196 dim=192 groups=6 mode=1 max_abs=1.49012e-07 cpu_max_abs=5.21867e-08
+florence_channel_check batch=1 seq=196 dim=192 groups=6 mode=2 max_abs=0 cpu_max_abs=5.21867e-08
+florence_channel_check batch=2 seq=784 dim=384 groups=12 mode=0 max_abs=0 cpu_max_abs=7.25371e-08
+florence_channel_check batch=2 seq=784 dim=384 groups=12 mode=1 max_abs=1.78814e-07 cpu_max_abs=7.25371e-08
+florence_channel_check batch=2 seq=784 dim=384 groups=12 mode=2 max_abs=0 cpu_max_abs=7.25371e-08
+florence_channel_check batch=1 seq=3136 dim=192 groups=6 mode=0 max_abs=0 cpu_max_abs=6.13898e-08
+florence_channel_check batch=1 seq=3136 dim=192 groups=6 mode=1 max_abs=2.38419e-07 cpu_max_abs=8.67939e-08
+florence_channel_check batch=1 seq=3136 dim=192 groups=6 mode=2 max_abs=0 cpu_max_abs=6.13898e-08
+fused_core_check key_heads=1 value_heads=2 step=0 fallback=0 max_abs=0
+fused_core_check key_heads=1 value_heads=2 step=1 fallback=0 max_abs=1.86265e-09
+fused_core_check key_heads=1 value_heads=2 step=2 fallback=0 max_abs=4.65661e-09
+fused_core_check key_heads=1 value_heads=2 step=3 fallback=0 max_abs=4.47035e-08
+fused_core_check key_heads=1 value_heads=2 step=4 fallback=1 max_abs=3.72529e-09
+fused_core_benchmark key_heads=1 value_heads=2 mode=staged mean_us=622.29 gpu_mean_us=216.41
+fused_core_benchmark key_heads=1 value_heads=2 mode=fused mean_us=411.36 gpu_mean_us=83.46
+fused_core_check key_heads=16 value_heads=16 step=0 fallback=0 max_abs=2.98023e-08
+fused_core_check key_heads=16 value_heads=16 step=1 fallback=0 max_abs=2.98023e-08
+fused_core_check key_heads=16 value_heads=16 step=2 fallback=0 max_abs=2.98023e-08
+fused_core_check key_heads=16 value_heads=16 step=3 fallback=0 max_abs=2.98023e-08
+fused_core_check key_heads=16 value_heads=16 step=4 fallback=1 max_abs=7.45058e-09
+fused_core_benchmark key_heads=16 value_heads=16 mode=staged mean_us=536.90 gpu_mean_us=223.17
+fused_core_benchmark key_heads=16 value_heads=16 mode=fused mean_us=417.18 gpu_mean_us=84.52
+fused_core_check key_heads=16 value_heads=32 step=0 fallback=0 max_abs=2.98023e-08
+fused_core_check key_heads=16 value_heads=32 step=1 fallback=0 max_abs=2.98023e-08
+fused_core_check key_heads=16 value_heads=32 step=2 fallback=0 max_abs=2.98023e-08
+fused_core_check key_heads=16 value_heads=32 step=3 fallback=0 max_abs=2.98023e-08
+fused_core_check key_heads=16 value_heads=32 step=4 fallback=1 max_abs=5.58794e-09
+fused_core_benchmark key_heads=16 value_heads=32 mode=staged mean_us=611.12 gpu_mean_us=224.53
+fused_core_benchmark key_heads=16 value_heads=32 mode=fused mean_us=462.76 gpu_mean_us=88.61

@@ -5886,12 +5886,41 @@ fn metalHostedBudgetPolicy(
     return sharedGpuHostedBudgetPolicy(model_weight_bytes, manifest, arch_config, quant_mode);
 }
 
+fn lightOnOcr4bBudgetPolicy(
+    model_weight_bytes: u64,
+    manifest: manifest_mod.ModelManifest,
+    arch_config: ArchConfig,
+) ?GpuHostedBudgetPolicy {
+    if (!manifest.isLightOnOcr3() or manifest.usesGgufWeights() or model_weight_bytes == 0) return null;
+    const qualified = switch (arch_config) {
+        .gpt => |cfg| cfg.hasQwen35VisionArchitectureContract() and cfg.hidden_size == 2560 and cfg.intermediate_size == 9216 and cfg.num_hidden_layers == 32,
+        else => false,
+    };
+    if (!qualified) return null;
+    const weights: usize = @intCast(@min(model_weight_bytes, std.math.maxInt(usize)));
+    const host = weights +| mib(256);
+    const device = weights +| gib(1);
+    var context = defaultPlanContextForBackend(.gpu);
+    context.host_budget_bytes = @max(context.host_budget_bytes, host);
+    context.backend_budget_bytes = @max(context.backend_budget_bytes, device);
+    return .{
+        .budget_floor = .{ .host_limit_bytes = host, .backend_limit_bytes = device, .combined_limit_bytes = host +| device +| gib(1) },
+        .shared_cache_floor = .{ .host_limit_bytes = host, .backend_limit_bytes = device },
+        .plan_context = context,
+        .prefer_f32_dense_tensors = false,
+    };
+}
+
 fn sharedGpuHostedBudgetPolicy(
     model_weight_bytes: u64,
     manifest: manifest_mod.ModelManifest,
     arch_config: ArchConfig,
     quant_mode: GpuHostedQuantExecutionMode,
 ) GpuHostedBudgetPolicy {
+    // The 4B BF16 artifact exceeds generic cache limits. Account for its
+    // mapped source and prepared GPU weights before loading any projections.
+    // Explicit serving limits are applied after this automatic floor.
+    if (lightOnOcr4bBudgetPolicy(model_weight_bytes, manifest, arch_config)) |policy| return policy;
     const prefer_f32_dense_tensors = shouldPreferGpuHostedF32DenseTensors(arch_config);
     const lazy_quant_budget_floor = if (shouldUseLargeGpuHostedLazyQuantBudgets(model_weight_bytes, manifest, quant_mode, false))
         recommendedGpuHostedLazyQuantBudgetFloor(model_weight_bytes, quant_mode)
@@ -6163,10 +6192,25 @@ fn makeMetalHostedComputeBackend(
         },
     );
     compute.require_f32_linears = self.arch_config == .embedding_gemma2;
+    compute.qwen35_ocr_deferred_attention = switch (self.arch_config) {
+        .gpt => |cfg| cfg.hasQwen35VisionArchitectureContract() and
+            ((cfg.hidden_size == 1024 and cfg.intermediate_size == 3584 and cfg.num_hidden_layers == 24) or
+                (cfg.hidden_size == 2560 and cfg.intermediate_size == 9216 and cfg.num_hidden_layers == 32)),
+        else => false,
+    };
+    compute.lightonocr3_projections = compute.qwen35_ocr_deferred_attention;
     // The shared provider belongs to this model, and init holds its execution
     // lease. Configure encoder normalization before any device work is queued.
     if (compute.provider_impl.raw_decode_runtime) |raw| {
         @import("../backends/metal_runtime.zig").termite_metal_decode_runtime_set_embeddinggemma2_rms_norm(raw, @intFromBool(self.arch_config == .embedding_gemma2));
+        const qwen35_ocr = switch (self.arch_config) {
+            .gpt => |cfg| cfg.hasQwen35VisionArchitectureContract() and
+                ((cfg.hidden_size == 1024 and cfg.intermediate_size == 3584 and cfg.num_hidden_layers == 24) or
+                    (cfg.hidden_size == 2560 and cfg.intermediate_size == 9216 and cfg.num_hidden_layers == 32)),
+            else => false,
+        };
+        @import("../backends/metal_runtime.zig").termite_metal_decode_runtime_set_qwen35_ocr_vector_loads(raw, @intFromBool(qwen35_ocr));
+        @import("../backends/metal_runtime.zig").termite_metal_decode_runtime_set_lightonocr3_projections(raw, @intFromBool(compute.lightonocr3_projections));
     }
     return compute.ownedComputeBackend();
 }
@@ -12423,6 +12467,33 @@ test "unsupported families keep their gguf weight mapping" {
         "model.layers.0.self_attn.q_a_proj.weight",
         normalizeGgufGptWeightKey(.{ .family = .deepseek_v4 }, "blk.0.attn_q_a.weight", &buf).?,
     );
+}
+
+test "LightOnOCR3 4B budget covers both weight domains and preserves explicit limits" {
+    const cfg = try gpt_mod.parseConfig(std.testing.allocator, @embedFile("../models/testdata/lightonocr3/config-4b.json"));
+    var capabilities = [_][]const u8{"lightonocr3"};
+    var tasks = [_][]const u8{ "read", "generate" };
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .generator,
+        .config_model_arch = "qwen3_5",
+        .capabilities = &capabilities,
+        .tasks = &tasks,
+    };
+    const weight_bytes = 9_078_531_072;
+    const policy = lightOnOcr4bBudgetPolicy(weight_bytes, manifest, .{ .gpt = cfg }).?;
+    try std.testing.expect(policy.budget_floor.host_limit_bytes > weight_bytes);
+    try std.testing.expect(policy.budget_floor.backend_limit_bytes > weight_bytes);
+    try std.testing.expect(policy.budget_floor.combined_limit_bytes > policy.budget_floor.host_limit_bytes + policy.budget_floor.backend_limit_bytes);
+    try std.testing.expectEqual(policy.budget_floor.host_limit_bytes, policy.shared_cache_floor.host_limit_bytes);
+    try std.testing.expectEqual(policy.budget_floor.backend_limit_bytes, policy.shared_cache_floor.backend_limit_bytes);
+    var unqualified = manifest;
+    unqualified.capabilities = &.{};
+    try std.testing.expect(lightOnOcr4bBudgetPolicy(weight_bytes, unqualified, .{ .gpt = cfg }) == null);
+    const small = try gpt_mod.parseConfig(std.testing.allocator, @embedFile("../models/testdata/lightonocr3/config.json"));
+    try std.testing.expect(lightOnOcr4bBudgetPolicy(weight_bytes, manifest, .{ .gpt = small }) == null);
+    const overridden = runtime.tier.memory.applyLimitOverrides(policy.budget_floor, .{ .backend_limit_bytes = 1 });
+    try std.testing.expectEqual(@as(usize, 1), overridden.backend_limit_bytes);
 }
 
 test "embeddinggemma2 coefficient cache relinquishes device credit before recovery and readmits before publication" {

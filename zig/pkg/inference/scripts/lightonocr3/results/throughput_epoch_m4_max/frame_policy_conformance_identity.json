@@ -1,0 +1,21 @@
+{
+  "driver_sha256": "0dfc5bab21bfc70e80958dd5991eaf45a58cec8807a132aa54c1fad0fc6516e7",
+  "binary_sha256": "1efed93bd94d5f0362f218ea52e158aee3f353c5ddbc8e745167954fc2419147",
+  "runtime_c_sha256": "bcc308c62584959f5987328d1c9b5795fd4e4a2a507840a8857f27e275386cdd",
+  "command": [
+    "clang",
+    "-O2",
+    "-fobjc-arc",
+    "-framework",
+    "Foundation",
+    "-framework",
+    "Metal",
+    "-framework",
+    "MetalPerformanceShaders",
+    "-framework",
+    "Accelerate",
+    ".venv-lighton-vllm-metal/frame_policy_conformance.m",
+    "-o",
+    ".venv-lighton-vllm-metal/frame_policy_conformance"
+  ]
+}

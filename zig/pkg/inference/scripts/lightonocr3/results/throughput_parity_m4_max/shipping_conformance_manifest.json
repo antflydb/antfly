@@ -1,0 +1,21 @@
+{
+  "runtime_source_sha256": "4dc3db472450e6d980e97f17f8309678b62e8ea07f7822121bcab186595a26b0",
+  "checks": [
+    {
+      "name": "projections",
+      "source_sha256": "6699dfba7cb0e92ac2214373ea5d212cdeecb40e12dd8488f088ec140aebf49e",
+      "source_archive": "qualified_test_sources/check_metal_projections.m.6699dfba7cb0e92ac2214373ea5d212cdeecb40e12dd8488f088ec140aebf49e.gz",
+      "binary_sha256": "e20133cf206370c9ac95e797d681cca90a9d07000cda6e18e57d26febc5cac1b",
+      "log": "shipping-conformance.txt",
+      "log_sha256": "111ec0100a6fb8da9b674c1b5d3bdbf296afdeaca6295e20ea8706edf554d561"
+    },
+    {
+      "name": "vision",
+      "source_sha256": "91804e7a65224c673aa1f6ea7b4f14dc35dd24c75035b1f8e51b30dd6bb14d02",
+      "source_archive": "qualified_test_sources/check_metal_vision.m.91804e7a65224c673aa1f6ea7b4f14dc35dd24c75035b1f8e51b30dd6bb14d02.gz",
+      "binary_sha256": "f26f672ce06f5f453c384ffad78e31fe50cfd3ca0bad77026a8f4edd32f6f362",
+      "log": "shipping-vision-conformance.txt",
+      "log_sha256": "491b29423db0438fb2417381669b7489d7aab8dd1bb42672b77f8fb1525ad43d"
+    }
+  ]
+}

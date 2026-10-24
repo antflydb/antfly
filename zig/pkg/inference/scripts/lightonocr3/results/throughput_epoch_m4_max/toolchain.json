@@ -1,0 +1,6 @@
+{
+  "zig_version": "0.17.0",
+  "zig_binary_sha256": "1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523",
+  "clang_version": "Apple clang version 21.0.0 (clang-2100.3.34.2)\nTarget: arm64-apple-darwin27.0.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin",
+  "runtime_scope": "Apple M4 Max Metal; this report does not establish NVIDIA CUDA/vLLM parity."
+}

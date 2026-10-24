@@ -1,0 +1,2397 @@
+{
+  "created_at": "2026-10-21T17:09:09.521775-07:00",
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "native_executable_sha256": "7d8fef271d65d8b0fd4c9ac7b321ac2adb4135da57621dd5a3e996e9921f665e",
+  "models": {
+    "florence2-base-q4_k": {
+      "directory": "/Users/ajroetker/.antfly/inference/models/antflydb/florence-2-base",
+      "weight_bytes": 141657728,
+      "weight_files": [
+        {
+          "name": "Florence-2-base.Q4_K.gguf",
+          "bytes": 141657728
+        }
+      ],
+      "metadata": {
+        "config.json": {
+          "_name_or_path": "florence2",
+          "architectures": [
+            "Florence2ForConditionalGeneration"
+          ],
+          "auto_map": {
+            "AutoConfig": "configuration_florence2.Florence2Config",
+            "AutoModelForCausalLM": "modeling_florence2.Florence2ForConditionalGeneration"
+          },
+          "bos_token_id": 0,
+          "eos_token_id": 2,
+          "ignore_index": -100,
+          "model_type": "florence2",
+          "pad_token_id": 1,
+          "projection_dim": 768,
+          "text_config": {
+            "vocab_size": 51289,
+            "activation_dropout": 0.1,
+            "activation_function": "gelu",
+            "add_bias_logits": false,
+            "add_final_layer_norm": false,
+            "attention_dropout": 0.1,
+            "bos_token_id": 0,
+            "classif_dropout": 0.1,
+            "classifier_dropout": 0.0,
+            "d_model": 768,
+            "decoder_attention_heads": 12,
+            "decoder_ffn_dim": 3072,
+            "decoder_layerdrop": 0.0,
+            "decoder_layers": 6,
+            "decoder_start_token_id": 2,
+            "dropout": 0.1,
+            "early_stopping": true,
+            "encoder_attention_heads": 12,
+            "encoder_ffn_dim": 3072,
+            "encoder_layerdrop": 0.0,
+            "encoder_layers": 6,
+            "eos_token_id": 2,
+            "forced_eos_token_id": 2,
+            "forced_bos_token_id": 0,
+            "gradient_checkpointing": false,
+            "init_std": 0.02,
+            "is_encoder_decoder": true,
+            "label2id": {
+              "LABEL_0": 0,
+              "LABEL_1": 1,
+              "LABEL_2": 2
+            },
+            "max_position_embeddings": 1024,
+            "no_repeat_ngram_size": 3,
+            "normalize_before": false,
+            "num_hidden_layers": 6,
+            "pad_token_id": 1,
+            "scale_embedding": false,
+            "num_beams": 3
+          },
+          "vision_config": {
+            "model_type": "davit",
+            "drop_path_rate": 0.1,
+            "patch_size": [
+              7,
+              3,
+              3,
+              3
+            ],
+            "patch_stride": [
+              4,
+              2,
+              2,
+              2
+            ],
+            "patch_padding": [
+              3,
+              1,
+              1,
+              1
+            ],
+            "patch_prenorm": [
+              false,
+              true,
+              true,
+              true
+            ],
+            "enable_checkpoint": false,
+            "dim_embed": [
+              128,
+              256,
+              512,
+              1024
+            ],
+            "num_heads": [
+              4,
+              8,
+              16,
+              32
+            ],
+            "num_groups": [
+              4,
+              8,
+              16,
+              32
+            ],
+            "depths": [
+              1,
+              1,
+              9,
+              1
+            ],
+            "window_size": 12,
+            "projection_dim": 768,
+            "visual_temporal_embedding": {
+              "type": "COSINE",
+              "max_temporal_embeddings": 100
+            },
+            "image_pos_embed": {
+              "type": "learned_abs_2d",
+              "max_pos_embeddings": 50
+            },
+            "image_feature_source": [
+              "spatial_avg_pool",
+              "temporal_avg_pool"
+            ]
+          },
+          "vocab_size": 51289,
+          "torch_dtype": "float16",
+          "transformers_version": "4.41.0.dev0",
+          "is_encoder_decoder": true
+        },
+        "preprocessor_config.json": {
+          "auto_map": {
+            "AutoProcessor": "processing_florence2.Florence2Processor"
+          },
+          "_valid_processor_keys": [
+            "images",
+            "do_resize",
+            "size",
+            "resample",
+            "do_rescale",
+            "rescale_factor",
+            "do_normalize",
+            "image_mean",
+            "image_std",
+            "return_tensors",
+            "data_format",
+            "input_data_format",
+            "do_convert_rgb"
+          ],
+          "do_convert_rgb": null,
+          "do_normalize": true,
+          "do_rescale": true,
+          "do_resize": true,
+          "do_center_crop": false,
+          "image_processor_type": "CLIPImageProcessor",
+          "image_seq_length": 577,
+          "image_mean": [
+            0.485,
+            0.456,
+            0.406
+          ],
+          "image_std": [
+            0.229,
+            0.224,
+            0.225
+          ],
+          "processor_class": "Florence2Processor",
+          "resample": 3,
+          "size": {
+            "height": 768,
+            "width": 768
+          },
+          "crop_size": {
+            "height": 768,
+            "width": 768
+          }
+        },
+        "model_manifest.json": {
+          "type": "reader",
+          "tasks": [
+            "read"
+          ],
+          "capabilities": [
+            "ocr",
+            "captioning",
+            "document_understanding",
+            "vision_language"
+          ],
+          "inputs": [
+            "text",
+            "image"
+          ]
+        }
+      }
+    },
+    "lightonocr3-0.8b-bf16": {
+      "directory": "/private/tmp/antfly-lightonocr3-model",
+      "weight_bytes": 1706030528,
+      "weight_files": [
+        {
+          "name": "model.safetensors",
+          "bytes": 1706030528
+        }
+      ],
+      "metadata": {
+        "config.json": {
+          "architectures": [
+            "Qwen3_5ForConditionalGeneration"
+          ],
+          "bos_token_id": null,
+          "dtype": "bfloat16",
+          "eos_token_id": 248046,
+          "image_token_id": 248056,
+          "model_type": "qwen3_5",
+          "pad_token_id": 248044,
+          "text_config": {
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "attn_output_gate": true,
+            "bos_token_id": null,
+            "dtype": "bfloat16",
+            "eos_token_id": 248044,
+            "full_attention_interval": 4,
+            "head_dim": 256,
+            "hidden_act": "silu",
+            "hidden_size": 1024,
+            "initializer_range": 0.02,
+            "intermediate_size": 3584,
+            "layer_types": [
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention"
+            ],
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 16,
+            "linear_value_head_dim": 128,
+            "mamba_ssm_dtype": "float32",
+            "max_position_embeddings": 262144,
+            "mlp_only_layers": [],
+            "model_type": "qwen3_5_text",
+            "mtp_num_hidden_layers": 0,
+            "mtp_use_dedicated_embeddings": false,
+            "num_attention_heads": 8,
+            "num_hidden_layers": 24,
+            "num_key_value_heads": 2,
+            "pad_token_id": null,
+            "partial_rotary_factor": 0.25,
+            "rms_norm_eps": 1e-06,
+            "rope_parameters": {
+              "mrope_interleaved": true,
+              "mrope_section": [
+                11,
+                11,
+                10
+              ],
+              "partial_rotary_factor": 0.25,
+              "rope_theta": 10000000,
+              "rope_type": "default"
+            },
+            "tie_word_embeddings": true,
+            "use_cache": false,
+            "vocab_size": 248320
+          },
+          "tie_word_embeddings": true,
+          "transformers_version": "5.5.4",
+          "video_token_id": 248057,
+          "vision_config": {
+            "deepstack_visual_indexes": [],
+            "depth": 12,
+            "dtype": "bfloat16",
+            "hidden_act": "gelu_pytorch_tanh",
+            "hidden_size": 768,
+            "in_channels": 3,
+            "initializer_range": 0.02,
+            "intermediate_size": 3072,
+            "model_type": "qwen3_5",
+            "num_heads": 12,
+            "num_position_embeddings": 2304,
+            "out_hidden_size": 1024,
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2
+          },
+          "vision_end_token_id": 248054,
+          "vision_start_token_id": 248053
+        },
+        "preprocessor_config.json": {
+          "size": {
+            "longest_edge": 16777216,
+            "shortest_edge": 65536
+          },
+          "patch_size": 16,
+          "temporal_patch_size": 2,
+          "merge_size": 2,
+          "image_mean": [
+            0.5,
+            0.5,
+            0.5
+          ],
+          "image_std": [
+            0.5,
+            0.5,
+            0.5
+          ],
+          "processor_class": "Qwen3VLProcessor",
+          "image_processor_type": "Qwen2VLImageProcessorFast"
+        },
+        "model_manifest.json": {
+          "type": "generator",
+          "tasks": [
+            "generate",
+            "read"
+          ],
+          "inputs": [
+            "text",
+            "image"
+          ],
+          "capabilities": [
+            "ocr",
+            "lightonocr3"
+          ]
+        }
+      }
+    },
+    "lightonocr3-4b-bf16": {
+      "directory": "/private/tmp/antfly-lightonocr3-4b-model",
+      "weight_bytes": 9078620536,
+      "weight_files": [
+        {
+          "name": "model.safetensors",
+          "bytes": 9078620536
+        }
+      ],
+      "metadata": {
+        "config.json": {
+          "architectures": [
+            "Qwen3_5ForConditionalGeneration"
+          ],
+          "bos_token_id": null,
+          "dtype": "bfloat16",
+          "eos_token_id": 248046,
+          "image_token_id": 248056,
+          "model_type": "qwen3_5",
+          "pad_token_id": 248044,
+          "text_config": {
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "attn_output_gate": true,
+            "bos_token_id": null,
+            "dtype": "bfloat16",
+            "eos_token_id": 248044,
+            "full_attention_interval": 4,
+            "head_dim": 256,
+            "hidden_act": "silu",
+            "hidden_size": 2560,
+            "initializer_range": 0.02,
+            "intermediate_size": 9216,
+            "layer_types": [
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention"
+            ],
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_value_head_dim": 128,
+            "mamba_ssm_dtype": "float32",
+            "max_position_embeddings": 262144,
+            "mlp_only_layers": [],
+            "model_type": "qwen3_5_text",
+            "mtp_num_hidden_layers": 0,
+            "mtp_use_dedicated_embeddings": false,
+            "num_attention_heads": 16,
+            "num_hidden_layers": 32,
+            "num_key_value_heads": 4,
+            "pad_token_id": null,
+            "partial_rotary_factor": 0.25,
+            "rms_norm_eps": 1e-06,
+            "rope_parameters": {
+              "mrope_interleaved": true,
+              "mrope_section": [
+                11,
+                11,
+                10
+              ],
+              "partial_rotary_factor": 0.25,
+              "rope_theta": 10000000,
+              "rope_type": "default"
+            },
+            "tie_word_embeddings": true,
+            "use_cache": true,
+            "vocab_size": 248320
+          },
+          "tie_word_embeddings": true,
+          "transformers_version": "5.5.4",
+          "video_token_id": 248057,
+          "vision_config": {
+            "deepstack_visual_indexes": [],
+            "depth": 24,
+            "dtype": "bfloat16",
+            "hidden_act": "gelu_pytorch_tanh",
+            "hidden_size": 1024,
+            "in_channels": 3,
+            "initializer_range": 0.02,
+            "intermediate_size": 4096,
+            "model_type": "qwen3_5",
+            "num_heads": 16,
+            "num_position_embeddings": 2304,
+            "out_hidden_size": 2560,
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2
+          },
+          "vision_end_token_id": 248054,
+          "vision_start_token_id": 248053
+        },
+        "preprocessor_config.json": {
+          "size": {
+            "longest_edge": 16777216,
+            "shortest_edge": 65536
+          },
+          "patch_size": 16,
+          "temporal_patch_size": 2,
+          "merge_size": 2,
+          "image_mean": [
+            0.5,
+            0.5,
+            0.5
+          ],
+          "image_std": [
+            0.5,
+            0.5,
+            0.5
+          ],
+          "processor_class": "Qwen3VLProcessor",
+          "image_processor_type": "Qwen2VLImageProcessorFast"
+        },
+        "model_manifest.json": {
+          "type": "generator",
+          "tasks": [
+            "generate",
+            "read"
+          ],
+          "inputs": [
+            "text",
+            "image"
+          ],
+          "capabilities": [
+            "ocr",
+            "lightonocr3"
+          ]
+        }
+      }
+    }
+  },
+  "warm_runs_per_case_per_round": 3,
+  "rounds": 2,
+  "process_limit_gib": 13,
+  "shared_limit_gib": 24,
+  "notes": [
+    "Antfly Node.readEncodedImagesReportedDirect: includes preprocessing, inference, output handling; excludes HTTP, PDF rendering, embeddings, indexing.",
+    "Serial single-page requests with resident weights during warm samples; pages/s is requests divided by total warm seconds, not concurrent serving throughput.",
+    "Each case/model/round gets a new process and a separately reported cold request; OS file caches are not flushed.",
+    "Model order reverses each round; models never execute concurrently in this harness. Other machine workloads are uncontrolled.",
+    "Identical original page PNGs and output budgets; model-native resize/tokenization differs. Florence Q4_K and LightOn BF16 are different precision/size configurations.",
+    "Null prompt selects each model's default OCR behavior. The shared checkpoint test retains historical LIGHTONOCR3 log labels for all readers.",
+    "Synthetic smoke pages and required-field/CER checks are not a representative OCR accuracy evaluation.",
+    "Peak process RSS is a separate whole-process maximum, not a complete measure of GPU/unified-memory use.",
+    "Aggregates exclude failed requests; comparable_workloads separates complete-corpus results from cases completed by all available models."
+  ],
+  "runs": [
+    {
+      "round": 0,
+      "model": "florence2-base-q4_k",
+      "case": "invoice",
+      "image_sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e",
+      "original_image_bytes": 29689,
+      "max_new_tokens": 128,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round0-florence2-base-q4_k-invoice.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 0.394,
+            "text": "Antify local OCRInvoice 12345Total USD 42.00",
+            "required_fields": {
+              "Antfly": false,
+              "12345": true,
+              "42.00": true
+            },
+            "plain_text_cer": 0.08695652173913043
+          },
+          {
+            "run": 1,
+            "seconds": 0.39,
+            "text": "Antify local OCRInvoice 12345Total USD 42.00",
+            "required_fields": {
+              "Antfly": false,
+              "12345": true,
+              "42.00": true
+            },
+            "plain_text_cer": 0.08695652173913043
+          },
+          {
+            "run": 2,
+            "seconds": 0.39,
+            "text": "Antify local OCRInvoice 12345Total USD 42.00",
+            "required_fields": {
+              "Antfly": false,
+              "12345": true,
+              "42.00": true
+            },
+            "plain_text_cer": 0.08695652173913043
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 0.703
+      },
+      "peak_process_rss_bytes": 171278336,
+      "original_image_width_height": [
+        1200,
+        360
+      ]
+    },
+    {
+      "round": 0,
+      "model": "florence2-base-q4_k",
+      "case": "receipt",
+      "image_sha256": "4ccfc5a949e85643492606a95832a3f7630877fd334fece0b4fe4dc6a3291e03",
+      "original_image_bytes": 36819,
+      "max_new_tokens": 256,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round0-florence2-base-q4_k-receipt.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 0.558,
+            "text": "ANTFLY MARKETReceipt 4087EDate: 2026-10-21Coffee\nUSD 4.50Notebook\nUSD 7.25Subtotal\nUSD 11.75TaxUSD 0.94TotalUSD 12.69",
+            "required_fields": {
+              "40872": false,
+              "4.50": true,
+              "7.25": true,
+              "11.75": true,
+              "0.94": true,
+              "12.69": true
+            },
+            "plain_text_cer": 0.07936507936507936
+          },
+          {
+            "run": 1,
+            "seconds": 0.556,
+            "text": "ANTFLY MARKETReceipt 4087EDate: 2026-10-21Coffee\nUSD 4.50Notebook\nUSD 7.25Subtotal\nUSD 11.75TaxUSD 0.94TotalUSD 12.69",
+            "required_fields": {
+              "40872": false,
+              "4.50": true,
+              "7.25": true,
+              "11.75": true,
+              "0.94": true,
+              "12.69": true
+            },
+            "plain_text_cer": 0.07936507936507936
+          },
+          {
+            "run": 2,
+            "seconds": 0.562,
+            "text": "ANTFLY MARKETReceipt 4087EDate: 2026-10-21Coffee\nUSD 4.50Notebook\nUSD 7.25Subtotal\nUSD 11.75TaxUSD 0.94TotalUSD 12.69",
+            "required_fields": {
+              "40872": false,
+              "4.50": true,
+              "7.25": true,
+              "11.75": true,
+              "0.94": true,
+              "12.69": true
+            },
+            "plain_text_cer": 0.07936507936507936
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 0.682
+      },
+      "peak_process_rss_bytes": 172163072,
+      "original_image_width_height": [
+        864,
+        640
+      ]
+    },
+    {
+      "round": 0,
+      "model": "florence2-base-q4_k",
+      "case": "letter",
+      "image_sha256": "24e54193d36349212ef3cad911016efaf48837934305759817525f03be003737",
+      "original_image_bytes": 35253,
+      "max_new_tokens": 256,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round0-florence2-base-q4_k-letter.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 0.492,
+            "text": "Delivery confirmation\nReference: ORDER-76291The replacement parts will arrive on Friday.\nPlease leave the package at reception.\nContact: Morgan LeeTelephone: 555-0148",
+            "required_fields": {
+              "ORDER-76291": true,
+              "Friday": true,
+              "reception": true,
+              "Morgan Lee": true,
+              "555-0148": true
+            },
+            "plain_text_cer": 0.011904761904761904
+          },
+          {
+            "run": 1,
+            "seconds": 0.492,
+            "text": "Delivery confirmation\nReference: ORDER-76291The replacement parts will arrive on Friday.\nPlease leave the package at reception.\nContact: Morgan LeeTelephone: 555-0148",
+            "required_fields": {
+              "ORDER-76291": true,
+              "Friday": true,
+              "reception": true,
+              "Morgan Lee": true,
+              "555-0148": true
+            },
+            "plain_text_cer": 0.011904761904761904
+          },
+          {
+            "run": 2,
+            "seconds": 0.491,
+            "text": "Delivery confirmation\nReference: ORDER-76291The replacement parts will arrive on Friday.\nPlease leave the package at reception.\nContact: Morgan LeeTelephone: 555-0148",
+            "required_fields": {
+              "ORDER-76291": true,
+              "Friday": true,
+              "reception": true,
+              "Morgan Lee": true,
+              "555-0148": true
+            },
+            "plain_text_cer": 0.011904761904761904
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 0.621
+      },
+      "peak_process_rss_bytes": 173522944,
+      "original_image_width_height": [
+        1100,
+        720
+      ]
+    },
+    {
+      "round": 0,
+      "model": "florence2-base-q4_k",
+      "case": "shipping",
+      "image_sha256": "3bfab6d55f212b14fcd91a4663e2a7aa9e031ccd1242fd236728af99836d0007",
+      "original_image_bytes": 40736,
+      "max_new_tokens": 256,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round0-florence2-base-q4_k-shipping.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 0.511,
+            "text": "EXPRESS DELIVERYSHIP TO:Avery Chen184 Cedar Street\nPortland OR 97205Tracking: 987654321012Weight: 2.40 kgService: NEXT DAY",
+            "required_fields": {
+              "Avery Chen": true,
+              "184": true,
+              "97205": true,
+              "987654321012": true,
+              "2.40": true,
+              "NEXT DAY": true
+            },
+            "plain_text_cer": 0.046875
+          },
+          {
+            "run": 1,
+            "seconds": 0.513,
+            "text": "EXPRESS DELIVERYSHIP TO:Avery Chen184 Cedar Street\nPortland OR 97205Tracking: 987654321012Weight: 2.40 kgService: NEXT DAY",
+            "required_fields": {
+              "Avery Chen": true,
+              "184": true,
+              "97205": true,
+              "987654321012": true,
+              "2.40": true,
+              "NEXT DAY": true
+            },
+            "plain_text_cer": 0.046875
+          },
+          {
+            "run": 2,
+            "seconds": 0.514,
+            "text": "EXPRESS DELIVERYSHIP TO:Avery Chen184 Cedar Street\nPortland OR 97205Tracking: 987654321012Weight: 2.40 kgService: NEXT DAY",
+            "required_fields": {
+              "Avery Chen": true,
+              "184": true,
+              "97205": true,
+              "987654321012": true,
+              "2.40": true,
+              "NEXT DAY": true
+            },
+            "plain_text_cer": 0.046875
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 0.633
+      },
+      "peak_process_rss_bytes": 173916160,
+      "original_image_width_height": [
+        768,
+        864
+      ]
+    },
+    {
+      "round": 0,
+      "model": "lightonocr3-0.8b-bf16",
+      "case": "invoice",
+      "image_sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e",
+      "original_image_bytes": 29689,
+      "max_new_tokens": 128,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round0-lightonocr3-0.8b-bf16-invoice.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 0.907,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+            "required_fields": {
+              "Antfly": true,
+              "12345": true,
+              "42.00": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 1,
+            "seconds": 0.913,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+            "required_fields": {
+              "Antfly": true,
+              "12345": true,
+              "42.00": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 2,
+            "seconds": 0.919,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+            "required_fields": {
+              "Antfly": true,
+              "12345": true,
+              "42.00": true
+            },
+            "plain_text_cer": 0.0
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 1.914
+      },
+      "peak_process_rss_bytes": 264060928,
+      "original_image_width_height": [
+        1200,
+        360
+      ]
+    },
+    {
+      "round": 0,
+      "model": "lightonocr3-0.8b-bf16",
+      "case": "receipt",
+      "image_sha256": "4ccfc5a949e85643492606a95832a3f7630877fd334fece0b4fe4dc6a3291e03",
+      "original_image_bytes": 36819,
+      "max_new_tokens": 256,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round0-lightonocr3-0.8b-bf16-receipt.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 5.718,
+            "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+            "required_fields": {
+              "40872": true,
+              "4.50": true,
+              "7.25": true,
+              "11.75": true,
+              "0.94": true,
+              "12.69": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 1,
+            "seconds": 5.782,
+            "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+            "required_fields": {
+              "40872": true,
+              "4.50": true,
+              "7.25": true,
+              "11.75": true,
+              "0.94": true,
+              "12.69": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 2,
+            "seconds": 5.652,
+            "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+            "required_fields": {
+              "40872": true,
+              "4.50": true,
+              "7.25": true,
+              "11.75": true,
+              "0.94": true,
+              "12.69": true
+            },
+            "plain_text_cer": 0.0
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 6.041
+      },
+      "peak_process_rss_bytes": 263782400,
+      "original_image_width_height": [
+        864,
+        640
+      ]
+    },
+    {
+      "round": 0,
+      "model": "lightonocr3-0.8b-bf16",
+      "case": "letter",
+      "image_sha256": "24e54193d36349212ef3cad911016efaf48837934305759817525f03be003737",
+      "original_image_bytes": 35253,
+      "max_new_tokens": 256,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round0-lightonocr3-0.8b-bf16-letter.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 1.959,
+            "text": "# Delivery confirmation\n\n**Reference:** ORDER-76291\n\nThe replacement parts will arrive on Friday.  \nPlease leave the package at reception.\n\n**Contact:** Morgan Lee  \n**Telephone:** 555-0148",
+            "required_fields": {
+              "ORDER-76291": true,
+              "Friday": true,
+              "reception": true,
+              "Morgan Lee": true,
+              "555-0148": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 1,
+            "seconds": 1.958,
+            "text": "# Delivery confirmation\n\n**Reference:** ORDER-76291\n\nThe replacement parts will arrive on Friday.  \nPlease leave the package at reception.\n\n**Contact:** Morgan Lee  \n**Telephone:** 555-0148",
+            "required_fields": {
+              "ORDER-76291": true,
+              "Friday": true,
+              "reception": true,
+              "Morgan Lee": true,
+              "555-0148": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 2,
+            "seconds": 1.964,
+            "text": "# Delivery confirmation\n\n**Reference:** ORDER-76291\n\nThe replacement parts will arrive on Friday.  \nPlease leave the package at reception.\n\n**Contact:** Morgan Lee  \n**Telephone:** 555-0148",
+            "required_fields": {
+              "ORDER-76291": true,
+              "Friday": true,
+              "reception": true,
+              "Morgan Lee": true,
+              "555-0148": true
+            },
+            "plain_text_cer": 0.0
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 2.386
+      },
+      "peak_process_rss_bytes": 279724032,
+      "original_image_width_height": [
+        1100,
+        720
+      ]
+    },
+    {
+      "round": 0,
+      "model": "lightonocr3-0.8b-bf16",
+      "case": "shipping",
+      "image_sha256": "3bfab6d55f212b14fcd91a4663e2a7aa9e031ccd1242fd236728af99836d0007",
+      "original_image_bytes": 40736,
+      "max_new_tokens": 256,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round0-lightonocr3-0.8b-bf16-shipping.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 2.172,
+            "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\n**Tracking:** 987654321012  \n**Weight:** 2.40 kg  \n**Service:** NEXT DAY",
+            "required_fields": {
+              "Avery Chen": true,
+              "184": true,
+              "97205": true,
+              "987654321012": true,
+              "2.40": true,
+              "NEXT DAY": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 1,
+            "seconds": 2.126,
+            "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\n**Tracking:** 987654321012  \n**Weight:** 2.40 kg  \n**Service:** NEXT DAY",
+            "required_fields": {
+              "Avery Chen": true,
+              "184": true,
+              "97205": true,
+              "987654321012": true,
+              "2.40": true,
+              "NEXT DAY": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 2,
+            "seconds": 2.133,
+            "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\n**Tracking:** 987654321012  \n**Weight:** 2.40 kg  \n**Service:** NEXT DAY",
+            "required_fields": {
+              "Avery Chen": true,
+              "184": true,
+              "97205": true,
+              "987654321012": true,
+              "2.40": true,
+              "NEXT DAY": true
+            },
+            "plain_text_cer": 0.0
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 2.649
+      },
+      "peak_process_rss_bytes": 263798784,
+      "original_image_width_height": [
+        768,
+        864
+      ]
+    },
+    {
+      "round": 0,
+      "model": "lightonocr3-4b-bf16",
+      "case": "invoice",
+      "image_sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e",
+      "original_image_bytes": 29689,
+      "max_new_tokens": 128,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round0-lightonocr3-4b-bf16-invoice.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 2.107,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+            "required_fields": {
+              "Antfly": true,
+              "12345": true,
+              "42.00": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 1,
+            "seconds": 1.732,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+            "required_fields": {
+              "Antfly": true,
+              "12345": true,
+              "42.00": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 2,
+            "seconds": 1.712,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+            "required_fields": {
+              "Antfly": true,
+              "12345": true,
+              "42.00": true
+            },
+            "plain_text_cer": 0.0
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 9.219
+      },
+      "peak_process_rss_bytes": 357580800,
+      "original_image_width_height": [
+        1200,
+        360
+      ]
+    },
+    {
+      "round": 0,
+      "model": "lightonocr3-4b-bf16",
+      "case": "receipt",
+      "image_sha256": "4ccfc5a949e85643492606a95832a3f7630877fd334fece0b4fe4dc6a3291e03",
+      "original_image_bytes": 36819,
+      "max_new_tokens": 256,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round0-lightonocr3-4b-bf16-receipt.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 9.606,
+            "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+            "required_fields": {
+              "40872": true,
+              "4.50": true,
+              "7.25": true,
+              "11.75": true,
+              "0.94": true,
+              "12.69": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 1,
+            "seconds": 9.215,
+            "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+            "required_fields": {
+              "40872": true,
+              "4.50": true,
+              "7.25": true,
+              "11.75": true,
+              "0.94": true,
+              "12.69": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 2,
+            "seconds": 9.847,
+            "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+            "required_fields": {
+              "40872": true,
+              "4.50": true,
+              "7.25": true,
+              "11.75": true,
+              "0.94": true,
+              "12.69": true
+            },
+            "plain_text_cer": 0.0
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 9.683
+      },
+      "peak_process_rss_bytes": 391233536,
+      "original_image_width_height": [
+        864,
+        640
+      ]
+    },
+    {
+      "round": 0,
+      "model": "lightonocr3-4b-bf16",
+      "case": "letter",
+      "image_sha256": "24e54193d36349212ef3cad911016efaf48837934305759817525f03be003737",
+      "original_image_bytes": 35253,
+      "max_new_tokens": 256,
+      "exit_code": 1,
+      "timed_out": false,
+      "log": "round0-lightonocr3-4b-bf16-letter.txt",
+      "status": "resource_limit_exceeded",
+      "diagnostic_tail": "1/60 server.server.test.LightOnOCR3 real checkpoint transcribes the invoice fixture...FAIL (ResourceLimitExceeded)\n1 selected; 0 passed; 0 skipped; 1 failed; 0 leaked.\n        0.73 real         0.57 user         0.07 sys\n           263028736  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n               27682  page reclaims\n                  12  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   7  signals received\n                  11  voluntary context switches\n                 718  involuntary context switches\n          4814269968  instructions retired\n          1360414391  cycles elapsed\n           257590088  peak memory footprint\n",
+      "original_image_width_height": [
+        1100,
+        720
+      ]
+    },
+    {
+      "round": 0,
+      "model": "lightonocr3-4b-bf16",
+      "case": "shipping",
+      "image_sha256": "3bfab6d55f212b14fcd91a4663e2a7aa9e031ccd1242fd236728af99836d0007",
+      "original_image_bytes": 40736,
+      "max_new_tokens": 256,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round0-lightonocr3-4b-bf16-shipping.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 4.471,
+            "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+            "required_fields": {
+              "Avery Chen": true,
+              "184": true,
+              "97205": true,
+              "987654321012": true,
+              "2.40": true,
+              "NEXT DAY": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 1,
+            "seconds": 4.354,
+            "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+            "required_fields": {
+              "Avery Chen": true,
+              "184": true,
+              "97205": true,
+              "987654321012": true,
+              "2.40": true,
+              "NEXT DAY": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 2,
+            "seconds": 4.315,
+            "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+            "required_fields": {
+              "Avery Chen": true,
+              "184": true,
+              "97205": true,
+              "987654321012": true,
+              "2.40": true,
+              "NEXT DAY": true
+            },
+            "plain_text_cer": 0.0
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 4.791
+      },
+      "peak_process_rss_bytes": 426246144,
+      "original_image_width_height": [
+        768,
+        864
+      ]
+    },
+    {
+      "round": 1,
+      "model": "lightonocr3-4b-bf16",
+      "case": "invoice",
+      "image_sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e",
+      "original_image_bytes": 29689,
+      "max_new_tokens": 128,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round1-lightonocr3-4b-bf16-invoice.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 1.858,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+            "required_fields": {
+              "Antfly": true,
+              "12345": true,
+              "42.00": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 1,
+            "seconds": 1.918,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+            "required_fields": {
+              "Antfly": true,
+              "12345": true,
+              "42.00": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 2,
+            "seconds": 1.912,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+            "required_fields": {
+              "Antfly": true,
+              "12345": true,
+              "42.00": true
+            },
+            "plain_text_cer": 0.0
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 2.451
+      },
+      "peak_process_rss_bytes": 363937792,
+      "original_image_width_height": [
+        1200,
+        360
+      ]
+    },
+    {
+      "round": 1,
+      "model": "lightonocr3-4b-bf16",
+      "case": "receipt",
+      "image_sha256": "4ccfc5a949e85643492606a95832a3f7630877fd334fece0b4fe4dc6a3291e03",
+      "original_image_bytes": 36819,
+      "max_new_tokens": 256,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round1-lightonocr3-4b-bf16-receipt.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 9.678,
+            "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+            "required_fields": {
+              "40872": true,
+              "4.50": true,
+              "7.25": true,
+              "11.75": true,
+              "0.94": true,
+              "12.69": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 1,
+            "seconds": 9.593,
+            "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+            "required_fields": {
+              "40872": true,
+              "4.50": true,
+              "7.25": true,
+              "11.75": true,
+              "0.94": true,
+              "12.69": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 2,
+            "seconds": 9.546,
+            "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+            "required_fields": {
+              "40872": true,
+              "4.50": true,
+              "7.25": true,
+              "11.75": true,
+              "0.94": true,
+              "12.69": true
+            },
+            "plain_text_cer": 0.0
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 10.014
+      },
+      "peak_process_rss_bytes": 391217152,
+      "original_image_width_height": [
+        864,
+        640
+      ]
+    },
+    {
+      "round": 1,
+      "model": "lightonocr3-4b-bf16",
+      "case": "letter",
+      "image_sha256": "24e54193d36349212ef3cad911016efaf48837934305759817525f03be003737",
+      "original_image_bytes": 35253,
+      "max_new_tokens": 256,
+      "exit_code": 1,
+      "timed_out": false,
+      "log": "round1-lightonocr3-4b-bf16-letter.txt",
+      "status": "resource_limit_exceeded",
+      "diagnostic_tail": "1/60 server.server.test.LightOnOCR3 real checkpoint transcribes the invoice fixture...FAIL (ResourceLimitExceeded)\n1 selected; 0 passed; 0 skipped; 1 failed; 0 leaked.\n        0.75 real         0.58 user         0.08 sys\n           263028736  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n               27536  page reclaims\n                 166  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   8  signals received\n                  45  voluntary context switches\n                1080  involuntary context switches\n          4841514989  instructions retired\n          1286386160  cycles elapsed\n           257590088  peak memory footprint\n",
+      "original_image_width_height": [
+        1100,
+        720
+      ]
+    },
+    {
+      "round": 1,
+      "model": "lightonocr3-4b-bf16",
+      "case": "shipping",
+      "image_sha256": "3bfab6d55f212b14fcd91a4663e2a7aa9e031ccd1242fd236728af99836d0007",
+      "original_image_bytes": 40736,
+      "max_new_tokens": 256,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round1-lightonocr3-4b-bf16-shipping.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 4.26,
+            "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+            "required_fields": {
+              "Avery Chen": true,
+              "184": true,
+              "97205": true,
+              "987654321012": true,
+              "2.40": true,
+              "NEXT DAY": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 1,
+            "seconds": 4.22,
+            "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+            "required_fields": {
+              "Avery Chen": true,
+              "184": true,
+              "97205": true,
+              "987654321012": true,
+              "2.40": true,
+              "NEXT DAY": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 2,
+            "seconds": 4.118,
+            "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+            "required_fields": {
+              "Avery Chen": true,
+              "184": true,
+              "97205": true,
+              "987654321012": true,
+              "2.40": true,
+              "NEXT DAY": true
+            },
+            "plain_text_cer": 0.0
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 4.619
+      },
+      "peak_process_rss_bytes": 425328640,
+      "original_image_width_height": [
+        768,
+        864
+      ]
+    },
+    {
+      "round": 1,
+      "model": "lightonocr3-0.8b-bf16",
+      "case": "invoice",
+      "image_sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e",
+      "original_image_bytes": 29689,
+      "max_new_tokens": 128,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round1-lightonocr3-0.8b-bf16-invoice.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 0.889,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+            "required_fields": {
+              "Antfly": true,
+              "12345": true,
+              "42.00": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 1,
+            "seconds": 0.892,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+            "required_fields": {
+              "Antfly": true,
+              "12345": true,
+              "42.00": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 2,
+            "seconds": 0.904,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+            "required_fields": {
+              "Antfly": true,
+              "12345": true,
+              "42.00": true
+            },
+            "plain_text_cer": 0.0
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 2.331
+      },
+      "peak_process_rss_bytes": 264028160,
+      "original_image_width_height": [
+        1200,
+        360
+      ]
+    },
+    {
+      "round": 1,
+      "model": "lightonocr3-0.8b-bf16",
+      "case": "receipt",
+      "image_sha256": "4ccfc5a949e85643492606a95832a3f7630877fd334fece0b4fe4dc6a3291e03",
+      "original_image_bytes": 36819,
+      "max_new_tokens": 256,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round1-lightonocr3-0.8b-bf16-receipt.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 5.466,
+            "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+            "required_fields": {
+              "40872": true,
+              "4.50": true,
+              "7.25": true,
+              "11.75": true,
+              "0.94": true,
+              "12.69": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 1,
+            "seconds": 5.518,
+            "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+            "required_fields": {
+              "40872": true,
+              "4.50": true,
+              "7.25": true,
+              "11.75": true,
+              "0.94": true,
+              "12.69": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 2,
+            "seconds": 5.528,
+            "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+            "required_fields": {
+              "40872": true,
+              "4.50": true,
+              "7.25": true,
+              "11.75": true,
+              "0.94": true,
+              "12.69": true
+            },
+            "plain_text_cer": 0.0
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 5.877
+      },
+      "peak_process_rss_bytes": 276185088,
+      "original_image_width_height": [
+        864,
+        640
+      ]
+    },
+    {
+      "round": 1,
+      "model": "lightonocr3-0.8b-bf16",
+      "case": "letter",
+      "image_sha256": "24e54193d36349212ef3cad911016efaf48837934305759817525f03be003737",
+      "original_image_bytes": 35253,
+      "max_new_tokens": 256,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round1-lightonocr3-0.8b-bf16-letter.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 1.902,
+            "text": "# Delivery confirmation\n\n**Reference:** ORDER-76291\n\nThe replacement parts will arrive on Friday.  \nPlease leave the package at reception.\n\n**Contact:** Morgan Lee  \n**Telephone:** 555-0148",
+            "required_fields": {
+              "ORDER-76291": true,
+              "Friday": true,
+              "reception": true,
+              "Morgan Lee": true,
+              "555-0148": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 1,
+            "seconds": 1.906,
+            "text": "# Delivery confirmation\n\n**Reference:** ORDER-76291\n\nThe replacement parts will arrive on Friday.  \nPlease leave the package at reception.\n\n**Contact:** Morgan Lee  \n**Telephone:** 555-0148",
+            "required_fields": {
+              "ORDER-76291": true,
+              "Friday": true,
+              "reception": true,
+              "Morgan Lee": true,
+              "555-0148": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 2,
+            "seconds": 1.931,
+            "text": "# Delivery confirmation\n\n**Reference:** ORDER-76291\n\nThe replacement parts will arrive on Friday.  \nPlease leave the package at reception.\n\n**Contact:** Morgan Lee  \n**Telephone:** 555-0148",
+            "required_fields": {
+              "ORDER-76291": true,
+              "Friday": true,
+              "reception": true,
+              "Morgan Lee": true,
+              "555-0148": true
+            },
+            "plain_text_cer": 0.0
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 2.311
+      },
+      "peak_process_rss_bytes": 282722304,
+      "original_image_width_height": [
+        1100,
+        720
+      ]
+    },
+    {
+      "round": 1,
+      "model": "lightonocr3-0.8b-bf16",
+      "case": "shipping",
+      "image_sha256": "3bfab6d55f212b14fcd91a4663e2a7aa9e031ccd1242fd236728af99836d0007",
+      "original_image_bytes": 40736,
+      "max_new_tokens": 256,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round1-lightonocr3-0.8b-bf16-shipping.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 2.183,
+            "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\n**Tracking:** 987654321012  \n**Weight:** 2.40 kg  \n**Service:** NEXT DAY",
+            "required_fields": {
+              "Avery Chen": true,
+              "184": true,
+              "97205": true,
+              "987654321012": true,
+              "2.40": true,
+              "NEXT DAY": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 1,
+            "seconds": 2.206,
+            "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\n**Tracking:** 987654321012  \n**Weight:** 2.40 kg  \n**Service:** NEXT DAY",
+            "required_fields": {
+              "Avery Chen": true,
+              "184": true,
+              "97205": true,
+              "987654321012": true,
+              "2.40": true,
+              "NEXT DAY": true
+            },
+            "plain_text_cer": 0.0
+          },
+          {
+            "run": 2,
+            "seconds": 2.213,
+            "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\n**Tracking:** 987654321012  \n**Weight:** 2.40 kg  \n**Service:** NEXT DAY",
+            "required_fields": {
+              "Avery Chen": true,
+              "184": true,
+              "97205": true,
+              "987654321012": true,
+              "2.40": true,
+              "NEXT DAY": true
+            },
+            "plain_text_cer": 0.0
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 2.558
+      },
+      "peak_process_rss_bytes": 270876672,
+      "original_image_width_height": [
+        768,
+        864
+      ]
+    },
+    {
+      "round": 1,
+      "model": "florence2-base-q4_k",
+      "case": "invoice",
+      "image_sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e",
+      "original_image_bytes": 29689,
+      "max_new_tokens": 128,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round1-florence2-base-q4_k-invoice.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 0.41,
+            "text": "Antify local OCRInvoice 12345Total USD 42.00",
+            "required_fields": {
+              "Antfly": false,
+              "12345": true,
+              "42.00": true
+            },
+            "plain_text_cer": 0.08695652173913043
+          },
+          {
+            "run": 1,
+            "seconds": 0.407,
+            "text": "Antify local OCRInvoice 12345Total USD 42.00",
+            "required_fields": {
+              "Antfly": false,
+              "12345": true,
+              "42.00": true
+            },
+            "plain_text_cer": 0.08695652173913043
+          },
+          {
+            "run": 2,
+            "seconds": 0.408,
+            "text": "Antify local OCRInvoice 12345Total USD 42.00",
+            "required_fields": {
+              "Antfly": false,
+              "12345": true,
+              "42.00": true
+            },
+            "plain_text_cer": 0.08695652173913043
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 0.745
+      },
+      "peak_process_rss_bytes": 172195840,
+      "original_image_width_height": [
+        1200,
+        360
+      ]
+    },
+    {
+      "round": 1,
+      "model": "florence2-base-q4_k",
+      "case": "receipt",
+      "image_sha256": "4ccfc5a949e85643492606a95832a3f7630877fd334fece0b4fe4dc6a3291e03",
+      "original_image_bytes": 36819,
+      "max_new_tokens": 256,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round1-florence2-base-q4_k-receipt.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 0.555,
+            "text": "ANTFLY MARKETReceipt 4087EDate: 2026-10-21Coffee\nUSD 4.50Notebook\nUSD 7.25Subtotal\nUSD 11.75TaxUSD 0.94TotalUSD 12.69",
+            "required_fields": {
+              "40872": false,
+              "4.50": true,
+              "7.25": true,
+              "11.75": true,
+              "0.94": true,
+              "12.69": true
+            },
+            "plain_text_cer": 0.07936507936507936
+          },
+          {
+            "run": 1,
+            "seconds": 0.544,
+            "text": "ANTFLY MARKETReceipt 4087EDate: 2026-10-21Coffee\nUSD 4.50Notebook\nUSD 7.25Subtotal\nUSD 11.75TaxUSD 0.94TotalUSD 12.69",
+            "required_fields": {
+              "40872": false,
+              "4.50": true,
+              "7.25": true,
+              "11.75": true,
+              "0.94": true,
+              "12.69": true
+            },
+            "plain_text_cer": 0.07936507936507936
+          },
+          {
+            "run": 2,
+            "seconds": 0.556,
+            "text": "ANTFLY MARKETReceipt 4087EDate: 2026-10-21Coffee\nUSD 4.50Notebook\nUSD 7.25Subtotal\nUSD 11.75TaxUSD 0.94TotalUSD 12.69",
+            "required_fields": {
+              "40872": false,
+              "4.50": true,
+              "7.25": true,
+              "11.75": true,
+              "0.94": true,
+              "12.69": true
+            },
+            "plain_text_cer": 0.07936507936507936
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 0.721
+      },
+      "peak_process_rss_bytes": 171655168,
+      "original_image_width_height": [
+        864,
+        640
+      ]
+    },
+    {
+      "round": 1,
+      "model": "florence2-base-q4_k",
+      "case": "letter",
+      "image_sha256": "24e54193d36349212ef3cad911016efaf48837934305759817525f03be003737",
+      "original_image_bytes": 35253,
+      "max_new_tokens": 256,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round1-florence2-base-q4_k-letter.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 0.482,
+            "text": "Delivery confirmation\nReference: ORDER-76291The replacement parts will arrive on Friday.\nPlease leave the package at reception.\nContact: Morgan LeeTelephone: 555-0148",
+            "required_fields": {
+              "ORDER-76291": true,
+              "Friday": true,
+              "reception": true,
+              "Morgan Lee": true,
+              "555-0148": true
+            },
+            "plain_text_cer": 0.011904761904761904
+          },
+          {
+            "run": 1,
+            "seconds": 0.485,
+            "text": "Delivery confirmation\nReference: ORDER-76291The replacement parts will arrive on Friday.\nPlease leave the package at reception.\nContact: Morgan LeeTelephone: 555-0148",
+            "required_fields": {
+              "ORDER-76291": true,
+              "Friday": true,
+              "reception": true,
+              "Morgan Lee": true,
+              "555-0148": true
+            },
+            "plain_text_cer": 0.011904761904761904
+          },
+          {
+            "run": 2,
+            "seconds": 0.485,
+            "text": "Delivery confirmation\nReference: ORDER-76291The replacement parts will arrive on Friday.\nPlease leave the package at reception.\nContact: Morgan LeeTelephone: 555-0148",
+            "required_fields": {
+              "ORDER-76291": true,
+              "Friday": true,
+              "reception": true,
+              "Morgan Lee": true,
+              "555-0148": true
+            },
+            "plain_text_cer": 0.011904761904761904
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 0.606
+      },
+      "peak_process_rss_bytes": 175669248,
+      "original_image_width_height": [
+        1100,
+        720
+      ]
+    },
+    {
+      "round": 1,
+      "model": "florence2-base-q4_k",
+      "case": "shipping",
+      "image_sha256": "3bfab6d55f212b14fcd91a4663e2a7aa9e031ccd1242fd236728af99836d0007",
+      "original_image_bytes": 40736,
+      "max_new_tokens": 256,
+      "exit_code": 0,
+      "timed_out": false,
+      "log": "round1-florence2-base-q4_k-shipping.txt",
+      "status": "ok",
+      "result": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 0.499,
+            "text": "EXPRESS DELIVERYSHIP TO:Avery Chen184 Cedar Street\nPortland OR 97205Tracking: 987654321012Weight: 2.40 kgService: NEXT DAY",
+            "required_fields": {
+              "Avery Chen": true,
+              "184": true,
+              "97205": true,
+              "987654321012": true,
+              "2.40": true,
+              "NEXT DAY": true
+            },
+            "plain_text_cer": 0.046875
+          },
+          {
+            "run": 1,
+            "seconds": 0.494,
+            "text": "EXPRESS DELIVERYSHIP TO:Avery Chen184 Cedar Street\nPortland OR 97205Tracking: 987654321012Weight: 2.40 kgService: NEXT DAY",
+            "required_fields": {
+              "Avery Chen": true,
+              "184": true,
+              "97205": true,
+              "987654321012": true,
+              "2.40": true,
+              "NEXT DAY": true
+            },
+            "plain_text_cer": 0.046875
+          },
+          {
+            "run": 2,
+            "seconds": 0.493,
+            "text": "EXPRESS DELIVERYSHIP TO:Avery Chen184 Cedar Street\nPortland OR 97205Tracking: 987654321012Weight: 2.40 kgService: NEXT DAY",
+            "required_fields": {
+              "Avery Chen": true,
+              "184": true,
+              "97205": true,
+              "987654321012": true,
+              "2.40": true,
+              "NEXT DAY": true
+            },
+            "plain_text_cer": 0.046875
+          }
+        ],
+        "phase_timings_ms": [],
+        "warm_phase_timings_ms": [],
+        "cold_request_seconds": 0.617
+      },
+      "peak_process_rss_bytes": 174014464,
+      "original_image_width_height": [
+        768,
+        864
+      ]
+    }
+  ],
+  "summary": {
+    "florence2-base-q4_k": {
+      "status": "ok",
+      "completed_cases": [
+        "invoice",
+        "letter",
+        "receipt",
+        "shipping"
+      ],
+      "warm_samples": 24,
+      "warm_total_seconds": 11.681000000000001,
+      "mean_seconds_per_page": 0.48670833333333335,
+      "serial_pages_per_second": 2.054618611420255,
+      "cases": {
+        "invoice": {
+          "samples": 6,
+          "median_seconds": 0.40049999999999997,
+          "range_seconds": [
+            0.39,
+            0.41
+          ],
+          "serial_pages_per_second": 2.5010421008753645,
+          "required_fields": {
+            "Antfly": false,
+            "12345": true,
+            "42.00": true
+          },
+          "all_required_fields_every_run": false,
+          "plain_text_cer_median": 0.08695652173913043,
+          "texts": [
+            "Antify local OCRInvoice 12345Total USD 42.00"
+          ],
+          "cold_request_seconds": [
+            0.703,
+            0.745
+          ],
+          "peak_process_rss_bytes": [
+            171278336,
+            172195840
+          ]
+        },
+        "receipt": {
+          "samples": 6,
+          "median_seconds": 0.556,
+          "range_seconds": [
+            0.544,
+            0.562
+          ],
+          "serial_pages_per_second": 1.8012608826178322,
+          "required_fields": {
+            "40872": false,
+            "4.50": true,
+            "7.25": true,
+            "11.75": true,
+            "0.94": true,
+            "12.69": true
+          },
+          "all_required_fields_every_run": false,
+          "plain_text_cer_median": 0.07936507936507936,
+          "texts": [
+            "ANTFLY MARKETReceipt 4087EDate: 2026-10-21Coffee\nUSD 4.50Notebook\nUSD 7.25Subtotal\nUSD 11.75TaxUSD 0.94TotalUSD 12.69"
+          ],
+          "cold_request_seconds": [
+            0.682,
+            0.721
+          ],
+          "peak_process_rss_bytes": [
+            172163072,
+            171655168
+          ]
+        },
+        "letter": {
+          "samples": 6,
+          "median_seconds": 0.488,
+          "range_seconds": [
+            0.482,
+            0.492
+          ],
+          "serial_pages_per_second": 2.0498804236419543,
+          "required_fields": {
+            "ORDER-76291": true,
+            "Friday": true,
+            "reception": true,
+            "Morgan Lee": true,
+            "555-0148": true
+          },
+          "all_required_fields_every_run": true,
+          "plain_text_cer_median": 0.011904761904761904,
+          "texts": [
+            "Delivery confirmation\nReference: ORDER-76291The replacement parts will arrive on Friday.\nPlease leave the package at reception.\nContact: Morgan LeeTelephone: 555-0148"
+          ],
+          "cold_request_seconds": [
+            0.621,
+            0.606
+          ],
+          "peak_process_rss_bytes": [
+            173522944,
+            175669248
+          ]
+        },
+        "shipping": {
+          "samples": 6,
+          "median_seconds": 0.505,
+          "range_seconds": [
+            0.493,
+            0.514
+          ],
+          "serial_pages_per_second": 1.9841269841269844,
+          "required_fields": {
+            "Avery Chen": true,
+            "184": true,
+            "97205": true,
+            "987654321012": true,
+            "2.40": true,
+            "NEXT DAY": true
+          },
+          "all_required_fields_every_run": true,
+          "plain_text_cer_median": 0.046875,
+          "texts": [
+            "EXPRESS DELIVERYSHIP TO:Avery Chen184 Cedar Street\nPortland OR 97205Tracking: 987654321012Weight: 2.40 kgService: NEXT DAY"
+          ],
+          "cold_request_seconds": [
+            0.633,
+            0.617
+          ],
+          "peak_process_rss_bytes": [
+            173916160,
+            174014464
+          ]
+        }
+      }
+    },
+    "lightonocr3-0.8b-bf16": {
+      "status": "ok",
+      "completed_cases": [
+        "invoice",
+        "letter",
+        "receipt",
+        "shipping"
+      ],
+      "warm_samples": 24,
+      "warm_total_seconds": 63.741000000000014,
+      "mean_seconds_per_page": 2.655875,
+      "serial_pages_per_second": 0.37652374452863924,
+      "cases": {
+        "invoice": {
+          "samples": 6,
+          "median_seconds": 0.9055,
+          "range_seconds": [
+            0.889,
+            0.919
+          ],
+          "serial_pages_per_second": 1.1061946902654867,
+          "required_fields": {
+            "Antfly": true,
+            "12345": true,
+            "42.00": true
+          },
+          "all_required_fields_every_run": true,
+          "plain_text_cer_median": 0.0,
+          "texts": [
+            "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+          ],
+          "cold_request_seconds": [
+            1.914,
+            2.331
+          ],
+          "peak_process_rss_bytes": [
+            264060928,
+            264028160
+          ]
+        },
+        "receipt": {
+          "samples": 6,
+          "median_seconds": 5.59,
+          "range_seconds": [
+            5.466,
+            5.782
+          ],
+          "serial_pages_per_second": 0.17823193916349808,
+          "required_fields": {
+            "40872": true,
+            "4.50": true,
+            "7.25": true,
+            "11.75": true,
+            "0.94": true,
+            "12.69": true
+          },
+          "all_required_fields_every_run": true,
+          "plain_text_cer_median": 0.0,
+          "texts": [
+            "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>"
+          ],
+          "cold_request_seconds": [
+            6.041,
+            5.877
+          ],
+          "peak_process_rss_bytes": [
+            263782400,
+            276185088
+          ]
+        },
+        "letter": {
+          "samples": 6,
+          "median_seconds": 1.9445000000000001,
+          "range_seconds": [
+            1.902,
+            1.964
+          ],
+          "serial_pages_per_second": 0.5163511187607572,
+          "required_fields": {
+            "ORDER-76291": true,
+            "Friday": true,
+            "reception": true,
+            "Morgan Lee": true,
+            "555-0148": true
+          },
+          "all_required_fields_every_run": true,
+          "plain_text_cer_median": 0.0,
+          "texts": [
+            "# Delivery confirmation\n\n**Reference:** ORDER-76291\n\nThe replacement parts will arrive on Friday.  \nPlease leave the package at reception.\n\n**Contact:** Morgan Lee  \n**Telephone:** 555-0148"
+          ],
+          "cold_request_seconds": [
+            2.386,
+            2.311
+          ],
+          "peak_process_rss_bytes": [
+            279724032,
+            282722304
+          ]
+        },
+        "shipping": {
+          "samples": 6,
+          "median_seconds": 2.1775,
+          "range_seconds": [
+            2.126,
+            2.213
+          ],
+          "serial_pages_per_second": 0.46036983043044577,
+          "required_fields": {
+            "Avery Chen": true,
+            "184": true,
+            "97205": true,
+            "987654321012": true,
+            "2.40": true,
+            "NEXT DAY": true
+          },
+          "all_required_fields_every_run": true,
+          "plain_text_cer_median": 0.0,
+          "texts": [
+            "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\n**Tracking:** 987654321012  \n**Weight:** 2.40 kg  \n**Service:** NEXT DAY"
+          ],
+          "cold_request_seconds": [
+            2.649,
+            2.558
+          ],
+          "peak_process_rss_bytes": [
+            263798784,
+            270876672
+          ]
+        }
+      }
+    },
+    "lightonocr3-4b-bf16": {
+      "status": "partial",
+      "completed_cases": [
+        "invoice",
+        "receipt",
+        "shipping"
+      ],
+      "warm_samples": 18,
+      "warm_total_seconds": 94.462,
+      "mean_seconds_per_page": 5.247888888888889,
+      "serial_pages_per_second": 0.1905528148885266,
+      "cases": {
+        "invoice": {
+          "samples": 6,
+          "median_seconds": 1.885,
+          "range_seconds": [
+            1.712,
+            2.107
+          ],
+          "serial_pages_per_second": 0.5338553252068688,
+          "required_fields": {
+            "Antfly": true,
+            "12345": true,
+            "42.00": true
+          },
+          "all_required_fields_every_run": true,
+          "plain_text_cer_median": 0.0,
+          "texts": [
+            "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+          ],
+          "cold_request_seconds": [
+            9.219,
+            2.451
+          ],
+          "peak_process_rss_bytes": [
+            357580800,
+            363937792
+          ]
+        },
+        "receipt": {
+          "samples": 6,
+          "median_seconds": 9.599499999999999,
+          "range_seconds": [
+            9.215,
+            9.847
+          ],
+          "serial_pages_per_second": 0.10437505436200747,
+          "required_fields": {
+            "40872": true,
+            "4.50": true,
+            "7.25": true,
+            "11.75": true,
+            "0.94": true,
+            "12.69": true
+          },
+          "all_required_fields_every_run": true,
+          "plain_text_cer_median": 0.0,
+          "texts": [
+            "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>"
+          ],
+          "cold_request_seconds": [
+            9.683,
+            10.014
+          ],
+          "peak_process_rss_bytes": [
+            391233536,
+            391217152
+          ]
+        },
+        "shipping": {
+          "samples": 6,
+          "median_seconds": 4.2875,
+          "range_seconds": [
+            4.118,
+            4.471
+          ],
+          "serial_pages_per_second": 0.23311834641386278,
+          "required_fields": {
+            "Avery Chen": true,
+            "184": true,
+            "97205": true,
+            "987654321012": true,
+            "2.40": true,
+            "NEXT DAY": true
+          },
+          "all_required_fields_every_run": true,
+          "plain_text_cer_median": 0.0,
+          "texts": [
+            "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY"
+          ],
+          "cold_request_seconds": [
+            4.791,
+            4.619
+          ],
+          "peak_process_rss_bytes": [
+            426246144,
+            425328640
+          ]
+        }
+      }
+    }
+  },
+  "hardware": {
+    "processor": "Apple M4 Max",
+    "physical_memory_bytes": 38654705664
+  },
+  "worktree_revision": "b037bec202289bd70a4128f5f7a7da3b5f9f0c61",
+  "comparable_workloads": {
+    "complete_four_page_models": {
+      "cases": [
+        "invoice",
+        "letter",
+        "receipt",
+        "shipping"
+      ],
+      "models": {
+        "florence2-base-q4_k": {
+          "warm_samples": 24,
+          "mean_seconds_per_page": 0.4867083333333333,
+          "serial_pages_per_second": 2.0546186114202554
+        },
+        "lightonocr3-0.8b-bf16": {
+          "warm_samples": 24,
+          "mean_seconds_per_page": 2.655875,
+          "serial_pages_per_second": 0.37652374452863935
+        }
+      }
+    },
+    "common_cases_all_available_models": {
+      "cases": [
+        "invoice",
+        "receipt",
+        "shipping"
+      ],
+      "models": {
+        "florence2-base-q4_k": {
+          "warm_samples": 18,
+          "mean_seconds_per_page": 0.4863333333333333,
+          "serial_pages_per_second": 2.0562028786840303
+        },
+        "lightonocr3-0.8b-bf16": {
+          "warm_samples": 18,
+          "mean_seconds_per_page": 2.895611111111111,
+          "serial_pages_per_second": 0.3453502427044761
+        },
+        "lightonocr3-4b-bf16": {
+          "warm_samples": 18,
+          "mean_seconds_per_page": 5.247888888888889,
+          "serial_pages_per_second": 0.1905528148885266
+        }
+      }
+    }
+  }
+}

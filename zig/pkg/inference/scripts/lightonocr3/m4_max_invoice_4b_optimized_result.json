@@ -1,0 +1,1909 @@
+{
+  "date": "2026-10-21",
+  "machine": "Apple M4 Max, 36 GiB unified memory",
+  "os": "macOS 27.0.1 arm64",
+  "model": {
+    "id": "lightonai/LightOnOCR-3-4B",
+    "revision": "b71010f095dc3735de7ee6b9969bff8f8f50b39a",
+    "bf16_parameters": 4539265536,
+    "checkpoint_bytes": 9078620536
+  },
+  "native_executable_sha256": "abca704a436dfc915b2d03dd952fd494503d90d28863b457b73af718ac15fc41",
+  "precision": {
+    "weights": "BF16",
+    "default_activations_accumulation_recurrent_state": "F32",
+    "experimental_bf16_inputs": "Eligible multi-token TensorOps projections only; outputs and recurrent state remain F32."
+  },
+  "summary": {
+    "warm_samples_per_runtime": 6,
+    "native_seconds": {
+      "min": 1.826,
+      "median": 2.2065,
+      "max": 2.658
+    },
+    "pytorch_seconds": {
+      "min": 3.195155540946871,
+      "median": 4.021259478991851,
+      "max": 4.29152908292599
+    },
+    "pytorch_over_native_median_ratio": 1.8224606748206893,
+    "native_latency_reduction_fraction": 0.4512913151893446,
+    "all_invoice_text_matches": true
+  },
+  "limitations": [
+    "Shared machine; substantial load changes, sequential runtime measurements, loading excluded from warm latency.",
+    "Two opposite runtime orders for the invoice; six warm requests per runtime.",
+    "Four synthetic smoke pages only; not a representative accuracy, dense-page, grounding, or CUDA evaluation.",
+    "Native direct encoded-image read API includes request setup and cleanup; PyTorch includes preprocessing and generation but excludes output text decoding.",
+    "Text agreement does not establish token/logit parity.",
+    "Final defaults were checked on invoice and receipt; final letter/shipping repeats were resource-limited. The projection-only round checked all four pages.",
+    "GPU-frame and CPU profiles use separate instrumented requests and are excluded from warm latency samples."
+  ],
+  "implementation": [
+    "Model-scoped M4 Max BF16 vector GEMV, including 32/64-output recurrent gates.",
+    "Single-token fused BF16 gate/up projection and SiLU with F32 math.",
+    "Optional Metal 4 TensorOps matrix path with F32 inputs by default; unsupported paths retain existing dispatch.",
+    "Parallel F32 RMS normalization for eligible 4B decode hidden/head shapes.",
+    "Independent test process/cache limits; production memory policy remains unchanged."
+  ],
+  "validation": {
+    "focused_tests_passed": 19,
+    "focused_tests_skipped": 0,
+    "real_08b_metal_regression_passed": true,
+    "all_projection_norm_and_bf16_edge_checks_passed": true,
+    "max_abs_projection_error": 1.80304e-06,
+    "max_abs_fused_gate_up_error": 2.38419e-06,
+    "max_abs_parallel_norm_error": 8.34465e-07,
+    "final_default_quality": [
+      {
+        "case": "invoice",
+        "native_f32_median_seconds": 2.222,
+        "native_bf16_input_median_seconds": 4.341,
+        "pytorch_median_seconds": 3.225324666011147,
+        "f32_text_matches_pytorch": true,
+        "bf16_input_text_matches_pytorch": true,
+        "required_fields_present": true,
+        "native_f32_plain_text_cer": 0.0
+      },
+      {
+        "case": "receipt",
+        "native_f32_median_seconds": 11.648,
+        "native_bf16_input_median_seconds": 12.15,
+        "pytorch_median_seconds": 39.10922187496908,
+        "f32_text_matches_pytorch": true,
+        "bf16_input_text_matches_pytorch": true,
+        "required_fields_present": true,
+        "native_f32_plain_text_cer": 0.0
+      }
+    ],
+    "final_default_corpus_status": {
+      "final_default_cases_completed": [
+        "invoice",
+        "receipt"
+      ],
+      "final_default_cases_resource_limited": [
+        "letter",
+        "shipping"
+      ],
+      "reason": "A cold letter run was stopped after more than five minutes waiting for GPU completion. A bounded retry hit live-memory admission; a larger process envelope also failed initial live-memory admission. No output mismatch was observed."
+    },
+    "projection_only_four_page_text_matches": true
+  },
+  "rounds": [
+    {
+      "pytorch_first": true,
+      "invoice": {
+        "name": "invoice",
+        "image": "../../../src/models/testdata/lightonocr3/invoice.png",
+        "expected": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+        "required": [
+          "Antfly",
+          "12345",
+          "42.00"
+        ],
+        "max_new_tokens": 128,
+        "image_sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e",
+        "native": {
+          "f32": {
+            "backend": "metal",
+            "runs": [
+              {
+                "run": 0,
+                "seconds": 2.293,
+                "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+              },
+              {
+                "run": 1,
+                "seconds": 1.876,
+                "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+              },
+              {
+                "run": 2,
+                "seconds": 1.826,
+                "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+              }
+            ],
+            "phase_timings_ms": [
+              {
+                "prompt_format": 0,
+                "tokenize": 0,
+                "multimodal_prepare": 766,
+                "runtime_prepare": 0,
+                "prefill": 4031,
+                "decode": 2430,
+                "text_decode": 1,
+                "total": 7228
+              },
+              {
+                "prompt_format": 0,
+                "tokenize": 0,
+                "multimodal_prepare": 721,
+                "runtime_prepare": 0,
+                "prefill": 700,
+                "decode": 787,
+                "text_decode": 0,
+                "total": 2208
+              },
+              {
+                "prompt_format": 0,
+                "tokenize": 0,
+                "multimodal_prepare": 368,
+                "runtime_prepare": 0,
+                "prefill": 624,
+                "decode": 794,
+                "text_decode": 0,
+                "total": 1786
+              },
+              {
+                "prompt_format": 0,
+                "tokenize": 0,
+                "multimodal_prepare": 407,
+                "runtime_prepare": 0,
+                "prefill": 546,
+                "decode": 785,
+                "text_decode": 0,
+                "total": 1738
+              }
+            ],
+            "warm_phase_timings_ms": [
+              {
+                "prompt_format": 0,
+                "tokenize": 0,
+                "multimodal_prepare": 721,
+                "runtime_prepare": 0,
+                "prefill": 700,
+                "decode": 787,
+                "text_decode": 0,
+                "total": 2208
+              },
+              {
+                "prompt_format": 0,
+                "tokenize": 0,
+                "multimodal_prepare": 368,
+                "runtime_prepare": 0,
+                "prefill": 624,
+                "decode": 794,
+                "text_decode": 0,
+                "total": 1786
+              },
+              {
+                "prompt_format": 0,
+                "tokenize": 0,
+                "multimodal_prepare": 407,
+                "runtime_prepare": 0,
+                "prefill": 546,
+                "decode": 785,
+                "text_decode": 0,
+                "total": 1738
+              }
+            ],
+            "cold_request_seconds": 11.72,
+            "median_seconds": 1.876,
+            "warm_text_stable": true,
+            "cer": 0.0,
+            "plain_text_cer": 0.0,
+            "required_present": {
+              "Antfly": true,
+              "12345": true,
+              "42.00": true
+            },
+            "speedup_vs_pytorch": 2.1436492979987216,
+            "normalized_text_matches_pytorch": true
+          }
+        },
+        "pytorch": {
+          "metadata": {
+            "torch": "2.14.1",
+            "transformers": "5.5.4",
+            "platform": "macOS-27.0.1-arm64-arm-64bit",
+            "device": "mps",
+            "dtype": "bfloat16",
+            "image_size": [
+              1200,
+              360
+            ],
+            "image_sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e",
+            "model_dir": "/private/tmp/antfly-lightonocr3-4b-model",
+            "max_new_tokens": 128,
+            "load_seconds": 13.49682037497405,
+            "prompt": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            "input_tokens": 432,
+            "image_grid_thw": [
+              [
+                1,
+                22,
+                76
+              ]
+            ]
+          },
+          "runs": [
+            {
+              "run": 0,
+              "warm": false,
+              "seconds": 7.727570499991998,
+              "tokens": 22,
+              "token_ids": [
+                16614,
+                20979,
+                2136,
+                77796,
+                271,
+                33526,
+                220,
+                16,
+                17,
+                18,
+                19,
+                20,
+                271,
+                7354,
+                18954,
+                220,
+                19,
+                17,
+                13,
+                15,
+                15,
+                248046
+              ],
+              "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+              "mps_allocated_bytes": 9087993344,
+              "max_rss_bytes": 649592832
+            },
+            {
+              "run": 1,
+              "warm": true,
+              "seconds": 4.021486083045602,
+              "tokens": 22,
+              "token_ids": [
+                16614,
+                20979,
+                2136,
+                77796,
+                271,
+                33526,
+                220,
+                16,
+                17,
+                18,
+                19,
+                20,
+                271,
+                7354,
+                18954,
+                220,
+                19,
+                17,
+                13,
+                15,
+                15,
+                248046
+              ],
+              "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+              "mps_allocated_bytes": 9087993344,
+              "max_rss_bytes": 649592832
+            },
+            {
+              "run": 2,
+              "warm": true,
+              "seconds": 4.021032874938101,
+              "tokens": 22,
+              "token_ids": [
+                16614,
+                20979,
+                2136,
+                77796,
+                271,
+                33526,
+                220,
+                16,
+                17,
+                18,
+                19,
+                20,
+                271,
+                7354,
+                18954,
+                220,
+                19,
+                17,
+                13,
+                15,
+                15,
+                248046
+              ],
+              "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+              "mps_allocated_bytes": 9087993344,
+              "max_rss_bytes": 649592832
+            },
+            {
+              "run": 3,
+              "warm": true,
+              "seconds": 4.29152908292599,
+              "tokens": 22,
+              "token_ids": [
+                16614,
+                20979,
+                2136,
+                77796,
+                271,
+                33526,
+                220,
+                16,
+                17,
+                18,
+                19,
+                20,
+                271,
+                7354,
+                18954,
+                220,
+                19,
+                17,
+                13,
+                15,
+                15,
+                248046
+              ],
+              "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+              "mps_allocated_bytes": 9087993344,
+              "max_rss_bytes": 649592832
+            }
+          ],
+          "profile": {
+            "preprocess_seconds": 0.022436207975260913,
+            "instrumented_generation_seconds": 3.9574887910857797,
+            "scopes": {
+              "vision_prefill": {
+                "calls": 1,
+                "mps_event_ms": 320.76849999999996,
+                "cpu_forward_ms": 318.41237493790686
+              },
+              "language_prefill": {
+                "calls": 1,
+                "mps_event_ms": 711.192417,
+                "cpu_forward_ms": 690.5626660445705
+              },
+              "lm_head_prefill": {
+                "calls": 1,
+                "mps_event_ms": 2.828792,
+                "cpu_forward_ms": 0.058125006034970284
+              },
+              "forward_prefill": {
+                "calls": 1,
+                "mps_event_ms": 1043.353666,
+                "cpu_forward_ms": 1019.4835829315707
+              },
+              "language_decode": {
+                "calls": 21,
+                "mps_event_ms": 2770.009336,
+                "cpu_forward_ms": 2703.959334990941
+              },
+              "lm_head_decode": {
+                "calls": 21,
+                "mps_event_ms": 91.70391799999999,
+                "cpu_forward_ms": 1.87729112803936
+              },
+              "forward_decode": {
+                "calls": 21,
+                "mps_event_ms": 2869.16029,
+                "cpu_forward_ms": 2712.360624689609
+              }
+            },
+            "token_ids": [
+              16614,
+              20979,
+              2136,
+              77796,
+              271,
+              33526,
+              220,
+              16,
+              17,
+              18,
+              19,
+              20,
+              271,
+              7354,
+              18954,
+              220,
+              19,
+              17,
+              13,
+              15,
+              15,
+              248046
+            ],
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+            "notes": [
+              "Separate instrumented request; excluded from warm latency statistics.",
+              "MPS event intervals include device queue idle time.",
+              "Forward scopes include vision/language/lm_head child scopes.",
+              "CPU forward time measures submission and incidental synchronization."
+            ]
+          },
+          "median_seconds": 4.021486083045602,
+          "cer": 0.0,
+          "plain_text_cer": 0.0,
+          "required_present": {
+            "Antfly": true,
+            "12345": true,
+            "42.00": true
+          },
+          "warm_text_stable": true,
+          "output_budget_reached": false
+        }
+      }
+    },
+    {
+      "pytorch_first": false,
+      "invoice": {
+        "name": "invoice",
+        "image": "../../../src/models/testdata/lightonocr3/invoice.png",
+        "expected": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+        "required": [
+          "Antfly",
+          "12345",
+          "42.00"
+        ],
+        "max_new_tokens": 128,
+        "image_sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e",
+        "native": {
+          "f32": {
+            "backend": "metal",
+            "runs": [
+              {
+                "run": 0,
+                "seconds": 2.191,
+                "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+              },
+              {
+                "run": 1,
+                "seconds": 2.222,
+                "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+              },
+              {
+                "run": 2,
+                "seconds": 2.658,
+                "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+              }
+            ],
+            "phase_timings_ms": [
+              {
+                "prompt_format": 0,
+                "tokenize": 0,
+                "multimodal_prepare": 428,
+                "runtime_prepare": 0,
+                "prefill": 807,
+                "decode": 841,
+                "text_decode": 0,
+                "total": 2076
+              },
+              {
+                "prompt_format": 0,
+                "tokenize": 0,
+                "multimodal_prepare": 410,
+                "runtime_prepare": 0,
+                "prefill": 875,
+                "decode": 818,
+                "text_decode": 0,
+                "total": 2103
+              },
+              {
+                "prompt_format": 0,
+                "tokenize": 0,
+                "multimodal_prepare": 403,
+                "runtime_prepare": 0,
+                "prefill": 858,
+                "decode": 858,
+                "text_decode": 0,
+                "total": 2119
+              },
+              {
+                "prompt_format": 0,
+                "tokenize": 0,
+                "multimodal_prepare": 406,
+                "runtime_prepare": 0,
+                "prefill": 1214,
+                "decode": 948,
+                "text_decode": 0,
+                "total": 2568
+              }
+            ],
+            "warm_phase_timings_ms": [
+              {
+                "prompt_format": 0,
+                "tokenize": 0,
+                "multimodal_prepare": 410,
+                "runtime_prepare": 0,
+                "prefill": 875,
+                "decode": 818,
+                "text_decode": 0,
+                "total": 2103
+              },
+              {
+                "prompt_format": 0,
+                "tokenize": 0,
+                "multimodal_prepare": 403,
+                "runtime_prepare": 0,
+                "prefill": 858,
+                "decode": 858,
+                "text_decode": 0,
+                "total": 2119
+              },
+              {
+                "prompt_format": 0,
+                "tokenize": 0,
+                "multimodal_prepare": 406,
+                "runtime_prepare": 0,
+                "prefill": 1214,
+                "decode": 948,
+                "text_decode": 0,
+                "total": 2568
+              }
+            ],
+            "cold_request_seconds": 2.578,
+            "median_seconds": 2.222,
+            "warm_text_stable": true,
+            "cer": 0.0,
+            "plain_text_cer": 0.0,
+            "required_present": {
+              "Antfly": true,
+              "12345": true,
+              "42.00": true
+            },
+            "speedup_vs_pytorch": 1.4515412538303993,
+            "normalized_text_matches_pytorch": true
+          },
+          "bf16": {
+            "backend": "metal",
+            "runs": [
+              {
+                "run": 0,
+                "seconds": 3.792,
+                "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+              },
+              {
+                "run": 1,
+                "seconds": 4.341,
+                "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+              },
+              {
+                "run": 2,
+                "seconds": 6.583,
+                "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+              }
+            ],
+            "phase_timings_ms": [
+              {
+                "prompt_format": 0,
+                "tokenize": 0,
+                "multimodal_prepare": 658,
+                "runtime_prepare": 0,
+                "prefill": 1818,
+                "decode": 1260,
+                "text_decode": 0,
+                "total": 3736
+              },
+              {
+                "prompt_format": 0,
+                "tokenize": 0,
+                "multimodal_prepare": 832,
+                "runtime_prepare": 0,
+                "prefill": 1906,
+                "decode": 955,
+                "text_decode": 0,
+                "total": 3693
+              },
+              {
+                "prompt_format": 0,
+                "tokenize": 0,
+                "multimodal_prepare": 459,
+                "runtime_prepare": 0,
+                "prefill": 2040,
+                "decode": 1745,
+                "text_decode": 0,
+                "total": 4244
+              },
+              {
+                "prompt_format": 0,
+                "tokenize": 0,
+                "multimodal_prepare": 1117,
+                "runtime_prepare": 0,
+                "prefill": 3106,
+                "decode": 2254,
+                "text_decode": 3,
+                "total": 6480
+              }
+            ],
+            "warm_phase_timings_ms": [
+              {
+                "prompt_format": 0,
+                "tokenize": 0,
+                "multimodal_prepare": 832,
+                "runtime_prepare": 0,
+                "prefill": 1906,
+                "decode": 955,
+                "text_decode": 0,
+                "total": 3693
+              },
+              {
+                "prompt_format": 0,
+                "tokenize": 0,
+                "multimodal_prepare": 459,
+                "runtime_prepare": 0,
+                "prefill": 2040,
+                "decode": 1745,
+                "text_decode": 0,
+                "total": 4244
+              },
+              {
+                "prompt_format": 0,
+                "tokenize": 0,
+                "multimodal_prepare": 1117,
+                "runtime_prepare": 0,
+                "prefill": 3106,
+                "decode": 2254,
+                "text_decode": 3,
+                "total": 6480
+              }
+            ],
+            "cold_request_seconds": 4.309,
+            "median_seconds": 4.341,
+            "warm_text_stable": true,
+            "cer": 0.0,
+            "plain_text_cer": 0.0,
+            "required_present": {
+              "Antfly": true,
+              "12345": true,
+              "42.00": true
+            },
+            "speedup_vs_pytorch": 0.7429911693183937,
+            "normalized_text_matches_pytorch": true
+          }
+        },
+        "pytorch": {
+          "metadata": {
+            "torch": "2.14.1",
+            "transformers": "5.5.4",
+            "platform": "macOS-27.0.1-arm64-arm-64bit",
+            "device": "mps",
+            "dtype": "bfloat16",
+            "image_size": [
+              1200,
+              360
+            ],
+            "image_sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e",
+            "model_dir": "/private/tmp/antfly-lightonocr3-4b-model",
+            "max_new_tokens": 128,
+            "load_seconds": 12.334866833058186,
+            "prompt": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            "input_tokens": 432,
+            "image_grid_thw": [
+              [
+                1,
+                22,
+                76
+              ]
+            ]
+          },
+          "runs": [
+            {
+              "run": 0,
+              "warm": false,
+              "seconds": 8.516608791076578,
+              "tokens": 22,
+              "token_ids": [
+                16614,
+                20979,
+                2136,
+                77796,
+                271,
+                33526,
+                220,
+                16,
+                17,
+                18,
+                19,
+                20,
+                271,
+                7354,
+                18954,
+                220,
+                19,
+                17,
+                13,
+                15,
+                15,
+                248046
+              ],
+              "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+              "mps_allocated_bytes": 9087993344,
+              "max_rss_bytes": 708591616
+            },
+            {
+              "run": 1,
+              "warm": true,
+              "seconds": 3.195155540946871,
+              "tokens": 22,
+              "token_ids": [
+                16614,
+                20979,
+                2136,
+                77796,
+                271,
+                33526,
+                220,
+                16,
+                17,
+                18,
+                19,
+                20,
+                271,
+                7354,
+                18954,
+                220,
+                19,
+                17,
+                13,
+                15,
+                15,
+                248046
+              ],
+              "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+              "mps_allocated_bytes": 9087993344,
+              "max_rss_bytes": 708591616
+            },
+            {
+              "run": 2,
+              "warm": true,
+              "seconds": 3.225324666011147,
+              "tokens": 22,
+              "token_ids": [
+                16614,
+                20979,
+                2136,
+                77796,
+                271,
+                33526,
+                220,
+                16,
+                17,
+                18,
+                19,
+                20,
+                271,
+                7354,
+                18954,
+                220,
+                19,
+                17,
+                13,
+                15,
+                15,
+                248046
+              ],
+              "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+              "mps_allocated_bytes": 9087993344,
+              "max_rss_bytes": 708591616
+            },
+            {
+              "run": 3,
+              "warm": true,
+              "seconds": 4.086049166042358,
+              "tokens": 22,
+              "token_ids": [
+                16614,
+                20979,
+                2136,
+                77796,
+                271,
+                33526,
+                220,
+                16,
+                17,
+                18,
+                19,
+                20,
+                271,
+                7354,
+                18954,
+                220,
+                19,
+                17,
+                13,
+                15,
+                15,
+                248046
+              ],
+              "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+              "mps_allocated_bytes": 9087993344,
+              "max_rss_bytes": 708591616
+            }
+          ],
+          "profile": {
+            "preprocess_seconds": 0.04198812507092953,
+            "instrumented_generation_seconds": 3.8776584579609334,
+            "scopes": {
+              "vision_prefill": {
+                "calls": 1,
+                "mps_event_ms": 448.829708,
+                "cpu_forward_ms": 434.58404194097966
+              },
+              "language_prefill": {
+                "calls": 1,
+                "mps_event_ms": 745.493375,
+                "cpu_forward_ms": 727.4357909336686
+              },
+              "lm_head_prefill": {
+                "calls": 1,
+                "mps_event_ms": 107.650458,
+                "cpu_forward_ms": 0.1385828945785761
+              },
+              "forward_prefill": {
+                "calls": 1,
+                "mps_event_ms": 1312.855625,
+                "cpu_forward_ms": 1186.88358401414
+              },
+              "language_decode": {
+                "calls": 21,
+                "mps_event_ms": 2408.384833,
+                "cpu_forward_ms": 2353.1221681041643
+              },
+              "lm_head_decode": {
+                "calls": 21,
+                "mps_event_ms": 95.429959,
+                "cpu_forward_ms": 1.6876680310815573
+              },
+              "forward_decode": {
+                "calls": 21,
+                "mps_event_ms": 2510.6175839999996,
+                "cpu_forward_ms": 2364.7983766859397
+              }
+            },
+            "token_ids": [
+              16614,
+              20979,
+              2136,
+              77796,
+              271,
+              33526,
+              220,
+              16,
+              17,
+              18,
+              19,
+              20,
+              271,
+              7354,
+              18954,
+              220,
+              19,
+              17,
+              13,
+              15,
+              15,
+              248046
+            ],
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+            "notes": [
+              "Separate instrumented request; excluded from warm latency statistics.",
+              "MPS event intervals include device queue idle time.",
+              "Forward scopes include vision/language/lm_head child scopes.",
+              "CPU forward time measures submission and incidental synchronization."
+            ]
+          },
+          "median_seconds": 3.225324666011147,
+          "cer": 0.0,
+          "plain_text_cer": 0.0,
+          "required_present": {
+            "Antfly": true,
+            "12345": true,
+            "42.00": true
+          },
+          "warm_text_stable": true,
+          "output_budget_reached": false
+        }
+      }
+    }
+  ],
+  "profiling": {
+    "before_parallel_norm": {
+      "frames": [
+        {
+          "regime": "prefill",
+          "frame": 0,
+          "gpu_ns": 2908228000,
+          "attention_ns": 2270365145,
+          "ffn_ns": 275769210,
+          "other_ns": 3926898
+        },
+        {
+          "regime": "prefill",
+          "frame": 0,
+          "gpu_ns": 479502000,
+          "attention_ns": 368823186,
+          "ffn_ns": 56594586,
+          "other_ns": 813443
+        },
+        {
+          "regime": "decode",
+          "frame": 0,
+          "gpu_ns": 52170041,
+          "attention_ns": 25613944,
+          "ffn_ns": 5791342,
+          "other_ns": 334370
+        },
+        {
+          "regime": "decode",
+          "frame": 0,
+          "gpu_ns": 51793791,
+          "attention_ns": 25605164,
+          "ffn_ns": 5709754,
+          "other_ns": 315577
+        },
+        {
+          "regime": "decode",
+          "frame": 0,
+          "gpu_ns": 50915416,
+          "attention_ns": 25001536,
+          "ffn_ns": 5785932,
+          "other_ns": 315402
+        },
+        {
+          "regime": "prefill",
+          "frame": 0,
+          "gpu_ns": 527594125,
+          "attention_ns": 409387078,
+          "ffn_ns": 60520700,
+          "other_ns": 904208
+        }
+      ],
+      "last_decoder_frame_dispatches": {
+        "termite_lightonocr3_gemv_vec4": 120,
+        "termite_apply_rms_norm_rows": 81,
+        "termite_apply_add_1x": 64,
+        "termite_lightonocr3_gemv_vec4_rows2": 64,
+        "termite_slice_last_dim_f32_2d": 48,
+        "termite_lightonocr3_gate_up_gemv": 32,
+        "termite_qwen35_conv": 24,
+        "termite_qwen35_history": 24,
+        "termite_qwen35_norm": 24,
+        "termite_qwen35_prepare": 24,
+        "termite_qwen35_recurrent_decode": 24,
+        "termite_apply_mrope": 16,
+        "termite_concat_lastdim_f32_2d": 16,
+        "termite_apply_activation_1x": 8,
+        "termite_apply_multiply_1x": 8,
+        "termite_paged_attention_kv_1x": 8,
+        "termite_paged_f16_kv_seed": 8
+      },
+      "median_sampled_decode_gpu_ms": 51.793791,
+      "status": "completed",
+      "resource_denial_log": null
+    },
+    "final_default": {
+      "frames": [
+        {
+          "regime": "prefill",
+          "frame": 0,
+          "gpu_ns": 5094308666,
+          "attention_ns": 3999429526,
+          "ffn_ns": 605234334,
+          "other_ns": 8240319
+        },
+        {
+          "regime": "prefill",
+          "frame": 0,
+          "gpu_ns": 511195750,
+          "attention_ns": 395848267,
+          "ffn_ns": 58792793,
+          "other_ns": 811949
+        },
+        {
+          "regime": "decode",
+          "frame": 0,
+          "gpu_ns": 27813374,
+          "attention_ns": 13430650,
+          "ffn_ns": 2955222,
+          "other_ns": 3390
+        },
+        {
+          "regime": "decode",
+          "frame": 0,
+          "gpu_ns": 27512541,
+          "attention_ns": 13155990,
+          "ffn_ns": 2953201,
+          "other_ns": 3395
+        },
+        {
+          "regime": "decode",
+          "frame": 0,
+          "gpu_ns": 26601124,
+          "attention_ns": 12737018,
+          "ffn_ns": 2883066,
+          "other_ns": 3477
+        },
+        {
+          "regime": "prefill",
+          "frame": 0,
+          "gpu_ns": 549686374,
+          "attention_ns": 424515888,
+          "ffn_ns": 64398138,
+          "other_ns": 889440
+        }
+      ],
+      "last_decoder_frame_dispatches": {
+        "termite_lightonocr3_gemv_vec4": 120,
+        "termite_apply_rms_norm_rows_simd4_reduce": 81,
+        "termite_apply_add_1x": 64,
+        "termite_lightonocr3_gemv_vec4_rows2": 64,
+        "termite_slice_last_dim_f32_2d": 48,
+        "termite_lightonocr3_gate_up_gemv": 32,
+        "termite_qwen35_conv": 24,
+        "termite_qwen35_history": 24,
+        "termite_qwen35_norm": 24,
+        "termite_qwen35_prepare": 24,
+        "termite_qwen35_recurrent_decode": 24,
+        "termite_apply_mrope": 16,
+        "termite_concat_lastdim_f32_2d": 16,
+        "termite_apply_activation_1x": 8,
+        "termite_apply_multiply_1x": 8,
+        "termite_paged_attention_kv_1x": 8,
+        "termite_paged_f16_kv_seed": 8
+      },
+      "median_sampled_decode_gpu_ms": 27.512541,
+      "status": "completed",
+      "resource_denial_log": null
+    }
+  },
+  "controls_before_parallel_norm": {
+    "name": "invoice",
+    "image": "../../../src/models/testdata/lightonocr3/invoice.png",
+    "expected": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+    "required": [
+      "Antfly",
+      "12345",
+      "42.00"
+    ],
+    "max_new_tokens": 128,
+    "native": {
+      "baseline": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 3.003,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+          },
+          {
+            "run": 1,
+            "seconds": 2.656,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+          },
+          {
+            "run": 2,
+            "seconds": 2.716,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+          }
+        ],
+        "phase_timings_ms": [
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 722,
+            "runtime_prepare": 0,
+            "prefill": 3266,
+            "decode": 1684,
+            "text_decode": 0,
+            "total": 5672
+          },
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 738,
+            "runtime_prepare": 0,
+            "prefill": 691,
+            "decode": 1505,
+            "text_decode": 0,
+            "total": 2934
+          },
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 378,
+            "runtime_prepare": 0,
+            "prefill": 682,
+            "decode": 1522,
+            "text_decode": 0,
+            "total": 2582
+          },
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 382,
+            "runtime_prepare": 0,
+            "prefill": 715,
+            "decode": 1547,
+            "text_decode": 0,
+            "total": 2644
+          }
+        ],
+        "warm_phase_timings_ms": [
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 738,
+            "runtime_prepare": 0,
+            "prefill": 691,
+            "decode": 1505,
+            "text_decode": 0,
+            "total": 2934
+          },
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 378,
+            "runtime_prepare": 0,
+            "prefill": 682,
+            "decode": 1522,
+            "text_decode": 0,
+            "total": 2582
+          },
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 382,
+            "runtime_prepare": 0,
+            "prefill": 715,
+            "decode": 1547,
+            "text_decode": 0,
+            "total": 2644
+          }
+        ],
+        "cold_request_seconds": 6.163,
+        "median_seconds": 2.716,
+        "normalized_text_matches_pytorch": true
+      },
+      "f32": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 2.361,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+          },
+          {
+            "run": 1,
+            "seconds": 2.412,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+          },
+          {
+            "run": 2,
+            "seconds": 2.242,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+          }
+        ],
+        "phase_timings_ms": [
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 387,
+            "runtime_prepare": 0,
+            "prefill": 588,
+            "decode": 1239,
+            "text_decode": 0,
+            "total": 2214
+          },
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 389,
+            "runtime_prepare": 0,
+            "prefill": 675,
+            "decode": 1224,
+            "text_decode": 0,
+            "total": 2288
+          },
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 365,
+            "runtime_prepare": 0,
+            "prefill": 675,
+            "decode": 1299,
+            "text_decode": 0,
+            "total": 2339
+          },
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 357,
+            "runtime_prepare": 0,
+            "prefill": 580,
+            "decode": 1231,
+            "text_decode": 0,
+            "total": 2168
+          }
+        ],
+        "warm_phase_timings_ms": [
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 389,
+            "runtime_prepare": 0,
+            "prefill": 675,
+            "decode": 1224,
+            "text_decode": 0,
+            "total": 2288
+          },
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 365,
+            "runtime_prepare": 0,
+            "prefill": 675,
+            "decode": 1299,
+            "text_decode": 0,
+            "total": 2339
+          },
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 357,
+            "runtime_prepare": 0,
+            "prefill": 580,
+            "decode": 1231,
+            "text_decode": 0,
+            "total": 2168
+          }
+        ],
+        "cold_request_seconds": 2.722,
+        "median_seconds": 2.361,
+        "normalized_text_matches_pytorch": true
+      },
+      "bf16": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 2.273,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+          },
+          {
+            "run": 1,
+            "seconds": 2.527,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+          },
+          {
+            "run": 2,
+            "seconds": 2.686,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+          }
+        ],
+        "phase_timings_ms": [
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 396,
+            "runtime_prepare": 0,
+            "prefill": 745,
+            "decode": 1235,
+            "text_decode": 0,
+            "total": 2376
+          },
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 374,
+            "runtime_prepare": 0,
+            "prefill": 588,
+            "decode": 1233,
+            "text_decode": 0,
+            "total": 2195
+          },
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 395,
+            "runtime_prepare": 0,
+            "prefill": 808,
+            "decode": 1243,
+            "text_decode": 0,
+            "total": 2446
+          },
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 399,
+            "runtime_prepare": 0,
+            "prefill": 958,
+            "decode": 1254,
+            "text_decode": 0,
+            "total": 2611
+          }
+        ],
+        "warm_phase_timings_ms": [
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 374,
+            "runtime_prepare": 0,
+            "prefill": 588,
+            "decode": 1233,
+            "text_decode": 0,
+            "total": 2195
+          },
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 395,
+            "runtime_prepare": 0,
+            "prefill": 808,
+            "decode": 1243,
+            "text_decode": 0,
+            "total": 2446
+          },
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 399,
+            "runtime_prepare": 0,
+            "prefill": 958,
+            "decode": 1254,
+            "text_decode": 0,
+            "total": 2611
+          }
+        ],
+        "cold_request_seconds": 2.859,
+        "median_seconds": 2.527,
+        "normalized_text_matches_pytorch": true
+      },
+      "no_fused": {
+        "backend": "metal",
+        "runs": [
+          {
+            "run": 0,
+            "seconds": 2.242,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+          },
+          {
+            "run": 1,
+            "seconds": 2.25,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+          },
+          {
+            "run": 2,
+            "seconds": 2.242,
+            "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+          }
+        ],
+        "phase_timings_ms": [
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 400,
+            "runtime_prepare": 0,
+            "prefill": 567,
+            "decode": 1238,
+            "text_decode": 0,
+            "total": 2205
+          },
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 359,
+            "runtime_prepare": 0,
+            "prefill": 576,
+            "decode": 1236,
+            "text_decode": 0,
+            "total": 2171
+          },
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 346,
+            "runtime_prepare": 0,
+            "prefill": 598,
+            "decode": 1230,
+            "text_decode": 0,
+            "total": 2174
+          },
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 354,
+            "runtime_prepare": 0,
+            "prefill": 584,
+            "decode": 1228,
+            "text_decode": 0,
+            "total": 2166
+          }
+        ],
+        "warm_phase_timings_ms": [
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 359,
+            "runtime_prepare": 0,
+            "prefill": 576,
+            "decode": 1236,
+            "text_decode": 0,
+            "total": 2171
+          },
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 346,
+            "runtime_prepare": 0,
+            "prefill": 598,
+            "decode": 1230,
+            "text_decode": 0,
+            "total": 2174
+          },
+          {
+            "prompt_format": 0,
+            "tokenize": 0,
+            "multimodal_prepare": 354,
+            "runtime_prepare": 0,
+            "prefill": 584,
+            "decode": 1228,
+            "text_decode": 0,
+            "total": 2166
+          }
+        ],
+        "cold_request_seconds": 2.697,
+        "median_seconds": 2.242,
+        "normalized_text_matches_pytorch": true
+      }
+    },
+    "pytorch": {
+      "metadata": {
+        "torch": "2.14.1",
+        "transformers": "5.5.4",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "device": "mps",
+        "dtype": "bfloat16",
+        "image_size": [
+          1200,
+          360
+        ],
+        "image_sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e",
+        "model_dir": "/private/tmp/antfly-lightonocr3-4b-model",
+        "max_new_tokens": 128,
+        "load_seconds": 9.031290750019252,
+        "prompt": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        "input_tokens": 432,
+        "image_grid_thw": [
+          [
+            1,
+            22,
+            76
+          ]
+        ]
+      },
+      "runs": [
+        {
+          "run": 0,
+          "warm": false,
+          "seconds": 3.4207555409520864,
+          "tokens": 22,
+          "token_ids": [
+            16614,
+            20979,
+            2136,
+            77796,
+            271,
+            33526,
+            220,
+            16,
+            17,
+            18,
+            19,
+            20,
+            271,
+            7354,
+            18954,
+            220,
+            19,
+            17,
+            13,
+            15,
+            15,
+            248046
+          ],
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "mps_allocated_bytes": 9087993344,
+          "max_rss_bytes": 773537792
+        },
+        {
+          "run": 1,
+          "warm": true,
+          "seconds": 2.05843612505123,
+          "tokens": 22,
+          "token_ids": [
+            16614,
+            20979,
+            2136,
+            77796,
+            271,
+            33526,
+            220,
+            16,
+            17,
+            18,
+            19,
+            20,
+            271,
+            7354,
+            18954,
+            220,
+            19,
+            17,
+            13,
+            15,
+            15,
+            248046
+          ],
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "mps_allocated_bytes": 9087993344,
+          "max_rss_bytes": 773537792
+        },
+        {
+          "run": 2,
+          "warm": true,
+          "seconds": 2.0893188340123743,
+          "tokens": 22,
+          "token_ids": [
+            16614,
+            20979,
+            2136,
+            77796,
+            271,
+            33526,
+            220,
+            16,
+            17,
+            18,
+            19,
+            20,
+            271,
+            7354,
+            18954,
+            220,
+            19,
+            17,
+            13,
+            15,
+            15,
+            248046
+          ],
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "mps_allocated_bytes": 9087993344,
+          "max_rss_bytes": 773537792
+        },
+        {
+          "run": 3,
+          "warm": true,
+          "seconds": 2.1352460000198334,
+          "tokens": 22,
+          "token_ids": [
+            16614,
+            20979,
+            2136,
+            77796,
+            271,
+            33526,
+            220,
+            16,
+            17,
+            18,
+            19,
+            20,
+            271,
+            7354,
+            18954,
+            220,
+            19,
+            17,
+            13,
+            15,
+            15,
+            248046
+          ],
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "mps_allocated_bytes": 9087993344,
+          "max_rss_bytes": 773537792
+        }
+      ],
+      "profile": {
+        "preprocess_seconds": 0.011056457995437086,
+        "instrumented_generation_seconds": 2.261073915986344,
+        "scopes": {
+          "vision_prefill": {
+            "calls": 1,
+            "mps_event_ms": 195.15195799999998,
+            "cpu_forward_ms": 188.52179194800556
+          },
+          "language_prefill": {
+            "calls": 1,
+            "mps_event_ms": 589.97,
+            "cpu_forward_ms": 568.5240419115871
+          },
+          "lm_head_prefill": {
+            "calls": 1,
+            "mps_event_ms": 3.99925,
+            "cpu_forward_ms": 0.08229189552366734
+          },
+          "forward_prefill": {
+            "calls": 1,
+            "mps_event_ms": 791.855334,
+            "cpu_forward_ms": 766.4901249809191
+          },
+          "language_decode": {
+            "calls": 21,
+            "mps_event_ms": 1364.267833,
+            "cpu_forward_ms": 1326.1337057920173
+          },
+          "lm_head_decode": {
+            "calls": 21,
+            "mps_event_ms": 83.89962699999998,
+            "cpu_forward_ms": 1.103751827031374
+          },
+          "forward_decode": {
+            "calls": 21,
+            "mps_event_ms": 1450.259748,
+            "cpu_forward_ms": 1331.913503818214
+          }
+        },
+        "token_ids": [
+          16614,
+          20979,
+          2136,
+          77796,
+          271,
+          33526,
+          220,
+          16,
+          17,
+          18,
+          19,
+          20,
+          271,
+          7354,
+          18954,
+          220,
+          19,
+          17,
+          13,
+          15,
+          15,
+          248046
+        ],
+        "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+        "notes": [
+          "Separate instrumented request; excluded from warm latency statistics.",
+          "MPS event intervals include device queue idle time.",
+          "Forward scopes include vision/language/lm_head child scopes.",
+          "CPU forward time measures submission and incidental synchronization."
+        ]
+      },
+      "median_seconds": 2.0893188340123743
+    }
+  },
+  "parallel_norm_candidate": {
+    "parallel_norm": {
+      "backend": "metal",
+      "runs": [
+        {
+          "run": 0,
+          "seconds": 1.804,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+        },
+        {
+          "run": 1,
+          "seconds": 1.707,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+        },
+        {
+          "run": 2,
+          "seconds": 1.736,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+        }
+      ],
+      "phase_timings_ms": [
+        {
+          "prompt_format": 0,
+          "tokenize": 0,
+          "multimodal_prepare": 533,
+          "runtime_prepare": 0,
+          "prefill": 1241,
+          "decode": 742,
+          "text_decode": 0,
+          "total": 2516
+        },
+        {
+          "prompt_format": 0,
+          "tokenize": 0,
+          "multimodal_prepare": 349,
+          "runtime_prepare": 0,
+          "prefill": 627,
+          "decode": 750,
+          "text_decode": 0,
+          "total": 1726
+        },
+        {
+          "prompt_format": 0,
+          "tokenize": 0,
+          "multimodal_prepare": 344,
+          "runtime_prepare": 0,
+          "prefill": 544,
+          "decode": 747,
+          "text_decode": 0,
+          "total": 1635
+        },
+        {
+          "prompt_format": 0,
+          "tokenize": 0,
+          "multimodal_prepare": 359,
+          "runtime_prepare": 0,
+          "prefill": 548,
+          "decode": 752,
+          "text_decode": 0,
+          "total": 1659
+        }
+      ],
+      "warm_phase_timings_ms": [
+        {
+          "prompt_format": 0,
+          "tokenize": 0,
+          "multimodal_prepare": 349,
+          "runtime_prepare": 0,
+          "prefill": 627,
+          "decode": 750,
+          "text_decode": 0,
+          "total": 1726
+        },
+        {
+          "prompt_format": 0,
+          "tokenize": 0,
+          "multimodal_prepare": 344,
+          "runtime_prepare": 0,
+          "prefill": 544,
+          "decode": 747,
+          "text_decode": 0,
+          "total": 1635
+        },
+        {
+          "prompt_format": 0,
+          "tokenize": 0,
+          "multimodal_prepare": 359,
+          "runtime_prepare": 0,
+          "prefill": 548,
+          "decode": 752,
+          "text_decode": 0,
+          "total": 1659
+        }
+      ],
+      "cold_request_seconds": 2.984,
+      "median_seconds": 1.736
+    },
+    "parallel_norm_no_fused": {
+      "backend": "metal",
+      "runs": [
+        {
+          "run": 0,
+          "seconds": 1.793,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+        },
+        {
+          "run": 1,
+          "seconds": 1.735,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+        },
+        {
+          "run": 2,
+          "seconds": 1.773,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+        }
+      ],
+      "phase_timings_ms": [
+        {
+          "prompt_format": 0,
+          "tokenize": 0,
+          "multimodal_prepare": 369,
+          "runtime_prepare": 0,
+          "prefill": 585,
+          "decode": 776,
+          "text_decode": 0,
+          "total": 1730
+        },
+        {
+          "prompt_format": 0,
+          "tokenize": 0,
+          "multimodal_prepare": 369,
+          "runtime_prepare": 0,
+          "prefill": 565,
+          "decode": 783,
+          "text_decode": 1,
+          "total": 1718
+        },
+        {
+          "prompt_format": 0,
+          "tokenize": 0,
+          "multimodal_prepare": 349,
+          "runtime_prepare": 0,
+          "prefill": 544,
+          "decode": 765,
+          "text_decode": 0,
+          "total": 1658
+        },
+        {
+          "prompt_format": 0,
+          "tokenize": 0,
+          "multimodal_prepare": 385,
+          "runtime_prepare": 0,
+          "prefill": 557,
+          "decode": 757,
+          "text_decode": 0,
+          "total": 1699
+        }
+      ],
+      "warm_phase_timings_ms": [
+        {
+          "prompt_format": 0,
+          "tokenize": 0,
+          "multimodal_prepare": 369,
+          "runtime_prepare": 0,
+          "prefill": 565,
+          "decode": 783,
+          "text_decode": 1,
+          "total": 1718
+        },
+        {
+          "prompt_format": 0,
+          "tokenize": 0,
+          "multimodal_prepare": 349,
+          "runtime_prepare": 0,
+          "prefill": 544,
+          "decode": 765,
+          "text_decode": 0,
+          "total": 1658
+        },
+        {
+          "prompt_format": 0,
+          "tokenize": 0,
+          "multimodal_prepare": 385,
+          "runtime_prepare": 0,
+          "prefill": 557,
+          "decode": 757,
+          "text_decode": 0,
+          "total": 1699
+        }
+      ],
+      "cold_request_seconds": 2.168,
+      "median_seconds": 1.773
+    }
+  },
+  "historical_baseline_artifact": "m4_max_invoice_4b_result.json"
+}

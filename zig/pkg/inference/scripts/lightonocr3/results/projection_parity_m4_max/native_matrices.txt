@@ -1,0 +1,126 @@
+projection rows=4 in=1024 out=3584 input_offset=16 bf16_input=0 max_abs=3.57628e-07
+projection rows=4 in=2560 out=8192 input_offset=16 bf16_input=0 max_abs=7.51019e-06
+projection rows=4 in=2560 out=9216 input_offset=16 bf16_input=0 max_abs=7.51019e-06
+projection rows=4 in=1024 out=3584 input_offset=16 bf16_input=0 max_abs=3.57628e-07
+projection rows=4 in=2560 out=8192 input_offset=16 bf16_input=0 max_abs=7.51019e-06
+projection rows=4 in=2560 out=9216 input_offset=16 bf16_input=0 max_abs=7.51019e-06
+projection rows=4 in=1024 out=3584 input_offset=16 bf16_input=0 max_abs=3.57628e-07
+projection rows=4 in=2560 out=8192 input_offset=16 bf16_input=0 max_abs=7.51019e-06
+projection rows=4 in=2560 out=9216 input_offset=16 bf16_input=0 max_abs=7.51019e-06
+prefill_conv_check seq=2 value_heads=16 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=2 value_heads=16 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=2 value_heads=32 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=2 value_heads=32 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=3 value_heads=16 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=3 value_heads=16 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=3 value_heads=32 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=3 value_heads=32 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=4 value_heads=16 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=4 value_heads=16 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=4 value_heads=32 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=4 value_heads=32 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=17 value_heads=16 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=17 value_heads=16 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=17 value_heads=32 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=17 value_heads=32 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=432 value_heads=16 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=432 value_heads=16 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=432 value_heads=32 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=432 value_heads=32 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=554 value_heads=16 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=554 value_heads=16 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=554 value_heads=32 initialized=0 offset=16 bit_exact=pass cpu_samples=pass
+prefill_conv_check seq=554 value_heads=32 initialized=1 offset=16 bit_exact=pass cpu_samples=pass
+metal_pipelined_decode_frame: enabled=1 owner=executor rollback=TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME
+down_split_frame_check in=3584 out=1024 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=1.43051e-06
+down_split_frame_check in=9216 out=2560 partial_scratch_interleaving=pass overlapping_frames=pass max_abs=3.69549e-06
+projection rows=2 in=3584 out=1024 input_offset=16 bf16_input=0 max_abs=8.34465e-07
+projection rows=2 in=9216 out=2560 input_offset=16 bf16_input=0 max_abs=1.78814e-06
+projection rows=3 in=3584 out=1024 input_offset=16 bf16_input=0 max_abs=8.34465e-07
+projection rows=3 in=9216 out=2560 input_offset=16 bf16_input=0 max_abs=2.6226e-06
+projection rows=4 in=3584 out=1024 input_offset=16 bf16_input=0 max_abs=8.34465e-07
+projection rows=4 in=9216 out=2560 input_offset=16 bf16_input=0 max_abs=4.17233e-06
+projection rows=5 in=3584 out=1024 input_offset=16 bf16_input=0 max_abs=1.72853e-06
+projection rows=5 in=9216 out=2560 input_offset=16 bf16_input=0 max_abs=4.88758e-06
+projection rows=6 in=3584 out=1024 input_offset=16 bf16_input=0 max_abs=1.72853e-06
+projection rows=6 in=9216 out=2560 input_offset=16 bf16_input=0 max_abs=4.88758e-06
+projection rows=7 in=3584 out=1024 input_offset=16 bf16_input=0 max_abs=1.72853e-06
+projection rows=7 in=9216 out=2560 input_offset=16 bf16_input=0 max_abs=4.88758e-06
+projection rows=8 in=3584 out=1024 input_offset=16 bf16_input=0 max_abs=1.72853e-06
+projection rows=8 in=9216 out=2560 input_offset=16 bf16_input=0 max_abs=4.88758e-06
+ocr_gqa_check kv=128 heads=8 kv_heads=2 amplitude=1 offset=16 max_abs=0 cpu_max_abs=3.70232e-09
+ocr_gqa_check kv=128 heads=16 kv_heads=4 amplitude=1 offset=16 max_abs=0 cpu_max_abs=1.50301e-08
+ocr_gqa_check kv=192 heads=8 kv_heads=2 amplitude=8 offset=16 max_abs=4.6242e-05 cpu_max_abs=1.09203e-05
+ocr_gqa_check kv=192 heads=16 kv_heads=4 amplitude=8 offset=16 max_abs=6.13183e-05 cpu_max_abs=2.33881e-05
+ocr_gqa_check kv=432 heads=8 kv_heads=2 amplitude=1 offset=16 max_abs=1.17458e-05 cpu_max_abs=6.82966e-06
+ocr_gqa_check kv=432 heads=16 kv_heads=4 amplitude=1 offset=16 max_abs=1.36655e-05 cpu_max_abs=3.8573e-06
+ocr_gqa_check kv=554 heads=8 kv_heads=2 amplitude=8 offset=16 max_abs=3.06482e-05 cpu_max_abs=1.22081e-05
+ocr_gqa_check kv=554 heads=16 kv_heads=4 amplitude=8 offset=16 max_abs=3.05921e-05 cpu_max_abs=6.19492e-06
+ocr_gqa_check kv=662 heads=8 kv_heads=2 amplitude=1 offset=16 max_abs=8.73394e-06 cpu_max_abs=2.65685e-06
+ocr_gqa_check kv=662 heads=16 kv_heads=4 amplitude=1 offset=16 max_abs=1.13137e-05 cpu_max_abs=3.017e-06
+ocr_gqa_check kv=1024 heads=8 kv_heads=2 amplitude=8 offset=16 max_abs=2.64477e-05 cpu_max_abs=1.51329e-05
+ocr_gqa_check kv=1024 heads=16 kv_heads=4 amplitude=8 offset=16 max_abs=2.27256e-05 cpu_max_abs=2.89929e-06
+ocr_gqa_check kv=2048 heads=8 kv_heads=2 amplitude=1 offset=16 max_abs=5.48689e-06 cpu_max_abs=2.65141e-06
+ocr_gqa_check kv=2048 heads=16 kv_heads=4 amplitude=1 offset=16 max_abs=6.07222e-06 cpu_max_abs=1.55673e-06
+ocr_gqa_check kv=2056 heads=8 kv_heads=2 amplitude=8 offset=16 max_abs=0 cpu_max_abs=8.14029e-09
+ocr_gqa_check kv=2056 heads=16 kv_heads=4 amplitude=8 offset=16 max_abs=0 cpu_max_abs=9.86706e-09
+small_projection_benchmark rows=1 in=1024 out=6144 mode=rollback mean_us=167.86 gpu_mean_us=26.27
+small_projection_benchmark rows=1 in=1024 out=6144 mode=production mean_us=173.40 gpu_mean_us=26.32
+small_projection_benchmark rows=4 in=1024 out=6144 mode=rollback mean_us=226.07 gpu_mean_us=79.98
+small_projection_benchmark rows=4 in=1024 out=6144 mode=production mean_us=213.01 gpu_mean_us=63.70
+small_projection_benchmark rows=8 in=1024 out=6144 mode=rollback mean_us=258.24 gpu_mean_us=106.52
+small_projection_benchmark rows=8 in=1024 out=6144 mode=production mean_us=191.79 gpu_mean_us=44.62
+small_projection_benchmark rows=128 in=1024 out=6144 mode=rollback mean_us=684.82 gpu_mean_us=490.35
+small_projection_benchmark rows=128 in=1024 out=6144 mode=production mean_us=685.10 gpu_mean_us=502.86
+small_projection_benchmark rows=512 in=1024 out=6144 mode=rollback mean_us=1633.14 gpu_mean_us=986.11
+small_projection_benchmark rows=512 in=1024 out=6144 mode=production mean_us=1226.38 gpu_mean_us=969.38
+small_projection_benchmark rows=1 in=1024 out=3584 mode=rollback mean_us=197.39 gpu_mean_us=22.37
+small_projection_benchmark rows=1 in=1024 out=3584 mode=production mean_us=181.29 gpu_mean_us=15.97
+small_projection_benchmark rows=4 in=1024 out=3584 mode=rollback mean_us=160.06 gpu_mean_us=30.59
+small_projection_benchmark rows=4 in=1024 out=3584 mode=production mean_us=150.80 gpu_mean_us=22.46
+small_projection_benchmark rows=8 in=1024 out=3584 mode=rollback mean_us=188.32 gpu_mean_us=39.18
+small_projection_benchmark rows=8 in=1024 out=3584 mode=production mean_us=181.20 gpu_mean_us=24.35
+small_projection_benchmark rows=128 in=1024 out=3584 mode=rollback mean_us=273.80 gpu_mean_us=116.64
+small_projection_benchmark rows=128 in=1024 out=3584 mode=production mean_us=278.04 gpu_mean_us=115.67
+small_projection_benchmark rows=512 in=1024 out=3584 mode=rollback mean_us=607.77 gpu_mean_us=417.25
+small_projection_benchmark rows=512 in=1024 out=3584 mode=production mean_us=599.15 gpu_mean_us=420.33
+small_projection_benchmark rows=1 in=3584 out=1024 mode=rollback mean_us=170.87 gpu_mean_us=23.79
+small_projection_benchmark rows=1 in=3584 out=1024 mode=production mean_us=158.68 gpu_mean_us=17.63
+small_projection_benchmark rows=4 in=3584 out=1024 mode=rollback mean_us=167.74 gpu_mean_us=19.52
+small_projection_benchmark rows=4 in=3584 out=1024 mode=production mean_us=155.88 gpu_mean_us=19.39
+small_projection_benchmark rows=8 in=3584 out=1024 mode=rollback mean_us=208.84 gpu_mean_us=56.71
+small_projection_benchmark rows=8 in=3584 out=1024 mode=production mean_us=155.97 gpu_mean_us=19.54
+small_projection_benchmark rows=128 in=3584 out=1024 mode=rollback mean_us=303.70 gpu_mean_us=147.78
+small_projection_benchmark rows=128 in=3584 out=1024 mode=production mean_us=300.26 gpu_mean_us=147.20
+small_projection_benchmark rows=512 in=3584 out=1024 mode=rollback mean_us=765.71 gpu_mean_us=580.70
+small_projection_benchmark rows=512 in=3584 out=1024 mode=production mean_us=754.32 gpu_mean_us=560.97
+small_projection_benchmark rows=1 in=2560 out=8192 mode=rollback mean_us=305.09 gpu_mean_us=137.21
+small_projection_benchmark rows=1 in=2560 out=8192 mode=production mean_us=313.54 gpu_mean_us=142.69
+small_projection_benchmark rows=4 in=2560 out=8192 mode=rollback mean_us=483.39 gpu_mean_us=305.79
+small_projection_benchmark rows=4 in=2560 out=8192 mode=production mean_us=418.36 gpu_mean_us=244.79
+small_projection_benchmark rows=8 in=2560 out=8192 mode=rollback mean_us=863.91 gpu_mean_us=682.77
+small_projection_benchmark rows=8 in=2560 out=8192 mode=production mean_us=439.10 gpu_mean_us=264.68
+small_projection_benchmark rows=128 in=2560 out=8192 mode=rollback mean_us=685.73 gpu_mean_us=505.40
+small_projection_benchmark rows=128 in=2560 out=8192 mode=production mean_us=688.51 gpu_mean_us=513.86
+small_projection_benchmark rows=512 in=2560 out=8192 mode=rollback mean_us=2179.36 gpu_mean_us=1945.72
+small_projection_benchmark rows=512 in=2560 out=8192 mode=production mean_us=2150.10 gpu_mean_us=1925.69
+small_projection_benchmark rows=1 in=2560 out=9216 mode=rollback mean_us=305.13 gpu_mean_us=145.72
+small_projection_benchmark rows=1 in=2560 out=9216 mode=production mean_us=304.50 gpu_mean_us=148.26
+small_projection_benchmark rows=4 in=2560 out=9216 mode=rollback mean_us=358.90 gpu_mean_us=196.36
+small_projection_benchmark rows=4 in=2560 out=9216 mode=production mean_us=343.84 gpu_mean_us=185.41
+small_projection_benchmark rows=8 in=2560 out=9216 mode=rollback mean_us=357.75 gpu_mean_us=203.99
+small_projection_benchmark rows=8 in=2560 out=9216 mode=production mean_us=325.05 gpu_mean_us=166.47
+small_projection_benchmark rows=128 in=2560 out=9216 mode=rollback mean_us=749.05 gpu_mean_us=568.76
+small_projection_benchmark rows=128 in=2560 out=9216 mode=production mean_us=726.74 gpu_mean_us=563.07
+small_projection_benchmark rows=512 in=2560 out=9216 mode=rollback mean_us=2424.34 gpu_mean_us=2191.08
+small_projection_benchmark rows=512 in=2560 out=9216 mode=production mean_us=2421.92 gpu_mean_us=2175.80
+small_projection_benchmark rows=1 in=9216 out=2560 mode=rollback mean_us=291.64 gpu_mean_us=138.82
+small_projection_benchmark rows=1 in=9216 out=2560 mode=production mean_us=288.69 gpu_mean_us=142.39
+small_projection_benchmark rows=4 in=9216 out=2560 mode=rollback mean_us=294.29 gpu_mean_us=144.45
+small_projection_benchmark rows=4 in=9216 out=2560 mode=production mean_us=315.73 gpu_mean_us=156.14
+small_projection_benchmark rows=8 in=9216 out=2560 mode=rollback mean_us=381.04 gpu_mean_us=228.04
+small_projection_benchmark rows=8 in=9216 out=2560 mode=production mean_us=301.26 gpu_mean_us=150.04
+small_projection_benchmark rows=128 in=9216 out=2560 mode=rollback mean_us=768.52 gpu_mean_us=597.67
+small_projection_benchmark rows=128 in=9216 out=2560 mode=production mean_us=782.39 gpu_mean_us=595.29
+small_projection_benchmark rows=512 in=9216 out=2560 mode=rollback mean_us=2445.17 gpu_mean_us=2225.44
+small_projection_benchmark rows=512 in=9216 out=2560 mode=production mean_us=2442.55 gpu_mean_us=2212.70

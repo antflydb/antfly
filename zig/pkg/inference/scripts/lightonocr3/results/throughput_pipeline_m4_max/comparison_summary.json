@@ -1,0 +1,73 @@
+{
+  "base_commit": "e7a0d695d77cc14dba96a942b7fc8b09ee70c13b",
+  "shipping_binary_sha256": "9236bbc66f60da4a69711a1fd30b0536512dc1c5c67a53c8a781b34c438201cc",
+  "scope": "Shared M4 Max; sixteen mixed pages, C8/rows8/window8, greedy up to256tokens. Native F32 decoder activations; vLLM production BF16. No universal parity claim.",
+  "models": {
+    "08": {
+      "default_pages_per_second": [
+        2.2893,
+        2.1926
+      ],
+      "optional_descriptor_pages_per_second": [
+        2.3581,
+        2.2929
+      ],
+      "vllm_early_pages_per_second": 2.8851145142781505,
+      "vllm_later_pages_per_second": 2.217008825893706,
+      "serial_parity": true,
+      "cross_runtime_content_parity": true,
+      "exact_reference_texts": true,
+      "descriptor_switch_observations": [
+        {
+          "policy": "default",
+          "observed": false
+        },
+        {
+          "policy": "on",
+          "observed": true
+        },
+        {
+          "policy": "on",
+          "observed": true
+        },
+        {
+          "policy": "default",
+          "observed": false
+        }
+      ]
+    },
+    "4b": {
+      "default_pages_per_second": [
+        0.6691,
+        0.5346
+      ],
+      "optional_descriptor_pages_per_second": [
+        0.6355,
+        0.6074
+      ],
+      "vllm_early_pages_per_second": 0.8063782757661064,
+      "vllm_later_pages_per_second": 0.6891299076474406,
+      "serial_parity": true,
+      "cross_runtime_content_parity": true,
+      "exact_reference_texts": true,
+      "descriptor_switch_observations": [
+        {
+          "policy": "default",
+          "observed": false
+        },
+        {
+          "policy": "on",
+          "observed": true
+        },
+        {
+          "policy": "on",
+          "observed": true
+        },
+        {
+          "policy": "default",
+          "observed": false
+        }
+      ]
+    }
+  }
+}

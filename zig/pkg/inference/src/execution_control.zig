@@ -203,12 +203,22 @@ pub const InferenceExecutionControl = struct {
     /// Acquire a process-local execution gate without turning queueing behind
     /// another inference request into an uncancellable wait.
     pub fn lock(self: InferenceExecutionControl, mutex: *std.atomic.Mutex) !void {
+        return self.lockWithPoll(mutex, 0);
+    }
+
+    /// Shared inference epochs can park between gate attempts instead of
+    /// repeatedly yielding during a long GPU step. Cancellation is checked on
+    /// every attempt and after acquiring the gate. Cap each requested sleep
+    /// at 100us so a caller cannot create an unbounded cancellation interval.
+    pub fn lockWithPoll(self: InferenceExecutionControl, mutex: *std.atomic.Mutex, poll_ns: u64) !void {
         var spins: usize = 0;
         while (!mutex.tryLock()) {
             try self.check();
             if (spins < 64) {
                 std.atomic.spinLoopHint();
                 spins += 1;
+            } else if (poll_ns != 0) {
+                platform_time.sleepNs(@min(poll_ns, 100 * std.time.ns_per_us));
             } else {
                 @import("antfly_platform").time.yieldNow();
             }
@@ -554,4 +564,32 @@ test "execution lane wakes a query ahead of queued enrichment" {
     released = true;
     try std.testing.expectEqual(@as(usize, 0), try query.await(std.testing.io));
     try std.testing.expectEqual(@as(usize, 1), try bulk.await(std.testing.io));
+}
+
+test "LightOnOCR3 parked execution gate preserves cancellation and lock ownership" {
+    const Cancel = struct {
+        calls: usize = 0,
+        limit: usize,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls >= self.limit) return error.Cancelled;
+        }
+    };
+    var mutex = std.atomic.Mutex.unlocked;
+    try std.testing.expect(mutex.tryLock());
+    var blocked = Cancel{ .limit = 67 };
+    const waiting = InferenceExecutionControl{ .ptr = &blocked, .check_fn = Cancel.check };
+    try std.testing.expectError(error.Cancelled, waiting.lockWithPoll(&mutex, std.time.ns_per_s));
+    try std.testing.expectEqual(@as(usize, 67), blocked.calls);
+    try std.testing.expect(!mutex.tryLock());
+    mutex.unlock();
+    var cancelled = Cancel{ .limit = 1 };
+    const acquired = InferenceExecutionControl{ .ptr = &cancelled, .check_fn = Cancel.check };
+    try std.testing.expectError(error.Cancelled, acquired.lockWithPoll(&mutex, 100 * std.time.ns_per_us));
+    try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
+    try (InferenceExecutionControl{}).lockWithPoll(&mutex, 100 * std.time.ns_per_us);
+    try std.testing.expect(!mutex.tryLock());
+    mutex.unlock();
 }

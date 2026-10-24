@@ -1,0 +1,18 @@
+scripts/cache_gc.sh
+==> Zig build caches under /Users/ajroetker/go/src/github.com/antflydb/antfly
+  skip (in use, 21.6G): /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/fix-upgrade-query-latency/zig/.zig-cache
+==> Stray Zig cache dirs
+==> Zig global cache (/tmp/zig-global-cache)
+==> Rust target dirs
+==> Go build cache
+  go clean -cache (/tmp/go-build-cache)
+==> Python (uv) cache
+  uv cache prune (/tmp/uv-cache)
+==> Node caches
+  pnpm store prune
+Removed all cached metadata files
+Removed 0 files (0 B)
+Removed 0 packages
+  npm cache verify
+
+Removed 0.0G of Zig/Rust build output; 365.8G free.

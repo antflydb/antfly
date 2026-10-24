@@ -1,0 +1,328 @@
+{
+  "created_at": "2026-10-22T17:56:51.913801+00:00",
+  "hardware": {
+    "processor": "Apple M4 Max",
+    "physical_memory_bytes": 38654705664
+  },
+  "runtime_commit": "5826bf2320e29e3ebb431ea89fa82463b437f57e",
+  "runtime_source_diff_sha256": "fda381d069ec5522df7d670d4a76481f12d2e39f318dd79ddb3104a80282ef28",
+  "binary_sha256": "f342bd54129473ead0020c1928f2886bb2d70f8626508cad3adb1876cde849b2",
+  "models": {
+    "lighton4b": {
+      "directory": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton4b",
+      "weight_bytes": 9078620536,
+      "weight_files": [
+        {
+          "name": "model.safetensors",
+          "bytes": 9078620536
+        }
+      ],
+      "metadata": {
+        "config.json": {
+          "architectures": [
+            "Qwen3_5ForConditionalGeneration"
+          ],
+          "bos_token_id": null,
+          "dtype": "bfloat16",
+          "eos_token_id": 248046,
+          "image_token_id": 248056,
+          "model_type": "qwen3_5",
+          "pad_token_id": 248044,
+          "text_config": {
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "attn_output_gate": true,
+            "bos_token_id": null,
+            "dtype": "bfloat16",
+            "eos_token_id": 248044,
+            "full_attention_interval": 4,
+            "head_dim": 256,
+            "hidden_act": "silu",
+            "hidden_size": 2560,
+            "initializer_range": 0.02,
+            "intermediate_size": 9216,
+            "layer_types": [
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention"
+            ],
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_value_head_dim": 128,
+            "mamba_ssm_dtype": "float32",
+            "max_position_embeddings": 262144,
+            "mlp_only_layers": [],
+            "model_type": "qwen3_5_text",
+            "mtp_num_hidden_layers": 0,
+            "mtp_use_dedicated_embeddings": false,
+            "num_attention_heads": 16,
+            "num_hidden_layers": 32,
+            "num_key_value_heads": 4,
+            "pad_token_id": null,
+            "partial_rotary_factor": 0.25,
+            "rms_norm_eps": 1e-06,
+            "rope_parameters": {
+              "mrope_interleaved": true,
+              "mrope_section": [
+                11,
+                11,
+                10
+              ],
+              "partial_rotary_factor": 0.25,
+              "rope_theta": 10000000,
+              "rope_type": "default"
+            },
+            "tie_word_embeddings": true,
+            "use_cache": true,
+            "vocab_size": 248320
+          },
+          "tie_word_embeddings": true,
+          "transformers_version": "5.5.4",
+          "video_token_id": 248057,
+          "vision_config": {
+            "deepstack_visual_indexes": [],
+            "depth": 24,
+            "dtype": "bfloat16",
+            "hidden_act": "gelu_pytorch_tanh",
+            "hidden_size": 1024,
+            "in_channels": 3,
+            "initializer_range": 0.02,
+            "intermediate_size": 4096,
+            "model_type": "qwen3_5",
+            "num_heads": 16,
+            "num_position_embeddings": 2304,
+            "out_hidden_size": 2560,
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2
+          },
+          "vision_end_token_id": 248054,
+          "vision_start_token_id": 248053
+        },
+        "preprocessor_config.json": {
+          "size": {
+            "longest_edge": 16777216,
+            "shortest_edge": 65536
+          },
+          "patch_size": 16,
+          "temporal_patch_size": 2,
+          "merge_size": 2,
+          "image_mean": [
+            0.5,
+            0.5,
+            0.5
+          ],
+          "image_std": [
+            0.5,
+            0.5,
+            0.5
+          ],
+          "processor_class": "Qwen3VLProcessor",
+          "image_processor_type": "Qwen2VLImageProcessorFast"
+        },
+        "model_manifest.json": {
+          "type": "generator",
+          "tasks": [
+            "generate",
+            "read"
+          ],
+          "inputs": [
+            "text",
+            "image"
+          ],
+          "capabilities": [
+            "ocr",
+            "lightonocr3"
+          ]
+        }
+      }
+    }
+  },
+  "images": [
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/src/models/testdata/lightonocr3/invoice.png",
+      "sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e"
+    },
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/corpus/receipt.png",
+      "sha256": "4ccfc5a949e85643492606a95832a3f7630877fd334fece0b4fe4dc6a3291e03"
+    },
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/corpus/shipping.png",
+      "sha256": "3bfab6d55f212b14fcd91a4663e2a7aa9e031ccd1242fd236728af99836d0007"
+    }
+  ],
+  "settings": {
+    "model": [
+      "lighton4b=/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton4b"
+    ],
+    "concurrency": [
+      8
+    ],
+    "modes": [
+      "batch"
+    ],
+    "requests": 16,
+    "pages_per_request": 1,
+    "max_tokens": 256,
+    "admission_units": 256,
+    "batch_rows": 8,
+    "batch_window": 8,
+    "batch_wait_us": 20000,
+    "florence_batch_wait_us": 5000,
+    "profile_reader": false,
+    "prefill_sg_attention": false,
+    "bf16_prefill_inputs": false,
+    "prefill_direct_kv": false,
+    "decode_wait_us": 1000,
+    "deferred_attention": "auto",
+    "disable_batch_projections": false,
+    "disable_tiled_projections": false,
+    "disable_recurrent_batch": false,
+    "disable_recurrent_fusion": false,
+    "disable_ffn_small_tile": false,
+    "disable_qkv_small_tile": false,
+    "disable_down_split": false,
+    "disable_four_row_tile": false,
+    "disable_f16_encoder_mpp": false,
+    "weight_residency": true,
+    "disable_prefill_conv_vec4": false,
+    "disable_batch_gate_up": true,
+    "disable_prefill_columns": true,
+    "disable_prefill_norm": true,
+    "disable_ocr_attention": false,
+    "disable_florence_window_softmax": false,
+    "disable_ocr_ffn_fusion": false,
+    "disable_florence_channel_reduction": false,
+    "disable_recurrent_encoder": false,
+    "disable_recurrent_norm": false,
+    "disable_step_pool": false,
+    "small_mpp": false,
+    "florence_encoder_mirrors": false,
+    "disable_florence_encoder_mirrors": false,
+    "bf16_projection_inputs": false,
+    "native_read_batch_size": 8,
+    "memory_gib": 24,
+    "shared_memory_gib": 28,
+    "backend_memory_gib": 16,
+    "kv_memory_gib": 4,
+    "scratch_memory_gib": 4,
+    "timeout": 360,
+    "reference_report": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/results/projection_parity_m4_max/vllm_4b/report.json",
+    "build_manifest": "zig/pkg/inference/scripts/lightonocr3/results/kernel_saturation_m4_max/build_manifest.json"
+  },
+  "scope": "One resident Node; timed native encoded-image API requests including preprocessing, queueing and inference; excludes loading, reference reads, HTTP, PDF rendering and indexing. Other machine workloads uncontrolled. Every timed output must match its same-model serial reference.",
+  "results": [
+    {
+      "model": "lighton4b",
+      "mode": "batch",
+      "concurrency": 8,
+      "log": "lighton4b-batch-c8.txt",
+      "exit_code": 0,
+      "status": "ok",
+      "requests": 16,
+      "pages_per_request": 1,
+      "completed": 16,
+      "elapsed_ms": 43016,
+      "pages_per_second": 0.372,
+      "p50_ms": 21695,
+      "p95_ms": 21696,
+      "native_items": 16,
+      "serial_reference_parity": true,
+      "references": [
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>"
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY"
+        }
+      ],
+      "cross_runtime_content_parity": true,
+      "reference_report_sha256": "04221f1cc148199b2074abf5a8c8d2ef6c18204f0d15698987932250cf0e8b5d",
+      "cohorts_including_untimed_warmup": [
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 8,
+          "decode_steps": 201,
+          "batched_steps": 201,
+          "singleton_steps": 0,
+          "decode_items": 784
+        },
+        {
+          "items": 8,
+          "decode_steps": 204,
+          "batched_steps": 203,
+          "singleton_steps": 1,
+          "decode_items": 642
+        }
+      ]
+    }
+  ],
+  "worktree_runtime_commit": "5826bf2320e29e3ebb431ea89fa82463b437f57e",
+  "worktree_runtime_source_diff_sha256": "5870847ab45a3ac4fc0dccbdaf820cbfd307249e29b3cc5889d47d38dcf092ba",
+  "build_manifest_sha256": "16d7af85b303145b5030d3942d7a0f3ee6ebee3f7207d48a2c5981066ed03383"
+}

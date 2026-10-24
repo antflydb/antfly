@@ -26,6 +26,7 @@
 // the active ComputeBackend so the same code works for native and devices.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const ops = @import("../ops/ops.zig");
 const MetalCompute = @import("../ops/metal_compute.zig").MetalCompute;
@@ -675,6 +676,14 @@ pub fn encoderForwardTensor(
     const layer_cb = layerComputeBackend(control_cb);
     const cb = &layer_cb;
     try control_cb.checkExecutionControl();
+    // Large encoder matrices benefit from the backend's bounded F16 mirrors
+    // of quantized weights. Keep incremental decoding on its original path.
+    const eager_mirrors = if (comptime build_options.enable_metal)
+        cb.kind() == .metal and @import("../backends/metal_runtime.zig").qualifiedM4FeatureEnabled("TERMITE_METAL_FLORENCE2_ENCODER_MIRRORS", true)
+    else
+        false;
+    if (eager_mirrors) cb.preferEagerQuantMirrors(true);
+    defer if (eager_mirrors) cb.preferEagerQuantMirrors(false);
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
     const profile = readProfileEnabled();
     if (debug_cuda_session) std.log.info("florence: encoder forward start batch={d} prompt_seq={d}", .{ batch, prompt_seq_len });

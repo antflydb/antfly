@@ -1,0 +1,10 @@
+{
+  "scope": "Final integration changes only the server and shared reader pool; the final C kernels are identical to the passing conformance and 86-case paired sweeps.",
+  "changed_runtime_files_from_tail_qualified": [
+    "zig/pkg/inference/src/server/server.zig",
+    "zig/pkg/inference/src/server/reader_execution_pool.zig"
+  ],
+  "metal_source_sha256": "e9c41e4790d52c2d0ad0f81acd29a2f36e0c246b1696ae2b7a486af75e36804f",
+  "shared_peak_build_manifest_sha256": "c051b3f74397330fb629c5a0a7d941db47b60c2b11a3e7af71350f95f8808960",
+  "kernel_conformance_manifest_sha256": "a9397372bcc7b15e21e486d7183a1928b158ef1e7e677c455093cde2455c7ebe"
+}

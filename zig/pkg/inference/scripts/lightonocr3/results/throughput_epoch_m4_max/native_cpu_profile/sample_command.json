@@ -1,0 +1,15 @@
+{
+  "command": [
+    "/usr/bin/sample",
+    "38160",
+    "4",
+    "1",
+    "-file",
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/results/throughput_epoch_m4_max/native_cpu_profile/sample.txt"
+  ],
+  "exit_code": 0,
+  "stdout": "Sampling process 38160 for 4 seconds with 1 millisecond of run time between samples\nSampling completed, processing symbols...\nSample analysis of process 38160 written to file /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/results/throughput_epoch_m4_max/native_cpu_profile/sample.txt\n",
+  "driver_pid": 38152,
+  "profiled_pid": 38160,
+  "scope": "Diagnostic CPU stack sampling during native default timed work; sampling adds overhead. Not a primary throughput result."
+}

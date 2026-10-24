@@ -1,0 +1,118 @@
+{
+  "08": [
+    {
+      "policy": "cacheoff",
+      "images": 8,
+      "mean_ms": {
+        "decode_ms": 1.80325,
+        "preprocess_ms": 5.16475,
+        "patchify_ms": 0.792,
+        "patch_embed_ms": 15.197375,
+        "positions_ms": 0.0025,
+        "blocks_ms": 115.873875,
+        "deepstack_ms": 0.0,
+        "final_merge_ms": 4.65525
+      }
+    },
+    {
+      "policy": "default",
+      "images": 8,
+      "mean_ms": {
+        "decode_ms": 1.6059999999999999,
+        "preprocess_ms": 4.273,
+        "patchify_ms": 0.61675,
+        "patch_embed_ms": 10.059125,
+        "positions_ms": 0.001875,
+        "blocks_ms": 121.535375,
+        "deepstack_ms": 0.0,
+        "final_merge_ms": 4.289125
+      }
+    },
+    {
+      "policy": "default",
+      "images": 8,
+      "mean_ms": {
+        "decode_ms": 1.62375,
+        "preprocess_ms": 4.223,
+        "patchify_ms": 0.615,
+        "patch_embed_ms": 10.34025,
+        "positions_ms": 0.0015,
+        "blocks_ms": 120.190625,
+        "deepstack_ms": 0.0,
+        "final_merge_ms": 4.706125
+      }
+    },
+    {
+      "policy": "cacheoff",
+      "images": 8,
+      "mean_ms": {
+        "decode_ms": 1.725625,
+        "preprocess_ms": 4.79625,
+        "patchify_ms": 0.6637500000000001,
+        "patch_embed_ms": 14.521749999999999,
+        "positions_ms": 0.00175,
+        "blocks_ms": 124.94725,
+        "deepstack_ms": 0.0,
+        "final_merge_ms": 5.500249999999999
+      }
+    }
+  ],
+  "4b": [
+    {
+      "policy": "cacheoff",
+      "images": 8,
+      "mean_ms": {
+        "decode_ms": 1.85075,
+        "preprocess_ms": 5.044875,
+        "patchify_ms": 0.787625,
+        "patch_embed_ms": 28.460875,
+        "positions_ms": 0.002125,
+        "blocks_ms": 381.66025,
+        "deepstack_ms": 0.0,
+        "final_merge_ms": 8.377
+      }
+    },
+    {
+      "policy": "default",
+      "images": 8,
+      "mean_ms": {
+        "decode_ms": 2.02675,
+        "preprocess_ms": 5.4335,
+        "patchify_ms": 0.779875,
+        "patch_embed_ms": 17.445875,
+        "positions_ms": 0.002125,
+        "blocks_ms": 333.538125,
+        "deepstack_ms": 0.0,
+        "final_merge_ms": 9.860375000000001
+      }
+    },
+    {
+      "policy": "default",
+      "images": 8,
+      "mean_ms": {
+        "decode_ms": 3.245375,
+        "preprocess_ms": 6.228875,
+        "patchify_ms": 0.809125,
+        "patch_embed_ms": 20.331875,
+        "positions_ms": 0.002375,
+        "blocks_ms": 338.03775,
+        "deepstack_ms": 0.0,
+        "final_merge_ms": 7.754125
+      }
+    },
+    {
+      "policy": "cacheoff",
+      "images": 8,
+      "mean_ms": {
+        "decode_ms": 2.2211250000000002,
+        "preprocess_ms": 5.460125,
+        "patchify_ms": 0.783375,
+        "patch_embed_ms": 19.781125,
+        "positions_ms": 0.002125,
+        "blocks_ms": 326.48775,
+        "deepstack_ms": 0.0,
+        "final_merge_ms": 8.013375
+      }
+    }
+  ]
+}

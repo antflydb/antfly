@@ -1,0 +1,5 @@
+# Measured data and exact source snapshots; README.md remains visible for review.
+*.json linguist-generated=true
+*.txt linguist-generated=true
+*.gz linguist-generated=true
+qualified_benchmark_sources/** linguist-generated=true
