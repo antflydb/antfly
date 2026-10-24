@@ -213,7 +213,7 @@ pub const ReadSet = struct {
         try checkpoint(ptr);
         return .{ .items = page.items, .examined = page.examined, .unfiltered = page.unfiltered, .next = try self.next(a, table, position, page.next) };
     }
-    const OrderedPosition = struct { coarse: bool = false, owner: usize, batched: bool = false, after: ?[]const u8 = null, finished: bool = false };
+    const OrderedPosition = struct { exact_keys: bool = false, coarse: bool = false, owner: usize, batched: bool = false, after: ?[]const u8 = null, finished: bool = false };
     const OrderedHead = struct { node: *const v.Node, after: ?[]const u8 };
     const OrderedSlot = struct {
         position: OrderedPosition,
@@ -254,7 +254,7 @@ pub const ReadSet = struct {
                 const count = if (slot.position.batched and slot.primed) @max(1, @min(self.quantum, self.demand)) else 1;
                 const page = (try read(owner.ptr, self.a, self.table, self.filters, self.order, slot.position.after, count, self.max_examined - self.examined)) orelse return error.CypherInvalidBackendPage;
                 slot.primed = true;
-                if (page.stable_ties == slot.position.coarse) return error.CypherInvalidBackendPage;
+                if ((page.stable_ties == slot.position.coarse or page.exact_keys != slot.position.exact_keys)) return error.CypherInvalidBackendPage;
                 const examined = page.examined orelse page.items.len;
                 if (page.items.len > count or examined < page.items.len or examined > self.max_examined - self.examined) return error.CypherInvalidBackendPage;
                 self.examined += examined;
@@ -328,15 +328,15 @@ pub const ReadSet = struct {
                 if (encoded != null) return error.CypherInvalidBackendPage;
                 return null;
             };
-            if (encoded != null and position.coarse == page.stable_ties) return error.CypherInvalidBackendPage;
+            if (encoded != null and (position.coarse == page.stable_ties or position.exact_keys != page.exact_keys)) return error.CypherInvalidBackendPage;
             try checkpoint(ptr);
             const cursors = if (page.cursors) |positions| blk: {
                 if (positions.len != page.items.len) return error.CypherInvalidBackendPage;
                 const saved = try a.alloc(?[]const u8, positions.len);
-                for (positions, saved) |position_after, *out| out.* = if (position_after) |after| try std.json.Stringify.valueAlloc(a, &.{OrderedPosition{ .coarse = !page.stable_ties, .owner = index, .after = after }}, .{}) else null;
+                for (positions, saved) |position_after, *out| out.* = if (position_after) |after| try std.json.Stringify.valueAlloc(a, &.{OrderedPosition{ .exact_keys = page.exact_keys, .coarse = !page.stable_ties, .owner = index, .after = after }}, .{}) else null;
                 break :blk saved;
             } else null;
-            return .{ .stable_ties = page.stable_ties, .encounter_owners = page.encounter_owners, .items = page.items, .cursors = cursors, .examined = page.examined, .next = if (page.next) |after| try std.json.Stringify.valueAlloc(a, &.{OrderedPosition{ .coarse = !page.stable_ties, .owner = index, .after = after }}, .{}) else null };
+            return .{ .exact_keys = page.exact_keys, .stable_ties = page.stable_ties, .encounter_owners = page.encounter_owners, .items = page.items, .cursors = cursors, .examined = page.examined, .next = if (page.next) |after| try std.json.Stringify.valueAlloc(a, &.{OrderedPosition{ .exact_keys = page.exact_keys, .coarse = !page.stable_ties, .owner = index, .after = after }}, .{}) else null };
         }
         var arena = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
         defer arena.deinit();
@@ -351,7 +351,7 @@ pub const ReadSet = struct {
                 const read = snapshot.backend.vtable.scan_ordered orelse return null;
                 const proof = (try read(snapshot.backend.ptr, temporary, table, filters, order, null, 0, 0)) orelse return null;
                 if (proof.items.len != 0 or (proof.examined orelse 0) != 0 or proof.next == null) return error.CypherInvalidBackendPage;
-                try positions.append(temporary, .{ .coarse = !proof.stable_ties, .owner = owner, .after = proof.next, .batched = proof.cursors != null });
+                try positions.append(temporary, .{ .exact_keys = proof.exact_keys, .coarse = !proof.stable_ties, .owner = owner, .after = proof.next, .batched = proof.cursors != null });
             }
         }
         var count: usize = 0;
@@ -363,7 +363,10 @@ pub const ReadSet = struct {
         const stable_ties = for (positions.items) |position| {
             if (position.coarse) break false;
         } else true;
-        if (limit == 0) return .{ .stable_ties = stable_ties, .items = &.{}, .cursors = if (self.ordered_item_cursors) &.{} else null, .examined = 0, .next = try std.json.Stringify.valueAlloc(a, positions.items, .{}) };
+        const exact_keys = for (positions.items) |position| {
+            if (!position.exact_keys) break false;
+        } else true;
+        if (limit == 0) return .{ .exact_keys = exact_keys, .stable_ties = stable_ties, .items = &.{}, .cursors = if (self.ordered_item_cursors) &.{} else null, .examined = 0, .next = try std.json.Stringify.valueAlloc(a, positions.items, .{}) };
         const slots = try temporary.alloc(OrderedSlot, count);
         var heap: std.ArrayList(usize) = .empty;
         var merge: OrderedMerge = .{ .read_set = self, .a = a, .table = table, .filters = filters, .order = order, .max_examined = max_examined, .quantum = if (max_examined > limit *| 2 +| count) @max(1, @min(64, limit / count)) else 1, .demand = limit };
@@ -416,7 +419,7 @@ pub const ReadSet = struct {
         try checkpoint(ptr);
         const continuation = if (more) try std.json.Stringify.valueAlloc(a, positions.items, .{}) else null;
         if (cursors.items.len != 0) cursors.items[cursors.items.len - 1] = continuation;
-        return .{ .stable_ties = stable_ties, .encounter_owners = if (!stable_ties) encounter_owners.items else null, .items = try output.toOwnedSlice(a), .cursors = if (self.ordered_item_cursors) cursors.items else null, .examined = merge.examined, .next = continuation };
+        return .{ .exact_keys = exact_keys, .stable_ties = stable_ties, .encounter_owners = if (!stable_ties) encounter_owners.items else null, .items = try output.toOwnedSlice(a), .cursors = if (self.ordered_item_cursors) cursors.items else null, .examined = merge.examined, .next = continuation };
     }
     fn estimateWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) !?usize {
         const self = cast(ptr);

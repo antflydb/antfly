@@ -206,6 +206,10 @@ pub const Scan = struct {
     /// may truncate only when it also attests order_satisfied. Advisory row_goal
     /// alone never grants this capability.
     ordered_window: ?u64 = null,
+    /// Complete outer SQL predicate, bound per invocation. A graph provider
+    /// may cap a prefix only after translating every arm exactly. SQL retains
+    /// its residual evaluation even when this certificate is consumed.
+    exact_graph_filter: ?GraphFilter = null,
     index_range: ?IndexRange = null,
     fields: []const []const u8,
     /// Mutation-only full document preimage; ordinary reads remain projected.

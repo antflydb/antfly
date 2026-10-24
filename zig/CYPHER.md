@@ -2918,13 +2918,13 @@ coarse reverse ties, filtered candidates, and repeated extremum observers.
 
 ### Constant domains, group-directed observers, and licensed SQL prefixes
 
-A finite, adjacent DISTINCT whose projected keys are all constant or fixed by
+An adjacent DISTINCT whose projected keys are all constant or fixed by
 source equality needs only an existence witness. It stops after the first
 qualifying row, including when LIMIT exceeds one or SKIP removes the sole
 result. Empty inputs remain empty. This singleton proof also applies without
 ORDER BY. Property results retain the ordinary filtered source's first
-representative; only literal-result domains may push later total filters across
-that source without depending on encounter order. MIN/MAX over a constant or
+representative; literal and proved NULL-result domains may push later total
+filters across that source without depending on encounter order. MIN/MAX over a constant or
 equality-fixed argument uses the same existence path. Logical singleton status is
 independent of the physical keys retained for an indexed access path, so the last
 allowed witness does not require a subsequent EOF read. A closed NULL argument
@@ -2933,17 +2933,39 @@ the totality proof.
 Fallible predicates, projections, and stages retain their normal execution.
 
 Ordered grouped COUNT/MIN/MAX with a finite window first negotiates an adjacent
-group-key proof and every observer's domain. It discovers only the requested
-group keys, seeking past duplicate tuples, then evaluates observers over each
-selected equality domain. COUNT consumes the complete selected domain; standalone
-extrema may seek its non-NULL boundaries. Mixed observers use the ordinary
-streaming aggregate fold for each domain. This avoids reading unselected groups
-without claiming that a COUNT can ignore members of a selected group. Each group
-owns a recyclable planning/evaluation arena; only result values escape to the
-statement arena. Invocation memoization resets before arena reuse. Sharing-aware
-clone contexts preserve compact value graphs while taking ownership of those
-results, and immutable literal/parameter grouping keys need no equality recheck.
-This bounds observer metadata by one active group, including broad result windows.
+group-key proof and every observer's domain. Counts and broad, sparse groups use
+one ordered source pass. Each complete group is projected and its reducer state
+is retired when the next group arrives; only the current group and selected
+output rows remain retained. A complete key order avoids both the candidate heap
+and the final result sort, and permits stopping at the first unselected group.
+A bounded, charged prefix sample compares observed density with the seek cost of
+standalone extrema. Dense extrema domains can instead discover selected keys
+with tuple seeks and observe their non-NULL boundaries. The sample is replayed
+from retained owned pages and never read or charged a second time. The choice is
+advisory: every chosen executor retains its original budgets and semantics.
+
+Per-domain observer invocations own a recyclable planning/evaluation arena; only
+result values escape to the statement arena. Invocation memoization resets before
+arena reuse. Sharing-aware clone contexts preserve compact value graphs while
+taking ownership of those results, and immutable literal/parameter grouping keys
+need no equality recheck. This bounds observer metadata by one active group,
+including broad result windows.
+
+Unbounded ordered DISTINCT uses the same complete-key cursor as finite windows.
+A projected row determined entirely by ordered keys and constants is adjacent
+across coarse owner ties too when every owner attests exact primitive key
+representations (exact_keys). Legacy providers retain tie refinement and preserve
+the primary representative, including mixed numeric representations. The
+certified path needs only the previous row and an exclusive
+tuple bound, without a global membership set or a final sort. Source order and
+collector layout are separate certificates: a partial DISTINCT collector that
+retains a selection heap still sorts its retained window. Only append-ordered
+picks can elide that final sort. A count-only
+consumer implements scalar COUNT(DISTINCT key) over the globally merged domain
+stream without retaining output rows. Counts are never added across owners that
+may share keys. COUNT(DISTINCT constant) needs an existence witness; COUNT(NULL)
+returns zero without source reads after proving the complete source pipeline
+total. Unsupported or fallible sources retain the ordinary aggregate fold.
 
 The rewrite carries total, single-node lineage through safe identity and
 projection stages. It requires grouping keys to be covered by the requested
@@ -2957,12 +2979,17 @@ equality parameters are immutable, invocation-scoped, collision-free with user
 bindings, and never
 enter the public JSON contract. NULL groups use an internal IS NULL filter rather
 than equality with NULL. Source authorization, owner snapshots, budgets, and
-runtime predicates remain authoritative. The physical plan reports index_groups.
+runtime predicates remain authoritative. The physical plan reports index_groups or ordered_groups for the selected strategy.
 
 SQL scans distinguish an advisory row_goal from an ordered_window capability.
 The planner licenses OFFSET+LIMIT only for a finite, row-preserving graph scan
-through identity projections with total outer column/literal outputs. Residual
-filters, joins, aggregates, windows, ordinals, scalar-cardinality observers,
+through identity projections with total outer column/literal outputs. A complete
+outer SQL predicate can grant the same license when every arm translates exactly
+to typed integer, string, or boolean graph comparisons. The certificate is bound
+per invocation and consumed atomically by the graph provider; partial conjunct
+hints, unsupported arms, approximate numeric domains, or failed translation grant
+no source cap. SQL still evaluates its full residual. Inner selection frames,
+joins, aggregates, windows, ordinals, scalar-cardinality observers,
 fallible projections, and unbounded consumers cannot license a truncated source.
 Transaction/lake overlays clear the capability when they clear physical ordering.
 
@@ -2991,3 +3018,34 @@ regression enforces a 16 MiB ceiling. Group observer ownership also preserves
 shared containers under a 2 MiB native budget. The SQL cursor tests distinguish
 advisory goals from licensed prefixes and exercise coarse ties, ordinary full
 relations, OFFSET, derived projections, NULL ordering, and source ordinals.
+
+#### Broad domains and complete predicate certificates
+
+The follow-up public fixtures compare the prior group-seek implementation with
+ordered folding and domain cursors on both Lite and Directory storage. The
+5,000-group fixture has one document per key; the 13,000-document domain fixture
+has three repeated scores. Counts below are statement-level charged work, not
+unaccounted owner-local reads.
+
+| Query shape | Prior anchors | Current anchors | Prior states | Current states |
+| --- | ---: | ---: | ---: | ---: |
+| 5,000 grouped COUNT results | 10,000 | 5,000 | 915,228 | 100,046 |
+| 5,000 grouped MAX results | default state budget exceeded | 5,000 | default state budget exceeded | 135,141 |
+| Unbounded score DISTINCT | 13,000 | 5 | 312,294 | 136 |
+| Scalar COUNT(DISTINCT score) | 13,000 | 5 | 272,974 | 171 |
+| COUNT(DISTINCT 7) | 13,000 | 1 | 207,994 | 14 |
+| COUNT(NULL) | 13,000 | 0 | 65,004 | 5 |
+| DISTINCT score under IS NULL | 13,000 | 1 | 189,597 | 24 |
+
+The grouped MAX fixture retains about 5.5 MiB, including its 5,000 output rows,
+and completes with an exact 5,000-anchor allowance. Native sparse-domain and rejected-prefix
+regressions also require fewer than 100 transport requests for 5,000 source
+records, preventing exclusive seeks from becoming one RPC per sparse key or
+rejected row.
+
+For `GRAPH_TABLE` with a fully consumed outer `score >= 0` predicate, ascending
+order and LIMIT 5, warmed local medians changed from 128.5 ms to 0.30 ms on Lite
+and from 113.5 ms to 3.1 ms on Directory. Timings depend on the environment;
+complete predicate transfer and bounded source work are the contract. A partial
+predicate, unsupported OR arm, inner selection frame, or fallible output retains
+the complete source and normal SQL residual evaluation.

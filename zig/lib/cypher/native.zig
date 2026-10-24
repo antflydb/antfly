@@ -516,7 +516,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 defer session.deinit();
                 session.reader.now_ns = self.ttl_now_ns;
                 try session.checkpoint();
-                if (limit == 0) return .{ .items = &.{}, .cursors = &.{}, .examined = 0, .stable_ties = !coarse, .next = try std.json.Stringify.valueAlloc(a, OrderedCursor{ .reverse = reverse, .coarse = coarse, .index = index.name, .schema_version = session.reader.active.version(), .after = if (cursor) |position| position.after else null }, .{}) };
+                if (limit == 0) return .{ .items = &.{}, .cursors = &.{}, .examined = 0, .stable_ties = !coarse, .exact_keys = true, .next = try std.json.Stringify.valueAlloc(a, OrderedCursor{ .reverse = reverse, .coarse = coarse, .index = index.name, .schema_version = session.reader.active.version(), .after = if (cursor) |position| position.after else null }, .{}) };
                 var page = try session.reader.nextPage(temporary, null, .{ .rows = @min(limit, 1024), .records = @min(@min(@max(limit, 128), max_examined), 1024), .output_bytes = 16 << 20 });
                 defer page.deinit();
                 var nodes: std.ArrayList(*const v.Node) = .empty;
@@ -528,7 +528,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 const next = if (page.more) try std.json.Stringify.valueAlloc(a, OrderedCursor{ .reverse = reverse, .coarse = coarse, .index = index.name, .schema_version = session.reader.active.version(), .after = page.next_cursor orelse return error.CypherInvalidBackendCursor }, .{}) else null;
                 if (cursors.items.len != 0) cursors.items[cursors.items.len - 1] = next;
                 try checkpoint(ptr);
-                return .{ .items = try nodes.toOwnedSlice(a), .cursors = try cursors.toOwnedSlice(a), .examined = page.records_examined, .stable_ties = !coarse, .next = next };
+                return .{ .items = try nodes.toOwnedSlice(a), .cursors = try cursors.toOwnedSlice(a), .examined = page.records_examined, .stable_ties = !coarse, .exact_keys = true, .next = next };
             };
             if (cursor != null) return error.CatalogGenerationChanged;
             return null;

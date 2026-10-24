@@ -106,7 +106,7 @@ pub const Path = struct { execution_summary: PathSummary = .{}, span: Span, alia
 pub const Match = struct { paths: []const Path, optional: bool = false, predicate: ?*const Expr = null, mode: PathMode = .relationship_simple };
 pub const Item = struct { expression: *const Expr, alias: ?[]const u8 = null };
 pub const Order = struct { expression: *const Expr, descending: bool = false, execution_nonnull: bool = false, execution_fixed: bool = false };
-pub const Projection = struct { items: []const Item, wildcard: bool = false, distinct: bool = false, predicate: ?*const Expr = null, order: []const Order = &.{}, skip: ?*const Expr = null, limit: ?*const Expr = null };
+pub const Projection = struct { execution_count: bool = false, items: []const Item, wildcard: bool = false, distinct: bool = false, predicate: ?*const Expr = null, order: []const Order = &.{}, skip: ?*const Expr = null, limit: ?*const Expr = null };
 pub const Assignment = struct { target: *const Expr, value: *const Expr, merge: bool = false };
 pub const Yield = struct { name: []const u8, alias: []const u8 };
 pub const UnionArm = struct { all: bool, clauses: []const Clause };

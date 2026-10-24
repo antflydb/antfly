@@ -47,6 +47,10 @@ pub fn Page(comptime T: type) type {
         /// Ordered keys are monotone. False requires boundary-tie refinement
         /// before a row goal may stop consumption.
         stable_ties: bool = true,
+        /// Complete ordered keys are NULL/integer/string/boolean, with identical
+        /// representations for Cypher-equal tuples across this table's owners.
+        /// This permits observing a projected key without primary tie repair.
+        exact_keys: bool = false,
         /// Primary encounter provenance for refinement across routed owners.
         encounter_owners: ?[]const usize = null,
     };

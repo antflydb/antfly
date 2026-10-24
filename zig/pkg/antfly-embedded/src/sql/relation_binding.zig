@@ -2206,6 +2206,24 @@ pub fn rowPreservingScan(original: *const Node) ?usize {
     return null;
 }
 
+/// Certify the entire outer predicate across row-preserving identity frames.
+/// Partial conjunct hints never grant a finite-prefix license.
+pub fn orderedGraphPredicate(a: Allocator, root: *const Node, program: scalar.Program, scan_index: usize) !?catalog.Scan.GraphPredicate {
+    if (rowPreservingScan(root) != scan_index) return null;
+    var source = root;
+    while (source.operation == .query) source = source.operation.query.source;
+    if (source.operation != .scan or source.operation.scan.index != scan_index) return null;
+    var mapped = program;
+    mapped.instructions = try a.dupe(scalar.Instruction, program.instructions);
+    for (@constCast(mapped.instructions)) |*instruction| if (instruction.operation == .column) {
+        const origin = scanColumn(root, instruction.operation.column) orelse return null;
+        if (origin.scan_index != scan_index) return null;
+        instruction.operation.column = @intCast(origin.position);
+    };
+    var remaining: usize = 128;
+    return graphBoolean(a, source, source, mapped, mapped.root, &remaining);
+}
+
 /// Snapshot-local estimates guide bounded left-deep enumeration. Unknown
 /// estimates decline reordering; estimates never become execution row limits.
 pub const JoinPlanning = struct {

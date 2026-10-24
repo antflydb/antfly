@@ -587,9 +587,8 @@ pub const NodeCursor = struct {
         var planned = (try e.planNodeOrder(&.{&.{}}, operation, projection, &.{}, true)) orelse return false;
         if (!planned.primary) {
             const proof = (try read(backend.ptr, e.a, planned.table, planned.filters, planned.fields, null, 0, 0)) orelse return false;
-            if (proof.items.len != 0 or (proof.examined orelse 0) != 0 or proof.next == null) return error.CypherInvalidBackendPage;
-            if (!proof.stable_ties) return false;
-            planned.initial_cursor = proof.next;
+            try planned.certify(proof);
+            if (planned.coarse) return false;
         }
         planned.active = true;
         const retained = try e.a.create(NodeOrder);
@@ -1220,6 +1219,7 @@ const NodeOrder = struct {
     distinct: enum { none, unique, adjacent, hashed } = .none,
     unique_stages: []const usize = &.{},
     coarse: bool = false,
+    exact_keys: bool = false,
     encounter_owner: usize = 0,
     encounter_key: ?[]const u8 = null,
     refill: usize = 1,
@@ -1234,6 +1234,20 @@ const NodeOrder = struct {
     active: bool = false,
     declined: bool = false,
     initial_cursor: ?[]const u8 = null,
+    grouped: bool = false,
+    prefetched: ?backend_mod.Page(*const v.Node) = null,
+    replayed: bool = false,
+    fn outputOrdered(self: NodeOrder) bool {
+        return self.active and (!self.coarse or (self.exact_keys and self.distinct == .adjacent));
+    }
+    fn certify(self: *NodeOrder, proof: backend_mod.Page(*const v.Node)) !void {
+        if (proof.items.len != 0 or (proof.examined orelse 0) != 0 or proof.next == null) return error.CypherInvalidBackendPage;
+        if (self.active and (self.coarse == proof.stable_ties or self.exact_keys != proof.exact_keys)) return error.CypherInvalidBackendPage;
+        self.active = true;
+        self.coarse = !proof.stable_ties;
+        self.exact_keys = proof.exact_keys;
+        self.initial_cursor = proof.next;
+    }
 };
 const Engine = struct {
     const Invariants = struct {
@@ -1280,6 +1294,8 @@ const Engine = struct {
     collect_match_paths: bool = false,
     shortest_fast: bool = false,
     node_order: ?*NodeOrder = null,
+    forced_order: ?NodeOrder = null,
+    allow_null_filters: bool = false,
     stream_fold: ?*StreamFold = null,
     expression_memo: ?CallMemo = null,
     expression_memo_scoped: bool = false,
@@ -2668,6 +2684,9 @@ const Engine = struct {
         capacity: usize,
         slots: []const usize,
         uniform: bool = false,
+        ordered: bool = false,
+        ordered_count: usize = 0,
+        ordered_rows: std.ArrayList(Row) = .empty,
         extended: bool = false,
         heap: std.ArrayList(usize) = .empty,
         sequence: usize = 0,
@@ -2726,7 +2745,7 @@ const Engine = struct {
             return .{ .capacity = if (limit == 0) 0 else (if (projection.skip) |skip| try engine.count(skip) else 0) + limit, .slots = slots, .uniform = uniform, .extended = uses_extended };
         }
         fn validate(self: @This(), engine: *Engine, call_value: ast.Function, value: v.Value, weight: Count) !void {
-            if (!self.extended or value == .null or std.ascii.eqlIgnoreCase(call_value.name, "count")) return;
+            if (self.ordered or !self.extended or value == .null or std.ascii.eqlIgnoreCase(call_value.name, "count")) return;
             // An evicted group cannot report a later failure. Certify every
             // contribution, including rejected keys, before forgetting state.
             if (std.ascii.eqlIgnoreCase(call_value.name, "min") or std.ascii.eqlIgnoreCase(call_value.name, "max")) {
@@ -2777,7 +2796,23 @@ const Engine = struct {
             for (self.slots, rank) |slot, *value| value.* = if (slot == std.math.maxInt(usize)) .null else key[slot];
             const candidate: Projected = .{ .row = &.{}, .source = &.{}, .group = null, .keys = rank, .sequence = self.sequence };
             self.sequence += 1;
-            const full = self.heap.items.len == self.capacity;
+            const full = if (self.ordered) self.ordered_count == self.capacity else self.heap.items.len == self.capacity;
+            // An attested complete group-key order makes every subsequent new
+            // group worse than the selected prefix. All observers were proved
+            // total before opening this source.
+            if (self.ordered and full) return error.CypherStreamComplete;
+            if (self.ordered) {
+                if (fold.groups.items.len != 0) {
+                    const scope = EvalScope.enter(engine, fold.retained);
+                    defer scope.leave(engine);
+                    try engine.retireOrderedGroup(self, fold.groups.items, fold.call_plan.?, fold.retention.?, fold.projection);
+                    fold.group_index.remove(fold.groups.items[0].window.?.hash, 0);
+                    fold.groups.items[0].deinit();
+                    fold.groups.clearRetainingCapacity();
+                    self.heap.clearRetainingCapacity();
+                }
+                self.ordered_count += 1;
+            }
             if (self.capacity == 0 or (full and try engine.compareProjected(candidate, projected(fold.groups.items[self.heap.items[0]]), fold.projection.order) != .lt)) {
                 // These values would have been consumed even for discarded
                 // groups. Do not hide type/arithmetic/pattern errors in args.
@@ -2823,7 +2858,7 @@ const Engine = struct {
             try fold.group_index.insert(engine.scratch_allocator, hash, index);
             if (!full) {
                 try self.heap.append(engine.scratch_allocator, index);
-                var position = self.heap.items.len - 1;
+                var position = if (self.ordered) 0 else self.heap.items.len - 1;
                 while (position > 0) {
                     const parent = (position - 1) / 2;
                     if (try compare(engine, fold.groups.items[self.heap.items[parent]], fold.groups.items[self.heap.items[position]], fold.projection.order) != .lt) break;
@@ -2919,6 +2954,22 @@ const Engine = struct {
             _ = std.math.add(usize, @intCast(skip.integer), @intCast(limit.integer)) catch return false;
         }
         return true;
+    }
+    fn retireOrderedGroup(self: *Engine, window: *GroupWindow, groups: []const StreamGroup, calls: *const reduction_plan.Calls, retention: *const GroupRetention, projection: ast.Projection) !void {
+        var domain = projection;
+        domain.order = &.{};
+        domain.skip = null;
+        domain.limit = null;
+        const rows = try self.finishStreamGroups(groups, calls, retention, domain);
+        try window.ordered_rows.appendSlice(self.a, rows);
+    }
+    fn finishOrderedGroups(self: *Engine, window: *GroupWindow, groups: []const StreamGroup, calls: *const reduction_plan.Calls, retention: *const GroupRetention, projection: ast.Projection) ![]const Row {
+        try self.retireOrderedGroup(window, groups, calls, retention, projection);
+        const skip = if (projection.skip) |expression| try self.count(expression) else 0;
+        const start = @min(skip, window.ordered_rows.items.len);
+        const limit = try self.count(projection.limit.?);
+        const end = start + @min(limit, window.ordered_rows.items.len - start);
+        return window.ordered_rows.items[start..end];
     }
     fn finishStreamGroups(self: *Engine, groups: []const StreamGroup, calls: *const reduction_plan.Calls, retention: *const GroupRetention, projection: ast.Projection) ![]const Row {
         var projected: std.ArrayList(Projected) = .empty;
@@ -4402,6 +4453,7 @@ const Engine = struct {
         group_window: ?*GroupWindow = null,
         window_retry: bool = false,
         membership_leaders: []const usize = &.{},
+        call_plan: ?*const reduction_plan.Calls = null,
         call_aliases: ?*const std.AutoHashMapUnmanaged(*const ast.Expr, usize) = null,
         retention: ?*const GroupRetention = null,
         top: *?TopK,
@@ -6220,7 +6272,7 @@ const Engine = struct {
             if (fold.record_rows) fold.matched.* +|= @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
             if (fold.top.*) |*top| {
                 try top.addWeighted(row, fold.weight);
-                const ordered_input = if (engine.node_order) |order| order.active and !order.coarse and engine.stream_fold == fold else false;
+                const ordered_input = if (engine.node_order) |order| order.outputOrdered() and engine.stream_fold == fold else false;
                 const singleton = if (engine.node_order) |order| order.active and order.singleton and engine.stream_fold == fold else false;
                 if (top.capacity != 0 and singleton and top.total != 0) return error.CypherStreamComplete;
                 if (fold.projection.limit != null and (fold.projection.order.len == 0 or ordered_input) and top.capacity != 0 and top.total == top.capacity) return error.CypherStreamComplete;
@@ -7490,6 +7542,7 @@ const Engine = struct {
     }
     noinline fn streamMatchProjectionInto(self: *Engine, input: []const Row, input_weights: ?[]const Count, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span, continuation: @FieldType(StreamFold, "continuation"), consumer: ?*PatternConsumer) anyerror!?[]const Row {
         if (continuation == null and consumer == null and (input_weights == null or (input_weights.?.len == 1 and input_weights.?[0].isOne()))) {
+            if (try self.indexedCardinality(input, operation, projection, original_middle, match_span, projection_span)) |rows| return rows;
             if (try self.indexedGroups(input, operation, projection, original_middle, match_span, projection_span)) |rows| return rows;
             if (try self.indexedExtrema(input, operation, projection, original_middle, match_span, projection_span)) |rows| return rows;
         }
@@ -7500,6 +7553,58 @@ const Engine = struct {
             // Keep already charged work; never repeat writes or refund budgets.
             return self.streamMatchProjectionAttempt(input, input_weights, operation, projection, original_middle, match_span, projection_span, continuation, consumer, false);
         };
+    }
+    /// Count the global union of ordered key domains without materializing
+    /// projected rows. The coordinator's ordinary ordered source owns merging,
+    /// authorization and budgets; owner-local cardinalities are never summed.
+    noinline fn indexedCardinality(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) anyerror!?[]const Row {
+        if (!self.read_only or input.len != 1 or projection.items.len == 0 or projection.wildcard or projection.predicate != null or projection.order.len != 0 or projection.skip != null or projection.limit != null or middle.len >= self.limits.recursion_depth -| self.recursion or self.limits.scanned_anchors > std.math.maxInt(i64)) return null;
+        const plans = try self.a.alloc(ast.Projection, projection.items.len);
+        const pipelines = try self.a.alloc([]const ast.Clause, projection.items.len);
+        for (projection.items, plans, pipelines) |item, *plan, *pipeline| {
+            if (item.expression.value != .call) return null;
+            const call_value = item.expression.value.call;
+            if (!std.ascii.eqlIgnoreCase(call_value.name, "count") or call_value.star or call_value.args.len != 1) return null;
+            const arg = call_value.args[0];
+            const closed = self.constant(arg, input[0]);
+            if (!call_value.distinct and !(closed != null and closed.? == .null)) return null;
+            const predicate = try self.a.create(ast.Expr);
+            predicate.* = .{ .span = arg.span, .value = .{ .unary = .{ .op = .is_not_null, .operand = arg } } };
+            const clauses = try self.a.alloc(ast.Clause, middle.len + 1);
+            @memcpy(clauses[0..middle.len], middle);
+            clauses[middle.len] = .{ .span = projection_span, .operation = .{ .project = .{ .final = false, .value = .{ .items = &.{}, .wildcard = true, .predicate = predicate } } } };
+            pipeline.* = clauses;
+            const items = try self.a.alloc(ast.Item, 1);
+            items[0] = .{ .expression = arg, .alias = "__antfly_domain_count" };
+            const orders = try self.a.alloc(ast.Order, 1);
+            orders[0] = .{ .expression = arg, .descending = true, .execution_nonnull = true };
+            plan.* = .{ .items = items, .distinct = true, .order = orders, .execution_count = true };
+            const proof = (try self.planNodeOrder(input, operation, plan.*, clauses, false)) orelse return null;
+            if (proof.declined or proof.distinct != .adjacent) return null;
+            if (!proof.primary) {
+                const read = self.backend.vtable.scan_ordered orelse return null;
+                const page = (try read(self.backend.ptr, self.a, proof.table, proof.filters, proof.fields, null, 0, 0)) orelse return null;
+                if (page.items.len != 0 or (page.examined orelse 0) != 0 or page.next == null) return error.CypherInvalidBackendPage;
+            }
+        }
+        const row = try self.a.alloc(v.Entry, projection.items.len);
+        const columns = try self.a.alloc([]const u8, projection.items.len);
+        for (projection.items, plans, pipelines, row, columns) |item, plan, pipeline, *entry, *column| {
+            const closed = self.constant(item.expression.value.call.args[0], input[0]);
+            const cardinality: v.Value = if (closed != null and closed.? == .null) .{ .integer = 0 } else cardinality: {
+                const scope = PatternScope.enter(self);
+                defer scope.leave(self);
+                const rows = (try self.streamMatchProjectionAttempt(input, null, operation, plan, pipeline, match_span, projection_span, null, null, true)) orelse return error.CypherInvalidBackendPage;
+                if (rows.len != 1) return error.CypherInvalidBackendPage;
+                break :cardinality rows[0][0].value;
+            };
+            const name = item.alias orelse try self.expressionName(item.expression);
+            column.* = name;
+            entry.* = .{ .name = name, .value = cardinality };
+        }
+        self.columns = columns;
+        try self.stages.append(self.a, .{ .operation = "index_cardinality", .span = projection_span, .input_rows = input.len, .output_rows = 1 });
+        return try self.a.dupe(Row, &.{row});
     }
     /// Discover only the requested group keys, then observe each selected
     /// equality domain once. Native tuple seeks bound discovery independently
@@ -7534,11 +7639,12 @@ const Engine = struct {
         var discovery = projection;
         discovery.items = keys.items;
         discovery.distinct = true;
-        const proof = (try self.planNodeOrder(input, operation, discovery, middle, false)) orelse return null;
+        var proof = (try self.planNodeOrder(input, operation, discovery, middle, false)) orelse return null;
         if (proof.declined or proof.primary or proof.distinct != .adjacent) return null;
         if (!proof.primary) {
             const page = (try read(self.backend.ptr, self.a, proof.table, proof.filters, proof.fields, null, 0, 0)) orelse return null;
-            if (page.items.len != 0 or (page.examined orelse 0) != 0 or page.next == null) return error.CypherInvalidBackendPage;
+            try proof.certify(page);
+            if (proof.coarse and !proof.exact_keys) return null;
         }
         // Non-DISTINCT counts only observe nullness. MIN/MAX and DISTINCT
         // counts also need an attested total key domain for their argument.
@@ -7583,9 +7689,64 @@ const Engine = struct {
             }
             if (!certified) return null;
         }
+        // Counts must consume every selected domain. Fold those domains in a
+        // single ordered pass. For extrema, sample a bounded source prefix and
+        // compare observed density with the cost of per-group observer seeks.
+        // Replay the charged sample; never pay for or read it twice.
+        var seek_groups = for (observers.items) |item| {
+            if (std.ascii.eqlIgnoreCase(item.expression.value.call.name, "count")) break false;
+        } else true;
+        if (try self.anchorKeys(operation.predicate, operation.paths[0].nodes[0].alias, input[0]) != null) return null;
+        if (seek_groups) {
+            const goal = self.windowGoal(discovery) orelse return null;
+            const seek_cost = 1 + 3 * observers.items.len;
+            const wanted = @min(32, @min(@max(goal +| 1, seek_cost + 1), self.limits.scanned_anchors -| self.stats.scanned_anchors));
+            if (wanted == 0) return null;
+            const page = (try read(self.backend.ptr, self.a, proof.table, proof.filters, proof.fields, proof.initial_cursor, wanted, self.limits.scanned_anchors -| self.stats.scanned_anchors)) orelse return error.CypherInvalidBackendPage;
+            const examined = page.examined orelse page.items.len;
+            if (examined < page.items.len or (proof.coarse == page.stable_ties or proof.exact_keys != page.exact_keys)) return error.CypherInvalidBackendPage;
+            if (examined > self.limits.scanned_anchors -| self.stats.scanned_anchors) return error.CypherAnchorBudgetExceeded;
+            self.stats.scanned_anchors += examined;
+            proof.prefetched = page;
+            var domains: usize = 0;
+            var previous: ?*const v.Node = null;
+            for (page.items) |node| {
+                const different = if (previous) |last| different: {
+                    for (proof.fields) |field| {
+                        const left = lookup(last.properties, field.property) orelse v.Value.null;
+                        const right = lookup(node.properties, field.property) orelse v.Value.null;
+                        if (!try self.values.eql(left, right)) break :different true;
+                    }
+                    break :different false;
+                } else true;
+                domains += @intFromBool(different);
+                previous = node;
+            }
+            seek_groups = page.items.len > domains * seek_cost;
+        }
+        if (!seek_groups) {
+            proof.grouped = true;
+            proof.distinct = .none;
+            const rows = rows: {
+                const scope = PatternScope.enter(self);
+                defer scope.leave(self);
+                const saved = self.forced_order;
+                self.forced_order = proof;
+                defer self.forced_order = saved;
+                break :rows (try self.streamMatchProjectionAttempt(input, null, operation, projection, middle, match_span, projection_span, null, null, true)) orelse return error.CypherInvalidBackendPage;
+            };
+            const columns = try self.a.alloc([]const u8, projection.items.len);
+            for (projection.items, columns) |item, *column| column.* = item.alias orelse try self.expressionName(item.expression);
+            self.columns = columns;
+            try self.stages.append(self.a, .{ .operation = "ordered_groups", .span = projection_span, .input_rows = input.len, .output_rows = rows.len });
+            return rows;
+        }
         const groups = groups: {
             const scope = PatternScope.enter(self);
             defer scope.leave(self);
+            const saved = self.forced_order;
+            self.forced_order = proof;
+            defer self.forced_order = saved;
             break :groups (try self.streamMatchProjectionAttempt(input, null, operation, discovery, middle, match_span, projection_span, null, null, true)) orelse return error.CypherInvalidBackendPage;
         };
         const saved_private = self.private_parameters;
@@ -7819,22 +7980,22 @@ const Engine = struct {
             self.cache_reads = previous_cache;
             if (!previous_cache) self.read_nodes = previous_reads;
         }
-        var node_order = if ((projection.limit != null or middle.len != 0) and input.len == 1 and continuation == null and consumer == null and (input_weights == null or input_weights.?[0].isOne())) try self.planNodeOrder(input, operation, projection, middle, false) else null;
+        const forced_order = self.forced_order;
+        self.forced_order = null;
+        defer self.forced_order = forced_order;
+        var node_order = if (forced_order) |forced| @as(?NodeOrder, forced) else if ((projection.limit != null or projection.distinct or middle.len != 0) and input.len == 1 and continuation == null and consumer == null and (input_weights == null or input_weights.?[0].isOne())) try self.planNodeOrder(input, operation, projection, middle, false) else null;
         const previous_node_order = self.node_order;
         self.node_order = if (node_order) |*order| order else null;
         defer self.node_order = previous_node_order;
         // DISTINCT may stream only after the complete physical order has
         // attested. A declined provider retains the ordinary grouped executor.
         if (projection.distinct and !reducers) if (self.node_order) |order| if (!order.declined and order.distinct != .none) {
-            if (order.primary) {
+            if (order.active) {} else if (order.primary) {
                 order.active = true;
             } else {
                 const read = self.backend.vtable.scan_ordered.?;
                 if (try read(self.backend.ptr, self.a, order.table, order.filters, order.fields, null, 0, 0)) |proof| {
-                    if (proof.items.len != 0 or (proof.examined orelse 0) != 0 or proof.next == null) return error.CypherInvalidBackendPage;
-                    order.active = true;
-                    order.coarse = !proof.stable_ties;
-                    order.initial_cursor = proof.next;
+                    try order.certify(proof);
                 } else order.declined = true;
             }
             if (order.active) grouped = false;
@@ -7922,6 +8083,9 @@ const Engine = struct {
         if (group_window == null and grouped and allow_group_window and scalar_seed and self.read_only and continuation == null and consumer == null) {
             group_window = try GroupWindow.initRanks(self, projection, true, true, true);
         }
+        if (group_window) |*window| if (self.node_order) |order| {
+            window.ordered = order.grouped and order.active;
+        };
         defer if (group_window) |*window| {
             window.heap.deinit(self.scratch_allocator);
             group_index.deinit(self.scratch_allocator);
@@ -7941,7 +8105,7 @@ const Engine = struct {
         for (probes, middle) |*probe, clause| probe.* = .{ .budget = .{ .backing = self.scratch_allocator, .limit = @min(4 << 20, self.limits.memory_bytes / 32) }, .disabled = clause.operation != .match and clause.operation != .subquery };
         defer for (probes) |*probe| probe.deinit();
         const retention: GroupRetention = if (grouped) try self.groupRetention(projection) else .{ .a = self.a };
-        var fold: StreamFold = .{ .scratch_group_index = group_window != null, .closed_domain = closed_domain, .partitioned_order = ordered, .single_seed = scalar_seed and input.len == 1 and (input_weights == null or input_weights.?[0].isOne()), .defer_aggregates = scalar_seed and group_window == null, .consumer = consumer, .retention = &retention, .probes = probes, .optional = operation.optional, .applies = applies, .continuation = continuation, .distinct = distinct_stages, .retained = retained, .middle = middle, .projection = projection, .calls = calls.items, .membership_leaders = calls.distinct_leaders.items, .group_window = if (group_window) |*window| window else null, .window_retry = self.read_only and continuation == null and consumer == null, .call_aliases = &calls.index.pointers, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = stage_counts, .matched = &matched };
+        var fold: StreamFold = .{ .call_plan = &calls, .scratch_group_index = group_window != null, .closed_domain = closed_domain, .partitioned_order = ordered, .single_seed = scalar_seed and input.len == 1 and (input_weights == null or input_weights.?[0].isOne()), .defer_aggregates = scalar_seed and group_window == null, .consumer = consumer, .retention = &retention, .probes = probes, .optional = operation.optional, .applies = applies, .continuation = continuation, .distinct = distinct_stages, .retained = retained, .middle = middle, .projection = projection, .calls = calls.items, .membership_leaders = calls.distinct_leaders.items, .group_window = if (group_window) |*window| window else null, .window_retry = self.read_only and continuation == null and consumer == null, .call_aliases = &calls.index.pointers, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = stage_counts, .matched = &matched };
         defer fold.closeAxes();
         var adaptive_probe = adaptive_candidate;
         if (adaptive_probe) for (input) |row| {
@@ -8153,7 +8317,7 @@ const Engine = struct {
         self.shortest_count = previous_count;
         self.stream_fold = previous_fold;
         if (continuation != null or consumer != null) return &.{};
-        const rows = if (top) |*value| try value.finish(true) else try self.finishStreamGroups(groups.items, &calls, &retention, projection);
+        const rows = if (top) |*value| try value.finish(true) else if (group_window != null and group_window.?.ordered) try self.finishOrderedGroups(&group_window.?, groups.items, &calls, &retention, projection) else try self.finishStreamGroups(groups.items, &calls, &retention, projection);
         if (!scalar_seed) try self.stages.append(self.a, .{ .operation = "match", .span = match_span, .input_rows = input.len, .output_rows = stage_counts[0] });
         for (middle, 0..) |clause, index| try self.stages.append(self.a, .{ .operation = @tagName(clause.operation), .span = clause.span, .input_rows = stage_counts[index], .output_rows = stage_counts[index + 1] });
         try self.stages.append(self.a, .{ .operation = "project", .span = projection_span, .input_rows = matched, .output_rows = if (self.pending_window) |weighted| weighted.count() else rows.len });
@@ -9251,6 +9415,9 @@ const Engine = struct {
                         break :blk true;
                     };
                     var group_window = if (grouped) try GroupWindow.init(self, projection, scalar_groups or (projection.distinct and calls.items.len == 0), false) else null;
+                    if (group_window) |*window| if (self.node_order) |order| {
+                        window.ordered = order.grouped and order.active;
+                    };
                     defer if (group_window) |*window| {
                         window.heap.deinit(self.scratch_allocator);
                         group_index.deinit(self.scratch_allocator);
@@ -9776,7 +9943,8 @@ const Engine = struct {
                 try self.checkpoint();
                 const page = try self.scanNodes(label.table, first, operation.predicate, rows[0], cursor, @min(128, goal - output.items.len));
                 const examined = page.examined orelse page.items.len;
-                if (examined < page.items.len) return error.CypherInvalidBackendPage;
+                const replayed = if (self.node_order) |order| order.replayed else false;
+                if (!replayed and examined < page.items.len) return error.CypherInvalidBackendPage;
                 if (examined > self.limits.scanned_anchors -| self.stats.scanned_anchors) return error.CypherAnchorBudgetExceeded;
                 self.stats.scanned_anchors += examined;
                 if (page.encounter_owners) |owners| if (owners.len != page.items.len) return error.CypherInvalidBackendPage;
@@ -10061,7 +10229,7 @@ const Engine = struct {
         };
     }
     fn predicateFilters(self: *Engine, expression: *const ast.Expr, alias: []const u8, row: Row, filters: *std.ArrayList(backend_mod.PropertyFilter)) !void {
-        if (self.private_parameters.len != 0 and expression.value == .unary and expression.value.unary.op == .is_null) {
+        if ((self.private_parameters.len != 0 or self.allow_null_filters) and expression.value == .unary and expression.value.unary.op == .is_null) {
             const operand = expression.value.unary.operand;
             if (operand.value == .property and operand.value.property.base.value == .variable and std.mem.eql(u8, operand.value.property.base.value.variable, alias))
                 try filters.append(self.a, .{ .property = operand.value.property.name, .op = .is_null, .value = .null });
@@ -10144,7 +10312,7 @@ const Engine = struct {
     /// in their lexical stages. Unknown conjuncts never imply an OR restriction.
     fn lineageFilters(self: *Engine, expression: *const ast.Expr, lineage: std.StringHashMapUnmanaged(NodeOrigin), filters: *std.ArrayList(backend_mod.PropertyFilter)) anyerror!void {
         try self.state();
-        if (self.private_parameters.len != 0 and expression.value == .unary and expression.value.unary.op == .is_null) {
+        if ((self.private_parameters.len != 0 or self.allow_null_filters) and expression.value == .unary and expression.value.unary.op == .is_null) {
             const origin = self.nodeOrigin(expression.value.unary.operand, lineage) orelse return;
             if (origin.property) |property| try filters.append(self.a, .{ .property = property, .op = .is_null, .value = .null });
             return;
@@ -10214,7 +10382,10 @@ const Engine = struct {
         // An ordinary empty scan may finish without spending an anchor. A
         // certificate cannot assume a zero-budget source is nonempty.
         if (self.stats.scanned_anchors >= self.limits.scanned_anchors) return null;
-        const unordered_singleton = projection.distinct and projection.limit != null and projection.order.len == 0;
+        const unordered_singleton = projection.distinct and projection.order.len == 0;
+        const saved_null_filters = self.allow_null_filters;
+        self.allow_null_filters = self.allow_null_filters or projection.distinct;
+        defer self.allow_null_filters = saved_null_filters;
         if (!self.read_only or input.len != 1 or operation.optional or operation.paths.len != 1 or (projection.order.len == 0 and middle.len == 0 and !unordered_singleton)) return null;
         const path = operation.paths[0];
         if (path.edges.len != 0 or path.alias != null or path.selector != .all) return null;
@@ -10284,7 +10455,7 @@ const Engine = struct {
             .{ .table = table orelse return null, .alias = alias, .fields = &.{}, .filters = filters.items, .unique_stages = unique_stages.items, .declined = true }
         else
             null;
-        if ((!external_order and projection.limit == null) or projection.wildcard or projection.predicate != null or (projection.order.len == 0 and !unordered_singleton) or projection.order.len > 32) return hinted;
+        if ((!external_order and projection.limit == null and !projection.distinct) or projection.wildcard or projection.predicate != null or (projection.order.len == 0 and !unordered_singleton) or projection.order.len > 32) return hinted;
         // ORDER BY evaluates in the projected scope; a shadow may replace the
         // source receiver. Preserve the conservative certificate boundary.
         for (projection.items) |item| if (item.alias) |name| if (std.mem.eql(u8, name, alias)) return hinted;
@@ -10352,14 +10523,20 @@ const Engine = struct {
         // Without a DISTINCT proof, source order must remain unchanged: a
         // nonprojected sort key belongs to the first encountered representative.
         if (projection.distinct and result.distinct == .none) return null;
-        if (unordered_singleton and result.distinct != .adjacent) return null;
+        if ((unordered_singleton or (projection.distinct and projection.limit == null)) and result.distinct != .adjacent) return null;
         result.singleton = result.distinct == .adjacent and for (result.fields) |field| {
             if (!fixed.contains(field.property)) break false;
         } else true;
         if (result.singleton) {
             const constant_row = for (projection.items) |item| {
                 const origin = self.nodeOrigin(item.expression, lineage) orelse break false;
-                if (origin.constant == null) break false;
+                if (origin.constant == null) {
+                    const property = origin.property orelse break false;
+                    const null_fixed = for (filters.items) |filter| {
+                        if (filter.op == .is_null and std.mem.eql(u8, filter.property, property)) break true;
+                    } else false;
+                    if (!null_fixed) break false;
+                }
             } else true;
             // Preserve the ordinary filtered source's first representative.
             // Only a closed row may also push later filters across that source.
@@ -10375,13 +10552,34 @@ const Engine = struct {
         return filters.items;
     }
     fn scanNodes(self: *Engine, table: []const u8, first: ast.Node, predicate: ?*const ast.Expr, row: Row, cursor: ?[]const u8, demand: usize) !backend_mod.Page(*const v.Node) {
+        if (self.node_order) |order| order.replayed = false;
         const bounded_demand = @min(demand, @max(@as(usize, 1), self.limits.scanned_anchors -| self.stats.scanned_anchors));
         if (self.lookup) |lookup_plan| if (lookup_plan.complete and std.mem.eql(u8, lookup_plan.table, table)) return lookup_plan.cachedPage(self, cursor, bounded_demand);
         if (self.node_order) |order| if (!order.declined and std.mem.eql(u8, order.table, table) and first.alias != null and std.mem.eql(u8, order.alias, first.alias.?)) {
+            if (order.prefetched) |prefetched| {
+                order.prefetched = null;
+                order.initial_cursor = null;
+                order.replayed = true;
+                var page = prefetched;
+                page.examined = 0;
+                return page;
+            }
             const wanted = if (self.stream_fold) |fold| if (fold.top.*) |top| wanted: {
-                const remaining = (if (order.singleton) @as(usize, 1) else top.capacity) -| top.total;
+                if (!order.singleton and top.projection.limit == null and order.distinct == .adjacent and (order.outputOrdered() or top.count_only)) {
+                    // Sparse unbounded domains need batched transport too.
+                    // Grow through rejected prefixes and fully productive
+                    // pages. Confirmed duplicate-heavy domains return to
+                    // exclusive seeks; ignored seeks still batch their ties.
+                    if (order.previous_total) |previous| {
+                        const produced = top.total - previous;
+                        order.refill = if (produced == 0 or produced >= order.refill) @min(128, order.refill * 2) else if (produced * 2 < order.refill) 1 else order.refill;
+                    }
+                    order.previous_total = top.total;
+                    break :wanted @min(bounded_demand, order.refill);
+                }
+                const remaining = if (order.singleton or (order.distinct == .adjacent and (order.outputOrdered() or top.count_only))) @as(usize, 1) else top.capacity -| top.total;
                 const stalled = order.previous_total != null and order.previous_total.? == top.total;
-                if (order.coarse or (order.distinct != .none and stalled)) {
+                if ((order.coarse and !order.outputOrdered() and !top.count_only) or (order.distinct != .none and stalled)) {
                     const quantum = order.refill;
                     order.refill = @min(128, quantum * 2);
                     order.previous_total = top.total;
@@ -10390,6 +10588,13 @@ const Engine = struct {
                 order.refill = 1;
                 order.previous_total = top.total;
                 break :wanted @min(bounded_demand, remaining);
+            } else if (order.grouped and fold.group_window != null and fold.group_window.?.ordered) wanted: {
+                const group_count = fold.group_window.?.ordered_count;
+                const remaining = fold.group_window.?.capacity -| group_count;
+                const stalled = order.previous_total != null and order.previous_total.? == group_count;
+                order.refill = if (stalled) @min(256, order.refill * 2) else 1;
+                order.previous_total = group_count;
+                break :wanted @min(bounded_demand, @max(@min(256, remaining +| 1), order.refill));
             } else bounded_demand else bounded_demand;
             if (order.primary) {
                 order.active = true;
@@ -10422,8 +10627,9 @@ const Engine = struct {
                 break :fields sought[0..after.len];
             } else order.fields;
             if (try read(self.backend.ptr, self.a, table, filters, fields, cursor orelse order.initial_cursor, @max(1, wanted), self.limits.scanned_anchors -| self.stats.scanned_anchors)) |page| {
-                if (order.active and order.coarse == page.stable_ties) return error.CypherInvalidBackendPage;
+                if (order.active and (order.coarse == page.stable_ties or order.exact_keys != page.exact_keys)) return error.CypherInvalidBackendPage;
                 order.coarse = !page.stable_ties;
+                order.exact_keys = page.exact_keys;
                 order.active = true;
                 order.initial_cursor = null;
                 return page;
@@ -10654,7 +10860,8 @@ const Engine = struct {
                 try self.checkpoint();
                 const page = try self.scanNodes(label.table, first, predicate, input.row, cursor, if (self.stream_fold) |fold| fold.demand() else 128);
                 const examined = page.examined orelse page.items.len;
-                if (examined < page.items.len) return error.CypherInvalidBackendPage;
+                const replayed = if (self.node_order) |order| order.replayed else false;
+                if (!replayed and examined < page.items.len) return error.CypherInvalidBackendPage;
                 if (examined > self.limits.scanned_anchors -| self.stats.scanned_anchors) return error.CypherAnchorBudgetExceeded;
                 self.stats.scanned_anchors += examined;
                 if (page.encounter_owners) |owners| if (owners.len != page.items.len) return error.CypherInvalidBackendPage;
@@ -15845,6 +16052,8 @@ const Engine = struct {
         distinct_previous: ?Row = null,
         seek_arena: ?std.heap.ArenaAllocator = null,
         hashed_distinct: bool = false,
+        count_only: bool = false,
+        ordered_picks: bool = false,
         distinct_heads: std.AutoHashMapUnmanaged(u64, *DistinctPick) = .{},
         fn init(engine: *Engine, projection: ast.Projection, first: Row) !TopK {
             const skip = if (projection.skip) |expression| try engine.count(expression) else 0;
@@ -15853,8 +16062,9 @@ const Engine = struct {
             const limit = if (projection.limit) |expression| try engine.count(expression) else std.math.maxInt(usize) - skip;
             var result: TopK = .{ .engine = engine, .projection = projection, .retained = engine.a, .skip = skip, .capacity = if (limit == 0) 0 else std.math.add(usize, skip, limit) catch return error.CypherLimitExceeded };
             if (projection.distinct) if (engine.node_order) |order| if (order.active) {
-                result.hashed_distinct = order.distinct == .hashed or (order.coarse and order.distinct == .adjacent);
-                if (order.distinct == .adjacent and !order.coarse) result.distinct_arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                result.count_only = projection.execution_count and order.distinct == .adjacent;
+                result.hashed_distinct = order.distinct == .hashed or (order.coarse and !order.exact_keys and order.distinct == .adjacent and !result.count_only);
+                if (order.distinct == .adjacent and !result.hashed_distinct) result.distinct_arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
             };
             if (projection.wildcard) for (first) |entry| try result.columns.append(engine.a, entry.name);
             for (projection.items) |item| try result.columns.append(engine.a, item.alias orelse try engine.expressionName(item.expression));
@@ -15895,7 +16105,7 @@ const Engine = struct {
                 self.distinct_previous = try cloneRowContext(row.items, &copies);
             }
             const order = engine.node_order;
-            if (order) |proof| if (proof.active and proof.distinct == .adjacent and proof.fields.len != 0) {
+            if (order) |proof| if (proof.active and proof.distinct == .adjacent and (proof.outputOrdered() or self.count_only) and proof.fields.len != 0) {
                 if (self.seek_arena == null) self.seek_arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
                 _ = self.seek_arena.?.reset(.free_all);
                 var copies: v.CloneContext = .{ .a = self.seek_arena.?.allocator(), .scratch = engine.scratch_allocator };
@@ -15908,7 +16118,11 @@ const Engine = struct {
                 for (after, proof.seek_indexes) |*key, index| key.* = try copies.clone(keys[index]);
                 proof.seek_values = after;
             };
-            const coarse = if (order) |proof| proof.active and proof.coarse else false;
+            if (self.count_only) {
+                self.total = std.math.add(usize, self.total, 1) catch return error.CypherNumericOverflow;
+                return;
+            }
+            const coarse = if (order) |proof| proof.active and proof.coarse and !proof.outputOrdered() else false;
             const candidate: Projected = .{ .row = row.items, .source = &.{}, .group = null, .keys = keys, .tie_owner = if (coarse) order.?.encounter_owner else 0, .tie_key = if (coarse) order.?.encounter_key orelse return error.CypherInvalidBackendPage else null, .sequence = self.sequence, .weight = @intCast(weight.cap(self.capacity)), .multiplicity = if (self.projection.limit == null) weight else null };
             // A coarse source can stop only beyond the complete boundary key
             // group. The heap repairs primary encounter ties with O(SKIP+LIMIT)
@@ -15935,7 +16149,8 @@ const Engine = struct {
             // Certified encounter order needs no selection heap. Evaluate the
             // normal row pipeline, then retire the offset immediately. total
             // still counts the complete logical window for demand/termination.
-            if (self.projection.limit != null and self.projection.order.len != 0 and !self.hashed_distinct) if (engine.node_order) |order| if (order.active and !order.coarse) {
+            if (self.projection.order.len != 0 and !self.hashed_distinct) if (engine.node_order) |order| if (order.outputOrdered() and !order.grouped) {
+                self.ordered_picks = true;
                 const weight = @min(candidate.weight, self.capacity - self.total);
                 const discard = @min(self.skip - self.dropped, weight);
                 self.dropped += discard;
@@ -16013,6 +16228,12 @@ const Engine = struct {
         fn finish(self: *TopK, final: bool) ![]const Row {
             const engine = self.engine;
             const retained = engine.a;
+            if (self.count_only) {
+                const value = std.math.cast(i64, self.total) orelse return error.CypherNumericOverflow;
+                if (final) engine.columns = try self.columns.toOwnedSlice(retained);
+                const row = try retained.dupe(v.Entry, &.{.{ .name = "__antfly_domain_count", .value = .{ .integer = value } }});
+                return try retained.dupe(Row, &.{row});
+            }
             var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
             defer scratch.deinit();
             // Picks own their values through this call. Sort borrowed descriptors
@@ -16027,7 +16248,7 @@ const Engine = struct {
                 fn less(_: void, left: Projected, right: Projected) bool {
                     return left.sequence < right.sequence;
                 }
-            }.less) else if (self.projection.order.len != 0) try engine.sort(projected, self.projection.order);
+            }.less) else if (self.projection.order.len != 0 and !self.ordered_picks) try engine.sort(projected, self.projection.order);
             var skip = @min(self.skip - self.dropped, self.total - self.dropped);
             if (engine.retain_windows) {
                 var rows: std.ArrayList(Row) = .empty;

@@ -8400,3 +8400,72 @@ def test_group_observer_plans_retire_between_selected_domains(graph_db):
         assert result["rows"][0][0]["value"] == "n0"
         assert result["rows"][-1][0]["value"] == "n999"
         assert result["stats"]["memory_bytes"] <= 16 << 20
+
+
+def test_broad_ordered_groups_use_one_source_pass(graph_db):
+    populate(graph_db, 5000)
+    graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
+    for observer in ("count(*)", "max(n.score)", "count(n.score),min(n.score),max(n.score)"):
+        query = f"MATCH (n:D) RETURN n.id,{observer} ORDER BY n.id LIMIT 5000"
+        actual = graph_db.cypher_json("g", {"query": query, "limits": {"scanned_anchors": 5000}})
+        control = graph_db.cypher_json(
+            "g", {"query": query.replace("ORDER BY n.id", "ORDER BY CASE WHEN true THEN n.id END")}
+        )
+        assert actual["rows"] == control["rows"]
+        assert len(actual["rows"]) == 5000
+        assert actual["stats"]["scanned_anchors"] == 5000
+        assert actual["stats"]["intermediate_states"] < 900000
+
+
+def test_unbounded_key_domains_and_cardinality_skip_duplicate_runs(graph_db):
+    populate(graph_db, 13000)
+    for start in range(0, 13000, 1000):
+        graph_db.sql(f"UPDATE docs SET score=score%3 WHERE score>={start} AND score<{start + 1000}")
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    partial = "MATCH (n:D) RETURN DISTINCT n.id,n.score ORDER BY n.score DESC LIMIT 5"
+    assert (
+        graph_db.cypher_json("g", {"query": partial})["rows"]
+        == graph_db.cypher_json(
+            "g", {"query": partial.replace("ORDER BY n.score", "ORDER BY CASE WHEN true THEN n.score END")}
+        )["rows"]
+    )
+    for direction, expected in (("ASC", [0, 1, 2]), ("DESC", [2, 1, 0])):
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D) RETURN DISTINCT n.score ORDER BY n.score {direction}",
+                "limits": {"scanned_anchors": 8},
+            },
+        )
+        assert [int(row[0]["value"]) for row in result["rows"]] == expected
+    for expression, expected, anchors in (
+        ("count(DISTINCT n.score)", "3", 8),
+        ("count(DISTINCT 7)", "1", 1),
+        ("count(null)", "0", 1),
+    ):
+        result = graph_db.cypher_json(
+            "g", {"query": f"MATCH (n:D) RETURN {expression}", "limits": {"scanned_anchors": anchors}}
+        )
+        assert result["rows"] == [[{"type": "integer", "value": expected}]]
+        assert result["stats"]["scanned_anchors"] <= anchors
+        if expression == "count(null)":
+            assert result["stats"]["scanned_anchors"] == 0
+    for start in range(0, 13000, 1000):
+        keys = ",".join(repr(f"n{i}") for i in range(start, min(start + 1000, 13000)))
+        graph_db.sql(f"UPDATE docs SET score=NULL WHERE score=0 AND _id IN ({keys})")
+    nonnull = graph_db.cypher_json(
+        "g", {"query": "MATCH (n:D) RETURN count(DISTINCT n.score)", "limits": {"scanned_anchors": 8}}
+    )
+    assert nonnull["rows"] == [[{"type": "integer", "value": "2"}]]
+    empty = graph_db.cypher_json("g", {"query": "MATCH (n:D) WHERE false RETURN count(DISTINCT 7)"})
+    assert empty["rows"] == [[{"type": "integer", "value": "0"}]]
+    for order in ("", "ORDER BY n.score DESC"):
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D) WHERE n.score IS NULL RETURN DISTINCT n.score {order}",
+                "limits": {"scanned_anchors": 1},
+            },
+        )
+        assert result["rows"] == [[{"type": "null", "value": None}]]
+        assert result["stats"]["scanned_anchors"] == 1

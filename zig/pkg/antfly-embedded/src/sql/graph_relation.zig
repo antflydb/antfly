@@ -250,6 +250,25 @@ fn filterNeeds(filter: catalog.Scan.GraphFilter, column: []const u8) bool {
     };
 }
 fn scanQuery(a: A, binding: Binding, request: catalog.Scan) !cypher.ast.Query {
+    var consumed = false;
+    return scanQueryCertified(a, binding, request, &consumed);
+}
+fn exactFilterDomain(binding: Binding, original: cypher.ast.Projection, filter: catalog.Scan.GraphFilter) bool {
+    return switch (filter) {
+        .comparison => |condition| for (original.items) |item| {
+            if (!std.mem.eql(u8, item.alias.?, condition.column)) continue;
+            break switch (expressionType(binding, item.expression)) {
+                .integer, .string, .boolean => true,
+                else => false,
+            };
+        } else false,
+        .all, .any => |children| for (children) |child| {
+            if (!exactFilterDomain(binding, original, child)) break false;
+        } else true,
+    };
+}
+fn scanQueryCertified(a: A, binding: Binding, request: catalog.Scan, consumed: *bool) !cypher.ast.Query {
+    consumed.* = false;
     var query = binding.definition.query;
     if (query.clauses.len != 2 or query.clauses[0].operation != .match or query.clauses[1].operation != .project) return query;
     const original = query.clauses[1].operation.project.value;
@@ -264,7 +283,13 @@ fn scanQuery(a: A, binding: Binding, request: catalog.Scan) !cypher.ast.Query {
     for (operation.paths) |path| if (path.selector != .all) {
         push = false;
     };
-    if (push) {
+    if (push) if (request.exact_graph_filter) |filter| exact: {
+        if (!exactFilterDomain(binding, original, filter)) break :exact;
+        const predicate = (try graphFilter(a, binding, original, filter)) orelse break :exact;
+        operation.predicate = if (operation.predicate) |previous| (try combinePredicate(a, previous, predicate, .@"and")) orelse break :exact else predicate;
+        consumed.* = true;
+    };
+    if (push and !consumed.*) {
         for (request.conditions) |condition| {
             const predicate = (try graphComparison(a, binding, original, condition, false)) orelse continue;
             operation.predicate = if (operation.predicate) |previous| (try combinePredicate(a, previous, predicate, .@"and")) orelse continue else predicate;
@@ -332,7 +357,8 @@ pub const Cursor = struct {
         // Tagged tokens resume the same pruned/pushed relation. Legacy ordinal
         // tokens retain their original unfiltered source interpretation.
         if (optimized) query_request.after = null;
-        var compiled: cypher.compiler.Compiled = .{ .arena = std.heap.ArenaAllocator.init(a), .query = try scanQuery(owned, binding, query_request), .parameters = binding.definition.parameters };
+        var consumed_filter = false;
+        var compiled: cypher.compiler.Compiled = .{ .arena = std.heap.ArenaAllocator.init(a), .query = try scanQueryCertified(owned, binding, query_request, &consumed_filter), .parameters = binding.definition.parameters };
         defer compiled.deinit();
         // Every ordinary comparison with SQL NULL is UNKNOWN. A conjunction
         // containing one can emit no rows, even across graph semantic barriers.
@@ -371,7 +397,7 @@ pub const Cursor = struct {
             }
             if (compatible) {
                 ordered = try cursor.certifyOrder(order.items);
-                if (!ordered and request.primary_key == null and request.after == null and request.conditions.len == 0 and request.graph_conditions.len == 0 and request.graph_predicates.len == 0 and request.graph_filters.len == 0) if (request.ordered_window) |maximum| {
+                if (!ordered and request.primary_key == null and request.after == null and (if (request.exact_graph_filter != null) consumed_filter else (request.conditions.len == 0 and request.graph_conditions.len == 0 and request.graph_predicates.len == 0 and request.graph_filters.len == 0))) if (request.ordered_window) |maximum| {
                     ordered = try cursor.certifyWindow(order.items, maximum);
                 };
             }
@@ -383,6 +409,7 @@ pub const Cursor = struct {
         copied.fields = fields;
         copied.conditions = conditions;
         copied.graph_filters = &.{};
+        copied.exact_graph_filter = null;
         copied.after = null;
         copied.primary_key = if (request.primary_key) |key| try owned.dupe(u8, key) else null;
         if ((empty and resume_position != 0) or (result != null and resume_position > result.?.rows.len)) return error.InvalidSqlBackendResponse;
@@ -615,12 +642,12 @@ test "SQL GRAPH_TABLE dependency partitions share quotas and resume narrow pages
         }
         fn ordered(_: *anyopaque, a: A, _: []const u8, _: []const cypher.backend.PropertyFilter, order: []const cypher.backend.PropertyOrder, after: ?[]const u8, limit: usize, _: usize) !?cypher.backend.Page(*const cypher.value.Node) {
             if (order.len != 1 or !std.mem.eql(u8, order[0].property, "rank")) return null;
-            if (limit == 0) return .{ .items = &.{}, .examined = 0, .next = "0" };
+            if (limit == 0) return .{ .exact_keys = true, .items = &.{}, .examined = 0, .next = "0" };
             const start = if (after) |text| try std.fmt.parseInt(usize, text, 10) else 0;
             const end = @min(nodes.len, start + limit);
             const out = try a.alloc(*const cypher.value.Node, end - start);
             for (out, start..) |*node, index| node.* = &nodes[if (order[0].descending) nodes.len - 1 - index else index];
-            return .{ .items = out, .examined = out.len, .next = if (end < nodes.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+            return .{ .exact_keys = true, .items = out, .examined = out.len, .next = if (end < nodes.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
         }
         fn coarse(ptr: *anyopaque, a: A, table: []const u8, filters: []const cypher.backend.PropertyFilter, order: []const cypher.backend.PropertyOrder, after: ?[]const u8, limit: usize, maximum: usize) !?cypher.backend.Page(*const cypher.value.Node) {
             var page = (try ordered(ptr, a, table, filters, order, after, limit, maximum)) orelse return null;
@@ -700,6 +727,28 @@ test "SQL GRAPH_TABLE dependency partitions share quotas and resume narrow pages
         }
     }
     callbacks.scan_ordered = F.coarse;
+    // Superset hints cannot cap a source. A complete, exactly translated
+    // predicate can, while an unsupported OR arm must decline atomically.
+    for ([_]bool{ true, false }) |exact| {
+        const filter: catalog.Scan.GraphFilter = if (exact) .{ .comparison = .{ .column = "rank", .op = .gte, .value = .{ .integer = 2 } } } else .{ .any = &.{
+            .{ .comparison = .{ .column = "rank", .op = .gte, .value = .{ .integer = 2 } } },
+            .{ .comparison = .{ .column = "rank", .op = .eq, .value = .{ .float = 1.5 } } },
+        } };
+        const cursor = try Cursor.open(std.testing.allocator, ordered_binding, indexed, &.{}, .{ .fields = &.{"rank"}, .order = &.{.{ .column = "rank", .descending = true, .nulls_first = true }}, .conditions = if (exact) &.{.{ .column = "rank", .op = .gte, .value = .{ .integer = 2 } }} else &.{}, .exact_graph_filter = filter, .ordered_window = 1, .limit = 1 }, .{ .scanned_anchors = 3 });
+        defer cursor.close(cursor.ptr);
+        try std.testing.expectEqual(exact, cursor.order_satisfied);
+        var emitted: usize = 0;
+        while (true) {
+            const page = try cursor.next(cursor.ptr, std.testing.allocator, 1);
+            defer page.deinit();
+            for (page.rows) |row| {
+                emitted += 1;
+                try std.testing.expectEqual(@as(i64, if (exact) 3 else @intCast(emitted)), (try row.cell("rank")).value.integer);
+            }
+            if (page.after == null) break;
+        }
+        try std.testing.expectEqual(@as(usize, if (exact) 1 else 3), emitted);
+    }
     for ([_]bool{ false, true }) |licensed| {
         const cursor = try Cursor.open(std.testing.allocator, ordered_binding, indexed, &.{}, .{ .fields = &.{"rank"}, .order = &.{.{ .column = "rank", .descending = true, .nulls_first = true }}, .row_goal = 1, .ordered_window = if (licensed) 1 else null, .limit = 1 }, .{ .scanned_anchors = if (licensed) 2 else 3 });
         defer cursor.close(cursor.ptr);

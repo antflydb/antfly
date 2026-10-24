@@ -7732,7 +7732,7 @@ test "ordered node certificates bound scans preserve residuals and decline falli
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             if (order.len != 1 or !std.mem.eql(u8, order[0].property, "rank")) return null;
-            if (limit == 0) return .{ .items = &.{}, .next = "0", .examined = 0 };
+            if (limit == 0) return .{ .exact_keys = true, .items = &.{}, .next = "0", .examined = 0 };
             const start = if (after) |bytes| try std.fmt.parseInt(usize, bytes, 10) else 0;
             const end = @min(3, start + @min(limit, max_examined));
             var nodes: std.ArrayList(*const v.Node) = .empty;
@@ -7741,7 +7741,7 @@ test "ordered node certificates bound scans preserve residuals and decline falli
                 if (self.fixture.deny_b and std.mem.eql(u8, node.identity.key, "b")) continue;
                 try nodes.append(a, node);
             }
-            return .{ .items = nodes.items, .examined = end - start, .next = if (end < 3) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+            return .{ .exact_keys = true, .items = nodes.items, .examined = end - start, .next = if (end < 3) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
         }
         fn bind(_: *anyopaque, _: std.mem.Allocator, _: catalog.Graph) !void {}
         fn checkpoint(_: *anyopaque) !void {}
@@ -7753,6 +7753,7 @@ test "ordered node certificates bound scans preserve residuals and decline falli
     for ([_]struct { text: []const u8, expected: i64, reads: usize, denied: bool = false }{
         .{ .text = "MATCH (n:Document) RETURN n.rank ORDER BY n.rank DESC LIMIT 1", .expected = 3, .reads = 1 },
         .{ .text = "MATCH (n:Document) RETURN DISTINCT n.rank ORDER BY n.rank DESC LIMIT 1", .expected = 3, .reads = 1 },
+        .{ .text = "MATCH (n:Document) RETURN DISTINCT n.rank,n.id ORDER BY n.rank DESC LIMIT 3", .expected = 3, .reads = 3 },
         .{ .text = "MATCH (n:Document) RETURN DISTINCT n.rank AS r ORDER BY r DESC SKIP 1 LIMIT 1", .expected = 2, .reads = 2 },
         .{ .text = "MATCH (n:Document) RETURN n.rank ORDER BY 1,n.rank DESC,n.rank LIMIT 1", .expected = 3, .reads = 1 },
         .{ .text = "MATCH (n:Document) WITH n RETURN n.rank ORDER BY n.rank DESC LIMIT 1", .expected = 3, .reads = 1 },
@@ -7899,6 +7900,7 @@ test "coarse RPC prefixes refine owner ties and bound partial DISTINCT across wi
             partition: usize,
             records: usize = 0,
             probes: usize = 0,
+            exact_keys: bool = true,
             fn scan(ptr: *anyopaque, a: A, _: []const u8, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
                 return page(ptr, a, after, limit, null);
             }
@@ -7908,7 +7910,7 @@ test "coarse RPC prefixes refine owner ties and bound partial DISTINCT across wi
                 if (limit == 0) {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.probes += 1;
-                    return .{ .items = &.{}, .cursors = &.{}, .next = "0", .examined = 0, .stable_ties = false };
+                    return .{ .items = &.{}, .cursors = &.{}, .next = "0", .examined = 0, .exact_keys = self.exact_keys, .stable_ties = false };
                 }
                 return try page(ptr, a, after, @min(limit, maximum), order);
             }
@@ -7937,7 +7939,7 @@ test "coarse RPC prefixes refine owner ties and bound partial DISTINCT across wi
                     cursor.* = if (ordinal + 1 < 4) try std.fmt.allocPrint(a, "{d}", .{ordinal + 1}) else null;
                 }
                 self.records += nodes.len;
-                return .{ .items = nodes, .cursors = cursors, .next = if (end < 4) try std.fmt.allocPrint(a, "{d}", .{end}) else null, .examined = nodes.len, .stable_ties = order == null };
+                return .{ .items = nodes, .cursors = cursors, .next = if (end < 4) try std.fmt.allocPrint(a, "{d}", .{end}) else null, .examined = nodes.len, .exact_keys = self.exact_keys, .stable_ties = order == null };
             }
             fn backend(self: *@This()) b.Backend {
                 return .{ .ptr = self, .vtable = &.{ .bind = Self.bind, .checkpoint = Self.check, .scan = scan, .get = Self.get, .expand = Self.expand, .scan_ordered = ordered } };
@@ -7965,6 +7967,42 @@ test "coarse RPC prefixes refine owner ties and bound partial DISTINCT across wi
     const targets = [_]root.distributed.Target{ .{ .table = "docs", .table_id = 1, .group_id = 1 }, .{ .table = "docs", .table_id = 1, .group_id = 2 } };
     const snapshots = [_]root.distributed.Snapshot{ .{ .backend = clients[0].backend(), .ptr = &fixture, .validate = F.check, .close = F.close }, .{ .backend = clients[1].backend(), .ptr = &fixture, .validate = F.check, .close = F.close } };
     var set: root.distributed.ReadSet = .{ .a = std.testing.allocator, .targets = &targets, .snapshots = &snapshots, .independent_validations = &.{}, .source = .{ .ptr = &fixture, .checkpoint = F.check, .admit = undefined, .capture = undefined } };
+    // Owners share NULL and non-NULL domains. Cardinality observes the global
+    // merged key stream, including legacy providers that ignore tuple bounds.
+    for ([_][]const u8{
+        "MATCH (n:Document) RETURN DISTINCT n.rank ORDER BY n.rank DESC",
+        "MATCH (n:Document) RETURN count(DISTINCT n.rank)",
+        "MATCH (n:Document) RETURN count(DISTINCT n.id)",
+        "MATCH (n:Document) WHERE false RETURN count(DISTINCT 7)",
+        "MATCH (n:Document) RETURN count(DISTINCT 7),count(null)",
+    }) |query| for ([_]bool{ true, false }) |exact_keys| {
+        for (&owners) |*owner| owner.exact_keys = exact_keys;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var ordinary_callbacks = set.backend().vtable.*;
+        ordinary_callbacks.scan_ordered = null;
+        const ordinary: b.Backend = .{ .ptr = &set, .vtable = &ordinary_callbacks };
+        try std.testing.expectEqualStrings(try F.run(a, ordinary, query), try F.run(a, set.backend(), query));
+    };
+    // Legacy coarse providers may mix numeric representations inside a key
+    // group. Retain the primary representative until every tie was observed.
+    fixture.properties[3][0].value = .{ .number = 1.0 };
+    for (&owners) |*owner| owner.exact_keys = false;
+    for ([_][]const u8{
+        "MATCH (n:Document) RETURN DISTINCT n.rank ORDER BY n.rank DESC",
+        "MATCH (n:Document) RETURN DISTINCT n.rank ORDER BY n.rank DESC LIMIT 9",
+    }) |query| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var ordinary_callbacks = set.backend().vtable.*;
+        ordinary_callbacks.scan_ordered = null;
+        const ordinary: b.Backend = .{ .ptr = &set, .vtable = &ordinary_callbacks };
+        try std.testing.expectEqualStrings(try F.run(a, ordinary, query), try F.run(a, set.backend(), query));
+    }
+    fixture.properties[3][0].value = .null;
+    for (&owners) |*owner| owner.exact_keys = true;
     for ([_][]const u8{ "", "WITH DISTINCT n ", "WITH n AS m WITH DISTINCT m WITH m AS n " }) |stage|
         for ([_][]const u8{ "n AS r", "n.id AS r,n.rank AS s", "DISTINCT n.id AS r,n.rank AS s", "DISTINCT n.rank AS r" }) |projection|
             for ([_][]const u8{ "ASC", "DESC" }) |direction|
@@ -8060,12 +8098,12 @@ test "equality-fixed extrema finish at their exact coarse witness budget" {
     const F = struct {
         fn ordered(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const b.PropertyFilter, order: []const b.PropertyOrder, _: ?[]const u8, limit: usize, maximum: usize) !?b.Page(*const v.Node) {
             if (order.len != 1 or !std.mem.eql(u8, order[0].property, "rank")) return null;
-            if (limit == 0) return .{ .items = &.{}, .cursors = &.{}, .next = "witness", .examined = 0, .stable_ties = false };
+            if (limit == 0) return .{ .items = &.{}, .cursors = &.{}, .next = "witness", .examined = 0, .exact_keys = true, .stable_ties = false };
             // Match native admission: a data request needs a positive remaining
             // allowance, even when its exclusive tuple would discover EOF.
             if (maximum == 0) return error.CypherAnchorBudgetExceeded;
-            if (order[0].after != null) return .{ .items = &.{}, .examined = 0, .stable_ties = false };
-            return .{ .items = try a.dupe(*const v.Node, &.{&Fixture.nodes[1]}), .next = "witness", .examined = 1, .stable_ties = false };
+            if (order[0].after != null) return .{ .items = &.{}, .examined = 0, .exact_keys = true, .stable_ties = false };
+            return .{ .items = try a.dupe(*const v.Node, &.{&Fixture.nodes[1]}), .next = "witness", .examined = 1, .exact_keys = true, .stable_ties = false };
         }
     };
     var fixture: Fixture = .{};
@@ -8113,4 +8151,89 @@ test "group observers preserve shared values when retiring invocation arenas" {
         try std.testing.expectEqual(@as(i128, 1), row[2].integer);
     }
     try std.testing.expect(result.stats.memory_bytes <= 2 << 20);
+}
+
+test "ordered groups retire reducers across a broad exact-budget prefix" {
+    const F = struct {
+        nodes: []const v.Node,
+        reads: usize = 0,
+        requests: usize = 0,
+        ordered_requests: usize = 0,
+        fn checkpoint(_: *anyopaque) !void {}
+        fn scan(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const start = if (after) |text| try std.fmt.parseInt(usize, text, 10) else 0;
+            const end = @min(self.nodes.len, start + limit);
+            const items = try a.alloc(*const v.Node, end - start);
+            for (items, start..) |*item, index| item.* = &self.nodes[index];
+            self.reads += items.len;
+            self.requests += 1;
+            return .{ .items = items, .examined = items.len, .next = if (end < self.nodes.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null, .exact_keys = true, .stable_ties = false };
+        }
+        fn ordered(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, _: []const b.PropertyFilter, fields: []const b.PropertyOrder, after: ?[]const u8, limit: usize, _: usize) !?b.Page(*const v.Node) {
+            if (fields.len == 0 or fields.len > 2 or !std.mem.eql(u8, fields[0].property, "id") or fields[0].descending) return null;
+            if (fields.len == 2 and !std.mem.eql(u8, fields[1].property, "rank")) return null;
+            if (limit == 0) return .{ .items = &.{}, .examined = 0, .next = "0", .exact_keys = true, .stable_ties = false };
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.ordered_requests += 1;
+            return try scan(ptr, a, table, after, limit);
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const nodes = try a.alloc(v.Node, 5000);
+    for (nodes, 0..) |*node, index| {
+        const key = try std.fmt.allocPrint(a, "{d:0>6}", .{index});
+        node.* = .{ .identity = .{ .table = "docs", .key = key }, .labels = &.{"Document"}, .properties = try a.dupe(v.Entry, &.{ .{ .name = "id", .value = .{ .string = key } }, .{ .name = "rank", .value = .{ .integer = @intCast(index) } } }) };
+    }
+    var fixture: F = .{ .nodes = nodes };
+    const backend: b.Backend = .{ .ptr = &fixture, .vtable = &.{ .bind = Fixture.bind, .checkpoint = F.checkpoint, .scan = F.scan, .get = Fixture.get, .expand = Fixture.expand, .scan_ordered = F.ordered } };
+    {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, "MATCH (n:Document) RETURN DISTINCT n.id ORDER BY n.id", .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 5000, .memory_bytes = 16 << 20 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 5000), result.rows.len);
+        try std.testing.expectEqual(@as(usize, 5000), fixture.reads);
+        try std.testing.expect(fixture.requests < 100);
+    }
+    {
+        fixture.reads = 0;
+        fixture.requests = 0;
+        fixture.ordered_requests = 0;
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, "MATCH (n:Document) WHERE n.rank<0 OR n.rank>10000 RETURN DISTINCT n.id ORDER BY n.id", .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 5000, .memory_bytes = 16 << 20 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 0), result.rows.len);
+        try std.testing.expectEqual(@as(usize, 5000), fixture.reads);
+        try std.testing.expect(fixture.requests < 100);
+        try std.testing.expectEqual(fixture.requests, fixture.ordered_requests);
+    }
+    for ([_][]const u8{ "count(*)", "max(n.rank)", "count(n.rank),min(n.rank),max(n.rank)" }) |observer| {
+        fixture.reads = 0;
+        const query = try std.fmt.allocPrint(a, "MATCH (n:Document) RETURN n.id,{s} ORDER BY n.id LIMIT 5000", .{observer});
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 5000, .memory_bytes = 16 << 20 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 5000), fixture.reads);
+        try std.testing.expectEqual(@as(usize, 5000), result.stats.scanned_anchors);
+        try std.testing.expectEqual(@as(usize, 5000), result.rows.len);
+        try std.testing.expect(result.stats.intermediate_states < 900000);
+        try std.testing.expectEqualStrings("000000", result.rows[0][0].string);
+        try std.testing.expectEqualStrings("004999", result.rows[4999][0].string);
+        for (result.rows, 0..) |row, index| {
+            const expected: i128 = if (std.mem.eql(u8, observer, "count(*)")) 1 else @intCast(index);
+            try std.testing.expectEqual(if (row.len == 4) @as(i128, 1) else expected, row[1].integer);
+            if (row.len == 4) {
+                try std.testing.expectEqual(@as(i128, @intCast(index)), row[2].integer);
+                try std.testing.expectEqual(@as(i128, @intCast(index)), row[3].integer);
+            }
+        }
+    }
 }

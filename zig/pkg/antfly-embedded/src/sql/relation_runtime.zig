@@ -3626,10 +3626,10 @@ fn Source(comptime Context: type) type {
                 const changed = try search_arena.allocator().dupe(catalog.StatementScan, scans);
                 changed[index].request.order = physical;
                 // A costing row_goal is never a source cap. Grant a separate
-                // exact-prefix proof only across identity frames with no SQL
-                // residual, cardinality observer, or fallible projection.
+                // exact-prefix proof across identity frames and a completely
+                // consumed predicate, without fallible outputs or cardinality observers.
                 license: {
-                    if (relation.statement.limit == null or relation.statement.predicate != null or context.binding.scalars.predicate != null or relation.statement.scalar_cardinality_limit or binding.rowPreservingScan(relation.root) != index) break :license;
+                    if (relation.statement.limit == null or relation.statement.scalar_cardinality_limit or binding.rowPreservingScan(relation.root) != index) break :license;
                     for (context.binding.scalars.projections) |program| if (program) |value| {
                         if (value.instructions.len != 1 or value.root != 0) break :license;
                         switch (value.instructions[0].operation) {
@@ -3637,8 +3637,17 @@ fn Source(comptime Context: type) type {
                             else => break :license,
                         }
                     };
+                    if (context.binding.scalars.predicate) |program| {
+                        const certificate = (try binding.orderedGraphPredicate(search_arena.allocator(), relation.root, program, index)) orelse break :license;
+                        const filter = bindGraphPredicate(search_arena.allocator(), certificate, context.parameters) catch |err| {
+                            if (err == error.SqlProgramLimitExceeded or std.mem.startsWith(u8, @import("errors.zig").describe(err).code, "22")) break :license;
+                            return err;
+                        };
+                        changed[index].request.exact_graph_filter = filter;
+                    } else if (relation.statement.predicate != null) break :license;
                     const request = changed[index].request;
-                    if (request.primary_key != null or request.after != null or request.graph_source_ordinals or request.conditions.len != 0 or request.graph_filters.len != 0 or request.graph_conditions.len != 0 or request.graph_predicates.len != 0) break :license;
+                    if (request.primary_key != null or request.after != null or request.graph_source_ordinals) break :license;
+                    if (request.exact_graph_filter == null and (request.conditions.len != 0 or request.graph_filters.len != 0 or request.graph_conditions.len != 0 or request.graph_predicates.len != 0)) break :license;
                     const skip = self.engine.context.offsetCount(relation.statement.offset) catch break :license;
                     const limit = self.engine.context.count(relation.statement.limit, std.math.maxInt(usize)) catch break :license;
                     const maximum = skip +| limit;
@@ -4750,19 +4759,23 @@ test "transparent graph relations forward order requests and certificates throug
         }
         fn next(raw: *anyopaque, a: Allocator, limit: u32) !catalog.Page {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            const end = @min(13000, self.position + limit);
+            const maximum = if (self.certify and self.negotiated) self.window orelse 13000 else 13000;
+            const end = @min(maximum, self.position + limit);
             const rows = try a.alloc(catalog.Row, end - self.position);
             const layout = try catalog.Row.TypedLayout.init(a, &.{"score"});
             for (rows, self.position..) |*row_value, index| row_value.* = try catalog.Row.fromDatums(a, "row", layout, &.{Datum.json(.{ .integer = @intCast(if (self.certify and self.negotiated) 12999 - index else index) })});
             self.examined += rows.len;
             self.position = end;
-            return .{ .rows = rows, .after = if (end < 13000) "more" else null };
+            return .{ .rows = rows, .after = if (end < maximum) "more" else null };
         }
         fn close(_: *anyopaque) void {}
         fn checkpoint(_: *anyopaque) !void {}
     };
     for ([_][]const u8{
         "SELECT g.score FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g ORDER BY g.score DESC LIMIT 5",
+        "SELECT g.score FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g WHERE g.score>=0 ORDER BY g.score DESC LIMIT 5",
+        "SELECT d.s FROM (SELECT g.score AS s FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g) d WHERE d.s>=0 AND d.s<13000 ORDER BY d.s DESC LIMIT 5",
+        "SELECT g.score FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g WHERE g.score>=0 OR g.score IN (1,2,NULL) ORDER BY g.score DESC LIMIT 5",
         "SELECT d.s FROM (SELECT g.score AS s FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g) d ORDER BY d.s DESC LIMIT 5",
         "SELECT d.score FROM (SELECT g.score FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g WHERE g.score>=0) d ORDER BY d.score DESC LIMIT 5",
     }) |text| for ([_]bool{ true, false }) |certify| {
@@ -4773,7 +4786,8 @@ test "transparent graph relations forward order requests and certificates throug
         var result = try @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, &.{}, .{});
         defer result.deinit();
         try std.testing.expect(fixture.negotiated);
-        try std.testing.expectEqual(@as(?u64, if (std.mem.indexOf(u8, text, "WHERE") == null) 5 else null), fixture.window);
+        try std.testing.expectEqual(@as(?u64, if (std.mem.indexOf(u8, text, "WHERE g.score>=0) d") == null) 5 else null), fixture.window);
+        if (fixture.examined != (if (certify) @as(usize, 5) else 13000)) std.debug.print("graph scan examined={d} certified={} window={any}: {s}\n", .{ fixture.examined, certify, fixture.window, text });
         try std.testing.expectEqual(@as(usize, if (certify) 5 else 13000), fixture.examined);
         try std.testing.expectEqual(@as(usize, 5), result.output.rows.len);
         for (result.output.rows, 0..) |row_values, index| {
