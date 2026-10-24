@@ -173,16 +173,24 @@ pub const Header = struct {
     installation: ?Installation = null,
     release: ?Release = null,
     reference_coverage: ?ReferenceCoverage = null,
+    /// Completed ordinary FK transactions, distinct from a read-only reference
+    /// witness. The actual record is checked again under the publication fence.
+    transaction_coverage: ?struct { record: Digest, physical_root: u128 } = null,
 
     pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
-        return std.mem.eql(u8, field, "reference_coverage") and self.reference_coverage == null;
+        return (std.mem.eql(u8, field, "reference_coverage") and self.reference_coverage == null) or
+            (std.mem.eql(u8, field, "transaction_coverage") and self.transaction_coverage == null);
     }
     pub fn jsonStringify(self: @This(), writer: anytype) @TypeOf(writer.*).Error!void {
         return writeFields(self, writer);
     }
     pub fn validate(self: Header) !void {
         try self.binding.validate();
-        if ((self.binding.purpose == .not_null) != (self.reference_coverage == null)) return error.InvalidSchemaValidationJob;
+        if (self.transaction_coverage) |coverage| {
+            if (self.binding.purpose != .foreign_key_source or self.reference_coverage != null or
+                std.mem.allEqual(u8, &coverage.record, 0) or ((self.binding.authority == .native) != (coverage.physical_root != 0)))
+                return error.InvalidSchemaValidationJob;
+        } else if ((self.binding.purpose == .not_null) != (self.reference_coverage == null)) return error.InvalidSchemaValidationJob;
         if (self.reference_coverage) |coverage| try coverage.validate(self.binding.purpose, self.records, self.rows_scanned, self.binding.columns);
         inline for (.{ "cursor_digest", "chain", "last_effect" }) |field|
             if (std.mem.allEqual(u8, &@field(self, field), 0)) return error.InvalidSchemaValidationJob;
@@ -785,4 +793,29 @@ test "foreign key validation owner page proofs bind witness bytes and reject fra
     bytes[4] = 1;
     @memcpy(bytes[bytes.len - 32 ..], &hash(bytes[0 .. bytes.len - 32]));
     try std.testing.expectError(error.InvalidSchemaValidationPageCommand, PageCommand.decode(bytes));
+}
+
+test "foreign key validation transaction coverage cannot substitute witness or root authority" {
+    const a = std.testing.allocator;
+    var header = ValidationContractFixture.ready(ValidationContractFixture.binding());
+    header.binding.purpose = .foreign_key_source;
+    header.transaction_coverage = .{ .record = @splat(16), .physical_root = 17 };
+    try header.validate();
+    const bytes = try header.encode(a);
+    defer a.free(bytes);
+    try std.testing.expectEqualDeep(header, try Header.decode(bytes));
+    var forged = header;
+    forged.reference_coverage = .{};
+    try std.testing.expectError(error.InvalidSchemaValidationJob, forged.validate());
+    forged = header;
+    forged.transaction_coverage.?.physical_root = 0;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, forged.validate());
+    forged = header;
+    forged.transaction_coverage.?.record = @splat(0);
+    try std.testing.expectError(error.InvalidSchemaValidationJob, forged.validate());
+    for ([_]Purpose{ .not_null, .foreign_key_parent, .foreign_key_dual }) |purpose| {
+        forged = header;
+        forged.binding.purpose = purpose;
+        try std.testing.expectError(error.InvalidSchemaValidationJob, forged.validate());
+    }
 }

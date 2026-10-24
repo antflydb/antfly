@@ -112,7 +112,7 @@ fn expectHistorical(db: *db_mod.DB, key: []const u8, wanted: bool) !void {
     try std.testing.expectEqual(wanted, (try integrity.Reference.decode(key, raw)).historical_unvalidated);
 }
 
-test "foreign key validation native transaction rejects stale children and absent parents and recovers prepared promotion" {
+test "foreign key validation native transaction preserves atomic pages and publication across cold recovery" {
     var directory = try local.common_test_directory.TestDirectory.init("fk-validation-transactions");
     defer directory.cleanup();
     const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 300, .shard_id = 301, .range_id = 302 }, .online_source_authority = .native, .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } };
@@ -318,7 +318,153 @@ test "foreign key validation native transaction rejects stale children and absen
     const cancel = try db.beginTransactionWithId(@splat(11), 1100);
     try db.writeTransaction(cancel, .{ .relational_schema_version = 1, .relational_integrity_generation_set = generation_set, .relational_activation = .{ .routing_key = "", .expected = ready_raw, .next = canceled_raw, .validation = .{ .binding = retry_binding, .physical_root = db.root_incarnation, .action = .cancel } } });
     try db.commitTransaction(cancel, 1101);
-    var released = try db.core.store.beginReadTxn();
-    defer released.abort();
-    try local.storage_db_relational_integrity_topology.requireUnfenced(&released);
+    {
+        var released = try db.core.store.beginReadTxn();
+        defer released.abort();
+        try local.storage_db_relational_integrity_topology.requireUnfenced(&released);
+    }
+    // A second complete validation exercises the real schema publication
+    // participant, not a direct public-schema KV substitution.
+    const install_identity = try db.relationalTopologyIdentity();
+    var install_read = try db.core.store.beginReadTxn();
+    const install_binding = job.prepareBinding(&install_read, &candidate, @splat(46), @splat(47), .{ .namespace = options.identity_namespace.?, .owner_group_id = 301, .peer_group_id = 301, .transition_id = 46, .attempt = 1, .admission_epoch = install_identity.next_epoch, .catalog_digest = install_identity.catalog_digest, .role = .schema_validation }, .native) catch |err| {
+        install_read.abort();
+        return err;
+    };
+    install_read.abort();
+    const install_record: activation.ForeignKeyValidationRecord = .{ .binding = install_binding, .physical_root = db.root_incarnation, .revision = 1, .progress = .{ .generation_set = generation_set, .owner = install_binding.owner, .schema_version = 1, .phase = .foreign_key } };
+    const install_initial = try install_record.encode(a);
+    defer a.free(install_initial);
+    const install_begin = try db.beginTransactionWithId(@splat(14), 1400);
+    try db.writeTransaction(install_begin, .{ .relational_schema_version = 1, .relational_integrity_generation_set = generation_set, .relational_activation = .{ .routing_key = "", .expected = canceled_raw, .next = install_initial, .validation = .{ .binding = install_binding, .physical_root = db.root_incarnation, .action = .begin, .inputs = .{ .bytes = candidate.inputs } } } });
+    try db.commitTransaction(install_begin, 1401);
+    try std.testing.expectError(error.SchemaValidationNotReady, applyControl(&db, .{ .binding = install_binding, .action = .begin, .payload = candidate.inputs }));
+    for (0..16) |_| {
+        if (!try worker.runForeignKeyValidationPage(a, fixture.source(), fixture.writer(), &tables, &ranges, ranges[0], install_binding.id)) break;
+    } else return error.ValidationDidNotConverge;
+    const original_row_key = try local.storage_internal_keys.relationalRowKeyAlloc(a, "child");
+    defer a.free(original_row_key);
+    const original_row = try db.core.store.get(a, original_row_key);
+    defer a.free(original_row);
+    var substituted = install_binding;
+    substituted.id[0] ^= 1;
+    try std.testing.expectError(error.SchemaValidationJobChanged, applyControl(&db, .{ .binding = substituted, .action = .begin, .payload = candidate.inputs }));
+    const completed_raw = (try db.core.getStoreValue(a, activation.validation_key)).?;
+    defer a.free(completed_raw);
+    const completed_record = try activation.ForeignKeyValidationRecord.decode(completed_raw);
+    {
+        // Match the budgeted ABI producer, which prepares directly and enters
+        // through the DB's common apply boundary rather than its convenience
+        // preparation wrapper. A copied record must still fail closed.
+        var direct = try db_mod.DB.NativeSchemaOwnerControl.Prepared.init(a, db.core, .{ .binding = install_binding, .action = .begin, .payload = candidate.inputs }, .{});
+        defer direct.deinit();
+        var copied = completed_record;
+        copied.physical_root ^= 1;
+        if (copied.physical_root == 0) copied.physical_root = 2;
+        const copied_raw = try copied.encode(a);
+        defer a.free(copied_raw);
+        try db.core.store.put(activation.validation_key, copied_raw);
+        defer db.core.store.put(activation.validation_key, completed_raw) catch unreachable;
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, db.applyPreparedNativeSchemaOwnerControl(&direct, null));
+    }
+    const admitted = try applyControl(&db, .{ .binding = install_binding, .action = .begin, .payload = candidate.inputs });
+    try std.testing.expectEqual(job.Phase.fencing, admitted.phase);
+    {
+        var substituted_record = completed_record;
+        substituted_record.revision += 1;
+        const substituted_raw = try substituted_record.encode(a);
+        defer a.free(substituted_raw);
+        try db.core.store.put(activation.validation_key, substituted_raw);
+        defer db.core.store.put(activation.validation_key, completed_raw) catch unreachable;
+        try std.testing.expectError(error.SchemaValidationJobChanged, applyControl(&db, .{ .binding = install_binding, .action = .freeze }));
+    }
+    const frozen = try applyControl(&db, .{ .binding = install_binding, .action = .freeze });
+    try std.testing.expectEqual(job.Phase.ready, frozen.phase);
+    try std.testing.expect(frozen.reference_coverage == null);
+    try std.testing.expect(frozen.transaction_coverage != null);
+    try std.testing.expectEqual(@as(u64, 4), frozen.rows_scanned);
+    try std.testing.expectEqualDeep(frozen, try applyControl(&db, .{ .binding = install_binding, .action = .freeze }));
+    var install_payload: [64]u8 = undefined;
+    @memset(install_payload[0..32], 91);
+    @memcpy(install_payload[32..64], &try frozen.digest());
+    const install_command: db_mod.DB.NativeSchemaOwnerControl.Command = .{ .binding = install_binding, .action = .install, .payload = &install_payload };
+    const Fault = struct {
+        pub fn validateBefore(_: @This(), _: anytype) !void {}
+        pub fn stage(_: @This(), txn: anytype, _: job.Header) !void {
+            try txn.put("\x00\x00__metadata__:fk_validation_fault_outbox", "must roll back");
+            return error.InjectedValidationInstallFailure;
+        }
+    };
+    {
+        var prepared = try db.prepareNativeSchemaOwnerControl(install_command, .{});
+        defer prepared.deinit();
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        try std.testing.expectError(error.InjectedValidationInstallFailure, prepared.commitSchema(db.core, null, Fault{}));
+    }
+    try std.testing.expectEqual(@as(u32, 1), db.core.schema.?.version);
+    try std.testing.expect((try db.core.getStoreValue(a, "\x00\x00__metadata__:fk_validation_fault_outbox")) == null);
+    const installed = try applyControl(&db, install_command);
+    try std.testing.expectEqual(job.Phase.installed, installed.phase);
+    try std.testing.expectEqual(@as(u32, 2), db.core.schema.?.version);
+    try std.testing.expectError(error.SchemaValidationPublicationRequired, applyControl(&db, .{ .binding = install_binding, .action = .cancel }));
+    const successor = (try db.core.getStoreValue(a, catalog.key)).?;
+    defer a.free(successor);
+    try std.testing.expectEqualSlices(u8, candidate.catalog_after, successor);
+    var successor_catalog = try catalog.decode(a, successor);
+    defer successor_catalog.deinit();
+    for (bindings.bindings) |binding| {
+        try std.testing.expectEqualDeep(binding.generation, successor_catalog.find(binding.definition.kind, binding.definition.name).?.generation);
+    }
+    db.close();
+    live = false;
+    db = try db_mod.DB.open(a, directory.path(), options);
+    live = true;
+    try std.testing.expectEqualDeep(installed, (try db.observeNativeSchemaOwner(install_binding, .{})).header.?);
+    const duplicate_install = try applyControl(&db, install_command);
+    try std.testing.expectEqualDeep(installed, duplicate_install);
+    const current_row = try db.core.store.get(a, original_row_key);
+    defer a.free(current_row);
+    try std.testing.expectEqualSlices(u8, original_row, current_row);
+    var release_payload: [96]u8 = undefined;
+    @memcpy(release_payload[0..32], install_payload[0..32]);
+    @memcpy(release_payload[32..64], &try installed.digest());
+    @memset(release_payload[64..96], 92);
+    const published = try applyControl(&db, .{ .binding = install_binding, .action = .release, .payload = &release_payload });
+    try std.testing.expectEqual(job.Phase.released, published.phase);
+    try std.testing.expect((try db.core.getStoreValue(a, activation.validation_key)) == null);
+    try std.testing.expect((try db.core.getStoreValue(a, activation.validation_inputs_key)) == null);
+    var finished = try db.core.store.beginReadTxn();
+    defer finished.abort();
+    try local.storage_db_relational_integrity_topology.requireUnfenced(&finished);
+    const final_coverage = try activation.Progress.decode(try finished.get(activation.key));
+    try std.testing.expectEqual(activation.State.enforced, final_coverage.state);
+    try std.testing.expect(final_coverage.matches(successor_catalog, install_binding.owner));
+    try std.testing.expectEqual(@as(u32, 2), final_coverage.schema_version);
+    const successor_public = (try db.core.getStoreValue(a, "\x00\x00__metadata__:schema_json")).?;
+    defer a.free(successor_public);
+    try std.testing.expectEqualStrings(after_schema, successor_public);
+    const next_tables = [_]local.common_topology_records.TableRecord{.{ .table_id = 300, .name = "rows", .schema_json = after_schema }};
+    // Same-owner parent claims are checked atomically by the participant,
+    // rather than by a racy coordinator-side existence read.
+    var rejected_child = try planner.prepareWithCoverageControlled(a, fixture.source(), &next_tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{.{ .key = "new_orphan", .value = "{\"id\":4,\"parent_id\":999,\"payload\":\"bad\"}" }} }}, .{});
+    defer rejected_child.deinit();
+    try std.testing.expectError(error.ForeignKeyParentMissing, fixture.prepare(&rejected_child, 16));
+    var accepted = try planner.prepareWithCoverageControlled(a, fixture.source(), &next_tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{.{ .key = "new_child", .value = "{\"id\":4,\"parent_id\":1,\"payload\":\"good\"}" }} }}, .{});
+    defer accepted.deinit();
+    try fixture.commit(&accepted, 15);
+    parent_delete: {
+        var rejected_parent = planner.prepareWithCoverageControlled(a, fixture.source(), &next_tables, &ranges, &.{.{ .table_name = "rows", .deletes = &.{"parent"} }}, .{}) catch |err| {
+            try std.testing.expectEqual(error.ForeignKeyReferenced, err);
+            break :parent_delete;
+        };
+        defer rejected_parent.deinit();
+        try std.testing.expectError(error.ForeignKeyReferenced, fixture.prepare(&rejected_parent, 17));
+    }
+}
+
+fn applyControl(db: *db_mod.DB, command: db_mod.DB.NativeSchemaOwnerControl.Command) !local.storage_db_relational_nullability_job.Header {
+    var prepared = try db.prepareNativeSchemaOwnerControl(command, .{});
+    defer prepared.deinit();
+    return (try db.applyPreparedNativeSchemaOwnerControl(&prepared, null)).header.?;
 }

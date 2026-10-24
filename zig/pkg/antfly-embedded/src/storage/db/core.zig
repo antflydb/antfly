@@ -1345,13 +1345,13 @@ pub const DBCore = struct {
         table_schema: schema_mod.TableSchema,
         metadata_writes: []const docstore_mod.KVPair,
     ) !PreparedSchemaMetadata {
-        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, false, null, null);
+        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, false, null, null, null);
     }
 
     /// Pin the translator's source epoch before preparing index/constraint
     /// transitions. Atomic commit rechecks this same immutable schema view.
     pub fn prepareSchemaMetadataAtVersion(self: *DBCore, table_schema: schema_mod.TableSchema, metadata_writes: []const docstore_mod.KVPair, expected_version: u32) !PreparedSchemaMetadata {
-        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, false, expected_version, null);
+        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, false, expected_version, null, null);
     }
 
     /// Compile a ready validation-only successor without rebuilding physical
@@ -1387,7 +1387,9 @@ pub const DBCore = struct {
             versioned_public = versioned_public or historical;
         }
         if (!active_public or !versioned_public) return error.SchemaValidationJobChanged;
-        var prepared = try self.prepareSchemaMetadataAtVersion(table_schema, metadata_writes, binding.before_version);
+        if (binding.purpose != .not_null and (binding.purpose != .foreign_key_source or ready_cut.transaction_coverage == null))
+            return error.ForeignKeyValidationRequired;
+        var prepared = try self.prepareSchemaMetadataMode(table_schema, metadata_writes, false, binding.before_version, null, if (binding.purpose == .foreign_key_source) candidate else null);
         errdefer prepared.deinit();
         if (!std.mem.eql(u8, prepared.encoded, candidate.native_after) or !prepared.generated_semantics_match or
             !std.mem.eql(u8, (prepared.integrity_catalog orelse return error.IntegrityCatalogChanged).value, candidate.catalog_after))
@@ -1418,7 +1420,7 @@ pub const DBCore = struct {
         table_schema: schema_mod.TableSchema,
         metadata_writes: []const docstore_mod.KVPair,
     ) !PreparedSchemaMetadata {
-        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, true, null, null);
+        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, true, null, null, null);
     }
 
     pub const ReservedIndexPreparation = struct {
@@ -1431,7 +1433,7 @@ pub const DBCore = struct {
     /// authority: ordinary commit rejects it until a native install participant
     /// can commit the decision, receipt and outbox while retaining the fence.
     pub fn prepareSchemaMetadataReservedIndex(self: *DBCore, table_schema: schema_mod.TableSchema, metadata_writes: []const docstore_mod.KVPair, reserved: ReservedIndexPreparation) !PreparedSchemaMetadata {
-        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, false, reserved.binding.physical_reserved.schema_version, reserved);
+        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, false, reserved.binding.physical_reserved.schema_version, reserved, null);
     }
 
     fn prepareSchemaMetadataMode(
@@ -1441,6 +1443,7 @@ pub const DBCore = struct {
         published_child: bool,
         expected_version: ?u32,
         reserved_index: ?ReservedIndexPreparation,
+        validated_foreign_key: ?*const @import("relational_nullability_job.zig").Candidate,
     ) !PreparedSchemaMetadata {
         try relational_index_catalog_mod.Controller.validateExtraMetadata(metadata_writes, &.{});
         const reserved_inputs: ?@import("relational_index_inputs.zig").View = if (reserved_index) |reserved|
@@ -1554,6 +1557,14 @@ pub const DBCore = struct {
             prepared.integrity_catalog = if (reserved_index) |reserved| blk: {
                 const inputs = reserved_inputs.?;
                 break :blk try integrity_catalog_mod.prepareIndexPublication(self.alloc, inputs.predecessor, previous_integrity orelse return error.IntegrityCatalogChanged, reserved.candidate.next.value, inputs.name);
+            } else if (validated_foreign_key) |candidate| blk: {
+                // A validity-only successor retains every live and retired
+                // generation. Re-derive it from actual predecessor metadata;
+                // never substitute caller-provided catalog bytes.
+                const source = candidate.foreign_source orelse return error.InvalidSchemaValidationJob;
+                const names = try declaration_arena.allocator().alloc([]const u8, source.rules.len);
+                for (source.rules, names) |rule, *name| name.* = rule.rule.name;
+                break :blk try integrity_catalog_mod.prepareForeignKeyValidation(self.alloc, previous_integrity orelse return error.IntegrityCatalogChanged, try integrity_catalog_mod.incarnationFromTableId(self.identity_namespace.table_id), table_schema.version, digest, definitions, names, checks_digest);
             } else try integrity_catalog_mod.prepareWithChecks(
                 self.alloc,
                 previous_integrity,
@@ -1980,6 +1991,12 @@ pub const DBCore = struct {
                     if (participants.prepared.reserved_index != null) {
                         const activation = if (participants.prepared.reserved_activation) |*value| value else return error.PrivateIndexTargetValidationRequired;
                         try activation.stage(txn);
+                    } else if (comptime validation_installation) {
+                        const binding = participants.prepared.validated_nullability.?.binding;
+                        if (binding.purpose == .foreign_key_source)
+                            try @import("relational_integrity_activation.zig").stageValidatedForeignKey(participants.prepared.alloc, txn, catalog.catalog, binding)
+                        else
+                            try @import("relational_integrity_activation.zig").stageSchema(participants.prepared.alloc, txn, catalog.catalog, participants.row_count);
                     } else try @import("relational_integrity_activation.zig").stageSchema(participants.prepared.alloc, txn, catalog.catalog, participants.row_count);
                 }
             }

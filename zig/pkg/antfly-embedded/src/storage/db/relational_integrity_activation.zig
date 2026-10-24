@@ -291,6 +291,24 @@ pub fn requireValidationDefinition(txn: anytype, binding: @import("relational_sc
     if (!std.mem.eql(u8, &binding.owner, &try ownership(txn))) return error.SchemaValidationJobChanged;
 }
 
+/// Validity-only installation already proved the unchanged physical generation
+/// set. Preserve enforced coverage while rebinding its logical fingerprint and
+/// schema epoch in the same schema/catalog/outbox transaction.
+pub fn stageValidatedForeignKey(alloc: Allocator, txn: anytype, catalog: catalog_mod.Catalog, binding: @import("relational_schema_owner_contract.zig").Binding) !void {
+    const record = try ValidationRecord.decode((try optional(txn, validation_key)) orelse return error.SchemaValidationJobRequired);
+    if (!std.meta.eql(record.binding, binding) or record.progress.state != .enforced or catalog.schema_version != binding.after_version)
+        return error.SchemaValidationJobChanged;
+    var progress = try Progress.decode((try optional(txn, key)) orelse return error.ConstraintActivationRequired);
+    if (progress.state != .enforced or progress.schema_version != binding.before_version or
+        !std.mem.eql(u8, &progress.owner, &binding.owner) or !std.mem.eql(u8, &progress.generation_set, &record.progress.generation_set))
+        return error.SchemaValidationNotReady;
+    progress.schema_version = catalog.schema_version;
+    progress.generation_set = generationSet(catalog);
+    const bytes = try progress.encode(alloc);
+    defer alloc.free(bytes);
+    try txn.put(key, bytes);
+}
+
 fn prepareForeignKeyValidationCommand(alloc: Allocator, txn: anytype, catalog: catalog_mod.Catalog, command: Command, physical_root: u128) !Prepared {
     const scope = command.validation.?;
     try scope.validate();

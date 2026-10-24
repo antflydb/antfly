@@ -145,10 +145,12 @@ fn stageBeginImpl(txn: anytype, fence: Fence, handoff: ?@import("relational_inte
     if (try optional(txn, @import("relational_integrity_activation_contract.zig").validation_key)) |bytes| {
         const validation = try @import("relational_integrity_activation_contract.zig").ForeignKeyValidationRecord.decode(bytes);
         if (validation.progress.state != .invalid and fence.role != .backup_snapshot) {
-            if (validation.progress.state != .enforced or fence.role != .child_generation_source or
-                fence.transition_id != validation.binding.fence.transition_id or !fence.namespace.eql(validation.binding.fence.namespace) or
-                !std.mem.eql(u8, &fence.catalog_digest, &validation.binding.fence.catalog_digest) or
-                fence.admission_epoch <= validation.binding.fence.admission_epoch) return error.IntegrityTopologyBusy;
+            const validation_handoff = fence.role == .schema_validation and fence.eql(validation.binding.fence);
+            const generation_handoff = fence.role == .child_generation_source and
+                fence.transition_id == validation.binding.fence.transition_id and fence.namespace.eql(validation.binding.fence.namespace) and
+                std.mem.eql(u8, &fence.catalog_digest, &validation.binding.fence.catalog_digest) and
+                fence.admission_epoch > validation.binding.fence.admission_epoch;
+            if (validation.progress.state != .enforced or (!validation_handoff and !generation_handoff)) return error.IntegrityTopologyBusy;
         }
     }
     if (handoff != null and fence.role != .rewrite_source) return error.InvalidGenerationHandoff;

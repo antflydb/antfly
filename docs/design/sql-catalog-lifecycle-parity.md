@@ -118,7 +118,8 @@ supporting tests and one native LSM transaction campaign, without skips or leaks
 The campaign checks missing parents, stale children, atomic cursor/reference
 promotion after reopening a prepared transaction, preservation by ordinary
 writes, guarded orphan diagnostics, parent repair and complete rescan, and
-cancellation of ready progress. Public schema bytes remain NOT VALID throughout.
+cancellation of ready progress. The scan-only phase preserves NOT VALID public
+schema bytes; the native publication qualification below extends that campaign.
 The complete native campaign now uses the production participant wire encoder
 and parser before storage preparation. Allocation-failure tests preserve binary
 inputs and full-width roots through typed and number-preserving JSON parsing;
@@ -128,11 +129,49 @@ unchanged. The existing seventeen transaction-commit regressions, Apache
 boundary, license, inventory and generated control-catalog checks also passed.
 
 This is a native execution checkpoint, not closure of `sql-0736`. Public
-coordinator admission/completion, parent-definition locks, current-owner
-readiness, retained-generation installation, transient restore/root recovery,
-and distributed fault qualification remain required. The earlier read-side
+coordinator admission/completion, parent-definition stability, distributed
+current-owner readiness, transient restore/root recovery, and distributed fault
+qualification remain required. The earlier read-side
 witness helpers below remain available, but their full parent scan is not a
 prerequisite for this transaction-based route. Original-case counts are unchanged.
+
+### FK transaction-to-publication handoff (2026-10-23)
+
+Completed source validation can now enter the existing schema-owner installation
+and release protocol. This is an exact handoff of the transaction record, job,
+source definition and native physical root, rather than a second read-only scan
+or permission inferred from a row counter. A distinct `transaction_coverage`
+evidence field prevents substitution of the older reference witnesses. The
+short publication fence drains outstanding transactions before converting the
+completed record to readiness. No primary rows are rewritten.
+
+The native schema installer re-derives the validity-only integrity successor
+from the actual predecessor and retains all live and retired generations. Its
+single schema/catalog/outbox transaction changes the public validity flag,
+publishes the immutable runtime epoch, and rebinds already-enforced activation
+coverage to the successor fingerprint. It keeps admission fenced until the
+existing terminal publication decision. Release reclaims the transient validation
+record and inputs in the same transaction. Cancellation retires its definition
+lease without changing the public constraint. Generic read-witness jobs remain
+unable to use this installer.
+
+The native transaction campaign now covers premature handoff, job substitution,
+wrong-root admission through the shared ABI apply boundary, completion-record
+substitution, duplicate freeze, injected schema/outbox rollback, retained claim
+generations, cold reopen between installation and release, duplicate installation,
+unchanged primary row bytes, and ordinary child/parent writes after release.
+This native installation path is not public SQL case closure: authenticated
+metadata admission and all-owner completion, parent-definition stability, and
+replacement-root/restore recovery and standby replay still need integration before removing the
+`sql-0736` public guard. Original-case dispositions remain unchanged.
+
+Verification used Debug throughout: twelve supporting FK tests plus the native
+transaction/publication campaign, four existing FK scan tests, thirty-five
+nullability/recovery tests, and the metadata publication gate passed without
+skips or leaks. All six mounted SQL lifecycle campaigns passed on an isolated
+rerun after the first run timed out at the existing fifteen-second release ACK
+pause. No assertion or timeout was relaxed. Inventory integrity, Apache source
+boundaries, license headers, formatting and diff checks passed.
 
 ### FK VALIDATE: native preparation and read execution in progress
 

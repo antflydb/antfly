@@ -9804,7 +9804,12 @@ pub const DB = struct {
             try @import("relational_nullability_job.zig").observe(self.alloc, &txn, binding)
         else
             null;
-        if (header) |value| if (value.phase == .installed) try resident.require(value);
+        if (header) |value| {
+            if (value.phase != .released and value.phase != .canceled) {
+                if (value.transaction_coverage) |coverage| if (coverage.physical_root != physical_root_incarnation) return error.SchemaValidationRuntimeRecoveryRequired;
+            }
+            if (value.phase == .installed) try resident.require(value);
+        }
         const result: NativeSchemaOwnerControl.Observation = .{
             .binding = binding,
             .physical_root_incarnation = physical_root_incarnation,
@@ -9821,10 +9826,31 @@ pub const DB = struct {
     /// Trusted owner adapter, not ordinary RPC/batch admission. The receiving
     /// service authenticates metadata/root/cohort and capability authority.
     pub fn prepareNativeSchemaOwnerControl(self: *DB, command: NativeSchemaOwnerControl.Command, context: @import("../../api/operation.zig").RequestContext) !NativeSchemaOwnerControl.Prepared {
+        try self.requireNativeSchemaOwnerValidationRoot(command.binding);
         return NativeSchemaOwnerControl.Prepared.init(self.alloc, self.core, command, context);
     }
 
+    fn requireNativeSchemaOwnerValidationRoot(self: *DB, binding: @import("relational_schema_owner_contract.zig").Binding) !void {
+        if (binding.purpose != .foreign_key_source) return;
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        if (try @import("relational_nullability_job.zig").load(&read)) |header| {
+            if (header.phase != .released and header.phase != .canceled) {
+                if (header.transaction_coverage) |coverage| if (coverage.physical_root != self.root_incarnation) return error.SchemaValidationRuntimeRecoveryRequired;
+            }
+        }
+        const raw = read.get(@import("relational_integrity_activation_contract.zig").validation_key) catch |err| {
+            if (err == error.NotFound) return;
+            return err;
+        };
+        const record = try @import("relational_integrity_activation_contract.zig").ForeignKeyValidationRecord.decode(raw);
+        if (record.physical_root != self.root_incarnation) return error.SchemaValidationRuntimeRecoveryRequired;
+    }
+
     pub fn applyPreparedNativeSchemaOwnerControl(self: *DB, prepared: *NativeSchemaOwnerControl.Prepared, replay: ?NativeIndexReplay) !NativeSchemaOwnerControl.Outcome {
+        // C/ABI producers use a budgeted allocator and prepare directly. Keep
+        // this check at the common DB admission boundary as well.
+        try self.requireNativeSchemaOwnerValidationRoot(prepared.command.binding);
         return self.applyPreparedNativeOwnerEffect(prepared, replay);
     }
 
