@@ -339,6 +339,7 @@ pub const Cursor = struct {
     empty: bool = false,
     weight_passes: []const WeightPass = &.{},
     weight_pass: usize = 0,
+    scalar_fields: []const []const u8 = &.{},
     const WeightPass = struct { plan: cypher.runtime.NodeCursor.WeightPlan, slots: []const usize };
     pub fn open(a: A, binding: Binding, backend: cypher.backend.Backend, parameters: []const cypher.value.Entry, request: catalog.Scan, limits: cypher.runtime.Limits) !catalog.Cursor {
         const self = try a.create(Cursor);
@@ -413,7 +414,15 @@ pub const Cursor = struct {
         copied.after = null;
         copied.primary_key = if (request.primary_key) |key| try owned.dupe(u8, key) else null;
         if ((empty and resume_position != 0) or (result != null and resume_position > result.?.rows.len)) return error.InvalidSqlBackendResponse;
-        self.* = .{ .a = a, .arena = arena, .result = result, .stream = stream, .request = copied, .position = if (stream != null) 0 else resume_position, .resume_position = resume_position, .optimized = optimized, .ordered = ordered, .empty = empty };
+        var scalar_fields: std.ArrayList([]const u8) = .empty;
+        for (binding.definition.query.clauses[1].operation.project.value.items) |item| {
+            if (item.expression.value != .property) continue;
+            switch (expressionType(binding, item.expression)) {
+                .integer, .string, .boolean => try scalar_fields.append(owned, try owned.dupe(u8, item.alias.?)),
+                else => {},
+            }
+        }
+        self.* = .{ .scalar_fields = scalar_fields.items, .a = a, .arena = arena, .result = result, .stream = stream, .request = copied, .position = if (stream != null) 0 else resume_position, .resume_position = resume_position, .optimized = optimized, .ordered = ordered, .empty = empty };
         return .{ .order_satisfied = ordered, .ptr = self, .next = next, .close = close, .count_rows = countRows, .enable_weights = enableWeights, .enable_aggregate_weights = enableAggregateWeights, .estimated_rows = if (empty) 0 else if (result) |value| value.rows.len else null };
     }
     fn enableAggregateWeights(ptr: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
@@ -431,6 +440,18 @@ pub const Cursor = struct {
         var candidates: std.ArrayList(Candidate) = .empty;
         for (requests, 0..) |request, i| {
             const multiplicity = request.multiplicity;
+            if (request.observer) |observer| scalar: {
+                if (self.request.conditions.len != 0 or request.fields.len != 1 or multiplicity != .presence) break :scalar;
+                const compatible = for (self.scalar_fields) |field| {
+                    if (std.mem.eql(u8, field, request.fields[0])) break true;
+                } else false;
+                if (!compatible) break :scalar;
+                const plan = (try stream.planScalarObserver(request.fields[0], observer)) orelse break :scalar;
+                var candidate: Candidate = .{ .plan = plan };
+                try candidate.slots.append(a, i);
+                try candidates.append(a, candidate);
+                continue;
+            }
             const summary_plan = selected: {
                 for (request.summaries) |certificate| {
                     if (certificate.joint) {
@@ -710,6 +731,30 @@ test "SQL GRAPH_TABLE dependency partitions share quotas and resume narrow pages
     var callbacks = backend.vtable.*;
     callbacks.scan_ordered = F.ordered;
     const indexed: cypher.backend.Backend = .{ .ptr = &marker, .vtable = &callbacks };
+    {
+        const cursor = try Cursor.open(std.testing.allocator, ordered_binding, indexed, &.{}, .{ .fields = &.{"rank"}, .limit = 1 }, .{ .scanned_anchors = 5 });
+        defer cursor.close(cursor.ptr);
+        try std.testing.expect(try cursor.enable_aggregate_weights.?(cursor.ptr, &.{
+            .{ .observer = .distinct, .fields = &.{"rank"}, .multiplicity = .presence },
+            .{ .observer = .min, .fields = &.{"rank"}, .multiplicity = .presence },
+            .{ .observer = .max, .fields = &.{"rank"}, .multiplicity = .presence },
+        }));
+        var counts = [_]usize{ 0, 0, 0 };
+        var totals = [_]i64{ 0, 0, 0 };
+        while (true) {
+            const page = try cursor.next(cursor.ptr, std.testing.allocator, 1);
+            defer page.deinit();
+            const slot = page.aggregate_slots.?[0];
+            for (page.rows, page.multiplicities.?) |row, weight| {
+                try std.testing.expectEqual(@as(u64, 1), weight);
+                counts[slot] += 1;
+                totals[slot] += (try row.cell("rank")).value.integer;
+            }
+            if (page.after == null) break;
+        }
+        try std.testing.expectEqualSlices(usize, &.{ 3, 1, 1 }, &counts);
+        try std.testing.expectEqualSlices(i64, &.{ 6, 1, 3 }, &totals);
+    }
     for ([_]bool{ true, false }) |nulls_first| {
         const cursor = try Cursor.open(std.testing.allocator, ordered_binding, indexed, &.{}, .{ .fields = &.{"rank"}, .order = &.{.{ .column = "rank", .descending = true, .nulls_first = nulls_first }}, .row_goal = 1, .limit = 1 }, .{ .scanned_anchors = 1 });
         defer cursor.close(cursor.ptr);

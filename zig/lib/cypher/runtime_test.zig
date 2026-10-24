@@ -7809,6 +7809,8 @@ test "ordered node certificates bound scans preserve residuals and decline falli
         .{ .text = "MATCH(n:Document) RETURN coalesce(min(n.rank),max(n.rank))", .expected = &.{1}, .reads = 1 },
         .{ .text = "MATCH(n:Document) RETURN min(n.rank) LIMIT 0", .expected = &.{}, .reads = 1 },
         .{ .text = "MATCH(n:Document) RETURN min(n.rank) SKIP 1", .expected = &.{}, .reads = 1 },
+        .{ .text = "MATCH(n:Document) WITH count(DISTINCT n.rank) AS c WHERE c>0 RETURN c", .expected = &.{3}, .reads = 3 },
+        .{ .text = "MATCH(n:Document) WITH count(DISTINCT n.rank) AS c WHERE c<0 RETURN c", .expected = &.{}, .reads = 3 },
     }) |item| {
         var indexed: Indexed = .{};
         var provider_callbacks = indexed.fixture.backend().vtable.*;
@@ -8240,6 +8242,48 @@ test "ordered groups retire reducers across a broad exact-budget prefix" {
     }
     var fixture: F = .{ .nodes = nodes };
     const backend: b.Backend = .{ .ptr = &fixture, .vtable = &.{ .bind = Fixture.bind, .checkpoint = F.checkpoint, .scan = F.scan, .get = Fixture.get, .expand = Fixture.expand, .scan_ordered = F.ordered } };
+    {
+        fixture.reads = 0;
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, "MATCH(n:Document) RETURN n.id AS id", .{}, &diagnostic);
+        defer compiled.deinit();
+        const cursor = (try runtime.NodeCursor.open(std.testing.allocator, backend, graph, compiled.query, &.{}, .{ .scanned_anchors = 5000, .memory_bytes = 512 << 10 })).?;
+        defer cursor.close();
+        const plan = (try cursor.planScalarObserver("id", .distinct)).?;
+        try cursor.startWeightPlan(plan);
+        var count: usize = 0;
+        while (!cursor.done) {
+            var page = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer page.deinit();
+            const rows = try cursor.next(page.allocator(), 64);
+            for (rows, cursor.last_weights.items) |row, weight| {
+                try std.testing.expectEqual(@as(u64, 1), weight);
+                const expected = try std.fmt.allocPrint(page.allocator(), "{d:0>6}", .{count});
+                try std.testing.expectEqualStrings(expected, row[0].value.string);
+                count += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 5000), count);
+        try std.testing.expectEqual(@as(usize, 5000), fixture.reads);
+    }
+    {
+        // This provider can certify the discovery tuple but declines the
+        // filtered scalar observer. Its ordinary fallback must not inherit
+        // discovery's certificate, cursor or already charged sample.
+        for (nodes[0..64]) |*node| @constCast(node.properties)[0].value = .{ .string = "000000" };
+        defer for (nodes[0..64]) |*node| {
+            @constCast(node.properties)[0].value = .{ .string = node.identity.key };
+        };
+        fixture.reads = 0;
+        fixture.ordered_requests = 0;
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, "MATCH(n:Document) RETURN n.id,max(n.rank) ORDER BY n.id LIMIT 1", .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 6000 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, 63), result.rows[0][1].integer);
+        try std.testing.expectEqual(@as(usize, 1), fixture.ordered_requests);
+    }
     for ([_][]const u8{ "", " LIMIT 5000" }) |suffix| {
         fixture.reads = 0;
         fixture.requests = 0;

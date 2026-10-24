@@ -8647,3 +8647,118 @@ def test_grouped_domain_seeks_preserve_null_keys_and_non_distinct_counts(graph_d
                 assert result["stats"]["scanned_anchors"] >= 1000
             else:
                 assert result["stats"]["scanned_anchors"] < 256
+
+
+def scope_domains(db, count):
+    with db.open_table("docs") as table:
+        table.batch(
+            [
+                af.WriteIntent(key=f"k{i:06}", value=json.dumps({"id": f"g{i % 8}", "score": (i // 8) % 3}).encode())
+                for i in range(count)
+            ],
+            timestamp=1,
+        )
+    db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
+    db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    db.run_until_idle()
+
+
+def test_group_observers_survive_output_filters_wrappers_and_later_order(graph_db):
+    scope_domains(graph_db, 64000)
+    groups = [[f"g{i}", "3"] for i in range(8)]
+    for query, expected in (
+        ("MATCH(n:D) RETURN n.id,count(DISTINCT n.score)+0 AS c ORDER BY n.id", groups),
+        (
+            "MATCH(n:D) RETURN n.id,coalesce(min(n.score),0),max(n.score)-min(n.score) ORDER BY n.id",
+            [[f"g{i}", "0", "2"] for i in range(8)],
+        ),
+        ("MATCH(n:D) WITH n.id AS g,count(DISTINCT n.score) AS c RETURN g,c ORDER BY g", groups),
+        ("MATCH(n:D) WITH n.id AS g,count(DISTINCT n.score) AS c RETURN g,c ORDER BY g SKIP 2 LIMIT 2", groups[2:4]),
+        ("MATCH(n:D) WITH n.id AS g,count(DISTINCT n.score) AS c WITH g AS h,c RETURN h,c ORDER BY h", groups),
+        ("MATCH(n:D) WITH count(DISTINCT n.score) AS c WHERE c>0 RETURN c", [["3"]]),
+        ("MATCH(n:D) WITH count(DISTINCT n.score) AS c WHERE c<0 RETURN c", []),
+        ("MATCH(n:D) WITH n.id AS g,count(DISTINCT n.score) AS c ORDER BY g WHERE c>0 RETURN g,c", groups),
+        (
+            "MATCH(n:D) WITH n.id AS g,count(DISTINCT n.score) AS c ORDER BY g SKIP 2 LIMIT 2 WHERE c>0 RETURN g,c",
+            groups[2:4],
+        ),
+        ("MATCH(n:D) WITH n.id AS g,count(DISTINCT n.score) AS c ORDER BY g SKIP 2 LIMIT 2 WHERE c<0 RETURN g,c", []),
+        ("MATCH(n:D) RETURN n.id,count(DISTINCT n.score)+0 ORDER BY n.id SKIP 6 LIMIT 1", groups[6:7]),
+    ):
+        result = graph_db.cypher_json(
+            "g", {"query": query, "limits": {"scanned_anchors": 256, "memory_bytes": 2 << 20}}
+        )
+        assert [[cell["value"] for cell in row] for row in result["rows"]] == expected, query
+        assert result["stats"]["scanned_anchors"] <= 256
+
+
+def test_group_observer_output_preserves_errors_and_filter_window_order(graph_db):
+    scope_domains(graph_db, 3000)
+    for window in ("", " LIMIT 0", " SKIP 20 LIMIT 1"):
+        with pytest.raises(af.GraphError, match="CypherDivisionByZero"):
+            graph_db.cypher_json(
+                "g", {"query": f"MATCH(n:D) RETURN n.id,count(DISTINCT n.score)/0 ORDER BY n.id{window}"}
+            )
+    for suffix in ("", " LIMIT 0", " SKIP 20 LIMIT 1"):
+        with pytest.raises(af.GraphError, match="CypherDivisionByZero"):
+            graph_db.cypher_json(
+                "g",
+                {
+                    "query": f"MATCH(n:D) WITH n.id AS g,count(DISTINCT n.score) AS c ORDER BY g{suffix} WHERE c/0>0 RETURN g,c"
+                },
+            )
+    for where in ("c>0", "c<0", "g='g6'", "g IS NULL OR c>0"):
+        for skip in (0, 2, 9):
+            query = f"MATCH(n:D) WITH n.id AS g,count(DISTINCT n.score) AS c ORDER BY g SKIP {skip} LIMIT 2 WHERE {where} RETURN g,c"
+            # The control uses the same logical filter/window but declines the
+            # native group-key certificate, preserving the ordinary executor.
+            control = query.replace("ORDER BY g", "ORDER BY CASE WHEN true THEN g END")
+            assert (
+                graph_db.cypher_json("g", {"query": query})["rows"]
+                == graph_db.cypher_json("g", {"query": control})["rows"]
+            )
+
+
+def test_sql_graph_scalar_observers_keep_sql_semantics_and_fallbacks(graph_db):
+    scope_domains(graph_db, 32000)
+    source = "GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.id AS id,n.score AS score)) q"
+    for statement, expected in (
+        (f"SELECT count(DISTINCT score),min(score),max(score) FROM {source}", [["3", "0", "2"]]),
+        (f"SELECT min(score),max(score),count(DISTINCT id) FROM {source}", [["0", "2", "8"]]),
+        (f"SELECT min(s),max(s),count(DISTINCT s) FROM (SELECT score AS s FROM {source}) d", [["0", "2", "3"]]),
+        (f"SELECT count(DISTINCT score),min(score) FROM {source} WHERE score>=1", [["2", "1"]]),
+        (f"SELECT min(score),max(score) FROM {source} WHERE score IS NULL", [[None, None]]),
+        (f"SELECT count(DISTINCT score),min(score),max(score) FROM {source} WHERE false", [["0", None, None]]),
+        (
+            f"SELECT id,count(DISTINCT score),min(score),max(score) FROM {source} GROUP BY id ORDER BY id",
+            [[f"g{i}", "3", "0", "2"] for i in range(8)],
+        ),
+    ):
+        assert graph_db.sql(statement)["rows"] == expected, statement
+    graph_db.sql("UPDATE docs SET score=NULL WHERE id='g0'")
+    graph_db.run_until_idle()
+    assert graph_db.sql(f"SELECT count(DISTINCT score),min(score),max(score) FROM {source}")["rows"] == [
+        ["3", "0", "2"]
+    ]
+    assert graph_db.sql(f"SELECT count(DISTINCT score),min(score),max(score) FROM {source} WHERE id='g0'")["rows"] == [
+        ["0", None, None]
+    ]
+    with pytest.raises(af.AntflyError):
+        graph_db.sql("SELECT min(score) FROM GRAPH_TABLE(g MATCH(n IS D) COLUMNS(1/(n.score-n.score) AS score)) q")
+
+
+def test_total_group_wrappers_preserve_bounded_high_cardinality_windows(graph_db):
+    populate(graph_db, 5000)
+    graph_db.sql("CREATE INDEX grouping ON docs(id,score)")
+    graph_db.run_until_idle()
+    for observer in ("count(DISTINCT n.score)+0", "coalesce(count(DISTINCT n.score),0)", "-(-count(DISTINCT n.score))"):
+        query = f"MATCH(n:D) RETURN n.id,{observer} AS c ORDER BY n.id SKIP 2 LIMIT 5"
+        result = graph_db.cypher_json(
+            "g", {"query": query, "limits": {"scanned_anchors": 256, "memory_bytes": 2 << 20}}
+        )
+        control = graph_db.cypher_json(
+            "g", {"query": query.replace("ORDER BY n.id", "ORDER BY CASE WHEN true THEN n.id END")}
+        )
+        assert result["rows"] == control["rows"]
+        assert len(result["rows"]) == 5
+        assert result["stats"]["scanned_anchors"] < 256

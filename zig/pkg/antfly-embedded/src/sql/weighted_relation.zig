@@ -50,7 +50,7 @@ pub const Plan = struct {
             for (request.fields, fields) |field, *name| name.* = try a.dupe(u8, field);
             const invariants = try a.alloc([]const u8, request.invariants.len);
             for (request.invariants, invariants) |field, *name| name.* = try a.dupe(u8, field);
-            out.* = .{ .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| try a.dupe(u8, name) else null, .invariants = invariants, .summaries = try ownCertificates(a, request.summaries) };
+            out.* = .{ .observer = request.observer, .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| try a.dupe(u8, name) else null, .invariants = invariants, .summaries = try ownCertificates(a, request.summaries) };
         }
         return initDepth(a, root, owned, cursors, 0);
     }
@@ -282,6 +282,7 @@ pub const Plan = struct {
                     if (columnIndex(node, field) == null) return null;
                     try wanted.put(a, field, {});
                 }
+                var observer_direct = request.observer != null and request.fields.len == 1 and bound.predicate == null;
                 var dependencies: Names = .empty;
                 if (bound.predicate) |p| {
                     try programFields(a, &dependencies, p, bound.columns);
@@ -305,6 +306,12 @@ pub const Plan = struct {
                     if (!direct and !covered.contains(column.internal)) try wanted.put(a, column.internal, {});
                     if (!wanted.contains(column.internal)) continue;
                     if (program) |p| {
+                        const instruction = p.instructions[p.root];
+                        observer_direct = observer_direct and !instruction.input_function and instruction.operation == .column;
+                        if (observer_direct) {
+                            const source = bound.columns[instruction.operation.column];
+                            observer_direct = p.output_type.kind == source.type and p.output_type.element_type == source.element_type and scalar.NumericModifier.eql(p.output_type.numeric_modifier, source.numeric_modifier);
+                        }
                         try programFields(a, &dependencies, p, bound.columns);
                     } else {
                         if (columnIndex(query.source, projection.field) == null) return null;
@@ -312,7 +319,7 @@ pub const Plan = struct {
                     }
                 }
                 output.* = try names(a, wanted);
-                input.* = .{ .fields = try names(a, dependencies), .multiplicity = request.multiplicity, .summaries = try projectCertificates(a, node, request, wanted) };
+                input.* = .{ .observer = if (observer_direct and dependencies.count() == 1) request.observer else null, .fields = try names(a, dependencies), .multiplicity = request.multiplicity, .summaries = try projectCertificates(a, node, request, wanted) };
             }
             try stages.append(a, .{ .node = node, .fields = outputs });
             width += node.columns.len;
@@ -405,7 +412,7 @@ pub const Plan = struct {
                 for (certificate.invariants, stable) |field, *name| name.* = node.operation.scan.source_columns[columnIndex(node, field) orelse return null];
                 mapped_certificate.* = .{ .field = node.operation.scan.source_columns[columnIndex(node, certificate.field) orelse return null], .invariants = stable, .joint = certificate.joint, .linear = try renameCheck(a, certificate.linear, request.fields, fields) };
             }
-            out.* = .{ .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| node.operation.scan.source_columns[columnIndex(node, name) orelse return null] else null, .invariants = invariants, .summaries = summaries };
+            out.* = .{ .observer = request.observer, .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| node.operation.scan.source_columns[columnIndex(node, name) orelse return null] else null, .invariants = invariants, .summaries = summaries };
         }
         return .{ .source = node, .requests = requests, .stages = stages.items, .physical = physical, .width = width + node.columns.len };
     }

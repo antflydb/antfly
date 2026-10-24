@@ -3167,3 +3167,41 @@ the default memory ceiling. The new public regression exercises these shapes
 with a 256-anchor, 2 MiB allowance and checks their exact expected results. A
 separate nullable-group fixture compares seeks and full folds across unbounded,
 bounded and beyond-end windows, including mixed ordinary/distinct counts.
+
+#### Aggregate output scopes and SQL scalar observers
+
+Grouped index planning now collects scope-local aggregate leaves inside scalar
+output expressions. Group-key discovery, observation, HAVING and the output
+window are separate phases. A certified adjacent key stream sends each key to
+its observer consumer without materializing the full key relation. The consumer
+recycles its invocation arena, evaluates output expressions and predicates, and
+owns only rows surviving the final SKIP/LIMIT. Ordered folds apply the same
+filter-before-window behavior. Bare total observers retain the existing cheap
+retirement of skipped groups; wrappers and predicates still evaluate losing
+groups so a finite window cannot hide their errors.
+
+A following sort can supply the earlier aggregate's group-key order through
+transparent alias projections. Computations, filters, DISTINCT, intervening windows and
+correlated stages remain barriers to this propagation; the following consumer
+still owns its original sort. Aggregate-output predicates remain after
+reduction and are never reinterpreted as source predicates. Global indexed
+observers apply their output predicate before ORDER BY and pagination, including
+empty results and late pagination diagnostics.
+
+SQL aggregate requests can negotiate an explicit scalar MIN, MAX or DISTINCT
+domain through GRAPH_TABLE. Direct column lineage and SQL type metadata must
+survive every forwarding projection. The graph bridge accepts integer, string
+and boolean property domains only, rejects residual scan conditions and source
+ordinals, and obtains a complete native ordering certificate before any pull.
+Computed inputs, numeric/structured coercions, grouping, filters and set/join
+barriers retain ordinary execution unless their existing independent proofs
+apply. Every graph projection retained for the SQL consumer still needs a total-expression
+proof. Observer negotiation cannot elide errors in demanded computations.
+
+Scalar observers use the resumable node cursor. MIN/MAX consume one authorized
+non-NULL boundary; DISTINCT keeps one owned adjacent key, adaptive source pages
+and unit SQL multiplicities. No full distinct relation is buffered between the
+graph and SQL reducers. Several observers share the statement's immutable read
+cut and cumulative anchor/state quotas; owner-local distinct counts are never
+summed. SQL keeps its own aggregate reduction, NULL/empty-input semantics,
+coercion and final output evaluation.

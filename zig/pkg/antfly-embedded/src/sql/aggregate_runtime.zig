@@ -571,7 +571,17 @@ fn aggregateRequests(a: std.mem.Allocator, bound: *const binding.Bound, table: c
             try invariants.append(a, key.*);
             if (!fields.contains(key.*)) try names.append(a, key.*);
         }
-        request.* = .{ .fields = names.items, .multiplicity = if (presence) .presence else .exact, .summary = summary, .invariants = invariants.items, .summaries = summaries.items };
+        var observer: ?@import("cypher").runtime.NodeCursor.ScalarObserver = null;
+        if (bound.group_count == 0 and conditions.len == 0 and bound.input.predicate == null and filter == null and names.items.len == 1) if (input) |slot| if (bound.input.projections[slot]) |program| {
+            const root = program.instructions[program.root];
+            if (root.operation == .column and !root.input_function) observer = switch (spec.kind) {
+                .min => .min,
+                .max => .max,
+                .count => if (spec.distinct) .distinct else null,
+                else => null,
+            };
+        };
+        request.* = .{ .observer = observer, .fields = names.items, .multiplicity = if (presence) .presence else .exact, .summary = summary, .invariants = invariants.items, .summaries = summaries.items };
     }
     return requests;
 }
