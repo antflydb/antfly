@@ -4663,3 +4663,19 @@ Both Cloud and self-hosted search use ordinary `/tables/{table}/query` requests.
 Cloud applies `X-Antfly-Source-ID` and `X-Antfly-Source-Access` preconditions on that
 route to enforce the current binding, access and readiness. These are Cloud
 preconditions, not new Antfly database APIs or authorization capabilities.
+
+Discover the same source catalog directly from a self-hosted Antfly table:
+
+```sh
+antfly-grep --source-endpoint https://antfly.example/db/v1 \
+  --source manuals 'retry budget'
+```
+
+The default ordinary catalog table is `antfly_sources`; override it with
+`--source-table NAME`. Authenticate with the normal table token and use
+`--source-principal ID` for additional local reader filtering when needed.
+The ingestion identity publishes versioned source records after content and
+reconciliation become query-visible. Grep traverses one bounded catalog snapshot
+before searching. Catalog and content visibility require server authorization;
+catalog records grant no authority. `--source-catalog FILE` remains available for
+file exports. See the [source record schema](schema/source-record-v1.json).

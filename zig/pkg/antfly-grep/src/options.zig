@@ -31,6 +31,9 @@ pub const Options = struct {
     table_config_json: ?[]const u8 = null,
     cloud: bool = false,
     source_catalog: ?[]const u8 = null,
+    source_endpoint: ?[]const u8 = null,
+    source_table: []const u8 = "antfly_sources",
+    source_principals: std.ArrayList([]const u8) = .empty,
     cloud_cli: []const u8 = "antfly-cloud",
     cloud_session: ?*@import("cloud.zig").Session = null,
     sources: std.ArrayList([]const u8) = .empty,
@@ -277,11 +280,11 @@ pub const Options = struct {
         self.paths.deinit(a);
         self.globs.deinit(a);
         self.glob_order.deinit(a);
-        inline for (.{ "sources", "tables", "filters", "colors", "type_clear", "pre_globs", "pattern_files", "ignore_files", "types", "types_not", "type_add", "iglobs", "queries", "exclude", "only", "not" }) |field| @field(self, field).deinit(a);
+        inline for (.{ "sources", "source_principals", "tables", "filters", "colors", "type_clear", "pre_globs", "pattern_files", "ignore_files", "types", "types_not", "type_add", "iglobs", "queries", "exclude", "only", "not" }) |field| @field(self, field).deinit(a);
     }
 
     pub fn sourced(self: *const Options) bool {
-        return self.cloud or self.source_catalog != null;
+        return self.cloud or self.source_catalog != null or self.source_endpoint != null;
     }
     pub fn indexed(self: *const Options) bool {
         return self.sourced() or self.table_config != null or self.table_config_json != null;
@@ -688,6 +691,12 @@ pub const Options = struct {
                     self.skip_oversize = true;
                 } else if (std.mem.eql(u8, name, "--source")) {
                     try self.sources.append(a, value);
+                } else if (std.mem.eql(u8, name, "--source-endpoint")) {
+                    self.source_endpoint = value;
+                } else if (std.mem.eql(u8, name, "--source-table")) {
+                    self.source_table = value;
+                } else if (std.mem.eql(u8, name, "--source-principal")) {
+                    try self.source_principals.append(a, value);
                 } else if (std.mem.eql(u8, name, "--source-catalog")) {
                     self.source_catalog = value;
                 } else if (std.mem.eql(u8, name, "--cloud-cli")) {
@@ -856,10 +865,12 @@ pub const Options = struct {
             if (self.max_image_bytes == 0 or self.max_image_bytes > 768 * 1024 or self.max_image_pixels == 0) return error.InvalidImageLimit;
         }
         if (!std.math.isFinite(self.threshold) or self.threshold < 0 or self.threshold > 1 or self.chunk_lines == 0 or self.batch_size == 0 or self.batch_size > 128 or self.decision_batch_wait_ms > 1000 or self.timeout_ms == 0 or (self.max_file_bytes == 0 and !self.skip_oversize)) return error.InvalidNumber;
-        if (self.sources.items.len > 0 and self.source_catalog == null) self.cloud = true;
+        if (self.sources.items.len > 0 and self.source_catalog == null and self.source_endpoint == null) self.cloud = true;
         if (self.cached_only and (self.ask == null or self.no_cache or self.cache_ttl_seconds == 0 or self.indexed() or self.pre != null or self.hostname_bin != null)) return error.ConflictingCachedOnlyFlags;
         if (self.files and (self.patterns.items.len > 0 or self.ask != null)) return error.ConflictingFlags;
-        if (self.source_catalog != null and (self.cloud or self.table_config != null or self.tables.items.len > 0 or self.paths.items.len > 0)) return error.ConflictingCloudSourceOptions;
+        if (self.source_endpoint == null and (self.source_principals.items.len > 0 or !std.mem.eql(u8, self.source_table, "antfly_sources"))) return error.SourceEndpointRequired;
+        if (self.source_catalog != null and self.source_endpoint != null) return error.ConflictingCloudSourceOptions;
+        if ((self.source_catalog != null or self.source_endpoint != null) and (self.cloud or self.table_config != null or self.tables.items.len > 0 or self.paths.items.len > 0)) return error.ConflictingCloudSourceOptions;
         if (self.cloud and (self.table_config != null or self.table_token != null or self.tables.items.len > 0 or self.paths.items.len > 0)) return error.ConflictingCloudSourceOptions;
         if (self.tables.items.len > 0 and !self.indexed()) return error.TableConfigRequired;
         if (self.max_index_documents == 0 or self.max_pending_output == 0) return error.InvalidNumber;

@@ -306,6 +306,30 @@ secrets, background synchronization, or Cloud source-management state. A conveni
 indexing command delegates to the shared ingestion runtime rather than embedding
 a second connector/extraction pipeline into the search process.
 
+The durable searchable-source catalog lives in an ordinary Antfly table named
+`antfly_sources` by default (configurable for self-hosted profiles). It is shared
+infrastructure for hosted and self-hosted ingestion, not Cloud-specific storage or
+a new core database API. One version-1 `source_catalog` record per stable source
+ID contains its v2 search binding, provider kind, document version, published
+revision, readiness, freshness lease and explicit sharing metadata. It contains
+no credentials, provider selection/configuration, session readers or job checkpoints.
+
+The shared catalog writer verifies a snapshot-visible `syncing` record before
+content mutation and publishes `searchable` only after content and reconciliation
+are query-visible. There is no cross-table transaction: interruption leaves a
+non-searchable record or a bounded prior lease, and retry repairs publication.
+The ingestion runtime owns catalog writes. Server authentication and row policy
+control catalog visibility as well as content; sharing metadata is descriptive,
+not a grant. In Cloud, current connection/sharing/table policy overrides retained
+catalog rows and snapshots, and non-admin catalog mutations are blocked.
+
+`antfly-grep --source-endpoint URL --source NAME` reads the catalog through normal
+table queries with bounded snapshot pagination. `--source-table` selects a custom
+catalog table. Provider secrets are not needed by grep. Cloud `/sources` is an
+authenticated view of the persisted publication plus current Cloud policy; its
+PostgreSQL records remain operational configuration/jobs, not a substitute for
+searchable catalog publication. File catalogs remain explicit exports/configuration.
+
 The portable catalog is version 2, independently of table configuration/document
 versions. It contains an Antfly API `endpoint`, `sources` with stable `id`, `alias`,
 physical `table`, `document_field`, selection `filter`, readiness `status` and

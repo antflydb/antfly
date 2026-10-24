@@ -173,6 +173,10 @@ pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     cloud_integration.addFileArg(b.path("pkg/antfly-grep/tests/test_cloud.py"));
     cloud_integration.addArtifactArg(exe);
     test_step.dependOn(&cloud_integration.step);
+    const catalog_integration = b.addSystemCommand(&.{"python3"});
+    catalog_integration.addFileArg(b.path("pkg/antfly-grep/tests/test_catalog.py"));
+    catalog_integration.addArtifactArg(exe);
+    test_step.dependOn(&catalog_integration.step);
     const differential_tools = b.addSystemCommand(&.{"python3"});
     differential_tools.addFileArg(b.path("pkg/antfly-grep/tests/test_differential_tools.py"));
     test_step.dependOn(&differential_tools.step);

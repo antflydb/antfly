@@ -118,7 +118,7 @@ fn resolveTableSelection(a: A, tables: []const Table, selectors: []const []const
     return selected;
 }
 
-fn escape(a: A, raw: []const u8) ![]const u8 {
+pub fn escape(a: A, raw: []const u8) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(a);
     errdefer out.deinit();
     for (raw) |byte| {

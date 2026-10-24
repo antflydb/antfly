@@ -48,6 +48,9 @@ Use '-' for stdin; '--' ends option parsing.
       --engine ENGINE       default, pcre2, auto
   -z, --search-zip           Native streaming compressed-file search
       --dictionary PATH     Brotli/LZ4/Zstandard external dictionary
+      --source-endpoint URL Discover sources from an ordinary Antfly catalog table
+      --source-table TABLE  Catalog table (default: antfly_sources)
+      --source-principal ID Additional local reader identity (repeatable)
       --source-catalog FILE Portable source profile (no Cloud dependency)
       --cloud              Search authorized sources from antfly-cloud login
       --source NAME        Select connected source alias/ID (repeatable)
@@ -615,6 +618,15 @@ See antfly-grep --help and the package README for semantics.
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --source-catalog
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --source-endpoint
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --source-principal
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --source-table
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --stats

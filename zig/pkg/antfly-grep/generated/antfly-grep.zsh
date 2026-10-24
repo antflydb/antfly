@@ -168,6 +168,9 @@ _arguments -s \
  '--sortr[sortr]:value:(none path modified accessed created)' \
  '--source[source]:value:' \
  '--source-catalog[source-catalog]:value:_files' \
+ '--source-endpoint[source-endpoint]:value:' \
+ '--source-principal[source-principal]:value:' \
+ '--source-table[source-table]:value:' \
  '--stats[stats]' \
  '--stdin[stdin]' \
  '--stop-on-nonmatch[stop-on-nonmatch]' \
