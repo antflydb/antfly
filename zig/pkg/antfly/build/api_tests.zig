@@ -1855,6 +1855,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-api-mcp-auth-test", "Run real MCP trusted-principal authorization regressions")
         .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, mcp_auth_tests, mcp_auth_filters).step);
 
+    const source_merge_filters = &.{"linear merge"};
+    const source_merge_tests = b.addTest(.{
+        .name = "api-source-merge-tests",
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = source_merge_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    b.step("antfly-api-source-merge-test", "Run bounded source LinearMerge regressions")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, source_merge_tests, source_merge_filters).step);
+
     const authorization_sink_filters = [_][]const u8{
         "api http server document scan requires table read permission",
         "global multi-query rechecks live permission before each table result",
