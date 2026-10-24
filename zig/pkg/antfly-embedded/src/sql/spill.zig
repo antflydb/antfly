@@ -27,6 +27,9 @@ const frame_bytes = 25;
 const snappy = @import("../encoding/snappy.zig");
 
 pub const Manager = struct {
+    /// Scoped allocation owners retain the enclosing statement's disk and FD
+    /// admission. Children close before this borrowed owner is destroyed.
+    quota_parent: ?*Manager = null,
     execution_pages: ?*@import("execution_pager.zig").Pager = null,
     page_residency_bytes: usize = 4 * 1024 * 1024,
     patterns: std.ArrayList(*scalar.PatternSet) = .empty,
@@ -61,6 +64,17 @@ pub const Manager = struct {
     peak_files: usize = 0,
     mutex: std.atomic.Mutex = .unlocked,
     allocation_mutex: std.atomic.Mutex = .unlocked,
+    pub fn scoped(self: *Manager, a: Allocator) Manager {
+        return .{ .page_residency_bytes = self.page_residency_bytes, .alloc = a, .io = self.io, .context = self.context, .checkpoint = self.checkpoint, .root = self.root, .max_bytes = self.max_bytes, .max_record_bytes = self.max_record_bytes, .array_limits = self.array_limits, .buffer_bytes = self.buffer_bytes, .async_writes = self.async_writes, .compression = self.compression, .quota_parent = self };
+    }
+    fn reserveFile(self: *Manager) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.files >= 64 or self.max_bytes == 0) return error.SqlProgramLimitExceeded;
+        if (self.quota_parent) |parent| try parent.reserveFile();
+        self.files += 1;
+        self.peak_files = @max(self.peak_files, self.files);
+    }
     fn lock(self: *Manager) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
@@ -113,18 +127,20 @@ pub const Manager = struct {
         self.lock();
         defer self.mutex.unlock();
         @field(self, field) += value;
+        if (self.quota_parent) |parent| parent.increment(field, value);
     }
     fn reserve(self: *Manager, bytes: u64) !void {
         self.lock();
         defer self.mutex.unlock();
         if (bytes > self.max_bytes -| self.live_bytes) return error.SqlProgramLimitExceeded;
+        if (self.quota_parent) |parent| try parent.reserve(bytes);
         self.live_bytes += bytes;
         self.peak_bytes = @max(self.peak_bytes, self.live_bytes);
     }
     pub fn fileHeadroom(self: *Manager) usize {
         self.lock();
         defer self.mutex.unlock();
-        return 64 - self.files;
+        return if (self.quota_parent) |parent| @min(64 - self.files, parent.fileHeadroom()) else 64 - self.files;
     }
     pub fn admissionStats(self: *Manager) struct { peak_files: usize, peak_bytes: u64, max_bytes: u64 } {
         self.lock();
@@ -135,12 +151,14 @@ pub const Manager = struct {
         self.lock();
         defer self.mutex.unlock();
         self.live_bytes -= bytes;
+        if (self.quota_parent) |parent| parent.releaseBytes(bytes);
     }
     fn closeFile(self: *Manager, bytes: u64) void {
         self.lock();
         defer self.mutex.unlock();
         self.live_bytes -= bytes;
         self.files -= 1;
+        if (self.quota_parent) |parent| parent.closeFile(bytes);
     }
     pub fn registerPattern(self: *Manager, pattern: *scalar.PatternSet) !void {
         self.lock();
@@ -165,6 +183,13 @@ pub const Manager = struct {
     fn open(self: *Manager) !void {
         if (comptime !native_spill_supported) return error.SqlProgramLimitExceeded;
         if (self.dir != null) return;
+        if (self.quota_parent) |owner| {
+            owner.lock();
+            defer owner.mutex.unlock();
+            try owner.open();
+            self.dir = owner.dir;
+            return;
+        }
         try self.check();
         const parent = try std.Io.Dir.openDirAbsolute(self.io, self.root, .{});
         errdefer parent.close(self.io);
@@ -176,6 +201,13 @@ pub const Manager = struct {
         self.dir = try parent.openDir(self.io, &self.directory_name, .{});
         self.parent = parent;
     }
+    fn nextId(self: *Manager) u64 {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.quota_parent) |parent| return parent.nextId();
+        self.sequence += 1;
+        return self.sequence;
+    }
     pub fn create(self: *Manager) !File {
         // Freestanding builds have no native spill directory. Keep bounded
         // in-memory SQL available and report its existing limit on overflow.
@@ -185,7 +217,9 @@ pub const Manager = struct {
         if (self.max_bytes == 0) return error.SqlProgramLimitExceeded;
         try self.open();
         if (self.files >= 64) return error.SqlProgramLimitExceeded;
-        self.sequence += 1;
+        if (self.quota_parent) |parent| try parent.reserveFile();
+        errdefer if (self.quota_parent) |parent| parent.closeFile(0);
+        if (self.quota_parent) |parent| self.sequence = parent.nextId() else self.sequence += 1;
         var name: [24]u8 = undefined;
         const text = try std.fmt.bufPrint(&name, "{d}", .{self.sequence});
         const file = try self.dir.?.createFile(self.io, text, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
@@ -223,7 +257,7 @@ pub const Manager = struct {
             std.debug.assert(self.dir == null and self.parent == null);
             return;
         }
-        if (self.dir) |dir| dir.close(self.io);
+        if (self.dir) |dir| if (self.quota_parent == null) dir.close(self.io);
         if (self.parent) |parent| {
             parent.deleteTree(self.io, &self.directory_name) catch {};
             parent.close(self.io);
@@ -9315,4 +9349,42 @@ test "SQL shared spill runs retain balanced tiers independently of descriptor ca
     try std.testing.expect(sort.shared_directory.items.len > sort.run_limit);
     try std.testing.expect(manager.merged_rows < count * 16);
     try std.testing.expect(manager.peak_files <= 1);
+}
+
+test "SQL scoped spill owners share disk and descriptor admission and unwind" {
+    const a = std.testing.allocator;
+    var marker: u8 = 0;
+    var parent: Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .max_bytes = 128, .async_writes = false };
+    defer parent.deinit();
+    var budget: @import("memory_budget.zig") = .{ .backing = parent.allocator(), .limit = 65536 };
+    var child = parent.scoped(budget.allocator());
+    defer child.deinit();
+    var file = try child.create();
+    defer file.close();
+    const bytes: [128]u8 = @splat(3);
+    try file.writeRaw(0, &bytes);
+    try std.testing.expectEqual(@as(u64, 128), parent.live_bytes);
+    try std.testing.expectEqual(@as(usize, 1), parent.files);
+    try std.testing.expect(std.meta.eql(parent.dir, child.dir));
+    var other = try parent.create();
+    defer other.close();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, other.writeRaw(0, "x"));
+    file.close();
+    try std.testing.expectEqual(@as(u64, 0), parent.live_bytes);
+    try std.testing.expectEqual(@as(usize, 1), parent.files);
+    try other.writeRaw(0, "x");
+    other.close();
+    try std.testing.expectEqual(@as(usize, 0), parent.files);
+    var handles: [64]File = undefined;
+    var opened: usize = 0;
+    defer for (handles[0..opened]) |*handle| handle.close();
+    for (&handles) |*handle| {
+        handle.* = try child.create();
+        opened += 1;
+    }
+    try std.testing.expectError(error.SqlProgramLimitExceeded, parent.create());
+    try std.testing.expectError(error.SqlProgramLimitExceeded, child.create());
+    try std.testing.expectEqual(@as(usize, 64), parent.files);
 }

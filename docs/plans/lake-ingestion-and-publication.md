@@ -3842,3 +3842,9 @@ adds descriptor-independent merge runs, adaptive paged join hash partitions,
 per-segment forward term evidence and bounded exact group reduction trees.
 Forward/statistics replacement metadata must survive file checkpoints, and GC
 must mark both new tree families before any corresponding publication is served.
+
+The maintenance-locality refinement in [lake row identity](lake-row-identity.md#maintenance-locality-allocation-ownership-and-evidence-reuse)
+uses bulk reduction construction, bounded authenticated decoded-page reuse,
+scoped forward spill admission and verified merge-map evidence transfer. Serving
+pack writers request summaries alone; canonical forward trees remain owned by
+canonical maintenance groups and their existing publication/GC closure.

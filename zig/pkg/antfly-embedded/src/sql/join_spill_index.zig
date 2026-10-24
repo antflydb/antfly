@@ -131,18 +131,18 @@ pub const Index = struct {
         if (hashes.len != output.len) return error.InvalidSqlSpill;
         var begin: usize = 0;
         while (begin < hashes.len) {
-            const count = @min(128, hashes.len - begin);
-            var ids: [128]usize = @splat(0);
-            var active: [128]bool = undefined;
+            const count = @min(512, hashes.len - begin);
+            var ids: [512]usize = @splat(0);
+            var active: [512]bool = undefined;
             for (hashes[begin..][0..count], active[0..count], output[begin..][0..count]) |hash, *live, *head| {
                 live.* = hash != null;
                 head.* = spill.none;
             }
-            var tables: [128]u64 = @splat(spill.none);
+            var tables: [512]u64 = @splat(spill.none);
             while (true) {
-                var selected: [128]usize = undefined;
-                var lanes: [128]usize = undefined;
-                var nodes: [128]Node = undefined;
+                var selected: [512]usize = undefined;
+                var lanes: [512]usize = undefined;
+                var nodes: [512]Node = undefined;
                 var pending: usize = 0;
                 for (active[0..count], 0..) |live, i| if (live) {
                     selected[pending] = ids[i];
@@ -150,6 +150,12 @@ pub const Index = struct {
                     pending += 1;
                 };
                 if (pending == 0) break;
+                std.mem.sort(usize, lanes[0..pending], &ids, struct {
+                    fn less(values: *const [512]usize, l: usize, r: usize) bool {
+                        return values[l] < values[r];
+                    }
+                }.less);
+                for (lanes[0..pending], selected[0..pending]) |lane, *value| value.* = ids[lane];
                 try self.nodes.getMany(selected[0..pending], nodes[0..pending]);
                 for (nodes[0..pending], lanes[0..pending]) |node, i| {
                     if (node.table != spill.none) {
@@ -162,16 +168,25 @@ pub const Index = struct {
                     }
                 }
             }
-            var done: [128]bool = @splat(false);
-            for (tables[0..count], 0..) |table, i| {
-                if (table == spill.none or done[i]) continue;
-                const held = try self.window(table, false);
+            var order: [512]usize = undefined;
+            var size: usize = 0;
+            for (tables[0..count], 0..) |table, lane| if (table != spill.none) {
+                order[size] = lane;
+                size += 1;
+            };
+            std.mem.sort(usize, order[0..size], &tables, struct {
+                fn less(values: *const [512]u64, l: usize, r: usize) bool {
+                    return values[l] < values[r];
+                }
+            }.less);
+            var at: usize = 0;
+            while (at < size) {
+                const held = try self.window(tables[order[at]], false);
                 defer held.lease.release();
-                for (tables[0..count], 0..) |candidate, j| {
-                    if (candidate == spill.none or done[j] or self.slots.pageStart(@as(usize, @intCast(candidate)) * width) != held.begin) continue;
-                    const values = held.values[tableOffset(candidate, held.begin)..][0..width];
-                    output[begin + j] = values[position(values, hashes[begin + j].?)].head;
-                    done[j] = true;
+                while (at < size and self.slots.pageStart(@as(usize, @intCast(tables[order[at]])) * width) == held.begin) : (at += 1) {
+                    const lane = order[at];
+                    const values = held.values[tableOffset(tables[lane], held.begin)..][0..width];
+                    output[begin + lane] = values[position(values, hashes[begin + lane].?)].head;
                 }
             }
             begin += count;

@@ -944,3 +944,49 @@ behavior, compare changed-term retractions with a complete native statistics
 oracle, and require a 257-row exact group update to inspect 64 contributions and
 five child summaries while the previous immutable root remains readable. These
 are local work bounds, not archive-scale latency or throughput measurements.
+
+### Maintenance locality, allocation ownership and evidence reuse
+
+Forward evidence has an explicitly scoped spill owner. Its allocator is backed
+by the 4 MiB forward budget, while disk bytes, physical file admission and I/O
+counters also charge the enclosing statement owner. Known child or parent quota
+declines disable optional forward evidence; genuine allocator failures propagate.
+The scope closes before its parent and does not create an independent disk quota.
+
+Fresh exact reductions stream the ordered contribution tree once. A bounded
+carry stack folds 64-row blocks and sixteen ordered children per ancestor, then
+externally sorts compact summaries for bulk publication. It does not build a
+large dirty-key census or seek once per group. Incremental repairs use operation
+local authenticated decoded-page leases, shared with contribution, reverse and
+extrema maintenance. The cache accounts encoded bytes, decoded entries and
+expanded keys, never evicts pinned pages, checks authority/cancellation on hits,
+and falls back to ordinary owned pages when a working set cannot be retained.
+Forward retractions sort their reached terms and use bounded multi-seek waves,
+sharing the same decoded page capability for summary reads and COW mutation.
+
+A structural high-cardinality fixture with 257 groups now reads its six
+contribution pages once during fresh construction and uses seven backing page
+reads for repair, replacing the previous 772-read construction. These counts are
+local work contracts, not measured cloud latency or archive-scale throughput.
+
+Ordinary large SQL joins already use Grace partitioning: both relations are
+partitioned, partitions build and probe locally, and skew retains the existing
+bounded fallback. Reusable/recursive disk hash owners need their persistent
+lookup representation instead. Their directory lookups now route larger bounded
+waves in page order; native candidate records are primed in file-offset order.
+Probes retain immutable record coordinates instead of borrowed decode buffers,
+leave duplicate chains lazy, preserve caller lanes and defer payload hydration.
+This complements Grace execution without materializing another complete probe
+relation for a reused selective lookup.
+
+Append compaction carries complete forward evidence from its staged producers.
+Sorted/deleting canonical compaction can stream published forward trees and
+staged evidence through the native merge's source map. Tombstones are omitted and
+all surviving document ordinals are rewritten from that verified mapping. No
+file-name or positional guess establishes row identity. Input sorts are rewound
+before their owners can be reused; optional quota declines disable incomplete
+evidence, while legacy inputs retain encoder capture. Serving-only packs request
+summary capture without forward capture because they do not publish canonical
+forward trees. This removes the otherwise unnecessary posting decode from copied
+sections. Existing protocol 80 representations, closure edges and public UX apply
+unchanged; no new wire format is needed.

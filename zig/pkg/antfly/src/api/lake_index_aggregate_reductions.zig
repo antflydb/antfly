@@ -66,6 +66,10 @@ pub fn repair(a: A, manager: *local.sql_spill.Manager, storage: tree.Store, rows
     return repairMeasured(a, manager, storage, rows, prior, dirty, row_count, layout, phase, null);
 }
 pub fn repairMeasured(a: A, manager: *local.sql_spill.Manager, storage: tree.Store, rows: ?tree.Ref, prior: ?tree.Ref, dirty: *const Dirty, row_count: u64, layout: *const record.Layout, phase: ?*const @import("../serverless/artifacts/store.zig").IoPhase, metrics: ?*Metrics) !?tree.Ref {
+    if (prior == null) return buildFresh(a, manager, storage, rows, row_count, layout, metrics);
+    var cache: tree.Cache = .{ .decoded = true, .alloc = local.sql_memory_budget.reclaimingAllocator(a), .underlying = storage };
+    defer cache.deinit();
+    const cached = if (storage.decoded_page != null) storage else cache.store();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
@@ -75,7 +79,7 @@ pub fn repairMeasured(a: A, manager: *local.sql_spill.Manager, storage: tree.Sto
     var root = prior;
     var level: u8 = 0;
     while (level <= levels(row_count)) : (level += 1) {
-        var changes = Mutations.init(a, manager, storage);
+        var changes = Mutations.init(a, manager, cached);
         defer changes.deinit();
         changes.private_pages.phase = phase;
         var parents: Dirty = .empty;
@@ -100,7 +104,7 @@ pub fn repairMeasured(a: A, manager: *local.sql_spill.Manager, storage: tree.Sto
                 lower = try key(sa, group, level - 1, block << 4);
                 upper = if (block <= (std.math.maxInt(u64) >> 4) - 1) try key(sa, group, level - 1, (block + 1) << 4) else try keys.successor(sa, lower[0 .. lower.len - 8]);
             }
-            var cursor = try tree.Cursor.init(sa, storage, if (level == 0) rows else root, lower, upper);
+            var cursor = try tree.Cursor.init(sa, cached, if (level == 0) rows else root, lower, upper);
             defer cursor.deinit();
             var merged: ?[]u8 = null;
             while (try cursor.next()) |contribution| {
@@ -116,6 +120,83 @@ pub fn repairMeasured(a: A, manager: *local.sql_spill.Manager, storage: tree.Sto
         pending = parents;
     }
     return root;
+}
+
+/// Fresh cohorts traverse contributions once. A bounded carry stack folds each
+/// ordinal block in order; only compact summaries enter the external sort.
+fn buildFresh(a: A, manager: *local.sql_spill.Manager, storage: tree.Store, rows: ?tree.Ref, row_count: u64, layout: *const record.Layout, metrics: ?*Metrics) !?tree.Ref {
+    const Builder = struct {
+        a: A,
+        layout: *const record.Layout,
+        depth: u8,
+        group: []const u8 = "",
+        blocks: [17]u64 = @splat(0),
+        states: [17]?[]u8 = @splat(null),
+        sort: *local.sql_spill.Sort,
+        metrics: ?*Metrics,
+        fn add(self: *@This(), level: u8, block: u64, value: []const u8) anyerror!void {
+            if (self.states[level] != null and self.blocks[level] != block) try self.flush(level);
+            const next = if (self.states[level]) |prior| try record.merge(self.a, prior, value, self.layout) else try self.a.dupe(u8, value);
+            if (self.states[level]) |prior| self.a.free(prior);
+            self.states[level] = next;
+            self.blocks[level] = block;
+            if (self.metrics) |m| if (level != 0) {
+                m.child_summaries += 1;
+            };
+        }
+        fn flush(self: *@This(), level: u8) anyerror!void {
+            const value = self.states[level] orelse return;
+            const encoded = try key(self.a, self.group, level, self.blocks[level]);
+            defer self.a.free(encoded);
+            try self.sort.add(.{ .keys = &.{local.sql_scalar.Datum.json(.{ .string = encoded })}, .values = &.{local.sql_scalar.Datum.json(.{ .string = value })}, .ordinal = self.sort.total });
+            if (level < self.depth) try self.add(level + 1, self.blocks[level] >> 4, value);
+            self.a.free(value);
+            self.states[level] = null;
+        }
+        fn finishGroup(self: *@This()) !void {
+            for (0..@as(usize, self.depth) + 1) |level| try self.flush(@intCast(level));
+        }
+        fn deinit(self: *@This()) void {
+            for (self.states) |state| if (state) |value| self.a.free(value);
+            self.a.free(self.group);
+        }
+    };
+    var sort = local.sql_spill.Sort.init(a, manager, &.{.{}}, 1024 * 1024);
+    sort.shared_runs = true;
+    sort.encoded_bytes = true;
+    defer sort.deinit();
+    var builder: Builder = .{ .a = a, .layout = layout, .depth = levels(row_count), .sort = &sort, .metrics = metrics };
+    defer builder.deinit();
+    var cursor = try tree.Cursor.init(a, storage, rows, "", null);
+    defer cursor.deinit();
+    while (try cursor.next()) |row| {
+        try manager.check();
+        if (row.key.len < 12) return error.InvalidNativeAggregateArtifact;
+        const group = row.key[0 .. row.key.len - 8];
+        const ordinal = std.mem.readInt(u64, row.key[row.key.len - 8 ..][0..8], .big);
+        if (ordinal >= row_count) return error.InvalidNativeAggregateArtifact;
+        if (!std.mem.eql(u8, group, builder.group)) {
+            try builder.finishGroup();
+            const next = try a.dupe(u8, group);
+            a.free(builder.group);
+            builder.group = next;
+        }
+        if (metrics) |m| m.leaf_rows += 1;
+        try builder.add(0, ordinal >> 6, row.value);
+    }
+    try builder.finishGroup();
+    const Source = struct {
+        sort: *local.sql_spill.Sort,
+        scratch: std.heap.ArenaAllocator,
+        pub fn next(self: *@This()) !?tree.Cursor.Record {
+            _ = self.scratch.reset(.free_all);
+            const row = (try self.sort.next(self.scratch.allocator())) orelse return null;
+            return .{ .key = row.keys[0].value.string, .value = row.values[0].value.string };
+        }
+    };
+    var source: Source = .{ .sort = &sort, .scratch = .init(a) };
+    defer source.scratch.deinit();
+    return tree.buildSortedWithOptions(a, storage, &source, .{ .target_bytes = tree.bulk_target_page_bytes });
 }
 
 test "external lake exact reduction trees refresh a bounded leaf and retain prior roots" {
@@ -187,4 +268,48 @@ test "external lake exact reduction dirty keys unwind allocation failures" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "external lake high cardinality reductions bulk read each contribution page once and cache repairs" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var memory: tree.testing.MemoryStore = .{ .alloc = a };
+    defer memory.deinit();
+    var marker: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    const recipe: local.sql_aggregate_materialization.Recipe = .{ .keys = &.{.{ .path = "k", .type = .string, .nullable = false }}, .inputs = &.{.{ .spec = .{ .kind = .bool_and, .input_type = .boolean }, .column = .{ .path = "n", .type = .boolean, .nullable = true } }} };
+    const layout = try record.Layout.init(a, recipe);
+    defer layout.deinit(a);
+    var rows: tree.SortedBuilder = .{ .alloc = a, .store = memory.store(), .target_bytes = 4096 };
+    defer rows.deinit();
+    var dirty: Dirty = .empty;
+    defer clear(a, &dirty);
+    const count = 257;
+    var state = try local.sql_operators.Aggregate.initTyped(out, .bool_and, .boolean, null);
+    defer state.deinit();
+    try state.update(local.sql_scalar.Datum.json(.{ .bool = true }));
+    for (0..count) |i| {
+        const group: [6]u8 = .{ 0, 0, 0, 2, @intCast(i >> 8), @truncate(i) };
+        const encoded = try record.encodeWithLayout(out, .{ .keys = &.{local.sql_scalar.Datum.json(.{ .string = group[4..] })}, .aggregates = &.{}, .typed_states = &.{state}, .ordinal = i }, layout);
+        var row_key: [14]u8 = undefined;
+        @memcpy(row_key[0..6], &group);
+        std.mem.writeInt(u64, row_key[6..14], i, .big);
+        try rows.add(&row_key, encoded);
+        try touch(a, &dirty, &group, i);
+    }
+    const root = try rows.finish();
+    const before_reads = memory.reads;
+    const input_pages = memory.pages.count();
+    const reduced = try repair(a, &manager, memory.store(), root, null, &dirty, count, &layout, null);
+    try std.testing.expectEqual(@as(usize, input_pages), memory.reads - before_reads);
+    try std.testing.expectEqual(@as(u64, 514), reduced.?.records);
+    const before_repair = memory.reads;
+    _ = try repair(a, &manager, memory.store(), root, reduced, &dirty, count, &layout, null);
+    try std.testing.expect(memory.reads - before_repair <= 32);
+    std.debug.print("bounded reductions: groups={} fresh_reads={} repair_reads={}\n", .{ count, input_pages, memory.reads - before_repair });
 }

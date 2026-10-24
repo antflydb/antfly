@@ -846,6 +846,8 @@ pub const HashJoin = struct {
         transient: bool = false,
         owner: ?*HashJoin = null,
         native: ?NativeMatch = null,
+        /// Primed disk candidates retain coordinates, never decode-arena data.
+        key_record: ?struct { join: *HashJoin, offset: u64 } = null,
         pub const NativeMatch = struct {
             join: *HashJoin,
             offset: u64,
@@ -861,6 +863,12 @@ pub const HashJoin = struct {
         /// Reconstruct row-boundary values from stable typed columns. Disk
         /// candidates are copied before the next probe reuses decode storage.
         pub fn materializeKeys(self: Match, alloc: Allocator) ![]const Datum {
+            if (self.key_record) |source| {
+                const row = try source.join.readDiskKey(&source.join.disk.?, source.offset);
+                const result = try alloc.alloc(Datum, row.row.keys.len);
+                for (row.row.keys, result) |key, *value| value.* = try cloneDatum(alloc, key);
+                return result;
+            }
             return if (self.owner) |owner| owner.key_columns.row(alloc, self.index) else self.keys;
         }
         /// Keep build payloads encoded when transferring into another operator.
@@ -1461,7 +1469,10 @@ pub const HashJoin = struct {
                 if (self.disk == null) probe_.cursor = self.heads.get(value);
             }
         }
-        if (self.disk != null) try self.disk_heads.seedProbes(hashes, probes);
+        if (self.disk != null) {
+            try self.disk_heads.seedProbes(hashes, probes);
+            if (self.disk_values != null) try self.primeDiskProbes(probes);
+        }
         if (self.disk == null) {
             // Interleave chain traversal across lanes. Keep the first exact
             // match in the probe and leave remaining duplicates lazy.
@@ -1480,6 +1491,56 @@ pub const HashJoin = struct {
             }
         }
         return probes;
+    }
+    /// Reusable/recursive builds keep their full-hash directory. Stage native
+    /// candidate metadata in file-offset order within a bounded partition wave;
+    /// output lanes retain input order and duplicate chains remain lazy.
+    fn primeDiskProbes(self: *HashJoin, probes: []Probe) !void {
+        var begin: usize = 0;
+        while (begin < probes.len) {
+            const cohort = probes[begin..@min(probes.len, begin + 512)];
+            var active: [512]bool = @splat(true);
+            while (true) {
+                var lanes: [512]usize = undefined;
+                var count: usize = 0;
+                for (cohort, 0..) |probe_, i| if (active[i] and probe_.cursor != null and probe_.first == null) {
+                    lanes[count] = i;
+                    count += 1;
+                };
+                if (count == 0) break;
+                std.mem.sort(usize, lanes[0..count], cohort, struct {
+                    fn less(values: []Probe, l: usize, r: usize) bool {
+                        return values[l].cursor.? < values[r].cursor.?;
+                    }
+                }.less);
+                for (lanes[0..count]) |lane| {
+                    const probe_ = &cohort[lane];
+                    const index = probe_.cursor.?;
+                    const decoded = try self.readDiskKey(&self.disk.?, index);
+                    // Inline rows retain ordinary bounded scalar decoding.
+                    if (decoded.row.ordinal & native_payload_bit == 0) {
+                        active[lane] = false;
+                        continue;
+                    }
+                    probe_.cursor = if (decoded.next == @import("spill.zig").none) null else @intCast(decoded.next);
+                    self.probes += 1;
+                    if (decoded.row.keys.len != probe_.keys.len) return error.InvalidSqlSpill;
+                    var equal = true;
+                    for (decoded.row.keys, probe_.keys) |l, r| if (l.sql_null or r.sql_null or (try scalar.compareDatums(l, r)) != .eq) {
+                        equal = false;
+                        break;
+                    };
+                    if (equal) {
+                        var match = try self.diskMatch(index, decoded);
+                        match.keys = &.{};
+                        match.transient = false;
+                        match.key_record = .{ .join = self, .offset = index };
+                        probe_.first = match;
+                    }
+                }
+            }
+            begin += cohort.len;
+        }
     }
     /// Mark only after the complete ON residual accepts this candidate.
     pub fn markMatched(self: *HashJoin, index: usize) !void {
@@ -5525,4 +5586,42 @@ test "SQL spilled joins reject full hash misses before decoding keys and preserv
     var unmatched: usize = 0;
     while (try join.unmatched(&next)) |_| unmatched += 1;
     try std.testing.expectEqual(@as(usize, 1024 - 128), unmatched);
+}
+
+test "SQL native disk probe waves preserve key and duplicate ownership without hydrating payloads" {
+    const a = std.testing.allocator;
+    var marker: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    const join = try HashJoin.create(a, .{ .bytes = 1024 * 1024, .spill = &manager });
+    defer join.deinit();
+    try join.startSpill();
+    const payload: [2048]u8 = @splat('p');
+    const count = 513;
+    for (0..count) |i| try join.add(&.{ Datum.json(.{ .integer = @intCast(i) }), Datum.json(.{ .string = &payload }) }, &.{Datum.json(.{ .integer = @intCast(i) })});
+    try join.add(&.{ Datum.json(.{ .integer = 9999 }), Datum.json(.{ .string = &payload }) }, &.{Datum.json(.{ .integer = 7 })});
+    var cells: [count]Datum = undefined;
+    var keys: [count][]const Datum = undefined;
+    for (&cells, &keys, 0..) |*cell, *key_, i| {
+        cell.* = Datum.json(.{ .integer = @intCast(count - 1 - i) });
+        key_.* = @as([*]Datum, @ptrCast(cell))[0..1];
+    }
+    const probes = try join.probeBatch(a, &keys);
+    defer a.free(probes);
+    try std.testing.expectEqual(@as(usize, 0), join.payload_reads);
+    for (probes, 0..) |*probe_, i| {
+        try std.testing.expect(probe_.first != null and probe_.first.?.key_record != null);
+        const match = (try probe_.next()).?;
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const key_ = try match.materializeKeys(scratch.allocator());
+        try std.testing.expectEqual(@as(i64, @intCast(count - 1 - i)), key_[0].value.integer);
+        const values = try match.materializeValues(scratch.allocator());
+        try std.testing.expectEqual(@as(i64, if (count - 1 - i == 7) 9999 else @intCast(count - 1 - i)), values[0].value.integer);
+        try std.testing.expectEqualSlices(u8, &payload, values[1].value.string);
+        if (count - 1 - i == 7) try std.testing.expect((try probe_.next()) != null);
+        try std.testing.expect((try probe_.next()) == null);
+    }
 }

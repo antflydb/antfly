@@ -166,12 +166,14 @@ pub const Captured = struct {
     sealed: bool = false,
     disabled: bool = false,
     forward_sort: ?local.sql_spill.Sort = null,
+    forward_manager: ?local.sql_spill.Manager = null,
     forward_disabled: bool = false,
+    reused_forward_entries: u64 = 0,
     forward_budget: local.sql_memory_budget = undefined,
     pub fn create(a: A, manager: *local.sql_spill.Manager) !*Captured {
         const self = try a.create(Captured);
         self.* = .{ .a = a, .manager = manager };
-        self.forward_budget = .{ .backing = a, .limit = 4 * 1024 * 1024 };
+        self.forward_budget = .{ .backing = manager.allocator(), .limit = 4 * 1024 * 1024 };
         return self;
     }
     pub fn deinit(self: *Captured) void {
@@ -179,7 +181,7 @@ pub const Captured = struct {
         self.previous.deinit(self.a);
         for (self.fields.items) |field| self.a.free(field.name);
         self.fields.deinit(self.a);
-        if (self.forward_sort) |*sort| sort.deinit();
+        self.discardForward();
         self.a.destroy(self);
     }
     fn io(self: *Captured) !stores.IoGuard {
@@ -187,7 +189,7 @@ pub const Captured = struct {
         return .{ .phase = self.phase };
     }
     pub fn observer(self: *Captured) inverted.TermObserver {
-        return .{ .ptr = self, .begin = begin, .finish = finish, .posting = posting };
+        return .{ .ptr = self, .begin = begin, .finish = finish, .posting = if (self.forward_disabled) null else posting };
     }
     fn posting(raw: *anyopaque, doc: u32, frequency: u32) !void {
         const self: *Captured = @ptrCast(@alignCast(raw));
@@ -195,33 +197,109 @@ pub const Captured = struct {
         self.recordPosting(doc, frequency) catch |err| switch (err) {
             error.OutOfMemory, error.SqlProgramLimitExceeded => {
                 if (err == error.OutOfMemory and !self.forward_budget.isExhausted()) return err;
-                if (self.forward_sort) |*sort| sort.deinit();
-                self.forward_sort = null;
+                self.discardForward();
                 self.forward_disabled = true;
             },
             else => return err,
         };
     }
+    fn discardForward(self: *Captured) void {
+        if (self.forward_sort) |*sort| sort.deinit();
+        self.forward_sort = null;
+        if (self.forward_manager) |*manager| manager.deinit();
+        self.forward_manager = null;
+    }
     fn recordPosting(self: *Captured, doc: u32, frequency: u32) !void {
-        if (self.forward_sort == null) {
-            var sort = local.sql_spill.Sort.init(self.forward_budget.allocator(), self.manager, &.{.{}}, 512 * 1024);
-            sort.shared_runs = true;
-            sort.encoded_bytes = true;
-            sort.parallel_runs = false;
-            self.forward_sort = sort;
-        }
         const term = self.term orelse return error.InvalidNativeLakeTextStatistics;
         const field = self.fields.items[self.fields.items.len - 1].name;
-        const suffix = try keyAlloc(self.a, field, term);
-        defer self.a.free(suffix);
+        const a = self.forward_budget.allocator();
+        const suffix = try keyAlloc(a, field, term);
+        defer a.free(suffix);
         if (suffix.len + 4 > tree.max_key_bytes) return error.SqlProgramLimitExceeded;
-        const key = try self.a.alloc(u8, suffix.len + 4);
-        defer self.a.free(key);
+        const key = try a.alloc(u8, suffix.len + 4);
+        defer a.free(key);
         std.mem.writeInt(u32, key[0..4], doc, .big);
         @memcpy(key[4..], suffix);
         var value: [4]u8 = undefined;
         std.mem.writeInt(u32, &value, frequency, .big);
-        try self.forward_sort.?.add(.{ .keys = &.{local.sql_scalar.Datum.json(.{ .string = key })}, .values = &.{local.sql_scalar.Datum.json(.{ .string = &value })}, .ordinal = self.forward_sort.?.total });
+        try self.addForward(key, &value);
+    }
+    pub fn disableForward(self: *Captured) void {
+        self.discardForward();
+        self.forward_disabled = true;
+    }
+    fn ensureForward(self: *Captured) void {
+        if (self.forward_sort != null) return;
+        self.forward_manager = self.manager.scoped(self.forward_budget.allocator());
+        var sort = local.sql_spill.Sort.init(self.forward_budget.allocator(), &self.forward_manager.?, &.{.{}}, 512 * 1024);
+        sort.shared_runs = true;
+        sort.encoded_bytes = true;
+        sort.parallel_runs = false;
+        self.forward_sort = sort;
+    }
+    fn addForward(self: *Captured, key: []const u8, value: []const u8) !void {
+        self.ensureForward();
+        try self.forward_sort.?.add(.{ .keys = &.{local.sql_scalar.Datum.json(.{ .string = key })}, .values = &.{local.sql_scalar.Datum.json(.{ .string = value })}, .ordinal = self.forward_sort.?.total });
+    }
+    pub const ForwardInput = union(enum) { captured: *Captured, tree: ?Ref };
+    pub fn hasForward(self: *const Captured) bool {
+        return !self.disabled and !self.forward_disabled;
+    }
+    pub fn reuseForward(self: *Captured, store: *stores.ArtifactStore, input: ForwardInput, index: usize, map: *const local.segment.MergeSourceMap, token: Cancellation) !void {
+        if (!self.hasForward()) return;
+        self.reuseForwardInner(store, input, index, map, token) catch |err| {
+            const source_exhausted = switch (input) {
+                .captured => |source| source.forward_budget.isExhausted(),
+                .tree => false,
+            };
+            if (err != error.SqlProgramLimitExceeded and !(err == error.OutOfMemory and (self.forward_budget.isExhausted() or source_exhausted))) return err;
+            self.disableForward();
+            if (input == .captured) input.captured.disableForward();
+        };
+    }
+    fn remapForward(self: *Captured, key: []const u8, value: []const u8, index: usize, map: *const local.segment.MergeSourceMap) !void {
+        if (key.len < 8 or value.len != 4 or index >= map.rows.len) return error.InvalidNativeLakeTextStatistics;
+        const doc = std.mem.readInt(u32, key[0..4], .big);
+        if (doc >= map.rows[index].count or std.mem.readInt(u32, value[0..4], .big) == 0) return error.InvalidNativeLakeTextStatistics;
+        const current = (try map.lookupRead(index, doc)) orelse return;
+        if (current.segment != 0) return error.InvalidNativeLakeTextStatistics;
+        const a = self.forward_budget.allocator();
+        const rewritten = try a.dupe(u8, key);
+        defer a.free(rewritten);
+        std.mem.writeInt(u32, rewritten[0..4], current.doc, .big);
+        try self.addForward(rewritten, value);
+        self.reused_forward_entries += 1;
+    }
+    fn reuseForwardInner(self: *Captured, store: *stores.ArtifactStore, input: ForwardInput, index: usize, map: *const local.segment.MergeSourceMap, token: Cancellation) !void {
+        const a = self.forward_budget.allocator();
+        if (input == .captured) {
+            const source = input.captured;
+            if (!source.hasForward() or source == self) return error.InvalidNativeLakeTextStatistics;
+            if (source.forward_sort) |*sort| {
+                errdefer source.disableForward();
+                try sort.rewind();
+                var scratch = std.heap.ArenaAllocator.init(source.forward_budget.allocator());
+                defer scratch.deinit();
+                while (true) {
+                    _ = scratch.reset(.free_all);
+                    try token.check();
+                    const row = (try sort.next(scratch.allocator())) orelse break;
+                    if (row.keys.len != 1 or row.values.len != 1 or row.keys[0].value != .string or row.values[0].value != .string) return error.InvalidNativeLakeTextStatistics;
+                    try self.remapForward(row.keys[0].value.string, row.values[0].value.string, index, map);
+                }
+                try sort.rewind();
+            }
+            return;
+        }
+        var reads: u64 = 0;
+        var writes: u64 = 0;
+        var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = store.upload_scope.?.domain, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+        pages.admitPublication();
+        var cursor = try tree.Cursor.init(a, pages.store(), input.tree, "", null);
+        defer cursor.deinit();
+        while (try cursor.next()) |row| {
+            try self.remapForward(row.key, row.value, index, map);
+        }
     }
     pub fn publishForward(self: *Captured, store: *stores.ArtifactStore, token: Cancellation) !?Ref {
         if (self.disabled or self.forward_disabled or self.forward_sort == null) return null;
@@ -243,8 +321,7 @@ pub const Captured = struct {
                 for (self.fields.items) |field| self.a.free(field.name);
                 self.fields.deinit(self.a);
                 self.fields = .empty;
-                if (self.forward_sort) |*sort| sort.deinit();
-                self.forward_sort = null;
+                self.discardForward();
                 self.forward_disabled = true;
                 self.disabled = true;
             },
@@ -1938,4 +2015,38 @@ test "external lake captured prefix frames bound repeated dictionary bytes and r
     try std.testing.expect(captured.length() < 8192 * 64);
     try std.testing.expectEqual(@as(u64, 8192), captured.count);
     try std.testing.expectEqualStrings("z", captured.fields.items[0].name);
+}
+
+test "external lake forward capture admits through its scoped quota and preserves real OOM" {
+    const a = std.testing.allocator;
+    var marker: u8 = 0;
+    var parent: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer parent.deinit();
+    const captured = try Captured.create(a, &parent);
+    defer captured.deinit();
+    captured.forward_budget.limit = 512;
+    const observer = captured.observer();
+    try observer.begin(observer.ptr, "body", "term");
+    try observer.posting.?(observer.ptr, 0, 1);
+    try std.testing.expect(captured.forward_disabled and captured.forward_sort == null);
+    try std.testing.expectEqual(@as(usize, 0), parent.files);
+    var bounded: local.sql_memory_budget = .{ .backing = a, .limit = 1 };
+    var limited = parent.scoped(bounded.allocator());
+    defer limited.deinit();
+    const child = try Captured.create(a, &limited);
+    defer child.deinit();
+    const other = child.observer();
+    try other.begin(other.ptr, "body", "term");
+    try other.posting.?(other.ptr, 0, 1);
+    try std.testing.expect(child.forward_disabled);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var actual = parent.scoped(failing.allocator());
+    defer actual.deinit();
+    const oom = try Captured.create(a, &actual);
+    defer oom.deinit();
+    const checked = oom.observer();
+    try checked.begin(checked.ptr, "body", "term");
+    try std.testing.expectError(error.OutOfMemory, checked.posting.?(checked.ptr, 0, 1));
 }

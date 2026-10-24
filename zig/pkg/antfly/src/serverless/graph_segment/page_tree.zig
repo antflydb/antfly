@@ -127,65 +127,113 @@ pub const Cache = struct {
     clock: u64 = 0,
     bytes: usize = 0,
     max_bytes: usize = 512 * 1024,
-
-    const Slot = struct { ref: Ref, bytes: []u8, used: u64 };
-
+    decoded: bool = false,
+    decodes: u64 = 0,
+    const Slot = struct {
+        ref: Ref,
+        bytes: []u8,
+        used: u64,
+        page: ?Page = null,
+        pins: usize = 0,
+        fn footprint(self: Slot) usize {
+            return self.bytes.len + if (self.page) |page| page.entries.len * @sizeOf(Entry) + page.expanded_keys.len else @as(usize, 0);
+        }
+    };
     pub fn deinit(self: *Cache) void {
-        for (&self.slots) |*slot| if (slot.*) |value| {
-            self.alloc.free(value.bytes);
-            slot.* = null;
-        };
-        self.bytes = 0;
+        for (0..self.slots.len) |i| if (self.slots[i] != null) self.evict(i);
     }
-
     pub fn store(self: *Cache) Store {
-        return .{ .domain = self.underlying.domain, .attempt = self.underlying.attempt, .prefix_keys = self.underlying.prefix_keys, .decoded_page = self.underlying.decoded_page, .read_many = self.underlying.read_many, .ptr = self, .get = get, .put = put, .put_many = if (self.underlying.put_many != null) putMany else null, .pack_many = if (self.underlying.pack_many != null) packMany else null, .check = check, .reduce = self.underlying.reduce };
+        return .{ .domain = self.underlying.domain, .attempt = self.underlying.attempt, .prefix_keys = self.underlying.prefix_keys, .decoded_page = if (self.decoded) .{ .ptr = self, .read = getDecoded } else self.underlying.decoded_page, .read_many = if (self.decoded) .{ .ptr = self, .read = readMany } else self.underlying.read_many, .ptr = self, .get = get, .put = put, .put_many = if (self.underlying.put_many != null) putMany else null, .pack_many = if (self.underlying.pack_many != null) packMany else null, .check = check, .reduce = self.underlying.reduce };
     }
-
     fn check(ptr: *anyopaque) !void {
         const self: *Cache = @ptrCast(@alignCast(ptr));
         try self.underlying.check(self.underlying.ptr);
     }
-
-    fn get(ptr: *anyopaque, alloc: Allocator, ref: Ref) ![]u8 {
-        const self: *Cache = @ptrCast(@alignCast(ptr));
-        try check(ptr);
-        self.clock +|= 1;
-        for (&self.slots) |*slot| if (slot.*) |*value| {
-            if (value.ref.eql(ref)) {
-                value.used = self.clock;
-                return alloc.dupe(u8, value.bytes);
-            }
-        };
-        const bytes = try self.underlying.get(self.underlying.ptr, alloc, ref);
-        errdefer alloc.free(bytes);
-        if (bytes.len > self.max_bytes) return bytes;
-        var digest: [32]u8 = undefined;
-        Sha256.hash(bytes, &digest, .{});
-        if (bytes.len != ref.bytes or !std.mem.eql(u8, &digest, &ref.digest)) return error.ArtifactIntegrityMismatch;
-        const owned = try self.alloc.dupe(u8, bytes);
-        errdefer self.alloc.free(owned);
+    fn evict(self: *Cache, index: usize) void {
+        const value = self.slots[index].?;
+        std.debug.assert(value.pins == 0);
+        self.bytes -= value.footprint();
+        if (value.page) |page_| {
+            var page = page_;
+            page.deinit(self.alloc);
+        } else self.alloc.free(value.bytes);
+        self.slots[index] = null;
+    }
+    fn room(self: *Cache, size: usize) ?usize {
+        if (size > self.max_bytes) return null;
         while (true) {
             var free: ?usize = null;
             var oldest: ?usize = null;
             for (self.slots, 0..) |slot, i| {
                 if (slot) |value| {
-                    if (oldest == null or value.used < self.slots[oldest.?].?.used) oldest = i;
+                    if (value.pins == 0 and (oldest == null or value.used < self.slots[oldest.?].?.used)) oldest = i;
                 } else free = i;
             }
-            if (free != null and bytes.len <= self.max_bytes - self.bytes) {
-                self.slots[free.?] = .{ .ref = ref, .bytes = owned, .used = self.clock };
-                self.bytes += bytes.len;
-                return bytes;
-            }
-            const index = oldest orelse return error.InvalidGraphPage;
-            const evicted = self.slots[index].?;
-            self.bytes -= evicted.bytes.len;
-            self.alloc.free(evicted.bytes);
-            self.slots[index] = null;
+            if (free != null and size <= self.max_bytes -| self.bytes) return free;
+            self.evict(oldest orelse return null);
         }
     }
-
+    fn get(ptr: *anyopaque, a: Allocator, ref: Ref) ![]u8 {
+        const self: *Cache = @ptrCast(@alignCast(ptr));
+        try check(ptr);
+        self.clock +|= 1;
+        for (&self.slots) |*slot| if (slot.*) |*value| if (value.ref.eql(ref)) {
+            value.used = self.clock;
+            return a.dupe(u8, value.bytes);
+        };
+        const bytes = try self.underlying.get(self.underlying.ptr, a, ref);
+        errdefer a.free(bytes);
+        var digest: [32]u8 = undefined;
+        Sha256.hash(bytes, &digest, .{});
+        if (bytes.len != ref.bytes or !std.mem.eql(u8, &digest, &ref.digest)) return error.ArtifactIntegrityMismatch;
+        if (self.room(bytes.len)) |index| {
+            self.slots[index] = .{ .ref = ref, .bytes = try self.alloc.dupe(u8, bytes), .used = self.clock };
+            self.bytes += bytes.len;
+        }
+        return bytes;
+    }
+    fn release(_: *anyopaque, item: *anyopaque) void {
+        const slot: *?Slot = @ptrCast(@alignCast(item));
+        std.debug.assert(slot.*.?.pins != 0);
+        slot.*.?.pins -= 1;
+    }
+    fn borrow(self: *Cache, index: usize) Page {
+        self.slots[index].?.pins += 1;
+        self.slots[index].?.used = self.clock;
+        var page = self.slots[index].?.page.?;
+        page.lease = .{ .owner = self, .item = &self.slots[index], .release = release };
+        return page;
+    }
+    fn getDecoded(raw: *anyopaque, a: Allocator, ref: Ref) !Page {
+        const self: *Cache = @ptrCast(@alignCast(raw));
+        try check(raw);
+        try ref.validate();
+        self.clock +|= 1;
+        for (self.slots, 0..) |slot, i| if (slot) |value| if (value.page != null and value.ref.eql(ref)) {
+            if (!std.mem.eql(u8, value.bytes[24..56], &self.underlying.domain)) return error.GraphPageDomainMismatch;
+            return self.borrow(i);
+        };
+        var original = try readPage(a, self.underlying, ref);
+        errdefer original.deinit(a);
+        const size = original.bytes.len + original.entries.len * @sizeOf(Entry) + original.expanded_keys.len;
+        const index = self.room(size) orelse return original;
+        // Independent cache ownership survives caller arenas and underlying
+        // leases. Authentication/decode costs recur only on cache misses.
+        const page = try decodePage(self.alloc, self.underlying.domain, ref, try self.alloc.dupe(u8, original.bytes));
+        original.deinit(a);
+        self.decodes += 1;
+        self.slots[index] = .{ .ref = ref, .bytes = @constCast(page.bytes), .used = self.clock, .page = page };
+        self.bytes += size;
+        return self.borrow(index);
+    }
+    fn readMany(raw: *anyopaque, a: Allocator, refs_: []const Ref, output: []Page) !void {
+        var initialized: usize = 0;
+        errdefer for (output[0..initialized]) |*page| page.deinit(a);
+        for (refs_, output) |ref, *page| {
+            page.* = try getDecoded(raw, a, ref);
+            initialized += 1;
+        }
+    }
     fn put(ptr: *anyopaque, ref: Ref, bytes: []const u8) !void {
         const self: *Cache = @ptrCast(@alignCast(ptr));
         try self.underlying.put(self.underlying.ptr, ref, bytes);
@@ -3575,4 +3623,53 @@ test "serverless graph streamed mutation failures release frontier and partial o
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
+}
+
+test "external lake decoded operation cache pins leases bounds eviction and checks authority" {
+    const a = std.testing.allocator;
+    var memory: testing.MemoryStore = .{ .alloc = a };
+    defer memory.deinit();
+    var one: SortedBuilder = .{ .alloc = a, .store = memory.store() };
+    defer one.deinit();
+    try one.add("a", "one");
+    const first = (try one.finish()).?;
+    var two: SortedBuilder = .{ .alloc = a, .store = memory.store() };
+    defer two.deinit();
+    try two.add("b", "two");
+    const second = (try two.finish()).?;
+    const before = memory.reads;
+    var cache: Cache = .{ .alloc = a, .underlying = memory.store(), .decoded = true };
+    defer cache.deinit();
+    var pinned = try readPage(a, cache.store(), first);
+    defer pinned.deinit(a);
+    for (0..32) |_| {
+        var reused = try readPage(a, cache.store(), first);
+        try std.testing.expectEqualStrings("one", reused.entries[0].value);
+        reused.deinit(a);
+    }
+    try std.testing.expectEqual(@as(usize, 1), memory.reads - before);
+    try std.testing.expectEqual(@as(u64, 1), cache.decodes);
+    cache.max_bytes = cache.bytes;
+    var fallback = try readPage(a, cache.store(), second);
+    defer fallback.deinit(a);
+    try std.testing.expect(fallback.lease == null);
+    try std.testing.expectEqualStrings("one", pinned.entries[0].value);
+    try std.testing.expect(cache.bytes <= cache.max_bytes);
+    memory.canceled = true;
+    try std.testing.expectError(error.Canceled, readPage(a, cache.store(), first));
+    memory.canceled = false;
+    cache.underlying.domain[0] = 1;
+    try std.testing.expectError(error.GraphPageDomainMismatch, readPage(a, cache.store(), first));
+    cache.underlying.domain[0] = 0;
+    const Failure = struct {
+        fn run(failing: Allocator, store_: Store, root: Ref) !void {
+            var owner: Cache = .{ .alloc = failing, .underlying = store_, .decoded = true };
+            defer owner.deinit();
+            var page = try readPage(failing, owner.store(), root);
+            defer page.deinit(failing);
+            var again = try readPage(failing, owner.store(), root);
+            defer again.deinit(failing);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Failure.run, .{ memory.store(), first });
 }

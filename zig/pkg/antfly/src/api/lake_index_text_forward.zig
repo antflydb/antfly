@@ -55,6 +55,9 @@ pub fn retractMeasured(a: A, store: *stores.ArtifactStore, manager: *local.sql_s
     const scope = store.upload_scope.?;
     var pages: Pages = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
     pages.admitPublication();
+    var cache: tree.Cache = .{ .decoded = true, .alloc = local.sql_memory_budget.reclaimingAllocator(a), .underlying = pages.store() };
+    defer cache.deinit();
+    const storage = cache.store();
     var counts: std.StringHashMapUnmanaged(u32) = .empty;
     defer {
         var it = counts.keyIterator();
@@ -69,7 +72,7 @@ pub fn retractMeasured(a: A, store: *stores.ArtifactStore, manager: *local.sql_s
         std.mem.writeInt(u32, &lower, doc, .big);
         var upper: [4]u8 = undefined;
         if (doc != std.math.maxInt(u32)) std.mem.writeInt(u32, &upper, doc + 1, .big);
-        var cursor = try tree.Cursor.init(a, pages.store(), forward, &lower, if (doc == std.math.maxInt(u32)) null else &upper);
+        var cursor = try tree.Cursor.init(a, storage, forward, &lower, if (doc == std.math.maxInt(u32)) null else &upper);
         defer cursor.deinit();
         while (try cursor.next()) |row| {
             if (metrics) |value| value.entries += 1;
@@ -100,20 +103,42 @@ pub fn retractMeasured(a: A, store: *stores.ArtifactStore, manager: *local.sql_s
             length.value_ptr.* = try std.math.add(u64, length.value_ptr.*, frequency);
         }
     }
-    var changes = Mutations.init(a, manager, pages.store());
+    var changes = Mutations.init(a, manager, storage);
     defer changes.deinit();
     changes.private_pages.phase = store.io_phase;
-    var it = counts.iterator();
-    while (it.next()) |change| {
-        if (metrics) |value| value.terms += 1;
-        var cursor = try tree.Cursor.init(a, pages.store(), summary, change.key_ptr.*, null);
-        defer cursor.deinit();
-        const found = (try cursor.next()) orelse return error.InvalidNativeLakeTextStatistics;
-        if (!std.mem.eql(u8, found.key, change.key_ptr.*)) return error.InvalidNativeLakeTextStatistics;
-        var value = try stats.Summary.decode(found.value);
-        value.frequency = try std.math.sub(u32, value.frequency, change.value_ptr.*);
-        var bytes: [stats.Summary.max_bytes]u8 = undefined;
-        try changes.addRecord(change.key_ptr.*, if (value.frequency == 0) null else value.encode(&bytes));
+    const terms = try a.alloc([]const u8, counts.count());
+    defer a.free(terms);
+    var it = counts.keyIterator();
+    var n: usize = 0;
+    while (it.next()) |term| {
+        terms[n] = term.*;
+        n += 1;
+    }
+    std.mem.sort([]const u8, terms, {}, struct {
+        fn less(_: void, l: []const u8, r: []const u8) bool {
+            return std.mem.order(u8, l, r) == .lt;
+        }
+    }.less);
+    var begin: usize = 0;
+    while (begin < terms.len) {
+        var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+        defer scratch.deinit();
+        var end = begin;
+        var bytes: usize = 0;
+        while (end < terms.len and end - begin < 64) : (end += 1) {
+            if (end != begin and bytes + terms[end].len > 512 * 1024) break;
+            bytes += terms[end].len;
+        }
+        const found = try tree.lookupMany(scratch.allocator(), storage, summary, terms[begin..end]);
+        for (found, terms[begin..end]) |entry, term| {
+            if (metrics) |value| value.terms += 1;
+            const row = entry orelse return error.InvalidNativeLakeTextStatistics;
+            var value = try stats.Summary.decode(row.value);
+            value.frequency = try std.math.sub(u32, value.frequency, counts.get(term).?);
+            var encoded: [stats.Summary.max_bytes]u8 = undefined;
+            try changes.addRecord(term, if (value.frequency == 0) null else value.encode(&encoded));
+        }
+        begin = end;
     }
     return changes.finish(summary);
 }
@@ -175,6 +200,28 @@ test "external lake forward text retractions seek changed terms and match comple
     var writes: u64 = 0;
     var pages: Pages = .{ .domain = store.upload_scope.?.domain, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
     try std.testing.expect(try tree.equivalent(a, pages.store(), expected, after, .{}));
+    // The native merge supplies the authenticated row mapping. Reuse must
+    // preserve frequencies through deletion and arbitrary document reordering.
+    const oracle = try @import("lake_index_segment_spill.zig").LocalSegment.empty(a, &manager, &store);
+    defer oracle.release();
+    oracle.captureStatistics(&manager);
+    var mapped = try local.segment.MergeSourceMap.init(a, &.{reader.doc_count});
+    defer mapped.deinit();
+    var sink2 = oracle.sink();
+    try local.segment.writeMergedSegmentToSinkWithOptions(a, &sink2, &.{.{ .reader = &reader, .deleted = deleted }}, .{ .input_order = .arbitrary, .index_sort = &.{.{ .field = "_id", .desc = true }}, .source_map = &mapped });
+    try mapped.finishOutput(count - 1);
+    try oracle.seal();
+    const oracle_forward = try oracle.statistics.?.publishForward(&store, .none);
+    for ([_]stats.Captured.ForwardInput{ .{ .captured = captured }, .{ .tree = forward } }) |input| {
+        const reused = try stats.Captured.create(a, &manager);
+        defer reused.deinit();
+        try reused.reuseForward(&store, input, 0, &mapped, .none);
+        try std.testing.expectEqual(@as(u64, (count - 1) * 2), reused.reused_forward_entries);
+        const rewritten = try reused.publishForward(&store, .none);
+        reads = 8 * 1024 * 1024;
+        try std.testing.expect(try tree.equivalent(a, pages.store(), oracle_forward, rewritten, .{}));
+        try std.testing.expect(reused.forward_budget.peak <= reused.forward_budget.limit);
+    }
     const FailureCase = struct {
         fn run(failing: A, backend: *stores.ArtifactStore, evidence: ?tree.Ref, original: ?tree.Ref, retired: *const local.encoding_roaring.RoaringBitmap) !void {
             var failure_token: u8 = 0;

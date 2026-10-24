@@ -174,21 +174,24 @@ fn buildInner(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, b
     var writes: u64 = 0;
     var pages: Pages = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
     pages.admitPublication();
+    var cache: tree.Cache = .{ .decoded = true, .alloc = local.sql_memory_budget.reclaimingAllocator(a), .underlying = pages.store() };
+    defer cache.deinit();
+    const storage = cache.store();
     var manager: local.sql_spill.Manager = .{ .alloc = a, .io = provider.context.io.?, .context = provider, .checkpoint = struct {
         fn check(raw: *anyopaque) !void {
             try @as(*Provider, @ptrCast(@alignCast(raw))).context.ensureActive();
         }
     }.check, .async_writes = false };
     defer manager.deinit();
-    var changes = Mutations.init(a, &manager, pages.store());
+    var changes = Mutations.init(a, &manager, storage);
     defer changes.deinit();
     changes.addition_first = true;
     changes.forest.policy = .addition_first;
     changes.private_pages.phase = store.io_phase;
-    var reverse = Mutations.init(a, &manager, pages.store());
+    var reverse = Mutations.init(a, &manager, storage);
     defer reverse.deinit();
     reverse.private_pages.phase = store.io_phase;
-    var extrema = Mutations.init(a, &manager, pages.store());
+    var extrema = Mutations.init(a, &manager, storage);
     defer extrema.deinit();
     extrema.addition_first = true;
     extrema.forest.policy = .addition_first;
@@ -209,7 +212,7 @@ fn buildInner(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, b
     if (old) |before| for (selected.?) |ordinal| {
         var key: [8]u8 = undefined;
         std.mem.writeInt(u64, &key, ordinal, .big);
-        var cursor = try tree.Cursor.init(a, pages.store(), before.rows.reverse, &key, null);
+        var cursor = try tree.Cursor.init(a, storage, before.rows.reverse, &key, null);
         defer cursor.deinit();
         const entry = (try cursor.next()) orelse return error.InvalidNativeAggregateArtifact;
         if (!std.mem.eql(u8, entry.key, &key) or entry.value.len < 4 or std.mem.readInt(u32, entry.value[0..4], .big) != entry.value.len - 4) return error.InvalidNativeAggregateArtifact;
@@ -220,9 +223,9 @@ fn buildInner(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, b
             slot.value_ptr.* = .{};
         }
         const row_key = try rowKey(ca, group, ordinal);
-        if (needsReductions(recipe)) try reductions.touch(ca, &dirty, group, ordinal);
+        if (old != null and needsReductions(recipe)) try reductions.touch(ca, &dirty, group, ordinal);
         {
-            var rows = try tree.Cursor.init(a, pages.store(), before.rows.rows, row_key, null);
+            var rows = try tree.Cursor.init(a, storage, before.rows.rows, row_key, null);
             defer rows.deinit();
             const value = (try rows.next()) orelse return error.InvalidNativeAggregateArtifact;
             if (!std.mem.eql(u8, value.key, row_key)) return error.InvalidNativeAggregateArtifact;
@@ -274,7 +277,7 @@ fn buildInner(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, b
             const encoded = try record.encodeWithLayout(sa, .{ .keys = group_keys, .aggregates = &.{}, .typed_states = states, .ordinal = ordinal }, layout);
             try changes.addRecord(try rowKey(sa, group, ordinal), encoded);
             try indexExtrema(sa, &extrema, group, ordinal, try record.View.init(encoded, &layout), recipe, false);
-            if (needsReductions(recipe)) try reductions.touch(ca, &dirty, group, ordinal);
+            if (old != null and needsReductions(recipe)) try reductions.touch(ca, &dirty, group, ordinal);
             var reverse_key: [8]u8 = undefined;
             std.mem.writeInt(u64, &reverse_key, ordinal, .big);
             try reverse.addRecord(&reverse_key, group);
@@ -291,10 +294,10 @@ fn buildInner(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, b
     var row_state: artifact.RowState = .{ .rows = try changes.finish(if (old) |seed_| seed_.rows.rows else null), .reverse = try reverse.finish(if (old) |seed_| seed_.rows.reverse else null), .extrema_version = 1, .extrema = try extrema.finish(if (old) |seed_| seed_.rows.extrema else null) };
     if ((if (row_state.rows) |root| root.records else 0) != provider.source.inventory.files[file].row_count or (if (row_state.reverse) |root| root.records else 0) != provider.source.inventory.files[file].row_count) return error.InvalidNativeAggregateArtifact;
     if (needsReductions(recipe)) {
-        row_state.reductions = try reductions.repair(a, &manager, pages.store(), row_state.rows, if (old) |before| before.rows.reductions else null, &dirty, provider.source.inventory.files[file].row_count, &layout, store.io_phase);
+        row_state.reductions = try reductions.repair(a, &manager, storage, row_state.rows, if (old) |before| before.rows.reductions else null, &dirty, provider.source.inventory.files[file].row_count, &layout, store.io_phase);
         row_state.reductions_version = 1;
     }
-    var result_changes = Mutations.init(a, &manager, pages.store());
+    var result_changes = Mutations.init(a, &manager, storage);
     defer result_changes.deinit();
     result_changes.private_pages.phase = store.io_phase;
     var iterator = groups.iterator();
@@ -309,15 +312,15 @@ fn buildInner(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, b
         const upper = try keys.successor(a, group.*);
         defer if (upper) |key| a.free(key);
         {
-            if (try tree.countRange(a, pages.store(), row_state.rows, group.*, upper) == 0) {
+            if (try tree.countRange(a, storage, row_state.rows, group.*, upper) == 0) {
                 try result_changes.addRecord(group.*[4..], null);
                 continue;
             }
-            var cursor = try tree.Cursor.init(a, pages.store(), old.?.index.page, group.*[4..], null);
+            var cursor = try tree.Cursor.init(a, storage, old.?.index.page, group.*[4..], null);
             defer cursor.deinit();
             const found = try cursor.next();
             const previous = if (found) |value| (if (std.mem.eql(u8, value.key, group.*[4..])) value.value else null) else null;
-            const updated = try adjust(a, previous, item.value_ptr.*, &layout, recipe, row_state, pages.store(), group.*, provider.source.inventory.files[file].row_count);
+            const updated = try adjust(a, previous, item.value_ptr.*, &layout, recipe, row_state, storage, group.*, provider.source.inventory.files[file].row_count);
             defer a.free(updated);
             try result_changes.addRecord(group.*[4..], updated);
             continue;

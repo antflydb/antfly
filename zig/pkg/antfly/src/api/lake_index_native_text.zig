@@ -2352,9 +2352,27 @@ const Compactor = struct {
         const staged = try @import("lake_index_segment_spill.zig").LocalSegment.empty(self.a, self.output_manager.?, self.store);
         errdefer staged.release();
         staged.captureStatistics(self.capture_manager.?);
+        const reusable = staged.statistics != null and patch.base.forward_version == 1 and patch.base.forwards.len == patch.base.segments.len and for (self.patch_inputs.items) |owned| {
+            if (owned.captured == null or !owned.captured.?.hasForward()) break false;
+        } else true;
+        const counts = try a.alloc(u32, inputs.len);
+        defer a.free(counts);
+        var live: u32 = 0;
+        for (inputs, counts) |input, *count_| {
+            count_.* = input.reader.doc_count;
+            live = try std.math.add(u32, live, @intCast(@as(u64, count_.*) - (if (input.deleted) |deleted| deleted.cardinality() else 0)));
+        }
+        var mapping = if (reusable) try local.segment.MergeSourceMap.init(a, counts) else null;
+        defer if (mapping) |*value| value.deinit();
         var sink = staged.sink();
-        try local.segment.writeMergedSegmentToSinkWithOptions(a, &sink, inputs, .{ .input_order = .arbitrary, .index_sort = &.{.{ .field = "_id", .desc = false }} });
+        if (reusable) sink.term_observer.?.posting = null;
+        try local.segment.writeMergedSegmentToSinkWithOptions(a, &sink, inputs, .{ .input_order = .arbitrary, .index_sort = &.{.{ .field = "_id", .desc = false }}, .source_map = if (mapping) |*value| value else null });
         try staged.seal();
+        if (reusable and live != 0) {
+            try mapping.?.finishOutput(live);
+            for (patch.base.forwards, 0..) |forward, i| try staged.statistics.?.reuseForward(self.store, .{ .tree = forward }, i, &mapping.?, self.cancellation);
+            for (self.patch_inputs.items, patch.base.segments.len..) |owned, i| try staged.statistics.?.reuseForward(self.store, .{ .captured = owned.captured.? }, i, &mapping.?, self.cancellation);
+        }
         return staged;
     }
     fn clearRuns(self: *Compactor) void {
@@ -2420,7 +2438,7 @@ const Compactor = struct {
         var opened: usize = 0;
         defer for (readers[0..opened]) |*reader| reader.deinit();
         var inputs: [fan_in]local.segment.MergeInput = undefined;
-        for (self.pending[0..self.count], &readers, &inputs) |bytes, *reader, *input| {
+        for (self.pending[0..self.count], readers[0..self.count], inputs[0..self.count]) |bytes, *reader, *input| {
             reader.* = try local.segment.SegmentReader.initSource(a, bytes.?.source());
             opened += 1;
             input.* = .{ .reader = reader };
@@ -2428,9 +2446,23 @@ const Compactor = struct {
         const staged = try @import("lake_index_segment_spill.zig").LocalSegment.empty(self.a, manager, self.store);
         errdefer staged.release();
         staged.captureStatistics(self.capture_manager orelse manager);
+        const reusable = staged.statistics != null and for (self.pending[0..self.count]) |owned| {
+            if (owned.?.captured == null or !owned.?.captured.?.hasForward()) break false;
+        } else true;
         var sink = staged.sink();
-        try local.segment.writeMergedSegmentToSink(a, &sink, &inputs);
+        var counts: [fan_in]u32 = undefined;
+        for (readers[0..self.count], counts[0..self.count]) |reader, *count| count.* = reader.doc_count;
+        var mapping = if (reusable) try local.segment.MergeSourceMap.init(a, counts[0..self.count]) else null;
+        defer if (mapping) |*value| value.deinit();
+        if (reusable) sink.term_observer.?.posting = null;
+        try local.segment.writeMergedSegmentToSinkWithOptions(a, &sink, inputs[0..self.count], .{ .source_map = if (mapping) |*value| value else null });
         try staged.seal();
+        if (reusable) {
+            var count: u32 = 0;
+            for (counts[0..self.count]) |value| count = try std.math.add(u32, count, value);
+            try mapping.?.finishOutput(count);
+            for (self.pending[0..self.count], 0..) |owned, i| try staged.statistics.?.reuseForward(self.store, .{ .captured = owned.?.captured.? }, i, &mapping.?, self.cancellation);
+        }
         return staged;
     }
     fn publishSource(self: *Compactor, source: local.index.SegmentSource, captured: ?*statistics.Captured) !void {
@@ -3601,4 +3633,38 @@ fn rowDeltaMergeScenario(mixed: bool, overlay_mode: bool, remove: bool, indexed:
     compactor.workspace_bytes = 1;
     try std.testing.expect((try compactor.mergeRows()) == .declined);
     try std.testing.expectEqual(@as(usize, 0), segments.items.len);
+}
+
+test "external lake append compaction carries forward evidence instead of observing postings again" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("append-forward-evidence");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(7), 1, std.testing.io);
+    var marker: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
+    var summaries: std.ArrayList(?statistics.Ref) = .empty;
+    var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
+    var compactor: Compactor = .{ .a = a, .out = out, .store = &store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = .none, .file_ordinal = 0, .output_manager = &manager, .capture_manager = &manager, .io = std.testing.io };
+    defer compactor.deinit();
+    const first = local.introducer.TextDocument{ .id = "one", .stored_data = "{}", .text_fields = &.{.{ .field_name = "body", .text = "alpha common common" }} };
+    const second = local.introducer.TextDocument{ .id = "two", .stored_data = "{}", .text_fields = &.{.{ .field_name = "title", .text = "beta common" }} };
+    compactor.pending[0] = try EncoderPipeline.encode(a, a, &manager, &manager, &store, .{ .docs = &.{first} }, .{}, .{}, 512 * 1024);
+    compactor.count = 1;
+    compactor.pending[1] = try EncoderPipeline.encode(a, a, &manager, &manager, &store, .{ .docs = &.{second} }, .{}, .{}, 512 * 1024);
+    compactor.count = 2;
+    const merged = try compactor.merge(a, &manager);
+    defer merged.release();
+    try std.testing.expect(merged.statistics.?.hasForward());
+    try std.testing.expectEqual(@as(u64, 4), merged.statistics.?.reused_forward_entries);
+    try std.testing.expect((try merged.statistics.?.publishForward(&store, .none)) != null);
 }
