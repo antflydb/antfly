@@ -2147,7 +2147,15 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (json.len > @import("online_merge_io.zig").contract.max_request_bytes) return error.InvalidMergePage;
         const native_context = try platformDeadlineContext(context);
         var cancellation = context.cancellation;
-        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = native_context.deadline_ns, .cancellation = cancellation });
+        // Lifecycle I/O addresses the durable physical owner, which outlives
+        // its serving route after cutover. Borrow the already admitted owner
+        // without re-resolving that removed route. The read-index above and
+        // the native owner's exact namespace/published-ledger scope checks
+        // still authorize every operation; ordinary query opens retain their
+        // catalog descriptor checks. Cold owners are prepared independently
+        // by placement recovery, never by an unbounded admin read here.
+        var lease = self.acquirePreparedOwner(group_id, table_name) catch
+            try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = native_context.deadline_ns, .cancellation = cancellation });
         defer lease.deinit();
         try context.ensureActive();
         var response = try lease.owner().onlineMergeIoJson(.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json), .execution_deadline_ns = native_context.deadline_ns orelse 0, .has_execution_deadline = @intFromBool(native_context.deadline_ns != null), .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
@@ -2181,6 +2189,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         // Never retire by group after
         // releasing the lease: that can close another operation's owner.
         lease.requestTransientRetirement();
+    }
+
+    /// Prepare a cold lifecycle owner on the control lane and retain it for
+    /// the next bounded merge turn. Unlike speculative startup warmup, that
+    /// turn needs the owner to survive after this lease drains. Descriptor
+    /// validation still uses the current catalog/lifecycle contract; ordinary
+    /// replica retirement and source teardown retain ownership of closing it.
+    pub fn prepareOnlineMergeOwner(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8) !void {
+        var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
+        defer descriptor.deinit(self.alloc);
+        var lease = try self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .resident, .{});
+        defer lease.deinit();
     }
 
     /// Apply the latest catalog schema/index contract to the already-resident
