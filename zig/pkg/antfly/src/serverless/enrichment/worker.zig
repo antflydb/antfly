@@ -554,7 +554,7 @@ pub const SparseEnricher = struct {
         if (cfg.stage == .chunk_embeddings and self.model_chunker != null) {
             var key_digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(key, &key_digest, .{});
-            self.checkpoint_context = .{ .pages = pages, .previous = fact.body, .key_digest = key_digest };
+            self.checkpoint_context = .{ .allocator = self.alloc, .pages = pages, .previous = fact.body, .key_digest = key_digest };
             // Traversing acknowledged groups is charged separately from this
             // bounded source-body read, under the same document hard limit.
             pages.remaining_read_bytes.* = cfg.document_limits.max_input_bytes;
@@ -3600,7 +3600,7 @@ test "model aware media serverless geometric checkpoints reduce body bytes with 
         var body = try a.dupe(u8, "{\"clip\":\"audio source\"}");
         defer a.free(body);
         while (true) {
-            if (mode == 3) worker.checkpoint_context = .{ .pages = &pages, .previous = try document_facts.putBody(a, &pages, body), .key_digest = @splat(5) };
+            if (mode == 3) worker.checkpoint_context = .{ .allocator = a, .pages = &pages, .previous = try document_facts.putBody(a, &pages, body), .key_digest = @splat(5) };
             const before = fake.calls[0];
             const next = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, body, 1, .require_model);
             try std.testing.expect(fake.calls[0] - before <= limit);
@@ -3722,7 +3722,7 @@ test "model aware media linked checkpoints authenticate the document and repair 
     var writes: u64 = 100 * 1024 * 1024;
     var pages = PageStore{ .domain = PageStore.namespaceDomain("docs"), .attempt = @splat(1), .artifacts = &artifacts, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
     worker.media_page_limit = 1;
-    worker.checkpoint_context = .{ .pages = &pages, .previous = try document_facts.putBody(a, &pages, "{\"clip\":\"audio source\"}"), .key_digest = @splat(5) };
+    worker.checkpoint_context = .{ .allocator = a, .pages = &pages, .previous = try document_facts.putBody(a, &pages, "{\"clip\":\"audio source\"}"), .key_digest = @splat(5) };
     const first = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, "{\"clip\":\"audio source\"}", 1, .require_model);
     defer a.free(first.body.?);
     worker.checkpoint_context.?.previous = try document_facts.putBody(a, &pages, first.body.?);

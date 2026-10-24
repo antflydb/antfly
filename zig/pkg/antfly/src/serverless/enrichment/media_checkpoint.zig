@@ -22,7 +22,7 @@ const facts = @import("../build/document_facts.zig");
 const PageStore = @import("../graph_segment/page_store.zig").PageStore;
 const outputs = @import("inference_chunker").outputs;
 
-pub const Context = struct { pages: *PageStore, previous: facts.BodyRef, key_digest: [32]u8 };
+pub const Context = struct { allocator: std.mem.Allocator, pages: *PageStore, previous: facts.BodyRef, key_digest: [32]u8 };
 pub const Group = struct {
     format: u8 = 1,
     key_digest: [32]u8,
@@ -76,12 +76,18 @@ pub fn expand(a: std.mem.Allocator, context: Context, document: *std.json.Value)
         try context.pages.cancellation.check();
         try groups.append(a, current);
         const parent = current.parent orelse break;
-        const bytes = try facts.readBodyAlloc(a, context.pages, parent);
-        defer a.free(bytes);
-        const previous = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .allocate = .alloc_always });
-        const next = (try get(a, previous)) orelse return error.InvalidMediaCheckpoint;
+        // Parse each body with the admitted backing allocator, not the
+        // result arena. Original source fields can dwarf this page's outputs
+        // and must retire before reading the next ancestor.
+        const bytes = try facts.readBodyAlloc(context.allocator, context.pages, parent);
+        defer context.allocator.free(bytes);
+        var previous = try std.json.parseFromSlice(std.json.Value, context.allocator, bytes, .{});
+        defer previous.deinit();
+        const next = (try get(previous.arena.allocator(), previous.value)) orelse return error.InvalidMediaCheckpoint;
         if (next.end != current.start or next.start >= current.start or !std.mem.eql(u8, &next.key_digest, &last.key_digest) or !std.mem.eql(u8, next.recipe, last.recipe) or !std.mem.eql(u8, next.plan_id, last.plan_id) or !std.mem.eql(u8, &next.generation, &last.generation)) return error.InvalidMediaCheckpoint;
-        current = next;
+        const encoded = try std.json.Stringify.valueAlloc(context.allocator, next, .{ .emit_null_optional_fields = false });
+        defer context.allocator.free(encoded);
+        current = try std.json.parseFromSliceLeaky(Group, a, encoded, .{ .allocate = .alloc_always });
     }
     var vectors = std.ArrayList(std.json.Value).empty;
     var previews = std.ArrayList(std.json.Value).empty;
@@ -112,4 +118,44 @@ pub fn compact(a: std.mem.Allocator, context: Context, document: *std.json.Value
     try state.object.put(a, "chunk_embeddings_checkpoint", try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{ .allocate = .alloc_always }));
     try document.object.put(a, "_enrichment", state);
     for ([_][]const u8{ "chunk_embeddings", "chunk_preview", "media_outputs", "transcript", "transcript_spans" }) |name| _ = document.object.swapRemove(name);
+}
+
+test "model aware media serverless checkpoint expansion bounds transient source copies independently of chain length" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/checkpoint-memory", .{tmp.sub_path});
+    var fs = try @import("../artifacts/fs_store.zig").FsStore.init(a, path);
+    defer fs.deinit();
+    var objects = fs.artifactStore();
+    var reads: u64 = 32 * 1024 * 1024;
+    var writes: u64 = 32 * 1024 * 1024;
+    var pages = PageStore{ .domain = PageStore.namespaceDomain("docs"), .attempt = @splat(1), .artifacts = &objects, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const padding = try a.alloc(u8, 128 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'x');
+    const plan: [64]u8 = @splat('1');
+    const recipe: [64]u8 = @splat('2');
+    var body = try a.dupe(u8, "{}");
+    defer a.free(body);
+    var parent: ?facts.BodyRef = null;
+    for (0..64) |i| {
+        const group = Group{ .key_digest = @splat(4), .recipe = &recipe, .generation = @splat(3), .plan_id = &plan, .start = @intCast(i), .end = @intCast(i + 1), .parent = parent, .vectors = &.{}, .previews = &.{}, .rows = &.{} };
+        const next = try std.json.Stringify.valueAlloc(a, .{ .padding = padding, ._enrichment = .{ .chunk_embeddings_checkpoint = group } }, .{ .emit_null_optional_fields = false });
+        a.free(body);
+        body = next;
+        if (i < 63) parent = try facts.putBody(a, &pages, body);
+    }
+    var bounded = try @import("../build/lake_build_limits.zig").WorkingSetAllocator.init(a, .{ .max_working_set_bytes = 2 * 1024 * 1024 });
+    {
+        var arena = std.heap.ArenaAllocator.init(bounded.allocator());
+        defer arena.deinit();
+        var document = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{ .allocate = .alloc_always });
+        try expand(arena.allocator(), .{ .allocator = bounded.allocator(), .pages = &pages, .previous = parent.?, .key_digest = @splat(4) }, &document);
+        try std.testing.expectEqual(@as(usize, 0), document.object.get("chunk_embeddings").?.array.items.len);
+        try std.testing.expect(!document.object.get("_enrichment").?.object.contains("chunk_embeddings_checkpoint"));
+    }
+    try std.testing.expect(!bounded.limit_exceeded);
+    try std.testing.expectEqual(@as(usize, 0), bounded.live_bytes);
 }

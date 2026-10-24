@@ -12116,7 +12116,7 @@ pub const Node = struct {
         }
 
         if (body.embedding != null or body.outputs != null) return self.chunkModelAwareHttp(ctx, body, input.value, config);
-        if (body.policy != null or body.continuation != null or (body.stream orelse false)) return ctx.status(400).json(.{ .@"error" = "EMBEDDING_TARGET_REQUIRED", .message = "model-aware chunk options require an embedding target" });
+        if (body.policy != null or body.continuation != null or (body.stream orelse false) or (body.observe_only orelse false)) return ctx.status(400).json(.{ .@"error" = "EMBEDDING_TARGET_REQUIRED", .message = "model-aware chunk options require an embedding target" });
 
         const chunk_admission = chunkInputWorkingAdmission(self, input, config, admission_units) catch
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "chunk media is malformed or exceeds image limits" });
