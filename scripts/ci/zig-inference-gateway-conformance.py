@@ -3183,7 +3183,7 @@ def main() -> None:
                         (
                             "chains/fallback",
                             {"X-Antfly-Inference-Timeout-Ms": "0"},
-                            504,
+                            400,
                             [],
                         ),
                     ]:

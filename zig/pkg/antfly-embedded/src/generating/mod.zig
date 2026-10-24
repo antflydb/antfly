@@ -56,7 +56,12 @@ pub const parseConfigFromSlice = lib.parseConfigFromSlice;
 
 test "provider registry gateway embedded canonical generation preserves tools usage and cancellation" {
     const Fake = struct {
-        fn generate(_: *anyopaque, alloc: std.mem.Allocator, body: []const u8, context: ?RequestContext) ![]u8 {
+        fn submitted(raw: *anyopaque) void {
+            const sent: *bool = @ptrCast(@alignCast(raw));
+            sent.* = true;
+        }
+        fn generate(raw: *anyopaque, alloc: std.mem.Allocator, body: []const u8, context: ?RequestContext) ![]u8 {
+            try std.testing.expect(@as(*bool, @ptrCast(@alignCast(raw))).*);
             try std.testing.expect(context != null);
             try context.?.check();
             try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") != null);
@@ -68,9 +73,10 @@ test "provider registry gateway embedded canonical generation preserves tools us
     };
     var client = httpx.Client.initWithConfig(std.testing.allocator, std.testing.io, .{});
     defer client.deinit();
+    var sent = false;
     var factory = BackendFactory.initWithOptions(std.testing.allocator, &client, .{
-        .antfly_provider = .{ .ptr = undefined, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fake.generate },
-        .request_context = .{ .io = std.testing.io, .deadline_ns = null },
+        .antfly_provider = .{ .ptr = &sent, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fake.generate },
+        .request_context = .{ .io = std.testing.io, .deadline_ns = null, .submission = .{ .ptr = &sent, .notify = Fake.submitted } },
     });
     var cfg = GeneratorConfig.fromAntfly(.{ .model = "gemma", .url = "" });
     cfg.tools_json = "[{\"type\":\"function\",\"function\":{\"name\":\"search\",\"parameters\":{\"type\":\"object\"}}}]";
@@ -542,6 +548,10 @@ const BackendState = struct {
         return result;
     }
 
+    fn notifyLocalSubmission(self: *BackendState) void {
+        if (self.request_context) |context| if (context.submission) |callback| callback.notify(callback.ptr);
+    }
+
     fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const ChatMessage) !GenerateResult {
         const self: *BackendState = @ptrCast(@alignCast(ptr));
         if (self.request_context) |context| {
@@ -570,6 +580,7 @@ const BackendState = struct {
             const timeout = if (self.request_context) |context| try context.remainingTimeoutMs() else try self.execution.remainingTimeoutMs(platform_time.monotonicNs(), 120_000);
             const cancellation = if (self.request_context) |context| if (context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null else httpx.CancellationToken.fromCallback(self.execution.cancellation.ptr, self.execution.cancellation.is_cancelled_fn);
             if (model.len > 0) return error.UnsupportedAppleGenerationOptions;
+            self.notifyLocalSubmission();
             return lib.generateApple(alloc, self.cfg, messages, self.max_response_bytes orelse (8 * 1024 * 1024), .{ .timeout_ms = timeout, .cancellation = cancellation });
         }
         const policy = try provider_limits.Policy.fromConfig(self.cfg.rate_limit);
@@ -700,6 +711,7 @@ const BackendState = struct {
                         .enable_thinking = if (self.cfg.tools_json != null or self.cfg.response_format_json != null or has_tool_history) false else null,
                     });
                     defer alloc.free(body);
+                    self.notifyLocalSubmission();
                     const response = try local.generateJson(alloc, body, self.request_context);
                     defer alloc.free(response);
                     if (self.usage_observer) |usage_sink| if (provider_limits.responseUsage(response)) |usage| usage_sink.record(usage.input_tokens, usage.output_tokens);
@@ -711,6 +723,7 @@ const BackendState = struct {
                     self.execution.io orelse self.io orelse std.Io.Threaded.global_single_threaded.io(),
                 );
                 if (local.generate_messages_with_context) |generate_messages| {
+                    self.notifyLocalSubmission();
                     const content = try managed_embedder.AntflyProviderBoundary.call(
                         "generate_messages_with_context",
                         local.boundary_dispatch,
@@ -723,6 +736,7 @@ const BackendState = struct {
                     };
                 }
                 if (local.generate_messages) |generate_messages| {
+                    self.notifyLocalSubmission();
                     const content = try managed_embedder.AntflyProviderBoundary.call(
                         "generate_messages",
                         local.boundary_dispatch,
@@ -745,6 +759,7 @@ const BackendState = struct {
                     roles[i] = message.role.toSlice();
                     contents[i] = textContent(message) orelse return error.UnsupportedGeneratorProvider;
                 }
+                if (local.generate_text_with_context != null or local.generate_text != null) self.notifyLocalSubmission();
                 const content = if (local.generate_text_with_context) |generate_text|
                     try managed_embedder.AntflyProviderBoundary.call(
                         "generate_text_with_context",
