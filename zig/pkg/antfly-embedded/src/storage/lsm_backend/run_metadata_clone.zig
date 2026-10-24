@@ -59,6 +59,7 @@ pub const Clone = struct {
         if (original) |port| try port.checkpoint();
     }
     pub fn resumeWithAdmission(self: *Clone, allocator: std.mem.Allocator, original: ?admission.Port) !void {
+        try checkpoint(original);
         if (self.retiring or self.taken or self.retired) return error.InvalidArgument;
         while (self.field < self.fields.len) {
             try checkpoint(original);
@@ -67,7 +68,10 @@ pub const Clone = struct {
                 continue;
             };
             if (self.fields[self.field] == null) {
-                self.fields[self.field] = try allocator.alloc(u8, input_bytes.len);
+                self.fields[self.field] = if (input_bytes.len == 0) try allocator.alloc(u8, 0) else blk: {
+                    const ptr = allocator.rawAlloc(input_bytes.len, .of(u8), @returnAddress()) orelse return error.OutOfMemory;
+                    break :blk ptr[0..input_bytes.len];
+                };
                 self.offset = 0;
                 continue;
             }
@@ -114,7 +118,8 @@ pub const Clone = struct {
         return .{ .source = run, .fields = .{ run.smallest_namespace_name, run.smallest_key, run.largest_namespace_name, run.largest_key, run.path }, .retiring = true };
     }
     pub fn retireWithAdmission(self: *Clone, allocator: std.mem.Allocator, original: ?admission.Port) !void {
-        if (self.retired) return;
+        try checkpoint(original);
+        if (self.retired or self.taken) return;
         self.retiring = true;
         while (self.retire_field < self.fields.len) {
             try checkpoint(original);
@@ -125,7 +130,7 @@ pub const Clone = struct {
                 @memset(value[self.retire_offset..][0..n], undefined);
                 self.retire_offset += n;
                 if (self.retire_offset != value.len) continue;
-                allocator.free(value);
+                if (value.len != 0) allocator.rawFree(value, .of(u8), @returnAddress());
                 self.fields[self.retire_field] = null;
             }
             self.retire_field += 1;
@@ -419,4 +424,53 @@ test "controlled physical sync run metadata destruction retains exact debt behin
     try manager.drainConstructionCleanupWithAdmission(original);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
     try resources.qualifyNoLiveReservations(&manager);
+}
+
+test "controlled physical sync metadata copy stops after raw allocation before whole buffer poisoning" {
+    const a = std.testing.allocator;
+    const Pattern = struct {
+        clone: *Clone,
+        rejected: bool = false,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+        }
+        fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const ptr = std.testing.allocator.rawAlloc(len, alignment, ra) orelse return null;
+            @memset(ptr[0..len], 0x5a);
+            return ptr;
+        }
+        fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.rejected) if (self.clone.fields[1]) |bytes| {
+                try std.testing.expectEqual(@as(usize, 0), self.clone.offset);
+                try std.testing.expectEqual(@as(u8, 0x5a), bytes[0]);
+                try std.testing.expectEqual(@as(u8, 0x5a), bytes[bytes.len - 1]);
+                self.rejected = true;
+                return error.Canceled;
+            };
+        }
+    };
+    const bytes = try a.alloc(u8, 3 * Clone.quantum + 1);
+    defer a.free(bytes);
+    @memset(bytes, 'm');
+    var clone = Clone.init(sourceRun(bytes));
+    var pattern: Pattern = .{ .clone = &clone };
+    defer clone.deinit(pattern.allocator());
+    const payload: admission.Payload = .{ .ptr = &pattern, .vtable = &.{ .checkpoint = Pattern.check } };
+    const port = admission.Port.init(&payload);
+    try std.testing.expectError(error.Canceled, clone.resumeWithAdmission(pattern.allocator(), port));
+    try std.testing.expect(pattern.rejected);
+    try clone.resumeWithAdmission(pattern.allocator(), port);
+    var owned = try clone.take();
+    var retirement = try Clone.retireOwned(owned);
+    owned = undefined;
+    try retirement.retireWithAdmission(pattern.allocator(), port);
+    pattern.rejected = false;
+    // A completed continuation still checks the current original.
+    var fault: Fault = .{ .at = 0 };
+    const fault_payload = fault.payload();
+    try std.testing.expectError(error.Canceled, retirement.retireWithAdmission(pattern.allocator(), admission.Port.init(&fault_payload)));
 }

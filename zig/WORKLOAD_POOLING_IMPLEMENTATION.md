@@ -26798,3 +26798,81 @@ work. V3 preserves the corrected ArrayList internal-field initialization error.
 V4 includes raw operations, generic spare-vector progress and the allocator
 pattern check. Full GNU qualification remains waived; the full default design
 and the remaining allocator/pin/ownership/coordinator work above are incomplete.
+
+
+### Complete retained run snapshots and the metadata allocator audit
+
+The allocator audit confirms `run_metadata_clone` used typed `alloc/free`
+wrappers around its byte-sized turns. It now allocates raw buffers and raw-frees
+only after its explicit retirement quanta, preserving zero-length and nullable
+fields. Cached completion/retirement also checks the current original. A known
+allocator pattern verifies rejection can occur after allocation and before any
+whole-buffer poison or copy. The streaming encoder and owned writer already
+use raw private-buffer/retirement helpers; cleanup-ticket paths are capped at
+4 KiB, below one byte quantum. These observations do not certify all other
+retained operators or pin-registry paths.
+
+`run_snapshot_clone.Clone` composes retained metadata and state cloning for
+pin-free compaction/directory snapshots. It plans the entire additional bound
+before allocating, retains partial phases and allocators across rejection/OOM,
+and transfers the completed Run without another fallible ownership gap.
+Canonical shared-memory snapshots retain their existing generation in constant
+time, preserving immutable state/metadata identity and the fast path. The
+ordinary `cloneRunCompactionSnapshot` keeps its legacy shared-memory branch and
+drives this same complete cursor for other sources, replacing the synchronous
+state-clone composition.
+
+`Retirement` owns an isolated snapshot and claims the final shared-memory
+reference atomically before touching its bytes. It retains the state reclaimer,
+metadata fields, optional owned Bloom storage and shared-header allocator until
+those owners retire in dependency order. Rejection preserves every remaining
+allocation, and a completed or non-final shared release still checks the next
+original. Writer RunOwner callbacks, output tickets, cached table indexes and
+registered file/read-version pins are rejected as separate authorities; the
+new constructor is for pin-free isolated snapshots and canonical immutable
+shared-memory generations. Such rejection happens before consuming ownership.
+
+`Owned` reserves the complete additional allocation bound before copying and
+adopts exact resident bytes into a preprepared stable usage identity. The caller
+must retain/register existing shared accounting roots, source/input authority,
+the fixed cursor header and output/physical-retirement ownership; shared pins
+are ownership transfer rather than newly allocated bytes. Partial abort retains
+construction charge through physical cleanup. Explicit deinit is a joined,
+quiesced fallback and is not ordinary admission-refusal cleanup.
+
+The global path-pin registry still hashes/compares, allocates/rehashes and
+acquires its worker mutex synchronously. Directory payload assembly, admitted
+pin registration/release, generic writer-owner/cache retirement, parent resource
+and retirement registration, and combined backend RunStore/view/generation/
+durability publication remain required. Broader default coordinator, cleanup,
+relief and overload/fairness qualification remain open. Full GNU qualification
+remains waived and the full design remains incomplete.
+
+
+The complete-snapshot tests sweep every planning, copying, take, abort and
+output-retirement checkpoint for disk metadata, unshared state and immutable
+shared-memory sources, preserving original error identity and borrowed input.
+A separate sweep drops the original shared-memory owner before retirement so
+the returned snapshot alone owns state, Bloom bytes, routing metadata and its
+header. Rejection retains that last-owner continuation until physical cleanup
+finishes. Allocation witnesses exercise every actual failure, pre-allocation
+quota refusal, exact adoption and charge preservation through final free.
+Existing snapshot cloning, immutable pin sharing, state/OOM, directory epochs,
+merge, overlay and accounting regressions complement those tests.
+
+Final-source receipts `retained-run-snapshot-v1`, `-regressions-corrected`,
+`-boundaries` and `-fast` pass all five native commands each. Debug physical-sync
+passes 53/53 steps and 110 cases. Regressions pass 60/60 steps and 34 existing
+snapshot/state/OOM, immutable-pin, merge/arena/overlay, directory, ledger,
+dependency and GC cases. Debug boundaries pass 80/80 steps, 32 owner-close,
+170 table/codec, 74 WAL recovery and 18 ABI checks. ReleaseFast passes 63/63
+steps and all 110/170/74 physical/table/recovery cases. Each receipt also passes
+four Bloom and 45/1/8 error-identity companions (companions use Debug). All
+5,594 recorded native/schema input hashes and final log digests match; four
+immutable snapshots cover every changed native file. Formatting, whitespace
+and the new module license pass. The first regression receipt preserves the
+rejected unmatched test filter; its corrected selection passes without source
+changes. Public/native ABI layouts and durable formats are unchanged in this
+step. Full GNU qualification remains waived; the remaining pin, payload,
+resource/retirement registration and combined-backend/default-design work
+above remains incomplete.

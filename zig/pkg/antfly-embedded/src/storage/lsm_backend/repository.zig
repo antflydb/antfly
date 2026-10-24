@@ -311,17 +311,11 @@ pub fn cloneRunSnapshot(allocator: Allocator, source: Run) !Run {
 
 pub fn cloneRunCompactionSnapshot(allocator: Allocator, source: Run) !Run {
     if (source.retainMemory()) |pinned| return pinned;
-    var clone = @import("run_metadata_clone.zig").Clone.init(source);
+    var clone = @import("run_snapshot_clone.zig").Clone.init(source);
     defer clone.deinit(allocator);
+    _ = try clone.memoryBoundWithAdmission(null);
     try clone.resumeWithAdmission(allocator, null);
-    var out = try clone.take();
-    errdefer out.deinit(allocator);
-
-    if (source.path == null) {
-        const state = source.state orelse return error.RunStateUnavailable;
-        out.state = try state.clone(allocator);
-    }
-    return out;
+    return clone.takeWithAdmission(null);
 }
 
 pub fn ensureOpenDirs(root_dir: []const u8) !void {
