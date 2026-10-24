@@ -368,7 +368,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const owner_authority_step = b.step("antfly-native-owner-authority-test", "Verify durable source observations, wire profiles and root receipt authority");
     const schema_publication_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
-        .filters = &.{ "schema validation publication", "table lifecycle lock" },
+        .filters = &.{ "schema validation publication", "table lifecycle lock", "relational integrity restore staging reserves external parent", "relational integrity restore staging fences incoming dependency admission" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const schema_publication_run = addFilteredTestRunArtifact(b, schema_publication_tests);
@@ -377,7 +377,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     schema_publication_step.dependOn(&schema_publication_run.step);
     const schema_publication_service_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[1],
-        .filters = &.{ "schema validation publication", "table lifecycle lock" },
+        .filters = &.{ "schema validation publication", "table lifecycle lock", "relational integrity restore staging reserves external parent", "relational integrity restore staging fences incoming dependency admission" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const schema_publication_service_run = addFilteredTestRunArtifact(b, schema_publication_service_tests);

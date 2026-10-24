@@ -234,7 +234,7 @@ test "foreign key validation native transaction preserves atomic pages and publi
         defer read.abort();
         try std.testing.expectError(error.IntegrityTopologyBusy, local.storage_db_relational_integrity_topology.requireUnfenced(&read));
         try local.storage_db_relational_integrity_topology.requireWriteUnfenced(&read);
-        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, job.validateSnapshot(a, &read, options.identity_namespace.?, .{ .io = std.Options.debug_io, .directory = directory.path() }));
+        try job.validateSnapshot(a, &read, options.identity_namespace.?, .{ .io = std.Options.debug_io, .directory = directory.path() });
     }
     const cursor = try local.storage_internal_keys.relationalRowKeyAlloc(a, "child");
     defer a.free(cursor);
@@ -512,4 +512,236 @@ fn applyControl(db: *db_mod.DB, command: db_mod.DB.NativeSchemaOwnerControl.Comm
     var prepared = try db.prepareNativeSchemaOwnerControl(command, .{});
     defer prepared.deinit();
     return (try db.applyPreparedNativeSchemaOwnerControl(&prepared, null)).header.?;
+}
+
+fn replayValidationJournal(journal: *@import("../storage/hot_standby/primary.zig").Primary, db: *db_mod.DB, next_lsn: *u64) !void {
+    while (next_lsn.* <= journal.lastLsn()) : (next_lsn.* += 1) {
+        var entry = (try journal.log.entryAt(a, next_lsn.*)) orelse return error.MissingReplicationRecord;
+        defer entry.deinit(a);
+        try local.storage_db_replication_ingress.applyRecord(db, entry.record);
+        const first = block: {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            break :block try local.storage_db_relational_nullability_job.load(&read);
+        };
+        try local.storage_db_replication_ingress.applyRecord(db, entry.record);
+        var again = try db.core.store.beginReadTxn();
+        defer again.abort();
+        try std.testing.expectEqualDeep(first, try local.storage_db_relational_nullability_job.load(&again));
+    }
+}
+
+test "foreign key validation native snapshot restarts unaccepted coverage on the actual replacement root" {
+    const job = local.storage_db_relational_nullability_job;
+    const lifecycle = local.storage_db_generation_lifecycle;
+    const rows = @import("schema_validation_rows.zig");
+    var directory = try local.common_test_directory.TestDirectory.init("fk-validation-root-restart");
+    defer directory.cleanup();
+    const source_path = try std.fs.path.join(a, &.{ directory.path(), "source" });
+    defer a.free(source_path);
+    const target_path = try std.fs.path.join(a, &.{ directory.path(), "target" });
+    defer a.free(target_path);
+    const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 300, .shard_id = 301, .range_id = 302 }, .online_source_authority = .native, .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } };
+    var source = try db_mod.DB.open(a, source_path, options);
+    defer source.close();
+    try source.setSchemaJson(a, declaration);
+    var original: Fixture = .{ .db = &source };
+    var insert = try planner.prepareWithCoverageControlled(a, original.source(), &tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{
+        .{ .key = "parent", .value = "{\"id\":1,\"parent_id\":null,\"payload\":\"root\"}" },
+        .{ .key = "child", .value = "{\"id\":2,\"parent_id\":1,\"payload\":\"referencing\"}" },
+    } }}, .{});
+    defer insert.deinit();
+    try original.commit(&insert, 1);
+    var selected = try planner.captureForeignKeyValidationSource(a, original.source(), &tables, "rows", &.{"fk"}, .{});
+    defer selected.deinit();
+    const raw_catalog = (try source.core.getStoreValue(a, catalog.key)).?;
+    defer a.free(raw_catalog);
+    const versioned = try std.mem.replaceOwned(u8, a, declaration, "\"version\":1", "\"version\":2");
+    defer a.free(versioned);
+    const after_schema = try std.mem.replaceOwned(u8, a, versioned, "\"not_valid\":true", "\"not_valid\":false");
+    defer a.free(after_schema);
+    var candidate = try job.Candidate.initForeignKeySource(a, 300, declaration, after_schema, raw_catalog, selected.value, .{});
+    defer candidate.deinit();
+    const identity = try source.relationalTopologyIdentity();
+    var read = try source.core.store.beginReadTxn();
+    const binding = job.prepareBinding(&read, &candidate, @splat(51), @splat(52), .{ .namespace = options.identity_namespace.?, .owner_group_id = 301, .peer_group_id = 301, .transition_id = 51, .attempt = 1, .admission_epoch = identity.next_epoch, .catalog_digest = identity.catalog_digest, .role = .schema_validation }, .native) catch |err| {
+        read.abort();
+        return err;
+    };
+    read.abort();
+    for (0..16) |_| {
+        if (try rows.step(a, original.source(), original.writer(), &tables, &ranges, ranges[0], binding, candidate.inputs, source.root_incarnation, false, .{}) == .ready) break;
+    } else return error.ValidationDidNotConverge;
+    const before = (try source.core.getStoreValue(a, activation.validation_key)).?;
+    defer a.free(before);
+    const previous = try activation.ForeignKeyValidationRecord.decode(before);
+    try std.testing.expectEqual(activation.State.enforced, previous.progress.state);
+    try std.testing.expectEqual(@as(u64, 2), previous.progress.rows_scanned);
+    {
+        var snapshot = try source.core.store.beginReadTxn();
+        defer snapshot.abort();
+        try std.testing.expect((try job.load(&snapshot)) == null);
+        try job.validateSnapshot(a, &snapshot, options.identity_namespace.?, .{ .io = std.Options.debug_io, .directory = source_path });
+    }
+    {
+        var incomplete = try source.core.store.beginWriteTxn();
+        defer incomplete.abort();
+        try incomplete.delete(activation.validation_inputs_key);
+        try std.testing.expectError(error.InvalidSchemaValidationJob, job.validateSnapshot(a, &incomplete, options.identity_namespace.?, .{ .io = std.Options.debug_io, .directory = source_path }));
+    }
+    _ = try source.snapshotNative("before-handoff");
+    const snapshot_path = try std.fmt.allocPrint(a, "{s}.snapshots/before-handoff", .{source_path});
+    defer a.free(snapshot_path);
+    {
+        var transition = try lifecycle.beginProcessExclusive(target_path);
+        defer transition.deinit();
+        var staged = try transition.beginStaging();
+        defer staged.deinit();
+        try db_mod.DB.restoreIdentityPreservingSnapshotToStagedGeneration(&staged, a, snapshot_path, staged.path(), options, options.identity_namespace.?);
+        _ = try staged.publish();
+    }
+    var restored = try db_mod.DB.open(a, target_path, options);
+    defer restored.close();
+    try std.testing.expect(source.root_incarnation != restored.root_incarnation);
+    try expectCheckpoint(&restored, before);
+    // This is the real owner preparation consumed by metadata's existing
+    // zero-progress bootstrap. Observing it grants no accepted ready phase.
+    const preparation = try restored.prepareSchemaOwnerObservation(&candidate, binding.id, binding.plan_digest, binding.fence, .native, .{});
+    try std.testing.expectEqualDeep(binding, preparation.binding);
+    try std.testing.expectEqual(restored.root_incarnation, preparation.physical_root_incarnation);
+    // Row 2PC does not advance the separate schema-owner control clock.
+    try std.testing.expect(preparation.position == null);
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, restored.lookup(a, "", .{ .relational_activation_json = "{\"mode\":\"validation_status\"}" }));
+    var replacement: Fixture = .{ .db = &restored, .next_transaction = 60 };
+    try std.testing.expectEqual(rows.Result.pending, try rows.step(a, replacement.source(), replacement.writer(), &tables, &ranges, ranges[0], binding, candidate.inputs, restored.root_incarnation, false, .{}));
+    const restarted_raw = (try restored.core.getStoreValue(a, activation.validation_key)).?;
+    defer a.free(restarted_raw);
+    const restarted = try activation.ForeignKeyValidationRecord.decode(restarted_raw);
+    try std.testing.expectEqual(restored.root_incarnation, restarted.physical_root);
+    try std.testing.expectEqual(previous.revision + 1, restarted.revision);
+    try std.testing.expectEqual(activation.State.validating, restarted.progress.state);
+    try std.testing.expectEqual(@as(u64, 0), restarted.progress.rows_scanned);
+    try std.testing.expectEqualStrings("", restarted.progress.cursor);
+    try std.testing.expectError(error.SchemaValidationNotReady, applyControl(&restored, .{ .binding = binding, .action = .begin, .payload = candidate.inputs }));
+    {
+        var same_root = restarted;
+        same_root.revision += 1;
+        const bytes = try same_root.encode(a);
+        defer a.free(bytes);
+        const same = try restored.beginTransactionWithId(@splat(70), 7000);
+        try std.testing.expectError(error.SchemaValidationJobChanged, restored.writeTransaction(same, .{ .relational_schema_version = 1, .relational_integrity_generation_set = same_root.progress.generation_set, .relational_activation = .{ .routing_key = "", .expected = restarted_raw, .next = bytes, .validation = .{ .binding = binding, .physical_root = restored.root_incarnation, .action = .restart, .inputs = .{ .bytes = candidate.inputs } } } }));
+        try restored.abortTransaction(same, 7001);
+        try expectCheckpoint(&restored, restarted_raw);
+    }
+    for (0..16) |_| {
+        if (try rows.step(a, replacement.source(), replacement.writer(), &tables, &ranges, ranges[0], binding, candidate.inputs, restored.root_incarnation, false, .{}) == .ready) break;
+    } else return error.ValidationDidNotConverge;
+    // Seed a real standby from the current native image, then use the real
+    // journal/publisher/ingress for the complete publication protocol.
+    _ = try restored.snapshotNative("standby-ready");
+    const peer_path = try std.fs.path.join(a, &.{ directory.path(), "standby" });
+    defer a.free(peer_path);
+    const peer_snapshot = try std.fmt.allocPrint(a, "{s}.snapshots/standby-ready", .{restored.core.path});
+    defer a.free(peer_snapshot);
+    {
+        var transition = try lifecycle.beginProcessExclusive(peer_path);
+        defer transition.deinit();
+        var staged = try transition.beginStaging();
+        defer staged.deinit();
+        try db_mod.DB.restoreIdentityPreservingSnapshotToStagedGeneration(&staged, a, peer_snapshot, staged.path(), options, options.identity_namespace.?);
+        _ = try staged.publish();
+    }
+    var peer = try db_mod.DB.open(a, peer_path, options);
+    var peer_live = true;
+    defer if (peer_live) peer.close();
+    try std.testing.expect(peer.root_incarnation != restored.root_incarnation);
+    const log_path = try std.fmt.allocPrintSentinel(a, "{s}/journal", .{directory.path()}, 0);
+    defer a.free(log_path);
+    const slots_path = try std.fmt.allocPrintSentinel(a, "{s}/slots", .{directory.path()}, 0);
+    defer a.free(slots_path);
+    var journal = try @import("../storage/hot_standby/primary.zig").Primary.open(a, log_path, slots_path, .{ .cluster_id = 71, .table_id = 300, .shard_id = 301, .timeline_id = 1, .epoch = 1 }, .{});
+    defer journal.close();
+    _ = try journal.append(.{ .kind = .checkpoint, .payload_codec = .raw, .payload = "" });
+    const mirror = @import("../storage/hot_standby/db_commit.zig").bindMirror(&journal, .{ .sync_policy = .{ .mode = .async } });
+    restored.local_execution.replication_async_metadata_mirror = mirror;
+    restored.local_execution.replication_async_batch_mirror = mirror;
+    defer {
+        restored.local_execution.replication_async_metadata_mirror = null;
+        restored.local_execution.replication_async_batch_mirror = null;
+    }
+    var next_lsn: u64 = 1;
+    _ = try applyControl(&restored, .{ .binding = binding, .action = .begin, .payload = candidate.inputs });
+    try replayValidationJournal(&journal, &peer, &next_lsn);
+    const ready = try applyControl(&restored, .{ .binding = binding, .action = .freeze });
+    try replayValidationJournal(&journal, &peer, &next_lsn);
+    {
+        var observed = try peer.core.store.beginReadTxn();
+        defer observed.abort();
+        try std.testing.expectEqualDeep(ready, (try job.load(&observed)).?);
+        try std.testing.expectEqual(restored.root_incarnation, (try job.load(&observed)).?.transaction_coverage.?.physical_root);
+    }
+    // Receiving identical log effects never authorizes current-root serving
+    // evidence or control on the standby's distinct native root.
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, peer.observeNativeSchemaOwner(binding, .{}));
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, peer.prepareNativeSchemaOwnerControl(.{ .binding = binding, .action = .freeze }, .{}));
+    try std.testing.expectEqual(job.Phase.ready, ready.phase);
+    try std.testing.expectEqual(restored.root_incarnation, ready.transaction_coverage.?.physical_root);
+    const terminal_raw = (try restored.core.getStoreValue(a, activation.validation_key)).?;
+    defer a.free(terminal_raw);
+    var reset = restarted;
+    reset.revision = (try activation.ForeignKeyValidationRecord.decode(terminal_raw)).revision + 1;
+    const proposed = try reset.encode(a);
+    defer a.free(proposed);
+    const attempt = try restored.beginTransactionWithId(@splat(80), 8000);
+    try std.testing.expectError(error.IntegrityTopologyBusy, restored.writeTransaction(attempt, .{ .relational_schema_version = 1, .relational_integrity_generation_set = reset.progress.generation_set, .relational_activation = .{ .routing_key = "", .expected = terminal_raw, .next = proposed, .validation = .{ .binding = binding, .physical_root = restored.root_incarnation, .action = .restart, .inputs = .{ .bytes = candidate.inputs } } } }));
+    try restored.abortTransaction(attempt, 8001);
+    try expectCheckpoint(&restored, terminal_raw);
+    {
+        var final = try restored.core.store.beginReadTxn();
+        defer final.abort();
+        try std.testing.expectEqualDeep(ready, (try job.load(&final)).?);
+    }
+    try replayValidationJournal(&journal, &peer, &next_lsn);
+    var install_payload: [64]u8 = @splat(91);
+    @memcpy(install_payload[32..64], &try ready.digest());
+    const installed = try applyControl(&restored, .{ .binding = binding, .action = .install, .payload = &install_payload });
+    try replayValidationJournal(&journal, &peer, &next_lsn);
+    peer.close();
+    peer_live = false;
+    peer = try db_mod.DB.open(a, peer_path, options);
+    peer_live = true;
+    {
+        var cold = try peer.core.store.beginReadTxn();
+        defer cold.abort();
+        try std.testing.expectEqualDeep(installed, (try job.load(&cold)).?);
+        try std.testing.expectEqual(@as(u32, 2), peer.core.schema.?.version);
+    }
+    var release_payload: [96]u8 = @splat(92);
+    @memcpy(release_payload[0..32], install_payload[0..32]);
+    @memcpy(release_payload[32..64], &try installed.digest());
+    const released = try applyControl(&restored, .{ .binding = binding, .action = .release, .payload = &release_payload });
+    try replayValidationJournal(&journal, &peer, &next_lsn);
+    try std.testing.expectEqualDeep(released, (try peer.observeNativeSchemaOwner(binding, .{})).header.?);
+    const remaining = try peer.core.getStoreValue(a, activation.validation_key);
+    defer if (remaining) |bytes| a.free(bytes);
+    try std.testing.expect(remaining == null);
+    var unfenced = try peer.core.store.beginReadTxn();
+    defer unfenced.abort();
+    try local.storage_db_relational_integrity_topology.requireUnfenced(&unfenced);
+    var child = (try peer.lookup(a, "child", .{})).?;
+    defer child.deinit(a);
+    var document = try std.json.parseFromSlice(std.json.Value, a, child.json, .{});
+    defer document.deinit();
+    try std.testing.expectEqual(@as(i64, 1), document.value.object.get("parent_id").?.integer);
+    try std.testing.expectEqualStrings("referencing", document.value.object.get("payload").?.string);
+    var peer_fixture: Fixture = .{ .db = &peer, .next_transaction = 100 };
+    const active_tables = [_]local.common_topology_records.TableRecord{.{ .table_id = 300, .name = "rows", .schema_json = after_schema }};
+    referenced: {
+        var deletion = planner.prepareWithCoverageControlled(a, peer_fixture.source(), &active_tables, &ranges, &.{.{ .table_name = "rows", .deletes = &.{"parent"} }}, .{}) catch |err| {
+            try std.testing.expectEqual(error.ForeignKeyReferenced, err);
+            break :referenced;
+        };
+        defer deletion.deinit();
+        try std.testing.expectError(error.ForeignKeyReferenced, peer_fixture.prepare(&deletion, 100));
+    }
 }

@@ -222,6 +222,64 @@ unchanged original SQL plus distributed fault campaign are qualified together.
 Original-case counts remain **765 implemented / 137 rejected / 428 superseded /
 256 unresolved**, including **164 unresolved DDL/catalog cases**.
 
+### Native FK restore and committed standby replay (2026-10-24)
+
+Identity-preserving restore now uses the existing native manifest validator and
+bounded materializer before opening the staged primary. It previously entered
+the logical snapshot importer even for a native checkpoint and failed looking
+for the logical row file. This is the shared restore path for document and
+relational tables; no alternate FK file format or publication mechanism is added.
+
+Snapshot validation recognizes the canonical semantic-progress/input pair.
+It recompiles the immutable candidate, checks the original generation set and
+namespace, rejects torn/extra records, and joins any live publication header to
+its exact transaction commitment. Imported progress is an inert checkpoint,
+not current-root coverage or metadata adoption authority.
+
+Before generic publication admission, a replacement native root uses the
+existing zero-ACK metadata bootstrap and an explicit 2PC restart. Restart checks
+the actual receiver root, exact binding/inputs/predecessor, and revision. It
+resets the cursor and count to zero; the replacement rechecks live parents using
+the ordinary bounded page pipeline. It cannot reset the same root, an admitted
+publication job, or a Raft authority. Cancellation uses the same guarded slot.
+The native owner clock is independent of row 2PC work: its genuine preparation
+position may be absent at sequence zero and must never be manufactured from a
+row count or replication LSN. Metadata root epochs and shared leases survive the
+zero-progress bootstrap without adding a ready ACK.
+
+Committed standby ingress now replays the primary's immutable root commitments
+through its native source position and atomic replication LSN. Normal control
+and serving observation retain their root guards; receiving a primary's ready
+header cannot authorize the standby's own root. The real journal campaign
+covers duplicate delivery, installation, cold standby reopen, terminal release,
+retained child data and referenced-parent deletion protection. It also includes
+a non-owner checkpoint record to keep the journal LSN distinct from the native
+schema-owner clock.
+
+Restore reservation additionally joins the shared schema lifecycle locks and
+parent-definition leases before any job/name reservation. An identical public
+declaration does not authorize replacing leased physical data or generations.
+Existing replacement/external-parent fixtures exercise every lock kind and
+verify that losing reservations leave no partial names or jobs.
+
+The production Debug build and focused gates pass: fifteen supporting FK
+tests, two native transaction/restore/journal campaigns, forty-six metadata
+publication/lifecycle/restore-exclusion tests in both server configurations,
+thirty-five neighboring nullability/journal/root tests, eight managed native
+restore tests and six mounted SQL validation/recovery campaigns. Strict focused
+gates have no skips or leaks. Generated-source, formatting, inventory, licensing
+and source-boundary checks also pass.
+
+Post-handoff replacement-root recovery remains unfinished, including cleanup
+of failed/ready owners and promotion during installation. It must retain the
+accepted header and ACK roots, qualify the new root's parent/reference and
+transaction state, then commit the existing root-epoch CAS. Rewriting the old
+header's root, accepting copied EOF counters, or treating the standby LSN as a
+native data proof would bypass that requirement. Committed standby replay alone
+does not complete promotion qualification. The public `sql-0736` guard and all
+original-case counts remain unchanged until this and the public PostgreSQL /
+distributed fault campaign pass.
+
 ### FK VALIDATE: native preparation and read execution in progress
 
 `sql-0736` remains unresolved. Native read-side support now prepares exact

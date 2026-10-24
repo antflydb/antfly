@@ -465,6 +465,58 @@ pub fn observeTransactionDebt(txn: anytype, binding: Binding) !?contract.Transac
     return result;
 }
 
+/// Imported semantic scan progress is an inert source checkpoint. Verify its
+/// canonical definition and pair, but grant neither current-root coverage nor
+/// metadata adoption. A replacement native root restarts it from zero in 2PC.
+fn validateTransactionSnapshot(a: A, txn: anytype, namespace: @import("doc_identity_namespace.zig").Namespace, header: ?Header, control: @import("antfly_cancellation").CancellationToken) !bool {
+    const raw = (try optional(txn, activation.validation_key)) orelse {
+        if (try optional(txn, activation.validation_inputs_key) != null) return error.InvalidSchemaValidationJob;
+        return false;
+    };
+    if (raw.len > activation.ValidationRecord.max_wire_bytes) return error.InvalidSchemaValidationJob;
+    const owned = try a.dupe(u8, raw);
+    defer a.free(owned);
+    const record = try activation.ValidationRecord.decode(owned);
+    const inputs = (try optional(txn, activation.validation_inputs_key)) orelse return error.InvalidSchemaValidationJob;
+    if (inputs.len > contract.max_input_bytes or !eq(hash(inputs), record.binding.inputs)) return error.InvalidSchemaValidationJob;
+    const Check = struct {
+        fn active(context: ?*anyopaque) anyerror!void {
+            const token: *const @import("antfly_cancellation").CancellationToken = @ptrCast(@alignCast(context.?));
+            try token.check();
+        }
+    };
+    var candidate = try Candidate.fromInputs(a, inputs, record.binding, .{ .context = @constCast(&control), .checkpoint = Check.active });
+    defer candidate.deinit();
+    var predecessor = try integrity.decode(a, (try contract.inputParts(candidate.inputs))[2]);
+    defer predecessor.deinit();
+    if (!record.progress.matches(predecessor, record.binding.owner)) return error.InvalidSchemaValidationJob;
+    try control.check();
+    if (header) |value| {
+        if (value.phase != .canceled and value.phase != .released) {
+            if (value.transaction_coverage) |coverage| {
+                if (!std.meta.eql(value.binding, record.binding) or !eq(coverage.record, hash(owned)) or coverage.physical_root != record.physical_root or
+                    record.progress.state == .validating or
+                    ((value.phase == .ready or value.phase == .installed) and record.progress.state != .enforced) or
+                    (value.phase == .failed and record.progress.state != .invalid)) return error.SchemaValidationRuntimeRecoveryRequired;
+            }
+        }
+    }
+    if (record.progress.state == .invalid) return true;
+    if (!record.binding.fence.namespace.eql(namespace)) return error.IdentityNamespaceMismatch;
+    if (header) |value| {
+        if (value.phase != .canceled and value.phase != .released) {
+            if (value.transaction_coverage == null) return error.SchemaValidationRuntimeRecoveryRequired;
+            if (value.installation != null) {
+                try requireSuccessorDefinition(a, txn, record.binding);
+                return true;
+            }
+        } else if (value.binding.fence.admission_epoch >= record.binding.fence.admission_epoch) return error.SchemaValidationJobChanged;
+    }
+    try activation.requireValidationDefinition(txn, record.binding);
+    if (!eq(try digestAt(txn, public_key), record.binding.before_public)) return error.SchemaValidationJobChanged;
+    return true;
+}
+
 /// Verify local progress evidence in the same immutable read as the imported
 /// rows and ordered marker. This grants neither physical-root adoption nor a
 /// metadata ACK. Nonterminal foreign jobs need explicit owner adoption; old
@@ -472,8 +524,18 @@ pub fn observeTransactionDebt(txn: anytype, binding: Binding) !?contract.Transac
 pub fn validateSnapshot(a: A, txn: anytype, namespace: @import("doc_identity_namespace.zig").Namespace, options: @import("../../spill_sort.zig").Options) !void {
     const control = options.cancellation orelse @import("antfly_cancellation").CancellationToken.none;
     try control.check();
-    const header = (try load(txn)) orelse {
-        if (try debt.hasPrefix(txn, debt.family_prefix) or try debt.hasPrefix(txn, family_prefix)) return error.SchemaValidationRuntimeRecoveryRequired;
+    const observed = try load(txn);
+    const has_transaction = try validateTransactionSnapshot(a, txn, namespace, observed, control);
+    const header = observed orelse {
+        if (try debt.hasPrefix(txn, debt.family_prefix)) return error.SchemaValidationRuntimeRecoveryRequired;
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(family_prefix);
+        while (entry) |row| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, row.key, family_prefix)) break;
+            try control.check();
+            if (!has_transaction or (!std.mem.eql(u8, row.key, activation.validation_key) and !std.mem.eql(u8, row.key, activation.validation_inputs_key))) return error.SchemaValidationRuntimeRecoveryRequired;
+        }
         _ = try transactions.TxnManager.validateTopologyDebtSnapshot(a, txn, null, options);
         return;
     };
@@ -503,7 +565,8 @@ pub fn validateSnapshot(a: A, txn: anytype, namespace: @import("doc_identity_nam
         while (entry) |row| : (entry = try cursor.next()) {
             if (!std.mem.startsWith(u8, row.key, family_prefix)) break;
             try control.check();
-            if (!std.mem.eql(u8, row.key, key) and !std.mem.eql(u8, row.key, inputs_key) and !std.mem.eql(u8, row.key, cursor_key)) return error.InvalidSchemaValidationJob;
+            if (!std.mem.eql(u8, row.key, key) and !std.mem.eql(u8, row.key, inputs_key) and !std.mem.eql(u8, row.key, cursor_key) and
+                !(has_transaction and (std.mem.eql(u8, row.key, activation.validation_key) or std.mem.eql(u8, row.key, activation.validation_inputs_key)))) return error.InvalidSchemaValidationJob;
         }
     }
     // Namespace/cut/completion checks are fixed work. Reject those failures

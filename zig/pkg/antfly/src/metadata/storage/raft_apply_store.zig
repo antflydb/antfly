@@ -16214,6 +16214,16 @@ test "relational integrity restore staging fences incoming dependency admission"
     // Remove the test declaration to model a completed child retirement/drop.
     try txn.delete(try tableKeyForGroup(&buf, group_id, 8));
     try store.deleteTableNameIndexTxn(&txn, group_id, child.name);
+    const dependencies = @import("../schema_validation_dependencies.zig");
+    const lease_head: @import("../schema_validation_publication.zig").Head = .{ .metadata_group_id = group_id, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .table_id = child.table_id, .id = @splat(91), .plan_digest = @splat(92), .owner_count = 1 };
+    // Fixture lease only: the real FK ledger campaign independently qualifies
+    // its admission/ACK authority. This verifies restore's exclusion boundary.
+    const lease_source: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.ForeignKeySource = .{ .table_name = child.name, .parents = &.{.{ .constraint_name = "parent_fk", .declared_parent = parent.name, .parent_table = parent.name, .parent_table_id = parent.table_id, .parent_schema_version = 1, .parent_schema = @splat(1), .parent_public = @splat(2), .parent_catalog = @splat(3), .parent_unique = "pk", .parent_generation = @splat(4), .parent_definition = @splat(5) }} };
+    try dependencies.acquire(alloc, &txn, lease_head, lease_source);
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = plan.id, .action = .reserve, .plan = plan });
+    try std.testing.expectError(error.NotFound, txn.get(try restore_staging.jobKey(&buf, group_id, plan.id)));
+    try std.testing.expectError(error.NotFound, txn.get(try restore_staging.nameKey(&buf, group_id, replacement.name)));
+    try dependencies.releaseJob(&txn, lease_head, 1);
     try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = plan.id, .action = .reserve, .plan = plan });
     _ = try txn.get(try restore_staging.jobKey(&buf, group_id, plan.id));
     // A late incoming FK is rejected by the authoritative apply transaction,
@@ -16261,6 +16271,17 @@ test "relational integrity restore staging reserves external parent and rejects 
     try std.testing.expect(try store.restoreReplacementMatchesTxn(&txn, group_id, target));
     try std.testing.expect(try store.restoreExternalParentMatchesTxn(&txn, group_id, parent));
     try std.testing.expect(try store.restoreIncomingDependenciesClosedTxn(&txn, group_id, plan));
+    const locks = @import("../table_lifecycle_lock.zig");
+    for ([_]u64{ old.table_id, parent_table.table_id }) |locked_table| {
+        for ([_]locks.Kind{ .generation, .initial_support, .index_build, .schema_validation }) |kind| {
+            const lock: locks.Lock = .{ .kind = kind, .id = @splat(91) };
+            try locks.acquire(&txn, group_id, locked_table, lock);
+            try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .reserve, .plan = plan });
+            try std.testing.expectError(error.NotFound, txn.get(try restore_staging.jobKey(&buf, group_id, id)));
+            try std.testing.expectError(error.NotFound, txn.get(try restore_staging.nameKey(&buf, group_id, target.table.name)));
+            try locks.release(&txn, group_id, locked_table, lock);
+        }
+    }
     try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = id, .action = .reserve, .plan = plan });
     _ = try txn.get(try restore_staging.jobKey(&buf, group_id, id));
     try std.testing.expect(try restoreStagingLocksTableTxn(&txn, group_id, parent_table.table_id));
@@ -31733,6 +31754,11 @@ pub const RaftApplyStore = struct {
         const current = try decodeTableRecord(self.alloc, encoded);
         defer metadata_table_manager.freeTable(self.alloc, current);
         if (!metadata_table_manager.tableDefinitionsEqual(current, old.table)) return false;
+        // Restoring an identical declaration can still replace its physical
+        // generations and data. Join the same schema locks and shared FK
+        // target leases before creating any restore reservation.
+        if (try self.fkGenerationTableLockedTxn(txn, group_id, old.table.table_id) or
+            try @import("../schema_validation_dependencies.zig").isLeased(txn, group_id, old.table.table_id)) return false;
         const fence = try self.loadTableTransitionFenceTxn(txn, group_id, old.table.table_id);
         if (fence.active() or try backupCohortLocksTableTxn(txn, group_id, old.table.table_id) or
             try self.extensionOwnsTableTxn(txn, group_id, old.table.name)) return false;
@@ -31755,6 +31781,7 @@ pub const RaftApplyStore = struct {
         const current = try decodeTableRecord(self.alloc, encoded);
         defer metadata_table_manager.freeTable(self.alloc, current);
         if (!metadata_table_manager.tableDefinitionsEqual(current, parent.table)) return false;
+        if (try self.fkGenerationTableLockedTxn(txn, group_id, parent.table.table_id)) return false;
         const transition = try self.loadTableTransitionFenceTxn(txn, group_id, parent.table.table_id);
         if (transition.active() or try backupCohortLocksTableTxn(txn, group_id, parent.table.table_id) or
             try self.extensionOwnsTableTxn(txn, group_id, parent.table.name)) return false;

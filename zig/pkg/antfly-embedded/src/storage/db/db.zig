@@ -10157,12 +10157,17 @@ pub const DB = struct {
         if (record.table_id != frame.position.namespace.table_id or record.shard_id != frame.position.namespace.shard_id or
             !frame.position.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
         if (try self.replicationMutationAlreadyApplied(record.lsn)) return;
-        var prepared = self.prepareNativeSchemaOwnerControl(frame.command, .{}) catch |err| {
+        // Committed standby replay preserves the PRIMARY's immutable root
+        // commitments. It grants no authority to attest or continue work on
+        // this replica's root: normal owner entry points keep their root guard.
+        // The native source position, namespace and atomic LSN below still
+        // qualify exact ordered replay, including duplicate delivery.
+        var prepared = NativeSchemaOwnerControl.Prepared.init(self.alloc, self.core, frame.command, .{}) catch |err| {
             if (try self.replicationMutationAlreadyApplied(record.lsn)) return;
             return err;
         };
         defer prepared.deinit();
-        _ = try self.applyPreparedNativeSchemaOwnerControl(&prepared, .{ .position = frame.position, .lsn = record.lsn });
+        _ = try self.applyPreparedNativeOwnerEffect(&prepared, .{ .position = frame.position, .lsn = record.lsn });
     }
 
     fn applyPreparedNativeOwnerEffect(self: *DB, prepared: anytype, replay: ?NativeIndexReplay) !@TypeOf(prepared.*).ApplyOutcome {
@@ -21251,12 +21256,12 @@ pub const DB = struct {
         const activation = @import("relational_integrity_activation.zig");
         const catalog_mod = @import("relational_integrity_catalog.zig");
         if (request_json.len > 1024) return error.InvalidConstraintActivation;
-        var request = try std.json.parseFromSlice(struct { mode: enum { status, page, retry, validation_status, validation_page } = .status, max_rows: u32 = 128, schema_version: ?u32 = null, validation_id: ?[16]u8 = null }, alloc, request_json, .{});
+        var request = try std.json.parseFromSlice(struct { mode: enum { status, page, retry, validation_status, validation_page, validation_recovery_status } = .status, max_rows: u32 = 128, schema_version: ?u32 = null, validation_id: ?[16]u8 = null }, alloc, request_json, .{});
         defer request.deinit();
         if (request.value.max_rows == 0 or request.value.max_rows > 128) return error.InvalidConstraintActivation;
-        const semantic = request.value.mode == .validation_page or request.value.mode == .validation_status;
+        const semantic = request.value.mode == .validation_page or request.value.mode == .validation_status or request.value.mode == .validation_recovery_status;
         if ((!semantic and request.value.validation_id != null) or (request.value.mode == .validation_page and request.value.validation_id == null)) return error.InvalidSchemaValidationJob;
-        if (request.value.mode == .validation_status) {
+        if (request.value.mode == .validation_status or request.value.mode == .validation_recovery_status) {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
             const raw = read.get(activation.validation_key) catch |err| switch (err) {
@@ -21265,7 +21270,9 @@ pub const DB = struct {
             };
             const record = try activation.ValidationRecord.decode(raw);
             if (request.value.validation_id) |id| if (!std.mem.eql(u8, &record.binding.id, &id)) return error.SchemaValidationJobChanged;
-            if (record.progress.state != .invalid and record.binding.authority == .native and record.physical_root != self.root_incarnation) return error.SchemaValidationRuntimeRecoveryRequired;
+            // Recovery status is inert input to an exact restart CAS. Normal
+            // status/page paths still refuse coverage from another root.
+            if (request.value.mode != .validation_recovery_status and record.progress.state != .invalid and record.binding.authority == .native and record.physical_root != self.root_incarnation) return error.SchemaValidationRuntimeRecoveryRequired;
             const encoded = try std.json.Stringify.valueAlloc(alloc, record, .{});
             errdefer alloc.free(encoded);
             // Inert canceled/failed history can be observed for an exact CAS
@@ -23926,7 +23933,15 @@ pub const DB = struct {
             return error.IdentityNamespaceMismatch;
         var staged_opts = opts;
         staged_opts.staged_generation = staged_generation;
-        try restoreSnapshotStoreTo(alloc, snapshot_root, path, staged_opts, null, null, .none, null, .{ .identity_preserving = expected_namespace });
+        var fallback_io: ?std.Io.Threaded = if (opts.backend_runtime == null) .init(alloc, .{}) else null;
+        defer if (fallback_io) |*threaded| threaded.deinit();
+        const io = if (opts.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else fallback_io.?.io();
+        // Use the same manifest/file verification and bounded materialization
+        // as ordinary native restore. Namespace preservation changes catalog
+        // admission, not the snapshot format or its integrity checks.
+        var native_generation = try native_backup.validateAndMaterializeWithCancellation(alloc, io, snapshot_root, path, .none);
+        defer if (native_generation) |*generation| generation.deinit();
+        try restoreSnapshotStoreTo(alloc, snapshot_root, path, staged_opts, null, io, .none, if (native_generation) |*generation| generation.value() else null, .{ .identity_preserving = expected_namespace });
         try finishSnapshotRuntimeRepair(alloc, path, staged_opts);
     }
 

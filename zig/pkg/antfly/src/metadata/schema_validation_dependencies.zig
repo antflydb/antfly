@@ -210,12 +210,17 @@ pub fn releaseJob(txn: anytype, head: anytype, constraints: u16) !void {
     }
 }
 
-pub fn requireUnleased(txn: anytype, group: u64, parent: u64) !void {
+pub fn isLeased(txn: anytype, group: u64, parent: u64) !bool {
     var buf: [256]u8 = undefined;
     const prefix = try parentPrefix(&buf, group, parent);
     var cursor = try txn.openCursor();
     defer cursor.close();
-    if (try cursor.seekAtOrAfter(prefix)) |row| if (std.mem.startsWith(u8, row.key, prefix)) return error.GenerationPublicationChanged;
+    const row = (try cursor.seekAtOrAfter(prefix)) orelse return false;
+    return std.mem.startsWith(u8, row.key, prefix);
+}
+
+pub fn requireUnleased(txn: anytype, group: u64, parent: u64) !void {
+    if (try isLeased(txn, group, parent)) return error.GenerationPublicationChanged;
 }
 
 /// Common parent schema writer. The no-lease path allocates nothing; active

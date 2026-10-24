@@ -325,15 +325,27 @@ fn prepareForeignKeyValidationCommand(alloc: Allocator, txn: anytype, catalog: c
     const routing = try routingKey(alloc, txn);
     defer alloc.free(routing);
     if (!std.mem.eql(u8, command.routing_key, routing)) return error.ConstraintActivationOwnerChanged;
-    if (scope.action == .begin) {
-        try @import("relational_integrity_topology.zig").requireUnfenced(txn);
+    if (scope.action == .begin or scope.action == .restart) {
+        if (scope.action == .restart) {
+            // A replacement root may discard unaccepted semantic scan work,
+            // never an admitted publication header or its accepted ACKs.
+            try @import("relational_integrity_topology.zig").requireWriteUnfenced(txn);
+            if (try @import("relational_nullability_job.zig").load(txn)) |header| {
+                if (header.phase != .released and header.phase != .canceled) return error.SchemaValidationRuntimeRecoveryRequired;
+            }
+        } else try @import("relational_integrity_topology.zig").requireUnfenced(txn);
         if (try @import("relational_integrity_topology.zig").completed(txn)) |done| if (done.admission_epoch >= scope.binding.fence.admission_epoch) return error.SchemaValidationJobChanged;
-        if (current_raw) |raw| {
+        var revision: u64 = 1;
+        if (scope.action == .restart) {
+            const before = try ValidationRecord.decode(current_raw orelse return error.SchemaValidationJobRequired);
+            if (!std.meta.eql(before.binding, scope.binding) or before.physical_root == scope.physical_root) return error.SchemaValidationJobChanged;
+            revision = std.math.add(u64, before.revision, 1) catch return error.InvalidSchemaValidationJob;
+        } else if (current_raw) |raw| {
             const before = try ValidationRecord.decode(raw);
             if (before.progress.state != .invalid or before.binding.fence.admission_epoch >= scope.binding.fence.admission_epoch or
                 std.mem.eql(u8, &before.binding.id, &scope.binding.id)) return error.SchemaValidationJobChanged;
         }
-        if (after.revision != 1 or after.progress.state != .validating or after.progress.rows_scanned != 0 or after.progress.cursor.len != 0) return error.InvalidSchemaValidationJob;
+        if (after.revision != revision or after.progress.state != .validating or after.progress.rows_scanned != 0 or after.progress.cursor.len != 0) return error.InvalidSchemaValidationJob;
         try requireReady(txn, catalog);
         try @import("relational_integrity_generation_admission.zig").requireAcknowledged(txn);
         try @import("relational_integrity_generation_admission.zig").requireReferenceCoverageAcknowledged(txn);

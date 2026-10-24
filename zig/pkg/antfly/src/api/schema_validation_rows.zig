@@ -32,7 +32,7 @@ pub fn step(a: std.mem.Allocator, reader: local.api_table_read_source.TableReadS
         if (value.table_id == range.table_id) break value;
     } else return error.TableNotFound;
     if (!std.mem.eql(u8, &owner_contract.hash(table.schema_json), &binding.before_public)) return error.SchemaValidationJobChanged;
-    var current = try reader.lookup(a, table.name, range.start_key, .{ .relational_activation_json = "{\"mode\":\"validation_status\"}", .execution_deadline_ns = control.deadline_ns, .cancellation = control.cancellation }, .read_index);
+    var current = try reader.lookup(a, table.name, range.start_key, .{ .relational_activation_json = "{\"mode\":\"validation_recovery_status\"}", .execution_deadline_ns = control.deadline_ns, .cancellation = control.cancellation }, .read_index);
     defer if (current) |*value| value.deinit(a);
     var parsed: ?std.json.Parsed(activation.ForeignKeyValidationRecord) = null;
     defer if (parsed) |*value| value.deinit();
@@ -40,6 +40,7 @@ pub fn step(a: std.mem.Allocator, reader: local.api_table_read_source.TableReadS
     const prior: ?activation.ForeignKeyValidationRecord = if (parsed) |value| value.value else null;
     var next: activation.ForeignKeyValidationRecord = undefined;
     var scope: activation.ForeignKeyValidationScope = undefined;
+    var restarting = false;
     if (prior) |record| {
         try record.validate();
         if (std.mem.eql(u8, &record.binding.id, &binding.id)) {
@@ -47,25 +48,27 @@ pub fn step(a: std.mem.Allocator, reader: local.api_table_read_source.TableReadS
             // Cancellation may retire inert history copied from an older
             // root. It grants no ready/failed attestation or install authority.
             if (cancel and record.progress.state == .invalid) return .failed;
-            if (record.physical_root != (if (binding.authority == .native) physical_root else 0)) return error.SchemaValidationRuntimeRecoveryRequired;
-            if (record.progress.state == .invalid) return .failed;
-            if (!cancel) {
+            restarting = record.physical_root != (if (binding.authority == .native) physical_root else 0);
+            if (!restarting and record.progress.state == .invalid) return .failed;
+            if (!restarting and !cancel) {
                 if (record.progress.state == .enforced) return .ready;
                 _ = try local.api_relational_activation_worker.runForeignKeyValidationPageControlled(a, reader, writer, tables, ranges, range, binding.id, control);
                 return .pending;
             }
-            next = record;
-            next.revision = try std.math.add(u64, record.revision, 1);
-            next.progress.state = .invalid;
-            next.progress.failure = "Canceled";
-            scope = .{ .binding = binding, .physical_root = record.physical_root, .action = .cancel };
+            if (!restarting) {
+                next = record;
+                next.revision = try std.math.add(u64, record.revision, 1);
+                next.progress.state = .invalid;
+                next.progress.failure = "Canceled";
+                scope = .{ .binding = binding, .physical_root = record.physical_root, .action = .cancel };
+            }
         } else {
             if (record.progress.state != .invalid or record.binding.fence.admission_epoch >= binding.fence.admission_epoch) return error.SchemaValidationJobChanged;
             if (cancel) return .failed;
         }
     } else if (cancel) return .failed;
     const beginning = prior == null or !std.mem.eql(u8, &prior.?.binding.id, &binding.id);
-    if (beginning) {
+    if (beginning or restarting) {
         if (inputs.len == 0 or !std.mem.eql(u8, &owner_contract.hash(inputs), &binding.inputs)) return error.SchemaValidationJobChanged;
         var status = (try reader.lookup(a, table.name, range.start_key, .{ .relational_activation_json = "{\"mode\":\"status\"}", .execution_deadline_ns = control.deadline_ns, .cancellation = control.cancellation }, .read_index)) orelse return error.ConstraintActivationUnavailable;
         defer status.deinit(a);
@@ -73,8 +76,8 @@ pub fn step(a: std.mem.Allocator, reader: local.api_table_read_source.TableReadS
         defer observed.deinit();
         if (observed.value.schema_version != binding.before_version or !std.mem.eql(u8, &observed.value.owner, &binding.owner)) return error.SchemaValidationJobChanged;
         if (observed.value.state != .enforced) return .pending;
-        next = .{ .binding = binding, .physical_root = if (binding.authority == .native) physical_root else 0, .revision = 1, .progress = .{ .generation_set = observed.value.generation_set, .owner = binding.owner, .schema_version = binding.before_version, .phase = .foreign_key } };
-        scope = .{ .binding = binding, .physical_root = next.physical_root, .action = .begin, .inputs = .{ .bytes = inputs } };
+        next = .{ .binding = binding, .physical_root = if (binding.authority == .native) physical_root else 0, .revision = if (restarting) try std.math.add(u64, prior.?.revision, 1) else 1, .progress = .{ .generation_set = observed.value.generation_set, .owner = binding.owner, .schema_version = binding.before_version, .phase = .foreign_key } };
+        scope = .{ .binding = binding, .physical_root = next.physical_root, .action = if (restarting) .restart else .begin, .inputs = .{ .bytes = inputs } };
     }
     const expected = if (prior) |record| try record.encode(a) else null;
     defer if (expected) |bytes| a.free(bytes);

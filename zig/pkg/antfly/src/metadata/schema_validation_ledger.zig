@@ -3375,6 +3375,13 @@ test "schema validation publication FK dependency admission and final cancellati
         errdefer write.abort();
         try begin(a, &write, &prepared, &preps, &.{input}, &context);
         var head = try readHead(&write, lookup);
+        const initial_owner = try readOwner(&write, head, 0);
+        head = try adoptRoot(&write, try TestProofs.bootstrapRequest(head, initial_owner, 97), &context);
+        const adopted_owner = try readOwner(&write, head, 0);
+        try std.testing.expectEqual(@as(u128, 97), adopted_owner.physical_root_incarnation);
+        try std.testing.expectEqual(@as(u64, 1), adopted_owner.root_epoch);
+        try std.testing.expectEqual(@as(u16, 0), head.ready);
+        try deps.requireSource(a, &write, head, source, false);
         head = try cancel(&write, lookup, head.revision, .requested);
         const owner = try readOwner(&write, head, 0);
         var canceled = TestProofs.ready(owner);
@@ -3394,6 +3401,8 @@ test "schema validation publication FK dependency admission and final cancellati
         var recovered = try recover(a, &read, lookup);
         defer recovered.deinit();
         try std.testing.expectEqual(@as(u16, 1), recovered.head.canceled);
+        try std.testing.expectEqual(@as(u64, 1), recovered.owners[0].root_epoch);
+        try std.testing.expectEqual(@as(u128, 97), recovered.owners[0].physical_root_incarnation);
         try verifyGroup(a, &read, lookup.group, &context);
     }
     for (1..8) |fail_write| for ([_]bool{ false, true }) |after_write| {

@@ -234,14 +234,16 @@ pub const ValidationInputs = struct {
 pub const ForeignKeyValidationScope = struct {
     binding: owner_contract.Binding,
     physical_root: u128,
-    action: enum { begin, page, cancel },
+    action: enum { begin, page, cancel, restart },
     inputs: ValidationInputs = .{},
 
     pub fn validate(self: @This()) !void {
         try self.binding.validate();
+        const preparing = self.action == .begin or self.action == .restart;
         if (self.binding.purpose != .foreign_key_source or ((self.binding.authority == .native) != (self.physical_root != 0)) or
-            ((self.action == .begin) != (self.inputs.bytes.len != 0)) or self.inputs.bytes.len > owner_contract.max_input_bytes) return error.InvalidSchemaValidationJob;
-        if (self.action == .begin and !std.mem.eql(u8, &digest(self.inputs.bytes), &self.binding.inputs)) return error.SchemaValidationJobChanged;
+            (self.action == .restart and self.binding.authority != .native) or
+            (preparing != (self.inputs.bytes.len != 0)) or self.inputs.bytes.len > owner_contract.max_input_bytes) return error.InvalidSchemaValidationJob;
+        if (preparing and !std.mem.eql(u8, &digest(self.inputs.bytes), &self.binding.inputs)) return error.SchemaValidationJobChanged;
     }
     pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
         return std.mem.eql(u8, field, "inputs") and self.inputs.bytes.len == 0;
