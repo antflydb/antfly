@@ -40,9 +40,9 @@ const Input = struct {
     masked: bool = false,
     const Wire = struct { ref: ?Chunk, admission: local.segment.SegmentReader.Admission, sources: []const Span, original_docs: u32, summary: ?corpus.statistics.Ref, masked: bool = false };
     fn copy(self: Input, a: A) !Input {
-        const bytes = try std.json.Stringify.valueAlloc(a, Wire{ .ref = self.ref, .admission = self.admission, .sources = self.sources, .original_docs = self.original_docs, .summary = self.summary, .masked = self.masked }, .{});
+        const bytes = try std.json.Stringify.valueAlloc(a, Wire{ .ref = self.ref, .admission = self.admission, .sources = &.{}, .original_docs = self.original_docs, .summary = self.summary, .masked = self.masked }, .{});
         const wire = try std.json.parseFromSliceLeaky(Wire, a, bytes, .{ .allocate = .alloc_always });
-        return .{ .ref = wire.ref, .staged = self.staged, .admission = wire.admission, .sources = wire.sources, .original_docs = wire.original_docs, .summary = wire.summary, .masked = wire.masked };
+        return .{ .ref = wire.ref, .staged = self.staged, .admission = wire.admission, .sources = try corpus.source_spans.cloneIntoArena(a, self.sources), .original_docs = wire.original_docs, .summary = wire.summary, .masked = wire.masked };
     }
 };
 const Builder = struct {
@@ -159,7 +159,9 @@ const Builder = struct {
     }
     fn emit(self: *@This(), inputs: []const Input, level: usize) anyerror!void {
         try self.check();
-        var memory: local.sql_memory_budget = .{ .backing = self.a, .limit = 64 * 1024 * 1024 };
+        var pending_bytes: usize = 0;
+        for (self.pending_arena) |arena_| pending_bytes +|= arena_.queryCapacity();
+        var memory: local.sql_memory_budget = .{ .backing = self.a, .limit = (64 * 1024 * 1024) -| pending_bytes };
         const a = memory.allocator();
         var arena = std.heap.ArenaAllocator.init(a);
         var arena_live = true;
@@ -250,6 +252,7 @@ const Builder = struct {
         const digest = corpus.term_directory.identity(group.segments[0].artifact_id);
         const id = try std.fmt.allocPrint(out, "pack-{x}", .{&digest});
         group.file = .{ .id = id, .digest = digest };
+        group.coalesced_source_routes = true;
         try corpus.text_directory.prepare(out, self.store, &group, self.token);
         const manifest = try put(out, out, self.store, group, self.token);
         try self.owner(group, manifest, false);
@@ -1108,7 +1111,7 @@ test "external lake global frontier ordered compaction composes interleaved orig
     var merges: [2]local.segment.MergeInput = undefined;
     const prefix: [200]u8 = @splat('a');
     for (&inputs, &readers, &merges, 0..) |*input, *reader, *merge_, i| {
-        const docs = try out.alloc(local.introducer.TextDocument, 512);
+        const docs = try out.alloc(local.introducer.TextDocument, 8192);
         for (docs, 0..) |*doc, j| doc.* = .{
             .id = try std.fmt.allocPrint(out, "{d:0>8}", .{j * 2 + i}),
             .stored_data = "{}",
@@ -1121,7 +1124,7 @@ test "external lake global frontier ordered compaction composes interleaved orig
         const bytes = try memory.finishOwned();
         reader.* = try local.segment.SegmentReader.init(out, bytes);
         merge_.* = .{ .reader = reader };
-        input.* = .{ .ref = try @import("lake_index_seekable_text.zig").publish(out, out, &store, bytes, .none), .admission = try reader.admission(out), .sources = try out.dupe(Span, &.{.{ .file = .{ .id = try std.fmt.allocPrint(out, "source-{d}", .{i}), .digest = @splat(1) }, .physical = try @import("lake_index_seekable_text.zig").publish(out, out, &store, bytes, .none), .file_rows = 512, .file_lower = 0, .pack_lower = 0, .count = 512 }}), .original_docs = 512, .summary = null };
+        input.* = .{ .ref = try @import("lake_index_seekable_text.zig").publish(out, out, &store, bytes, .none), .admission = try reader.admission(out), .sources = try out.dupe(Span, &.{.{ .file = .{ .id = try std.fmt.allocPrint(out, "source-{d}", .{i}), .digest = @splat(1) }, .physical = try @import("lake_index_seekable_text.zig").publish(out, out, &store, bytes, .none), .file_rows = 8192, .file_lower = 0, .pack_lower = 0, .count = 8192 }}), .original_docs = 8192, .summary = null };
     }
     defer for (&readers) |*reader| reader.deinit();
     const expected = try local.segment.mergeSegmentInputsWithOptions(out, &merges, .{ .index_sort = &.{.{ .field = "_id", .desc = false }} });
@@ -1140,7 +1143,7 @@ test "external lake global frontier ordered compaction composes interleaved orig
         defer staged.release();
         const actual = try staged.materialize(out);
         try std.testing.expectEqualSlices(u8, expected, actual);
-        try std.testing.expectEqual(@as(usize, 1024), sources.items.len);
+        try std.testing.expectEqual(@as(usize, 16384), sources.items.len);
         for (sources.items, 0..) |span, rank| {
             try std.testing.expectEqual(@as(u32, @intCast(rank)), span.pack_lower);
             try std.testing.expectEqual(@as(u32, @intCast(rank / 2)), span.file_lower);
@@ -1148,12 +1151,15 @@ test "external lake global frontier ordered compaction composes interleaved orig
             try std.testing.expectEqualStrings(inputs[rank % 2].sources[0].file.id, span.file.id);
             try std.testing.expectEqualStrings(inputs[rank % 2].sources[0].physical.artifact_id, span.physical.artifact_id);
         }
+        const source_pages = try corpus.source_spans.publish(out, &store, sources.items, .none);
+        const loaded = try corpus.source_spans.loadPublication(out, store, source_pages, @intCast(sources.items.len), store.upload_scope.?.domain, .none, null);
+        try std.testing.expectEqualDeep(sources.items, loaded);
         var merged_reader = try local.segment.SegmentReader.init(out, actual);
         defer merged_reader.deinit();
         var bounds = (try merged_reader.indexSortBoundsAlloc(out)).?;
         defer bounds.deinit(out);
         try std.testing.expectEqualStrings("00000000", bounds.first[0].id);
-        try std.testing.expectEqualStrings("00001023", bounds.last[0].id);
+        try std.testing.expectEqualStrings("00016383", bounds.last[0].id);
     }
     try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
     try std.testing.expectEqual(@as(usize, 0), manager.files);

@@ -33,10 +33,11 @@ pub const term_directory = @import("lake_index_term_directory.zig");
 // Includes v8 ordered producer identities and stored projection coverage.
 // Never reuse a v8 source-free segment as a covered stored-text sidecar.
 // V11 authenticates independent serving packs and original-source spans.
-// Protocol 42 fences paged source spans and larger byte-targeted serving packs.
-pub const metadata_version: u16 = 11;
+// V12/protocol 82 use compact dictionary/range source pages. Historical JSON
+// source pages and v9-v11 retained roots remain readable.
+pub const metadata_version: u16 = 12;
 pub fn supportsBuildMetadata(version: u16) bool {
-    return version == 9 or version == 10 or version == metadata_version;
+    return version == 9 or version == 10 or version == 11 or version == metadata_version;
 }
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const max_segments = 262144;
@@ -138,6 +139,9 @@ pub const FileGroup = struct {
     sources: []const source_spans.Span = &.{},
     source_pages: []const artifacts.ChunkRef = &.{},
     source_count: u32 = 0,
+    /// Writer evidence for efficient inverse-route deletion. Legacy manifests
+    /// delete every span start, a superset covering older uncoalesced routes.
+    coalesced_source_routes: bool = false,
     /// Historical v10 compaction coordinates, normalized before serving.
     members: []const Member = &.{},
     segments: []const artifacts.ChunkRef,
@@ -498,7 +502,7 @@ pub fn servingRootPublication(a: A, store: stores.ArtifactStore, outer: Root, to
 }
 fn servingRootInner(a: A, store: stores.ArtifactStore, outer: Root, token: Cancellation, cache: ?artifacts.CachedRead, publication: bool) !Root {
     const ref = outer.serving orelse outer.compacted orelse return outer;
-    const root = if (outer.serving != null) try loadRootDirectoryInner(a, store, .{ .kind = .text_segment, .metadata_version = metadata_version, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cache, publication) else (try loadRootDirectoryAutoInner(a, store, ref, token, cache, publication)).root;
+    const root = (try loadRootDirectoryAutoInner(a, store, ref, token, cache, publication)).root;
     if (root.serving != null or root.compacted != null or !rebuild.bindingsEqual(root.binding, outer.binding) or !std.mem.eql(u8, &root.recipe, &outer.recipe) or !std.mem.eql(u8, &root.domain, &outer.domain) or root.collection == null or outer.collection == null or root.collection.?.documents != outer.collection.?.documents or root.collection.?.fields.len != outer.collection.?.fields.len or root.stored_projection != outer.stored_projection or !std.mem.eql(u8, root.config_json, outer.config_json)) return error.InvalidNativeLakeTextCorpus;
     return root;
 }
@@ -1981,7 +1985,7 @@ pub fn checkpointBasePublication(a: A, store: stores.ArtifactStore, root: Root, 
 }
 fn checkpointBaseInner(a: A, store: stores.ArtifactStore, root: Root, cancellation: Cancellation, publication: bool) !Root {
     const ref = root.checkpoint_base orelse return error.InvalidNativeLakeTextCorpus;
-    const base = try loadRootDirectoryInner(a, store, .{ .kind = .text_segment, .metadata_version = metadata_version, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, null, publication);
+    const base = (try loadRootDirectoryAutoInner(a, store, ref, cancellation, null, publication)).root;
     if (base.checkpoint_base != null or base.serving == null or !std.mem.eql(u8, &base.domain, &root.domain) or !std.mem.eql(u8, &base.recipe, &root.recipe)) return error.InvalidNativeLakeTextCorpus;
     return base;
 }
@@ -2812,6 +2816,25 @@ test "external lake text statistics wire upgrade fences new roots and admits his
     try std.testing.expectError(error.InvalidNativeLakeTextCorpus, loadRootDirectory(ca, store, ref, .none, null));
     ref.metadata_version = metadata_version + 1;
     try std.testing.expectError(error.InvalidNativeLakeTextCorpus, loadRootDirectory(ca, store, ref, .none, null));
+    var historical = legacy;
+    historical.version = 11;
+    historical.collection = .{ .documents = 0, .fields = &.{} };
+    const old_inner_bytes = try std.json.Stringify.valueAlloc(ca, historical, .{});
+    var old_inner = try store.putWithCancellation(old_inner_bytes, .none);
+    defer old_inner.deinit(a);
+    const old_inner_ref: artifacts.ChunkRef = .{ .artifact_id = old_inner.artifact_id, .checksum = old_inner.checksum, .byte_len = old_inner.byte_len };
+    historical.serving = old_inner_ref;
+    const old_outer_bytes = try std.json.Stringify.valueAlloc(ca, historical, .{});
+    var old_outer = try store.putWithCancellation(old_outer_bytes, .none);
+    defer old_outer.deinit(a);
+    const old_outer_ref: artifacts.ChunkRef = .{ .artifact_id = old_outer.artifact_id, .checksum = old_outer.checksum, .byte_len = old_outer.byte_len };
+    const old_root = (try loadRootDirectoryAuto(ca, store, old_outer_ref, .none, null)).root;
+    const old_serving = try servingRoot(ca, store, old_root, .none, null);
+    try std.testing.expectEqual(metadata_version, old_serving.version);
+    var current = old_root;
+    current.checkpoint_base = old_outer_ref;
+    const checkpoint = try checkpointBasePublication(ca, store, current, .none);
+    try std.testing.expectEqual(metadata_version, checkpoint.version);
     try std.testing.expect(metadata_version > 9 and local.metadata_lake_index_catalog.native_reader_protocol > 33);
 }
 

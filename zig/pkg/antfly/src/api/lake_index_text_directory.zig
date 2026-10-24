@@ -371,7 +371,7 @@ fn get(a: A, storage: tree.Store, root: ?tree.Ref, id: Id) ![]const u8 {
 fn segmentPlanningBytes(record: SegmentRecord) u64 {
     var metadata = corpus.source_spans.metadataBytes(record.sources, record.source_pages) +| record.manifest.byte_len;
     if (record.route.descriptor) |descriptor| metadata +|= descriptor.byte_len;
-    return corpus.source_spans.planningBytes(record.route.bytes, metadata);
+    return corpus.source_spans.planningBytesWithSources(record.route.bytes, metadata, @max(record.source_count, record.sources.len));
 }
 /// Authenticate a selected leaf's size without admitting its inventory.
 pub fn segmentBytes(a: A, storage: tree.Store, root: corpus.Root, id: Id) !u64 {

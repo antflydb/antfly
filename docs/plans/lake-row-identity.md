@@ -1207,11 +1207,20 @@ ordered runs using the native merge's explicit source map, then composes that
 permutation with original-file ranges. Adjacent output/source coordinates coalesce
 into authenticated ranges. Existing eight-way, byte, workspace and source-range
 limits apply; highly fragmented mappings split into smaller packs instead of
-publishing unbounded row metadata. This bounds amplification, but a compact binary
-permutation representation could improve fan-out for very large, heavily
-interleaved runs beyond the range cap. Existing maps,
-publication certificates, reader leases and GC closure own all dependencies;
-no new artifact family or reader format is introduced.
+publishing unbounded row metadata. A pack admits at most 65,536 ranges and 4 MiB
+of authenticated source pages. Pages use a compact source dictionary plus
+fixed-width native range records, rather than repeating file/manifest paths for
+every range. Pending inputs intern source descriptors; merge workspace admission
+includes pending arenas, and query admission includes a decoded-span floor
+independent of wire size. Inverse routes coalesce contiguous original-file ranks
+even when their serving positions interleave. Physical-generation changes and
+source-rank gaps retain separate routes; historical uncoalesced maps remain
+removable during refresh.
+Native text metadata v12 and reader protocol 82 fence the writer change; retained
+v9-v11 roots and historical JSON span pages remain readable. Nested serving and
+checkpoint roots resolve their own authenticated versions. Existing publication
+certificates, reader leases and GC closure own every dictionary source reference;
+there is no additional artifact family.
 
 Detailed `x-antfly-field.index: false` suppresses that field's text postings.
 Stored source, explicitly enabled named subfields and independently requested
@@ -1225,7 +1234,10 @@ Unknown provenance mismatches keep their existing manual policy. Active postings
 are never relabeled under new semantics. Schema binding also recognizes the exact,
 complete omitted-source encoding briefly emitted by this PR; unrelated changes,
 partial omissions and lost enabled fields remain invalid. Stored epoch bytes are
-preserved rather than rewritten under the same version.
+preserved rather than rewritten under the same version, including owner descriptor
+rehydration. Read-only repair observation exposes verified startup debt even before
+an intent exists; the next leader-admitted turn discovers and advances that debt.
+A named repair never discovers unrelated startup failures.
 
 Qualification must compare projected answers on frozen Parquet bytes, including
 numeric/timestamp directions, nulls, ties, filtering, cursor continuation,

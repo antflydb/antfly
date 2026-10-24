@@ -26,6 +26,7 @@ test {
     _ = @import("serverless/artifacts/cloud_generations.zig");
     _ = @import("api/lake_generation_envelope.zig");
     _ = @import("api/lake_index_serving_compaction.zig");
+    _ = @import("api/lake_index_text_spans.zig");
     _ = @import("api/lake_cloud_publication.zig");
     _ = @import("api/lake_index_gc_progress.zig");
     _ = @import("api/http_server.zig");

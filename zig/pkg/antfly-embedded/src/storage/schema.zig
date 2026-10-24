@@ -333,6 +333,33 @@ pub fn schemasEqual(alloc: Allocator, a: TableSchema, b: TableSchema) !bool {
     return std.mem.eql(u8, encoded_a, encoded_b);
 }
 
+/// PR #1286 briefly omitted disabled leaf sources from ASCH while retaining
+/// the same public schema version. Accept only that complete deterministic
+/// producer output, never arbitrary subsets or any other runtime-schema drift.
+/// Keep the immutable stored epoch intact; physical projection policy is fenced
+/// independently by posting-generation provenance.
+pub fn matchesExcludedSourceEpoch(alloc: Allocator, actual: TableSchema, canonical: TableSchema) !bool {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var known = canonical;
+    const documents = try a.dupe(FullTextDocument, canonical.full_text_documents);
+    var removed = false;
+    for (documents) |*document| {
+        var fields: std.ArrayList(FullTextField) = .empty;
+        for (document.fields) |field| {
+            if (resolveDeclaredFieldType(canonical, field.path)) |mapping| if (!mapping.do_index) {
+                removed = true;
+                continue;
+            };
+            try fields.append(a, field);
+        }
+        document.fields = try fields.toOwnedSlice(a);
+    }
+    known.full_text_documents = documents;
+    return removed and try schemasEqual(alloc, actual, known);
+}
+
 /// Bind schemas actually emitted by v0.2.1-v0.2.5 (ASCH v12) to their
 /// public validator. Only metadata absent from that writer may be recovered;
 /// every field it wrote must still match. Modern epochs remain strictly equal.

@@ -49899,3 +49899,55 @@ test "logical query excluded source upgrade fences historical physical postings"
     try std.testing.expect((try lease.entry.reader.invertedIndex("payload")) == null);
     try std.testing.expect((try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, null, 2, 0)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, config, null)));
 }
+
+test "logical query projection upgrade is discovered by the admitted owner turn" {
+    const a = std.testing.allocator;
+    const DB = @import("../db.zig").DB;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/projection-owner", .{tmp.sub_path});
+    defer a.free(path);
+    const schema: schema_mod.TableSchema = .{
+        .version = 1,
+        .default_type = "doc",
+        .full_text_documents = &.{.{ .name = "doc", .fields = &.{
+            .{ .path = "body", .emitted_name = "body", .analyzer = "standard" },
+            .{ .path = "payload", .emitted_name = "payload", .analyzer = "standard" },
+        } }},
+        .exact_fields = &.{.{ .field = "payload", .source_field = "payload", .mapping = .{ .field_type = .text, .do_index = false } }},
+    };
+    const cfg: types.IndexConfig = .{ .name = "text", .kind = .full_text, .config_json = "{}" };
+    const docs = &.{types.BatchWrite{ .key = "one", .value = "{\"body\":\"quasar\",\"payload\":\"secretpayload\"}" }};
+    {
+        var db = try DB.open(a, path, .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchema(schema);
+        try db.addIndex(cfg);
+        try db.batch(.{ .writes = docs, .sync_level = .write });
+        const entry = db.core.index_manager.textIndexEntry(cfg.name).?;
+        @constCast(entry.runtime_schema.?.exact_fields)[0].mapping.do_index = true;
+        try db.core.index_manager.indexBatch(db.core.store, docs);
+        @constCast(entry.runtime_schema.?.exact_fields)[0].mapping.do_index = false;
+        try saveTextProjectionProvenance(&entry.persistent, a, try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, entry.config, schema, 2, 0));
+    }
+    var db = try DB.open(a, path, .{ .start_optional_runtimes = false });
+    defer db.close();
+    const owner = @import("../../write.zig");
+    const observed = try owner.repairStorageKernelOwnerDb(a, &db, null, false, .{});
+    try std.testing.expectEqual(@as(usize, 1), observed.repair_remaining);
+    try std.testing.expectEqual(@as(usize, 0), (try db.indexRepairIntentSummary(a)).runnable);
+    var completed = false;
+    for (0..64) |_| {
+        const result = try owner.repairStorageKernelOwnerDb(a, &db, null, true, .{});
+        if (result.state == .complete) {
+            completed = true;
+            break;
+        }
+    }
+    try std.testing.expect(completed);
+    const entry = db.core.index_manager.textIndexEntry(cfg.name).?;
+    var lease = try entry.persistent.snapshot().leaseSegment(0);
+    defer lease.deinit();
+    try std.testing.expect((try lease.entry.reader.invertedIndex("body")) != null);
+    try std.testing.expect((try lease.entry.reader.invertedIndex("payload")) == null);
+}
