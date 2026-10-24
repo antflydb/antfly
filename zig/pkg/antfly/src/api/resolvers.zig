@@ -669,8 +669,12 @@ fn scanEntityConsumers(server: anytype, owner: std.mem.Allocator, snapshot: anyt
     if (server.source.vtable.supports_resolver_catalog_read) {
         var cursor: ?[]const u8 = null;
         defer if (cursor) |value| owner.free(value);
-        var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        defer seen.deinit(owner);
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer {
+            var keys = seen.keyIterator();
+            while (keys.next()) |value| owner.free(value.*);
+            seen.deinit(owner);
+        }
         while (true) {
             var arena = std.heap.ArenaAllocator.init(owner);
             defer arena.deinit();
@@ -679,10 +683,12 @@ fn scanEntityConsumers(server: anytype, owner: std.mem.Allocator, snapshot: anyt
             var pending: std.ArrayList(ConsumerConfig) = .empty;
             var source_reads: std.ArrayList([]const u8) = .empty;
             for (page.consumers) |consumer| {
-                if ((try seen.getOrPut(owner, consumer.table.table_id)).found_existing) continue;
                 var needs_source_read = false;
                 for (consumer.configs orelse try configs(scratch, consumer.table.indexes_json)) |cfg| {
                     for (consumer.names) |name| if (std.mem.eql(u8, cfg.name, name)) {
+                        const identity = try std.json.Stringify.valueAlloc(scratch, .{ consumer.table.table_id, cfg.name }, .{});
+                        if (seen.contains(identity)) break;
+                        try seen.put(owner, try owner.dupe(u8, identity), {});
                         needs_source_read = needs_source_read or !namespaceAdopted(stored, cfg.key_template);
                         try pending.append(scratch, .{ .source_name = consumer.table.name, .config = cfg });
                         break;

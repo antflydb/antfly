@@ -16,6 +16,7 @@
 //! Native destination-owned curation records. The enclosing native transaction
 //! owns revision comparison, record/index edits and publication of its head.
 //! A single-entity read touches its redirect component and incident policy only.
+pub const routes = @import("resolver_namespace_routes.zig");
 const std = @import("std");
 const resolver = @import("antfly_resolver");
 const c = resolver.curation;
@@ -276,6 +277,13 @@ pub const Store = struct {
             if (after == null) break;
         }
         return values.snapshot(h);
+    }
+    pub const ForwardNode = struct { target: ?[]const u8, suppressed: bool };
+    /// Minimal point state for path-compressed execution caches. Callers pin
+    /// the namespace head and invalidate their cache whenever it changes.
+    pub fn forwardNode(self: Store, template: []const u8, id: []const u8) !ForwardNode {
+        const alias = try self.get(resolver.KeyAlias, template, .redirect, id);
+        return .{ .target = if (alias) |value| value.target else null, .suppressed = try self.backend.get(self.backend.ptr, self.a, try self.record(template, .suppressed, id)) != null };
     }
     /// Forward and reverse redirect indexes bound discovery to the affected
     /// components. Distinct endpoints add only their forward canonical paths.

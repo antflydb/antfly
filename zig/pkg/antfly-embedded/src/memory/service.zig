@@ -483,6 +483,7 @@ pub const Service = struct {
 const valueEqual = @import("value_equal.zig").equal;
 
 const Run = struct {
+    const ForwardIdentity = struct { canonical: []const u8, suppressed: bool, target_suppressed: bool, distance: u32 };
     const IdentityScope = struct { policy: EntityPolicy, redirects: curation.RedirectIndex, suppression: curation.Index };
 
     const ChangeTree = std.Treap([]const u8, struct {
@@ -509,6 +510,8 @@ const Run = struct {
     identity_members: std.StringHashMapUnmanaged([]const []const u8) = .empty,
     identity_policy: ?EntityPolicy = null,
     identity_native: bool = false,
+    identity_forward: std.StringHashMapUnmanaged(ForwardIdentity) = .empty,
+    test_identity_forward_steps: usize = 0,
     identity_scopes: std.StringHashMapUnmanaged(*IdentityScope) = .empty,
     identity_full_scopes: std.StringHashMapUnmanaged(*IdentityScope) = .empty,
     identity_legacy_scope: ?*IdentityScope = null,
@@ -1444,13 +1447,7 @@ const Run = struct {
     }
     fn stageChange(self: *Run, path: []const u8, json: ?[]const u8) !void {
         if (eql(u8, path, "entity-policy") or std.mem.startsWith(u8, path, "entity-authority/head/")) {
-            self.identity_policy = null;
-            self.identity_index = null;
-            self.suppression_index = null;
-            self.identity_scopes = .empty;
-            self.identity_full_scopes = .empty;
-            self.identity_legacy_scope = null;
-            self.identity_members = .empty;
+            self.clearIdentityCaches();
         }
         _ = self.assertion_rows.remove(path);
         _ = self.evidence_rows.remove(path);
@@ -1480,13 +1477,7 @@ const Run = struct {
         self.evidence_rows.clearRetainingCapacity();
         self.entity_rows.clearRetainingCapacity();
         self.projection_rows.clearRetainingCapacity();
-        self.identity_policy = null;
-        self.identity_index = null;
-        self.suppression_index = null;
-        self.identity_scopes = .empty;
-        self.identity_full_scopes = .empty;
-        self.identity_legacy_scope = null;
-        self.identity_members = .empty;
+        self.clearIdentityCaches();
         self.views.clearRetainingCapacity();
         self.historical.clearRetainingCapacity();
         for (checkpoint) |change| try self.stageChange(change.key, change.json);
@@ -2796,6 +2787,16 @@ const Run = struct {
     fn identityStore(self: *Run) identity_records.Store {
         return .{ .a = self.a, .prefix = "entity-authority/", .backend = .{ .ptr = self, .get = identityGet, .put = identityPut, .remove = identityRemove, .scan = identityScan }, .max_namespace_bytes = null, .max_queue_bytes = null, .max_queue_count = null };
     }
+    fn clearIdentityCaches(self: *Run) void {
+        self.identity_policy = null;
+        self.identity_index = null;
+        self.suppression_index = null;
+        self.identity_forward = .empty;
+        self.identity_scopes = .empty;
+        self.identity_full_scopes = .empty;
+        self.identity_legacy_scope = null;
+        self.identity_members = .empty;
+    }
     fn ensureIdentityAuthority(self: *Run) !void {
         const store = self.identityStore();
         self.state.identity_format = 1;
@@ -2934,6 +2935,48 @@ const Run = struct {
         self.identity_policy = scope.policy;
         self.identity_index = scope.redirects;
         self.suppression_index = scope.suppression;
+    }
+    fn forwardIdentity(self: *Run, id: []const u8) !ForwardIdentity {
+        if (self.identity_forward.get(id)) |cached| return cached;
+        const store = self.identityStore();
+        if (try store.head(identity_template) == null) {
+            try self.prepareIdentityIndex(&.{id}, false);
+            const target = self.identity_index.?.canonical(id);
+            return .{ .canonical = target, .suppressed = self.suppression_index.?.keySuppressed(id), .target_suppressed = self.suppression_index.?.keySuppressed(target), .distance = 0 };
+        }
+        const Step = struct { id: []const u8, suppressed: bool };
+        var path: std.ArrayList(Step) = .empty;
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        var current = id;
+        var tail: ForwardIdentity = undefined;
+        while (true) {
+            if (self.identity_forward.get(current)) |cached| {
+                tail = cached;
+                break;
+            }
+            if ((try seen.getOrPut(self.a, current)).found_existing) return error.InvalidResolverAliasCycle;
+            if (seen.count() > 16384) return error.ResolverCurationLimitExceeded;
+            if (comptime @import("builtin").is_test) self.test_identity_forward_steps += 1;
+            const node = try store.forwardNode(identity_template, current);
+            const owned = try self.a.dupe(u8, current);
+            if (node.target) |next| {
+                try path.append(self.a, .{ .id = owned, .suppressed = node.suppressed });
+                current = next;
+            } else {
+                tail = .{ .canonical = owned, .suppressed = node.suppressed, .target_suppressed = node.suppressed, .distance = 0 };
+                try self.identity_forward.put(self.a, owned, tail);
+                break;
+            }
+        }
+        if (path.items.len + tail.distance >= 16384) return error.ResolverCurationLimitExceeded;
+        var remaining = path.items.len;
+        while (remaining > 0) {
+            remaining -= 1;
+            const step = path.items[remaining];
+            tail = .{ .canonical = tail.canonical, .suppressed = step.suppressed, .target_suppressed = tail.target_suppressed, .distance = tail.distance + 1 };
+            try self.identity_forward.put(self.a, step.id, tail);
+        }
+        return self.identity_forward.get(id).?;
     }
     fn identityMembers(self: *Run, id: []const u8) ![]const []const u8 {
         try self.prepareIdentityIndex(&.{id}, true);
@@ -3107,12 +3150,9 @@ const Run = struct {
             self.authorize(record.owner, record.entity.visibility) catch return null;
             if (!try self.entityVisible(record)) return null;
         }
-        try self.prepareIdentityIndex(&.{id}, false);
-        const redirects = self.identity_index.?;
-        const index = self.suppression_index.?;
-        if (index.keySuppressed(id)) return null;
-        const canonical_id = redirects.canonical(id);
-        if (index.keySuppressed(canonical_id)) return null;
+        const identity = try self.forwardIdentity(id);
+        if (identity.suppressed or identity.target_suppressed) return null;
+        const canonical_id = identity.canonical;
         if (!eql(u8, id, canonical_id)) {
             if (input == null) return null;
             const target = (try self.read(t.EntityRecord, try key(self.a, "entity", canonical_id))) orelse return null;
@@ -3204,10 +3244,9 @@ const Run = struct {
         }
         try self.judged_views.appendSlice(self.a, inputs);
     }
-    fn validateJudgedViews(self: *Run) !void {
-        if (self.judged_views.items.len == 0) return;
-        // Validate against the admitted state, excluding the verdict's own
-        // redirect/assertion overlay. The control CAS fences concurrent writes.
+    /// Reconstruct the admitted read cut independently of this verdict's
+    /// overlay and every cache derived from that overlay.
+    fn admittedViewRun(self: *Run) Run {
         var before = self.*;
         before.changes = .empty;
         before.change_positions = .empty;
@@ -3217,16 +3256,20 @@ const Run = struct {
         before.entity_rows = .empty;
         before.projection_rows = .empty;
         before.backend_rows = .empty;
-        before.identity_members = .empty;
-        before.identity_policy = null;
-        before.identity_index = null;
-        before.suppression_index = null;
+        before.clearIdentityCaches();
         before.views = .empty;
         before.historical = .empty;
         before.temporal_tracking = true;
         before.temporal_boundary = null;
         before.semantic_assertions = .empty;
         before.service.context.now_ms = self.service.context.currentTime();
+        return before;
+    }
+    fn validateJudgedViews(self: *Run) !void {
+        if (self.judged_views.items.len == 0) return;
+        // Validate against the admitted state, excluding the verdict's own
+        // redirect/assertion overlay. The control CAS fences concurrent writes.
+        var before = self.admittedViewRun();
         for (self.judged_views.items) |input| {
             const current = try before.entityViewInput(input.id);
             if (!eql(u8, try self.encode(input), try self.encode(current))) return error.MemoryResourceChanged;
@@ -3823,8 +3866,7 @@ const Run = struct {
         for (try self.identityMembers(id)) |name| {
             const record = (try self.read(t.EntityRecord, try key(self.a, "entity", name))) orelse continue;
             for (record.entity.distinct_from) |other| {
-                try self.prepareIdentityIndex(&.{other}, false);
-                try result.put(self.a, self.identity_index.?.canonical(other), {});
+                try result.put(self.a, (try self.forwardIdentity(other)).canonical, {});
             }
         }
         return result;
@@ -4970,9 +5012,7 @@ const Run = struct {
             defer self.reviewing_entity = previous_review;
             if (accept or request.pin_distinct) try self.curateEntity(.{ .action = if (!accept) .distinct else std.meta.stringToEnum(@FieldType(t.EntityCorrection, "action"), @tagName(proposal.action)).?, .from = proposal.key, .to = proposal.into, .expected_revision = request.expected_revision, .replace = if (accept) proposal.options.replace else false, .pin_distinct = if (accept) proposal.options.pin_distinct else false, .absorbed = if (accept) std.meta.stringToEnum(@FieldType(t.EntityCorrection, "absorbed"), @tagName(proposal.options.absorbed)).? else .reject });
             try self.writeIdentityPolicy(stored, .{ .state = plan.state, .redirects = plan.merges }, policy_seeds);
-            self.identity_policy = null;
-            self.identity_index = null;
-            self.suppression_index = null;
+            self.clearIdentityCaches();
         }
         const ids = if (proposal.into) |target| &[_][]const u8{ proposal.key, target } else &[_][]const u8{proposal.key};
         if (request.reason.len > 0) try self.put(try std.fmt.allocPrint(self.a, "entity-curation/{d:0>20}", .{self.state.revision}), EntityCurationProvenance{ .owner = self.service.context.principal, .recorded_at = self.service.context.now_ms, .revision = self.state.revision, .entity_ids = ids, .reason = request.reason, .evidence = inputs, .judgment = artifact.operation });
@@ -5056,9 +5096,7 @@ const Run = struct {
         var index = try curation.Index.init(self.a, "", try self.encode(plan.state));
         try index.bindRedirects(self.a, redirects);
         try self.writeIdentityPolicy(stored, .{ .state = plan.state, .redirects = plan.merges }, policy_seeds);
-        self.identity_policy = null;
-        self.identity_index = null;
-        self.suppression_index = null;
+        self.clearIdentityCaches();
         if (self.state.config.semantic_discovery.enabled) {
             var names = affected_names.keyIterator();
             while (names.next()) |name| try self.semanticDirty(name.*);
@@ -5328,9 +5366,7 @@ const Run = struct {
             // so discard the entire curation payload, including free-text
             // provenance, without retaining another copy in audit metadata.
             try self.remove("entity-policy");
-            self.identity_policy = null;
-            self.identity_index = null;
-            self.suppression_index = null;
+            self.clearIdentityCaches();
         }
         for (request.source_ids) |id| {
             try t.validateId(id);
@@ -7671,4 +7707,62 @@ test "memory performance indexed identity scope excludes ten thousand unrelated 
     try std.testing.expectEqual(@as(usize, 2), members.len);
     try std.testing.expect(Empty.scans <= 6);
     try std.testing.expectEqual(@as(usize, 1), run.identity_policy.?.redirects.len);
+}
+
+test "memory performance forward identity shares long chains and converging paths" {
+    const Empty = struct {
+        fn scan(_: *anyopaque, _: A, _: []const u8, _: ?[]const u8, _: u32) !Page {
+            return .{ .rows = &.{}, .next = null };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = performanceTestRun(a);
+    run.service.backend.scan = Empty.scan;
+    const redirects = try a.alloc(curation.Redirect, 10512);
+    for (redirects[0..10000], 0..) |*redirect, i| redirect.* = .{ .key = try std.fmt.allocPrint(a, "chain-{d}", .{i}), .target = try std.fmt.allocPrint(a, "chain-{d}", .{i + 1}) };
+    for (redirects[10000..], 0..) |*redirect, i| redirect.* = .{ .key = try std.fmt.allocPrint(a, "branch-{d}", .{i}), .target = "chain-5000" };
+    try run.identityStore().adoptNamespace(.{ .key_template = Run.identity_template, .revision = 1, .merges = redirects });
+    for (redirects) |redirect| try std.testing.expectEqualStrings("chain-10000", (try run.forwardIdentity(redirect.key)).canonical);
+    try std.testing.expectEqual(@as(usize, 10513), run.test_identity_forward_steps);
+    try std.testing.expectEqual(@as(usize, 10513), run.identity_forward.count());
+    const before = (try run.identityStore().component(Run.identity_template, &.{"chain-0"})).?;
+    var next = before.namespace;
+    next.revision += 1;
+    next.state.suppress.keys = &.{"chain-10000"};
+    try run.identityStore().apply(try identity_records.difference(a, before.namespace, next));
+    try std.testing.expect((try run.forwardIdentity("chain-9999")).target_suppressed);
+}
+
+test "memory admitted verdict snapshot excludes cached overlay redirects" {
+    const Base = struct {
+        rows: std.StringHashMapUnmanaged([]const u8) = .empty,
+        fn get(ptr: *anyopaque, _: A, path: []const u8) !?Row {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return if (self.rows.get(path)) |raw| .{ .key = path, .json = raw } else null;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var base: Base = .{};
+    var run = performanceTestRun(a);
+    run.service.backend.ptr = &base;
+    run.service.backend.get = Base.get;
+    const original: @import("../storage/db/resolver_namespace.zig").Namespace = .{ .key_template = Run.identity_template, .revision = 1 };
+    try run.identityStore().adoptNamespace(original);
+    for (run.changes.items) |change| try base.rows.put(a, change.key, change.json.?);
+    // Start a new operation after committing the fixture's admitted base.
+    run = performanceTestRun(a);
+    run.service.backend.ptr = &base;
+    run.service.backend.get = Base.get;
+    var replacement = original;
+    replacement.revision = 2;
+    replacement.merges = &.{.{ .key = "a", .target = "b" }};
+    try run.identityStore().apply(try identity_records.difference(a, original, replacement));
+    try std.testing.expectEqualStrings("b", (try run.forwardIdentity("a")).canonical);
+    var before = run.admittedViewRun();
+    try std.testing.expectEqualStrings("a", (try before.forwardIdentity("a")).canonical);
+    try std.testing.expectEqualStrings("b", (try run.forwardIdentity("a")).canonical);
 }

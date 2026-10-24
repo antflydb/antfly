@@ -23350,6 +23350,12 @@ pub const RaftApplyStore = struct {
         const continuation: ?wire.Cursor = if (input.cursor) |value| try resolver_curation.decodeToken(wire.Cursor, a, value) else null;
         if (continuation) |value| if (value.revision != revision or value.table_id != table.table_id or !std.mem.eql(u8, &value.key_digest, &wire.keyDigest(input.key))) return error.InvalidResolverCurationRequest;
         result.indexed = if (continuation) |value| value.indexed else indexed;
+        if (indexed and input.key.len > 0 and (continuation == null or continuation.?.scoped)) {
+            try self.scopedResolverConsumersTxn(a, &txn, group_id, input, &result, continuation);
+            result.indexed = true;
+            return std.json.Stringify.valueAlloc(alloc, result, .{});
+        }
+        if (continuation != null and continuation.?.scoped) return error.CatalogGenerationChanged;
         var prefix_buf: [160]u8 = undefined;
         const prefix = if (result.indexed) try self.resolverConsumerPrefixTxn(a, &txn, group_id, table.table_id) else try a.dupe(u8, try tablePrefixForGroup(&prefix_buf, group_id));
         const after = if (continuation) |value| value.after else prefix;
@@ -23414,6 +23420,99 @@ pub const RaftApplyStore = struct {
             result.next_cursor = try resolver_curation.encodeToken(a, wire.Cursor{ .revision = revision, .table_id = table.table_id, .key_digest = wire.keyDigest(input.key), .indexed = result.indexed, .after = last orelse return error.InvalidCatalogRecord });
         }
         return std.json.Stringify.valueAlloc(alloc, result, .{});
+    }
+
+    const NamespaceRoutes = @import("antfly_local_sources").storage_db_resolver_authority.routes;
+    fn namespaceConsumerPrefix(a: std.mem.Allocator, target: []const u8, template: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(a, "{s}namespace-v3/{s}/", .{ try std.mem.replaceOwned(u8, a, target, ":target:", ":scoped-v3:"), try NamespaceRoutes.digest(a, template) });
+    }
+    fn namespaceRouteRoot(a: std.mem.Allocator, target: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(a, "{s}routes/", .{try std.mem.replaceOwned(u8, a, target, ":target:", ":scoped-v3:")});
+    }
+    fn scopedResolverConsumersTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, input: @import("../resolver_catalog_read.zig").Request, result: *@import("../resolver_catalog_read.zig").Page, continuation: ?@import("../resolver_catalog_read.zig").Cursor) !void {
+        const wire = @import("../resolver_catalog_read.zig");
+        const target = try self.resolverConsumerPrefixTxn(a, txn, group, result.table.table_id);
+        const templates = try NamespaceRoutes.matching(a, txn, try namespaceRouteRoot(a, target), input.key);
+        std.mem.sort([]const u8, templates, {}, struct {
+            fn less(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.less);
+        var index: usize = if (continuation) |value| value.namespace_index else 0;
+        if (index > templates.len) return error.InvalidResolverCurationRequest;
+        var after: ?[]const u8 = if (continuation) |value| value.after else null;
+        var consumers: std.ArrayList(wire.Consumer) = .empty;
+        var bytes: usize = 0;
+        while (index < templates.len) {
+            const prefix = try namespaceConsumerPrefix(a, target, templates[index]);
+            if (after) |value| if (!std.mem.startsWith(u8, value, prefix)) return error.InvalidResolverCurationRequest;
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(after orelse prefix);
+            if (after) |value| if (row != null and std.mem.eql(u8, row.?.key, value)) {
+                row = try cursor.next();
+            };
+            var last: ?[]const u8 = null;
+            while (row) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                if (result.visited == 16 or bytes >= 1024 * 1024) {
+                    result.next_cursor = try resolver_curation.encodeToken(a, wire.Cursor{ .revision = result.revision, .table_id = result.table.table_id, .key_digest = wire.keyDigest(input.key), .indexed = true, .scoped = true, .namespace_index = index, .after = last orelse after orelse prefix });
+                    result.consumers = consumers.items;
+                    return;
+                }
+                result.visited += 1;
+                bytes += entry.value.len;
+                last = try a.dupe(u8, entry.key);
+                const reference = try wire.decodeConsumerReference(a, entry.value);
+                const names = try a.alloc([]const u8, reference.configs.len);
+                for (reference.configs, names) |cfg, *name| name.* = cfg.name;
+                try consumers.append(a, .{ .table = .{ .table_id = reference.source_id, .name = reference.source_name }, .names = names, .configs = reference.configs });
+                row = try cursor.next();
+            }
+            index += 1;
+            after = null;
+        }
+        result.consumers = consumers.items;
+    }
+    const NamespaceConsumer = struct { root: []const u8, template: []const u8, configs: std.ArrayList(@import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig) = .empty };
+    fn namespaceConsumerEntries(a: std.mem.Allocator, group: u64, record: metadata.TableRecord) !std.StringHashMapUnmanaged(NamespaceConsumer) {
+        var entries: std.StringHashMapUnmanaged(NamespaceConsumer) = .empty;
+        if (record.indexes_json.len == 0) return entries;
+        const root = try std.json.parseFromSliceLeaky(std.json.Value, a, record.indexes_json, .{});
+        const identities = try resolver_curation.metadataFromValue(a, root);
+        for (try resolverConfigs(a, root)) |original| {
+            const target = try resolverTargetPrefix(a, group, try system_catalog.Target.parse(original.table));
+            const path = try std.fmt.allocPrint(a, "{s}{x:0>16}", .{ try namespaceConsumerPrefix(a, target, original.key_template), record.table_id });
+            const entry = try entries.getOrPut(a, path);
+            if (!entry.found_existing) entry.value_ptr.* = .{ .root = target, .template = original.key_template };
+            var cfg = original;
+            for (identities.identities) |identity| if (identity.namespace_owned and std.mem.eql(u8, identity.name, cfg.name)) {
+                cfg.merges = &.{};
+                cfg.curation_json = "{}";
+                break;
+            };
+            try entry.value_ptr.configs.append(a, cfg);
+        }
+        return entries;
+    }
+    fn synchronizeNamespaceConsumersTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, previous: ?metadata.TableRecord, next: ?metadata.TableRecord) !void {
+        const old = if (previous) |record| try namespaceConsumerEntries(a, group, record) else std.StringHashMapUnmanaged(NamespaceConsumer).empty;
+        const desired = if (next) |record| try namespaceConsumerEntries(a, group, record) else std.StringHashMapUnmanaged(NamespaceConsumer).empty;
+        var retired = old.iterator();
+        while (retired.next()) |entry| if (!desired.contains(entry.key_ptr.*)) {
+            try txn.delete(entry.key_ptr.*);
+            const prefix = try namespaceConsumerPrefix(a, entry.value_ptr.root, entry.value_ptr.template);
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            const first = try cursor.seekAtOrAfter(prefix);
+            if (first == null or !std.mem.startsWith(u8, first.?.key, prefix)) try NamespaceRoutes.update(a, txn, try namespaceRouteRoot(a, entry.value_ptr.root), entry.value_ptr.template, false);
+        };
+        var added = desired.iterator();
+        while (added.next()) |entry| {
+            const raw = try std.json.Stringify.valueAlloc(a, @import("../resolver_catalog_read.zig").ConsumerReference{ .source_id = next.?.table_id, .source_name = next.?.name, .configs = entry.value_ptr.configs.items }, .{});
+            try txn.put(entry.key_ptr.*, raw);
+            try NamespaceRoutes.update(a, txn, try namespaceRouteRoot(a, entry.value_ptr.root), entry.value_ptr.template, true);
+        }
     }
 
     fn resolverNamespaceAdoptionAllowedTxn(txn: *docstore.DocStore.Txn, group_id: u64, a: std.mem.Allocator, previous: metadata.TableRecord, next: metadata.TableRecord) !bool {
@@ -23487,7 +23586,7 @@ pub const RaftApplyStore = struct {
         return std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:job:", .{group_id});
     }
     fn resolverNamespaceBootstrapKey(a: std.mem.Allocator, group_id: u64) ![]const u8 {
-        return std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v2", .{group_id});
+        return std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v3", .{group_id});
     }
     fn resolverConfigs(a: std.mem.Allocator, root: std.json.Value) ![]const @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig {
         const Config = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
@@ -23535,6 +23634,7 @@ pub const RaftApplyStore = struct {
         return keys;
     }
     fn removeResolverDependenciesTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.TableRecord) !void {
+        try synchronizeNamespaceConsumersTxn(a, txn, group_id, record, null);
         const keys = try self.resolverDependencyKeysTxn(a, txn, group_id, record);
         var it = keys.keyIterator();
         while (it.next()) |key| try txn.delete(key.*);
@@ -23583,6 +23683,7 @@ pub const RaftApplyStore = struct {
         var added = desired.keyIterator();
         while (added.next()) |key| if (!old.contains(key.*)) try txn.put(key.*, value);
         try self.putCompactResolverConsumersTxn(a, txn, group_id, next);
+        try synchronizeNamespaceConsumersTxn(a, txn, group_id, previous, next);
     }
     /// The authoritative namespace is read in the table mutation transaction.
     /// New consumers therefore inherit it before their first owner is opened.
@@ -40330,4 +40431,66 @@ test "resolver curation namespace propagation persists compact bindings and mate
     try std.testing.expect(missing_configs[0].namespace_curation_missing);
     try std.testing.expectEqual(@as(usize, 0), missing_configs[0].merges.len);
     try std.testing.expectEqual(@as(usize, 1), store.resolver_projection_exports);
+}
+
+test "resolver curation namespace propagation scoped discovery excludes ten thousand unrelated sources" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/scoped-discovery", .{tmp.sub_path});
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const group: u64 = 41;
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 1, .name = "entities", .indexes_json = "{}" } });
+    const wire = @import("../resolver_catalog_read.zig");
+    const Config = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        for (0..10000) |i| {
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const sa = scratch.allocator();
+            const cfg: Config = .{ .name = "r", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = try std.fmt.allocPrint(sa, "scope-{d}/{{{{_key}}}}", .{i}), .promote = false };
+            const record: metadata.TableRecord = .{ .table_id = i + 2, .name = try std.fmt.allocPrint(sa, "source-{d}", .{i}), .indexes_json = try std.json.Stringify.valueAlloc(sa, .{ .resolvers = &.{cfg} }, .{}) };
+            try RaftApplyStore.synchronizeNamespaceConsumersTxn(sa, &txn, group, null, record);
+        }
+        try txn.put(try RaftApplyStore.resolverNamespaceBootstrapKey(a, group), "1");
+        try txn.commit();
+    }
+    const page = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .consumers, .key = "scope-123/item", .compact_consumers = true }), .{});
+    try std.testing.expect(page.indexed);
+    try std.testing.expectEqual(@as(usize, 1), page.visited);
+    try std.testing.expectEqual(@as(usize, 1), page.consumers.len);
+    try std.testing.expectEqualStrings("source-123", page.consumers[0].table.name);
+    try std.testing.expect(page.next_cursor == null);
+    // Removal retires the last namespace route atomically.
+    const cfg: Config = .{ .name = "r", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "scope-123/{{_key}}", .promote = false };
+    const record: metadata.TableRecord = .{ .table_id = 125, .name = "source-123", .indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = &.{cfg} }, .{}) };
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try RaftApplyStore.synchronizeNamespaceConsumersTxn(a, &txn, group, record, null);
+        try txn.commit();
+    }
+    const gone = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .consumers, .key = "scope-123/item" }), .{});
+    try std.testing.expectEqual(@as(usize, 0), gone.visited);
+    // Twenty matching namespaces in one source retain all identities across pages.
+    const configs = try a.alloc(Config, 20);
+    for (configs, 0..) |*item, i| item.* = .{ .name = try std.fmt.allocPrint(a, "r-{d}", .{i}), .table = "entities", .source_artifact = "kg", .resolution_artifact = try std.fmt.allocPrint(a, "resolved-{d}", .{i}), .key_template = try std.fmt.allocPrint(a, "scope-123/{{{{{s}_key}}}}", .{(@as([20]u8, @splat(' ')))[0..i]}), .promote = false };
+    const multi: metadata.TableRecord = .{ .table_id = 10002, .name = "multi", .indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = configs }, .{}) };
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try RaftApplyStore.synchronizeNamespaceConsumersTxn(a, &txn, group, null, multi);
+        try txn.commit();
+    }
+    const first = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .consumers, .key = "scope-123/item" }), .{});
+    try std.testing.expectEqual(@as(usize, 16), first.consumers.len);
+    const second = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .consumers, .key = "scope-123/item", .cursor = first.next_cursor.? }), .{});
+    try std.testing.expectEqual(@as(usize, 4), second.consumers.len);
+    try std.testing.expect(second.next_cursor == null);
 }

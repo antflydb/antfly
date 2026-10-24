@@ -203,6 +203,64 @@ pub fn foldNamespace(a: std.mem.Allocator, current: Namespace, cfg: catalog.Reso
     return next;
 }
 
+/// First-use adoption unions each input once, then validates the resulting
+/// graph once. Intermediate snapshots never grow quadratically in the arena.
+pub fn foldNamespaceBatch(a: std.mem.Allocator, template: []const u8, configs: []const catalog.ResolverConfig) !Namespace {
+    var aliases: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+    var keys: std.StringArrayHashMapUnmanaged(void) = .empty;
+    var texts: std.StringArrayHashMapUnmanaged(void) = .empty;
+    var removed: std.StringArrayHashMapUnmanaged(void) = .empty;
+    var pairs: std.StringArrayHashMapUnmanaged(resolver.curation.Pair) = .empty;
+    var entries: std.StringArrayHashMapUnmanaged(resolver.curation.Entry) = .empty;
+    var text_entries: std.StringArrayHashMapUnmanaged(resolver.curation.Entry) = .empty;
+    var origins: std.StringArrayHashMapUnmanaged(resolver.curation.RedirectOrigin) = .empty;
+    var next: Namespace = .{ .key_template = template };
+    var min_text_chars: u32 = 0;
+    for (configs) |cfg| {
+        if (!std.mem.eql(u8, cfg.key_template, template)) return error.ResolverNamespaceMigrationConflict;
+        if (cfg.namespace_curation_table_id != 0 or cfg.namespace_curation_generation != 0) continue;
+        for (cfg.merges) |alias| {
+            const entry = try aliases.getOrPut(a, alias.key);
+            if (entry.found_existing) {
+                if (!std.mem.eql(u8, entry.value_ptr.*, alias.target)) return error.ResolverNamespaceMigrationConflict;
+            } else entry.value_ptr.* = alias.target;
+        }
+        const state = try resolver.curation.parseState(a, cfg.curation_json);
+        for (state.suppress.keys) |key| try keys.put(a, key, {});
+        for (state.suppress.texts) |text| try texts.put(a, text, {});
+        for (state.removed_aliases) |key| try removed.put(a, key, {});
+        for (state.distinct) |pair| {
+            const ordered = std.mem.order(u8, pair.from, pair.to) != .gt;
+            const identity = try std.json.Stringify.valueAlloc(a, .{ if (ordered) pair.from else pair.to, if (ordered) pair.to else pair.from }, .{});
+            const entry = try pairs.getOrPut(a, identity);
+            if (!entry.found_existing) entry.value_ptr.* = pair;
+        }
+        // Match incremental folding: the earliest source owns duplicate origins.
+        for (state.suppress.entries) |item| {
+            const entry = try entries.getOrPut(a, item.key);
+            if (!entry.found_existing) entry.value_ptr.* = item;
+        }
+        for (state.suppress.text_entries) |item| {
+            const entry = try text_entries.getOrPut(a, item.key);
+            if (!entry.found_existing) entry.value_ptr.* = item;
+        }
+        for (state.redirect_origins) |item| {
+            const entry = try origins.getOrPut(a, item.key);
+            if (!entry.found_existing) entry.value_ptr.* = item;
+        }
+        min_text_chars = @max(min_text_chars, state.suppress.min_text_chars);
+        next.revision = @max(next.revision, cfg.curation_revision);
+    }
+    const merged = try a.alloc(resolver.KeyAlias, aliases.count());
+    for (aliases.keys(), aliases.values(), merged) |key, target, *alias| alias.* = .{ .key = key, .target = target };
+    next.merges = merged;
+    next.state = .{ .redirect_origins = origins.values(), .suppress = .{ .entries = entries.values(), .text_entries = text_entries.values(), .keys = keys.keys(), .texts = texts.keys(), .min_text_chars = min_text_chars }, .removed_aliases = removed.keys(), .distinct = pairs.values() };
+    var index = try resolver.curation.Index.init(a, "", try std.json.Stringify.valueAlloc(a, next.state, .{}));
+    try index.bindRedirects(a, try resolver.curation.RedirectIndex.init(a, merged));
+    for (merged) |alias| if (index.keySuppressed(alias.target) or try index.pinnedDistinct(a, alias.key, alias.target)) return error.ResolverNamespaceMigrationConflict;
+    return next;
+}
+
 pub const MetadataPlan = struct { indexes_json: []const u8, changed: bool, revision: u64, config_generation: u64 };
 
 /// Scratch-arena result used by the metadata CAS path. Index declarations are
@@ -1141,4 +1199,22 @@ test "resolver curation ownership index borrows opaque proposal evidence" {
     try std.testing.expect(index.owns("concept/{{uslug _entity.text}}"));
     try std.testing.expect(index.owns("other/{{uslug _entity.text}}"));
     try std.testing.expect(!index.owns("person/{{uslug _entity.text}}"));
+}
+
+test "resolver curation namespace propagation batches legacy policy unions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const configs = try a.alloc(catalog.ResolverConfig, 5000);
+    for (configs, 0..) |*cfg, i| cfg.* = .{ .name = try std.fmt.allocPrint(a, "r-{d}", .{i}), .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{_key}}", .curation_revision = i + 1, .merges = try a.dupe(resolver.KeyAlias, &.{.{ .key = try std.fmt.allocPrint(a, "concept/a-{d}", .{i}), .target = try std.fmt.allocPrint(a, "concept/b-{d}", .{i}) }}) };
+    const batch = try foldNamespaceBatch(a, "concept/{{_key}}", configs);
+    try std.testing.expectEqual(@as(usize, 5000), batch.merges.len);
+    try std.testing.expectEqual(@as(u64, 5000), batch.revision);
+    const first = try foldNamespace(a, .{ .key_template = "concept/{{_key}}" }, configs[0]);
+    const incremental = try foldNamespace(a, first, configs[1]);
+    const small = try foldNamespaceBatch(a, "concept/{{_key}}", configs[0..2]);
+    try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, incremental, .{}), try std.json.Stringify.valueAlloc(a, small, .{}));
+    var conflicting = configs[0];
+    conflicting.merges = &.{.{ .key = configs[0].merges[0].key, .target = "concept/elsewhere" }};
+    try std.testing.expectError(error.ResolverNamespaceMigrationConflict, foldNamespaceBatch(a, "concept/{{_key}}", &.{ configs[0], conflicting }));
 }

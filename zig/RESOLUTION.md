@@ -2088,3 +2088,20 @@ only named resolvers and, for query resolution, the siblings that can consume th
 same extraction. Consumer pages own strings independently of storage cursor
 movement. Progress observation runs in bounded groups of 16 source tables, with a
 shared deadline and per-worker allocation ownership.
+
+
+Resolver catalog lookup shares generation-owned indexes for namespace consumers,
+identity names and replacement reservations. Warm projection publication checks
+reservations by identity rather than rescanning the catalog per consumer; point
+entity discovery clones only the selected descriptor. First-use Lite adoption
+prepares selected namespace policies before entering the writer lease and fences
+source configuration generations both at adoption and final publication.
+
+Metadata consumer discovery uses the same durable prefix trie as Lite, with
+separate namespace/source postings. Matching namespaces are ordered and paged
+under one catalog revision; a source may appear in multiple namespace pages, so
+HTTP admission deduplicates resolver identities rather than source tables. Source
+edits and deletions update postings and reference-counted routes atomically.
+Decoder 43 rebuilds the namespace routing index through the bounded bootstrap
+worker before publishing v3 readiness. Its records remain in the resolver
+namespace snapshot projection; legacy reads retain their scan path until ready.

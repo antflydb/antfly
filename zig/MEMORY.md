@@ -2310,3 +2310,11 @@ serialize or rebuild previously visited components. Membership, canonical lookup
 and distinct checks explicitly select the appropriate scope; a changed authority
 head or rollback discards the cache. Scale coverage includes hundreds of distinct
 scopes in one operation, alongside single-scope reads in a large space.
+
+
+Canonical execution additionally memoizes each visited identity's canonical
+endpoint, redirect distance and endpoint suppression within the operation. New
+paths stop at cached tails, and path compression stores one result per identity;
+long chains and converging paths share work and storage. Full components remain
+separate for membership and distinct checks. Authority changes and rollback
+invalidate both caches, preserving the same revision fence and traversal budget.
