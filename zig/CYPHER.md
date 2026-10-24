@@ -3290,3 +3290,13 @@ Grouped GRAPH_TABLE COLUMNS can request intrinsic group-key order when direct
 scalar group keys are available. Native execution still certifies the index and
 reducer. Synthetic source ordinals, positional resume tokens and unsupported
 expressions remain barriers; SQL keeps its own final ordering.
+
+
+Admission certificates come from SQL's bound typed program, including scalar
+AST predicates and its inserted coercions. Closed literal/parameter coercions
+bind once per invocation; a failed speculative conversion declines observation
+and remains the residual evaluator's responsibility. Row-dependent casts and
+fallible predicates remain barriers. Identity frames carry and rename the
+entire predicate obligation and its dependencies. Catalog retention uses a
+typed clone, preserving the internal representation and ownership of label
+predicate values independently of their wire JSON form.

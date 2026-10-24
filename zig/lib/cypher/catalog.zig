@@ -69,6 +69,26 @@ pub const Graph = struct {
     revision: u64,
     labels: []const Label,
     relationships: []const Relationship,
+    /// Own catalog values directly; Value's wire JSON intentionally has a
+    /// different representation from its internal tagged union.
+    pub fn clone(self: Graph, a: std.mem.Allocator) !Graph {
+        var result = self;
+        result.name = try a.dupe(u8, self.name);
+        const labels = try a.alloc(Label, self.labels.len);
+        for (self.labels, labels) |label_value, *out| {
+            out.* = label_value;
+            inline for (.{ "name", "table", "logical_table", "database", "namespace" }) |field| @field(out, field) = try a.dupe(u8, @field(label_value, field));
+            out.predicate = (try (values.Value{ .map = label_value.predicate }).clone(a)).map;
+        }
+        result.labels = labels;
+        const relationships = try a.alloc(Relationship, self.relationships.len);
+        for (self.relationships, relationships) |relationship_value, *out| {
+            out.* = relationship_value;
+            inline for (.{ "name", "index", "source_label", "target_label", "stored_type" }) |field| @field(out, field) = try a.dupe(u8, @field(relationship_value, field));
+        }
+        result.relationships = relationships;
+        return result;
+    }
     pub fn label(self: Graph, name: []const u8) ?Label {
         for (self.labels) |l| if (std.mem.eql(u8, l.name, name)) return l;
         return null;
@@ -122,3 +142,22 @@ pub const Store = struct {
         try self.vtable.put(self.ptr, graph, expected_revision);
     }
 };
+
+test "catalog clone owns label predicates independently of wire serialization" {
+    var retained = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer retained.deinit();
+    const cloned = blk: {
+        var source = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer source.deinit();
+        const graph = try parseDefinition(source.allocator(), "g", 1, 1,
+            \\{"labels":[{"name":"D","table":"docs","where":{"flag":true,"name":"kept","nested":{"x":[1,null]}}}],"relationships":[{"name":"R","index":"links","source_label":"D","target_label":"D","stored_type":"r"}]}
+        );
+        break :blk try graph.clone(retained.allocator());
+    };
+    try cloned.validate();
+    try std.testing.expectEqualStrings("g", cloned.name);
+    try std.testing.expectEqualStrings("links", cloned.relationships[0].index);
+    try std.testing.expectEqualStrings("kept", cloned.labels[0].predicate[1].value.string);
+    try std.testing.expectEqual(@as(i64, 1), cloned.labels[0].predicate[2].value.map[0].value.list[0].integer);
+    try std.testing.expect(cloned.labels[0].predicate[2].value.map[0].value.list[1] == .null);
+}

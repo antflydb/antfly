@@ -8821,6 +8821,10 @@ def test_sql_group_and_filter_observers_scale_with_index_domains(graph_db):
         ),
     ):
         assert graph_db.sql(query)["rows"] == expected, query
+    assert graph_db.sql(
+        f"SELECT count(DISTINCT s),min(s),max(s) FROM (SELECT id AS g,score AS s FROM {source} WHERE id='g3') d WHERE s >= $1",
+        [1],
+    )["rows"] == [["2", "1", "2"]]
 
 
 def test_group_observer_proofs_preserve_nulls_ordinals_and_late_errors(graph_db):
@@ -8858,6 +8862,8 @@ def test_group_observer_proofs_preserve_nulls_ordinals_and_late_errors(graph_db)
                 "query": "MATCH(n:D) WITH n.id AS g,count(DISTINCT n.score) AS c ORDER BY g LIMIT 2 WHERE g<'g6' OR 1/0>0 RETURN g,c"
             },
         )
+    with pytest.raises(SQLStateError, match="22012"):
+        graph_db.sql(f"SELECT count(DISTINCT score),min(score),max(score) FROM {source} WHERE score=1 OR 1/0>0")
     weighted = "UNWIND range(1,1000000) AS x UNWIND range(1,1000000) AS y RETURN 0 AS g,"
     result = graph_db.cypher_json("g", {"query": weighted + "count(*)+1 ORDER BY g LIMIT 1"})
     assert result["rows"][0][1]["value"] == "1000000000001"

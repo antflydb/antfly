@@ -377,7 +377,7 @@ pub const Cursor = struct {
         // Observer negotiation happens after open returns. Retain its AST and
         // scalar type environment in the cursor, independently of caller arenas.
         const scalar_query = try std.json.parseFromSliceLeaky(cypher.ast.Query, owned, try std.json.Stringify.valueAlloc(owned, binding.definition.query, .{}), .{});
-        const scalar_graph = try std.json.parseFromSliceLeaky(cypher.catalog.Graph, owned, try std.json.Stringify.valueAlloc(owned, binding.graph, .{}), .{});
+        const scalar_graph = try binding.graph.clone(owned);
         const scalar_dependencies = try owned.alloc(catalog.Table, binding.dependencies.len);
         for (binding.dependencies, scalar_dependencies) |table, *copy| {
             const copied_columns = try owned.alloc(catalog.Column, table.columns.len);

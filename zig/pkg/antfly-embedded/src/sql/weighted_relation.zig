@@ -42,6 +42,9 @@ pub const Plan = struct {
     width: usize,
 
     pub fn init(a: A, root: *const binding.Node, requests: []const catalog.AggregateWeight, cursors: []const catalog.Cursor) anyerror!?Plan {
+        return initWithParameters(a, root, requests, cursors, &.{});
+    }
+    pub fn initWithParameters(a: A, root: *const binding.Node, requests: []const catalog.AggregateWeight, cursors: []const catalog.Cursor, parameters: []const std.json.Value) anyerror!?Plan {
         // Adapters may negotiate with a temporary request descriptor. The
         // operator tree retains it across pulls, so own both descriptors and
         // field vectors before returning to the caller.
@@ -54,7 +57,7 @@ pub const Plan = struct {
             const observer = try observer_request.forward(a, request, request.fields, fields);
             out.* = .{ .observer = observer.kind, .observer_field = observer.field, .observer_keys = observer.keys, .observer_filter = observer.filter, .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| try a.dupe(u8, name) else null, .invariants = invariants, .summaries = try ownCertificates(a, request.summaries) };
         }
-        return initDepth(a, root, owned, cursors, 0);
+        return initDepth(a, root, owned, cursors, parameters, 0);
     }
     fn ownCertificates(a: A, input: []const catalog.SummaryCertificate) ![]const catalog.SummaryCertificate {
         const result = try a.alloc(catalog.SummaryCertificate, input.len);
@@ -236,7 +239,7 @@ pub const Plan = struct {
         }
         return result.items;
     }
-    fn initDepth(a: A, root: *const binding.Node, requests: []const catalog.AggregateWeight, cursors: []const catalog.Cursor, depth: usize) anyerror!?Plan {
+    fn initDepth(a: A, root: *const binding.Node, requests: []const catalog.AggregateWeight, cursors: []const catalog.Cursor, parameters: []const std.json.Value, depth: usize) anyerror!?Plan {
         if (depth >= 64 or requests.len == 0) return null;
         var node = root;
         var mapped = requests;
@@ -264,7 +267,7 @@ pub const Plan = struct {
                 for (query.binding.order_keys) |key| if (key.source == .column) try needed.put(a, key.source.column.path, {});
                 const input = try a.alloc(catalog.AggregateWeight, 1);
                 input[0] = .{ .fields = try names(a, needed), .multiplicity = .capped };
-                const nested = try child(a, query.source, input, cursors, depth + stages.items.len + 1);
+                const nested = try child(a, query.source, input, cursors, parameters, depth + stages.items.len + 1);
                 return .{ .source = node, .terminal = .{ .window = .{ .child = nested } }, .requests = requests, .stages = stages.items, .physical = &.{}, .width = width + node.columns.len + nested.width };
             }
             if (query.binding.aggregate != null or query.binding.window != null or query.statement.count_all or
@@ -274,6 +277,10 @@ pub const Plan = struct {
             const bound = query.binding.scalars;
             if (bound.predicate) |p| if (!p.repeatable()) return null;
             for (bound.projections) |optional| if (optional) |p| if (!p.repeatable()) return null;
+            const has_observer = for (mapped) |request| {
+                if (request.observer != null) break true;
+            } else false;
+            const admission = if (has_observer and bound.predicate != null) try observer_request.fromProgram(a, bound.predicate.?, bound.columns, parameters) else null;
             var covered: Names = .empty;
             for (mapped) |request| for (request.fields) |field| try covered.put(a, field, {});
             const inputs = try a.alloc(catalog.AggregateWeight, mapped.len);
@@ -284,7 +291,7 @@ pub const Plan = struct {
                     if (columnIndex(node, field) == null) return null;
                     try wanted.put(a, field, {});
                 }
-                var observer_direct = request.observer != null and bound.predicate == null;
+                var observer_direct = request.observer != null and (bound.predicate == null or admission != null);
                 var observer_from: std.ArrayList([]const u8) = .empty;
                 var observer_to: std.ArrayList([]const u8) = .empty;
                 var dependencies: Names = .empty;
@@ -326,7 +333,10 @@ pub const Plan = struct {
                         try observer_to.append(a, projection.field);
                     }
                 }
-                const observer: observer_request.Forward = if (observer_direct) try observer_request.forward(a, request, observer_from.items, observer_to.items) else .{};
+                var observer: observer_request.Forward = if (observer_direct) try observer_request.forward(a, request, observer_from.items, observer_to.items) else .{};
+                if (observer.kind != null) if (admission) |filter| {
+                    observer.filter = if (observer.filter) |previous| .{ .all = try a.dupe(catalog.Scan.GraphFilter, &.{ previous, filter }) } else filter;
+                };
                 output.* = try names(a, wanted);
                 input.* = .{ .observer = observer.kind, .observer_field = observer.field, .observer_keys = observer.keys, .observer_filter = observer.filter, .fields = try names(a, dependencies), .multiplicity = request.multiplicity, .summaries = try projectCertificates(a, node, request, wanted) };
             }
@@ -344,14 +354,14 @@ pub const Plan = struct {
                 for (source.columns, fields) |column, *field| field.* = column.internal;
                 const input = try a.alloc(catalog.AggregateWeight, 1);
                 input[0] = .{ .fields = fields, .multiplicity = .exact };
-                const nested = try child(a, source, input, cursors, depth + 1);
+                const nested = try child(a, source, input, cursors, parameters, depth + 1);
                 width += nested.width;
                 break :blk .{ .replay = .{ .child = nested } };
             },
             .set => |set| blk: {
                 if (set.kind != .@"union" or !set.all) return null;
-                const left = try child(a, set.left, try positional(a, node, set.left, mapped), cursors, depth + stages.items.len + 1);
-                const right = try child(a, set.right, try positional(a, node, set.right, mapped), cursors, depth + stages.items.len + 1);
+                const left = try child(a, set.left, try positional(a, node, set.left, mapped), cursors, parameters, depth + stages.items.len + 1);
+                const right = try child(a, set.right, try positional(a, node, set.right, mapped), cursors, parameters, depth + stages.items.len + 1);
                 width += @max(left.width, right.width);
                 break :blk .{ .union_all = .{ .left = left, .right = right } };
             },
@@ -382,7 +392,7 @@ pub const Plan = struct {
                     };
                     out.* = .{ .fields = try names(a, fields), .multiplicity = request.multiplicity };
                 }
-                const nested = try child(a, graph, input, cursors, depth + stages.items.len + 1);
+                const nested = try child(a, graph, input, cursors, parameters, depth + stages.items.len + 1);
                 // Build one dependency partition shared by every probe slot. A
                 // build tuple carries its own bag weight through memory/spill.
                 var build_fields: Names = .empty;
@@ -399,7 +409,7 @@ pub const Plan = struct {
                 for (keys) |program| for (program.required_columns) |ordinal| try build_fields.put(a, single.columns[ordinal].internal, {});
                 const build_requests = try a.alloc(catalog.AggregateWeight, 1);
                 build_requests[0] = .{ .fields = try names(a, build_fields), .multiplicity = multiplicity };
-                const build = try child(a, single, build_requests, cursors, depth + stages.items.len + 1);
+                const build = try child(a, single, build_requests, cursors, parameters, depth + stages.items.len + 1);
                 width += nested.width + build.width;
                 break :blk .{ .cross = .{ .child = nested, .build = build, .singleton = single, .graph_left = graph_left, .factor_only = factor_only } };
             },
@@ -427,9 +437,9 @@ pub const Plan = struct {
         return .{ .source = node, .requests = requests, .stages = stages.items, .physical = physical, .width = width + node.columns.len };
     }
 
-    fn child(a: A, node: *const binding.Node, requests: []const catalog.AggregateWeight, cursors: []const catalog.Cursor, depth: usize) !*Plan {
+    fn child(a: A, node: *const binding.Node, requests: []const catalog.AggregateWeight, cursors: []const catalog.Cursor, parameters: []const std.json.Value, depth: usize) !*Plan {
         const result = try a.create(Plan);
-        result.* = (try initDepth(a, node, requests, cursors, depth)) orelse .{ .source = node, .terminal = .ordinary, .requests = requests, .stages = &.{}, .physical = &.{}, .width = node.columns.len };
+        result.* = (try initDepth(a, node, requests, cursors, parameters, depth)) orelse .{ .source = node, .terminal = .ordinary, .requests = requests, .stages = &.{}, .physical = &.{}, .width = node.columns.len };
         return result;
     }
     fn positional(a: A, parent: *const binding.Node, nested: *const binding.Node, requests: []const catalog.AggregateWeight) ![]const catalog.AggregateWeight {

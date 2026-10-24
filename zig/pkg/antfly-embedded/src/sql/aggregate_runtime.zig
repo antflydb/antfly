@@ -472,24 +472,19 @@ const StatisticConsumer = struct {
         return self.program.statisticProof(a, self.columns, fields, self.integers);
     }
 };
-/// Complete admission proof. Partial conjunct hints still use the ordinary
-/// reducer. Boolean trees retain SQL NULL semantics in the graph bridge.
-fn observerFilter(context: anytype, table: catalog.Table, predicate: *const ast.Predicate, depth: usize) anyerror!?catalog.Scan.GraphFilter {
-    if (depth >= 64) return null;
-    return switch (predicate.*) {
-        .comparison, .is_null => blk: {
-            const bound = try context.conditions(table, predicate);
-            if (!bound.complete or bound.empty or bound.primary_key != null or bound.terms.items.len != 1) break :blk null;
-            break :blk .{ .comparison = bound.terms.items[0] };
-        },
-        .conjunction, .disjunction => |both| blk: {
-            const left = (try observerFilter(context, table, both.left, depth + 1)) orelse break :blk null;
-            const right = (try observerFilter(context, table, both.right, depth + 1)) orelse break :blk null;
-            const children = try context.arena.dupe(catalog.Scan.GraphFilter, &.{ left, right });
-            break :blk if (predicate.* == .conjunction) .{ .all = children } else .{ .any = children };
-        },
-        else => null,
-    };
+/// Bind the entire typed admission program, including predicates represented
+/// as scalar ASTs. A partial scan hint never licenses scalar observation.
+fn observerFilter(context: anytype, table: catalog.Table, bound: *const binding.Bound) !?catalog.Scan.GraphFilter {
+    const program = bound.input.predicate orelse return null;
+    const observers = @import("observer_request.zig");
+    const filter = (try observers.fromProgram(context.arena, program, bound.input.columns, context.parameters)) orelse return null;
+    const from = try context.arena.alloc([]const u8, bound.input.columns.len);
+    const to = try context.arena.alloc([]const u8, bound.input.columns.len);
+    for (bound.input.columns, from, to) |column, *source, *target| {
+        source.* = column.name;
+        target.* = (try table.column(column.name)).path;
+    }
+    return observers.mapFilter(context.arena, filter, from, to);
 }
 fn aggregateRequests(a: std.mem.Allocator, bound: *const binding.Bound, table: catalog.Table, conditions: []const catalog.Condition, parameters: []const Json, predicate_complete: bool, exact_filter: ?catalog.Scan.GraphFilter) ![]const catalog.AggregateWeight {
     const integers = try a.alloc(?i64, parameters.len);
@@ -670,8 +665,8 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
             try grouped.addGlobalCount(count);
             aggregate_loaded = true;
         };
-        const exact_filter = if (statement.predicate) |predicate| try observerFilter(context, table, predicate, 0) else null;
-        const observer_admission = statement.predicate == null or exact_filter != null;
+        const exact_filter = try observerFilter(context, table, bound);
+        const observer_admission = bound.input.predicate == null or exact_filter != null;
         const can_weight = !aggregate_loaded and !predicates.empty and !external and supportsWeights(bound);
         const partitioned = can_weight and bound.specs.len > 0 and
             try scan.aggregateWeights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, try aggregateRequests(context.arena, bound, table, predicates.terms.items, context.parameters, observer_admission, exact_filter));

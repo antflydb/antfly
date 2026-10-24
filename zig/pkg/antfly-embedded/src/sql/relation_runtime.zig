@@ -3502,7 +3502,7 @@ fn Engine(comptime Context: type) type {
             fn enableAggregateWeights(ptr: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
                 if (!self.untouched()) return false;
-                const plan = (try @import("weighted_relation.zig").Plan.init(self.engine.context.arena, self.iterator.node, requests, self.engine.cursors)) orelse return false;
+                const plan = (try @import("weighted_relation.zig").Plan.initWithParameters(self.engine.context.arena, self.iterator.node, requests, self.engine.cursors, self.engine.context.parameters)) orelse return false;
                 const reader = try WeightedReader.create(self.engine, plan);
                 if (!reader.compressed) {
                     reader.deinit();
@@ -4805,4 +4805,76 @@ test "transparent graph relations forward order requests and certificates throug
             try std.testing.expectEqual(@as(i64, @intCast(12999 - index)), actual);
         }
     };
+}
+
+test "SQL scalar observer admission survives filtered identity frames" {
+    const Fixture = struct {
+        negotiated: bool = false,
+        text: []const u8,
+        position: usize = 0,
+        fn resolve(_: *anyopaque, _: Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return error.UnexpectedPhysicalResolve;
+        }
+        fn graph(_: *anyopaque, a: Allocator, definition: @import("ast.zig").GraphTable) !catalog.Table {
+            const graph_binding = try a.create(catalog.graph_relation.Binding);
+            graph_binding.* = .{ .catalog_json = "{}", .definition = definition, .graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{}, .relationships = &.{} }, .dependencies = &.{} };
+            return .{ .id = 1, .physical_name = "graph", .schema_version = 1, .graph = graph_binding, .columns = &.{.{ .name = "score", .path = "score", .type = .integer }} };
+        }
+        fn open(raw: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            return .{ .ptr = raw, .next = next, .close = close, .enable_aggregate_weights = enable };
+        }
+        fn filter(input: catalog.Scan.GraphFilter) !void {
+            switch (input) {
+                .comparison => |condition| try std.testing.expectEqualStrings("score", condition.column),
+                .all, .any => |children| for (children) |child| try filter(child),
+            }
+        }
+        fn enable(raw: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (requests.len == 1 and requests[0].observer == null) {
+                // Ordinary weight negotiation retries after the provider
+                // declines the complete three-observer plan.
+                try std.testing.expect(self.negotiated);
+                return false;
+            }
+            try std.testing.expectEqual(@as(usize, 3), requests.len);
+            for (requests) |request| {
+                if (request.observer == null or request.observer_filter == null) std.debug.print("missing observer={any} field={s} filter={any}: {s}\n", .{ request.observer, request.observer_field orelse "<none>", request.observer_filter, self.text });
+                try std.testing.expect(request.observer != null);
+                try std.testing.expectEqualStrings("score", request.observer_field.?);
+                try std.testing.expect(request.observer_filter != null);
+                try filter(request.observer_filter.?);
+            }
+            self.negotiated = true;
+            // A provider may decline. SQL still applies its original predicate.
+            return false;
+        }
+        fn next(raw: *anyopaque, a: Allocator, limit: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const end = @min(3, self.position + limit);
+            const rows = try a.alloc(catalog.Row, end - self.position);
+            const layout = try catalog.Row.TypedLayout.init(a, &.{"score"});
+            for (rows, self.position..) |*row, i| row.* = try catalog.Row.fromDatums(a, "row", layout, &.{Datum.json(.{ .integer = @intCast(i) })});
+            self.position = end;
+            return .{ .rows = rows, .after = if (end < 3) "more" else null };
+        }
+        fn close(_: *anyopaque) void {}
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    for ([_][]const u8{
+        "SELECT count(DISTINCT score),min(score),max(score) FROM GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.score AS score)) q WHERE score>=1",
+        "SELECT count(DISTINCT s),min(s),max(s) FROM (SELECT score AS s FROM GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.score AS score)) q WHERE score>=1) d WHERE s=1 OR s=2",
+        "SELECT count(DISTINCT score),min(score),max(score) FROM GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.score AS score)) q WHERE score>= $1",
+        "SELECT count(DISTINCT score),min(score),max(score) FROM GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.score AS score)) q WHERE score IS NULL OR score>=1",
+    }) |text| {
+        var fixture: Fixture = .{ .text = text };
+        const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Fixture.resolve, .resolve_graph = Fixture.graph, .scan = SetTestBackend.scan, .open_scan = Fixture.open, .mutate = SetTestBackend.mutate, .checkpoint = Fixture.checkpoint } };
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, text, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, if (std.mem.indexOf(u8, text, "$1") != null) &.{.{ .integer = 1 }} else &.{}, .{});
+        defer result.deinit();
+        if (!fixture.negotiated) std.debug.print("not negotiated: {s}\n", .{text});
+        try std.testing.expect(fixture.negotiated);
+        for (result.output.rows[0], [_][]const u8{ "2", "1", "2" }) |actual, expected| try std.testing.expectEqualStrings(expected, actual.string);
+    }
 }
