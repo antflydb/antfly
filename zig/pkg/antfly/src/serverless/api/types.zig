@@ -38,6 +38,7 @@ pub const DocumentMutation = struct {
 };
 
 pub const IngestBatchRequest = struct {
+    operation_id: ?[]const u8 = null,
     namespace: []const u8,
     timestamp_ns: u64,
     mutations: []const DocumentMutation,

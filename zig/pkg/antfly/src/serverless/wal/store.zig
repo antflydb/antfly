@@ -25,9 +25,11 @@ pub const WalStore = struct {
     pub const VTable = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
         append: *const fn (*anyopaque, []const u8, u64, []const u8) anyerror!u64,
+        append_batch_idempotent: ?*const fn (*anyopaque, []const u8, u64, []const []const u8, []const u8) anyerror!wal_types.BatchResult = null,
         append_idempotent: ?*const fn (*anyopaque, []const u8, u64, []const u8, []const u8) anyerror!u64 = null,
         append_idempotent_if_latest: ?*const fn (*anyopaque, []const u8, u64, []const u8, []const u8, u64) anyerror!?u64 = null,
         read_from_alloc: *const fn (*anyopaque, Allocator, []const u8, u64) anyerror![]wal_types.Record,
+        read_range_alloc: ?*const fn (*anyopaque, Allocator, []const u8, wal_types.ReadRange) anyerror![]wal_types.Record = null,
         latest_lsn: *const fn (*anyopaque, []const u8) anyerror!u64,
         truncate_prefix: *const fn (*anyopaque, []const u8, u64) anyerror!u64,
     };
@@ -53,6 +55,13 @@ pub const WalStore = struct {
     ) !u64 {
         const append_fn = self.vtable.append_idempotent orelse return error.IdempotentAppendUnsupported;
         return try append_fn(self.ptr, namespace, timestamp_ns, payload, operation_id);
+    }
+
+    /// An atomic batch requires a store-provided commit primitive. Never
+    /// emulate it with independently acknowledged per-record appends.
+    pub fn appendBatchIdempotent(self: *WalStore, namespace: []const u8, timestamp_ns: u64, payloads: []const []const u8, operation_id: []const u8) !wal_types.BatchResult {
+        const append_fn = self.vtable.append_batch_idempotent orelse return error.IdempotentBatchAppendUnsupported;
+        return append_fn(self.ptr, namespace, timestamp_ns, payloads, operation_id);
     }
 
     pub fn supportsIdempotentAppend(self: *const WalStore) bool {
@@ -88,6 +97,14 @@ pub const WalStore = struct {
 
     pub fn readFromAlloc(self: *WalStore, namespace: []const u8, start_lsn: u64) ![]wal_types.Record {
         return try self.vtable.read_from_alloc(self.ptr, self.allocator, namespace, start_lsn);
+    }
+
+    /// No unbounded fallback: an old provider must opt into bounded I/O.
+    pub fn readRangeAlloc(self: *WalStore, namespace: []const u8, range: wal_types.ReadRange) ![]wal_types.Record {
+        try range.check();
+        if (range.start_lsn > range.end_lsn) return self.allocator.alloc(wal_types.Record, 0);
+        const read = self.vtable.read_range_alloc orelse return error.BoundedWalReadUnsupported;
+        return read(self.ptr, self.allocator, namespace, range);
     }
 
     pub fn latestLsn(self: *WalStore, namespace: []const u8) !u64 {

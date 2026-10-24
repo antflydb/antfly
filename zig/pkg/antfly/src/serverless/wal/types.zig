@@ -16,6 +16,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+pub const BatchResult = struct { start_lsn: u64, end_lsn: u64 };
+
 pub const Record = struct {
     lsn: u64,
     timestamp_ns: u64,
@@ -24,6 +26,20 @@ pub const Record = struct {
     /// Legacy records and stores that do not support that protocol leave it
     /// null.
     operation_id: ?[]u8 = null,
+};
+
+/// A captured, inclusive committed prefix. Exceeding any budget fails the
+/// entire read; consumers must never mistake a truncated page for fresh state.
+pub const ReadRange = struct {
+    start_lsn: u64,
+    end_lsn: u64,
+    max_records: usize = 4096,
+    max_bytes: usize = 8 * 1024 * 1024,
+    cancellation: ?@import("objectstore").CancellationToken = null,
+
+    pub fn check(self: @This()) !void {
+        if (self.cancellation) |token| try token.check();
+    }
 };
 
 pub fn freeRecords(alloc: Allocator, records: []Record) void {

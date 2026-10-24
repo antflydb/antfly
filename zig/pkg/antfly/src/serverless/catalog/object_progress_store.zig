@@ -145,9 +145,9 @@ pub const ObjectProgressStore = struct {
 
     pub fn deinit(self: *ObjectProgressStore) void {
         if (self.owns_client) self.client.deinit();
-        if (self.fs_client) |fs| self.alloc.destroy(fs);
-        if (self.gcs_client) |gcs| self.alloc.destroy(gcs);
-        if (self.s3_client) |s3| self.alloc.destroy(s3);
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.fs_client) |fs| self.alloc.destroy(fs);
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.gcs_client) |gcs| self.alloc.destroy(gcs);
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.s3_client) |s3| self.alloc.destroy(s3);
         self.alloc.free(self.bucket);
         self.alloc.free(self.prefix);
         self.* = undefined;

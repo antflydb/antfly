@@ -19,6 +19,20 @@ const builtin = @import("builtin");
 var freestanding_counter: u64 = 0;
 const is_hostless = builtin.os.tag == .freestanding or builtin.os.tag == .wasi;
 
+/// Host-owned clocks for serialized freestanding execution. Install before
+/// opening any lease or request; callbacks must remain valid for the instance.
+/// Authority must include suspension, and failed/backward clocks return zero.
+pub const HostClocks = struct {
+    monotonic_ns: *const fn () u64,
+    realtime_ns: *const fn () u64,
+    authority_ns: *const fn () u64,
+};
+var host_clocks: ?HostClocks = null;
+pub fn installHostClocks(clocks: HostClocks) void {
+    if (comptime !is_hostless) @compileError("host clocks are only supported in freestanding hosts");
+    host_clocks = clocks;
+}
+
 pub fn sleepNs(ns: u64) void {
     if (comptime is_hostless) return;
 
@@ -65,6 +79,7 @@ pub fn awakeNs(io: std.Io) u64 {
 
 pub fn monotonicNs() u64 {
     if (comptime is_hostless) {
+        if (host_clocks) |clocks| return clocks.monotonic_ns();
         freestanding_counter +%= 1;
         return freestanding_counter;
     }
@@ -80,6 +95,7 @@ pub fn monotonicNs() u64 {
 /// CLOCK_BOOTTIME advances while a VM/node is suspended; MONOTONIC does not.
 /// Other supported platforms fall back to their monotonic clock.
 pub fn authorityNs() u64 {
+    if (comptime is_hostless) if (host_clocks) |clocks| return clocks.authority_ns();
     if (comptime builtin.os.tag == .linux) {
         var ts: std.posix.timespec = undefined;
         switch (std.posix.errno(std.posix.system.clock_gettime(.BOOTTIME, &ts))) {
@@ -94,6 +110,7 @@ pub fn authorityNs() u64 {
 
 pub fn realtimeNs() u64 {
     if (comptime is_hostless) {
+        if (host_clocks) |clocks| return clocks.realtime_ns();
         freestanding_counter +%= 1;
         return freestanding_counter;
     }

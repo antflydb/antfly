@@ -265,6 +265,7 @@ jobs:
 
           if ! "$helper" "$base" "${{ inputs.head_sha || github.sha }}" -- \
             ':(glob)zig/**' \
+            ':(glob)examples/cloudflare-serverless/**' \
             ':(exclude,glob)zig/pkg/antfly/antfarm/**' \
             ':(glob)scripts/ci/zig-*.sh' \
             scripts/ci/zig_e2e_shard.py \
@@ -958,6 +959,17 @@ jobs:
           node web/test-wasm-abi.mjs wasm32
           zig build wasm -Dwasm=true -Dwasm-memory-model=wasm64 -j1 --summary all
           node web/test-wasm-abi.mjs wasm64
+
+      - name: Build and test hosted serverless Worker
+        working-directory: examples/cloudflare-serverless
+        env:
+          WRANGLER_SEND_METRICS: "false"
+        run: |
+          npm ci --ignore-scripts
+          npm run test:native
+          npm run build
+          npm test
+          npm run test:workerd
 
       - name: Release completed qualification artifacts
         if: always() && steps.cache.outcome == 'success'

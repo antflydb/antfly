@@ -20,6 +20,7 @@ const std = @import("std");
 // A physical fallback here would become a cache dependency of control owners.
 const consumer = @import("antfly_test_source_root");
 pub const antfly_sources = consumer.antfly_sources;
+pub const hosted_sources = if (builtin.os.tag == .freestanding) @import("source_owner_embedded_db.zig") else struct {};
 pub const api_backup_contract = @import("api/backup_contract.zig");
 pub const api_batch = @import("api/batch.zig");
 pub const api_bounded_diagnostic_gate = @import("api/bounded_diagnostic_gate.zig");

@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Antfly on Cloudflare</title>
+<style>body{font:16px system-ui;max-width:780px;margin:60px auto;padding:0 24px;background:#f5f5f2;color:#232d26}h1{font-size:32px}label{display:block;margin:20px 0 6px}input,textarea,button{font:inherit;padding:10px;border:1px solid #adb4ac;border-radius:5px}input,textarea{box-sizing:border-box;width:100%}button{margin:12px 8px 0 0;background:#245a43;color:white;cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:white;padding:20px;border-radius:6px}</style>
+<h1>Antfly on Cloudflare</h1><p>Add documents and search your database.</p>
+<label for="token">API token</label><input id="token" type="password" autocomplete="off">
+<label for="id">Document ID</label><input id="id" value="welcome">
+<label for="document">Document</label><textarea id="document" rows="4">{"text":"Hello from Antfly on Cloudflare"}</textarea>
+<button id="save">Save document</button><button id="list">List documents</button>
+<label for="query">Search</label><input id="query" value="hello"><button id="search">Search</button>
+<pre id="result" role="status">Ready.</pre>
+<script type="module">
+const $=id=>document.getElementById(id); let visibility, pendingMutation;
+async function call(args){const response=await fetch('/api',{method:'POST',headers:{Authorization:`Bearer ${$('token').value}`,'Content-Type':'application/json'},body:JSON.stringify(args)});const result=await response.json();if(!response.ok)throw Error(result.error??response.status);if(result.visibility&&(!visibility||result.visibility.slice(0,66)!==visibility.slice(0,66)||result.visibility>visibility))visibility=result.visibility;return result}
+async function show(fn){try{$('result').textContent='Working…';$('result').textContent=JSON.stringify(await fn(),null,2)}catch(e){$('result').textContent=e.message}}
+$('save').onclick=()=>show(async()=>{const body=JSON.parse($('document').value);if(!body||typeof body!=='object'||Array.isArray(body))throw Error('Enter a JSON object');const mutation={kind:'upsert',doc_id:$('id').value,body:JSON.stringify(body)};if(!pendingMutation||JSON.stringify(pendingMutation.mutations[0])!==JSON.stringify(mutation))pendingMutation={op:'mutate',operation_id:crypto.randomUUID(),timestamp_ns:String(BigInt(Date.now())*1000000n),mutations:[mutation]};const result=await call(pendingMutation);pendingMutation=null;return result});
+$('list').onclick=()=>show(()=>call({op:'list',limit:20,required_visibility:visibility}));
+$('search').onclick=()=>show(()=>call({op:'search',text:$('query').value,fresh:true,required_visibility:visibility}));
+</script></html>

@@ -323,7 +323,7 @@ fn warmResolvedSearchPath(session: *runtime_mod.QuerySession, lanes: ResolvedSea
     }
 }
 
-fn searchTextAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, req: query_request.QueryRequest) ![]ScoredDoc {
+pub fn searchTextAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, req: query_request.QueryRequest) ![]ScoredDoc {
     const text_index = try resolveTextArtifactIndex(session, req);
     const text_payload = try session.fetchArtifactAlloc(text_index);
     defer alloc.free(text_payload);
@@ -522,7 +522,7 @@ fn applyTextFilterSetsAlloc(
     return try filtered.toOwnedSlice(alloc);
 }
 
-fn resolveTextArtifactIndex(
+pub fn resolveTextArtifactIndex(
     session: *runtime_mod.QuerySession,
     req: query_request.QueryRequest,
 ) !usize {

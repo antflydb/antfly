@@ -1,0 +1,71 @@
+{
+  "name": "antfly-serverless",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-10-23",
+  "rules": [
+    {
+      "type": "CompiledWasm",
+      "globs": [
+        "**/*.wasm"
+      ],
+      "fallthrough": true
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "DATABASE",
+      "bucket_name": "antfly-serverless"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "COMMITS",
+        "class_name": "CommitCoordinator"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "CommitCoordinator"
+      ]
+    }
+  ],
+  "vars": {
+    "ANTFLY_INCARNATION": "example-v1"
+  },
+  "ai": {
+    "binding": "AI"
+  },
+  "limits": {
+    "cpu_ms": 30000
+  },
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "queues": {
+    "producers": [
+      {
+        "binding": "MAINTENANCE",
+        "queue": "antfly-maintenance"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "antfly-maintenance",
+        "max_batch_size": 1,
+        "max_retries": 10,
+        "dead_letter_queue": "antfly-maintenance-dead"
+      }
+    ]
+  },
+  "triggers": {
+    "crons": [
+      "* * * * *"
+    ]
+  }
+}

@@ -418,6 +418,7 @@ pub const QuerySession = struct {
     graph_metric_transport_credit: usize = 0,
 
     pub fn graphAdjacencyCache(self: *QuerySession) ?@import("../graph_segment/topology_reader.zig").ReadCache {
+        if (comptime @import("builtin").os.tag == .freestanding) return null;
         if (self.cache == null) return null;
         return .{ .ptr = self, .read = readGraphAdjacencyBlock };
     }
@@ -619,7 +620,7 @@ pub const QuerySession = struct {
         try self.checkCancellation();
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactForQuery(artifact);
-        const result = if (self.cache) |cache|
+        const result = if (if (@import("builtin").os.tag == .freestanding) @as(?*cache_mod.QueryCache, null) else self.cache) |cache|
             try cache.getOrFetchVerifiedAllocWithCancellationUsingAllocator(
                 self.alloc,
                 self.artifacts,
@@ -662,7 +663,7 @@ pub const QuerySession = struct {
         try self.checkCancellation();
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactRange(artifact, offset, len);
-        const result = if (self.cache) |cache|
+        const result = if (if (@import("builtin").os.tag == .freestanding) @as(?*cache_mod.QueryCache, null) else self.cache) |cache|
             try cache.getVerifiedRangeOrFetchAllocWithCancellationUsingAllocator(
                 self.alloc,
                 self.artifacts,
@@ -692,7 +693,7 @@ pub const QuerySession = struct {
         try self.checkCancellation();
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactRange(artifact, offset, len);
-        const result = if (self.cache) |cache|
+        const result = if (if (@import("builtin").os.tag == .freestanding) @as(?*cache_mod.QueryCache, null) else self.cache) |cache|
             try cache.getVerifiedBlockOrFetchRangeAllocWithCancellationUsingAllocator(
                 self.alloc,
                 self.artifacts,
@@ -731,7 +732,7 @@ pub const QuerySession = struct {
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactRange(artifact, offset, len);
         if (len == 0) return error.InvalidArtifactRange;
-        const result = if (self.cache) |cache|
+        const result = if (if (@import("builtin").os.tag == .freestanding) @as(?*cache_mod.QueryCache, null) else self.cache) |cache|
             try cache.getAuthenticatedBlockOrFetchRangeAllocWithCancellationUsingAllocator(
                 self.alloc,
                 self.artifacts,
@@ -775,6 +776,7 @@ pub const QuerySession = struct {
         try self.checkCancellation();
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactRange(artifact, offset, len);
+        if (comptime @import("builtin").os.tag == .freestanding) return null;
         const cache = self.cache orelse return null;
         return cache.readAuthenticatedBlockIfPresentLease(alloc, artifact.artifact_id, block_id, artifact.byte_len, artifact.checksum, checksum, offset, len, self.readCancellation()) catch |err| switch (err) {
             error.OutOfMemory, error.Canceled => return err,
@@ -785,6 +787,7 @@ pub const QuerySession = struct {
     }
 
     pub fn cacheAuthenticatedBlocks(self: *QuerySession, index: usize, blocks: []const AuthenticatedBlockPublication) !void {
+        if (comptime @import("builtin").os.tag == .freestanding) return;
         const cache = self.cache orelse return;
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         cache.retainAuthenticatedBlocks(artifact.artifact_id, artifact.byte_len, artifact.checksum, blocks);

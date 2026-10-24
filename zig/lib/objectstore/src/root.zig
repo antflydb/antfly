@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const wasm_host = @import("wasm_host.zig");
 pub const types = @import("types.zig");
 pub const client = @import("client.zig");
 pub const filesystem = @import("filesystem.zig");

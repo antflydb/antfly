@@ -1,0 +1,18 @@
+{
+  "name": "antfly-cloudflare-serverless",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test test/host.test.mjs",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test:workerd": "wrangler deploy --dry-run --outdir dist/worker && node --test test/workerd.test.mjs",
+    "test:native": "node test/native.mjs"
+  },
+  "devDependencies": {
+    "binaryen": "132.0.0",
+    "wrangler": "4.152.0",
+    "miniflare": "5.20261019.2-beta"
+  }
+}

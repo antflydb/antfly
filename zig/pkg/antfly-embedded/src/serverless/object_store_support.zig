@@ -131,8 +131,8 @@ pub const OpenedObjectStore = struct {
     gcs_client: ?*object_storage.Gcs.JsonApiClient = null,
     s3_client: ?*object_storage.S3.Client = null,
     owns_client: bool = true,
-    credential_context: ?*AwsCredentialContext = null,
-    credential_io: ?*std.Io.Threaded = null,
+    credential_context: ?*if (@import("builtin").os.tag == .freestanding) void else AwsCredentialContext = null,
+    credential_io: ?*if (@import("builtin").os.tag == .freestanding) void else std.Io.Threaded = null,
     bucket: []u8,
     prefix: []u8,
 
@@ -422,17 +422,17 @@ pub const OpenedObjectStore = struct {
 
     pub fn deinit(self: *OpenedObjectStore) void {
         if (self.owns_client) self.client.deinit();
-        if (self.credential_context) |context| {
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.credential_context) |context| {
             context.deinit();
             self.alloc.destroy(context);
-        }
-        if (self.credential_io) |io| {
+        };
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.credential_io) |io| {
             io.deinit();
             self.alloc.destroy(io);
-        }
-        if (self.fs_client) |fs| self.alloc.destroy(fs);
-        if (self.gcs_client) |gcs| self.alloc.destroy(gcs);
-        if (self.s3_client) |s3| self.alloc.destroy(s3);
+        };
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.fs_client) |fs| self.alloc.destroy(fs);
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.gcs_client) |gcs| self.alloc.destroy(gcs);
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.s3_client) |s3| self.alloc.destroy(s3);
         self.alloc.free(self.bucket);
         self.alloc.free(self.prefix);
         self.* = undefined;

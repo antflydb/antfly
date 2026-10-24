@@ -34,12 +34,24 @@ pub const Service = struct {
     }
 
     pub fn ingestBatch(self: *Service, req: api_types.IngestBatchRequest) !api_types.IngestBatchResult {
+        const namespace = try self.alloc.dupe(u8, req.namespace);
+        errdefer self.alloc.free(namespace);
         if (req.mutations.len == 0) return .{
-            .namespace = try self.alloc.dupe(u8, req.namespace),
+            .namespace = namespace,
             .mutation_count = 0,
             .start_lsn = 0,
             .end_lsn = 0,
         };
+
+        if (req.operation_id) |operation_id| {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const temporary = arena.allocator();
+            const payloads = try temporary.alloc([]const u8, req.mutations.len);
+            for (req.mutations, payloads) |mutation, *payload| payload.* = try api_codec.encodeMutationAlloc(temporary, mutation);
+            const result = try self.wal.appendBatchIdempotent(req.namespace, req.timestamp_ns, payloads, operation_id);
+            return .{ .namespace = namespace, .mutation_count = req.mutations.len, .start_lsn = result.start_lsn, .end_lsn = result.end_lsn };
+        }
 
         var start_lsn: u64 = 0;
         var end_lsn: u64 = 0;
@@ -52,7 +64,7 @@ pub const Service = struct {
         }
 
         return .{
-            .namespace = try self.alloc.dupe(u8, req.namespace),
+            .namespace = namespace,
             .mutation_count = req.mutations.len,
             .start_lsn = start_lsn,
             .end_lsn = end_lsn,

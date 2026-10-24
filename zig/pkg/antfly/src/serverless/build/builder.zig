@@ -133,6 +133,10 @@ pub const Builder = struct {
     progress: *catalog_mod.ProgressStore,
     wal: *wal_mod.WalStore,
     io: ?std.Io = null,
+    /// Hosted invocations publish a bounded prefix. A subsequent invocation
+    /// resumes from the durably published manifest's WAL watermark.
+    max_wal_records: ?usize = null,
+    max_wal_bytes: usize = 8 * 1024 * 1024,
     graph_metric_max_parallelism: usize = lake_graph_metric.default_compute_parallelism,
     publication_lifecycle_hook: ?PublicationLifecycleHook = null,
 
@@ -161,6 +165,24 @@ pub const Builder = struct {
             .progress = progress,
             .wal = wal,
         };
+    }
+
+    fn readWalForBuild(self: *Builder, namespace: []const u8, start: u64) ![]wal_mod.Record {
+        const count = self.max_wal_records orelse return self.wal.readFromAlloc(namespace, start);
+        if (count == 0) return error.InvalidWalBatch;
+        const latest = try self.wal.latestLsn(namespace);
+        if (start > latest) return self.alloc.alloc(wal_mod.Record, 0);
+        var end = @min(latest, start +| (@as(u64, @intCast(count)) - 1));
+        while (true) {
+            return self.wal.readRangeAlloc(namespace, .{ .start_lsn = start, .end_lsn = end, .max_records = count, .max_bytes = self.max_wal_bytes }) catch |err| switch (err) {
+                error.WalReadBudgetExceeded => {
+                    if (end == start) return err;
+                    end = start + (end - start) / 2;
+                    continue;
+                },
+                else => return err,
+            };
+        }
     }
 
     pub fn setIo(self: *Builder, io: ?std.Io) void {
@@ -351,7 +373,7 @@ pub const Builder = struct {
         plan: publication_plan.TablePublicationPlan,
         cancellation: CancellationToken,
     ) !BuildResult {
-        var fallback: ?std.Io.Threaded = if (self.io == null) threadedIo() else null;
+        var fallback: ?FallbackIo = if (self.io == null) threadedIo() else null;
         defer if (fallback) |*value| value.deinit();
         return self.publishNamespaceWithMetricAndPlanGuardedUntil(namespace, vector_metric, plan, null, .{
             .io = self.io orelse fallback.?.io(),
@@ -367,7 +389,7 @@ pub const Builder = struct {
         publication_guard: ?work_lease.PublicationGuard,
         cancellation: ?maintenance_cancellation.Token,
     ) !BuildResult {
-        var fallback: ?std.Io.Threaded = if (self.io == null and cancellation == null) threadedIo() else null;
+        var fallback: ?FallbackIo = if (self.io == null and cancellation == null) threadedIo() else null;
         defer if (fallback) |*value| value.deinit();
         const io = if (cancellation) |token| token.io else self.io orelse fallback.?.io();
         if (publication_guard == null) {
@@ -415,7 +437,7 @@ pub const Builder = struct {
         const next_version: u64 = current_head + 1;
         const start_lsn: u64 = if (current_manifest) |current| current.wal_end_lsn + 1 else 1;
 
-        const records = try self.wal.readFromAlloc(namespace, start_lsn);
+        const records = try self.readWalForBuild(namespace, start_lsn);
         defer wal_mod.freeRecords(self.alloc, records);
         try maintenance_cancellation.check(cancellation);
 
@@ -1157,7 +1179,7 @@ pub const Builder = struct {
         defer head.deinit(self.alloc);
         const current = head.manifest orelse return null;
 
-        var fallback: ?std.Io.Threaded = if (self.io == null and parent_cancellation == null) threadedIo() else null;
+        var fallback: ?FallbackIo = if (self.io == null and parent_cancellation == null) threadedIo() else null;
         defer if (fallback) |*value| value.deinit();
         const io = if (parent_cancellation) |token| token.io else self.io orelse fallback.?.io();
         var protection = try GraphSourceProtection.initAt(self.progress, namespace, current.version, parent_cancellation);
@@ -1165,7 +1187,7 @@ pub const Builder = struct {
         var cancellation_bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
 
         const start_lsn = current.wal_end_lsn + 1;
-        const records = try self.wal.readFromAlloc(namespace, start_lsn);
+        const records = try self.readWalForBuild(namespace, start_lsn);
         defer wal_mod.freeRecords(self.alloc, records);
         if (records.len == 0) return null;
         if (records.len > limits.max_rows) return error.LakeSidecarBuildBudgetExceeded;
@@ -3906,7 +3928,7 @@ fn freeQueryMutations(alloc: Allocator, mutations: []query_mod.QueryMaterializer
     freeMaterializerMutations(alloc, mutations);
 }
 
-fn allocTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterializedDocument, spec: FullTextIndexSpec, cancellation: ?maintenance_cancellation.Token) !text_segment_mod.Segment {
+pub fn allocTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterializedDocument, spec: FullTextIndexSpec, cancellation: ?maintenance_cancellation.Token) !text_segment_mod.Segment {
     const doc_entries = try alloc.alloc(text_segment_mod.DocumentEntry, docs.len);
     errdefer alloc.free(doc_entries);
 
@@ -7957,7 +7979,14 @@ test "serverless external selector transitions preserve resolved sidecars withou
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
-fn threadedIo() std.Io.Threaded {
+const FallbackIo = if (@import("builtin").os.tag == .freestanding) struct {
+    fn io(_: *@This()) std.Io {
+        return .failing;
+    }
+    fn deinit(_: *@This()) void {}
+} else std.Io.Threaded;
+fn threadedIo() FallbackIo {
+    if (comptime @import("builtin").os.tag == .freestanding) return .{};
     return std.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
