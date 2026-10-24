@@ -56064,7 +56064,7 @@ func (c *Client) DropGraph(ctx context.Context, graphName string, reqEditors ...
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeGraphCatalogRequest(c.Client, req)
 }
 
 // GetGraph Get graph
@@ -56098,7 +56098,7 @@ func (c *Client) CreateGraphWithBody(ctx context.Context, graphName string, cont
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeGraphCatalogRequest(c.Client, req)
 }
 
 // CreateGraph Create graph
@@ -56117,7 +56117,7 @@ func (c *Client) CreateGraph(ctx context.Context, graphName string, body CreateG
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeGraphCatalogRequest(c.Client, req)
 }
 
 // UpdateGraphWithBody Update graph definition
@@ -56136,7 +56136,7 @@ func (c *Client) UpdateGraphWithBody(ctx context.Context, graphName string, cont
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeGraphCatalogRequest(c.Client, req)
 }
 
 // UpdateGraph Update graph definition
@@ -56155,7 +56155,7 @@ func (c *Client) UpdateGraph(ctx context.Context, graphName string, body UpdateG
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeGraphCatalogRequest(c.Client, req)
 }
 
 // ExecuteGraphQueryWithBody Execute Cypher against a named graph
@@ -56174,7 +56174,7 @@ func (c *Client) ExecuteGraphQueryWithBody(ctx context.Context, graphName string
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeGraphRequest(c.Client, req)
 }
 
 // ExecuteGraphQuery Execute Cypher against a named graph
@@ -56193,7 +56193,7 @@ func (c *Client) ExecuteGraphQuery(ctx context.Context, graphName string, body E
 	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
 		return nil, err
 	}
-	return c.Client.Do(req)
+	return executeGraphRequest(c.Client, req)
 }
 
 // GlobalQueryWithBody Perform a global query
@@ -67538,7 +67538,7 @@ func NewGetGraphRequest(server string, graphName string) (*http.Request, error) 
 // NewCreateGraphRequest calls the generic CreateGraph builder with application/json body
 func NewCreateGraphRequest(server string, graphName string, body CreateGraphJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+	buf, err := marshalGraphCatalogRequest(body)
 	if err != nil {
 		return nil, err
 	}
@@ -67585,7 +67585,7 @@ func NewCreateGraphRequestWithBody(server string, graphName string, contentType 
 // NewUpdateGraphRequest calls the generic UpdateGraph builder with application/json body
 func NewUpdateGraphRequest(server string, graphName string, body UpdateGraphJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+	buf, err := marshalGraphCatalogRequest(body)
 	if err != nil {
 		return nil, err
 	}
@@ -67632,7 +67632,7 @@ func NewUpdateGraphRequestWithBody(server string, graphName string, contentType 
 // NewExecuteGraphQueryRequest calls the generic ExecuteGraphQuery builder with application/json body
 func NewExecuteGraphQueryRequest(server string, graphName string, body ExecuteGraphQueryJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+	buf, err := marshalGraphRequest(body)
 	if err != nil {
 		return nil, err
 	}
@@ -111734,7 +111734,7 @@ func ParseListGraphsResponse(rsp *http.Response) (*ListGraphsResponse, error) {
 
 // ParseDropGraphResponse parses an HTTP response from a DropGraphWithResponse call
 func ParseDropGraphResponse(rsp *http.Response) (*DropGraphResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
+	bodyBytes, err := readGraphResponseBody(rsp.Body)
 	defer func() { _ = rsp.Body.Close() }()
 	if err != nil {
 		return nil, err
@@ -111796,7 +111796,7 @@ func ParseGetGraphResponse(rsp *http.Response) (*GetGraphResponse, error) {
 
 // ParseCreateGraphResponse parses an HTTP response from a CreateGraphWithResponse call
 func ParseCreateGraphResponse(rsp *http.Response) (*CreateGraphResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
+	bodyBytes, err := readGraphResponseBody(rsp.Body)
 	defer func() { _ = rsp.Body.Close() }()
 	if err != nil {
 		return nil, err
@@ -111839,7 +111839,7 @@ func ParseCreateGraphResponse(rsp *http.Response) (*CreateGraphResponse, error) 
 
 // ParseUpdateGraphResponse parses an HTTP response from a UpdateGraphWithResponse call
 func ParseUpdateGraphResponse(rsp *http.Response) (*UpdateGraphResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
+	bodyBytes, err := readGraphResponseBody(rsp.Body)
 	defer func() { _ = rsp.Body.Close() }()
 	if err != nil {
 		return nil, err
@@ -111892,7 +111892,7 @@ func ParseUpdateGraphResponse(rsp *http.Response) (*UpdateGraphResponse, error) 
 
 // ParseExecuteGraphQueryResponse parses an HTTP response from a ExecuteGraphQueryWithResponse call
 func ParseExecuteGraphQueryResponse(rsp *http.Response) (*ExecuteGraphQueryResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
+	bodyBytes, err := readGraphResponseBody(rsp.Body)
 	defer func() { _ = rsp.Body.Close() }()
 	if err != nil {
 		return nil, err

@@ -628,7 +628,7 @@ export class AntflyClient {
       headers.Authorization = authHeader;
     }
 
-    return createClient<paths>({
+    const client = createClient<paths>({
       baseUrl: normalizeBaseUrl(this.config.baseUrl),
       headers,
       bodySerializer: (body) => {
@@ -638,6 +638,19 @@ export class AntflyClient {
         return JSON.stringify(body);
       },
     });
+    // A graph query can mutate data. Protect wrappers and the typed API alike,
+    // including catalog mutations, without changing unrelated read requests.
+    client.use({
+      onRequest({ schemaPath, request }) {
+        if (
+          schemaPath === "/db/v1/graphs/{graphName}/query" ||
+          (schemaPath === "/db/v1/graphs/{graphName}" &&
+            ["POST", "PUT", "DELETE"].includes(request.method))
+        )
+          return new Request(request, { redirect: "error" });
+      },
+    });
+    return client;
   }
 
   private requestHeaders(extra?: Record<string, string>): Record<string, string> {

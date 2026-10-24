@@ -175,3 +175,44 @@ func TestGraphCatalogUpdateRetainsRevisionAndDoesNotReplay(t *testing.T) {
 		t.Fatalf("mutation replayed: %d calls", calls)
 	}
 }
+
+func TestCypherAndCatalogMutationsDoNotFollowRedirects(t *testing.T) {
+	for _, status := range []int{301, 302, 303, 307, 308} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			calls, redirects := 0, 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Location", "/replayed")
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+			borrowed := server.Client()
+			borrowed.CheckRedirect = func(*http.Request, []*http.Request) error { redirects++; return nil }
+			client, err := NewAntflyClient(server.URL, borrowed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, operation := range []func() error{
+				func() error {
+					_, err := client.ExecuteGraphQuery(context.Background(), "g", GraphQueryRequest{Query: "CREATE(n:D)"})
+					return err
+				},
+				func() error { _, err := client.CreateGraph(context.Background(), "g", GraphDefinition{}); return err },
+				func() error {
+					_, err := client.UpdateGraph(context.Background(), "g", "1", GraphDefinition{})
+					return err
+				},
+				func() error { _, err := client.DropGraph(context.Background(), "g"); return err },
+			} {
+				before := calls
+				if err := operation(); err == nil || calls != before+1 || redirects != 0 {
+					t.Fatalf("redirect policy: err=%v calls=%d redirects=%d", err, calls-before, redirects)
+				}
+			}
+			_ = borrowed.CheckRedirect(nil, nil)
+			if redirects != 1 {
+				t.Fatal("mutated caller's redirect policy")
+			}
+		})
+	}
+}

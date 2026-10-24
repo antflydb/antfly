@@ -1,5 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+
+import http from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AntflyClient, GraphExecutionError } from "../src/client.js";
 
@@ -15,6 +17,38 @@ const result = {
 };
 afterEach(() => vi.unstubAllGlobals());
 describe("graph query transport", () => {
+  it("rejects graph redirects before replaying a mutation", async () => {
+    let deliveries = 0;
+    const server = http.createServer((_request, response) => {
+      deliveries++;
+      response.writeHead(307, { Location: "/replayed" });
+      response.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("missing local address");
+      const client = new AntflyClient({ baseUrl: `http://127.0.0.1:${address.port}` });
+      for (const operation of [
+        () => client.graphs.execute("g", { query: "CREATE(n:D)" }),
+        () => client.graphs.create("g", { labels: [] }),
+        () => client.graphs.update("g", "1", { labels: [] }),
+        () => client.graphs.drop("g"),
+        () =>
+          client.api.POST("/db/v1/graphs/{graphName}/query", {
+            params: { path: { graphName: "g" } },
+            body: { query: "CREATE(n:D)" },
+          }),
+      ]) {
+        const before = deliveries;
+        await expect(operation()).rejects.toThrow();
+        expect(deliveries - before).toBe(1);
+      }
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
   it("conditionally updates a graph without retrying a stale revision", async () => {
     const fetch = vi.fn(
       async (_request: Request) =>

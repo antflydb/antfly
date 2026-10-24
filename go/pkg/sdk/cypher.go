@@ -31,6 +31,7 @@ type GraphQueryRequest = oapi.GraphQueryRequest
 type GraphQueryResult = oapi.GraphQueryResult
 type GraphValue = oapi.GraphWireValue
 type GraphWriteReceipt = oapi.GraphWriteReceipt
+type GraphNoReplayDoer = oapi.GraphNoReplayDoer
 
 // CypherExecutionError retains diagnostics and write delivery outcomes.
 type CypherExecutionError struct {
