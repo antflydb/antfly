@@ -391,6 +391,16 @@ pub const Run = struct {
         result.max_output_bytes = @min(self.limits.max_output_bytes, self.usage.output_bytes +| child.max_output_bytes);
         return result;
     }
+    /// Borrowing avoids a second physical byte/pixel charge but does not
+    /// exempt the child from its own input ceilings.
+    pub fn nestedViewLimits(self: *const Run, child: Limits, bytes: usize, width: u32, height: u32) !Limits {
+        if (bytes > child.max_source_bytes) return error.DocumentSourceLimitExceeded;
+        const view_pixels = @as(u64, width) * height;
+        if (width > child.max_dimension or height > child.max_dimension or view_pixels > child.max_pixels or view_pixels > child.max_total_pixels) return error.DocumentPixelLimitExceeded;
+        var result = self.nestedLimits(child);
+        result.max_total_pixels = @min(result.max_total_pixels, self.usage.rendered_pixels +| (child.max_total_pixels - view_pixels));
+        return result;
+    }
     pub fn call(self: *Run) !void {
         try self.control.check();
         if (self.usage.model_calls >= self.limits.max_model_calls) return error.DocumentBudgetExhausted;
@@ -471,4 +481,15 @@ test "document nested ceilings preserve consumed work and all child resource lim
     run.limits = parent;
     try std.testing.expectEqual(@as(usize, 3), run.usage.model_calls);
     try std.testing.expectEqual(@as(u64, 25), run.usage.total_tokens);
+}
+
+test "document borrowed views enforce child bytes and reserve pixels without double charges" {
+    const run = Run{ .limits = .{}, .source_count = 2, .source_bytes = 100, .usage = .{ .rendered_pixels = 500 } };
+    const child = Limits{ .max_source_bytes = 68, .max_pixels = 100, .max_total_pixels = 150 };
+    const limits = try run.nestedViewLimits(child, 68, 10, 10);
+    try std.testing.expectEqual(@as(u64, 550), limits.max_total_pixels);
+    try std.testing.expectEqual(@as(usize, 100), run.source_bytes);
+    try std.testing.expectEqual(@as(usize, 2), run.source_count);
+    try std.testing.expectError(error.DocumentSourceLimitExceeded, run.nestedViewLimits(child, 69, 10, 10));
+    try std.testing.expectError(error.DocumentPixelLimitExceeded, run.nestedViewLimits(child, 68, 11, 10));
 }

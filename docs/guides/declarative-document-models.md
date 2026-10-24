@@ -202,7 +202,15 @@ inherited decorations, conditional footer content, and backgrounds that require
 composition or rendering keep the slide unresolved until those capabilities are
 available. PDF native inspection checks
 painting operators without decoding images or materializing vector paths;
-text-bearing pages with drawings still require visual inspection.
+text-bearing pages with drawings still require visual inspection. PDF annotation
+coverage is inspected separately from page content streams, using bounded metadata
+and reference resolution. Potentially visible stamps, widgets/form fields and
+other annotations remain unresolved because appearance compositing is unavailable.
+Both native painting and document OCR reject that unsupported rendering path;
+page-content-only rasters cannot certify coverage. Hidden annotations and
+borderless links without appearances do not require visual work. See the
+[PDF reference, annotation flags](https://printtechnologies.org/wp-content/uploads/2020/03/pdfreference_v1-4-1.pdf)
+for the screen/print visibility rules.
 
 Sources parse once. Remote routing/extraction/verification share one bounded,
 resource-accounted HTTP pool per run. Source buffers release between documents and page scratch
@@ -213,7 +221,9 @@ and extractors share cumulative calls, measured tokens, pixels, output ceilings,
 deadlines and cancellation. Child entry points intersect every resource ceiling
 with the parent's remaining budget, retaining cumulative consumption when the
 child returns; model identities are captured before execution and
-checked again around child calls. Reading metadata includes a run fingerprint of
+checked again around child calls. Borrowed document views still obey each
+child's encoded-byte, dimension and pixel ceilings; borrowing avoids a second
+physical source charge. Reading metadata includes a run fingerprint of
 source hashes, source-selection options, prompts, effective limits, model
 identities and adapter/runtime versions. Remote providers expose model names
 without an immutable weight revision. Per-run execution is currently serial; existing
@@ -231,11 +241,16 @@ Region `text_start` and `text_end` are UTF-8 byte offsets within the page text.
 Nested regions retain source coordinates and qualified identities. Page origin
 provides the default provenance, with mapped regional origins overriding it, so
 literal fields remain extractable alongside interpreted captions. Interpreted
-values never acquire literal source spans. Fields without offsets use a single
+values never acquire literal source spans. Provider-supplied evidence is rebuilt
+from verified spans; nonliteral, schema-derived and null values discard literal
+offsets and unverified provider evidence while retaining their provenance. Fields without offsets use a single
 summary of the input's effective provenance. If interpretation remains in that
 input, unlocated fields are marked derived and obey `allow_derived_values` even
 when literal span support is optional. Located literal fields on mixed pages
 still use their precise regional provenance.
+
+Document response decoding preserves unresolved/truncated page status and
+aggregate usage for both HTTP and native readers, parsing the envelope once.
 
 Local reader results carry explicit per-item completion state and measured token
 counts through direct execution and batching. A token count equal to a requested

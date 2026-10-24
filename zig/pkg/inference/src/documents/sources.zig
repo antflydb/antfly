@@ -122,8 +122,9 @@ pub const Source = struct {
                 const regions = try a.alloc(c.Region, analysis.runs.len);
                 for (regions, analysis.runs, 0..) |*region, run, i| region.* = .{ .id = i, .text = try a.dupe(u8, run.text), .bbox = .{ run.x, run.y, run.x + run.advance_width, run.y + run.font_size }, .origin = .native };
                 page.regions = regions;
-                if (analysis.outline_fallback) page.findings = &.{"native_font_fallback"};
-                if (analysis.has_nontext_visual) page.findings = if (analysis.outline_fallback) &.{ "native_font_fallback", "visual_content_requires_inspection" } else &.{"visual_content_requires_inspection"};
+                if (analysis.has_unrendered_annotations) try @import("representation.zig").finding(a, &page, "pdf_annotation_rendering_unavailable", true);
+                if (analysis.outline_fallback) try @import("representation.zig").finding(a, &page, "native_font_fallback", true);
+                if (analysis.has_nontext_visual) try @import("representation.zig").finding(a, &page, "visual_content_requires_inspection", true);
             },
             .slides => |s| {
                 if (number == 0 or number > s.slides.len) return error.InvalidDocumentSelection;
@@ -173,7 +174,10 @@ pub const Source = struct {
                 const request = pdf.PageRenderRequest{ .page_number = number, .max_pixels = run.limits.max_pixels, .max_dimension = @min(run.limits.max_dimension, 4096), .max_output_bytes = run.limits.max_source_bytes };
                 const geometry = try pdf.planParsedPageRenderGeometry(p, request);
                 try run.pixels(@as(u64, geometry.width) * geometry.height);
-                const rendered = try pdf.renderParsedPagePngAdaptiveAlloc(a, p, number, 150, run.limits.max_pixels, @min(run.limits.max_dimension, 4096));
+                const rendered = pdf.renderParsedPagePngAdaptiveAlloc(a, p, number, 150, run.limits.max_pixels, @min(run.limits.max_dimension, 4096)) catch |err| switch (err) {
+                    error.UnsupportedPdfAnnotationRendering => return error.DocumentRendererUnavailable,
+                    else => return err,
+                };
                 const page_box = try p.extractPageBox(number);
                 const rotation = @mod((try p.extractPageRotation(number)) orelse 0, 360);
                 const unit = 72.0 / @as(f64, @floatFromInt(rendered.effective_dpi));

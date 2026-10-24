@@ -58,12 +58,21 @@ pub fn attach(a: A, item: *V, state: []const u8, metadata: ?V, required: bool, a
 
 fn attachField(a: A, item: *V, key: []const u8, state: []const u8, metadata: ?V, required: bool, allow_derived: bool, unit: []const u8, unlocated_interpretation: bool) !bool {
     const value = field(item.*, key) orelse return error.InvalidDocumentModelResult;
-    if (value == .null) return true;
-    if (field(item.*, "source")) |source| if (source == .string and std.mem.eql(u8, source.string, "schema")) return allow_derived;
+    // Provider evidence is not Antfly-verified evidence. Rebuild it only from
+    // checked spans against the exact submitted source and reading metadata.
+    _ = item.object.swapRemove("evidence");
+    if (value == .null) {
+        stripLiteralOffsets(item);
+        return true;
+    }
+    if (field(item.*, "source")) |source| if (source == .string and std.mem.eql(u8, source.string, "schema")) return markDerived(a, item, allow_derived);
     const origin = field(item.*, "origin");
     if (origin) |o| {
         if (o != .string) return error.InvalidDocumentModelResult;
-        if (std.mem.eql(u8, o.string, "derived") or std.mem.eql(u8, o.string, "estimated")) return allow_derived;
+        if (std.mem.eql(u8, o.string, "derived") or std.mem.eql(u8, o.string, "estimated")) {
+            stripLiteralOffsets(item);
+            return allow_derived;
+        }
         if (std.mem.eql(u8, o.string, "interpretation")) return markDerived(a, item, allow_derived);
     }
     if (value == .array) {
@@ -101,11 +110,14 @@ fn interpreted(references: []const V) bool {
     };
     return false;
 }
-fn markDerived(a: A, item: *V, allowed: bool) !bool {
-    try item.object.put(a, "origin", .{ .string = "derived" });
+fn stripLiteralOffsets(item: *V) void {
     _ = item.object.swapRemove("start");
     _ = item.object.swapRemove("end");
     _ = item.object.swapRemove("spans");
+}
+fn markDerived(a: A, item: *V, allowed: bool) !bool {
+    try item.object.put(a, "origin", .{ .string = "derived" });
+    stripLiteralOffsets(item);
     return allowed;
 }
 fn unlocated(a: A, item: *V, required: bool, allowed: bool, source_interpreted: bool) !bool {
@@ -314,4 +326,23 @@ test "document unlocated extraction preserves interpreted provenance independent
         \\{"structures":{"r":[{"caption":{"value":"Caption"}}]}}
     , .{});
     try std.testing.expect(try attach(a, &item, "Caption", literal, false, false));
+}
+
+test "document nonliteral and null values cannot inherit provider literal evidence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var item = try std.json.parseFromSliceLeaky(V, a,
+        \\{"structures":{"r":[{"derived":{"value":"12.50","origin":"derived","start":0,"end":5,"evidence":[{"source_id":"unverified"}]},"estimate":{"value":12.5,"origin":"estimated","start":0,"end":5,"spans":[[0,5]]},"schema_value":{"value":"12.50","source":"schema","start":0,"end":5},"empty":{"value":null,"start":0,"end":5,"evidence":[{"source_id":"unverified"}]}}]}}
+    , .{});
+    try std.testing.expect(try attach(a, &item, "12.50", null, true, true));
+    const record = item.object.get("structures").?.object.get("r").?.array.items[0];
+    for (record.object.values()) |field_value| {
+        try std.testing.expect(!field_value.object.contains("start"));
+        try std.testing.expect(!field_value.object.contains("end"));
+        try std.testing.expect(!field_value.object.contains("spans"));
+        try std.testing.expect(!field_value.object.contains("evidence"));
+    }
+    try std.testing.expectEqualStrings("estimated", record.object.get("estimate").?.object.get("origin").?.string);
+    try std.testing.expectEqualStrings("derived", record.object.get("schema_value").?.object.get("origin").?.string);
 }

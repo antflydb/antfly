@@ -367,9 +367,7 @@ pub fn Service(comptime Node: type) type {
                 raster_height = bottom - top;
             }
             if (self.graph.get(binding.model)) |child| {
-                const view_pixels = @as(u64, raster_width) * raster_height;
-                if (raster_width > child.budget.max_dimension or raster_height > child.budget.max_dimension or
-                    view_pixels > child.budget.max_pixels or view_pixels > child.budget.max_total_pixels) return error.DocumentPixelLimitExceeded;
+                const child_limits = try run.nestedViewLimits(child.budget, data.len, raster_width, raster_height);
                 var nested_source = sources.Source{ .input = .{ .id = self.source.input.id, .url = "", .media_type = mime }, .fingerprint = @splat(0), .bytes = data, .parsed = .image };
                 var nested = self.*;
                 nested.definition = child;
@@ -379,10 +377,7 @@ pub fn Service(comptime Node: type) type {
                 nested.control.deadline_ns = if (nested.control.deadline_ns) |deadline| @min(deadline, child_deadline) else child_deadline;
                 const parent_limits = run.limits;
                 defer run.limits = parent_limits;
-                run.limits = run.nestedLimits(child.budget);
-                // The parent already charged this borrowed view. Reserve that
-                // work against the child without double-counting physical pixels.
-                run.limits.max_total_pixels = @min(run.limits.max_total_pixels, run.usage.rendered_pixels +| (child.budget.max_total_pixels - view_pixels));
+                run.limits = child_limits;
                 const parent_control = run.control;
                 defer run.control = parent_control;
                 const ChildProbe = struct {
@@ -441,7 +436,7 @@ pub fn Service(comptime Node: type) type {
                     region.* = .{ .id = i, .text = item.text, .bbox = box, .confidence = item.confidence, .label = item.label, .model = binding.model, .origin = binding.output_origin };
                 }
             }
-            return .{ .text = result.text, .model = binding.model, .origin = binding.output_origin, .truncated = result.completion == .length, .regions = regions, .fields = if (result.fields_json) |json| try std.json.parseFromSliceLeaky(V, a, json, .{}) else null };
+            return .{ .text = result.text, .model = binding.model, .origin = binding.output_origin, .status = if (result.completion == .unresolved) .unresolved else null, .truncated = result.completion == .length, .regions = regions, .fields = if (result.fields_json) |json| try std.json.parseFromSliceLeaky(V, a, json, .{}) else null };
         }
 
         fn decide(raw: *anyopaque, a: A, binding: c.Binding, observation: executor.Observation, run: *c.Run) !executor.Action {
@@ -814,6 +809,7 @@ test "document nested composites share one budget and one rendered view" {
     const Fake = struct {
         reads: usize = 0,
         narrow_child: bool = false,
+        byte_limited_child: bool = false,
         measured: bool = false,
         incomplete: bool = false,
         tiny_tokens: bool = false,
@@ -823,7 +819,9 @@ test "document nested composites share one budget and one rendered view" {
             else if (std.mem.eql(u8, name, "parent"))
                 "{\"models\":[{\"name\":\"child\",\"model\":\"child\",\"operation\":\"read\"}],\"read\":{\"reader\":\"child\"},\"budget\":{\"max_model_calls\":2}}"
             else if (std.mem.eql(u8, name, "child"))
-                if (self.narrow_child)
+                if (self.byte_limited_child)
+                    \\{"models":[{"name":"leaf","model":"leaf","operation":"read"}],"read":{"reader":"leaf"},"budget":{"max_source_bytes":1}}
+                else if (self.narrow_child)
                     "{\"models\":[{\"name\":\"leaf\",\"model\":\"leaf\",\"operation\":\"read\"}],\"read\":{\"reader\":\"leaf\"},\"budget\":{\"max_pixels\":1}}"
                 else
                     "{\"models\":[{\"name\":\"leaf\",\"model\":\"leaf\",\"operation\":\"read\"}],\"read\":{\"reader\":\"leaf\"}}"
@@ -890,6 +888,9 @@ test "document nested composites share one budget and one rendered view" {
     fake.tiny_tokens = true;
     try std.testing.expectError(error.DocumentTokenLimitExceeded, Service(Fake).readEncodedJson(&fake, a, "parent", .{ .images = &.{.{ .bytes = @embedFile("testdata/one-pixel.png"), .mime_type = "image/png" }} }, .{}));
     fake.tiny_tokens = false;
+    fake.byte_limited_child = true;
+    try std.testing.expectError(error.DocumentSourceLimitExceeded, Service(Fake).readEncodedJson(&fake, a, "parent", .{ .images = &.{.{ .bytes = @embedFile("testdata/one-pixel.png"), .mime_type = "image/png" }} }, .{}));
+    fake.byte_limited_child = false;
     fake.narrow_child = true;
     const wide = try image.png.encodeRgba(a, 2, 1, &.{ 0, 0, 0, 255, 0, 0, 0, 255 });
     defer a.free(wide);

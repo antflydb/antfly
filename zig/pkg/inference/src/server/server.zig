@@ -7936,7 +7936,8 @@ pub const Node = struct {
                 const result = try self.documentOperationJson(allocator, model_name, control, .read, request);
                 defer allocator.free(result);
                 if (request.max_response_bytes) |limit| if (result.len > limit) return error.ResponseTooLarge;
-                const items = try readers_api.documentResults(allocator, result);
+                const batch = try readers_api.documentBatchResult(allocator, result);
+                const items = batch.items;
                 errdefer {
                     for (items) |*item| readers_api.deinitResult(allocator, item);
                     allocator.free(items);
@@ -7949,11 +7950,7 @@ pub const Node = struct {
                     item.page_number = original.page_number;
                     if (original.source_fingerprint) |fingerprint| item.source_fingerprint = try allocator.dupe(u8, fingerprint);
                 }
-                var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
-                defer parsed.deinit();
-                const usage = try std.json.parseFromValue(api.GenerateUsage, allocator, parsed.value.object.get("usage").?, .{ .ignore_unknown_fields = true });
-                defer usage.deinit();
-                return .{ .items = items, .usage = usage.value, .execution = .{ .requested_items = items.len, .serial_items = items.len } };
+                return batch;
             }
         }
         const security = effectiveRequestContentSecurity(self);
@@ -8189,6 +8186,8 @@ pub const Node = struct {
     fn cloneReaderApiResult(allocator: std.mem.Allocator, source: readers_api.Result) !readers_api.Result {
         const text = try allocator.dupe(u8, source.text);
         errdefer allocator.free(text);
+        const document_json = if (source.document_json) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (document_json) |value| allocator.free(value);
         const fields_json = if (source.fields_json) |value| try allocator.dupe(u8, value) else null;
         errdefer if (fields_json) |value| allocator.free(value);
         const regions_json = if (source.regions_json) |value| try allocator.dupe(u8, value) else null;
@@ -8199,6 +8198,7 @@ pub const Node = struct {
         errdefer if (source_fingerprint) |value| allocator.free(value);
         return .{
             .text = text,
+            .document_json = document_json,
             .completion = source.completion,
             .prompt_tokens = source.prompt_tokens,
             .completion_tokens = source.completion_tokens,
@@ -22194,7 +22194,7 @@ pub const Node = struct {
                 .remote_execution = if (definition) |def| def.allow_remote else false,
                 .max_parallel_calls = @as(u32, 1),
                 .document_formats = .{
-                    .pdf = .{ .native_text = true, .visual_rendering = true },
+                    .pdf = .{ .native_text = true, .visual_rendering = true, .annotation_rendering = false },
                     .pptx = .{ .native_text = true, .visual_rendering = false, .speaker_notes = true, .hidden_slide_policy = true },
                     .images = .{ .formats = .{ "image/png", "image/jpeg", "image/webp" }, .perspective_correction = false },
                 },
@@ -40839,4 +40839,34 @@ test "document artifact admission reclaims retained memory without evicting on i
     defer request.release();
     try std.testing.expect(owner.lease == null);
     try std.testing.expectError(error.DocumentArtifactNotFound, node.readDocumentArtifact(a, &@as([64]u8, @splat('a'))));
+}
+
+test "document native annotation coverage remains unresolved through HTTP and typed decoding" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const models = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(models);
+    var node = try Node.init(a, .{ .models_dir = models });
+    defer node.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const fixture = @embedFile("../documents/testdata/annotation.pdf");
+    const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(fixture.len));
+    _ = std.base64.standard.Encoder.encode(encoded, fixture);
+    const uri = try std.fmt.allocPrint(alloc, "data:application/pdf;base64,{s}", .{encoded});
+    const body = try std.json.Stringify.valueAlloc(alloc, .{ .model = "antfly/native-document", .documents = .{.{ .id = "invoice", .media_type = "application/pdf", .url = uri }} }, .{});
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/read");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.readImages(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var batch = try readers_api.documentBatchResult(a, response.body.?);
+    defer batch.deinit(a);
+    try std.testing.expectEqual(readers_api.Completion.unresolved, batch.items[0].completion);
+    try std.testing.expect(std.mem.indexOf(u8, batch.items[0].document_json.?, "pdf_annotation_rendering_unavailable") != null);
 }

@@ -163,7 +163,7 @@ test "encoded reader validation is execution-mode independent" {
     );
 }
 
-pub const Completion = enum { complete, length };
+pub const Completion = enum { complete, length, unresolved };
 
 pub const Result = struct {
     completion: Completion = .complete,
@@ -638,8 +638,7 @@ const AntflyReaderState = struct {
             var response = try self.http.post(url, .{ .json = body, .headers = headers[0..count], .timeout_ms = self.timeout_ms, .cancellation = self.cancellation, .max_response_size = req.max_response_bytes });
             defer response.deinit();
             if (!response.ok()) return readHttpStatusError(response.status.code, responseCapabilityStale(response));
-            const items = try documentResults(alloc, response.body orelse return error.InvalidReadResultCount);
-            return .{ .items = items, .execution = .{ .requested_items = items.len, .serial_items = items.len } };
+            return documentBatchResult(alloc, response.body orelse return error.InvalidReadResultCount);
         }
         const images = try alloc.alloc(inference_api.ImageURL, req.images.len);
         defer alloc.free(images);
@@ -1658,6 +1657,11 @@ fn canonicalName(name: []const u8) []const u8 {
 
 /// Canonical whole-document response decoder shared by HTTP and native hosts.
 pub fn documentResults(a: Allocator, json: []const u8) ![]Result {
+    return (try documentBatchResult(a, json)).items;
+}
+
+/// Parse the document envelope once, preserving completion and aggregate usage.
+pub fn documentBatchResult(a: Allocator, json: []const u8) !BatchResult {
     var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidReadResultCount;
@@ -1675,6 +1679,10 @@ pub fn documentResults(a: Allocator, json: []const u8) ![]Result {
         if (text != .string) return error.InvalidReadResultCount;
         item.* = .{ .text = try a.dupe(u8, text.string) };
         initialized += 1;
+        if (row.object.get("status")) |status| {
+            if (status != .string) return error.InvalidReadResultCount;
+            item.completion = if (std.mem.eql(u8, status.string, "complete")) .complete else if (std.mem.eql(u8, status.string, "truncated")) .length else if (std.mem.eql(u8, status.string, "unresolved")) .unresolved else return error.InvalidReadResultCount;
+        }
         item.document_json = try std.json.Stringify.valueAlloc(a, row, .{});
         if (row.object.get("source_id")) |id| {
             if (id != .string) return error.InvalidReadResultCount;
@@ -1691,5 +1699,29 @@ pub fn documentResults(a: Allocator, json: []const u8) ![]Result {
             item.regions_json = try std.json.Stringify.valueAlloc(a, value, .{});
         };
     }
-    return out;
+    var usage: ?inference_api.GenerateUsage = null;
+    if (parsed.value.object.get("usage")) |value| {
+        var decoded = try std.json.parseFromValue(inference_api.GenerateUsage, a, value, .{ .ignore_unknown_fields = true });
+        defer decoded.deinit();
+        const counts = decoded.value;
+        if (counts.prompt_tokens < 0 or counts.completion_tokens < 0 or counts.total_tokens < 0) return error.InvalidReadExecutionReport;
+        usage = counts;
+    }
+    return .{ .items = out, .usage = usage, .execution = .{ .requested_items = out.len, .serial_items = out.len } };
+}
+
+test "document reader decoding preserves completion and usage with allocation rollback" {
+    const Case = struct {
+        fn check(a: Allocator) !void {
+            var batch = try documentBatchResult(a,
+                \\{"data":[{"source_id":"pdf","number":1,"text":"Partial","status":"truncated"},{"source_id":"pdf","number":2,"text":"Uncertain","status":"unresolved"}],"usage":{"prompt_tokens":2,"completion_tokens":7,"total_tokens":9}}
+            );
+            defer batch.deinit(a);
+            try std.testing.expectEqual(Completion.length, batch.items[0].completion);
+            try std.testing.expectEqual(Completion.unresolved, batch.items[1].completion);
+            try std.testing.expectEqual(@as(i64, 9), batch.usage.?.total_tokens);
+            try std.testing.expectEqual(@as(usize, 2), batch.execution.requested_items);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.check, .{});
 }
