@@ -68,7 +68,10 @@ const Fixture = struct {
         const request = prepared.tables[0];
         const txn = try self.db.beginTransactionWithId(@splat(id), @as(u64, id) * 100);
         errdefer self.db.abortTransaction(txn, @as(u64, id) * 100 + 1) catch {};
-        try self.db.writeTransaction(txn, .{
+        // Exercise the production participant envelope/parser before native
+        // preparation, including exact numeric roots and binary progress.
+        const transport = @import("distributed_txn.zig");
+        const wire = try transport.encodeTxnPrepareRequest(a, .{ .txn_id = txn, .req = .{
             .relational_schema_version = request.relational_schema_version,
             .relational_integrity_generation_set = request.relational_integrity_generation_set,
             .writes = request.writes,
@@ -77,7 +80,12 @@ const Fixture = struct {
             .integrity = request.integrity,
             .integrity_commands = request.integrity_commands,
             .relational_activation = request.relational_activation,
-        });
+        } });
+        defer a.free(wire);
+        var decoded = try transport.parseTxnPrepareRequest(a, wire);
+        defer transport.freeTxnPrepareRequest(a, &decoded);
+        try std.testing.expectEqualDeep(txn, decoded.txn_id);
+        try self.db.writeTransaction(txn, decoded.req);
         return txn;
     }
     fn commit(self: *@This(), prepared: *const planner.Prepared, id: u8) !void {
@@ -182,6 +190,14 @@ test "foreign key validation native transaction rejects stale children and absen
     try db.writeTransaction(begin, .{ .relational_schema_version = 1, .relational_integrity_generation_set = generation_set, .relational_activation = .{ .routing_key = "", .expected = null, .next = initial_record, .validation = .{ .binding = source_binding, .physical_root = db.root_incarnation, .action = .begin, .inputs = .{ .bytes = candidate.inputs } } } });
     try db.commitTransaction(begin, 801);
     try expectCheckpoint(&db, initial_record);
+    // Root mismatches fail before any validation intent can be accepted.
+    const wrong_root_txn = try db.beginTransactionWithId(@splat(12), 1200);
+    var wrong_scope = scope;
+    wrong_scope.physical_root ^= 1;
+    if (wrong_scope.physical_root == 0) wrong_scope.physical_root = 2;
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, db.writeTransaction(wrong_root_txn, .{ .relational_schema_version = 1, .relational_integrity_generation_set = generation_set, .relational_activation = .{ .routing_key = "", .expected = initial_record, .next = initial_record, .validation = wrong_scope } }));
+    try db.abortTransaction(wrong_root_txn, 1201);
+    try expectCheckpoint(&db, initial_record);
     try std.testing.expectEqual(source_binding.fence.admission_epoch + 1, (try db.relationalTopologyIdentity()).next_epoch);
     {
         var read = try db.core.store.beginReadTxn();
@@ -230,6 +246,9 @@ test "foreign key validation native transaction rejects stale children and absen
     live = true;
     try db.commitTransaction(promoted, 501);
     try expectHistorical(&db, &child_key, false);
+    try expectCheckpoint(&db, next_record);
+    // A successfully committed predecessor cannot be reused after reopen.
+    try std.testing.expectError(error.ConstraintActivationChanged, fixture.prepare(&checked, 13));
     try expectCheckpoint(&db, next_record);
     var after = (try db.lookup(a, "child", .{ .include_primary_digest = true })).?;
     defer after.deinit(a);

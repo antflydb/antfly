@@ -347,6 +347,121 @@ test "foreign key validation input transport streams compact canonical base64 ac
     }
 }
 
+const ValidationWireFixture = struct {
+    fn record() ForeignKeyValidationRecord {
+        const binding: owner_contract.Binding = .{
+            .purpose = .foreign_key_source,
+            .id = @splat(1),
+            .plan_digest = @splat(2),
+            .owner = @splat(3),
+            .fence = .{ .transition_id = 4, .attempt = 1, .admission_epoch = 1, .owner_group_id = 72, .peer_group_id = 72, .namespace = .{ .table_id = 7, .shard_id = 172, .range_id = 272 }, .catalog_digest = @splat(5), .role = .schema_validation },
+            .authority = .native,
+            .before_version = 1,
+            .after_version = 2,
+            .columns = 1,
+            .before_schema = @splat(6),
+            .after_schema = @splat(7),
+            .before_public = @splat(8),
+            .after_public = @splat(9),
+            .after_catalog = @splat(10),
+            .physical_catalog = @splat(11),
+            .inputs = digest("\x00\xffASVI"),
+            .projection_identity = @splat(13),
+        };
+        return .{ .binding = binding, .physical_root = std.math.maxInt(u128) - 42, .revision = 1, .progress = .{ .generation_set = @splat(14), .owner = binding.owner, .schema_version = 1, .phase = .foreign_key, .cursor = "\x00\xffcursor" } };
+    }
+    fn roundTrip(a: Allocator) !void {
+        const record_value = record();
+        const bytes = try record_value.encode(a);
+        defer a.free(bytes);
+        const command: Command = .{ .routing_key = "\x00\xffroute", .expected = null, .next = bytes, .validation = .{ .binding = record_value.binding, .physical_root = record_value.physical_root, .action = .begin, .inputs = .{ .bytes = "\x00\xffASVI" } } };
+        const Request = @import("../../api/distributed_txn_contract.zig").TableCommitRequest;
+        const json = try std.json.Stringify.valueAlloc(a, Request{ .table_name = "rows", .relational_activation = command }, .{});
+        defer a.free(json);
+        var parsed = try std.json.parseFromSlice(Request, a, json, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        const result = parsed.value.relational_activation.?;
+        try result.validation.?.validate();
+        try std.testing.expectEqualDeep(command, result);
+        try std.testing.expectEqualDeep(record_value, try ForeignKeyValidationRecord.decode(result.next));
+        // Private recovery/HTTP handlers may first retain a semantic JSON tree.
+        // Number strings preserve full-width roots instead of rounding via f64.
+        var tree = try std.json.parseFromSlice(std.json.Value, a, json, .{ .parse_numbers = false });
+        defer tree.deinit();
+        var from_tree = try std.json.parseFromValue(Request, a, tree.value, .{});
+        defer from_tree.deinit();
+        try std.testing.expectEqualDeep(command, from_tree.value.relational_activation.?);
+    }
+};
+
+test "foreign key validation transaction transport retains binary inputs and full width native roots through allocation failure" {
+    try ValidationWireFixture.roundTrip(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, ValidationWireFixture.roundTrip, .{});
+}
+
+test "foreign key validation progress rejects corruption truncation forged lengths and authority substitution" {
+    const a = std.testing.allocator;
+    const value = ValidationWireFixture.record();
+    const bytes = try value.encode(a);
+    defer a.free(bytes);
+    try std.testing.expectEqualDeep(value, try ForeignKeyValidationRecord.decode(bytes));
+    for (0..bytes.len) |offset| {
+        bytes[offset] ^= 1;
+        try std.testing.expectError(error.InvalidSchemaValidationJob, ForeignKeyValidationRecord.decode(bytes));
+        bytes[offset] ^= 1;
+        try std.testing.expectError(error.InvalidSchemaValidationJob, ForeignKeyValidationRecord.decode(bytes[0..offset]));
+    }
+    const malformed = try a.dupe(u8, bytes);
+    defer a.free(malformed);
+    for ([_]usize{ 32, 36 }) |offset| {
+        @memcpy(malformed, bytes);
+        std.mem.writeInt(u32, malformed[offset..][0..4], std.math.maxInt(u32), .little);
+        @memcpy(malformed[malformed.len - 32 ..], &digest(malformed[0 .. malformed.len - 32]));
+        try std.testing.expectError(error.InvalidSchemaValidationJob, ForeignKeyValidationRecord.decode(malformed));
+    }
+    var invalid = value;
+    invalid.physical_root = 0;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, invalid.validate());
+    invalid = value;
+    invalid.binding.authority = .raft;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, invalid.validate());
+    invalid.physical_root = 0;
+    try invalid.validate();
+    const raft = try invalid.encode(a);
+    defer a.free(raft);
+    try std.testing.expectEqualDeep(invalid, try ForeignKeyValidationRecord.decode(raft));
+    var scope: ForeignKeyValidationScope = .{ .binding = value.binding, .physical_root = value.physical_root, .action = .page };
+    try scope.validate();
+    scope.physical_root = 0;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, scope.validate());
+    scope.binding.authority = .raft;
+    try scope.validate();
+    scope.physical_root = value.physical_root;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, scope.validate());
+    scope.binding.purpose = .foreign_key_parent;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, scope.validate());
+}
+
+test "foreign key validation extension preserves ordinary activation command bytes" {
+    const a = std.testing.allocator;
+    const command: Command = .{ .routing_key = "\x00\xff", .expected = "\x01\xfe", .next = "\x02\xfd" };
+    const current = try std.json.Stringify.valueAlloc(a, command, .{});
+    defer a.free(current);
+    const Legacy = struct {
+        routing_key: []const u8,
+        expected: ?[]const u8,
+        next: []const u8,
+        retry: bool = false,
+        diagnostic: bool = false,
+        pub fn jsonStringify(self: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+            return @import("relational_integrity_json.zig").write(self, stream);
+        }
+    };
+    const legacy = try std.json.Stringify.valueAlloc(a, Legacy{ .routing_key = command.routing_key, .expected = command.expected, .next = command.next }, .{});
+    defer a.free(legacy);
+    try std.testing.expectEqualSlices(u8, legacy, current);
+}
+
 pub fn commandProgress(command: Command, bytes: []const u8) !Progress {
     return if (command.validation != null) (try ForeignKeyValidationRecord.decode(bytes)).progress else Progress.decode(bytes);
 }

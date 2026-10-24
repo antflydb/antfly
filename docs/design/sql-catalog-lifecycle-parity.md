@@ -80,13 +80,19 @@ apply identical effects. Root-qualified readiness and metadata publication are
 still required before either can authorize a public validity change. Snapshot
 import of these transient records currently fails closed.
 
-The strict Debug `antfly-fk-validation-transactions-test` gate passed eight
+The strict Debug `antfly-fk-validation-transactions-test` gate passed eleven
 supporting tests and one native LSM transaction campaign, without skips or leaks.
 The campaign checks missing parents, stale children, atomic cursor/reference
 promotion after reopening a prepared transaction, preservation by ordinary
 writes, guarded orphan diagnostics, parent repair and complete rescan, and
 cancellation of ready progress. Public schema bytes remain NOT VALID throughout.
-Apache boundary and generated control-catalog checks also passed.
+The complete native campaign now uses the production participant wire encoder
+and parser before storage preparation. Allocation-failure tests preserve binary
+inputs and full-width roots through typed and number-preserving JSON parsing;
+corruption, truncation, forged sizes, wrong authorities, wrong native roots and
+stale predecessor replay are rejected. Ordinary activation command bytes remain
+unchanged. The existing seventeen transaction-commit regressions, Apache
+boundary, license, inventory and generated control-catalog checks also passed.
 
 This is a native execution checkpoint, not closure of `sql-0736`. Public
 coordinator admission/completion, parent-definition locks, current-owner
