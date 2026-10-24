@@ -25,7 +25,13 @@ pub const ContentPart = generating.ContentPart;
 pub const ChatMessageContent = generating.ChatMessageContent;
 pub const ToolCall = generating.ToolCall;
 pub const GenerationUsage = generating.GenerationUsage;
+pub const GenerationFinishReason = generating.GenerationFinishReason;
 pub const ChatMessage = generating.ChatMessage;
+pub const TextContentCursor = generating.TextContentCursor;
+pub const jsonValuesEqual = generating.jsonValuesEqual;
+pub const emptyToolParameters = generating.emptyToolParameters;
+pub const ChatStream = generating.ChatStream;
+pub const writeChatStreamChunk = generating.writeChatStreamChunk;
 
 /// Request-scoped local generation controls. Keep these in the provider
 /// request (including its serialized bridge), never in shared model state.
@@ -120,18 +126,24 @@ pub const SparseEmbedResult = struct {
 };
 
 pub const GenerateResult = struct {
+    finish_reason: ?GenerationFinishReason = null,
     content: []const u8,
     usage: ?GenerationUsage = null,
     tool_calls: []ToolCall = &.{},
     tool_calls_synthesized: bool = false,
     token_logprobs_json: ?[]const u8 = null,
     google_parts_json: ?[]const u8 = null,
+    anthropic_content_json: ?[]const u8 = null,
+    /// Original Bedrock blocks preserve signed reasoning across tool turns.
+    bedrock_content_json: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *GenerateResult) void {
         self.allocator.free(self.content);
         if (self.token_logprobs_json) |evidence| self.allocator.free(evidence);
         if (self.google_parts_json) |parts| self.allocator.free(parts);
+        if (self.anthropic_content_json) |parts| self.allocator.free(parts);
+        if (self.bedrock_content_json) |parts| self.allocator.free(parts);
         for (self.tool_calls) |*tool_call| tool_call.deinit(self.allocator);
         if (self.tool_calls.len > 0) self.allocator.free(self.tool_calls);
         self.* = undefined;

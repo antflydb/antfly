@@ -26,7 +26,6 @@ import pytest
 import requests
 from conftest import DEFAULT_ANTFLY_BIN, StandaloneAntflyServer, resolve_binary_path
 
-
 # Server ownership is dynamic/direct, outside static fixture inference.
 pytestmark = pytest.mark.e2e_resource("antfly_process")
 
@@ -62,31 +61,52 @@ def test_inspect_standalone_lite_tables_and_dependencies(tmp_path):
         capabilities.write_text(
             json.dumps({"version": 1, "configuration_id": "test", "requirements": []})
         )
-        result = subprocess.run(
-            [
-                binary,
-                "backup",
-                "inspect",
-                "--input",
-                str(source),
-                "--destination-capabilities",
-                str(capabilities),
-            ],
-            text=True,
-            capture_output=True,
-            timeout=60,
-            check=True,
-        )
-        report = json.loads(result.stdout)
-        assert report["completeness"]["scan_complete"], report
-        assert report["inventory"]["documents"] == 2, report
-        assert report["inventory"]["shards"] == 2, report
-        assert any(r["kind"] == "model" for r in report["inventory"]["requirements"]), (
-            report
-        )
-        assert report["compatibility"]["verdict"] != "compatible", report
-        assert report["source"]["sha256"] == before
-        assert hashlib.sha256(source.read_bytes()).hexdigest() == before
+        original = None
+        for flags in (
+            [],
+            ["--no-agent"],
+            ["--agent"],
+            ["--agent", "--output", "table"],
+            ["--agent", "--output", "compact"],
+            ["--agent", "--fingerprint", "ordered"],
+            ["--agent", "--display-cell-bytes", "1", "--display-bytes", "1024"],
+        ):
+            result = subprocess.run(
+                [
+                    binary,
+                    *flags,
+                    "backup",
+                    "inspect",
+                    "--input",
+                    str(source),
+                    "--destination-capabilities",
+                    str(capabilities),
+                ],
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=True,
+                env={
+                    **os.environ,
+                    "ANTFLY_URL": "://invalid-server-url",
+                    "ANTFLY_AGENT_MODE": "0",
+                },
+            )
+            if original is None:
+                original = result.stdout
+            assert result.stdout == original, (
+                "presentation policy changed the inspection artifact"
+            )
+            report = json.loads(result.stdout)
+            assert report["completeness"]["scan_complete"], report
+            assert report["inventory"]["documents"] == 2, report
+            assert report["inventory"]["shards"] == 2, report
+            assert any(
+                r["kind"] == "model" for r in report["inventory"]["requirements"]
+            ), report
+            assert report["compatibility"]["verdict"] != "compatible", report
+            assert report["source"]["sha256"] == before
+            assert hashlib.sha256(source.read_bytes()).hexdigest() == before
         failed = False
     finally:
         server.stop(test_failed=failed)

@@ -118,7 +118,7 @@ class ReleaseLicenseTests(unittest.TestCase):
                 "    root = Path(__file__).resolve().parents[1]\n"
                 "    entry = 'cache-embedded.build.zig' if '--build-file' in args else 'cache-server.build.zig'\n"
                 "    options = [arg for arg in args if arg.startswith(('-Dtarget=', '-Doptimize='))]\n"
-                "    built = run_fixture([os.environ['RELEASE_CACHE_PROBE_ZIG'], 'build', '--build-file', entry, '--summary', 'all', '--cache-dir', args[args.index('--cache-dir') + 1], *options], cwd=root, timeout=180)\n"
+                "    built = run_fixture([os.environ['RELEASE_CACHE_PROBE_ZIG'], 'build', '--build-file', entry, '--summary', 'all', '--cache-dir', args[args.index('--cache-dir') + 1], *options], cwd=root, timeout=600)\n"
                 "    Path('cache-summary.txt').write_text(built.stdout + built.stderr)\n"
                 "    if built.returncode: raise RuntimeError(built.stdout + built.stderr)\n"
                 "inference = Path.cwd().name == 'inference'\n"
@@ -135,6 +135,8 @@ class ReleaseLicenseTests(unittest.TestCase):
             if probe_zig:
                 # Both product entrypoints compile the same provider, as in
                 # the real graph. Give it a real compiler/cache, not a marker.
+                # The first cold Zig build also compiles its build runner; give
+                # that tool bootstrap a bounded ten minutes on shared CI CPUs.
                 for entry in ("cache-server.build.zig", "cache-embedded.build.zig"):
                     (root / "zig" / entry).write_text(
                         'pub const build = @import("cache-support.zig").build;\n'

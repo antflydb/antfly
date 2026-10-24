@@ -713,6 +713,7 @@ const Instance = struct {
     project_id: []const u8 = "",
     location: []const u8 = "",
     credentials_path: []const u8 = "",
+    workspace_id: []const u8 = "",
     key: []const u8 = "",
     names: std.ArrayListUnmanaged([]const u8) = .empty,
     sources: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -1232,6 +1233,7 @@ fn instanceFromConnectionConfig(
         .project_id = if (cfg.project_id) |value| try arena.dupe(u8, value) else "",
         .location = if (cfg.location) |value| try arena.dupe(u8, value) else "",
         .credentials_path = if (cfg.credentials_path) |value| try arena.dupe(u8, value) else "",
+        .workspace_id = if (cfg.workspace_id orelse (if (provider == .anthropic) @import("antfly_platform").env.getenv("ANTHROPIC_WORKSPACE_ID") else null)) |value| try arena.dupe(u8, value) else "",
         .key = try std.fmt.allocPrint(arena, "config:connections/{s}", .{id}),
         .model_types = model_types,
     };
@@ -1383,6 +1385,7 @@ fn resolveModels(
                 .project_id = instance.project_id,
                 .location = instance.location,
                 .credentials_path = instance.credentials_path,
+                .workspace_id = instance.workspace_id,
             },
             .timeout_ms = opts.timeout_ms,
             .arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator),

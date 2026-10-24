@@ -89,7 +89,9 @@ else:
     def run(*args, extra_env=None):
         child_env = env | (extra_env or {})
         return subprocess.run(
-            [binary, "connections", *args],
+            # Credential assertions consume raw JSON, independently of TTY
+            # detection, agent envelopes, or presentation budgets.
+            [binary, "--no-agent", "--output", "json", "connections", *args],
             env=child_env,
             capture_output=True,
             check=False,

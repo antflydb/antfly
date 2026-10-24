@@ -25,6 +25,8 @@ class GeneratorConfig:
 
     Attributes:
         provider (GeneratorProvider): Generator providers implemented by Antfly's generation runtime.
+        max_image_input_tokens (int | Unset): Conservative input-token ceiling per image. Required for image calls when
+            tokens_per_minute is configured; choose a bound valid for the model and image policy.
         rate_limit (RateLimitConfig | Unset): Outbound provider limits shared within one Antfly process by effective
             endpoint, operation, model, credential source, project and region/location.
             Conflicting policies for an active scope are rejected. These limits do
@@ -32,11 +34,14 @@ class GeneratorConfig:
     """
 
     provider: GeneratorProvider
+    max_image_input_tokens: int | Unset = UNSET
     rate_limit: RateLimitConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         provider = self.provider.value
+
+        max_image_input_tokens = self.max_image_input_tokens
 
         rate_limit: dict[str, Any] | Unset = UNSET
         if not isinstance(self.rate_limit, Unset):
@@ -49,6 +54,8 @@ class GeneratorConfig:
                 "provider": provider,
             }
         )
+        if max_image_input_tokens is not UNSET:
+            field_dict["max_image_input_tokens"] = max_image_input_tokens
         if rate_limit is not UNSET:
             field_dict["rate_limit"] = rate_limit
 
@@ -61,6 +68,8 @@ class GeneratorConfig:
         d = dict(src_dict)
         provider = GeneratorProvider(d.pop("provider"))
 
+        max_image_input_tokens = d.pop("max_image_input_tokens", UNSET)
+
         _rate_limit = d.pop("rate_limit", UNSET)
         rate_limit: RateLimitConfig | Unset
         if isinstance(_rate_limit, Unset):
@@ -70,6 +79,7 @@ class GeneratorConfig:
 
         generator_config = cls(
             provider=provider,
+            max_image_input_tokens=max_image_input_tokens,
             rate_limit=rate_limit,
         )
 

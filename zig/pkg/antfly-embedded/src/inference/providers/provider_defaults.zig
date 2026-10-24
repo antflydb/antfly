@@ -100,3 +100,6 @@ test "shared provider limits match upstream APIs" {
         vertexMaxEmbeddingBatchSize("text-embedding-005"),
     );
 }
+
+/// Version shared by direct Messages and model discovery.
+pub const anthropic_api_version = "2026-10-21";

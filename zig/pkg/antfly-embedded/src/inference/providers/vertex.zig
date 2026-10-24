@@ -546,7 +546,18 @@ pub const Provider = struct {
         );
     }
 
-    fn appendAuthHeaders(
+    pub fn openAiChatUrlAlloc(self: *const Provider, alloc: Allocator, model: []const u8) ![]u8 {
+        const base = std.mem.trimEnd(u8, self.base_url, "/");
+        if (std.mem.endsWith(u8, base, "/endpoints/openapi")) return std.fmt.allocPrint(alloc, "{s}/chat/completions", .{base});
+        // A fully qualified model retains its project/location authority.
+        if (std.mem.startsWith(u8, model, "projects/")) {
+            const end = std.mem.indexOf(u8, model, "/publishers/") orelse return error.InvalidGeneratorConfig;
+            return std.fmt.allocPrint(alloc, "{s}/{s}/endpoints/openapi/chat/completions", .{ base, model[0..end] });
+        }
+        return std.fmt.allocPrint(alloc, "{s}/projects/{s}/locations/{s}/endpoints/openapi/chat/completions", .{ base, self.project_id, self.location });
+    }
+
+    pub fn appendAuthHeaders(
         self: *Provider,
         alloc: Allocator,
         headers: *std.ArrayList([2][]const u8),
