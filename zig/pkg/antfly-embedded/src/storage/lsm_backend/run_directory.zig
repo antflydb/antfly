@@ -451,6 +451,72 @@ pub const Directory = struct {
     /// needs physical retirement; deinit is an explicit quiesced fallback.
     pub const EntryLease = struct {
         entry: Entry,
+        /// The owner supplies a retained pin-release operation. It must not
+        /// invoke the legacy path registry under admission: rejection retains
+        /// its progress, and success releases exactly this payload's pin.
+        pub const PinRelease = struct {
+            context: *anyopaque,
+            resume_fn: *const fn (*anyopaque, *anyopaque, *Run, ?@import("../../common/read_admission.zig").Port) anyerror!void,
+        };
+        pub const Retirement = struct {
+            payload: ?*Payload,
+            pin: PinRelease,
+            physical: ?@import("run_snapshot_clone.zig").Retirement = null,
+            pin_released: bool = false,
+            complete: bool = false,
+
+            /// Pin release precedes path retirement. Keep the payload header
+            /// and both accounting references until every owned byte is gone.
+            fn retire(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
+                if (original) |port| try port.checkpoint();
+                if (self.complete) return;
+                const payload = self.payload.?;
+                if (!self.pin_released) {
+                    try self.pin.resume_fn(self.pin.context, payload.owner, &payload.run, original);
+                    payload.run.version_ref_pinned = false;
+                    self.pin_released = true;
+                }
+                if (self.physical == null) self.physical = @import("run_snapshot_clone.zig").Retirement.init(payload.run) catch unreachable;
+                try self.physical.?.retireWithAdmission(allocator, original);
+                if (original) |port| try port.checkpoint();
+                self.finish(allocator);
+            }
+            fn finish(self: *@This(), allocator: std.mem.Allocator) void {
+                const payload = self.payload.?;
+                const account = payload.account;
+                const bytes = payload.bytes;
+                allocator.destroy(payload);
+                account.discharge(bytes);
+                account.release();
+                self.payload = null;
+                self.complete = true;
+            }
+            pub fn retireWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: @import("../../common/read_admission.zig").Port) !void {
+                try self.retire(allocator, original);
+            }
+            /// Explicit joined/quiesced fallback drives the same pin cursor,
+            /// including any progress retained before admission rejection.
+            pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+                self.retire(allocator, null) catch unreachable;
+            }
+        };
+
+        /// Consumes this lease only after admission and ownership validation.
+        /// Other directory/handle owners may still exist; their non-final drop
+        /// is constant work. A coordinator keeps a final lease until all such
+        /// owners drain so their generic destructors cannot become final.
+        pub fn beginRetirementWithAdmission(self: *@This(), pin: PinRelease, original: @import("../../common/read_admission.zig").Port) !Retirement {
+            try original.checkpoint();
+            const payload = self.entry.payload.?;
+            var view = payload.run;
+            view.version_ref_pinned = false;
+            if (!@import("run_snapshot_clone.zig").Retirement.supports(view)) return error.ExecutionWaitUnsupported;
+            const account = payload.account;
+            const final = payload.refs.fetchSub(1, .acq_rel) == 1;
+            if (!final) account.release();
+            self.* = undefined;
+            return .{ .payload = if (final) payload else null, .pin = pin, .complete = !final };
+        }
         pub fn run(self: *const @This()) *const Run {
             return self.entry.run;
         }
@@ -2710,4 +2776,150 @@ test "controlled physical sync private put replaces every index across ordering 
             }
         }
     }
+}
+
+test "controlled physical sync directory lease retains final payload pin bytes and charge through retirement rejection" {
+    const a = std.testing.allocator;
+    const admission = @import("../../common/read_admission.zig");
+    const Fault = struct {
+        checks: usize = 0,
+        at: usize = std.math.maxInt(usize),
+        failure: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const at = self.checks;
+            self.checks += 1;
+            if (at == self.at) return self.failure;
+        }
+    };
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pins: usize = 0,
+        pin_phase: usize = 0,
+        releases: usize = 0,
+        pub fn retainRunSnapshotRef(self: *@This(), run: *Run) !void {
+            self.pins += 1;
+            run.version_ref_pinned = true;
+        }
+        pub fn releaseRunSnapshotRef(self: *@This(), run: *Run) void {
+            std.debug.assert(self.pins == 1 and run.version_ref_pinned);
+            self.pins -= 1;
+            self.releases += 1;
+            run.version_ref_pinned = false;
+        }
+        fn release(raw: *anyopaque, owner: *anyopaque, run: *Run, original: ?admission.Port) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(raw == owner);
+            // Model a retained registry lookup: no lock or path allocation is
+            // hidden in this fixture. The production registry remains separate.
+            while (self.pin_phase < 3) {
+                if (original) |port| try port.checkpoint();
+                self.pin_phase += 1;
+            }
+            if (original) |port| try port.checkpoint();
+            self.releaseRunSnapshotRef(run);
+        }
+        fn pin(self: *@This()) Directory.EntryLease.PinRelease {
+            return .{ .context = self, .resume_fn = release };
+        }
+    };
+    const bytes = try a.alloc(u8, 3 * 16 * 1024 + 7);
+    defer a.free(bytes);
+    @memset(bytes, 'l');
+    var state_source: state.State = .{};
+    defer state_source.deinit(a);
+    try state_source.appendUpsert(a, .{ .name = "docs" }, bytes, bytes, true);
+    const base = Run{ .id = 301, .level = 0, .size_bytes = 1, .path = null, .smallest_namespace_name = null, .smallest_key = bytes, .largest_namespace_name = null, .largest_key = bytes, .entry_count = 1, .bloom_filter = null, .state = state_source, .owns_metadata = false };
+    for (0..3) |mode| {
+        var total: usize = 0;
+        var target: usize = 0;
+        while (target <= total) : (target += 1) {
+            for ([_]bool{ false, true }) |quiesced| {
+                if (target == 0 and quiesced) continue;
+                var source = base;
+                if (mode == 0) {
+                    source.path = @constCast("/retire/301.sst");
+                    source.state = null;
+                }
+                if (mode == 2) {
+                    source = try repository.cloneRunCompactionSnapshot(a, source);
+                    try source.shareMemory(a);
+                }
+                var fixture: Fixture = .{ .allocator = a };
+                const directory = try Directory.create(a);
+                defer directory.destroy(a);
+                try directory.tree.prepare(a);
+                const account = directory.tree.account.?;
+                const baseline = account.bytes.load(.acquire);
+                var lease: ?Directory.EntryLease = try directory.prepareEntryLegacy(&fixture, source);
+                defer if (lease) |*value| value.deinit(a);
+                if (mode == 2) source.deinit(a); // Payload owns the last shared pin.
+                const charged = account.bytes.load(.acquire);
+                try std.testing.expect(charged > baseline);
+                var fault: Fault = .{ .at = if (target == 0) std.math.maxInt(usize) else target - 1, .failure = switch (target % 3) {
+                    0 => error.Canceled,
+                    1 => error.DeadlineExceeded,
+                    else => error.FileNotFound,
+                } };
+                const payload: admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+                const original = admission.Port.init(&payload);
+                var retirement: ?Directory.EntryLease.Retirement = null;
+                defer if (retirement) |*value| value.deinit(a);
+                const result: anyerror!void = blk: {
+                    retirement = lease.?.beginRetirementWithAdmission(fixture.pin(), original) catch |err| break :blk err;
+                    lease = null;
+                    retirement.?.retireWithAdmission(a, original) catch |err| break :blk err;
+                    break :blk {};
+                };
+                if (target == 0) {
+                    try result;
+                    total = fault.checks;
+                    try std.testing.expect(total > 10);
+                } else {
+                    try std.testing.expectError(fault.failure, result);
+                    try std.testing.expectEqual(charged, account.bytes.load(.acquire));
+                }
+                if (lease) |*value| {
+                    retirement = try value.beginRetirementWithAdmission(fixture.pin(), original);
+                    lease = null;
+                }
+                if (quiesced) retirement.?.deinit(a) else try retirement.?.retireWithAdmission(a, original);
+                try std.testing.expectEqual(baseline, account.bytes.load(.acquire));
+                try std.testing.expectEqual(@as(usize, 0), fixture.pins);
+                try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+                fault.at = fault.checks;
+                try std.testing.expectError(fault.failure, retirement.?.retireWithAdmission(a, original));
+                try retirement.?.retireWithAdmission(a, original);
+                try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+            }
+        }
+    }
+    // A directory/handle still owns the payload. Dropping this lease cannot
+    // start pin release or physical retirement, even on the quiesced path.
+    var fixture: Fixture = .{ .allocator = a };
+    const directory = try Directory.create(a);
+    defer directory.destroy(a);
+    try directory.tree.prepare(a);
+    var lease = try directory.prepareEntryLegacy(&fixture, base);
+    var other: Directory.EntryLease = .{ .entry = lease.entry.retainShared() };
+    _ = other.entry.payload.?.account.retain();
+    var fault: Fault = .{};
+    const payload: admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+    const original = admission.Port.init(&payload);
+    lease.entry.payload.?.run.shared_read_version = true;
+    fault.at = fault.checks;
+    try std.testing.expectError(error.Canceled, lease.beginRetirementWithAdmission(fixture.pin(), original));
+    try std.testing.expectError(error.ExecutionWaitUnsupported, lease.beginRetirementWithAdmission(fixture.pin(), original));
+    try std.testing.expectEqual(@as(usize, 2), lease.entry.payload.?.refs.load(.acquire));
+    lease.entry.payload.?.run.shared_read_version = false;
+    var first = try lease.beginRetirementWithAdmission(fixture.pin(), original);
+    try std.testing.expect(first.complete);
+    try first.retireWithAdmission(a, original);
+    first.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), fixture.pins);
+    try std.testing.expectEqual(@as(usize, 0), fixture.pin_phase);
+    var last = try other.beginRetirementWithAdmission(fixture.pin(), original);
+    defer last.deinit(a);
+    try last.retireWithAdmission(a, original);
+    try std.testing.expectEqual(@as(usize, 1), fixture.releases);
 }

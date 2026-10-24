@@ -26876,3 +26876,55 @@ changes. Public/native ABI layouts and durable formats are unchanged in this
 step. Full GNU qualification remains waived; the remaining pin, payload,
 resource/retirement registration and combined-backend/default-design work
 above remains incomplete.
+
+### Final directory entry lease retirement
+
+`Directory.EntryLease.beginRetirementWithAdmission` now transfers a final
+payload owner into retained physical retirement. It validates the snapshot's
+supported ownership shape before consuming the lease, claims the last payload
+reference atomically, and leaves non-final directory/handle drops constant in
+size. A coordinator must keep its final lease until the candidate/predecessor
+index and handle owners drain; this helper does not make generic directory
+payload destructors admitted.
+
+The caller supplies one stable pin-release continuation. Its context, backend,
+allocator and accounting authority must remain registered through completion.
+The callback owns any pin lookup/release progress, checks the current original,
+and releases exactly this payload's registration before returning success. It
+may return the original admission error while retaining progress; the null-port
+joined fallback must complete without failure. It must leave run metadata and
+memory ownership intact. A synchronous legacy registry adapter does not satisfy
+this contract under admission. The same callback/context is retained for retry
+and joined cleanup, so interruption cannot silently switch pin owners or repeat
+an already completed release.
+
+After pin release, the existing complete snapshot cursor retires state,
+metadata, Bloom storage and any last shared-memory header. The payload header,
+physical charge and lease account reference survive every rejection, including
+rejection after physical snapshot completion but before final header release.
+The payload's charge is discharged only after the header is freed. Completed
+and non-final cursors continue to check each new original before returning.
+This fixed continuation header and the external pin cursor must themselves be
+prepaid and registered by the owning coordinator.
+
+The global path-pin registry remains synchronous, and payload preparation,
+combined RunStore/directory/view/generation/durability publication, registered
+parent retirement, broader operator eligibility and default overload/fairness
+qualification remain incomplete. This change does not enable defaults or claim
+that the production registry already meets the callback contract. Public/native
+layouts and durable formats are unchanged. Full GNU qualification remains waived.
+
+Final-source `retained-directory-lease-v2`, `-regressions` and `-fast` receipts
+pass all five native commands each. Debug physical-sync passes 53/53 steps and
+111 cases, including every final-lease retirement checkpoint for disk,
+copied-memory and last shared-memory ownership, retry/joined fallback, original
+error identity, cached completion, non-final drops and validation before lease
+consumption. Existing directory, state/OOM, immutable-pin, merge/arena/overlay,
+ledger, dependency and GC regressions pass 60/60 steps and 34 cases.
+ReleaseFast passes 63/63 steps and all 111 physical, 170 table/codec and 74 WAL
+recovery cases. Each receipt also passes four Bloom and 45/1/8 error-identity
+companions (companions use Debug). All 5,594 native/schema input hashes and log
+digests match current source. Formatting and whitespace checks pass. The v1
+receipt preserves a corrected test-fixture error: an empty directory's tree
+account must be prepared before payload construction. The full default design
+and production pin/coordinator integration remain incomplete.
