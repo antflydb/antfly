@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Ordinary Antfly source catalog record v1",
+  "type": "object",
+  "required": [
+    "version",
+    "doc_type",
+    "source",
+    "provider",
+    "document_version",
+    "permissions"
+  ],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "doc_type": {
+      "const": "source_catalog"
+    },
+    "source": {
+      "allOf": [
+        {
+          "$ref": "sources-v2.json#/properties/sources/items"
+        },
+        {
+          "not": {
+            "required": [
+              "access_id"
+            ]
+          }
+        }
+      ]
+    },
+    "provider": {
+      "enum": [
+        "github",
+        "google_drive",
+        "gcs",
+        "s3"
+      ]
+    },
+    "document_version": {
+      "const": 1
+    },
+    "published_revision": {
+      "type": "string",
+      "minLength": 1
+    },
+    "permissions": {
+      "type": "object",
+      "required": [
+        "public",
+        "readers"
+      ],
+      "properties": {
+        "public": {
+          "type": "boolean"
+        },
+        "readers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "source": {
+            "properties": {
+              "status": {
+                "const": "searchable"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "published_revision"
+        ],
+        "properties": {
+          "source": {
+            "required": [
+              "valid_until"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

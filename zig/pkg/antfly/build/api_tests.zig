@@ -339,6 +339,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
 
     const lib_api_auth_default_filters = [_][]const u8{
+        "trusted principal table operations",
         "storage migration job observation preserves admitted and unpublished catalog state",
         "storage migration command admission fences delayed starts across handlers",
         "api http server requires auth on public routes when enabled",
@@ -425,7 +426,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     // The real MCP transport/database security regression does not need the
     // monolithic library discovery root or its full-suite memory reservation.
-    const mcp_auth_filters = &.{"api http server serves document lookup through mcp tool"};
+    const mcp_auth_filters = &.{ "api http server serves document lookup through mcp tool", "trusted principal table operations" };
     const mcp_auth_tests = b.addTest(.{
         .name = "api-mcp-auth-tests",
         .root_module = options.api_http_runtime_test_mod,

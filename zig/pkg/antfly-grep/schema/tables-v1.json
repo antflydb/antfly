@@ -76,6 +76,37 @@
               }
             },
             "description": "Complete raw-content byte trigrams encoded as lowercase hex keyword terms; atomic with the source revision. Opt-in acceleration only."
+          },
+          "status": {
+            "type": "string",
+            "description": "Optional current source state supplied by Cloud discovery."
+          },
+          "access_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Source-specific access consistency precondition supplied by Cloud discovery."
+          },
+          "table": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Optional physical table binding for a logical source."
+          },
+          "source_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "source_filter": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "valid_until": {
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         }
       }
