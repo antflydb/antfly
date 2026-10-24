@@ -15,7 +15,9 @@
 
 //! Private candidate/hydration proof. Public request parsers never enable it.
 const std = @import("std");
-pub const Mode = enum { none, candidates, hydrate };
+/// Internal read modes. Lookup returns whole primary rows under the admitted
+/// read fence; candidates/hydrate retain the two-phase authority protocol.
+pub const Mode = enum { none, candidates, hydrate, lookup };
 pub const Authority = struct {
     group: u64,
     version: u64,
