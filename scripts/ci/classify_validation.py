@@ -31,6 +31,7 @@ SCOPES = (
     "sdk",
     "typescript",
     "memoryaf",
+    "sources",
     "release",
     "antfarm_e2e",
 )
@@ -161,6 +162,7 @@ def classify(paths: list[str], force_all: bool = False) -> dict[str, bool]:
         # producer before the byte-for-byte and browser checks can run.
         scopes["typescript"] |= antfarm_input
         scopes["memoryaf"] |= path.startswith("go/pkg/memoryaf/")
+        scopes["sources"] |= path.startswith("go/pkg/sources/")
         scopes["antfarm_e2e"] |= antfarm_input
         scopes["release"] |= matches(
             path, RELEASE_FILES, RELEASE_PREFIXES

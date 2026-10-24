@@ -66,6 +66,18 @@ check_memoryaf() {
   )
 }
 
+check_sources() {
+  section "Checking portable source ingestion"
+  (
+    cd "$repo_root/go/pkg/sources"
+    GOWORK=off go mod tidy
+    git diff --exit-code -- go.mod go.sum
+    GOWORK=off go vet ./...
+    CGO_ENABLED=0 GOWORK=off go test -count=1 ./...
+    CGO_ENABLED=1 GOWORK=off go test -race -count=1 ./...
+  )
+}
+
 check_sdk() {
   if [[ ${CI:-false} == true ]]; then
     with_disposable_cargo_target check_sdk_impl
@@ -196,7 +208,7 @@ check_release() {
 }
 
 usage() {
-  echo "usage: $0 {format|sdk|typescript|memoryaf|release|all} [format language ...]" >&2
+  echo "usage: $0 {format|sdk|typescript|memoryaf|sources|release|all} [format language ...]" >&2
   exit 2
 }
 
@@ -215,12 +227,16 @@ case "$command" in
   memoryaf)
     check_memoryaf
     ;;
+  sources)
+    check_sources
+    ;;
   release)
     check_release
     ;;
   all)
     "$repo_root/scripts/format.sh" --check
     check_sdk
+    check_sources
     check_release
     ;;
   *)
