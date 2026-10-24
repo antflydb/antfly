@@ -39,6 +39,7 @@ python3 scripts/packaging/sync_cabi_header.py --check
 
 bash scripts/test_install_download_markers.sh
 python3 scripts/test_quickstart_docs.py
+python3 -m unittest scripts.test_quickstart_terminology
 python3 -m unittest discover -s scripts/packaging -p 'test_*.py'
 python3 -m unittest discover -s scripts/release -p 'test_*.py'
 python3 scripts/release/validate_workflow_actions.py

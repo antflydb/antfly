@@ -1034,6 +1034,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     inference_bedrock_mod.addImport("antfly_cancellation", cancellation_mod);
     inference_bedrock_mod.addImport("httpx", httpx_mod);
+    inference_bedrock_mod.addImport("antfly_hash", hash_mod);
     inference_bedrock_mod.addImport("antfly_inference_types", inference_types_mod);
     inference_bedrock_mod.addImport("antfly_inference_work", inference_work_mod);
     inference_bedrock_mod.addImport("antfly_credentials", credentials_mod);
