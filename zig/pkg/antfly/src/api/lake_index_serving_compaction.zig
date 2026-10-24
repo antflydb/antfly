@@ -109,6 +109,10 @@ const Builder = struct {
         // A bounded posting delta retains its physical base for one cut. The
         // next affected refresh compacts it; never merge unrelated work here.
         if (input.masked) return self.emit(&.{input}, 0);
+        for (input.admission.fields) |field| {
+            if (!std.mem.eql(u8, field.name, local.segment.index_sort_field)) continue;
+            for (field.sections) |section| if (section.kind == .index_sort_bounds) return self.emit(&.{input}, 0);
+        }
         var level: usize = 0;
         var threshold: usize = 8;
         while (level < 3 and input.sources.len >= threshold) : (level += 1) threshold *= 8;

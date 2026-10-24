@@ -30,8 +30,10 @@ pytestmark = [
 ]
 
 
+@pytest.mark.parametrize("explicit_config", [False, True])
 def test_real_parquet_archive_qualification_preserves_cache_and_refresh_contracts(
     tmp_path,
+    explicit_config,
 ):
     pytest.importorskip("pyarrow")
     binary = Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))).resolve()
@@ -68,6 +70,9 @@ def test_real_parquet_archive_qualification_preserves_cache_and_refresh_contract
         "--timeout",
         "120",
     ]
+    if not explicit_config:
+        position = command.index("--server-config")
+        del command[position : position + 2]
     with log.open("w") as stream:
         completed = subprocess.run(
             command, stdout=stream, stderr=subprocess.STDOUT, timeout=240
@@ -76,6 +81,11 @@ def test_real_parquet_archive_qualification_preserves_cache_and_refresh_contract
     report = json.loads((output / "report.json").read_text())
     assert report["complete"] is True
     assert report["server_config_sha256"]
+    assert report["harness_sha256"]
+    assert report["runtime_environment_sha256"]
+    assert report["server_config_origin"] == (
+        "supplied" if explicit_config else "generated"
+    )
     assert report["cache_contract"]["empty_cache_qualified"] is False
     assert report["source_identity_assurance"] == "verified_local_file_bytes"
     assert len(report["samples"]) == 4
@@ -100,8 +110,9 @@ def test_real_parquet_archive_qualification_preserves_cache_and_refresh_contract
 
 
 @pytest.mark.parametrize("additional_declarations", [False, True])
+@pytest.mark.parametrize("physical_order", ["ascending", "shuffled"])
 def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
-    tmp_path, additional_declarations
+    tmp_path, additional_declarations, physical_order
 ):
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
@@ -110,8 +121,13 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
         pytest.skip("Build the Antfly binary first")
     root = Path(__file__).resolve().parents[2]
     archive = tmp_path / "archive.parquet"
+    ids = (
+        list(range(128))
+        if physical_order == "ascending"
+        else list(range(0, 128, 2)) + list(range(1, 128, 2))
+    )
     pq.write_table(
-        pa.table({"hn_id": list(range(128)), "body": ["quasar"] * 128}),
+        pa.table({"hn_id": ids, "body": [f"quasar row{i}" for i in ids]}),
         archive,
         row_group_size=32,
     )
@@ -122,6 +138,10 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
             "schema": {
                 "storage_mode": "relational",
                 "default_type": "row",
+                "index_sort": [
+                    {"field": "hn_id", "order": "asc"},
+                    {"field": "_id", "order": "asc"},
+                ],
                 "base_source": {
                     "kind": "external",
                     "format": "parquet",
@@ -165,7 +185,8 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
                 "expected_ids": list(range(20)),
                 "request": {
                     "full_text_search": {"match": "quasar", "field": "body"},
-                    "fields": ["hn_id"],
+                    "fields": ["hn_id", "body"],
+                    "profile": True,
                     "order_by": [{"field": "hn_id"}],
                     "limit": 20,
                 },
@@ -213,3 +234,12 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
     assert len({s["result_sha256"] for s in report["samples"]}) == 1
     answer = json.loads((output / "custom_identity-answer.json").read_text())
     assert [h["_source"]["hn_id"] for h in answer["hits"]["hits"]] == list(range(20))
+
+    assert [h["_source"]["body"] for h in answer["hits"]["hits"]] == [
+        f"quasar row{i}" for i in range(20)
+    ]
+    profiles = [s["profile"]["sort"] for s in report["samples"]]
+    assert all(p["index_sort_coverage"] == "covered_with_bounds" for p in profiles), (
+        profiles
+    )
+    assert all(p["ordered_scanned_count"] < 128 for p in profiles), profiles

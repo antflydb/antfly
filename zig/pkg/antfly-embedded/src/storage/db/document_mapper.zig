@@ -1229,7 +1229,7 @@ pub fn buildTextSegmentsFromDocumentsWithMetadata(
     };
 }
 
-fn indexSortFieldsForSchemaAlloc(
+pub fn indexSortFieldsForSchemaAlloc(
     alloc: Allocator,
     schema: ?runtime_schema.TableSchema,
 ) ![]const segment_mod.SegmentIndexSortField {
@@ -2857,6 +2857,15 @@ fn appendSchemaTextFields(
             }
         }
     }
+    // A disabled root can still declare separately indexed named subfields.
+    // Its source remains available even though the root emits no postings.
+    for (schema.exact_fields) |field| {
+        if (field.mapping.do_index or !std.mem.eql(u8, field.field, field.source_field)) continue;
+        var values: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer values.deinit(alloc);
+        try collectFieldValues(alloc, &values, root, field.source_field);
+        for (values.items) |text| try appendMappedSubfieldTextFields(alloc, fields, field.source_field, text, schema, text_analysis, observed_field_analyzers);
+    }
 }
 
 fn appendDynamicSchemaTextFields(
@@ -3034,7 +3043,7 @@ fn mappedTypedDocValueFieldAlloc(
     };
 }
 
-fn typedDocValueForMappedFieldAlloc(
+pub fn typedDocValueForMappedFieldAlloc(
     alloc: Allocator,
     mapping: runtime_schema.FieldMapping,
     value: std.json.Value,
@@ -3093,7 +3102,7 @@ fn jsonValueToFiniteF64(value: std.json.Value) ?f64 {
     return number;
 }
 
-fn typedValueType(value: typed_dv.TypedValue) typed_dv.ValueType {
+pub fn typedValueType(value: typed_dv.TypedValue) typed_dv.ValueType {
     return switch (value) {
         .datetime_ns => .datetime_ns,
         .u64_val => .u64_val,
@@ -7094,4 +7103,33 @@ test "external lake typed column text projection matches source schemas arrays n
     try std.testing.expect(borrowing.batch().docs[0].text_fields[0].text.ptr == text[0..].ptr);
     text[0] = 'S';
     try std.testing.expectEqualStrings("star", owning.batch().docs[0].text_fields[0].text);
+}
+
+test "disabled physical text mappings retain source and independently indexed subfields" {
+    const a = std.testing.allocator;
+    const schema_json =
+        \\{"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{
+        \\ "body":{"type":"string","x-antfly-field":{"type":"text"}},
+        \\ "payload":{"type":"string","x-antfly-field":{"type":"text","index":false}},
+        \\ "label":{"type":"string","x-antfly-field":{"type":"text","index":false,"fields":{"exact":{"type":"keyword"}}}},
+        \\ "amount":{"type":"integer","x-antfly-field":{"type":"number","index":false,"sortable":true}}
+        \\}}}}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(a, schema_json);
+    defer parsed.deinit(a);
+    const schema = try schema_api.deriveRuntimeTableSchema(a, parsed);
+    defer runtime_schema.freeSchema(a, schema);
+    const source = "{\"body\":\"quasar\",\"payload\":\"stored-only-long-payload\",\"label\":\"Exact Label\",\"amount\":42}";
+    const bytes = (try buildTextSegmentFromDocuments(a, &.{.{ .key = "doc", .value = source }}, .{}, schema)).?;
+    defer a.free(bytes);
+    var reader = try segment_mod.SegmentReader.init(a, bytes);
+    defer reader.deinit();
+    try std.testing.expect((try reader.invertedIndex("body")) != null);
+    try std.testing.expect((try reader.invertedIndex("payload")) == null);
+    try std.testing.expect((try reader.invertedIndex("label")) == null);
+    try std.testing.expect((try reader.invertedIndex("label.exact")) != null);
+    try std.testing.expect((try reader.getSection("amount", .typed_doc_values)) != null);
+    const stored = (try reader.storedDocDecompressed(a, 0)).?;
+    defer a.free(stored.data);
+    try std.testing.expectEqualStrings(source, stored.data);
 }

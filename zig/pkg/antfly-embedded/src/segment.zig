@@ -3527,6 +3527,40 @@ fn indexSortFieldsEqual(a: []const SegmentIndexSortField, b: []const SegmentInde
     return true;
 }
 
+const AppendSortProof = struct { fields: []const SegmentIndexSortField, bounds: SegmentIndexSortBounds };
+
+/// Concatenation preserves source ordinals. Keep physical-order evidence only
+/// when every live input attests the same order and its full bounds are disjoint
+/// in that order. Deleted endpoints conservatively widen these bounds.
+fn appendSortProofAlloc(a: Allocator, inputs: []const MergeInput) !?AppendSortProof {
+    const fields = try commonIndexSortForMergeInputsAlloc(a, inputs);
+    if (fields.len == 0) return null;
+    var first: ?SegmentIndexSortBounds = null;
+    var previous: ?SegmentIndexSortBounds = null;
+    for (inputs) |input| {
+        if (!inputHasLiveDocs(input)) continue;
+        const bounds = (try input.reader.indexSortBoundsAlloc(a)) orelse return null;
+        if (bounds.first.len != fields.len or bounds.last.len != fields.len) return error.InvalidSegment;
+        if (previous) |prior| {
+            for (prior.last, bounds.first, fields) |left, right, field| {
+                if (std.meta.activeTag(left) != std.meta.activeTag(right)) return null;
+                const order = switch (left) {
+                    .bytes_val => |v| std.mem.order(u8, v, right.bytes_val),
+                    .id => |v| std.mem.order(u8, v, right.id),
+                    .bool_val => |v| std.math.order(@intFromBool(v), @intFromBool(right.bool_val)),
+                    inline else => |v, tag| std.math.order(v, @field(right, @tagName(tag))),
+                };
+                if (order == .eq) continue;
+                if (if (field.desc) order == .lt else order == .gt) return null;
+                break;
+            }
+        }
+        if (first == null) first = bounds;
+        previous = bounds;
+    }
+    return if (first != null) .{ .fields = fields, .bounds = .{ .first = first.?.first, .last = previous.?.last } } else null;
+}
+
 fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: []const MergeInput, doc_counts: []const u32, rank_maps: []const inverted.RankDocMap) !void {
     if (inputs.len == 0) return error.NoSegments;
 
@@ -3650,6 +3684,20 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
         errdefer built_field.deinit(alloc);
         try appendBuiltSection(alloc, sink, &built_field, .doc_key_range, merged_key_range);
         try built_fields.append(alloc, built_field);
+    }
+
+    var ordering_arena = std.heap.ArenaAllocator.init(alloc);
+    defer ordering_arena.deinit();
+    if (try appendSortProofAlloc(ordering_arena.allocator(), inputs)) |proof| {
+        var field = BuiltField{ .name = index_sort_field };
+        errdefer field.deinit(alloc);
+        const metadata = try encodeIndexSortMetadataAlloc(alloc, proof.fields);
+        defer alloc.free(metadata);
+        const bounds = try encodeIndexSortBoundsMetadataAlloc(alloc, proof.bounds);
+        defer alloc.free(bounds);
+        try appendBuiltSection(alloc, sink, &field, .index_sort, metadata);
+        try appendBuiltSection(alloc, sink, &field, .index_sort_bounds, bounds);
+        try built_fields.append(alloc, field);
     }
 
     const directory = try writePageDirectory(sink);
@@ -12428,5 +12476,37 @@ test "postings run read cache preserves four warm pages under tight budgets" {
             try std.testing.expectEqual(expected, run.read_buffer.len);
         }
         try std.testing.expectEqual(@as(usize, 0), budget.live);
+    }
+}
+
+test "observed physical ordering survives append compaction only for monotone bounds" {
+    const a = std.testing.allocator;
+    const intro = @import("introducer.zig");
+    const fields = [_]SegmentIndexSortField{ .{ .field = "rank" }, .{ .field = "_id" } };
+    const first = try intro.buildSegmentFromTextWithAnalysisOptions(a, &.{
+        .{ .id = "a", .stored_data = "{\"rank\":1}", .text_fields = &.{} },
+        .{ .id = "b", .stored_data = "{\"rank\":3}", .text_fields = &.{} },
+    }, &@import("search/analysis.zig").default_analyzer, .{}, .{ .index_sort = &fields });
+    defer a.free(first);
+    const second = try intro.buildSegmentFromTextWithAnalysisOptions(a, &.{
+        .{ .id = "c", .stored_data = "{\"rank\":4}", .text_fields = &.{} },
+        .{ .id = "d", .stored_data = "{\"rank\":6}", .text_fields = &.{} },
+    }, &@import("search/analysis.zig").default_analyzer, .{}, .{ .index_sort = &fields });
+    defer a.free(second);
+    for (0..2) |reverse| {
+        const merged = try mergeSegments(a, if (reverse == 0) &.{ first, second } else &.{ second, first });
+        defer a.free(merged);
+        var reader = try SegmentReader.init(a, merged);
+        defer reader.deinit();
+        const order = try reader.indexSortFieldsAlloc(a);
+        defer if (order) |owned| freeIndexSortFields(a, owned);
+        try std.testing.expectEqual(reverse == 0, order != null);
+        try std.testing.expectEqualStrings(if (reverse == 0) "a" else "c", (try reader.storedDoc(0)).?.id);
+        if (reverse == 0) {
+            var bounds = (try reader.indexSortBoundsAlloc(a)).?;
+            defer bounds.deinit(a);
+            try std.testing.expectEqual(@as(f64, 1), bounds.first[0].f64_val);
+            try std.testing.expectEqual(@as(f64, 6), bounds.last[0].f64_val);
+        }
     }
 }

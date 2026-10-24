@@ -541,6 +541,9 @@ pub const BuildTextOptions = struct {
     infer_type_dynamic_paths: []const []const u8 = &.{},
     unindexed_paths: []const []const u8 = &.{},
     index_sort: []const segment_mod.SegmentIndexSortField = &.{},
+    /// Attest an existing physical order instead of reordering source rows.
+    /// A non-monotone or missing key keeps the segment unordered.
+    attest_index_sort_in_place: bool = false,
     profile: ?*BuildTextProfile = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     build_memory_target_bytes: usize = default_build_memory_target_bytes,
@@ -1015,15 +1018,22 @@ fn writeTextSegmentWithScratch(
     var scratch = TextBuildScratch{};
     defer scratch.deinit(alloc);
 
+    const attested = options.attest_index_sort_in_place and options.index_sort.len != 0 and
+        (textDocumentsAreIndexSorted(alloc, docs, text_analysis, options.index_sort) catch |err| switch (err) {
+            error.OutOfMemory => false,
+            else => return err,
+        });
+    const index_sort = if (options.attest_index_sort_in_place and !attested) &.{} else options.index_sort;
+    const sort_docs: []const TextDocument = if (attested and docs.len > 1) &.{ docs[0], docs[docs.len - 1] } else docs;
     var empty_doc_order: [0]TextIndexSortEntry = .{};
-    const doc_order: []TextIndexSortEntry = if (options.index_sort.len > 0)
-        try buildTextDocumentOrderAlloc(alloc, docs, text_analysis, options.index_sort)
+    const doc_order: []TextIndexSortEntry = if (index_sort.len > 0)
+        try buildTextDocumentOrderAlloc(alloc, sort_docs, text_analysis, index_sort)
     else
         empty_doc_order[0..];
     defer freeTextDocumentOrder(alloc, doc_order);
 
     for (0..docs.len) |doc_idx| {
-        const source_doc_idx = if (options.index_sort.len > 0) doc_order[doc_idx].doc_index else doc_idx;
+        const source_doc_idx = if (index_sort.len > 0 and !attested) doc_order[doc_idx].doc_index else doc_idx;
         const text_doc = docs[source_doc_idx];
         _ = doc_arena_state.reset(.{ .retain_with_limit = options.doc_scratch_retained_bytes });
         scratch.reset(alloc, options.doc_scratch_retained_bytes);
@@ -1209,13 +1219,13 @@ fn writeTextSegmentWithScratch(
     if (!options.store_documents) {
         try seg_writer.addDocKeyRange(min_doc_key orelse return error.InvalidSegment, max_doc_key orelse return error.InvalidSegment);
     }
-    if (options.index_sort.len > 0) {
+    if (index_sort.len > 0) {
         if (doc_order.len > 0) {
             var bounds = try textIndexSortBoundsAlloc(alloc, doc_order[0].keys, doc_order[doc_order.len - 1].keys);
             defer bounds.deinit(alloc);
-            try seg_writer.addIndexSortMetadataWithBounds(options.index_sort, bounds);
+            try seg_writer.addIndexSortMetadataWithBounds(index_sort, bounds);
         } else {
-            try seg_writer.addIndexSortMetadata(options.index_sort);
+            try seg_writer.addIndexSortMetadata(index_sort);
         }
     }
 
@@ -1380,6 +1390,40 @@ fn textIndexSortEntryLessThan(index_sort: []const segment_mod.SegmentIndexSortFi
     return a.doc_index < b.doc_index;
 }
 
+/// Prove existing physical order without changing document/source ordinals.
+/// Only two tuples are resident. Missing/null or incompatible scalar values
+/// conservatively leave the segment unordered; ordinary encoding still runs.
+pub fn textDocumentsAreIndexSorted(alloc: Allocator, docs: []const TextDocument, analysis: TextAnalysisConfig, fields: []const segment_mod.SegmentIndexSortField) !bool {
+    if (fields.len == 0 or docs.len == 0) return false;
+    var regions = [_]std.heap.ArenaAllocator{ .init(alloc), .init(alloc) };
+    defer for (&regions) |*region| region.deinit();
+    var previous: ?TextIndexSortEntry = null;
+    for (docs, 0..) |doc, index| {
+        const region = &regions[index % 2];
+        _ = region.reset(.retain_capacity);
+        const scratch = region.allocator();
+        const next: TextIndexSortEntry = .{ .doc_index = index, .keys = try scratch.alloc(TextIndexSortValue, fields.len) };
+        for (fields, next.keys) |field, *key| {
+            key.* = textDocumentSortValueAlloc(scratch, doc, field.field, analysis) catch |err| switch (err) {
+                error.InvalidSegment, error.UnsupportedTypedDocValues => {
+                    return false;
+                },
+                else => return err,
+            };
+        }
+        if (previous) |entry| {
+            for (entry.keys, next.keys) |left, right| if (std.meta.activeTag(left) != std.meta.activeTag(right)) {
+                return false;
+            };
+            if (textIndexSortEntryLessThan(fields, next, entry)) {
+                return false;
+            }
+        }
+        previous = next;
+    }
+    return true;
+}
+
 fn buildTextDocumentOrderAlloc(
     alloc: Allocator,
     docs: []const TextDocument,
@@ -1421,6 +1465,15 @@ fn buildTextDocumentOrderAlloc(
     }
     std.sort.pdq(TextIndexSortEntry, order, index_sort, textIndexSortEntryLessThan);
     return order;
+}
+
+/// Sort only bounded navigation keys; payloads retain their capture ownership.
+pub fn sortedTextDocumentIndicesAlloc(a: Allocator, docs: []const TextDocument, fields: []const segment_mod.SegmentIndexSortField) ![]u32 {
+    const order = try buildTextDocumentOrderAlloc(a, docs, .{}, fields);
+    defer freeTextDocumentOrder(a, order);
+    const indices = try a.alloc(u32, order.len);
+    for (order, indices) |entry, *index| index.* = @intCast(entry.doc_index);
+    return indices;
 }
 
 fn freeTextDocumentOrder(alloc: Allocator, order: []TextIndexSortEntry) void {
@@ -4958,4 +5011,58 @@ test "postings spill policy retains small-node bounds and adapts to live headroo
     defer held.release();
     try std.testing.expectEqual(@as(u64, 10 * MiB), postingsRunTarget(.{ .resource_manager = &large }, 8 * MiB));
     try std.testing.expectEqual(@as(u64, 1024), postingsRunTarget(.{ .resource_manager = &large, .postings_run_target_bytes = 1024 }, 8 * MiB));
+}
+
+test "observed physical ordering proves directions ties and conservative null fallback" {
+    const a = std.testing.allocator;
+    const docs = [_]TextDocument{
+        .{ .id = "a", .stored_data = "{\"rank\":1}", .text_fields = &.{} },
+        .{ .id = "b", .stored_data = "{\"rank\":1}", .text_fields = &.{} },
+        .{ .id = "c", .stored_data = "{\"rank\":2}", .text_fields = &.{} },
+    };
+    const fields = [_]segment_mod.SegmentIndexSortField{ .{ .field = "rank" }, .{ .field = "_id" } };
+    try std.testing.expect(try textDocumentsAreIndexSorted(a, &docs, .{}, &fields));
+    try std.testing.expect(!try textDocumentsAreIndexSorted(a, &.{ docs[1], docs[0] }, .{}, &fields));
+    try std.testing.expect(!try textDocumentsAreIndexSorted(a, &.{ docs[2], docs[0] }, .{}, &fields));
+    try std.testing.expect(try textDocumentsAreIndexSorted(a, &.{ docs[2], docs[0], docs[1] }, .{}, &.{ .{ .field = "rank", .desc = true }, .{ .field = "_id" } }));
+    try std.testing.expect(!try textDocumentsAreIndexSorted(a, &.{ docs[0], .{ .id = "z", .stored_data = "{\"rank\":null}", .text_fields = &.{} } }, .{}, &fields));
+}
+
+test "observed physical ordering encoder keeps all source ordinals and declines unsorted input" {
+    const a = std.testing.allocator;
+    const docs = [_]TextDocument{
+        .{ .id = "a", .stored_data = "{\"rank\":1}", .text_fields = &.{} },
+        .{ .id = "b", .stored_data = "{\"rank\":2}", .text_fields = &.{} },
+        .{ .id = "c", .stored_data = "{\"rank\":3}", .text_fields = &.{} },
+    };
+    for (0..2) |unordered| {
+        const input = if (unordered == 0) docs else [_]TextDocument{ docs[2], docs[0], docs[1] };
+        const bytes = try buildSegmentFromTextWithAnalysisOptions(a, &input, &analysis_mod.default_analyzer, .{}, .{ .index_sort = &.{ .{ .field = "rank" }, .{ .field = "_id" } }, .attest_index_sort_in_place = true });
+        defer a.free(bytes);
+        var reader = try segment_mod.SegmentReader.init(a, bytes);
+        defer reader.deinit();
+        try std.testing.expectEqual(@as(u32, 3), reader.doc_count);
+        for (input, 0..) |doc, i| try std.testing.expectEqualStrings(doc.id, (try reader.storedDoc(@intCast(i))).?.id);
+        const order = try reader.indexSortFieldsAlloc(a);
+        defer if (order) |fields| segment_mod.freeIndexSortFields(a, fields);
+        try std.testing.expectEqual(unordered == 0, order != null);
+    }
+}
+
+test "observed physical ordering uses signed timestamp keys and releases failed scratch" {
+    const Check = struct {
+        fn run(a: Allocator) !void {
+            const values = [_]TypedFieldValue{
+                .{ .field_name = "at", .value_type = .datetime_ns, .value = .{ .datetime_ns = -1 } },
+                .{ .field_name = "at", .value_type = .datetime_ns, .value = .{ .datetime_ns = 1 } },
+            };
+            const docs = [_]TextDocument{
+                .{ .id = "a", .stored_data = "{}", .text_fields = &.{}, .typed_fields = values[0..1] },
+                .{ .id = "b", .stored_data = "{}", .text_fields = &.{}, .typed_fields = values[1..2] },
+            };
+            try std.testing.expect(try textDocumentsAreIndexSorted(a, &docs, .{}, &.{ .{ .field = "at" }, .{ .field = "_id" } }));
+            try std.testing.expect(!try textDocumentsAreIndexSorted(a, &docs, .{}, &.{ .{ .field = "at", .desc = true }, .{ .field = "_id" } }));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

@@ -1463,6 +1463,7 @@ class StandaloneAntflyServer:
         *,
         pgwire: bool = False,
         metrics: bool = False,
+        api_root: str | None = None,
         config_path: Path | None = None,
         storage_engine: str | None = None,
         inference_host_budget_mb: int | None = None,
@@ -1481,7 +1482,7 @@ class StandaloneAntflyServer:
             self.health_port = self.port_reservations.reserve() if metrics else None
             self.health_url = f"http://{host}:{self.health_port}" if metrics else None
             self.url = f"http://{host}:{port}"
-            self.api_url = antfly_public_api_url(self.url, binary=binary)
+            self.api_url = antfly_public_api_url(self.url, binary=binary, root=api_root)
             self.tempdir = tempfile.TemporaryDirectory(
                 prefix="antfly-zig-standalone-e2e-"
             )

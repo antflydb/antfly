@@ -29,7 +29,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-import benchmark_lake_archive as bench
+if __package__:
+    from . import benchmark_lake_archive as bench
+else:
+    import benchmark_lake_archive as bench
 
 
 class QualificationTest(unittest.TestCase):
@@ -96,7 +99,13 @@ class QualificationTest(unittest.TestCase):
                 with (
                     mock.patch.dict(
                         sys.modules,
-                        {"conftest": SimpleNamespace(StandaloneAntflyServer=factory)},
+                        {
+                            "conftest": SimpleNamespace(
+                                StandaloneAntflyServer=factory,
+                                __file__=__file__,
+                                _write_remote_content_e2e_config=lambda _: plan_path,
+                            )
+                        },
                     ),
                     mock.patch.object(
                         bench.platform, "platform", return_value="test-machine"
@@ -176,6 +185,92 @@ class QualificationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Incorrect logical IDs"):
             bench.verify_case(case, response)
 
+    def test_default_configuration_and_environment_are_comparison_inputs(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            binary = root / "binary"
+            binary.write_bytes(b"same executable")
+            plan = bench.generated_plan({"manifest_uri": "file:///frozen"}, 16, 8)
+            plan["source_fingerprint"] = "same-source"
+            plan_path = root / "plan.json"
+            plan_path.write_text(json.dumps(plan))
+            reports = []
+            configs = []
+
+            def make_config(output):
+                path = output / "generated.json"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "models_dir": os.environ[
+                                "ANTFLY_INFERENCE_STANDALONE_MODELS_DIR"
+                            ]
+                        }
+                    )
+                )
+                configs.append(path)
+                return path
+
+            for label in ("a", "b"):
+                server = mock.Mock()
+                server.log_path = root / "absent.log"
+                factory = mock.Mock(return_value=server)
+                client = mock.Mock()
+                client.ready.return_value = {"text": 1, "archive_id": 1}
+                harness = SimpleNamespace(
+                    __file__=__file__,
+                    StandaloneAntflyServer=factory,
+                    _write_remote_content_e2e_config=make_config,
+                )
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"ANTFLY_INFERENCE_STANDALONE_MODELS_DIR": f"/models/{label}"},
+                    ),
+                    mock.patch.dict(sys.modules, {"conftest": harness}),
+                    mock.patch.object(bench, "Client", return_value=client),
+                    mock.patch.object(
+                        bench, "run_queries", return_value=self.report()["samples"]
+                    ),
+                    mock.patch("builtins.print"),
+                ):
+                    bench.main(
+                        [
+                            "run",
+                            "--binary",
+                            str(binary),
+                            "--plan",
+                            str(plan_path),
+                            "--output-dir",
+                            str(root / label),
+                        ]
+                    )
+                self.assertEqual(
+                    factory.call_args.kwargs["config_path"], configs[-1].resolve()
+                )
+                self.assertEqual(factory.call_args.kwargs["api_root"], "/api/v1")
+                report = json.loads((root / label / "report.json").read_text())
+                self.assertTrue(report["complete"])
+                self.assertEqual(
+                    report["server_config_sha256"], bench.file_digest(configs[-1])
+                )
+                self.assertEqual(report["server_config_origin"], "generated")
+                reports.append(report)
+            self.assertNotEqual(
+                reports[0]["runtime_environment_sha256"],
+                reports[1]["runtime_environment_sha256"],
+            )
+            with self.assertRaisesRegex(ValueError, "server_config_sha256"):
+                bench.compare_reports(*reports)
+
+    def test_environment_edits_invalidate_the_active_run(self):
+        with mock.patch.dict(os.environ, {"ANTFLY_INFERENCE_HOST_BUDGET_MB": "1024"}):
+            identity = bench.VerifiedEnvironment()
+            identity.verify()
+            os.environ["ANTFLY_INFERENCE_HOST_BUDGET_MB"] = "2048"
+            with self.assertRaisesRegex(RuntimeError, "environment changed"):
+                identity.verify()
+
     def report(self, count=3):
         rows = [
             {
@@ -189,13 +284,17 @@ class QualificationTest(unittest.TestCase):
             for i in range(count)
         ]
         return {
-            "version": 1,
+            "version": 2,
             "complete": True,
             "source_identity": "archive-hash",
             "source_identity_assurance": "verified_local_file_bytes",
             "workload_sha256": "workload",
             "cache_contract": {"empty_cache_qualified": False},
+            "binary_sha256": "binary",
             "tool_sha256": "tool",
+            "harness_sha256": "harness",
+            "server_config_sha256": "config",
+            "runtime_environment_sha256": "environment",
             "platform": "machine",
             "samples": rows,
         }
@@ -348,6 +447,8 @@ class QualificationTest(unittest.TestCase):
             "tool_sha256",
             "platform",
             "server_config_sha256",
+            "harness_sha256",
+            "runtime_environment_sha256",
         ):
             candidate = copy.deepcopy(base)
             candidate[key] = "changed"
@@ -358,6 +459,9 @@ class QualificationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unequal"):
             bench.compare_reports(base, candidate)
         for broken in (
+            {**base, "version": 1},
+            {**base, "server_config_sha256": None},
+            {**base, "harness_sha256": None},
             {**base, "complete": False},
             {**base, "source_identity": None},
             {**base, "samples": []},

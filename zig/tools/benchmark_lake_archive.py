@@ -101,14 +101,38 @@ class VerifiedInput:
             )
 
 
+class VerifiedEnvironment:
+    """Bind runtime tuning without writing environment values into reports."""
+
+    @staticmethod
+    def values():
+        return {
+            key: value
+            for key, value in os.environ.items()
+            if (key.startswith("ANTFLY_") and not key.endswith("_BIN"))
+            or key in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")
+        }
+
+    def __init__(self):
+        self.sha256 = digest(self.values())
+
+    def verify(self, *, content=False):
+        if digest(self.values()) != self.sha256:
+            raise RuntimeError(
+                "Qualification runtime environment changed during the run"
+            )
+
+
 def verify_inputs(inputs, *, content=False):
     for value in inputs:
         value.verify(content=content)
 
 
 @contextmanager
-def managed_server(factory, binary, config, output):
-    server = factory(str(binary), "127.0.0.1", 0, metrics=True, config_path=config)
+def managed_server(factory, binary, config, output, *, api_root=None):
+    server = factory(
+        str(binary), "127.0.0.1", 0, metrics=True, config_path=config, api_root=api_root
+    )
     try:
         yield server
     finally:
@@ -827,8 +851,19 @@ def summaries(samples):
 
 def compare_reports(baseline, candidate):
     for report in (baseline, candidate):
-        if report.get("version") != 1 or report.get("complete") is not True:
-            raise ValueError("Only complete version-1 reports can be compared")
+        if report.get("version") != 2 or report.get("complete") is not True:
+            raise ValueError("Only complete version-2 reports can be compared")
+        for key in (
+            "binary_sha256",
+            "tool_sha256",
+            "server_config_sha256",
+            "harness_sha256",
+            "runtime_environment_sha256",
+        ):
+            if not report.get(key):
+                raise ValueError(
+                    f"Comparison requires complete qualification provenance: {key}"
+                )
         if not report.get("source_identity") or not report.get("workload_sha256"):
             raise ValueError(
                 "Comparison requires a frozen source fingerprint and workload identity"
@@ -841,6 +876,8 @@ def compare_reports(baseline, candidate):
         "tool_sha256",
         "platform",
         "server_config_sha256",
+        "harness_sha256",
+        "runtime_environment_sha256",
     ):
         if baseline.get(key) != candidate.get(key):
             raise ValueError(f"Incompatible benchmark reports: {key}")
@@ -881,7 +918,7 @@ def compare_reports(baseline, candidate):
             }
         )
     return {
-        "version": 1,
+        "version": 2,
         "timing_qualified": all(r["minimum_sample_count_met"] for r in results),
         "environment_scope": "same declared platform and collector; sequential runs are observational, not randomized paired trials",
         "comparisons": results,
@@ -968,11 +1005,6 @@ def main(argv=None):
         parser.error("Build the Antfly binary first")
     binary_input = VerifiedInput(binary)
     collector_input = VerifiedInput(__file__)
-    config_input = VerifiedInput(args.server_config) if args.server_config else None
-    inputs = tuple(
-        v for v in (binary_input, collector_input, config_input) if v is not None
-    )
-    config = config_input.path if config_input else None
     args.output_dir.mkdir(parents=True, exist_ok=False)
     output = args.output_dir.resolve()
     fixture = None
@@ -1006,13 +1038,35 @@ def main(argv=None):
         plan["cases"] = [c for c in plan["cases"] if c["name"] in args.case]
     (output / "plan.json").write_text(json.dumps(plan, indent=2))
     sys.path.insert(0, str(ROOT / "e2e" / "antfly"))
-    from conftest import StandaloneAntflyServer
+    import conftest as harness
+
+    environment_input = VerifiedEnvironment()
+
+    # Materialize defaults once. Every restart receives this same pinned file,
+    # including configurations derived from the fixture's environment/helpers.
+    config = args.server_config
+    if config is None:
+        config = harness._write_remote_content_e2e_config(output)
+        config.chmod(0o600)
+    config_input = VerifiedInput(config)
+    harness_input = VerifiedInput(harness.__file__)
+    inputs = (
+        binary_input,
+        collector_input,
+        config_input,
+        harness_input,
+        environment_input,
+    )
+    config = config_input.path
 
     report = {
-        "version": 1,
+        "version": 2,
         "binary_sha256": binary_input.sha256,
         "tool_sha256": collector_input.sha256,
-        "server_config_sha256": config_input.sha256 if config_input else None,
+        "server_config_sha256": config_input.sha256,
+        "server_config_origin": "supplied" if args.server_config else "generated",
+        "harness_sha256": harness_input.sha256,
+        "runtime_environment_sha256": environment_input.sha256,
         "input_identity_contract": "identity checked around launches/measurements and content verified before completion",
         "git_head": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
@@ -1082,7 +1136,13 @@ def main(argv=None):
     }
     try:
         verify_inputs(inputs)
-        with managed_server(StandaloneAntflyServer, binary, config, output) as server:
+        with managed_server(
+            harness.StandaloneAntflyServer,
+            binary,
+            config,
+            output,
+            api_root=getattr(harness, "ANTFLY_PUBLIC_API_ROOT", "/api/v1"),
+        ) as server:
             verify_inputs(inputs)
             client = Client(server, args.timeout)
             with closing(client.session):

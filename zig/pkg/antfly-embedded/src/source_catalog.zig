@@ -812,6 +812,7 @@ pub const serverless_segment_sidecar_manifest = @import("serverless/segment/side
 pub const serverless_segment_source_binding = @import("serverless/segment/source_binding.zig");
 pub const storage_rowsource_external = @import("storage/rowsource/external.zig");
 pub const storage_rowsource_local = @import("storage/rowsource/local.zig");
+pub const storage_rowsource_logical = @import("storage/rowsource/logical.zig");
 pub const serverless_lake_host = @import("serverless/lake_host.zig");
 pub const sql_lake_cursor = @import("sql/lake_cursor.zig");
 pub const sql_lake_predicate_kernel = @import("sql/lake_predicate_kernel.zig");

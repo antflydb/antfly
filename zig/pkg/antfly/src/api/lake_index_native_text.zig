@@ -56,7 +56,16 @@ pub fn sourceRecipe(a: A, table: local.common_topology_records.TableRecord, conf
     defer parsed.deinit();
     const field = if (parsed.value == .object) parsed.value.object.get("field") else null;
     const selected: ?[]const u8 = if (!store_source and @import("lake_row_input_recipes.zig").configurationReusable(parsed.value) and field != null and field.? == .string) field.?.string else null;
-    const original = try state.recipe(a, table, config, if (selected) |path| &.{path} else null);
+    var original = try state.recipe(a, table, config, if (selected) |path| &.{path} else null);
+    var table_schema = try std.json.parseFromSlice(std.json.Value, a, table.schema_json, .{});
+    defer table_schema.deinit();
+    const sort = if (table_schema.value == .object) table_schema.value.object.get("index_sort") else null;
+    if ((sort != null and sort.? == .array and sort.?.array.items.len != 0) or hasDisabledMapping(table_schema.value)) {
+        var ordering = std.crypto.hash.Blake3.init(.{});
+        ordering.update("native-lake-physical-projection-and-order-v1");
+        ordering.update(&original);
+        ordering.final(&original);
+    }
     if (!store_source) return original;
     var hash = std.crypto.hash.Blake3.init(.{});
     // v2 stores the complete declared relational row even when `field`
@@ -66,6 +75,23 @@ pub fn sourceRecipe(a: A, table: local.common_topology_records.TableRecord, conf
     var digest: [32]u8 = undefined;
     hash.final(&digest);
     return digest;
+}
+
+fn hasDisabledMapping(value: std.json.Value) bool {
+    switch (value) {
+        .object => |object| {
+            if (object.get("x-antfly-field")) |mapping| if (mapping == .object) {
+                if (mapping.object.get("index")) |flag| if (flag == .bool and !flag.bool) return true;
+            };
+            var fields = object.iterator();
+            while (fields.next()) |field| if (hasDisabledMapping(field.value_ptr.*)) return true;
+        },
+        .array => |array| for (array.items) |item| {
+            if (hasDisabledMapping(item)) return true;
+        },
+        else => {},
+    }
+    return false;
 }
 
 test "external lake stored source recipe attests production without changing source free identity" {
@@ -1086,6 +1112,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     defer schema.deinit(a);
     const runtime = try local.schema_mod.deriveRuntimeTableSchema(a, schema);
     defer local.storage_schema.freeSchema(a, runtime);
+    const index_sort = try mapper.indexSortFieldsForSchemaAlloc(a, runtime);
+    defer a.free(index_sort);
     var declarations: std.ArrayList(Declared) = .empty;
     errdefer declarations.deinit(out);
     for (desired.artifacts) |want| {
@@ -1338,7 +1366,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             defer capture_manager.deinit();
             var output_manager: local.sql_spill.Manager = .{ .alloc = a, .io = capture_manager.io, .context = &capture_check, .checkpoint = capture_manager.checkpoint, .max_bytes = 768 * 1024 * 1024, .async_writes = false };
             defer output_manager.deinit();
-            var compactor: Compactor = .{ .context = provider.context, .output_manager = &output_manager, .global = &df, .directory = &directory_builder, .capture_manager = &capture_manager, .a = a, .out = fa, .store = store, .segments = &segments, .summaries = &summaries, .forwards = &forwards, .admissions = &admissions, .cancellation = cancellation, .file_ordinal = file_ordinal, .opening = &opening, .io = provider.context.io };
+            var compactor: Compactor = .{ .index_sort = index_sort, .ordered_coordinates = provider.fragment_rows != null and std.mem.startsWith(u8, source.inventory.files[file_ordinal].etag, "so1-"), .context = provider.context, .output_manager = &output_manager, .global = &df, .directory = &directory_builder, .capture_manager = &capture_manager, .a = a, .out = fa, .store = store, .segments = &segments, .summaries = &summaries, .forwards = &forwards, .admissions = &admissions, .cancellation = cancellation, .file_ordinal = file_ordinal, .opening = &opening, .io = provider.context.io };
             defer compactor.deinit();
             if (provider.rowsForFile(file_ordinal)) |selected| if (selected.len != 0 and selected.len < source.inventory.files[file_ordinal].row_count / 2 and file.key_digest != null) {
                 const old = if (previous_refs.get(file.id)) |record| try loadRecordedFile(fa, store.*, record, seed.?.domain, cancellation) else previous_groups.get(file.id);
@@ -2064,6 +2092,8 @@ const Compactor = struct {
     };
     a: A,
     encoder: ?*EncoderPipeline = null,
+    index_sort: []const local.segment.SegmentIndexSortField = &.{},
+    ordered_coordinates: bool = false,
     context: local.serverless_query_lake_read_context.Context = .{},
     row_patch: ?struct { base: FileGroup, rows: []const u64, intervals: []const []const text_directory.Interval = &.{} } = null,
     patch_arena: ?std.heap.ArenaAllocator = null,
@@ -2366,7 +2396,7 @@ const Compactor = struct {
         defer if (mapping) |*value| value.deinit();
         var sink = staged.sink();
         if (reusable) sink.term_observer.?.posting = null;
-        try local.segment.writeMergedSegmentToSinkWithOptions(a, &sink, inputs, .{ .input_order = .arbitrary, .index_sort = &.{.{ .field = "_id", .desc = false }}, .source_map = if (mapping) |*value| value else null });
+        try local.segment.writeMergedSegmentToSinkWithOptions(a, &sink, inputs, .{ .input_order = .arbitrary, .index_sort = if (self.ordered_coordinates) self.index_sort else &.{.{ .field = "_id", .desc = false }}, .source_map = if (mapping) |*value| value else null });
         try staged.seal();
         if (reusable and live != 0) {
             try mapping.?.finishOutput(live);
@@ -2495,7 +2525,7 @@ const Compactor = struct {
     }
 };
 fn flush(compactor: *Compactor, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, store_source: bool) !void {
-    return flushWithOptions(compactor, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source });
+    return flushWithOptions(compactor, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source, .index_sort = compactor.index_sort });
 }
 fn flushWithOptions(compactor: *Compactor, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, build_options: mapper.BuildTextSegmentsOptions) !void {
     try compactor.finishEncoding();
@@ -2572,7 +2602,9 @@ const EncoderPipeline = struct {
         adaptive.threshold = threshold;
         var sink = adaptive.sink();
         sink.term_observer = if (captured) |value| value.observer() else null;
-        try mapper.writeTextSegmentFromProjectionBatchToSink(workspace, chunk, analysis_, options, &sink);
+        var verified_options = options;
+        verified_options.attest_index_sort_in_place = true;
+        try mapper.writeTextSegmentFromProjectionBatchToSink(workspace, chunk, analysis_, verified_options, &sink);
         if (captured) |value| try value.seal();
         return if (adaptive.staged) |staged| blk: {
             try staged.seal();
@@ -2698,7 +2730,7 @@ fn flushRetained(compactor: *Compactor, arena: *std.heap.ArenaAllocator, leases:
             arena.* = .init(compactor.a);
             leases.* = .{};
             transferred = true;
-            try encoder.enqueue(batch, owned, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source });
+            try encoder.enqueue(batch, owned, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source, .index_sort = compactor.index_sort });
             return;
         }
     }

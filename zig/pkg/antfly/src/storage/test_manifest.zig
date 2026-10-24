@@ -45,6 +45,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_group_source_transfer;
     _ = @import("antfly_local_sources").storage_db_group_source_worker;
     _ = @import("antfly_local_sources").storage_db_group_sources;
+    _ = @import("antfly_local_sources").storage_db_resolver_authority;
     _ = @import("antfly_local_sources").storage_db_resolver_curation;
     _ = @import("antfly_local_sources").storage_db_native_query_reuse;
     _ = @import("antfly_local_sources").storage_db_runtime_callbacks;
@@ -449,6 +450,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_rowsource_identity;
     _ = @import("antfly_local_sources").storage_rowsource_external;
     _ = @import("antfly_local_sources").storage_rowsource_local;
+    _ = @import("antfly_local_sources").storage_rowsource_logical;
     _ = @import("rowsource/mod.zig");
     _ = @import("antfly_local_sources").storage_rowsource_types;
     _ = @import("antfly_local_sources").storage_schema;

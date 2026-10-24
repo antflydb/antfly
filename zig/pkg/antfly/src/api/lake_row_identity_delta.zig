@@ -47,6 +47,11 @@ pub const Builder = struct {
         return createWithOptions(a, manager, pages, files, prior, delta, recipes, source, snapshot, false);
     }
     pub fn createWithOptions(a: A, manager: *local.sql_spill.Manager, pages: *Pages, files: []const []const u8, prior: ?Root, delta: ?@import("lake_source_navigation.zig").Delta, recipes: []const @import("lake_row_input_recipes.zig").Recipe, source: []const u8, snapshot: []const u8, compact: bool) !*Builder {
+        return createWithScan(a, manager, pages, files, prior, delta, recipes, source, snapshot, compact, null);
+    }
+    /// Rebuild an explicitly selected file layout under the same durable maps.
+    pub fn createWithScan(a: A, manager: *local.sql_spill.Manager, pages: *Pages, files: []const []const u8, prior: ?Root, delta: ?@import("lake_source_navigation.zig").Delta, recipes: []const @import("lake_row_input_recipes.zig").Recipe, source: []const u8, snapshot: []const u8, compact: bool, selected: ?[]const bool) !*Builder {
+        if (selected) |mask| if (mask.len != files.len) return error.InvalidLogicalRowIdentity;
         if (prior) |old| if (old.current.compact != compact) return error.InvalidLogicalRowIdentity;
         if (compact) pages.prefix_keys = true;
         const self = try a.create(Builder);
@@ -88,7 +93,7 @@ pub const Builder = struct {
                 if (position) |index| {
                     self.slots[index] = slot;
                     try used.put(a, slot, {});
-                    if (delta != null and !delta.?.isChanged(index)) {
+                    if (if (selected) |mask| !mask[index] else delta != null and !delta.?.isChanged(index)) {
                         self.scan[index] = false;
                         try self.unchanged.put(a, slot, {});
                         continue;

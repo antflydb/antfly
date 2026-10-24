@@ -1149,38 +1149,53 @@ The initial Debug filesystem run exposes all-candidate numeric text sorting and
 publication artifact volume as targets for deeper profiling, without making
 archive-scale or live-cloud performance claims.
 
-### Qualification integrity and outstanding physical ordering
+### Qualification integrity and native physical ordering
 
-Archive qualification binds binary, configuration and collector identity before
-startup, rejects changes around restarts and measurements, and verifies content
-before completing the report. The managed lifetime covers provenance/client
-failures, interruptions, log collection and temporary-root cleanup. Readiness
-includes embedded table indexes, additional index declarations and schema
-relational indexes. A custom declared identity field controls the exact ID oracle
-as well as result normalization; it never changes the physical source coordinates.
+Archive qualification version 2 binds the executable, effective configuration
+(including the generated default), collector, harness and runtime-environment
+digest before startup. It rejects changes around restarts and measurements and
+verifies content before completing a report. Comparison requires complete,
+matching provenance. Environment values and configuration contents are not
+included in reports. Readiness includes embedded table indexes, additional index
+declarations and schema relational indexes. A declared identity field controls
+the exact ID oracle and answer normalization independently of physical source
+coordinates. Python tooling tests run in the regular CI unittest suite.
 
-A declared `schema.index_sort` is not currently sufficient to create physically
-sorted native lake text segments. The canonical producer omits the build sort,
-patch merges currently restore `_id` order, and serving compaction concatenates
-runs. Thus an exact doc-values top-N fallback remains necessary. The fixed
-qualification runner can expose this through `missing_segment_index_sort`; a
-schema-only setting must not be presented as a performance improvement.
+For stable-key sources, logical fragments assign native coordinates in declared
+`schema.index_sort` order. The existing publication-bound by-ID and by-location
+maps authenticate both directions; the physical source space and public stable
+identity remain independent. Sorting uses captured typed payloads and the shared
+native key comparator, with at most 8,192 rows per fragment and the existing
+scheduler, memory and spill admission. Only changed input fragments are sorted.
+Missing, null or unsupported keys retain canonical coordinates and the exact
+doc-values top-N fallback. Failed admission retains the physical-source fallback.
 
-The outstanding implementation needs an authenticated, compact, paged mapping
-between native segment ordinals and canonical file-local live ranks, in both
-directions. Sorting must preserve the physical `(file, row_group, row)` coordinate
-and public stable identity independently. Fresh encoding, delete/patch merges,
-forward-statistics transfer and cross-file serving compaction must compose the
-same mapping, with existing resource admission and reader/GC publication closure.
-Per-row JSON source spans are not a substitute: their metadata size and bounded
-span limits defeat the intended efficiency. Shared schema validation, bounded
-external sorting and a reader-version fence belong in that implementation.
+A normalized ordering recipe and ordered-member digest travel in authenticated
+fragment navigation. The digest also binds native coordinate reuse: a changed
+sort key that moves rows forces a full run rebuild, while unchanged layouts can
+retain row patches. Source recipes fence earlier producers that omitted ordering
+or ignored disabled detailed text mappings. Native encoders attest the observed
+physical order before writing ordinary sort metadata and endpoint bounds. They
+never silently rearrange documents after source ordinals have been assigned.
 
-Qualification must compare exact projected answers on the same frozen Parquet
-bytes, including numeric/timestamp directions, nulls and ties, filtering, cursor
-continuation, deleted rows, file rewrites and restarts after serving compaction.
-Only reduced candidate work and repeated timing improvements with bounded build
-memory/publication cost qualify the engine change as a win. The current experiment
-is a configuration comparison, not a prototype or qualification of that missing
-engine implementation. Native reader protocol 81 is unchanged by these runner
-fixes.
+Append compaction preserves ordering only when all input metadata and bounds
+prove the concatenation monotone. Lake serving compaction retains sorted runs
+individually when their coordinates would interleave; it does not discard the
+ordering proof to reduce fan-out. A future merge that combines overlapping runs
+must compose an explicit segment-to-coordinate permutation. This is a remaining
+tradeoff, not a reason to add per-row JSON source metadata. Existing maps,
+publication certificates, reader leases and GC closure own all dependencies;
+no new artifact family or reader format is introduced.
+
+Detailed `x-antfly-field.index: false` suppresses that field's text postings.
+Stored source, explicitly enabled named subfields and independently requested
+typed doc values retain their own policies. This avoids generating dictionaries
+and statistics for large payload fields that the schema excluded from indexing.
+
+Qualification must compare projected answers on frozen Parquet bytes, including
+numeric/timestamp directions, nulls, ties, filtering, cursor continuation,
+deletions, rewrites and restarts. Reduced candidate work and repeated timing
+improvements must be weighed against bounded build memory and publication cost.
+The earlier configuration-only probe remains historical evidence, not evidence
+for the implementation above. Filesystem observations do not qualify live-cloud
+transport or retention behavior.

@@ -73,8 +73,10 @@ without copying its contents into the report; the managed server uses isolated
 data/replica paths. Configuration must be suitable for a qualification server. Live cloud
 query/retention qualification is separate from the filesystem fixture run.
 
-Qualification binds the executable, supplied configuration, and collector to one
-file identity before starting the server. Checks around every restart and
+Qualification report version 2 binds the executable, effective configuration
+(including a generated default), collector and harness to file identities before
+starting the server. It also hashes relevant runtime environment settings without
+reporting their values. Checks around every restart and
 measurement reject replacements and edits; final content checks run before a
 report can be marked complete. Executables stay at their original resolved path
 so executable-relative resources continue to work. Provenance is collected before
@@ -130,8 +132,9 @@ uv run --project zig/e2e/antfly python zig/tools/benchmark_lake_archive.py compa
   --output .benchmark-results/lake/comparison.json
 ```
 
-Comparison rejects different source identity/assurance, workload, collector,
-platform, cache contract, case coverage or answers. It rejects incomplete runs
+Comparison requires complete version-2 provenance and rejects different source
+identity/assurance, workload, collector, effective configuration, harness, runtime
+environment, platform, cache contract, case coverage or answers. It rejects incomplete runs
 and duplicate samples. Fewer than three samples cannot qualify timing. Ratios
 from separate runs are observational; alternate build order and repeat on a
 quiet machine before attributing a change to the implementation. Reports preserve
@@ -153,8 +156,9 @@ medians were 949 ms without the declaration and 980 ms with it; these local Debu
 numbers establish no speedup. The declared case reported
 `missing_segment_index_sort`. This tests the existing configuration path, not an
 implementation of the missing encoder/compactor support. The
-[remaining ordinal-lineage design](../../../docs/plans/lake-row-identity.md#qualification-integrity-and-outstanding-physical-ordering)
-is explicit; changing schema metadata alone cannot qualify that engine work.
+[native physical-ordering design](../../../docs/plans/lake-row-identity.md#qualification-integrity-and-native-physical-ordering)
+now assigns sorted logical coordinates through the existing authenticated maps;
+the probe above predates that implementation.
 
 Tests:
 
