@@ -16,10 +16,10 @@
 import { ObjectStoreError } from "./r2.mjs";
 // The physical store binding must declare this placement permanently. Switching
 // between R2-only and coordinated HEADs would create competing authorities.
-export function withCommitCoordinator(transport, coordinator) {
+export function withCommitCoordinator(transport, coordinator, collection) {
   return async (request, body) => {
     if (!(/\/wal-v1\/[a-f0-9]{64}\/HEAD$/.test(request.key ?? "") || /\/progress\//.test(request.key ?? ""))) return transport(request, body);
-    const result = await coordinator.objectCall(request, body);
+    const result = await coordinator.objectCall(collection ? { ...request, collection } : request, body);
     if (result.status !== 0) throw new ObjectStoreError(result.status, "commit coordinator rejected operation");
     return { json: result.json, body: result.body };
   };

@@ -27,8 +27,9 @@ A bounded Cloudflare Workers profile now compiles this engine to WASM with
 suspending R2 binding I/O, an indexed object WAL, visibility fences, and recent
 lookup/list/text overlays. See the [hosted design](../docs/design/cloudflare-serverless.md)
 and [Wrangler example](../examples/cloudflare-serverless/README.md). Hosted
-physical garbage collection and live deployment qualification remain open;
-this profile does not imply full native capability parity.
+collection now uses bounded durable mark/sweep steps and fenced upload epochs;
+live deployment qualification uses a separate disposable-resource harness.
+This profile does not imply full native capability parity.
 
 The goal is not "run the current Antfly architecture without servers." The goal
 is to build a different storage and control-plane architecture that reuses the

@@ -288,6 +288,15 @@ pub fn materializeTouchedAlloc(alloc: Allocator, pages: *page_store.PageStore, r
 /// the same authoritative root. Ordinary prediction/publication uses point
 /// lookup instead. Ownership remains caller-local even for a streaming walk.
 pub fn materializeAllAlloc(alloc: Allocator, pages: *page_store.PageStore, root: facts.Root) ![]materializer.Document {
+    return materializeWithSnapshotAlloc(alloc, pages, root, &.{});
+}
+
+/// A verified packed snapshot is a body cache, never the authority for row
+/// membership or revision. Facts select every ID/version and authenticate any
+/// reused body by digest and encoded length; stale/missing entries hydrate.
+pub fn materializeWithSnapshotAlloc(alloc: Allocator, pages: *page_store.PageStore, root: facts.Root, snapshot: []const @import("../document_segment/mod.zig").Entry) ![]materializer.Document {
+    for (snapshot, 0..) |entry, i| if (i != 0 and std.mem.order(u8, snapshot[i - 1].doc_id, entry.doc_id) != .lt) return error.InvalidDocumentSnapshot;
+    var snapshot_index: usize = 0;
     if (!std.mem.eql(u8, &pages.domain, &root.domain)) return error.GraphPageDomainMismatch;
     var cursor = try tree.Cursor.init(alloc, pages.store(), root.page, "", null);
     defer cursor.deinit();
@@ -297,10 +306,15 @@ pub fn materializeAllAlloc(alloc: Allocator, pages: *page_store.PageStore, root:
         docs.deinit(alloc);
     }
     while (try cursor.next()) |record| {
+        try pages.cancellation.check();
         const fact = try facts.Fact.decode(record.value);
+        if (fact.last_lsn > root.wal_end_lsn) return error.InvalidDocumentFact;
+        while (snapshot_index < snapshot.len and std.mem.order(u8, snapshot[snapshot_index].doc_id, record.key) == .lt) snapshot_index += 1;
+        const cached = if (snapshot_index < snapshot.len and std.mem.eql(u8, snapshot[snapshot_index].doc_id, record.key)) snapshot[snapshot_index].body else null;
+        const reusable = if (cached) |body| fact.body.bytes == @as(u64, body.len) + facts.body_header_bytes and std.mem.eql(u8, &fact.body.digest, &facts.bodyDigest(body)) else false;
         const id = try alloc.dupe(u8, record.key);
         errdefer alloc.free(id);
-        const body = try facts.readBodyAlloc(alloc, pages, fact.body);
+        const body = if (reusable) try alloc.dupe(u8, cached.?) else try facts.readBodyAlloc(alloc, pages, fact.body);
         errdefer alloc.free(body);
         try docs.append(alloc, .{ .doc_id = id, .body = body, .last_lsn = fact.last_lsn, .last_timestamp_ns = fact.last_timestamp_ns });
     }
@@ -507,4 +521,42 @@ test "serverless document facts compiled normalization agrees with existing stat
             try std.testing.expectEqual(expected, actual);
         }
     }
+}
+
+test "serverless packed body snapshots hydrate only mismatches and facts retain row authority" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/snapshot-facts", .{tmp.sub_path});
+    defer a.free(path);
+    var fs = try @import("../artifacts/fs_store.zig").FsStore.init(a, path);
+    var artifacts = fs.artifactStore();
+    defer artifacts.deinit();
+    var reads: u64 = 1024 * 1024;
+    var writes: u64 = 1024 * 1024;
+    var pages = page_store.PageStore{ .domain = page_store.PageStore.namespaceDomain("docs"), .attempt = @splat(1), .artifacts = &artifacts, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const docs = [_]materializer.Document{
+        .{ .doc_id = @constCast("a"), .body = @constCast("{\"text\":\"one\"}"), .last_lsn = 1, .last_timestamp_ns = 10 },
+        .{ .doc_id = @constCast("b"), .body = @constCast("{\"text\":\"current\"}"), .last_lsn = 2, .last_timestamp_ns = 20 },
+        .{ .doc_id = @constCast("c"), .body = @constCast("{\"text\":\"new\"}"), .last_lsn = 3, .last_timestamp_ns = 30 },
+    };
+    const ref = try publishAlloc(a, &pages, null, &docs, null, .{}, "{}", 3);
+    defer freeRef(a, ref);
+    const root = try facts.loadRoot(a, &pages, ref);
+    const b = (try facts.lookup(a, pages.store(), root, "b")).?;
+    const c = (try facts.lookup(a, pages.store(), root, "c")).?;
+    const Entry = @import("../document_segment/mod.zig").Entry;
+    const snapshot = [_]Entry{
+        .{ .doc_id = @constCast("a"), .body = docs[0].body, .last_lsn = 999, .last_timestamp_ns = 999 },
+        .{ .doc_id = @constCast("b"), .body = @constCast("stale"), .last_lsn = 0, .last_timestamp_ns = 0 },
+        .{ .doc_id = @constCast("z"), .body = @constCast("deleted"), .last_lsn = 0, .last_timestamp_ns = 0 },
+    };
+    const before = reads;
+    const result = try materializeWithSnapshotAlloc(a, &pages, root, &snapshot);
+    defer materializer.freeDocuments(a, result);
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expectEqual(@as(u64, 1), result[0].last_lsn);
+    try std.testing.expectEqualStrings(docs[1].body, result[1].body);
+    try std.testing.expectEqualStrings("c", result[2].doc_id);
+    try std.testing.expectEqual(@as(u64, root.page.?.bytes) + b.body.bytes + c.body.bytes, before - reads);
 }

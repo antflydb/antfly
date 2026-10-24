@@ -29,7 +29,7 @@ const version = spawnSync(compiler, ["version"], { encoding: "utf8" });
 if (version.status !== 0 || !version.stdout.startsWith("0.17.")) throw new Error("Antfly requires its pinned Zig 0.17 toolchain; set ANTFLY_ZIG to that compiler");
 if (process.argv.includes("--wal-only")) {
   run(compiler, ["build-exe", "-target", "wasm32-freestanding", "-OReleaseSafe",
-    "-fno-entry", "-rdynamic", "--export-memory", "--stack", "1048576", "--max-memory=67108864",
+    "-fno-entry", "-rdynamic", "--export-memory", "--stack", "1048576", "--max-memory=33554432",
     "--dep", "objectstore", "-Mroot=zig/pkg/antfly/src/serverless_host_wasm.zig",
     "--dep", "antfly_platform", "-Mobjectstore=zig/lib/objectstore/src/root.zig",
     "-Mantfly_platform=zig/lib/platform/src/root.zig", `-femit-bin=${out}host.raw.wasm`]);
@@ -41,13 +41,13 @@ if (process.argv.includes("--wal-only")) {
 // sources as well as Apache embedded/storage components.
 await cp(`${root}LICENSES`, `${out}LICENSES`, { recursive: true });
 for (const name of ["LICENSE", "LICENSING.md", "THIRD_PARTY_NOTICES.md"]) await copyFile(`${root}${name}`, `${out}${name}`);
-// Binaryen is pinned in package-lock.json. Asyncify instruments only the one
-// asynchronous object-store import; no native cloud transport is linked.
+// Binaryen is pinned in package-lock.json. Asyncify instruments the object-store
+// and typed inference imports; no native cloud transport is linked.
 if (process.env.ANTFLY_WASM_OPT) {
   const tool = process.env.ANTFLY_WASM_OPT;
   const version = spawnSync(tool, ["--version"], { encoding: "utf8" });
   if (version.status !== 0 || !version.stdout.includes("version 132 ")) throw new Error("ANTFLY_WASM_OPT must point to Binaryen 132");
-  run(tool, [`${out}host.raw.wasm`, "--strip-dwarf", "--asyncify", "--pass-arg=asyncify-imports@antfly_host.object_call", "--enable-simd", "--enable-bulk-memory", "--enable-mutable-globals", "--enable-sign-ext", "--enable-nontrapping-float-to-int", "--enable-threads", "-O1", "--coalesce-locals", ...(process.env.ANTFLY_HOST_DEBUG ? ["-g"] : []), "-o", `${out}antfly-serverless.wasm`]);
+  run(tool, [`${out}host.raw.wasm`, "--strip-dwarf", "--asyncify", "--pass-arg=asyncify-imports@antfly_host.object_call,antfly_host.infer_call", "--enable-simd", "--enable-bulk-memory", "--enable-mutable-globals", "--enable-sign-ext", "--enable-nontrapping-float-to-int", "--enable-threads", "-O1", "--coalesce-locals", ...(process.env.ANTFLY_HOST_DEBUG ? ["-g"] : []), "-o", `${out}antfly-serverless.wasm`]);
 } else {
   const binaryen = (await import("binaryen")).default;
   const module = binaryen.readBinary(await readFile(`${out}host.raw.wasm`));
@@ -55,7 +55,7 @@ if (process.env.ANTFLY_WASM_OPT) {
   module.setFeatures(features.MVP | features.Atomics | features.MutableGlobals | features.NontrappingFPToInt |
     features.SIMD128 | features.BulkMemory | features.BulkMemoryOpt | features.SignExt);
   binaryen.setOptimizeLevel(1);
-  binaryen.setPassArgument("asyncify-imports", "antfly_host.object_call");
+  binaryen.setPassArgument("asyncify-imports", "antfly_host.object_call,antfly_host.infer_call");
   module.runPasses(["strip-dwarf", "asyncify"]);
   module.optimize();
   module.runPasses(["coalesce-locals"]);

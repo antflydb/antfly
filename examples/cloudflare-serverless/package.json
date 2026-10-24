@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
-    "test": "node --test test/host.test.mjs",
+    "test": "node --test test/host.test.mjs test/collection.test.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "test:workerd": "wrangler deploy --dry-run --outdir dist/worker && node --test test/workerd.test.mjs",

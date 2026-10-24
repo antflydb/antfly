@@ -57,11 +57,18 @@ The old object WAL rewrites one encoded namespace log. The new opt-in
 The implementation reuses `graph_segment/page_tree.zig`, including bounded
 pages, authenticated references, sorted batched updates, and range cursors.
 Immutable content-addressed pages live under
-`<prefix>/wal-v1/<sha256(incarnation)>/pages/<digest>`. A small HEAD stores both
-roots, the committed high watermark, and retained floor. One HEAD CAS commits
+`<prefix>/wal-v1/<sha256(incarnation)>/pages/<epoch-attempt>/<digest>`.
+Legacy format-1 pages remain readable. A small HEAD stores both
+roots, the committed high watermark, retained floor, and upload epoch. One HEAD CAS commits
 the batch and its receipt together. Losing writers retry from the new roots;
 uploaded losing pages are unreachable, never accepted mutations. Ambiguous
 successful CAS responses are resolved through the receipt tree.
+
+Flat-index publication reuses bodies from the verified packed document snapshot
+only when their byte length and digest match the current authoritative facts.
+Missing or changed bodies are hydrated individually; facts still determine
+membership and revision. This bounds cold-rebuild object reads without changing
+the persisted formats or replacing the current full in-memory index build.
 
 Append and receipt lookup touch tree paths, not historical log bytes. A batch
 shares changed paths and one commit boundary. A captured inclusive LSN range
@@ -98,6 +105,7 @@ implicitly fresh because point reads are fresh.
 Opaque list cursors bind incarnation, query/limit, generation, WAL cutoff, and
 last ID. Subsequent pages reopen that generation and cutoff rather than HEAD.
 They acquire the generation's native reader lease or fail if it has expired.
+Cursors also carry the score/document-ID position for ranked text pages.
 Cursors and visibility tokens are positions, not credentials: hosts authorize
 each request independently. A physical incarnation must never be reused for a
 dropped/recreated database. This is a per-database guarantee, with no claim
@@ -113,15 +121,19 @@ repair trigger drive progress after eviction. Acceptance does not depend on
 queue admission succeeding, and a scheduling failure cannot erase an accepted
 write receipt.
 
-Physical collection is **not enabled** for hosted stores. Reader pins alone
-cannot make a mark/sweep of content-addressed WAL pages safe: a writer could
-have uploaded a page before its HEAD CAS while the collector considers it
-unreachable. A future bounded collector must coordinate active upload attempts
-and writers, preserve cursor/reader retention, retain idempotency receipts, and
-persist sweep progress. R2 lifecycle deletion or a separate lease check followed
-by unconditional DELETE is insufficient. Until that protocol is implemented,
-history and orphan pages consume durable storage but cannot be prematurely
-removed by this runtime.
+Hosted collection now has an epoch-fenced WAL compactor and a durable SQLite
+frontier/mark set. The collector reuses native publication fencing, retirement
+floors, reader pins, and authenticated format decoders. It checkpoints bounded
+steps across Queue deliveries, retains retry receipts, and applies a bounded
+reader grace period before deleting retired immutable identities. See
+[the safety argument and deployment contract](cloudflare-hosted-collection.md).
+
+Fresh scalar filters and ranked text cursors merge current bodies before
+limiting; exact unfiltered document counts use fact-count deltas. Vector/hybrid
+visibility fences require a sufficiently published generation with no configured
+embedding work pending. Native enrichment uses a suspending typed host callback,
+durable pending-cycle progress, and conditional idempotent WAL appends; model
+results computed from a stale source cannot overwrite newer documents.
 
 ## Validation and remaining qualification
 
@@ -132,11 +144,13 @@ writers, ambiguous commit responses, bounded I/O, publication, fresh reads, and
 pinned pagination. The workerd test uses persisted local R2 and SQLite DO state
 across complete runtime restarts. CI runs these in the WASM qualification job.
 
-These tests establish local protocol behavior, not deployed service limits.
-The current Wrangler dry-run bundle is about 3.4 MiB uncompressed / 1.1 MiB
-gzip; sizes vary with the toolchain. WASM linear memory has a 64 MiB hard cap
-and the JS immutable cache an 8 MiB cap. Total isolate memory, startup, CPU,
-real R2 latency/throttling, deployment contention/failure injection, AI task
-execution through Gateway, and sustained compaction/collection need live
-qualification. Large builds can exceed admitted Worker budgets and remain an
+These tests establish local protocol behavior. A disposable deployed fixture
+also passed; see the [measurements and limits](cloudflare-qualification.md).
+The current Wrangler dry-run bundle is about 3.7 MiB uncompressed / 1.1 MiB
+gzip; sizes vary with the toolchain. The interactive and maintenance instances each cap WASM memory at 32 MiB
+and share an 8 MiB immutable JS cache. Total isolate memory, startup, CPU,
+real R2 throttling, broad deployment failure injection, and sustained
+compaction/collection need further qualification. The small live fixture
+measured latency/CPU and exercised collection and Gateway; it did not measure
+total isolate memory. Large builds can exceed admitted Worker budgets and remain an
 explicit deployment limitation.

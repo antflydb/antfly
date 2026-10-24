@@ -18,28 +18,43 @@ import { instantiateHost } from "../../zig/lib/objectstore/wasm/asyncify.mjs";
 import { createR2Transport } from "../../zig/lib/objectstore/wasm/r2.mjs";
 import { withCommitCoordinator } from "../../zig/lib/objectstore/wasm/coordinated.mjs";
 import { createImmutableReadCache } from "../../zig/lib/objectstore/wasm/cache.mjs";
+import { collect } from "./collect.mjs";
 export { CommitCoordinator } from "./coordinator.mjs";
-let lane, busy = false;
+const lanes = {interactive: null, maintenance: null};
+const busy = {interactive: false, maintenance: false};
 const cache = createImmutableReadCache();
 class Busy extends Error {}
-async function run(env, input, signal) {
-  if (busy) throw new Busy("database is busy");
-  busy = true;
+async function run(env, input, signal, collection) {
+  const role = ["publish", "enrich", "gc_prepare", "gc_trace", "gc_wal"].includes(input.op) ? "maintenance" : "interactive";
+  if (busy[role]) throw new Busy("database is busy");
+  busy[role] = true;
+  let lane = lanes[role];
   try {
     if (!env.ANTFLY_INCARNATION) throw new Error("database incarnation is not configured");
-    if (!lane) lane = await instantiateHost(module, null, {
+    if (env.EMBEDDING_MODEL && (["publish", "enrich"].includes(input.op) || (input.op === "search" && input.mode && input.mode !== "text"))) {
+      const accepted = await env.COMMITS.getByName(env.ANTFLY_INCARNATION).ensureEmbeddingProfile({model: env.EMBEDDING_MODEL, dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 384)});
+      if (!accepted) throw new Error("HostedEmbeddingProfileChanged");
+    }
+    if (!lane) lanes[role] = lane = await instantiateHost(module, null, {
       onTransportError: (error, op) => console.error("Antfly object operation failed", op, String(error)),
       onLog: message => console.error("Antfly runtime", message),
     });
     const transport = cache.wrap(withCommitCoordinator(createR2Transport({ database: env.DATABASE }),
-      env.COMMITS.getByName(env.ANTFLY_INCARNATION)), env.ANTFLY_INCARNATION);
-    return await lane.request({ ...input, bucket: "database", prefix: "antfly", namespace: env.ANTFLY_INCARNATION }, { transport, signal });
+      env.COMMITS.getByName(env.ANTFLY_INCARNATION), collection), env.ANTFLY_INCARNATION);
+    const publicationBudget = input.op === "publish" ? await env.COMMITS.getByName(env.ANTFLY_INCARNATION).publicationBudget(Number(env.PUBLICATION_RECORDS ?? 16)) : 16;
+    const settings = ["publish", "enrich"].includes(input.op) ? { enrichment: Boolean(env.EMBEDDING_MODEL), embedding_dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 384), publication_records: publicationBudget } : {};
+    const inference = async request => {
+      if (request.task !== "embedding" || !env.EMBEDDING_MODEL?.startsWith("@cf/") || !env.AI_GATEWAY ||
+        request.dimensions !== Number(env.EMBEDDING_DIMENSIONS ?? 384) || !Array.isArray(request.texts) || request.texts.length < 1 || request.texts.length > 64 || request.texts.some(text => typeof text !== "string" || text.length > 16384)) throw new Error("HostedEmbeddingCapabilityUnsupported");
+      return {json: await env.AI.run(env.EMBEDDING_MODEL, {text: request.texts}, {gateway: {id: env.AI_GATEWAY}})};
+    };
+    return await lane.request({ ...input, ...settings, bucket: "database", prefix: "antfly", namespace: env.ANTFLY_INCARNATION }, { transport, signal, inference });
   } catch (error) {
     if (/IntegrityMismatch/.test(String(error))) cache.clear();
     throw error;
   } finally {
-    if (lane && !lane.usable()) lane = null;
-    busy = false;
+    if (lane && !lane.usable()) lanes[role] = null;
+    busy[role] = false;
   }
 }
 async function readJson(request) {
@@ -60,9 +75,9 @@ async function readJson(request) {
   for (const chunk of chunks) { input.set(chunk, offset); offset += chunk.byteLength; }
   return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(input));
 }
-async function enqueue(env) {
+async function enqueue(env, kind = "publish", job_id, delaySeconds = 0) {
   if (!env.MAINTENANCE) return false;
-  await env.MAINTENANCE.send({ incarnation: env.ANTFLY_INCARNATION });
+  await env.MAINTENANCE.send({ incarnation: env.ANTFLY_INCARNATION, ...(kind === "collect" ? { kind, job_id } : {}) }, { delaySeconds });
   return true;
 }
 export default {
@@ -81,9 +96,14 @@ export default {
         if (!env.AI_MODEL?.startsWith("@cf/") || !env.AI_GATEWAY) return new Response("AI model and gateway are not configured", { status: 503 });
         return Response.json(await env.AI.run(env.AI_MODEL, args, { gateway: { id: env.AI_GATEWAY } }));
       }
-      if (!["mutate", "lookup", "list", "search", "publish", "latest"].includes(args.op)) return new Response("unsupported operation", { status: 400 });
+      if (args.op === "collect") {
+        const result = await collect(env, (input, token) => run(env, input, request.signal, token), args.job_id);
+        if (result.has_more) await enqueue(env, "collect", result.job_id, result.delay_seconds);
+        return Response.json(result, env.WORKER_VERSION ? {headers: {"X-Antfly-Version": env.WORKER_VERSION.id}} : undefined);
+      }
+      if (!["mutate", "lookup", "list", "search", "count", "status", "publish", "enrich", "latest"].includes(args.op)) return new Response("unsupported operation", { status: 400 });
       const result = await run(env, args, request.signal);
-      if ((args.op === "mutate" && result.committed) || (args.op === "publish" && result.has_more)) {
+      if ((args.op === "mutate" && result.committed) || (args.op === "publish" && result.has_more) || (args.op === "enrich" && result.wal_appends)) {
         try { result.maintenance_pending = !await enqueue(env); }
         catch (error) {
           // Preserve the accepted write's durable outcome if scheduling fails.
@@ -91,7 +111,7 @@ export default {
           console.error("Antfly maintenance enqueue failed", String(error));
         }
       }
-      return Response.json(result);
+      return Response.json(result, env.WORKER_VERSION ? {headers: {"X-Antfly-Version": env.WORKER_VERSION.id}} : undefined);
     } catch (error) {
       return Response.json({ error: String(error.message ?? error) }, { status: error instanceof Busy ? 503 : 409,
         headers: error instanceof Busy ? { "Retry-After": "1" } : undefined });
@@ -100,16 +120,37 @@ export default {
   async queue(batch, env) {
     for (const message of batch.messages) {
       if (message.body?.incarnation !== env.ANTFLY_INCARNATION) { message.ack(); continue; }
+      let publishing = message.body.kind !== "collect";
       try {
+        if (message.body.kind === "collect") {
+          const result = await collect(env, (input, token) => run(env, input, undefined, token), message.body.job_id);
+          if (result.has_more && !await enqueue(env, "collect", result.job_id, result.delay_seconds)) throw new Error("maintenance queue is not configured");
+          message.ack(); continue;
+        }
         const result = await run(env, { op: "publish" });
-        if (result.has_more && !await enqueue(env)) throw new Error("maintenance queue is not configured");
+        publishing = false;
+        if (result.has_more) {
+          if (!await enqueue(env)) throw new Error("maintenance queue is not configured");
+        } else if (env.EMBEDDING_MODEL) {
+          const enriched = await run(env, {op: "enrich"});
+          // A bounded scan may checkpoint before reaching a pending document.
+          // Continue from that checkpoint even when this scan appended nothing.
+          const pending = enriched.wal_appends || BigInt((await run(env, {op: "status"})).pending_embeddings ?? "0") > 0n;
+          if (pending && !await enqueue(env)) throw new Error("maintenance queue is not configured");
+        }
         message.ack();
       } catch (error) {
         console.error("Antfly publication deferred", String(error));
+        if (publishing && /Canceled|DeadlineExceeded|ObjectIoBudgetExceeded|OutOfMemory|ResponseTooLarge/.test(String(error))) {
+          await env.COMMITS.getByName(env.ANTFLY_INCARNATION).lowerPublicationBudget(Number(env.PUBLICATION_RECORDS ?? 16));
+        }
         message.retry({ delaySeconds: 10 });
       }
     }
   },
   // Recovery also covers a crash between WAL acceptance and queue admission.
-  async scheduled(_controller, env) { await enqueue(env); },
+  async scheduled(controller, env) {
+    await enqueue(env);
+    if (env.AUTO_GC === "true" && Math.floor(controller.scheduledTime / 60000) % 15 === 0) await enqueue(env, "collect");
+  },
 };

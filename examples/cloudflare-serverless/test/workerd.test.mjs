@@ -20,7 +20,7 @@ import { mkdtemp, rm, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-test("workerd persists R2 pages and coordinated commits across restart", async () => {
+test("workerd persists R2 pages and coordinated commits across restart", { timeout: 180000 }, async () => {
   const persist = await mkdtemp(join(tmpdir(), "antfly-workerd-"));
   const output = fileURLToPath(new URL("../dist/worker/", import.meta.url));
   const wasm = (await readdir(output)).filter(name => name.endsWith(".wasm"));
@@ -29,10 +29,18 @@ test("workerd persists R2 pages and coordinated commits across restart", async (
     modules: [{ type: "ESModule", path: join(output, "harness.mjs"), contents: `
       import worker from "./worker.js";
       export { CommitCoordinator } from "./worker.js";
+      let embeddingCalls = 0;
       export default { async fetch(request, env, ctx) {
         const path = new URL(request.url).pathname;
         const sent = [];
         const localEnv = { ...env, MAINTENANCE: { async send(value) { sent.push(value); } } };
+        if (path === "/test/embedding") {
+          const dimensions = new URL(request.url).searchParams.get("dimensions") ?? "4";
+          const embeddingEnv = {...localEnv, ANTFLY_INCARNATION: "test-embedding", EMBEDDING_MODEL: "@cf/test/embedding", EMBEDDING_DIMENSIONS: dimensions, AI_GATEWAY: "test-gateway",
+            AI: {async run(_model, input) { embeddingCalls++; return {data: input.text.map(() => Array(Number(dimensions)).fill(0.5))}; }} };
+          const response = await worker.fetch(new Request("https://example.test/api", request), embeddingEnv, ctx);
+          response.headers.set("X-Model-Calls", String(embeddingCalls)); return response;
+        }
         if (path === "/test/queue") {
           let ack = false, retry = false;
           await worker.queue({messages: [{body: {incarnation: env.ANTFLY_INCARNATION},
@@ -113,9 +121,43 @@ test("workerd persists R2 pages and coordinated commits across restart", async (
     })) });
     const partial = await mf.dispatchFetch("https://example.test/test/queue");
     assert.deepEqual(await partial.json(), { ack: true, retry: false, sent: [{ incarnation: "test-incarnation" }] });
-    const finished = await mf.dispatchFetch("https://example.test/test/queue");
-    assert.deepEqual(await finished.json(), { ack: true, retry: false, sent: [] });
+    let publicationFinished = false;
+    for (let i = 0; i < 30; i++) {
+      const finished = await mf.dispatchFetch("https://example.test/test/queue");
+      const status = await finished.json();
+      assert.equal(status.ack, true); assert.equal(status.retry, false);
+      if (!status.sent.length) { publicationFinished = true; break; }
+    }
+    assert.ok(publicationFinished, "bounded queue publication must converge");
     assert.equal((await call({ op: "search", text: "queued", limit: 1 })).hits[0].doc_id, "queued/0000");
+    let job, collected = false;
+    for (let step = 0; step < 400; step++) {
+      const gc = await call({ op: "collect", ...(job ? { job_id: job } : {}) });
+      job = gc.job_id;
+      if (gc.done) { collected = true; break; }
+      if (gc.delay_seconds) await new Promise(resolve => setTimeout(resolve, gc.delay_seconds * 1000 + 50));
+      if (step % 12 === 0) {
+        await mf.dispose();
+        mf = new Miniflare(convertV4MiniflareOptions(options));
+      }
+    }
+    assert.ok(collected, "GC must finish across coordinator and Worker restarts");
+    assert.equal((await call({ op: "search", text: "queued", limit: 1 })).hits[0].doc_id, "queued/0000");
+    assert.equal((await call(mutation)).visibility, committed.visibility, "GC must preserve old retry receipts");
+    const embeddingCall = async (body, dimensions = "4") => mf.dispatchFetch(`https://example.test/test/embedding?dimensions=${dimensions}`, {method: "POST", headers: {Authorization: "Bearer local-test"}, body: JSON.stringify(body)});
+    assert.equal((await embeddingCall({op: "mutate", operation_id: "message", mutations: [{kind: "upsert", doc_id: "message/a", body: JSON.stringify({text: "mail body", owner: "alice"})}]})).status, 200);
+    assert.equal((await embeddingCall({op: "publish"})).status, 200);
+    const enriched = await embeddingCall({op: "enrich"});
+    assert.equal(enriched.status, 200); assert.equal(enriched.headers.get("X-Model-Calls"), "1");
+    assert.equal((await embeddingCall({op: "publish"})).status, 200);
+    await embeddingCall({op: "mutate", operation_id: "state", mutations: [{kind: "upsert", doc_id: "state/a", body: JSON.stringify({text: "", message_ref: "message/a", read: true})}]});
+    await embeddingCall({op: "publish"});
+    const idle = await embeddingCall({op: "enrich"});
+    assert.equal(idle.headers.get("X-Model-Calls"), "1");
+    const changedProfile = await embeddingCall({op: "publish"}, "8");
+    assert.equal(changedProfile.status, 409);
+    assert.match((await changedProfile.json()).error, /HostedEmbeddingProfileChanged/);
+
   } finally {
     if (mf) await mf.dispose();
     await rm(persist, { recursive: true, force: true });

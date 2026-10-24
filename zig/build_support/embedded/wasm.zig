@@ -505,7 +505,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     serverless_wasm.rdynamic = true;
     serverless_wasm.export_memory = true;
     serverless_wasm.stack_size = 1024 * 1024;
-    serverless_wasm.max_memory = 64 * 1024 * 1024;
+    serverless_wasm.max_memory = 32 * 1024 * 1024;
     const host_install = b.addInstallArtifact(serverless_wasm, .{ .dest_dir = .{ .override = .prefix }, .dest_sub_path = "antfly-serverless/host.raw.wasm" });
     b.step("serverless-wasm", "Build the R2-backed serverless WASM host").dependOn(&host_install.step);
 

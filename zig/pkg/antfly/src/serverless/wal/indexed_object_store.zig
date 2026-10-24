@@ -33,9 +33,17 @@ pub const IndexedObjectStore = struct {
     bucket: []u8,
     prefix: []u8,
     max_attempts: usize = 8,
+    /// Optional host admission ceiling. Existing receipts bypass this limit.
+    max_new_lsn: ?u64 = null,
 
     pub const Head = struct {
-        format: u32 = 1,
+        format: u32 = 2,
+        write_epoch: u64 = 1,
+        physical_first_lsn: u64 = 1,
+        gc_attempt: [16]u8 = @splat(0),
+        gc_records: ?tree.Ref = null,
+        gc_operations: ?tree.Ref = null,
+        gc_retired_before: u64 = 0,
         latest_lsn: u64 = 0,
         first_lsn: u64 = 1,
         records: ?tree.Ref = null,
@@ -79,12 +87,13 @@ pub const IndexedObjectStore = struct {
         if (operation_id) |id| if (id.len == 0 or id.len > 4096) return error.InvalidWalOperationId;
         var ctx = try Context.init(self, namespace, null);
         defer ctx.deinit();
-        var cache = tree.Cache{ .alloc = self.alloc, .underlying = ctx.store() };
-        defer cache.deinit();
-        const pages = cache.store();
         for (0..self.max_attempts) |_| {
             var current = try ctx.readHead();
             defer current.deinit(self.alloc);
+            ctx.setEpoch(current.value.write_epoch);
+            var cache = tree.Cache{ .alloc = self.alloc, .underlying = ctx.store() };
+            defer cache.deinit();
+            const pages = cache.store();
             var receipt: [48]u8 = undefined;
             std.mem.writeInt(u64, receipt[8..16], timestamp, .little);
             Sha256.hash(payload, receipt[16..48], .{});
@@ -103,6 +112,7 @@ pub const IndexedObjectStore = struct {
             if (expected_latest) |latest| if (current.value.latest_lsn != latest) return null;
             const next = std.math.add(u64, current.value.latest_lsn, 1) catch return error.WalLsnExhausted;
             // Reserve maxInt for the exclusive upper bound and retained floor.
+            if (self.max_new_lsn) |maximum| if (next > maximum) return error.PublicationLagExceeded;
             if (next == std.math.maxInt(u64)) return error.WalLsnExhausted;
             const encoded = if (operation_id) |id|
                 try codec.encodeIdempotentRecordAlloc(self.alloc, next, timestamp, payload, id)
@@ -152,12 +162,13 @@ pub const IndexedObjectStore = struct {
         @memcpy(receipt[24..56], &hash.finalResult());
         var ctx = try Context.init(self, namespace, null);
         defer ctx.deinit();
-        var cache = tree.Cache{ .alloc = self.alloc, .underlying = ctx.store() };
-        defer cache.deinit();
-        const pages = cache.store();
         for (0..self.max_attempts) |_| {
             var current = try ctx.readHead();
             defer current.deinit(self.alloc);
+            ctx.setEpoch(current.value.write_epoch);
+            var cache = tree.Cache{ .alloc = self.alloc, .underlying = ctx.store() };
+            defer cache.deinit();
+            const pages = cache.store();
             const found = try tree.lookupMany(self.alloc, pages, current.value.operations, &.{id});
             defer self.alloc.free(found);
             defer if (found[0]) |value| value.deinit(self.alloc);
@@ -169,6 +180,7 @@ pub const IndexedObjectStore = struct {
                 return .{ .start_lsn = start, .end_lsn = end };
             }
             const last = std.math.add(u64, current.value.latest_lsn, payloads.len) catch return error.WalLsnExhausted;
+            if (self.max_new_lsn) |maximum| if (last > maximum) return error.PublicationLagExceeded;
             if (last == std.math.maxInt(u64)) return error.WalLsnExhausted;
             var arena = std.heap.ArenaAllocator.init(self.alloc);
             defer arena.deinit();
@@ -271,6 +283,80 @@ pub const IndexedObjectStore = struct {
         return error.WalCommitContended;
     }
 
+    /// Remove only a bounded prefix of logically expired records. The receipt
+    /// index and high watermark survive compaction. A later epoch barrier and
+    /// reader grace period are required before deleting unreachable pages.
+    pub fn compactPrefixStep(self: *@This(), namespace: []const u8, max_records: usize) !bool {
+        if (max_records == 0 or max_records > 256) return error.InvalidWalBatch;
+        var ctx = try Context.init(self, namespace, null);
+        defer ctx.deinit();
+        for (0..self.max_attempts) |_| {
+            var head = try ctx.readHead();
+            defer head.deinit(self.alloc);
+            if (head.value.physical_first_lsn == head.value.first_lsn) return false;
+            ctx.setEpoch(head.value.write_epoch);
+            var cache = tree.Cache{ .alloc = self.alloc, .underlying = ctx.store() };
+            defer cache.deinit();
+            const pages = cache.store();
+            const end = @min(head.value.first_lsn, head.value.physical_first_lsn +| max_records);
+            var keys: [256][8]u8 = undefined;
+            var changes: [256]tree.Mutation = undefined;
+            const count: usize = @intCast(end - head.value.physical_first_lsn);
+            for (keys[0..count], changes[0..count], 0..) |*key, *change, i| {
+                std.mem.writeInt(u64, key, head.value.physical_first_lsn + i, .big);
+                change.* = .{ .key = key, .value = null };
+            }
+            var updated = head.value;
+            updated.records = try tree.apply(self.alloc, pages, head.value.records, changes[0..count]);
+            updated.physical_first_lsn = end;
+            ctx.writeHead(updated, head.etag) catch |err| switch (err) {
+                error.PreconditionFailed => continue,
+                else => return err,
+            };
+            return end != updated.first_lsn;
+        }
+        return error.WalCommitContended;
+    }
+
+    pub const Collection = struct { records: ?tree.Ref, operations: ?tree.Ref, retired_before: u64, domain: [32]u8 };
+    /// Atomically fences every writer that could publish an older upload
+    /// attempt. Caller must retain these roots and honor bounded reader leases
+    /// before sweeping attempts older than retired_before. Idempotent by job ID.
+    pub fn beginCollection(self: *@This(), namespace: []const u8, id: [16]u8) !Collection {
+        if (std.mem.allEqual(u8, &id, 0)) return error.InvalidCollectionId;
+        var ctx = try Context.init(self, namespace, null);
+        defer ctx.deinit();
+        for (0..self.max_attempts) |_| {
+            var head = try ctx.readHead();
+            defer head.deinit(self.alloc);
+            var next = head.value;
+            if (!std.mem.eql(u8, &next.gc_attempt, &id)) {
+                next.write_epoch = std.math.add(u64, next.write_epoch, 1) catch return error.WalLsnExhausted;
+                next.gc_attempt = id;
+                next.gc_records = next.records;
+                next.gc_operations = next.operations;
+                next.gc_retired_before = next.write_epoch;
+                ctx.writeHead(next, head.etag) catch |err| switch (err) {
+                    error.PreconditionFailed => continue,
+                    else => return err,
+                };
+            }
+            return .{ .records = next.gc_records, .operations = next.gc_operations, .retired_before = next.gc_retired_before, .domain = ctx.domain };
+        }
+        return error.WalCommitContended;
+    }
+
+    pub fn tracePage(self: *@This(), alloc: A, namespace: []const u8, ref: tree.Ref) !tree.Page {
+        var ctx = try Context.init(self, namespace, null);
+        defer ctx.deinit();
+        return tree.readPage(alloc, ctx.store(), ref);
+    }
+    pub fn pageKeyAlloc(self: *@This(), alloc: A, namespace: []const u8, ref: tree.Ref) ![]u8 {
+        var ctx = try Context.init(self, namespace, null);
+        defer ctx.deinit();
+        return ctx.pageKey(alloc, ref);
+    }
+
     const Snapshot = struct {
         value: Head = .{},
         etag: ?[]u8 = null,
@@ -284,6 +370,7 @@ pub const IndexedObjectStore = struct {
         root: []u8,
         domain: [32]u8,
         cancellation: ?objectstore.CancellationToken,
+        attempt: [16]u8 = @splat(0),
 
         fn init(owner: *IndexedObjectStore, namespace: []const u8, cancellation: ?objectstore.CancellationToken) !@This() {
             // Hash the namespace so untrusted names cannot escape the prefix.
@@ -297,8 +384,11 @@ pub const IndexedObjectStore = struct {
         fn deinit(self: *@This()) void {
             self.owner.alloc.free(self.root);
         }
+        fn setEpoch(self: *@This(), epoch: u64) void {
+            std.mem.writeInt(u64, self.attempt[0..8], epoch, .big);
+        }
         fn store(self: *@This()) tree.Store {
-            return .{ .ptr = self, .domain = self.domain, .get = getPage, .put = putPage, .check = check, .prefix_keys = true };
+            return .{ .ptr = self, .domain = self.domain, .get = getPage, .put = putPage, .check = check, .prefix_keys = true, .attempt = self.attempt };
         }
         fn check(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -316,11 +406,11 @@ pub const IndexedObjectStore = struct {
             const parsed = try std.json.parseFromSlice(Head, a, result.body, .{});
             defer parsed.deinit();
             const head = parsed.value;
-            if (head.format != 1 or head.first_lsn == 0 or head.latest_lsn == std.math.maxInt(u64) or
-                head.first_lsn > head.latest_lsn + 1 or (head.latest_lsn != 0 and head.records == null)) return error.InvalidWal;
+            if ((head.format != 1 and head.format != 2) or head.write_epoch == 0 or head.physical_first_lsn == 0 or head.physical_first_lsn > head.first_lsn or head.first_lsn == 0 or head.latest_lsn == std.math.maxInt(u64) or
+                head.first_lsn > head.latest_lsn + 1 or (head.latest_lsn >= head.physical_first_lsn and head.records == null)) return error.InvalidWal;
             if (head.records) |ref| {
                 try ref.validate();
-                if (ref.records != head.latest_lsn) return error.InvalidWal;
+                if (ref.records != head.latest_lsn + 1 - head.physical_first_lsn) return error.InvalidWal;
             }
             if (head.operations) |ref| {
                 try ref.validate();
@@ -333,7 +423,9 @@ pub const IndexedObjectStore = struct {
             const a = self.owner.alloc;
             const key = try std.fmt.allocPrint(a, "{s}/HEAD", .{self.root});
             defer a.free(key);
-            const bytes = try std.json.Stringify.valueAlloc(a, head, .{});
+            var upgraded = head;
+            upgraded.format = 2;
+            const bytes = try std.json.Stringify.valueAlloc(a, upgraded, .{});
             defer a.free(bytes);
             var result = try self.owner.client.putObject(self.owner.bucket, key, bytes, .{
                 .if_none_match = etag == null,
@@ -344,7 +436,8 @@ pub const IndexedObjectStore = struct {
             defer result.deinit(a);
         }
         fn pageKey(self: *@This(), a: A, ref: tree.Ref) ![]u8 {
-            return std.fmt.allocPrint(a, "{s}/pages/{s}", .{ self.root, std.fmt.bytesToHex(ref.digest, .lower) });
+            if (std.mem.allEqual(u8, &ref.attempt, 0)) return std.fmt.allocPrint(a, "{s}/pages/{s}", .{ self.root, std.fmt.bytesToHex(ref.digest, .lower) });
+            return std.fmt.allocPrint(a, "{s}/pages/{s}/{s}", .{ self.root, std.fmt.bytesToHex(ref.attempt, .lower), std.fmt.bytesToHex(ref.digest, .lower) });
         }
         fn getPage(raw: *anyopaque, a: A, ref: tree.Ref) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -454,4 +547,36 @@ test "serverless indexed WAL survives reopen, retains idempotency and never rese
     try std.testing.expectEqual(@as(u64, 1), try second.appendIdempotent("docs", 10, "hello", "op-1"));
     try std.testing.expectEqual(@as(u64, 3), try second.append("docs", 30, "later"));
     try std.testing.expectEqual(@as(u64, 0), try second.latestLsn("other-table"));
+}
+
+test "serverless indexed WAL compaction preserves receipts and collection barriers are retryable" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var wal = try IndexedObjectStore.init(a, client, "db", "prefix");
+    defer wal.deinit();
+    for (0..10) |i| {
+        var id: [20]u8 = undefined;
+        _ = try wal.appendIdempotent("table", 0, "body", try std.fmt.bufPrint(&id, "op-{d}", .{i}));
+    }
+    _ = try wal.truncatePrefix("table", 9);
+    try std.testing.expect(try wal.compactPrefixStep("table", 3));
+    try std.testing.expect(try wal.compactPrefixStep("table", 3));
+    try std.testing.expect(!try wal.compactPrefixStep("table", 3));
+    const snapshot = try wal.beginCollection("table", @splat(1));
+    try std.testing.expectEqual(@as(u64, 2), snapshot.records.?.records);
+    try std.testing.expectEqual(@as(u64, 10), snapshot.operations.?.records);
+    const same = try wal.beginCollection("table", @splat(1));
+    try std.testing.expectEqual(snapshot.retired_before, same.retired_before);
+    try std.testing.expectEqual(@as(u64, 1), try wal.appendIdempotent("table", 0, "body", "op-0"));
+    try std.testing.expectEqual(@as(u64, 11), try wal.append("table", 0, "next"));
+    const next = try wal.beginCollection("table", @splat(2));
+    try std.testing.expect(next.retired_before > same.retired_before);
+    var page = try wal.tracePage(a, "table", next.records.?);
+    defer page.deinit(a);
+    _ = try wal.truncatePrefix("table", 100);
+    try std.testing.expect(!try wal.compactPrefixStep("table", 256));
+    try std.testing.expectEqual(@as(u64, 12), try wal.append("table", 0, "after-empty"));
 }

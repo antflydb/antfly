@@ -18,10 +18,10 @@
 import { ObjectStoreError } from "./r2.mjs";
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
-export async function instantiateHost(module, transport, { stackBytes = 1024 * 1024, onTransportError = () => {}, onLog = () => {} } = {}) {
+export async function instantiateHost(module, transport, { stackBytes = 1024 * 1024, onTransportError = () => {}, onLog = () => {}, clock = Date.now } = {}) {
   if (!(module instanceof WebAssembly.Module)) throw new TypeError("a precompiled WebAssembly.Module is required");
   if (!Number.isSafeInteger(stackBytes) || stackBytes < 4096 || stackBytes > 8 * 1024 * 1024) throw new TypeError("invalid suspension stack size");
-  let wasm, pending, completed, activeTransport, activeOptions, operations, transferred, busy = false, poisoned = false;
+  let wasm, pending, completed, activeTransport, activeOptions, operations, inferenceCalls, transferred, busy = false, poisoned = false;
   const bytes = (ptr, len) => new Uint8Array(wasm.memory.buffer, ptr, len);
   function allocate(value) {
     if (value.byteLength === 0) return 0;
@@ -31,17 +31,7 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
     return ptr;
   }
   let lastWall = 0, invalidClock = false;
-  const instance = await WebAssembly.instantiate(module, { antfly_host: {
-    check_cancel() { return activeOptions?.signal?.aborted || Date.now() >= (activeOptions?.deadlineMs ?? Infinity) ? 1 : 0; },
-    log(ptr, len) { onLog(decoder.decode(bytes(ptr, len))); },
-    now_ns(kind) {
-      const wall = Date.now();
-      if (wall < lastWall) invalidClock = true;
-      lastWall = wall;
-      if (invalidClock) return 0n;
-      return kind === 0 ? BigInt(Math.floor(performance.now() * 1e6)) : BigInt(wall) * 1000000n;
-    },
-    object_call(ptr, len, bodyPtr, bodyLen, replyPtr) {
+  function exchange(ptr, len, bodyPtr, bodyLen, replyPtr, handler) {
       if (wasm.asyncify_get_state() === 2) {
         wasm.asyncify_stop_rewind();
         const view = new DataView(wasm.memory.buffer);
@@ -54,21 +44,37 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
         completed = null;
         return value.status;
       }
+      if (typeof handler !== "function") return 3;
       if (pending) throw new Error("overlapping WASM I/O");
       if (activeOptions.signal?.aborted) return 5;
-      if (Date.now() >= activeOptions.deadlineMs) return 9;
+      if (clock() >= activeOptions.deadlineMs) return 9;
       if (++operations > activeOptions.maxOperations || bodyLen + len > activeOptions.maxTransferBytes - transferred) return 8;
       transferred += bodyLen + len;
       const request = JSON.parse(decoder.decode(bytes(ptr, len)));
       // The WASM memory may grow while preparing a completion. Do not retain
       // views across the async boundary, including upload bodies.
       const body = bytes(bodyPtr, bodyLen).slice();
-      pending = Promise.resolve().then(() => activeTransport(request, body)).then(
+      pending = Promise.resolve().then(() => handler(request, body)).then(
         value => ({ status: 0, value }),
         error => { if (!(error instanceof ObjectStoreError) || error.status >= 6) onTransportError(error, request.op); return { status: error instanceof ObjectStoreError ? error.status : /10058/.test(String(error)) ? 6 : 7, value: {} }; },
       );
       wasm.asyncify_start_unwind(stackDescriptor);
       return 0;
+  }
+  const instance = await WebAssembly.instantiate(module, { antfly_host: {
+    check_cancel() { return activeOptions?.signal?.aborted || clock() >= (activeOptions?.deadlineMs ?? Infinity) ? 1 : 0; },
+    log(ptr, len) { onLog(decoder.decode(bytes(ptr, len))); },
+    now_ns(kind) {
+      const wall = clock();
+      if (wall < lastWall) invalidClock = true;
+      lastWall = wall;
+      if (invalidClock) return 0n;
+      return kind === 0 ? BigInt(Math.floor(performance.now() * 1e6)) : BigInt(wall) * 1000000n;
+    },
+    object_call: (ptr, len, bodyPtr, bodyLen, replyPtr) => exchange(ptr, len, bodyPtr, bodyLen, replyPtr, activeTransport),
+    infer_call: (ptr, len, bodyPtr, bodyLen, replyPtr) => {
+      if (wasm.asyncify_get_state() !== 2 && ++inferenceCalls > 8) return 8;
+      return exchange(ptr, len, bodyPtr, bodyLen, replyPtr, activeOptions?.inference);
     },
   }, env: {
     antfly_platform_random_secure(ptr, len) {
@@ -87,7 +93,7 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
   new DataView(wasm.memory.buffer).setUint32(stackDescriptor, stackDescriptor + 8, true);
   new DataView(wasm.memory.buffer).setUint32(stackDescriptor + 4, stackDescriptor + 8 + stackBytes, true);
   async function request(value, { transport: requestTransport = transport, signal,
-    deadlineMs = Date.now() + 30000, maxOperations = 1024, maxTransferBytes = 32 * 1024 * 1024 } = {}) {
+    inference, deadlineMs = clock() + 30000, maxOperations = 1024, maxTransferBytes = 32 * 1024 * 1024 } = {}) {
     if (busy || poisoned) throw new Error(poisoned ? "WASM instance is unusable" : "WASM instance is busy");
     if (typeof requestTransport !== "function") throw new TypeError("request transport required");
     if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 0 || !Number.isSafeInteger(maxOperations) || maxOperations < 1 ||
@@ -97,8 +103,8 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
     const input = encoder.encode(JSON.stringify(value));
     busy = true;
     activeTransport = requestTransport;
-    activeOptions = { signal, deadlineMs, maxOperations, maxTransferBytes };
-    operations = 0; transferred = 0;
+    activeOptions = { signal, deadlineMs, maxOperations, maxTransferBytes, inference };
+    operations = 0; inferenceCalls = 0; transferred = 0;
     let requestPtr = 0, protocolError = false;
     try {
       requestPtr = allocate(input);

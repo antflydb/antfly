@@ -7,9 +7,9 @@ Related design: [#1278](https://github.com/antflydb/antfly/issues/1278) and
 [hosted runtime design](../../docs/design/cloudflare-serverless.md).
 
 It is a bounded deployment profile of the unreleased serverless engine. Local
-Node and workerd tests cover durable reopen and publication. A live Cloudflare
-deployment, workload qualification, physical garbage collection, vector
-freshness, and automatic enrichment are **not** established by these tests.
+Node and workerd tests cover durable reopen, publication, resumable collection,
+and conditional enrichment. Live qualification uses separate disposable
+resources; local tests do not establish deployed runtime budgets.
 
 ## Build and test
 
@@ -104,7 +104,11 @@ WAL durability; index publication occurs separately.
 | `lookup` | `doc_id`, optional `required_visibility` | Published point lookup plus the bounded canonical WAL tail, including before first publication. Returns `body` or null and observed `visibility`. |
 | `list` | `limit` (1–100), optional `cursor`, `required_visibility` | Ascending document-ID listing. Pins the published generation and WAL cutoff in the cursor. Later writes and publications do not change that page sequence. |
 | `search` | `text`, `limit` (1–100) | Searches the published text index. |
-| `search` | additionally `fresh:true` or `required_visibility` | Merges published text candidates with recent mutations before limiting; suppresses stale hits and admits newly matching documents. Returns observed `visibility`. |
+| `search` | additionally `fresh:true`, scalar `filters`, or `required_visibility` | Merges published text candidates with recent mutations before limiting; suppresses stale hits and admits newly matching documents. Returns observed `visibility`. |
+| `count` | optional `required_visibility` | Exact current document count as a decimal string, including unique recent updates and tombstones. Filtered counts are not supported. |
+| `status` | none | Accepted visibility token, published watermark, and published pending-embedding count. |
+| `collect` | optional `job_id` | Runs one durable GC step; returns phase, job ID, continuation and any grace-period delay. |
+| `enrich` | none | Runs a configured native embedding batch with source validation and durable progress. |
 | `publish` | none | Runs one fenced publication prefix. Returns decimal-string `version`, `wal_end_lsn`, and `has_more`. The next invocation resumes from the committed watermark. |
 | `latest` | none | Returns the latest committed visibility token. |
 
@@ -116,19 +120,35 @@ claims freshness. A cursor is valid only for `list` with the same limit and
 incarnation. An expired generation or retained WAL prefix fails explicitly.
 There is no cross-table snapshot or transaction guarantee.
 
-Fresh search currently admits simple text search with the existing
-document-local term-frequency scorer. Corpus-dependent ranking, exact counts,
-aggregations, vector/hybrid freshness, custom filters, and ranked pagination
-need their own contracts and are not exposed by this example. The generic
-ordered overlay supports predicates before limiting and refills pages, but
-this administrator demo has no per-document authorization policy.
+Fresh text search supports scalar predicates such as
+`"filters":[{"field":"state.read","eq":false}]`. Dot paths address nested
+objects; `$id` addresses the document ID. Up to 16 scalar equality clauses are
+ANDed against current bodies, before offset/limit. Missing fields do not match.
+The generic native predicate contract can enforce host-owned authorization;
+caller-provided filters are not an authorization policy.
+
+Fresh text results include an opaque `cursor`. Resume with the same text,
+filters, limit, and cursor. Ranking uses the existing document-local term
+frequency scorer and document-ID tie breaking. Ranked pagination and predicate
+refill admit a prefix of at most 4,096 candidates; exhausting that budget fails
+explicitly. Cursors pin the original generation and cutoff across publication.
+
+Published vector and hybrid search use `"mode":"vector"` or `"hybrid"`, with a
+`vector` array and optional text. A visibility fence requires that publication
+covers the requested token and configured embeddings are ready. `fresh:true`
+also requires publication to cover the current accepted watermark. Otherwise
+an explicit visibility/publication/embedding-pending error is returned. These
+reads wait for the indexed generation; they do not score unindexed vectors
+from a WAL overlay. Filters and ranked cursors are currently text-only.
+Corpus-dependent ranking, filtered exact counts, and aggregates remain outside
+this admitted profile.
 
 ## Budgets and maintenance boundaries
 
-- One suspended WASM execution lane per isolate; competing calls receive 503
-  with `Retry-After`. Instances may run concurrently and arbitrate durable
-  writes with CAS and the existing publication fences.
-- WASM linear memory is capped at 64 MiB; immutable JS cache at 8 MiB/128
+- Separate serialized interactive and maintenance lanes keep R2 indexing waits
+  from occupying the interactive stack. Calls competing for the same lane receive
+  503 with `Retry-After`. Instances arbitrate writes with CAS and publication fences.
+- Each lane caps WASM linear memory at 32 MiB (64 MiB combined); immutable JS cache at 8 MiB/128
   entries. The isolate's remaining memory must also accommodate JS, R2 streams,
   copied buffers, and assets. The linear-memory cap is not a measurement of
   total isolate usage.
@@ -140,9 +160,12 @@ this administrator demo has no per-document authorization policy.
   the host returns an error instead of buffering without a bound.
 - WAL batches: at most 1,024 records/8 MiB (the HTTP envelope is tighter).
   Indexed tree values additionally have the native page-tree record limit.
-- Interactive overlay: at most 4,096 WAL records/8 MiB. Publication: at most
-  256 records/4 MiB of WAL input per invocation, with smaller prefixes retried
-  when the byte bound is exceeded. These input bounds do not promise that every
+- Interactive overlay: at most 4,096 WAL records/8 MiB. Publication: defaults to
+  16 records/4 MiB of WAL input per invocation, with smaller prefixes retried
+  when the byte bound is exceeded. `PUBLICATION_RECORDS` can set a measured
+  ceiling from 1–256. The coordinator durably halves the admitted batch after
+  a publication deadline or resource failure; Queue retries use that smaller
+  prefix, so eviction does not reset tuning. These input bounds do not promise that every
   possible index build fits Workers CPU or memory; large workloads fail and
   need a different maintenance profile.
 
@@ -152,13 +175,40 @@ do not download historical payloads. The warm cache stores copied immutable
 bytes and plain metadata; it never retains request-owned R2/DO handles or caches
 mutable HEAD/progress records.
 
-Hosted physical garbage collection is deliberately unavailable. Logical WAL
-truncation preserves high watermarks and idempotency receipts but does not
-reclaim historical pages. Superseded index artifacts and failed-attempt pages
-are retained. Do not install automatic R2 lifecycle deletion on these keys.
-Collection needs writer fencing, reader pins, retention policy, and durable
-incremental progress before deletion can be enabled. This is a remaining
-operational capability of #1278, not a claim of bounded lifetime storage.
+## Collection and format upgrade
+
+`collect` drives a bounded native-format tracer with a SQLite-backed durable
+frontier and exact mark set in the coordinator. It fences old publishers,
+commits the native manifest retirement floor, then includes every protected
+reader pin. It physically compacts expired WAL payload entries in batches,
+advances the WAL write epoch atomically, marks both current WAL trees, and
+waits 60 seconds before sweeping. Each invocation traces a bounded number of
+pages or processes at most 128 listed/deleted objects. A Queue delivery resumes
+from the last durable checkpoint after eviction. Duplicate and stale collectors
+cannot advance the current job's state.
+
+Scoped artifact and WAL attempt identities are never reused after retirement.
+This makes an authorized deletion safe even if its response arrives late; a
+fenced writer's late orphan upload is found by the next collection cycle.
+Old manifests are deleted only below the irreversible retirement floor.
+Unknown artifact formats stop collection before sweeping. Unscoped artifact
+objects and above-floor unpublished candidates are conservatively retained.
+Idempotency receipts remain durable indefinitely, so their index still grows
+with unique operations. Collection does not promise constant lifetime storage.
+
+Set `AUTO_GC="true"` to enqueue collection every 15 minutes. The example keeps
+the latest two published generations plus native reader leases (10 minutes,
+with the native clock-skew grace). Cursors can explicitly expire after their
+retention rights end. No R2 lifecycle deletion should target database objects.
+
+The indexed WAL now writes format 2: epoch-scoped immutable pages and a physical
+retained floor. Existing format-1 indexed pages remain readable; the first write
+upgrades HEAD. Old module versions cannot write/read the upgraded metadata.
+Deploy the new runtime to every client before enabling collection. Collection
+is supported only for this coordinated hosted profile with its 30-second
+request deadline and bounded clock skew; do not mix unbounded native readers
+into the same physical incarnation. The original whole-log native ObjectStore
+format remains unchanged. See the [collection safety argument](../../docs/design/cloudflare-hosted-collection.md).
 
 ## Workers AI and AI Gateway
 
@@ -168,8 +218,55 @@ to `env.AI.run(model, input, {gateway:{id}})`. Choose a model supporting that
 task's native input/output contract. With no model/gateway configured this
 route returns 503. Local tests do not make billable AI calls.
 
-This route is a host adapter for application AI requests. It does not wire
-automatic database embedding/extraction into the builder. Typed Antfly
+For automatic database embeddings, configure `EMBEDDING_MODEL` (a Workers AI
+embedding model), `EMBEDDING_DIMENSIONS` (default 384), and `AI_GATEWAY`. Publication
+records pending work; the Queue runs the existing native enrichment worker,
+which batches bounded chunk windows through the provider, captures a finite
+pending cycle, persists progress, and conditionally
+appends derived mutations only while its source WAL boundary is still current.
+The next publication makes those vectors searchable. Model failures never
+substitute deterministic vectors. Each invocation admits four documents and
+at most eight host inference calls. Each model batch admits at most 64 chunks
+and a conservative dimension-dependent vector-output budget. Larger documents
+fail clearly and remain pending; they need a different admitted chunking profile.
+The coordinator fixes the embedding model and dimensions for the physical
+incarnation, preventing accidental reuse of vectors after a provider change.
+Changing that profile requires a new incarnation or an explicit migration.
+
+The "Save mailbox state" action writes a separate `state/<document-id>` record
+with `text:""` and a reference to the message. It does not rewrite or embed the
+message body. There is no atomic cross-record update guarantee. Public upserts
+strip `_enrichment`, `chunk_preview`, and `chunk_embeddings` so a content edit
+cannot carry an old derived readiness marker forward; native enrichment writes
+use their own conditional WAL path.
+Search filters inspect the message's own current fields; this profile does not
+join `state/` records into ranked search. An application combining the two must
+read state explicitly and refill its view, or keep query-critical metadata on
+the searchable record. The example demonstrates independent state writes and
+fenced state reads, rather than a complete unread-mail search implementation.
+
+The `/ai` route is a host adapter for application AI requests. Typed Antfly
 Cloudflare provider integration is tracked separately in
 [#1271](https://github.com/antflydb/antfly/issues/1271). Model weights are not
 bundled with the database WASM module.
+
+
+## Live qualification
+
+See the [recorded live measurements and limits](../../docs/design/cloudflare-qualification.md).
+
+`qualification/prepare.mjs ACCOUNT_ID` creates an ignored, uniquely named
+configuration and a mode-0600 API token under `dist/qualification/`. Provision
+its R2 bucket and two Queues, install the token with Wrangler, then run
+`qualification/snapshot.mjs RUN_JSON` to seal a self-contained, validated bundle.
+Deploy that configuration and run `qualification/run.mjs RUN_JSON HTTPS_ORIGIN`.
+It exercises real R2/DO/Queue durability, concurrent writers, publication,
+collection, and a Workers AI embedding through Gateway, and saves latencies
+and deployment version IDs. It performs real billable service operations.
+
+The qualification wrapper alone has a token-protected drain route, restricted
+to the generated physical incarnation. Disable/remove the Queue consumer
+before `run.mjs ... --drain`; then delete the generated Worker, Queues, and empty
+bucket. Production `worker.mjs` has no drain route. Reports contain no API token.
+A successful fixture and absence of resource-limit errors do not measure total
+isolate memory or establish all-workload production qualification.

@@ -88,6 +88,24 @@ pub const Session = struct {
     /// Corpus-dependent ranking, vector/hybrid queries and aggregations need
     /// their own visibility contracts and are deliberately rejected here.
     pub fn searchTextAlloc(self: *Session, req: @import("request.zig").QueryRequest, max_output_bytes: usize) ![]@import("request.zig").SearchHit {
+        const All = struct {
+            pub fn matches(_: @This(), _: Overlay.Document) !bool {
+                return true;
+            }
+        };
+        return self.searchTextCore(req, max_output_bytes, All{}, null, null);
+    }
+    /// Filter current bodies before offset/limit and refill from an admitted
+    /// ranked prefix. Exhausting that prefix is an explicit budget failure.
+    pub fn searchTextFilteredAlloc(self: *Session, req: @import("request.zig").QueryRequest, max_output_bytes: usize, predicate: anytype, max_candidates: usize) ![]@import("request.zig").SearchHit {
+        if (max_candidates == 0 or max_candidates > 4096) return error.QueryCandidateBudgetExceeded;
+        return self.searchTextCore(req, max_output_bytes, predicate, max_candidates, null);
+    }
+    pub const RankPosition = struct { score: u32, id: []const u8 };
+    pub fn searchTextPageAlloc(self: *Session, req: @import("request.zig").QueryRequest, max_output_bytes: usize, predicate: anytype, after: ?RankPosition) ![]@import("request.zig").SearchHit {
+        return self.searchTextCore(req, max_output_bytes, predicate, 4096, after);
+    }
+    fn searchTextCore(self: *Session, req: @import("request.zig").QueryRequest, max_output_bytes: usize, predicate: anytype, candidate_budget: ?usize, after: ?RankPosition) ![]@import("request.zig").SearchHit {
         if (req.mode != .text or req.count_only or req.filter_text != null or req.exclusion_text != null or
             req.filter_prefix != null or req.fields != null or req.semantic_search != null or req.indexes != null or req.vector != null or req.sparse != null)
             return error.FreshQueryCapabilityUnsupported;
@@ -119,21 +137,23 @@ pub const Session = struct {
         var segment = try builder.allocTextSegmentAlloc(self.alloc, docs.items, spec, if (self.io) |io| .{ .io = io, .cooperative = self.cancellation } else null);
         defer segment.deinit(self.alloc);
         const needed = req.offset + req.limit;
-        const recent = try indexed.searchTextSegmentDocIdsWithCancellationAlloc(self.alloc, segment, req.text, req.operator, 0, needed, req.min_score, self.cancellation);
+        const recent = try indexed.searchTextSegmentDocIdsWithCancellationAlloc(self.alloc, segment, req.text, req.operator, 0, candidate_budget orelse needed, req.min_score, self.cancellation);
         defer indexed.freeScoredDocs(self.alloc, recent);
         var candidates: std.ArrayListUnmanaged(indexed.ScoredDoc) = .empty;
         defer {
             for (candidates.items) |hit| self.alloc.free(hit.doc_id);
             candidates.deinit(self.alloc);
         }
+        var base_exhausted = true;
         if (self.published) |*published| {
             var base_req = req;
             base_req.offset = 0;
             // At most one published candidate per changed identity can be
             // invalidated. Asking for this extra prefix guarantees page refill.
-            base_req.limit = needed + self.view.overlay.by_id.count();
+            base_req.limit = candidate_budget orelse (needed + self.view.overlay.by_id.count());
             const base = try indexed.searchTextAlloc(self.alloc, published, base_req);
             defer indexed.freeScoredDocs(self.alloc, base);
+            base_exhausted = base.len < base_req.limit;
             for (base) |hit| if (self.view.overlay.lookup(hit.doc_id) == .unchanged) {
                 const id = try self.alloc.dupe(u8, hit.doc_id);
                 errdefer self.alloc.free(id);
@@ -150,26 +170,50 @@ pub const Session = struct {
                 return if (l.score != r.score) l.score > r.score else std.mem.order(u8, l.doc_id, r.doc_id) == .lt;
             }
         }.less);
-        const start = @min(req.offset, candidates.items.len);
-        const end = @min(needed, candidates.items.len);
-        const hits = try self.alloc.alloc(@import("request.zig").SearchHit, end - start);
-        var initialized: usize = 0;
-        var bytes: usize = 0;
+        var hits: std.ArrayListUnmanaged(@import("request.zig").SearchHit) = .empty;
         errdefer {
-            for (hits[0..initialized]) |*hit| hit.deinit(self.alloc);
-            self.alloc.free(hits);
+            for (hits.items) |*hit| hit.deinit(self.alloc);
+            hits.deinit(self.alloc);
         }
-        for (candidates.items[start..end], hits) |candidate, *hit| {
+        var bytes: usize = 0;
+        var matched: usize = 0;
+        for (candidates.items) |candidate| {
             try self.cancellation.check();
+            if (after) |position| if (candidate.score > position.score or (candidate.score == position.score and std.mem.order(u8, candidate.doc_id, position.id) != .gt)) continue;
             const body = (try self.lookupAlloc(candidate.doc_id)) orelse return error.DocumentBodyNotFound;
-            errdefer self.alloc.free(body);
+            defer self.alloc.free(body);
+            if (!try predicate.matches(Overlay.Document{ .doc_id = candidate.doc_id, .body = body })) continue;
+            matched += 1;
+            if (matched <= req.offset) continue;
             bytes = std.math.add(usize, bytes, body.len + candidate.doc_id.len) catch return error.QueryCandidateBudgetExceeded;
             if (bytes > max_output_bytes) return error.QueryCandidateBudgetExceeded;
             const id = try self.alloc.dupe(u8, candidate.doc_id);
-            hit.* = .{ .doc_id = id, .body = body, .score = candidate.score };
-            initialized += 1;
+            errdefer self.alloc.free(id);
+            const owned_body = try self.alloc.dupe(u8, body);
+            errdefer self.alloc.free(owned_body);
+            try hits.append(self.alloc, .{ .doc_id = id, .body = owned_body, .score = candidate.score });
+            if (hits.items.len == req.limit) break;
         }
-        return hits;
+        if (candidate_budget != null and hits.items.len < req.limit and (!base_exhausted or recent.len == candidate_budget.?)) return error.QueryCandidateBudgetExceeded;
+        return hits.toOwnedSlice(self.alloc);
+    }
+
+    pub fn countDocuments(self: *Session) !u64 {
+        var count: u64 = if (self.published) |published| published.manifest.stats.document_count else 0;
+        for (self.view.overlay.ordered) |id| {
+            try self.cancellation.check();
+            const existed = if (self.reader) |reader| (try reader.lookup(id)) != null else false;
+            switch (self.view.overlay.lookup(id)) {
+                .deleted => if (existed) {
+                    count -= 1;
+                },
+                .present => if (!existed) {
+                    count = try std.math.add(u64, count, 1);
+                },
+                .unchanged => unreachable,
+            }
+        }
+        return count;
     }
 
     pub fn generation(self: *const Session) u64 {

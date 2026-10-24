@@ -19,7 +19,7 @@ import { ObjectStoreError } from "./r2.mjs";
 export function createImmutableReadCache({ maxBytes = 8 * 1024 * 1024, maxEntries = 128 } = {}) {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || !Number.isSafeInteger(maxEntries) || maxEntries < 0) throw new TypeError("invalid cache budget");
   const entries = new Map(); let retained = 0;
-  const eligible = key => /\/wal-v1\/[a-f0-9]{64}\/pages\/[a-f0-9]{64}$/.test(key) ||
+  const eligible = key => /\/wal-v1\/[a-f0-9]{64}\/pages\/(?:[a-f0-9]{32}\/)?[a-f0-9]{64}$/.test(key) ||
     /\/artifacts\/(?:sha256\/[a-f0-9]{2}\/[a-f0-9]{62}|graph\/[a-f0-9]{64}\/[a-f0-9]{32}\/[a-f0-9]{64})$/.test(key);
   function evict(key) { const item = entries.get(key); if (item) retained -= item.charge; entries.delete(key); }
   return {

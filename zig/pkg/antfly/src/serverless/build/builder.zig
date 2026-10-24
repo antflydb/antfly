@@ -2784,6 +2784,15 @@ pub fn materializeManifestFactsAlloc(alloc: Allocator, artifacts: *artifacts_mod
     var pages = graph_page_store.PageStore{ .domain = graph_page_store.PageStore.namespaceDomain(manifest.namespace), .artifacts = artifacts, .cancellation = bridge.token(), .remaining_read_bytes = &read_budget, .remaining_write_bytes = &write_budget };
     const root = try document_facts.loadRoot(alloc, &pages, ref);
     if (root.wal_end_lsn != manifest.wal_end_lsn) return error.DocumentFactsSourceChanged;
+    if (findArtifactIndex(manifest, .document_segment)) |index| {
+        const snapshot = manifest.artifacts[index];
+        try @import("../artifacts/store.zig").chargeReadBudget(&read_budget, snapshot.byte_len);
+        const payload = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(alloc, snapshot.artifact_id, snapshot.byte_len, snapshot.checksum, bridge.token());
+        defer alloc.free(payload);
+        const entries = try document_segment_mod.decodeAlloc(alloc, payload);
+        defer document_segment_mod.freeEntries(alloc, entries);
+        return document_facts_builder.materializeWithSnapshotAlloc(alloc, &pages, root, entries);
+    }
     return document_facts_builder.materializeAllAlloc(alloc, &pages, root);
 }
 

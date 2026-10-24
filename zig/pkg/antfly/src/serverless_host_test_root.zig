@@ -16,6 +16,7 @@
 test {
     _ = @import("serverless/query/live_view.zig");
     _ = @import("serverless/query/live_overlay.zig");
+    _ = @import("serverless/query/live_filter.zig");
     _ = @import("serverless/visibility.zig");
     _ = @import("serverless/wal/indexed_object_store.zig");
 }
