@@ -174,12 +174,13 @@ fn inspectionScope(a: A, store: native.Store, selected: []const Consumer, source
     if (try store.component(source.cfg.key_template, &.{key})) |snapshot| return snapshot;
     // Read-only legacy inspection folds only this namespace. Its first
     // authorized mutation publishes the native records.
-    var namespace: policy.Namespace = .{ .key_template = source.cfg.key_template };
+    var builder: policy.NamespaceBuilder = .{ .template = source.cfg.key_template };
     for (selected) |consumer| {
         if (consumer.synthetic or !std.mem.eql(u8, consumer.cfg.key_template, source.cfg.key_template)) continue;
         const cfg = try consumer.db.core.index_manager.resolverDescriptor(a, consumer.cfg.name, false) orelse return error.ResolverCurationConflict;
-        namespace = try policy.foldNamespace(a, namespace, cfg);
+        try builder.add(a, a, cfg);
     }
+    const namespace = try builder.finish(a);
     return .{ .head = .{ .key_template = namespace.key_template, .revision = namespace.revision }, .namespace = namespace };
 }
 fn consumerProfiles(a: A, selected: []const Consumer, template: []const u8) ![]const native.AliasProfile {

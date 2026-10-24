@@ -275,6 +275,7 @@ pub const ResolverObservation = struct {
     retired: bool,
     promote: bool,
     config_generation: u64,
+    effective_generation: u64 = 0,
     namespace_generation: u64,
     curation_revision: u64,
     namespace_curation_table_id: u64,
@@ -287,7 +288,7 @@ pub const ResolverObservation = struct {
         const table = try a.dupe(u8, cfg.table);
         errdefer a.free(table);
         const template = try a.dupe(u8, cfg.key_template);
-        return .{ .name = name, .table = table, .key_template = template, .retired = cfg.retired, .promote = cfg.promote, .config_generation = cfg.config_generation, .namespace_generation = cfg.namespace_generation, .curation_revision = cfg.curation_revision, .namespace_curation_table_id = cfg.namespace_curation_table_id, .namespace_curation_generation = cfg.namespace_curation_generation, .namespace_curation_missing = cfg.namespace_curation_missing };
+        return .{ .name = name, .table = table, .key_template = template, .retired = cfg.retired, .promote = cfg.promote, .config_generation = cfg.config_generation, .effective_generation = cfg.effectiveGeneration(), .namespace_generation = cfg.namespace_generation, .curation_revision = cfg.curation_revision, .namespace_curation_table_id = cfg.namespace_curation_table_id, .namespace_curation_generation = cfg.namespace_curation_generation, .namespace_curation_missing = cfg.namespace_curation_missing };
     }
     pub fn deinit(self: *ResolverObservation, a: Allocator) void {
         a.free(self.name);

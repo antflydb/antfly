@@ -2105,3 +2105,34 @@ edits and deletions update postings and reference-counted routes atomically.
 Decoder 43 rebuilds the namespace routing index through the bounded bootstrap
 worker before publishing v3 readiness. Its records remain in the resolver
 namespace snapshot projection; legacy reads retain their scan path until ready.
+
+### Scoped diagnostics and batched metadata
+
+Owner progress reads scalar catalog descriptors without cloning aliases,
+provider configuration or namespace policy. The private progress request accepts
+`resolver_names`: omission enumerates public active identities, an empty list
+selects none, and a named set uses the catalog's identity index. Point waits
+filter heartbeat diagnostics to those identities and probe only their progress;
+an unrelated resolver's backlog does not cause another owner request.
+
+HTTP reads and metadata apply share a name-indexed declaration/identity join,
+including dropped fences, retired identities and shared policy validation.
+Projection propagation resolves each destination and namespace binding once per
+transaction, replaces the identity set in one batch, and serializes metadata
+once. Existing projection attachments and retirement records survive the batch.
+Namespace/source postings are rewritten only when their encoded content changes.
+
+A shared streaming namespace builder owns unique policy entries independently of
+consumer transport pages. Routed adoption releases each page after consumption;
+embedded adoption uses the same union semantics. Both validate the final graph
+once before publication, preserving the revision cut, origin precedence and
+static-policy checks. Scale regressions cover 5,000 independent policy pages,
+1,000 shared source bindings, reversed identity joins and progress reports under
+a fixed allocation budget with large configured policies.
+
+Destination-wide reverse bindings contain only source IDs. Scoped postings are
+the sole descriptor directory; old aggregate descriptor rows are retired during
+ordinary reconciliation or bounded bootstrap. Dependency maintenance caches
+logical destination resolution per source cut, so repeated declarations do not
+reparse the same destination catalog. Legacy read-only inspection also uses the
+shared streaming union before a namespace has been adopted.

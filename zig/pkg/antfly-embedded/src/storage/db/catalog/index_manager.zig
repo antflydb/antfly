@@ -13312,28 +13312,42 @@ pub const IndexManager = struct {
         return result.toOwnedSlice(alloc);
     }
 
-    /// One catalog pass for a batch of replay observations. Policy, providers,
-    /// aliases and extraction config never enter a wait-loop snapshot.
     pub fn resolverObservationDescriptors(self: *IndexManager, alloc: Allocator, names: []const []const u8) ![]resolver_catalog.ResolverObservation {
-        self.catalog_mutex.lockShared();
-        defer self.catalog_mutex.unlockShared();
-        var wanted: std.StringHashMapUnmanaged(void) = .empty;
-        defer wanted.deinit(alloc);
-        for (names) |name| try wanted.put(alloc, name, {});
+        return self.resolverScalarDescriptors(alloc, names, false);
+    }
+    /// null requests all public active identities; an empty set requests none.
+    pub fn resolverProgressDescriptors(self: *IndexManager, alloc: Allocator, names: ?[]const []const u8) ![]resolver_catalog.ResolverObservation {
+        return self.resolverScalarDescriptors(alloc, names, true);
+    }
+    fn resolverScalarDescriptors(self: *IndexManager, alloc: Allocator, names: ?[]const []const u8, public_only: bool) ![]resolver_catalog.ResolverObservation {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.ensureResolverLookup();
         var result: std.ArrayList(resolver_catalog.ResolverObservation) = .empty;
         errdefer {
             for (result.items) |*cfg| cfg.deinit(alloc);
             result.deinit(alloc);
         }
-        for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }) |definitions| for (definitions) |definition| {
-            if (!wanted.contains(definition.name)) continue;
-            const owned = try resolver_catalog.ResolverObservation.fromConfig(alloc, definition);
-            errdefer {
-                var cleanup = owned;
-                cleanup.deinit(alloc);
+        if (names) |selected| {
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            defer seen.deinit(alloc);
+            for (selected) |name| {
+                if ((try seen.getOrPut(alloc, name)).found_existing) continue;
+                const slot = self.resolver_namespace_lookup.?.names.get(name) orelse continue;
+                const cfg = if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index];
+                if (public_only and (cfg.retired or cfg.replacement_index.len > 0)) continue;
+                var owned = try resolver_catalog.ResolverObservation.fromConfig(alloc, cfg);
+                errdefer owned.deinit(alloc);
+                try result.append(alloc, owned);
             }
-            try result.append(alloc, owned);
-        };
+        } else {
+            for (self.resolvers.items) |cfg| {
+                if (public_only and cfg.replacement_index.len > 0) continue;
+                var owned = try resolver_catalog.ResolverObservation.fromConfig(alloc, cfg);
+                errdefer owned.deinit(alloc);
+                try result.append(alloc, owned);
+            }
+        }
         return result.toOwnedSlice(alloc);
     }
 
