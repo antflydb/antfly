@@ -461,6 +461,54 @@ def test_generated_request_models_preserve_nested_configuration(extraction: bool
     assert result.model == "registered"
 
 
+def test_direct_document_read_preserves_page_identity_and_artifact():
+    request = {
+        "model": "balanced",
+        "retain_artifact": True,
+        "documents": [
+            {"id": "receipt", "url": "data:application/pdf;base64,ZmFrZQ==", "media_type": "application/pdf"}
+        ],
+    }
+    payload = {
+        "object": "list",
+        "model": "balanced",
+        "data": [
+            {
+                "object": "read",
+                "index": 0,
+                "source_id": "receipt",
+                "number": 2,
+                "text": "Total 12.50",
+                "origin": "transcription",
+                "regions": [
+                    {
+                        "id": 4,
+                        "bbox": [0, 0, 100, 20],
+                        "text": "Total 12.50",
+                        "text_start": 0,
+                        "text_end": 11,
+                        "origin": "transcription",
+                        "children": [{"id": 1, "text": "12.50", "text_start": 6, "text_end": 11}],
+                        "tables": [{"id": 1, "cells": [{"text": "12.50"}]}],
+                        "fields": {"total": "12.50"},
+                    }
+                ],
+                "inherited_parts": [{"path": "ppt/slideMasters/slideMaster1.xml", "shapes_visible": False}],
+            }
+        ],
+        "document": {"artifact_id": "a" * 64},
+    }
+
+    def handler(incoming):
+        assert incoming.url.path == "/ai/v1/read"
+        assert json.loads(incoming.read()) == request
+        return httpx.Response(200, json=payload)
+
+    client = AntflyClient("http://test")
+    client._client.set_httpx_client(httpx.Client(base_url="http://test", transport=httpx.MockTransport(handler)))
+    assert client.read(request).to_dict() == payload
+
+
 def test_tool_call_preserves_provider_metadata_for_replay() -> None:
     from antfly.client_generated.models import ToolCall
 

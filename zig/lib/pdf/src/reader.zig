@@ -1399,10 +1399,32 @@ const LayoutTextRun = struct {
     }
 };
 
+/// Inspect decoded operators without materializing images or vector paths.
+/// Strings/comments are lexed normally, so text containing operator names does
+/// not trigger visual work. Form/image invocations conservatively require it.
+fn contentHasNontextPaint(alloc: Allocator, bytes: []const u8, cancellation: CancellationProbe) !bool {
+    var scanner = syntax.Scanner.init(alloc, bytes);
+    defer scanner.deinit();
+    var count: usize = 0;
+    while (true) {
+        if (count & 255 == 0) try cancellation.check();
+        count +|= 1;
+        var token = (try readContentLexeme(&scanner)) orelse continue;
+        defer syntax.Scanner.freeLexeme(alloc, &token);
+        if (token == .eof) return false;
+        if (token != .keyword) continue;
+        for ([_][]const u8{ "Do", "BI", "S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "sh" }) |operator| {
+            if (std.mem.eql(u8, token.keyword, operator)) return true;
+        }
+    }
+}
+
 pub const PageTextAnalysis = struct {
     text: []u8,
     runs: []TextRun,
     outline_fallback: bool = false,
+    has_nontext_visual: bool = false,
+    has_unrendered_annotations: bool = false,
 
     pub fn deinit(self: *PageTextAnalysis, alloc: Allocator) void {
         alloc.free(self.text);
@@ -4623,6 +4645,109 @@ pub const Reader = struct {
         return owned_text;
     }
 
+    /// Metadata-only coverage inspection: never decode appearance streams or
+    /// execute annotation actions. Non-hidden screen/print content needs a
+    /// compositor; a page-content-only renderer must not silently omit it.
+    pub fn pageHasVisibleAnnotations(self: *Reader, page_num: usize) !bool {
+        var page = try self.readPageObject(page_num);
+        defer page.deinit(self.alloc);
+        return self.pageHasVisibleAnnotationsFromObject(&page);
+    }
+
+    const AnnotationValue = struct {
+        value: syntax.Object,
+        owned: bool = false,
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            if (self.owned) self.value.deinit(alloc);
+        }
+    };
+    fn annotationValue(self: *Reader, object: *const syntax.Object) !AnnotationValue {
+        var result = AnnotationValue{ .value = object.* };
+        errdefer result.deinit(self.alloc);
+        for (0..32) |_| {
+            if (result.value != .obj_ref) return result;
+            try self.checkCancellation();
+            const next = try self.readIndirectObject(result.value.obj_ref);
+            result.deinit(self.alloc);
+            result = .{ .value = next, .owned = true };
+        }
+        return error.InvalidPdfAnnotations;
+    }
+    fn annotationNumber(self: *Reader, object: *const syntax.Object) !f64 {
+        var resolved = try self.annotationValue(object);
+        defer resolved.deinit(self.alloc);
+        const number: f64 = switch (resolved.value) {
+            .integer => |n| @floatFromInt(n),
+            .real => |n| n,
+            else => return error.InvalidPdfAnnotations,
+        };
+        if (!std.math.isFinite(number)) return error.InvalidPdfAnnotations;
+        return number;
+    }
+    fn pageHasVisibleAnnotationsFromObject(self: *Reader, page: *const syntax.Object) !bool {
+        const annotations = page.get("Annots") orelse return false;
+        var resolved = try self.annotationValue(annotations);
+        defer resolved.deinit(self.alloc);
+        if (resolved.value == .null) return false;
+        if (resolved.value != .array or resolved.value.array.len > 16384) return error.InvalidPdfAnnotations;
+        // Validate all entries even after visible content is found. The bound
+        // and cancellation apply to the entire array, including hidden entries.
+        var visible = false;
+        for (resolved.value.array) |*entry| {
+            try self.checkCancellation();
+            var annotation = try self.annotationValue(entry);
+            defer annotation.deinit(self.alloc);
+            if (annotation.value != .dict) return error.InvalidPdfAnnotations;
+            visible = (try self.annotationIsVisible(&annotation.value)) or visible;
+        }
+        return visible;
+    }
+    fn annotationIsVisible(self: *Reader, annotation: *const syntax.Object) !bool {
+        var flags: u32 = 0;
+        if (annotation.get("F")) |field| {
+            var value = try self.annotationValue(field);
+            defer value.deinit(self.alloc);
+            if (value.value != .integer) return error.InvalidPdfAnnotations;
+            flags = std.math.cast(u32, value.value.integer) orelse return error.InvalidPdfAnnotations;
+        }
+        if (flags & 2 != 0 or (flags & 32 != 0 and flags & 4 == 0 and flags & 256 == 0)) return false;
+        if (annotation.get("Rect")) |field| {
+            var rect = try self.annotationValue(field);
+            defer rect.deinit(self.alloc);
+            if (rect.value != .array or rect.value.array.len != 4) return error.InvalidPdfAnnotations;
+            var box: [4]f64 = undefined;
+            for (&box, rect.value.array) |*n, *coordinate| n.* = try self.annotationNumber(coordinate);
+            if (box[0] == box[2] or box[1] == box[3]) return false;
+        }
+        // Borderless hyperlinks without an appearance have no static paint.
+        // Other unknown/viewer-generated appearances remain unsupported.
+        if (annotation.get("Subtype")) |field| {
+            var subtype = try self.annotationValue(field);
+            defer subtype.deinit(self.alloc);
+            if (subtype.value == .name and std.mem.eql(u8, subtype.value.name, "Link")) {
+                if (annotation.get("AP")) |appearance| {
+                    var ap = try self.annotationValue(appearance);
+                    defer ap.deinit(self.alloc);
+                    if (ap.value != .null) return true;
+                }
+                if (annotation.get("BS")) |field_bs| {
+                    var bs = try self.annotationValue(field_bs);
+                    defer bs.deinit(self.alloc);
+                    if (bs.value != .dict) return error.InvalidPdfAnnotations;
+                    if (bs.value.get("W")) |width| return (try self.annotationNumber(width)) != 0;
+                    return true; // Default border width is nonzero.
+                }
+                if (annotation.get("Border")) |field_border| {
+                    var border = try self.annotationValue(field_border);
+                    defer border.deinit(self.alloc);
+                    if (border.value != .array or border.value.array.len < 3) return error.InvalidPdfAnnotations;
+                    return (try self.annotationNumber(&border.value.array[2])) != 0;
+                }
+            }
+        }
+        return true;
+    }
+
     /// Extracts canonical page text and positioned text runs while sharing the
     /// page object, resource collection, content stream resolution, and stream
     /// decoding work between both representations.
@@ -4634,10 +4759,12 @@ pub const Reader = struct {
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
 
+        const annotations = try self.pageHasVisibleAnnotationsFromObject(&page);
         const contents = page.get("Contents") orelse return .{
             .text = try self.alloc.dupe(u8, ""),
             .runs = try self.alloc.alloc(TextRun, 0),
             .outline_fallback = false,
+            .has_unrendered_annotations = annotations,
         };
         var stream_ranges: ?[]ContentStreamRange = null;
         const decoded_content = try self.readCombinedContentStreamsWithRangesAlloc(contents, &stream_ranges);
@@ -4660,7 +4787,10 @@ pub const Reader = struct {
         }
 
         var analysis = try self.extractDecodedTextAnalysisAlloc(decoded_content, stream_ranges.?, fonts, &.{}, forms, color_spaces);
+        errdefer analysis.deinit(self.alloc);
+        analysis.has_unrendered_annotations = annotations;
         analysis.outline_fallback = pageFontsUsedOutlineFallback(fonts);
+        analysis.has_nontext_visual = try contentHasNontextPaint(self.alloc, decoded_content, self.cancellation);
         return analysis;
     }
 
@@ -4810,6 +4940,7 @@ pub const Reader = struct {
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
+        if (try self.pageHasVisibleAnnotationsFromObject(&page)) return error.UnsupportedPdfAnnotationRendering;
         const page_box = try self.extractPageBoxFromObject(&page);
         const decoded_content = if (page.get("Contents")) |contents|
             try self.readCombinedContentStreamsAlloc(contents)
@@ -31541,4 +31672,64 @@ test "reader resolves indirect Type0 subtype before decoding" {
     const text = try reader.extractPlainTextAlloc();
     defer alloc.free(text);
     try std.testing.expectEqualStrings("A\n", text);
+}
+
+test "document PDF coverage inspects paint operators without confusing literal text" {
+    const a = std.testing.allocator;
+    try std.testing.expect(!try contentHasNontextPaint(a, "BT (S Do BI) Tj ET % f\n", .{}));
+    try std.testing.expect(try contentHasNontextPaint(a, "0 0 30 40 re f", .{}));
+    try std.testing.expect(try contentHasNontextPaint(a, "/Figure Do", .{}));
+    try std.testing.expect(try contentHasNontextPaint(a, "BI /W 1 /H 1 ID binary", .{}));
+}
+
+test "document PDF annotation coverage is bounded and prevents incomplete native painting" {
+    const Case = struct {
+        fn check(a: Allocator) !void {
+            const bytes = try buildImageDecodeTestPdfAlloc(a, &.{
+                "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+                "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+                "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Annots 4 0 R >>\nendobj\n",
+                "4 0 obj\n[5 0 R]\nendobj\n",
+                "5 0 obj\n<< /Subtype /Stamp /Rect [0 0 20 20] /F 6 0 R >>\nendobj\n",
+                "6 0 obj\n4\nendobj\n",
+                "7 0 obj\n8 0 R\nendobj\n",
+                "8 0 obj\n7 0 R\nendobj\n",
+            });
+            defer a.free(bytes);
+            var pdf_reader = try Reader.init(a, bytes);
+            defer pdf_reader.deinit();
+            var analysis = try pdf_reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            try std.testing.expect(analysis.has_unrendered_annotations);
+            if (pdf_reader.extractPageRenderRunsAlloc(1)) |value| {
+                var runs = value;
+                defer runs.deinit(a);
+                return error.TestUnexpectedResult;
+            } else |err| if (err != error.UnsupportedPdfAnnotationRendering) return err;
+            const cycle = syntax.Object{ .obj_ref = .{ .id = 7, .gen = 0 } };
+            if (pdf_reader.annotationValue(&cycle)) |value| {
+                var resolved = value;
+                defer resolved.deinit(a);
+                return error.TestUnexpectedResult;
+            } else |err| if (err != error.InvalidPdfAnnotations) return err;
+            inline for (.{
+                .{ "<< /Subtype /Stamp /F 2 >>", false },
+                .{ "<< /Subtype /Stamp /F 32 >>", false },
+                .{ "<< /Subtype /Stamp /F 36 >>", true },
+                .{ "<< /Subtype /Stamp /F 288 >>", true },
+                .{ "<< /Subtype /Link /Border [0 0 0] >>", false },
+                .{ "<< /Subtype /Link /BS << /W 0 >> >>", false },
+                .{ "<< /Subtype /Link /Border [0 0 0] /AP << /N 5 0 R >> >>", true },
+                .{ "<< /Subtype /Widget /Rect [0 0 20 20] >>", true },
+                .{ "<< /Subtype /Stamp /Rect [0 0 0 20] >>", false },
+            }) |fixture| {
+                var scanner = syntax.Scanner.init(a, fixture[0]);
+                defer scanner.deinit();
+                var annotation = try scanner.readObject();
+                defer annotation.deinit(a);
+                try std.testing.expectEqual(fixture[1], try pdf_reader.annotationIsVisible(&annotation));
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.check, .{});
 }

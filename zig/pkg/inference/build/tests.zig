@@ -49,6 +49,7 @@ pub fn create(ctx: Context) Suite {
     });
     tests.root_module.strip = ctx.strip;
     tests.root_module.addImport("build_info", ctx.graph.build_info_mod);
+    tests.root_module.addImport("antfly_cloudflare", ctx.graph.inference_mod.import_table.get("antfly_cloudflare").?);
     tests.root_module.addImport("antfly_decisions", ctx.graph.inference_mod.import_table.get("antfly_decisions").?);
     tests.root_module.addImport("antfly_structured", ctx.graph.inference_mod.import_table.get("antfly_structured").?);
     ctx.graph.identities.addImports(tests.root_module);

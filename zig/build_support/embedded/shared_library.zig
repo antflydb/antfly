@@ -124,6 +124,17 @@ pub fn addWithStorageOwner(b: *std.Build, module: *std.Build.Module, providers: 
         // Release archives contain only the library, not this diagnostic map.
         run.addArg("--map");
         _ = run.addOutputFileArg("libantfly.map");
+        // With a separate storage owner, objects on the source-less final
+        // module were never bundled into the storage archive. Preserve them
+        // explicitly while deduplicating objects already owned by providers.
+        if (storage_owner != null) {
+            for (module.link_objects.items) |input| {
+                if (input == .other_step and input.other_step.kind == .obj) {
+                    run.addArg("--object");
+                    run.addFileArg(input.other_step.getEmittedBin());
+                }
+            }
+        }
         run.addArg("--");
         var visited: std.AutoHashMap(*std.Build.Module, void) = .init(b.allocator);
         var libraries: std.AutoHashMap(*std.Build.Step.Compile, void) = .init(b.allocator);

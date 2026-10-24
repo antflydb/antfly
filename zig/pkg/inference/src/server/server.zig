@@ -30,6 +30,9 @@ const readers_api = @import("antfly_readers");
 const antfly_image = @import("antfly_image");
 const transcribing_api = @import("antfly_transcribing");
 const extracting_api = @import("antfly_extracting");
+const document_service = @import("../documents/service.zig");
+const document_contract = @import("../documents/contract.zig");
+const cloudflare_provider = @import("antfly_cloudflare");
 const scraping = @import("antfly_scraping");
 const data_uri_mod = scraping.data_uri;
 const ant_json = @import("antfly-json");
@@ -3988,6 +3991,7 @@ test "raw ModernBERT span listing selects only the qualified decision route" {
 
 pub const Node = struct {
     config: NodeConfig,
+    document_artifacts: @import("../documents/artifacts.zig").Store = .{},
     allocator: std.mem.Allocator,
     session_manager: backends_mod.SessionManager,
     model_manager: model_manager_mod.ModelManager,
@@ -4255,6 +4259,7 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
+        self.document_artifacts.deinit(self.allocator);
         // Sessions hold only PCM buffers; drop them before any runtime teardown.
         self.transcription_sessions.deinit();
         var silero_it = self.silero_weights.iterator();
@@ -7569,6 +7574,7 @@ pub const Node = struct {
     }
 
     const Qwen3VlReadResult = struct {
+        truncated: bool = false,
         text: []u8,
         prompt_tokens: usize,
         completion_tokens: usize,
@@ -7592,7 +7598,7 @@ pub const Node = struct {
             allocator.free(out);
         }
         for (results, images, out) |result, image, *item| {
-            item.* = .{ .text = try allocator.dupe(u8, result.text) };
+            item.* = .{ .text = try allocator.dupe(u8, result.text), .completion = if (result.truncated) .length else .complete, .prompt_tokens = result.prompt_tokens, .completion_tokens = result.completion_tokens };
             initialized += 1;
             item.item_id = if (image.item_id.len > 0) try allocator.dupe(u8, image.item_id) else "";
             item.source_fingerprint = if (image.source_fingerprint) |value| try allocator.dupe(u8, value) else null;
@@ -7600,6 +7606,7 @@ pub const Node = struct {
         }
         return .{
             .items = out,
+            .usage = try readers_api.measuredUsage(out),
             .execution = .{ .requested_items = out.len, .serial_items = out.len },
         };
     }
@@ -7613,6 +7620,7 @@ pub const Node = struct {
         requested_max_tokens: ?usize,
         reserved_units: *usize,
         control: InferenceExecutionControl,
+        allow_incomplete: bool,
     ) ![]Qwen3VlReadResult {
         try control.update(.loading_model, 0, 1);
         const prompt = qwen3vl_reader_mod.resolvePrompt(requested_prompt);
@@ -7684,12 +7692,13 @@ pub const Node = struct {
                 "qwen3vl_read_timing_ms: page={d} resolve={d} load={d} setup={d} generate={d} total={d}",
                 .{ i, read_timing.resolve_ms, read_timing.load_ms, read_timing.setup_ms, read_timing.generate_ms, read_timing.total_ms },
             );
-            if (generated.truncated) {
+            if (generated.truncated and !allow_incomplete) {
                 allocator.free(generated.text);
                 return error.ReadOutputTruncated;
             }
             out[i] = .{
                 .text = generated.text,
+                .truncated = generated.truncated,
                 .prompt_tokens = generated.prompt_tokens,
                 .completion_tokens = generated.completion_tokens,
             };
@@ -7716,6 +7725,25 @@ pub const Node = struct {
     ) ![]readers_api.Result {
         const control = self.bindExecutionControl(null, supplied_control);
         try control.check();
+        const definition = try self.documentDefinition(allocator, model_name, .read);
+        defer if (definition) |bytes| allocator.free(bytes);
+        if (request.documents.len > 0 or definition != null or std.mem.eql(u8, model_name, "antfly/native-document")) {
+            if (request.documents.len > 0 and request.images.len > 0) return error.InvalidDocumentSource;
+            const Image = struct { url: []const u8 };
+            const images = try allocator.alloc(Image, request.images.len);
+            defer allocator.free(images);
+            for (images, request.images) |*image, url| image.* = .{ .url = url };
+            const bytes = if (request.documents.len > 0)
+                try std.json.Stringify.valueAlloc(allocator, .{ .model = model_name, .documents = request.documents, .prompt = request.prompt, .max_tokens = request.max_tokens }, .{ .emit_null_optional_fields = false })
+            else
+                try std.json.Stringify.valueAlloc(allocator, .{ .model = model_name, .images = images, .prompt = request.prompt, .max_tokens = request.max_tokens }, .{ .emit_null_optional_fields = false });
+            defer allocator.free(bytes);
+            const result = try self.readDocumentsJsonWithControl(allocator, bytes, control);
+            defer allocator.free(result);
+            if (request.max_response_bytes) |limit| if (result.len > limit) return error.ResponseTooLarge;
+            return readers_api.documentResults(allocator, result);
+        }
+
         if (request.images.len == 0) return try allocator.alloc(readers_api.Result, 0);
         if (request.images.len > max_read_batch_images) return error.ReadBatchTooLarge;
         const max_tokens = try validateReadMaxTokens(request.max_tokens);
@@ -7800,6 +7828,7 @@ pub const Node = struct {
                 max_tokens,
                 &reserved_units,
                 control,
+                false,
             );
             defer {
                 for (qwen_results) |*result| result.deinit(allocator);
@@ -7898,6 +7927,32 @@ pub const Node = struct {
         if (request.images.len > max_read_batch_images) return error.ReadBatchTooLarge;
         try readers_api.validateEncodedRequest(request);
         const max_tokens = try validateReadMaxTokens(request.max_tokens);
+        if (!std.fs.path.isAbsolute(model_name)) {
+            const definition = try self.documentDefinition(allocator, model_name, .read);
+            defer if (definition) |bytes| allocator.free(bytes);
+            if (definition != null or std.mem.eql(u8, model_name, "antfly/native-document")) {
+                var probe = BorrowedReadControl{ .deadline_ns = deadline_ns, .cancellation = cancellation };
+                const control = self.bindExecutionControl(null, .{ .deadline_ns = deadline_ns, .ptr = &probe, .check_fn = BorrowedReadControl.check });
+                const result = try self.documentOperationJson(allocator, model_name, control, .read, request);
+                defer allocator.free(result);
+                if (request.max_response_bytes) |limit| if (result.len > limit) return error.ResponseTooLarge;
+                const batch = try readers_api.documentBatchResult(allocator, result);
+                const items = batch.items;
+                errdefer {
+                    for (items) |*item| readers_api.deinitResult(allocator, item);
+                    allocator.free(items);
+                }
+                if (items.len != request.images.len) return error.InvalidReadResultCount;
+                for (items, request.images) |*item, original| {
+                    if (item.item_id.len > 0) allocator.free(@constCast(item.item_id));
+                    item.item_id = "";
+                    if (original.item_id.len > 0) item.item_id = try allocator.dupe(u8, original.item_id);
+                    item.page_number = original.page_number;
+                    if (original.source_fingerprint) |fingerprint| item.source_fingerprint = try allocator.dupe(u8, fingerprint);
+                }
+                return batch;
+            }
+        }
         const security = effectiveRequestContentSecurity(self);
         const per_image_byte_cap = std.math.cast(
             usize,
@@ -7975,6 +8030,7 @@ pub const Node = struct {
                     max_tokens,
                     &reserved_units,
                     execution_control,
+                    request.allow_incomplete,
                 );
                 defer {
                     for (results) |*result| result.deinit(allocator);
@@ -8130,6 +8186,8 @@ pub const Node = struct {
     fn cloneReaderApiResult(allocator: std.mem.Allocator, source: readers_api.Result) !readers_api.Result {
         const text = try allocator.dupe(u8, source.text);
         errdefer allocator.free(text);
+        const document_json = if (source.document_json) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (document_json) |value| allocator.free(value);
         const fields_json = if (source.fields_json) |value| try allocator.dupe(u8, value) else null;
         errdefer if (fields_json) |value| allocator.free(value);
         const regions_json = if (source.regions_json) |value| try allocator.dupe(u8, value) else null;
@@ -8140,6 +8198,10 @@ pub const Node = struct {
         errdefer if (source_fingerprint) |value| allocator.free(value);
         return .{
             .text = text,
+            .document_json = document_json,
+            .completion = source.completion,
+            .prompt_tokens = source.prompt_tokens,
+            .completion_tokens = source.completion_tokens,
             .fields_json = fields_json,
             .regions_json = regions_json,
             .item_id = item_id,
@@ -8671,7 +8733,7 @@ pub const Node = struct {
         if (execution.fallback_items > 0)
             execution.fallback_reason = "native reader microbatch fallback";
         try execution.validate(items.len);
-        return .{ .items = items, .execution = execution };
+        return .{ .items = items, .execution = execution, .usage = try readers_api.measuredUsage(items) };
     }
 
     fn runReadImageBatchDirect(
@@ -8797,7 +8859,7 @@ pub const Node = struct {
         }
         for (results, rasters, out, 0..) |result, raster, *item, index| {
             const result_allocator = if (result_allocators) |allocators| allocators[index] else allocator;
-            item.* = .{ .text = try result_allocator.dupe(u8, result.text) };
+            item.* = .{ .text = try result_allocator.dupe(u8, result.text), .completion = result.completion, .prompt_tokens = exact_prompt_tokens, .completion_tokens = result.completion_tokens };
             errdefer readers_api.deinitResult(result_allocator, item);
             item.fields_json = try readerFieldsJsonAlloc(result_allocator, result.fields);
             item.regions_json = try readerRegionsJsonAlloc(result_allocator, result.regions);
@@ -8808,6 +8870,7 @@ pub const Node = struct {
         }
         return .{
             .items = out,
+            .usage = try readers_api.measuredUsage(out),
             .execution = switch (raw_batch.mode) {
                 .native => .{
                     .requested_items = rasters.len,
@@ -8931,6 +8994,9 @@ pub const Node = struct {
             const result_allocator = if (result_allocators) |allocators| allocators[i] else allocator;
             var item: readers_api.Result = .{
                 .text = try result_allocator.dupe(u8, result.text),
+                .completion = result.completion,
+                .prompt_tokens = exact_prompt_tokens,
+                .completion_tokens = result.completion_tokens,
             };
             errdefer readers_api.deinitResult(result_allocator, &item);
             item.fields_json = try readerFieldsJsonAlloc(result_allocator, result.fields);
@@ -8945,6 +9011,7 @@ pub const Node = struct {
         }
         return .{
             .items = out,
+            .usage = try readers_api.measuredUsage(out),
             .execution = switch (batch.mode) {
                 .native => .{
                     .requested_items = image_datas.len,
@@ -9313,7 +9380,7 @@ pub const Node = struct {
         model_name: []const u8,
         request: extracting_api.Request,
     ) !extracting_api.Response {
-        return self.extractWithAdmission(allocator, model_name, request, .direct, null);
+        return self.extractDirectWithControl(allocator, model_name, request, .{});
     }
 
     pub fn extractDirectWithControl(
@@ -9323,6 +9390,14 @@ pub const Node = struct {
         request: extracting_api.Request,
         control: InferenceExecutionControl,
     ) !extracting_api.Response {
+        try control.check();
+        const definition = try self.documentDefinition(allocator, model_name, .extract);
+        defer if (definition) |bytes| allocator.free(bytes);
+        if (definition != null) {
+            const json = try extracting_api.requestJsonAlloc(allocator, .{ .provider = .antfly, .model = model_name }, request);
+            defer allocator.free(json);
+            return .{ .allocator = allocator, .json = try self.extractDocumentsJsonWithControl(allocator, json, control) };
+        }
         return self.extractWithAdmission(allocator, model_name, request, .direct, control);
     }
 
@@ -9358,6 +9433,13 @@ pub const Node = struct {
         request_json: []const u8,
         control: ?InferenceExecutionControl,
     ) !extracting_api.Response {
+        if (control) |active| try active.check();
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, request_json, .{ .duplicate_field_behavior = .@"error" });
+        defer parsed.deinit();
+        if (try self.isDocumentOperation(allocator, parsed.value, .extract)) return .{
+            .allocator = allocator,
+            .json = try self.extractDocumentsJsonWithControl(allocator, request_json, control orelse .{}),
+        };
         var failure = extraction_v2.FailureContext{};
         return self.extractV2WithAdmission(allocator, .{ .json = request_json }, .direct, control, &failure, null, "extract");
     }
@@ -17912,7 +17994,269 @@ pub const Node = struct {
         return ctx.json(.{ .object = "list", .model = "Apple Vision OCR", .data = items });
     }
 
+    pub fn readDocumentsJsonWithControl(self: *Node, a: std.mem.Allocator, json: []const u8, control: InferenceExecutionControl) ![]u8 {
+        return self.documentOperationJson(a, json, control, .read, null);
+    }
+
+    pub fn extractDocumentsJsonWithControl(self: *Node, a: std.mem.Allocator, json: []const u8, control: InferenceExecutionControl) ![]u8 {
+        return self.documentOperationJson(a, json, control, .extract, null);
+    }
+
+    fn admitDocumentHost(self: *Node, bytes: usize) !runtime.tier.memory.AdmissionLease {
+        self.document_artifacts.pruneExpired(self.allocator, platform.time.monotonicNs());
+        var evictions: usize = 0;
+        while (true) {
+            return self.model_manager.admitHostPreflight(bytes) catch |err| switch (err) {
+                error.ResourceTemporarilyUnavailable => {
+                    if (evictions >= 128 or !self.document_artifacts.evictOldest(self.allocator)) return err;
+                    evictions += 1;
+                    continue;
+                },
+                else => return err,
+            };
+        }
+    }
+
+    fn documentOperationJson(self: *Node, output: std.mem.Allocator, json: []const u8, supplied: InferenceExecutionControl, operation: enum { read, extract }, encoded: ?readers_api.EncodedRequest) ![]u8 {
+        const Admission = struct {
+            fn acquire(raw: *anyopaque, bytes: usize) !runtime.tier.memory.AdmissionLease {
+                const node: *Node = @ptrCast(@alignCast(raw));
+                return node.admitDocumentHost(bytes);
+            }
+        };
+        var admitted = @import("../backends/admitted_allocator.zig").AdmittedAllocator{ .backing = std.heap.smp_allocator, .admission_context = self, .admit = Admission.acquire, .trim_on_free = true };
+        defer admitted.deinit();
+        var bounded = BoundedRequestAllocator{ .backing = admitted.allocator(), .limit = 512 * 1024 * 1024 };
+        const a = bounded.allocator();
+        const control = self.bindExecutionControl(null, supplied);
+        const result = (switch (operation) {
+            .read => if (encoded) |request| document_service.Service(Node).readEncodedJson(self, a, json, request, control) else document_service.Service(Node).readJson(self, a, json, control),
+            .extract => document_service.Service(Node).extractJson(self, a, json, control),
+        }) catch |err| {
+            if (err == error.OutOfMemory) {
+                if (admitted.admission_error) |failure| return failure;
+                if (bounded.denied) return error.DocumentMemoryLimitExceeded;
+            }
+            return err;
+        };
+        defer a.free(result);
+        if (operation == .read and encoded == null) {
+            const request = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+            const retain = cloudflare_provider.field(request, "retain_artifact");
+            if (retain != null and retain.? == .bool and retain.?.bool) {
+                // Timer failure disables optional retention; reading still succeeds.
+                self.document_artifacts.startMaintenance(self.allocator, self.session_manager.io, platform.time.monotonicNs) catch return output.dupe(u8, result);
+                const Lease = struct {
+                    allocator: std.mem.Allocator,
+                    lease: runtime.tier.memory.AdmissionLease,
+                    fn release(raw: ?*anyopaque) void {
+                        const owner: *@This() = @ptrCast(@alignCast(raw.?));
+                        owner.lease.release();
+                        owner.allocator.destroy(owner);
+                    }
+                };
+                const charge = self.allocator.create(Lease) catch return output.dupe(u8, result);
+                charge.* = .{ .allocator = self.allocator, .lease = self.admitDocumentHost(result.len + @sizeOf(Lease) + @import("../documents/artifacts.zig").retention_overhead) catch {
+                    self.allocator.destroy(charge);
+                    return output.dupe(u8, result);
+                } };
+                var entropy: [32]u8 = undefined;
+                fillRandomBytes(&entropy) catch {
+                    Lease.release(charge);
+                    return output.dupe(u8, result);
+                };
+                const key = std.fmt.bytesToHex(entropy, .lower);
+                const retained = self.document_artifacts.put(self.allocator, key, result, platform.time.monotonicNs() +| 5 * std.time.ns_per_min, .{ .ptr = charge, .release_fn = Lease.release }) catch {
+                    Lease.release(charge);
+                    return output.dupe(u8, result);
+                };
+                if (!retained) {
+                    Lease.release(charge);
+                    return output.dupe(u8, result);
+                }
+                var envelope = try std.json.parseFromSliceLeaky(std.json.Value, a, result, .{});
+                const document = envelope.object.getPtr("document").?;
+                try document.object.put(a, "artifact_id", .{ .string = &key });
+                try document.object.put(a, "artifact_ttl_ms", .{ .integer = 300000 });
+                return std.json.Stringify.valueAlloc(output, envelope, .{});
+            }
+        }
+        return output.dupe(u8, result);
+    }
+
+    pub fn borrowDocumentArtifact(self: *Node, handle: []const u8) !@import("../documents/artifacts.zig").Snapshot {
+        return self.document_artifacts.acquire(self.allocator, handle, platform.time.monotonicNs());
+    }
+
+    pub fn readDocumentArtifact(self: *Node, a: std.mem.Allocator, handle: []const u8) ![]u8 {
+        return self.document_artifacts.get(self.allocator, a, handle, platform.time.monotonicNs());
+    }
+
+    fn isDocumentOperation(self: *Node, a: std.mem.Allocator, root: std.json.Value, operation: document_contract.Operation) !bool {
+        if (root != .object) return false;
+        if (root.object.contains("documents") or root.object.contains("read_artifact")) return true;
+        if (root.object.get("retain_artifact")) |value| if (value == .bool and value.bool) return true;
+        const model = root.object.get("model") orelse return false;
+        if (model != .string) return false;
+        if (std.mem.eql(u8, model.string, "antfly/native-document")) return true;
+        const definition = try self.documentDefinition(a, model.string, operation);
+        defer if (definition) |bytes| a.free(bytes);
+        return definition != null;
+    }
+
+    /// Resolve in exactly the requested task namespace. A reader and an
+    /// extractor may intentionally share a public model identifier.
+    pub fn documentDefinition(self: *Node, a: std.mem.Allocator, name: []const u8, operation: document_contract.Operation) !?[]const u8 {
+        if (std.mem.eql(u8, name, "antfly/native-document") or std.fs.path.isAbsolute(name)) return null;
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*owned| owned.deinit();
+        const io = self.inferenceIo(a, null, &owned_io);
+        const scope = switch (operation) {
+            .read => "readers",
+            .extract => "extractors",
+            .decide => "deciders",
+        };
+        const path = self.resolveRequestModelPath(a, io, name, scope) catch |err| switch (err) {
+            error.ModelNotFound => return null,
+            else => return err,
+        };
+        defer a.free(path);
+        const file = try std.fs.path.join(a, &.{ path, "document_agent.json" });
+        defer a.free(file);
+        const canonical_file = realPathExistingAlloc(a, io, file) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer a.free(canonical_file);
+        if (!pathHasComponentPrefix(canonical_file, path)) return error.ModelOutsideModelsDir;
+        return @import("../util/c_file.zig").readFileMax(a, canonical_file, 1024 * 1024) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+    }
+
+    pub fn documentResolveBinding(self: *Node, a: std.mem.Allocator, binding: document_contract.Binding) !document_contract.Snapshot {
+        if (std.mem.eql(u8, binding.model, "antfly/native-document") and binding.operation == .read) return .{ .binding = binding, .path = binding.model, .identity = @splat(0) };
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*owned| owned.deinit();
+        const io = self.inferenceIo(a, null, &owned_io);
+        const path = if (binding.operation == .read) try self.resolveReadRequestModelPath(a, io, binding.model) else try self.resolveRequestModelPath(a, io, binding.model, if (binding.operation == .decide) "deciders" else "extractors");
+        var manifest = try manifest_mod.loadListingFromDir(a, path);
+        defer manifest.deinit();
+        switch (binding.operation) {
+            .read => if (!isQwen3VlReadModel(&manifest) and !(try readers_mod.probeManifest(a, path, manifest)).isSupported()) return error.DocumentCapabilityMismatch,
+            .decide => if (decideExecutionContract(manifest) == null) return error.DocumentCapabilityMismatch,
+            .extract => if (!manifest.hasCapability("extraction") and manifest.model_type != .extractor) return error.DocumentCapabilityMismatch,
+        }
+        const identity = try self.model_manager.modelIdentityForManifest(path, manifest);
+        if (binding.model_identity) |expected| {
+            const hex = std.fmt.bytesToHex(identity, .lower);
+            if (!std.mem.eql(u8, expected, &hex)) return error.DocumentModelRevisionMismatch;
+        }
+        return .{ .binding = binding, .path = path, .identity = identity };
+    }
+
+    pub fn documentTaskLimits(self: *Node, a: std.mem.Allocator, name: []const u8, is_read: bool) !?document_contract.Limits {
+        if (is_read and std.mem.eql(u8, name, "antfly/native-document")) return self.documentLimits(.{});
+        const bytes = (try self.documentDefinition(a, name, if (is_read) .read else .extract)) orelse return null;
+        defer a.free(bytes);
+        var definition = try document_contract.Definition.parse(a, bytes);
+        defer definition.deinit();
+        if ((is_read and definition.value.read == null) or (!is_read and definition.value.extract == null)) return error.DocumentCapabilityMismatch;
+        return self.documentLimits(definition.value.budget);
+    }
+
+    pub fn documentLimits(self: *Node, requested: document_contract.Limits) document_contract.Limits {
+        var limits = requested;
+        limits.max_source_bytes = @min(limits.max_source_bytes, requestMediaMaxBytes(self));
+        limits.max_pixels = @min(limits.max_pixels, requestMediaMaxDecodedPixels(self, 1));
+        if (effectiveRequestContentSecurity(self).max_image_dimension) |dimension| limits.max_dimension = @min(limits.max_dimension, dimension);
+        return limits;
+    }
+
+    pub fn documentDownload(self: *Node, a: std.mem.Allocator, url: []const u8, max_bytes: usize, control: InferenceExecutionControl) !scraping.DownloadedContent {
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*owned| owned.deinit();
+        const io = self.inferenceIo(a, null, &owned_io);
+        var budget = RequestMediaBudget.init(@min(max_bytes, requestMediaMaxBytes(self)));
+        return downloadRemoteContentWithBudgetForRequestWithContext(self, a, .{ .io = io, .control = control }, url, &budget);
+    }
+
+    pub fn invokeCloudflare(self: *Node, a: std.mem.Allocator, binding: document_contract.Binding, payload: std.json.Value, control: InferenceExecutionControl, run: *document_contract.Run) !std.json.Value {
+        try control.check();
+        const env_name = try a.dupeSentinel(u8, binding.token_env orelse return error.InvalidCloudflareConfig, 0);
+        const token = platform.env.getenvSlice(env_name) orelse return error.CloudflareCredentialMissing;
+        // One bounded, resource-accounted pool per run, shared by routing,
+        // extraction and verification. It outlives child scratch arenas.
+        const Session = struct {
+            allocator: std.mem.Allocator,
+            owned_io: ?std.Io.Threaded = null,
+            client: httpx.Client,
+            fn release(raw: ?*anyopaque) void {
+                const session: *@This() = @ptrCast(@alignCast(raw.?));
+                session.client.deinit();
+                if (session.owned_io) |*owned| owned.deinit();
+                session.allocator.destroy(session);
+            }
+        };
+        const session: *Session = if (run.provider_state) |state| @ptrCast(@alignCast(state)) else init: {
+            const backing = run.work_allocator orelse a;
+            const state = try backing.create(Session);
+            state.* = .{ .allocator = backing, .client = undefined };
+            const io = self.inferenceIo(backing, control.io, &state.owned_io);
+            state.client = httpx.Client.init(backing, io);
+            run.provider_state = state;
+            run.provider_deinit_fn = Session.release;
+            break :init state;
+        };
+        const Cancel = struct {
+            fn cancelled(raw: *const anyopaque) bool {
+                const ctl: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
+                ctl.check() catch return true;
+                return false;
+            }
+        };
+        if (binding.operation == .read) {
+            if (!cloudflare_provider.routing.visionModel(binding.model)) return error.DocumentCapabilityMismatch;
+            const base = try cloudflare_provider.routing.baseUrl(a, binding.account_id, null);
+            return cloudflare_provider.invokeNative(&session.client, a, .{
+                .account_id = binding.account_id.?,
+                .model = binding.model,
+                .api_key = token,
+                .gateway_id = binding.gateway_id,
+                .url = try std.fmt.allocPrint(a, "{s}/chat/completions", .{base}),
+            }, payload, .{
+                .timeout_ms = try remainingInferenceDeadlineMs(control.deadline_ns, embedTimingNowNs()),
+                .max_response_bytes = @as(usize, 16 * 1024 * 1024),
+                .cancellation = @as(?httpx.CancellationToken, .{ .ptr = &control, .is_cancelled_fn = Cancel.cancelled }),
+            });
+        }
+        return cloudflare_provider.invoke(&session.client, a, .{
+            .account_id = binding.account_id orelse return error.InvalidCloudflareConfig,
+            .model = binding.model,
+            .api_key = token,
+            .gateway_id = binding.gateway_id,
+        }, payload, .{
+            .timeout_ms = try remainingInferenceDeadlineMs(control.deadline_ns, embedTimingNowNs()),
+            .max_response_bytes = @as(usize, 16 * 1024 * 1024),
+            .cancellation = @as(?httpx.CancellationToken, .{ .ptr = &control, .is_cancelled_fn = Cancel.cancelled }),
+        });
+    }
+
     pub fn readImages(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        if (try ctx.body()) |raw| {
+            const envelope = std.json.parseFromSlice(std.json.Value, ctx.allocator, raw, .{}) catch null;
+            if (envelope) |parsed_document| {
+                defer parsed_document.deinit();
+                if (self.isDocumentOperation(ctx.allocator, parsed_document.value, .read) catch |err| return documentFailureResponse(ctx, err)) {
+                    const result = self.readDocumentsJsonWithControl(ctx.allocator, raw, httpInferenceExecutionControl(self, ctx)) catch |err| return documentFailureResponse(ctx, err);
+                    defer ctx.allocator.free(result);
+                    try ctx.setHeader("content-type", "application/json");
+                    _ = ctx.response.body(result);
+                    return ctx.response.build();
+                }
+            }
+        }
         const execution_control = httpInferenceExecutionControl(self, ctx);
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
@@ -17935,10 +18279,10 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
-        if (body.images.len == 0) {
+        if ((body.images orelse @as([]const api.ImageURL, &.{})).len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "'images' must not be empty" });
         }
-        if (body.images.len > max_read_batch_images) {
+        if ((body.images orelse @as([]const api.ImageURL, &.{})).len > max_read_batch_images) {
             return ctx.status(413).json(.{
                 .@"error" = "BATCH_TOO_LARGE",
                 .message = try std.fmt.allocPrint(ctx.allocator, "'images' must contain at most {d} items", .{max_read_batch_images}),
@@ -17948,12 +18292,12 @@ pub const Node = struct {
             envelope.attachments
         else
             &.{};
-        const attachment_indexes = try ctx.allocator.alloc(?usize, body.images.len);
+        const attachment_indexes = try ctx.allocator.alloc(?usize, (body.images orelse @as([]const api.ImageURL, &.{})).len);
         defer ctx.allocator.free(attachment_indexes);
         const attachment_seen = try ctx.allocator.alloc(bool, attachments.len);
         defer ctx.allocator.free(attachment_seen);
         @memset(attachment_seen, false);
-        for (body.images, attachment_indexes) |image, *attachment_index| {
+        for ((body.images orelse @as([]const api.ImageURL, &.{})), attachment_indexes) |image, *attachment_index| {
             attachment_index.* = parseAttachmentUrl(image.url) catch
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
@@ -17985,7 +18329,7 @@ pub const Node = struct {
             });
         const inline_source_cap = readInlineSourceByteCap(self);
         var inline_source_bytes: usize = 0;
-        for (body.images, attachment_indexes) |image, attachment_index| {
+        for ((body.images orelse @as([]const api.ImageURL, &.{})), attachment_indexes) |image, attachment_index| {
             if (attachment_index) |index| {
                 inline_source_bytes = std.math.add(usize, inline_source_bytes, attachments[index].data.len) catch
                     return ctx.status(413).json(.{
@@ -18005,7 +18349,7 @@ pub const Node = struct {
                     });
             }
         }
-        const admission = readRequestAdmission(self, body.images.len, inline_source_bytes, max_tokens);
+        const admission = readRequestAdmission(self, (body.images orelse @as([]const api.ImageURL, &.{})).len, inline_source_bytes, max_tokens);
         if (try self.acquireSlotUnits(ctx, admission.units)) |resp| return resp;
         var reserved_units = admission.units;
         defer self.releaseSlotUnits(reserved_units);
@@ -18042,7 +18386,7 @@ pub const Node = struct {
         else
             0;
         validateInferenceExecutorInvocation(executor_contract, .{
-            .item_count = body.images.len,
+            .item_count = (body.images orelse @as([]const api.ImageURL, &.{})).len,
             .text_bytes_per_item = read_prompt_bytes,
             .input_tokens_per_item = 0,
             .output_tokens_per_item = max_tokens orelse 0,
@@ -18054,28 +18398,28 @@ pub const Node = struct {
         defer arena.deinit();
         const alloc = arena.allocator();
 
-        const results_out = try alloc.alloc(api.ReadObject, body.images.len);
+        const results_out = try alloc.alloc(api.ReadObject, (body.images orelse @as([]const api.ImageURL, &.{})).len);
         var filled: usize = 0;
         defer {
             for (0..filled) |i| {
                 var tmp = results_out[i];
-                if (tmp.fields) |*f| f.deinit(alloc);
+                if (tmp.fields == .value) tmp.fields.value.deinit(alloc);
             }
         }
 
-        const downloaded = try ctx.allocator.alloc(scraping.DownloadedContent, body.images.len);
+        const downloaded = try ctx.allocator.alloc(scraping.DownloadedContent, (body.images orelse @as([]const api.ImageURL, &.{})).len);
         var downloaded_count: usize = 0;
         defer {
             for (downloaded[0..downloaded_count]) |*item| item.deinit(ctx.allocator);
             ctx.allocator.free(downloaded);
         }
-        const image_datas = try ctx.allocator.alloc([]const u8, body.images.len);
+        const image_datas = try ctx.allocator.alloc([]const u8, (body.images orelse @as([]const api.ImageURL, &.{})).len);
         defer ctx.allocator.free(image_datas);
 
         const batch_byte_cap = admission.byte_cap;
         var batch_bytes: usize = 0;
         var decoded_budget = ReadDecodedImageBudget.init(admission, effectiveRequestContentSecurity(self).max_image_dimension);
-        for (body.images, attachment_indexes, 0..) |img_url, attachment_index, i| {
+        for ((body.images orelse @as([]const api.ImageURL, &.{})), attachment_indexes, 0..) |img_url, attachment_index, i| {
             if (attachment_index) |index| {
                 const attachment = attachments[index];
                 batch_bytes = std.math.add(usize, batch_bytes, attachment.data.len) catch
@@ -18139,7 +18483,7 @@ pub const Node = struct {
         }
 
         validateInferenceExecutorInvocation(executor_contract, .{
-            .item_count = body.images.len,
+            .item_count = (body.images orelse @as([]const api.ImageURL, &.{})).len,
             .text_bytes_per_item = read_prompt_bytes,
             .input_tokens_per_item = 0,
             .output_tokens_per_item = max_tokens orelse 0,
@@ -18163,6 +18507,7 @@ pub const Node = struct {
                 max_tokens,
                 &reserved_units,
                 execution_control,
+                false,
             ) catch |err| switch (err) {
                 error.ReadOutputTruncated => return ctx.status(400).json(.{
                     .@"error" = "OUTPUT_TRUNCATED",
@@ -18241,7 +18586,7 @@ pub const Node = struct {
             .max_tokens = max_tokens,
         }) catch |err| return inferenceFailureResponse(ctx, err);
         validateInferenceExecutorInvocation(executor_contract, .{
-            .item_count = body.images.len,
+            .item_count = (body.images orelse @as([]const api.ImageURL, &.{})).len,
             .text_bytes_per_item = read_prompt_bytes,
             .input_tokens_per_item = exact_prompt_tokens,
             .output_tokens_per_item = max_tokens orelse 0,
@@ -18271,7 +18616,7 @@ pub const Node = struct {
             }
             ctx.allocator.free(results);
         }
-        if (results.len != body.images.len)
+        if (results.len != (body.images orelse @as([]const api.ImageURL, &.{})).len)
             return internalErrorResponse(ctx, "INFERENCE_FAILED", error.InvalidReadResultCount);
 
         var completion_tokens: usize = 0;
@@ -18281,7 +18626,7 @@ pub const Node = struct {
             filled = i + 1;
         }
 
-        const prompt_tokens = std.math.mul(usize, exact_prompt_tokens, body.images.len) catch
+        const prompt_tokens = std.math.mul(usize, exact_prompt_tokens, (body.images orelse @as([]const api.ImageURL, &.{})).len) catch
             std.math.maxInt(usize);
         return ctx.json(api.ReadResponse{
             .object = "list",
@@ -18359,7 +18704,7 @@ pub const Node = struct {
 
         return .{
             .text = text_copy,
-            .fields = fields_map,
+            .fields = if (fields_map) |fields| .{ .value = fields } else .absent,
             .regions = regions,
             .object = "read",
             .index = @intCast(index),
@@ -20098,6 +20443,14 @@ pub const Node = struct {
                 _ = ctx.response.body(output);
                 return ctx.response.build();
             };
+            if (self.isDocumentOperation(ctx.allocator, public_envelope.value, .extract) catch |err| return documentFailureResponse(ctx, err)) {
+                if (uses_attachment_envelope) return documentFailureResponse(ctx, error.UnsupportedDocumentTransport);
+                const output = self.extractDocumentsJsonWithControl(ctx.allocator, request_json, execution_control) catch |err| return documentFailureResponse(ctx, err);
+                defer ctx.allocator.free(output);
+                try ctx.setHeader("content-type", "application/json");
+                _ = ctx.response.body(output);
+                return ctx.response.build();
+            }
             @import("antfly_decisions").validateExtractionBoundary(public_envelope.value) catch
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "standalone decisions use /decisions" });
         }
@@ -20152,7 +20505,7 @@ pub const Node = struct {
         if (body.model.len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "model is required" });
         }
-        validateExtractionCardinality(body.inputs.len) catch |err|
+        validateExtractionCardinality((body.inputs orelse @as([]const extraction_api.ExtractionInput, &.{})).len) catch |err|
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) });
         const has_relations = if (body.schema.relations) |relations| relations.len > 0 else false;
         const operation = canonicalExtractionOperation(body.schema) catch |err| switch (err) {
@@ -20165,7 +20518,7 @@ pub const Node = struct {
             &.{};
         const extraction_attachments = extractionAttachmentsFromEnvelope(
             ctx.allocator,
-            body.inputs,
+            (body.inputs orelse @as([]const extraction_api.ExtractionInput, &.{})),
             envelope_attachments,
             uses_attachment_envelope,
         ) catch |err| return ctx.status(400).json(.{
@@ -20184,7 +20537,7 @@ pub const Node = struct {
         }
 
         if (operation == .structures) {
-            const inputs = try canonicalExtractingInputs(ctx.allocator, body.inputs);
+            const inputs = try canonicalExtractingInputs(ctx.allocator, (body.inputs orelse @as([]const extraction_api.ExtractionInput, &.{})));
             defer freeCanonicalExtractingInputs(ctx.allocator, inputs);
             const schema_json = try std.json.Stringify.valueAlloc(ctx.allocator, body.schema, .{});
             defer ctx.allocator.free(schema_json);
@@ -20206,13 +20559,13 @@ pub const Node = struct {
         }
 
         if (operation == .classifications) {
-            var classification_inputs = parseCanonicalTextInputs(ctx.allocator, body.inputs) catch
+            var classification_inputs = parseCanonicalTextInputs(ctx.allocator, (body.inputs orelse @as([]const extraction_api.ExtractionInput, &.{}))) catch
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "classification extraction requires text inputs" });
             defer classification_inputs.deinit();
             return self.extractClassifications(ctx, body, classification_inputs.texts.items);
         }
 
-        var direct_inputs = parseCanonicalTextInputs(ctx.allocator, body.inputs) catch
+        var direct_inputs = parseCanonicalTextInputs(ctx.allocator, (body.inputs orelse @as([]const extraction_api.ExtractionInput, &.{}))) catch
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "entity and relation extraction requires text inputs" });
         defer direct_inputs.deinit();
         if (try self.acquireSlot(ctx)) |resp| return resp;
@@ -20233,7 +20586,7 @@ pub const Node = struct {
             .flat_ner = options.flat_ner,
             .include_confidence = options.include_confidence orelse false,
             .include_spans = options.include_spans orelse false,
-            .input_ids = try canonicalInputIds(ctx.allocator, body.inputs),
+            .input_ids = try canonicalInputIds(ctx.allocator, (body.inputs orelse @as([]const extraction_api.ExtractionInput, &.{}))),
             .schema_bytes = schema_contract_json.len,
         };
         defer ctx.allocator.free(entity_request.input_ids);
@@ -20386,7 +20739,7 @@ pub const Node = struct {
 
         const data = try alloc.alloc(extraction_api.ExtractionObject, texts.len);
         for (data, 0..) |*item, index| item.* = .{
-            .id = body.inputs[index].id,
+            .id = (body.inputs orelse @as([]const extraction_api.ExtractionInput, &.{}))[index].id,
             .classifications = lists[index].items,
         };
 
@@ -21805,7 +22158,74 @@ pub const Node = struct {
         if (catalog.value.object.getPtr("embedders")) |models| if (models.* == .object) {
             for (models.object.values()) |*info| if (info.* == .object) try info.object.put(a, "chunking_limits", limits.value);
         };
+        // Composite discovery reads only bounded declarative metadata. It
+        // never loads model weights or exposes private provider bindings.
+        const ca = catalog.arena.allocator();
+        const native_info = try self.documentCatalogInfo(ca, null, "read");
+        try catalog.value.object.getPtr("readers").?.object.put(ca, "antfly/native-document", native_info);
+        for (discovered) |entry| {
+            // Resolve each advertised operation independently; never let one
+            // same-named registration overwrite another task's definition.
+            for ([_]document_contract.Operation{ .read, .extract }) |operation| {
+                const definition_bytes = self.documentDefinition(ca, entry.name, operation) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    continue;
+                } orelse continue;
+                const parsed = document_contract.Definition.parse(ca, definition_bytes) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    continue;
+                };
+                const definition = parsed.value;
+                const is_read = operation == .read;
+                if ((is_read and definition.read == null) or (!is_read and definition.extract == null)) continue;
+                const scope = if (is_read) "readers" else "extractors";
+                const task = if (is_read) "read" else "extract";
+                try catalog.value.object.getPtr(scope).?.object.put(ca, entry.name, try self.documentCatalogInfo(ca, definition, task));
+            }
+        }
         return std.json.Stringify.valueAlloc(a, catalog.value, .{});
+    }
+
+    fn documentCatalogInfo(self: *Node, a: std.mem.Allocator, definition: ?document_contract.Definition, task: []const u8) !std.json.Value {
+        const limits = self.documentLimits(if (definition) |def| def.budget else .{});
+        const is_read = std.mem.eql(u8, task, "read");
+        const modalities: []const []const u8 = if (is_read) &.{"image"} else &.{"text"};
+        const mime_types: []const []const u8 = if (is_read) &.{ "image/png", "image/jpeg", "image/webp" } else &.{"text/plain"};
+        const encoded = try std.json.Stringify.valueAlloc(a, .{
+            .capabilities = .{ "document_sources_v1", "document_evidence_v1" },
+            .inputs = modalities,
+            .inference_capabilities = .{
+                .version = @as(u32, 3),
+                .task = task,
+                .input_modalities = modalities,
+                .accepted_mime_types = mime_types,
+                .input_granularity = if (is_read) "page" else "item",
+                .output = if (is_read) "read_result" else "extraction",
+                .result_cardinality = "one_per_item",
+                .prompt_policy = if (is_read) "model_default" else "structured_schema",
+                .borrowed_attachments = false,
+                .framed_attachments = false,
+                .batch = .{
+                    .mode = "serial_compatibility",
+                    .preferred_items = @as(u32, 1),
+                    .max_items = limits.max_sources,
+                    .max_encoded_media_bytes = limits.max_source_bytes,
+                    .max_decoded_pixels = @min(limits.max_total_pixels, requestMediaMaxDecodedPixels(self, limits.max_sources)),
+                    .max_media_parts_per_item = @as(u32, 1),
+                    .per_item_failures = false,
+                },
+                .executor = if (definition != null) "declarative_composite" else "native_document",
+                .remote_execution = if (definition) |def| def.allow_remote else false,
+                .max_parallel_calls = @as(u32, 1),
+                .document_formats = .{
+                    .pdf = .{ .native_text = true, .visual_rendering = true, .annotation_rendering = false },
+                    .pptx = .{ .native_text = true, .visual_rendering = false, .speaker_notes = true, .hidden_slide_policy = true },
+                    .images = .{ .formats = .{ "image/png", "image/jpeg", "image/webp" }, .perspective_correction = false },
+                },
+                .artifact_reuse = .{ .retention = "process_local", .max_ttl_ms = @as(u32, 300000), .durable_resume = false },
+            },
+        }, .{});
+        return std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{});
     }
 
     pub fn listPredictors(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -23009,6 +23429,11 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
 }
 
 test {
+    _ = @import("../documents/executor.zig");
+    _ = @import("../documents/artifacts.zig");
+    _ = @import("../documents/service.zig");
+    _ = @import("../documents/ooxml.zig");
+    _ = @import("antfly_cloudflare");
     _ = @import("gliner_boundary_service_test.zig");
     _ = @import("gliner_family_service_test.zig");
     _ = @import("gliner_decide_1b_service_test.zig");
@@ -29125,7 +29550,7 @@ test "extraction framed attachments preserve input identity and borrowed bytes" 
     }};
     const resolved = try extractionAttachmentsFromEnvelope(
         allocator,
-        parsed.value.inputs,
+        parsed.value.inputs.?,
         &attachments,
         true,
     );
@@ -29274,6 +29699,7 @@ test "Qwen3-VL read and prepared generation stop cancelled work before model loa
         null,
         &reserved_units,
         cancelled,
+        false,
     ));
     try std.testing.expectEqual(@as(usize, 1), reserved_units);
 
@@ -29302,6 +29728,7 @@ test "Qwen3-VL read and prepared generation stop cancelled work before model loa
         null,
         &reserved_units,
         .{ .deadline_ns = 0 },
+        false,
     ));
 }
 
@@ -29587,7 +30014,7 @@ test "Qwen3-VL encoded read results own page identities and report serial execut
             var fingerprint = [_]u8{ 'd', 'o', 'c' };
             const results = [_]Node.Qwen3VlReadResult{
                 .{ .text = &text, .prompt_tokens = 10, .completion_tokens = 2 },
-                .{ .text = &text, .prompt_tokens = 11, .completion_tokens = 2 },
+                .{ .text = &text, .prompt_tokens = 11, .completion_tokens = 2, .truncated = true },
             };
             const images = [_]readers_api.EncodedImage{
                 .{ .bytes = "image", .mime_type = "image/png", .item_id = &item_id, .source_fingerprint = &fingerprint, .page_number = 2 },
@@ -29595,6 +30022,16 @@ test "Qwen3-VL encoded read results own page identities and report serial execut
             };
             var batch = try Node.qwen3VlEncodedReadBatchResult(allocator, &results, &images);
             defer batch.deinit(allocator);
+            try std.testing.expectEqual(@as(i64, 21), batch.usage.?.prompt_tokens);
+            try std.testing.expectEqual(@as(i64, 4), batch.usage.?.completion_tokens);
+            try std.testing.expectEqual(readers_api.Completion.complete, batch.items[0].completion);
+            try std.testing.expectEqual(readers_api.Completion.length, batch.items[1].completion);
+            try std.testing.expectEqual(@as(?usize, 11), batch.items[1].prompt_tokens);
+            const cloned = try Node.cloneReaderApiResult(allocator, batch.items[1]);
+            var owned_clone = cloned;
+            defer readers_api.deinitResult(allocator, &owned_clone);
+            try std.testing.expectEqual(readers_api.Completion.length, cloned.completion);
+            try std.testing.expectEqual(@as(?usize, 2), cloned.completion_tokens);
             @memset(&text, 'x');
             @memset(&item_id, 'x');
             @memset(&fingerprint, 'x');
@@ -40313,4 +40750,227 @@ test "generated constrained native request parsing preserves single and batch sc
     var batch = try parseGenerateBody(api.GenerateBatchRequest, a, batch_raw);
     defer batch.deinit();
     try std.testing.expectEqualStrings("1e-400", batch.value.requests[0].body.response_format.?.json_schema.?.schema.?.map.get("minimum").?.number_string);
+}
+
+fn documentFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (remoteContentRequestFailure(err)) |_| return remoteContentErrorResponse(ctx, err);
+    if (isTransientInferenceCapacityError(err) or err == error.ResourceLimitExceeded or err == error.MemoryBudgetExceeded or err == error.Cancelled or err == error.Canceled or err == error.OutOfMemory) return inferenceFailureResponse(ctx, err);
+    const name = @errorName(err);
+    const status: u16 = if (err == error.DocumentArtifactNotFound or err == error.ModelNotFound) 404 else if (err == error.DocumentArtifactExpired) 410 else if (err == error.DocumentModelRevisionMismatch) 409 else if (err == error.DocumentUnresolved) 422 else if (err == error.DocumentBudgetExhausted or err == error.Timeout) 504 else if (err == error.RemoteDocumentModelDenied) 403 else if (err == error.CloudflareRateLimited) 429 else if (std.mem.indexOf(u8, name, "Limit") != null or err == error.DocumentOutputTooLarge) 413 else if (std.mem.startsWith(u8, name, "Cloudflare") or err == error.InvalidCloudflareResponse) 502 else 400;
+    return ctx.status(status).json(.{ .@"error" = name, .message = "Document operation could not satisfy its input, capability, evidence, or execution contract" });
+}
+
+test "document direct read accepts whole PDF and ordered PPTX without model admission" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const models = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(models);
+    var node = try Node.init(a, .{ .models_dir = models });
+    defer node.deinit();
+    inline for (.{ .{ @embedFile("../documents/testdata/two-pages.pdf"), "application/pdf", "First page" }, .{ @embedFile("../documents/testdata/ordered-slides.pptx"), "application/vnd.openxmlformats-officedocument.presentationml.presentation", "Slide 2" }, .{ @embedFile("../documents/testdata/inherited-slides.pptx"), "application/vnd.openxmlformats-officedocument.presentationml.presentation", "Slide 2" } }) |fixture| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(fixture[0].len));
+        _ = std.base64.standard.Encoder.encode(encoded, fixture[0]);
+        const uri = try std.fmt.allocPrint(alloc, "data:{s};base64,{s}", .{ fixture[1], encoded });
+        const request = try std.json.Stringify.valueAlloc(alloc, .{ .model = "antfly/native-document", .documents = .{.{ .id = "source", .url = uri, .media_type = fixture[1] }} }, .{});
+        const result = try node.readDocumentsJsonWithControl(alloc, request, .{});
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, result, .{});
+        const rows = parsed.object.get("data").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
+        try std.testing.expect(std.mem.indexOf(u8, rows[0].object.get("text").?.string, fixture[2]) != null);
+        try std.testing.expectEqual(@as(i64, 0), parsed.object.get("usage").?.object.get("model_calls").?.integer);
+        if (std.mem.eql(u8, fixture[0], @embedFile("../documents/testdata/inherited-slides.pptx"))) {
+            try std.testing.expectEqualStrings("unresolved", rows[0].object.get("status").?.string);
+            try std.testing.expectEqualStrings("complete", rows[1].object.get("status").?.string);
+            const inherited = rows[0].object.get("inherited_parts").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), inherited.len);
+            try std.testing.expectEqualStrings("Confidential\n", inherited[1].object.get("text").?.string);
+            try std.testing.expect(std.mem.indexOf(u8, rows[0].object.get("text").?.string, "Template") == null);
+        }
+        const typed = try node.readImagesDirectWithControl(a, "antfly/native-document", .{ .documents = &.{.{ .id = "source", .url = uri, .media_type = fixture[1] }} }, .{});
+        defer {
+            for (typed) |*item| readers_api.deinitResult(a, item);
+            a.free(typed);
+        }
+        try std.testing.expectEqual(@as(usize, 2), typed.len);
+        try std.testing.expectEqual(@as(?u32, 2), typed[1].page_number);
+        var http_request = try httpx.Request.init(a, .POST, "/ai/v1/read");
+        defer http_request.deinit();
+        http_request.body = request;
+        var ctx = httpx.Context.init(a, std.testing.io, &http_request);
+        defer ctx.deinit();
+        var http_response = try node.readImages(&ctx);
+        defer http_response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), http_response.status.code);
+        try std.testing.expectEqualStrings(result, http_response.body.?);
+        const retained_request = try std.json.Stringify.valueAlloc(alloc, .{ .model = "antfly/native-document", .retain_artifact = true, .documents = .{.{ .id = "source", .url = uri, .media_type = fixture[1] }} }, .{});
+        const retained = try node.readDocumentsJsonWithControl(alloc, retained_request, .{});
+        const retained_value = try std.json.parseFromSliceLeaky(std.json.Value, alloc, retained, .{});
+        const handle = retained_value.object.get("document").?.object.get("artifact_id").?.string;
+        const cached = try node.readDocumentArtifact(a, handle);
+        defer a.free(cached);
+        try std.testing.expectEqualStrings(result, cached);
+    }
+    const catalog_bytes = try node.listModelsJsonAlloc(a, std.testing.io);
+    defer a.free(catalog_bytes);
+    var catalog = try std.json.parseFromSlice(std.json.Value, a, catalog_bytes, .{});
+    defer catalog.deinit();
+    const native = catalog.value.object.get("readers").?.object.get("antfly/native-document").?;
+    try std.testing.expect(!native.object.get("inference_capabilities").?.object.get("document_formats").?.object.get("pptx").?.object.get("visual_rendering").?.bool);
+}
+
+test "document model dispatch preserves client errors for invalid ordinary model names" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    inline for (.{ "read", "extract" }) |task| {
+        var request = try httpx.Request.init(a, .POST, "/ai/v1/" ++ task);
+        defer request.deinit();
+        request.body = if (std.mem.eql(u8, task, "read"))
+            "{\"model\":\"../escape\",\"images\":[{\"url\":\"invalid\"}]}"
+        else
+            "{\"model\":\"../escape\",\"inputs\":[{\"content\":\"source\"}],\"schema\":{}}";
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = if (std.mem.eql(u8, task, "read")) try node.readImages(&ctx) else try node.extractJSON(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "InvalidModelIdentifier") != null);
+    }
+}
+
+test "document artifact admission reclaims retained memory without evicting on impossible requests" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .generation_budget_overrides = .{ .host_limit_bytes = 4096, .scratch_limit_bytes = 4096 } });
+    defer node.deinit();
+    const Owner = struct {
+        lease: ?runtime.tier.memory.AdmissionLease,
+        fn release(raw: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.lease) |*lease| lease.release();
+            self.lease = null;
+        }
+    };
+    var owner = Owner{ .lease = try node.model_manager.admitHostPreflight(3072) };
+    errdefer if (owner.lease != null) Owner.release(&owner);
+    try std.testing.expect(try node.document_artifacts.put(a, @splat('a'), "retained", std.math.maxInt(u64), .{ .ptr = &owner, .release_fn = Owner.release }));
+    try std.testing.expectError(error.ResourceLimitExceeded, node.admitDocumentHost(8192));
+    try std.testing.expect(owner.lease != null);
+    var request = try node.admitDocumentHost(2048);
+    defer request.release();
+    try std.testing.expect(owner.lease == null);
+    try std.testing.expectError(error.DocumentArtifactNotFound, node.readDocumentArtifact(a, &@as([64]u8, @splat('a'))));
+}
+
+test "document native annotation coverage remains unresolved through HTTP and typed decoding" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const models = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(models);
+    var node = try Node.init(a, .{ .models_dir = models });
+    defer node.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const fixture = @embedFile("../documents/testdata/annotation.pdf");
+    const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(fixture.len));
+    _ = std.base64.standard.Encoder.encode(encoded, fixture);
+    const uri = try std.fmt.allocPrint(alloc, "data:application/pdf;base64,{s}", .{encoded});
+    const body = try std.json.Stringify.valueAlloc(alloc, .{ .model = "antfly/native-document", .documents = .{.{ .id = "invoice", .media_type = "application/pdf", .url = uri }} }, .{});
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/read");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.readImages(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var batch = try readers_api.documentBatchResult(a, response.body.?);
+    defer batch.deinit(a);
+    try std.testing.expectEqual(readers_api.Completion.unresolved, batch.items[0].completion);
+    try std.testing.expect(std.mem.indexOf(u8, batch.items[0].document_json.?, "pdf_annotation_rendering_unavailable") != null);
+}
+
+test "document task namespaces stay distinct in dispatch limits and discovery" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const reader =
+        \\{"models":[{"name":"native","model":"antfly/native-document","operation":"read"}],"read":{"reader":"native"},"budget":{"max_sources":2}}
+    ;
+    const extractor =
+        \\{"allow_remote":true,"models":[{"name":"extractor","model":"@cf/cloudflare/clairic","operation":"extract","provider":"cloudflare","account_id":"test","token_env":"ANTFLY_TEST_TASK_COLLISION_MISSING_TOKEN"}],"extract":{"model":"extractor"},"budget":{"max_sources":3}}
+    ;
+    inline for (.{ .{ "readers", reader }, .{ "extractors", extractor } }) |fixture| {
+        try tmp.dir.createDirPath(std.testing.io, fixture[0] ++ "/test/shared");
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = fixture[0] ++ "/test/shared/config.json", .data = "{}" });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = fixture[0] ++ "/test/shared/document_agent.json", .data = fixture[1] });
+    }
+    const models = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(models);
+    var node = try Node.init(a, .{ .models_dir = models });
+    defer node.deinit();
+    inline for (.{ .{ document_contract.Operation.read, reader }, .{ document_contract.Operation.extract, extractor } }) |fixture| {
+        const definition = (try node.documentDefinition(a, "test/shared", fixture[0])).?;
+        defer a.free(definition);
+        try std.testing.expectEqualStrings(fixture[1], definition);
+    }
+    try std.testing.expectEqual(@as(usize, 2), (try node.documentTaskLimits(a, "test/shared", true)).?.max_sources);
+    try std.testing.expectEqual(@as(usize, 3), (try node.documentTaskLimits(a, "test/shared", false)).?.max_sources);
+    const catalog_bytes = try node.listModelsJsonAlloc(a, std.testing.io);
+    defer a.free(catalog_bytes);
+    var catalog = try std.json.parseFromSlice(std.json.Value, a, catalog_bytes, .{});
+    defer catalog.deinit();
+    const read_info = catalog.value.object.get("readers").?.object.get("test/shared").?.object.get("inference_capabilities").?;
+    const extract_info = catalog.value.object.get("extractors").?.object.get("test/shared").?.object.get("inference_capabilities").?;
+    try std.testing.expect(!read_info.object.get("remote_execution").?.bool);
+    try std.testing.expect(extract_info.object.get("remote_execution").?.bool);
+    // HTTP extraction with text must dispatch to the extractor, not the reader.
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
+    defer request.deinit();
+    request.body =
+        \\{"model":"test/shared","schema_version":2,"schema":{"structures":{"record":{"fields":{"name":"str"}}}},"inputs":[{"content":"Alice"}]}
+    ;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.extractJSON(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 502), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "CloudflareCredentialMissing") != null);
+    // Even an ordinary reader without agent metadata must not mask extraction.
+    try tmp.dir.deleteFile(std.testing.io, "readers/test/shared/document_agent.json");
+    try std.testing.expect(try node.documentDefinition(a, "test/shared", .read) == null);
+    const definition = (try node.documentDefinition(a, "test/shared", .extract)).?;
+    defer a.free(definition);
+    try std.testing.expectEqualStrings(extractor, definition);
+}
+
+test "document native slide read preserves hard breaks in text tables and notes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const models = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(models);
+    var node = try Node.init(a, .{ .models_dir = models });
+    defer node.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const fixture = @embedFile("../documents/testdata/line-breaks.pptx");
+    const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(fixture.len));
+    _ = std.base64.standard.Encoder.encode(encoded, fixture);
+    const uri = try std.fmt.allocPrint(alloc, "data:application/vnd.openxmlformats-officedocument.presentationml.presentation;base64,{s}", .{encoded});
+    const body = try std.json.Stringify.valueAlloc(alloc, .{ .model = "antfly/native-document", .documents = .{.{ .id = "slide", .url = uri, .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation", .include_notes = true }} }, .{});
+    const result = try node.readDocumentsJsonWithControl(alloc, body, .{});
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, result, .{});
+    const page = parsed.object.get("data").?.array.items[0].object;
+    try std.testing.expectEqualStrings("complete", page.get("status").?.string);
+    try std.testing.expectEqualStrings("12\n34\n56\n78\n\t\n", page.get("text").?.string);
+    try std.testing.expectEqualStrings("56\n78\n", page.get("tables").?.array.items[0].object.get("cells").?.array.items[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("Notes\ncontinued\n", page.get("notes").?.string);
+    try std.testing.expectEqual(@as(i64, 0), parsed.object.get("usage").?.object.get("model_calls").?.integer);
 }

@@ -7505,7 +7505,7 @@ export interface components {
          * @description The embedding provider to use.
          * @enum {string}
          */
-        EmbedderProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "cohere" | "antfly";
+        EmbedderProvider: "cloudflare" | "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "bedrock" | "cohere" | "antfly";
         /**
          * @description A unified configuration for an embedding provider.
          *
@@ -7644,7 +7644,7 @@ export interface components {
          *       "model": "text-embedding-3-small"
          *     }
          */
-        EmbedderConfig: (components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"]) & {
+        EmbedderConfig: (components["schemas"]["CloudflareEmbedderConfig"] | components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"]) & {
             /** @description This named embedder produces sparse index/value vectors. */
             sparse?: boolean;
             rate_limit?: components["schemas"]["RateLimitConfig"];
@@ -7699,7 +7699,7 @@ export interface components {
          *     canonical provider configurations; it does not define a second provider
          *     namespace.
          */
-        IndexEmbedderConfig: components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"];
+        IndexEmbedderConfig: components["schemas"]["CloudflareEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"];
         /**
          * @description Overall health status of the cluster
          * @enum {string}
@@ -14605,7 +14605,7 @@ export interface components {
          * @description The reranking provider to use.
          * @enum {string}
          */
-        RerankerProvider: "antfly" | "cohere" | "vertex";
+        RerankerProvider: "cloudflare" | "antfly" | "cohere" | "vertex";
         /**
          * @description Objective used to rank graph paths:
          *     - min_hops: Minimize the number of edges.
@@ -14614,6 +14614,26 @@ export interface components {
          * @enum {string}
          */
         GraphPathObjective: "min_hops" | "min_weight_sum" | "max_weight_product";
+        /** @description Cloudflare Workers AI embedding. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference. */
+        CloudflareEmbedderConfig: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "cloudflare";
+            account_id: string;
+            /** @description Optional AI Gateway ID, sent through cf-aig-gateway-id. */
+            gateway_id?: string;
+            /** @default @cf/baai/bge-base-en-v1.5 */
+            model: string;
+            api_key?: string;
+            /** @description Optional deployment-owned endpoint override. */
+            url?: string;
+            /** @description Expected fixed model output dimension; the adapter validates returned vectors and never requests unsupported resizing. */
+            dimensions?: number;
+            /** @description Alias of dimensions. */
+            dimension?: number;
+        };
         /**
          * @description Advanced retrieval-role overrides. Antfly assigns canonical task intent
          *     automatically: semantic-search inputs are `RETRIEVAL_QUERY`, while index
@@ -15273,6 +15293,28 @@ export interface components {
             embedding?: components["schemas"]["ChunkEmbeddingTarget"];
             policy?: components["schemas"]["MediaChunkPolicy"];
         };
+        /** @description Cloudflare Workers AI generation. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference. */
+        CloudflareGeneratorConfig: {
+            /** @enum {string} */
+            provider: "cloudflare";
+            account_id: string;
+            /** @description Optional AI Gateway ID, sent through cf-aig-gateway-id. */
+            gateway_id?: string;
+            /** @default @cf/meta/llama-3.3-70b-instruct-fp8-fast */
+            model: string;
+            api_key?: string;
+            /** @description Optional deployment-owned endpoint override. */
+            url?: string;
+            max_tokens?: number;
+            /** Format: float */
+            temperature?: number;
+            /** Format: float */
+            top_p?: number;
+            /** Format: float */
+            frequency_penalty?: number;
+            /** Format: float */
+            presence_penalty?: number;
+        };
         /** @description Configuration for the Google generative AI provider (Gemini). */
         GoogleGeneratorConfig: {
             /** @enum {string} */
@@ -15585,7 +15627,7 @@ export interface components {
          * @description Generator providers implemented by Antfly's generation runtime.
          * @enum {string}
          */
-        GeneratorProvider: "gemini" | "vertex" | "bedrock" | "anthropic" | "ollama" | "openai" | "chatgpt" | "openrouter" | "antfly" | "apple";
+        GeneratorProvider: "cloudflare" | "gemini" | "vertex" | "bedrock" | "anthropic" | "ollama" | "openai" | "chatgpt" | "openrouter" | "antfly" | "apple";
         /**
          * @description A unified configuration for a generative AI provider.
          * @example {
@@ -15595,7 +15637,7 @@ export interface components {
          *       "max_tokens": 2048
          *     }
          */
-        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["BedrockGeneratorConfig"] | components["schemas"]["AnthropicGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["ChatGPTGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"] | components["schemas"]["AppleGeneratorConfig"]) & {
+        GeneratorConfig: (components["schemas"]["CloudflareGeneratorConfig"] | components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["BedrockGeneratorConfig"] | components["schemas"]["AnthropicGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["ChatGPTGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"] | components["schemas"]["AppleGeneratorConfig"]) & {
             /**
              * Format: int64
              * @description Conservative input-token ceiling per image. Required for image calls when tokens_per_minute is configured; choose a bound valid for the model and image policy.
@@ -15705,7 +15747,14 @@ export interface components {
         };
         ExtractionStructureField: string | ({
             /** @enum {string} */
-            type?: "str" | "string" | "list" | "array";
+            type?: "str" | "string" | "list" | "array" | "text" | "number" | "date" | "estimate";
+            /** @description Decimal precision for compatible hosted number fields. */
+            decimals?: number;
+            unit?: string;
+            /** @description Minimum of a hosted estimate distribution. */
+            min?: number;
+            max?: number;
+            step?: number;
             enum?: string[];
             /** @enum {string} */
             dtype?: "str" | "list";
@@ -16215,7 +16264,7 @@ export interface components {
          * @description The STT provider to use.
          * @enum {string}
          */
-        STTProvider: "openai" | "vertex" | "antfly" | "apple";
+        STTProvider: "cloudflare" | "openai" | "vertex" | "antfly" | "apple";
         /**
          * @description Speech-to-text provider for the `transcriber` enrichment shorthand.
          *
@@ -16312,7 +16361,7 @@ export interface components {
             full_text_index?: boolean;
             /** @description Produced asset content type for asset enrichments. */
             content_type?: string;
-            /** @description Write-only producer configuration. Cannot be combined with producer_json or transcriber. Decision producers use type=decision and config={version, decider, questions}, where decider is a frozen Antfly or Jev DeciderConfig. Outputs include answers, usage, resolved model, specification hash, version, and source fingerprint. Change version or specification to rebuild through the enrichment lifecycle. */
+            /** @description Write-only producer configuration. Cannot be combined with producer_json or transcriber. Decision producers use type=decision and config={version, decider, questions}. A named-embedder similarity decider also requires embedders={name: frozen EmbedderConfig}; the dependency travels with the specification for deterministic replay instead of resolving mutable node configuration. Credentials use secret references or environment defaults. Outputs include answers, usage, resolved model, specification hash, version, and source fingerprint. Change version or specification to rebuild through the enrichment lifecycle. */
             producer?: components["schemas"]["EnrichmentProducerConfig"];
             /**
              * @deprecated
@@ -16670,7 +16719,7 @@ export interface components {
         };
         DeciderConfig: {
             /** @enum {string} */
-            provider?: "antfly" | "jev" | "openai";
+            provider?: "antfly" | "jev" | "openai" | "cloudflare";
             /**
              * @description Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities.
              * @default typed
@@ -16683,10 +16732,16 @@ export interface components {
             output?: components["schemas"]["ConstrainedOutput"];
             probabilities?: components["schemas"]["ConstrainedProbabilities"];
             batch?: components["schemas"]["ConstrainedGenerationBatch"];
-            /** @description Required for Antfly and OpenAI; Jev defaults to jev-latest. */
+            /** @description Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Cloudflare uses @cf/cloudflare/clef or @cf/cloudflare/clef-flash. */
             model?: string;
+            /** @description Required with the cloudflare provider; Workers AI account identifier. */
+            account_id?: string;
+            /** @description Optional Cloudflare AI Gateway identifier. */
+            gateway_id?: string;
             /** @description Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity. */
             model_identity?: string;
+            /** @description Named dense embedder for provider-neutral embedding_similarity routing. Specify matching embedding_options.dimensions. Native fitted calibrations require the original Antfly model path; hosted routes use explicit thresholds and estimated token admission. */
+            embedder?: string;
             /** @description EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto each question and can be overridden per question. Other models reject these options. Raw cosine similarities never represent probabilities. */
             embedding_options?: {
                 /** @description Qualified fitted raw thresholds in model/calibrations/{id}.json. Bound to the exact asset identity, task, renderer, dimensions and category prototypes; mutually exclusive with manual thresholds. Does not produce probabilities. */
@@ -20423,6 +20478,19 @@ export interface components {
              */
             rank_constant?: number;
         };
+        /** @description Cloudflare Workers AI reranking. Uses CLOUDFLARE_API_TOKEN or an Antfly secret reference. */
+        CloudflareRerankerConfig: {
+            /** @enum {string} */
+            provider: "cloudflare";
+            account_id: string;
+            /** @description Optional AI Gateway ID, sent through cf-aig-gateway-id. */
+            gateway_id?: string;
+            /** @default @cf/baai/bge-reranker-base */
+            model: string;
+            api_key?: string;
+            /** @description Optional deployment-owned endpoint override. */
+            url?: string;
+        };
         /**
          * @description Configuration for the Antfly inference reranking provider.
          * @example {
@@ -20512,6 +20580,8 @@ export interface components {
          *     }
          */
         RerankerConfig: {
+            account_id?: string;
+            gateway_id?: string;
             rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["RerankerProvider"];
             /** @description Field name to extract from documents for reranking. */
@@ -20527,7 +20597,7 @@ export interface components {
              * @description Deprecated compatibility override for QueryRequest.limit. When present, this is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit. Cannot exceed candidate_count when both are present or the selected provider's candidate ceiling; Vertex currently accepts at most 200.
              */
             top_n?: number;
-        } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
+        } & (components["schemas"]["CloudflareRerankerConfig"] | components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
         /** @description Reads a published graph metric. Score-bearing graph metric queries on multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required instead of merging mathematically incompatible shard-local scores. */
         GraphMetricQuery: {
             /** @description Direction of query-time personalized PageRank; defaults to out. Requires seed_nodes and metric_freshness=fresh. Both treats every selected relationship as undirected, allowing entity seeds to reach documents through incoming mention edges. */
@@ -22406,12 +22476,20 @@ export interface components {
             /** @description Rewritten texts for this input, one per beam. */
             texts: string[];
         };
+        /** @description Read exactly one of images or documents. The server rejects absent or simultaneous input forms before inference. */
         InferenceReadRequest: {
             /**
              * @description Name of reader model from models_dir/readers/
              * @example microsoft/trocr-base-printed
              */
             model: string;
+            /**
+             * @description Request an opaque, process-local reading handle for extraction reuse. Retention is best effort; inspect document.artifact_id and artifact_ttl_ms.
+             * @default false
+             */
+            retain_artifact?: boolean;
+            /** @description Complete documents, mutually exclusive with images. Each source is independent; selected pages are read in original source order. */
+            documents?: components["schemas"]["DocumentSource"][];
             /**
              * @description Images to read text from. Supports:
              *     - Data URIs: `data:image/png;base64,...`
@@ -22422,7 +22500,7 @@ export interface components {
              *       }
              *     ]
              */
-            images: components["schemas"]["InferenceImageURL"][];
+            images?: components["schemas"]["InferenceImageURL"][];
             /**
              * @description Optional task prompt for document understanding models.
              *     - TrOCR: Not used (pure OCR)
@@ -22442,9 +22520,38 @@ export interface components {
             max_tokens?: number;
         };
         InferenceTextRegion: {
+            /** @description Region identity within its parent; nested regions use qualified paths. */
+            id?: number;
+            /**
+             * @description Default provenance of this region; nested region origins override it.
+             * @enum {string}
+             */
+            origin?: "native" | "transcription" | "interpretation" | "derived" | "estimated";
+            /**
+             * Format: int64
+             * @description Start UTF-8 byte offset in the containing page text; null when unmapped.
+             */
+            text_start?: number | null;
+            /**
+             * Format: int64
+             * @description Exclusive end UTF-8 byte offset in the containing page text.
+             */
+            text_end?: number | null;
+            /** @description Accepted subregions in the same source coordinate space and page text offsets. */
+            children?: {
+                [key: string]: unknown;
+            }[];
+            /** @description Tables owned by this region, including cells and provenance. */
+            tables?: {
+                [key: string]: unknown;
+            }[];
+            /** @description Structured output owned by this region. */
+            fields?: {
+                [key: string]: unknown;
+            } | null;
             /** @description Recognized text within the region */
             text: string;
-            /** @description Bounding box [x1, y1, x2, y2] in pixel coordinates */
+            /** @description Bounding box [x1, y1, x2, y2] in the document source coordinate space, or pixels for ordinary image requests */
             bbox: number[];
             /** @description Recognition confidence score (0-1) */
             confidence?: number;
@@ -22452,6 +22559,41 @@ export interface components {
             label?: string;
         };
         InferenceReadResult: {
+            /** @description Original document source ID. */
+            source_id?: string;
+            /** @description One-based original page or slide number. */
+            number?: number;
+            /** @enum {string} */
+            kind?: "page" | "slide" | "image";
+            /** @description Native layout/master content, source part identity, and visibility/coverage metadata; unsupported composition remains unresolved. */
+            inherited_parts?: {
+                [key: string]: unknown;
+            }[];
+            native_text?: string;
+            /** @description Speaker notes, separate from slide text. */
+            notes?: string;
+            /** @enum {string} */
+            status?: "complete" | "unresolved" | "truncated";
+            /**
+             * @description Default provenance for page text; mapped region origins override it.
+             * @enum {string}
+             */
+            origin?: "native" | "transcription" | "interpretation" | "derived" | "estimated";
+            /** @description Coordinate space of regions; PDF points, slide EMUs or image pixels. */
+            coordinate_space?: string;
+            /** @description Projective source transform. */
+            transform?: {
+                [key: string]: unknown;
+            };
+            /** @description Mapping from rendered pixels to original source coordinates, including page rotation and actual render DPI. */
+            raster_to_source?: {
+                [key: string]: unknown;
+            } | null;
+            /** @description Tables and cells in source coordinates with provenance. */
+            tables?: {
+                [key: string]: unknown;
+            }[];
+            findings?: string[];
             /**
              * @description Extracted text from the image
              * @example Invoice Total: $123.45
@@ -22469,7 +22611,7 @@ export interface components {
              */
             fields?: {
                 [key: string]: string;
-            };
+            } | null;
             /**
              * @description Individual text regions with bounding boxes and recognized text.
              *     Populated by multi-stage OCR models (Surya, PaddleOCR).
@@ -22484,6 +22626,14 @@ export interface components {
             object: "list";
             /** @description Read result objects, one per input image. */
             data: components["schemas"]["InferenceReadObject"][];
+            /** @description Versioned reading metadata containing status, source fingerprints, definition fingerprint, pinned model identities, adapter version and optional artifact retention handle. */
+            document?: {
+                [key: string]: unknown;
+            };
+            /** @description Bounded progress and audit events. These contain model names and source IDs, never credentials. */
+            events?: {
+                [key: string]: unknown;
+            }[];
             /** @description Name of model used for reading */
             model: string;
             usage?: components["schemas"]["InferenceGenerateUsage"];
@@ -23301,6 +23451,18 @@ export interface components {
             completion_tokens: number;
             /** @description Total tokens used (prompt + completion) */
             total_tokens: number;
+            /** @description Cumulative logical child invocations for a document run. */
+            model_calls?: number;
+            /** @description Physical child operation invocations, separate from logical composite calls. */
+            physical_model_calls?: number;
+            /** @description Cumulative rendered or decoded pixels charged by document work. */
+            rendered_pixels?: number;
+            /** @description Cumulative document text bytes charged before envelope serialization. */
+            output_bytes?: number;
+            /** @description Selected pages completed successfully. */
+            completed_pages?: number;
+            /** @description Selected pages visited, including unresolved work. */
+            visited_pages?: number;
             /** @description Prompt tokens served from inference-native prefix KV cache */
             cached_prompt_tokens?: number;
         };
@@ -28472,6 +28634,26 @@ export interface components {
          * @enum {integer}
          */
         ExtractionSchemaVersion: 1 | 2;
+        DocumentSource: {
+            /** @description Unique source identity within the request. Separate sources are never implicitly merged. */
+            id: string;
+            /** @description Inline data URI or location allowed by the deployment content security policy. */
+            url: string;
+            /** @enum {string} */
+            media_type: "application/pdf" | "application/vnd.openxmlformats-officedocument.presentationml.presentation" | "image/png" | "image/jpeg" | "image/webp";
+            /** @description Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide. */
+            pages?: number[];
+            /**
+             * @description Include slide speaker notes as separate evidence, never silently as visible slide text.
+             * @default false
+             */
+            include_notes?: boolean;
+            /**
+             * @description Include hidden slides.
+             * @default false
+             */
+            include_hidden?: boolean;
+        };
         ExtractionToken: {
             text: string;
             box?: number[];
@@ -28488,11 +28670,15 @@ export interface components {
             /** @description Version 2 only. Replaces the complete shared options; omitted fields use runtime defaults. */
             options?: components["schemas"]["ExtractionOptions"];
         };
-        /** @description Atomic extraction request. Every input is validated before inference; failures return no partial data. */
+        /** @description Atomic extraction request. Supply exactly one of inputs, documents or read_artifact. Every input is validated before inference; failures return no partial data. */
         ExtractionRequest: {
             model: string;
             schema_version?: components["schemas"]["ExtractionSchemaVersion"];
-            inputs: components["schemas"]["ExtractionInput"][];
+            /** @description Opaque handle returned by read with retain_artifact. Mutually exclusive with inputs and documents. Reuses the immutable complete reading without downloading or running OCR again. Handles expire and are local to the serving process. */
+            read_artifact?: string;
+            /** @description Complete PDF/PPTX/image sources. Mutually exclusive with inputs. Reading and extraction share document adapters and preserve independent source grouping. */
+            documents?: components["schemas"]["DocumentSource"][];
+            inputs?: components["schemas"]["ExtractionInput"][];
             schema: components["schemas"]["ExtractionSchema"];
             options?: components["schemas"]["ExtractionOptions"];
         };

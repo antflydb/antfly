@@ -1,0 +1,24 @@
+{
+  "cases": [
+    {
+      "id": "two-page-native-pdf",
+      "path": "../../../zig/pkg/inference/src/documents/testdata/two-pages.pdf",
+      "media_type": "application/pdf",
+      "normalize_whitespace": true,
+      "pages": [
+        {"number": 1, "text": "First page total 12.50"},
+        {"number": 2, "text": "Second page notes"}
+      ]
+    },
+    {
+      "id": "declared-slide-order",
+      "path": "../../../zig/pkg/inference/src/documents/testdata/ordered-slides.pptx",
+      "media_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      "normalize_whitespace": true,
+      "pages": [
+        {"number": 1, "text": "Slide 2"},
+        {"number": 2, "text": "Slide 1"}
+      ]
+    }
+  ]
+}

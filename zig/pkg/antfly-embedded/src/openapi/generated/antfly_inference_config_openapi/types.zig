@@ -454,6 +454,61 @@ pub const ContentPart = union(enum) {
     }
 };
 
+pub const DocumentSource = struct {
+    /// Unique source identity within the request. Separate sources are never implicitly merged.
+    id: []const u8,
+    /// Inline data URI or location allowed by the deployment content security policy.
+    url: []const u8,
+    media_type: []const u8,
+    /// Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide.
+    pages: ?[]const i64 = null,
+    /// Include slide speaker notes as separate evidence, never silently as visible slide text.
+    include_notes: ?bool = null,
+    /// Include hidden slides.
+    include_hidden: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "url", "url", false },
+        .{ "media_type", "media_type", false },
+        .{ "pages", "pages", true },
+        .{ "include_notes", "include_notes", true },
+        .{ "include_hidden", "include_hidden", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("url");
+        try jw.write(self.url);
+        try jw.objectField("media_type");
+        try jw.write(self.media_type);
+        if (self.pages) |value| {
+            try jw.objectField("pages");
+            try jw.write(value);
+        }
+        if (self.include_notes) |value| {
+            try jw.objectField("include_notes");
+            try jw.write(value);
+        }
+        if (self.include_hidden) |value| {
+            try jw.objectField("include_hidden");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const EmbedRequest = struct {
     /// Name of the embedder model from models_dir/embedders/
     model: []const u8,
@@ -1633,11 +1688,16 @@ pub const PromptCacheConfig = struct {
     }
 };
 
+/// Read exactly one of images or documents. The server rejects absent or simultaneous input forms before inference.
 pub const ReadRequest = struct {
     /// Name of reader model from models_dir/readers/
     model: []const u8,
+    /// Request an opaque, process-local reading handle for extraction reuse. Retention is best effort; inspect document.artifact_id and artifact_ttl_ms.
+    retain_artifact: ?bool = null,
+    /// Complete documents, mutually exclusive with images. Each source is independent; selected pages are read in original source order.
+    documents: ?[]const DocumentSource = null,
     /// Images to read text from. Supports: - Data URIs: `data:image/png;base64,...` - URLs (if content_security allows)
-    images: []const ImageURL,
+    images: ?[]const ImageURL = null,
     /// Optional task prompt for document understanding models. - TrOCR: Not used (pure OCR) - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning
     prompt: ?[]const u8 = null,
     /// Maximum tokens to generate
@@ -1646,7 +1706,9 @@ pub const ReadRequest = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "model", "model", false },
-        .{ "images", "images", false },
+        .{ "retain_artifact", "retain_artifact", true },
+        .{ "documents", "documents", true },
+        .{ "images", "images", true },
         .{ "prompt", "prompt", true },
         .{ "max_tokens", "max_tokens", true },
     };
@@ -1663,8 +1725,18 @@ pub const ReadRequest = struct {
         try jw.beginObject();
         try jw.objectField("model");
         try jw.write(self.model);
-        try jw.objectField("images");
-        try jw.write(self.images);
+        if (self.retain_artifact) |value| {
+            try jw.objectField("retain_artifact");
+            try jw.write(value);
+        }
+        if (self.documents) |value| {
+            try jw.objectField("documents");
+            try jw.write(value);
+        }
+        if (self.images) |value| {
+            try jw.objectField("images");
+            try jw.write(value);
+        }
         if (self.prompt) |value| {
             try jw.objectField("prompt");
             try jw.write(value);
@@ -1678,24 +1750,96 @@ pub const ReadRequest = struct {
 };
 
 pub const ReadResponse = struct {
+    /// Versioned reading metadata containing status, source fingerprints, definition fingerprint, pinned model identities, adapter version and optional artifact retention handle.
+    document: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Bounded progress and audit events. These contain model names and source IDs, never credentials.
+    events: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
     /// Name of model used for reading
     model: []const u8,
     /// Array of read results (one per input image)
     results: []const ReadResult,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "document", "document", true },
+        .{ "events", "events", true },
+        .{ "model", "model", false },
+        .{ "results", "results", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.document) |value| {
+            try jw.objectField("document");
+            try jw.write(value);
+        }
+        if (self.events) |value| {
+            try jw.objectField("events");
+            try jw.write(value);
+        }
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("results");
+        try jw.write(self.results);
+        try jw.endObject();
+    }
 };
 
 pub const ReadResult = struct {
+    /// Original document source ID.
+    source_id: ?[]const u8 = null,
+    /// One-based original page or slide number.
+    number: ?i64 = null,
+    kind: ?[]const u8 = null,
+    /// Native layout/master content, source part identity, and visibility/coverage metadata; unsupported composition remains unresolved.
+    inherited_parts: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
+    native_text: ?[]const u8 = null,
+    /// Speaker notes, separate from slide text.
+    notes: ?[]const u8 = null,
+    status: ?[]const u8 = null,
+    /// Default provenance for page text; mapped region origins override it.
+    origin: ?[]const u8 = null,
+    /// Coordinate space of regions; PDF points, slide EMUs or image pixels.
+    coordinate_space: ?[]const u8 = null,
+    /// Projective source transform.
+    transform: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Mapping from rendered pixels to original source coordinates, including page rotation and actual render DPI.
+    raster_to_source: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
+    /// Tables and cells in source coordinates with provenance.
+    tables: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
+    findings: ?[]const []const u8 = null,
     /// Extracted text from the image
     text: []const u8,
     /// Structured fields extracted by document understanding models (Donut, Florence-2). Fields are flattened with dot notation for nested structures. Only present for models that output structured data.
-    fields: ?std.json.ArrayHashMap([]const u8) = null,
+    fields: OpenApiOptionalNullable(std.json.ArrayHashMap([]const u8)) = .absent,
     /// Individual text regions with bounding boxes and recognized text. Populated by multi-stage OCR models (Surya, PaddleOCR).
     regions: ?[]const TextRegion = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "source_id", "source_id", true },
+        .{ "number", "number", true },
+        .{ "kind", "kind", true },
+        .{ "inherited_parts", "inherited_parts", true },
+        .{ "native_text", "native_text", true },
+        .{ "notes", "notes", true },
+        .{ "status", "status", true },
+        .{ "origin", "origin", true },
+        .{ "coordinate_space", "coordinate_space", true },
+        .{ "transform", "transform", true },
+        .{ "raster_to_source", "raster_to_source", false },
+        .{ "tables", "tables", true },
+        .{ "findings", "findings", true },
         .{ "text", "text", false },
-        .{ "fields", "fields", true },
+        .{ "fields", "fields", false },
         .{ "regions", "regions", true },
     };
 
@@ -1709,11 +1853,77 @@ pub const ReadResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.source_id) |value| {
+            try jw.objectField("source_id");
+            try jw.write(value);
+        }
+        if (self.number) |value| {
+            try jw.objectField("number");
+            try jw.write(value);
+        }
+        if (self.kind) |value| {
+            try jw.objectField("kind");
+            try jw.write(value);
+        }
+        if (self.inherited_parts) |value| {
+            try jw.objectField("inherited_parts");
+            try jw.write(value);
+        }
+        if (self.native_text) |value| {
+            try jw.objectField("native_text");
+            try jw.write(value);
+        }
+        if (self.notes) |value| {
+            try jw.objectField("notes");
+            try jw.write(value);
+        }
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        if (self.origin) |value| {
+            try jw.objectField("origin");
+            try jw.write(value);
+        }
+        if (self.coordinate_space) |value| {
+            try jw.objectField("coordinate_space");
+            try jw.write(value);
+        }
+        if (self.transform) |value| {
+            try jw.objectField("transform");
+            try jw.write(value);
+        }
+        switch (self.raster_to_source) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("raster_to_source");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("raster_to_source");
+                try jw.write(value);
+            },
+        }
+        if (self.tables) |value| {
+            try jw.objectField("tables");
+            try jw.write(value);
+        }
+        if (self.findings) |value| {
+            try jw.objectField("findings");
+            try jw.write(value);
+        }
         try jw.objectField("text");
         try jw.write(self.text);
-        if (self.fields) |value| {
-            try jw.objectField("fields");
-            try jw.write(value);
+        switch (self.fields) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("fields");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("fields");
+                try jw.write(value);
+            },
         }
         if (self.regions) |value| {
             try jw.objectField("regions");
@@ -2028,9 +2238,23 @@ pub const TextContentPart = struct {
 };
 
 pub const TextRegion = struct {
+    /// Region identity within its parent; nested regions use qualified paths.
+    id: ?i64 = null,
+    /// Default provenance of this region; nested region origins override it.
+    origin: ?[]const u8 = null,
+    /// Start UTF-8 byte offset in the containing page text; null when unmapped.
+    text_start: OpenApiOptionalNullable(i64) = .absent,
+    /// Exclusive end UTF-8 byte offset in the containing page text.
+    text_end: OpenApiOptionalNullable(i64) = .absent,
+    /// Accepted subregions in the same source coordinate space and page text offsets.
+    children: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
+    /// Tables owned by this region, including cells and provenance.
+    tables: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
+    /// Structured output owned by this region.
+    fields: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
     /// Recognized text within the region
     text: []const u8,
-    /// Bounding box [x1, y1, x2, y2] in pixel coordinates
+    /// Bounding box [x1, y1, x2, y2] in the document source coordinate space, or pixels for ordinary image requests
     bbox: []const f64,
     /// Recognition confidence score (0-1)
     confidence: ?f64 = null,
@@ -2039,6 +2263,13 @@ pub const TextRegion = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "origin", "origin", true },
+        .{ "text_start", "text_start", false },
+        .{ "text_end", "text_end", false },
+        .{ "children", "children", true },
+        .{ "tables", "tables", true },
+        .{ "fields", "fields", false },
         .{ "text", "text", false },
         .{ "bbox", "bbox", false },
         .{ "confidence", "confidence", true },
@@ -2055,6 +2286,55 @@ pub const TextRegion = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.origin) |value| {
+            try jw.objectField("origin");
+            try jw.write(value);
+        }
+        switch (self.text_start) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("text_start");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("text_start");
+                try jw.write(value);
+            },
+        }
+        switch (self.text_end) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("text_end");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("text_end");
+                try jw.write(value);
+            },
+        }
+        if (self.children) |value| {
+            try jw.objectField("children");
+            try jw.write(value);
+        }
+        if (self.tables) |value| {
+            try jw.objectField("tables");
+            try jw.write(value);
+        }
+        switch (self.fields) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("fields");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("fields");
+                try jw.write(value);
+            },
+        }
         try jw.objectField("text");
         try jw.write(self.text);
         try jw.objectField("bbox");

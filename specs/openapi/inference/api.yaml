@@ -2629,12 +2629,24 @@ components:
       type: object
       required:
         - model
-        - images
+      description: Read exactly one of images or documents. The server rejects absent or simultaneous input forms before inference.
+      x-antfly-exactly-one-of: [images, documents]
       properties:
         model:
           type: string
           description: Name of reader model from models_dir/readers/
           example: microsoft/trocr-base-printed
+        retain_artifact:
+          type: boolean
+          default: false
+          description: Request an opaque, process-local reading handle for extraction reuse. Retention is best effort; inspect document.artifact_id and artifact_ttl_ms.
+        documents:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: Complete documents, mutually exclusive with images. Each source is independent; selected pages are read in original source order.
+          items:
+            $ref: '../ai/extraction.yaml#/components/schemas/DocumentSource'
         images:
           type: array
           minItems: 1
@@ -2671,6 +2683,43 @@ components:
         - text
         - bbox
       properties:
+        id:
+          type: integer
+          minimum: 0
+          description: Region identity within its parent; nested regions use qualified paths.
+        origin:
+          type: string
+          enum: [native, transcription, interpretation, derived, estimated]
+          description: Default provenance of this region; nested region origins override it.
+        text_start:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 0
+          description: Start UTF-8 byte offset in the containing page text; null when unmapped.
+        text_end:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 0
+          description: Exclusive end UTF-8 byte offset in the containing page text.
+        children:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Accepted subregions in the same source coordinate space and page text offsets.
+        tables:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Tables owned by this region, including cells and provenance.
+        fields:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: Structured output owned by this region.
         text:
           type: string
           description: Recognized text within the region
@@ -2680,7 +2729,7 @@ components:
             type: number
           minItems: 4
           maxItems: 4
-          description: Bounding box [x1, y1, x2, y2] in pixel coordinates
+          description: "Bounding box [x1, y1, x2, y2] in the document source coordinate space, or pixels for ordinary image requests"
         confidence:
           type: number
           description: Recognition confidence score (0-1)
@@ -2692,12 +2741,63 @@ components:
       required:
         - text
       properties:
+        source_id:
+          type: string
+          description: Original document source ID.
+        number:
+          type: integer
+          minimum: 1
+          description: One-based original page or slide number.
+        kind:
+          type: string
+          enum: [page, slide, image]
+        inherited_parts:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Native layout/master content, source part identity, and visibility/coverage metadata; unsupported composition remains unresolved.
+        native_text:
+          type: string
+        notes:
+          type: string
+          description: Speaker notes, separate from slide text.
+        status:
+          type: string
+          enum: [complete, unresolved, truncated]
+        origin:
+          type: string
+          enum: [native, transcription, interpretation, derived, estimated]
+          description: Default provenance for page text; mapped region origins override it.
+        coordinate_space:
+          type: string
+          description: Coordinate space of regions; PDF points, slide EMUs or image pixels.
+        transform:
+          type: object
+          additionalProperties: true
+          description: Projective source transform.
+        raster_to_source:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: Mapping from rendered pixels to original source coordinates, including page rotation and actual render DPI.
+        tables:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Tables and cells in source coordinates with provenance.
+        findings:
+          type: array
+          items:
+            type: string
         text:
           type: string
           description: Extracted text from the image
-          example: 'Invoice Total: $123.45'
+          example: "Invoice Total: $123.45"
         fields:
           type: object
+          nullable: true
           additionalProperties:
             type: string
           description: |
@@ -2705,16 +2805,17 @@ components:
             Fields are flattened with dot notation for nested structures.
             Only present for models that output structured data.
           example:
-            menu.nm: Coffee
-            menu.price: $3.50
-            total: $123.45
+            menu.nm: "Coffee"
+            menu.price: "$3.50"
+            total: "$123.45"
         regions:
           type: array
           items:
-            $ref: '#/components/schemas/TextRegion'
+            $ref: "#/components/schemas/TextRegion"
           description: |
             Individual text regions with bounding boxes and recognized text.
             Populated by multi-stage OCR models (Surya, PaddleOCR).
+
     ReadResponse:
       type: object
       required:
@@ -2733,6 +2834,16 @@ components:
           items:
             $ref: '#/components/schemas/ReadObject'
           description: Read result objects, one per input image.
+        document:
+          type: object
+          additionalProperties: true
+          description: Versioned reading metadata containing status, source fingerprints, definition fingerprint, pinned model identities, adapter version and optional artifact retention handle.
+        events:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Bounded progress and audit events. These contain model names and source IDs, never credentials.
         model:
           type: string
           description: Name of model used for reading
@@ -4072,6 +4183,30 @@ components:
         total_tokens:
           type: integer
           description: Total tokens used (prompt + completion)
+        model_calls:
+          type: integer
+          minimum: 0
+          description: Cumulative logical child invocations for a document run.
+        physical_model_calls:
+          type: integer
+          minimum: 0
+          description: Physical child operation invocations, separate from logical composite calls.
+        rendered_pixels:
+          type: integer
+          minimum: 0
+          description: Cumulative rendered or decoded pixels charged by document work.
+        output_bytes:
+          type: integer
+          minimum: 0
+          description: Cumulative document text bytes charged before envelope serialization.
+        completed_pages:
+          type: integer
+          minimum: 0
+          description: Selected pages completed successfully.
+        visited_pages:
+          type: integer
+          minimum: 0
+          description: Selected pages visited, including unresolved work.
         cached_prompt_tokens:
           type: integer
           description: Prompt tokens served from inference-native prefix KV cache

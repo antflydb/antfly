@@ -2051,7 +2051,7 @@ fn isModelDir(io: Io, path: []const u8) bool {
             return !download.managedDownloadPublicationBlocked(alloc, check_io, model_path);
         }
     }.check;
-    const indicators = [_][]const u8{ "config.json", "tokenizer.json", "genai_config.json", "antfly_metadata.json" };
+    const indicators = [_][]const u8{ "config.json", "tokenizer.json", "genai_config.json", "antfly_metadata.json", "document_agent.json" };
     for (indicators) |filename| {
         const file_path = std.fs.path.join(allocator, &.{ path, filename }) catch continue;
         defer allocator.free(file_path);

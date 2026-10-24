@@ -147,6 +147,12 @@ from .classification_step_config import ClassificationStepConfig
 from .classification_transformation_result import ClassificationTransformationResult
 from .close_prepared_sql_response_200 import ClosePreparedSQLResponse200
 from .close_sql_connection_response_200 import CloseSQLConnectionResponse200
+from .cloudflare_embedder_config import CloudflareEmbedderConfig
+from .cloudflare_embedder_config_provider import CloudflareEmbedderConfigProvider
+from .cloudflare_generator_config import CloudflareGeneratorConfig
+from .cloudflare_generator_config_provider import CloudflareGeneratorConfigProvider
+from .cloudflare_reranker_config import CloudflareRerankerConfig
+from .cloudflare_reranker_config_provider import CloudflareRerankerConfigProvider
 from .cluster_backup_request import ClusterBackupRequest
 from .cluster_backup_request_format import ClusterBackupRequestFormat
 from .cluster_backup_response import ClusterBackupResponse
@@ -321,6 +327,8 @@ from .document_field_mapping_fields import DocumentFieldMappingFields
 from .document_field_mapping_missing_null_policy import DocumentFieldMappingMissingNullPolicy
 from .document_schema import DocumentSchema
 from .document_schema_schema import DocumentSchemaSchema
+from .document_source import DocumentSource
+from .document_source_media_type import DocumentSourceMediaType
 from .document_subfield_mapping import DocumentSubfieldMapping
 from .document_subfield_mapping_missing_null_policy import DocumentSubfieldMappingMissingNullPolicy
 from .drop_extension_request import DropExtensionRequest
@@ -1039,9 +1047,18 @@ from .inference_read_object import InferenceReadObject
 from .inference_read_object_object import InferenceReadObjectObject
 from .inference_read_request import InferenceReadRequest
 from .inference_read_response import InferenceReadResponse
+from .inference_read_response_document import InferenceReadResponseDocument
+from .inference_read_response_events_item import InferenceReadResponseEventsItem
 from .inference_read_response_object import InferenceReadResponseObject
 from .inference_read_result import InferenceReadResult
-from .inference_read_result_fields import InferenceReadResultFields
+from .inference_read_result_fields_type_0 import InferenceReadResultFieldsType0
+from .inference_read_result_inherited_parts_item import InferenceReadResultInheritedPartsItem
+from .inference_read_result_kind import InferenceReadResultKind
+from .inference_read_result_origin import InferenceReadResultOrigin
+from .inference_read_result_raster_to_source_type_0 import InferenceReadResultRasterToSourceType0
+from .inference_read_result_status import InferenceReadResultStatus
+from .inference_read_result_tables_item import InferenceReadResultTablesItem
+from .inference_read_result_transform import InferenceReadResultTransform
 from .inference_request_admission_config import InferenceRequestAdmissionConfig
 from .inference_rerank_object import InferenceRerankObject
 from .inference_rerank_object_object import InferenceRerankObjectObject
@@ -1067,6 +1084,10 @@ from .inference_text_content import InferenceTextContent
 from .inference_text_content_part import InferenceTextContentPart
 from .inference_text_content_part_type import InferenceTextContentPartType
 from .inference_text_region import InferenceTextRegion
+from .inference_text_region_children_item import InferenceTextRegionChildrenItem
+from .inference_text_region_fields_type_0 import InferenceTextRegionFieldsType0
+from .inference_text_region_origin import InferenceTextRegionOrigin
+from .inference_text_region_tables_item import InferenceTextRegionTablesItem
 from .inference_tool import InferenceTool
 from .inference_tool_call_delta import InferenceToolCallDelta
 from .inference_tool_call_delta_type import InferenceToolCallDeltaType
@@ -2549,6 +2570,12 @@ __all__ = (
     "ClassificationTransformationResult",
     "ClosePreparedSQLResponse200",
     "CloseSQLConnectionResponse200",
+    "CloudflareEmbedderConfig",
+    "CloudflareEmbedderConfigProvider",
+    "CloudflareGeneratorConfig",
+    "CloudflareGeneratorConfigProvider",
+    "CloudflareRerankerConfig",
+    "CloudflareRerankerConfigProvider",
     "ClusterBackupRequest",
     "ClusterBackupRequestFormat",
     "ClusterBackupResponse",
@@ -2721,6 +2748,8 @@ __all__ = (
     "DocumentFieldMappingMissingNullPolicy",
     "DocumentSchema",
     "DocumentSchemaSchema",
+    "DocumentSource",
+    "DocumentSourceMediaType",
     "DocumentSubfieldMapping",
     "DocumentSubfieldMappingMissingNullPolicy",
     "DropExtensionRequest",
@@ -3431,9 +3460,18 @@ __all__ = (
     "InferenceReadObjectObject",
     "InferenceReadRequest",
     "InferenceReadResponse",
+    "InferenceReadResponseDocument",
+    "InferenceReadResponseEventsItem",
     "InferenceReadResponseObject",
     "InferenceReadResult",
-    "InferenceReadResultFields",
+    "InferenceReadResultFieldsType0",
+    "InferenceReadResultInheritedPartsItem",
+    "InferenceReadResultKind",
+    "InferenceReadResultOrigin",
+    "InferenceReadResultRasterToSourceType0",
+    "InferenceReadResultStatus",
+    "InferenceReadResultTablesItem",
+    "InferenceReadResultTransform",
     "InferenceRequestAdmissionConfig",
     "InferenceRerankObject",
     "InferenceRerankObjectObject",
@@ -3458,6 +3496,10 @@ __all__ = (
     "InferenceTextContentPart",
     "InferenceTextContentPartType",
     "InferenceTextRegion",
+    "InferenceTextRegionChildrenItem",
+    "InferenceTextRegionFieldsType0",
+    "InferenceTextRegionOrigin",
+    "InferenceTextRegionTablesItem",
     "InferenceTool",
     "InferenceToolCallDelta",
     "InferenceToolCallDeltaType",

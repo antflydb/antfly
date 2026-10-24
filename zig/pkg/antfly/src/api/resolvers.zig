@@ -1350,7 +1350,7 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
         }
         fn options(ptr: *anyopaque) local.asset_producer_runtime.Runtime.Options {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            return .{ .antfly_provider = self.server.antfly_provider, .inference_api_url = self.server.configuredInferenceAPIURL(), .secret_store = self.server.cfg.secret_store, .source_table = self.source_table };
+            return .{ .provider_runtime = &self.server.embedding_provider_runtime, .antfly_provider = self.server.antfly_provider, .inference_api_url = self.server.configuredInferenceAPIURL(), .secret_store = self.server.cfg.secret_store, .source_table = self.source_table };
         }
         fn bind(ptr: *anyopaque, allocator: std.mem.Allocator, names: []const []const u8) ![][]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));

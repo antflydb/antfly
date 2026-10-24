@@ -55,8 +55,17 @@ pub const InlineContentTrust = enum {
     trusted_internal,
 };
 
+pub const DocumentSource = struct {
+    id: []const u8,
+    url: []const u8,
+    media_type: []const u8,
+    pages: ?[]const usize = null,
+    include_notes: bool = false,
+    include_hidden: bool = false,
+};
 pub const Request = struct {
-    images: []const []const u8,
+    images: []const []const u8 = &.{},
+    documents: []const DocumentSource = &.{},
     prompt: ?[]const u8 = null,
     max_tokens: ?i64 = null,
     /// Trust applies only to inline `data:` image content. Network locations
@@ -83,6 +92,8 @@ pub const EncodedImage = struct {
 };
 
 pub const EncodedRequest = struct {
+    /// Composition may inspect incomplete output; ordinary callers keep strict behavior.
+    allow_incomplete: bool = false,
     images: []const EncodedImage,
     prompt: ?[]const u8 = null,
     max_tokens: ?i64 = null,
@@ -152,7 +163,13 @@ test "encoded reader validation is execution-mode independent" {
     );
 }
 
+pub const Completion = enum { complete, length, unresolved };
+
 pub const Result = struct {
+    completion: Completion = .complete,
+    prompt_tokens: ?usize = null,
+    completion_tokens: ?usize = null,
+    document_json: ?[]const u8 = null,
     text: []const u8,
     fields_json: ?[]const u8 = null,
     regions_json: ?[]const u8 = null,
@@ -163,6 +180,7 @@ pub const Result = struct {
 
 pub fn deinitResult(alloc: Allocator, result: *Result) void {
     alloc.free(@constCast(result.text));
+    if (result.document_json) |value| alloc.free(@constCast(value));
     if (result.fields_json) |value| alloc.free(@constCast(value));
     if (result.regions_json) |value| alloc.free(@constCast(value));
     if (result.item_id.len > 0) alloc.free(@constCast(result.item_id));
@@ -204,21 +222,43 @@ pub const BatchResult = struct {
     }
 };
 
+/// Aggregate measured counters only. Text-length estimates never establish completion.
+pub fn measuredUsage(items: []const Result) !?inference_api.GenerateUsage {
+    var prompt: usize = 0;
+    var output: usize = 0;
+    var measured = false;
+    for (items) |item| {
+        if (item.prompt_tokens) |n| {
+            prompt = try std.math.add(usize, prompt, n);
+            measured = true;
+        }
+        if (item.completion_tokens) |n| {
+            output = try std.math.add(usize, output, n);
+            measured = true;
+        }
+    }
+    if (!measured) return null;
+    return .{ .prompt_tokens = std.math.cast(i64, prompt) orelse return error.InvalidReadExecutionReport, .completion_tokens = std.math.cast(i64, output) orelse return error.InvalidReadExecutionReport, .total_tokens = std.math.cast(i64, try std.math.add(usize, prompt, output)) orelse return error.InvalidReadExecutionReport };
+}
+
 pub const Reader = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
+        accepts_documents: bool = false,
         read: *const fn (ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result,
         read_reported: ?*const fn (ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!BatchResult = null,
         deinit: *const fn (ptr: *anyopaque) void,
     };
 
     pub fn read(self: Reader, alloc: Allocator, req: Request) ![]Result {
+        if (req.documents.len > 0 and !self.vtable.accepts_documents) return error.UnsupportedDocumentFormat;
         return try self.vtable.read(self.ptr, alloc, req);
     }
 
     pub fn readReported(self: Reader, alloc: Allocator, req: Request) !BatchResult {
+        if (req.documents.len > 0 and !self.vtable.accepts_documents) return error.UnsupportedDocumentFormat;
         if (self.vtable.read_reported) |reported| return try reported(self.ptr, alloc, req);
         const items = try self.read(alloc, req);
         return .{ .items = items, .execution = .{ .requested_items = items.len, .serial_items = items.len } };
@@ -352,12 +392,12 @@ pub const Registry = struct {
 
 pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
     var owned = cfg;
-    inline for (.{ "model", "prompt", "api_key", "bearer_token", "capability_token", "capability_revision", "base_url", "url", "api_url", "project_id", "location", "credentials_path" }) |field| {
+    inline for (.{ "account_id", "gateway_id", "model", "prompt", "api_key", "bearer_token", "capability_token", "capability_revision", "base_url", "url", "api_url", "project_id", "location", "credentials_path" }) |field| {
         @field(owned, field) = null;
     }
     owned.recognition_languages = &.{};
     errdefer deinitConfig(alloc, &owned);
-    inline for (.{ "model", "prompt", "api_key", "bearer_token", "capability_token", "capability_revision", "base_url", "url", "api_url", "project_id", "location", "credentials_path" }) |field| {
+    inline for (.{ "account_id", "gateway_id", "model", "prompt", "api_key", "bearer_token", "capability_token", "capability_revision", "base_url", "url", "api_url", "project_id", "location", "credentials_path" }) |field| {
         @field(owned, field) = try dupOpt(alloc, @field(cfg, field));
     }
     const languages = try alloc.alloc([]const u8, cfg.recognition_languages.len);
@@ -375,6 +415,8 @@ pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
 }
 
 pub fn deinitConfig(alloc: Allocator, cfg: *Config) void {
+    freeOpt(alloc, cfg.account_id);
+    freeOpt(alloc, cfg.gateway_id);
     freeOpt(alloc, cfg.model);
     freeOpt(alloc, cfg.prompt);
     freeOpt(alloc, cfg.api_key);
@@ -411,6 +453,7 @@ fn initReaderWithOptions(alloc: Allocator, http: *httpx.Client, cfg: Config, opt
     try cfg.validate();
     return switch (cfg.provider) {
         .antfly => try AntflyReaderState.init(alloc, http, cfg, options),
+        .cloudflare => try CloudReaderState(.cloudflare).init(alloc, http, cfg, options),
         .openai => try OpenAiReaderState.init(alloc, http, cfg, options),
         .vertex => try VertexReaderState.init(alloc, http, cfg, options),
         .apple => try AppleReaderState.init(alloc, http, cfg, options),
@@ -545,7 +588,7 @@ const AntflyReaderState = struct {
         if (cfg.bearer_token orelse cfg.api_key) |token| {
             try state.setBearer(token);
         }
-        return .{ .ptr = state, .vtable = &.{ .read = read, .read_reported = readReported, .deinit = deinit } };
+        return .{ .ptr = state, .vtable = &.{ .accepts_documents = true, .read = read, .read_reported = readReported, .deinit = deinit } };
     }
 
     pub fn deinit(ptr: *anyopaque) void {
@@ -571,6 +614,35 @@ const AntflyReaderState = struct {
 
     fn readReported(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!BatchResult {
         const self: *AntflyReaderState = @ptrCast(@alignCast(ptr));
+        if (req.documents.len > 0) {
+            if (req.images.len > 0) return error.InvalidDocumentSource;
+            const body = try std.json.Stringify.valueAlloc(alloc, .{ .model = self.model, .documents = req.documents, .prompt = req.prompt, .max_tokens = req.max_tokens }, .{ .emit_null_optional_fields = false });
+            defer alloc.free(body);
+            const url = try std.fmt.allocPrint(alloc, "{s}/read", .{self.api_url});
+            defer alloc.free(url);
+            var headers: [5][2][]const u8 = undefined;
+            var count: usize = 0;
+            if (self.auth_header) |header| {
+                headers[count] = header;
+                count += 1;
+            }
+            if (self.source_table) |v| {
+                headers[count] = .{ "X-Antfly-Source-Table", v };
+                count += 1;
+            }
+            if (self.capability_token) |v| {
+                headers[count] = .{ "X-Antfly-Capability-Token", v };
+                count += 1;
+            }
+            if (self.capability_revision) |v| {
+                headers[count] = .{ "X-Antfly-Capability-Revision", v };
+                count += 1;
+            }
+            var response = try self.http.post(url, .{ .json = body, .headers = headers[0..count], .timeout_ms = self.timeout_ms, .cancellation = self.cancellation, .max_response_size = req.max_response_bytes });
+            defer response.deinit();
+            if (!response.ok()) return readHttpStatusError(response.status.code, responseCapabilityStale(response));
+            return documentBatchResult(alloc, response.body orelse return error.InvalidReadResultCount);
+        }
         const images = try alloc.alloc(inference_api.ImageURL, req.images.len);
         defer alloc.free(images);
         for (req.images, 0..) |image, i| images[i] = .{ .url = image };
@@ -645,7 +717,7 @@ const AntflyReaderState = struct {
                 .regions_json = null,
             };
             errdefer deinitResult(alloc, &result);
-            if (item.fields) |fields| result.fields_json = try std.json.Stringify.valueAlloc(alloc, fields, .{});
+            if (item.fields == .value) result.fields_json = try std.json.Stringify.valueAlloc(alloc, item.fields.value, .{});
             if (item.regions) |regions| result.regions_json = try std.json.Stringify.valueAlloc(alloc, regions, .{});
             out[result_index] = result;
             assigned[result_index] = true;
@@ -770,7 +842,7 @@ const AntflyReaderState = struct {
             owns_item_id = false;
             owns_source_fingerprint = false;
             errdefer deinitResult(alloc, &result);
-            if (wire_item.fields) |fields| result.fields_json = try std.json.Stringify.valueAlloc(alloc, fields, .{});
+            if (wire_item.fields == .value) result.fields_json = try std.json.Stringify.valueAlloc(alloc, wire_item.fields.value, .{});
             if (wire_item.regions) |regions| result.regions_json = try std.json.Stringify.valueAlloc(alloc, regions, .{});
             out[result_index] = result;
             assigned[result_index] = true;
@@ -864,6 +936,7 @@ fn CloudReaderState(comptime provider: Provider) type {
         project_id: ?[]const u8 = null,
         location: ?[]const u8 = null,
 
+        gateway_id: ?[]const u8 = null,
         options: RemoteOptions,
 
         const Self = @This();
@@ -875,12 +948,14 @@ fn CloudReaderState(comptime provider: Provider) type {
                 .alloc = alloc,
                 .http = http,
                 .options = options,
-                .base_url = try alloc.dupe(u8, cfg.base_url orelse switch (provider) {
+                .gateway_id = try dupOpt(alloc, cfg.gateway_id),
+                .base_url = if (provider == .cloudflare) try config.cloudflare.baseUrl(alloc, cfg.account_id, cfg.base_url orelse cfg.url) else try alloc.dupe(u8, cfg.base_url orelse switch (provider) {
                     .openai => "https://api.openai.com/v1",
                     .vertex => "https://aiplatform.googleapis.com/v1",
                     else => unreachable,
                 }),
                 .model = try alloc.dupe(u8, cfg.model orelse switch (provider) {
+                    .cloudflare => return error.InvalidReaderConfig,
                     .openai => "gpt-4.1-mini",
                     .vertex => "gemini-2.5-flash",
                     else => unreachable,
@@ -907,6 +982,7 @@ fn CloudReaderState(comptime provider: Provider) type {
         }
 
         fn deinitState(self: *Self) void {
+            freeOpt(self.alloc, self.gateway_id);
             self.alloc.free(self.base_url);
             self.alloc.free(self.model);
             freeOpt(self.alloc, self.prompt);
@@ -950,7 +1026,7 @@ fn CloudReaderState(comptime provider: Provider) type {
         pub fn read(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result {
             const self: *Self = @ptrCast(@alignCast(ptr));
             return switch (provider) {
-                .openai => try self.readOpenAi(alloc, req),
+                .cloudflare, .openai => try self.readOpenAi(alloc, req),
                 .vertex => try self.readVertex(alloc, req),
                 else => unreachable,
             };
@@ -986,6 +1062,7 @@ fn CloudReaderState(comptime provider: Provider) type {
             var minted_auth: ?[]u8 = null;
             defer if (minted_auth) |value| alloc.free(value);
             try self.appendAuthHeaders(alloc, &headers, &minted_auth, control);
+            if (self.gateway_id) |id| try headers.append(alloc, .{ "cf-aig-gateway-id", id });
             var resp = try self.http.post(url, .{
                 .json = body,
                 .headers = headers.items,
@@ -1196,7 +1273,7 @@ test "reader encodes a large inline image within one request buffer budget" {
 
     var parsed = try std.json.parseFromSlice(inference_api.ReadRequest, alloc, body, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings(image_url, parsed.value.images[0].url);
+    try std.testing.expectEqualStrings(image_url, parsed.value.images.?[0].url);
     try std.testing.expectEqualStrings(prompt, parsed.value.prompt.?);
 }
 
@@ -1574,9 +1651,9 @@ fn expectAntflyReaderBatchRequest(req: httpx.testing_mod.RequestInfo) !void {
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("reader", parsed.value.model);
-    try std.testing.expectEqual(@as(usize, 2), parsed.value.images.len);
-    try std.testing.expectEqualStrings("data:image/png;base64,ZmFrZTE=", parsed.value.images[0].url);
-    try std.testing.expectEqualStrings("data:image/png;base64,ZmFrZTI=", parsed.value.images[1].url);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.images.?.len);
+    try std.testing.expectEqualStrings("data:image/png;base64,ZmFrZTE=", parsed.value.images.?[0].url);
+    try std.testing.expectEqualStrings("data:image/png;base64,ZmFrZTI=", parsed.value.images.?[1].url);
     try std.testing.expectEqualStrings("read pages", parsed.value.prompt orelse return error.MissingPrompt);
     try std.testing.expectEqual(@as(?i64, 42), parsed.value.max_tokens);
 }
@@ -1584,4 +1661,75 @@ fn expectAntflyReaderBatchRequest(req: httpx.testing_mod.RequestInfo) !void {
 fn canonicalName(name: []const u8) []const u8 {
     const prefix = "readers/";
     return if (std.mem.startsWith(u8, name, prefix)) name[prefix.len..] else name;
+}
+
+/// Canonical whole-document response decoder shared by HTTP and native hosts.
+pub fn documentResults(a: Allocator, json: []const u8) ![]Result {
+    return (try documentBatchResult(a, json)).items;
+}
+
+/// Parse the document envelope once, preserving completion and aggregate usage.
+pub fn documentBatchResult(a: Allocator, json: []const u8) !BatchResult {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidReadResultCount;
+    const data = parsed.value.object.get("data") orelse return error.InvalidReadResultCount;
+    if (data != .array or data.array.items.len > 10000) return error.InvalidReadResultCount;
+    const out = try a.alloc(Result, data.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*item| deinitResult(a, item);
+        a.free(out);
+    }
+    for (data.array.items, out) |row, *item| {
+        if (row != .object) return error.InvalidReadResultCount;
+        const text = row.object.get("text") orelse return error.InvalidReadResultCount;
+        if (text != .string) return error.InvalidReadResultCount;
+        item.* = .{ .text = try a.dupe(u8, text.string) };
+        initialized += 1;
+        if (row.object.get("status")) |status| {
+            if (status != .string) return error.InvalidReadResultCount;
+            item.completion = if (std.mem.eql(u8, status.string, "complete")) .complete else if (std.mem.eql(u8, status.string, "truncated")) .length else if (std.mem.eql(u8, status.string, "unresolved")) .unresolved else return error.InvalidReadResultCount;
+        }
+        item.document_json = try std.json.Stringify.valueAlloc(a, row, .{});
+        if (row.object.get("source_id")) |id| {
+            if (id != .string) return error.InvalidReadResultCount;
+            item.item_id = try a.dupe(u8, id.string);
+        }
+        if (row.object.get("number")) |number| {
+            if (number != .integer or number.integer < 1) return error.InvalidReadResultCount;
+            item.page_number = std.math.cast(u32, number.integer) orelse return error.InvalidReadResultCount;
+        }
+        if (row.object.get("fields")) |value| if (value != .null) {
+            item.fields_json = try std.json.Stringify.valueAlloc(a, value, .{});
+        };
+        if (row.object.get("regions")) |value| if (value != .null) {
+            item.regions_json = try std.json.Stringify.valueAlloc(a, value, .{});
+        };
+    }
+    var usage: ?inference_api.GenerateUsage = null;
+    if (parsed.value.object.get("usage")) |value| {
+        var decoded = try std.json.parseFromValue(inference_api.GenerateUsage, a, value, .{ .ignore_unknown_fields = true });
+        defer decoded.deinit();
+        const counts = decoded.value;
+        if (counts.prompt_tokens < 0 or counts.completion_tokens < 0 or counts.total_tokens < 0) return error.InvalidReadExecutionReport;
+        usage = counts;
+    }
+    return .{ .items = out, .usage = usage, .execution = .{ .requested_items = out.len, .serial_items = out.len } };
+}
+
+test "document reader decoding preserves completion and usage with allocation rollback" {
+    const Case = struct {
+        fn check(a: Allocator) !void {
+            var batch = try documentBatchResult(a,
+                \\{"data":[{"source_id":"pdf","number":1,"text":"Partial","status":"truncated"},{"source_id":"pdf","number":2,"text":"Uncertain","status":"unresolved"}],"usage":{"prompt_tokens":2,"completion_tokens":7,"total_tokens":9}}
+            );
+            defer batch.deinit(a);
+            try std.testing.expectEqual(Completion.length, batch.items[0].completion);
+            try std.testing.expectEqual(Completion.unresolved, batch.items[1].completion);
+            try std.testing.expectEqual(@as(i64, 9), batch.usage.?.total_tokens);
+            try std.testing.expectEqual(@as(usize, 2), batch.execution.requested_items);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.check, .{});
 }
