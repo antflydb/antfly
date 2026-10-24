@@ -317,3 +317,7 @@ __all__ += [
     "CurationProposalOperations",
     "EntityOperations",
 ]
+
+from .provenance import resource_reference, trace_event
+
+__all__ += ["resource_reference", "trace_event"]

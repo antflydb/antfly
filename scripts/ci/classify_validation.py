@@ -30,7 +30,7 @@ SCOPES = (
     "format_rust",
     "sdk",
     "typescript",
-    "memoryaf",
+    "memory",
     "sources",
     "release",
     "antfarm_e2e",
@@ -161,8 +161,10 @@ def classify(paths: list[str], force_all: bool = False) -> dict[str, bool]:
         # A checked-in embedded bundle change must rebuild its TypeScript
         # producer before the byte-for-byte and browser checks can run.
         scopes["typescript"] |= antfarm_input
-        scopes["memoryaf"] |= path.startswith("go/pkg/memoryaf/")
         scopes["sources"] |= path.startswith("go/pkg/sources/")
+        scopes["memory"] |= path.startswith(
+            ("zig/pkg/antfly-embedded/src/memory/", "specs/openapi/memory/")
+        )
         scopes["antfarm_e2e"] |= antfarm_input
         scopes["release"] |= matches(
             path, RELEASE_FILES, RELEASE_PREFIXES

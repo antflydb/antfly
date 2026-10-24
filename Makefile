@@ -1,4 +1,5 @@
 SHELL := /bin/bash
+ZIG ?= zig
 ZIG_MAKE := $(MAKE) -C ./zig
 ZIG_BUILD_FLAGS ?=
 SCRIPTS_PY ?= uv run --project scripts --locked python
@@ -13,7 +14,6 @@ GO_MODULES := \
 	./go/pkg/evalaf/plugins/antfly \
 	./go/pkg/genkit/antfly \
 	./go/pkg/genkit/openrouter \
-	./go/pkg/memoryaf \
 	./go/pkg/sources
 
 # Run a command in every Go module: $(call go_each,<label>,<command>)
@@ -42,6 +42,7 @@ build: ## Build the Zig antfly binary and copy it to ./antfly.
 	cp zig/zig-out/bin/antfly ./antfly
 
 generate: graph-identifier-generate ## Regenerate openapi.yaml, Zig modules, SDKs, and the antfarm build.
+	$(SCRIPTS_PY) scripts/generate_memory_openapi.py --zig $(ZIG)
 	$(SCRIPTS_PY) scripts/join_public_openapi.py openapi.yaml
 	$(SCRIPTS_PY) scripts/sync_rust_sdk_spec.py
 	$(MAKE) tidy

@@ -725,6 +725,9 @@ importers:
 
   packages/embedded:
     dependencies:
+      lossless-json:
+        specifier: ^4.3.2
+        version: 4.3.2
       koffi:
         specifier: ^3.3.1
         version: 3.3.1
@@ -772,6 +775,9 @@ importers:
 
   packages/sdk:
     dependencies:
+      lossless-json:
+        specifier: ^4.3.2
+        version: 4.3.2
       openapi-fetch:
         specifier: ^0.17.0
         version: 0.17.0
@@ -7046,6 +7052,10 @@ packages:
   kysely@0.29.6:
     resolution: {integrity: sha512-hHaB8C/rfzDDtr/t8YZwxAuPJTT0zHyaPoVzcXwDYhYNAgH/4sIfVhi/XLLIY+bL/FqaIJnjATDbi8ObSELmxg==}
     engines: {node: '>=22.0.0'}
+
+  lossless-json@4.3.2:
+    resolution: {integrity: sha512-TWT1oIGJKaHkme0nDFoW9Tsv0/IZxy6P8rzD03hZpk7de04PWGfl/uMj/WcENrJLNF4P+QGGByPjap6qx++bDQ==}
+
 
 snapshots:
 
@@ -13593,3 +13603,5 @@ snapshots:
   zwitch@2.0.4: {}
 
   kysely@0.29.6: {}
+
+  lossless-json@4.3.2: {}
