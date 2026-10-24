@@ -109,7 +109,7 @@ func (p *Publisher) EnsureTable(ctx context.Context, table string) error {
 	if status, ok := err.(*PublishHTTPError); !ok || status.Status != 404 {
 		return err
 	}
-	_, err = p.call(ctx, "POST", "/tables", map[string]any{"name": table})
+	_, err = p.call(ctx, "POST", tablePath(table), map[string]any{"num_shards": 1})
 	return err
 }
 func (p *Publisher) Batch(ctx context.Context, table string, inserts map[string]any, deletes []string) error {
@@ -118,12 +118,14 @@ func (p *Publisher) Batch(ctx context.Context, table string, inserts map[string]
 		return err
 	}
 	var result struct {
-		Errors map[string]any `json:"errors"`
+		Errors map[string]any    `json:"errors"`
+		Failed []json.RawMessage `json:"failed"`
+		Status string            `json:"status"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
 		return fmt.Errorf("invalid batch acknowledgement: %w", err)
 	}
-	if len(result.Errors) > 0 {
+	if len(result.Errors) > 0 || len(result.Failed) > 0 || result.Status != "" && result.Status != "committed" {
 		return fmt.Errorf("Antfly batch contains record failures")
 	}
 	return nil
@@ -190,10 +192,16 @@ func samePermissions(actual *Permissions, expected Permissions) bool {
 // ReadyAbsent prevents publishing a complete catalog while retired rows are
 // still visible to a fresh query snapshot.
 func (p *Publisher) ReadyAbsent(ctx context.Context, table string, ids []string) error {
+	return WaitForAbsent(ctx, p.Query, table, ids)
+}
+
+// WaitForAbsent verifies retirement through fresh ordinary table-query snapshots.
+func WaitForAbsent(ctx context.Context, query func(context.Context, string, []byte) ([]byte, error), table string, ids []string) error {
 	wait, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	for {
-		data, err := p.call(wait, "POST", tablePath(table)+"/query", map[string]any{"query": map[string]any{"ids": ids}, "fields": []string{"_id"}, "limit": 1, "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
+		body, _ := json.Marshal(map[string]any{"query": map[string]any{"ids": ids}, "fields": []string{"_id"}, "limit": 1, "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
+		data, err := query(wait, table, body)
 		if err != nil {
 			return err
 		}

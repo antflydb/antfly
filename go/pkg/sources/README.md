@@ -116,3 +116,33 @@ purge request.
 Ownership of up to 100,000 potentially written rows is retained across interrupted
 inventories; active inventories remain limited to 10,000 items. Reconciliation
 checks deletion visibility before publishing a searchable catalog.
+
+## Durable Antfly catalog
+
+The runner publishes one versioned `source_catalog` record per source in the
+ordinary `antfly_sources` table. Set `catalog_table` in a profile to choose another
+name. Content destinations cannot use that table. Records contain the source
+binding, provider kind, document version, published revision, explicit sharing
+metadata and freshness lease. Secrets, provider selectors and job checkpoints
+stay outside Antfly's catalog. `--catalog-out` is an optional file export; the
+runner also retains a private mirror in its state directory for recovery.
+
+```sh
+antfly-source sync --config sources.json --state-dir /var/lib/antfly-sources
+antfly-grep --source-endpoint https://antfly.example/api/v1 \
+  --source manuals 'retry budget'
+```
+
+Use `--source-table NAME` for a custom catalog and repeat `--source-principal ID`
+for additional local reader filtering on private content. Authenticate with the
+normal data-plane token. Provision server read/row policy for both catalog and
+content tables; only the ingestion identity should be able to write the catalog.
+Cloud supplies its own current permission checks over the same catalog records.
+
+A snapshot-visible syncing record precedes any content mutation. Searchable
+publication follows query-visible writes and owned-only reconciliation. There is
+no cross-table transaction; interrupted publication remains syncing/stale or has
+only its previous bounded lease. Catalog reads fail on invalid versions, missing
+publication metadata, snapshot changes, duplicates and traversal budgets. Removing
+a source from a profile retires its catalog record while retaining content/state;
+an empty source list retires all entries owned by that profile.

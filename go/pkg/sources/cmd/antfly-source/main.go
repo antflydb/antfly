@@ -44,13 +44,13 @@ func run() error {
 	catalog := flags.String("catalog-out", "", "portable search catalog path")
 	restart := flags.Bool("restart", false, "discard a failed pinned selection and enumerate afresh (retain ownership)")
 	if len(os.Args) < 2 || os.Args[1] != "sync" {
-		return fmt.Errorf("usage: antfly-source sync --config FILE --state-dir DIR --catalog-out FILE [--restart]")
+		return fmt.Errorf("usage: antfly-source sync --config FILE --state-dir DIR [--catalog-out FILE] [--restart]")
 	}
 	if err := flags.Parse(os.Args[2:]); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 || *profile == "" || *state == "" || *catalog == "" {
-		return fmt.Errorf("config, state-dir and catalog-out are required")
+	if flags.NArg() != 0 || *profile == "" || *state == "" {
+		return fmt.Errorf("config and state-dir are required")
 	}
 	file, err := os.Open(*profile)
 	if err != nil {

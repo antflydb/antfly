@@ -56,6 +56,7 @@ func (c *fixtureConnector) ValidateAbsentSources(context.Context, Request, []str
 
 type publicationFixture struct {
 	mu              sync.Mutex
+	catalogRecords  map[string]map[string]any
 	records         map[string]map[string]any
 	failAfterWrite  bool
 	deletes         int
@@ -65,6 +66,13 @@ type publicationFixture struct {
 func (f *publicationFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	records := f.records
+	if strings.Contains(r.URL.Path, "/tables/"+DefaultCatalogTable+"/") {
+		if f.catalogRecords == nil {
+			f.catalogRecords = map[string]map[string]any{}
+		}
+		records = f.catalogRecords
+	}
 	w.Header().Set("Content-Type", "application/json")
 	if r.Header.Get("Authorization") != "Bearer database-test-token" {
 		http.Error(w, "denied", 403)
@@ -86,16 +94,16 @@ func (f *publicationFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if inserts, ok := body["inserts"].(map[string]any); ok {
 			for id, raw := range inserts {
-				f.records[id] = raw.(map[string]any)
+				records[id] = raw.(map[string]any)
 			}
 		}
 		if deletes, ok := body["deletes"].([]any); ok {
 			for _, id := range deletes {
-				delete(f.records, id.(string))
+				delete(records, id.(string))
 				f.deletes++
 			}
 		}
-		if f.failAfterWrite {
+		if f.failAfterWrite && !strings.Contains(r.URL.Path, "/tables/"+DefaultCatalogTable+"/") {
 			f.failAfterWrite = false
 			http.Error(w, "write ack lost", 500)
 			return
@@ -118,8 +126,8 @@ func (f *publicationFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	filterBytes, _ := json.Marshal(body["filter_query"])
 	if len(selected) == 0 {
-		for id, record := range f.records {
-			if strings.Contains(string(filterBytes), `"field":"source_id"`) && !strings.Contains(string(filterBytes), record["source_id"].(string)) {
+		for id, record := range records {
+			if _, ok := record["source_id"]; ok && strings.Contains(string(filterBytes), `"field":"source_id"`) && !strings.Contains(string(filterBytes), record["source_id"].(string)) {
 				continue
 			}
 			selected = append(selected, id)
@@ -139,7 +147,7 @@ func (f *publicationFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if id <= after {
 			continue
 		}
-		record, ok := f.records[id]
+		record, ok := records[id]
 		if !ok {
 			continue
 		}
@@ -228,7 +236,7 @@ func TestRunnerCatalogNativeGrepWithoutCloud(t *testing.T) {
 	if err := runner.Sync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	command := exec.CommandContext(t.Context(), binary, "--source-catalog", runner.CatalogPath, "--source", "manuals", "retry budget")
+	command := exec.CommandContext(t.Context(), binary, "--source-endpoint", runner.Profile.Endpoint, "--source-principal", "user:self", "--source", "manuals", "retry budget")
 	for _, entry := range os.Environ() {
 		if !strings.HasPrefix(entry, "ANTFLY_GREP_") && !strings.HasPrefix(entry, "RIPGREP_CONFIG_PATH=") {
 			command.Env = append(command.Env, entry)

@@ -109,6 +109,11 @@ func TestStandaloneCommandPublishesS3AndSearchableCatalog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("search standalone output without Cloud: %v: %s", err, output)
 	}
+	direct := exec.CommandContext(t.Context(), grep, "--source-endpoint", profile.Endpoint, "--source", "manuals", "retry budget")
+	direct.Env = search.Env
+	if result, err := direct.CombinedOutput(); err != nil || !strings.Contains(string(result), "retry budget") {
+		t.Fatalf("catalog table search without file/Cloud: %v: %s", err, result)
+	}
 	if !strings.Contains(string(output), "retry budget") {
 		t.Fatalf("missing source text: %s", output)
 	}
