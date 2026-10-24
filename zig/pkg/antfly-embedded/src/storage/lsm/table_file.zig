@@ -2230,53 +2230,216 @@ fn encodeBlockPayloadAlloc(
     return payload;
 }
 
-fn encodePrefixCompressedBlockAlloc(allocator: std.mem.Allocator, block_bytes: []const u8) ![]u8 {
-    var encoded_entries = std.ArrayListUnmanaged(u8).empty;
-    defer encoded_entries.deinit(allocator);
-    var restart_offsets = std.ArrayListUnmanaged(u32).empty;
-    defer restart_offsets.deinit(allocator);
-    var previous_key: []const u8 = &.{};
+/// Pure CPU prefix encoder. The caller retains immutable raw entries and a
+/// private output allocation of outputBound() bytes until done. All state is
+/// scalar, so moving this cursor never invalidates its own borrows. No step
+/// allocates, calls a sink, or publishes partially encoded output.
+pub const PrefixEncodeCursor = struct {
+    pub const Progress = struct { done: bool, work: usize, output_bytes: usize };
+    const Phase = enum { entry, restart, shared, header, namespace, key, value, trailer, restarts, done, failed };
+    input_len: usize,
+    phase: Phase = .entry,
+    input_offset: usize = 0,
+    output_offset: usize = 24,
+    entry_count: usize = 0,
+    restart_count: usize = 0,
+    restart_base: usize,
+    previous_key_offset: usize = 0,
+    previous_key_len: usize = 0,
+    namespace_offset: usize = 0,
+    namespace_len: usize = 0,
+    key_offset: usize = 0,
+    key_len: usize = 0,
+    value_offset: usize = 0,
+    value_len: usize = 0,
+    shared_len: usize = 0,
+    copied: usize = 0,
+    header: [24]u8 = undefined,
+    header_offset: usize = 0,
+    restart_copied: usize = 0,
+    restart_header: [4]u8 = undefined,
+    restart_header_offset: usize = 0,
 
-    var cursor: usize = 0;
-    var entry_count: usize = 0;
-    while (cursor < block_bytes.len) : (entry_count += 1) {
-        const entry_start = cursor;
-        const entry = try parseEntryAt(block_bytes, entry_start);
-        const entry_len = try tableEntryEncodedLen(entry);
-        if (entry_len > block_bytes.len - cursor) return error.InvalidTableFile;
-        cursor += entry_len;
-
-        var shared_key_len: usize = 0;
-        if (entry_count % prefix_restart_interval == 0) {
-            try restart_offsets.append(allocator, try checkedU32(encoded_entries.items.len));
-        } else {
-            shared_key_len = commonPrefixLen(previous_key, entry.key);
-        }
-        const unshared_key = entry.key[shared_key_len..];
-
-        try encoded_entries.append(allocator, if (entry.tombstone) 1 else 0);
-        try appendU32(allocator, &encoded_entries, if (entry.namespace_name) |name| try checkedU32(name.len) else 0);
-        try appendU32(allocator, &encoded_entries, try checkedU32(shared_key_len));
-        try appendU32(allocator, &encoded_entries, try checkedU32(unshared_key.len));
-        try appendU32(allocator, &encoded_entries, try checkedU32(entry.value.len));
-        if (entry.namespace_name) |name| try encoded_entries.appendSlice(allocator, name);
-        try encoded_entries.appendSlice(allocator, unshared_key);
-        try encoded_entries.appendSlice(allocator, entry.value);
-
-        previous_key = entry.key;
+    /// Raw rows use a 13-byte header; prefix rows add four bytes per
+    /// entry and one four-byte restart per sixteen entries. This includes
+    /// temporary tail storage used for restarts before their final placement.
+    pub fn outputBound(input_len: usize) !usize {
+        _ = try checkedU32(input_len);
+        const entries = input_len / 13;
+        const base = try checkedAddUsize(24, try checkedAddUsize(input_len, try std.math.mul(usize, entries, 4)));
+        return checkedAddUsize(base, try std.math.mul(usize, (entries + 15) / 16, 4));
     }
-    if (cursor != block_bytes.len) return error.InvalidTableFile;
 
-    var out = std.ArrayListUnmanaged(u8).empty;
+    pub fn init(input_len: usize) !PrefixEncodeCursor {
+        _ = try outputBound(input_len);
+        return .{ .input_len = input_len, .restart_base = 24 + input_len + (input_len / 13) * 4 };
+    }
+
+    fn put(out: []u8, offset: usize, value: usize) !void {
+        std.mem.writeInt(u32, out[offset..][0..4], try checkedU32(value), .little);
+    }
+
+    /// A work unit parses one fixed row header, compares one shared-key
+    /// byte, writes/copies one byte, or records one fixed-width restart.
+    /// At most quantum units and quantum output bytes are touched per call.
+    pub fn step(self: *PrefixEncodeCursor, src: []const u8, dst: []u8, quantum: usize) !Progress {
+        if (quantum == 0 or src.len != self.input_len or dst.len < try outputBound(self.input_len)) return error.InvalidArgument;
+        return self.advance(src, dst, quantum) catch |err| {
+            self.phase = .failed;
+            return err;
+        };
+    }
+
+    fn advance(self: *PrefixEncodeCursor, src: []const u8, dst: []u8, quantum: usize) !Progress {
+        var left = quantum;
+        var touched: usize = 0;
+        while (left != 0) {
+            switch (self.phase) {
+                .failed => return error.InvalidTableFile,
+                .done => break,
+                .entry => {
+                    if (self.input_offset == src.len) {
+                        @memcpy(self.header[0..8], prefix_block_magic);
+                        try put(&self.header, 8, self.entry_count);
+                        try put(&self.header, 12, prefix_restart_interval);
+                        try put(&self.header, 16, self.restart_count);
+                        try put(&self.header, 20, self.output_offset - 24);
+                        self.header_offset = 0;
+                        self.phase = .trailer;
+                        left -= 1;
+                        continue;
+                    }
+                    const e = try parseEntryAt(src, self.input_offset);
+                    const row_len = try tableEntryEncodedLen(e);
+                    self.namespace_offset = self.input_offset + 13;
+                    self.namespace_len = if (e.namespace_name) |name| name.len else 0;
+                    self.key_offset = self.namespace_offset + self.namespace_len;
+                    self.key_len = e.key.len;
+                    self.value_offset = self.key_offset + self.key_len;
+                    self.value_len = e.value.len;
+                    self.input_offset += row_len;
+                    self.shared_len = 0;
+                    self.header[0] = if (e.tombstone) 1 else 0;
+                    if (self.entry_count % 16 == 0) {
+                        try put(&self.restart_header, 0, self.output_offset - 24);
+                        self.restart_header_offset = 0;
+                        self.phase = .restart;
+                    } else self.phase = .shared;
+                    left -= 1;
+                    self.header_offset = 0;
+                },
+                .restart => {
+                    const n = @min(4 - self.restart_header_offset, @min(left, quantum - touched));
+                    if (n == 0) break;
+                    @memcpy(dst[self.restart_base + self.restart_count * 4 + self.restart_header_offset ..][0..n], self.restart_header[self.restart_header_offset..][0..n]);
+                    self.restart_header_offset += n;
+                    left -= n;
+                    touched += n;
+                    if (self.restart_header_offset == 4) {
+                        self.restart_count += 1;
+                        self.phase = .header;
+                    }
+                },
+                .shared => {
+                    const limit = @min(self.previous_key_len, self.key_len);
+                    while (left != 0 and self.shared_len < limit) {
+                        left -= 1;
+                        if (src[self.previous_key_offset + self.shared_len] != src[self.key_offset + self.shared_len]) break;
+                        self.shared_len += 1;
+                    } else {
+                        if (self.shared_len != limit) continue;
+                    }
+                    self.phase = .header;
+                },
+                .header => {
+                    if (self.header_offset == 0) {
+                        try put(&self.header, 1, self.namespace_len);
+                        try put(&self.header, 5, self.shared_len);
+                        try put(&self.header, 9, self.key_len - self.shared_len);
+                        try put(&self.header, 13, self.value_len);
+                    }
+                    const n = @min(17 - self.header_offset, @min(left, quantum - touched));
+                    if (n == 0) break;
+                    @memcpy(dst[self.output_offset..][0..n], self.header[self.header_offset..][0..n]);
+                    self.header_offset += n;
+                    self.output_offset += n;
+                    touched += n;
+                    left -= n;
+                    if (self.header_offset == 17) {
+                        self.phase = .namespace;
+                        self.copied = 0;
+                    }
+                },
+                .namespace, .key, .value => {
+                    const start = switch (self.phase) {
+                        .namespace => self.namespace_offset,
+                        .key => self.key_offset + self.shared_len,
+                        else => self.value_offset,
+                    };
+                    const len = switch (self.phase) {
+                        .namespace => self.namespace_len,
+                        .key => self.key_len - self.shared_len,
+                        else => self.value_len,
+                    };
+                    const n = @min(len - self.copied, @min(left, quantum - touched));
+                    if (n == 0 and self.copied != len) break;
+                    @memcpy(dst[self.output_offset..][0..n], src[start + self.copied ..][0..n]);
+                    self.output_offset += n;
+                    self.copied += n;
+                    left -= n;
+                    touched += n;
+                    if (self.copied == len) {
+                        self.copied = 0;
+                        self.phase = switch (self.phase) {
+                            .namespace => .key,
+                            .key => .value,
+                            else => .entry,
+                        };
+                        if (self.phase == .entry) {
+                            self.previous_key_offset = self.key_offset;
+                            self.previous_key_len = self.key_len;
+                            self.entry_count += 1;
+                        }
+                    }
+                },
+                .trailer => {
+                    const n = @min(24 - self.header_offset, @min(left, quantum - touched));
+                    if (n == 0) break;
+                    @memcpy(dst[self.header_offset..][0..n], self.header[self.header_offset..][0..n]);
+                    self.header_offset += n;
+                    left -= n;
+                    touched += n;
+                    if (self.header_offset == 24) self.phase = .restarts;
+                },
+                .restarts => {
+                    const n = @min(self.restart_count * 4 - self.restart_copied, @min(left, quantum - touched));
+                    if (n == 0 and self.restart_copied != self.restart_count * 4) break;
+                    // Destination is at/before source; forward copies remain
+                    // correct across overlap and arbitrary step boundaries.
+                    std.mem.copyForwards(u8, dst[self.output_offset + self.restart_copied ..][0..n], dst[self.restart_base + self.restart_copied ..][0..n]);
+                    self.restart_copied += n;
+                    left -= n;
+                    touched += n;
+                    if (self.restart_copied == self.restart_count * 4) {
+                        self.output_offset += self.restart_copied;
+                        self.phase = .done;
+                    }
+                },
+            }
+        }
+        return .{ .done = self.phase == .done, .work = quantum - left, .output_bytes = touched };
+    }
+};
+
+fn encodePrefixCompressedBlockAlloc(allocator: std.mem.Allocator, block_bytes: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, prefix_block_magic);
-    try appendU32(allocator, &out, try checkedU32(entry_count));
-    try appendU32(allocator, &out, try checkedU32(prefix_restart_interval));
-    try appendU32(allocator, &out, try checkedU32(restart_offsets.items.len));
-    try appendU32(allocator, &out, try checkedU32(encoded_entries.items.len));
-    try out.appendSlice(allocator, encoded_entries.items);
-    for (restart_offsets.items) |offset| try appendU32(allocator, &out, offset);
-    return try out.toOwnedSlice(allocator);
+    const bound = try PrefixEncodeCursor.outputBound(block_bytes.len);
+    try out.ensureTotalCapacity(allocator, bound);
+    var cursor = try PrefixEncodeCursor.init(block_bytes.len);
+    while (!(try cursor.step(block_bytes, out.allocatedSlice()[0..bound], 4096)).done) {}
+    out.items.len = cursor.output_offset;
+    return out.toOwnedSlice(allocator);
 }
 
 fn decodePrefixCompressedBlockAlloc(
@@ -5952,4 +6115,155 @@ test "controlled physical sync legacy table finish rejects replay after partial 
     try std.testing.expectError(error.InvalidTableFile, encoder.finish());
     try std.testing.expectEqual(after, fixture.memory.out.items.len);
     try std.testing.expectEqual(writes, fixture.writes);
+}
+
+// Frozen pre-cursor prefix encoder used as an independent wire oracle.
+fn encodePrefixReferenceForTest(allocator: std.mem.Allocator, block_bytes: []const u8) ![]u8 {
+    var encoded_entries = std.ArrayListUnmanaged(u8).empty;
+    defer encoded_entries.deinit(allocator);
+    var restart_offsets = std.ArrayListUnmanaged(u32).empty;
+    defer restart_offsets.deinit(allocator);
+    var previous_key: []const u8 = &.{};
+
+    var cursor: usize = 0;
+    var entry_count: usize = 0;
+    while (cursor < block_bytes.len) : (entry_count += 1) {
+        const entry_start = cursor;
+        const entry = try parseEntryAt(block_bytes, entry_start);
+        const entry_len = try tableEntryEncodedLen(entry);
+        if (entry_len > block_bytes.len - cursor) return error.InvalidTableFile;
+        cursor += entry_len;
+
+        var shared_key_len: usize = 0;
+        if (entry_count % prefix_restart_interval == 0) {
+            try restart_offsets.append(allocator, try checkedU32(encoded_entries.items.len));
+        } else {
+            shared_key_len = commonPrefixLen(previous_key, entry.key);
+        }
+        const unshared_key = entry.key[shared_key_len..];
+
+        try encoded_entries.append(allocator, if (entry.tombstone) 1 else 0);
+        try appendU32(allocator, &encoded_entries, if (entry.namespace_name) |name| try checkedU32(name.len) else 0);
+        try appendU32(allocator, &encoded_entries, try checkedU32(shared_key_len));
+        try appendU32(allocator, &encoded_entries, try checkedU32(unshared_key.len));
+        try appendU32(allocator, &encoded_entries, try checkedU32(entry.value.len));
+        if (entry.namespace_name) |name| try encoded_entries.appendSlice(allocator, name);
+        try encoded_entries.appendSlice(allocator, unshared_key);
+        try encoded_entries.appendSlice(allocator, entry.value);
+
+        previous_key = entry.key;
+    }
+    if (cursor != block_bytes.len) return error.InvalidTableFile;
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, prefix_block_magic);
+    try appendU32(allocator, &out, try checkedU32(entry_count));
+    try appendU32(allocator, &out, try checkedU32(prefix_restart_interval));
+    try appendU32(allocator, &out, try checkedU32(restart_offsets.items.len));
+    try appendU32(allocator, &out, try checkedU32(encoded_entries.items.len));
+    try out.appendSlice(allocator, encoded_entries.items);
+    for (restart_offsets.items) |offset| try appendU32(allocator, &out, offset);
+    return try out.toOwnedSlice(allocator);
+}
+
+test "table file prefix encoder cursor bounds huge keys values and restart relocation" {
+    const a = std.testing.allocator;
+    var raw: std.ArrayListUnmanaged(u8) = .empty;
+    defer raw.deinit(a);
+    const key = try a.alloc(u8, 32769);
+    defer a.free(key);
+    @memset(key, 'k');
+    const value = try a.alloc(u8, 65537);
+    defer a.free(value);
+    @memset(value, 'v');
+    var table: std.ArrayListUnmanaged(u8) = .empty;
+    defer table.deinit(a);
+    for ([_]usize{ 0, 1, 16, 17, 33 }) |count| {
+        raw.clearRetainingCapacity();
+        for (0..count) |i| {
+            key[key.len - 1] = @intCast(i);
+            try appendEntryBytesToList(a, &raw, .{
+                .namespace_name = if (i % 2 == 0) "docs" else null,
+                .key = if (i % 7 == 0) "" else key,
+                .value = if (i % 3 == 0) value else "",
+                .tombstone = i % 3 == 1,
+            });
+        }
+        const expected = try encodePrefixReferenceForTest(a, raw.items);
+        defer a.free(expected);
+        const bound = try PrefixEncodeCursor.outputBound(raw.items.len);
+        try table.resize(a, bound + 16);
+        for ([_]usize{ 1, 7, 4096 }) |quantum| {
+            @memset(table.items, 0xcc);
+            var cursor = try PrefixEncodeCursor.init(raw.items.len);
+            while (true) {
+                var moved = cursor;
+                const progress = try moved.step(raw.items, table.items[0..bound], quantum);
+                try std.testing.expect(progress.work <= quantum and progress.output_bytes <= quantum);
+                try std.testing.expect(progress.done or progress.work != 0);
+                cursor = moved;
+                if (progress.done) break;
+            }
+            try std.testing.expectEqualSlices(u8, expected, table.items[0..cursor.output_offset]);
+            for (table.items[bound..]) |b| try std.testing.expectEqual(@as(u8, 0xcc), b);
+            const done = try cursor.step(raw.items, table.items[0..bound], quantum);
+            try std.testing.expect(done.done and done.work == 0 and done.output_bytes == 0);
+            if (count != 0) {
+                const decoded = try decodePrefixCompressedBlockAlloc(a, a, table.items[0..cursor.output_offset], raw.items.len);
+                defer a.free(decoded);
+                try std.testing.expectEqualSlices(u8, raw.items, decoded);
+            }
+        }
+        const ordinary = try encodePrefixCompressedBlockAlloc(a, raw.items);
+        defer a.free(ordinary);
+        try std.testing.expectEqualSlices(u8, expected, ordinary);
+    }
+}
+
+test "table file prefix encoder malformed input is terminal and invalid borrows preserve progress" {
+    var cursor = try PrefixEncodeCursor.init(13);
+    var output: [128]u8 = @splat(0xcc);
+    var invalid: [13]u8 = @splat(0);
+    invalid[0] = 2;
+    try std.testing.expectError(error.InvalidArgument, cursor.step(&invalid, &output, 0));
+    try std.testing.expectError(error.InvalidArgument, cursor.step(&invalid, output[0..1], 1));
+    try std.testing.expectError(error.InvalidArgument, cursor.step(invalid[0..1], &output, 1));
+    try std.testing.expectEqual(@as(usize, 0), cursor.input_offset);
+    for (output) |b| try std.testing.expectEqual(@as(u8, 0xcc), b);
+    try std.testing.expectError(error.InvalidTableFile, cursor.step(&invalid, &output, 1));
+    try std.testing.expectError(error.InvalidTableFile, cursor.step(&invalid, &output, 1));
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const raw: [13]u8 = @splat(0);
+            const bytes = try encodePrefixCompressedBlockAlloc(a, &raw);
+            defer a.free(bytes);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "table file prefix encoder relocates overlapping restart tail in one byte steps" {
+    const a = std.testing.allocator;
+    var raw: std.ArrayListUnmanaged(u8) = .empty;
+    defer raw.deinit(a);
+    // Exactly one shared byte makes the final restart destination overlap
+    // its staging range, exercising memmove across separate step calls.
+    for (0..64) |i| {
+        const key = [_]u8{ if (i == 2) 1 else @intCast(i), @intCast(i) };
+        try appendEntryBytesToList(a, &raw, .{ .key = if (i == 1 or i == 2) &key else "", .value = "" });
+    }
+    const expected = try encodePrefixReferenceForTest(a, raw.items);
+    defer a.free(expected);
+    const output = try a.alloc(u8, try PrefixEncodeCursor.outputBound(raw.items.len));
+    defer a.free(output);
+    var cursor = try PrefixEncodeCursor.init(raw.items.len);
+    while (cursor.phase != .restarts) {
+        const p = try cursor.step(raw.items, output, 1);
+        try std.testing.expect(p.work <= 1 and p.output_bytes <= 1 and !p.done);
+    }
+    try std.testing.expect(cursor.output_offset < cursor.restart_base);
+    try std.testing.expect(cursor.output_offset + cursor.restart_count * 4 > cursor.restart_base);
+    while (!(try cursor.step(raw.items, output, 1)).done) {}
+    try std.testing.expectEqualSlices(u8, expected, output[0..cursor.output_offset]);
 }

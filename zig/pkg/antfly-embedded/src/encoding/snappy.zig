@@ -499,67 +499,187 @@ pub fn encode(alloc: Allocator, src: []const u8) ![]u8 {
 /// Encode data using Snappy block compression into a reusable output buffer.
 /// Returns the written slice, backed by `out.items`.
 pub fn encodeInto(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), src: []const u8) ![]const u8 {
+    const bound = try EncodeCursor.outputBound(src.len);
     out.clearRetainingCapacity();
-    try out.ensureTotalCapacity(alloc, maxEncodedLen(src.len));
-
-    // Write uncompressed length as varint preamble
-    try writeVarint(alloc, out, src.len);
-
-    if (src.len == 0) {
-        return out.items;
-    }
-
-    // Hash table: maps 4-byte sequences to source positions (1-indexed, 0 = empty)
-    var table: [hash_table_size]u32 = undefined;
-    @memset(&table, 0);
-
-    var s: usize = 0; // source position
-    var lit_start: usize = 0; // start of current literal run
-
-    // Process input
-    while (s + 4 <= src.len) {
-        // Hash current 4-byte sequence
-        const h = hash4(src[s..][0..4]);
-
-        // Check for match (table stores 1-indexed positions)
-        const table_val = table[h];
-        table[h] = @intCast(s + 1); // store 1-indexed
-
-        if (table_val > 0 and blk: {
-            const candidate = table_val - 1; // convert to 0-indexed
-            break :blk s - candidate <= 65535 and
-                std.mem.eql(u8, src[candidate..][0..4], src[s..][0..4]);
-        }) {
-            const candidate = table_val - 1;
-            // Found match - emit pending literals first
-            if (lit_start < s) {
-                try emitLiteral(alloc, out, src[lit_start..s]);
-            }
-
-            // Extend match forward
-            var match_len: usize = 4;
-            while (s + match_len < src.len and
-                src[s + match_len] == src[candidate + match_len])
-            {
-                match_len += 1;
-            }
-
-            const offset = s - candidate;
-            try emitCopy(alloc, out, offset, match_len);
-            s += match_len;
-            lit_start = s;
-        } else {
-            s += 1;
-        }
-    }
-
-    // Emit remaining literals
-    if (lit_start < src.len) {
-        try emitLiteral(alloc, out, src[lit_start..]);
-    }
-
+    try out.ensureTotalCapacity(alloc, bound);
+    var cursor = EncodeCursor.init(src.len);
+    var table: [EncodeCursor.table_entries]u32 = undefined;
+    while (!(try cursor.step(src, out.allocatedSlice()[0..bound], &table, 4096)).done) {}
+    out.items.len = cursor.output_offset;
     return out.items;
 }
+
+/// Resumable pure-CPU raw-block encoder. Immutable input, private output and
+/// table storage are borrowed per step and retained by the caller across
+/// rejection. No output is publishable before done. Scalar offsets make this
+/// value movable; it contains no input/output/control pointer.
+pub const EncodeCursor = struct {
+    pub const table_entries = hash_table_size;
+    pub const Progress = struct { done: bool, work: usize, output_bytes: usize };
+    const Phase = enum { header, clear, search, literal, extend, copy, done };
+    input_len: usize,
+    output_offset: usize = 0,
+    phase: Phase = .header,
+    after_header: Phase,
+    header: [10]u8 = undefined,
+    header_len: usize = 0,
+    header_offset: usize = 0,
+    cleared: usize = 0,
+    source_offset: usize = 0,
+    literal_start: usize = 0,
+    literal_offset: usize = 0,
+    literal_end: usize = 0,
+    after_literal: Phase = .done,
+    candidate: usize = 0,
+    match_len: usize = 0,
+    copy_remaining: usize = 0,
+
+    pub fn outputBound(input_len: usize) !usize {
+        if (input_len > std.math.maxInt(u32)) return error.InvalidArgument;
+        if (input_len == 0) return 1;
+        const extra = std.math.add(usize, input_len / 6, 32) catch return error.OutOfMemory;
+        return std.math.add(usize, input_len, extra) catch error.OutOfMemory;
+    }
+
+    pub fn init(input_len: usize) EncodeCursor {
+        var self: EncodeCursor = .{ .input_len = input_len, .after_header = if (input_len == 0) .done else if (input_len < 4) .search else .clear };
+        var n = input_len;
+        while (n >= 128) {
+            self.header[self.header_len] = @as(u8, @truncate(n)) | 128;
+            self.header_len += 1;
+            n >>= 7;
+        }
+        self.header[self.header_len] = @truncate(n);
+        self.header_len += 1;
+        return self;
+    }
+
+    fn literalHeader(self: *EncodeCursor, start: usize, end: usize, after: Phase) void {
+        const n = end - start;
+        std.debug.assert(n != 0);
+        self.literal_offset = start;
+        self.literal_end = end;
+        self.after_literal = after;
+        self.header_offset = 0;
+        if (n <= 60) {
+            self.header[0] = @intCast((n - 1) << 2);
+            self.header_len = 1;
+        } else {
+            const bytes: usize = if (n <= 256) 1 else if (n <= 65536) 2 else if (n <= 16777216) 3 else 4;
+            self.header[0] = @intCast((59 + bytes) << 2);
+            for (0..bytes) |i| self.header[1 + i] = @truncate((n - 1) >> @as(std.math.Log2Int(usize), @intCast(i * 8)));
+            self.header_len = 1 + bytes;
+        }
+        self.after_header = .literal;
+        self.phase = .header;
+    }
+
+    /// At most quantum work units and output bytes are consumed. A work unit
+    /// clears one u32, probes one four-byte hash/match, compares one extension
+    /// byte, or copies one output byte (plus fixed scalar state transitions).
+    /// Search reads at most eight input bytes per unit. No step allocates.
+    pub fn step(self: *EncodeCursor, src: []const u8, dst: []u8, table: []u32, quantum: usize) !Progress {
+        if (quantum == 0 or src.len != self.input_len or table.len != table_entries or dst.len < try outputBound(self.input_len)) return error.InvalidArgument;
+        const output_start = self.output_offset;
+        var left = quantum;
+        var output_left = quantum;
+        while (left != 0) {
+            switch (self.phase) {
+                .done => break,
+                .header => {
+                    const n = @min(self.header_len - self.header_offset, @min(left, output_left));
+                    if (n == 0) break;
+                    @memcpy(dst[self.output_offset..][0..n], self.header[self.header_offset..][0..n]);
+                    self.output_offset += n;
+                    self.header_offset += n;
+                    left -= n;
+                    output_left -= n;
+                    if (self.header_offset == self.header_len) self.phase = self.after_header;
+                },
+                .clear => {
+                    const n = @min(table_entries - self.cleared, left);
+                    @memset(table[self.cleared..][0..n], 0);
+                    self.cleared += n;
+                    left -= n;
+                    if (self.cleared == table_entries) self.phase = .search;
+                },
+                .search => {
+                    while (left != 0 and self.source_offset + 4 <= src.len) {
+                        const at = self.source_offset;
+                        const h = hash4(src[at..][0..4]);
+                        const previous = table[h];
+                        table[h] = @intCast(at + 1);
+                        left -= 1;
+                        if (previous != 0 and at - (previous - 1) <= 65535 and
+                            std.mem.eql(u8, src[previous - 1 ..][0..4], src[at..][0..4]))
+                        {
+                            self.candidate = previous - 1;
+                            self.match_len = 4;
+                            if (self.literal_start < at) self.literalHeader(self.literal_start, at, .extend) else self.phase = .extend;
+                            break;
+                        }
+                        self.source_offset += 1;
+                    }
+                    if (self.phase == .search and self.source_offset + 4 > src.len) {
+                        if (self.literal_start < src.len) self.literalHeader(self.literal_start, src.len, .done) else self.phase = .done;
+                    }
+                },
+                .literal => {
+                    const n = @min(self.literal_end - self.literal_offset, @min(left, output_left));
+                    if (n == 0) break;
+                    @memcpy(dst[self.output_offset..][0..n], src[self.literal_offset..][0..n]);
+                    self.literal_offset += n;
+                    self.output_offset += n;
+                    left -= n;
+                    output_left -= n;
+                    if (self.literal_offset == self.literal_end) self.phase = self.after_literal;
+                },
+                .extend => {
+                    while (left != 0 and self.source_offset + self.match_len < src.len) {
+                        left -= 1;
+                        if (src[self.source_offset + self.match_len] != src[self.candidate + self.match_len]) {
+                            self.copy_remaining = self.match_len;
+                            self.phase = .copy;
+                            break;
+                        }
+                        self.match_len += 1;
+                    }
+                    if (self.source_offset + self.match_len == src.len) {
+                        self.copy_remaining = self.match_len;
+                        self.phase = .copy;
+                    }
+                },
+                .copy => {
+                    if (self.copy_remaining == 0) {
+                        self.source_offset += self.match_len;
+                        self.literal_start = self.source_offset;
+                        self.phase = .search;
+                        continue;
+                    }
+                    left -= 1;
+                    const distance = self.source_offset - self.candidate;
+                    self.header_offset = 0;
+                    if (self.copy_remaining >= 4 and self.copy_remaining <= 11 and distance <= 2047) {
+                        self.header[0] = (@as(u8, @truncate(distance >> 8)) << 5) | (@as(u8, @intCast(self.copy_remaining - 4)) << 2) | tag_copy1;
+                        self.header[1] = @truncate(distance);
+                        self.header_len = 2;
+                        self.copy_remaining = 0;
+                    } else {
+                        const n = @min(self.copy_remaining, 64);
+                        self.header[0] = (@as(u8, @intCast(n - 1)) << 2) | tag_copy2;
+                        self.header[1] = @truncate(distance);
+                        self.header[2] = @truncate(distance >> 8);
+                        self.header_len = 3;
+                        self.copy_remaining -= n;
+                    }
+                    self.after_header = .copy;
+                    self.phase = .header;
+                },
+            }
+        }
+        return .{ .done = self.phase == .done, .work = quantum - left, .output_bytes = self.output_offset - output_start };
+    }
+};
 
 // -- Internal helpers --
 
@@ -1051,4 +1171,142 @@ test "Snappy continuation preserves high COPY offsets across partial headers" {
     try std.testing.expectEqualSlices(u8, literal, output[0..count]);
     try std.testing.expectEqualSlices(u8, literal[count - 300 ..][0..4], output[count..][0..4]);
     try std.testing.expectEqualSlices(u8, literal[count + 4 - 65536 ..][0..64], output[count + 4 ..]);
+}
+
+// Frozen pre-cursor implementation: independent wire oracle for the retained encoder.
+fn encodeReferenceForTest(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), src: []const u8) ![]const u8 {
+    out.clearRetainingCapacity();
+    try out.ensureTotalCapacity(alloc, maxEncodedLen(src.len));
+
+    // Write uncompressed length as varint preamble
+    try writeVarint(alloc, out, src.len);
+
+    if (src.len == 0) {
+        return out.items;
+    }
+
+    // Hash table: maps 4-byte sequences to source positions (1-indexed, 0 = empty)
+    var table: [hash_table_size]u32 = undefined;
+    @memset(&table, 0);
+
+    var s: usize = 0; // source position
+    var lit_start: usize = 0; // start of current literal run
+
+    // Process input
+    while (s + 4 <= src.len) {
+        // Hash current 4-byte sequence
+        const h = hash4(src[s..][0..4]);
+
+        // Check for match (table stores 1-indexed positions)
+        const table_val = table[h];
+        table[h] = @intCast(s + 1); // store 1-indexed
+
+        if (table_val > 0 and blk: {
+            const candidate = table_val - 1; // convert to 0-indexed
+            break :blk s - candidate <= 65535 and
+                std.mem.eql(u8, src[candidate..][0..4], src[s..][0..4]);
+        }) {
+            const candidate = table_val - 1;
+            // Found match - emit pending literals first
+            if (lit_start < s) {
+                try emitLiteral(alloc, out, src[lit_start..s]);
+            }
+
+            // Extend match forward
+            var match_len: usize = 4;
+            while (s + match_len < src.len and
+                src[s + match_len] == src[candidate + match_len])
+            {
+                match_len += 1;
+            }
+
+            const offset = s - candidate;
+            try emitCopy(alloc, out, offset, match_len);
+            s += match_len;
+            lit_start = s;
+        } else {
+            s += 1;
+        }
+    }
+
+    // Emit remaining literals
+    if (lit_start < src.len) {
+        try emitLiteral(alloc, out, src[lit_start..]);
+    }
+
+    return out.items;
+}
+
+test "Snappy encoding cursor preserves legacy bytes across bounded movable steps" {
+    const a = std.testing.allocator;
+    const input = try a.alloc(u8, 128 * 1024 + 19);
+    defer a.free(input);
+    var oracle: std.ArrayListUnmanaged(u8) = .empty;
+    defer oracle.deinit(a);
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    defer output.deinit(a);
+    var table: [EncodeCursor.table_entries]u32 = undefined;
+    for (0..4) |pattern| {
+        var state: u64 = 0x123456789abcdef;
+        for (input, 0..) |*b, i| {
+            state = state *% 6364136223846793005 +% 1;
+            b.* = switch (pattern) {
+                0 => @truncate(state >> 32), // long literal/search runs
+                1 => 0x61, // long overlapping match
+                2 => @truncate(i % 251),
+                else => if (i % 16387 < 12000) @truncate(i % 71) else @truncate(state >> 32),
+            };
+        }
+        for ([_]usize{ 0, 1, 2, 3, 4, 11, 59, 60, 61, 255, 256, 257, 65535, 65536, 65537, input.len }) |size| {
+            const src = input[0..size];
+            const expected = try encodeReferenceForTest(a, &oracle, src);
+            const bound = try EncodeCursor.outputBound(size);
+            try output.resize(a, bound + 16);
+            for ([_]usize{ 1, 3, 17, 4096 }) |quantum| {
+                @memset(output.items, 0xcc);
+                @memset(&table, 0xdeadbeef);
+                var cursor = EncodeCursor.init(size);
+                var total: usize = 0;
+                while (true) {
+                    // Move the owner and reborrow all private buffers after
+                    // every bounded slice of CPU work.
+                    var moved = cursor;
+                    const progress = try moved.step(src, output.items[0..bound], &table, quantum);
+                    try std.testing.expect(progress.work <= quantum);
+                    try std.testing.expect(progress.output_bytes <= quantum);
+                    try std.testing.expect(progress.done or progress.work != 0);
+                    total += progress.output_bytes;
+                    cursor = moved;
+                    if (progress.done) break;
+                }
+                try std.testing.expectEqual(total, cursor.output_offset);
+                try std.testing.expectEqualSlices(u8, expected, output.items[0..total]);
+                for (output.items[bound..]) |guard| try std.testing.expectEqual(@as(u8, 0xcc), guard);
+                const done = try cursor.step(src, output.items[0..bound], &table, quantum);
+                try std.testing.expect(done.done and done.work == 0 and done.output_bytes == 0);
+            }
+            const ordinary = try encode(a, src);
+            defer a.free(ordinary);
+            try std.testing.expectEqualSlices(u8, expected, ordinary);
+            const decoded = try decode(a, ordinary);
+            defer a.free(decoded);
+            try std.testing.expectEqualSlices(u8, src, decoded);
+        }
+    }
+    try std.testing.expect(@sizeOf(EncodeCursor) <= 192);
+}
+
+test "Snappy encoding cursor rejects invalid buffers without advancing" {
+    var cursor = EncodeCursor.init(4);
+    var table: [EncodeCursor.table_entries]u32 = @splat(0xdeadbeef);
+    var output: [64]u8 = @splat(0xcc);
+    try std.testing.expectError(error.InvalidArgument, cursor.step("abcd", &output, &table, 0));
+    try std.testing.expectError(error.InvalidArgument, cursor.step("abc", &output, &table, 1));
+    try std.testing.expectError(error.InvalidArgument, cursor.step("abcd", output[0..1], &table, 1));
+    try std.testing.expectError(error.InvalidArgument, cursor.step("abcd", &output, table[0..1], 1));
+    try std.testing.expectEqual(@as(usize, 0), cursor.output_offset);
+    try std.testing.expectEqual(@as(usize, 0), cursor.header_offset);
+    for (output) |b| try std.testing.expectEqual(@as(u8, 0xcc), b);
+    for (table) |v| try std.testing.expectEqual(@as(u32, 0xdeadbeef), v);
+    if (@bitSizeOf(usize) > 32) try std.testing.expectError(error.InvalidArgument, EncodeCursor.outputBound(@as(usize, std.math.maxInt(u32)) + 1));
 }

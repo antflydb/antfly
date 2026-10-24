@@ -25481,3 +25481,48 @@ manifest/close adoption still need implementation before the full default path
 is admitted. Remaining teardown, completion/history relief, provider/legacy
 adoption and default-gate evidence remain open. Full GNU qualification remains
 waived and the full design is incomplete.
+
+
+## Bounded table block encoding CPU cursors
+
+`encoding.snappy.EncodeCursor` and `table_file.PrefixEncodeCursor` now retain
+compression progress as scalar offsets. Callers supply immutable raw input,
+private output and (for Snappy) the 16,384-entry hash workspace on each step.
+Neither cursor allocates or calls a physical sink. The caller must fund and
+retain those allocations until completion or explicit abandonment; these
+helpers do not acquire fresh execution or memory budgets.
+
+Snappy bounds hash-table clearing, hash probes, long literal copying, match
+extension and copy-tag emission. Prefix encoding bounds common-key comparisons,
+namespace/key/value copies, row headers and restart placement, including final
+overlapping restart relocation. One-unit steps make progress. Invalid buffer
+contracts leave progress unchanged; corrupt raw prefix input becomes terminal.
+Partial output remains private until done. Existing synchronous encode paths
+drive the same cursors, preserving their wire bytes and compression choices.
+No existing exported owner layout or storage wire version changes.
+
+Frozen previous implementations serve as independent byte oracles. Coverage
+includes empty inputs, literal header boundaries, long incompressible input,
+overlapping Snappy matches, long keys/values, tombstones, namespaces, restart
+boundaries, movable cursors, invalid borrows, guard bytes and allocation failure.
+The overlap fixture separately proves its staging/final restart ranges overlap
+before exercising relocation one byte at a time.
+
+This is a prerequisite for retained final-block construction, not its adoption.
+The streaming block owner still needs to prepare filters/checksums/bounds and
+metadata capacity before physical output, publish metadata after the last
+acknowledged write, and retain speculative allocations through rejection and
+retirement. Entry ingestion, prepaid output/run construction, cold-write policy,
+manifest/close adoption, remaining teardown/completion relief and default-gate
+evidence remain open. Full GNU qualification remains waived; the full design
+is incomplete.
+
+Qualification `bounded-block-codecs-v4` (Debug) and
+`bounded-block-codecs-fast` (ReleaseFast) each pass 60/60 build steps,
+158 table/codec cases and 74 WAL/recovery cases. The runners additionally pass
+45/1/8 error-identity cases. Native input hashes and log digests were rechecked;
+final source snapshots are retained alongside the receipts. Earlier receipts
+preserve the standalone module-root invocation failure, the pinned-Zig fixture
+syntax failure, and the first overlap fixture failing its own range assertion;
+the corrected overlap fixture proves overlap and passes. Formatting and
+whitespace checks pass.
