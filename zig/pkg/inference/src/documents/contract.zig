@@ -267,6 +267,12 @@ pub const Region = struct {
     origin: Origin = .transcription,
     model: ?[]const u8 = null,
     validated: bool = false,
+    /// UTF-8 byte range in Page.text, shared by nested regions.
+    text_start: ?usize = null,
+    text_end: ?usize = null,
+    children: []const Region = &.{},
+    tables: []const Table = &.{},
+    fields: ?std.json.Value = null,
 };
 pub const Cell = struct {
     row: usize,
@@ -276,7 +282,18 @@ pub const Cell = struct {
     text: []const u8,
     bbox: ?[4]f64 = null,
 };
-pub const Table = struct { id: usize, rows: usize, columns: usize, cells: []const Cell, origin: Origin = .native };
+pub const Table = struct { id: usize, region_id: ?usize = null, rows: usize, columns: usize, cells: []const Cell, origin: Origin = .native };
+pub const InheritedPart = struct {
+    path: []const u8,
+    role: enum { layout, master },
+    text: []const u8,
+    tables: []const Table = &.{},
+    shapes_visible: bool,
+    background_visible: bool,
+    shape_visual: bool,
+    background_visual: bool,
+    conditional_content: bool = false,
+};
 pub const Page = struct {
     object: []const u8 = "read",
     index: usize = 0,
@@ -284,6 +301,7 @@ pub const Page = struct {
     number: usize,
     kind: enum { page, slide, image },
     native_text: []const u8 = "",
+    inherited_parts: []const InheritedPart = &.{},
     notes: []const u8 = "",
     text: []const u8 = "",
     regions: []const Region = &.{},

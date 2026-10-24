@@ -1778,17 +1778,20 @@ pub const ReadResult = struct {
     /// One-based original page or slide number.
     number: ?i64 = null,
     kind: ?[]const u8 = null,
+    /// Native layout/master content, source part identity, and visibility/coverage metadata; unsupported composition remains unresolved.
+    inherited_parts: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
     native_text: ?[]const u8 = null,
     /// Speaker notes, separate from slide text.
     notes: ?[]const u8 = null,
     status: ?[]const u8 = null,
+    /// Default provenance for page text; mapped region origins override it.
     origin: ?[]const u8 = null,
     /// Coordinate space of regions; PDF points, slide EMUs or image pixels.
     coordinate_space: ?[]const u8 = null,
     /// Projective source transform.
     transform: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Mapping from rendered pixels to original source coordinates, including page rotation and actual render DPI.
-    raster_to_source: ?std.json.ArrayHashMap(std.json.Value) = null,
+    raster_to_source: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
     /// Tables and cells in source coordinates with provenance.
     tables: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
     findings: ?[]const []const u8 = null,
@@ -1804,13 +1807,14 @@ pub const ReadResult = struct {
         .{ "source_id", "source_id", true },
         .{ "number", "number", true },
         .{ "kind", "kind", true },
+        .{ "inherited_parts", "inherited_parts", true },
         .{ "native_text", "native_text", true },
         .{ "notes", "notes", true },
         .{ "status", "status", true },
         .{ "origin", "origin", true },
         .{ "coordinate_space", "coordinate_space", true },
         .{ "transform", "transform", true },
-        .{ "raster_to_source", "raster_to_source", true },
+        .{ "raster_to_source", "raster_to_source", false },
         .{ "tables", "tables", true },
         .{ "findings", "findings", true },
         .{ "text", "text", false },
@@ -1840,6 +1844,10 @@ pub const ReadResult = struct {
             try jw.objectField("kind");
             try jw.write(value);
         }
+        if (self.inherited_parts) |value| {
+            try jw.objectField("inherited_parts");
+            try jw.write(value);
+        }
         if (self.native_text) |value| {
             try jw.objectField("native_text");
             try jw.write(value);
@@ -1864,9 +1872,16 @@ pub const ReadResult = struct {
             try jw.objectField("transform");
             try jw.write(value);
         }
-        if (self.raster_to_source) |value| {
-            try jw.objectField("raster_to_source");
-            try jw.write(value);
+        switch (self.raster_to_source) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("raster_to_source");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("raster_to_source");
+                try jw.write(value);
+            },
         }
         if (self.tables) |value| {
             try jw.objectField("tables");
@@ -2202,9 +2217,23 @@ pub const TextContentPart = struct {
 };
 
 pub const TextRegion = struct {
+    /// Region identity within its parent; nested regions use qualified paths.
+    id: ?i64 = null,
+    /// Default provenance of this region; nested region origins override it.
+    origin: ?[]const u8 = null,
+    /// Start UTF-8 byte offset in the containing page text; null when unmapped.
+    text_start: OpenApiOptionalNullable(i64) = .absent,
+    /// Exclusive end UTF-8 byte offset in the containing page text.
+    text_end: OpenApiOptionalNullable(i64) = .absent,
+    /// Accepted subregions in the same source coordinate space and page text offsets.
+    children: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
+    /// Tables owned by this region, including cells and provenance.
+    tables: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
+    /// Structured output owned by this region.
+    fields: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
     /// Recognized text within the region
     text: []const u8,
-    /// Bounding box [x1, y1, x2, y2] in pixel coordinates
+    /// Bounding box [x1, y1, x2, y2] in the document source coordinate space, or pixels for ordinary image requests
     bbox: []const f64,
     /// Recognition confidence score (0-1)
     confidence: ?f64 = null,
@@ -2213,6 +2242,13 @@ pub const TextRegion = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "origin", "origin", true },
+        .{ "text_start", "text_start", false },
+        .{ "text_end", "text_end", false },
+        .{ "children", "children", true },
+        .{ "tables", "tables", true },
+        .{ "fields", "fields", false },
         .{ "text", "text", false },
         .{ "bbox", "bbox", false },
         .{ "confidence", "confidence", true },
@@ -2229,6 +2265,55 @@ pub const TextRegion = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.origin) |value| {
+            try jw.objectField("origin");
+            try jw.write(value);
+        }
+        switch (self.text_start) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("text_start");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("text_start");
+                try jw.write(value);
+            },
+        }
+        switch (self.text_end) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("text_end");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("text_end");
+                try jw.write(value);
+            },
+        }
+        if (self.children) |value| {
+            try jw.objectField("children");
+            try jw.write(value);
+        }
+        if (self.tables) |value| {
+            try jw.objectField("tables");
+            try jw.write(value);
+        }
+        switch (self.fields) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("fields");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("fields");
+                try jw.write(value);
+            },
+        }
         try jw.objectField("text");
         try jw.write(self.text);
         try jw.objectField("bbox");

@@ -40717,7 +40717,7 @@ test "document direct read accepts whole PDF and ordered PPTX without model admi
     defer a.free(models);
     var node = try Node.init(a, .{ .models_dir = models });
     defer node.deinit();
-    inline for (.{ .{ @embedFile("../documents/testdata/two-pages.pdf"), "application/pdf", "First page" }, .{ @embedFile("../documents/testdata/ordered-slides.pptx"), "application/vnd.openxmlformats-officedocument.presentationml.presentation", "Slide 2" } }) |fixture| {
+    inline for (.{ .{ @embedFile("../documents/testdata/two-pages.pdf"), "application/pdf", "First page" }, .{ @embedFile("../documents/testdata/ordered-slides.pptx"), "application/vnd.openxmlformats-officedocument.presentationml.presentation", "Slide 2" }, .{ @embedFile("../documents/testdata/inherited-slides.pptx"), "application/vnd.openxmlformats-officedocument.presentationml.presentation", "Slide 2" } }) |fixture| {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const alloc = arena.allocator();
@@ -40731,6 +40731,14 @@ test "document direct read accepts whole PDF and ordered PPTX without model admi
         try std.testing.expectEqual(@as(usize, 2), rows.len);
         try std.testing.expect(std.mem.indexOf(u8, rows[0].object.get("text").?.string, fixture[2]) != null);
         try std.testing.expectEqual(@as(i64, 0), parsed.object.get("usage").?.object.get("model_calls").?.integer);
+        if (std.mem.eql(u8, fixture[0], @embedFile("../documents/testdata/inherited-slides.pptx"))) {
+            try std.testing.expectEqualStrings("unresolved", rows[0].object.get("status").?.string);
+            try std.testing.expectEqualStrings("complete", rows[1].object.get("status").?.string);
+            const inherited = rows[0].object.get("inherited_parts").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), inherited.len);
+            try std.testing.expectEqualStrings("Confidential\n", inherited[1].object.get("text").?.string);
+            try std.testing.expect(std.mem.indexOf(u8, rows[0].object.get("text").?.string, "Template") == null);
+        }
         const typed = try node.readImagesDirectWithControl(a, "antfly/native-document", .{ .documents = &.{.{ .id = "source", .url = uri, .media_type = fixture[1] }} }, .{});
         defer {
             for (typed) |*item| readers_api.deinitResult(a, item);

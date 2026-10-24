@@ -21613,9 +21613,38 @@ export interface components {
             max_tokens?: number;
         };
         InferenceTextRegion: {
+            /** @description Region identity within its parent; nested regions use qualified paths. */
+            id?: number;
+            /**
+             * @description Default provenance of this region; nested region origins override it.
+             * @enum {string}
+             */
+            origin?: "native" | "transcription" | "interpretation" | "derived" | "estimated";
+            /**
+             * Format: int64
+             * @description Start UTF-8 byte offset in the containing page text; null when unmapped.
+             */
+            text_start?: number | null;
+            /**
+             * Format: int64
+             * @description Exclusive end UTF-8 byte offset in the containing page text.
+             */
+            text_end?: number | null;
+            /** @description Accepted subregions in the same source coordinate space and page text offsets. */
+            children?: {
+                [key: string]: unknown;
+            }[];
+            /** @description Tables owned by this region, including cells and provenance. */
+            tables?: {
+                [key: string]: unknown;
+            }[];
+            /** @description Structured output owned by this region. */
+            fields?: {
+                [key: string]: unknown;
+            } | null;
             /** @description Recognized text within the region */
             text: string;
-            /** @description Bounding box [x1, y1, x2, y2] in pixel coordinates */
+            /** @description Bounding box [x1, y1, x2, y2] in the document source coordinate space, or pixels for ordinary image requests */
             bbox: number[];
             /** @description Recognition confidence score (0-1) */
             confidence?: number;
@@ -21629,12 +21658,19 @@ export interface components {
             number?: number;
             /** @enum {string} */
             kind?: "page" | "slide" | "image";
+            /** @description Native layout/master content, source part identity, and visibility/coverage metadata; unsupported composition remains unresolved. */
+            inherited_parts?: {
+                [key: string]: unknown;
+            }[];
             native_text?: string;
             /** @description Speaker notes, separate from slide text. */
             notes?: string;
             /** @enum {string} */
             status?: "complete" | "unresolved" | "truncated";
-            /** @enum {string} */
+            /**
+             * @description Default provenance for page text; mapped region origins override it.
+             * @enum {string}
+             */
             origin?: "native" | "transcription" | "interpretation" | "derived" | "estimated";
             /** @description Coordinate space of regions; PDF points, slide EMUs or image pixels. */
             coordinate_space?: string;

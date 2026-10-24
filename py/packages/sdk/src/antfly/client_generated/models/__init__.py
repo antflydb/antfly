@@ -1037,6 +1037,7 @@ from .inference_read_response_events_item import InferenceReadResponseEventsItem
 from .inference_read_response_object import InferenceReadResponseObject
 from .inference_read_result import InferenceReadResult
 from .inference_read_result_fields_type_0 import InferenceReadResultFieldsType0
+from .inference_read_result_inherited_parts_item import InferenceReadResultInheritedPartsItem
 from .inference_read_result_kind import InferenceReadResultKind
 from .inference_read_result_origin import InferenceReadResultOrigin
 from .inference_read_result_raster_to_source_type_0 import InferenceReadResultRasterToSourceType0
@@ -1068,6 +1069,10 @@ from .inference_text_content import InferenceTextContent
 from .inference_text_content_part import InferenceTextContentPart
 from .inference_text_content_part_type import InferenceTextContentPartType
 from .inference_text_region import InferenceTextRegion
+from .inference_text_region_children_item import InferenceTextRegionChildrenItem
+from .inference_text_region_fields_type_0 import InferenceTextRegionFieldsType0
+from .inference_text_region_origin import InferenceTextRegionOrigin
+from .inference_text_region_tables_item import InferenceTextRegionTablesItem
 from .inference_tool import InferenceTool
 from .inference_tool_call_delta import InferenceToolCallDelta
 from .inference_tool_call_delta_type import InferenceToolCallDeltaType
@@ -2739,6 +2744,7 @@ __all__ = (
     "InferenceReadResponseObject",
     "InferenceReadResult",
     "InferenceReadResultFieldsType0",
+    "InferenceReadResultInheritedPartsItem",
     "InferenceReadResultKind",
     "InferenceReadResultOrigin",
     "InferenceReadResultRasterToSourceType0",
@@ -2769,6 +2775,10 @@ __all__ = (
     "InferenceTextContentPart",
     "InferenceTextContentPartType",
     "InferenceTextRegion",
+    "InferenceTextRegionChildrenItem",
+    "InferenceTextRegionFieldsType0",
+    "InferenceTextRegionOrigin",
+    "InferenceTextRegionTablesItem",
     "InferenceTool",
     "InferenceToolCallDelta",
     "InferenceToolCallDeltaType",

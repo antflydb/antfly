@@ -185,7 +185,7 @@ pub fn Service(comptime Node: type) type {
                             var unresolved = page;
                             unresolved.text = page.native_text;
                             unresolved.status = .unresolved;
-                            unresolved.findings = if (err == error.DocumentBudgetExhausted) &.{"model_call_budget_exhausted"} else &.{"renderer_unavailable_for_visual_content"};
+                            try @import("representation.zig").finding(sa, &unresolved, if (err == error.DocumentBudgetExhausted) "model_call_budget_exhausted" else "renderer_unavailable_for_visual_content", true);
                             try run.output(unresolved.text.len);
                             break :blk unresolved;
                         },
@@ -306,20 +306,17 @@ pub fn Service(comptime Node: type) type {
             out.text = try a.dupe(u8, page.text);
             out.native_text = try a.dupe(u8, page.native_text);
             out.notes = try a.dupe(u8, page.notes);
+            const inherited = try a.dupe(c.InheritedPart, page.inherited_parts);
+            for (inherited) |*part| {
+                part.path = try a.dupe(u8, part.path);
+                part.text = try a.dupe(u8, part.text);
+                part.tables = try @import("representation.zig").cloneTables(a, part.tables, 65536);
+            }
+            out.inherited_parts = inherited;
             if (page.fields) |fields| out.fields = try std.json.parseFromSliceLeaky(V, a, try std.json.Stringify.valueAlloc(a, fields, .{}), .{});
-            const regions = try a.dupe(c.Region, page.regions);
-            for (regions) |*r| {
-                r.text = try a.dupe(u8, r.text);
-                if (r.label) |label| r.label = try a.dupe(u8, label);
-            }
-            out.regions = regions;
-            const tables = try a.dupe(c.Table, page.tables);
-            for (tables) |*table| {
-                const cells = try a.dupe(c.Cell, table.cells);
-                for (cells) |*cell| cell.text = try a.dupe(u8, cell.text);
-                table.cells = cells;
-            }
-            out.tables = tables;
+            const ir = @import("representation.zig");
+            out.regions = try ir.cloneRegions(a, page.regions, 65536);
+            out.tables = try ir.cloneTables(a, page.tables, 65536);
             const findings = try a.dupe([]const u8, page.findings);
             for (findings) |*finding| finding.* = try a.dupe(u8, finding.*);
             out.findings = findings;
@@ -399,19 +396,12 @@ pub fn Service(comptime Node: type) type {
                 nested.source = &nested_source;
                 nested.rendered = .{ .bytes = data, .mime_type = mime, .width = raster_width, .height = raster_height, .effective_dpi = 0, .raster_to_source = .{} };
                 const page = try executor.readPage(a, child, .{ .ptr = &nested, .read_fn = read, .decide_fn = decide, .validate_fn = validate }, 0, .{ .source_id = self.source.input.id, .number = self.number, .kind = .image }, run);
-                const regions = try a.dupe(c.Region, page.regions);
-                for (regions) |*region| {
-                    if (binding.output_origin == .interpretation) region.origin = .interpretation;
-                    if (region.bbox) |child_box| {
-                        var box = child_box;
-                        box[0] += offset[0];
-                        box[2] += offset[0];
-                        box[1] += offset[1];
-                        box[3] += offset[1];
-                        region.bbox = try view.raster_to_source.box(box);
-                    }
-                }
-                return .{ .text = page.text, .model = binding.model, .origin = if (binding.output_origin == .interpretation) .interpretation else page.origin, .status = page.status, .regions = regions, .tables = page.tables, .fields = page.fields };
+                const ir = @import("representation.zig");
+                const regions = try ir.cloneRegions(a, page.regions, run.limits.max_regions);
+                const tables = try ir.cloneTables(a, page.tables, run.limits.max_regions);
+                try ir.transformRegions(regions, view.raster_to_source, offset, binding.output_origin == .interpretation);
+                try ir.transformTables(tables, view.raster_to_source, offset, binding.output_origin == .interpretation);
+                return .{ .text = page.text, .model = binding.model, .origin = if (binding.output_origin == .interpretation) .interpretation else page.origin, .status = page.status, .regions = regions, .tables = tables, .fields = page.fields };
             }
             const Cancel = struct {
                 fn cancelled(ptr: *const anyopaque) bool {

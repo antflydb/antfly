@@ -2668,6 +2668,43 @@ components:
         - text
         - bbox
       properties:
+        id:
+          type: integer
+          minimum: 0
+          description: Region identity within its parent; nested regions use qualified paths.
+        origin:
+          type: string
+          enum: [native, transcription, interpretation, derived, estimated]
+          description: Default provenance of this region; nested region origins override it.
+        text_start:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 0
+          description: Start UTF-8 byte offset in the containing page text; null when unmapped.
+        text_end:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 0
+          description: Exclusive end UTF-8 byte offset in the containing page text.
+        children:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Accepted subregions in the same source coordinate space and page text offsets.
+        tables:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Tables owned by this region, including cells and provenance.
+        fields:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: Structured output owned by this region.
         text:
           type: string
           description: Recognized text within the region
@@ -2677,7 +2714,7 @@ components:
             type: number
           minItems: 4
           maxItems: 4
-          description: Bounding box [x1, y1, x2, y2] in pixel coordinates
+          description: "Bounding box [x1, y1, x2, y2] in the document source coordinate space, or pixels for ordinary image requests"
         confidence:
           type: number
           description: Recognition confidence score (0-1)
@@ -2699,6 +2736,12 @@ components:
         kind:
           type: string
           enum: [page, slide, image]
+        inherited_parts:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Native layout/master content, source part identity, and visibility/coverage metadata; unsupported composition remains unresolved.
         native_text:
           type: string
         notes:
@@ -2710,6 +2753,7 @@ components:
         origin:
           type: string
           enum: [native, transcription, interpretation, derived, estimated]
+          description: Default provenance for page text; mapped region origins override it.
         coordinate_space:
           type: string
           description: Coordinate space of regions; PDF points, slide EMUs or image pixels.
@@ -2735,7 +2779,7 @@ components:
         text:
           type: string
           description: Extracted text from the image
-          example: 'Invoice Total: $123.45'
+          example: "Invoice Total: $123.45"
         fields:
           type: object
           nullable: true
@@ -2746,16 +2790,17 @@ components:
             Fields are flattened with dot notation for nested structures.
             Only present for models that output structured data.
           example:
-            menu.nm: Coffee
-            menu.price: $3.50
-            total: $123.45
+            menu.nm: "Coffee"
+            menu.price: "$3.50"
+            total: "$123.45"
         regions:
           type: array
           items:
-            $ref: '#/components/schemas/TextRegion'
+            $ref: "#/components/schemas/TextRegion"
           description: |
             Individual text regions with bounding boxes and recognized text.
             Populated by multi-stage OCR models (Surya, PaddleOCR).
+
     ReadResponse:
       type: object
       required:

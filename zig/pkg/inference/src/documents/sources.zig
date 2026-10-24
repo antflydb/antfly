@@ -20,9 +20,10 @@ const pdf = @import("antfly_pdf");
 const image = @import("antfly_image");
 const c = @import("contract.zig");
 const ooxml = @import("ooxml.zig");
+const slide_parts = @import("slides.zig");
 const A = std.mem.Allocator;
 pub const Input = @import("antfly_readers").DocumentSource;
-pub const Slide = struct { path: []const u8, hidden: bool = false, notes: ?[]const u8 = null };
+pub const Slide = struct { path: []const u8, hidden: bool = false, notes: ?[]const u8 = null, inherited: []const c.InheritedPart = &.{} };
 pub const Source = struct {
     input: Input,
     fingerprint: [64]u8,
@@ -52,6 +53,7 @@ pub const Source = struct {
             const presentation = try archive.get(a, "ppt/presentation.xml");
             const relationships = try archive.get(a, "ppt/_rels/presentation.xml.rels");
             var slides = std.ArrayList(Slide).empty;
+            var inheritance = slide_parts.Cache{};
             var iter = ooxml.Xml{ .bytes = presentation };
             while (try iter.next()) |token| {
                 try control.check();
@@ -68,7 +70,7 @@ pub const Source = struct {
                     }
                 }
                 if (slides.items.len >= limits.max_pages) return error.DocumentPageLimitExceeded;
-                try slides.append(a, .{ .path = path, .hidden = hidden });
+                try slides.append(a, .{ .path = path, .hidden = hidden, .inherited = try inheritance.inherited(a, archive, path, xml) });
             }
             if (slides.items.len == 0) return error.InvalidDocumentSource;
             result = .{ .input = input, .bytes = bytes, .fingerprint = fingerprint, .parsed = .{ .slides = .{ .archive = archive, .slides = try slides.toOwnedSlice(a) } } };
@@ -121,7 +123,7 @@ pub const Source = struct {
                 for (regions, analysis.runs, 0..) |*region, run, i| region.* = .{ .id = i, .text = try a.dupe(u8, run.text), .bbox = .{ run.x, run.y, run.x + run.advance_width, run.y + run.font_size }, .origin = .native };
                 page.regions = regions;
                 if (analysis.outline_fallback) page.findings = &.{"native_font_fallback"};
-                if (analysis.has_nontext_visual) page.findings = &.{"visual_content_requires_inspection"};
+                if (analysis.has_nontext_visual) page.findings = if (analysis.outline_fallback) &.{ "native_font_fallback", "visual_content_requires_inspection" } else &.{"visual_content_requires_inspection"};
             },
             .slides => |s| {
                 if (number == 0 or number > s.slides.len) return error.InvalidDocumentSelection;
@@ -134,6 +136,12 @@ pub const Source = struct {
                 // Native extraction alone cannot assert visual completeness.
                 if (try ooxml.needsVisualInspection(xml))
                     page.findings = &.{"slide_visual_inspection_unavailable"};
+                page.inherited_parts = slide.inherited;
+                const ir = @import("representation.zig");
+                for (slide.inherited) |part| {
+                    if ((part.shapes_visible and part.shape_visual) or (part.background_visible and part.background_visual)) try ir.finding(a, &page, "slide_inherited_visual_inspection_unavailable", true);
+                    if (part.conditional_content or (part.shapes_visible and (std.mem.trim(u8, part.text, " \t\r\n").len > 0 or part.tables.len > 0))) try ir.finding(a, &page, "slide_inherited_native_content_requires_composition", true);
+                }
                 if (slide.hidden and !self.input.include_hidden) return error.HiddenDocumentPage;
                 if (self.input.include_notes) {
                     const slash = std.mem.lastIndexOfScalar(u8, slide.path, '/') orelse return error.InvalidDocumentSource;
@@ -200,19 +208,4 @@ fn relationship(a: A, xml: []const u8, id: []const u8, base: []const u8) ![]cons
     }
     return error.MissingDocumentPart;
 }
-fn normalizedPart(a: A, base: []const u8, target: []const u8) ![]const u8 {
-    if (target.len == 0 or target[0] == '/' or std.mem.indexOfAny(u8, target, "\\:%?#") != null) return error.ExternalDocumentPartDenied;
-    var parts = std.ArrayList([]const u8).empty;
-    const combined = try std.mem.concat(a, u8, &.{ base, target });
-    var iter = std.mem.splitScalar(u8, combined, '/');
-    while (iter.next()) |part| {
-        if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
-        if (std.mem.eql(u8, part, "..")) {
-            if (parts.items.len == 0) return error.ExternalDocumentPartDenied;
-            _ = parts.pop();
-        } else try parts.append(a, part);
-    }
-    const result = try std.mem.join(a, "/", parts.items);
-    if (!std.mem.startsWith(u8, result, "ppt/")) return error.ExternalDocumentPartDenied;
-    return result;
-}
+const normalizedPart = slide_parts.normalizedPart;

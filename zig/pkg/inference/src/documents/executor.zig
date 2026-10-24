@@ -18,6 +18,8 @@
 const std = @import("std");
 pub const c = @import("contract.zig");
 const A = std.mem.Allocator;
+const ir = @import("representation.zig");
+const support = @import("source_support.zig");
 pub const Action = c.Action;
 pub const Candidate = struct {
     model: ?[]const u8 = null,
@@ -75,7 +77,7 @@ fn defaultAction(r: c.Read, page: c.Page, region: ?c.Region) Action {
             return if (r.accurate_reader != null) .accurate else .unresolved;
         return .accept;
     }
-    if (!meaningful(page.text)) return if (r.accurate_reader != null) .accurate else .unresolved;
+    if (!meaningful(page.text) or ir.hasFinding(page, "native_text_coverage_incomplete")) return if (r.accurate_reader != null) .accurate else .unresolved;
     return .accept;
 }
 
@@ -88,6 +90,8 @@ pub fn readPage(a: A, def: c.Definition, driver: Driver, page_index: usize, supp
     // Native adapters add a finding when coverage is uncertain (e.g. images).
     if (r.native_text == .inspect and meaningful(page.native_text) and page.findings.len == 0) {
         page.text = page.native_text;
+        page.regions = try ir.cloneRegions(a, page.regions, run.limits.max_regions);
+        ir.annotate(page.text, @constCast(page.regions));
         page.status = .complete;
         try run.output(page.text.len);
         try run.emit(.{ .phase = .native_text, .source_id = page.source_id, .page_number = page.number });
@@ -97,37 +101,68 @@ pub fn readPage(a: A, def: c.Definition, driver: Driver, page_index: usize, supp
     try run.call();
     try run.emit(.{ .phase = .reading, .source_id = page.source_id, .page_number = page.number, .model = initial.model });
     const candidate = try driver.read_fn(driver.ptr, a, initial, page_index, null, run);
-    if (candidate.regions.len > run.limits.max_regions) return error.DocumentRegionLimitExceeded;
-    page.text = candidate.text;
-    page.regions = candidate.regions;
-    if (candidate.tables.len > 0) page.tables = candidate.tables;
-    page.fields = candidate.fields;
-    page.model = initial.model;
-    page.origin = candidate.origin;
-    page.status = candidate.status orelse if (candidate.truncated) .truncated else if (meaningful(page.text)) .complete else .unresolved;
-    if (candidate.regions.len == 0) {
+    // Initial model output is a candidate too. A non-empty string does not
+    // demonstrate coverage of source text that the adapter already observed.
+    const missing_native = !support.coversNative(page.native_text, candidate.text);
+    var verified_repair = false;
+    if (missing_native and ir.hasFinding(page, "native_font_fallback")) {
+        if (driver.validate_fn) |validate| verified_repair = try validate(driver.ptr, page, null, candidate, run);
+    }
+    page = try applyPage(a, page, candidate, initial.model, run.limits.max_regions);
+    try ir.finding(a, &page, "native_text_superseded_by_verification", verified_repair);
+    try ir.finding(a, &page, "native_text_coverage_incomplete", missing_native and !verified_repair);
+    if (missing_native and !verified_repair) page.status = .unresolved;
+    var refined_whole = false;
+    if (missing_native and !verified_repair) {
         page = try refine(a, def, driver, page_index, page, null, run);
+        refined_whole = true;
+    }
+    if (page.regions.len == 0) {
+        if (!refined_whole) page = try refine(a, def, driver, page_index, page, null, run);
     } else {
-        const regions = try a.dupe(c.Region, candidate.regions);
+        const original_text = page.text;
+        const original_regions = page.regions;
+        const regions = try ir.cloneRegions(a, page.regions, run.limits.max_regions);
         for (regions) |*region| {
             const revised = try refine(a, def, driver, page_index, page, region.*, run);
             if (revised.status != .complete) page.status = revised.status;
             if (revised.regions.len == 1) region.* = revised.regions[0];
         }
         page.regions = regions;
-        for (regions) |region| if (region.origin == .interpretation) {
-            page.origin = .interpretation;
+        page.text = ir.assemble(a, original_text, original_regions, regions) catch |err| switch (err) {
+            error.InvalidDocumentRegion => blk: {
+                page.status = .unresolved;
+                try ir.finding(a, &page, "region_text_mapping_unresolved", true);
+                break :blk original_text;
+            },
+            else => return err,
         };
-        var joined = std.Io.Writer.Allocating.init(a);
-        for (regions, 0..) |region, i| {
-            if (i > 0) try joined.writer.writeByte('\n');
-            try joined.writer.writeAll(region.text);
+        const projection = try ir.projectTables(a, page.tables, regions, run.limits.max_regions);
+        page.tables = projection.tables;
+        if (!projection.resolved) {
+            page.status = .unresolved;
+            try ir.finding(a, &page, "table_revision_scope_unresolved", true);
         }
-        page.text = try joined.toOwnedSlice();
-        if (candidate.truncated) page.status = .truncated;
     }
+    ir.annotate(page.text, @constCast(page.regions));
+    if (!support.coversNative(page.native_text, page.text) and !ir.hasFinding(page, "native_text_superseded_by_verification")) {
+        page.status = .unresolved;
+        try ir.finding(a, &page, "native_text_coverage_incomplete", true);
+    } else try ir.finding(a, &page, "native_text_coverage_incomplete", false);
     try run.output(page.text.len);
     try run.emit(.{ .phase = if (page.status == .complete) .accepted else .unresolved, .source_id = page.source_id, .page_number = page.number });
+    return page;
+}
+
+fn applyPage(a: A, supplied: c.Page, candidate: Candidate, model: []const u8, limit: usize) !c.Page {
+    var page = supplied;
+    page.text = try a.dupe(u8, candidate.text);
+    page.regions = try ir.cloneRegions(a, candidate.regions, limit);
+    page.tables = try ir.cloneTables(a, candidate.tables, limit);
+    page.fields = try ir.cloneValue(a, candidate.fields);
+    page.model = model;
+    page.origin = candidate.origin;
+    page.status = if (candidate.truncated) .truncated else candidate.status orelse if (meaningful(page.text)) .complete else .unresolved;
     return page;
 }
 
@@ -196,11 +231,15 @@ fn refine(a: A, def: c.Definition, driver: Driver, page_index: usize, supplied: 
                 v.model = binding.model;
                 v.origin = candidate.origin;
                 v.validated = true;
+                v.confidence = candidate.confidence;
+                v.children = try ir.cloneRegions(a, candidate.regions, run.limits.max_regions);
+                v.tables = try ir.cloneTables(a, candidate.tables, run.limits.max_regions);
+                v.fields = try ir.cloneValue(a, candidate.fields);
             } else {
-                page.text = try a.dupe(u8, candidate.text);
-                if (candidate.fields) |fields| page.fields = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, fields, .{}), .{});
-                page.model = binding.model;
-                page.origin = candidate.origin;
+                const repaired_native = ir.hasFinding(page, "native_font_fallback") and !std.mem.eql(u8, page.text, candidate.text);
+                page = try applyPage(a, page, candidate, binding.model, run.limits.max_regions);
+                if (repaired_native) try ir.finding(a, &page, "native_text_superseded_by_verification", true);
+                try ir.finding(a, &page, "native_text_coverage_incomplete", !support.coversNative(page.native_text, page.text) and !ir.hasFinding(page, "native_text_superseded_by_verification"));
             }
             page.status = .complete;
             break;
@@ -284,4 +323,126 @@ test "document region evaluation retains fast text and selectively corroborates 
     try std.testing.expectEqual(@as(usize, 3), fake.calls);
     try std.testing.expect(!page.regions[0].validated);
     try std.testing.expect(page.regions[1].validated and page.regions[2].validated);
+}
+
+test "document initial OCR cannot silently discard known native content" {
+    const Fake = struct {
+        fn read(_: *anyopaque, _: A, _: c.Binding, _: usize, _: ?[4]f64, _: *c.Run) !Candidate {
+            return .{ .text = "Header" };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var run = c.Run{ .limits = .{} };
+    const def = c.Definition{ .models = &.{.{ .name = "fast", .model = "fast", .operation = .read }}, .read = .{ .reader = "fast" } };
+    const page = try readPage(arena.allocator(), def, .{ .ptr = undefined, .read_fn = Fake.read }, 0, .{ .source_id = "doc", .number = 1, .kind = .page, .native_text = "Header\nBody", .findings = &.{"visual_content_requires_inspection"} }, &run);
+    try std.testing.expect(page.status != .complete or std.mem.indexOf(u8, page.text, "Body") != null);
+}
+
+test "document accepted specialist revision retains tables and regions" {
+    const Fake = struct {
+        fn read(_: *anyopaque, _: A, binding: c.Binding, _: usize, _: ?[4]f64, _: *c.Run) !Candidate {
+            if (std.mem.eql(u8, binding.name, "fast")) return .{ .text = "" };
+            return .{ .text = "Correct", .regions = &.{.{ .id = 0, .text = "Correct", .bbox = .{ 0, 0, 10, 10 } }}, .tables = &.{.{ .id = 0, .rows = 1, .columns = 1, .cells = &.{.{ .row = 0, .column = 0, .text = "Correct" }} }} };
+        }
+        fn validate(_: *anyopaque, _: c.Page, _: ?c.Region, _: Candidate, _: *c.Run) !bool {
+            return true;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var run = c.Run{ .limits = .{} };
+    const def = c.Definition{ .models = &.{ .{ .name = "fast", .model = "fast", .operation = .read }, .{ .name = "accurate", .model = "accurate", .operation = .read } }, .read = .{ .reader = "fast", .accurate_reader = "accurate" } };
+    const page = try readPage(arena.allocator(), def, .{ .ptr = undefined, .read_fn = Fake.read, .validate_fn = Fake.validate }, 0, .{ .source_id = "doc", .number = 1, .kind = .page }, &run);
+    try std.testing.expectEqual(@as(usize, 1), page.tables.len);
+    try std.testing.expectEqual(@as(usize, 1), page.regions.len);
+}
+
+test "document mixed interpretation does not invalidate unrelated literal spans" {
+    const Fake = struct {
+        fn read(_: *anyopaque, _: A, _: c.Binding, _: usize, _: ?[4]f64, _: *c.Run) !Candidate {
+            return .{ .text = "Header\nCaption", .regions = &.{ .{ .id = 0, .text = "Header", .origin = .transcription }, .{ .id = 1, .text = "Caption", .origin = .interpretation } } };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = c.Run{ .limits = .{} };
+    const def = c.Definition{ .models = &.{.{ .name = "fast", .model = "fast", .operation = .read }}, .read = .{ .reader = "fast" } };
+    const page = try readPage(a, def, .{ .ptr = undefined, .read_fn = Fake.read }, 0, .{ .source_id = "doc", .number = 1, .kind = .image }, &run);
+    const metadata = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .source_id = "doc", .segments = .{.{ .number = 1, .start = 0, .end = page.text.len, .origin = page.origin, .regions = page.regions }} }, .{}), .{});
+    var item = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"structures\":{\"r\":[{\"title\":{\"value\":\"Header\",\"start\":0,\"end\":6}}]}}", .{});
+    const supported = try @import("evidence.zig").attach(a, &item, page.text, metadata, true, false);
+    try std.testing.expect(supported);
+    var caption = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"structures\":{\"r\":[{\"caption\":{\"value\":\"Caption\",\"start\":7,\"end\":14}}]}}", .{});
+    try std.testing.expect(!try @import("evidence.zig").attach(a, &caption, page.text, metadata, true, false));
+}
+
+test "document regional revisions retain owned structure after scratch teardown" {
+    const Fake = struct {
+        fn read(_: *anyopaque, a: A, binding: c.Binding, _: usize, _: ?[4]f64, _: *c.Run) !Candidate {
+            if (std.mem.eql(u8, binding.name, "fast")) return .{ .text = "Bad", .regions = &.{.{ .id = 3, .text = "Bad", .label = "table", .bbox = .{ 0, 0, 10, 10 } }} };
+            const text = try a.dupe(u8, "Correct");
+            return .{
+                .text = text,
+                .regions = try a.dupe(c.Region, &.{.{ .id = 0, .text = text, .bbox = .{ 0, 0, 10, 10 } }}),
+                .tables = try a.dupe(c.Table, &.{.{ .id = 0, .rows = 1, .columns = 1, .cells = try a.dupe(c.Cell, &.{.{ .row = 0, .column = 0, .text = text }}) }}),
+                .fields = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"count\":7}", .{}),
+            };
+        }
+        fn validate(_: *anyopaque, _: c.Page, _: ?c.Region, _: Candidate, _: *c.Run) !bool {
+            return true;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var run = c.Run{ .limits = .{}, .work_allocator = std.testing.allocator };
+    const def = c.Definition{ .models = &.{ .{ .name = "fast", .model = "fast", .operation = .read }, .{ .name = "table", .model = "table", .operation = .read } }, .read = .{ .reader = "fast", .table_reader = "table" } };
+    const page = try readPage(arena.allocator(), def, .{ .ptr = undefined, .read_fn = Fake.read, .validate_fn = Fake.validate }, 0, .{ .source_id = "doc", .number = 1, .kind = .image }, &run);
+    try std.testing.expectEqual(c.Status.complete, page.status);
+    try std.testing.expectEqualStrings("Correct", page.regions[0].children[0].text);
+    try std.testing.expectEqualStrings("Correct", page.regions[0].tables[0].cells[0].text);
+    try std.testing.expectEqual(@as(i64, 7), page.regions[0].fields.?.object.get("count").?.integer);
+    try std.testing.expectEqual(@as(usize, 1), page.tables.len);
+    try std.testing.expectEqual(@as(?usize, 3), page.tables[0].region_id);
+}
+
+test "document initial coverage preserves native words outside detected regions" {
+    const Fake = struct {
+        fn read(_: *anyopaque, _: A, _: c.Binding, _: usize, _: ?[4]f64, _: *c.Run) !Candidate {
+            return .{ .text = "Header\nBody\nVisual", .regions = &.{.{ .id = 0, .text = "Header", .bbox = .{ 0, 0, 10, 10 } }} };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var run = c.Run{ .limits = .{} };
+    const def = c.Definition{ .models = &.{.{ .name = "fast", .model = "fast", .operation = .read }}, .read = .{ .reader = "fast" } };
+    const page = try readPage(arena.allocator(), def, .{ .ptr = undefined, .read_fn = Fake.read }, 0, .{ .source_id = "doc", .number = 1, .kind = .page, .native_text = "Header\nBody", .findings = &.{"visual_content_requires_inspection"} }, &run);
+    try std.testing.expectEqual(c.Status.complete, page.status);
+    try std.testing.expectEqualStrings("Header\nBody\nVisual", page.text);
+}
+
+test "document missing native coverage routes a whole-page repair before acceptance" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn read(raw: *anyopaque, _: A, binding: c.Binding, _: usize, box: ?[4]f64, _: *c.Run) !Candidate {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expect(box == null);
+            return .{ .text = if (std.mem.eql(u8, binding.name, "fast")) "Header" else "Header\nBody" };
+        }
+        fn validate(_: *anyopaque, page: c.Page, _: ?c.Region, candidate: Candidate, _: *c.Run) !bool {
+            return std.mem.eql(u8, page.native_text, candidate.text);
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var fake = Fake{};
+    var run = c.Run{ .limits = .{ .max_model_calls = 2 }, .work_allocator = std.testing.allocator };
+    const def = c.Definition{ .models = &.{ .{ .name = "fast", .model = "fast", .operation = .read }, .{ .name = "accurate", .model = "accurate", .operation = .read } }, .read = .{ .reader = "fast", .accurate_reader = "accurate" } };
+    const page = try readPage(arena.allocator(), def, .{ .ptr = &fake, .read_fn = Fake.read, .validate_fn = Fake.validate }, 0, .{ .source_id = "doc", .number = 1, .kind = .page, .native_text = "Header\nBody", .findings = &.{"visual_content_requires_inspection"} }, &run);
+    try std.testing.expectEqual(c.Status.complete, page.status);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqualStrings("Header\nBody", page.text);
+    try std.testing.expect(!ir.hasFinding(page, "native_text_coverage_incomplete"));
 }

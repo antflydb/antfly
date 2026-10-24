@@ -92,6 +92,7 @@ fn preserveOrigin(a: A, item: *V, references: []const V, allow_derived: bool) !b
             try item.object.put(a, "origin", .{ .string = "derived" });
             _ = item.object.swapRemove("start");
             _ = item.object.swapRemove("end");
+            _ = item.object.swapRemove("spans");
             return allow_derived;
         }
     };
@@ -137,16 +138,47 @@ fn mapSpan(a: A, out: *std.array_list.Managed(V), metadata: ?V, range: [2]usize)
         const left = @max(start, range[0]);
         const right = @min(end, range[1]);
         if (left >= right) continue;
-        var reference = V{ .object = .{} };
-        try reference.object.put(a, "source_id", id);
-        try reference.object.put(a, "offset_unit", .{ .string = "utf8_bytes" });
-        try reference.object.put(a, "page_number", field(segment, "number") orelse return error.InvalidDocumentEvidence);
-        try reference.object.put(a, "start", .{ .integer = @intCast(left - start) });
-        try reference.object.put(a, "end", .{ .integer = @intCast(right - start) });
-        if (field(segment, "origin")) |origin| try reference.object.put(a, "origin", origin);
-        if (field(segment, "role")) |role| try reference.object.put(a, "role", role);
-        try out.append(reference);
+        var path: [17]usize = undefined;
+        var remaining: usize = 65536;
+        try mapRegionSpan(a, out, id, segment, field(segment, "regions"), .{ left - start, right - start }, field(segment, "origin"), &path, 0, &remaining);
     }
+}
+
+fn mapRegionSpan(a: A, out: *std.array_list.Managed(V), id: V, segment: V, regions: ?V, range: [2]usize, inherited: ?V, path: *[17]usize, depth: usize, remaining: *usize) !void {
+    if (depth > 16) return error.InvalidDocumentEvidence;
+    var cursor = range[0];
+    if (regions) |list| {
+        if (list != .array or list.array.items.len > remaining.*) return error.InvalidDocumentEvidence;
+        remaining.* -= list.array.items.len;
+        for (list.array.items) |region| {
+            const first = field(region, "text_start") orelse continue;
+            const last = field(region, "text_end") orelse continue;
+            if (first == .null or last == .null) continue;
+            const start = try offset(first);
+            const end = try offset(last);
+            if (start > end) return error.InvalidDocumentEvidence;
+            const left = @max(cursor, start);
+            const right = @min(range[1], end);
+            if (left >= right) continue;
+            if (cursor < left) try appendReference(a, out, id, segment, .{ cursor, left }, inherited, path[0..depth]);
+            path[depth] = try offset(field(region, "id") orelse return error.InvalidDocumentEvidence);
+            try mapRegionSpan(a, out, id, segment, field(region, "children"), .{ left, right }, field(region, "origin") orelse inherited, path, depth + 1, remaining);
+            cursor = right;
+        }
+    }
+    if (cursor < range[1]) try appendReference(a, out, id, segment, .{ cursor, range[1] }, inherited, path[0..depth]);
+}
+fn appendReference(a: A, out: *std.array_list.Managed(V), id: V, segment: V, range: [2]usize, origin: ?V, path: []const usize) !void {
+    var reference = V{ .object = .{} };
+    try reference.object.put(a, "source_id", id);
+    try reference.object.put(a, "offset_unit", .{ .string = "utf8_bytes" });
+    try reference.object.put(a, "page_number", field(segment, "number") orelse return error.InvalidDocumentEvidence);
+    try reference.object.put(a, "start", .{ .integer = @intCast(range[0]) });
+    try reference.object.put(a, "end", .{ .integer = @intCast(range[1]) });
+    if (origin) |value| try reference.object.put(a, "origin", value);
+    if (field(segment, "role")) |role| try reference.object.put(a, "role", role);
+    if (path.len > 0) try reference.object.put(a, "region_path", try std.json.parseFromSliceLeaky(V, a, try std.json.Stringify.valueAlloc(a, path, .{}), .{}));
+    try out.append(reference);
 }
 
 /// Independent extraction corroboration compares requested values/records,

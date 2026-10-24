@@ -472,7 +472,30 @@ def test_direct_document_read_preserves_page_identity_and_artifact():
     payload = {
         "object": "list",
         "model": "balanced",
-        "data": [{"object": "read", "index": 0, "source_id": "receipt", "number": 2, "text": "Total 12.50"}],
+        "data": [
+            {
+                "object": "read",
+                "index": 0,
+                "source_id": "receipt",
+                "number": 2,
+                "text": "Total 12.50",
+                "origin": "transcription",
+                "regions": [
+                    {
+                        "id": 4,
+                        "bbox": [0, 0, 100, 20],
+                        "text": "Total 12.50",
+                        "text_start": 0,
+                        "text_end": 11,
+                        "origin": "transcription",
+                        "children": [{"id": 1, "text": "12.50", "text_start": 6, "text_end": 11}],
+                        "tables": [{"id": 1, "cells": [{"text": "12.50"}]}],
+                        "fields": {"total": "12.50"},
+                    }
+                ],
+                "inherited_parts": [{"path": "ppt/slideMasters/slideMaster1.xml", "shapes_visible": False}],
+            }
+        ],
         "document": {"artifact_id": "a" * 64},
     }
 

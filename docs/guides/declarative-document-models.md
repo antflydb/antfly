@@ -195,7 +195,12 @@ slide policy, and separately attributed speaker notes. Visual slide rendering,
 chart interpretation and perspective correction are unavailable and are reported
 as such. XML inspection recognizes drawings independently of namespace prefixes,
 including vector shapes, pictures, charts and embedded content. A slide with
-unsupported visual content remains unresolved. PDF native inspection checks
+unsupported visual content remains unresolved. Slide layouts and masters are
+parsed once per source and shared across slides. Inherited parts retain their
+source identity and visibility metadata; template prompts are excluded. Visible
+inherited decorations, conditional footer content, and backgrounds that require
+composition or rendering keep the slide unresolved until those capabilities are
+available. PDF native inspection checks
 painting operators without decoding images or materializing vector paths;
 text-bearing pages with drawings still require visual inspection.
 
@@ -213,6 +218,19 @@ source hashes, source-selection options, prompts, effective limits, model
 identities and adapter/runtime versions. Remote providers expose model names
 without an immutable weight revision. Per-run execution is currently serial; existing
 reader executors own physical batching. Model discovery reports this limit.
+
+Initial OCR output and accepted revisions must retain trustworthy native text
+coverage. Missing coverage triggers whole-page escalation and prevents a router
+from accepting an incomplete transcription. Known broken font mappings can be
+superseded only through source verification. Regional revisions preserve page
+text outside the corrected region, nested regions, tables and structured fields;
+ambiguous table ownership is reported as unresolved.
+
+Region `text_start` and `text_end` are UTF-8 byte offsets within the page text.
+Nested regions retain source coordinates and qualified identities. Page origin
+provides the default provenance, with mapped regional origins overriding it, so
+literal fields remain extractable alongside interpreted captions. Interpreted
+values never acquire literal source spans.
 
 Responses include bounded events and measured aggregate usage separately from
 physical batch reports. Artifact reuse is implemented; durable checkpoint/resume,

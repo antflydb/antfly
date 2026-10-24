@@ -14,6 +14,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.inference_read_result_fields_type_0 import InferenceReadResultFieldsType0
+    from ..models.inference_read_result_inherited_parts_item import InferenceReadResultInheritedPartsItem
     from ..models.inference_read_result_raster_to_source_type_0 import InferenceReadResultRasterToSourceType0
     from ..models.inference_read_result_tables_item import InferenceReadResultTablesItem
     from ..models.inference_read_result_transform import InferenceReadResultTransform
@@ -33,10 +34,12 @@ class InferenceReadObject:
         source_id (str | Unset): Original document source ID.
         number (int | Unset): One-based original page or slide number.
         kind (InferenceReadResultKind | Unset):
+        inherited_parts (list[InferenceReadResultInheritedPartsItem] | Unset): Native layout/master content, source part
+            identity, and visibility/coverage metadata; unsupported composition remains unresolved.
         native_text (str | Unset):
         notes (str | Unset): Speaker notes, separate from slide text.
         status (InferenceReadResultStatus | Unset):
-        origin (InferenceReadResultOrigin | Unset):
+        origin (InferenceReadResultOrigin | Unset): Default provenance for page text; mapped region origins override it.
         coordinate_space (str | Unset): Coordinate space of regions; PDF points, slide EMUs or image pixels.
         transform (InferenceReadResultTransform | Unset): Projective source transform.
         raster_to_source (InferenceReadResultRasterToSourceType0 | None | Unset): Mapping from rendered pixels to
@@ -58,6 +61,7 @@ class InferenceReadObject:
     source_id: str | Unset = UNSET
     number: int | Unset = UNSET
     kind: InferenceReadResultKind | Unset = UNSET
+    inherited_parts: list[InferenceReadResultInheritedPartsItem] | Unset = UNSET
     native_text: str | Unset = UNSET
     notes: str | Unset = UNSET
     status: InferenceReadResultStatus | Unset = UNSET
@@ -88,6 +92,13 @@ class InferenceReadObject:
         kind: str | Unset = UNSET
         if not isinstance(self.kind, Unset):
             kind = self.kind.value
+
+        inherited_parts: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.inherited_parts, Unset):
+            inherited_parts = []
+            for inherited_parts_item_data in self.inherited_parts:
+                inherited_parts_item = inherited_parts_item_data.to_dict()
+                inherited_parts.append(inherited_parts_item)
 
         native_text = self.native_text
 
@@ -156,6 +167,8 @@ class InferenceReadObject:
             field_dict["number"] = number
         if kind is not UNSET:
             field_dict["kind"] = kind
+        if inherited_parts is not UNSET:
+            field_dict["inherited_parts"] = inherited_parts
         if native_text is not UNSET:
             field_dict["native_text"] = native_text
         if notes is not UNSET:
@@ -184,6 +197,7 @@ class InferenceReadObject:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.inference_read_result_fields_type_0 import InferenceReadResultFieldsType0
+        from ..models.inference_read_result_inherited_parts_item import InferenceReadResultInheritedPartsItem
         from ..models.inference_read_result_raster_to_source_type_0 import InferenceReadResultRasterToSourceType0
         from ..models.inference_read_result_tables_item import InferenceReadResultTablesItem
         from ..models.inference_read_result_transform import InferenceReadResultTransform
@@ -206,6 +220,15 @@ class InferenceReadObject:
             kind = UNSET
         else:
             kind = InferenceReadResultKind(_kind)
+
+        _inherited_parts = d.pop("inherited_parts", UNSET)
+        inherited_parts: list[InferenceReadResultInheritedPartsItem] | Unset = UNSET
+        if _inherited_parts is not UNSET:
+            inherited_parts = []
+            for inherited_parts_item_data in _inherited_parts:
+                inherited_parts_item = InferenceReadResultInheritedPartsItem.from_dict(inherited_parts_item_data)
+
+                inherited_parts.append(inherited_parts_item)
 
         native_text = d.pop("native_text", UNSET)
 
@@ -295,6 +318,7 @@ class InferenceReadObject:
             source_id=source_id,
             number=number,
             kind=kind,
+            inherited_parts=inherited_parts,
             native_text=native_text,
             notes=notes,
             status=status,
