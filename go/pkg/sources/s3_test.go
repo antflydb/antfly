@@ -18,6 +18,7 @@ package sources
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"net/http"
@@ -67,5 +68,117 @@ func TestS3ObjectKeysRemainDistinctCanonicalURIs(t *testing.T) {
 			t.Errorf("distinct keys %q and %q collapse to canonical URI %q", prior, key, doc.URI)
 		}
 		uris[doc.URI] = key
+	}
+}
+
+// Exercise real MinIO request construction: a readable replacement must never
+// authorize bytes staged from a version whose access has since been revoked.
+func TestS3PinnedVersionLifecycle(t *testing.T) {
+	for _, prefix := range []bool{false, true} {
+		for _, version := range []string{"old-version", "null", ""} {
+			t.Run(fmt.Sprintf("prefix=%v/version=%q", prefix, version), func(t *testing.T) {
+				denied, replaced, ignoreVersion, changeListing := false, false, false, false
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Query().Get("list-type") == "2" {
+						w.Header().Set("Content-Type", "application/xml")
+						fmt.Fprint(w, `<ListBucketResult><Name>docs</Name><IsTruncated>false</IsTruncated><Contents><Key>doc.txt</Key><ETag>"etag"</ETag><Size>1</Size></Contents></ListBucketResult>`)
+						return
+					}
+					requested := r.URL.Query().Get("versionId")
+					if denied && requested == version {
+						w.WriteHeader(http.StatusForbidden)
+						return
+					}
+					actual, etag := version, "etag"
+					if (replaced && (requested == "" || ignoreVersion)) || changeListing {
+						actual, etag = "replacement", "new-etag"
+					}
+					if !replaced && !changeListing && r.Method == http.MethodGet && requested != version {
+						t.Errorf("GET versionId = %q, want %q", requested, version)
+					}
+					w.Header().Set("ETag", `"`+etag+`"`)
+					w.Header().Set("Content-Length", "1")
+					w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+					if actual != "" {
+						w.Header().Set("x-amz-version-id", actual)
+					}
+					if r.Method == http.MethodGet {
+						fmt.Fprint(w, "x")
+					}
+				}))
+				defer server.Close()
+				target, _ := url.Parse(server.URL)
+				client, err := minio.New(target.Host, &minio.Options{Creds: credentials.NewStaticV4("access", "secret", ""), Secure: false, Region: "us-east-1"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				connector := S3Connector{Client: client}
+				cfg := S3Config{Bucket: "docs", Key: "doc.txt"}
+				if prefix {
+					cfg.Key = ""
+				}
+				raw, _ := json.Marshal(cfg)
+				req := Request{Mode: ImportModeSource, SourceNamespace: testSourceID, Config: raw}
+				inventory, err := connector.Enumerate(context.Background(), req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(inventory.Objects) != 1 {
+					t.Fatalf("inventory: %+v", inventory)
+				}
+				item := inventory.Objects[0]
+				if got, ok := item.Metadata["version_id"]; !ok || got != version {
+					t.Fatalf("pinned version = %v, want %q", got, version)
+				}
+				// The inventory survives a persisted JSON manifest round trip.
+				encoded, _ := json.Marshal(item)
+				if err := json.Unmarshal(encoded, &item); err != nil {
+					t.Fatal(err)
+				}
+				check := func(wantOK bool) {
+					t.Helper()
+					if err := connector.CheckAccess(context.Background(), req, item); (err == nil) != wantOK {
+						t.Errorf("CheckAccess = %v; wantOK %v", err, wantOK)
+					}
+					data, err := connector.Read(context.Background(), req, item)
+					if (err == nil) != wantOK {
+						t.Errorf("Read = %q, %v; wantOK %v", data, err, wantOK)
+					}
+				}
+				check(true)
+				replaced = true
+				check(version != "") // Old versions remain usable only via exact-version access.
+				denied = true
+				check(false)
+				denied, ignoreVersion = false, true
+				check(false) // Fail closed for servers that ignore versionId.
+				if prefix {
+					replaced, ignoreVersion, changeListing = false, false, true
+					if _, err := connector.Enumerate(context.Background(), req); err == nil {
+						t.Error("accepted changed listing during version pinning")
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestS3PinnedResponseIdentity(t *testing.T) {
+	item := Item{Path: "doc.txt", Revision: "etag", Size: 1, Metadata: map[string]any{"bucket": "docs"}}
+	for _, tc := range []struct {
+		name string
+		info minio.ObjectInfo
+		ok   bool
+	}{
+		{"legacy unversioned", minio.ObjectInfo{ETag: "etag", Size: 1}, true},
+		{"legacy versioned same bytes", minio.ObjectInfo{ETag: "etag", Size: 1, VersionID: "replacement"}, false},
+		{"changed etag", minio.ObjectInfo{ETag: "new", Size: 1}, false},
+		{"changed size", minio.ObjectInfo{ETag: "etag", Size: 2}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateS3Response(item, tc.info); (err == nil) != tc.ok {
+				t.Fatalf("validateS3Response = %v; wantOK %v", err, tc.ok)
+			}
+		})
 	}
 }

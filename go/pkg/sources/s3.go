@@ -63,7 +63,7 @@ func (c *S3Connector) Enumerate(ctx context.Context, r Request) (Inventory, erro
 		limit = 1
 	}
 	retry := exactSourceKeySet(r.RetrySourceKeys)
-	add := func(info minio.ObjectInfo) error {
+	add := func(info minio.ObjectInfo, listed bool) error {
 		if !sourceObjectAllowed(info.Key, cfg.Suffixes, cfg.Patterns, cfg.ExcludePatterns) {
 			return nil
 		}
@@ -76,12 +76,26 @@ func (c *S3Connector) Enumerate(ctx context.Context, r Request) (Inventory, erro
 		if len(out.Objects) >= limit {
 			return fmt.Errorf("%w: S3 inventory limit exceeded", ErrInvalidInput)
 		}
+		// ListObjects does not return version IDs. Resolve each selected entry
+		// through HEAD and fence it against the listed identity before persisting
+		// the version used for every subsequent download and authorization check.
+		if listed {
+			pinned, err := c.Client.StatObject(ctx, cfg.Bucket, info.Key, minio.StatObjectOptions{})
+			if err != nil {
+				return err
+			}
+			if strings.Trim(pinned.ETag, `"`) != strings.Trim(info.ETag, `"`) || pinned.Size != info.Size {
+				return &RevisionChangedError{Expected: strings.Trim(info.ETag, `"`), Actual: strings.Trim(pinned.ETag, `"`)}
+			}
+			pinned.Key = info.Key
+			info = pinned
+		}
 		rev := strings.Trim(info.ETag, `"`)
 		if rev == "" || info.Size < 0 {
 			return fmt.Errorf("invalid S3 revision or size")
 		}
 		uri := canonicalS3URI(cfg.Bucket, info.Key)
-		out.Objects = append(out.Objects, Item{ID: "s3://" + strings.Trim(r.SourceNamespace, "/") + "/" + cfg.Bucket + "/" + info.Key, Path: info.Key, Filename: filepath.Base(info.Key), Revision: rev, URL: uri, Size: info.Size, SourceKind: ProviderS3, ReadMode: sourceReadBytes, ObjectIndex: len(out.Objects) + 1, Metadata: map[string]any{"source_namespace": r.SourceNamespace, "bucket": cfg.Bucket, "key": info.Key, "etag": rev, "size": info.Size}})
+		out.Objects = append(out.Objects, Item{ID: "s3://" + strings.Trim(r.SourceNamespace, "/") + "/" + cfg.Bucket + "/" + info.Key, Path: info.Key, Filename: filepath.Base(info.Key), Revision: rev, URL: uri, Size: info.Size, SourceKind: ProviderS3, ReadMode: sourceReadBytes, ObjectIndex: len(out.Objects) + 1, Metadata: map[string]any{"source_namespace": r.SourceNamespace, "bucket": cfg.Bucket, "key": info.Key, "etag": rev, "size": info.Size, "version_id": info.VersionID}})
 		return nil
 	}
 	if cfg.Key != "" {
@@ -96,7 +110,7 @@ func (c *S3Connector) Enumerate(ctx context.Context, r Request) (Inventory, erro
 			}
 		} else {
 			info.Key = cfg.Key
-			if err := add(info); err != nil {
+			if err := add(info, false); err != nil {
 				return Inventory{}, err
 			}
 		}
@@ -107,7 +121,7 @@ func (c *S3Connector) Enumerate(ctx context.Context, r Request) (Inventory, erro
 			if info.Err != nil {
 				return Inventory{}, info.Err
 			}
-			if err := add(info); err != nil {
+			if err := add(info, true); err != nil {
 				return Inventory{}, err
 			}
 			if (cfg.MaxObjects > 0 || r.Preview) && len(out.Objects) >= limit {
@@ -128,10 +142,10 @@ func (c *S3Connector) OpenSource(ctx context.Context, r Request, o Item) (io.Rea
 	if err != nil {
 		return nil, err
 	}
-	if cfg.Bucket != configString(o.Metadata, "bucket") || o.Revision == "" {
-		return nil, fmt.Errorf("invalid pinned S3 source")
+	if err := validatePinnedS3Source(cfg, o); err != nil {
+		return nil, err
 	}
-	opts := minio.GetObjectOptions{}
+	opts := minio.GetObjectOptions{VersionID: configString(o.Metadata, "version_id")}
 	if err := opts.SetMatchETag(o.Revision); err != nil {
 		return nil, err
 	}
@@ -139,9 +153,9 @@ func (c *S3Connector) OpenSource(ctx context.Context, r Request, o Item) (io.Rea
 	if err != nil {
 		return nil, err
 	}
-	if strings.Trim(info.ETag, `"`) != o.Revision || info.Size != o.Size {
+	if err := validateS3Response(o, info); err != nil {
 		reader.Close()
-		return nil, &RevisionChangedError{Expected: o.Revision, Actual: strings.Trim(info.ETag, `"`)}
+		return nil, err
 	}
 	return reader, nil
 }
@@ -162,7 +176,39 @@ func (c *S3Connector) CheckAccess(ctx context.Context, r Request, o Item) error 
 	if err != nil {
 		return err
 	}
-	_, err = c.Client.StatObject(ctx, cfg.Bucket, o.Path, minio.StatObjectOptions{})
-	return err
+	if err := validatePinnedS3Source(cfg, o); err != nil {
+		return err
+	}
+	opts := minio.StatObjectOptions{VersionID: configString(o.Metadata, "version_id")}
+	if err := opts.SetMatchETag(o.Revision); err != nil {
+		return err
+	}
+	info, err := c.Client.StatObject(ctx, cfg.Bucket, o.Path, opts)
+	if err != nil {
+		return err
+	}
+	return validateS3Response(o, info)
 }
 func (c *S3Connector) ValidateAbsentSources(context.Context, Request, []string) error { return nil }
+
+func validatePinnedS3Source(cfg S3Config, o Item) error {
+	if cfg.Bucket != configString(o.Metadata, "bucket") || o.Path == "" || o.Revision == "" || o.Size < 0 {
+		return fmt.Errorf("invalid pinned S3 source")
+	}
+	return nil
+}
+
+func validateS3Response(o Item, info minio.ObjectInfo) error {
+	version := configString(o.Metadata, "version_id")
+	// Empty version IDs denote unversioned objects (including old manifests).
+	// A versioned response cannot prove access to those snapshots, even when
+	// the replacement happens to have the same ETag and size. The literal S3
+	// version ID "null" is retained and sent explicitly like any other ID.
+	if info.VersionID != version {
+		return fmt.Errorf("S3 version changed: expected %q, got %q; enumerate a fresh snapshot", version, info.VersionID)
+	}
+	if strings.Trim(info.ETag, `"`) != o.Revision || info.Size != o.Size {
+		return &RevisionChangedError{Expected: o.Revision, Actual: strings.Trim(info.ETag, `"`)}
+	}
+	return nil
+}

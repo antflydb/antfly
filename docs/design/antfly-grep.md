@@ -336,7 +336,13 @@ all metadata (including the content SHA), rather than treating a provider revisi
 as the identity of normalized output. Metadata-only changes must be query-visible
 before publication. Cached GCS bytes are authorized against their selected
 `generation` with a matching generation precondition, never against the live
-replacement's ACL.
+replacement's ACL. S3 inventories likewise persist `version_id`; prefix listings
+resolve each selected entry with HEAD and reject an intervening ETag/size change.
+Downloads and cache authorization request the exact version (including literal
+`null`) and validate the returned version, ETag and size. Versionless legacy
+snapshots fail closed on versioned responses, even for identical replacement
+bytes; operators must enumerate a new snapshot. Unversioned objects retain
+conditional ETag/size checks.
 
 MCP trusted-principal tokens retain their broad read scope and add concrete
 `table_operations` write/admin grants for allowed application tables. Reserved

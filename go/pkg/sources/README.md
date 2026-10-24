@@ -153,3 +153,11 @@ complete normalized metadata projection, including URI/path, sharing, connection
 metadata, indexing time and content digest, before publication can complete.
 Unchanged provider revisions do not bypass this check. GCS cache access checks
 are pinned to the original object generation and enforce its current permissions.
+
+S3 inventories persist the exact `version_id`, resolving prefix-list entries with
+HEAD before pinning. Downloads and cached-byte authorization address that version
+and verify the returned version, ETag and size. The literal `null` version is sent
+explicitly. Versionless snapshots are accepted only while the provider still
+returns an unversioned object with the pinned ETag and size; a versioned response
+requires a freshly enumerated snapshot. A readable replacement never authorizes
+cached bytes from another version.
