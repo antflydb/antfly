@@ -2088,3 +2088,80 @@ only named resolvers and, for query resolution, the siblings that can consume th
 same extraction. Consumer pages own strings independently of storage cursor
 movement. Progress observation runs in bounded groups of 16 source tables, with a
 shared deadline and per-worker allocation ownership.
+
+
+Resolver catalog lookup shares generation-owned indexes for namespace consumers,
+identity names and replacement reservations. Warm projection publication checks
+reservations by identity rather than rescanning the catalog per consumer; point
+entity discovery clones only the selected descriptor. First-use Lite adoption
+prepares selected namespace policies before entering the writer lease and fences
+source configuration generations both at adoption and final publication.
+
+Metadata consumer discovery uses the same durable prefix trie as Lite, with
+separate namespace/source postings. Matching namespaces are ordered and paged
+under one catalog revision; a source may appear in multiple namespace pages, so
+HTTP admission deduplicates resolver identities rather than source tables. Source
+edits and deletions update postings and reference-counted routes atomically.
+Decoder 43 rebuilds the namespace routing index through the bounded bootstrap
+worker before publishing v3 readiness. Its records remain in the resolver
+namespace snapshot projection; legacy reads retain their scan path until ready.
+
+### Scoped diagnostics and batched metadata
+
+Owner progress reads scalar catalog descriptors without cloning aliases,
+provider configuration or namespace policy. The private progress request accepts
+`resolver_names`: omission enumerates public active identities, an empty list
+selects none, and a named set uses the catalog's identity index. Point waits
+filter heartbeat diagnostics to those identities and probe only their progress;
+an unrelated resolver's backlog does not cause another owner request.
+
+HTTP reads and metadata apply share a name-indexed declaration/identity join,
+including dropped fences, retired identities and shared policy validation.
+Projection propagation resolves each destination and namespace binding once per
+transaction, replaces the identity set in one batch, and serializes metadata
+once. Existing projection attachments and retirement records survive the batch.
+Namespace/source postings are rewritten only when their encoded content changes.
+
+A shared streaming namespace builder owns unique policy entries independently of
+consumer transport pages. Routed adoption releases each page after consumption;
+embedded adoption uses the same union semantics. Both validate the final graph
+once before publication, preserving the revision cut, origin precedence and
+static-policy checks. Scale regressions cover 5,000 independent policy pages,
+1,000 shared source bindings, reversed identity joins and progress reports under
+a fixed allocation budget with large configured policies.
+
+Destination-wide reverse bindings contain only source IDs. Scoped postings are
+the sole descriptor directory; old aggregate descriptor rows are retired during
+ordinary reconciliation or bounded bootstrap. Dependency maintenance caches
+logical destination resolution per source cut, so repeated declarations do not
+reparse the same destination catalog. Legacy read-only inspection also uses the
+shared streaming union before a namespace has been adopted.
+
+
+### Curation admission and retirement observations
+
+Entity consumer discovery uses the shared native `ResolverAdmission` contract.
+It retains identity, namespace, static aliases and suppression, publication
+clocks, promotion/retirement flags, and legacy policy only until adoption. It
+excludes extraction artifacts, scorer/adjudicator prompts, provider configuration,
+and embedding selectors. Embedded consumers clone that contract; private routed
+consumer rows serialize the same fields. Empty artifact fields preserve existing
+private `ResolverConfig` wire decoders, but admission descriptors must never be
+used as execution definitions. Reconciliation and query execution continue to
+load their complete selected execution contracts.
+
+Scoped consumer rows are already selected and are consumed directly. Legacy
+whole-source rows use a name-membership set, so a dense source with R resolvers
+costs O(R) selection work. Named review/curation reads select one catalog identity
+before cloning policy; review admission still excludes retired and private
+replacement streams.
+
+A named owner progress probe may acknowledge a retained retired resolver, while
+an unselected public progress listing continues to enumerate active resolvers.
+Retirement is a private owner proof, not an inference from missing heartbeat
+rows or a client flag. An acknowledgement is terminal only after the current
+owner reports the required config generation, curation generation, physical
+authority incarnation and missing-authority state. Retired identities have no
+replay workers, so unrelated live-worker backlog cannot hold entity curation
+pending. Retirement never substitutes for an explicit source-journal watermark;
+those waits still require their sequence proof.

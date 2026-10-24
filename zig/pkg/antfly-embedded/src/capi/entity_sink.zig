@@ -2700,6 +2700,12 @@ test "capi resolver curation fair coalesced projection work survives a continuou
     }
     try root.db.addResolver(.{ .name = "unowned", .table = "entities", .source_artifact = "unowned", .resolution_artifact = "unowned-resolved", .key_template = "unowned/{{_key}}", .promote = false });
     const static_publications = root.db.core.index_manager.test_resolver_catalog_publications;
+    for (0..8) |i| {
+        const descriptor = (try root.db.core.index_manager.resolverStaticDescriptor(scratch, try std.fmt.allocPrint(scratch, "r-{d}", .{i}))).?;
+        try std.testing.expectEqualStrings(try std.fmt.allocPrint(scratch, "r-{d}", .{i}), descriptor.name);
+    }
+    const lookups = root.db.core.index_manager.test_resolver_lookup_builds;
+    const reservation_visits = root.db.core.index_manager.test_resolver_reservation_visits;
     for (0..12) |i| {
         const reverse = @import("../storage/lite/resolver_consumers.zig");
         reverse.test_binding_visits.store(0, .monotonic);
@@ -2725,6 +2731,8 @@ test "capi resolver curation fair coalesced projection work survives a continuou
     try std.testing.expect(!try authority.hasProjectionDebt(root, &root.db, scratch));
     try std.testing.expect(root.db.core.index_manager.getResolver("unowned").?.namespace_curation_generation > 0);
     try std.testing.expectEqual(static_publications, root.db.core.index_manager.test_resolver_catalog_publications);
+    try std.testing.expectEqual(lookups, root.db.core.index_manager.test_resolver_lookup_builds);
+    try std.testing.expectEqual(reservation_visits, root.db.core.index_manager.test_resolver_reservation_visits);
     const revision = root.db.core.index_manager.getResolver("r-0").?.namespace_curation_generation;
     api.antfly_db_close(handle);
     live = false;

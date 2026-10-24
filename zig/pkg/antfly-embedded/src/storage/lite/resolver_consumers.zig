@@ -133,58 +133,18 @@ fn namespaceBindingKey(a: A, source: []const u8, cfg: Definition) ![]u8 {
     std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ source, cfg.name }, .{}), &digest, .{});
     return std.fmt.allocPrint(a, "{s}{s}", .{ try namespacePrefix(a, cfg.table, cfg.key_template), std.fmt.bytesToHex(digest, .lower) });
 }
-const RouteNode = struct { refs: u64 = 0, terminal: u64 = 0 };
-fn routeDigest(a: A, raw: []const u8) ![]const u8 {
-    var hash: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(raw, &hash, .{});
-    return a.dupe(u8, &std.fmt.bytesToHex(hash, .lower));
-}
+const routes = @import("../db/resolver_namespace_routes.zig");
 fn routeRoot(a: A, table: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(a, "\x00antfly/embedded/resolver-consumers/v3/routes/{s}/", .{try routeDigest(a, table)});
+    return std.fmt.allocPrint(a, "\x00antfly/embedded/resolver-consumers/v3/routes/{s}/", .{try routes.digest(a, table)});
 }
 fn updateRoute(a: A, txn: anytype, cfg: Definition, add: bool) !void {
-    const root = try routeRoot(a, cfg.table);
-    const static_prefix = cfg.key_template[0 .. std.mem.indexOf(u8, cfg.key_template, "{{") orelse cfg.key_template.len];
-    const edge = try std.fmt.allocPrint(a, "{s}route/{s}/{s}", .{ root, try routeDigest(a, static_prefix), try routeDigest(a, cfg.key_template) });
-    const exists = if (txn.get(edge)) |_| true else |err| if (err == error.NotFound) false else return err;
-    if (exists == add) return;
-    for (0..static_prefix.len + 1) |length| {
-        const path = try std.fmt.allocPrint(a, "{s}node/{s}", .{ root, try routeDigest(a, static_prefix[0..length]) });
-        var node = if (txn.get(path)) |raw| try std.json.parseFromSliceLeaky(RouteNode, a, raw, .{}) else |err| if (err == error.NotFound and add) RouteNode{} else return err;
-        if (add) {
-            node.refs = try std.math.add(u64, node.refs, 1);
-            if (length == static_prefix.len) node.terminal = try std.math.add(u64, node.terminal, 1);
-        } else {
-            node.refs = try std.math.sub(u64, node.refs, 1);
-            if (length == static_prefix.len) node.terminal = try std.math.sub(u64, node.terminal, 1);
-        }
-        if (node.refs == 0) try txn.delete(path) else try txn.put(path, try std.json.Stringify.valueAlloc(a, node, .{}));
-    }
-    if (add) try txn.put(edge, try std.json.Stringify.valueAlloc(a, cfg.key_template, .{})) else try txn.delete(edge);
+    try routes.update(a, txn, try routeRoot(a, cfg.table), cfg.key_template, add);
 }
 pub fn matchingNamespacePrefixes(a: A, txn: anytype, table: []const u8, key: []const u8) ![]const []const u8 {
-    const root = try routeRoot(a, table);
-    var result: std.ArrayList([]const u8) = .empty;
-    for (0..key.len + 1) |length| {
-        const prefix_digest = try routeDigest(a, key[0..length]);
-        const node_raw = txn.get(try std.fmt.allocPrint(a, "{s}node/{s}", .{ root, prefix_digest })) catch |err| switch (err) {
-            error.NotFound => break,
-            else => return err,
-        };
-        const node = try std.json.parseFromSliceLeaky(RouteNode, a, node_raw, .{});
-        if (node.terminal == 0) continue;
-        const bucket = try std.fmt.allocPrint(a, "{s}route/{s}/", .{ root, prefix_digest });
-        var cursor = try txn.openCursor();
-        defer cursor.close();
-        var row = try seekEntry(&cursor, bucket);
-        while (row) |entry| {
-            if (!std.mem.startsWith(u8, entry.key, bucket)) break;
-            const template = try std.json.parseFromSliceLeaky([]const u8, a, entry.value, .{ .allocate = .alloc_always });
-            if (@import("../db/resolver_namespace.zig").keyInNamespace(template, key)) try result.append(a, try namespacePrefix(a, table, template));
-            row = try nextEntry(&cursor);
-        }
-    }
-    return result.items;
+    const templates = try routes.matching(a, txn, try routeRoot(a, table), key);
+    const result = try a.alloc([]const u8, templates.len);
+    for (templates, result) |template, *value| value.* = try namespacePrefix(a, table, template);
+    return result;
 }
 fn bindingKey(a: A, source: []const u8, cfg: Definition) ![]u8 {
     var hash: [32]u8 = undefined;

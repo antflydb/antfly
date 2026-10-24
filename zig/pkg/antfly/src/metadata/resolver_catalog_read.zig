@@ -87,7 +87,7 @@ pub const Page = struct {
         return .{ .status = .{ .metadata_group_id = 0, .metrics = .{} }, .tables = @constCast((&self.table)[0..1]), .ranges = self.ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
     }
 };
-pub const Cursor = struct { revision: u64, table_id: u64, key_digest: [32]u8, indexed: bool, after: []const u8 };
+pub const Cursor = struct { revision: u64, table_id: u64, key_digest: [32]u8, indexed: bool, after: []const u8, scoped: bool = false, namespace_index: usize = 0 };
 pub fn keyDigest(key: []const u8) [32]u8 {
     var out: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(key, &out, .{});
@@ -113,7 +113,7 @@ pub const Consumer = struct {
 };
 fn writeExecutionConfigs(writer: anytype, values: anytype) !void {
     try writer.beginArray();
-    for (values) |cfg| try cfg.jsonExecution(writer);
+    for (values) |cfg| try writer.write(@import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverAdmission.fromConfig(cfg, false));
     try writer.endArray();
 }
 
@@ -144,9 +144,12 @@ pub fn decodeConsumerReference(a: std.mem.Allocator, bytes: []const u8) !Consume
 test "resolver curation namespace propagation compact consumers retain unadopted merges" {
     const a = std.testing.allocator;
     const Config = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
-    const cfg: Config = .{ .name = "legacy", .table = "entities", .key_template = "other/{{_entity.text}}", .source_artifact = "source", .resolution_artifact = "resolved", .merges = &.{.{ .key = "other/a", .target = "other/b" }}, .merge_generation = 7, .merge_state_version = 1 };
+    const cfg: Config = .{ .name = "legacy", .table = "entities", .key_template = "other/{{_entity.text}}", .source_artifact = "source", .resolution_artifact = "resolved", .merges = &.{.{ .key = "other/a", .target = "other/b" }}, .merge_generation = 7, .merge_state_version = 1, .scorer_json = "SCORER_PROMPT_MUST_STAY_WITH_EXECUTION", .name_embedding = "EXECUTION_EMBEDDER" };
     const bytes = try std.json.Stringify.valueAlloc(a, ConsumerReference{ .source_id = 2, .source_name = "source", .configs = &.{cfg} }, .{});
     defer a.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "SCORER_PROMPT") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "EXECUTION_EMBEDDER") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "scorer_json") == null);
     {
         var row_arena = std.heap.ArenaAllocator.init(a);
         defer row_arena.deinit();
@@ -160,6 +163,9 @@ test "resolver curation namespace propagation compact consumers retain unadopted
     }
     const reference = try std.json.parseFromSlice(ConsumerReference, a, bytes, .{});
     defer reference.deinit();
+    try std.testing.expectEqualStrings("", reference.value.configs[0].scorer_json);
+    try std.testing.expectEqualStrings("", reference.value.configs[0].source_artifact);
+    try std.testing.expectEqual(@as(u64, 7), reference.value.configs[0].effectiveGeneration());
     try std.testing.expect(Config.aliasesEqual(cfg.merges, reference.value.configs[0].merges));
     const page_bytes = try std.json.Stringify.valueAlloc(a, Consumer{ .table = .{ .table_id = 2, .name = "source" }, .names = &.{"legacy"}, .configs = reference.value.configs }, .{});
     defer a.free(page_bytes);

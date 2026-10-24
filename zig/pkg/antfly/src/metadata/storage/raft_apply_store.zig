@@ -10399,6 +10399,8 @@ pub const RaftApplyStore = struct {
     resolver_projection_payloads: std.StringHashMapUnmanaged([]const u8) = .empty,
     resolver_projection_bytes: usize = 0,
     resolver_projection_exports: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
+    resolver_binding_reads: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
+    resolver_destination_lookups: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     store: docstore.DocStore,
     checkpoints: std.AutoHashMapUnmanaged(u64, AppliedMetadataCheckpoint) = .empty,
     projected_placement_intents: std.ArrayListUnmanaged(ProjectedPlacementIntent) = .empty,
@@ -23350,6 +23352,12 @@ pub const RaftApplyStore = struct {
         const continuation: ?wire.Cursor = if (input.cursor) |value| try resolver_curation.decodeToken(wire.Cursor, a, value) else null;
         if (continuation) |value| if (value.revision != revision or value.table_id != table.table_id or !std.mem.eql(u8, &value.key_digest, &wire.keyDigest(input.key))) return error.InvalidResolverCurationRequest;
         result.indexed = if (continuation) |value| value.indexed else indexed;
+        if (indexed and input.key.len > 0 and (continuation == null or continuation.?.scoped)) {
+            try self.scopedResolverConsumersTxn(a, &txn, group_id, input, &result, continuation);
+            result.indexed = true;
+            return std.json.Stringify.valueAlloc(alloc, result, .{});
+        }
+        if (continuation != null and continuation.?.scoped) return error.CatalogGenerationChanged;
         var prefix_buf: [160]u8 = undefined;
         const prefix = if (result.indexed) try self.resolverConsumerPrefixTxn(a, &txn, group_id, table.table_id) else try a.dupe(u8, try tablePrefixForGroup(&prefix_buf, group_id));
         const after = if (continuation) |value| value.after else prefix;
@@ -23414,6 +23422,104 @@ pub const RaftApplyStore = struct {
             result.next_cursor = try resolver_curation.encodeToken(a, wire.Cursor{ .revision = revision, .table_id = table.table_id, .key_digest = wire.keyDigest(input.key), .indexed = result.indexed, .after = last orelse return error.InvalidCatalogRecord });
         }
         return std.json.Stringify.valueAlloc(alloc, result, .{});
+    }
+
+    const NamespaceRoutes = @import("antfly_local_sources").storage_db_resolver_authority.routes;
+    fn namespaceConsumerPrefix(a: std.mem.Allocator, target: []const u8, template: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(a, "{s}namespace-v3/{s}/", .{ try std.mem.replaceOwned(u8, a, target, ":target:", ":scoped-v3:"), try NamespaceRoutes.digest(a, template) });
+    }
+    fn namespaceRouteRoot(a: std.mem.Allocator, target: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(a, "{s}routes/", .{try std.mem.replaceOwned(u8, a, target, ":target:", ":scoped-v3:")});
+    }
+    fn scopedResolverConsumersTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, input: @import("../resolver_catalog_read.zig").Request, result: *@import("../resolver_catalog_read.zig").Page, continuation: ?@import("../resolver_catalog_read.zig").Cursor) !void {
+        const wire = @import("../resolver_catalog_read.zig");
+        const target = try self.resolverConsumerPrefixTxn(a, txn, group, result.table.table_id);
+        const templates = try NamespaceRoutes.matching(a, txn, try namespaceRouteRoot(a, target), input.key);
+        std.mem.sort([]const u8, templates, {}, struct {
+            fn less(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.less);
+        var index: usize = if (continuation) |value| value.namespace_index else 0;
+        if (index > templates.len) return error.InvalidResolverCurationRequest;
+        var after: ?[]const u8 = if (continuation) |value| value.after else null;
+        var consumers: std.ArrayList(wire.Consumer) = .empty;
+        var bytes: usize = 0;
+        while (index < templates.len) {
+            const prefix = try namespaceConsumerPrefix(a, target, templates[index]);
+            if (after) |value| if (!std.mem.startsWith(u8, value, prefix)) return error.InvalidResolverCurationRequest;
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(after orelse prefix);
+            if (after) |value| if (row != null and std.mem.eql(u8, row.?.key, value)) {
+                row = try cursor.next();
+            };
+            var last: ?[]const u8 = null;
+            while (row) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                if (result.visited == 16 or bytes >= 1024 * 1024) {
+                    result.next_cursor = try resolver_curation.encodeToken(a, wire.Cursor{ .revision = result.revision, .table_id = result.table.table_id, .key_digest = wire.keyDigest(input.key), .indexed = true, .scoped = true, .namespace_index = index, .after = last orelse after orelse prefix });
+                    result.consumers = consumers.items;
+                    return;
+                }
+                result.visited += 1;
+                bytes += entry.value.len;
+                last = try a.dupe(u8, entry.key);
+                const reference = try wire.decodeConsumerReference(a, entry.value);
+                const names = try a.alloc([]const u8, reference.configs.len);
+                for (reference.configs, names) |cfg, *name| name.* = cfg.name;
+                try consumers.append(a, .{ .table = .{ .table_id = reference.source_id, .name = reference.source_name }, .names = names, .configs = reference.configs });
+                row = try cursor.next();
+            }
+            index += 1;
+            after = null;
+        }
+        result.consumers = consumers.items;
+    }
+    const NamespaceConsumer = struct { root: []const u8, template: []const u8, configs: std.ArrayList(@import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig) = .empty };
+    fn namespaceConsumerEntries(a: std.mem.Allocator, group: u64, record: metadata.TableRecord) !std.StringHashMapUnmanaged(NamespaceConsumer) {
+        var entries: std.StringHashMapUnmanaged(NamespaceConsumer) = .empty;
+        if (record.indexes_json.len == 0) return entries;
+        const root = try std.json.parseFromSliceLeaky(std.json.Value, a, record.indexes_json, .{});
+        const identities = try resolver_curation.metadataFromValue(a, root);
+        var owned_names: std.StringHashMapUnmanaged(void) = .empty;
+        for (identities.identities) |identity| if (identity.namespace_owned) {
+            try owned_names.put(a, identity.name, {});
+        };
+        for (try resolverConfigs(a, root)) |original| {
+            const target = try resolverTargetPrefix(a, group, try system_catalog.Target.parse(original.table));
+            const path = try std.fmt.allocPrint(a, "{s}{x:0>16}", .{ try namespaceConsumerPrefix(a, target, original.key_template), record.table_id });
+            const entry = try entries.getOrPut(a, path);
+            if (!entry.found_existing) entry.value_ptr.* = .{ .root = target, .template = original.key_template };
+            const cfg = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverAdmission.fromConfig(original, owned_names.contains(original.name)).config();
+            try entry.value_ptr.configs.append(a, cfg);
+        }
+        return entries;
+    }
+    pub var test_resolver_consumer_puts: std.atomic.Value(usize) = .init(0);
+    fn synchronizeNamespaceConsumersTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, previous: ?metadata.TableRecord, next: ?metadata.TableRecord) !void {
+        const old = if (previous) |record| try namespaceConsumerEntries(a, group, record) else std.StringHashMapUnmanaged(NamespaceConsumer).empty;
+        const desired = if (next) |record| try namespaceConsumerEntries(a, group, record) else std.StringHashMapUnmanaged(NamespaceConsumer).empty;
+        var retired = old.iterator();
+        while (retired.next()) |entry| if (!desired.contains(entry.key_ptr.*)) {
+            try txn.delete(entry.key_ptr.*);
+            const prefix = try namespaceConsumerPrefix(a, entry.value_ptr.root, entry.value_ptr.template);
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            const first = try cursor.seekAtOrAfter(prefix);
+            if (first == null or !std.mem.startsWith(u8, first.?.key, prefix)) try NamespaceRoutes.update(a, txn, try namespaceRouteRoot(a, entry.value_ptr.root), entry.value_ptr.template, false);
+        };
+        var added = desired.iterator();
+        while (added.next()) |entry| {
+            const raw = try std.json.Stringify.valueAlloc(a, @import("../resolver_catalog_read.zig").ConsumerReference{ .source_id = next.?.table_id, .source_name = next.?.name, .configs = entry.value_ptr.configs.items }, .{});
+            if (old.get(entry.key_ptr.*)) |prior| {
+                const prior_raw = try std.json.Stringify.valueAlloc(a, @import("../resolver_catalog_read.zig").ConsumerReference{ .source_id = previous.?.table_id, .source_name = previous.?.name, .configs = prior.configs.items }, .{});
+                if (std.mem.eql(u8, prior_raw, raw)) continue;
+            }
+            if (builtin.is_test) _ = test_resolver_consumer_puts.fetchAdd(1, .monotonic);
+            try txn.put(entry.key_ptr.*, raw);
+            try NamespaceRoutes.update(a, txn, try namespaceRouteRoot(a, entry.value_ptr.root), entry.value_ptr.template, true);
+        }
     }
 
     fn resolverNamespaceAdoptionAllowedTxn(txn: *docstore.DocStore.Txn, group_id: u64, a: std.mem.Allocator, previous: metadata.TableRecord, next: metadata.TableRecord) !bool {
@@ -23487,30 +23593,20 @@ pub const RaftApplyStore = struct {
         return std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:job:", .{group_id});
     }
     fn resolverNamespaceBootstrapKey(a: std.mem.Allocator, group_id: u64) ![]const u8 {
-        return std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v2", .{group_id});
+        return std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:bootstrapped-v3", .{group_id});
     }
     fn resolverConfigs(a: std.mem.Allocator, root: std.json.Value) ![]const @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig {
         const Config = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
         var desired: std.ArrayListUnmanaged(Config) = .empty;
         try @import("antfly_local_sources").metadata_local_index_reconcile.collectDesiredResolvers(a, root, &desired);
-        const identities = try resolver_curation.metadataFromValue(a, root);
-        var profiles: std.StringHashMapUnmanaged(void) = .empty;
-        for (desired.items) |*cfg| for (identities.identities) |identity| {
-            if (!identity.dropped and std.mem.eql(u8, identity.name, cfg.name)) cfg.* = try resolver_curation.overlayMetadataCached(a, cfg.*, identity, &profiles);
-        };
-        for (identities.identities) |identity| {
-            if (identity.dropped) continue;
-            const found = for (desired.items) |cfg| {
-                if (std.mem.eql(u8, cfg.name, identity.name)) break true;
-            } else false;
-            if (!found) try desired.append(a, try resolver_curation.overlayMetadataCached(a, .{ .name = identity.name, .table = identity.table, .key_template = identity.key_template, .source_artifact = "retired_source", .resolution_artifact = "retired_resolution", .retired = true, .promote = false }, identity, &profiles));
-        }
-        return desired.items;
+        return resolver_curation.joinMetadata(a, desired.items, try resolver_curation.metadataFromValue(a, root));
     }
+
     fn resolverDestinationTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, name: []const u8) !?metadata.TableRecord {
         return self.resolveSystemCatalogResultTxn(metadata.TableRecord, a, txn, group_id, try system_catalog.Target.parse(name));
     }
     fn resolverDestinationForRecordTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, name: []const u8, record: metadata.TableRecord) !?metadata.TableRecord {
+        if (builtin.is_test) self.resolver_destination_lookups += 1;
         const target = try system_catalog.Target.parse(name);
         const namespace = (try resolveSystemCatalogNamespaceTxn(a, txn, group_id, target.database, target.namespace)) orelse return null;
         if (try system_catalog_storage.find(a, txn, group_id, .table, namespace, target.table)) |value| {
@@ -23523,18 +23619,22 @@ pub const RaftApplyStore = struct {
     fn resolverDependencyKeysTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.TableRecord) !std.StringHashMapUnmanaged(void) {
         var keys: std.StringHashMapUnmanaged(void) = .empty;
         if (record.indexes_json.len == 0) return keys;
+        var destinations: std.StringHashMapUnmanaged(?metadata.TableRecord) = .empty;
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, record.indexes_json, .{});
         for (try resolverConfigs(a, root)) |cfg| {
             const digest = try @import("antfly_resolver").fingerprint(a, .{ cfg.key_template, cfg.name });
             const target_key = try std.fmt.allocPrint(a, "{s}{x:0>16}", .{ try resolverTargetPrefix(a, group_id, try system_catalog.Target.parse(cfg.table)), record.table_id });
             try keys.put(a, target_key, {});
-            const destination = (try self.resolverDestinationForRecordTxn(a, txn, group_id, cfg.table, record)) orelse continue;
+            const target = try destinations.getOrPut(a, cfg.table);
+            if (!target.found_existing) target.value_ptr.* = try self.resolverDestinationForRecordTxn(a, txn, group_id, cfg.table, record);
+            const destination = target.value_ptr.* orelse continue;
             const key = try std.fmt.allocPrint(a, "{s}{x:0>16}:{x}", .{ try resolverDependencyPrefix(a, group_id, destination.table_id), record.table_id, &digest });
             try keys.put(a, key, {});
         }
         return keys;
     }
     fn removeResolverDependenciesTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.TableRecord) !void {
+        try synchronizeNamespaceConsumersTxn(a, txn, group_id, record, null);
         const keys = try self.resolverDependencyKeysTxn(a, txn, group_id, record);
         var it = keys.keyIterator();
         while (it.next()) |key| try txn.delete(key.*);
@@ -23545,34 +23645,6 @@ pub const RaftApplyStore = struct {
         if (raw.len > 0 and raw[0] == '{') return (try std.json.parseFromSliceLeaky(struct { source_id: u64 }, a, raw, .{ .ignore_unknown_fields = true })).source_id;
         return std.json.parseFromSliceLeaky(u64, a, raw, .{});
     }
-    fn putCompactResolverConsumersTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, source: metadata.TableRecord) !void {
-        if (source.indexes_json.len == 0) return;
-        const root = try std.json.parseFromSliceLeaky(std.json.Value, a, source.indexes_json, .{});
-        const wire = @import("../resolver_catalog_read.zig");
-        const Config = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
-        const identities = try resolver_curation.metadataFromValue(a, root);
-        var targets: std.StringHashMapUnmanaged(std.ArrayList(Config)) = .empty;
-        for (try resolverConfigs(a, root)) |original| {
-            const destination = (try self.resolverDestinationForRecordTxn(a, txn, group, original.table, source)) orelse continue;
-            const target_root = try std.json.parseFromSliceLeaky(std.json.Value, a, if (destination.indexes_json.len == 0) "{}" else destination.indexes_json, .{});
-            if (!@import("../resolver_authority.zig").isNative(target_root)) continue;
-            var cfg = original;
-            for (identities.identities) |identity| if (identity.namespace_owned and std.mem.eql(u8, identity.name, cfg.name)) {
-                cfg.merges = &.{};
-                cfg.curation_json = "{}";
-                break;
-            };
-            const entry = try targets.getOrPut(a, cfg.table);
-            if (!entry.found_existing) entry.value_ptr.* = .empty;
-            try entry.value_ptr.append(a, cfg);
-        }
-        var it = targets.iterator();
-        while (it.next()) |target| {
-            const key = try std.fmt.allocPrint(a, "{s}{x:0>16}", .{ try resolverTargetPrefix(a, group, try system_catalog.Target.parse(target.key_ptr.*)), source.table_id });
-            try txn.put(key, try std.json.Stringify.valueAlloc(a, wire.ConsumerReference{ .source_id = source.table_id, .source_name = source.name, .configs = target.value_ptr.items }, .{}));
-        }
-    }
-
     fn synchronizeResolverDependenciesTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, previous: ?metadata.TableRecord, next: metadata.TableRecord) !void {
         if (previous) |old| if (std.mem.eql(u8, old.name, next.name) and std.mem.eql(u8, old.indexes_json, next.indexes_json)) return;
         const old = if (previous) |value| try self.resolverDependencyKeysTxn(a, txn, group_id, value) else std.StringHashMapUnmanaged(void).empty;
@@ -23581,8 +23653,18 @@ pub const RaftApplyStore = struct {
         while (retired.next()) |key| if (!desired.contains(key.*)) try txn.delete(key.*);
         const value = try std.json.Stringify.valueAlloc(a, next.table_id, .{});
         var added = desired.keyIterator();
-        while (added.next()) |key| if (!old.contains(key.*)) try txn.put(key.*, value);
-        try self.putCompactResolverConsumersTxn(a, txn, group_id, next);
+        while (added.next()) |key| {
+            if (!old.contains(key.*)) {
+                try txn.put(key.*, value);
+            } else if (std.mem.indexOf(u8, key.*, ":target:") != null) {
+                // Destination-wide bindings are source IDs. Namespace-scoped
+                // postings own descriptors; retire old aggregate copies once.
+                if (try stagingGet(txn, key.*)) |raw| if (!std.mem.eql(u8, raw, value)) {
+                    try txn.put(key.*, value);
+                };
+            }
+        }
+        try synchronizeNamespaceConsumersTxn(a, txn, group_id, previous, next);
     }
     /// The authoritative namespace is read in the table mutation transaction.
     /// New consumers therefore inherit it before their first owner is opened.
@@ -23702,20 +23784,36 @@ pub const RaftApplyStore = struct {
     fn projectResolverNamespacesValueTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.TableRecord, value: std.json.Value) !metadata.TableRecord {
         var root = value;
         const configs = try resolverConfigs(a, root);
-        var changed = false;
+        var destinations: std.StringHashMapUnmanaged(?metadata.TableRecord) = .empty;
+        var headers: std.AutoHashMapUnmanaged(u64, std.StringHashMapUnmanaged(resolver_curation.Namespace)) = .empty;
+        var bindings: std.StringHashMapUnmanaged(resolver_curation.Namespace) = .empty;
+        var updates: std.ArrayList(resolver_curation.MetadataIdentity) = .empty;
         for (configs) |cfg| {
-            const destination = (try self.resolverDestinationForRecordTxn(a, txn, group_id, cfg.table, record)) orelse continue;
+            const target = try destinations.getOrPut(a, cfg.table);
+            if (!target.found_existing) target.value_ptr.* = try self.resolverDestinationForRecordTxn(a, txn, group_id, cfg.table, record);
+            const destination = target.value_ptr.* orelse continue;
             if (destination.indexes_json.len == 0) continue;
-            const namespaces = try resolver_curation.namespacesFromValue(a, try std.json.parseFromSliceLeaky(std.json.Value, a, destination.indexes_json, .{}));
-            for (namespaces.namespaces) |header| {
-                if (!std.mem.eql(u8, header.key_template, cfg.key_template)) continue;
-                const namespace = try resolverNamespaceBindingTxn(a, txn, group_id, destination.table_id, header);
-                try resolver_curation.replaceMetadata(a, &root, .{ .name = cfg.name, .table = cfg.table, .key_template = cfg.key_template, .merges = namespace.merges, .state = namespace.state, .revision = namespace.revision, .namespace_generation = cfg.namespace_generation, .namespace_owned = true, .authority_table_id = if (header.record_store) destination.table_id else 0, .projection_only = header.record_store });
-                changed = true;
+            const catalog = try headers.getOrPut(a, destination.table_id);
+            if (!catalog.found_existing) {
+                catalog.value_ptr.* = .empty;
+                const namespaces = try resolver_curation.namespacesFromValue(a, try std.json.parseFromSliceLeaky(std.json.Value, a, destination.indexes_json, .{}));
+                for (namespaces.namespaces) |header| try catalog.value_ptr.put(a, header.key_template, header);
             }
+            const header = catalog.value_ptr.get(cfg.key_template) orelse continue;
+            const key = try std.json.Stringify.valueAlloc(a, .{ destination.table_id, cfg.key_template }, .{});
+            const binding = try bindings.getOrPut(a, key);
+            if (!binding.found_existing) {
+                if (builtin.is_test) self.resolver_binding_reads += 1;
+                binding.value_ptr.* = try resolverNamespaceBindingTxn(a, txn, group_id, destination.table_id, header);
+            }
+            const namespace = binding.value_ptr.*;
+            try updates.append(a, .{ .name = cfg.name, .table = cfg.table, .key_template = cfg.key_template, .merges = namespace.merges, .state = namespace.state, .revision = namespace.revision, .namespace_generation = cfg.namespace_generation, .namespace_owned = true, .authority_table_id = if (header.record_store) destination.table_id else 0, .projection_only = header.record_store });
         }
         var projected = record;
-        if (changed) projected.indexes_json = try std.json.Stringify.valueAlloc(a, root, .{});
+        if (updates.items.len > 0) {
+            try resolver_curation.replaceMetadataBatch(a, &root, updates.items);
+            projected.indexes_json = try std.json.Stringify.valueAlloc(a, root, .{});
+        }
         return projected;
     }
     const ResolverRejection = struct { digest: [32]u8, term: u64, index: u64 };
@@ -40330,4 +40428,117 @@ test "resolver curation namespace propagation persists compact bindings and mate
     try std.testing.expect(missing_configs[0].namespace_curation_missing);
     try std.testing.expectEqual(@as(usize, 0), missing_configs[0].merges.len);
     try std.testing.expectEqual(@as(usize, 1), store.resolver_projection_exports);
+}
+
+test "resolver curation namespace propagation scoped discovery excludes ten thousand unrelated sources" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/scoped-discovery", .{tmp.sub_path});
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const group: u64 = 41;
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 1, .name = "entities", .indexes_json = "{}" } });
+    const wire = @import("../resolver_catalog_read.zig");
+    const Config = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        for (0..10000) |i| {
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const sa = scratch.allocator();
+            const cfg: Config = .{ .name = "r", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = try std.fmt.allocPrint(sa, "scope-{d}/{{{{_key}}}}", .{i}), .promote = false };
+            const record: metadata.TableRecord = .{ .table_id = i + 2, .name = try std.fmt.allocPrint(sa, "source-{d}", .{i}), .indexes_json = try std.json.Stringify.valueAlloc(sa, .{ .resolvers = &.{cfg} }, .{}) };
+            try RaftApplyStore.synchronizeNamespaceConsumersTxn(sa, &txn, group, null, record);
+        }
+        try txn.put(try RaftApplyStore.resolverNamespaceBootstrapKey(a, group), "1");
+        try txn.commit();
+    }
+    const page = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .consumers, .key = "scope-123/item", .compact_consumers = true }), .{});
+    try std.testing.expect(page.indexed);
+    try std.testing.expectEqual(@as(usize, 1), page.visited);
+    try std.testing.expectEqual(@as(usize, 1), page.consumers.len);
+    try std.testing.expectEqualStrings("source-123", page.consumers[0].table.name);
+    try std.testing.expect(page.next_cursor == null);
+    // Removal retires the last namespace route atomically.
+    const cfg: Config = .{ .name = "r", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "scope-123/{{_key}}", .promote = false };
+    const record: metadata.TableRecord = .{ .table_id = 125, .name = "source-123", .indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = &.{cfg} }, .{}) };
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try RaftApplyStore.synchronizeNamespaceConsumersTxn(a, &txn, group, record, null);
+        try txn.commit();
+    }
+    const gone = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .consumers, .key = "scope-123/item" }), .{});
+    try std.testing.expectEqual(@as(usize, 0), gone.visited);
+    // Twenty matching namespaces in one source retain all identities across pages.
+    const configs = try a.alloc(Config, 20);
+    for (configs, 0..) |*item, i| item.* = .{ .name = try std.fmt.allocPrint(a, "r-{d}", .{i}), .table = "entities", .source_artifact = "kg", .resolution_artifact = try std.fmt.allocPrint(a, "resolved-{d}", .{i}), .key_template = try std.fmt.allocPrint(a, "scope-123/{{{{{s}_key}}}}", .{(@as([20]u8, @splat(' ')))[0..i]}), .promote = false };
+    const multi: metadata.TableRecord = .{ .table_id = 10002, .name = "multi", .indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = configs }, .{}) };
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try RaftApplyStore.synchronizeNamespaceConsumersTxn(a, &txn, group, null, multi);
+        try txn.commit();
+    }
+    const first = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .consumers, .key = "scope-123/item" }), .{});
+    try std.testing.expectEqual(@as(usize, 16), first.consumers.len);
+    const second = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .consumers, .key = "scope-123/item", .cursor = first.next_cursor.? }), .{});
+    try std.testing.expectEqual(@as(usize, 4), second.consumers.len);
+    try std.testing.expect(second.next_cursor == null);
+    RaftApplyStore.test_resolver_consumer_puts.store(0, .monotonic);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try RaftApplyStore.synchronizeNamespaceConsumersTxn(a, &txn, group, multi, multi);
+        try std.testing.expectEqual(@as(usize, 0), RaftApplyStore.test_resolver_consumer_puts.load(.monotonic));
+        // Execution-only edits do not rewrite admission postings.
+        configs[0].min_confidence = 0.5;
+        var changed = multi;
+        changed.indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = configs }, .{});
+        try RaftApplyStore.synchronizeNamespaceConsumersTxn(a, &txn, group, multi, changed);
+        try std.testing.expectEqual(@as(usize, 0), RaftApplyStore.test_resolver_consumer_puts.load(.monotonic));
+        configs[0].config_generation += 1;
+        changed.indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = configs }, .{});
+        try RaftApplyStore.synchronizeNamespaceConsumersTxn(a, &txn, group, multi, changed);
+        try std.testing.expectEqual(@as(usize, 1), RaftApplyStore.test_resolver_consumer_puts.load(.monotonic));
+        try txn.commit();
+    }
+}
+
+test "resolver curation namespace propagation batches a thousand source bindings" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/batch-bindings", .{tmp.sub_path}) });
+    defer store.deinit();
+    const group: u64 = 41;
+    const Config = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
+    const header: resolver_curation.Namespace = .{ .key_template = "concept/{{_key}}", .revision = 7 };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 1, .name = "entities", .indexes_json = try std.json.Stringify.valueAlloc(a, .{ ._resolver_namespaces = resolver_curation.Namespaces{ .namespaces = &.{header} } }, .{}) } });
+    const definitions = try a.alloc(Config, 1000);
+    for (definitions, 0..) |*cfg, i| cfg.* = .{ .name = try std.fmt.allocPrint(a, "r-{d}", .{i}), .table = "entities", .source_artifact = "kg", .resolution_artifact = try std.fmt.allocPrint(a, "out-{d}", .{i}), .key_template = header.key_template, .promote = false };
+    const source: metadata.TableRecord = .{ .table_id = 2, .name = "source", .indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = definitions }, .{}) };
+    var txn = try store.store.beginWriteTxn();
+    defer txn.abort();
+    const before = store.resolver_binding_reads;
+    const lookups = store.resolver_destination_lookups;
+    const projected = try store.projectResolverNamespacesTxn(a, &txn, group, source);
+    try std.testing.expectEqual(before + 1, store.resolver_binding_reads);
+    try std.testing.expectEqual(lookups + 1, store.resolver_destination_lookups);
+    try store.synchronizeResolverDependenciesTxn(a, &txn, group, null, projected);
+    try std.testing.expectEqual(lookups + 2, store.resolver_destination_lookups);
+    const identities = try resolver_curation.metadataFromValue(a, try std.json.parseFromSliceLeaky(std.json.Value, a, projected.indexes_json, .{}));
+    try std.testing.expectEqual(@as(usize, 1000), identities.identities.len);
+    for (identities.identities) |identity| {
+        try std.testing.expectEqual(@as(u64, 7), identity.revision);
+        try std.testing.expect(identity.namespace_owned);
+    }
 }

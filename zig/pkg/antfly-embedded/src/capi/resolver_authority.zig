@@ -85,7 +85,7 @@ fn consumers(root: *h.Handle, a: A, table: []const u8, key: []const u8) ![]const
     for (bindings.items) |binding| {
         if (binding.source_id != 0 and root.embedded_table_records.get(binding.source) != binding.source_id) continue;
         const source = try tables.get(root, binding.source);
-        const cfg = try source.core.index_manager.resolverStaticDescriptor(a, binding.resolver) orelse continue;
+        const cfg = try source.core.index_manager.resolverAdmissionDescriptor(a, binding.resolver, true) orelse continue;
         if (!std.mem.eql(u8, cfg.table, table) or !std.mem.eql(u8, cfg.key_template, binding.key_template)) return error.ResolverCurationConflict;
         try result.append(a, .{ .db = source, .source = binding.source, .cfg = cfg });
     }
@@ -95,9 +95,9 @@ fn legacyConsumers(root: *h.Handle, a: A, table: []const u8, key: []const u8) ![
     try tables.load(root);
     var result: std.ArrayList(Consumer) = .empty;
     var sources = root.embedded_tables.iterator();
-    const defaults = try root.db.core.index_manager.listResolverStaticDescriptors(a);
+    const defaults = try root.db.core.index_manager.listResolverAdmissionDescriptors(a);
     for (defaults) |cfg| if (std.mem.eql(u8, cfg.table, table) and policy.keyInNamespace(cfg.key_template, key)) try result.append(a, .{ .db = &root.db, .source = "default", .cfg = cfg });
-    while (sources.next()) |source| for (try source.value_ptr.*.db.core.index_manager.listResolverStaticDescriptors(a)) |cfg| {
+    while (sources.next()) |source| for (try source.value_ptr.*.db.core.index_manager.listResolverAdmissionDescriptors(a)) |cfg| {
         if (std.mem.eql(u8, cfg.table, table) and policy.keyInNamespace(cfg.key_template, key)) try result.append(a, .{ .db = &source.value_ptr.*.db, .source = source.key_ptr.*, .cfg = cfg });
     };
     return result.items;
@@ -120,36 +120,67 @@ fn initialize(a: A, bridge: *Bridge, store: native.Store, legacy: c.State) !void
     if (legacy.proposals.len != 0 or legacy.receipt_scope != null) try store.applyQueue(.{ .expected_revision = 0, .revision = 1, .receipt_scope = legacy.receipt_scope, .proposals = legacy.proposals });
     try bridge.backendPut(a, marker, "1");
 }
-fn adopt(a: A, store: native.Store, selected: []const Consumer) !void {
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    for (selected) |consumer| {
-        const template = consumer.cfg.key_template;
-        if ((try seen.getOrPut(a, template)).found_existing or try store.head(template) != null) continue;
-        var namespace: policy.Namespace = .{ .key_template = template };
-        for (selected) |source| if (std.mem.eql(u8, source.cfg.key_template, template)) {
-            // Full policy is copied once, at adoption, never on warm reads.
-            const configs = try source.db.core.index_manager.listResolverIdentities(a);
-            for (configs) |cfg| if (std.mem.eql(u8, cfg.name, source.cfg.name)) {
-                namespace = try policy.foldNamespace(a, namespace, cfg);
-                break;
-            };
-        };
-        try store.adoptNamespace(namespace);
+const PreparedAdoption = struct {
+    namespaces: []const policy.Namespace = &.{},
+    sources: []const Source = &.{},
+    const Source = struct { db: *h.db_mod.DB, generation: u64 };
+    fn check(self: PreparedAdoption) !void {
+        for (self.sources) |source| if (source.db.core.index_manager.write_plan_generation.load(.acquire) != source.generation) return error.ResolverCurationConflict;
     }
+};
+/// Snapshot only selected definitions before taking a writer lease. The owner
+/// fence retains source incarnations; generation checks fence config edits.
+fn prepareAdoption(a: A, destination: *h.db_mod.DB, selected: []const Consumer) !PreparedAdoption {
+    var read = try destination.core.store.beginReadTxn();
+    defer read.abort();
+    var bridge: Bridge = .{ .txn = &read };
+    const store = bridge.store(a, prefix);
+    var namespaces: std.StringArrayHashMapUnmanaged(std.ArrayList(h.db_mod.ResolverConfig)) = .empty;
+    var sources: std.AutoHashMapUnmanaged(*h.db_mod.DB, u64) = .empty;
+    var profiles: std.StringHashMapUnmanaged(void) = .empty;
+    for (selected) |source| {
+        if (source.synthetic or try store.head(source.cfg.key_template) != null) continue;
+        const fence = try sources.getOrPut(a, source.db);
+        if (!fence.found_existing) fence.value_ptr.* = source.db.core.index_manager.write_plan_generation.load(.acquire);
+        const cfg = try source.db.core.index_manager.resolverAdmissionDescriptor(a, source.cfg.name, false) orelse return error.ResolverCurationConflict;
+        if (cfg.config_generation != source.cfg.config_generation or cfg.retired != source.cfg.retired or !std.mem.eql(u8, cfg.table, source.cfg.table) or !std.mem.eql(u8, cfg.key_template, source.cfg.key_template)) return error.ResolverCurationConflict;
+        const profile = try json(a, .{ cfg.key_template, cfg.merges, cfg.curation_json, cfg.curation_revision });
+        if ((try profiles.getOrPut(a, profile)).found_existing) continue;
+        const entry = try namespaces.getOrPut(a, cfg.key_template);
+        if (!entry.found_existing) {
+            entry.key_ptr.* = try a.dupe(u8, cfg.key_template);
+            entry.value_ptr.* = .empty;
+        }
+        try entry.value_ptr.append(a, cfg);
+    }
+    const fences = try a.alloc(PreparedAdoption.Source, sources.count());
+    var it = sources.iterator();
+    for (fences) |*source| {
+        const entry = it.next().?;
+        source.* = .{ .db = entry.key_ptr.*, .generation = entry.value_ptr.* };
+    }
+    const policies = try a.alloc(policy.Namespace, namespaces.count());
+    for (namespaces.keys(), namespaces.values(), policies) |template, definitions, *namespace| namespace.* = try policy.foldNamespaceBatch(a, template, definitions.items);
+    const prepared: PreparedAdoption = .{ .namespaces = policies, .sources = fences };
+    try prepared.check();
+    return prepared;
+}
+fn adopt(a: A, store: native.Store, prepared: PreparedAdoption) !void {
+    _ = a;
+    try prepared.check();
+    for (prepared.namespaces) |namespace| if (try store.head(namespace.key_template) == null) try store.adoptNamespace(namespace);
 }
 fn inspectionScope(a: A, store: native.Store, selected: []const Consumer, source: Consumer, key: []const u8) !native.Snapshot {
     if (try store.component(source.cfg.key_template, &.{key})) |snapshot| return snapshot;
     // Read-only legacy inspection folds only this namespace. Its first
     // authorized mutation publishes the native records.
-    var namespace: policy.Namespace = .{ .key_template = source.cfg.key_template };
+    var builder: policy.NamespaceBuilder = .{ .template = source.cfg.key_template };
     for (selected) |consumer| {
         if (consumer.synthetic or !std.mem.eql(u8, consumer.cfg.key_template, source.cfg.key_template)) continue;
-        const configs = try consumer.db.core.index_manager.listResolverIdentities(a);
-        for (configs) |cfg| if (std.mem.eql(u8, cfg.name, consumer.cfg.name)) {
-            namespace = try policy.foldNamespace(a, namespace, cfg);
-            break;
-        };
+        const cfg = try consumer.db.core.index_manager.resolverAdmissionDescriptor(a, consumer.cfg.name, false) orelse return error.ResolverCurationConflict;
+        try builder.add(a, a, cfg);
     }
+    const namespace = try builder.finish(a);
     return .{ .head = .{ .key_template = namespace.key_template, .revision = namespace.revision }, .namespace = namespace };
 }
 fn consumerProfiles(a: A, selected: []const Consumer, template: []const u8) ![]const native.AliasProfile {
@@ -240,13 +271,14 @@ fn finish(a: A, bridge: *Bridge, txn: *docstore.DocStore.Txn, db: *h.db_mod.DB, 
 pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: Input, legacy: c.State) ![]const u8 {
     const db = try tables.get(root, table);
     const reading = input.action == .redirects;
-    var lease = if (reading) try db.local_execution.row_policy_gate.enterRawRead() else try db.local_execution.row_policy_gate.enterRaw();
-    defer lease.release();
     if (!reading and try db.maintenanceRequiresOrderedApply()) return error.OrderedResolverReviewRequired;
     var selected: []const Consumer = &.{};
     if (!reading) {
         selected = try consumers(root, a, table, key);
     }
+    const prepared = if (reading) PreparedAdoption{} else try prepareAdoption(a, db, selected);
+    var lease = if (reading) try db.local_execution.row_policy_gate.enterRawRead() else try db.local_execution.row_policy_gate.enterRaw();
+    defer lease.release();
     var txn = if (reading) try db.core.store.beginReadTxn() else try db.core.store.beginWriteTxn();
     var txn_live = true;
     defer if (txn_live) txn.abort();
@@ -254,7 +286,7 @@ pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: 
     const store = bridge.store(a, prefix);
     if (!reading) {
         try initialize(a, &bridge, store, legacy);
-        try adopt(a, store, selected);
+        try adopt(a, store, prepared);
     }
     selected = try ownedConsumers(a, store, db, selected, table, key);
     if (reading and selected.len == 0) {
@@ -298,6 +330,7 @@ pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: 
     }
     const rows = try results(a, db.core.identity_namespace.table_id, selected, store, key, input.action == .redirects, changed, absorbed);
     if (!reading) {
+        try prepared.check();
         try finish(a, &bridge, &txn, db, &lease);
         txn_live = false;
     } else try lease.checkAt(@intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
@@ -307,8 +340,6 @@ pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: 
 pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8, id: []const u8, raw: []const u8, legacy: c.State) ![]const u8 {
     const db = try tables.get(root, table);
     const reading = operation == .list or operation == .get;
-    var lease = if (reading) try db.local_execution.row_policy_gate.enterRawRead() else try db.local_execution.row_policy_gate.enterRaw();
-    defer lease.release();
     if (!reading and try db.maintenanceRequiresOrderedApply()) return error.OrderedResolverReviewRequired;
     // Open matching sources before the destination write transaction. All
     // namespaces share the native file writer; queue-only decisions need none.
@@ -332,6 +363,9 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
             selected = try consumers(root, a, table, key);
         }
     }
+    const prepared = if (reading) PreparedAdoption{} else try prepareAdoption(a, db, selected);
+    var lease = if (reading) try db.local_execution.row_policy_gate.enterRawRead() else try db.local_execution.row_policy_gate.enterRaw();
+    defer lease.release();
     var txn = if (reading) try db.core.store.beginReadTxn() else try db.core.store.beginWriteTxn();
     var txn_live = true;
     defer if (txn_live) txn.abort();
@@ -372,6 +406,7 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
                 decided.decided = origin;
                 try publishQueue(a, store, .{ .proposals = &.{proposal} }, .{ .receipt_scope = (try store.queueHead()).receipt_scope, .proposals = &.{decided} });
                 try store.markQueueOnly(proposal.id);
+                try prepared.check();
                 try finish(a, &bridge, &txn, db, &lease);
                 txn_live = false;
             } else try lease.checkAt(@intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
@@ -398,7 +433,7 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
         try lease.checkAt(@intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
         return json(a, .{ .proposal = proposal, .atomicity = "namespace", .changed = false, .complete = true, .applied = applied, .results = rows });
     }
-    try adopt(a, store, selected);
+    try adopt(a, store, prepared);
     var head = try store.queueHead();
     if (creation) |request| {
         if (head.receipt_scope == null) {
@@ -409,6 +444,7 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
         const plan = try c.propose(a, .{ .receipt_scope = head.receipt_scope }, &.{}, request, policy.manualOrigin(.{ .action = .suppress, .actor = request.actor, .reason = request.reason }, 0));
         try publishQueue(a, store, .{}, plan.state);
         existing = plan.state.proposals[0];
+        try prepared.check();
         try finish(a, &bridge, &txn, db, &lease);
         txn_live = false;
         return json(a, existing.?);
@@ -475,6 +511,7 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
         try publishQueue(a, store, .{ .proposals = &.{proposal} }, .{ .receipt_scope = head.receipt_scope, .proposals = &.{decided} });
     }
     const rows = try results(a, db.core.identity_namespace.table_id, selected, store, key, false, changed, absorbed);
+    try prepared.check();
     try finish(a, &bridge, &txn, db, &lease);
     txn_live = false;
     const applied = if (!decision.accept and !decision.pin_distinct) true else for (rows.array.items) |row| {
@@ -562,7 +599,7 @@ pub fn pullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
     return true;
 }
 fn legacyPullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
-    const configs = try database.core.index_manager.listResolverStaticDescriptors(a);
+    const configs = try database.core.index_manager.listResolverAdmissionDescriptors(a);
     for (configs) |cfg| {
         const desired = (try projection(root, a, cfg)) orelse continue;
         if (!desired.changed) continue;
@@ -619,8 +656,35 @@ pub fn hasProjectionDebt(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
         var bridge: Bridge = .{ .txn = &read };
         return (try bridge.store(a, "").backend.scan(&bridge, a, @import("../storage/lite/resolver_consumers.zig").work_prefix, null, 1)).rows.len != 0;
     }
-    for (try database.core.index_manager.listResolverStaticDescriptors(a)) |cfg| if (try projection(root, a, cfg)) |desired| {
+    for (try database.core.index_manager.listResolverAdmissionDescriptors(a)) |cfg| if (try projection(root, a, cfg)) |desired| {
         if (desired.changed) return true;
     };
     return false;
+}
+
+test "capi resolver curation prepared adoption fences a source config edit" {
+    const api = @import("db.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = try api.TestDirectory.init("resolver-prepared-adoption");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    const root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    const handle = try api.publishHandle(root);
+    defer api.antfly_db_close(handle);
+    try tables.create(root, "entities", "{}", false);
+    var cfg: h.db_mod.ResolverConfig = .{ .name = "r", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{_key}}", .promote = false };
+    try root.db.addResolver(cfg);
+    const db = try tables.get(root, "entities");
+    const prepared = try prepareAdoption(a, db, try consumers(root, a, "entities", "concept/a"));
+    try std.testing.expectEqual(@as(usize, 1), prepared.namespaces.len);
+    cfg.min_confidence = 0.5;
+    _ = try root.db.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false, .wait_for_activity = true });
+    var txn = try db.core.store.beginWriteTxn();
+    defer txn.abort();
+    var bridge: Bridge = .{ .txn = &txn };
+    const store = bridge.store(a, prefix);
+    try std.testing.expectError(error.ResolverCurationConflict, adopt(a, store, prepared));
+    try std.testing.expect(try store.head(cfg.key_template) == null);
 }
