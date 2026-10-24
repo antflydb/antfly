@@ -30,8 +30,9 @@ pub fn sameValues(backing: A, left: V, right: V) !bool {
     };
 }
 fn compare(a: A, left: V, right: V) !bool {
-    const lidx = try refs.Index.init(a, left);
-    const ridx = try refs.Index.init(a, right);
+    var identities = Identities{};
+    const lidx = try Projection.init(a, left, &identities);
+    const ridx = try Projection.init(a, right, &identities);
     for ([_][]const u8{ "structures", "entities", "relations", "classifications" }) |name| {
         const l = field(left, name);
         const r = field(right, name);
@@ -43,6 +44,28 @@ fn compare(a: A, left: V, right: V) !bool {
     }
     return true;
 }
+// Preserve complete semantic identity at relation endpoints. Canonicalize
+// attributes once per entity, even when a high-degree entity has many edges.
+const Identities = struct {
+    keys: std.StringHashMapUnmanaged(usize) = .empty,
+    fn intern(self: *Identities, a: A, value: V) !V {
+        const key = try encode(a, value);
+        const entry = try self.keys.getOrPut(a, key);
+        if (!entry.found_existing) entry.value_ptr.* = self.keys.count() - 1;
+        return .{ .integer = std.math.cast(i64, entry.value_ptr.*) orelse return error.InvalidDocumentModelResult };
+    }
+};
+const Projection = struct {
+    index: refs.Index,
+    entities: []V,
+    identities: *Identities,
+    fn init(a: A, root: V, identities: *Identities) !Projection {
+        const index = try refs.Index.init(a, root);
+        const entities = try a.alloc(V, index.entities.len);
+        for (index.entities, entities) |value, *identity| identity.* = try identities.intern(a, try entity(a, value));
+        return .{ .index = index, .entities = entities, .identities = identities };
+    }
+};
 fn object() V {
     return .{ .object = .{} };
 }
@@ -56,7 +79,7 @@ fn string(value: V, key: []const u8) !V {
     const result = try required(value, key);
     return if (result == .string) result else error.InvalidDocumentModelResult;
 }
-fn project(a: A, name: []const u8, value: V, idx: refs.Index) !V {
+fn project(a: A, name: []const u8, value: V, projection: Projection) !V {
     if (std.mem.eql(u8, name, "structures")) {
         if (value != .object) return error.InvalidDocumentModelResult;
         var result = object();
@@ -74,18 +97,17 @@ fn project(a: A, name: []const u8, value: V, idx: refs.Index) !V {
         return result;
     }
     if (value != .array) return error.InvalidDocumentModelResult;
+    if (std.mem.eql(u8, name, "entities")) return bag(a, projection.entities);
     var rows: std.array_list.Managed(V) = .init(a);
     for (value.array.items) |item| {
         var row = object();
-        if (std.mem.eql(u8, name, "entities")) {
-            row = try entity(a, item);
-        } else if (std.mem.eql(u8, name, "classifications")) {
+        if (std.mem.eql(u8, name, "classifications")) {
             try put(a, &row, "name", try string(item, "name"));
             try put(a, &row, "label", try string(item, "label"));
         } else {
             try put(a, &row, "type", try string(item, "type"));
-            try put(a, &row, "source", try endpoint(a, try required(item, "source"), idx));
-            try put(a, &row, "target", try endpoint(a, try required(item, "target"), idx));
+            try put(a, &row, "source", try endpoint(a, try required(item, "source"), projection));
+            try put(a, &row, "target", try endpoint(a, try required(item, "target"), projection));
         }
         try rows.append(row);
     }
@@ -109,20 +131,17 @@ fn entity(a: A, value: V) !V {
     try put(a, &result, "attributes", attributes);
     return result;
 }
-fn endpoint(a: A, value: V, idx: refs.Index) !V {
-    switch (try idx.resolve(value)) {
-        .entity => |i| {
-            var result = object();
-            try put(a, &result, "label", try string(idx.entities[i], "label"));
-            try put(a, &result, "text", try string(idx.entities[i], "text"));
-            return result;
-        },
+fn endpoint(a: A, value: V, projection: Projection) !V {
+    switch (try projection.index.resolve(value)) {
+        .entity => |i| return projection.entities[i],
         .inline_value => {
             var result = object();
             try put(a, &result, "text", try string(value, "text"));
-            // Inline endpoints need not have an entity type or attributes.
+            // Inline endpoints have no referenced entity attributes. Keeping
+            // that empty identity distinguishes them from attributed entities.
             if (field(value, "label")) |_| try put(a, &result, "label", try string(value, "label"));
-            return result;
+            try put(a, &result, "attributes", object());
+            return projection.identities.intern(a, result);
         },
         .unresolved => return error.InvalidDocumentModelResult,
     }
@@ -143,6 +162,9 @@ fn less(_: void, l: []const u8, r: []const u8) bool {
 fn bag(a: A, values: []const V) !V {
     const encoded = try a.alloc([]const u8, values.len);
     for (values, encoded) |v, *out| out.* = try encode(a, v);
+    return sortedTokens(a, encoded);
+}
+fn sortedTokens(a: A, encoded: [][]const u8) !V {
     std.mem.sort([]const u8, encoded, {}, less);
     var result: std.array_list.Managed(V) = .init(a);
     for (encoded) |v| try result.append(.{ .string = v });
@@ -262,4 +284,19 @@ test "document comparison decimal canonicalization is exact and bounded" {
         const result = try number(a, pair[0]);
         try std.testing.expectEqualStrings(pair[1], result);
     }
+}
+
+test "document relation verification preserves attributed endpoint identity across reordering" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const left = try std.json.parseFromSliceLeaky(V, a,
+        \\{"entities":[{"id":"buyer","label":"person","text":"Alex","attributes":{"role":{"label":"buyer","confidence":0.8}}},{"id":"seller","label":"person","text":"Alex","attributes":{"role":{"label":"seller"}}},{"id":"org","label":"org","text":"Antfly"}],"relations":[{"type":"works_for","source":{"entity_index":0},"target":{"id":"org"}}]}
+    , .{});
+    var right = try std.json.parseFromSliceLeaky(V, a,
+        \\{"entities":[{"id":"company","label":"org","text":"Antfly"},{"id":"s","label":"person","text":"Alex","attributes":{"role":{"label":"seller"}}},{"id":"b","label":"person","text":"Alex","attributes":{"role":{"label":"buyer","confidence":0.1}}}],"relations":[{"type":"works_for","source":{"id":"b"},"target":{"entity_index":0}}]}
+    , .{});
+    try std.testing.expect(try sameValues(a, left, right));
+    try right.object.getPtr("relations").?.array.items[0].object.getPtr("source").?.object.put(a, "id", .{ .string = "s" });
+    try std.testing.expect(!try sameValues(a, left, right));
 }

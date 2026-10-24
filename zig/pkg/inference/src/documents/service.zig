@@ -924,6 +924,8 @@ test "document extraction keeps independent sources atomic and reuses retained r
         family: enum { records, entities, relations, classifications } = .records,
         unsupported_relation: bool = false,
         with_fallback: bool = false,
+        attributed_relations: bool = false,
+        slides: bool = false,
         fn documentDefinition(self: *@This(), a: A, name: []const u8, operation: c.Operation) !?[]const u8 {
             if (operation != .extract) return null;
             if (std.mem.eql(u8, name, "nested-parent")) return try a.dupe(u8,
@@ -945,7 +947,7 @@ test "document extraction keeps independent sources atomic and reuses retained r
         }
         fn documentDownload(self: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
             self.downloads += 1;
-            return .{ .data = @embedFile("testdata/two-pages.pdf") };
+            return .{ .data = if (self.slides) @embedFile("testdata/line-breaks.pptx") else @embedFile("testdata/two-pages.pdf") };
         }
         fn readDocumentArtifact(_: *@This(), a: A, _: []const u8) ![]u8 {
             return a.dupe(u8,
@@ -970,6 +972,12 @@ test "document extraction keeps independent sources atomic and reuses retained r
                     .records => unreachable,
                 };
                 var row = try std.json.parseFromSliceLeaky(V, a, row_json, .{});
+                if (self.attributed_relations) {
+                    row = try std.json.parseFromSliceLeaky(V, a,
+                        \\{"entities":[{"label":"person","text":"Alex","start":0,"end":4,"attributes":{"role":{"label":"buyer"}}},{"label":"person","text":"Alex","start":5,"end":9,"attributes":{"role":{"label":"seller"}}},{"label":"org","text":"Antfly","start":10,"end":16}],"relations":[{"type":"works_for","source":{"entity_index":0},"target":{"entity_index":2}}]}
+                    , .{});
+                    if (self.disagree and std.mem.eql(u8, name, "verifier")) try row.object.getPtr("relations").?.array.items[0].object.getPtr("source").?.object.put(a, "entity_index", .{ .integer = 1 });
+                }
                 const family_name = @tagName(self.family);
                 if (std.mem.eql(u8, name, "verifier")) try row.object.getPtr(family_name).?.array.items[0].object.put(a, "score", .{ .float = 0.7 });
                 return .{ .allocator = a, .json = try std.json.Stringify.valueAlloc(a, .{ .object = "extraction", .model = name, .schema_version = request.schema_version, .data = .{row} }, .{}) };
@@ -1060,6 +1068,30 @@ test "document extraction keeps independent sources atomic and reuses retained r
     const fallback_response = try Service(Fake).extractJson(&fake, a, relation_request, .{});
     defer a.free(fallback_response);
     try std.testing.expectEqual(@as(usize, 4), fake.calls);
+
+    fake.with_fallback = false;
+    fake.unsupported_relation = false;
+    fake.attributed_relations = true;
+    const attributed_request =
+        \\{"model":"composite","schema_version":2,"schema":{"entities":["person","org"],"relations":["works_for"]},"inputs":[{"content":"Alex Alex Antfly"}]}
+    ;
+    const agreed = try Service(Fake).extractJson(&fake, a, attributed_request, .{});
+    defer a.free(agreed);
+    fake.disagree = true;
+    try std.testing.expectError(error.DocumentUnresolved, Service(Fake).extractJson(&fake, a, attributed_request, .{}));
+    fake.disagree = false;
+    fake.family = .records;
+    fake.attributed_relations = false;
+    fake.slides = true;
+    const slide_response = try Service(Fake).extractJson(&fake, a,
+        \\{"model":"composite","schema_version":2,"schema":{"structures":{"record":{"fields":{"value":"str"}}}},"documents":[{"id":"slide","url":"fixture","media_type":"application/vnd.openxmlformats-officedocument.presentationml.presentation","include_notes":true}]}
+    , .{});
+    defer a.free(slide_response);
+    var slide_result = try std.json.parseFromSlice(V, a, slide_response, .{});
+    defer slide_result.deinit();
+    const extracted = slide_result.value.object.get("data").?.array.items[0].object.get("structures").?.object.get("record").?.array.items[0].object.get("value").?;
+    try std.testing.expectEqualStrings("12\n34", extracted.object.get("value").?.string);
+    try std.testing.expect(extracted.object.get("evidence").?.array.items.len > 0);
 }
 
 test "document graph keys separate same named tasks and retain real cycle detection" {

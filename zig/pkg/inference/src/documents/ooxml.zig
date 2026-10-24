@@ -251,6 +251,9 @@ pub fn text(a: A, xml: []const u8) ![]const u8 {
     while (try iter.next()) |token| switch (token) {
         .tag => |tag| {
             if (std.mem.eql(u8, tag.local(), "t")) inside = !tag.closing and !tag.empty;
+            // DrawingML hard breaks separate runs within one paragraph. Emit
+            // once at the opening tag for both empty and paired br elements.
+            if (!tag.closing and std.mem.eql(u8, tag.local(), "br")) try output.writer.writeByte('\n');
             if (tag.closing and (std.mem.eql(u8, tag.local(), "p") or std.mem.eql(u8, tag.local(), "tr"))) try output.writer.writeByte('\n');
             if (tag.closing and std.mem.eql(u8, tag.local(), "tc")) try output.writer.writeByte('\t');
         },
@@ -386,4 +389,18 @@ test "document slide coverage detects vector drawings independently of XML prefi
     try std.testing.expect(try needsVisualInspection("<sld><graphicData uri='chart'/></sld>"));
     try std.testing.expect(!try needsVisualInspection("<sld><sp><cNvSpPr txBox='1'/><prstGeom prst='rect'/><txBody><t>Native</t></txBody></sp></sld>"));
     try std.testing.expect(!try needsVisualInspection("<sld><graphicData uri='http://schemas.openxmlformats.org/drawingml/2006/table'><tbl/></graphicData></sld>"));
+}
+
+test "document native text preserves hard breaks in runs and table cells" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const xml = "<a:p><a:r><a:t>12</a:t></a:r><a:br/><a:r><a:t>34</a:t></a:r><a:br><a:rPr lang='en-US'/></a:br><a:br/><a:r><a:t>Éva &amp; 李</a:t></a:r></a:p>";
+    try std.testing.expectEqualStrings("12\n34\n\nÉva & 李\n", try text(a, xml));
+    // Run boundaries alone are not line breaks.
+    try std.testing.expectEqualStrings("1234\n", try text(a, "<p><r><t>12</t></r><r><t>34</t></r></p>"));
+    const table_xml = "<tbl><tr><tc><p><r><t>12</t></r><br/><r><t>34</t></r></p></tc></tr></tbl>";
+    const table = try tables(a, table_xml);
+    try std.testing.expectEqualStrings("12\n34\n", table[0].cells[0].text);
+    try std.testing.expectEqualStrings("12\n34\n\t\n", try text(a, table_xml));
 }

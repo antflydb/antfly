@@ -122,8 +122,11 @@ field values, entity labels/text/attributes, relation types and endpoints, and
 classification names/labels. Scores, evidence and provider metadata do not vote.
 Entity, relation, classification and record result sets may be reordered; duplicate
 counts and list-valued field order still matter. Relation references resolve
-against each result's own entity indexes or IDs before comparison. Literal spans are checked
-against the exact input and mapped to original page text; declared Unicode or
+against each result's own entity indexes or IDs before comparison. Referenced
+endpoint identities retain entity attributes, so same-named entities with different
+roles remain distinct. Canonical identities are shared within each comparison;
+relations reuse compact references without reprocessing attributes per edge.
+Literal spans are checked against the exact input and mapped to original page text; declared Unicode or
 UTF-16 offsets are converted before evidence mapping. Provider-native estimates
 never acquire fabricated visual or literal grounding. Required source support
 also applies to inline relation endpoints. Referenced endpoints reuse checked
@@ -252,6 +255,9 @@ superseded only through source verification. Regional revisions preserve page
 text outside the corrected region, nested regions, tables and structured fields;
 ambiguous table ownership is reported as unresolved. An accepted regional revision
 replaces its owned table set, including when the replacement contains no tables.
+
+Native slide text preserves explicit DrawingML line breaks in text boxes, table
+cells and included speaker notes.
 
 Region `text_start` and `text_end` are UTF-8 byte offsets within the page text.
 Nested regions retain source coordinates and qualified identities. Page origin

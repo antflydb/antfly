@@ -40933,3 +40933,29 @@ test "document task namespaces stay distinct in dispatch limits and discovery" {
     defer a.free(definition);
     try std.testing.expectEqualStrings(extractor, definition);
 }
+
+test "document native slide read preserves hard breaks in text tables and notes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const models = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(models);
+    var node = try Node.init(a, .{ .models_dir = models });
+    defer node.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const fixture = @embedFile("../documents/testdata/line-breaks.pptx");
+    const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(fixture.len));
+    _ = std.base64.standard.Encoder.encode(encoded, fixture);
+    const uri = try std.fmt.allocPrint(alloc, "data:application/vnd.openxmlformats-officedocument.presentationml.presentation;base64,{s}", .{encoded});
+    const body = try std.json.Stringify.valueAlloc(alloc, .{ .model = "antfly/native-document", .documents = .{.{ .id = "slide", .url = uri, .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation", .include_notes = true }} }, .{});
+    const result = try node.readDocumentsJsonWithControl(alloc, body, .{});
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, result, .{});
+    const page = parsed.object.get("data").?.array.items[0].object;
+    try std.testing.expectEqualStrings("complete", page.get("status").?.string);
+    try std.testing.expectEqualStrings("12\n34\n56\n78\n\t\n", page.get("text").?.string);
+    try std.testing.expectEqualStrings("56\n78\n", page.get("tables").?.array.items[0].object.get("cells").?.array.items[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("Notes\ncontinued\n", page.get("notes").?.string);
+    try std.testing.expectEqual(@as(i64, 0), parsed.object.get("usage").?.object.get("model_calls").?.integer);
+}
