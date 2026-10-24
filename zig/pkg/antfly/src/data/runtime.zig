@@ -10944,6 +10944,19 @@ pub const DataServer = struct {
         return try alloc.dupe(u8, store.api_url);
     }
 
+    fn readOnlineMergeOwner(self: *DataServer, source: *antfly.public_api.ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: @import("antfly_local_sources").storage_db_online_merge_io_contract.Request, context: antfly.public_api.operation.RequestContext) ![]u8 {
+        return source.onlineMergeIo(alloc, group_id, table_name, request, context) catch |err| {
+            // A bounded lifecycle quantum must not perform a diagnostic
+            // catalog read when a retired source became cold. Its ReadIndex
+            // has already established local authority; prepare that one owner
+            // on the durable control lane and leave the caller's debt pending.
+            if (err == error.CatalogRoutingUnavailable and request.operation != .artifact)
+                self.requestRetainedOwnerWarmup(group_id, table_name) catch |warm_err|
+                    std.log.warn("retained owner warmup admission deferred group_id={} err={s}", .{ group_id, @errorName(warm_err) });
+            return err;
+        };
+    }
+
     fn onlineMergeIo(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: @import("antfly_local_sources").storage_db_online_merge_io_contract.Request, context: antfly.public_api.operation.RequestContext) ![]u8 {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
@@ -10967,7 +10980,7 @@ pub const DataServer = struct {
             // Status is a leader ReadIndex observation in the native owner.
             // Revoke preparation adds raw ordinary-transition state from the
             // same replica; the returned command still arbitrates at apply.
-            const observation = try source.onlineMergeIo(alloc, group_id, table_name, .{ .scope = request.scope, .operation = .{ .status = .donor } }, context);
+            const observation = try self.readOnlineMergeOwner(source, alloc, group_id, table_name, .{ .scope = request.scope, .operation = .{ .status = .donor } }, context);
             defer alloc.free(observation);
             const contract = @import("antfly_local_sources").storage_db_online_merge_io_contract;
             const raw = self.localTransitionApplyStore() orelse return error.GroupLeaderUnavailable;
@@ -10996,7 +11009,7 @@ pub const DataServer = struct {
             };
             return std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
         }
-        if (request.operation != .admission) return source.onlineMergeIo(alloc, group_id, table_name, request, context);
+        if (request.operation != .admission) return self.readOnlineMergeOwner(source, alloc, group_id, table_name, request, context);
         try context.ensureActive();
         try request.validate();
         if (request.ownerGroup() != group_id) return error.OnlineSourceScopeChanged;
@@ -11034,7 +11047,7 @@ pub const DataServer = struct {
         // The actual payload is committed atomically with source admission or
         // receiver acceptance, never as an independently expiring seal.
         // The owner read performs ReadIndex before observing durable counters.
-        const json = try source.onlineMergeIo(alloc, group_id, table_name, request, context);
+        const json = try self.readOnlineMergeOwner(source, alloc, group_id, table_name, request, context);
         defer alloc.free(json);
         const contract = @import("antfly_local_sources").storage_db_online_merge_io_contract;
         var parsed = try std.json.parseFromSlice(contract.AdmissionFacts, alloc, json, .{});
@@ -21421,6 +21434,63 @@ pub const DataServer = struct {
         entry.identity_range_id = identity_range_id;
     }
 
+    const RetainedOwnerWarmup = struct {
+        server: *DataServer,
+        group_id: u64,
+        table_name: []u8,
+
+        fn run(ptr: *anyopaque) !void {
+            const job: *@This() = @ptrCast(@alignCast(ptr));
+            const server = job.server;
+            const started = server.backgroundMonotonicNs();
+            _ = server.provisioned_warmup_started.fetchAdd(1, .monotonic);
+            server.provisioned_warmup_last_group_count.store(0, .monotonic);
+            defer server.provisioned_warmup_last_duration_ns.store(server.backgroundMonotonicNs() -| started, .monotonic);
+            errdefer _ = server.provisioned_warmup_failed.fetchAdd(1, .monotonic);
+            const source = server.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+            try source.prepareOnlineMergeOwner(job.group_id, job.table_name);
+            server.provisioned_warmup_last_group_count.store(1, .monotonic);
+            _ = server.provisioned_warmup_completed.fetchAdd(1, .monotonic);
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const job: *@This() = @ptrCast(@alignCast(ptr));
+            const server = job.server;
+            server.alloc.free(job.table_name);
+            server.alloc.destroy(job);
+            server.provisioned_warmup_active.store(false, .release);
+        }
+    };
+
+    fn requestRetainedOwnerWarmup(self: *DataServer, group_id: u64, table_name: []const u8) !void {
+        if (self.provisioned_warmup_active.load(.acquire)) return;
+        const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
+        if (runtime.durable_jobs.executesInline()) return error.ConcurrencyUnavailable;
+        const owner_id = try self.dataServerBackgroundOwnerId(runtime);
+        lockAtomic(&self.provisioned_warmup_mutex);
+        if (self.provisioned_warmup_active.load(.acquire)) {
+            self.provisioned_warmup_mutex.unlock();
+            return;
+        }
+        self.provisioned_warmup_active.store(true, .release);
+        self.provisioned_warmup_mutex.unlock();
+        errdefer self.provisioned_warmup_active.store(false, .release);
+        const job = try self.alloc.create(RetainedOwnerWarmup);
+        errdefer self.alloc.destroy(job);
+        const name = try self.alloc.dupe(u8, table_name);
+        errdefer self.alloc.free(name);
+        job.* = .{ .server = self, .group_id = group_id, .table_name = name };
+        // Share the startup warmup admission slot, but open only the requested
+        // group. Another cold caller retries after this coalesced job drains.
+        try runtime.durable_jobs.submit(.{
+            .owner_id = owner_id,
+            .class = .maintenance,
+            .ptr = job,
+            .run = RetainedOwnerWarmup.run,
+            .deinit = RetainedOwnerWarmup.deinit,
+        });
+    }
+
     pub fn requestProvisionedCacheWarmup(self: *DataServer) !void {
         if (self.provisioned_warmup_active.load(.acquire)) return;
 
@@ -21526,6 +21596,7 @@ pub const DataServer = struct {
         const io = (try self.ensureBackendRuntime()).io() orelse
             return error.BackendRuntimeUnavailable;
         for (local_group_ids) |group_id| {
+            var retained_donor = false;
             if (findRangeByGroupId(ranges, group_id)) |range| {
                 if (range.table_id != table.table_id) continue;
             } else retained: {
@@ -21539,6 +21610,7 @@ pub const DataServer = struct {
                     const online = merge.online orelse continue;
                     if (online.phase != .release) continue;
                     try merge.table_contract.validateForMerge(merge.allow_doc_identity_reassignment);
+                    retained_donor = true;
                     break :retained;
                 }
                 continue;
@@ -21557,7 +21629,10 @@ pub const DataServer = struct {
             // startup for large tables.
             if (comptime linked_storage) {
                 const owner_source = try self.ensureKernelOwnerSource();
-                try owner_source.warmTableGroup(group_id, table.name);
+                if (retained_donor)
+                    try owner_source.prepareOnlineMergeOwner(group_id, table.name)
+                else
+                    try owner_source.warmTableGroup(group_id, table.name);
             } else {
                 try self.read_source.warmTableGroup(self.alloc, group_id, table.name);
             }

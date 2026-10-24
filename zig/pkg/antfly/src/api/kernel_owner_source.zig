@@ -2191,6 +2191,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         lease.requestTransientRetirement();
     }
 
+    /// Prepare a cold lifecycle owner on the control lane and retain it for
+    /// the next bounded merge turn. Unlike speculative startup warmup, that
+    /// turn needs the owner to survive after this lease drains. Descriptor
+    /// validation still uses the current catalog/lifecycle contract; ordinary
+    /// replica retirement and source teardown retain ownership of closing it.
+    pub fn prepareOnlineMergeOwner(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8) !void {
+        var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
+        defer descriptor.deinit(self.alloc);
+        var lease = try self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .resident, .{});
+        defer lease.deinit();
+    }
+
     /// Apply the latest catalog schema/index contract to the already-resident
     /// physical group owner, or open that owner with the contract when absent.
     /// Routing and catalog selection remain in distributed control.
