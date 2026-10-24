@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
+#include <cstdint>
 #include <string>
 #include <vector>
 #define RT(call) do { auto e=(call); if(e!=cudaSuccess) { fprintf(stderr,"%s: %s\n",#call,cudaGetErrorString(e));exit(2); } } while(0)
@@ -17,7 +19,28 @@ static std::string string(FILE *file) {
     unsigned length=read<unsigned>(file);require(length<=256,"Oversized name");std::string value(length,' ');
     require(fread(&value[0],1,length,file)==length,"Truncated name");return value;
 }
-struct Argument { unsigned role; size_t written; std::vector<unsigned char> initial; CUdeviceptr device[2]={0,0}; };
+struct Argument { unsigned role; size_t written; double absolute=0, relative=0; std::vector<unsigned char> initial; CUdeviceptr device[2]={0,0}; };
+// Oracle precision does not relax A/B equality. F32 poison is nonfinite for
+// finite expectations, and finite for nonfinite expectations, to catch omissions.
+static void poison(const Argument& arg, std::vector<unsigned char>& bytes) {
+    if(arg.role==3)for(size_t i=0;i<arg.written;i++)bytes[i]^=0xff;
+    if(arg.role==4)for(size_t i=0;i<arg.written;i+=4) {
+        float want;memcpy(&want,arg.initial.data()+i,4);
+        uint32_t value=std::isfinite(want)?0x7fc00000u:0u;
+        memcpy(bytes.data()+i,&value,4);
+    }
+}
+static bool reference_matches(const Argument& arg, const std::vector<unsigned char>& bytes) {
+    if(arg.role==3)return memcmp(bytes.data(),arg.initial.data(),arg.written)==0;
+    if(arg.role!=4)return true;
+    for(size_t i=0;i<arg.written;i+=4) {
+        float want,got;memcpy(&want,arg.initial.data()+i,4);memcpy(&got,bytes.data()+i,4);
+        bool ok=std::isfinite(want)?std::isfinite(got)&&std::abs(double(got)-want)<=arg.absolute+arg.relative*std::abs(double(want))
+            :std::isnan(want)?std::isnan(got):got==want;
+        if(!ok){fprintf(stderr,"Reference element %zu: got %.9g expected %.9g\n",i/4,got,want);return false;}
+    }
+    return true;
+}
 int main(int argc,char **argv) {
     require(argc==5 || (argc==6 && (std::string(argv[5])=="--long" || std::string(argv[5])=="--stable")),"Usage: kernel-family-cuda baseline.fatbin candidate.fatbin cases.bin receipt.json [--long|--stable]");
     const bool extended=argc==6, stable=extended && std::string(argv[5])=="--stable";
@@ -25,7 +48,7 @@ int main(int argc,char **argv) {
     RT(cudaSetDevice(0));RT(cudaFree(nullptr));CUmodule modules[2];DR(cuModuleLoad(&modules[0],argv[1]));DR(cuModuleLoad(&modules[1],argv[2]));
     FILE *manifest=fopen(argv[3],"rb");require(manifest!=nullptr,"Cannot read manifest");
     unsigned magic=read<unsigned>(manifest);
-    require(magic==0x4b464331u || magic==0x4b464332u,"Wrong manifest version");unsigned count=read<unsigned>(manifest);
+    require(magic==0x4b464331u || magic==0x4b464332u || magic==0x4b464333u,"Wrong manifest version");unsigned count=read<unsigned>(manifest);
     cudaStream_t stream;RT(cudaStreamCreate(&stream));std::vector<std::string> receipts;bool passed=true;
     for(unsigned test=0;test<count;test++) {
         std::string name=string(manifest),kernel=string(manifest);unsigned grid[3],block[3];
@@ -34,19 +57,24 @@ int main(int argc,char **argv) {
         std::vector<Argument> arguments(argc);std::vector<void*> params[2];
         for(auto &arg:arguments) {
             arg.role=read<unsigned>(manifest);arg.written=read<unsigned long long>(manifest);
-            require(arg.role<= (magic==0x4b464332u?3u:2u),"Invalid argument role");
+            require(arg.role<= (magic==0x4b464333u?4u:magic==0x4b464332u?3u:2u),"Invalid argument role");
             size_t size=read<unsigned long long>(manifest);require(size>0&&size<(1ull<<32),"Invalid buffer size");arg.initial.resize(size);
+            if(magic==0x4b464333u){arg.absolute=read<double>(manifest);arg.relative=read<double>(manifest);}
+            require(arg.role!=4 || (arg.written%4==0 && std::isfinite(arg.absolute) && arg.absolute>=0 && std::isfinite(arg.relative) && arg.relative>=0),"Invalid F32 reference precision");
             require(fread(arg.initial.data(),1,size,manifest)==size,"Truncated fixture");require(arg.written<=size,"Invalid output extent");
             std::vector<unsigned char> initial=arg.initial;
             // Poison every reference byte so an omitted write cannot pass.
-            if(arg.role==3)for(size_t i=0;i<arg.written;i++)initial[i]^=0xff;
+            poison(arg,initial);
             if(arg.role) {DR(cuMemAlloc(&arg.device[0],size));DR(cuMemcpyHtoD(arg.device[0],initial.data(),size));arg.device[1]=arg.device[0];
                 if(arg.role>=2) {DR(cuMemAlloc(&arg.device[1],size));DR(cuMemcpyHtoD(arg.device[1],initial.data(),size));}}
         }
         for(auto &arg:arguments)for(int v=0;v<2;v++)params[v].push_back(arg.role?(void*)&arg.device[v]:(void*)arg.initial.data());
         CUfunction functions[2];cudaGraph_t graphs[2];cudaGraphExec_t execs[2];
+        int active_blocks[2], registers[2];
         for(int version=0;version<2;version++) {
             DR(cuModuleGetFunction(&functions[version],modules[version],kernel.c_str()));
+            DR(cuFuncGetAttribute(&registers[version],CU_FUNC_ATTRIBUTE_NUM_REGS,functions[version]));
+            DR(cuOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks[version],functions[version],block[0]*block[1]*block[2],shared));
             DR(cuLaunchKernel(functions[version],grid[0],grid[1],grid[2],block[0],block[1],block[2],shared,(CUstream)stream,params[version].data(),nullptr));
         }
         auto verify_outputs = [&]() {
@@ -55,7 +83,7 @@ int main(int argc,char **argv) {
             ++outputs;std::vector<unsigned char> bytes[2];
             for(int v=0;v<2;v++) {bytes[v].resize(arg.initial.size());DR(cuMemcpyDtoH(bytes[v].data(),arg.device[v],bytes[v].size()));
                 require(memcmp(bytes[v].data()+arg.written,arg.initial.data()+arg.written,arg.initial.size()-arg.written)==0,"Output guard changed");
-                if(arg.role==3)require(memcmp(bytes[v].data(),arg.initial.data(),arg.written)==0,"Independent reference mismatch");}
+                require(reference_matches(arg,bytes[v]),"Independent reference mismatch");}
             if(bytes[0]!=bytes[1]) {fprintf(stderr,"Output mismatch %s\n",name.c_str());exit(3);}
         }
         require(outputs>0,"No output bindings");
@@ -97,7 +125,7 @@ int main(int argc,char **argv) {
         for(int version=0;version<2;version++) {
             for(auto &arg:arguments)if(arg.role>=2) {
                 std::vector<unsigned char> initial=arg.initial;
-                if(arg.role==3)for(size_t i=0;i<arg.written;i++)initial[i]^=0xff;
+                poison(arg,initial);
                 DR(cuMemcpyHtoD(arg.device[0],initial.data(),initial.size()));
             }
             RT(cudaGraphLaunch(execs[version],stream));
@@ -106,7 +134,7 @@ int main(int argc,char **argv) {
         arms+="]";double median[2];for(int v=0;v<2;v++){auto &t=times[v];std::sort(t.begin(),t.end());median[v]=(t[t.size()/2-1]+t[t.size()/2])/2;}
         double ratio=median[1]/median[0];bool ok=ratio<=1.05;passed&=ok;char row[1000];
         snprintf(row,sizeof(row),"{\"name\":\"%s\",\"kernel\":\"%s\",\"exact\":true,\"replay_exact\":true,\"guards\":true,\"baseline_ns\":%.9f,\"candidate_ns\":%.9f,\"ratio\":%.9f,\"pass\":%s,\"arms\":",name.c_str(),kernel.c_str(),median[0],median[1],ratio,ok?"true":"false");
-        char protocol[128];snprintf(protocol,sizeof(protocol),",\"launches_per_arm\":%d,\"additional_warmup_gpu_ms\":%.6f}",100*launches,warmup_ms);
+        char protocol[256];snprintf(protocol,sizeof(protocol),",\"launches_per_arm\":%d,\"additional_warmup_gpu_ms\":%.6f,\"baseline_registers\":%d,\"candidate_registers\":%d,\"baseline_active_blocks_per_sm\":%d,\"candidate_active_blocks_per_sm\":%d}",100*launches,warmup_ms,registers[0],registers[1],active_blocks[0],active_blocks[1]);
         receipts.push_back(std::string(row)+arms+protocol);FILE *output=fopen(argv[4],"wb");require(output!=nullptr,"Cannot save receipt");fputs("[\n",output);
         for(size_t i=0;i<receipts.size();i++)fprintf(output,"%s%s\n",receipts[i].c_str(),i+1<receipts.size()?",":"");fputs("]\n",output);fclose(output);
         printf("%s exact=1 guards=1 ratio=%.6f pass=%d\n",name.c_str(),ratio,ok);fflush(stdout);

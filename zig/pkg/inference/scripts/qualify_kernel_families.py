@@ -67,6 +67,11 @@ def models(args):
             line = next((x for x in run.stdout.decode(errors='replace').splitlines()
                          if x.startswith(prefix)), '')
             row['timing'] = dict(re.findall(r'(\w+)=([^ ]+)', line))
+            setup = next((x for x in run.stdout.decode(errors='replace').splitlines()
+                          if x.startswith('unified_setup ')), '')
+            if setup:
+                row['setup'] = {key: int(value) for key, value in
+                                re.findall(r'(\w+)=(\d+)', setup)}
             if run.returncode == 0 and output.exists():
                 raw = output.read_bytes()
                 values = array.array('f')
@@ -91,6 +96,14 @@ def models(args):
                 old, new = (statistics.median(values[arm]) for arm in 'AB')
                 summary[key] = {'baseline': old, 'candidate': new, 'ratio': new / old,
                                 'pass': new / old <= limit}
+        # First warmup includes the cold execution, rather than isolating host
+        # preparation. Keep it separate from steady-state acceptance timings.
+        for key in ('load_ns', 'inputs_ns', 'first_warmup_ns'):
+            values = {arm: [x.get('setup', {}).get(key) for x in current['arms']
+                            if x['arm'] == arm] for arm in 'AB'}
+            if all(v and all(x is not None and x > 0 for x in v) for v in values.values()):
+                old, new = (statistics.median(values[arm]) for arm in 'AB')
+                summary[key] = {'baseline': old, 'candidate': new, 'ratio': new / old}
         summary['pass'] = bool(summary['numerical_pass'] and summary['p50_ns']['pass']
                                and summary['p95_ns']['pass'])
         current['summary'] = summary
@@ -176,8 +189,9 @@ def source_ledger(args):
 
 def pack_cuda(args):
     config = json.loads(args.config.read_text())
+    tolerant = any(arg['kind'] == 'reference_output_f32' for case in config['cases'] for arg in case['arguments'])
     reference = any(arg['kind'] == 'reference_output' for case in config['cases'] for arg in case['arguments'])
-    data = bytearray(struct.pack('<II', 0x4b464332 if reference else 0x4b464331, len(config['cases'])))
+    data = bytearray(struct.pack('<II', 0x4b464333 if tolerant else 0x4b464332 if reference else 0x4b464331, len(config['cases'])))
     def string(value, pattern):
         if len(value) > 256 or not re.fullmatch(pattern, value):
             raise ValueError('Invalid CUDA case/kernel name')
@@ -190,11 +204,18 @@ def pack_cuda(args):
                             [case.get('shared_bytes', 0), len(case['arguments'])]))
         for arg in case['arguments']:
             raw = (args.config.parent / arg['file']).read_bytes()
-            role = {'value': 0, 'buffer': 1, 'output': 2, 'reference_output': 3}[arg['kind']]
+            role = {'value': 0, 'buffer': 1, 'output': 2, 'reference_output': 3, 'reference_output_f32': 4}[arg['kind']]
             written = arg.get('written_bytes', 0)
             if not raw or written < 0 or written > len(raw) or (role >= 2 and written == 0):
                 raise ValueError('Invalid fixture extent')
-            data += struct.pack('<IQQ', role, written, len(raw)) + raw
+            absolute = arg.get('absolute_tolerance', 0)
+            relative = arg.get('relative_tolerance', 0)
+            if role == 4 and (written % 4 or not all(math.isfinite(x) and x >= 0 for x in (absolute, relative))):
+                raise ValueError('Invalid F32 reference precision contract')
+            data += struct.pack('<IQQ', role, written, len(raw))
+            if tolerant:
+                data += struct.pack('<dd', absolute if role == 4 else 0, relative if role == 4 else 0)
+            data += raw
     (args.results / 'cuda-cases.bin').write_bytes(data)
     save(args.results / 'cuda-manifest.json', config)
     return True

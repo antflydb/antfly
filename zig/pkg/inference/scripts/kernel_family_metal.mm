@@ -3,6 +3,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cmath>
 #include <cstring>
@@ -126,8 +127,23 @@ int main(int argc, char **argv) { @autoreleasepool {
                       && pipelines[1].staticThreadgroupMemoryLength <= pipelines[0].staticThreadgroupMemoryLength;
         int warmup = [manifest[@"warmup"] intValue], repeats = [manifest[@"repeats"] intValue];
         require(warmup > 0 && repeats > 0, @"Warmup/repeats must be positive");
+        double warmup_gpu_ns[2];
+        unsigned long long warmup_dispatches[2] = {(unsigned long long)warmup, (unsigned long long)warmup};
         for (int version = 0; version < 2; ++version)
-            dispatch(queue, pipelines[version], test, buffers[0], data, warmup);
+            warmup_gpu_ns[version] = dispatch(queue, pipelines[version], test, buffers[0], data, warmup) * warmup;
+        const double warmup_ms = [manifest[@"warmup_ms"] doubleValue];
+        require(std::isfinite(warmup_ms) && warmup_ms >= 0, @"Invalid warmup duration");
+        if (warmup_ms > 0) {
+            // Fixed-count warmups can finish before a tiny kernel reaches a
+            // steady device clock. Alternate equal batches on both pipelines.
+            const auto started = std::chrono::steady_clock::now();
+            int version = 0;
+            do {
+                warmup_gpu_ns[version] += dispatch(queue, pipelines[version], test, buffers[0], data, repeats) * repeats;
+                warmup_dispatches[version] += repeats;
+                version ^= 1;
+            } while (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() < warmup_ms);
+        }
         NSString *order = manifest[@"arm_order"] ?: @"ABBABAABABBAABBA";
         std::vector<double> times[2]; NSMutableArray *arms = [NSMutableArray array];
         for (NSUInteger arm = 0; arm < order.length; ++arm) {
@@ -145,6 +161,8 @@ int main(int argc, char **argv) { @autoreleasepool {
         [results addObject:@{@"name":test[@"name"], @"kernel":name, @"exact":@(exact), @"guards":@(guards),
             @"baseline_ns":@(medians[0]), @"candidate_ns":@(medians[1]), @"ratio":@(ratio), @"pass":@(ok),
             @"resources_pass":@(resources), @"arms":arms,
+            @"warmup_ms":@(warmup_ms), @"warmup_dispatches":@[@(warmup_dispatches[0]), @(warmup_dispatches[1])],
+            @"warmup_gpu_ns":@[@(warmup_gpu_ns[0]), @(warmup_gpu_ns[1])], @"launches_per_arm":@(repeats),
             @"reference_outputs":@(reference_outputs), @"reference_pass":reference_outputs ? @(reference) : [NSNull null],
             @"baseline_max_threads":@(pipelines[0].maxTotalThreadsPerThreadgroup),
             @"candidate_max_threads":@(pipelines[1].maxTotalThreadsPerThreadgroup),

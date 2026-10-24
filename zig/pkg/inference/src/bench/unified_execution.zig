@@ -64,12 +64,14 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("soak_allocator_final live={d} peak={d} denied={}\n", .{ bounded.live, bounded.peak, bounded.denied });
         std.debug.assert(bounded.live == 0);
     };
+    const setup_started = inference.platform.time.awakeNs(init.io);
     try backend_choice.validate(options.backend);
     var sessions = inference.backends.SessionManager.initWithIo(a, init.io);
     backend_choice.configureSessionPreference(&sessions, options.backend);
     var manager = inference.server.model_manager.ModelManager.init(a, sessions);
     defer manager.deinit();
     const model = try manager.loadFromDir(options.model_dir);
+    const model_loaded = inference.platform.time.awakeNs(init.io);
     const session = model.session;
     if (options.decoder_steps != 0) {
         try runDecoder(init, model, a, options, &bounded);
@@ -118,11 +120,15 @@ pub fn main(init: std.process.Init) !void {
             try inputs.append(a, try Tensor.initInt64(a, info.name, shape[0..rank], data));
         } else return error.UnsupportedInputType;
     }
-    for (0..options.warmup) |_| {
+    const inputs_ready = inference.platform.time.awakeNs(init.io);
+    var first_warmup_ns: u64 = 0;
+    for (0..options.warmup) |warmup_index| {
         const outputs = try session.run(inputs.items, a);
         for (outputs) |*output| output.deinit();
         a.free(outputs);
+        if (warmup_index == 0) first_warmup_ns = inference.platform.time.awakeNs(init.io) - inputs_ready;
     }
+    std.debug.print("unified_setup load_ns={d} inputs_ns={d} first_warmup_ns={d}\n", .{ model_loaded - setup_started, inputs_ready - model_loaded, first_warmup_ns });
     if (options.soak_seconds != 0) {
         try runSoak(init, session, inputs.items, a, &bounded, options);
         return;

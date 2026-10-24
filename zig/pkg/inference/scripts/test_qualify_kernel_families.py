@@ -92,6 +92,29 @@ class QualificationTests(unittest.TestCase):
         self.assertTrue(qualification.pack_cuda(self.args))
         self.assertEqual(struct.unpack_from('<I', (self.root / 'cuda-cases.bin').read_bytes())[0], 0x4b464331)
 
+    def test_float_reference_precision_is_explicit_and_old_protocol_stays_strict(self):
+        import struct
+        (self.root / 'reference.bin').write_bytes(struct.pack('<f', 1) + b'guard')
+        arg = dict(kind='reference_output_f32', file='reference.bin', written_bytes=4,
+                   absolute_tolerance=.001, relative_tolerance=.002)
+        case = dict(name='float.rows', kernel='float_rows', grid=[1, 1, 1], threads=[32, 1, 1], arguments=[arg])
+        self.config.write_text(json.dumps(dict(cases=[case])))
+        self.assertTrue(qualification.pack_cuda(self.args))
+        raw = (self.root / 'cuda-cases.bin').read_bytes()
+        self.assertEqual(struct.unpack_from('<II', raw), (0x4b464333, 1))
+        offset = 8 + 4 + len(case['name']) + 4 + len(case['kernel']) + 32
+        self.assertEqual(struct.unpack_from('<IQQdd', raw, offset), (4, 4, 9, .001, .002))
+        for invalid in (-1, float('nan'), float('inf')):
+            arg['absolute_tolerance'] = invalid
+            self.config.write_text(json.dumps(dict(cases=[case])))
+            with self.assertRaises(ValueError):
+                qualification.pack_cuda(self.args)
+        arg['absolute_tolerance'] = 0
+        arg['written_bytes'] = 3
+        self.config.write_text(json.dumps(dict(cases=[case])))
+        with self.assertRaises(ValueError):
+            qualification.pack_cuda(self.args)
+
 
 if __name__ == '__main__':
     unittest.main()
