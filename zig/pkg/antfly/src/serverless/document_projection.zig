@@ -30,6 +30,7 @@ pub const Projection = struct {
     chunk_preview_version: ?u32 = null,
     chunk_embeddings_version: ?u32 = null,
     chunk_embeddings_pending: bool = false,
+    has_media_checkpoint: bool = false,
     model_media_source_present: bool = false,
     rerank_terms_version: ?u32 = null,
 
@@ -216,6 +217,10 @@ pub fn parseAllocWithSourceFields(alloc: Allocator, body: []const u8, source_fie
         .chunk_preview_version = findChunkPreviewVersion(obj),
         .chunk_embeddings_version = findChunkEmbeddingsVersion(obj),
         .chunk_embeddings_pending = pendingMediaOutputs(obj),
+        .has_media_checkpoint = checkpoint: {
+            const state = obj.get("_enrichment") orelse break :checkpoint false;
+            break :checkpoint state == .object and state.object.contains("chunk_embeddings_checkpoint");
+        },
         .model_media_source_present = source: {
             for (source_fields) |field| {
                 const value = obj.get(field) orelse continue;

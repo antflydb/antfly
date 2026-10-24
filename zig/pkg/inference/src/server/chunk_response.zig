@@ -77,6 +77,7 @@ pub const Collector = struct {
     request: ?pipeline.Request = null,
     started: bool = false,
     items: std.ArrayList(WireItem) = .empty,
+    observation: ?WireItem = null,
     gaps: std.ArrayList(WireCoordinates) = .empty,
     retained: usize = 0,
     limit: usize = 100 * 1024 * 1024,
@@ -108,6 +109,12 @@ pub const Collector = struct {
             } else null,
             .@"error" = if (item.failure) |err| .{ .code = "CHUNK_EMBEDDING_FAILED", .message = @errorName(err) } else null,
         };
+        if (item.observation) {
+            if (self.writer != null) return error.InvalidChunkPolicy;
+            self.observation = wire;
+            self.retained += bytes;
+            return;
+        }
         const gap = if (item.failure != null) try coordinates(self.allocator, item.descriptor.coordinates) else null;
         if (gap != null) try self.gaps.ensureUnusedCapacity(self.allocator, 1);
         if (self.writer) |*writer| {
@@ -139,13 +146,14 @@ pub const Collector = struct {
         const source = std.fmt.bytesToHex(summary.identity.source, .lower);
         const plan = std.fmt.bytesToHex(summary.identity.plan, .lower);
         var cursor: [85]u8 = undefined;
-        const resumable = if (execution.failure) |err| pipeline.abort(err) or err == error.ChunkOutputTooLarge or err == error.ResourceLimitExceeded or err == error.StreamTooLong else !summary.source_complete;
+        const resumable = !request.observe_only and if (execution.failure) |err| pipeline.abort(err) or err == error.ChunkOutputTooLarge or err == error.ResourceLimitExceeded or err == error.StreamTooLong else !summary.source_complete;
         const partial = if (execution.failure) |err| (err == error.ChunkOutputTooLarge or err == error.ChunkEventBudgetExceeded) else !summary.complete;
         const output_coverage = try a.alloc(api.ChunkOutputCoverage, summary.output_count);
         for (output_coverage, summary.output_counts[0..summary.output_count]) |*dest, count| dest.* = .{ .name = count.name, .required = count.required, .complete = @intCast(count.complete), .failed = @intCast(count.failed), .skipped = @intCast(count.skipped) };
         return .{
             .object = "chunk.embedding.list",
             .data = self.items.items,
+            .observation = self.observation,
             .source_complete = summary.source_complete,
             .output_coverage = if (output_coverage.len != 0) output_coverage else null,
             .degraded = summary.degraded,
@@ -197,11 +205,13 @@ pub const NativeCollector = struct {
     allow_partial: bool = false,
     allocator: std.mem.Allocator,
     chunks: std.ArrayList(@import("inference_chunker").Chunk) = .empty,
+    observation: ?@import("inference_chunker").Chunk = null,
     retained: usize = 0,
     limit: usize = 100 * 1024 * 1024,
     pub fn deinit(self: *@This()) void {
         for (self.chunks.items) |*chunk| chunk.deinit(self.allocator);
         self.chunks.deinit(self.allocator);
+        if (self.observation) |*chunk| chunk.deinit(self.allocator);
     }
     pub fn accept(raw: *anyopaque, item: pipeline.Item) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -243,7 +253,7 @@ pub const NativeCollector = struct {
         };
         chunk.metadata = try metadata.clone(self.allocator);
         chunk.owns_metadata = true;
-        try self.chunks.append(self.allocator, chunk);
+        if (item.observation) self.observation = chunk else try self.chunks.append(self.allocator, chunk);
         self.retained += size;
     }
     pub fn finish(self: *@This(), request: pipeline.Request, target: Target, execution: Execution) ![]@import("inference_chunker").Chunk {
@@ -255,7 +265,7 @@ pub const NativeCollector = struct {
         if (execution.failure) |err| return err;
         const summary = execution.summary;
         if (summary.next_ordinal - summary.start_ordinal != self.chunks.items.len or
-            (!summary.complete and self.chunks.items.len == 0)) return error.IncompleteChunkCoverage;
+            (!summary.complete and self.chunks.items.len == 0) or (request.observe_only and self.observation == null)) return error.IncompleteChunkCoverage;
         const a = self.allocator;
         const plan = try a.dupe(u8, &std.fmt.bytesToHex(summary.identity.plan, .lower));
         errdefer a.free(plan);
@@ -263,33 +273,42 @@ pub const NativeCollector = struct {
         errdefer a.free(source);
         const version = try a.dupe(u8, sourceVersion(request, source));
         errdefer a.free(version);
-        return .{ .chunks = try self.finishAcknowledged(request, target, execution), .plan_id = plan, .source_fingerprint = source, .source_version = version, .start_ordinal = summary.start_ordinal, .covered_through_ordinal = summary.next_ordinal, .complete = summary.source_complete };
+        const chunks = try self.finishAcknowledged(request, target, execution);
+        errdefer @import("inference_chunker").types.freeChunks(a, chunks);
+        var observed: ?*@import("inference_chunker").types.ModelMetadata = null;
+        if (self.observation) |*chunk| {
+            try self.bindMetadata(chunk, request, target, execution);
+            observed = chunk.metadata;
+            chunk.owns_metadata = false;
+        }
+        return .{ .chunks = chunks, .observation = observed, .plan_id = plan, .source_fingerprint = source, .source_version = version, .start_ordinal = summary.start_ordinal, .covered_through_ordinal = summary.next_ordinal, .complete = summary.source_complete };
     }
     pub fn finishAcknowledged(self: *@This(), request: pipeline.Request, supplied_target: Target, execution: Execution) ![]@import("inference_chunker").Chunk {
+        if (execution.failure) |err| return err;
+        for (self.chunks.items) |*chunk| try self.bindMetadata(chunk, request, supplied_target, execution);
+        return self.chunks.toOwnedSlice(self.allocator);
+    }
+    fn bindMetadata(self: *@This(), chunk: *@import("inference_chunker").Chunk, request: pipeline.Request, supplied: Target, execution: Execution) !void {
         const target = if (request.outputs) |config| blk: {
             const boundary = try config.boundary();
             break :blk Target{ .model = boundary.model, .task_type = if (boundary.kind == .transcribe) "TRANSCRIBE" else boundary.task_type, .dimensions = boundary.dimensions, .model_identity = boundary.model_identity };
-        } else supplied_target;
-        if (execution.failure) |err| return err;
+        } else supplied;
         const source = std.fmt.bytesToHex(execution.summary.identity.source, .lower);
         const plan = std.fmt.bytesToHex(execution.summary.identity.plan, .lower);
-        for (self.chunks.items) |*chunk| {
-            const current = chunk.metadata.?;
-            var metadata = current.*;
-            metadata.source_fingerprint = &source;
-            metadata.source_version = sourceVersion(request, &source);
-            metadata.plan_id = &plan;
-            metadata.model = target.model;
-            metadata.model_identity = &execution.model_identity;
-            metadata.model_revision = &execution.model_revision;
-            metadata.task_type = target.task_type;
-            metadata.dimensions = execution.dimensions;
-            metadata.policy = request.policy;
-            const owned = try metadata.clone(self.allocator);
-            current.deinit(self.allocator);
-            chunk.metadata = owned;
-        }
-        return self.chunks.toOwnedSlice(self.allocator);
+        const current = chunk.metadata.?;
+        var metadata = current.*;
+        metadata.source_fingerprint = &source;
+        metadata.source_version = sourceVersion(request, &source);
+        metadata.plan_id = &plan;
+        metadata.model = target.model;
+        metadata.model_identity = &execution.model_identity;
+        metadata.model_revision = &execution.model_revision;
+        metadata.task_type = target.task_type;
+        metadata.dimensions = execution.dimensions;
+        metadata.policy = request.policy;
+        const owned = try metadata.clone(self.allocator);
+        current.deinit(self.allocator);
+        chunk.metadata = owned;
     }
 };
 
@@ -310,4 +329,30 @@ test "model aware media native pages keep enumeration separate from output cover
     var empty = NativeCollector{ .allocator = a };
     defer empty.deinit();
     try std.testing.expectError(error.IncompleteChunkCoverage, empty.finishPage(.{ .input = .{ .text = "unused" } }, .{ .model = "audio" }, execution));
+}
+
+test "model aware media generation observations own metadata without claiming inventory coverage" {
+    const a = std.testing.allocator;
+    var native = NativeCollector{ .allocator = a };
+    defer native.deinit();
+    const identity = planning.Identity{ .plan = @splat(1), .source = @splat(2) };
+    var id: [85]u8 = undefined;
+    const item = pipeline.Item{ .observation = true, .descriptor = .{ .ordinal = 0, .input_tokens = 0, .coordinates = .{ .kind = .text, .start_byte = 0, .end_byte = 0 } }, .id = identity.cursor(0, &id), .mime_type = "application/json" };
+    try NativeCollector.accept(&native, item);
+    const execution = Execution{ .summary = .{ .identity = identity, .start_ordinal = 0, .next_ordinal = 0, .complete = true, .source_complete = false }, .model_identity = @splat('3'), .model_revision = @splat('4'), .dimensions = 2 };
+    const request = Request{ .input = .{ .text = "unused" }, .observe_only = true, .execute = false, .max_chunks = 1 };
+    var page = try native.finishPage(request, .{ .model = "model" }, execution);
+    defer page.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), page.chunks.len);
+    try std.testing.expect(page.observation != null and !page.complete);
+    try std.testing.expectEqualStrings("model", page.observedMetadata().?.model);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var wire = Collector{ .allocator = arena.allocator() };
+    try Collector.accept(&wire, item);
+    const response = try wire.response(request, .{ .model = "model" }, execution);
+    try std.testing.expect(response.observation != null and response.next_continuation == null);
+    try std.testing.expectEqual(@as(usize, 0), response.data.len);
+    try std.testing.expectEqual(@as(i64, 0), response.covered_through_ordinal);
+    try std.testing.expect(!response.source_complete.?);
 }

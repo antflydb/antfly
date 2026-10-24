@@ -218,6 +218,7 @@ test "text chunk offsets are nullable when they exceed u32 range" {
 /// never successful coverage of every required output.
 pub const ChunkPage = struct {
     chunks: []Chunk,
+    observation: ?*ModelMetadata = null,
     plan_id: []const u8,
     source_fingerprint: []const u8,
     source_version: []const u8,
@@ -225,8 +226,14 @@ pub const ChunkPage = struct {
     covered_through_ordinal: u64,
     complete: bool,
 
+    /// Legacy providers still return their first planned member for probes.
+    pub fn observedMetadata(self: @This()) ?*ModelMetadata {
+        return self.observation orelse if (self.chunks.len != 0) self.chunks[0].metadata else null;
+    }
+
     pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
         freeChunks(a, self.chunks);
+        if (self.observation) |metadata| metadata.deinit(a);
         a.free(self.plan_id);
         a.free(self.source_fingerprint);
         a.free(self.source_version);

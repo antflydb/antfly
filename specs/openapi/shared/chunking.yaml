@@ -219,6 +219,10 @@ components:
           $ref: '#/components/schemas/ChunkEmbeddingTarget'
         outputs:
           $ref: '#/components/schemas/ChunkOutputs'
+        observe_only:
+          type: boolean
+          default: false
+          description: Resolve source/plan and deployed output identities without enumerating media or executing models. Returns observation metadata separately from data; provides no chunk coverage or source-completion certificate. Requires every output target to have execute=false and no continuation.
         allow_partial:
           type: boolean
           description: Continue enumerating descriptors after individual output failures. Applies to named outputs, including transcribe-only requests; overrides the legacy embedding.allow_partial option when present.
@@ -686,6 +690,9 @@ components:
         degraded:
           type: boolean
           description: Optional outputs failed without preventing required-output coverage.
+        observation:
+          $ref: '#/components/schemas/ChunkEmbeddingObject'
+          description: Metadata-only generation observation when observe_only=true. Never a chunk inventory member or a coverage acknowledgement.
         source_complete:
           type: boolean
           description: True when source enumeration reached EOF, independently of per-output gaps. Resume enumeration at covered_through_ordinal; repair gaps separately.

@@ -143,7 +143,7 @@ pub fn needsRebuild(alloc: Allocator, root: facts.Root, policy: catalog.Namespac
     return !std.mem.eql(u8, &root.policy_fingerprint, &try fingerprint(alloc, policy, indexes_json));
 }
 
-pub const Flags = struct { present: u3, pending: u4 };
+pub const Flags = struct { present: u3, pending: u4, body_has_dependencies: bool = false };
 pub fn outputsFromCountsAlloc(alloc: Allocator, counts: [7]u64, requested: builder.DerivedOutputDetectionSelection) !sources.MaterializedDerivedOutputs {
     var outputs = std.ArrayListUnmanaged(sources.DerivedOutputDescriptor).empty;
     errdefer {
@@ -203,6 +203,7 @@ pub const Context = struct {
         } else false;
         const has_chunk_source = projection.chunk_embeddings_pending or projection.model_media_source_present or (if (projection.chunk_preview) |chunks| chunks.len > 0 else has_text);
         return .{
+            .body_has_dependencies = projection.has_media_checkpoint,
             .present = @as(u3, @intFromBool(has_chunk_preview)) |
                 (@as(u3, @intFromBool(projection.chunk_embeddings != null)) << 1) |
                 (@as(u3, @intFromBool(projection.rerank_terms != null)) << 2),
@@ -274,7 +275,7 @@ fn makeFact(alloc: Allocator, pages: *page_store.PageStore, store: tree.Store, p
         old.?.body
     else
         try facts.putBody(alloc, pages, doc.body);
-    return .{ .body = body, .last_lsn = doc.last_lsn, .last_timestamp_ns = doc.last_timestamp_ns, .present = flags.present, .pending = flags.pending };
+    return .{ .body = body, .body_has_dependencies = flags.body_has_dependencies, .last_lsn = doc.last_lsn, .last_timestamp_ns = doc.last_timestamp_ns, .present = flags.present, .pending = flags.pending };
 }
 
 fn findDocument(docs: []const materializer.Document, id: []const u8) ?materializer.Document {

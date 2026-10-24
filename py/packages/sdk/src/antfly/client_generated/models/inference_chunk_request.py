@@ -36,6 +36,9 @@ class InferenceChunkRequest:
         outputs (ChunkOutputs | Unset): Named independent media outputs. The named boundary model alone determines the
             shared plan; adding or changing another output preserves parent IDs. The compatibility embedding target is named
             embedding. Smaller output windows are identified by the parent ordinal and sub_index.
+        observe_only (bool | Unset): Resolve source/plan and deployed output identities without enumerating media or
+            executing models. Returns observation metadata separately from data; provides no chunk coverage or source-
+            completion certificate. Requires every output target to have execute=false and no continuation. Default: False.
         allow_partial (bool | Unset): Continue enumerating descriptors after individual output failures. Applies to
             named outputs, including transcribe-only requests; overrides the legacy embedding.allow_partial option when
             present.
@@ -54,6 +57,7 @@ class InferenceChunkRequest:
     config: InferenceChunkConfig | Unset = UNSET
     embedding: ChunkEmbeddingTarget | Unset = UNSET
     outputs: ChunkOutputs | Unset = UNSET
+    observe_only: bool | Unset = False
     allow_partial: bool | Unset = UNSET
     policy: MediaChunkPolicy | Unset = UNSET
     source_id: str | Unset = UNSET
@@ -90,6 +94,8 @@ class InferenceChunkRequest:
         if not isinstance(self.outputs, Unset):
             outputs = self.outputs.to_dict()
 
+        observe_only = self.observe_only
+
         allow_partial = self.allow_partial
 
         policy: dict[str, Any] | Unset = UNSET
@@ -119,6 +125,8 @@ class InferenceChunkRequest:
             field_dict["embedding"] = embedding
         if outputs is not UNSET:
             field_dict["outputs"] = outputs
+        if observe_only is not UNSET:
+            field_dict["observe_only"] = observe_only
         if allow_partial is not UNSET:
             field_dict["allow_partial"] = allow_partial
         if policy is not UNSET:
@@ -198,6 +206,8 @@ class InferenceChunkRequest:
         else:
             outputs = ChunkOutputs.from_dict(_outputs)
 
+        observe_only = d.pop("observe_only", UNSET)
+
         allow_partial = d.pop("allow_partial", UNSET)
 
         _policy = d.pop("policy", UNSET)
@@ -222,6 +232,7 @@ class InferenceChunkRequest:
             config=config,
             embedding=embedding,
             outputs=outputs,
+            observe_only=observe_only,
             allow_partial=allow_partial,
             policy=policy,
             source_id=source_id,

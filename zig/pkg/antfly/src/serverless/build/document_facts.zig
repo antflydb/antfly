@@ -46,6 +46,7 @@ pub const BodyRef = struct {
 
 pub const Fact = struct {
     body: BodyRef,
+    body_has_dependencies: bool = false,
     last_lsn: u64,
     last_timestamp_ns: u64,
     /// chunk_preview, chunk_embeddings, rerank_terms.
@@ -63,13 +64,15 @@ pub const Fact = struct {
         std.mem.writeInt(u64, bytes[64..72], self.last_timestamp_ns, .little);
         bytes[72] = self.present;
         bytes[73] = self.pending;
+        bytes[74] = @intFromBool(self.body_has_dependencies);
         return bytes;
     }
     pub fn decode(bytes: []const u8) !Fact {
         if (bytes.len != encoded_bytes or bytes[72] > 7 or bytes[73] > 15 or
-            !std.mem.allEqual(u8, bytes[74..80], 0)) return error.InvalidDocumentFact;
+            bytes[74] > 1 or !std.mem.allEqual(u8, bytes[75..80], 0)) return error.InvalidDocumentFact;
         return .{
             .body = .{ .digest = bytes[0..32].*, .attempt = bytes[32..48].*, .bytes = std.mem.readInt(u64, bytes[48..56], .little) },
+            .body_has_dependencies = bytes[74] == 1,
             .last_lsn = std.mem.readInt(u64, bytes[56..64], .little),
             .last_timestamp_ns = std.mem.readInt(u64, bytes[64..72], .little),
             .present = @intCast(bytes[72]),
@@ -95,13 +98,13 @@ pub const Root = struct {
     counts: [7]u64 = @splat(0),
 
     pub const encoded_bytes = 576;
-    pub const metadata_version = 4;
+    pub const metadata_version = 5;
     pub fn eql(a: Root, b: Root) bool {
         return std.mem.eql(u8, &a.encode(), &b.encode());
     }
     pub fn encode(self: Root) [encoded_bytes]u8 {
         var out = @as([encoded_bytes]u8, @splat(0));
-        @memcpy(out[0..8], "AFDFACT4");
+        @memcpy(out[0..8], "AFDFACT5");
         @memcpy(out[16..48], &self.domain);
         @memcpy(out[48..80], &self.policy_fingerprint);
         std.mem.writeInt(u64, out[80..88], self.wal_end_lsn, .little);
@@ -121,7 +124,7 @@ pub const Root = struct {
     }
     pub fn decode(bytes: []const u8) !Root {
         const legacy = bytes.len == 512 and std.mem.eql(u8, bytes[0..8], "AFDFACT3");
-        if (!legacy and (bytes.len != encoded_bytes or !std.mem.eql(u8, bytes[0..8], "AFDFACT4"))) return error.InvalidDocumentFactsRoot;
+        if (!legacy and (bytes.len != encoded_bytes or (!std.mem.eql(u8, bytes[0..8], "AFDFACT4") and !std.mem.eql(u8, bytes[0..8], "AFDFACT5")))) return error.InvalidDocumentFactsRoot;
         if (bytes[8] > (if (legacy) @as(u8, 31) else 63) or !std.mem.allEqual(u8, bytes[9..16], 0) or
             !std.mem.allEqual(u8, bytes[if (legacy) @as(usize, 472) else 536..], 0)) return error.InvalidDocumentFactsRoot;
         var root = Root{
@@ -375,6 +378,24 @@ pub fn bodyDigest(bytes: []const u8) [32]u8 {
     return hash.finalResult();
 }
 
+/// Only flagged bodies need this dependency walk. Ordinary documents retain
+/// the existing metadata-only GC path. Links stay in the namespace's fact-body
+/// domain and every referenced envelope is length/digest verified before use.
+pub fn mediaCheckpointParent(a: Allocator, body: []const u8) !?BodyRef {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const state = parsed.value.object.get("_enrichment") orelse return null;
+    if (state != .object) return null;
+    const group = state.object.get("chunk_embeddings_checkpoint") orelse return null;
+    if (group != .object) return error.InvalidDocumentBody;
+    const version = group.object.get("format") orelse return error.InvalidDocumentBody;
+    if (version != .integer or version.integer != 1) return error.InvalidDocumentBody;
+    const parent = group.object.get("parent") orelse return null;
+    if (parent == .null) return null;
+    return try std.json.parseFromValueLeaky(BodyRef, parsed.arena.allocator(), parent, .{});
+}
+
 pub fn putBody(alloc: Allocator, pages: *page_store.PageStore, bytes: []const u8) !BodyRef {
     try pages.cancellation.check();
     const len = std.math.add(usize, bytes.len, body_header_bytes) catch return error.ArtifactTooLarge;
@@ -420,7 +441,7 @@ pub fn readBodyAlloc(alloc: Allocator, pages: *page_store.PageStore, ref: BodyRe
 }
 
 pub fn loadRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.ArtifactRef) !Root {
-    if (source.kind != .document_facts or !((source.metadata_version == 3 and source.byte_len == 512) or (source.metadata_version == Root.metadata_version and source.byte_len == Root.encoded_bytes)))
+    if (source.kind != .document_facts or !((source.metadata_version == 3 and source.byte_len == 512) or ((source.metadata_version == 4 or source.metadata_version == Root.metadata_version) and source.byte_len == Root.encoded_bytes)))
         return error.InvalidDocumentFactsRoot;
     try artifacts.validateSha256ArtifactIdentity(source.artifact_id, source.checksum);
     const scope = (try artifacts.uploadScopeFromArtifactId(source.artifact_id)) orelse return error.InvalidDocumentFactsRoot;
@@ -432,6 +453,13 @@ pub fn loadRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.Art
     };
     defer alloc.free(bytes);
     try artifacts.validatePayloadSha256WithCancellation(bytes, source.checksum, pages.cancellation);
+    const magic = switch (source.metadata_version) {
+        3 => "AFDFACT3",
+        4 => "AFDFACT4",
+        5 => "AFDFACT5",
+        else => return error.InvalidDocumentFactsRoot,
+    };
+    if (!std.mem.eql(u8, bytes[0..8], magic)) return error.InvalidDocumentFactsRoot;
     const root = try Root.decode(bytes);
     if (!std.mem.eql(u8, &root.domain, &scope.domain)) return error.GraphPageDomainMismatch;
     if (!std.mem.allEqual(u8, &pages.domain, 0) and !std.mem.eql(u8, &root.domain, &pages.domain)) return error.GraphPageDomainMismatch;
@@ -499,7 +527,21 @@ const Reachability = struct {
     }
     pub fn visitRecord(self: *@This(), _: tree.Ref, _: []const u8, value: []const u8) !void {
         const fact = try Fact.decode(value);
-        try self.mark(&try fact.body.identity(self.pages.domain));
+        if (!fact.body_has_dependencies) return self.mark(&try fact.body.identity(self.pages.domain));
+        var current: ?BodyRef = fact.body;
+        while (current) |body| {
+            const id = try body.identity(self.pages.domain);
+            if (self.retained.contains(&id)) break;
+            const bytes = readBodyAlloc(self.alloc, self.pages, body) catch |err| switch (err) {
+                error.FileNotFound => if (self.reclaim) break else return err,
+                else => return err,
+            };
+            defer self.alloc.free(bytes);
+            current = try mediaCheckpointParent(self.alloc, bytes);
+            // Body links form a content-addressed DAG; count and byte budgets
+            // remain owned by the retention operation, just like tree pages.
+            try self.mark(&id);
+        }
     }
     pub fn visit(self: *@This(), ref: tree.Ref) !void {
         try self.mark(&try page_store.PageStore.identity(self.pages.domain, ref));
@@ -522,6 +564,9 @@ test "serverless document facts update only touched paths and maintain exact sou
     try std.testing.expectEqual(@as(u64, 2), root.document_count);
     try std.testing.expectEqual([7]u64{ 2, 0, 2, 2, 2, 0, 0 }, root.counts);
     try std.testing.expect(root.eql(try Root.decode(&root.encode())));
+    var v4 = root.encode();
+    @memcpy(v4[0..8], "AFDFACT4");
+    try std.testing.expect(root.eql(try Root.decode(&v4)));
     // Released v3 roots keep their five original trees readable. Migration
     // rebuilds the separate v4 audit tree from the immutable document facts.
     var legacy = root.encode()[0..512].*;
@@ -743,4 +788,55 @@ test "model aware media audit cycle keeps new arrivals beyond its captured bound
     if (std.mem.eql(u8, next.order_key, after)) next = (try resumed.next()).?;
     // A finite cycle captured at WAL 1 must not admit the WAL 2 arrival.
     if (std.mem.order(u8, next.order_key, upper) != .gt) try std.testing.expectEqualStrings("z", next.key);
+}
+
+test "model aware media checkpoint bodies retain and reclaim their authenticated ancestry" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/checkpoint-retention", .{tmp.sub_path});
+    var fs = try @import("../artifacts/fs_store.zig").FsStore.init(a, path);
+    defer fs.deinit();
+    var objects = fs.artifactStore();
+    var reads: u64 = 16 * 1024 * 1024;
+    var writes: u64 = 16 * 1024 * 1024;
+    var pages = page_store.PageStore{ .domain = page_store.PageStore.namespaceDomain("docs"), .attempt = @splat(1), .artifacts = &objects, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const parent = try putBody(a, &pages, "{\"_enrichment\":{\"chunk_embeddings_checkpoint\":{\"format\":1}}}");
+    const child_bytes = try std.json.Stringify.valueAlloc(a, .{ ._enrichment = .{ .chunk_embeddings_checkpoint = .{ .format = 1, .parent = parent } } }, .{});
+    defer a.free(child_bytes);
+    const child = try putBody(a, &pages, child_bytes);
+    const initial = Root{ .domain = pages.domain, .policy_fingerprint = @splat(2) };
+    var first = try planAlloc(a, pages.store(), initial, &.{.{ .id = "doc", .value = .{ .body = parent, .body_has_dependencies = true, .last_lsn = 1, .last_timestamp_ns = 1 } }}, 1);
+    defer first.deinit();
+    const first_root = try first.publish(pages.store(), initial);
+    const first_ref = try publishRoot(a, &pages, first_root);
+    defer {
+        a.free(first_ref.artifact_id);
+        a.free(first_ref.checksum);
+    }
+    var second = try planAlloc(a, pages.store(), first_root, &.{.{ .id = "doc", .value = .{ .body = child, .body_has_dependencies = true, .last_lsn = 2, .last_timestamp_ns = 2 } }}, 2);
+    defer second.deinit();
+    const second_root = try second.publish(pages.store(), first_root);
+    const second_ref = try publishRoot(a, &pages, second_root);
+    defer {
+        a.free(second_ref.artifact_id);
+        a.free(second_ref.checksum);
+    }
+    var retained: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var keys = retained.keyIterator();
+        while (keys.next()) |key| a.free(key.*);
+        retained.deinit(a);
+    }
+    try retainRoot(a, &pages, second_ref, &retained);
+    try std.testing.expect(retained.contains(&try parent.identity(pages.domain)));
+    try std.testing.expect(retained.contains(&try child.identity(pages.domain)));
+    _ = try reclaimRoot(a, &pages, first_ref, &retained);
+    const old_body = try readBodyAlloc(a, &pages, parent);
+    defer a.free(old_body);
+    var empty: std.StringHashMapUnmanaged(void) = .empty;
+    defer empty.deinit(a);
+    try std.testing.expect(try reclaimRoot(a, &pages, second_ref, &empty) >= 3);
+    try std.testing.expectError(error.FileNotFound, objects.getAlloc(&try parent.identity(pages.domain)));
 }

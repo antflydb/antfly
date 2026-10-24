@@ -66,6 +66,7 @@ pub const Request = struct {
     audio_boundary: bool = false,
     needs_audio: bool = false,
     execute_outputs: bool = true,
+    observe_only: bool = false,
     limits: Limits = .{},
     input: chunker.Input,
     /// Borrow immutable provider context through completed execution/cancellation.
@@ -84,6 +85,7 @@ pub const Request = struct {
     max_working_bytes: usize = 512 * 1024 * 1024,
 };
 pub const Item = struct {
+    observation: bool = false,
     identity: ?planning.Identity = null,
     context: ?EmbeddingContext = null,
     descriptor: planning.Descriptor,
@@ -132,6 +134,10 @@ pub const Runner = struct {
         if (request.outputs) |config| {
             try config.validate();
             if (request.output_executor == null) return error.InvalidChunkOutputs;
+        }
+        if (request.observe_only) {
+            if (request.execute or request.continuation != null or request.outputs == null) return error.InvalidChunkPolicy;
+            for (request.outputs.?.targets) |target| if (target.execute) return error.InvalidChunkPolicy;
         }
         try request.policy.validate();
         try request.limits.validate();
@@ -316,6 +322,20 @@ pub const Runner = struct {
         const scope = image.work_control.Scope.enter(self.control.imageWorkControl());
         defer scope.deinit();
         try self.control.check();
+        if (self.request.observe_only) {
+            // Identity.init already binds immutable source metadata/content,
+            // model planning assets and policy. No parser, decode, token count
+            // or model execution is needed to observe deployed generations.
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const descriptor = planning.Descriptor{ .ordinal = 0, .input_tokens = 0, .coordinates = .{ .kind = .text, .start_byte = 0, .end_byte = 0 } };
+            const context = if (self.executor.describe) |describe| describe(self.executor.context) else null;
+            const values = try self.request.output_executor.?.execute(self.request.output_executor.?.context, arena.allocator(), .{ .text = "" }, descriptor, context, null, null, true);
+            var id: [85]u8 = undefined;
+            try self.sink.accept(self.sink.context, .{ .observation = true, .identity = self.summary.identity, .context = context, .descriptor = descriptor, .id = self.summary.identity.cursor(0, &id), .mime_type = "application/json", .outputs = values });
+            self.summary.complete = true;
+            return self.summary;
+        }
         if (self.request.native_source) |source| {
             try self.readSource(source);
         } else switch (self.request.input) {
@@ -1754,5 +1774,69 @@ test "model aware media audio pages reuse admitted indexes and bind only the cur
         try std.testing.expect(cache.get(Cache.audioKey(&source, request.limits.max_index_packets, request.max_working_bytes).?) == null);
         try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) > 0);
         try std.testing.expectEqual(@as(usize, 0), provider.controller.snapshot().hostTotalBytes());
+    }
+}
+
+test "model aware media generation observation reads no audio source bytes" {
+    const Cache = @import("media_index_cache.zig").Cache;
+    const memory = @import("../runtime/tier/memory.zig");
+    const Provider = struct {
+        bytes: []const u8,
+        read_bytes: usize = 0,
+        controller: memory.AdmissionController = .{},
+        fn acquire(raw: *anyopaque, bytes: usize) !memory.AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.controller.tryAcquire(.cpu, .{ .host_limit_bytes = Cache.max_bytes }, .{ .host_scratch_bytes = bytes }, false);
+        }
+        fn read(raw: *anyopaque, offset: u64, out: []u8, control: media.source.Control) !usize {
+            try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const first: usize = @intCast(offset);
+            const count = @min(out.len, self.bytes.len - first);
+            @memcpy(out[0..count], self.bytes[first..][0..count]);
+            self.read_bytes += count;
+            return count;
+        }
+        fn cancelled(_: ?*anyopaque) bool {
+            return true;
+        }
+    };
+    const ProbeSink = struct {
+        fn accept(raw: *anyopaque, item: Item) !void {
+            const q: *Qualification = @ptrCast(@alignCast(raw));
+            q.seen += 1;
+            try std.testing.expect(item.observation and item.embedding == null);
+            try std.testing.expectEqual(@as(usize, 1), item.outputs.len);
+            try std.testing.expectEqual(.skipped, item.outputs[0].status);
+        }
+    };
+    const Observer = struct {
+        fn execute(_: *anyopaque, a: std.mem.Allocator, _: Payload, _: planning.Descriptor, _: ?EmbeddingContext, _: ?Output, _: ?anyerror, _: bool) ![]const output_types.Result {
+            const values = try a.alloc(output_types.Result, 1);
+            values[0] = .{ .name = "embedding", .kind = .embedding, .required = true, .model = "model", .model_identity = "3333333333333333333333333333333333333333333333333333333333333333", .model_revision = "4444444444444444444444444444444444444444444444444444444444444444", .recipe_id = "5555555555555555555555555555555555555555555555555555555555555555", .status = .skipped };
+            return values;
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "tone.mp3", "codec-corpus/tone-stereo.flac" }) |name| {
+        const path = try std.fmt.allocPrint(a, "../../lib/audio/testdata/{s}", .{name});
+        defer a.free(path);
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(1024 * 1024));
+        defer a.free(bytes);
+        var cache: Cache = .{};
+        defer cache.deinit();
+        var provider = Provider{ .bytes = bytes };
+        var source = media.source.Source{ .allocator = a, .identity = name, .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = bytes.len, .immutable_binding = @splat(1) } } };
+        const mp3 = std.mem.endsWith(u8, name, ".mp3");
+        var first = Qualification{};
+        const config = output_types.Config{ .boundary_model = "embedding", .targets = &.{.{ .name = "embedding", .kind = .embedding, .model = "model", .dimensions = 2, .execute = false }} };
+        const request = Request{ .input = .{ .binary = .{ .mime_type = if (mp3) "audio/mpeg" else "audio/flac", .data = &.{} } }, .native_source = &source, .source_version = "v1", .index_cache = &cache, .index_cache_admission = .{ .context = &provider, .acquire = Provider.acquire }, .policy = .{ .window_ns = 100 * std.time.ns_per_ms, .step_ns = 100 * std.time.ns_per_ms }, .max_chunks = 1, .execute = false, .execute_outputs = true, .observe_only = true, .outputs = config, .output_executor = .{ .context = &first, .execute = Observer.execute } };
+        var runner = try Runner.init(a, request, first.executor(), .{}, .{ .context = &first, .accept = ProbeSink.accept });
+        const summary = try runner.run();
+        try std.testing.expectEqual(@as(u64, 0), summary.next_ordinal);
+        try std.testing.expect(!summary.source_complete);
+        try std.testing.expectEqual(@as(usize, 0), provider.read_bytes);
+        std.debug.print("generation observation {s}: read={d} source={d} outputs={d}\n", .{ name, provider.read_bytes, bytes.len, first.seen });
+        try std.testing.expectEqual(@as(usize, 1), first.seen);
     }
 }

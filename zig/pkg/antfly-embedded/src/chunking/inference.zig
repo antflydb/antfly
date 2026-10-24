@@ -169,6 +169,7 @@ pub fn probeModelPageWithProvider(a: Allocator, supplied: chunking_types.Config,
     cfg.outputs_json = try std.json.Stringify.valueAlloc(scratch, consumers, .{ .emit_null_optional_fields = false });
     cfg.embedding = null;
     cfg.page = true;
+    cfg.observe_only = true;
     cfg.max_chunks = 1;
     cfg.replay = null;
     return chunkPageWithProvider(a, cfg, input, provider);
@@ -431,7 +432,16 @@ fn validateModelChunks(cfg: chunking_types.Config, chunks: []const RemoteChunk) 
         for (chunks) |chunk| {
             const metadata = chunk.metadata orelse return error.ModelAwareChunkProviderRequired;
             if (!std.mem.eql(u8, metadata.model, boundary.model)) return error.InvalidChunkOutput;
-            const results_json = metadata.outputs_json orelse return error.InvalidChunkOutput;
+            const results_json = metadata.outputs_json orelse {
+                // A pre-output-protocol provider may still return its sole
+                // embedding/error on the parent, even for a generation probe.
+                // Accept only that exact legacy contract; multiple consumers
+                // still require independent authenticated result receipts.
+                if (config.value.targets.len != 1 or boundary.kind != .embedding or !boundary.required or !std.mem.eql(u8, boundary.name, "embedding")) return error.InvalidChunkOutput;
+                const legacy = chunking_types.Config{ .provider = .antfly, .page = cfg.page, .embedding = .{ .model = boundary.model, .model_identity = boundary.model_identity, .task_type = boundary.task_type, .dimensions = if (boundary.dimensions) |n| @intCast(n) else null, .execute = boundary.execute } };
+                try validateModelChunks(legacy, &.{chunk});
+                continue;
+            };
             var results = try std.json.parseFromSlice([]inference_chunker.outputs.Result, a, results_json, .{});
             defer results.deinit();
             for (config.value.targets) |target| {
@@ -592,7 +602,7 @@ fn encodeChunkRequest(
     switch (input) {
         .source => |reference| {
             if (!cfg.isModelAware()) return error.ModelAwareChunkProviderRequired;
-            const request = .{ .input = .{ .type = "source", .uri = reference.uri, .mime_type = reference.mime_type, .version = reference.version, .version_kind = @tagName(reference.version_kind), .length = reference.length }, .config = config, .outputs = requested_outputs, .allow_partial = if (cfg.page) true else null, .embedding = requestEmbedding(cfg), .policy = convertOptional(inference_api.MediaChunkPolicy, cfg.policy), .include_content = !cfg.page, .stream = cfg.page, .continuation = continuation, .source_version = if (cfg.replay) |replay| replay.source_version else null };
+            const request = .{ .input = .{ .type = "source", .uri = reference.uri, .mime_type = reference.mime_type, .version = reference.version, .version_kind = @tagName(reference.version_kind), .length = reference.length }, .config = config, .outputs = requested_outputs, .allow_partial = if (cfg.page) true else null, .embedding = requestEmbedding(cfg), .policy = convertOptional(inference_api.MediaChunkPolicy, cfg.policy), .include_content = !cfg.page, .stream = cfg.page and !cfg.observe_only, .observe_only = cfg.observe_only, .continuation = continuation, .source_version = if (cfg.replay) |replay| replay.source_version else null };
             return .{ .metadata_or_json = try httpx.json.Json.stringify(alloc, request) };
         },
         .text => |text| {
@@ -601,10 +611,11 @@ fn encodeChunkRequest(
                 .config = config,
                 .outputs = requested_outputs,
                 .allow_partial = if (cfg.page) true else null,
+                .observe_only = cfg.observe_only,
                 .embedding = requestEmbedding(cfg),
                 .policy = convertOptional(inference_api.MediaChunkPolicy, cfg.policy),
                 .include_content = if (cfg.isModelAware()) true else null,
-                .stream = if (cfg.page) true else null,
+                .stream = if (cfg.page and !cfg.observe_only) true else null,
                 .continuation = continuation,
                 .source_version = if (cfg.replay) |replay| replay.source_version else null,
             };
@@ -622,6 +633,7 @@ fn encodeChunkRequest(
                 config: inference_api.ChunkConfig,
                 outputs: ?inference_api.ChunkOutputs,
                 allow_partial: ?bool,
+                observe_only: bool,
                 embedding: ?inference_api.ChunkEmbeddingTarget,
                 policy: ?inference_api.MediaChunkPolicy,
                 include_content: ?bool,
@@ -637,10 +649,11 @@ fn encodeChunkRequest(
                 .config = config,
                 .outputs = requested_outputs,
                 .allow_partial = if (cfg.page) true else null,
+                .observe_only = cfg.observe_only,
                 .embedding = requestEmbedding(cfg),
                 .policy = convertOptional(inference_api.MediaChunkPolicy, cfg.policy),
                 .include_content = if (cfg.isModelAware()) !cfg.page else null,
-                .stream = if (cfg.page) true else null,
+                .stream = if (cfg.page and !cfg.observe_only) true else null,
                 .continuation = continuation,
                 .source_version = if (cfg.replay) |replay| replay.source_version else null,
             };
@@ -720,6 +733,15 @@ fn parseChunkResponse(alloc: Allocator, response_body: []const u8) ![]RemoteChun
     }
 
     return chunks;
+}
+
+fn responsePolicy(raw: @TypeOf(@as(inference_api.ChunkEmbeddingResponse, undefined).policy)) !inference_chunker.planning.Policy {
+    var policy = inference_chunker.planning.Policy{};
+    inline for (@typeInfo(inference_chunker.planning.Policy).@"struct".field_names) |name| if (@field(raw, name)) |n| {
+        @field(policy, name) = std.math.cast(@TypeOf(@field(policy, name)), n) orelse return error.InvalidChunkerResponse;
+    };
+    try policy.validate();
+    return policy;
 }
 
 fn parseModelChunkResponse(a: Allocator, body: []const u8, replay: ?chunking_types.Replay) ![]RemoteChunk {
@@ -1238,13 +1260,21 @@ fn parseModelChunkPage(a: Allocator, body: []const u8, cfg: chunking_types.Confi
     errdefer a.free(source);
     const version = try a.dupe(u8, r.source_version);
     errdefer a.free(version);
-    const page = ChunkPage{ .chunks = chunks, .plan_id = plan, .source_fingerprint = source, .source_version = version, .start_ordinal = @intCast(r.start_ordinal), .covered_through_ordinal = @intCast(r.covered_through_ordinal), .complete = r.source_complete orelse (std.mem.eql(u8, r.status, "complete") and r.next_continuation == null) };
+    var observation: ?*RemoteMetadata = null;
+    errdefer if (observation) |metadata| metadata.deinit(a);
+    if (r.observation) |item| {
+        if (!cfg.observe_only or chunks.len != 0 or r.start_ordinal != 0 or r.covered_through_ordinal != 0 or r.next_continuation != null or (r.source_complete orelse false)) return error.InvalidChunkerResponse;
+        const outputs_json = if (item.outputs) |values| try std.json.Stringify.valueAlloc(a, values, .{ .emit_null_optional_fields = false }) else return error.InvalidChunkOutput;
+        defer a.free(outputs_json);
+        observation = try (RemoteMetadata{ .descriptor = .{ .ordinal = 0, .input_tokens = 0, .coordinates = .{ .kind = .text, .start_byte = 0, .end_byte = 0 } }, .inference_id = item.descriptor.id, .source_fingerprint = r.source_fingerprint, .source_version = r.source_version, .plan_id = r.plan_id, .model = r.model, .model_identity = r.model_identity, .model_revision = r.model_revision, .task_type = r.task_type, .dimensions = @intCast(r.dimensions), .policy = try responsePolicy(r.policy), .outputs_json = outputs_json }).clone(a);
+    }
+    const page = ChunkPage{ .observation = observation, .chunks = chunks, .plan_id = plan, .source_fingerprint = source, .source_version = version, .start_ordinal = @intCast(r.start_ordinal), .covered_through_ordinal = @intCast(r.covered_through_ordinal), .complete = r.source_complete orelse (std.mem.eql(u8, r.status, "complete") and r.next_continuation == null) };
     if (r.next_continuation) |next| {
         if (page.complete) return error.InvalidChunkerResponse;
         var buffer: [85]u8 = undefined;
         const expected = try std.fmt.bufPrint(&buffer, "{s}:{d}", .{ page.plan_id, page.covered_through_ordinal });
         if (!std.mem.eql(u8, expected, next)) return error.InvalidChunkerResponse;
-    } else if (!page.complete) return error.IncompleteChunkCoverage;
+    } else if (!page.complete and observation == null) return error.IncompleteChunkCoverage;
     var gaps: usize = 0;
     for (chunks) |chunk| if (chunk.metadata.?.embedding_error != null) {
         gaps += 1;
@@ -1256,6 +1286,18 @@ fn parseModelChunkPage(a: Allocator, body: []const u8, cfg: chunking_types.Confi
 
 pub fn validateChunkPage(cfg: chunking_types.Config, page: ChunkPage) !void {
     const start = if (cfg.replay) |position| position.ordinal else 0;
+    if (page.observation != null) {
+        if (page.plan_id.len != 64 or page.source_fingerprint.len != 64 or page.source_version.len == 0) return error.InvalidChunkerResponse;
+        var digest: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&digest, page.plan_id) catch return error.InvalidChunkerResponse;
+        _ = std.fmt.hexToBytes(&digest, page.source_fingerprint) catch return error.InvalidChunkerResponse;
+    }
+    if (page.observation) |metadata| {
+        if (!cfg.observe_only or cfg.replay != null or page.chunks.len != 0 or page.complete or page.start_ordinal != 0 or page.covered_through_ordinal != 0 or metadata.model_identity.len != 64 or metadata.model_revision.len != 64 or !std.mem.eql(u8, page.plan_id, metadata.plan_id) or !std.mem.eql(u8, page.source_fingerprint, metadata.source_fingerprint) or !std.mem.eql(u8, page.source_version, metadata.source_version)) return error.InvalidChunkerResponse;
+        const entry = RemoteChunk{ .id = 0, .mime_type = "application/json", .metadata = metadata };
+        try validateModelChunks(cfg, &.{entry});
+        return;
+    }
     if (page.chunks.len != 0 or start != 0) {
         if (page.plan_id.len != 64 or page.source_fingerprint.len != 64 or page.source_version.len == 0) return error.InvalidChunkerResponse;
         var digest: [32]u8 = undefined;
@@ -1393,4 +1435,35 @@ test "model aware media remote transcription pages request partial results witho
     try std.testing.expect(parsed.value.object.get("allow_partial").?.bool);
     try std.testing.expect(parsed.value.object.get("embedding") == null or parsed.value.object.get("embedding").? == .null);
     try std.testing.expectEqualStrings("speech", parsed.value.object.get("outputs").?.object.get("boundary_model").?.string);
+}
+
+test "model aware media HTTP observations cannot become inventory acknowledgements" {
+    const a = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, model_page_fixture, .{});
+    defer parsed.deinit();
+    const scratch = parsed.arena.allocator();
+    var observation = parsed.value.object.get("data").?.array.items[0];
+    _ = observation.object.swapRemove("embedding");
+    try observation.object.put(scratch, "outputs", .{ .array = std.array_list.Managed(std.json.Value).init(scratch) });
+    try parsed.value.object.put(scratch, "observation", observation);
+    try parsed.value.object.put(scratch, "data", .{ .array = std.array_list.Managed(std.json.Value).init(scratch) });
+    try parsed.value.object.put(scratch, "covered_through_ordinal", .{ .integer = 0 });
+    try parsed.value.object.put(scratch, "source_complete", .{ .bool = false });
+    const encoded = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    defer a.free(encoded);
+    const cfg = chunking_types.Config{ .provider = .antfly, .page = true, .observe_only = true, .max_chunks = 1, .embedding = .{ .model = "model", .dimensions = 2, .execute = false } };
+    var page = try parseModelChunkPage(a, encoded, cfg);
+    defer page.deinit(a);
+    try std.testing.expect(page.observation != null and !page.complete);
+    try std.testing.expectEqual(@as(usize, 0), page.chunks.len);
+    var normal = cfg;
+    normal.observe_only = false;
+    try std.testing.expectError(error.InvalidChunkerResponse, validateChunkPage(normal, page));
+    var request = try encodeChunkRequest(a, cfg, .{ .binary = .{ .mime_type = "audio/mpeg", .data = "fixture" } }, .base64_payload);
+    defer request.deinit(a);
+    var sent = try std.json.parseFromSlice(std.json.Value, a, request.metadata_or_json, .{});
+    defer sent.deinit();
+    try std.testing.expect(sent.value.object.get("observe_only").?.bool);
+    const stream = sent.value.object.get("stream");
+    try std.testing.expect(stream == null or stream.? == .null or !stream.?.bool);
 }

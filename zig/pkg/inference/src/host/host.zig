@@ -1595,7 +1595,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 const wire = inference.server.chunk_response;
                 const cursor = if (cfg.replay) |position| try std.fmt.allocPrint(alloc, "{s}:{d}", .{ position.plan_id, position.ordinal }) else null;
                 defer if (cursor) |value| alloc.free(value);
-                const request: wire.Request = .{ .outputs = if (output_config) |value| value.value else null, .input = input, .policy = try wire.parsePolicy(if (cfg.policy) |policy| convert: {
+                const request: wire.Request = .{ .observe_only = cfg.observe_only, .outputs = if (output_config) |value| value.value else null, .input = input, .policy = try wire.parsePolicy(if (cfg.policy) |policy| convert: {
                     var converted = wire.WirePolicy{};
                     inline for (@typeInfo(wire.WirePolicy).@"struct".field_names) |name| @field(converted, name) = @field(policy, name);
                     break :convert converted;

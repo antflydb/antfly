@@ -46,6 +46,7 @@ class InferenceChunkEmbeddingResponse:
         gaps (list[ChunkCoordinates]):
         output_coverage (list[ChunkOutputCoverage] | Unset):
         degraded (bool | Unset): Optional outputs failed without preventing required-output coverage.
+        observation (ChunkEmbeddingObject | Unset):
         source_complete (bool | Unset): True when source enumeration reached EOF, independently of per-output gaps.
             Resume enumeration at covered_through_ordinal; repair gaps separately.
         source_reference (ChunkSourceReference | Unset):
@@ -71,6 +72,7 @@ class InferenceChunkEmbeddingResponse:
     gaps: list[ChunkCoordinates]
     output_coverage: list[ChunkOutputCoverage] | Unset = UNSET
     degraded: bool | Unset = UNSET
+    observation: ChunkEmbeddingObject | Unset = UNSET
     source_complete: bool | Unset = UNSET
     source_reference: ChunkSourceReference | Unset = UNSET
     source_id: str | Unset = UNSET
@@ -124,6 +126,10 @@ class InferenceChunkEmbeddingResponse:
 
         degraded = self.degraded
 
+        observation: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.observation, Unset):
+            observation = self.observation.to_dict()
+
         source_complete = self.source_complete
 
         source_reference: dict[str, Any] | Unset = UNSET
@@ -163,6 +169,8 @@ class InferenceChunkEmbeddingResponse:
             field_dict["output_coverage"] = output_coverage
         if degraded is not UNSET:
             field_dict["degraded"] = degraded
+        if observation is not UNSET:
+            field_dict["observation"] = observation
         if source_complete is not UNSET:
             field_dict["source_complete"] = source_complete
         if source_reference is not UNSET:
@@ -237,6 +245,13 @@ class InferenceChunkEmbeddingResponse:
 
         degraded = d.pop("degraded", UNSET)
 
+        _observation = d.pop("observation", UNSET)
+        observation: ChunkEmbeddingObject | Unset
+        if isinstance(_observation, Unset):
+            observation = UNSET
+        else:
+            observation = ChunkEmbeddingObject.from_dict(_observation)
+
         source_complete = d.pop("source_complete", UNSET)
 
         _source_reference = d.pop("source_reference", UNSET)
@@ -275,6 +290,7 @@ class InferenceChunkEmbeddingResponse:
             gaps=gaps,
             output_coverage=output_coverage,
             degraded=degraded,
+            observation=observation,
             source_complete=source_complete,
             source_reference=source_reference,
             source_id=source_id,

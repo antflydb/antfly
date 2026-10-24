@@ -22313,6 +22313,11 @@ export interface components {
             config?: components["schemas"]["InferenceChunkConfig"];
             embedding?: components["schemas"]["ChunkEmbeddingTarget"];
             outputs?: components["schemas"]["ChunkOutputs"];
+            /**
+             * @description Resolve source/plan and deployed output identities without enumerating media or executing models. Returns observation metadata separately from data; provides no chunk coverage or source-completion certificate. Requires every output target to have execute=false and no continuation.
+             * @default false
+             */
+            observe_only?: boolean;
             /** @description Continue enumerating descriptors after individual output failures. Applies to named outputs, including transcribe-only requests; overrides the legacy embedding.allow_partial option when present. */
             allow_partial?: boolean;
             policy?: components["schemas"]["MediaChunkPolicy"];
@@ -28405,6 +28410,8 @@ export interface components {
             output_coverage?: components["schemas"]["ChunkOutputCoverage"][];
             /** @description Optional outputs failed without preventing required-output coverage. */
             degraded?: boolean;
+            /** @description Metadata-only generation observation when observe_only=true. Never a chunk inventory member or a coverage acknowledgement. */
+            observation?: components["schemas"]["ChunkEmbeddingObject"];
             /** @description True when source enumeration reached EOF, independently of per-output gaps. Resume enumeration at covered_through_ordinal; repair gaps separately. */
             source_complete?: boolean;
             source_reference?: components["schemas"]["ChunkSourceReference"];

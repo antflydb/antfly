@@ -401,7 +401,7 @@ pub fn loadArtifactFieldValueTxn(
             // and exclude windows/ordinals hidden by the selected generation.
             const prefix = try internal_keys.artifactTypePrefixAlloc(alloc, doc_key, "chunk");
             defer alloc.free(prefix);
-            var vectors = try read_txn.?.openCursor();
+            var vectors = try read_txn.?.openPhysicalKeyCursorAdapter();
             defer vectors.close();
             var next = try vectors.seekAtOrAfter(prefix);
             while (next) |entry| : (next = try vectors.next()) {
@@ -411,7 +411,8 @@ pub fn loadArtifactFieldValueTxn(
                 if ((try @import("artifact_chunk_generation.zig").readMember(alloc, read_txn.?, base)) == null) continue;
                 var ref = (try decodeArtifactRefIfKnownAlloc(alloc, entry.key)) orelse continue;
                 defer ref.deinit(alloc);
-                var value = try artifactProjectionValue(self, alloc, ref, entry.value, artifact_catalog);
+                const payload = try read_txn.?.get(entry.key);
+                var value = try artifactProjectionValue(self, alloc, ref, payload, artifact_catalog);
                 errdefer freeJsonValue(alloc, &value);
                 try appendArtifactProjectionValue(alloc, &artifacts_obj, ref.name, ref.kind, value);
                 artifact_count += 1;

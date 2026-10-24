@@ -4396,6 +4396,8 @@ pub const ChunkEmbeddingResponse = struct {
     output_coverage: ?[]const ChunkOutputCoverage = null,
     /// Optional outputs failed without preventing required-output coverage.
     degraded: ?bool = null,
+    /// Metadata-only generation observation when observe_only=true. Never a chunk inventory member or a coverage acknowledgement.
+    observation: ?ChunkEmbeddingObject = null,
     /// True when source enumeration reached EOF, independently of per-output gaps. Resume enumeration at covered_through_ordinal; repair gaps separately.
     source_complete: ?bool = null,
     source_reference: ?ChunkSourceReference = null,
@@ -4424,6 +4426,7 @@ pub const ChunkEmbeddingResponse = struct {
         .{ "status", "status", false },
         .{ "output_coverage", "output_coverage", true },
         .{ "degraded", "degraded", true },
+        .{ "observation", "observation", true },
         .{ "source_complete", "source_complete", true },
         .{ "source_reference", "source_reference", true },
         .{ "source_id", "source_id", true },
@@ -4465,6 +4468,10 @@ pub const ChunkEmbeddingResponse = struct {
         }
         if (self.degraded) |value| {
             try jw.objectField("degraded");
+            try jw.write(value);
+        }
+        if (self.observation) |value| {
+            try jw.objectField("observation");
             try jw.write(value);
         }
         if (self.source_complete) |value| {
@@ -26624,6 +26631,8 @@ pub const InferenceChunkRequest = struct {
     config: ?InferenceChunkConfig = null,
     embedding: ?ChunkEmbeddingTarget = null,
     outputs: ?ChunkOutputs = null,
+    /// Resolve source/plan and deployed output identities without enumerating media or executing models. Returns observation metadata separately from data; provides no chunk coverage or source-completion certificate. Requires every output target to have execute=false and no continuation.
+    observe_only: ?bool = null,
     /// Continue enumerating descriptors after individual output failures. Applies to named outputs, including transcribe-only requests; overrides the legacy embedding.allow_partial option when present.
     allow_partial: ?bool = null,
     policy: ?MediaChunkPolicy = null,
@@ -26644,6 +26653,7 @@ pub const InferenceChunkRequest = struct {
         .{ "config", "config", true },
         .{ "embedding", "embedding", true },
         .{ "outputs", "outputs", true },
+        .{ "observe_only", "observe_only", true },
         .{ "allow_partial", "allow_partial", true },
         .{ "policy", "policy", true },
         .{ "source_id", "source_id", true },
@@ -26675,6 +26685,10 @@ pub const InferenceChunkRequest = struct {
         }
         if (self.outputs) |value| {
             try jw.objectField("outputs");
+            try jw.write(value);
+        }
+        if (self.observe_only) |value| {
+            try jw.objectField("observe_only");
             try jw.write(value);
         }
         if (self.allow_partial) |value| {

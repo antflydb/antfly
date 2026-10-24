@@ -97,9 +97,10 @@ pub const Config = struct {
     replay: ?Replay = null,
     /// Internal bounded media-pass request; never part of the persisted policy.
     page: bool = false,
+    observe_only: bool = false,
 
     pub fn clone(self: Config, alloc: Allocator) !Config {
-        var copy = Config{ .provider = self.provider, .store_chunks = self.store_chunks, .max_chunks = self.max_chunks, .threshold = self.threshold, .audio = self.audio, .policy = self.policy, .page = self.page };
+        var copy = Config{ .provider = self.provider, .store_chunks = self.store_chunks, .max_chunks = self.max_chunks, .threshold = self.threshold, .audio = self.audio, .policy = self.policy, .page = self.page, .observe_only = self.observe_only };
         errdefer copy.deinit(alloc);
         copy.api_url = try alloc.dupe(u8, self.api_url);
         copy.model = try alloc.dupe(u8, self.model);

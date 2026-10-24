@@ -12038,7 +12038,11 @@ pub const Node = struct {
         const target = wire.Target{ .model = options.model, .model_identity = options.model_identity, .task_type = options.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (options.dimensions) |n| std.math.cast(usize, n) orelse return ctx.status(400).json(.{ .@"error" = "INVALID_DIMENSIONS", .message = "dimensions must be positive" }) else null };
         const limits = self.config.chunking_limits;
         try limits.validate();
-        const request = @import("../pipelines/media_chunking.zig").Request{ .outputs = if (output_config) |value| value.value else null, .execute_outputs = options.execute orelse true, .limits = limits, .max_working_bytes = limits.max_working_bytes, .input = input, .policy = policy, .source_id = body.source_id, .source_version = body.source_version orelse "", .continuation = body.continuation, .execute = options.execute orelse true, .include_content = body.include_content orelse false, .allow_partial = body.allow_partial orelse options.allow_partial orelse false, .max_chunks = config.max_chunks };
+        if (body.observe_only orelse false) {
+            if ((body.stream orelse false) or body.continuation != null or output_config == null) return ctx.status(400).json(.{ .@"error" = "INVALID_CHUNK_POLICY", .message = "observe_only requires named outputs, no continuation, and a buffered response" });
+            for (output_config.?.value.targets) |value| if (value.execute) return ctx.status(400).json(.{ .@"error" = "INVALID_CHUNK_POLICY", .message = "observe_only requires execute=false for every target" });
+        }
+        const request = @import("../pipelines/media_chunking.zig").Request{ .observe_only = body.observe_only orelse false, .outputs = if (output_config) |value| value.value else null, .execute_outputs = options.execute orelse true, .limits = limits, .max_working_bytes = limits.max_working_bytes, .input = input, .policy = policy, .source_id = body.source_id, .source_version = body.source_version orelse "", .continuation = body.continuation, .execute = options.execute orelse true, .include_content = body.include_content orelse false, .allow_partial = body.allow_partial orelse options.allow_partial orelse false, .max_chunks = config.max_chunks };
         const OutputAdmission = struct {
             fn acquire(raw: *anyopaque, bytes: usize) !runtime.tier.memory.AdmissionLease {
                 const manager: *model_manager_mod.ModelManager = @ptrCast(@alignCast(raw));
