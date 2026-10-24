@@ -620,45 +620,38 @@ pub fn testCloudflareSynthesis() !void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var server = try httpx.TestServer.start(a, io, &.{
-        .{ .method = .POST, .path = "/", .max_uses = 1, .respond = .{ .body = "ID3fixture", .content_type = "audio/mpeg" } },
-        .{ .method = .POST, .path = "/", .max_uses = 1, .respond = .{ .body = "{\"success\":true,\"result\":{\"audio\":\"SUQzZml4dHVyZQ==\"}}", .content_type = "application/json" } },
-        .{ .method = .POST, .path = "/", .max_uses = 1, .respond = .{ .body = "{broken", .content_type = "application/json" } },
-        .{ .method = .POST, .path = "/", .max_uses = 1, .respond = .{ .body = "{\"result\":{\"audio\":123}}", .content_type = "application/json" } },
-    });
-    defer server.deinit();
-    var client = server.client();
-    defer client.deinit();
-    var failure: ?anyerror = null;
-    var group = std.Io.Group.init;
-    const Fiber = struct {
-        fn run(alloc: Allocator, http: *httpx.Client, url: []const u8, out: *?anyerror) std.Io.Cancelable!void {
-            var result = synthesizeWithConfig(alloc, http, .{ .provider = .cloudflare, .model = "@cf/deepgram/aura-2-en", .account_id = "account", .api_key = "fixture", .base_url = url }, .{ .text = "hello" }, .{}) catch |err| {
-                out.* = err;
-                return;
-            };
-            defer deinitResult(alloc, &result);
-            std.testing.expectEqualStrings("ID3fixture", result.audio.?) catch |err| {
-                out.* = err;
-                return;
-            };
-            var json_result = synthesizeWithConfig(alloc, http, .{ .provider = .cloudflare, .model = "@cf/deepgram/aura-2-en", .account_id = "account", .api_key = "fixture", .base_url = url }, .{ .text = "hello" }, .{}) catch |err| {
-                out.* = err;
-                return;
-            };
-            defer deinitResult(alloc, &json_result);
-            std.testing.expectEqualStrings("ID3fixture", json_result.audio.?) catch |err| {
-                out.* = err;
-                return;
-            };
-            for (0..2) |_| std.testing.expectError(error.InvalidCloudflareResponse, synthesizeWithConfig(alloc, http, .{ .provider = .cloudflare, .model = "@cf/deepgram/aura-2-en", .account_id = "account", .api_key = "fixture", .base_url = url }, .{ .text = "hello" }, .{})) catch |err| {
-                out.* = err;
-                return;
-            };
-        }
-    };
-    group.concurrent(io, Fiber.run, .{ a, &client, server.baseUrl(), &failure }) catch return;
-    for (0..4) |_| try server.handleOne();
-    group.await(io) catch {};
-    if (failure) |err| return err;
+    const Case = struct { body: []const u8, content_type: []const u8, invalid: bool = false };
+    for ([_]Case{
+        .{ .body = "ID3fixture", .content_type = "audio/mpeg" },
+        .{ .body = "{\"success\":true,\"result\":{\"audio\":\"SUQzZml4dHVyZQ==\"}}", .content_type = "application/json" },
+        .{ .body = "{broken", .content_type = "application/json", .invalid = true },
+        .{ .body = "{\"result\":{\"audio\":123}}", .content_type = "application/json", .invalid = true },
+    }) |case| {
+        var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/", .respond = .{ .body = case.body, .content_type = case.content_type } }});
+        defer server.deinit();
+        var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+        defer client.deinit();
+        var failure: ?anyerror = null;
+        var group = std.Io.Group.init;
+        const Fiber = struct {
+            fn run(alloc: Allocator, http: *httpx.Client, url: []const u8, invalid: bool, out: *?anyerror) std.Io.Cancelable!void {
+                var result = synthesizeWithConfig(alloc, http, .{ .provider = .cloudflare, .model = "@cf/deepgram/aura-2-en", .account_id = "account", .api_key = "fixture", .base_url = url }, .{ .text = "hello" }, .{}) catch |err| {
+                    if (!invalid or err != error.InvalidCloudflareResponse) out.* = err;
+                    return;
+                };
+                defer deinitResult(alloc, &result);
+                if (invalid) {
+                    out.* = error.TestExpectedError;
+                    return;
+                }
+                std.testing.expectEqualStrings("ID3fixture", result.audio.?) catch |err| {
+                    out.* = err;
+                };
+            }
+        };
+        try group.concurrent(io, Fiber.run, .{ a, &client, server.baseUrl(), case.invalid, &failure });
+        try server.handleOne();
+        group.await(io) catch {};
+        if (failure) |err| return err;
+    }
 }
