@@ -126,6 +126,9 @@ pub const GroupProgress = struct {
     available: bool = false,
     fresh: bool = false,
     curation_revision: u64 = 0,
+    namespace_curation_generation: u64 = 0,
+    namespace_curation_table_id: u64 = 0,
+    namespace_curation_missing: bool = false,
     config_generation: u64 = 0,
     effective_generation: u64 = 0,
     backfill_pending: bool = true,
@@ -137,7 +140,7 @@ pub const GroupProgress = struct {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |name| {
-            if (comptime std.mem.eql(u8, name, "empty")) continue;
+            if (comptime std.mem.eql(u8, name, "empty") or std.mem.eql(u8, name, "namespace_curation_generation") or std.mem.eql(u8, name, "namespace_curation_table_id") or std.mem.eql(u8, name, "namespace_curation_missing")) continue;
             try jw.objectField(name);
             try jw.write(@field(self, name));
         }
@@ -148,8 +151,10 @@ const ObservationTarget = struct {
     name: []const u8,
     config_generation: u64,
     promote: bool,
+    authority_table_id: u64 = 0,
+    authority_missing: bool = false,
     fn fromConfig(cfg: Config) ObservationTarget {
-        return .{ .name = cfg.name, .config_generation = cfg.config_generation, .promote = cfg.promote };
+        return .{ .name = cfg.name, .config_generation = cfg.config_generation, .promote = cfg.promote, .authority_table_id = cfg.namespace_curation_table_id, .authority_missing = cfg.namespace_curation_missing };
     }
 };
 pub const Progress = struct { applied: bool, shards: []const GroupProgress, observation_error: []const u8 = "" };
@@ -158,7 +163,9 @@ const ReplayRequirement = struct {
     revision: u64,
     floor: ?ReplayFloor,
     fn applied(self: ReplayRequirement, row: GroupProgress) bool {
-        if (!row.available or !row.fresh or row.curation_revision < self.revision or
+        const revision = if (self.target.authority_table_id != 0) row.namespace_curation_generation else row.curation_revision;
+        if (self.target.authority_table_id != 0 and (row.namespace_curation_missing != self.target.authority_missing or row.namespace_curation_table_id != self.target.authority_table_id)) return false;
+        if (!row.available or !row.fresh or revision < self.revision or
             row.config_generation < self.target.config_generation or row.backfill_pending or
             !curation.stageApplied(row.resolution, row.empty) or
             (self.target.promote and !curation.stageApplied(row.promotion, row.empty))) return false;
@@ -199,6 +206,9 @@ fn sample(server: anytype, a: std.mem.Allocator, snapshot: anytype, table: anyty
     return sampleForReplay(server, a, snapshot, table, request, probe_owners, null);
 }
 fn sampleForReplay(server: anytype, a: std.mem.Allocator, snapshot: anytype, table: anytype, request: operation.RequestContext, probe_owners: bool, required: ?ReplayRequirement) !Sample {
+    return sampleForRequirements(server, a, snapshot, table, request, probe_owners, if (required) |value| &.{value} else &.{});
+}
+fn sampleForRequirements(server: anytype, a: std.mem.Allocator, snapshot: anytype, table: anytype, request: operation.RequestContext, probe_owners: bool, required: []const ReplayRequirement) !Sample {
     var result: Sample = .{};
     for (snapshot.ranges) |range| if (range.table_id == table.table_id) try result.groups.put(a, range.group_id, {});
     var statuses = try server.localTableRuntimeStatusesWithSnapshot(table.name, snapshot);
@@ -220,6 +230,9 @@ fn sampleForReplay(server: anytype, a: std.mem.Allocator, snapshot: anytype, tab
                 .available = true,
                 .fresh = runtime_status.statusRuntimeFresh(status),
                 .curation_revision = cfg.curation_revision,
+                .namespace_curation_generation = cfg.namespace_curation_generation,
+                .namespace_curation_table_id = cfg.namespace_curation_table_id,
+                .namespace_curation_missing = cfg.namespace_curation_missing,
                 .config_generation = cfg.config_generation,
                 .effective_generation = cfg.effective_generation,
                 .backfill_pending = status.stats.resolver_replay.reresolve_pending,
@@ -257,7 +270,9 @@ fn sampleForReplay(server: anytype, a: std.mem.Allocator, snapshot: anytype, tab
                 row.resolution.applied_sequence < row.resolution.target_sequence or
                 (cfg.promote and (!row.promotion.enabled or row.promotion.blocked or row.promotion.catch_up_required or row.promotion.applied_sequence < row.promotion.target_sequence))) break true;
         } else false;
-        const behind_requested = if (required) |target| result.needsReplayProbe(group, target) else false;
+        const behind_requested = for (required) |target| {
+            if (result.needsReplayProbe(group, target)) break true;
+        } else false;
         if (needs_probe or behind_requested) try probes.append(a, .{ .group = group });
     }
     var offset: usize = 0;
@@ -295,6 +310,9 @@ fn mergeOwnerProgress(a: std.mem.Allocator, result: *Sample, group: u64, report:
             .available = true,
             .fresh = true,
             .curation_revision = row.curation_revision,
+            .namespace_curation_generation = row.namespace_curation_generation,
+            .namespace_curation_table_id = row.namespace_curation_table_id,
+            .namespace_curation_missing = row.namespace_curation_missing,
             .config_generation = row.config_generation,
             .effective_generation = row.effective_generation,
             .backfill_pending = row.backfill_pending,
@@ -314,9 +332,10 @@ fn configs(a: std.mem.Allocator, indexes_json: []const u8) ![]const Config {
     const root = try std.json.parseFromSliceLeaky(std.json.Value, a, indexes_json, .{});
     const metadata = try curation.metadataFromValue(a, root);
     var out: std.ArrayListUnmanaged(Config) = .empty;
+    var profiles: std.StringHashMapUnmanaged(void) = .empty;
     try local.metadata_local_index_reconcile.collectDesiredResolvers(a, root, &out);
     for (out.items) |*cfg| for (metadata.identities) |identity| if (!identity.dropped and std.mem.eql(u8, cfg.name, identity.name)) {
-        cfg.* = try curation.overlayMetadata(a, cfg.*, identity);
+        cfg.* = try curation.overlayMetadataCached(a, cfg.*, identity, &profiles);
         break;
     };
     for (metadata.identities) |identity| {
@@ -326,7 +345,7 @@ fn configs(a: std.mem.Allocator, indexes_json: []const u8) ![]const Config {
             found = true;
             break;
         };
-        if (!found) try out.append(a, try curation.overlayMetadata(a, .{ .name = identity.name, .table = identity.table, .key_template = identity.key_template, .source_artifact = "retired_source", .resolution_artifact = "retired_resolution", .promote = false, .retired = true }, identity));
+        if (!found) try out.append(a, try curation.overlayMetadataCached(a, .{ .name = identity.name, .table = identity.table, .key_template = identity.key_template, .source_artifact = "retired_source", .resolution_artifact = "retired_resolution", .promote = false, .retired = true }, identity, &profiles));
     }
     return out.items;
 }
@@ -447,7 +466,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
     // All resolver resources use the same scoped source cut. Full snapshots
     // remain only for sources without the private catalog-read capability.
     const page: ?catalog_read.Page = if (server.source.vtable.supports_resolver_catalog_read)
-        try readResolverCatalog(server, a, .{ .table_name = table_name }, request)
+        try readResolverCatalog(server, a, .{ .table_name = table_name, .projection_names = if (op == .list) null else if (resolver_name.len > 0) &.{resolver_name} else &.{}, .routing_siblings = op == .resolve }, request)
     else
         null;
     const adoption_revision = if (page) |value| @as(?u64, value.revision) else if (entity_mutation and server.source.vtable.linearizable_routing_snapshot != null) blk: {
@@ -462,7 +481,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
         return proposalOperation(server, alloc, a, &snapshot, table, op, key, body, query, request, adoption_revision);
     if (op == .entity_redirects or op == .entity_merge or op == .entity_unmerge or op == .entity_suppress or op == .entity_unsuppress or op == .entity_distinct)
         return entityOperation(server, alloc, a, &snapshot, table, op, key, body, request, adoption_revision, null);
-    const all = try configs(a, table.indexes_json);
+    const all = if (page) |value| value.configs orelse try configs(a, value.executionIndexes()) else try configs(a, table.indexes_json);
     if (op == .list) {
         const observation = try sample(server, a, &snapshot, table, request, true);
         var out = std.json.Array.init(a);
@@ -578,9 +597,12 @@ const EntityDiscovery = struct {
     key: []const u8,
     observations: bool,
     aliases: bool,
+    authority_table_id: u64 = 0,
     consumers: std.ArrayListUnmanaged(EntityConsumer) = .empty,
     folded: std.StringHashMapUnmanaged(std.json.Parsed(curation.Namespace)) = .empty,
     local_targets: std.StringHashMapUnmanaged(LocalTarget) = .empty,
+    profiles: std.ArrayListUnmanaged(@import("../metadata/resolver_authority.zig").AliasProfile) = .empty,
+    profile_keys: std.StringHashMapUnmanaged(void) = .empty,
 
     fn deinit(self: *EntityDiscovery) void {
         var values = self.folded.valueIterator();
@@ -609,6 +631,14 @@ const EntityDiscovery = struct {
             prior.value_ptr.* = owned;
             entry.value_ptr.* = owned.value;
         }
+        const static_aliases = if (self.observations) try cfg.effectiveAliasesAlloc(scratch) else &.{};
+        const profile_key = if (self.observations) try std.json.Stringify.valueAlloc(scratch, .{ template, static_aliases, cfg.suppress_json }, .{}) else "";
+        if (self.observations and !self.profile_keys.contains(profile_key)) {
+            try self.profile_keys.put(self.a, try self.a.dupe(u8, profile_key), {});
+            const owned = try self.a.alloc(resolver.KeyAlias, static_aliases.len);
+            for (static_aliases, owned) |alias, *copy| copy.* = .{ .key = try self.a.dupe(u8, alias.key), .target = try self.a.dupe(u8, alias.target) };
+            try self.profiles.append(self.a, .{ .key_template = template, .aliases = owned, .suppress_json = try self.a.dupe(u8, cfg.suppress_json) });
+        }
         if (self.aliases) for (try cfg.effectiveAliasesAlloc(scratch)) |alias| {
             if (!std.mem.eql(u8, alias.key, self.key)) continue;
             const prior = try self.local_targets.getOrPut(self.a, template);
@@ -619,19 +649,17 @@ const EntityDiscovery = struct {
             .name = try self.a.dupe(u8, cfg.name),
             .config_generation = cfg.config_generation,
             .promote = cfg.promote,
+            .authority_table_id = if (authoritative) self.authority_table_id else 0,
         } });
     }
 };
-const EntityValidation = struct {
-    namespaces: *std.StringArrayHashMapUnmanaged(curation.Namespace),
-    fn consume(self: *EntityValidation, scratch: std.mem.Allocator, _: []const u8, cfg: Config) !void {
-        const namespace = self.namespaces.get(cfg.key_template) orelse return error.InvalidCatalogRecord;
-        var projected = cfg;
-        projected.merges = namespace.merges;
-        projected.curation_json = try std.json.Stringify.valueAlloc(scratch, namespace.state, .{});
-        try projected.validate();
-    }
-};
+/// Static aliases stay local declarations, but planning absorbed releases and
+/// canonical paths must see the same affected graph as validation. Native
+/// corrections override declarations; tombstones mask them. Ambiguity outside
+/// the affected component cannot block an unrelated correction.
+fn entityEffectiveAliases(a: std.mem.Allocator, namespace: curation.Namespace, profiles: []const native_authority.AliasProfile, key: []const u8, into: ?[]const u8) ![]const resolver.KeyAlias {
+    return native_authority.records.effectiveAliases(a, namespace, profiles, key, into);
+}
 
 /// Both passes read the same revision-fenced catalog cut. A page arena owns
 /// transport bytes, table schemas and parsed configs; callbacks retain only
@@ -647,13 +675,13 @@ fn scanEntityConsumers(server: anytype, owner: std.mem.Allocator, snapshot: anyt
             var arena = std.heap.ArenaAllocator.init(owner);
             defer arena.deinit();
             const scratch = arena.allocator();
-            const page = try readResolverCatalog(server, scratch, .{ .table_name = entity_table.name, .mode = .consumers, .key = key, .expected_revision = adoption_revision, .cursor = cursor }, request);
+            const page = try readResolverCatalog(server, scratch, .{ .table_name = entity_table.name, .mode = .consumers, .key = key, .expected_revision = adoption_revision, .cursor = cursor, .compact_consumers = server.source.vtable.supports_resolver_authority }, request);
             var pending: std.ArrayList(ConsumerConfig) = .empty;
             var source_reads: std.ArrayList([]const u8) = .empty;
             for (page.consumers) |consumer| {
                 if ((try seen.getOrPut(owner, consumer.table.table_id)).found_existing) continue;
                 var needs_source_read = false;
-                for (try configs(scratch, consumer.table.indexes_json)) |cfg| {
+                for (consumer.configs orelse try configs(scratch, consumer.table.indexes_json)) |cfg| {
                     for (consumer.names) |name| if (std.mem.eql(u8, cfg.name, name)) {
                         needs_source_read = needs_source_read or !namespaceAdopted(stored, cfg.key_template);
                         try pending.append(scratch, .{ .source_name = consumer.table.name, .config = cfg });
@@ -733,6 +761,65 @@ fn validateProposalPublicationCapacity(alloc: std.mem.Allocator, table: @import(
 
 const proposals_key = curation.proposals_key;
 const ProposalEdit = struct { id: []const u8, decision: resolver.curation.ProposalDecision };
+const native_authority = @import("../metadata/resolver_authority.zig");
+fn readNativeAuthority(server: anytype, a: std.mem.Allocator, table: anytype, input: native_authority.Read, request: operation.RequestContext, cut: ?u64) !?native_authority.View {
+    if (!server.source.vtable.supports_resolver_authority) return null;
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, if (table.indexes_json.len == 0) "{}" else table.indexes_json, .{});
+    if (!native_authority.isNative(root)) return null;
+    const bytes = try server.source.systemCatalog(a, request, .{ .resolver_catalog_read = .{ .table_name = table.name, .table_id = table.table_id, .mode = .authority, .authority = input, .expected_revision = cut } });
+    const view = try std.json.parseFromSliceLeaky(native_authority.View, a, bytes, .{});
+    if (!view.native or view.table_id != table.table_id) return error.CatalogGenerationChanged;
+    return view;
+}
+fn withNativeAuthority(a: std.mem.Allocator, root: *std.json.Value, view: native_authority.View) !void {
+    var namespaces: std.ArrayList(curation.Namespace) = .empty;
+    for (view.namespaces) |value| try namespaces.append(a, value.namespace);
+    try root.object.put(a, curation.namespaces_key, try json(a, curation.Namespaces{ .namespaces = namespaces.items }));
+    try root.object.put(a, proposals_key, try json(a, view.proposals));
+}
+fn publishAuthority(server: anytype, a: std.mem.Allocator, table: anytype, root: std.json.Value, view: ?native_authority.View, owned: []const []const u8, cut: ?u64, request: operation.RequestContext) !?@import("../metadata/api.zig").CatalogMutationStamp {
+    var replacement = table.*;
+    if (!server.source.vtable.supports_resolver_authority) {
+        replacement.indexes_json = try std.json.Stringify.valueAlloc(a, root, .{});
+        return server.source.replaceTableDefinitionStamped(table.*, replacement);
+    }
+    var write: native_authority.Write = .{ .table_id = table.table_id, .schema = try native_authority.schemaFingerprint(a, table.*), .catalog_revision = cut, .standalone = server.cfg.deployment_mode == .standalone, .owned_templates = owned };
+    const before = view orelse legacy: {
+        const old_root = try std.json.parseFromSliceLeaky(std.json.Value, a, if (table.indexes_json.len == 0) "{}" else table.indexes_json, .{});
+        const old_namespaces = try curation.namespacesFromValue(a, old_root);
+        const old_queue = try proposalQueue(a, old_root);
+        const values = try a.alloc(native_authority.records.Snapshot, old_namespaces.namespaces.len);
+        for (old_namespaces.namespaces, values) |namespace, *value| value.* = .{ .head = .{ .key_template = namespace.key_template, .revision = namespace.revision }, .namespace = namespace };
+        write.bootstrap = .{ .expected_indexes = try resolver.fingerprint(a, table.indexes_json) };
+        break :legacy native_authority.View{ .native = false, .table_id = table.table_id, .namespaces = values, .proposals = old_queue, .queue_revision = if (old_queue.proposals.len > 0) 1 else 0 };
+    };
+    {
+        var patches: std.ArrayList(native_authority.records.Patch) = .empty;
+        for ((try curation.namespacesFromValue(a, root)).namespaces) |next| {
+            const old = for (before.namespaces) |value| {
+                if (std.mem.eql(u8, value.head.key_template, next.key_template)) break value.namespace;
+            } else curation.Namespace{ .key_template = next.key_template };
+            if (next.revision != old.revision) try patches.append(a, try native_authority.records.difference(a, old, next));
+        }
+        write.patches = patches.items;
+        const next = try proposalQueue(a, root);
+        var previous: std.StringHashMapUnmanaged([]const u8) = .empty;
+        for (before.proposals.proposals) |value| try previous.put(a, value.id, try std.json.Stringify.valueAlloc(a, value, .{}));
+        var changed: std.ArrayList(resolver.curation.Proposal) = .empty;
+        for (next.proposals) |value| {
+            const raw = try std.json.Stringify.valueAlloc(a, value, .{});
+            if (previous.get(value.id)) |old| if (std.mem.eql(u8, old, raw)) continue;
+            try changed.append(a, value);
+        }
+        if (changed.items.len > 0) write.queue = .{ .expected_revision = before.queue_revision, .revision = try std.math.add(u64, before.queue_revision, 1), .proposals = changed.items };
+    }
+    try request.ensureActive();
+    const bytes = try server.source.systemCatalog(a, request, .{ .resolver_authority_mutate = write });
+    const result = try std.json.parseFromSliceLeaky(native_authority.View, a, bytes, .{});
+    if (!result.receipt) return error.ResolverCurationConflict;
+    return result.stamp;
+}
+
 fn proposalQueue(a: std.mem.Allocator, root: std.json.Value) !resolver.curation.State {
     const value = root.object.get(proposals_key) orelse return .{};
     const state = try resolver.curation.parseState(a, try std.json.Stringify.valueAlloc(a, value, .{}));
@@ -749,6 +836,7 @@ fn findProposal(state: resolver.curation.State, id: []const u8) !resolver.curati
 const ProposalReplay = struct {
     a: std.mem.Allocator,
     namespaces: std.StringArrayHashMapUnmanaged(curation.Namespace) = .empty,
+    authority_table_id: u64 = 0,
     consumers: std.ArrayListUnmanaged(EntityConsumer) = .empty,
 
     fn consume(self: *ProposalReplay, _: std.mem.Allocator, table_name: []const u8, cfg: Config) !void {
@@ -757,6 +845,7 @@ const ProposalReplay = struct {
             .name = try self.a.dupe(u8, cfg.name),
             .config_generation = cfg.config_generation,
             .promote = cfg.promote,
+            .authority_table_id = self.authority_table_id,
         } });
     }
 };
@@ -769,7 +858,7 @@ fn observeProposalDecision(server: anytype, alloc: std.mem.Allocator, a: std.mem
     var applied = true;
     if (has_policy) {
         const stored = try curation.namespacesFromValue(a, root);
-        var replay: ProposalReplay = .{ .a = a };
+        var replay: ProposalReplay = .{ .a = a, .authority_table_id = if (native_authority.isNative(root)) table.table_id else 0 };
         for (stored.namespaces) |namespace| if (curation.keyInNamespace(namespace.key_template, proposal.key)) try replay.namespaces.put(a, namespace.key_template, namespace);
         scanEntityConsumers(server, alloc, snapshot, table, proposal.key, request, adoption_revision, stored, &replay) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -780,12 +869,9 @@ fn observeProposalDecision(server: anytype, alloc: std.mem.Allocator, a: std.mem
                 return response(alloc, 202, .{ .proposal = proposal, .changed = false, .complete = true, .atomicity = "namespace", .applied = false, .results = std.json.Value{ .array = results } });
             },
         };
-        const deadline = @import("antfly_platform").time.monotonicNs() +| @as(u64, if (wait) |w| w.timeout_ms else 0) * std.time.ns_per_ms;
-        for (replay.consumers.items) |consumer| {
+        const observations = try observeConsumers(server, a, replay.consumers.items, replay.namespaces, wait, request);
+        for (replay.consumers.items, observations) |consumer, progress| {
             const namespace = replay.namespaces.get(consumer.key_template).?;
-            const remaining_ns = deadline -| @import("antfly_platform").time.monotonicNs();
-            const remaining = (remaining_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
-            const progress = try observeAccepted(server, a, consumer.table_name, consumer.target, namespace.revision, if (remaining > 0) .{ .timeout_ms = @intCast(remaining) } else null, request);
             applied = applied and progress.applied;
             try results.append(try json(a, .{ .source_table = consumer.table_name, .resolver = consumer.target.name, .changed = false, .revision = namespace.revision, .replay_sequence = namespace.revision, .replay_sequence_kind = "resolver_revision", .accepted = true, .@"error" = progress.observation_error, .applied = progress.applied, .progress = progress }));
         }
@@ -796,6 +882,27 @@ fn observeProposalDecision(server: anytype, alloc: std.mem.Allocator, a: std.mem
 fn proposalOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, snapshot: anytype, table: anytype, op: Operation, id: []const u8, body: []const u8, query: []const u8, request: operation.RequestContext, adoption_revision: ?u64) !@import("public_table_http.zig").OwnedResponse {
     if (readOnly(op)) try server.authorizeTableReads(a, request, &.{table.name}) else try server.authorizeIntegrityMutations(request, &.{.{ .table_name = table.name, .deletes = &.{id} }});
     var root = try std.json.parseFromSliceLeaky(std.json.Value, a, if (table.indexes_json.len == 0) "{}" else table.indexes_json, .{});
+    var native: ?native_authority.View = null;
+    var owned_templates: std.ArrayList([]const u8) = .empty;
+    if (server.source.vtable.supports_resolver_authority) {
+        var input: native_authority.Read = .{ .mode = .proposal, .id = id };
+        if (op == .proposal_create) {
+            const proposed = try std.json.parseFromSliceLeaky(resolver.curation.ProposalRequest, a, body, .{});
+            input = .{ .key = proposed.key, .into = proposed.into, .id = try resolver.curation.proposalId(a, proposed) };
+        } else if (op == .proposals) {
+            const filter = try resolver.curation.proposalQuery(a, query);
+            input = .{ .mode = .proposals, .state = filter.state, .action = filter.action, .cursor = if (filter.cursor.len == 0) null else filter.cursor, .limit = filter.limit };
+        }
+        native = try readNativeAuthority(server, a, table, input, request, adoption_revision);
+        if (native) |view| {
+            if (op == .proposals) return response(alloc, 200, resolver.curation.ProposalPage{ .proposals = view.proposals.proposals, .next_cursor = view.next_cursor });
+            if (op == .proposal_accept or op == .proposal_reject) {
+                const selected = try findProposal(view.proposals, id);
+                native = try readNativeAuthority(server, a, table, .{ .key = selected.key, .into = selected.into, .id = id }, request, adoption_revision);
+            }
+            try withNativeAuthority(a, &root, native.?);
+        }
+    }
     var state = try proposalQueue(a, root);
     if (op == .proposal) return response(alloc, 200, try findProposal(state, id));
     if (op == .proposals) {
@@ -813,6 +920,7 @@ fn proposalOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Alloc
         for (stored.namespaces) |namespace| if (curation.keyInNamespace(namespace.key_template, input.key)) try namespaces.put(a, namespace.key_template, namespace);
         try scanEntityConsumers(server, alloc, snapshot, table, input.key, request, adoption_revision, stored, &discovery);
         if (namespaces.count() == 0) return error.ResolverNotFound;
+        try owned_templates.appendSlice(a, namespaces.keys());
         if (input.into) |into| for (namespaces.values()) |namespace| if (!curation.keyInNamespace(namespace.key_template, into)) return error.InvalidResolverCurationRequest;
         const stamp = curation.manualOrigin(.{ .action = .suppress, .actor = input.actor, .reason = input.reason }, 0);
         const plan = try resolver.curation.propose(a, state, &.{}, input, stamp);
@@ -844,9 +952,9 @@ fn proposalOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Alloc
     try root.object.put(a, proposals_key, try json(a, state));
     var replacement = table.*;
     replacement.indexes_json = try std.json.Stringify.valueAlloc(a, root, .{});
-    if (op == .proposal_create) try validateProposalPublicationCapacity(alloc, replacement, state);
+    if (op == .proposal_create and !server.source.vtable.supports_resolver_authority) try validateProposalPublicationCapacity(alloc, replacement, state);
     try request.ensureActive();
-    _ = try server.source.replaceTableDefinitionStamped(table.*, replacement);
+    _ = try publishAuthority(server, a, table, root, native, owned_templates.items, adoption_revision, request);
     if (op == .proposal_create) return response(alloc, 200, try findProposal(state, try resolver.curation.proposalId(a, try std.json.parseFromSliceLeaky(resolver.curation.ProposalRequest, a, body, .{}))));
     return response(alloc, 200, .{ .proposal = try findProposal(state, id), .changed = true, .complete = true, .atomicity = "namespace", .applied = true, .results = @as([]const std.json.Value, &.{}) });
 }
@@ -862,12 +970,25 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
     if (key.len == 0 or (op == .entity_merge and input.into == null)) return error.InvalidResolverCurationRequest;
     if (input.wait) |wait| if (wait.timeout_ms == 0 or wait.timeout_ms > 300000) return error.InvalidResolverCurationRequest;
     var root = try std.json.parseFromSliceLeaky(std.json.Value, a, if (entity_table.indexes_json.len == 0) "{}" else entity_table.indexes_json, .{});
+    var native = try readNativeAuthority(server, a, entity_table, .{ .key = key, .into = input.into, .include_proposals = op != .entity_redirects, .id = if (proposal_edit) |edit| edit.id else "" }, request, adoption_revision);
+    if (native) |view| try withNativeAuthority(a, &root, view);
     const stored = try curation.namespacesFromValue(a, root);
     var namespaces: std.StringArrayHashMapUnmanaged(curation.Namespace) = .empty;
     for (stored.namespaces) |namespace| if (curation.keyInNamespace(namespace.key_template, key)) try namespaces.put(a, namespace.key_template, namespace);
-    var discovery: EntityDiscovery = .{ .a = a, .owner = alloc, .namespaces = &namespaces, .stored = stored, .adoption_revision = adoption_revision, .standalone = server.cfg.deployment_mode == .standalone, .key = key, .observations = op != .entity_redirects, .aliases = op == .entity_merge or op == .entity_unmerge };
+    var discovery: EntityDiscovery = .{ .a = a, .owner = alloc, .namespaces = &namespaces, .stored = stored, .adoption_revision = adoption_revision, .standalone = server.cfg.deployment_mode == .standalone, .key = key, .observations = op != .entity_redirects, .aliases = op == .entity_merge or op == .entity_unmerge, .authority_table_id = if (native != null) entity_table.table_id else 0 };
     defer discovery.deinit();
-    try scanEntityConsumers(server, alloc, snapshot, entity_table, key, request, adoption_revision, stored, &discovery);
+    // An adopted namespace is self-contained. Inspection does not depend on
+    // source consumers or copy their static/projected policy into the request.
+    if (op != .entity_redirects or native == null or namespaces.count() == 0)
+        try scanEntityConsumers(server, alloc, snapshot, entity_table, key, request, adoption_revision, stored, &discovery);
+    if (native != null and discovery.profiles.items.len > 0) {
+        var seeds: std.ArrayList([]const u8) = .empty;
+        var targets = discovery.local_targets.valueIterator();
+        while (targets.next()) |target| try seeds.append(a, target.target);
+        native = try readNativeAuthority(server, a, entity_table, .{ .key = key, .into = input.into, .seeds = seeds.items, .profiles = discovery.profiles.items, .id = if (proposal_edit) |edit| edit.id else "" }, request, adoption_revision);
+        try withNativeAuthority(a, &root, native.?);
+        for (native.?.namespaces) |value| try namespaces.put(a, value.head.key_template, value.namespace);
+    }
     if (namespaces.count() == 0) return error.ResolverNotFound;
     if (op == .entity_redirects) {
         var states = std.json.Array.init(a);
@@ -893,26 +1014,8 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
     for (namespaces.values()) |*namespace| {
         if (input.into) |target| if (!curation.keyInNamespace(namespace.key_template, target)) return error.InvalidResolverCurationRequest;
         if (input.expected_revision) |expected| if (expected != namespace.revision) return error.ResolverCurationConflict;
-        var materialized_alias = false;
-        var policy_merges = namespace.merges;
-        var effective: std.ArrayListUnmanaged(resolver.KeyAlias) = .empty;
-        try effective.appendSlice(a, namespace.merges);
-        const redirected = for (namespace.merges) |alias| {
-            if (std.mem.eql(u8, alias.key, key)) break true;
-        } else false;
-        if (!redirected and (action == .merge or action == .unmerge)) {
-            if (discovery.local_targets.get(namespace.key_template)) |local_target| {
-                if (local_target.conflict) return error.ResolverNamespaceMigrationConflict;
-                try effective.append(a, .{ .key = key, .target = local_target.target });
-                if (action == .merge and std.mem.eql(u8, local_target.target, input.into.?)) {
-                    // An identical source-local alias is not yet a shared
-                    // correction. Publish that explicit assertion for every
-                    // consumer, including when this namespace is already owned.
-                    policy_merges = effective.items;
-                    materialized_alias = true;
-                }
-            }
-        }
+        const policy_merges = namespace.merges;
+        const effective = try native_authority.records.planningAliases(a, namespace.*, try entityEffectiveAliases(a, namespace.*, discovery.profiles.items, key, input.into), action, key, input.into);
         var planning_state = namespace.state;
         const stamp = curation.manualOrigin(intent, try std.math.add(u64, namespace.revision, 1));
         if (proposal_edit) |edit| {
@@ -921,9 +1024,9 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
             planning_state.proposals = try a.dupe(resolver.curation.Proposal, &.{proposal});
         }
         var plan = if (proposal_edit) |edit|
-            try resolver.curation.decide(a, planning_state, policy_merges, effective.items, edit.id, edit.decision, stamp)
+            try resolver.curation.decide(a, planning_state, policy_merges, effective, edit.id, edit.decision, stamp)
         else
-            try resolver.curation.planWithOrigin(a, try std.json.Stringify.valueAlloc(a, planning_state, .{}), policy_merges, effective.items, intent, stamp);
+            try resolver.curation.planWithOrigin(a, try std.json.Stringify.valueAlloc(a, planning_state, .{}), policy_merges, effective, intent, stamp);
         const local_decision = if (proposal_edit != null) plan.state.proposals[0] else @as(?resolver.curation.Proposal, null);
         plan.state.proposals = namespace.state.proposals;
         const policy_changed = !Config.aliasesEqual(namespace.merges, plan.merges) or !std.mem.eql(u8, try std.json.Stringify.valueAlloc(a, namespace.state, .{}), try std.json.Stringify.valueAlloc(a, plan.state, .{}));
@@ -946,7 +1049,7 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
         try absorbed_results.put(a, namespace.key_template, plan.absorbed);
         const check: Config = .{ .name = "namespace", .table = entity_table.name, .source_artifact = "metadata", .resolution_artifact = "resolved", .key_template = namespace.key_template, .merges = plan.merges, .curation_json = try std.json.Stringify.valueAlloc(a, plan.state, .{}) };
         try check.validate();
-        if (policy_changed or materialized_alias or !namespaceAdopted(stored, namespace.key_template)) {
+        if (policy_changed or !namespaceAdopted(stored, namespace.key_template)) {
             namespace.adoption_revision = adoption_revision;
             namespace.adoption_standalone = server.cfg.deployment_mode == .standalone;
             namespace.state = plan.state;
@@ -956,24 +1059,18 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
             changed = true;
         }
     }
-    var validation: EntityValidation = .{ .namespaces = &namespaces };
-    try scanEntityConsumers(server, alloc, snapshot, entity_table, key, request, adoption_revision, stored, &validation);
+    for (namespaces.values()) |namespace| try native_authority.records.validateProfiles(a, namespace, discovery.profiles.items);
     if (changed) {
         _ = try resolver.curation.parseState(a, try std.json.Stringify.valueAlloc(a, proposal_state, .{}));
         try root.object.put(a, proposals_key, try json(a, proposal_state));
     }
-    var replacement = entity_table.*;
-    replacement.indexes_json = try std.json.Stringify.valueAlloc(a, root, .{});
     try request.ensureActive();
-    const stamp = if (changed) try server.source.replaceTableDefinitionStamped(entity_table.*, replacement) else null;
+    const stamp = if (changed) try publishAuthority(server, a, entity_table, root, native, namespaces.keys(), adoption_revision, request) else null;
     var results = std.json.Array.init(a);
     var applied = true;
-    const deadline = @import("antfly_platform").time.monotonicNs() +| @as(u64, if (input.wait) |wait| wait.timeout_ms else 0) * std.time.ns_per_ms;
-    for (discovery.consumers.items) |consumer| {
+    const observations = try observeConsumers(server, a, discovery.consumers.items, namespaces, input.wait, request);
+    for (discovery.consumers.items, observations) |consumer, progress| {
         const namespace = namespaces.get(consumer.key_template).?;
-        const remaining_ns = deadline -| @import("antfly_platform").time.monotonicNs();
-        const remaining = (remaining_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
-        const progress = try observeAccepted(server, a, consumer.table_name, consumer.target, namespace.revision, if (remaining > 0) .{ .timeout_ms = @intCast(remaining) } else null, request);
         applied = applied and progress.applied;
         try results.append(try json(a, .{ .source_table = consumer.table_name, .resolver = consumer.target.name, .absorbed = absorbed_results.get(consumer.key_template) orelse &.{}, .changed = changed, .revision = namespace.revision, .replay_sequence = namespace.revision, .replay_sequence_kind = "resolver_revision", .accepted = true, .@"error" = progress.observation_error, .applied = progress.applied, .progress = progress }));
     }
@@ -994,7 +1091,114 @@ fn observeReplayAccepted(server: anytype, a: std.mem.Allocator, table_name: []co
     };
 }
 const ReplayFloor = struct { group: u64, sequence: u64 };
+fn observeConsumers(server: anytype, a: std.mem.Allocator, consumers: []const EntityConsumer, namespaces: std.StringArrayHashMapUnmanaged(curation.Namespace), wait: ?resolver.curation.Wait, request: operation.RequestContext) ![]const Progress {
+    var tables: std.StringArrayHashMapUnmanaged(std.ArrayList(usize)) = .empty;
+    for (consumers, 0..) |consumer, i| {
+        const slot = try tables.getOrPut(a, consumer.table_name);
+        if (!slot.found_existing) slot.value_ptr.* = .empty;
+        try slot.value_ptr.append(a, i);
+    }
+    const clock = @import("antfly_platform").time;
+    const deadline = clock.monotonicNs() +| @as(u64, if (wait) |value| value.timeout_ms else 0) * std.time.ns_per_ms;
+    const Probe = struct {
+        arena: std.heap.ArenaAllocator = .init(std.heap.smp_allocator),
+        table: []const u8,
+        indices: []const usize,
+        progress: ?[]const Progress = null,
+        failure: ?anyerror = null,
+        done: bool = false,
+        fn run(self: *@This(), srv: @TypeOf(server), inputs: []const EntityConsumer, policy: @TypeOf(namespaces), requested_wait: @TypeOf(wait), context: operation.RequestContext, end: u64) void {
+            self.arena.deinit();
+            self.arena = .init(std.heap.smp_allocator);
+            self.progress = null;
+            self.failure = null;
+            const scratch = self.arena.allocator();
+            const targets = scratch.alloc(ReplayRequirement, self.indices.len) catch |err| {
+                self.failure = err;
+                return;
+            };
+            for (self.indices, targets) |index, *target| {
+                const consumer = inputs[index];
+                target.* = .{ .target = consumer.target, .revision = policy.get(consumer.key_template).?.revision, .floor = null };
+            }
+            const remaining = (end -| @import("antfly_platform").time.monotonicNs() +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms;
+            if (requested_wait != null and remaining == 0) {
+                self.failure = error.DeadlineExceeded;
+                return;
+            }
+            var bounded = context;
+            if (requested_wait != null) bounded.deadline_ns = @min(bounded.deadline_ns orelse std.math.maxInt(u64), end);
+            self.progress = observeReplayTargetsMode(srv, scratch, self.table, targets, if (requested_wait != null) .{ .timeout_ms = @intCast(remaining) } else null, bounded, true) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.done = for (self.progress.?) |value| {
+                if (!value.applied) break false;
+            } else true;
+        }
+    };
+    const probes = try a.alloc(Probe, tables.count());
+    for (tables.keys(), tables.values(), probes) |table, selected, *probe| probe.* = .{ .table = table, .indices = selected.items };
+    defer for (probes) |*probe| probe.arena.deinit();
+    while (true) {
+        var offset: usize = 0;
+        while (offset < probes.len) {
+            var batch: [16]*Probe = undefined;
+            var count: usize = 0;
+            while (offset < probes.len and count < batch.len) : (offset += 1) {
+                if (probes[offset].done) continue;
+                batch[count] = &probes[offset];
+                count += 1;
+            }
+            if (request.fanout_io orelse request.deadline_io) |borrow| {
+                var receiver = try borrow.receive();
+                const io = receiver.io();
+                var tasks: std.Io.Group = .init;
+                defer tasks.cancel(io);
+                for (batch[0..count]) |probe| tasks.async(io, Probe.run, .{ probe, server, consumers, namespaces, wait, request, deadline });
+                tasks.await(io) catch return error.Canceled;
+            } else for (batch[0..count]) |probe| Probe.run(probe, server, consumers, namespaces, wait, request, deadline);
+            try request.ensureActive();
+            for (batch[0..count]) |probe| if (probe.failure) |failure| {
+                if (failure == error.OutOfMemory) return error.OutOfMemory;
+            };
+        }
+        const complete = for (probes) |probe| {
+            if (!probe.done) break false;
+        } else true;
+        const borrow = request.fanout_io orelse request.deadline_io;
+        if (complete or wait == null or clock.monotonicNs() >= deadline or borrow == null) break;
+        var receiver = try borrow.?.receive();
+        try receiver.io().sleep(.fromNanoseconds(@intCast(@min(100 * std.time.ns_per_ms, deadline -| clock.monotonicNs()))), .awake);
+    }
+    const result = try a.alloc(Progress, consumers.len);
+    for (probes) |probe| {
+        if (probe.progress) |progress| {
+            for (probe.indices, progress) |index, value| {
+                const rows = try a.dupe(GroupProgress, value.shards);
+                for (rows) |*row| {
+                    row.resolution.blocked_reason = try a.dupe(u8, row.resolution.blocked_reason);
+                    row.promotion.blocked_reason = try a.dupe(u8, row.promotion.blocked_reason);
+                }
+                result[index] = .{ .applied = value.applied, .shards = rows, .observation_error = try a.dupe(u8, value.observation_error) };
+            }
+        } else for (probe.indices) |index| result[index] = .{ .applied = false, .shards = &.{}, .observation_error = if (probe.failure) |err| @errorName(err) else "Unavailable" };
+    }
+    return result;
+}
+
+fn pendingProgress(a: std.mem.Allocator, count: usize, failure: []const u8) ![]const Progress {
+    const result = try a.alloc(Progress, count);
+    @memset(result, .{ .applied = false, .shards = &.{}, .observation_error = failure });
+    return result;
+}
 fn observeReplayUntil(server: anytype, a: std.mem.Allocator, table_name: []const u8, cfg: ObservationTarget, revision: u64, wait: ?resolver.curation.Wait, request: operation.RequestContext, floor: ?ReplayFloor) !Progress {
+    return (try observeReplayTargets(server, a, table_name, &.{.{ .target = cfg, .revision = revision, .floor = floor }}, wait, request))[0];
+}
+fn observeReplayTargets(server: anytype, a: std.mem.Allocator, table_name: []const u8, targets: []const ReplayRequirement, wait: ?resolver.curation.Wait, request: operation.RequestContext) ![]const Progress {
+    return observeReplayTargetsMode(server, a, table_name, targets, wait, request, false);
+}
+fn observeReplayTargetsMode(server: anytype, a: std.mem.Allocator, table_name: []const u8, targets: []const ReplayRequirement, wait: ?resolver.curation.Wait, request: operation.RequestContext, once: bool) ![]const Progress {
     const clock = @import("antfly_platform").time;
     const deadline = clock.monotonicNs() +| @as(u64, if (wait) |w| w.timeout_ms else 0) * std.time.ns_per_ms;
     while (true) {
@@ -1005,36 +1209,45 @@ fn observeReplayUntil(server: anytype, a: std.mem.Allocator, table_name: []const
         var observation_request = try request.platformDeadline();
         if (wait != null) observation_request.deadline_ns = @min(observation_request.deadline_ns orelse std.math.maxInt(u64), deadline);
         const scoped = server.source.vtable.supports_resolver_catalog_read;
-        const page: ?catalog_read.Page = if (scoped) readResolverCatalog(server, scratch, .{ .table_name = table_name }, observation_request) catch |err| {
+        const page: ?catalog_read.Page = if (scoped) readResolverCatalog(server, scratch, .{ .table_name = table_name, .projection_names = &.{} }, observation_request) catch |err| {
             try request.ensureActive();
-            if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return .{ .applied = false, .shards = &.{}, .observation_error = @errorName(err) };
+            if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return pendingProgress(a, targets.len, @errorName(err));
             return err;
         } else null;
         var snapshot = if (page) |*value| value.snapshot() else (server.source.linearizableSnapshot(observation_request) catch |err| {
             try request.ensureActive();
-            if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return .{ .applied = false, .shards = &.{}, .observation_error = @errorName(err) };
+            if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return pendingProgress(a, targets.len, @errorName(err));
             return err;
         }) orelse return error.TableNotFound;
         const table = tableByName(&snapshot, table_name) catch |err| {
             if (!scoped) server.source.freeAdminSnapshot(&snapshot);
             return err;
         };
-        const observation = sampleForReplay(server, scratch, &snapshot, table, observation_request, wait != null, .{ .target = cfg, .revision = revision, .floor = floor }) catch |err| {
+        const observation = sampleForRequirements(server, scratch, &snapshot, table, observation_request, wait != null, targets) catch |err| {
             if (!scoped) server.source.freeAdminSnapshot(&snapshot);
             try request.ensureActive();
-            if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return .{ .applied = false, .shards = &.{}, .observation_error = @errorName(err) };
+            if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return pendingProgress(a, targets.len, @errorName(err));
             return err;
         };
         if (!scoped) server.source.freeAdminSnapshot(&snapshot);
-        const progress = try observation.progressForReplay(scratch, .{ .target = cfg, .revision = revision, .floor = floor });
+        const progress = try scratch.alloc(Progress, targets.len);
+        var applied = true;
+        for (targets, progress) |target, *out| {
+            out.* = try observation.progressForReplay(scratch, target);
+            applied = applied and out.applied;
+        }
         const borrow = request.fanout_io orelse request.deadline_io;
-        if (progress.applied or clock.monotonicNs() >= deadline or borrow == null) {
-            const rows = try a.dupe(GroupProgress, progress.shards);
-            for (rows) |*row| {
-                row.resolution.blocked_reason = try a.dupe(u8, row.resolution.blocked_reason);
-                row.promotion.blocked_reason = try a.dupe(u8, row.promotion.blocked_reason);
+        if (once or applied or clock.monotonicNs() >= deadline or borrow == null) {
+            const owned = try a.alloc(Progress, progress.len);
+            for (progress, owned) |value, *out| {
+                const rows = try a.dupe(GroupProgress, value.shards);
+                for (rows) |*row| {
+                    row.resolution.blocked_reason = try a.dupe(u8, row.resolution.blocked_reason);
+                    row.promotion.blocked_reason = try a.dupe(u8, row.promotion.blocked_reason);
+                }
+                out.* = .{ .applied = value.applied, .shards = rows };
             }
-            return .{ .applied = progress.applied, .shards = rows };
+            return owned;
         }
         var receiver = try borrow.?.receive();
         try receiver.io().sleep(.fromNanoseconds(@intCast(@min(100 * std.time.ns_per_ms, deadline -| clock.monotonicNs()))), .awake);
@@ -1242,7 +1455,7 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
 /// Query-time embedding configuration and final source validation share the
 /// scoped definition path, including nested reads after candidate execution.
 fn readResolverIndexes(server: anytype, a: std.mem.Allocator, name: []const u8, request: operation.RequestContext) ![]const u8 {
-    if (server.source.vtable.supports_resolver_catalog_read) return (try readResolverCatalog(server, a, .{ .table_name = name }, request)).table.indexes_json;
+    if (server.source.vtable.supports_resolver_catalog_read) return (try readResolverCatalog(server, a, .{ .table_name = name, .projection_names = &.{} }, request)).table.indexes_json;
     var snapshot = (try server.source.linearizableSnapshot(request)) orelse return error.TableNotFound;
     defer server.source.freeAdminSnapshot(&snapshot);
     return a.dupe(u8, (try tableByName(&snapshot, name)).indexes_json);
@@ -1494,4 +1707,146 @@ test "resolver curation HTTP namespace edits preserve resolver-shaped proposal e
     const declaring = try owners(a, plan.indexes_json, "r");
     try std.testing.expectEqual(@as(usize, 1), declaring.len);
     try std.testing.expectEqualStrings("graph", declaring[0]);
+}
+
+test "resolver curation progress shares catalog and status reads across namespace consumers" {
+    const Snapshot = @import("../metadata/api.zig").AdminSnapshot;
+    const Source = struct {
+        vtable: struct { supports_resolver_catalog_read: bool = false } = .{},
+        reads: usize = 0,
+        snapshot: Snapshot,
+        pub fn systemCatalog(_: *@This(), _: std.mem.Allocator, _: operation.RequestContext, _: anytype) ![]u8 {
+            return error.UnsupportedOperation;
+        }
+        pub fn linearizableSnapshot(self: *@This(), _: operation.RequestContext) !?Snapshot {
+            self.reads += 1;
+            return self.snapshot;
+        }
+        pub fn freeAdminSnapshot(_: *@This(), _: *Snapshot) void {}
+    };
+    const Server = struct {
+        alloc: std.mem.Allocator,
+        source: Source,
+        samples: usize = 0,
+        pub fn localTableRuntimeStatusesWithSnapshot(self: *@This(), _: []const u8, _: anytype) !?runtime_status.LocalTableRuntimeStatuses {
+            self.samples += 1;
+            var row: runtime_status.LocalTableRuntimeStatus = .{ .group_id = 7, .metadata = .{ .source = .remote_store, .freshness = .fresh }, .stats = .{} };
+            row.stats.resolution = .{ .enabled = true };
+            row.stats.resolver_replay.resolvers = &.{ .{ .name = "concepts", .curation_revision = 4 }, .{ .name = "events", .curation_revision = 4 } };
+            var rows = [_]runtime_status.LocalTableRuntimeStatus{row};
+            const statuses: runtime_status.LocalTableRuntimeStatuses = .{ .items = &rows };
+            return try statuses.clone(self.alloc);
+        }
+        pub fn executeResolverOperation(_: *@This(), _: std.mem.Allocator, _: []const u8, _: u64, _: []const u8, _: operation.RequestContext) ![]u8 {
+            return error.UnsupportedOperation;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tables = [_]@import("../metadata/table_manager.zig").TableRecord{.{ .name = "source", .table_id = 1, .indexes_json = "{}" }};
+    var ranges = [_]@import("../metadata/table_manager.zig").RangeRecord{.{ .table_id = 1, .group_id = 7, .start_key = "" }};
+    var server: Server = .{ .alloc = std.testing.allocator, .source = .{ .snapshot = .{ .status = .{ .metadata_group_id = 0, .metrics = .{} }, .tables = &tables, .ranges = &ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} } } };
+    var namespaces: std.StringArrayHashMapUnmanaged(curation.Namespace) = .empty;
+    try namespaces.put(a, "concept/{{ _entity.text }}", .{ .key_template = "concept/{{ _entity.text }}", .revision = 4 });
+    try namespaces.put(a, "event/{{ _entity.text }}", .{ .key_template = "event/{{ _entity.text }}", .revision = 5 });
+    const progress = try observeConsumers(&server, a, &.{ .{ .table_name = "source", .key_template = namespaces.keys()[0], .target = .{ .name = "concepts", .config_generation = 0, .promote = false } }, .{ .table_name = "source", .key_template = namespaces.keys()[1], .target = .{ .name = "events", .config_generation = 0, .promote = false } } }, namespaces, null, .{});
+    try std.testing.expectEqual(@as(usize, 1), server.source.reads);
+    try std.testing.expectEqual(@as(usize, 1), server.samples);
+    try std.testing.expect(progress[0].applied);
+    try std.testing.expect(!progress[1].applied);
+}
+
+test "resolver curation HTTP discovery retains static edges beyond the requested key" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var namespaces: std.StringArrayHashMapUnmanaged(curation.Namespace) = .empty;
+    const template = "entity/{{_key}}";
+    var discovery: EntityDiscovery = .{ .a = a, .owner = std.testing.allocator, .namespaces = &namespaces, .stored = .{ .namespaces = &.{.{ .key_template = template, .revision = 1 }} }, .adoption_revision = 1, .standalone = true, .key = "entity/a", .observations = true, .aliases = true, .authority_table_id = 7 };
+    defer discovery.deinit();
+    try discovery.consume(a, "source", .{ .name = "concepts", .table = "entities", .key_template = template, .source_artifact = "kg", .resolution_artifact = "resolved", .aliases = &.{ .{ .key = "entity/b", .target = "entity/c" }, .{ .key = "entity/d", .target = "entity/e" } } });
+    try std.testing.expectEqual(@as(usize, 1), discovery.profiles.items.len);
+    try std.testing.expectEqual(@as(usize, 2), discovery.profiles.items[0].aliases.len);
+    try std.testing.expectEqual(@as(usize, 0), discovery.local_targets.count());
+    try std.testing.expectEqual(@as(u64, 7), discovery.consumers.items[0].target.authority_table_id);
+}
+
+test "resolver curation HTTP plans static absorbed releases without unrelated alias conflicts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const template = "entity/{{_key}}";
+    const namespace: curation.Namespace = .{ .key_template = template, .revision = 1, .merges = &.{.{ .key = "entity/q", .target = "entity/r" }} };
+    const profiles = [_]native_authority.AliasProfile{
+        .{ .key_template = template, .aliases = &.{ .{ .key = "entity/b", .target = "entity/c" }, .{ .key = "entity/r", .target = "entity/x" }, .{ .key = "entity/x", .target = "entity/y" } } },
+        .{ .key_template = template, .aliases = &.{.{ .key = "entity/x", .target = "entity/z" }} },
+    };
+    const effective = try entityEffectiveAliases(a, namespace, &profiles, "entity/c", null);
+    try std.testing.expectEqual(@as(usize, 1), effective.len);
+    const plan = try resolver.curation.plan(a, "", namespace.merges, effective, .{ .action = .suppress, .key = "entity/c", .absorbed = .release });
+    try std.testing.expectEqual(@as(usize, 1), plan.absorbed.len);
+    try std.testing.expectEqualStrings("entity/b", plan.absorbed[0].key);
+    try std.testing.expectEqualStrings("entity/b", plan.state.removed_aliases[0]);
+    try std.testing.expectError(error.ResolverNamespaceMigrationConflict, entityEffectiveAliases(a, namespace, &profiles, "entity/x", null));
+}
+
+test "resolver curation progress observes source tables with bounded parallel ownership" {
+    const Snapshot = @import("../metadata/api.zig").AdminSnapshot;
+    const Source = struct {
+        vtable: struct { supports_resolver_catalog_read: bool = false } = .{},
+        reads: std.atomic.Value(usize) = .init(0),
+        snapshot: Snapshot,
+        pub fn systemCatalog(_: *@This(), _: std.mem.Allocator, _: operation.RequestContext, _: anytype) ![]u8 {
+            return error.UnsupportedOperation;
+        }
+        pub fn linearizableSnapshot(self: *@This(), _: operation.RequestContext) !?Snapshot {
+            _ = self.reads.fetchAdd(1, .monotonic);
+            return self.snapshot;
+        }
+        pub fn freeAdminSnapshot(_: *@This(), _: *Snapshot) void {}
+    };
+    const Server = struct {
+        alloc: std.mem.Allocator = std.heap.smp_allocator,
+        source: Source,
+        active: std.atomic.Value(usize) = .init(0),
+        maximum: std.atomic.Value(usize) = .init(0),
+        pub fn localTableRuntimeStatusesWithSnapshot(self: *@This(), name: []const u8, _: anytype) !?runtime_status.LocalTableRuntimeStatuses {
+            const active = self.active.fetchAdd(1, .monotonic) + 1;
+            defer _ = self.active.fetchSub(1, .monotonic);
+            var prior = self.maximum.load(.monotonic);
+            while (prior < active) prior = self.maximum.cmpxchgWeak(prior, active, .monotonic, .monotonic) orelse break;
+            try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+            const index = try std.fmt.parseInt(u64, name[7..], 10);
+            var row: runtime_status.LocalTableRuntimeStatus = .{ .group_id = index + 100, .metadata = .{ .source = .remote_store, .freshness = .fresh }, .stats = .{} };
+            row.stats.resolution = .{ .enabled = true };
+            row.stats.resolver_replay.resolvers = &.{.{ .name = "concepts", .curation_revision = 4 }};
+            var rows = [_]runtime_status.LocalTableRuntimeStatus{row};
+            return try (runtime_status.LocalTableRuntimeStatuses{ .items = &rows }).clone(self.alloc);
+        }
+        pub fn executeResolverOperation(_: *@This(), _: std.mem.Allocator, _: []const u8, _: u64, _: []const u8, _: operation.RequestContext) ![]u8 {
+            return error.UnsupportedOperation;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tables = try a.alloc(@import("../metadata/table_manager.zig").TableRecord, 32);
+    const ranges = try a.alloc(@import("../metadata/table_manager.zig").RangeRecord, 32);
+    const consumers = try a.alloc(EntityConsumer, 32);
+    for (tables, ranges, consumers, 0..) |*table, *range, *consumer, i| {
+        const name = try std.fmt.allocPrint(a, "source-{d}", .{i});
+        table.* = .{ .name = name, .table_id = i + 1, .indexes_json = "{}" };
+        range.* = .{ .table_id = i + 1, .group_id = i + 100, .start_key = "" };
+        consumer.* = .{ .table_name = name, .key_template = "concept/{{_key}}", .target = .{ .name = "concepts", .config_generation = 0, .promote = false } };
+    }
+    var server: Server = .{ .source = .{ .snapshot = .{ .status = .{ .metadata_group_id = 0, .metrics = .{} }, .tables = tables, .ranges = ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} } } };
+    var namespaces: std.StringArrayHashMapUnmanaged(curation.Namespace) = .empty;
+    try namespaces.put(a, "concept/{{_key}}", .{ .key_template = "concept/{{_key}}", .revision = 4 });
+    const io = std.testing.io;
+    const progress = try observeConsumers(&server, a, consumers, namespaces, null, .{ .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io) });
+    for (progress) |value| try std.testing.expect(value.applied);
+    try std.testing.expectEqual(@as(usize, 32), server.source.reads.load(.monotonic));
+    try std.testing.expect(server.maximum.load(.monotonic) > 1 and server.maximum.load(.monotonic) <= 16);
+    try std.testing.expectEqual(@as(usize, 0), server.active.load(.monotonic));
 }

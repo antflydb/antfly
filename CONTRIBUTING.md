@@ -5,6 +5,7 @@
 ```
 zig/pkg/antfly/      Antfly server, CLI, storage, Raft, and embedded runtime
 zig/pkg/inference/   Local inference runtime
+zig/pkg/antfly-embedded/src/memory/  Shared native memory policy
 zig/e2e/             Zig runtime end-to-end suites
 go/pkg/
   embedded/          Go binding for local databases and inference
@@ -12,7 +13,6 @@ go/pkg/
   docsaf/            Content ingestion (filesystem, web crawl, git, S3)
   evalaf/            LLM/RAG evaluation framework
   genkit/            Firebase Genkit plugins (antfly, openrouter)
-  memoryaf/          Memory-focused Antfly helpers
 ts/
   packages/sdk/      TypeScript SDK (@antfly/sdk)
   packages/embedded/    TypeScript embedded binding (@antfly/embedded)
@@ -33,7 +33,7 @@ docs/                Hand-written documentation (synced to docs site at build ti
 
 ## Prerequisites
 
-- **Zig 0.16** — required for the server runtime
+- **Zig 0.17** — required for the server runtime
 - **Go 1.26+** — required for retained Go SDKs and tools
 - **Python 3.11+ and uv** — required for Python SDK and repository tooling
 - **Rust** — required for the Rust SDK and extensions; CI pins the exact version
@@ -56,7 +56,7 @@ Run `make help` for the full list. Key targets:
 | `make generate` | Join the public `openapi.yaml` and regenerate OpenAPI types, Go/TS/Python/Rust SDKs, and the embedded Antfarm dashboard |
 | `make fmt` | Format Zig, Go, Python, TypeScript, and Rust sources |
 | `make fmt-check` | Verify repository formatting without changing files |
-| `make repository-check` | Run formatting, SDK, memoryaf, and release-tooling checks serially |
+| `make repository-check` | Run formatting, SDK, native memory, and release-tooling checks serially |
 | `make lint` | Run linters across retained Go modules and TypeScript |
 | `make tidy` | Run `go mod tidy` across retained Go modules |
 | `make tidy-check` | Verify retained Go modules are tidy |
@@ -103,7 +103,6 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 | evalaf antfly plugin | `go/pkg/evalaf/plugins/antfly/` |
 | Genkit plugin | `go/pkg/genkit/antfly/` |
 | Genkit OpenRouter | `go/pkg/genkit/openrouter/` |
-| Memory helpers | `go/pkg/memoryaf/` |
 
 `make generate`, `make lint`, and `make update-deps` iterate over all submodules automatically.
 `make tidy` and `make tidy-check` do too.

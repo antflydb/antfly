@@ -69,17 +69,27 @@ const std = @import("std");
 /// queues. Even an empty newly serialized namespace has fields v35 rejects.
 /// Version 37 fences proposal-owned source corrections at primary apply and
 /// understands durable queue identities on embedded resolver receipts.
-pub const current_version: u16 = 39;
+/// Version 38 preserves native service table ownership at every ingress and
+/// metadata peer, independently of resolver namespace/proposal support.
+/// Version 39 decodes native per-record resolver authority and its atomic heads.
+/// Version 40 carries compact physical namespace bindings and projection reads.
+/// Version 41 carries shared content-addressed namespace execution attachments.
+pub const current_version: u16 = 44;
+pub const resolver_records_version: u16 = 42;
+pub const native_service_tables_version: u16 = 38;
 pub const resolver_namespaces_version: u16 = 37;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
+pub fn usesResolverRecords(indexes_json: []const u8) bool {
+    return std.mem.indexOf(u8, indexes_json, "_resolver_record_store") != null or std.mem.indexOf(u8, indexes_json, "projection_only") != null or std.mem.indexOf(u8, indexes_json, "authority_table_id") != null;
+}
 pub fn usesResolverNamespaces(indexes_json: []const u8) bool {
     return std.mem.indexOf(u8, indexes_json, "_resolver_namespaces") != null or std.mem.indexOf(u8, indexes_json, "namespace_owned") != null or std.mem.indexOf(u8, indexes_json, "resolvers") != null or std.mem.indexOf(u8, indexes_json, "_resolver_curation") != null or std.mem.indexOf(u8, indexes_json, "_curation_proposals") != null;
 }
 
-/// Version 38 adds atomic transaction sessions; version 39 adds graph definitions.
-pub const transaction_sessions_version: u16 = 38;
-pub const graph_definition_version: u16 = 39;
+/// Version 43 adds atomic transaction sessions; version 44 adds graph definitions.
+pub const transaction_sessions_version: u16 = 43;
+pub const graph_definition_version: u16 = 44;
 pub const relation_mutation_version: u16 = 33;
 pub const relation_publication_version: u16 = 32;
 pub const relation_reconciliation_version: u16 = 31;

@@ -3835,3 +3835,39 @@ Reuse-aware posting publication also batches changed pack uploads and overlaps
 local capture under the same cancellation/admission contract as fresh builds.
 These paths preserve inline/full-construction fallbacks when optional work cannot
 be admitted. No archive-scale speedup is claimed without measurement.
+
+
+The protocol 80 refinement in [lake row identity](lake-row-identity.md#shared-spill-locality-and-bounded-reducer-maintenance-reader-protocol-80)
+adds descriptor-independent merge runs, adaptive paged join hash partitions,
+per-segment forward term evidence and bounded exact group reduction trees.
+Forward/statistics replacement metadata must survive file checkpoints, and GC
+must mark both new tree families before any corresponding publication is served.
+
+The maintenance-locality refinement in [lake row identity](lake-row-identity.md#maintenance-locality-allocation-ownership-and-evidence-reuse)
+uses bulk reduction construction, bounded authenticated decoded-page reuse,
+scoped forward spill admission and verified merge-map evidence transfer. Serving
+pack writers request summaries alone; canonical forward trees remain owned by
+canonical maintenance groups and their existing publication/GC closure.
+
+
+Reader protocol 81 adds [publication read waves and projected reductions](lake-row-identity.md#publication-read-waves-and-projected-reductions-reader-protocol-81).
+Maintenance cache misses share bounded, phase-admitted packed range reads; append
+forward transfer preserves verified order without merge rewrites. Reduction state
+version 2 stores only reducers that need tree maintenance and rebuilds older state
+once. These refinements retain the existing publication and reclamation boundary.
+
+
+[Compact decoded navigation and shared probe candidates](lake-row-identity.md#compact-decoded-navigation-and-shared-probe-candidates)
+keep larger reduction working sets within the existing cache admission policy.
+Dirty-key ordering and compact read descriptors remove repeated backing reads;
+encoded fallback handles oversized decoded pages without increasing the cache
+limit. Repeated native join keys share candidate metadata decoding within a wave.
+These are in-memory refinements under the existing publication/GC contract.
+
+
+[Reuse-admitted join metadata and direct decoded-page ownership](lake-row-identity.md#reuse-admitted-join-metadata-and-direct-decoded-page-ownership)
+remove repeated duplicate-chain decoding and cold admission copies. Metadata
+admission requires observed offset reuse and remains bounded by the existing
+request budget. Matched flags stay fresh, saved matches retain coordinates, and
+borrowed pages keep independent ownership. Publication, reader protocol 81 and
+reclamation semantics remain unchanged.

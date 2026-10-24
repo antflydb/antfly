@@ -79,8 +79,12 @@ tls-compat-check: ## Verify the checked-in Zig TLS compatibility patch has not d
 openapi-generate: mcp-schema-fragments-generate
 	$(ZIG) build regen-openapi $(ZIG_BUILD_FLAGS)
 
-openapi-check: mcp-schema-fragments-check
+openapi-check: memory-contracts-check mcp-schema-fragments-check
 	$(ZIG) build check-openapi $(ZIG_BUILD_FLAGS)
+
+.PHONY: memory-contracts-check
+memory-contracts-check:
+	$(SCRIPTS_PY) ../scripts/generate_memory_openapi.py --zig $(ZIG) --check
 
 mcp-schema-fragments-generate:
 	$(SCRIPTS_PY) ../scripts/generate_mcp_schema_fragments.py

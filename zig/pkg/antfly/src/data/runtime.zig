@@ -26265,6 +26265,7 @@ const RemoteMetadataSource = struct {
                 .system_catalog = remoteSystemCatalog,
                 .supports_query_definitions = true,
                 .supports_resolver_catalog_read = true,
+                .supports_resolver_authority = true,
                 .status = remoteStatus,
                 .admin_snapshot = remoteAdminSnapshot,
                 .control_snapshot = remoteControlSnapshot,

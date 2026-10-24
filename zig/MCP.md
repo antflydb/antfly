@@ -20,6 +20,15 @@ permission filtering, product tool definitions, and delegation through the same 
 Substantial structured tool inputs are derived selectively from the public OpenAPI contract; simple and dynamic tool
 schemas remain in the runtime registry.
 
+Native memory uses a separate **`/memory/v1/mcp`** server. It advertises typed
+`memory_<action>` tools generated from the native memory operation contracts,
+while `/mcp/v1` keeps its database and extension tool catalog. The two servers
+share protocol/authentication infrastructure and have separate session stores.
+Each memory call delegates to the same native memory ingress used by REST;
+credential projection, live grants, private provenance, retention, cancellation
+and deadlines apply there. The memory endpoint selects memory API v1, independently
+of the negotiated MCP protocol revision. See [MEMORY.md](MEMORY.md).
+
 ## Implemented
 
 - `zig/lib/mcp`
@@ -35,6 +44,10 @@ schemas remain in the runtime registry.
 - Antfly HTTP routes
   - `GET /mcp/v1`
   - `POST /mcp/v1`
+  - `DELETE /mcp/v1`
+  - `GET /memory/v1/mcp`
+  - `POST /memory/v1/mcp`
+  - `DELETE /memory/v1/mcp`
 - Trusted-principal auth
   - Antfly can accept `X-Antfly-Trusted-Principal: <token>` from a trusted upstream proxy when
     `ANTFLY_TRUSTED_PRINCIPAL_SECRET` is configured.

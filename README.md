@@ -112,7 +112,7 @@ See [LICENSING.md](LICENSING.md) for third-party notices and source ownership.
 - [Documentation index](docs/README.md)
 - [Antfly Lite](docs/guides/lite.mdx), [Architecture](docs/architecture.mdx), and [Object storage](docs/reference/s3-storage.md)
 - End-to-end guides: [support answer agent](docs/guides/support-answer-agent.mdx), [site search and answers](docs/guides/site-search-and-answers.mdx), [ticket routing](docs/guides/ticket-routing.mdx), [coding copilot retrieval](docs/guides/coding-copilot-retrieval.mdx)
-- Runnable [examples](examples): Lite in Go, image search, memoryaf, Pinecone migration, Postgres sync
+- Runnable [examples](examples): Lite in Go, image search, native memory, Pinecone migration, Postgres sync
 
 Prefer not to run it yourself? [Antfly Cloud](https://antfly.io/cloud) is the hosted option.
 
@@ -155,7 +155,7 @@ Antfly inference handles the ML side: embeddings, chunking, reranking, classific
 | docsaf | Ingest content from the filesystem, web crawls and sitemaps, git repos, S3, and Google Drive | [`go/pkg/docsaf`](go/pkg/docsaf) |
 | evalaf | LLM/RAG/agent evaluation ("promptfoo for Go") | [`go/pkg/evalaf`](go/pkg/evalaf) |
 | Genkit plugin | Firebase Genkit integration for retrieval and docstore | [`go/pkg/genkit/antfly`](go/pkg/genkit/antfly) |
-| memoryaf | Shared long-term memory for AI agents over MCP and HTTP | [`go/pkg/memoryaf`](go/pkg/memoryaf) |
+| Native memory | Evidence-backed temporal agent memory over HTTP, MCP and embedded APIs | [Design and contracts](zig/MEMORY.md) |
 | embedded | Go, Python, Rust, and TypeScript bindings for local databases and inference over the C ABI | [`go/pkg/embedded`](go/pkg/embedded), [`py/packages/embedded`](py/packages/embedded), [`rs/crates/embedded`](rs/crates/embedded), [`ts/packages/embedded`](ts/packages/embedded) |
 
 ## Architecture

@@ -1026,7 +1026,7 @@ pub const Resolver = struct {
             if (lo == 0) return null;
             const entry = page.entries[lo - 1];
             if (ref.height == 0) return if (std.mem.eql(u8, entry.key, id)) try a.dupe(u8, entry.value) else null;
-            ref = entry.child orelse return error.InvalidNativeLakeFileState;
+            ref = (entry.child orelse return error.InvalidNativeLakeFileState).*;
             lower = entry.key[0..32].*;
             if (lo < page.entries.len) upper = page.entries[lo].key[0..32].*;
         }

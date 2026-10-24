@@ -205,7 +205,7 @@ urn:ai:example.com:antfly:mcp-profile:copilot
 urn:ai:example.com:antfly:a2a:default
 urn:ai:example.com:antfly:openapi:public
 urn:ai:example.com:antfly:skill:query-builder
-urn:ai:example.com:antfly:extension:memoryaf:mcp
+urn:ai:example.com:antfly:extension:records:mcp
 ```
 
 ## Publication Discovery
@@ -333,7 +333,7 @@ Skills can also point to extension MCP profiles where the skill is only useful w
 
 Extension package and installed extension entries should be included only in authenticated scoped catalogs unless explicitly public.
 
-Package visibility must be derived from a visible installed extension, not from the tenant package-store inventory. A table-scoped identity that can see `docsaf` must not learn that `memoryaf` packages are present merely because both packages exist in metadata.
+Package visibility must be derived from a visible installed extension, not from the tenant package-store inventory. A table-scoped identity that can see `docsaf` must not learn that `records` packages are present merely because both packages exist in metadata.
 
 Package entry:
 

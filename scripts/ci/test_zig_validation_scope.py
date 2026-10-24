@@ -410,6 +410,7 @@ class ZigValidationScopeTests(unittest.TestCase):
             "scripts/yaml_to_json.py",
             "scripts/generate_graph_identifier_policy.py",
             "scripts/generate_mcp_schema_fragments.py",
+            "scripts/generate_memory_openapi.py",
             "scripts/pyproject.toml",
             "scripts/uv.lock",
             "specs/openapi/new-owner/nested/new-schema.yaml",

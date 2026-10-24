@@ -49,6 +49,45 @@ pub const RawValue = raw_mod.RawValue;
 pub const RawObject = raw_mod.RawObject;
 pub const max_raw_nesting = raw_mod.max_raw_nesting;
 
+/// A lexical JSON value borrowed from a complete-input scanner. Its input must
+/// outlive the parsed result; use RawValue when independent ownership is needed.
+pub const BorrowedValue = struct {
+    json: []const u8,
+    pub fn jsonParse(allocator: Allocator, scanner: anytype, options: ParseOptions) ParseError(@TypeOf(scanner.*))!@This() {
+        var start = scanner.cursor;
+        while (start < scanner.input.len and (std.ascii.isWhitespace(scanner.input[start]) or scanner.input[start] == ':' or scanner.input[start] == ',')) : (start += 1) {}
+        scanValue(allocator, scanner, options.max_value_len orelse scanner.input.len, null) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+        return .{ .json = scanner.input[start..scanner.cursor] };
+    }
+};
+
+/// Validate an object and borrow selected members directly from its input.
+/// No DOM or reserialization is needed, including for large vector arrays.
+/// Names are decoded and duplicate keys at every depth are rejected.
+pub fn objectFields(allocator: Allocator, input: []const u8, names: []const []const u8, values: []?[]const u8) !void {
+    std.debug.assert(names.len == values.len);
+    @memset(values, null);
+    const Observer = struct {
+        names: []const []const u8,
+        values: []?[]const u8,
+        fn member(ctx: *anyopaque, name: []const u8, raw: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            for (self.names, self.values) |wanted, *out| if (std.mem.eql(u8, wanted, name)) {
+                out.* = raw;
+            };
+        }
+    };
+    var observer: Observer = .{ .names = names, .values = values };
+    var scanner = Scanner.initCompleteInput(allocator, input);
+    defer scanner.deinit();
+    if (try scanner.peekNextTokenType() != .object_begin) return error.UnexpectedToken;
+    try scanValue(allocator, &scanner, input.len, .{ .ctx = &observer, .member_fn = Observer.member });
+    if (try scanner.next() != .end_of_document) return error.UnexpectedToken;
+}
+
 pub const Scanner = std.json.Scanner;
 pub const validate = std.json.validate;
 pub const validateTyped = @import("validate_typed.zig").validateTyped;
@@ -529,4 +568,40 @@ test "native typed parser support predicate accepts common config shapes" {
     };
 
     try std.testing.expect(simdTypedSupportsType(T));
+}
+
+test "borrowed object fields preserve lexical values and reject ambiguous documents" {
+    const input = "{\"v\\u0061lue\": {\"integer\":18446744073709551615,\"float\":1.2300e+40,\"text\":\"a\\u0062\"},\"version\":1}";
+    var fields: [2]?[]const u8 = undefined;
+    try objectFields(std.testing.allocator, input, &.{ "value", "version" }, &fields);
+    try std.testing.expectEqualStrings("{\"integer\":18446744073709551615,\"float\":1.2300e+40,\"text\":\"a\\u0062\"}", fields[0].?);
+    try std.testing.expectEqualStrings("1", fields[1].?);
+    try std.testing.expect(@intFromPtr(fields[0].?.ptr) >= @intFromPtr(input.ptr));
+    const Wire = struct { value: BorrowedValue, version: u8 };
+    const parsed = try parseFromSlice(Wire, std.testing.allocator, input, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(fields[0].?, std.mem.trim(u8, parsed.value.value.json, " \r\n\t"));
+    for ([_][]const u8{
+        "{\"value\":1,\"v\\u0061lue\":2}",
+        "{\"value\":{\"nested\":1,\"nested\":2}}",
+        "{\"value\":[1,]}",
+        "{\"value\":1} true",
+    }) |invalid| {
+        if (objectFields(std.testing.allocator, invalid, &.{ "value", "version" }, &fields)) |_| return error.TestUnexpectedResult else |_| {}
+    }
+}
+
+test "borrowed vector payload decoding keeps scratch independent of array length" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const vector = try a.alloc(f32, 1536);
+    @memset(vector, 0.123456);
+    const input = try Stringify.valueAlloc(a, .{ .memory_record_version = 1, .value = .{ .embedding = vector } }, .{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    var fields: [2]?[]const u8 = undefined;
+    try objectFields(fixed.allocator(), input, &.{ "memory_record_version", "value" }, &fields);
+    try std.testing.expect(fields[1].?.len > 1536 * 6);
+    try std.testing.expect(fixed.end_index < 16 * 1024);
 }

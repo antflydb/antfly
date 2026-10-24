@@ -54,6 +54,19 @@ authentication mechanism: enabling CORS without `allowed_origins` grants no
 cross-origin access. Configure exact trusted origins; `"*"` requires explicit
 opt-in and cannot be combined with credentialed CORS.
 
+### Native memory curation
+
+Grant the shared table permission `curator` on a memory space's logical table
+(for example `memory_team`). Curator includes read access and the native memory
+proposal, verdict and entity curation operations. It does not include arbitrary
+table writes, configuration, ontology changes, source-wide forgetting or
+embedding publication. Admin includes curator; write alone does not.
+
+HTTP and `/memory/v1/mcp` share this authorization. Operations retain their
+required grant and recheck the live credential at publication and receipt replay.
+Revocation applies to admitted work as well as new requests. Private records
+remain in their owner's audience. Lite's database owner retains full rights.
+
 ### Local files in remote templates
 
 `remoteText`, `remotePDF`, `remoteMedia`, and other file download callers deny

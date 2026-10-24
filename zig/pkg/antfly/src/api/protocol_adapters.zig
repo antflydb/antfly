@@ -60,6 +60,7 @@ const McpToolPermission = enum {
     none,
     read,
     write,
+    curator,
     admin,
 };
 
@@ -325,6 +326,7 @@ const ExtensionRuntimeBinding = struct {
 pub const McpRequest = struct {
     method: contextual_operations.Method,
     endpoint_path: []const u8,
+    context: @import("antfly_local_sources").api_operation.RequestContext = .{},
     authorization: ?[]const u8 = null,
     trusted_principal: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
@@ -382,7 +384,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             defer alloc.free(table_name);
             var body = std.json.ObjectMap.empty;
             const default_shards: i64 = if (ctx.server.cfg.deployment_mode.isStandalone()) 1 else 3;
-            try body.put(alloc, "num_shards", .{ .integer = jsonIntArg(args, "numShards") orelse default_shards });
+            try body.put(alloc, "num_shards", .{ .integer = (try jsonIntArg(alloc, args, "numShards")) orelse default_shards });
             if (jsonStringArg(args, "fields")) |fields_json| {
                 if (fields_json.len != 0) {
                     const fields = std.json.parseFromSliceLeaky(std.json.Value, alloc, fields_json, .{}) catch return mcpError(alloc, "invalid fields JSON");
@@ -403,7 +405,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             var body = std.json.ObjectMap.empty;
             try body.put(alloc, "name", .{ .string = index_name });
             try body.put(alloc, "type", .{ .string = "embeddings" });
-            if (jsonIntArg(args, "dimension")) |dimension| try body.put(alloc, "dimension", .{ .integer = dimension });
+            if (try jsonIntArg(alloc, args, "dimension")) |dimension| try body.put(alloc, "dimension", .{ .integer = dimension });
             if (jsonStringArg(args, "field")) |field| if (field.len != 0) try body.put(alloc, "field", .{ .string = field });
             if (jsonStringArg(args, "template")) |template| if (template.len != 0) try body.put(alloc, "template", .{ .string = template });
             if (jsonStringArg(args, "embedder")) |embedder_json| {
@@ -459,7 +461,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         fn sampleDocuments(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
             defer alloc.free(table_name);
-            const limit = jsonIntArg(args, "limit") orelse 5;
+            const limit = (try jsonIntArg(alloc, args, "limit")) orelse 5;
             if (limit <= 0) return mcpError(alloc, "limit must be greater than 0");
             if (limit > max_mcp_sample_documents_limit) return mcpError(alloc, "limit exceeds maximum sample size");
             var body = std.json.ObjectMap.empty;
@@ -517,7 +519,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             if (jsonValueArg(args, "orderBy")) |order_by| try body.put(alloc, "order_by", order_by);
             if (jsonValueArg(args, "indexes")) |indexes| try body.put(alloc, "indexes", indexes);
             if (jsonStringArg(args, "filterPrefix")) |prefix| if (prefix.len != 0) try body.put(alloc, "filter_prefix", .{ .string = prefix });
-            try body.put(alloc, "limit", .{ .integer = jsonIntArg(args, "limit") orelse 10 });
+            try body.put(alloc, "limit", .{ .integer = (try jsonIntArg(alloc, args, "limit")) orelse 10 });
             return try ctx.executeOperation(alloc, .{ .query = .{
                 .table_name = table_name,
                 .body = try stringifyJsonValue(alloc, .{ .object = body }),
@@ -696,6 +698,70 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         });
     }
 
+    return executeMcpTransport(server_ptr, &protocol_server, request);
+}
+
+/// Domain-specific discovery and sessions; transport remains shared with the
+/// database and extension MCP servers. No memory tools enter their catalogs.
+pub fn executeMemoryMcpRequest(server_ptr: anytype, request: McpRequest, authenticated_identity: anytype) !contextual_operations.OwnedResponse {
+    const memory_api = @import("memory.zig");
+    const tools = @import("generated/mcp_memory_tools.zig").tools;
+    const Context = struct {
+        server: @TypeOf(server_ptr),
+        identity: @TypeOf(authenticated_identity),
+        request: @import("antfly_local_sources").api_operation.RequestContext,
+        action: memory_api.memory.Action,
+
+        fn call(ptr: *anyopaque, a: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const Arguments = struct {
+                branch: []const u8 = "",
+                space: []const u8,
+                database: []const u8 = "default",
+                namespace: []const u8 = "public",
+                id: []const u8 = "",
+                body: std.json.Value = .{ .object = .empty },
+                idempotency_key: []const u8 = "",
+            };
+            const input = std.json.parseFromSliceLeaky(Arguments, a, try @import("antfly-json").stringifyValueAlloc(a, args), .{ .ignore_unknown_fields = false, .parse_numbers = false }) catch return mcpError(a, "invalid memory tool arguments");
+            if (memory_api.memory.operations.idRequired(self.action) and input.id.len == 0) return mcpError(a, "missing memory resource id");
+            var response = try self.server.executeMemoryService(input.space, .{
+                .branch = input.branch,
+                .database = input.database,
+                .namespace = input.namespace,
+                .action = self.action,
+                .id = input.id,
+                .body = input.body,
+                .idempotency_key = input.idempotency_key,
+            }, self.identity, self.request);
+            defer response.deinit(self.server.alloc);
+            return mcpResultFromOwnedResponse(a, response);
+        }
+    };
+    var contexts: [tools.len]Context = undefined;
+    var protocol_server: mcp.Server = .{
+        .implementation = .{ .name = "antfly-memory", .version = "1.0.0" },
+        .session_store = server_ptr.memory_mcp_sessions.iface(),
+        .max_tool_result_bytes = server_ptr.cfg.mcp_max_tool_result_bytes,
+        .tool_result_too_large_text = "Memory result exceeds the MCP response budget. Reduce limit, token_budget or explanation bounds and retry.",
+    };
+    defer protocol_server.deinit(server_ptr.alloc);
+    inline for (tools, 0..) |tool, i| {
+        const action = comptime @field(memory_api.memory.Action, tool.action);
+        contexts[i] = .{ .server = server_ptr, .identity = authenticated_identity, .request = request.context, .action = action };
+        const permission: McpToolPermission = switch (memory_api.memory.actionGrant(action)) {
+            .admin => .admin,
+            .curator => .curator,
+            .write => if (memory_api.memory.mutates(action)) .write else .read,
+        };
+        if (mcpPermissionVisibleForIdentity(permission, authenticated_identity)) {
+            try protocol_server.addTool(server_ptr.alloc, .{ .name = tool.name, .description = tool.description, .input_schema_json = tool.input_schema_json, .handler = .{ .ptr = &contexts[i], .call_fn = Context.call } });
+        }
+    }
+    return executeMcpTransport(server_ptr, &protocol_server, request);
+}
+
+fn executeMcpTransport(server_ptr: anytype, protocol_server: *mcp.Server, request: McpRequest) !contextual_operations.OwnedResponse {
     var transport = switch (request.method) {
         .get => protocol_server.handleStreamableHttpGetWithSession(
             server_ptr.alloc,
@@ -723,11 +789,12 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
 }
 
 fn mcpToolVisibleForIdentity(spec: McpToolSpec, authenticated_identity: anytype) bool {
+    return mcpPermissionVisibleForIdentity(spec.permission, authenticated_identity);
+}
+
+fn mcpPermissionVisibleForIdentity(permission: McpToolPermission, authenticated_identity: anytype) bool {
     const identity = authenticated_identity orelse return true;
-    const required = permissionTypeForMcpTool(spec.permission) orelse return true;
-    if (spec.wildcard_table) {
-        return identityHasAnyPermission(identity.permissions, .table, required);
-    }
+    const required = permissionTypeForMcpTool(permission) orelse return true;
     return identityHasAnyPermission(identity.permissions, .table, required);
 }
 
@@ -771,6 +838,7 @@ fn permissionTypeForMcpTool(permission: McpToolPermission) ?usermgr.PermissionTy
         .none => null,
         .read => .read,
         .write => .write,
+        .curator => .curator,
         .admin => .admin,
     };
 }
@@ -827,7 +895,7 @@ fn identityHasAnyPermission(permissions: []const usermgr.Permission, resource_ty
     for (permissions) |permission| {
         const type_match = permission.resource_type == .@"*" or permission.resource_type == resource_type;
         if (!type_match) continue;
-        if (permission.type == .admin or permission.type == permission_type) return true;
+        if (permission.type.allows(permission_type)) return true;
     }
     return false;
 }
@@ -842,7 +910,7 @@ fn identityHasPermission(
         const type_match = permission.resource_type == .@"*" or permission.resource_type == resource_type;
         const resource_match = std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource) or (resource_type == .table and @import("../system_catalog/routes.zig").tableResourceMatches(permission.resource, resource));
         if (!type_match or !resource_match) continue;
-        if (permission.type == .admin or permission.type == permission_type) return true;
+        if (permission.type.allows(permission_type)) return true;
     }
     return false;
 }
@@ -1609,13 +1677,13 @@ fn buildA2aDispatcher(
                         var full_text = std.json.ObjectMap.empty;
                         try full_text.put(alloc, "query", .{ .string = text });
                         try query_obj.put(alloc, "full_text_search", .{ .object = full_text });
-                        try query_obj.put(alloc, "limit", .{ .integer = jsonIntObjectField(data.object, "limit") orelse 5 });
+                        try query_obj.put(alloc, "limit", .{ .integer = (try jsonIntObjectField(alloc, data.object, "limit")) orelse 5 });
                         var queries = std.json.Array.init(alloc);
                         try queries.append(.{ .object = query_obj });
                         try body.put(alloc, "queries", .{ .array = queries });
                     }
                     if (data.object.get("steps")) |steps| try body.put(alloc, "steps", steps);
-                    if (jsonIntObjectField(data.object, "max_internal_iterations")) |max_iterations| try body.put(alloc, "max_internal_iterations", .{ .integer = max_iterations });
+                    if (try jsonIntObjectField(alloc, data.object, "max_internal_iterations")) |max_iterations| try body.put(alloc, "max_internal_iterations", .{ .integer = max_iterations });
                 }
             }
             const body_json = try stringifyJsonValue(alloc, .{ .object = body });
@@ -1735,18 +1803,21 @@ fn jsonStringObjectField(object: anytype, key: []const u8) ?[]const u8 {
     };
 }
 
-fn jsonIntArg(value: std.json.Value, key: []const u8) ?i64 {
-    if (value != .object) return null;
-    return jsonIntObjectField(value.object, key);
+fn jsonIntArg(alloc: std.mem.Allocator, value: std.json.Value, key: []const u8) !?i64 {
+    if (value != .object) return error.InvalidParams;
+    return jsonIntObjectField(alloc, value.object, key);
 }
 
-fn jsonIntObjectField(object: anytype, key: []const u8) ?i64 {
+fn jsonIntObjectField(alloc: std.mem.Allocator, object: anytype, key: []const u8) !?i64 {
     const value = object.get(key) orelse return null;
-    return switch (value) {
-        .integer => |n| n,
-        .float => |n| @intFromFloat(n),
-        else => null,
+    // MCP integer arguments are counts and dimensions. Missing values may
+    // default; present values must be exact, nonnegative, bounded integers.
+    // Reuse the decimal contract instead of rounding/truncating through f64.
+    const integer = @import("antfly_jsonschema").unsignedInteger(alloc, value, std.math.maxInt(i64)) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidParams,
     };
+    return @intCast(integer);
 }
 
 fn jsonBoolArg(value: std.json.Value, key: []const u8) ?bool {
@@ -1821,7 +1892,7 @@ fn putFullTextSearchArg(
 }
 
 fn stringifyJsonValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    return @import("antfly-json").stringifyValueAlloc(alloc, value);
 }
 
 fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), text: []const u8) !void {
@@ -1846,10 +1917,29 @@ fn mcpResultFromOwnedResponse(alloc: std.mem.Allocator, resp: contextual_operati
     }
     var structured: ?std.json.Value = null;
     if (std.mem.indexOf(u8, resp.content_type, "json") != null and resp.body.len != 0) {
-        structured = std.json.parseFromSliceLeaky(std.json.Value, alloc, resp.body, .{}) catch null;
+        structured = @import("antfly-json").parseValueLosslessLeaky(alloc, resp.body) catch null;
     }
     return .{
         .text = try alloc.dupe(u8, if (resp.body.len == 0) "ok" else resp.body),
         .structured = structured,
     };
+}
+
+test "native memory MCP numeric helpers accept only exact bounded integer arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "2.0", "2e0", "2", "9007199254740993.0", "9223372036854775807.0" }, [_]i64{ 2, 2, 2, 9007199254740993, std.math.maxInt(i64) }) |raw, expected| {
+        const input = try @import("antfly-json").parseValueLosslessLeaky(a, try std.fmt.allocPrint(a, "{{\"limit\":{s}}}", .{raw}));
+        try std.testing.expectEqual(expected, (try jsonIntArg(a, input, "limit")).?);
+    }
+    for ([_][]const u8{ "1.0000000000000001", "9223372036854775808", "1e100000", "1e-400", "-1.0", "true", "null", "\"2\"" }) |raw| {
+        const input = try @import("antfly-json").parseValueLosslessLeaky(a, try std.fmt.allocPrint(a, "{{\"limit\":{s}}}", .{raw}));
+        try std.testing.expectError(error.InvalidParams, jsonIntArg(a, input, "limit"));
+    }
+    const empty = try @import("antfly-json").parseValueLosslessLeaky(a, "{}");
+    try std.testing.expectEqual(@as(?i64, null), try jsonIntArg(a, empty, "limit"));
+    const raw = "{\"value\":1.0000000000000001}";
+    const result = try mcpResultFromOwnedResponse(a, .{ .status = 200, .content_type = "application/json", .body = try a.dupe(u8, raw) });
+    try std.testing.expectEqualStrings("1.0000000000000001", result.structured.?.object.get("value").?.number_string);
 }

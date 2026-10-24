@@ -3,6 +3,7 @@ from enum import StrEnum
 
 class PermissionType(StrEnum):
     ADMIN = "admin"
+    CURATOR = "curator"
     READ = "read"
     WRITE = "write"
 

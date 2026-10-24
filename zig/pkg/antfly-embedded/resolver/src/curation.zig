@@ -165,6 +165,24 @@ pub fn propose(a: std.mem.Allocator, state: State, merges: []const Redirect, inp
     try validateProposalQueue(next);
     return .{ .state = next, .merges = merges, .changed = true };
 }
+/// Replace the inputs/options of an open queue item. Callers retain immutable
+/// attempt history and fence review against the new revision; terminal queue
+/// outcomes can never be reset through this operation.
+pub fn refreshProposal(a: std.mem.Allocator, state: State, merges: []const Redirect, input: ProposalRequest, stamp: Origin) !Plan {
+    const candidate = try propose(a, .{}, merges, input, stamp);
+    const replacement = candidate.state.proposals[0];
+    const selected = for (state.proposals, 0..) |proposal, i| {
+        if (std.mem.eql(u8, proposal.id, replacement.id)) break i;
+    } else return error.NotFound;
+    const previous = state.proposals[selected];
+    if (previous.state != .open or stamp.revision <= previous.origin.revision) return error.ResolverCurationConflict;
+    const entries = try a.dupe(Proposal, state.proposals);
+    entries[selected] = replacement;
+    var next = state;
+    next.proposals = entries;
+    try validateProposalQueue(next);
+    return .{ .state = next, .merges = merges, .changed = true };
+}
 pub fn decide(a: std.mem.Allocator, state: State, merges: []const Redirect, effective: []const Redirect, id: []const u8, input: ProposalDecision, stamp: Origin) !Plan {
     try validateProposalOrigin(stamp);
     const selected = for (state.proposals, 0..) |proposal, i| {
@@ -209,7 +227,8 @@ pub fn decide(a: std.mem.Allocator, state: State, merges: []const Redirect, effe
 pub const ProposalPage = struct { proposals: []const Proposal, next_cursor: ?[]const u8 = null };
 /// Stable keyset pagination; decision changes cannot move an item across the
 /// cursor. Queue size and evidence are bounded independently of page size.
-pub fn proposalPage(a: std.mem.Allocator, state: State, query: []const u8) !ProposalPage {
+pub const ProposalQuery = struct { state: ?ProposalState, action: ?EntityAction, cursor: []const u8, limit: u32 };
+pub fn proposalQuery(a: std.mem.Allocator, query: []const u8) !ProposalQuery {
     var wanted: ?ProposalState = .open;
     var action: ?EntityAction = null;
     var cursor: []const u8 = "";
@@ -237,6 +256,14 @@ pub fn proposalPage(a: std.mem.Allocator, state: State, query: []const u8) !Prop
         if (cursor.len != 64) return error.InvalidResolverCurationRequest;
         for (cursor) |ch| if (!std.ascii.isHex(ch)) return error.InvalidResolverCurationRequest;
     }
+    return .{ .state = wanted, .action = action, .cursor = cursor, .limit = @intCast(limit) };
+}
+pub fn proposalPage(a: std.mem.Allocator, state: State, query: []const u8) !ProposalPage {
+    const parsed = try proposalQuery(a, query);
+    const wanted = parsed.state;
+    const action = parsed.action;
+    const cursor = parsed.cursor;
+    const limit = parsed.limit;
     var items: std.ArrayListUnmanaged(Proposal) = .empty;
     for (state.proposals) |proposal| {
         if (wanted) |value| if (proposal.state != value) continue;
@@ -1198,4 +1225,28 @@ test "curation queue reserves escaped decision attribution for every open propos
     const reopened = try parseProposalManifest(a, manifest);
     try std.testing.expectEqual(count, reopened.queue.proposals.len);
     try std.testing.expectEqual(jsonSize(state), jsonSize(reopened.queue));
+}
+
+test "curation refresh replaces only open proposals and preserves queue identity and terminal decisions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var request: ProposalRequest = .{ .action = .merge, .key = "a", .into = "b" };
+    const initial = try propose(a, .{ .receipt_scope = @splat(7) }, &.{}, request, .{ .actor = "first", .revision = 1 });
+    request.options.replace = true;
+    const next = try refreshProposal(a, initial.state, &.{}, request, .{ .actor = "second", .revision = 2 });
+    try std.testing.expectEqualStrings(initial.state.proposals[0].id, next.state.proposals[0].id);
+    try std.testing.expect(next.state.proposals[0].options.replace);
+    try std.testing.expectEqualStrings("second", next.state.proposals[0].origin.actor);
+    try std.testing.expect(sameReceiptScope(initial.state.receipt_scope, next.state.receipt_scope));
+    try std.testing.expectError(error.ResolverCurationConflict, refreshProposal(a, next.state, &.{}, request, .{ .revision = 2 }));
+    for ([_]ProposalState{ .accepted, .rejected, .superseded }) |terminal| {
+        var entry = next.state.proposals[0];
+        entry.state = terminal;
+        var state = next.state;
+        state.proposals = &.{entry};
+        try std.testing.expectError(error.ResolverCurationConflict, refreshProposal(a, state, &.{}, request, .{ .revision = 3 }));
+    }
+    request.options.absorbed = .release;
+    try std.testing.expectError(error.InvalidResolverCurationRequest, refreshProposal(a, next.state, &.{}, request, .{ .revision = 3 }));
 }

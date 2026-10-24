@@ -348,6 +348,7 @@ fn bulkHashes(a: A, store: tree.Store, source: []const u8, snapshot: []const u8,
     if (manager) |managed| {
         var sort = local.sql_spill.Sort.init(a, managed, &.{.{}}, 512 * 1024);
         sort.run_limit = 4;
+        sort.shared_runs = true;
         sort.encoded_bytes = true;
         defer sort.deinit();
         for (files, 0..) |name, i| {

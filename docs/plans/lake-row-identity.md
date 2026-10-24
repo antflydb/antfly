@@ -888,3 +888,239 @@ reopening without query caches, closure retention of the historical base, and
 compaction on a subsequent affected update. Typed proof lanes must reproduce
 serial bytes and return admission after null-key errors. Archive-scale speedups
 and live-provider qualification remain unmeasured.
+
+
+### Shared spill locality and bounded reducer maintenance (reader protocol 80)
+
+The follow-up to #1234 separates logical merge runs from physical descriptors.
+Shared-run sorts keep a dynamically allocated, quota-accounted directory of
+balanced levels. A caller's four-descriptor reservation no longer forces four
+logical runs into unequal-level merges. Merge heads remain bounded by decoded
+workspace; final consolidation consumes smaller physical runs first. Nonshared
+legacy sorts retain their descriptor cap. Native file-hash and tie directories
+use the shared run owner. The maximum directory follows the machine ordinal
+width and maximum fan-in, independently of archive row count.
+
+Spilled joins use an adaptive radix directory over full 64-bit hash slots when
+the paged path is admitted. A pressured leaf splits locally by the next hash bit;
+fixed typed slots and directory nodes use the statement execution pager. Probe
+tiles group directory and leaf reads by page, and only a complete hash match
+opens the variable-width key/payload record. Full hashes do not replace typed
+equality: exact comparisons still reject collisions, duplicate chains retain
+build order, and matched flags continue to address the original spill records
+for outer joins. Small workspaces retain the existing bounded flat fallback.
+This keeps streaming probe order without materializing the entire probe input.
+
+Native text writers optionally emit exact document/term/frequency evidence while
+encoding ordinary and merged postings. A bounded shared-run sort publishes an
+authenticated forward tree per canonical segment. The explicit version also
+represents complete, empty evidence. Accepted terms too wide for the forward
+key or known optional workspace declines keep the legacy exact statistics path.
+Eligible one-base posting updates seek only the retired documents' forward
+ranges, adjust reached DF keys in COW summary pages and subtract exact field
+lengths. Global DF updates visit only summary differences. The base term
+directory replacement is adopted during finalization, after the last durable
+file checkpoint; its marker survives restart so recovered work cannot apply a
+second retirement. Changed-row segments keep their ordinary exact contributions.
+Mixed serving packs, legacy forward metadata and other ineligible bases retain
+complete construction or the existing exact merge. Both canonical forward roots
+and surviving summary roots belong to publication, certificate, reader-lease and
+GC closure; protocol 80 fences readers that do not know these dependencies.
+
+Mixed exact aggregate cohorts keep independent maintenance capabilities. COUNT,
+integer SUM and indexed extrema update directly. Other accepted exact reducers,
+including NUMERIC SUM/AVG and boolean reducers, read a COW reduction tree instead
+of refolding every contribution in an affected group. A leaf covers 64 stable row
+ordinals; each ancestor folds at most sixteen ordered child summaries. The
+ordered fold preserves exact decimal scales, NULL state and first-row
+presentation. Changed groups repair only their reached leaves and ancestors.
+Legacy row state without summaries rebuilds once. The reduction root is
+versioned, authenticated and retained alongside the contribution, reverse and
+extrema roots. Query behavior and public source identity remain unchanged.
+
+Structural regressions bound merge input work independently of descriptor caps,
+exercise radix splits with one resident frame and exact duplicate/outer-join
+behavior, compare changed-term retractions with a complete native statistics
+oracle, and require a 257-row exact group update to inspect 64 contributions and
+five child summaries while the previous immutable root remains readable. These
+are local work bounds, not archive-scale latency or throughput measurements.
+
+### Maintenance locality, allocation ownership and evidence reuse
+
+Forward evidence has an explicitly scoped spill owner. Its allocator is backed
+by the 4 MiB forward budget, while disk bytes, physical file admission and I/O
+counters also charge the enclosing statement owner. Known child or parent quota
+declines disable optional forward evidence; genuine allocator failures propagate.
+The scope closes before its parent and does not create an independent disk quota.
+
+Fresh exact reductions stream the ordered contribution tree once. A bounded
+carry stack folds 64-row blocks and sixteen ordered children per ancestor, then
+externally sorts compact summaries for bulk publication. It does not build a
+large dirty-key census or seek once per group. Incremental repairs use operation
+local authenticated decoded-page leases, shared with contribution, reverse and
+extrema maintenance. The cache accounts encoded bytes, decoded entries and
+expanded keys, never evicts pinned pages, checks authority/cancellation on hits,
+and falls back to ordinary owned pages when a working set cannot be retained.
+Forward retractions sort their reached terms and use bounded multi-seek waves,
+sharing the same decoded page capability for summary reads and COW mutation.
+
+A structural high-cardinality fixture with 257 groups now reads its six
+contribution pages once during fresh construction and uses seven backing page
+reads for repair, replacing the previous 772-read construction. These counts are
+local work contracts, not measured cloud latency or archive-scale throughput.
+
+Ordinary large SQL joins already use Grace partitioning: both relations are
+partitioned, partitions build and probe locally, and skew retains the existing
+bounded fallback. Reusable/recursive disk hash owners need their persistent
+lookup representation instead. Their directory lookups now route larger bounded
+waves in page order; native candidate records are primed in file-offset order.
+Probes retain immutable record coordinates instead of borrowed decode buffers,
+leave duplicate chains lazy, preserve caller lanes and defer payload hydration.
+This complements Grace execution without materializing another complete probe
+relation for a reused selective lookup.
+
+Append compaction carries complete forward evidence from its staged producers.
+Sorted/deleting canonical compaction can stream published forward trees and
+staged evidence through the native merge's source map. Tombstones are omitted and
+all surviving document ordinals are rewritten from that verified mapping. No
+file-name or positional guess establishes row identity. Input sorts are rewound
+before their owners can be reused; optional quota declines disable incomplete
+evidence, while legacy inputs retain encoder capture. Serving-only packs request
+summary capture without forward capture because they do not publish canonical
+forward trees. This removes the otherwise unnecessary posting decode from copied
+sections. Existing protocol 80 representations, closure edges and public UX apply
+unchanged; no new wire format is needed.
+
+
+### Publication read waves and projected reductions (reader protocol 81)
+
+Publication maintenance uses the existing execution I/O phase to admit bounded
+read waves. The coordinator validates references, reserves read bytes, and groups
+adjacent or overlapping ranges from the same immutable pack, attempt and size.
+A combined range never exceeds one maximum page; at most eight page references
+enter a batch. There is no speculative gap overfetch. The phase bounds concurrent
+range requests; workers borrow immutable jobs and a synchronized allocator,
+without sharing counters, cache slots or the mutable phase. Every worker joins
+before CPU admission resumes, errors escape or storage capabilities retire.
+Authentication and decoding run after resumption, independently for every page.
+Query read budgets retain their cumulative semantics; streaming construction
+admits each bounded batch. Stores with a separate read-cache capability retain
+its established serial admission path.
+
+The decoded operation cache separates pinned hits from misses and forwards only
+misses to the backing batch capability. Adoption and eviction remain serial;
+failed reads or allocations release all partial pages and hit leases. A mixed
+six-page fixture retains two warm pages, reads the remaining packed pairs in one
+bounded wave, and requires three total range reads rather than six. Backend
+failure and cancellation on resumption must leave no readers or phase active.
+
+Append compaction streams remapped forward evidence into the existing presorted
+spill representation. Source maps concatenate disjoint document ranges, and the
+consumer verifies strict key order across source boundaries. This retains bounded
+spilling while eliminating sort and merge rewrites for that path. Deleting or
+arbitrarily reordered merges keep the general sorter. Regression coverage compares
+both paths against the same authenticated forward tree and checks zero merge work
+for the ordered stream.
+
+Reduction state version 2 projects summary records to the reducers that require a
+reduction tree. COUNT, integer SUM and indexed extrema remain in contribution and
+result state, but no longer occupy or merge at every summary level. Slot order is
+derived from the authenticated cohort recipe; original-to-summary lookups are
+constant-time. Projection copies portable transition bytes, including NUMERIC
+coefficients and display scale, without decoding them. All-reduction recipes reuse
+their existing record bytes. Legacy reduction layouts rebuild once from the verified contribution tree,
+without rereading unchanged Parquet rows; subsequent repairs reuse version 2
+summaries. Protocol 81 prevents older readers from interpreting the new layout. Publication, certificate, lease and GC dependencies remain the same.
+
+These are structural work and correctness contracts. Archive-scale throughput,
+cold cloud latency and live-provider retention qualification remain unmeasured.
+
+
+### Compact decoded navigation and shared probe candidates
+
+Decoded page descriptors separate immutable read views from mutable serialization
+entries. A leaf descriptor uses 56 bytes on the qualified 64-bit native target,
+instead of reserving the 168-byte serialization entry's inline child reference
+for every row. Branch references live in a page-owned array; their pointers are
+borrowed for the page/lease lifetime. Mutation and serialization boundaries copy
+references by value. Encoded page bytes, checksums, publication authority and
+reader protocol 81 remain unchanged.
+
+Decoded cache accounting includes descriptors, branch-reference arrays, wire
+bytes and expanded prefix keys. The operation cache retains its 512 KiB limit.
+When a decoded page cannot fit, authenticated encoded bytes can still be retained
+within that same budget. A later read owns its decoded copy and checks authority,
+cancellation and domain before using the retained bytes. Pinned decoded leases
+remain protected during fallback and eviction; allocation failure releases every
+partial descriptor and branch allocation.
+
+Reduction repairs order the borrowed dirty keys at each level before seeking
+contribution and summary ranges. The temporary order directory charges the
+existing workspace and is freed at the end of the level. Together with compact
+pages, this preserves locality beyond the previous small-fixture working set.
+The 2,049-group no-op repair fixture with 34 contribution pages needs 45 backing
+reads instead of the measured 3,847 reads with the earlier decoded representation
+and hash-order repair. Updating every contribution in that fixture needs 47
+backing reads, compares against complete rebuilding and retains the prior
+immutable reduction root. Encoded fallback, prefix/branch
+ownership and all allocation-failure exits have separate coverage.
+
+Reusable native disk join probes group identical immutable candidate offsets
+within each existing, bounded 512-lane wave. One metadata decode serves all lanes
+that reach the record; each lane still evaluates exact typed key equality and
+retains its own next duplicate and residual/matched state. Results retain stable
+coordinates, and payload decoding remains lazy. A scalar probe oracle and a
+1,025-lane repeated-key fixture require 1,025 versus three key-record decodes,
+with no payload hydration during priming. NULL lanes and residual rejection of
+one duplicate preserve their existing behavior. A second fixture uses ordinary
+SMP allocation behind a tracked 32 MiB budget and verifies a zero live balance.
+For 8,193 repeated lanes it needs 8,193 versus seventeen metadata decodes; one
+local Debug run measured 16.29 ms versus 5.11 ms. These timings support the work
+reduction and have no timing assertion. Archive-scale throughput and cloud
+latency remain unmeasured.
+
+
+### Reuse-admitted join metadata and direct decoded-page ownership
+
+Native spilled joins retain immutable key/coordinate records only after a
+bounded exact-offset probation filter observes reuse. A hash collision in that
+filter declines admission; it never establishes key equality. One-pass distinct
+candidate offsets do not allocate the retained metadata directory. Admitted records occupy
+at most eight LRU slots and 64 KiB of arena capacity, further capped at one eighth
+of the join budget and admitted only with 128 KiB of remaining scratch headroom.
+Directory storage and arena bookkeeping also charge the existing request budget.
+The cache moves completed decode arenas rather than copying typed keys. Local
+and shared admission pressure can reclaim those arenas before allocating more
+scratch. Small-budget joins retain the scalar path.
+
+Every probe still checks cancellation and evaluates exact typed equality. Native
+matches retain immutable record/payload coordinates, so later decodes, eviction,
+and payload reads cannot invalidate saved matches. Payload hydration remains
+lazy. Duplicate traversal uses the same metadata cache as initial probing.
+Mutable matched flags never determine cached probe results; outer-join unmatched
+scans bypass the cache and read fresh record headers. Allocation-failure, cancellation, residual,
+NULL, eviction and zero-live-budget checks cover these ownership boundaries.
+
+The 8,193 repeated-lane fixture needs two initial and two duplicate-tail metadata
+decodes instead of 8,193 each. One local Debug run measured duplicate traversal at
+14.3 ms versus 2.25 ms. A distinct 2,049-key fixture compares three runs per mode:
+it retains the same 6,147 total decodes, with median times of 5.26 ms and 5.20 ms.
+The probation policy avoids the measured roughly 13% distinct-key regression of
+unconditional cache admission. Timing is diagnostic, never a test assertion.
+
+Cold decoded-page misses now allocate directly through the operation cache's
+owner and move independently owned pages into admitted slots. A borrowed backing
+lease or a differently owned page still takes the independent-copy path. Only
+the cache boundary records an alternate deallocation owner for uncached oversized
+pages; ordinary decoding does not retain temporary worker allocator wrappers.
+Batched misses apply the same ownership transfer after workers join. Existing
+512 KiB admission, pinned leases, encoded fallback, authentication and cancellation
+checks remain in force.
+
+Across 128 cold admissions of a prefix-compressed 1,024-row page, this removes
+one full decode and ownership copy per miss: 22,826,496 versus 11,413,248 allocated
+bytes and 768 versus 384 allocations. One local Debug run measured 41.1 ms versus
+21.0 ms. Separate caller/cache allocators, oversized fallback and every injected
+allocation failure release their owners correctly. These are in-memory changes
+under reader protocol 81; wire artifacts, publication authority and GC closure
+are unchanged. Archive-scale throughput and cloud latency remain unmeasured.

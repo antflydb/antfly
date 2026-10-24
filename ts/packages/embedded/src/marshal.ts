@@ -15,6 +15,7 @@
 
 import { promisify } from "node:util";
 import koffi from "koffi";
+import { isInteger, parse as parseExact, stringify as stringifyExact } from "lossless-json";
 import { InvalidArgumentError } from "./errors.js";
 import type { NativeLibrary } from "./native.js";
 
@@ -169,4 +170,32 @@ export function txnIdBytes(id: Uint8Array | string): Buffer {
 
 export function txnIdToHex(buf: Uint8Array): string {
   return Buffer.from(buf).toString("hex");
+}
+
+/** Native memory uses full-width integer resource versions, including nested references. */
+export function memoryJsonSlice(input: JsonInput): SliceArg {
+  if (typeof input === "string" || input instanceof Uint8Array) return jsonSlice(input);
+  const text = stringifyExact(input, (_key, value) => {
+    if (
+      typeof value === "number" &&
+      (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value)))
+    ) {
+      throw new RangeError(
+        "Memory integers must be safe numbers or bigint; unsafe numbers have already lost precision"
+      );
+    }
+    return value;
+  });
+  if (text === undefined) throw new TypeError("Memory requests must be JSON values");
+  return stringSlice(text);
+}
+
+export function parseMemoryJson(buf: Buffer): unknown {
+  if (buf.length === 0) return null;
+  return parseExact(buf.toString("utf8"), null, {
+    parseNumber: (token) => {
+      const value = Number(token);
+      return isInteger(token) && !Number.isSafeInteger(value) ? BigInt(token) : value;
+    },
+  });
 }

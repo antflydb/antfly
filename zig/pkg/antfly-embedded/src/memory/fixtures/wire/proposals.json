@@ -1,0 +1,31 @@
+{
+  "items": [
+    {
+      "id": "de5d6fb72a856b5d9ca755d0670b2ca6def8b08fde480b3774fb1fb3866419f9",
+      "action": "merge",
+      "key": "a",
+      "into": "b",
+      "options": {
+        "replace": false,
+        "pin_distinct": false,
+        "absorbed": "reject"
+      },
+      "confidence": null,
+      "evidence": null,
+      "origin": {
+        "origin": "manual",
+        "actor": "alice",
+        "reason": "",
+        "created_at_ms": 3,
+        "revision": 4,
+        "proposal_id": null,
+        "cascade_from": null
+      },
+      "state": "open",
+      "decided": null
+    }
+  ],
+  "next_cursor": null,
+  "complete": true,
+  "revision": 4
+}

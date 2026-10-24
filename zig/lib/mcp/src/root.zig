@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const json = @import("antfly-json");
 
 pub const testing = @import("testing.zig");
 
@@ -314,7 +315,7 @@ pub const Server = struct {
         defer arena_impl.deinit();
         const temp_alloc = arena_impl.allocator();
 
-        const request = std.json.parseFromSliceLeaky(std.json.Value, temp_alloc, body, .{}) catch {
+        const request = json.parseValueLosslessLeaky(temp_alloc, body) catch {
             return .{
                 .status = 200,
                 .content_type = "application/json",
@@ -430,7 +431,7 @@ pub const Server = struct {
         defer arena_impl.deinit();
         const temp_alloc = arena_impl.allocator();
 
-        const request = std.json.parseFromSliceLeaky(std.json.Value, temp_alloc, body, .{}) catch {
+        const request = json.parseValueLosslessLeaky(temp_alloc, body) catch {
             return try stringifyValue(alloc, try errorResponse(temp_alloc, .null, -32700, "parse error"));
         };
         const response = (try self.handleJsonRpcRequest(temp_alloc, request)) orelse return null;
@@ -503,7 +504,7 @@ pub const Server = struct {
     fn toolsListResult(self: *const Server, alloc: std.mem.Allocator) !std.json.Value {
         var tools = std.json.Array.init(alloc);
         for (self.tools.items) |tool| {
-            const parsed_schema = try std.json.parseFromSliceLeaky(std.json.Value, alloc, tool.input_schema_json, .{});
+            const parsed_schema = try json.parseValueLosslessLeaky(alloc, tool.input_schema_json);
             var entry = std.json.ObjectMap.empty;
             try entry.put(alloc, "name", .{ .string = tool.name });
             try entry.put(alloc, "description", .{ .string = tool.description });
@@ -595,7 +596,7 @@ fn errorResponse(alloc: std.mem.Allocator, id: std.json.Value, code: i64, messag
 }
 
 fn stringifyValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    return json.stringifyValueAlloc(alloc, value);
 }
 
 test "mcp handles initialize and tool call" {
@@ -975,4 +976,46 @@ test "mcp stdio line dispatch frames responses" {
     try std.testing.expectEqual(@as(?[]u8, null), try server.handleStdioLine(alloc,
         \\{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
     ));
+}
+
+test "mcp lossless ingress preserves numeric IDs arguments and deeply nested results on both transports" {
+    const a = std.testing.allocator;
+    const Echo = struct {
+        fn call(_: *anyopaque, _: std.mem.Allocator, args: std.json.Value) !CallToolResult {
+            return .{ .structured = args };
+        }
+    };
+    var token: u8 = 0;
+    var server: Server = .{};
+    defer server.deinit(a);
+    try server.addTool(a, .{ .name = "echo", .description = "Echo raw values", .handler = .{ .ptr = &token, .call_fn = Echo.call } });
+    var request: std.ArrayList(u8) = .empty;
+    defer request.deinit(a);
+    try request.appendSlice(a,
+        \\{"jsonrpc":"2.0","id":9007199254740993.0,"method":"tools/call","params":{"name":"echo","arguments":{"values":[9007199254740993.0,18446744073709551615,1.0000000000000001,1e-400,1e100000,42],"deep":
+    );
+    try request.appendNTimes(a, '[', 6000);
+    try request.appendSlice(a, "1e-400");
+    try request.appendNTimes(a, ']', 6000);
+    try request.appendSlice(a, "}}}");
+    for ([_]bool{ false, true }) |http| {
+        const response = if (http) blk: {
+            var result = try server.handleStreamableHttpPost(a, request.items);
+            defer result.deinit(a);
+            try std.testing.expectEqual(@as(u16, 200), result.status);
+            break :blk try a.dupe(u8, result.body);
+        } else (try server.handleJsonRpc(a, request.items)).?;
+        defer a.free(response);
+        var parsed = try json.parseValueLossless(a, response);
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("9007199254740993.0", parsed.value.object.get("id").?.number_string);
+        const output = parsed.value.object.get("result").?.object.get("structuredContent").?;
+        const values = output.object.get("values").?.array.items;
+        const expected = [_][]const u8{ "9007199254740993.0", "18446744073709551615", "1.0000000000000001", "1e-400", "1e100000" };
+        for (expected, 0..) |raw, i| try std.testing.expectEqualStrings(raw, values[i].number_string);
+        try std.testing.expectEqual(@as(i64, 42), values[5].integer);
+        var deep = output.object.get("deep").?;
+        for (0..6000) |_| deep = deep.array.items[0];
+        try std.testing.expectEqualStrings("1e-400", deep.number_string);
+    }
 }

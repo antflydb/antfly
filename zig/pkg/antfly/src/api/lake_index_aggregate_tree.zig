@@ -165,7 +165,7 @@ fn differencesRange(a: A, backing: tree.Store, left: ?tree.Ref, right: ?tree.Ref
                 const fence = page.entries[ri + 1].key;
                 if (end == null or std.mem.order(u8, fence, end.?) == .lt) end = fence;
             };
-            try differencesRange(a, backing, if (lp) |page| page.entries[li].child else left, if (rp) |page| page.entries[ri].child else right, begin, end, visitor);
+            try differencesRange(a, backing, if (lp) |page| page.entries[li].valueEntry().child else left, if (rp) |page| page.entries[ri].valueEntry().child else right, begin, end, visitor);
             if (end == null or (upper != null and std.mem.eql(u8, end.?, upper.?))) break;
             begin = end.?;
         }
@@ -356,7 +356,7 @@ test "external lake aggregate interval differences skip retained pages across fe
     // The same retained leaf can acquire a taller root after a boundary split.
     var root_page = try tree.readPage(a, backing, root);
     defer root_page.deinit(a);
-    const first_leaf = root_page.entries[0].child.?;
+    const first_leaf = root_page.entries[0].child.?.*;
     var visitor: Visitor = .{ .expected = 0 };
     var cache: tree.Cache = .{ .alloc = a, .underlying = backing };
     defer cache.deinit();

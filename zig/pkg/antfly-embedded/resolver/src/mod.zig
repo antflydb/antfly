@@ -39,6 +39,7 @@ const matcher = @import("antfly_matcher");
 /// later redesign.
 pub const adjudication = @import("adjudication.zig");
 pub const curation = @import("curation.zig");
+pub const policy_cache = @import("policy_cache.zig");
 
 pub const DocRef = struct {
     table: []const u8,
@@ -457,6 +458,15 @@ pub const Resolver = struct {
         if (self.labels.len == 0) return true;
         for (self.labels) |l| if (std.mem.eql(u8, l, label)) return true;
         return false;
+    }
+
+    /// Exact fields needed for scoring, type admission, redirects and live
+    /// adjudication validation. Unrelated assets stay outside candidate payloads.
+    pub fn candidateFields(self: *const Resolver, a: std.mem.Allocator) ![]const []const u8 {
+        var fields: std.StringArrayHashMapUnmanaged(void) = .empty;
+        for ([_][]const u8{ "canonical_name", "name", "label", "entity_type", "description", "merged_into", "merged_into_table" }) |name| try fields.put(a, name, {});
+        if (self.scorer) |scorer| for (scorer.comparisons) |comparison| try fields.put(a, comparison.right, {});
+        return try a.dupe([]const u8, fields.keys());
     }
 
     /// Caller owns the slice; field names borrow the resolver's scorer.
@@ -978,6 +988,13 @@ pub const OverrideProvider = struct {
 pub const MentionEmbedder = struct {
     ptr: *anyopaque,
     embed_fn: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, text: []const u8) anyerror!?[]const f32,
+    embed_batch_fn: ?*const fn (*anyopaque, std.mem.Allocator, []const []const u8) anyerror![]const ?[]const f32 = null,
+    pub fn embedBatch(self: MentionEmbedder, a: std.mem.Allocator, texts: []const []const u8) ![]const ?[]const f32 {
+        if (self.embed_batch_fn) |batch| return batch(self.ptr, a, texts);
+        const vectors = try a.alloc(?[]const f32, texts.len);
+        for (texts, vectors) |text, *vector| vector.* = self.embed(a, text) catch null;
+        return vectors;
+    }
 
     pub fn embed(self: MentionEmbedder, alloc: std.mem.Allocator, text: []const u8) anyerror!?[]const f32 {
         return self.embed_fn(self.ptr, alloc, text);
@@ -2104,6 +2121,9 @@ pub const ResolutionStage = struct {
         // the parse arena so the vectors outlive scoring. Embedding failures are
         // non-fatal: the mention simply scores without a vector.
         if (if (self.resolver.scorer != null) self.embedder else null) |embedder| {
+            var unique: std.StringArrayHashMapUnmanaged(void) = .empty;
+            const pending = try arena.alloc(?usize, parsed.entities.len);
+            @memset(pending, null);
             for (parsed.entities, 0..) |*entity, i| {
                 if (alias_mask[i] or reused[i] != null or entity.embedding != null or entity.text.len == 0) continue;
                 const cache_key: ?[32]u8 = if (self.embedding_dependency) |dependency| try fingerprint(arena, .{ dependency, work[i].embedding_input }) else null;
@@ -2122,12 +2142,27 @@ pub const ResolutionStage = struct {
                         continue;
                     }
                 }
-                if (self.stats) |stats| stats.embeddings += 1;
-                entity.embedding = embedder.embed(arena, entity.text) catch null;
-                if (self.retain_work and self.work_retention != .none) if (self.embedding_cache) |cache| if (cache_key) |key| if (entity.embedding) |vector| {
-                    cache.put(cache.ptr, key, vector) catch {};
-                    work[i].embedding_key = key;
-                };
+                pending[i] = (try unique.getOrPut(arena, entity.text)).index;
+            }
+            var offset: usize = 0;
+            while (offset < unique.count()) {
+                const end = @min(offset + 64, unique.count());
+                if (self.stats) |stats| stats.embeddings += end - offset;
+                const batch = embedder.embedBatch(arena, unique.keys()[offset..end]) catch null;
+                if (batch) |vectors| {
+                    if (vectors.len != end - offset) return error.InvalidArgument;
+                    for (parsed.entities, pending, 0..) |*entity, slot, i| {
+                        const selected = slot orelse continue;
+                        if (selected < offset or selected >= end) continue;
+                        entity.embedding = vectors[selected - offset];
+                        const cache_key: ?[32]u8 = if (self.embedding_dependency) |dependency| try fingerprint(arena, .{ dependency, work[i].embedding_input }) else null;
+                        if (self.retain_work and self.work_retention != .none) if (self.embedding_cache) |cache| if (cache_key) |key| if (entity.embedding) |vector| {
+                            cache.put(cache.ptr, key, vector) catch {};
+                            work[i].embedding_key = key;
+                        };
+                    }
+                }
+                offset = end;
             }
         }
 
@@ -3821,4 +3856,8 @@ test "resolver reviewed targets follow current redirects without changing the se
     var separate = try parseResolution(a, cross_table);
     defer separate.deinit();
     try testing.expectEqualStrings("concept/a", separate.entities[0].doc_ref.key);
+}
+
+test {
+    _ = policy_cache;
 }

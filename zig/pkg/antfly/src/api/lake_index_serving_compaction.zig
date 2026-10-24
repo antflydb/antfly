@@ -303,6 +303,8 @@ const Builder = struct {
         const staged = try LocalSegment.empty(self.a, self.staging, self.store);
         errdefer staged.release();
         staged.captureStatistics(self.summary_staging);
+        // Serving packs publish summaries and lineage, not canonical forwards.
+        if (staged.statistics) |captured| captured.disableForward();
         var sink = staged.sink();
         try local.segment.writeMergedSegmentToSink(a, &sink, merged[0..inputs.len]);
         try staged.seal();

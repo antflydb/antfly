@@ -69,6 +69,7 @@ pub fn closeAll(handle: *h.Handle) void {
     var iterator = handle.embedded_tables.valueIterator();
     while (iterator.next()) |table| destroy(handle, table.*);
     handle.embedded_tables.deinit(handle.alloc);
+    handle.embedded_tables = .empty;
     handle.embedded_table_errors.deinit(handle.alloc);
     handle.embedded_table_errors = .empty;
     var names = handle.embedded_table_records.keyIterator();

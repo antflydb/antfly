@@ -60,7 +60,7 @@ pub const PageStore = struct {
     }
 
     pub fn store(self: *PageStore) tree.Store {
-        return .{ .domain = self.domain, .attempt = self.attempt, .prefix_keys = self.prefix_keys, .decoded_page = if (self.read_cache != null and self.read_cache.?.decoded_read != null) .{ .ptr = self, .read = readDecoded } else null, .ptr = self, .get = get, .read_many = if (self.io != null and self.read_phase == null) .{ .ptr = self, .read = readMany } else null, .put = put, .put_many = if (self.io != null) putMany else null, .pack_many = if (self.pack_pages) packMany else null, .check = check };
+        return .{ .domain = self.domain, .attempt = self.attempt, .prefix_keys = self.prefix_keys, .decoded_page = if (self.read_cache != null and self.read_cache.?.decoded_read != null) .{ .ptr = self, .read = readDecoded } else null, .ptr = self, .get = get, .read_many = if (self.io != null) .{ .ptr = self, .read = readMany } else null, .put = put, .put_many = if (self.io != null) putMany else null, .pack_many = if (self.pack_pages) packMany else null, .check = check };
     }
 
     pub fn namespaceDomain(namespace: []const u8) [32]u8 {
@@ -163,7 +163,8 @@ pub const PageStore = struct {
 
     fn readMany(raw: *anyopaque, a: std.mem.Allocator, refs_: []const tree.Ref, output: []tree.Page) !void {
         const self: *PageStore = @ptrCast(@alignCast(raw));
-        if (refs_.len != output.len or refs_.len > tree.max_read_batch or self.read_phase != null) return error.InvalidGraphPage;
+        if (refs_.len != output.len or refs_.len > tree.max_read_batch) return error.InvalidGraphPage;
+        if (self.read_phase != null) return self.readPublication(a, refs_, output);
         if (self.read_cache) |cache| if (cache.decoded_many) |many| return many(cache.ptr, a, self.artifacts, self.domain, refs_, output, self.cancellation, self.remaining_read_bytes);
         var bytes: u64 = 0;
         for (refs_) |ref| {
@@ -203,6 +204,111 @@ pub const PageStore = struct {
             stores_[i] = copies[i].store();
         }
         try readBatch(self.io.?, a, stores_[0..refs_.len], refs_, output);
+    }
+
+    /// The coordinator owns phase transitions and counters. Workers receive
+    /// immutable ranges and a locked allocator, never the mutable phase/cache.
+    fn readPublication(self: *PageStore, a: std.mem.Allocator, refs_: []const tree.Ref, output: []tree.Page) !void {
+        try self.cancellation.check();
+        if (self.read_cache != null) {
+            var initialized: usize = 0;
+            errdefer for (output[0..initialized]) |*page| page.deinit(a);
+            for (refs_, output) |ref, *page| {
+                page.* = try tree.readPage(a, .{ .domain = self.domain, .ptr = self, .get = get, .put = put, .check = check }, ref);
+                initialized += 1;
+            }
+            return;
+        }
+        const Job = struct {
+            ref: tree.Ref,
+            begin: u32,
+            end: u32,
+            bytes: ?[]u8 = null,
+            failure: ?anyerror = null,
+            fn run(job: *@This(), backend: *artifacts.ArtifactStore, alloc: std.mem.Allocator, domain: [32]u8, token: CancellationToken) void {
+                const id = identity(domain, job.ref) catch |err| {
+                    job.failure = err;
+                    return;
+                };
+                job.bytes = backend.getRangeAllocWithCancellationUsingAllocator(alloc, &id, job.begin, job.end - job.begin, token) catch |err| {
+                    job.failure = err;
+                    return;
+                };
+                if (job.bytes.?.len != job.end - job.begin) job.failure = error.ArtifactIntegrityMismatch;
+            }
+        };
+        var order: [tree.max_read_batch]usize = undefined;
+        for (refs_, order[0..refs_.len], 0..) |ref, *index, i| {
+            try ref.validate();
+            index.* = i;
+        }
+        std.mem.sort(usize, order[0..refs_.len], refs_, struct {
+            fn less(input: []const tree.Ref, l: usize, r: usize) bool {
+                const left = input[l];
+                const right = input[r];
+                const ld = left.artifactDigest();
+                const rd = right.artifactDigest();
+                const digest_order = std.mem.order(u8, &ld, &rd);
+                if (digest_order != .eq) return digest_order == .lt;
+                const attempt_order = std.mem.order(u8, &left.attempt, &right.attempt);
+                if (attempt_order != .eq) return attempt_order == .lt;
+                return left.offset() < right.offset();
+            }
+        }.less);
+        var jobs: [tree.max_read_batch]Job = undefined;
+        var owners: [tree.max_read_batch]usize = undefined;
+        var count: usize = 0;
+        var bytes: u64 = 0;
+        for (order[0..refs_.len]) |index| {
+            const ref = refs_[index];
+            const end = ref.offset() + ref.bytes;
+            const digest = ref.artifactDigest();
+            const previous_digest = if (count != 0) jobs[count - 1].ref.artifactDigest() else @as([32]u8, @splat(0));
+            if (count != 0 and std.mem.eql(u8, &digest, &previous_digest) and std.mem.eql(u8, &ref.attempt, &jobs[count - 1].ref.attempt) and ref.artifactBytes() == jobs[count - 1].ref.artifactBytes() and ref.offset() <= jobs[count - 1].end and @max(end, jobs[count - 1].end) - jobs[count - 1].begin <= tree.max_page_bytes) {
+                bytes += @max(end, jobs[count - 1].end) - jobs[count - 1].end;
+                jobs[count - 1].end = @max(end, jobs[count - 1].end);
+            } else {
+                jobs[count] = .{ .ref = ref, .begin = ref.offset(), .end = end };
+                count += 1;
+                bytes += ref.bytes;
+            }
+            owners[index] = count - 1;
+        }
+        if (self.streaming) self.remaining_read_bytes.* = @as(u64, tree.max_page_bytes) * refs_.len;
+        try artifacts.chargeReadBudget(self.remaining_read_bytes, bytes);
+        defer for (jobs[0..count]) |job| if (job.bytes) |data| a.free(data);
+        const scheduler = @import("antfly_local_sources").sql_parallel_scheduler;
+        var allocations: scheduler.LockedAllocator = .{ .backing = a };
+        var backend = self.artifacts.*;
+        backend.io_phase = null;
+        const phase = self.read_phase.?;
+        const width = @max(1, @min(tree.max_read_batch, phase.max_parallel));
+        var begin: usize = 0;
+        while (begin < count) {
+            try self.cancellation.check();
+            const end = @min(count, begin + width);
+            try phase.begin(phase.ptr, end - begin);
+            var guard: artifacts.IoGuard = .{ .phase = phase };
+            defer guard.abort();
+            var group: std.Io.Group = .init;
+            for (jobs[begin..end]) |*job| group.async(phase.io, Job.run, .{ job, &backend, allocations.allocator(), self.domain, self.cancellation });
+            group.await(phase.io) catch |err| {
+                group.cancel(phase.io);
+                return guard.failed(err);
+            };
+            for (jobs[begin..end]) |job| if (job.failure) |err| return guard.failed(err);
+            try guard.finish();
+            begin = end;
+        }
+        try self.cancellation.check();
+        var initialized: usize = 0;
+        errdefer for (output[0..initialized]) |*page| page.deinit(a);
+        for (refs_, owners[0..refs_.len], output) |ref, owner, *page| {
+            const job = jobs[owner];
+            const offset = ref.offset() - job.begin;
+            page.* = try tree.decodePage(a, self.domain, ref, try a.dupe(u8, job.bytes.?[offset..][0..ref.bytes]));
+            initialized += 1;
+        }
     }
 
     fn put(ptr: *anyopaque, ref: tree.Ref, bytes: []const u8) !void {
@@ -680,6 +786,8 @@ const TestArtifacts = struct {
     fn range(ptr: *anyopaque, alloc: std.mem.Allocator, id: []const u8, offset: u64, len: usize) ![]u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.read_hook) |hook| try hook.call(hook.ptr);
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
         const bytes = self.memory.pages.get(address(id)) orelse return error.FileNotFound;
         if (offset > bytes.len or len > bytes.len - offset) return error.InvalidRange;
         self.memory.reads += 1;
@@ -1318,7 +1426,7 @@ test "serverless graph query page waves overlap reads and drain failures cancell
     var sources: [tree.max_read_batch]tree.Store = undefined;
     const count = @min(refs_.len, page.entries.len);
     for (page.entries[0..count], refs_[0..count], sources[0..count]) |entry, *ref, *source| {
-        ref.* = entry.child.?;
+        ref.* = entry.child.?.*;
         source.* = store;
     }
     var output: [tree.max_read_batch]tree.Page = undefined;
@@ -1470,4 +1578,104 @@ test "serverless navigation packed builders release every failed allocation" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
+}
+
+test "external lake publication miss waves coalesce packs bound fanout and drain failures" {
+    const Phase = struct {
+        io: std.Io,
+        active: bool = false,
+        begins: usize = 0,
+        finishes: usize = 0,
+        fail: bool = false,
+        cancel_resume: bool = false,
+        reading: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        completed: std.atomic.Value(usize) = .init(0),
+        fn begin(raw: *anyopaque, count: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.active and count > 0 and count <= 2);
+            self.active = true;
+            self.begins += 1;
+        }
+        fn finish(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.active);
+            try std.testing.expectEqual(@as(usize, 0), self.reading.load(.acquire));
+            self.active = false;
+            self.finishes += 1;
+            if (self.cancel_resume) return error.Canceled;
+        }
+        fn abort(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.reading.load(.acquire) == 0);
+            self.active = false;
+        }
+        fn read(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const active = self.reading.fetchAdd(1, .acq_rel) + 1;
+            _ = self.peak.fetchMax(active, .acq_rel);
+            defer {
+                _ = self.reading.fetchSub(1, .acq_rel);
+                _ = self.completed.fetchAdd(1, .acq_rel);
+            }
+            try std.Io.sleep(self.io, .fromMilliseconds(5), .awake);
+            if (self.fail) return error.InjectedReadFailure;
+        }
+    };
+    const a = std.testing.allocator;
+    var executor = std.Io.Threaded.init(a, .{});
+    defer executor.deinit();
+    var fixture: TestArtifacts = .{ .memory = .{ .alloc = a } };
+    defer fixture.memory.deinit();
+    var backend = fixture.capability();
+    var reads: u64 = 0;
+    var writes: u64 = 0;
+    var pages: PageStore = .{ .domain = @splat(9), .attempt = @splat(1), .artifacts = &backend, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true, .pack_pages = true };
+    var roots: [6]tree.Ref = undefined;
+    for (&roots, 0..) |*root, i| {
+        const key: [1]u8 = .{@intCast('a' + i)};
+        root.* = (try tree.apply(a, pages.store(), null, &.{.{ .key = &key, .value = "payload" }})).?;
+    }
+    for (0..3) |pair| {
+        var pack_writes: [2]tree.Write = undefined;
+        for (&pack_writes, 0..) |*write, i| {
+            const root = roots[pair * 2 + i];
+            write.* = .{ .ref = root, .bytes = fixture.memory.pages.get(TestArtifacts.address(&try PageStore.identity(pages.domain, root))).? };
+        }
+        try PageStore.packMany(&pages, &pack_writes);
+        for (pack_writes, 0..) |write, i| roots[pair * 2 + i] = write.ref;
+    }
+    var phase: Phase = .{ .io = executor.io() };
+    const capability: artifacts.IoPhase = .{ .io = executor.io(), .ptr = &phase, .max_parallel = 2, .begin = Phase.begin, .finish = Phase.finish, .abort = Phase.abort };
+    backend.io_phase = &capability;
+    pages.admitPublication();
+    fixture.read_hook = .{ .ptr = &phase, .call = Phase.read };
+    var cache: tree.Cache = .{ .alloc = a, .decoded = true, .underlying = pages.store() };
+    defer cache.deinit();
+    const storage = cache.store();
+    var output: [6]tree.Page = undefined;
+    const before = fixture.memory.reads;
+    // Reverse the request order to exercise scatter after packed range sorting.
+    std.mem.reverse(tree.Ref, &roots);
+    try storage.read_many.?.read(storage.read_many.?.ptr, a, roots[0..2], output[0..2]);
+    for (output[0..2]) |*page| page.deinit(a);
+    try storage.read_many.?.read(storage.read_many.?.ptr, a, &roots, &output);
+    for (&output) |*page| page.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), fixture.memory.reads - before);
+    try std.testing.expectEqual(@as(usize, 2), phase.begins);
+    try std.testing.expectEqual(phase.begins, phase.finishes);
+    try std.testing.expectEqual(@as(usize, 2), phase.peak.load(.acquire));
+    const completed = phase.completed.load(.acquire);
+    try storage.read_many.?.read(storage.read_many.?.ptr, a, &roots, &output);
+    for (&output) |*page| page.deinit(a);
+    try std.testing.expectEqual(completed, phase.completed.load(.acquire));
+    phase.fail = true;
+    try std.testing.expectError(error.InjectedReadFailure, pages.store().read_many.?.read(&pages, a, &roots, &output));
+    try std.testing.expect(!phase.active);
+    try std.testing.expectEqual(@as(usize, 0), phase.reading.load(.acquire));
+    phase.fail = false;
+    phase.cancel_resume = true;
+    try std.testing.expectError(error.Canceled, pages.store().read_many.?.read(&pages, a, &roots, &output));
+    try std.testing.expect(!phase.active);
+    try std.testing.expectEqual(@as(usize, 0), phase.reading.load(.acquire));
 }

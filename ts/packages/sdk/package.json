@@ -63,6 +63,7 @@
     "vitest": "^4.1.9"
   },
   "dependencies": {
+    "lossless-json": "^4.3.2",
     "openapi-fetch": "^0.17.0"
   },
   "engines": {

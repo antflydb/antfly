@@ -1,3 +1,8 @@
+> Historical plan: references to the Go `pkg/memoryaf` implementation below are
+> superseded by the [native memory service design](../../zig/MEMORY.md). The Go
+> memory server and Rust memory extension are retired; integrations use the
+> native `/memory/v1` or embedded operation contract.
+
 # Antfly as an Agentic Memory Layer over BigQuery/Snowflake
 
 ## Context

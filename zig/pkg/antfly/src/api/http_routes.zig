@@ -44,6 +44,7 @@ pub const Routes = struct {
     pub const agents_research = "/agents/research";
     pub const agents_research_jobs = "/agents/research/jobs";
     pub const mcp_v1 = "/mcp/v1";
+    pub const memory_mcp_v1 = "/memory/v1/mcp";
     pub const mcp_v1_prefix = "/mcp/v1/";
     pub const mcp_v1_extensions = "/mcp/v1/extensions";
     pub const mcp_v1_extensions_prefix = "/mcp/v1/extensions/";

@@ -19,7 +19,8 @@
 const std = @import("std");
 
 pub fn isOpaqueEntry(name: []const u8) bool {
-    return std.mem.eql(u8, name, "_resolver_curation") or
+    return std.mem.eql(u8, name, "_resolver_record_store") or std.mem.eql(u8, name, "_resolver_record_owners") or
+        std.mem.eql(u8, name, "_resolver_curation") or
         std.mem.eql(u8, name, "_resolver_namespaces") or
         std.mem.eql(u8, name, "_curation_proposals");
 }

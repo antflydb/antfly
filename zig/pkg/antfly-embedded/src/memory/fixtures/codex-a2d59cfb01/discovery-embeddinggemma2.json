@@ -1,0 +1,66 @@
+{
+  "evaluated_at": "2026-10-22T06:08:04.245592+00:00",
+  "fixture": "codex-a2d59cfb01/concept_merge.jsonl",
+  "fixture_sha256": "57d194998481b8b17dd1566d1c8af60fdd218d74e416f0c4b1131545372c1f3f",
+  "entities": 84,
+  "model": {
+    "provider": "antfly",
+    "model": "embeddinggemma2",
+    "revision": "1de7ce3dfd82958332698f61e9810172ec07d4a8ef7cc0cbd0e25c732aa50d54",
+    "dimensions": 768,
+    "upstream_revision": "914f7f89142e33e77833254d9c9b90c3cef7303b"
+  },
+  "thresholds": {
+    "names": 0.8,
+    "views": 0.85
+  },
+  "neighbors_per_projection": 32,
+  "method": "Either-direction pair admission; native order for lexical/union top5, descending normalized similarity for ANN top5. ANN admission requires semantic_discovered. No aliases synthesized from labels. Averages rounded to three decimals.",
+  "results": {
+    "lexical": {
+      "synonym_pairs": 18,
+      "recalled_pairs": 17,
+      "recalled_pairs_top5": 17,
+      "labelled_non_synonyms": 46,
+      "admitted_non_synonyms": 26,
+      "average_candidates_per_seed": 2.929
+    },
+    "ann": {
+      "synonym_pairs": 18,
+      "recalled_pairs": 18,
+      "recalled_pairs_top5": 18,
+      "labelled_non_synonyms": 46,
+      "admitted_non_synonyms": 38,
+      "average_candidates_per_seed": 4.631
+    },
+    "union": {
+      "synonym_pairs": 18,
+      "recalled_pairs": 18,
+      "recalled_pairs_top5": 18,
+      "labelled_non_synonyms": 46,
+      "admitted_non_synonyms": 39,
+      "average_candidates_per_seed": 4.964
+    }
+  },
+  "pure_semantic_pairs_recalled": [
+    [
+      "knowledge graph",
+      "KG"
+    ],
+    [
+      "Antfly",
+      "AntflyDB"
+    ]
+  ],
+  "scale": {
+    "entities": 10000,
+    "bounded_neighbor_calls": 20000,
+    "primary_entity_scans": 0,
+    "native_index_documents_per_projection": 10002,
+    "elapsed_ms": 606568,
+    "build_mode": "Debug",
+    "platform": "macOS arm64",
+    "vectors": "deterministic 2D mechanics fixture; independent of model accuracy"
+  },
+  "toolchain": "0.17.0"
+}

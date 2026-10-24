@@ -3592,6 +3592,11 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
                     defer terms.deinit();
                     while (try terms.next()) |entry| {
                         try observer.begin(observer.ptr, field_name, entry.term);
+                        if (observer.posting) |posting| {
+                            var hits = try entry.result.iterator(alloc);
+                            defer hits.deinit();
+                            while (try hits.next()) |hit| try posting(observer.ptr, hit.doc_id, hit.freq);
+                        }
                         switch (entry.result) {
                             .one_hit => |hit| try observer.finish(observer.ptr, 1, null, hit.norm_bits),
                             .postings => |postings| try observer.finish(observer.ptr, postings.doc_freq, postings.block_max, null),

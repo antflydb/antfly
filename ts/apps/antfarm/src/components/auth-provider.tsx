@@ -167,7 +167,10 @@ export function AuthProvider({ children }: AuthProviderProps) {
       return (user.permissions ?? []).some((perm: Permission) => {
         const resourceMatch = perm.resource === resource || perm.resource === "*";
         const typeMatch = perm.resource_type === resourceType || perm.resource_type === "*";
-        const permMatch = perm.type === permissionType || perm.type === "admin";
+        const permMatch =
+          perm.type === permissionType ||
+          perm.type === "admin" ||
+          (perm.type === "curator" && permissionType === "read");
 
         return resourceMatch && typeMatch && permMatch;
       });

@@ -1651,11 +1651,11 @@ destination alias cleanup and scoped retirement.
 
 Per-resolver policy mutations publish through the source table's authoritative
 metadata CAS until namespace adoption. Entity corrections publish through one
-destination-table CAS; source projections enqueue ordinary resolver backfill.
+destination-owned native transaction; source projections enqueue ordinary resolver backfill.
 Entity writes require destination write permission, and entity-state GET requires
 destination read permission. Background propagation uses internal metadata
 authority and does not delegate source-table authorization to the caller.
-Native Lite curation retains per-resolver atomicity.
+Native Lite uses the same namespace atomicity.
 Entity inspection returns redirects, key suppressions, distinct pins and
 unmerged keys for the requested redirect component; text suppressions and
 unrelated keys remain available only through the source resolver resources.
@@ -1760,7 +1760,7 @@ when the namespace is adopted, and conflicting redirect targets reject adoption
 with `ResolverNamespaceMigrationConflict`. Source projections are derived views;
 per-resolver runtime edits return `ResolverNamespaceCurationRequired` after
 adoption. Inline aliases remain source configuration, applied before shared
-namespace corrections. Lite retains its local resolver curation contract.
+namespace corrections. Lite uses the same destination-owned native record contract.
 
 Namespace projection is read-only; reverse dependency edges change only after
 table admission succeeds, in the same metadata transaction. Updates apply the edge
@@ -1836,10 +1836,15 @@ original target in `cascade_from`; review acceptance names its proposal in
 `proposal_id`. Attribution remains sparse when no origin was recorded; reading a policy
 never synthesizes per-key origins. Records may have zero creation time/revision;
 table-level proposals can also have revision zero until an individual policy edit is
-recorded. Mention-review provenance requires reader version 10; newly serialized
-curation state and queue receipts require reader version 11. Cluster metadata writers
-require coordinated decoder version 37 before publishing resolver policy or proposal
-queues, including queue-only and retired resolver metadata restored from backups.
+recorded. Mention-review provenance requires reader version 10; scoped legacy
+curation state and queue receipts require reader version 11. Original native
+resolver records remain readable at Lite reader version 12. Physical projection
+bindings, shared catalogs and fingerprinted heads require version 13; native
+metadata commands and shared execution attachments require coordinated decoder
+version 42. Version 41 introduced shared attachments; version 42 adds selective
+execution cuts and indexed namespace routes.
+Coalesced native Lite projection jobs require reader version 14.
+Legacy blob policy publication retains its version 37 decoder fence.
 
 `/tables/{entity_table}/curation/proposals` is the entity-level review surface;
 it does not replace mention-level resolver reviews. Create a typed entity action
@@ -1848,10 +1853,10 @@ accept or reject it. Both default and database/namespace-qualified routes are
 available. Accept uses the entity planner and returns its curation result. A
 merge rejection can atomically pin the proposed pair distinct. Accepted effects
 carry `origin: review`. Direct entity corrections supersede affected open
-proposals. Lite resolver-level edits settle the same destination queue through
-atomic source receipts. HTTP source-only edits are rejected with
-`ResolverNamespaceCurationRequired` once a namespace has entity proposals;
-clients use the entity resources so policy and queue changes share one CAS. The same
+proposals. Source-only edits are rejected with
+`ResolverNamespaceCurationRequired` once the destination owns a namespace or
+its proposals. Clients use entity resources so policy and queue changes commit
+in one native owner transaction. The same
 ownership check runs inside the primary metadata transaction, so proposal
 creation racing a source write cannot bypass it. Ownership checks index only
 namespace templates and proposal keys, with one index per destination table.
@@ -1864,10 +1869,11 @@ keyset pagination, with a default open-state filter and pages of 1–256 records
 is bounded at 16 KiB, 4096 JSON values and depth 32; confidence must be finite and
 between zero and one. Each table queue has a 4096-record, 4 MiB budget. Admission
 reserves the maximum escaped decision attribution for every open proposal, so rejecting
-or superseding admitted work never runs out of queue space. The HTTP path also reserves
+or superseding admitted work never runs out of queue space. Native queue heads track
+reserved bytes with per-record deltas. Legacy HTTP publication additionally reserves
 this growth in both definitions of its bounded metadata CAS. Size checks use a counting
-writer with fixed scratch space. Interrupted Lite decisions have a separately bounded
-envelope sized for both copies of frozen attribution. Budget exhaustion is explicit; no
+writer with fixed scratch space. Legacy interrupted Lite decisions retain their separately
+bounded frozen-attribution envelope until migration. Budget exhaustion is explicit; no
 existing decision is silently evicted. Queue records are metadata, never resolver
 declarations, and inference admission parses only execution policy, skipping proposal
 evidence and attribution history. Index configuration walkers share an opaque boundary
@@ -1877,26 +1883,75 @@ authorization sealing and namespace edits preserve their payloads verbatim as JS
 values. Configuration-shaped evidence cannot install producers, require destination
 credentials, or be rewritten as a live resolver declaration.
 
-HTTP stores proposals alongside destination namespace authority. Accept/reject and their
-policy effects share one destination-table metadata CAS, including catalog retries and
-Raft replay. Queue-only edits leave resolver policy revisions unchanged and do not
-enqueue resolver work. Lite retains the existing per-resolver atomicity of entity
-actions: each accepted effect and its decision receipt share one catalog publication. A
-durable pending decision fences competing decisions and resolver namespace migrations,
-including same-table resets and migrations into its destination. It supports resuming a
-partial fanout after reopening. Namespace migration reconciles dirty supersessions
-before removing their source receipts; healthy migrations inspect only the old and new
-destination manifests. Every queue writer first reconciles a dirty manifest across all
-source namespaces, including unrelated entity and resolver edits. Recovery indexes open
-IDs once and releases each source catalog's scratch memory before reading the next
-source. Edits that do not affect proposals skip extra queue publications. `complete` set to false means the caller should retry the same decision. Effect options and attribution
-remain frozen, while revision fences and wait budgets belong to the current request. A
-newly created Lite queue receives a durable random identity. Source receipts are bound
-to that queue identity as well as the public proposal ID. Dropping and recreating a
-destination therefore cannot reuse its prior source receipts. Backups preserve the
-identity and reopen/retry preserves completed decisions. Persisted nonempty Lite queues
-require this identity; there is no migration path for unreleased unscoped queues.
-Inference ignores this receipt metadata.
+HTTP and Lite store policy and proposals in destination-owned native records.
+Namespace heads fence component deltas; a separate compact queue head fences
+proposal deltas. Redirect/incoming, suppression/cascade, distinct-endpoint and
+proposal state/action/entity indexes are updated atomically with these heads.
+Queue-only decisions leave policy revisions unchanged. Terminal decisions stay
+idempotent across reopen and later corrections. Lite queues retain their random
+receipt identity across reopen and receive a fresh identity on destination
+recreation. Native publication and its minimum reader version commit together.
+
+Existing legacy corrections are folded once at namespace adoption. A legacy Lite
+pending fanout must finish through its frozen original decision before adoption;
+new decisions never create that envelope. Worker resolver configurations are derived
+projections. Remote replay coalesces updates in its bounded durable namespace job;
+Lite pulls one current source projection per detached maintenance turn. Publication
+rechecks the destination identity and head after building a projection outside the
+writer lease. Both adapters close components over alternating static aliases and
+native forward/reverse edges before planning or validating; the merge destination
+and every reached alias endpoint participate in the same traversal. Static aliases
+remain local configuration, rather than becoming shared corrections.
+
+Metadata source records carry compact physical destination/template/revision
+bindings. Raft replay reads heads and writes bindings, never full policy payloads.
+Read-only execution/provisioning cuts expand bindings from one immutable namespace
+snapshot per destination/template in that cut. A bounded immutable payload cache
+is keyed by the transaction's physical namespace revision and state fingerprint;
+warm reads do not scan policy records again. Adoption and every delta derive a
+new fingerprint, including divergent equal-revision histories after restore.
+Revision-zero native adoptions remain valid and cannot be mistaken for an
+unprojected source. Raw source records remain unchanged
+for DDL CAS; portable export materializes the policy and removes physical bindings.
+Lite pulls a namespace once per turn and publishes all of its serving/retired
+consumers in one catalog transaction. Reader-13 catalogs store shared projection
+payloads once in a content-addressed dictionary, with per-resolver references.
+The serving catalog and reopened catalogs retain immutable projection owners:
+policy allocation and digest computation happen once per shared projection,
+while consumer slots hold lightweight references. Detached config clones retain
+ordinary allocator ownership, including arena readers. Runtime ownership never
+crosses JSON boundaries. Legacy merge sidecars retain only source-owned policy;
+private compact consumer wires explicitly retain those unadopted merges until
+the namespace's first native adoption.
+
+The source execution clock (`resolution_generation`) advances independently of
+the destination curation revision. Projection/readiness stamps include the physical
+destination ID and explicit missing-authority state, so moving to a namespace
+with a lower revision or recreating a destination cannot regress execution or
+falsely report an old projection applied. A dropped or unadopted replacement
+retracts derived corrections even while the retired authority's rows/cache remain;
+publication fences both authority presence and absence.
+Replay retains its cursor when writes arrive and marks the pass dirty. It finishes
+the tail before another pass and rotates among namespace jobs; continuous writes
+cannot repeatedly restart the first page.
+
+Native Lite maintains a durable reverse consumer index in the same physical
+transaction as resolver catalog edits. Warm mutations seek the destination and
+open only matching sources. Legacy index bootstrap reads catalog bytes without
+opening unrelated indexes/providers. Directory changes enroll/retire their own bindings atomically;
+source IDs fence dropped/recreated tables. Queue-only rejections and their receipt
+replays use point admission and no consumer discovery. Their effect classification
+is a durable native receipt witness, independent of caller-supplied retry flags or
+actor revision; rejected distinct pins still observe their policy consumers.
+Unclassified legacy receipts conservatively observe the scoped consumers.
+Entity inspection of an unadopted native namespace uses the same reverse lookup
+without opening unrelated tables. C ABI waits capture immutable source and
+namespace requirements before releasing admission, then batch lightweight
+identity and replay observations per source. Physical source/destination IDs,
+namespace template/generation, missing authority and accepted revision fences
+all participate; a moved or recreated namespace cannot satisfy an old wait.
+Manual maintenance uses the same pull operation. `complete` describes
+atomic authority admission; `applied` observes asynchronous consumer replay.
 
 HTTP initial decisions and terminal retries return the same decision envelope,
 including the proposal, `changed`, `complete`, `applied`, and per-consumer results.
@@ -1918,3 +1973,118 @@ The HTTP convenience clients expose Go `ProposeCuration` / scoped variants,
 TypeScript `curationProposals` / `namespaceCurationProposals`, and Python
 `curation_proposals` with `in_namespace`. Entity suppression uses the typed
 `EntitySuppressRequest` in each SDK, including its absorbed-key disposition.
+
+
+### Bounded resolver candidate work and policy reuse
+
+Within one resolution work unit, missing mention texts are deduplicated and sent
+through the configured Antfly embedding provider in batches of at most 64.
+Embedding identity, role, dimensions and existing source/publication fences stay
+unchanged. Providers without a batch callback retain their scalar adapter.
+
+ANN discovery deduplicates identical vectors and uses the shared native
+`nearest_many` callback in batches of at most 64 queries. Routed adapters execute
+at most eight neighbor queries concurrently; embedded adapters use their native
+owner lease. This is bounded fanout over Antfly's existing indexes. It does not
+introduce another vector store or pretend that one RPC replaces all neighbor
+queries. Distinct redirect targets are bulk-read once per table and work unit,
+including missing targets. Repeated mentions share immutable decoded candidates.
+ANN requests hydrate scorer inputs and canonical/type/redirect metadata instead
+of full documents. Routed hit decoding borrows the `_source` JSON slice rather
+than building and serializing a source DOM.
+
+Resolver execution caches immutable compiled suppression, distinct-pair and
+redirect indexes by the exact alias and policy content. The process cache holds
+at most 32 entries and 32 MiB. Each executing resolver holds a reference-counted
+lease, so eviction cannot free an active reader's policy. Content changes,
+including removal of a correction, select a different compiled policy. Grants,
+authorized documents, and decision results are not cached.
+
+Entity and terminal proposal progress observations group consumers by source
+table. Every polling round shares one source catalog cut, one local status sample,
+and at most one owner probe per group across its resolvers. Each resolver still
+checks its own namespace revision, configuration generation, journal floor and
+promotion requirements. An overall wait budget covers all source tables.
+
+Native curation no longer serializes a destination's entire `indexes_json` for
+ordinary corrections. Protocol 39 publishes typed component record deltas and
+compact version heads. Table metadata retains immutable discovery references;
+current revisions live in native rows. Schema and consumer catalog cuts remain
+final publication fences. Generic table mutations cannot replace these private
+references or bypass source ownership. Native metadata snapshots include all
+records, indexes, receipts and pending replay; destination retirement removes them
+in bounded pages.
+
+Point entity reads seek the redirect component and incident negative policy.
+Proposal lookup uses its stable ID; listing seeks state/action indexes with keyset
+pagination. Consumer admission reads compact static descriptors rather than every
+source's projected policy. Full namespace exports occur only for derived worker
+configuration. The shared record-store regression imports 10,000 unrelated aliases
+and bounds point-component reads and single-component writes independently of that
+namespace size. Namespace graph size and aggregate policy/queue quotas remain
+explicit bounds; no record or decision is silently discarded.
+
+Portable system-catalog exports materialize current native policy and proposals
+into self-contained table authority. They omit instance-local adoption cuts and
+native discovery markers. Live catalog projections keep compact native references.
+Lite portable backups retain typed native authority rows and require reader version
+12 plus the native marker; native file backups retain their original indexes and
+heads. Durable authority is never reconstructed from a possibly lagging worker.
+
+### Scoped admission and projection work
+
+HTTP and embedded entity mutations build the same effective graph from all
+consumer static profiles, native overrides and tombstones. Planning never
+selects a consumer as the namespace authority. Static-profile compatibility is
+validated once per distinct profile from the admitted catalog cut; HTTP retains
+those profiles rather than fetching consumers again. Explicitly asserting an
+identical source-local alias publishes a shared redirect with its own origin.
+
+Private execution/provisioning catalogs carry one content-addressed namespace
+attachment and compact references from resolver identities. Hydration and
+validation are batched; repeated references borrow the same parsed policy and
+encoded state. Raw source records remain compact for CAS. Portable exports
+expand attachments and detach physical bindings in one pass. Persistent owners
+copy each policy out of the metadata arena once, then retain shared immutable
+ownership across consumers. Runtime validation evidence binds the policy digest
+and static profile, is never serialized, and is invalidated by caller edits;
+unchanged shared policies compare by digest.
+
+Native Lite maintains coalesced per-owner namespace jobs in the same physical
+transaction as authority-head changes, binding changes and destination directory
+changes. A durable cursor rotates work, so a hot namespace cannot pin the tail.
+Projection publication acknowledges the selected job and advances its cursor
+atomically, under the same namespace dependency fence. Reader 14 introduced
+pending jobs and cursor records; reader 15 fences the durable namespace routes
+and projection delta records, including portable restore. Work discovery
+seeks the pending-job prefix instead of opening or polling every destination.
+
+The native transaction overlay keeps an ordered staged index. Prefix reads merge
+bounded base and staged ranges, including replacements and tombstones; unrelated
+staged writes do not participate in adjacency scans during adoption or curation.
+
+
+### Incremental projection publication and scoped reads
+
+Native projection replay writes one namespace snapshot and its execution clocks
+under a private projection prefix. Static resolver catalogs are unchanged by
+replay. Empty work acknowledgements write only their job/cursor records. A source
+owner loads the static catalog and namespace snapshots at one read cut; structural
+edits fold serving snapshots into the catalog and retire their delta records in
+the same transaction. Publication epochs fence prepared work across reopen and
+snapshot replacement. Portable imports validate the snapshot bindings against the
+static catalog before publication.
+
+Namespace routing uses an atomically populated prefix index; legacy read-only
+spaces retain the scan fallback until an authorized writer completes adoption.
+Native Lite consumer lookup and invalidation use namespace-specific reverse
+bindings. Projection clocks are read from the source owner's namespace index,
+not a second copy in reverse bindings. Structural routing comparisons group
+labels once per routing domain rather than rescanning sibling catalogs for each
+resolver.
+
+HTTP descriptor/status cuts export no execution policies. Execution cuts hydrate
+only named resolvers and, for query resolution, the siblings that can consume the
+same extraction. Consumer pages own strings independently of storage cursor
+movement. Progress observation runs in bounded groups of 16 source tables, with a
+shared deadline and per-worker allocation ownership.

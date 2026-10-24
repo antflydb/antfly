@@ -138,14 +138,13 @@ jobs:
           package_json_file: ts/package.json
 
       - name: Set up Go
-        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memoryaf == 'true' || steps.scopes.outputs.format_go == 'true'
+        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memory == 'true' || steps.scopes.outputs.format_go == 'true'
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ steps.toolchain.outputs.go_version }}
           cache: true
           cache-dependency-path: |
             go/pkg/sdk/go.sum
-            go/pkg/memoryaf/go.sum
 
       - name: Set up Rust
         if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.format_rust == 'true'
@@ -159,9 +158,9 @@ jobs:
       # for Go's race detector and Rust dependencies. Release packaging executes
       # the Homebrew formula's C ABI smoke program even without SDK changes.
       - name: Install native test dependencies
-        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memoryaf == 'true' || steps.scopes.outputs.format_zig == 'true' || steps.scopes.outputs.release == 'true'
+        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memory == 'true' || steps.scopes.outputs.format_zig == 'true' || steps.scopes.outputs.release == 'true'
         env:
-          NEED_BUILD_TOOLS: ${{ steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memoryaf == 'true' || steps.scopes.outputs.release == 'true' }}
+          NEED_BUILD_TOOLS: ${{ steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memory == 'true' || steps.scopes.outputs.release == 'true' }}
         run: |
           sudo_cmd=""
           if command -v sudo >/dev/null 2>&1; then
@@ -244,9 +243,9 @@ jobs:
         if: steps.scopes.outputs.typescript == 'true' && steps.scopes.outputs.sdk != 'true'
         run: scripts/ci/check.sh typescript
 
-      - name: Check memoryaf
-        if: steps.scopes.outputs.memoryaf == 'true' && steps.scopes.outputs.sdk != 'true'
-        run: scripts/ci/check.sh memoryaf
+      - name: Check memory
+        if: steps.scopes.outputs.memory == 'true' && steps.scopes.outputs.sdk != 'true'
+        run: scripts/ci/check.sh memory
 
       - name: Check release packaging and scripts
         if: steps.scopes.outputs.release == 'true'
