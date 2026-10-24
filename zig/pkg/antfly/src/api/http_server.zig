@@ -1973,6 +1973,9 @@ pub const AuthenticatedIdentity = struct {
     /// True only for an audience-bound node/service credential. A generic
     /// trusted upstream user is deliberately not an internal service.
     is_internal_service: bool = false,
+    /// Signed MCP discovery hint, never mutation authority. Every create/restore
+    /// invocation still requires an ordinary grant on its concrete target.
+    mcp_creation_discovery: bool = false,
     permissions: []usermgr.Permission = &.{},
     row_filter: []usermgr.RowFilterEntry = &.{},
     metadata_json: []u8 = &.{},
@@ -8438,6 +8441,7 @@ pub const ApiHttpServer = struct {
                 .{ jsonStringField(payload.get("iss")) orelse "", subject },
             ),
             .is_internal_service = is_internal_service,
+            .mcp_creation_discovery = jsonBoolField(payload.get("mcp_creation_discovery")),
             .permissions = permissions,
             .row_filter = row_filters,
             .metadata_json = metadata_json,
@@ -57954,6 +57958,7 @@ pub fn cloneCatalogIdentity(alloc: std.mem.Allocator, identity: ?AuthenticatedId
     var owned = try cloneAuthenticatedIdentity(alloc, value.username, value.credential_principal, value.permissions, value.row_filter, value.metadata_json, value.roles);
     errdefer owned.deinit(alloc);
     owned.is_internal_service = value.is_internal_service;
+    owned.mcp_creation_discovery = value.mcp_creation_discovery;
     owned.live_user_manager = value.live_user_manager;
     for (value.catalog_aliases) |alias| try appendCatalogAlias(alloc, &owned, alias.logical, alias.physical);
     return owned;
@@ -59837,4 +59842,30 @@ test "trusted principal table operations reject malformed and wildcard grant exp
         defer parsed.deinit();
         try std.testing.expectError(error.Unauthorized, trustedPrincipalPermissionsFromPayload(a, parsed.value.object));
     }
+}
+
+test "trusted principal table operations preserve discovery hints without granting target authority" {
+    const a = std.testing.allocator;
+    const FakeSource = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var server = ApiHttpServer.init(a, .{ .trusted_principal_issuer = "cloudaf" }, .{ .ptr = undefined, .vtable = &.{ .status = FakeSource.status } }, null, null);
+    defer server.deinit();
+    const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const payload = try std.fmt.allocPrint(a,
+        \\{{"iss":"cloudaf","sub":"creator","tables":["*"],"operations":["read"],"mcp_creation_discovery":true,"iat":{d},"exp":{d}}}
+    , .{ now, now + 60 });
+    defer a.free(payload);
+    const token = try encodeTrustedPrincipalToken(a, "secret", payload);
+    defer a.free(token);
+    var identity = try server.authenticateTrustedPrincipal(token, "secret");
+    defer identity.deinit(a);
+    try std.testing.expect(identity.mcp_creation_discovery);
+    var clone = (try cloneCatalogIdentity(a, identity)).?;
+    defer clone.deinit(a);
+    try std.testing.expect(clone.mcp_creation_discovery);
+    try std.testing.expect(!permissionsAllow(clone.permissions, .table, "new_table", .admin));
+    try std.testing.expect(!permissionsAllow(clone.permissions, .table, "antfly_sources", .admin));
 }

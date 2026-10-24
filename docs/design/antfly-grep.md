@@ -342,10 +342,16 @@ Downloads and cache authorization request the exact version (including literal
 `null`) and validate the returned version, ETag and size. Versionless legacy
 snapshots fail closed on versioned responses, even for identical replacement
 bytes; operators must enumerate a new snapshot. Unversioned objects retain
-conditional ETag/size checks.
+conditional ETag/size checks. Cache authorization uses the GET content data plane,
+including SSE-KMS decryption, rather than metadata HEAD. It requests one byte for
+nonempty objects, validates the complete-object size from Content-Range, and uses
+an ordinary GET for empty objects. Ignored ranges still consume at most one byte.
 
 MCP trusted-principal tokens retain their broad read scope and add concrete
-`table_operations` write/admin grants for allowed application tables. Reserved
+`table_operations` write/admin grants for allowed application tables. Create/restore
+requests add their concrete destinations only after intersection with current
+Cloud grants and reservations. The signed `mcp_creation_discovery` hint exposes
+creation tools on empty instances without granting invocation authority. Reserved
 catalog/source tables receive no write grants. Wildcard writers use the current
 table catalog to bound the request's write scope; missing scope cannot become a
 wildcard grant. Older Antfly runtimes ignore the additive claim and retain only
