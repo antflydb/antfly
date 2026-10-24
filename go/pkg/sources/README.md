@@ -72,8 +72,8 @@ antfly-grep --source-catalog ./catalog.json --source manuals 'retry budget'
 The runner creates a missing destination through the normal table API, writes
 canonical rows with a write barrier, and checks revision, content digest and
 permissions through a snapshot-capable query before declaring them searchable.
-Use a dedicated destination: the runner never imports arbitrary application rows
-into its ownership ledger. All queries use existing Antfly table endpoints;
+Multiple sources may share an ingestion destination. The runner never imports
+arbitrary application rows into its ownership ledger. All queries use existing Antfly table endpoints;
 self-hosted grep never invokes `antfly-cloud`.
 
 The catalog contains aliases, physical tables, selection filters and readiness,
@@ -95,7 +95,7 @@ fsynced before writes, so a lost acknowledgement cannot lose potentially written
 rows. Retrying uses the pinned selection; `--restart` explicitly re-enumerates
 while retaining the ownership ledger. Provider revision/access failures and
 incomplete inventories leave the catalog stale. GitHub omitted identities are
-checked independently before deletion. Only previously owned IDs are retired.
+checked independently before deletion. Legacy provider-key rows are retired only when present in the ownership journal.
 
 The catalog is marked syncing before writes and published atomically after
 readiness and reconciliation. Its permission lease starts at enumeration, not
@@ -167,3 +167,40 @@ of the pinned version, so revoked SSE-KMS decrypt access blocks staged plaintext
 reuse. Nonempty objects request a one-byte range; empty objects use an ordinary
 GET. Responses must match version, ETag and object size, and the probe reads at
 most one byte even when an S3-compatible server ignores Range.
+
+## Shared LinearMerge synchronization
+
+Colony source jobs and `antfly-source` use the same `SyncWriter`. Provider IDs
+remain stable acquisition/retry identities; destination keys use
+`source://job/<source UUID>/records/<SHA-256 of provider ID>`. Each source owns an
+exclusive key range, so reconciling one source cannot remove another source's
+records or unrelated application keys. Hosted deployments still reserve source
+tables to protect their ACL markers.
+
+The writer first queries normalized metadata, preserving `indexed_at` only when
+all canonical fields and the content digest are unchanged. Volatile enumeration
+positions are excluded. Non-destructive LinearMerge pages compare canonical
+content hashes and skip unchanged rows. Every page must pass the shared snapshot
+readiness barrier. Only a fully verified authoritative inventory can issue the
+final bounded cleanup, retaining its verified IDs without uploading their text a
+second time. Partial selections, failed reads, and repair retries never reconcile
+missing rows. Provider access/absence checks precede cleanup, and a fresh query
+proves the range contains no extra records before catalog publication.
+
+The existing `/tables/{table}/merge` endpoint accepts the versioned
+`application/vnd.antfly.scoped-merge.v1+json` envelope (`scoped_merge` with explicit
+`key_range`, `records`, optional `retain_ids`, and `delete_missing`). Bounds are
+exclusive; deletion defaults to false. `retain_ids` is valid only on empty-record
+cleanup and every retained ID must exist before storage mutation starts. There is
+no fallback to the legacy unbounded merge format. Upgrade the Antfly server before
+upgrading ingestion workers; older servers reject this envelope before mutation.
+
+Existing standalone state is upgraded in place: write and verify the bounded
+representation, reconcile its complete inventory, then delete only journaled
+legacy provider keys. Interrupted migration resumes from the same durable state.
+Colony preserves its job manifests, attempt fences, and ownership ledger, retiring
+legacy rows only after their replacement is query-visible. Source IDs must remain
+stable, and overlapping writers for the same source must be serialized (the
+standalone state lock or Colony's job admission). Distinct sources can sync
+independently. `antfly-grep` continues to use the catalog and ordinary queries;
+it does not schedule ingestion.
