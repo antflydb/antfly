@@ -290,6 +290,7 @@ jobs:
             scripts/yaml_to_json.py \
             scripts/generate_graph_identifier_policy.py \
             scripts/generate_mcp_schema_fragments.py \
+            scripts/generate_memory_openapi.py \
             scripts/pyproject.toml \
             scripts/uv.lock \
             scripts/ci/test_zig_validation_scope.py \
@@ -2618,9 +2619,9 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.rust_version }}
           targets: wasm32-wasip2
 
-      - name: Build MemoryAF extension package
+      - name: Build record-tools extension test fixture
         if: matrix.suite == 'antfly'
-        run: cargo build --manifest-path extensions/memoryaf/Cargo.toml --release --target wasm32-wasip2
+        run: cargo build --manifest-path zig/e2e/fixtures/extensions/records/Cargo.toml --release --target wasm32-wasip2
 
       - name: Download E2E executable
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2

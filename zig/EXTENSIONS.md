@@ -591,17 +591,14 @@ described above.
 
 **Worked examples from the original design**
 
-The original design's `memoryaf` (memory extension: memory/event/edge tables,
-full-text + vector + graph indexes, `remember`/`recall`/`search_memory`/
-`forget`/`link_memory`/`summarize_memory` MCP tools, background
-dedup/compaction/decay tasks) and `antfly_durable` (durable in-database
-workflow extension modeled on Microsoft's `pg_durable`, with workflow/
-instance/checkpoint/timer/work-queue records and start/cancel/signal/inspect
-handlers) are illustrative target-state scenarios, not installed extensions
-that exist in the codebase today. They remain useful as worked examples of
-what the shipped catalog, membership, and (eventually) non-WASM/non-table
-object kinds are meant to support, but every MCP tool, background task, and
-workflow DAG shown for them is hypothetical.
+Agent memory is now a native first-party service, documented in [MEMORY.md](MEMORY.md).
+The former Rust memory extension and standalone Go memory server are retired.
+Generic extension-runtime coverage uses the test-only record-tools package in
+`e2e/fixtures/extensions/records`; it is not an agent-memory backend.
+
+The original `antfly_durable` workflow example remains a hypothetical extension
+scenario for workflow/instance/checkpoint/timer/work-queue records and
+start/cancel/signal/inspect handlers.
 
 **Deferred questions carried over from the original design**
 

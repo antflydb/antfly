@@ -122,6 +122,22 @@ fn refreshScenario(object_backend: bool, collect: bool, comptime numeric_body: b
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const root = try identity.load(arena.allocator(), store, published.row_identity.?, .none, null);
+        if (step == 0 and !numeric_body) {
+            var hydrated = published;
+            try @import("lake_index_directory.zig").hydrateLazy(arena.allocator(), store, &hydrated, .none, null);
+            const text = for (hydrated.declarations) |entry| {
+                if (std.mem.eql(u8, entry.name, "body_text")) break entry;
+            } else return error.TestUnexpectedResult;
+            const corpus = @import("lake_index_native_text.zig");
+            const text_root = try corpus.loadRoot(arena.allocator(), store, text.artifact, .none, null);
+            var count: usize = 0;
+            for (text_root.file_groups) |group| if (group.segments.len != 0) {
+                try std.testing.expectEqual(@as(u8, 1), group.forward_version);
+                try std.testing.expectEqual(group.segments.len, group.forwards.len);
+                count += 1;
+            };
+            try std.testing.expect(count != 0);
+        }
         const navigation = root.spaceForIndex("body_text").navigation.?;
         if (step == 3) after_body = navigation.checksum[0..64].*;
         if (step == 6 and !numeric_body) try std.testing.expectEqualSlices(u8, &after_body, navigation.checksum);

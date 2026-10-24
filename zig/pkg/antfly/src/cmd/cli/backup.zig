@@ -102,9 +102,9 @@ pub fn runInspect(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
     defer if (capabilities) |bytes| allocator.free(bytes);
     const json = try lite_restore_staging.inspectInputJsonAlloc(allocator, opts.input_path.?, capabilities, opts.max_input_bytes, opts.max_expanded_bytes);
     defer allocator.free(json);
-    var report = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
-    defer report.deinit();
-    try cli.writeJson(allocator, io, report.value);
+    // The inspection report is a portable JSON artifact. Presentation policy
+    // must not summarize, envelope, fingerprint or truncate its inventory.
+    try cli.output.writeJsonArtifact(allocator, io, json);
 }
 
 fn parseInspectArgs(args: *std.process.Args.Iterator) !InspectArgs {

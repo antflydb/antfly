@@ -298,6 +298,7 @@ export interface NativeLibrary {
   dbRenderResolverKeyJson: KoffiFunc<
     (handle: unknown, arg0: object, arg1: object, out: object) => number
   >;
+  dbMemoryJson: KoffiFunc<(handle: unknown, space: object, request: object, out: object) => number>;
   dbResolveQueryJson: KoffiFunc<
     (handle: unknown, arg0: object, arg1: object, out: object) => number
   >;
@@ -614,6 +615,12 @@ function buildNative(): NativeLibrary {
     dbGetSchemaJson: f("antfly_db_get_schema_json", "uint32_t", [PAntflyDb, PAntflyBufferOut]),
     dbSetSchemaJson: f("antfly_db_set_schema_json", "uint32_t", [PAntflyDb, AntflySlice]),
     dbRenderResolverKeyJson: f("antfly_db_render_resolver_key_json", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]),
+    dbMemoryJson: f("antfly_db_memory_json", "uint32_t", [
       PAntflyDb,
       AntflySlice,
       AntflySlice,

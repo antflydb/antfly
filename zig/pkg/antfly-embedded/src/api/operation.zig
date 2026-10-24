@@ -113,6 +113,8 @@ pub const RequestDiagnostics = struct {
 };
 
 pub const RequestContext = struct {
+    /// Native service admission only; never reconstructed from user input.
+    native_service: ?@import("../common/service_ownership.zig").Owner = null,
     /// Granted only after administrator authentication by a trusted native
     /// ingress. Metadata HTTP never reconstructs this from request JSON.
     setting_admin: bool = false,
@@ -314,3 +316,5 @@ test "serverless request diagnostics remain isolated across interleaved operatio
     try std.testing.expectEqualStrings("degree", second_rejection.metricName());
     try std.testing.expectEqual(@as(u64, 22), second_rejection.materializer_fingerprint);
 }
+
+pub const requireNativeServiceAccess = @import("../common/service_ownership.zig").requireAccess;
