@@ -1369,9 +1369,14 @@ def test_memory_evaluation_pages_and_indexed_candidates_with_admin_key(storage_e
         while True:
             try:
                 call("POST", space + "/maintenance", {})
+                page = call(
+                    "POST",
+                    space + "/memories/claim-0/supersession-candidates",
+                    {"mode": "lexical"},
+                )
             except requests.HTTPError as error:
-                # Standalone also advances memory in the background. A lost
-                # revision fence requires a new bounded admission attempt.
+                # Standalone advances memory in the background. Both mutation
+                # CAS and read-snapshot fences require a fresh bounded attempt.
                 response = error.response
                 if (
                     response is None
@@ -1382,11 +1387,6 @@ def test_memory_evaluation_pages_and_indexed_candidates_with_admin_key(storage_e
                 assert time.monotonic() < deadline
                 time.sleep(0.1)
                 continue
-            page = call(
-                "POST",
-                space + "/memories/claim-0/supersession-candidates",
-                {"mode": "lexical"},
-            )
             if page["retrieval"] == "indexed":
                 assert [
                     item["view"]["memory"]["assertion"]["id"] for item in page["items"]

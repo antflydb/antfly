@@ -1594,7 +1594,15 @@ test "capi resolver REVIEW adjudication publishes promotes queries and reopens d
     try std.testing.expect(std.mem.indexOf(u8, query, "concept/antfly\"") != null);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
     const catalog = @import("../storage/db/catalog/resolver_catalog.zig");
-    try std.testing.expectEqual(catalog.adjudication_reader_version, handle.db.core.index_manager.minimum_reader_version.load(.acquire));
+    // Native projection bookkeeping can require a newer format than REVIEW.
+    // The compatibility contract rejects pre-adjudication readers and keeps
+    // the durable fence synchronized with the loaded catalog.
+    {
+        var read = try handle.db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, catalog.readMinimumReaderVersion(&read, catalog.adjudication_reader_version - 1));
+        try std.testing.expectEqual(handle.db.core.index_manager.minimum_reader_version.load(.acquire), try catalog.readMinimumReaderVersion(&read, catalog.supported_reader_version));
+    }
     const resolution_key = try @import("../storage/internal_keys.zig").resolutionArtifactKeyAlloc(a, "source", "resolved");
     defer a.free(resolution_key);
     const before = try handle.db.core.store.get(a, resolution_key);
