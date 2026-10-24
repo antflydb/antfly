@@ -3863,3 +3863,11 @@ Dirty-key ordering and compact read descriptors remove repeated backing reads;
 encoded fallback handles oversized decoded pages without increasing the cache
 limit. Repeated native join keys share candidate metadata decoding within a wave.
 These are in-memory refinements under the existing publication/GC contract.
+
+
+[Reuse-admitted join metadata and direct decoded-page ownership](lake-row-identity.md#reuse-admitted-join-metadata-and-direct-decoded-page-ownership)
+remove repeated duplicate-chain decoding and cold admission copies. Metadata
+admission requires observed offset reuse and remains bounded by the existing
+request budget. Matched flags stay fresh, saved matches retain coordinates, and
+borrowed pages keep independent ownership. Publication, reader protocol 81 and
+reclamation semantics remain unchanged.

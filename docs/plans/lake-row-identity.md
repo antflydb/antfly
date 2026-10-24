@@ -1078,3 +1078,49 @@ For 8,193 repeated lanes it needs 8,193 versus seventeen metadata decodes; one
 local Debug run measured 16.29 ms versus 5.11 ms. These timings support the work
 reduction and have no timing assertion. Archive-scale throughput and cloud
 latency remain unmeasured.
+
+
+### Reuse-admitted join metadata and direct decoded-page ownership
+
+Native spilled joins retain immutable key/coordinate records only after a
+bounded exact-offset probation filter observes reuse. A hash collision in that
+filter declines admission; it never establishes key equality. One-pass distinct
+candidate offsets do not allocate the retained metadata directory. Admitted records occupy
+at most eight LRU slots and 64 KiB of arena capacity, further capped at one eighth
+of the join budget and admitted only with 128 KiB of remaining scratch headroom.
+Directory storage and arena bookkeeping also charge the existing request budget.
+The cache moves completed decode arenas rather than copying typed keys. Local
+and shared admission pressure can reclaim those arenas before allocating more
+scratch. Small-budget joins retain the scalar path.
+
+Every probe still checks cancellation and evaluates exact typed equality. Native
+matches retain immutable record/payload coordinates, so later decodes, eviction,
+and payload reads cannot invalidate saved matches. Payload hydration remains
+lazy. Duplicate traversal uses the same metadata cache as initial probing.
+Mutable matched flags never determine cached probe results; outer-join unmatched
+scans bypass the cache and read fresh record headers. Allocation-failure, cancellation, residual,
+NULL, eviction and zero-live-budget checks cover these ownership boundaries.
+
+The 8,193 repeated-lane fixture needs two initial and two duplicate-tail metadata
+decodes instead of 8,193 each. One local Debug run measured duplicate traversal at
+14.3 ms versus 2.25 ms. A distinct 2,049-key fixture compares three runs per mode:
+it retains the same 6,147 total decodes, with median times of 5.26 ms and 5.20 ms.
+The probation policy avoids the measured roughly 13% distinct-key regression of
+unconditional cache admission. Timing is diagnostic, never a test assertion.
+
+Cold decoded-page misses now allocate directly through the operation cache's
+owner and move independently owned pages into admitted slots. A borrowed backing
+lease or a differently owned page still takes the independent-copy path. Only
+the cache boundary records an alternate deallocation owner for uncached oversized
+pages; ordinary decoding does not retain temporary worker allocator wrappers.
+Batched misses apply the same ownership transfer after workers join. Existing
+512 KiB admission, pinned leases, encoded fallback, authentication and cancellation
+checks remain in force.
+
+Across 128 cold admissions of a prefix-compressed 1,024-row page, this removes
+one full decode and ownership copy per miss: 22,826,496 versus 11,413,248 allocated
+bytes and 768 versus 384 allocations. One local Debug run measured 41.1 ms versus
+21.0 ms. Separate caller/cache allocators, oversized fallback and every injected
+allocation failure release their owners correctly. These are in-memory changes
+under reader protocol 81; wire artifacts, publication authority and GC closure
+are unchanged. Archive-scale throughput and cloud latency remain unmeasured.

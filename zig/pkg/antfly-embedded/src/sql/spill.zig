@@ -1290,7 +1290,10 @@ pub const CachePressure = struct {
         return if (owner.*) |payloads| payloads.evictOne() else false;
     }
     pub fn prepare(self: *CachePressure, growth: usize) void {
-        while (@import("memory_budget.zig").headroom(self.manager.alloc)) |available| {
+        while (true) {
+            const shared = @import("memory_budget.zig").headroom(self.manager.alloc);
+            const local = if (self.backing) |backing| @import("memory_budget.zig").headroom(backing) else null;
+            const available = @min(shared orelse std.math.maxInt(usize), local orelse std.math.maxInt(usize));
             if (growth <= available or !self.evict(self.context)) break;
         }
     }
@@ -6611,7 +6614,12 @@ test "SQL shared spill extents unwind every allocation failure" {
 }
 
 test "SQL shared logical runs avoid repeatedly rewriting large retained runs" {
-    const a = std.testing.allocator;
+    // The legacy baseline deliberately rewrites large runs. Track every live
+    // byte without capturing allocation stack traces for that quadratic work;
+    // separate failure tests qualify ownership and allocation unwinding.
+    var budget: @import("memory_budget.zig") = .{ .backing = std.heap.smp_allocator, .limit = 32 * 1024 * 1024 };
+    defer std.debug.assert(budget.live == 0);
+    const a = budget.allocator();
     const Hook = struct {
         fn check(_: *anyopaque) !void {}
     };

@@ -215,7 +215,12 @@ pub const Cache = struct {
             self.slots[i].?.used = self.clock;
             return decodePage(a, self.underlying.domain, ref, try a.dupe(u8, value.bytes));
         };
-        return self.adopt(a, ref, try readPage(a, self.underlying, ref));
+        return self.adopt(a, ref, try self.readMiss(ref));
+    }
+    fn readMiss(self: *Cache, ref: Ref) !Page {
+        var page = try readPage(self.alloc, self.underlying, ref);
+        if (page.lease == null and page.allocation == null) page.allocation = self.alloc;
+        return page;
     }
     fn adopt(self: *Cache, a: Allocator, ref: Ref, input: Page) !Page {
         var original = input;
@@ -230,10 +235,12 @@ pub const Cache = struct {
             }
             return original;
         };
-        // Independent cache ownership survives caller arenas and underlying
-        // leases. Authentication/decode costs recur only on cache misses.
-        const page = try decodePage(self.alloc, self.underlying.domain, ref, try self.alloc.dupe(u8, original.bytes));
-        original.deinit(a);
+        // Independently owned misses were decoded with the cache allocator and
+        // can move directly into the slot. Borrowed backing leases still need
+        // an independent copy; never transfer ownership out of another cache.
+        const transfer = original.lease == null and if (original.allocation) |owner| owner.ptr == self.alloc.ptr and owner.vtable == self.alloc.vtable else false;
+        const page = if (transfer) original else try decodePage(self.alloc, self.underlying.domain, ref, try self.alloc.dupe(u8, original.bytes));
+        if (!transfer) original.deinit(a);
         self.decodes += 1;
         self.slots[index] = .{ .ref = ref, .bytes = @constCast(page.bytes), .used = self.clock, .page = page };
         self.bytes += size;
@@ -267,15 +274,21 @@ pub const Cache = struct {
         if (count == 0) return;
         var pages: [max_read_batch]Page = undefined;
         if (self.underlying.read_many) |many| {
-            try many.read(many.ptr, a, misses[0..count], pages[0..count]);
+            try many.read(many.ptr, self.alloc, misses[0..count], pages[0..count]);
         } else {
             var read: usize = 0;
             errdefer for (pages[0..read]) |*page| page.deinit(a);
             for (misses[0..count], pages[0..count]) |ref, *page| {
-                page.* = try readPage(a, self.underlying, ref);
+                page.* = try self.readMiss(ref);
                 read += 1;
             }
         }
+        // The batch capability returns independently owned pages allocated
+        // through its supplied allocator, or explicit borrowed leases. Do not
+        // retain temporary worker allocator wrappers inside decoded pages.
+        for (pages[0..count]) |*page| if (page.lease == null and page.allocation == null) {
+            page.allocation = self.alloc;
+        };
         var consumed: usize = 0;
         defer for (pages[consumed..count]) |*page| page.deinit(a);
         for (misses[0..count], positions[0..count], pages[0..count]) |ref, position, page| {
@@ -338,6 +351,10 @@ pub const Page = struct {
     ref: Ref,
     aggregate: []const u8 = "",
     expanded_keys: []const u8 = &.{},
+    /// Cache misses can move into retained storage or return an oversized page
+    /// allocated by a different owner than the caller. Only that boundary sets
+    /// this override; ordinary decoding keeps the supplied deinit allocator.
+    allocation: ?Allocator = null,
     lease: ?struct {
         owner: *anyopaque,
         item: *anyopaque,
@@ -351,10 +368,11 @@ pub const Page = struct {
         if (self.lease) |lease| {
             lease.release(lease.owner, lease.item);
         } else {
-            alloc.free(self.entries);
-            alloc.free(self.child_refs);
-            alloc.free(self.bytes);
-            alloc.free(self.expanded_keys);
+            const owner = self.allocation orelse alloc;
+            owner.free(self.entries);
+            owner.free(self.child_refs);
+            owner.free(self.bytes);
+            owner.free(self.expanded_keys);
         }
         self.* = undefined;
     }
@@ -3802,4 +3820,66 @@ test "external lake compact decoded pages keep encoded fallback bounded and unwi
     try Case.run(a, memory.store(), root);
     try std.testing.expectEqual(@as(usize, 1), memory.reads - before);
     try std.testing.checkAllAllocationFailures(a, Case.run, .{ memory.store(), root });
+}
+
+test "external lake cold decoded cache transfers ownership without duplicate decoding" {
+    const Proof = struct {
+        const Result = struct { bytes: usize = 0, allocations: usize = 0, ns: i128 = 0 };
+        fn run(backing: Allocator, store_: Store, root: Ref, transfer: bool) !Result {
+            var caller = std.testing.FailingAllocator.init(backing, .{});
+            var retained = std.testing.FailingAllocator.init(backing, .{});
+            const a = caller.allocator();
+            const ca = retained.allocator();
+            const clock_ = @import("antfly_platform").time;
+            const start = clock_.monotonicNs();
+            for (0..128) |_| {
+                var cache: Cache = .{ .alloc = ca, .underlying = store_, .decoded = true };
+                defer cache.deinit();
+                // Reproduce the former admission path with a separately owned
+                // caller page. The normal capability now decodes directly into
+                // independently owned cache storage and transfers that page.
+                var page = if (transfer) try readPage(a, cache.store(), root) else try cache.adopt(a, root, try readPage(a, store_, root));
+                defer page.deinit(a);
+                try std.testing.expect(page.lease != null);
+                try std.testing.expectEqual(@as(usize, 1024), page.entries.len);
+                try std.testing.expectEqualStrings("value", page.entries[1023].value);
+                try std.testing.expect(cache.bytes <= cache.max_bytes);
+            }
+            try std.testing.expectEqual(caller.allocated_bytes, caller.freed_bytes);
+            try std.testing.expectEqual(retained.allocated_bytes, retained.freed_bytes);
+            return .{ .bytes = caller.allocated_bytes + retained.allocated_bytes, .allocations = caller.allocations + retained.allocations, .ns = clock_.monotonicNs() - start };
+        }
+        fn failure(a: Allocator, store_: Store, root: Ref, max_bytes: usize) !void {
+            var caller = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer caller.deinit();
+            var cache: Cache = .{ .alloc = a, .underlying = store_, .decoded = true, .max_bytes = max_bytes };
+            defer cache.deinit();
+            var page = try readPage(caller.allocator(), cache.store(), root);
+            defer page.deinit(caller.allocator());
+            var next: [2]Page = undefined;
+            const many = cache.store().read_many.?;
+            try many.read(many.ptr, caller.allocator(), &.{ root, root }, &next);
+            defer for (&next) |*item| item.deinit(caller.allocator());
+        }
+    };
+    const a = std.testing.allocator;
+    var memory: testing.MemoryStore = .{ .alloc = a };
+    defer memory.deinit();
+    var store_ = memory.store();
+    store_.prefix_keys = true;
+    var builder: SortedBuilder = .{ .alloc = a, .store = store_, .target_bytes = bulk_target_page_bytes };
+    defer builder.deinit();
+    for (0..1024) |index| {
+        var key: [16]u8 = @splat('p');
+        std.mem.writeInt(u64, key[8..16], index, .big);
+        try builder.add(&key, "value");
+    }
+    const root = (try builder.finish()).?;
+    const baseline = try Proof.run(std.heap.smp_allocator, store_, root, false);
+    const direct = try Proof.run(std.heap.smp_allocator, store_, root, true);
+    try std.testing.expectEqual(baseline.bytes, direct.bytes * 2);
+    try std.testing.expectEqual(baseline.allocations, direct.allocations * 2);
+    std.debug.print("cold decoded admission: copied_bytes={} transferred_bytes={} copied_allocs={} transferred_allocs={} copied_ns={} transferred_ns={}\n", .{ baseline.bytes, direct.bytes, baseline.allocations, direct.allocations, baseline.ns, direct.ns });
+    try std.testing.checkAllAllocationFailures(a, Proof.failure, .{ store_, root, 512 * 1024 });
+    try std.testing.checkAllAllocationFailures(a, Proof.failure, .{ store_, root, 32 * 1024 });
 }
