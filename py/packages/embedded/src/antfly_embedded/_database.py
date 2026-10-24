@@ -444,6 +444,20 @@ class Database:
         finally:
             self._release()
 
+    def memory(self, space: str, request: JSONInput, *, raw: bool = False) -> Any:
+        """Execute native memory policy with an action/body/idempotency envelope."""
+        handle = self._acquire()
+        try:
+            name, keep_name = _ffi.make_slice(encode_text(space))
+            data, keep_data = _ffi.make_slice(encode_json_input(request))
+            out = _ffi.AntflyBuffer()
+            errors.raise_for_code(
+                self._lib.antfly_db_memory_json(ctypes.c_void_p(handle), name, data, ctypes.byref(out))
+            )
+            return decode_json_response(_ffi.take_buffer(out), raw)
+        finally:
+            self._release()
+
     def resolve_query(self, resolver: str, request: JSONInput, *, raw: bool = False) -> Any:
         """Extract {"text": "..."}, or resolve {"extraction": {"entities": [...]}}.
 

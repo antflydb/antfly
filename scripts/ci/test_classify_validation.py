@@ -102,7 +102,7 @@ class ClassifyValidationTests(unittest.TestCase):
                 for scope in (
                     "sdk",
                     "typescript",
-                    "memoryaf",
+                    "memory",
                     "release",
                     "antfarm_e2e",
                 ):

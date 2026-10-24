@@ -86,7 +86,9 @@ pub const CandidateSource = struct {
     vtable: *const VTable,
 
     pub const Consume = *const fn (ctx: *anyopaque, entity_key: []const u8, value: []const u8) anyerror!void;
+    pub const CandidateDocument = struct { key: []const u8, json: []const u8 };
     pub const NearestQuery = struct {
+        fields: []const []const u8 = &.{},
         index_name: []const u8,
         embedding: []const f32,
         k: usize,
@@ -150,11 +152,13 @@ pub const CandidateSource = struct {
         bound_table: ?*const fn (*anyopaque, []const u8) anyerror!?[]const u8 = null,
         /// Optional table-scoped embedding configuration for mention blocking.
         embed_mention: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8, u32) anyerror![]f32 = null,
+        embed_mentions: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const []const u8, u32) anyerror![]const []const f32 = null,
         /// Fetch the entity doc for `key` in `table` (owned bytes or null).
         get: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8) anyerror!?[]u8,
         /// Scan `table` for entities whose key starts with `prefix`.
         scan_prefix: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, prefix: []const u8, opts: ScanOptions, ctx: *anyopaque, consume: Consume) anyerror!void = null,
         /// The nearest entities in `table` for a named dense index.
+        nearest_many: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const NearestQuery) anyerror![]const []const CandidateDocument = null,
         nearest: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, query: NearestQuery, ctx: *anyopaque, consume: Consume) anyerror!void = null,
     };
 
@@ -186,6 +190,25 @@ pub const CandidateSource = struct {
     pub fn nearest(self: CandidateSource, allocator: std.mem.Allocator, table: []const u8, query: NearestQuery, ctx: *anyopaque, consume: Consume) anyerror!void {
         if (self.vtable.nearest == null) return error.NearestUnsupported;
         return IterationBoundary.call("nearest", self.iteration_dispatch, self.iteration_methods.nearest, .{ self, allocator, table, query, Consumer{ .context = ctx, .callback = consume } });
+    }
+    pub fn nearestMany(self: CandidateSource, a: std.mem.Allocator, table: []const u8, queries: []const NearestQuery) ![]const []const CandidateDocument {
+        if (queries.len > 64) return error.InvalidArgument;
+        if (self.vtable.nearest_many) |method| return NativeBoundary.call("nearest_many", self.callback_dispatch, method, .{ self.ptr, a, table, queries });
+        const Collect = struct {
+            a: std.mem.Allocator,
+            docs: std.ArrayList(CandidateDocument) = .empty,
+            fn consume(raw: *anyopaque, key: []const u8, json: []const u8) !void {
+                const current: *@This() = @ptrCast(@alignCast(raw));
+                try current.docs.append(current.a, .{ .key = try current.a.dupe(u8, key), .json = try current.a.dupe(u8, json) });
+            }
+        };
+        const result = try a.alloc([]const CandidateDocument, queries.len);
+        for (queries, result) |query, *out| {
+            var collected: Collect = .{ .a = a };
+            try self.nearest(a, table, query, &collected, Collect.consume);
+            out.* = collected.docs.items;
+        }
+        return result;
     }
     pub fn getMany(self: CandidateSource, alloc: std.mem.Allocator, table: []const u8, keys: []const []const u8, ctx: *anyopaque, consume: Consume) anyerror!void {
         if (self.vtable.get_many == null) return error.ScanUnsupported;
@@ -219,6 +242,10 @@ pub const CandidateSource = struct {
         const method = self.vtable.embed_mention orelse return error.NearestUnsupported;
         return NativeBoundary.call("embed_mention", self.callback_dispatch, method, .{ self.ptr, alloc, table, embedding, text, dims });
     }
+    pub fn embedMentions(self: CandidateSource, a: std.mem.Allocator, table: []const u8, embedding: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+        const method = self.vtable.embed_mentions orelse return error.NearestUnsupported;
+        return NativeBoundary.call("embed_mentions", self.callback_dispatch, method, .{ self.ptr, a, table, embedding, texts, dims });
+    }
     /// A receiving view is synchronous. Its address and source must remain
     /// live until all stage callbacks complete; retained batches keep originals.
     pub fn receive(self: CandidateSource) Receiver {
@@ -235,12 +262,14 @@ pub const CandidateSource = struct {
             if (self.source.vtable.adjudicate != null) self.vtable.adjudicate = Receiver.adjudicate;
             if (self.source.vtable.bound_table != null) self.vtable.bound_table = bound_table;
             if (self.source.vtable.embed_mention != null) self.vtable.embed_mention = embed_mention;
+            if (self.source.vtable.embed_mentions != null) self.vtable.embed_mentions = embed_mentions;
             if (self.source.vtable.revisions != null) self.vtable.revisions = revisions;
             if (self.source.vtable.embedding_cache_get != null) self.vtable.embedding_cache_get = embedding_cache_get;
             if (self.source.vtable.embedding_cache_put != null) self.vtable.embedding_cache_put = embedding_cache_put;
             if (self.source.vtable.load_vector != null) self.vtable.load_vector = load_vector;
             if (self.source.vtable.scan_prefix != null) self.vtable.scan_prefix = scan_prefix;
             if (self.source.vtable.nearest != null) self.vtable.nearest = Receiver.nearest;
+            if (self.source.vtable.nearest_many != null) self.vtable.nearest_many = nearest_many;
             if (self.source.vtable.get_many != null) self.vtable.get_many = get_many;
             return .{ .ptr = self, .vtable = &self.vtable };
         }
@@ -265,6 +294,12 @@ pub const CandidateSource = struct {
         }
         fn bound_table(raw: *anyopaque, table: []const u8) anyerror!?[]const u8 {
             return original(raw).boundTable(table);
+        }
+        fn nearest_many(raw: *anyopaque, a: std.mem.Allocator, table: []const u8, queries: []const NearestQuery) ![]const []const CandidateDocument {
+            return original(raw).nearestMany(a, table, queries);
+        }
+        fn embed_mentions(raw: *anyopaque, a: std.mem.Allocator, table: []const u8, embedding: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+            return original(raw).embedMentions(a, table, embedding, texts, dims);
         }
         fn embed_mention(raw: *anyopaque, alloc: std.mem.Allocator, table: []const u8, embedding: []const u8, text: []const u8, dims: u32) anyerror![]f32 {
             return original(raw).embedMention(alloc, table, embedding, text, dims);

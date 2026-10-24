@@ -15769,7 +15769,7 @@ fn queryRemoteWithScratch(
     req: db_mod.types.SearchRequest,
 ) !db_mod.types.SearchResult {
     var result = queryResponseRemote(executor, scratch, base_uri, group_id, table_name, req) catch |err| {
-        if (req.document_authority_mode == .hydrate and err == error.UnexpectedHttpStatus) return error.StorageReadTemporarilyUnavailable;
+        if ((req.document_authority_mode == .hydrate or req.document_authority_mode == .lookup) and err == error.UnexpectedHttpStatus) return error.StorageReadTemporarilyUnavailable;
         if (req.document_authority_mode != .candidates or err != error.UnexpectedHttpStatus) return err;
         var legacy = req;
         legacy.document_authority_mode = .none;
@@ -15778,13 +15778,13 @@ fn queryRemoteWithScratch(
         return queryRemoteWithScratch(executor, alloc, scratch, base_uri, group_id, table_name, legacy);
     };
     defer result.deinit(scratch);
-    var parsed = if (req.document_authority_mode != .none)
+    var parsed = if (req.document_authority_mode != .none and req.document_authority_mode != .lookup)
         try local_query_contract.parseRemoteSearchResultWithAuthority(alloc, scratch, result.json, group_id, req.document_output_allocator)
     else
         try local_query_contract.parseRemoteSearchResultWithScratch(alloc, scratch, result.json);
     errdefer parsed.deinit();
     parsed.identity_read_generation = result.identity_read_generation orelse return error.InvalidQueryRequest;
-    if (req.document_authority_mode != .none) {
+    if (req.document_authority_mode != .none and req.document_authority_mode != .lookup) {
         if (parsed.document_authority_version != 1) {
             if (req.document_authority_mode != .candidates) return error.StorageReadTemporarilyUnavailable;
             var legacy = req;
@@ -27294,6 +27294,23 @@ pub const document_hydration_tests = if (builtin.is_test) struct {
         defer after.deinit();
         try std.testing.expect(!deferred.document_authority.?.eql(after.hits[0].document_authority.?.*));
         std.debug.print("DOCUMENT_HYDRATION candidates=2 deferred=1 primary_bytes={d} deferred_body_bytes=0 winner_projection_bytes={d}\n", .{ large.len, before.hits[0].stored_data.?.len });
+    }
+
+    test "native memory primary lookup preserves whole rows and exact IDs through private wire admission" {
+        const a = std.testing.allocator;
+        const request: db_mod.types.SearchRequest = .{ .document_authority_mode = .lookup, .document_authority_group = 11, .filter_doc_ids_positive = true, .filter_doc_ids = &.{ "a", "b" }, .limit = 2 };
+        const body = try local_query_contract.encodeQueryRequest(a, request);
+        defer a.free(body);
+        var parsed = try query_contract.parseQueryRequest(a, null, "docs", body);
+        defer parsed.deinit(a);
+        try std.testing.expectEqual(.lookup, parsed.req.document_authority_mode);
+        try std.testing.expect(parsed.req.include_stored and parsed.req.include_all_fields and parsed.req.filter_doc_ids_positive);
+        try std.testing.expectEqual(@as(usize, 2), parsed.req.filter_doc_ids.len);
+        for (request.filter_doc_ids, parsed.req.filter_doc_ids) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+        const shard = distributedSearchShardRequest(request, &.{}, false);
+        try std.testing.expectEqual(.lookup, shard.document_authority_mode);
+        try std.testing.expect(shard.include_stored);
+        try std.testing.expectError(error.InvalidQueryRequest, query_contract.parsePublicQueryRequest(a, null, "docs", body));
     }
 
     test "public graph metric borrowed wire document authority private controls roundtrip and public admission rejects them" {

@@ -32,6 +32,7 @@ JOIN_OPENAPI = ROOT / "scripts/join_openapi.py"
 INFERENCE_SPEC = ROOT / "specs/openapi/inference/api.yaml"
 GATEWAY_SPEC = ROOT / "specs/openapi/inference/gateway.yaml"
 EXTENSIONS_SPEC = ROOT / "specs/openapi/extensions/api.yaml"
+MEMORY_SPEC = ROOT / "specs/openapi/memory/api.yaml"
 OUTPUT = ROOT / "openapi.yaml"
 
 
@@ -264,6 +265,7 @@ def join_specs() -> dict:
         inference.get("components", {}), gateway.get("components", {})
     )
     extensions = load_yaml(EXTENSIONS_SPEC)
+    memory = load_yaml(MEMORY_SPEC)
     # Vendor adapters preserve actual usage when available. The native runtime
     # keeps its own stronger usage contract; the public gateway may omit it.
     for name in (
@@ -294,11 +296,18 @@ def join_specs() -> dict:
         )
     for path, item in extensions.get("paths", {}).items():
         paths[extension_public_path(path)] = copy.deepcopy(item)
+    for path, item in memory.get("paths", {}).items():
+        if path in paths:
+            raise RuntimeError(f"duplicate memory path: {path}")
+        paths[path] = copy.deepcopy(item)
 
     tags = []
     seen_tags = set()
     for item in (
-        antfly.get("tags", []) + inference.get("tags", []) + extensions.get("tags", [])
+        antfly.get("tags", [])
+        + inference.get("tags", [])
+        + extensions.get("tags", [])
+        + memory.get("tags", [])
     ):
         name = item.get("name") if isinstance(item, dict) else None
         if not name or name in seen_tags:
@@ -324,7 +333,9 @@ def join_specs() -> dict:
         "paths": paths,
         "components": merge_component_sections(
             merge_components(antfly, inference, inference_schema_names),
-            extensions.get("components", {}),
+            merge_component_sections(
+                extensions.get("components", {}), memory.get("components", {})
+            ),
         ),
         "x-tagGroups": [
             {
