@@ -44,14 +44,18 @@ pub const PartialBatch = struct {
     input_tokens: u64 = 0,
 };
 
-/// Shared embedding work is charged once even when individual scoring fails.
-/// Only valid rows escape scratch storage; failures retain their original index.
-pub fn batchPartial(backing: A, runtime: anytype, cfg: d.DeciderConfig, requests: []const d.Request) !PartialBatch {
-    var scratch = std.heap.ArenaAllocator.init(backing);
-    defer scratch.deinit();
-    const a = scratch.allocator();
-    const name = cfg.embedder orelse return error.InvalidDeciderConfig;
-    const embedder = try runtime.registry.getEmbedderConfig(name);
+const Plan = struct {
+    first: contract.Request,
+    dimensions: u32,
+    texts: Texts,
+    questions: []Question,
+    vector_bytes: usize,
+};
+
+/// One planner owns rendering, deduplication and physical vector bounds for
+/// both admission and execution. Planning never loads a model or opens HTTP.
+fn prepare(a: A, cfg: d.DeciderConfig, embedder: @import("antfly_embeddings").Config, requests: []const d.Request) !Plan {
+    if (requests.len == 0) return error.InvalidDecisionSpecification;
     const dimensions = (cfg.embedding_options orelse d.EmbeddingOptions{}).dimensions;
     if ((embedder.dimensions orelse embedder.dimension orelse return error.InvalidDeciderConfig) != dimensions or (embedder.sparse orelse false)) return error.InvalidDeciderConfig;
     const first = try contract.parse(a, try d.wireRequest(a, cfg, try requests[0].input.requireText(), requests[0].questions));
@@ -82,7 +86,40 @@ pub fn batchPartial(backing: A, runtime: anytype, cfg: d.DeciderConfig, requests
         plan.* = .{ .categories = categories, .queries = queries, .hash = std.fmt.bytesToHex(hash.finalResult(), .lower) };
     }
     // Bound vector materialization before dispatch, independently of JSON size.
-    if (try std.math.mul(usize, try std.math.mul(usize, texts.values.items.len, dimensions), @sizeOf(f32)) > 32 * 1024 * 1024) return error.DecisionLimitExceeded;
+    const vector_bytes = try std.math.mul(usize, try std.math.mul(usize, texts.values.items.len, dimensions), @sizeOf(f32));
+    if (vector_bytes > 32 * 1024 * 1024) return error.DecisionLimitExceeded;
+    return .{ .first = first, .dimensions = dimensions, .texts = texts, .questions = questions, .vector_bytes = vector_bytes };
+}
+
+pub fn workingBytes(a: A, cfg: d.DeciderConfig, embedder: @import("antfly_embeddings").Config, requests: []const d.Request) !usize {
+    const plan = try prepare(a, cfg, embedder, requests);
+    var prototypes: usize = 0;
+    var indexes: usize = 0;
+    for (plan.questions) |question| {
+        prototypes = try std.math.add(usize, prototypes, question.categories.len);
+        indexes = try std.math.add(usize, indexes, question.queries.len);
+        for (question.categories) |category| indexes = try std.math.add(usize, indexes, category.len);
+    }
+    const prototype_bytes = try std.math.mul(usize, try std.math.mul(usize, prototypes, plan.dimensions), @sizeOf(f32));
+    const metadata = try std.math.mul(usize, indexes + prototypes, 4 * @sizeOf(usize));
+    // Vector/centroid transfers and encoded/rendered text coexist transiently.
+    const vectors = try std.math.mul(usize, try std.math.add(usize, plan.vector_bytes, prototype_bytes), 2);
+    return std.math.add(usize, vectors, try std.math.add(usize, metadata, try std.math.mul(usize, plan.texts.bytes, 2)));
+}
+
+/// Shared embedding work is charged once even when individual scoring fails.
+/// Only valid rows escape scratch storage; failures retain their original index.
+pub fn batchPartial(backing: A, runtime: anytype, cfg: d.DeciderConfig, requests: []const d.Request) !PartialBatch {
+    var scratch = std.heap.ArenaAllocator.init(backing);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const name = cfg.embedder orelse return error.InvalidDeciderConfig;
+    const embedder = try runtime.registry.getEmbedderConfig(name);
+    const plan = try prepare(a, cfg, embedder, requests);
+    const dimensions = plan.dimensions;
+    const first = plan.first;
+    const texts = plan.texts;
+    const questions = plan.questions;
     if (texts.bytes > cfg.max_input_tokens -| runtime.input_tokens) return error.DecisionLimitExceeded;
     const Executor = @import("../common/inference_tasks.zig").Executor;
     const executor = Executor{

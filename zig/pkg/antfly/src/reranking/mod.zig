@@ -78,13 +78,15 @@ pub const ProviderCapabilities = lib.ProviderCapabilities;
 pub const providerCapabilities = lib.providerCapabilities;
 pub const max_candidate_count = lib.max_candidate_count;
 
-/// Long-lived resources shared by reranking requests. This keeps HTTP
-/// connections warm and lets ADC refresh single-flight per credential/scope.
+/// Long-lived resources shared by read post-processing. Reranking and
+/// decision evaluation retain separate transport policies while reusing
+/// connections and credential refresh across requests.
 pub const Runtime = struct {
     limits: *provider_limits.Registry = &provider_limits.process_registry,
     io: std.Io,
     http: httpx.Client,
     credentials: google_auth.CredentialManager,
+    providers: managed_embedder.ProviderRuntime,
     admission: request_admission.RequestAdmission = request_admission.RequestAdmission.init(16),
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io) Runtime {
@@ -99,6 +101,7 @@ pub const Runtime = struct {
                 .cookies_enabled = false,
             }),
             .credentials = google_auth.CredentialManager.init(alloc, io),
+            .providers = managed_embedder.ProviderRuntime.init(alloc, io),
         };
     }
 
@@ -171,6 +174,7 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Runtime) void {
+        self.providers.deinit();
         self.credentials.deinit();
         self.http.deinit();
         self.* = undefined;

@@ -469,36 +469,45 @@ pub const ProviderRuntime = struct {
     /// retain per-request URLs, authentication, cancellation, and deadlines;
     /// the client owns only reusable DNS/TLS/connection state.
     pub fn httpClient(self: *ProviderRuntime) !*httpx.Client {
-        return self.pooledHttpClient(&self.http_client, remote_embedding_max_response_bytes, max_embedding_request_timeout_ms, false);
+        return self.pooledHttpClient(&self.http_client, .{ .response_limit = remote_embedding_max_response_bytes, .io_timeout_ms = max_embedding_request_timeout_ms });
     }
 
     /// A client's response ceiling is a hard transport cap, even when a caller
     /// supplies a larger request limit. Generation therefore has its own
     /// reusable pool, while embedding retains its smaller family safeguards.
     pub fn generationHttpClient(self: *ProviderRuntime) !*httpx.Client {
-        return self.pooledHttpClient(&self.generation_http_client, httpx.types.default_max_body_size, 300_000, true);
+        return self.pooledHttpClient(&self.generation_http_client, .{ .response_limit = httpx.types.default_max_body_size, .io_timeout_ms = 300_000, .cancel_on_shutdown = true });
     }
 
     /// Media/task adapters apply their own operation ceilings within this
     /// stable outer envelope. Keep large audio/read responses out of the
     /// smaller embedding and ordinary generation pools.
     pub fn assetHttpClient(self: *ProviderRuntime) !*httpx.Client {
-        return self.pooledHttpClient(&self.asset_http_client, 64 << 20, 300_000, true);
+        return self.pooledHttpClient(&self.asset_http_client, .{ .response_limit = 64 << 20, .io_timeout_ms = 300_000, .request_timeout_ms = 300_000, .cancel_on_shutdown = true });
     }
 
-    fn pooledHttpClient(self: *ProviderRuntime, slot: *std.atomic.Value(?*httpx.Client), response_limit: usize, timeout_ms: u64, cancel_on_shutdown: bool) !*httpx.Client {
+    const HttpPolicy = struct {
+        response_limit: usize,
+        io_timeout_ms: u64,
+        request_timeout_ms: u64 = 0,
+        cancel_on_shutdown: bool = false,
+    };
+
+    fn pooledHttpClient(self: *ProviderRuntime, slot: *std.atomic.Value(?*httpx.Client), policy: HttpPolicy) !*httpx.Client {
         if (slot.load(.acquire)) |client| return client;
         lockAtomic(&self.http_mutex);
         defer self.http_mutex.unlock();
         if (slot.load(.acquire)) |client| return client;
         const client = try self.alloc.create(httpx.Client);
         errdefer self.alloc.destroy(client);
+        var timeouts = httpx.Timeouts.uniform(policy.io_timeout_ms);
+        timeouts.request_ms = policy.request_timeout_ms;
         client.* = httpx.Client.initWithConfig(std.heap.smp_allocator, self.io, .{
             .keep_alive = true,
             .cookies_enabled = false,
-            .max_response_size = response_limit,
-            .timeouts = httpx.Timeouts.uniform(timeout_ms),
-            .cancel_in_flight_on_shutdown = cancel_on_shutdown,
+            .max_response_size = policy.response_limit,
+            .timeouts = timeouts,
+            .cancel_in_flight_on_shutdown = policy.cancel_on_shutdown,
         });
         slot.store(client, .release);
         return client;

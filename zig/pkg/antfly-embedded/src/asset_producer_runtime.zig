@@ -730,6 +730,7 @@ pub const Runtime = struct {
         var remote = false;
         var allocator_owner: inference_work.InvocationAllocatorOwner = .caller;
         var native_workspace_bytes: usize = 0;
+        var caller_workspace_bytes: usize = 0;
         const transport: inference_work.AttachmentTransport = switch (requests[0].producer_type) {
             .copy, .document_extraction => .borrowed_binary,
             .decision => blk: {
@@ -737,7 +738,19 @@ pub const Runtime = struct {
                 defer parsed.deinit();
                 const cfg = parsed.value.decider;
                 remote = true;
-                if (cfg.decision_method == .generated) {
+                if (cfg.embedder) |name| {
+                    const materialization = @import("functions/materialization.zig");
+                    var dependencies = try materialization.registry(alloc, parsed.value);
+                    defer dependencies.deinit();
+                    const embedder = try dependencies.getEmbedderConfig(name);
+                    remote = embedder.provider != .antfly or managed_embedder.hasRemoteAntflyEndpoint(embedder, self.inference_api_url) or self.antfly_provider == null;
+                    var arena = std.heap.ArenaAllocator.init(alloc);
+                    defer arena.deinit();
+                    const a = arena.allocator();
+                    const inputs = try a.alloc(@import("functions/decisions.zig").Request, requests.len);
+                    for (requests, inputs) |request, *input| input.* = .{ .decider = "materialized", .questions = parsed.value.questions, .input = .{ .text = request.source_text } };
+                    caller_workspace_bytes = try @import("functions/embedding_decisions.zig").workingBytes(a, cfg, embedder, inputs);
+                } else if (cfg.decision_method == .generated) {
                     try self.routeGeneratorConfig(alloc, &parsed.value.decider.generator.?);
                     var engine = self.constrainedRuntime();
                     const capabilities = try engine.capabilities(alloc, &parsed.value.decider.generator.?);
@@ -871,6 +884,7 @@ pub const Runtime = struct {
             return error.InferenceEncodedBytesExceeded;
         fixed = std.math.add(usize, fixed, control) catch return error.InferenceEncodedBytesExceeded;
         fixed = std.math.add(usize, fixed, native_workspace_bytes) catch return error.InferenceEncodedBytesExceeded;
+        fixed = std.math.add(usize, fixed, caller_workspace_bytes) catch return error.InferenceEncodedBytesExceeded;
         const configured_results = try self.configuredResultLimit(requests[0].producer_type, requests.len);
         const results = if (remote)
             self.remoteLogicalResultLimit(requests[0].producer_type, requests.len)
@@ -982,7 +996,26 @@ pub const Runtime = struct {
         return switch (request.producer_type) {
             // These routes never enter an external callback. Unsupported
             // document extraction also fails synchronously in produceOne.
-            .copy, .document_extraction, .decision => true,
+            .copy, .document_extraction => true,
+            .decision => blk: {
+                var spec = try @import("functions/materialization.zig").parse(alloc, request.config_json);
+                defer spec.deinit();
+                if (spec.value.decider.embedder) |name| {
+                    var dependencies = try @import("functions/materialization.zig").registry(alloc, spec.value);
+                    defer dependencies.deinit();
+                    const embedder = try dependencies.getEmbedderConfig(name);
+                    if (embedder.provider != .antfly or managed_embedder.hasRemoteAntflyEndpoint(embedder, self.inference_api_url)) break :blk true;
+                    const local = self.antfly_provider orelse break :blk true;
+                    break :blk local.embed_dense_texts_with_context != null;
+                }
+                if (spec.value.decider.generator) |generator| {
+                    if (generator.provider == .apple) break :blk false;
+                    if (generator.provider != .antfly or generator.url.len != 0) break :blk true;
+                    const local = self.antfly_provider orelse break :blk true;
+                    break :blk local.generate_json != null;
+                }
+                break :blk true;
+            },
             .generator => blk: {
                 var parsed = try parseGeneratorProducerConfig(alloc, request.config_json);
                 defer parsed.deinit(alloc);

@@ -2292,3 +2292,95 @@ test "decision provider materialized named embedders use frozen dependencies and
     ;
     try std.testing.expectError(error.UnknownEmbedder, @import("materialization.zig").parse(a, missing));
 }
+
+test "decision provider asset pool preserves the whole request ceiling" {
+    const a = std.testing.allocator;
+    const Assets = @import("../asset_producer_runtime.zig").Runtime;
+    const owned = try Assets.createOwned(a, std.testing.io, .{});
+    defer {
+        owned.deinit();
+        a.destroy(owned);
+    }
+    try std.testing.expectEqual(@as(u64, 300000), owned.http.config.timeouts.request_ms);
+    try std.testing.expectEqual(@as(u64, 300000), owned.http.config.timeouts.read_ms);
+    const request = @import("../storage/db/enrichment/asset_producer.zig").Request{
+        .producer_type = .decision,
+        .source_text = "hello",
+        .config_json = "{\"version\":\"v1\",\"decider\":{\"provider\":\"openai\",\"model\":\"m\"},\"questions\":[{\"name\":\"p\",\"type\":\"predicate\",\"instructions\":\"Yes?\"}]}",
+    };
+    try std.testing.expect(try owned.ownedProducer().foregroundBoundedForRequests(a, &.{request}));
+}
+
+test "decision provider remote frozen embedder ignores unrelated native admission" {
+    const a = std.testing.allocator;
+    const Assets = @import("../asset_producer_runtime.zig").Runtime;
+    const Fake = struct {
+        fn decide(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?execution.RequestContext) ![]u8 {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var http = httpx.Client.init(a, std.testing.io);
+    defer http.deinit();
+    var linked = Assets.initWithOptions(a, &http, .{ .antfly_provider = .{
+        .ptr = undefined,
+        .embed_dense_texts = undefined,
+        .embed_sparse_texts = undefined,
+        .decide_json = Fake.decide,
+    } });
+    defer linked.deinit();
+    const specification =
+        \\{"version":"v1","decider":{"decision_method":"embedding_similarity","embedder":"cf-text","embedding_options":{"dimensions":768}},"embedders":{"cf-text":{"provider":"cloudflare","account_id":"account","model":"@cf/baai/bge-base-en-v1.5","dimensions":768}},"questions":[{"name":"route","type":"choice","instructions":"Route","choices":[{"value":"a"},{"value":"b"}]}]}
+    ;
+    const request = @import("../storage/db/enrichment/asset_producer.zig").Request{
+        .producer_type = .decision,
+        .source_text = "hello",
+        .config_json = specification,
+    };
+    const linked_plan = try linked.producer().invocationMemoryForRequests(a, &.{request});
+    try std.testing.expectEqual(@import("antfly_inference_work").InvocationAllocatorOwner.caller, linked_plan.allocator_owner);
+    try std.testing.expect(try linked.ownedProducer().foregroundBoundedForRequests(a, &.{request}));
+    var remote = Assets.init(a, &http);
+    defer remote.deinit();
+    const plan = try remote.producer().invocationMemoryForRequests(a, &.{request});
+    try std.testing.expectEqual(@import("antfly_inference_work").InvocationAllocatorOwner.caller, plan.allocator_owner);
+    try std.testing.expectEqual(plan, linked_plan);
+    const native_specification = try std.mem.replaceOwned(u8, a, specification, "\"provider\":\"cloudflare\",\"account_id\":\"account\"", "\"provider\":\"antfly\"");
+    defer a.free(native_specification);
+    var native_request = request;
+    native_request.config_json = native_specification;
+    try std.testing.expectError(error.InferenceInvocationMemoryUnavailable, linked.producer().invocationMemoryForRequests(a, &.{native_request}));
+    try std.testing.expect(!try linked.ownedProducer().foregroundBoundedForRequests(a, &.{native_request}));
+    linked.inference_api_url = "https://remote-inference.example";
+    const routed_plan = try linked.producer().invocationMemoryForRequests(a, &.{native_request});
+    try std.testing.expectEqual(@import("antfly_inference_work").InvocationAllocatorOwner.caller, routed_plan.allocator_owner);
+    try std.testing.expect(try linked.ownedProducer().foregroundBoundedForRequests(a, &.{native_request}));
+}
+
+test "decision provider asset transport enforces default request timeout without a caller deadline" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const owned = try @import("../asset_producer_runtime.zig").Runtime.createOwned(a, io, .{});
+    defer {
+        owned.deinit();
+        a.destroy(owned);
+    }
+    // Shorten the production ceiling for the fixture; a missing ceiling stays
+    // disabled and this test receives a successful response instead of Timeout.
+    owned.http.config.timeouts.request_ms = @min(owned.http.config.timeouts.request_ms, 50);
+    owned.http.config.retry_policy.max_retries = 0;
+    var server = try httpx.TestServer.start(a, io, &.{.{ .method = .GET, .path = "/slow", .respond = .{ .body = "ok", .delay_ns = 250 * std.time.ns_per_ms } }});
+    defer server.deinit();
+    const url = try std.fmt.allocPrint(a, "{s}/slow", .{server.baseUrl()});
+    defer a.free(url);
+    const Fixture = struct {
+        fn serve(s: *httpx.TestServer) void {
+            s.handleOne() catch {};
+        }
+    };
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Fixture.serve, .{&server});
+    try std.testing.expectError(error.Timeout, owned.http.get(url, .{}));
+}

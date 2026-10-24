@@ -178,7 +178,7 @@ pub const Adapter = struct {
                     .provider_runtime = &self.server.embedding_provider_runtime,
                     .limits = self.server.embedding_provider_runtime.limits,
                     .io = self.server.embedding_provider_runtime.io,
-                    .http = try self.server.embedding_provider_runtime.httpClient(),
+                    .http = try self.server.embedding_provider_runtime.assetHttpClient(),
                     .context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation },
                     .secret_store = self.server.cfg.secret_store,
                     .antfly_provider = self.server.antfly_provider,
