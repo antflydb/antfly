@@ -3995,6 +3995,7 @@ pub const Node = struct {
     extraction_reader_resolver: extractors_mod.ReaderResolver,
     tabular_registry: tabular_mod.registry.Registry,
     embed_cache: cache_mod.ResultCache([]const f32),
+    media_index_cache: @import("../pipelines/media_index_cache.zig").Cache = .{},
     metrics: metrics_mod.Metrics,
     inference_admission: inference_admission_mod.InferenceAdmission,
     /// Live streaming transcription sessions (voice API).
@@ -4255,6 +4256,7 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
+        self.media_index_cache.deinit();
         // Sessions hold only PCM buffers; drop them before any runtime teardown.
         self.transcription_sessions.deinit();
         var silero_it = self.silero_weights.iterator();
@@ -11866,6 +11868,14 @@ pub const Node = struct {
 
     fn chunkAndEmbedAdmitted(self: *Node, a: std.mem.Allocator, io: std.Io, supplied: InferenceExecutionControl, supplied_request: @import("../pipelines/media_chunking.zig").Request, target: @import("chunk_response.zig").Target, sink: @import("../pipelines/media_chunking.zig").Sink) anyerror!@import("chunk_response.zig").Execution {
         var request = supplied_request;
+        const IndexAdmission = struct {
+            fn acquire(raw: *anyopaque, bytes: usize) !runtime.tier.memory.AdmissionLease {
+                const manager: *model_manager_mod.ModelManager = @ptrCast(@alignCast(raw));
+                return manager.admitHostPreflight(bytes);
+            }
+        };
+        request.index_cache = &self.media_index_cache;
+        request.index_cache_admission = .{ .context = &self.model_manager, .acquire = IndexAdmission.acquire };
         if (request.outputs) |outputs_config| if (request.output_executor == null) {
             var consumers = try MediaOutputExecution.init(self, a, io, supplied, outputs_config, request.allow_partial);
             defer consumers.deinit(a);
@@ -11925,7 +11935,9 @@ pub const Node = struct {
             identity_hash.update(&identity_length);
             identity_hash.update(remote.identity);
             identity_hash.update(reference.version);
-            const source_identity = std.fmt.bytesToHex(identity_hash.finalResult(), .lower);
+            const binding = identity_hash.finalResult();
+            const source_identity = std.fmt.bytesToHex(binding, .lower);
+            cache.upstream.immutable_binding = binding;
             var source = media.source.Source{ .allocator = transport_allocator, .identity = &source_identity, .storage = .{ .range = cache.range() }, .limits = .{ .max_total_bytes = std.math.maxInt(u64) } };
             var resolved = request;
             resolved.input = .{ .binary = .{ .mime_type = reference.mime_type, .data = &.{} } };

@@ -13,9 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Immutable staged output sets. This storage primitive is not an activation
-//! entrypoint: ordered command authorization, admission, receipts, recovery,
-//! and all semantic readers must be integrated before enabling head publication.
+//! Immutable staged output sets. Production activation is authorized by
+//! artifact_chunk_staging and the ordered publication writer; these storage
+//! primitives alone do not grant publication authority.
 const std = @import("std");
 const keys = @import("../internal_keys.zig");
 const publication = @import("artifact_publication.zig");
@@ -413,6 +413,42 @@ pub fn readMember(alloc: std.mem.Allocator, txn: anytype, logical_key: []const u
     defer input.deinit();
     return input.value;
 }
+
+/// Override a physical batch lookup with its selected immutable member. The
+/// sorted batch shares one head lookup per contiguous producer scope.
+pub const MemberReader = struct {
+    arena: std.heap.ArenaAllocator,
+    scope: ?[]const u8 = null,
+    prefix: ?[]const u8 = null,
+    count: u32 = 0,
+    pub fn init(a: std.mem.Allocator) MemberReader {
+        return .{ .arena = .init(a) };
+    }
+    pub fn deinit(self: *MemberReader) void {
+        self.arena.deinit();
+    }
+    pub fn override(self: *MemberReader, txn: anytype, logical: []const u8, physical_value: ?[]const u8) !?[]const u8 {
+        const a = self.arena.allocator();
+        const scope = (try chunks.keyForMemberAlloc(a, logical)) orelse return physical_value;
+        if (self.scope == null or !std.mem.eql(u8, scope, self.scope.?)) {
+            self.scope = scope;
+            self.prefix = null;
+            const head_key = try physicalKey(a, scope, keys.producer_generation_head_kind, null);
+            if (txn.get(head_key) catch |err| if (err == error.NotFound) null else return err) |head| {
+                var plan = try Plan.init(a, scope, try Spec.decode(head));
+                defer plan.deinit();
+                self.prefix = try a.dupe(u8, plan.row_prefix);
+                self.count = plan.spec.output.count;
+            }
+        }
+        const prefix = self.prefix orelse return physical_value;
+        if (std.mem.readInt(u32, logical[logical.len - 4 ..][0..4], .big) >= self.count) return null;
+        const member = try a.alloc(u8, prefix.len + 4);
+        @memcpy(member[0..prefix.len], prefix);
+        @memcpy(member[prefix.len..], logical[logical.len - 4 ..]);
+        return txn.get(member) catch |err| if (err == error.NotFound) return error.ArtifactCatalogCorrupt else return err;
+    }
+};
 
 /// One snapshot's logical value and visibility witness. Payloads are borrowed
 /// from the transaction; only the head key is owned. A selected generation's

@@ -719,22 +719,45 @@ fn needsServerlessOutput(target: media_outputs.Target, cached: []const media_out
 }
 
 fn mergeServerlessOutputs(a: Allocator, fresh: []const media_outputs.Result, cached: []const media_outputs.Result, max_attempts: u32) ![]const media_outputs.Result {
-    const results = try a.dupe(media_outputs.Result, fresh);
-    for (results) |*value| {
+    var results = std.ArrayList(media_outputs.Result).empty;
+    errdefer results.deinit(a);
+    for (fresh) |incoming| {
+        // A skipped target is a single recipe-level placeholder, regardless of
+        // how many windows that target produced. Restore the entire result set.
+        if (incoming.status == .skipped) {
+            for (results.items) |value| {
+                if (std.mem.eql(u8, value.name, incoming.name) and std.mem.eql(u8, value.recipe_id, incoming.recipe_id)) break;
+            } else {
+                var found = false;
+                for (cached) |old| {
+                    if (!std.mem.eql(u8, old.name, incoming.name) or !std.mem.eql(u8, old.recipe_id, incoming.recipe_id)) continue;
+                    if (old.status != .complete and !old.terminal) return error.IncompleteChunkCoverage;
+                    var restored = old;
+                    restored.required = incoming.required;
+                    try results.append(a, restored);
+                    found = true;
+                }
+                if (!found) return error.IncompleteChunkCoverage;
+            }
+            continue;
+        }
+        var value = incoming;
         const previous: ?media_outputs.Result = for (cached) |old| {
             if (std.mem.eql(u8, old.name, value.name) and old.sub_index == value.sub_index and std.mem.eql(u8, old.recipe_id, value.recipe_id)) break old;
         } else null;
         if (previous) |old| if (old.status == .complete or old.terminal) {
             const required = value.required;
-            value.* = old;
+            value = old;
             value.required = required;
+            try results.append(a, value);
             continue;
         };
         if (value.status == .skipped) return error.IncompleteChunkCoverage;
         value.attempts = (if (previous) |old| old.attempts else @as(u32, 0)) +| 1;
         value.terminal = value.status == .failed and value.attempts >= @max(max_attempts, 1);
+        try results.append(a, value);
     }
-    return results;
+    return results.toOwnedSlice(a);
 }
 
 fn appendServerlessEmbeddingRows(a: Allocator, target: chunking.types.EmbeddingTarget, metadata: *const chunking.inference.RemoteMetadata, results: []const media_outputs.Result, text: []const u8, rows: *std.ArrayListUnmanaged(std.json.Value), previews: *std.ArrayListUnmanaged(std.json.Value)) !void {
@@ -3074,7 +3097,7 @@ const ServerlessMediaTestProvider = struct {
             const identity = "3333333333333333333333333333333333333333333333333333333333333333";
             const revision = "4444444444444444444444444444444444444444444444444444444444444444";
             const recipe = try target.recipeIdentity(scratch, identity, revision);
-            const copies: usize = if (index == 1) 2 else 1;
+            const copies: usize = if (index == 1 and target.execute) 2 else 1;
             for (0..copies) |sub_index| {
                 var result = media_outputs.Result{ .name = target.name, .kind = target.kind, .required = target.required, .model = target.model, .model_identity = identity, .model_revision = revision, .recipe_id = try scratch.dupe(u8, &recipe), .sub_index = @intCast(sub_index), .start_ns = @intCast(sub_index * 50), .end_ns = @intCast((sub_index + 1) * 50), .status = if (!target.execute) .skipped else if (index == 2 and self.fail) .failed else .complete };
                 if (result.status == .failed) result.code = "SpeechUnavailable";
@@ -3098,3 +3121,16 @@ const ServerlessMediaTestProvider = struct {
         return .{ .chunks = chunks, .plan_id = owned_plan, .source_fingerprint = owned_fingerprint, .source_version = try a.dupe(u8, "v1"), .start_ordinal = 0, .covered_through_ordinal = 1, .complete = true };
     }
 };
+test "model aware media serverless skipped placeholder preserves every cached subwindow" {
+    const a = std.testing.allocator;
+    const first = media_outputs.Result{ .name = "embedding", .kind = .embedding, .required = true, .model = "model", .model_identity = "identity", .model_revision = "revision", .recipe_id = "recipe", .status = .complete, .embedding = &.{ 1, 0 } };
+    var second = first;
+    second.sub_index = 1;
+    second.embedding = &.{ 0, 1 };
+    var skipped = first;
+    skipped.status = .skipped;
+    skipped.embedding = null;
+    const merged = try mergeServerlessOutputs(a, &.{skipped}, &.{ first, second }, 3);
+    defer a.free(merged);
+    try std.testing.expectEqual(@as(usize, 2), merged.len);
+}

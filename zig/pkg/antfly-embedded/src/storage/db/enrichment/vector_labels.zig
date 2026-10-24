@@ -32,10 +32,17 @@ pub const Config = struct {
     pub fn validate(self: Config) !void {
         if (self.labels.len == 0 or self.labels.len > max_labels or self.top_k == 0 or self.top_k > max_top_k) return error.InvalidAssetProducerConfig;
         if (self.min_score) |minimum| if (!std.math.isFinite(minimum)) return error.InvalidAssetProducerConfig;
+        // Bounded open-addressed set avoids quadratic validation for large
+        // vocabularies, including validation at the publication receiver.
+        var names: [max_labels * 2]u16 = @splat(0);
         for (self.labels, 0..) |label, i| {
             if (label.label.len == 0 or label.label.len > 1024 or !std.unicode.utf8ValidateSlice(label.label)) return error.InvalidAssetProducerConfig;
             if (label.prompt) |prompt| if (prompt.len == 0 or prompt.len > 65536 or !std.unicode.utf8ValidateSlice(prompt)) return error.InvalidAssetProducerConfig;
-            for (self.labels[0..i]) |previous| if (std.mem.eql(u8, previous.label, label.label)) return error.InvalidAssetProducerConfig;
+            var bucket: usize = @intCast(std.hash.Wyhash.hash(0, label.label) % names.len);
+            while (names[bucket] != 0) : (bucket = (bucket + 1) % names.len) {
+                if (std.mem.eql(u8, self.labels[names[bucket] - 1].label, label.label)) return error.InvalidAssetProducerConfig;
+            }
+            names[bucket] = @intCast(i + 1);
         }
     }
 };
@@ -60,6 +67,10 @@ pub const Scorer = struct {
 
     pub fn init(a: Allocator, config: Config, prompts: []const []const f32) !Scorer {
         try config.validate();
+        return initValidated(a, config, prompts);
+    }
+    /// The owner must have already validated this immutable vocabulary.
+    pub fn initValidated(a: Allocator, config: Config, prompts: []const []const f32) !Scorer {
         if (prompts.len != config.labels.len or prompts.len == 0 or prompts[0].len == 0) return error.InvalidEmbeddingResponse;
         const dimensions = prompts[0].len;
         const padded = std.mem.alignForward(usize, prompts.len, 8);

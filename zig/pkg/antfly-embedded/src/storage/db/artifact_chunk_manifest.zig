@@ -152,19 +152,28 @@ pub const PreparedRows = struct {
     manifest: ?Manifest,
 
     pub fn init(alloc: std.mem.Allocator, document: []const u8, producer: []const u8, source_field: []const u8, chunks: []const @import("../../chunking/chunk.zig").Chunk) !PreparedRows {
-        return prepare(alloc, document, producer, source_field, chunks, false, true);
+        return prepare(alloc, document, producer, source_field, chunks, false, true, 0, true);
     }
 
     pub fn initProjection(alloc: std.mem.Allocator, document: []const u8, producer: []const u8, source_field: []const u8, chunks: []const @import("../../chunking/chunk.zig").Chunk) !PreparedRows {
-        return prepare(alloc, document, producer, source_field, chunks, true, true);
+        return prepare(alloc, document, producer, source_field, chunks, true, true, 0, true);
     }
 
     pub fn initRecipes(alloc: std.mem.Allocator, document: []const u8, producer: []const u8, source_field: []const u8, chunks: []const @import("../../chunking/chunk.zig").Chunk) !PreparedRows {
         for (chunks) |chunk| if (chunk.metadata == null) return error.InvalidBatchRequest;
-        return prepare(alloc, document, producer, source_field, chunks, false, false);
+        return prepare(alloc, document, producer, source_field, chunks, false, false, 0, true);
     }
 
-    fn prepare(alloc: std.mem.Allocator, document: []const u8, producer: []const u8, source_field: []const u8, chunks: []const @import("../../chunking/chunk.zig").Chunk, text_only: bool, include_payload: bool) !PreparedRows {
+    /// Bounded row preparation for a private immutable generation. A page is
+    /// not an output-set certificate; the caller builds the full digest.
+    pub fn initPage(alloc: std.mem.Allocator, document: []const u8, producer: []const u8, source_field: []const u8, page: []const @import("../../chunking/chunk.zig").Chunk, include_payload: bool) !PreparedRows {
+        if (!include_payload) for (page) |chunk| {
+            if (chunk.metadata == null) return error.InvalidBatchRequest;
+        };
+        return prepare(alloc, document, producer, source_field, page, false, include_payload, if (page.len != 0) page[0].chunk_id else 0, false);
+    }
+
+    fn prepare(alloc: std.mem.Allocator, document: []const u8, producer: []const u8, source_field: []const u8, chunks: []const @import("../../chunking/chunk.zig").Chunk, text_only: bool, include_payload: bool, first: u32, complete: bool) !PreparedRows {
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const rows = try alloc.alloc(publication.Mutation, chunks.len);
@@ -178,7 +187,7 @@ pub const PreparedRows = struct {
         }
         var builder = Builder.init();
         for (chunks, rows, 0..) |chunk, *row, ordinal| {
-            if (chunk.chunk_id != ordinal) return error.InvalidBatchRequest;
+            if (chunk.chunk_id != first + ordinal) return error.InvalidBatchRequest;
             if (text_only and !chunk.isText()) {
                 row.* = .{ .family = .document_artifact, .key = "", .value = null, .source_index = 0 };
                 initialized += 1;
@@ -196,11 +205,11 @@ pub const PreparedRows = struct {
             try @import("../../chunking/chunk.zig").appendArtifactFields(temporary, &obj, source_field, chunk, include_payload);
             const payload = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
             errdefer alloc.free(payload);
-            if (!text_only) try builder.append(chunk.chunk_id, payload);
+            if (!text_only and complete) try builder.append(chunk.chunk_id, payload);
             row.* = .{ .family = .document_artifact, .key = try keys.chunkArtifactKeyAlloc(alloc, document, producer, chunk.chunk_id), .value = payload, .source_index = 0 };
             initialized += 1;
         }
-        return .{ .alloc = alloc, .mutations = rows, .manifest = if (text_only) null else builder.finish() };
+        return .{ .alloc = alloc, .mutations = rows, .manifest = if (text_only or !complete) null else builder.finish() };
     }
 
     /// Transfer to an independently owned replay document without copying the

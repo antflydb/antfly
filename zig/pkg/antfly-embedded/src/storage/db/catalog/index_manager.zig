@@ -15451,7 +15451,7 @@ pub const IndexManager = struct {
             }
             requests.shrinkRetainingCapacity(retained);
         }
-        try orderGeneratedArtifactDependencies(requests.items);
+        try orderGeneratedArtifactDependencies(self.alloc, requests.items);
         return try requests.toOwnedSlice(alloc);
     }
 
@@ -34298,7 +34298,27 @@ fn generatedOutputName(request: enrichment_types.GeneratedEnrichmentRequest) []c
     };
 }
 
-fn orderGeneratedArtifactDependencies(items: []enrichment_types.GeneratedEnrichmentRequest) !void {
+fn orderGeneratedArtifactDependencies(alloc: Allocator, items: []enrichment_types.GeneratedEnrichmentRequest) !void {
+    const Kind = @FieldType(enrichment_types.GeneratedEnrichmentRequest, "kind");
+    // Names are scoped by producer family. Resolve each typed edge once before
+    // sorting, then move its kind alongside the request.
+    const dependencies = try alloc.alloc(Kind, items.len);
+    defer alloc.free(dependencies);
+    for (items, dependencies) |request, *kind| {
+        kind.* = switch (request.kind) {
+            .dense_embedding, .sparse_embedding => .chunk_text,
+            .chunk_text, .asset => .asset,
+        };
+        if (request.kind == .asset and request.upstream_artifact_name.len != 0 and request.producer_json.len != 0) {
+            var producer = try @import("../enrichment/asset_producer.zig").parseProducerConfig(alloc, request.producer_json);
+            defer producer.deinit(alloc);
+            kind.* = switch (producer.type) {
+                .vector_labels => .dense_embedding,
+                .media_output => .chunk_text,
+                else => .asset,
+            };
+        }
+    }
     for (0..items.len) |position| {
         var selected: ?usize = null;
         for (items[position..], position..) |request, index| {
@@ -34308,11 +34328,7 @@ fn orderGeneratedArtifactDependencies(items: []enrichment_types.GeneratedEnrichm
             };
             const pending = if (upstream.len != 0) blk: {
                 for (items[position..]) |candidate| {
-                    const compatible_kind = switch (request.kind) {
-                        .dense_embedding, .sparse_embedding => candidate.kind == .chunk_text,
-                        .chunk_text => candidate.kind == .asset,
-                        .asset => true,
-                    };
+                    const compatible_kind = candidate.kind == dependencies[index];
                     if (compatible_kind and std.mem.eql(u8, generatedOutputName(candidate), upstream)) break :blk true;
                 }
                 break :blk false;
@@ -34324,8 +34340,11 @@ fn orderGeneratedArtifactDependencies(items: []enrichment_types.GeneratedEnrichm
         }
         const index = selected orelse return error.InvalidEnrichmentConfig;
         const request = items[index];
+        const dependency = dependencies[index];
         std.mem.copyBackwards(enrichment_types.GeneratedEnrichmentRequest, items[position + 1 .. index + 1], items[position..index]);
+        std.mem.copyBackwards(Kind, dependencies[position + 1 .. index + 1], dependencies[position..index]);
         items[position] = request;
+        dependencies[position] = dependency;
     }
 }
 
@@ -49572,12 +49591,24 @@ test "model aware media generated dependencies order chunks vectors labels and t
 
 test "model aware media dependency ordering permits a legacy shared chunk and embedding name" {
     var requests = [_]enrichment_types.GeneratedEnrichmentRequest{
-        .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "semantic" },
+        .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "semantic", .producer_json = "{\"type\":\"vector_labels\",\"config\":{}}" },
         .{ .kind = .dense_embedding, .index_name = "semantic", .artifact_name = "semantic", .embedding_name = "semantic", .doc_key = "doc", .source_field = "body", .input_kind = .inline_chunks },
         .{ .kind = .chunk_text, .index_name = "semantic", .artifact_name = "semantic", .doc_key = "doc", .source_field = "body" },
     };
-    try orderGeneratedArtifactDependencies(&requests);
+    try orderGeneratedArtifactDependencies(std.testing.allocator, &requests);
     try std.testing.expect(requests[0].kind == .chunk_text);
     try std.testing.expect(requests[1].kind == .dense_embedding);
     try std.testing.expect(requests[2].kind == .asset);
+}
+
+test "model aware media dependency ordering distinguishes identical names across families" {
+    var requests = [_]enrichment_types.GeneratedEnrichmentRequest{
+        .{ .kind = .asset, .index_name = "semantic", .artifact_name = "semantic", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "semantic", .producer_json = "{\"type\":\"vector_labels\",\"config\":{}}" },
+        .{ .kind = .dense_embedding, .index_name = "semantic", .artifact_name = "clips", .embedding_name = "semantic", .doc_key = "doc", .source_field = "body", .input_kind = .inline_chunks },
+        .{ .kind = .chunk_text, .index_name = "clips", .artifact_name = "clips", .doc_key = "doc", .source_field = "body" },
+    };
+    try orderGeneratedArtifactDependencies(std.testing.allocator, &requests);
+    try std.testing.expectEqual(.chunk_text, requests[0].kind);
+    try std.testing.expectEqual(.dense_embedding, requests[1].kind);
+    try std.testing.expectEqual(.asset, requests[2].kind);
 }

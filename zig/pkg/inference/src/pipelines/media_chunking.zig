@@ -58,6 +58,8 @@ pub const Executor = struct {
 };
 pub const Limits = @import("media_chunk_limits.zig").Limits;
 pub const Request = struct {
+    index_cache: ?*@import("media_index_cache.zig").Cache = null,
+    index_cache_admission: ?@import("media_index_cache.zig").Cache.Admission = null,
     outputs: ?output_types.Config = null,
     output_executor: ?OutputExecutor = null,
     transcribe_boundary: bool = false,
@@ -585,8 +587,19 @@ pub const Runner = struct {
                 defer if (audio_track) |*track_owner| track_owner.deinit();
                 if (audio_track) |*track_owner| self.audio_provider = track_owner.provider();
                 defer self.audio_provider = null;
+                const identity = @import("media_index_cache.zig").Cache.key(&source, true, self.request.limits.max_index_packets, self.request.max_working_bytes);
+                const cached = if (identity) |key| if (self.request.index_cache) |cache| cache.get(key) else null else null;
+                defer if (cached) |entry| self.request.index_cache.?.release(entry);
+                if (cached) |entry| {
+                    var reader = entry.data.webm;
+                    reader.input = &source;
+                    reader.allocator = self.allocator;
+                    try self.webmWindows(&reader);
+                    return;
+                }
                 var reader = try media.webm.Reader.init(self.allocator, &source, .{ .max_packets = self.request.limits.max_index_packets });
                 defer reader.deinit();
+                if (identity) |key| if (self.request.index_cache) |cache| if (self.request.index_cache_admission) |admission| cache.remember(std.heap.smp_allocator, key, .{ .webm = reader }, admission);
                 try self.webmWindows(&reader);
                 return;
             } else {
@@ -598,8 +611,21 @@ pub const Runner = struct {
                 defer if (audio_track) |*track_owner| track_owner.deinit();
                 if (audio_track) |*track_owner| self.audio_provider = track_owner.provider();
                 defer self.audio_provider = null;
+                const identity = @import("media_index_cache.zig").Cache.key(&source, false, self.request.limits.max_index_packets, self.request.max_working_bytes);
+                const cached = if (identity) |key| if (self.request.index_cache) |cache| cache.get(key) else null else null;
+                defer if (cached) |entry| self.request.index_cache.?.release(entry);
+                if (cached) |entry| {
+                    var reader = entry.data.mp4;
+                    reader.input = &source;
+                    reader.allocator = self.allocator;
+                    var owner = try @import("media_chunking_video.zig").Owner.init(self.allocator, &reader, &self.pool, self.request.limits);
+                    defer owner.deinit();
+                    try self.videoWindows(&.{}, &reader, try owner.durationNs(), owner.origin, reader.track.timescale, &owner, null);
+                    return;
+                }
                 var reader = try media.mp4.Reader.init(self.allocator, &source, .{ .max_samples = self.request.limits.max_index_packets, .max_index_bytes = @min(self.request.max_working_bytes, try std.math.mul(usize, self.request.limits.max_index_packets, @sizeOf(media.mp4.Packet))) });
                 defer reader.deinit();
+                if (identity) |key| if (self.request.index_cache) |cache| if (self.request.index_cache_admission) |admission| cache.remember(std.heap.smp_allocator, key, .{ .mp4 = reader }, admission);
                 var owner = try @import("media_chunking_video.zig").Owner.init(self.allocator, &reader, &self.pool, self.request.limits);
                 defer owner.deinit();
                 try self.videoWindows(&.{}, &reader, try owner.durationNs(), owner.origin, reader.track.timescale, &owner, null);
