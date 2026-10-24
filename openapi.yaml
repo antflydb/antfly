@@ -30030,6 +30030,99 @@ components:
       required:
         - provider
         - model
+    BedrockGeneratorConfig:
+      type: object
+      description: >
+        AWS Bedrock Converse generation, including image inputs and tools for
+
+        models that support them. Uses the AWS default credential chain unless
+
+        an explicit Bedrock API key is configured. Image capability is declared
+
+        per target through inference_capabilities; model IDs are not allowlisted.
+      properties:
+        provider:
+          type: string
+          enum:
+            - bedrock
+        url:
+          type: string
+          description: Optional Bedrock Runtime endpoint override. Defaults to the regional AWS endpoint.
+        api_key:
+          type: string
+          description: Optional Bedrock bearer API key or secret reference. Omit to use signed AWS requests
+            and the default credential chain.
+        model:
+          type: string
+          description: The Bedrock model ID to use.
+          example: anthropic.claude-sonnet-4-5-20250929-v1:0
+        region:
+          type: string
+          description: AWS region. Defaults to AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1.
+        temperature:
+          type: number
+          format: float
+          description: Controls randomness in generation (0.0-1.0).
+          minimum: 0.0
+          maximum: 1.0
+        max_tokens:
+          type: integer
+          description: Maximum number of tokens to generate.
+        top_p:
+          type: number
+          format: float
+          description: Nucleus sampling parameter.
+          minimum: 0.0
+          maximum: 1.0
+      required:
+        - provider
+        - model
+    AnthropicGeneratorConfig:
+      type: object
+      description: >
+        Configuration for the Anthropic generative AI provider.
+      properties:
+        provider:
+          type: string
+          enum:
+            - anthropic
+        workspace_id:
+          type: string
+          description: Anthropic workspace for keys not scoped to a workspace. Defaults to ANTHROPIC_WORKSPACE_ID.
+        model:
+          type: string
+          description: The full model ID of the Anthropic model to use.
+          default: claude-sonnet-4-5-20250929
+          example: claude-sonnet-4-5-20250929
+        api_key:
+          type: string
+          writeOnly: true
+          description: Anthropic API key or secret reference. Defaults to ANTHROPIC_API_KEY.
+        url:
+          type: string
+          format: uri
+          description: Messages API base URL. Defaults to https://api.anthropic.com/v1.
+        temperature:
+          type: number
+          format: float
+          description: Controls randomness in generation (0.0-1.0).
+          minimum: 0.0
+          maximum: 1.0
+        max_tokens:
+          type: integer
+          description: Maximum number of tokens to generate in the response.
+        top_p:
+          type: number
+          format: float
+          description: Nucleus sampling parameter (0.0-1.0).
+          minimum: 0.0
+          maximum: 1.0
+        top_k:
+          type: integer
+          description: Top-k sampling parameter.
+      required:
+        - provider
+        - model
     OllamaGeneratorConfig:
       type: object
       description: >
@@ -30282,6 +30375,8 @@ components:
       enum:
         - gemini
         - vertex
+        - bedrock
+        - anthropic
         - ollama
         - openai
         - chatgpt
@@ -30296,6 +30391,8 @@ components:
         - oneOf:
             - $ref: '#/components/schemas/GoogleGeneratorConfig'
             - $ref: '#/components/schemas/VertexGeneratorConfig'
+            - $ref: '#/components/schemas/BedrockGeneratorConfig'
+            - $ref: '#/components/schemas/AnthropicGeneratorConfig'
             - $ref: '#/components/schemas/OllamaGeneratorConfig'
             - $ref: '#/components/schemas/AntflyGeneratorConfig'
             - $ref: '#/components/schemas/ChatGPTGeneratorConfig'
@@ -30303,6 +30400,13 @@ components:
             - $ref: '#/components/schemas/OpenRouterGeneratorConfig'
             - $ref: '#/components/schemas/AppleGeneratorConfig'
         - properties:
+            max_image_input_tokens:
+              x-go-type-skip-optional-pointer: false
+              type: integer
+              format: int64
+              minimum: 1
+              description: Conservative input-token ceiling per image. Required for image calls when tokens_per_minute
+                is configured; choose a bound valid for the model and image policy.
             rate_limit:
               x-go-type-skip-optional-pointer: false
               $ref: '#/components/schemas/RateLimitConfig'
@@ -38406,12 +38510,22 @@ components:
             - function
         function:
           $ref: '#/components/schemas/ToolCallFunction'
+        extra_content:
+          type: object
+          additionalProperties: true
+          description: Opaque provider tool metadata, including Google thought signatures. Preserve it
+            unchanged when replaying assistant tool calls.
     ChatMessage:
       type: object
       description: OpenAI-compatible message in a generation/chat conversation.
       required:
         - role
       properties:
+        extra_content:
+          type: object
+          additionalProperties: true
+          description: Opaque provider message metadata. Preserve unchanged when replaying assistant messages;
+            native Anthropic content retains signed thinking blocks.
         role:
           $ref: '#/components/schemas/ChatMessageRole'
         content:
@@ -44698,6 +44812,11 @@ components:
       required:
         - role
       properties:
+        extra_content:
+          type: object
+          additionalProperties: true
+          description: Opaque provider message metadata. Preserve unchanged when replaying assistant messages;
+            native Anthropic content retains signed thinking blocks.
         role:
           $ref: '#/components/schemas/InferenceRole'
         content:
@@ -45211,6 +45330,11 @@ components:
       required:
         - role
       properties:
+        extra_content:
+          type: object
+          additionalProperties: true
+          description: Opaque provider message metadata. Preserve unchanged when replaying assistant messages;
+            native Anthropic content retains signed thinking blocks.
         role:
           $ref: '#/components/schemas/InferenceRole'
         content:
@@ -45301,6 +45425,11 @@ components:
       type: object
       description: Delta content for streaming
       properties:
+        extra_content:
+          type: object
+          additionalProperties: true
+          description: Opaque provider stream metadata, including native Anthropic thinking and signature
+            events. Preserve it when assembling provider-native assistant history.
         role:
           $ref: '#/components/schemas/InferenceRole'
         content:
