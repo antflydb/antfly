@@ -143,3 +143,24 @@ reference output is present; older runners reject it. Ordinary manifests retain
 v1 compatibility. These byte-level references also support exact integer and
 packed-header contracts. Keep independent operator references and model/lifetime
 gates alongside direct baseline comparisons.
+
+The CUDA family runner also accepts `--stable`: it alternates both captured
+versions for at least 500 ms, then measures 32 balanced arms with 20,000 kernel
+dispatches per arm. Receipts record the additional GPU warmup duration and
+dispatch count. Use this protocol when fixed-count warmup exposes clock
+transitions in tiny kernels; retain the original receipts and unchanged timing
+budgets. Reverse-image and identical-image controls help investigate effects
+that are absent from native instruction/resource comparisons.
+
+For a net source ledger that separates inline Zig tests, generated regions,
+kernel bodies, host glue and binary images, run:
+
+```sh
+python3 zig/pkg/inference/scripts/kernel_source_accounting.py \
+  --revision <frozen-baseline-commit> --output /tmp/kernel-source-ledger.json
+```
+
+The ledger includes replacement owners and metadata, staged/unstaged changes
+and untracked files outside ignored fixture directories. Metal shader bytes
+measure the maintained Objective-C string representation; generated copies and
+compiled images remain separate from authored production savings.

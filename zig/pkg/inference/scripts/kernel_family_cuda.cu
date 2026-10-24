@@ -3,6 +3,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -18,8 +19,9 @@ static std::string string(FILE *file) {
 }
 struct Argument { unsigned role; size_t written; std::vector<unsigned char> initial; CUdeviceptr device[2]={0,0}; };
 int main(int argc,char **argv) {
-    require(argc==5 || (argc==6 && std::string(argv[5])=="--long"),"Usage: kernel-family-cuda baseline.fatbin candidate.fatbin cases.bin receipt.json [--long]");
-    const bool extended=argc==6; const int launches=extended?40:10;
+    require(argc==5 || (argc==6 && (std::string(argv[5])=="--long" || std::string(argv[5])=="--stable")),"Usage: kernel-family-cuda baseline.fatbin candidate.fatbin cases.bin receipt.json [--long|--stable]");
+    const bool extended=argc==6, stable=extended && std::string(argv[5])=="--stable";
+    const int launches=stable?200:(extended?40:10);
     RT(cudaSetDevice(0));RT(cudaFree(nullptr));CUmodule modules[2];DR(cuModuleLoad(&modules[0],argv[1]));DR(cuModuleLoad(&modules[1],argv[2]));
     FILE *manifest=fopen(argv[3],"rb");require(manifest!=nullptr,"Cannot read manifest");
     unsigned magic=read<unsigned>(manifest);
@@ -66,7 +68,21 @@ int main(int argc,char **argv) {
             RT(cudaStreamEndCapture(stream,&graphs[version]));RT(cudaGraphInstantiate(&execs[version],graphs[version],nullptr,nullptr,0));
         }
         for(int i=0;i<(extended?80:40);i++){RT(cudaGraphLaunch(execs[i%2],stream));RT(cudaStreamSynchronize(stream));}
-        cudaEvent_t begin,end;RT(cudaEventCreate(&begin));RT(cudaEventCreate(&end));std::vector<double> times[2];std::string arms="[";
+        cudaEvent_t begin,end;RT(cudaEventCreate(&begin));RT(cudaEventCreate(&end));
+        float warmup_ms=0.0f;
+        if(stable) {
+            // Tiny kernels otherwise finish their fixed-count warmup before
+            // the device's clock governor reaches a steady operating point.
+            auto started=std::chrono::steady_clock::now();int version=0;
+            RT(cudaEventRecord(begin,stream));
+            do {
+                RT(cudaGraphLaunch(execs[version],stream));RT(cudaStreamSynchronize(stream));
+                version^=1;
+            } while(std::chrono::steady_clock::now()-started<std::chrono::milliseconds(500));
+            RT(cudaEventRecord(end,stream));RT(cudaEventSynchronize(end));
+            RT(cudaEventElapsedTime(&warmup_ms,begin,end));
+        }
+        std::vector<double> times[2];std::string arms="[";
         std::string order="ABBABAABABBAABBA"; if(extended)order+=order;
         for(char arm:order) {
             int version=arm=='B';RT(cudaEventRecord(begin,stream));for(int repeat=0;repeat<launches;repeat++)RT(cudaGraphLaunch(execs[version],stream));
@@ -90,7 +106,8 @@ int main(int argc,char **argv) {
         arms+="]";double median[2];for(int v=0;v<2;v++){auto &t=times[v];std::sort(t.begin(),t.end());median[v]=(t[t.size()/2-1]+t[t.size()/2])/2;}
         double ratio=median[1]/median[0];bool ok=ratio<=1.05;passed&=ok;char row[1000];
         snprintf(row,sizeof(row),"{\"name\":\"%s\",\"kernel\":\"%s\",\"exact\":true,\"replay_exact\":true,\"guards\":true,\"baseline_ns\":%.9f,\"candidate_ns\":%.9f,\"ratio\":%.9f,\"pass\":%s,\"arms\":",name.c_str(),kernel.c_str(),median[0],median[1],ratio,ok?"true":"false");
-        receipts.push_back(std::string(row)+arms+"}");FILE *output=fopen(argv[4],"wb");require(output!=nullptr,"Cannot save receipt");fputs("[\n",output);
+        char protocol[128];snprintf(protocol,sizeof(protocol),",\"launches_per_arm\":%d,\"additional_warmup_gpu_ms\":%.6f}",100*launches,warmup_ms);
+        receipts.push_back(std::string(row)+arms+protocol);FILE *output=fopen(argv[4],"wb");require(output!=nullptr,"Cannot save receipt");fputs("[\n",output);
         for(size_t i=0;i<receipts.size();i++)fprintf(output,"%s%s\n",receipts[i].c_str(),i+1<receipts.size()?",":"");fputs("]\n",output);fclose(output);
         printf("%s exact=1 guards=1 ratio=%.6f pass=%d\n",name.c_str(),ratio,ok);fflush(stdout);
         RT(cudaEventDestroy(begin));RT(cudaEventDestroy(end));for(int v=0;v<2;v++){RT(cudaGraphExecDestroy(execs[v]));RT(cudaGraphDestroy(graphs[v]));}
