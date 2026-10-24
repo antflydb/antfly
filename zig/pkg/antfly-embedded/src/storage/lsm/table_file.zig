@@ -1347,100 +1347,360 @@ pub const StreamingEncoder = struct {
         try self.setBlockLargest(entry);
     }
 
+    /// The final block must already have been published by its owning writer.
+    /// Metadata owns the final filters and borrows this frozen encoder until
+    /// result transfer or destruction. It issues no filesystem operations.
+    pub fn prepareMetadata(self: *StreamingEncoder) !Metadata {
+        if (self.finished) return error.InvalidTableFile;
+        return self.metadataAfterFinalBlock();
+    }
+
+    fn metadataAfterFinalBlock(self: *StreamingEncoder) !Metadata {
+        if (self.block_entry_count != 0) return error.InvalidTableFile;
+        const physical_len = self.sink.len() - self.entry_data_start;
+        _ = try checkedU32(self.entry_count);
+        _ = try checkedU32(self.logical_entry_data_len);
+        _ = try checkedU32(physical_len);
+        self.finished = true;
+        const filter = self.filter_builder.finish();
+        self.filter_builder_active = false;
+        return .{ .encoder = self, .table_filter = filter, .metadata_offset = self.sink.len(), .stats = .{
+            .logical_entry_bytes = @intCast(self.logical_entry_data_len),
+            .physical_entry_bytes = @intCast(physical_len),
+        } };
+    }
+
     pub fn finish(self: *StreamingEncoder) !StreamingEncoderResult {
         if (self.finished) return error.InvalidTableFile;
+        // This legacy API has no retained physical-write receipt. A failed
+        // final block may have mutated the sink and must never be replayed.
         self.finished = true;
         try self.flushBlock();
-
-        const entry_data_len_u32 = try checkedU32(self.logical_entry_data_len);
-        const physical_entry_data_len = self.sink.len() - self.entry_data_start;
-        const physical_entry_data_len_u32 = try checkedU32(physical_entry_data_len);
-        try self.sink.writeAt(self.entry_count_offset, &@as([4]u8, @bitCast(@as(u32, try checkedU32(self.entry_count)))));
-        try self.sink.writeAt(self.entry_data_len_offset, &@as([4]u8, @bitCast(@as(u32, physical_entry_data_len_u32))));
-
-        var filter = self.filter_builder.finish();
-        self.filter_builder_active = false;
-        errdefer filter.deinit(self.allocator);
-        const encoded_filter = try filter.encodeInto(self.allocator, &self.encoded_filter_bytes);
-        var prefix_filter = try buildFilterFromHashesAlloc(self.allocator, self.prefix_hashes.items, self.bloom_config);
-        defer prefix_filter.deinit(self.allocator);
-        const encoded_prefix_filter = try prefix_filter.encodeAlloc(self.allocator);
-        defer self.allocator.free(encoded_prefix_filter);
-
-        const metadata_offset = self.sink.len();
-        var metadata_sink_impl = ChecksummedTableSink{ .parent = self.sink };
-        var metadata_sink = metadata_sink_impl.sink();
-        try metadata_sink.appendSlice(packed_offsets_magic);
-        for (self.entry_offsets.items) |offset| try sinkAppendU16(&metadata_sink, offset);
-        try sinkAppendU32(&metadata_sink, try checkedU32(encoded_filter.len));
-        try metadata_sink.appendSlice(encoded_filter);
-        try sinkAppendU32(&metadata_sink, try checkedU32(self.blocks.items.len));
-        for (self.blocks.items) |block| {
-            try sinkAppendU32(&metadata_sink, block.relative_offset);
-            try sinkAppendU32(&metadata_sink, block.len);
-            try sinkAppendU32(&metadata_sink, block.first_entry_index);
-            try sinkAppendU32(&metadata_sink, block.entry_count);
-            try sinkAppendU32(&metadata_sink, if (block.largest_namespace_name) |name| try checkedU32(name.len) else std.math.maxInt(u32));
-            try sinkAppendU32(&metadata_sink, try checkedU32(block.largest_key.len));
-            if (block.largest_namespace_name) |name| try metadata_sink.appendSlice(name);
-            try metadata_sink.appendSlice(block.largest_key);
+        var metadata = try self.metadataAfterFinalBlock();
+        defer metadata.deinit();
+        while (try metadata.next(null)) |command| {
+            if (command.append) {
+                std.debug.assert(self.sink.len() == command.offset);
+                try self.sink.appendSlice(command.bytes);
+            } else try self.sink.writeAt(command.offset, command.bytes);
+            metadata.acknowledge();
         }
-        try sinkAppendU32(&metadata_sink, try checkedU32(self.blocks.items.len));
-        for (self.blocks.items) |block| {
-            const encoded_block_filter = try block.filter.encodeInto(self.allocator, &self.encoded_filter_bytes);
-            try sinkAppendU32(&metadata_sink, try checkedU32(encoded_block_filter.len));
-            try metadata_sink.appendSlice(encoded_block_filter);
-        }
-        try sinkAppendU32(&metadata_sink, try checkedU32(self.blocks.items.len));
-        for (self.blocks.items) |block| {
-            try sinkAppendU32(&metadata_sink, try checkedU32(block.hash_slots.len));
-            for (block.hash_slots) |slot| try sinkAppendU32(&metadata_sink, slot);
-        }
-        try sinkAppendU32(&metadata_sink, try checkedU32(self.blocks.items.len));
-        for (self.blocks.items) |block| {
-            try sinkAppendU32(&metadata_sink, block.physical_relative_offset);
-            try sinkAppendU32(&metadata_sink, block.physical_len);
-            try sinkAppendU32(&metadata_sink, @backingInt(block.compression));
-            try sinkAppendU32(&metadata_sink, block.checksum);
-        }
-        try sinkAppendU32(&metadata_sink, try checkedU32(self.blocks.items.len));
-        for (self.blocks.items) |block| {
-            try sinkAppendU32(&metadata_sink, if (block.smallest_namespace_name) |name| try checkedU32(name.len) else std.math.maxInt(u32));
-            try sinkAppendU32(&metadata_sink, try checkedU32(block.smallest_key.len));
-            if (block.smallest_namespace_name) |name| try metadata_sink.appendSlice(name);
-            try metadata_sink.appendSlice(block.smallest_key);
-        }
-        try sinkAppendU32(&metadata_sink, @backingInt(self.prefix_extractor));
-        try sinkAppendU32(&metadata_sink, try checkedU32(encoded_prefix_filter.len));
-        try metadata_sink.appendSlice(encoded_prefix_filter);
-        try sinkAppendU32(&metadata_sink, try checkedU32(self.blocks.items.len));
-        for (self.blocks.items) |block| {
-            const encoded_block_prefix_filter = if (block.prefix_filter) |block_prefix_filter|
-                try block_prefix_filter.encodeInto(self.allocator, &self.encoded_filter_bytes)
-            else
-                "";
-            try sinkAppendU32(&metadata_sink, try checkedU32(encoded_block_prefix_filter.len));
-            try metadata_sink.appendSlice(encoded_block_prefix_filter);
-        }
-        const metadata_len = self.sink.len() - metadata_offset;
-        try appendFooter(
-            self.sink,
-            metadata_offset,
-            metadata_len,
-            self.entry_count,
-            entry_data_len_u32,
-            metadata_sink_impl.checksum(),
-        );
-
-        const compression_stats = summarizeOwnedCompressionStats(self.logical_entry_data_len, physical_entry_data_len, self.blocks.items);
-        if (self.compression_stats_out) |stats| stats.* = compression_stats;
-        return .{
-            .size_bytes = self.sink.len(),
-            .entry_count = self.entry_count,
-            .filter = filter,
-            .compression_stats = compression_stats,
-        };
+        return metadata.takeResult();
     }
+
+    /// Retained pure-CPU metadata producer. The caller retains the encoder's
+    /// existing credits (including the moved table filter), prepays the extra
+    /// memoryBound(), freezes the encoder and serializes methods. Each command remains byte
+    /// identical until acknowledged after physical completion. IO ownership and
+    /// partial-write recovery belong to the writer; this value never dispatches
+    /// work, stores an admission borrow or treats a rejected waiter as a receipt.
+    pub const Metadata = struct {
+        pub const Command = struct { offset: usize, append: bool, bytes: []const u8 };
+        const Phase = enum {
+            entry_count_patch,
+            data_len_patch,
+            prefix_allocate,
+            prefix_zero,
+            prefix_hashes,
+            offsets_magic,
+            offsets,
+            table_filter,
+            largest_count,
+            largest,
+            filters_count,
+            filters,
+            slots_count,
+            slots,
+            physical_count,
+            physical,
+            smallest_count,
+            smallest,
+            extractor,
+            prefix_filter,
+            block_prefix_count,
+            block_prefix,
+            footer,
+            complete,
+        };
+        encoder: *StreamingEncoder,
+        table_filter: ?bloom.OwnedFilter,
+        prefix_builder: ?bloom.Builder = null,
+        prefix_filter: ?bloom.OwnedFilter = null,
+        phase: Phase = .entry_count_patch,
+        index: usize = 0,
+        field: usize = 0,
+        slot: usize = 0,
+        offset: usize = 0,
+        metadata_offset: usize,
+        metadata_len: usize = 0,
+        crc: Crc32 = .init(),
+        stats: CompressionStats,
+        buffer: [16 * 1024]u8 = undefined,
+        len: usize = 0,
+        output_offset: usize = 0,
+        append: bool = true,
+        pending: bool = false,
+
+        pub fn memoryBound(encoder: *const StreamingEncoder) !usize {
+            const prefix_bytes = (try bloomEncodedLenForKeyCount(encoder.prefix_hashes.items.len, encoder.bloom_config)) - bloom_encoded_header_len;
+            return checkedAddUsize(@sizeOf(@This()), prefix_bytes);
+        }
+
+        pub fn deinit(self: *@This()) void {
+            if (self.table_filter) |*filter| filter.deinit(self.encoder.allocator);
+            if (self.prefix_builder) |*builder| builder.deinit();
+            if (self.prefix_filter) |*filter| filter.deinit(self.encoder.allocator);
+            self.* = undefined;
+        }
+
+        fn advance(self: *@This(), phase: Phase) void {
+            self.phase = phase;
+            self.index = 0;
+            self.field = 0;
+            self.slot = 0;
+            self.offset = 0;
+        }
+
+        fn command(self: *@This()) Command {
+            std.debug.assert(self.len != 0);
+            self.pending = true;
+            return .{ .offset = self.output_offset, .append = self.append, .bytes = self.buffer[0..self.len] };
+        }
+
+        /// Fixed receipt only. The caller must acknowledge once, after its
+        /// accepted write is known complete, before asking for another command.
+        pub fn acknowledge(self: *@This()) void {
+            std.debug.assert(self.pending);
+            self.pending = false;
+            self.len = 0;
+        }
+
+        fn beginBytes(self: *@This()) void {
+            if (self.len == 0) {
+                self.output_offset = self.metadata_offset + self.metadata_len;
+                self.append = true;
+            }
+        }
+
+        fn emit(self: *@This(), bytes: []const u8) !bool {
+            self.beginBytes();
+            const n = @min(bytes.len - self.offset, self.buffer.len - self.len);
+            const new_len = try checkedAddUsize(self.metadata_len, n);
+            const out = self.buffer[self.len..][0..n];
+            @memcpy(out, bytes[self.offset..][0..n]);
+            self.crc.update(out);
+            self.metadata_len = new_len;
+            self.len += n;
+            self.offset += n;
+            if (self.offset != bytes.len) return false;
+            self.offset = 0;
+            return true;
+        }
+
+        fn number(self: *@This(), comptime T: type, value: T) !bool {
+            var raw: [@sizeOf(T)]u8 = undefined;
+            std.mem.writeInt(T, &raw, value, .little);
+            return self.emit(&raw);
+        }
+
+        fn emitFilter(self: *@This(), value: ?bloom.OwnedFilter) !bool {
+            if (self.field == 0) {
+                if (try self.number(u32, try checkedU32(if (value) |v| v.encodedSize() else 0))) self.field = 1;
+                return false;
+            }
+            if (value) |v| {
+                self.beginBytes();
+                const n = v.encodeRange(self.offset, self.buffer[self.len..]);
+                const new_len = try checkedAddUsize(self.metadata_len, n);
+                self.crc.update(self.buffer[self.len..][0..n]);
+                self.metadata_len = new_len;
+                self.len += n;
+                self.offset += n;
+                if (self.offset != v.encodedSize()) return false;
+            }
+            self.field = 0;
+            self.offset = 0;
+            return true;
+        }
+
+        pub fn next(self: *@This(), original: ?read_admission.Port) !?Command {
+            if (original) |control| try control.checkpoint();
+            if (self.pending) return self.command();
+            const e = self.encoder;
+            while (self.phase != .complete) {
+                if (original) |control| try control.checkpoint();
+                if (self.len == self.buffer.len) return self.command();
+                switch (self.phase) {
+                    .entry_count_patch, .data_len_patch => {
+                        const count = self.phase == .entry_count_patch;
+                        std.debug.assert(self.len == 0);
+                        std.mem.writeInt(u32, self.buffer[0..4], try checkedU32(if (count) e.entry_count else @as(usize, @intCast(self.stats.physical_entry_bytes))), .little);
+                        self.len = 4;
+                        self.output_offset = if (count) e.entry_count_offset else e.entry_data_len_offset;
+                        self.append = false;
+                        self.advance(if (count) .data_len_patch else .prefix_allocate);
+                        return self.command();
+                    },
+                    .prefix_allocate => {
+                        // Validate the size before entering the library's
+                        // uninitialized allocation; no hash sees dirty bytes.
+                        _ = try memoryBound(e);
+                        self.prefix_builder = try bloom.Builder.initUninitialized(e.allocator, e.prefix_hashes.items.len, e.bloom_config);
+                        self.advance(.prefix_zero);
+                    },
+                    .prefix_zero => {
+                        const bytes = self.prefix_builder.?.bytes;
+                        const n = @min(bytes.len - self.offset, 16 * 1024);
+                        @memset(bytes[self.offset..][0..n], 0);
+                        self.offset += n;
+                        if (self.offset == bytes.len) self.advance(.prefix_hashes);
+                    },
+                    .prefix_hashes => {
+                        const end = self.index + @min(e.prefix_hashes.items.len - self.index, 64);
+                        while (self.index < end) : (self.index += 1) {
+                            const hashes = e.prefix_hashes.items[self.index];
+                            self.prefix_builder.?.addHashes(hashes[0], hashes[1]);
+                        }
+                        if (self.index == e.prefix_hashes.items.len) {
+                            self.prefix_filter = self.prefix_builder.?.finish();
+                            self.prefix_builder = null;
+                            self.advance(.offsets_magic);
+                        }
+                    },
+                    .offsets_magic => if (try self.emit(packed_offsets_magic)) {
+                        self.advance(.offsets);
+                    },
+                    .offsets => {
+                        if (self.index == e.entry_offsets.items.len) self.advance(.table_filter) else if (try self.number(u16, e.entry_offsets.items[self.index])) {
+                            self.index += 1;
+                        }
+                    },
+                    .table_filter => if (try self.emitFilter(self.table_filter)) {
+                        self.advance(.largest_count);
+                    },
+                    .largest_count, .filters_count, .slots_count, .physical_count, .smallest_count, .block_prefix_count => {
+                        if (try self.number(u32, try checkedU32(e.blocks.items.len))) self.advance(switch (self.phase) {
+                            .largest_count => .largest,
+                            .filters_count => .filters,
+                            .slots_count => .slots,
+                            .physical_count => .physical,
+                            .smallest_count => .smallest,
+                            .block_prefix_count => .block_prefix,
+                            else => unreachable,
+                        });
+                    },
+                    .largest, .smallest => {
+                        const largest = self.phase == .largest;
+                        if (self.index == e.blocks.items.len) {
+                            self.advance(if (largest) .filters_count else .extractor);
+                            continue;
+                        }
+                        const block = e.blocks.items[self.index];
+                        const name = if (largest) block.largest_namespace_name else block.smallest_namespace_name;
+                        const key = if (largest) block.largest_key else block.smallest_key;
+                        const base: usize = if (largest) 4 else 0;
+                        const done = if (self.field < base) try self.number(u32, switch (self.field) {
+                            0 => block.relative_offset,
+                            1 => block.len,
+                            2 => block.first_entry_index,
+                            3 => block.entry_count,
+                            else => unreachable,
+                        }) else switch (self.field - base) {
+                            0 => try self.number(u32, if (name) |n| try checkedU32(n.len) else std.math.maxInt(u32)),
+                            1 => try self.number(u32, try checkedU32(key.len)),
+                            2 => try self.emit(if (name) |n| n else ""),
+                            3 => try self.emit(key),
+                            else => unreachable,
+                        };
+                        if (done) {
+                            self.field += 1;
+                            if (self.field == base + 4) {
+                                self.field = 0;
+                                self.index += 1;
+                            }
+                        }
+                    },
+                    .filters, .block_prefix => {
+                        const prefix = self.phase == .block_prefix;
+                        if (self.index == e.blocks.items.len) self.advance(if (prefix) .footer else .slots_count) else if (try self.emitFilter(if (prefix) e.blocks.items[self.index].prefix_filter else e.blocks.items[self.index].filter)) {
+                            self.index += 1;
+                        }
+                    },
+                    .slots => {
+                        if (self.index == e.blocks.items.len) {
+                            self.advance(.physical_count);
+                            continue;
+                        }
+                        const slots = e.blocks.items[self.index].hash_slots;
+                        if (self.field == 0) {
+                            if (try self.number(u32, try checkedU32(slots.len))) self.field = 1;
+                        } else if (self.slot == slots.len) {
+                            self.index += 1;
+                            self.field = 0;
+                            self.slot = 0;
+                        } else if (try self.number(u32, slots[self.slot])) {
+                            self.slot += 1;
+                        }
+                    },
+                    .physical => {
+                        if (self.index == e.blocks.items.len) {
+                            self.advance(.smallest_count);
+                            continue;
+                        }
+                        const block = e.blocks.items[self.index];
+                        if (try self.number(u32, switch (self.field) {
+                            0 => block.physical_relative_offset,
+                            1 => block.physical_len,
+                            2 => @backingInt(block.compression),
+                            3 => block.checksum,
+                            else => unreachable,
+                        })) {
+                            self.field += 1;
+                            if (self.field == 4) {
+                                switch (block.compression) {
+                                    .none => self.stats.raw_blocks += 1,
+                                    .snappy, .prefix, .prefix_snappy => {
+                                        self.stats.compressed_blocks += 1;
+                                        self.stats.compression_codec_mask |= blockCompressionCodecMask(block.compression);
+                                    },
+                                }
+                                self.field = 0;
+                                self.index += 1;
+                            }
+                        }
+                    },
+                    .extractor => if (try self.number(u32, @backingInt(e.prefix_extractor))) {
+                        self.advance(.prefix_filter);
+                    },
+                    .prefix_filter => if (try self.emitFilter(self.prefix_filter)) {
+                        self.advance(.block_prefix_count);
+                    },
+                    .footer => {
+                        // Keep the checksummed metadata command separate from
+                        // the footer; rejection cannot hash either one twice.
+                        if (self.len != 0) return self.command();
+                        const raw = try footerBytes(self.metadata_offset, self.metadata_len, e.entry_count, e.logical_entry_data_len, self.crc.final());
+                        @memcpy(self.buffer[0..raw.len], &raw);
+                        self.len = raw.len;
+                        self.output_offset = self.metadata_offset + self.metadata_len;
+                        self.append = true;
+                        self.advance(.complete);
+                        return self.command();
+                    },
+                    .complete => unreachable,
+                }
+            }
+            return null;
+        }
+
+        pub fn takeResult(self: *@This()) !StreamingEncoderResult {
+            if (self.phase != .complete or self.pending or self.table_filter == null) return error.InvalidTableFile;
+            const owned_filter = self.table_filter.?;
+            self.table_filter = null;
+            if (self.encoder.compression_stats_out) |out| out.* = self.stats;
+            return .{ .size_bytes = self.metadata_offset + self.metadata_len + footer_len, .entry_count = self.encoder.entry_count, .filter = owned_filter, .compression_stats = self.stats };
+        }
+    };
 
     fn setBlockSmallest(self: *StreamingEncoder, entry: Entry) !void {
         self.clearBlockSmallest();
@@ -1631,23 +1891,6 @@ fn ownedEncodedBlockMetaHeapBytes(block: OwnedEncodedBlockMeta) u64 {
 }
 
 fn summarizeCompressionStats(logical_entry_data_len: usize, physical_entry_data_len: usize, blocks: []const EncodedBlockMeta) CompressionStats {
-    var stats = CompressionStats{
-        .logical_entry_bytes = @intCast(logical_entry_data_len),
-        .physical_entry_bytes = @intCast(physical_entry_data_len),
-    };
-    for (blocks) |block| {
-        switch (block.compression) {
-            .none => stats.raw_blocks += 1,
-            .snappy, .prefix, .prefix_snappy => {
-                stats.compressed_blocks += 1;
-                stats.compression_codec_mask |= blockCompressionCodecMask(block.compression);
-            },
-        }
-    }
-    return stats;
-}
-
-fn summarizeOwnedCompressionStats(logical_entry_data_len: usize, physical_entry_data_len: usize, blocks: []const OwnedEncodedBlockMeta) CompressionStats {
     var stats = CompressionStats{
         .logical_entry_bytes = @intCast(logical_entry_data_len),
         .physical_entry_bytes = @intCast(physical_entry_data_len),
@@ -3516,6 +3759,11 @@ fn appendFooter(
     entry_data_len: usize,
     metadata_checksum: u32,
 ) !void {
+    const raw = try footerBytes(metadata_offset, metadata_len, entry_count, entry_data_len, metadata_checksum);
+    try sink.appendSlice(&raw);
+}
+
+fn footerBytes(metadata_offset: usize, metadata_len: usize, entry_count: usize, entry_data_len: usize, metadata_checksum: u32) ![footer_len]u8 {
     var raw: [footer_len]u8 = undefined;
     @memcpy(raw[0..footer_magic.len], footer_magic);
     std.mem.writeInt(u32, raw[8..12], version, .little);
@@ -3526,7 +3774,7 @@ fn appendFooter(
     std.mem.writeInt(u32, raw[36..40], try checkedU32(entry_data_len), .little);
     std.mem.writeInt(u32, raw[40..44], metadata_checksum, .little);
     std.mem.writeInt(u32, raw[44..48], Crc32.hash(raw[0..44]), .little);
-    try sink.appendSlice(&raw);
+    return raw;
 }
 
 fn readByte(raw: []const u8, cursor: *usize) !u8 {
@@ -5449,4 +5697,239 @@ test "table file retained index continuation preserves malformed metadata valida
         }
     }
     try std.testing.expect(rejected > 0 and accepted > 0);
+}
+
+test "controlled physical sync table metadata commands retain original rejection and match the existing wire encoder" {
+    const Control = struct {
+        calls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        failure: anyerror,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const call = self.calls;
+            self.calls += 1;
+            if (call == self.fail_at) return self.failure;
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.FileNotFound }) |failure| {
+        for ([_]usize{ 2, 17 }) |stride| {
+            var sink_impl = MemoryTableSink.init(a);
+            defer sink_impl.deinit();
+            var sink = sink_impl.sink();
+            var encoder = try StreamingEncoder.init(a, &sink, 1_000_000, .{});
+            defer encoder.deinit();
+            const keys = try a.alloc(u8, 24 * 36 * 1024);
+            defer a.free(keys);
+            var entries: [24]Entry = undefined;
+            for (&entries, 0..) |*entry, i| {
+                const key = keys[i * 36 * 1024 ..][0 .. 36 * 1024];
+                @memset(key, 'x');
+                _ = try std.fmt.bufPrint(key[0..16], "doc{d:0>8}/", .{i});
+                entry.* = .{ .namespace_name = "docs", .key = key, .value = "value", .tombstone = i % 3 == 0 };
+                try encoder.appendEntry(entry.*);
+            }
+            // The unchanged whole-table producer is an independent wire
+            // oracle. Supply the same deliberately oversized table Bloom.
+            const borrowed_filter: bloom.OwnedFilter = .{ .bytes = encoder.filter_builder.bytes, .bit_count = encoder.filter_builder.bit_count, .hash_count = encoder.filter_builder.hash_count };
+            const expected = try encodeWithFilterAllocOptions(a, &entries, borrowed_filter, .{});
+            defer a.free(expected);
+            try encoder.flushBlock();
+            var metadata = try encoder.prepareMetadata();
+            defer metadata.deinit();
+            var control: Control = .{ .failure = failure };
+            const payload: read_admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check } };
+            const original = read_admission.Port.init(&payload);
+            var rejections: usize = 0;
+            var commands: usize = 0;
+            var image: [16 * 1024]u8 = undefined;
+            while (true) {
+                control.fail_at = control.calls + stride;
+                const command = (metadata.next(original) catch |cause| {
+                    try std.testing.expectEqual(failure, cause);
+                    rejections += 1;
+                    continue;
+                }) orelse break;
+                commands += 1;
+                try std.testing.expect(command.bytes.len <= image.len);
+                @memcpy(image[0..command.bytes.len], command.bytes);
+                // Rejected observation cannot mutate a pending command, even
+                // when the caller has already physically applied its bytes.
+                if (command.append) {
+                    try std.testing.expectEqual(sink.len(), command.offset);
+                    try sink.appendSlice(command.bytes);
+                } else try sink.writeAt(command.offset, command.bytes);
+                control.fail_at = control.calls;
+                try std.testing.expectError(failure, metadata.next(original));
+                control.fail_at = std.math.maxInt(usize);
+                const same = (try metadata.next(original)).?;
+                try std.testing.expectEqual(command.offset, same.offset);
+                try std.testing.expectEqual(command.append, same.append);
+                try std.testing.expectEqualSlices(u8, image[0..command.bytes.len], same.bytes);
+                try std.testing.expectError(error.InvalidTableFile, metadata.takeResult());
+                metadata.acknowledge();
+            }
+            var result = try metadata.takeResult();
+            defer result.filter.deinit(a);
+            try std.testing.expectError(error.InvalidTableFile, metadata.takeResult());
+            try std.testing.expect(commands > 100 and rejections > 10);
+            try std.testing.expectEqual(expected.len, result.size_bytes);
+            try std.testing.expectEqualSlices(u8, expected, sink_impl.out.items);
+            var decoded = try decodeIndexAlloc(a, sink_impl.out.items);
+            defer decoded.deinit(a);
+            try std.testing.expectEqual(@as(usize, entries.len), decoded.entryCount());
+            try std.testing.expect(decoded.maybeContainsPrefix("docs", "doc00000000/"));
+        }
+    }
+}
+
+test "controlled physical sync table metadata prefix preparation yields CPU and retires partial allocation ownership" {
+    const cpu = @import("../../common/runnable_scheduler.zig");
+    const now = @import("antfly_platform").time.monotonicNs;
+    const Control = struct {
+        execution: *cpu.Execution,
+        scheduler: *cpu.Scheduler,
+        calls: usize = 0,
+        turns: usize = 0,
+        metadata: ?*StreamingEncoder.Metadata = null,
+        stop: enum { none, zero, hashes } = .none,
+        rejected: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.checkLifetime();
+            try std.testing.expectEqual(cpu.State.running, self.scheduler.state(&self.execution.entry.?));
+            self.calls += 1;
+            if (self.metadata) |m| {
+                const reject = switch (self.stop) {
+                    .none => false,
+                    .zero => m.phase == .prefix_zero and m.offset != 0,
+                    .hashes => m.phase == .prefix_hashes and m.index != 0,
+                };
+                if (reject) {
+                    self.rejected = true;
+                    return error.DeadlineExceeded;
+                }
+            }
+            if (self.calls % 32 == 0) {
+                try self.execution.park(.resource_blocked);
+                var control: cpu.Execution = .{};
+                defer control.finish();
+                try control.start(self.scheduler, .{ .io = std.testing.io, .native_now_ns = @import("antfly_platform").time.monotonicNs }, .control);
+                control.finish();
+                self.turns += 1;
+                try self.execution.enter(.write);
+            }
+        }
+    };
+    const a = std.testing.allocator;
+    var slots = try cpu.Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 });
+    defer slots.close();
+    var execution: cpu.Execution = .{};
+    defer execution.finish();
+    try execution.reserveCleanupRoot(&slots, .{ .io = std.testing.io, .native_now_ns = now, .allow_wait = true }, 10 * std.time.ns_per_s);
+    try execution.activateCleanup();
+    var query: cpu.Execution = .{};
+    defer query.finish();
+    try query.start(&slots, .{ .io = std.testing.io, .native_now_ns = now }, .query);
+    var control: Control = .{ .execution = &execution, .scheduler = &slots };
+    const payload: read_admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check } };
+    const original = read_admission.Port.init(&payload);
+    var failures: usize = 0;
+    // Failed prefix allocation keeps the moved table filter alive. Retrying
+    // or abandoning partial zero/hash preparation must free each owner once.
+    for ([_]@FieldType(Control, "stop"){ .none, .zero, .hashes }) |stop| {
+        const abandon = stop != .none;
+        var failing = std.testing.FailingAllocator.init(a, .{});
+        const allocator = failing.allocator();
+        var sink_impl = MemoryTableSink.init(a);
+        defer sink_impl.deinit();
+        var sink = sink_impl.sink();
+        var encoder = try StreamingEncoder.init(allocator, &sink, 8192, .{ .bloom_config = .{ .min_bits = 1024 * 1024 } });
+        defer encoder.deinit();
+        for (0..192) |i| {
+            var key: [24]u8 = undefined;
+            try encoder.appendEntry(.{ .namespace_name = "docs", .key = try std.fmt.bufPrint(&key, "{d:0>8}/key", .{i}), .value = "value" });
+        }
+        try encoder.flushBlock();
+        var metadata = try encoder.prepareMetadata();
+        defer metadata.deinit();
+        control.metadata = &metadata;
+        control.stop = stop;
+        control.rejected = false;
+        var allocated = false;
+        while (true) {
+            if (metadata.phase == .prefix_allocate and !allocated) {
+                const index = failing.alloc_index;
+                failing.fail_index = index;
+                try std.testing.expectError(error.OutOfMemory, metadata.next(original));
+                try std.testing.expect(metadata.table_filter != null and metadata.prefix_builder == null);
+                failures += 1;
+                failing.fail_index = std.math.maxInt(usize);
+                allocated = true;
+            }
+            const command = (metadata.next(original) catch |cause| {
+                try std.testing.expect(abandon and control.rejected);
+                try std.testing.expectEqual(error.DeadlineExceeded, cause);
+                try std.testing.expect(metadata.table_filter != null and metadata.prefix_builder != null and metadata.prefix_filter == null);
+                break;
+            }) orelse break;
+            if (command.append) try sink.appendSlice(command.bytes) else try sink.writeAt(command.offset, command.bytes);
+            metadata.acknowledge();
+        }
+        if (!abandon) {
+            var result = try metadata.takeResult();
+            defer result.filter.deinit(allocator);
+            var decoded = try decodeIndexAlloc(a, sink_impl.out.items);
+            defer decoded.deinit(a);
+            try std.testing.expectEqual(@as(usize, 128 * 1024), decoded.prefix_filter.?.bytes.len);
+            try std.testing.expect(decoded.maybeContainsPrefix("docs", "00000001/"));
+        }
+    }
+    try std.testing.expect(failures == 3 and control.turns > 0);
+    try std.testing.expectEqual(cpu.State.running, slots.state(&query.entry.?));
+}
+
+test "controlled physical sync legacy table finish rejects replay after partial final block output" {
+    const Fixture = struct {
+        memory: MemoryTableSink,
+        fail: bool = false,
+        writes: usize = 0,
+        fn len(raw: *anyopaque) usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.memory.out.items.len;
+        }
+        fn append(raw: *anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.writes += 1;
+            if (self.fail) {
+                try self.memory.out.appendSlice(self.memory.allocator, bytes[0 .. bytes.len / 2]);
+                return error.InjectedWriteFault;
+            }
+            try self.memory.out.appendSlice(self.memory.allocator, bytes);
+        }
+        fn byte(raw: *anyopaque, value: u8) !void {
+            return append(raw, &.{value});
+        }
+        fn write(raw: *anyopaque, offset: usize, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var sink = self.memory.sink();
+            try sink.writeAt(offset, bytes);
+        }
+    };
+    const a = std.testing.allocator;
+    var fixture: Fixture = .{ .memory = .init(a) };
+    defer fixture.memory.deinit();
+    var sink: TableSink = .{ .ptr = &fixture, .vtable = &.{ .len = Fixture.len, .append_slice = Fixture.append, .append_byte = Fixture.byte, .write_at = Fixture.write } };
+    var encoder = try StreamingEncoder.init(a, &sink, 1, .{});
+    defer encoder.deinit();
+    try encoder.appendEntry(.{ .namespace_name = "docs", .key = "doc:key", .value = "value" });
+    fixture.fail = true;
+    const before = fixture.memory.out.items.len;
+    try std.testing.expectError(error.InjectedWriteFault, encoder.finish());
+    const after = fixture.memory.out.items.len;
+    const writes = fixture.writes;
+    try std.testing.expect(after > before);
+    try std.testing.expectError(error.InvalidTableFile, encoder.finish());
+    try std.testing.expectEqual(after, fixture.memory.out.items.len);
+    try std.testing.expectEqual(writes, fixture.writes);
 }

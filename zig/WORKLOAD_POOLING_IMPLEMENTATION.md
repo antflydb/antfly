@@ -25357,3 +25357,58 @@ ownership. Broader
 completion/history relief, remaining provider/legacy-generation adoption and
 default-gate evidence remain open. Full GNU qualification remains waived; the
 full goal is incomplete.
+
+### Retained table metadata producer
+
+Streaming table finalization now uses one retained metadata producer for both
+legacy output and future owning physical writers. The producer issues at most
+16 KiB per command, with an explicit destination offset and append/backpatch
+kind. It performs no sink calls or filesystem work. A command stays identical
+until the writer records physical completion and acknowledges it. A rejected
+original checkpoint retains the partially built command, section/field cursors,
+checksum, incremental compression summary, and filter ownership; asking again
+cannot manufacture a new physical-write receipt.
+
+Prefix Bloom allocation, zeroing, hash insertion and filter serialization are
+separate retained CPU phases. Zeroing and copying use at most 16 KiB per phase;
+hash insertion uses at most 64 hashes. Metadata scalars and long key/namespace
+bounds can cross command boundaries without replay. Bloom range serialization
+is shared with its existing allocating serializer, so no second full encoded
+filter image is required. Compression statistics accumulate with block metadata
+instead of scanning the complete block array again at the end.
+
+The caller retains the frozen encoder and its existing credits, including the
+moved table filter, and prepays Metadata.memoryBound() for the extra owner and
+prefix filter. The producer must stay at a stable address while any command is
+borrowed by a writer. It never retains an admission port. Final result transfer
+requires acknowledgement of the footer and transfers the table filter once;
+explicit destruction frees partial prefix construction and any untransferred
+filter. Legacy finish still treats a partial final-block write as terminal.
+The existing table format and native owner layouts remain unchanged.
+
+Qualification receipts in the cumulative integration directory:
+
+- `owned-table-metadata-v1` preserves a test-only reference to an index field
+  instead of its entryCount() method; the host and error-identity suites passed.
+- `owned-table-metadata-v2` passes 75/75 build steps, 42 physical-IO cases,
+  153 and 74 table/WAL regression cases, 16 host/ABI cases and 45/1/8
+  error-identity cases, with unchanged native inputs.
+- `owned-table-metadata-bloom-release-fast` passes all four Bloom cases with
+  assertions disabled, including range serialization and buffer reuse.
+
+Native physical and table/WAL regressions exercise the default encoder path.
+The new cases compare complete bytes against the independent whole-table
+encoder with large keys and an oversized Bloom, interrupt command preparation
+and observation for cancellation/deadline/FileNotFound, reject partial prefix
+allocation, zeroing and hashing, and check reserved-control progress with
+ordinary capacity occupied. A separate regression prevents replay after partial
+legacy output. Formatting and whitespace checks pass; logs, source hashes and
+changed-source snapshots remain preserved.
+
+This separates final metadata CPU from physical output; final block encoding
+and output still need their own retained producer. Next are an owning native
+atomic-file writer with funded physical completion and retry receipts, their
+adoption by run construction and manifest publication, and admitted backend
+finalization/teardown. Remaining completion/history relief, provider/legacy
+adoption and default-gate evidence stay open. Full GNU qualification remains
+waived; the full design is incomplete.

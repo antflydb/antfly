@@ -53,15 +53,36 @@ pub const OwnedFilter = struct {
         return try out.toOwnedSlice(allocator);
     }
 
+    pub fn encodedSize(self: OwnedFilter) usize {
+        return encodedLen(self);
+    }
+
+    /// Serialize a bounded range without allocating a second filter image.
+    /// The caller retains the filter and chooses the maximum copy quantum.
+    pub fn encodeRange(self: OwnedFilter, offset: usize, out: []u8) usize {
+        const header_len = magic.len + 4 + 4 + 1 + 4;
+        var header: [header_len]u8 = undefined;
+        @memcpy(header[0..magic.len], magic);
+        std.mem.writeInt(u32, header[magic.len..][0..4], version, .little);
+        std.mem.writeInt(u32, header[magic.len + 4 ..][0..4], self.bit_count, .little);
+        header[magic.len + 8] = self.hash_count;
+        std.mem.writeInt(u32, header[magic.len + 9 ..][0..4], @intCast(self.bytes.len), .little);
+        if (offset >= self.encodedSize()) return 0;
+        const count = @min(out.len, self.encodedSize() - offset);
+        const prefix = if (offset < header.len) @min(count, header.len - offset) else 0;
+        @memcpy(out[0..prefix], header[@min(offset, header.len)..][0..prefix]);
+        if (prefix < count) {
+            const body_offset = offset + prefix - header.len;
+            @memcpy(out[prefix..count], self.bytes[body_offset..][0 .. count - prefix]);
+        }
+        return count;
+    }
+
     pub fn encodeInto(self: OwnedFilter, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) ![]const u8 {
-        out.clearRetainingCapacity();
-        try out.ensureTotalCapacity(allocator, encodedLen(self));
-        try out.appendSlice(allocator, magic);
-        try appendU32(allocator, out, version);
-        try appendU32(allocator, out, self.bit_count);
-        try out.append(allocator, self.hash_count);
-        try appendU32(allocator, out, @intCast(self.bytes.len));
-        try out.appendSlice(allocator, self.bytes);
+        try out.ensureTotalCapacity(allocator, self.encodedSize());
+        out.items.len = self.encodedSize();
+        const written = self.encodeRange(0, out.items);
+        std.debug.assert(written == out.items.len);
         return out.items;
     }
 
@@ -148,11 +169,18 @@ pub const Builder = struct {
     hash_count: u8,
 
     pub fn init(allocator: std.mem.Allocator, key_count: usize, config: Config) !Builder {
+        const builder = try initUninitialized(allocator, key_count, config);
+        @memset(builder.bytes, 0);
+        return builder;
+    }
+
+    /// All bytes must be zeroed before adding hashes or publishing the filter.
+    /// Allows a retained CPU continuation to initialize in bounded slices.
+    pub fn initUninitialized(allocator: std.mem.Allocator, key_count: usize, config: Config) !Builder {
         const raw_bits = @max(config.min_bits, key_count * config.bits_per_key);
         const bit_count = if (key_count == 0) 0 else std.math.ceilPowerOfTwo(usize, raw_bits) catch raw_bits;
         const byte_len = if (bit_count == 0) 0 else (bit_count + 7) / 8;
         const bytes = try allocator.alloc(u8, byte_len);
-        @memset(bytes, 0);
         return .{
             .allocator = allocator,
             .bytes = bytes,
@@ -341,4 +369,27 @@ test "power of two optimization preserves v1 bits and query results" {
             }
         }
     }
+}
+
+test "bloom bounded encoding ranges preserve the wire header and support nonsequential slices" {
+    const a = std.testing.allocator;
+    var builder = try Builder.init(a, 800, .{});
+    defer builder.deinit();
+    builder.addHashes(13, 71);
+    const filter: OwnedFilter = .{ .bytes = builder.bytes, .bit_count = builder.bit_count, .hash_count = builder.hash_count };
+    const raw = try filter.encodeAlloc(a);
+    defer a.free(raw);
+    for ([_]usize{ 1, 3, 17, 64 }) |size| {
+        var buffer: [64]u8 = undefined;
+        var offset: usize = raw.len;
+        while (offset != 0) {
+            const n = @min(size, offset);
+            offset -= n;
+            try std.testing.expectEqual(n, filter.encodeRange(offset, buffer[0..n]));
+            try std.testing.expectEqualSlices(u8, raw[offset..][0..n], buffer[0..n]);
+        }
+        try std.testing.expectEqual(@as(usize, 0), filter.encodeRange(raw.len, &buffer));
+    }
+    const decoded = try BorrowedFilter.decode(raw);
+    try std.testing.expect(decoded.maybeContainsHashes(13, 71));
 }
