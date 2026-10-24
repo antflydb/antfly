@@ -25938,3 +25938,76 @@ file. Formatting and whitespace pass. Earlier v1/v2 receipts preserve corrected
 Zig naming conflicts and the test-only narrow phase-index overflow. Full GNU
 qualification remains waived; backend installation/default adoption and the
 remaining full-design requirements above remain incomplete.
+
+
+## Prepared backend checkpoint installation
+
+`ManifestJournal.CheckpointFence` captures fixed durable lineage identities,
+including the descriptor, sequencing/counters, linked segment IDs, obsolete
+root and durable directory pointer. Current run roots can advance independently
+without making an older pinned durable snapshot invalid. A changed durable
+lineage cannot be installed over: installation fences recovery and preserves
+the prepared roots. The existing production pinned checkpoint path now uses
+this same fixed installation receipt after its descriptor write.
+
+`Backend.QuiescedPreparedCheckpoint` consumes an already registered/funded
+checkpoint directory, ledger snapshot and prepaid durability grant. The caller
+permanently fences unrelated serving/mutation/accounting through rejection and
+retirement. Preparation must include all previous manifest-file retirement
+paths in the obsolete ledger; the operation validates one such path per original
+checkpoint before IO. Successful initialization reserves one fresh manifest ID
+and retains the publication lane; busy admission transfers nothing and never
+performs an uncancelable lock wait. No new heap allocation or application budget
+is introduced during this handoff. Earlier admission/allocation of these roots
+remains a separate integration requirement.
+
+The operation writes checkpoint/journal off the backend mutex, stops before
+opening the descriptor temporary and checks lineage under original bounded
+mutex admission. It checks again after durable descriptor publication. The
+fixed successful receipt promotes the directory, swaps the journal ledger,
+settles captured logical WAL debt and updates statistics exactly once. Old
+roots transfer to existing bounded retirement queues without early accounting
+release. Accepted IO is never replayed after rejected installation observation.
+Abort joins IO before transferring prepared metadata to those queues. Ambiguous
+descriptor publication keeps recovery fencing and the old metadata ownership;
+no final file is deleted by this operation. No backend mutex spans an IO wait.
+
+Owned default caller wiring, admitted metadata/root preparation, SST/output
+ticket adoption and remaining completion/history relief/default-gate evidence
+remain required. The new entry explicitly requires quiescence and does not
+claim to enable concurrent default backend publication. Full GNU qualification
+remains waived and the whole design remains incomplete.
+
+The caller must also retain cleanup tickets for all possibly published final
+paths reported by the physical owner, even after operation retirement. This
+entry does not silently erase those obligations or enable default retry loops
+that could accumulate untracked manifest outputs. Admission of those tickets
+and their handoff to the durable obsolete ledger remain part of caller adoption.
+
+Native backend tests prepare/register roots through the existing legacy path
+before the operation, then refuse every subsequent backend allocation/resize.
+They exercise all three original rejections during physical writes and after
+known descriptor completion, denied installation-lock waiting, interrupted
+abort after provider retirement, busy publication admission with no grant/ID
+transfer, missing retired-path coverage, changed lineage before/after descriptor
+IO and physical failure after rename. Metadata roots, accounting and publication
+leases remain owned across each refusal; statistics/WAL logical debt settle
+exactly once on successful installation. IO waits prove the backend mutex is
+free, sole-FD completion succeeds with query capacity occupied and reserved
+control progresses. Crash-style teardown prevents a legacy close write from
+masking results; native read-only reopen verifies every stored row.
+
+`backend-checkpoint-v2-fast` passes 63/63 optimized build steps, all 71
+physical-IO, 170 table/codec and 74 WAL/recovery cases, plus four standalone
+Bloom and 45/1/8 error-identity companions. All 5,586 native/schema input hashes
+and the log digest match the unchanged source; five immutable snapshots preserve
+every changed native file. The earlier v1 run also passes the complete initial
+prepared-backend suite before the additional lock/abort rejection checks.
+
+Final `backend-checkpoint-v2-integrated` passes 83/83 build steps, all 71
+physical-IO, 32 embedded close, 170 table/codec, 74 WAL/recovery and 18 host/ABI
+checks, plus the same four Bloom and 45/1/8 error companions. The receipt/log
+digest and all 5,586 native/schema input hashes match the unchanged final source
+and preserved snapshots. Formatting and whitespace pass. Existing ABI layouts
+are unchanged. Full GNU qualification remains waived; the full default-adoption
+design and the explicit caller-preparation/cleanup requirements remain open.

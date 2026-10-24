@@ -87,9 +87,18 @@ pub fn Publication(comptime Source: type) type {
             self.phase = phase;
         }
         pub fn resumeWithAdmission(self: *Self, original: admission.Port) !void {
+            return self.drive(original, false);
+        }
+        /// Stop before even opening the descriptor temporary. The backend can
+        /// validate its captured lineage under its mutex before authorizing IO.
+        pub fn prepareDescriptorWithAdmission(self: *Self, original: admission.Port) !void {
+            return self.drive(original, true);
+        }
+        fn drive(self: *Self, original: admission.Port, before_descriptor: bool) !void {
             if (self.aborting or self.retired) return error.InvalidArgument;
             if (self.phase == .complete) return original.checkpoint();
             while (self.phase != .complete) {
+                if (before_descriptor and self.phase == .descriptor) return original.checkpoint();
                 if (self.file.phase == .initial or self.file.phase == .opening) try self.file.openWithAdmission(original);
                 if (self.file.phase == .failed) return self.file.failure.?;
                 switch (self.phase) {

@@ -6272,6 +6272,38 @@ pub const Backend = struct {
         }
     };
 
+    /// Caller holds the backend mutex. A busy lane is observed without raw
+    /// waiting; release this mutex before the original execution waits/retries.
+    pub fn tryBeginManifestTurnWithAdmission(self: *Backend, original: read_admission.Port) !?ManifestTurn {
+        _ = (try original.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+        _ = (try original.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+        const io = self.manifestCoordinationIo();
+        if (!(if (io != null) self.manifest_publish_mu.tryLock() else self.manifest_publish_fallback_mu.tryLock())) return null;
+        errdefer if (io) |runtime| self.manifest_publish_mu.unlock(runtime) else self.manifest_publish_fallback_mu.unlock();
+        try original.checkLifetime();
+        self.retainReaderKind(.other);
+        self.manifest_publish_in_flight = true;
+        return .{ .backend = self, .io = io, .waited = false };
+    }
+
+    pub const QuiescedPreparedCheckpoint = @import("lsm_backend/prepared_checkpoint.zig").Publication(Backend);
+
+    /// Fixed post-descriptor receipt under the backend mutex/publication lane.
+    /// Prepared roots were registered and funded before physical publication.
+    pub fn installPreparedManifestCheckpoint(self: *Backend, fence: *const repository_mod.ManifestJournal.CheckpointFence, descriptor: repository_mod.manifest_set.Descriptor, next_run_id: u64, bytes: u64, directory: *RunDirectory, ledger: *repository_mod.ObsoleteLedger, covered_logical_bytes: u64, started: u64) !void {
+        const result = try self.manifest_journal.installPreparedCheckpoint(self, fence, descriptor, next_run_id, bytes, directory, ledger);
+        self.current_manifest_bytes = result.total;
+        self.write_stats.manifest_writes +|= 1;
+        self.write_stats.manifest_checkpoints +|= 1;
+        self.write_stats.manifest_bytes +|= result.written;
+        self.write_stats.manifest_ns +|= self.writeStatsElapsedNs(started);
+        self.unpublished_wal_logical_bytes -|= covered_logical_bytes;
+        if (self.unpublished_wal_logical_bytes == 0) self.unpublished_wal_max_batch_logical_bytes = 0;
+        self.manifest_dirty = !self.manifestCoversCurrentRuns();
+        self.obsolete_manifest_dirty = self.obsolete_paths.tree.root != self.manifest_journal.obsolete.tree.root;
+        self.reconcileManifestCredit();
+    }
+
     /// The lane serializes durable metadata, not readers or incoming flushes.
     /// Waiters prepare from the latest root after admission, naturally grouping
     /// publications accumulated during the previous fsync into one next edit.
