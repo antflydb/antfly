@@ -47,15 +47,19 @@ pub fn update(hash: *std.crypto.hash.sha2.Sha256, key: []const u8, value: []cons
 pub fn indices(a: std.mem.Allocator, payload: []const u8) ![]u32 {
     const metadata = try @import("../../chunking/chunk.zig").modelMetadataAlloc(a, payload);
     defer if (metadata) |value| value.deinit(a);
-    var result = std.ArrayList(u32).empty;
-    errdefer result.deinit(a);
     if (metadata) |value| if (value.outputs_json) |raw| {
         var parsed = try std.json.parseFromSlice([]@import("inference_chunker").outputs.Result, a, raw, .{});
         defer parsed.deinit();
-        for (parsed.value) |receipt| if (receipt.kind == .embedding and std.mem.eql(u8, receipt.name, "embedding")) {
-            if (receipt.status != .complete) return if (receipt.status == .failed and receipt.terminal) error.RequiredMediaOutputFailed else error.ArtifactPublicationPending;
-            try result.append(a, receipt.sub_index);
-        };
+        return indicesFromResults(a, parsed.value);
+    };
+    return indicesFromResults(a, &.{});
+}
+pub fn indicesFromResults(a: std.mem.Allocator, results: []const @import("inference_chunker").outputs.Result) ![]u32 {
+    var result = std.ArrayList(u32).empty;
+    errdefer result.deinit(a);
+    for (results) |receipt| if (receipt.kind == .embedding and std.mem.eql(u8, receipt.name, "embedding")) {
+        if (receipt.status != .complete) return if (receipt.status == .failed and receipt.terminal) error.RequiredMediaOutputFailed else error.ArtifactPublicationPending;
+        try result.append(a, receipt.sub_index);
     };
     if (result.items.len == 0) try result.append(a, 0);
     std.mem.sort(u32, result.items, {}, std.sort.asc(u32));

@@ -22,11 +22,14 @@ const resources = @import("../../resource_manager.zig");
 const Allocator = std.mem.Allocator;
 pub const Cache = struct {
     pub const max_bytes = 32 * 1024 * 1024;
-    pub const max_entries = 8;
+    pub const max_entries = 4096;
+    const bucket_count = 1024;
     mutex: std.atomic.Mutex = .unlocked,
-    entries: [max_entries]?*Entry = @splat(null),
+    buckets: [bucket_count]?*Entry = @splat(null),
+    oldest: ?*Entry = null,
+    newest: ?*Entry = null,
+    count: usize = 0,
     bytes: usize = 0,
-    clock: u64 = 0,
     manager: ?*resources.ResourceManager = null,
     reclaimer_id: u64 = 0,
     pub const Entry = struct {
@@ -37,15 +40,22 @@ pub const Cache = struct {
         scorer: ?labels.Scorer = null,
         key: [32]u8,
         refs: usize = 1,
-        used: u64 = 0,
+        hash_next: ?*Entry = null,
+        older: ?*Entry = null,
+        newer: ?*Entry = null,
+        header: ?resources.Reservation = null,
         bytes: usize = 0,
         retained: bool = false,
         pub fn create(a: Allocator, key: [32]u8, raw: []const u8) !*Entry {
             return createAdmitted(a, key, raw, null);
         }
         pub fn createAdmitted(a: Allocator, key: [32]u8, raw: []const u8, manager: ?*resources.ResourceManager) !*Entry {
-            const entry = try a.create(Entry);
-            entry.* = .{ .backing = a, .arena = undefined, .key = key, .config = undefined, .budget = if (manager) |resource_manager| resources.BudgetedAllocator.init(resource_manager, .document_extraction_working_set, a, 1) else null };
+            var header = if (manager) |value| try value.reserve(.document_extraction_working_set, @sizeOf(Entry)) else null;
+            const entry = a.create(Entry) catch |err| {
+                if (header) |*lease| lease.release();
+                return err;
+            };
+            entry.* = .{ .header = header, .backing = a, .arena = undefined, .key = key, .config = undefined, .budget = if (manager) |resource_manager| resources.BudgetedAllocator.init(resource_manager, .document_extraction_working_set, a, 1) else null };
             entry.arena = .init(if (entry.budget) |*budget| budget.allocator() else a);
             errdefer entry.destroy();
             entry.initialize(raw) catch |err| return entry.admissionError(err);
@@ -65,11 +75,52 @@ pub const Cache = struct {
             const a = self.backing;
             self.arena.deinit();
             if (self.budget) |*budget| budget.deinit();
+            if (self.header) |*lease| lease.release();
             a.destroy(self);
         }
     };
     fn lock(self: *Cache) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+    fn bucket(identity: [32]u8) usize {
+        return @intCast(std.hash.Wyhash.hash(0, &identity) % bucket_count);
+    }
+    fn find(self: *Cache, identity: [32]u8) ?*Entry {
+        var next = self.buckets[bucket(identity)];
+        while (next) |entry| : (next = entry.hash_next) {
+            if (std.mem.eql(u8, &identity, &entry.key)) return entry;
+        }
+        return null;
+    }
+    fn unlinkLru(self: *Cache, entry: *Entry) void {
+        if (entry.older) |older| older.newer = entry.newer else self.oldest = entry.newer;
+        if (entry.newer) |newer| newer.older = entry.older else self.newest = entry.older;
+    }
+    fn touch(self: *Cache, entry: *Entry) void {
+        entry.older = self.newest;
+        entry.newer = null;
+        if (self.newest) |previous| previous.newer = entry else self.oldest = entry;
+        self.newest = entry;
+    }
+    fn evictable(self: *Cache) ?*Entry {
+        var next = self.oldest;
+        while (next) |entry| : (next = entry.newer) if (entry.refs == 0) return entry;
+        return null;
+    }
+    fn remove(self: *Cache, entry: *Entry) void {
+        var link = &self.buckets[bucket(entry.key)];
+        while (link.*) |candidate| {
+            if (candidate == entry) {
+                link.* = entry.hash_next;
+                break;
+            }
+            link = &candidate.hash_next;
+        }
+        self.unlinkLru(entry);
+        self.bytes -= entry.bytes;
+        self.count -= 1;
+        entry.retained = false;
+        entry.destroy();
     }
     /// Register only at the lifecycle owner's stable address. A different
     /// admission domain bypasses retention rather than borrowing its budget.
@@ -78,7 +129,7 @@ pub const Cache = struct {
         defer self.mutex.unlock();
         if (self.manager) |current| return manager == current;
         if (manager) |current| {
-            for (self.entries) |slot| if (slot != null) return false;
+            if (self.count != 0) return false;
             self.reclaimer_id = current.registerReclaimer(.document_extraction_working_set, self, reclaim) catch return false;
             self.manager = current;
         }
@@ -90,31 +141,20 @@ pub const Cache = struct {
         defer self.mutex.unlock();
         var released: u64 = 0;
         while (released < target_bytes) {
-            var victim: ?usize = null;
-            for (self.entries, 0..) |slot, index| if (slot) |entry| {
-                if (entry.refs == 0 and (victim == null or entry.used < self.entries[victim.?].?.used)) victim = index;
-            };
-            const index = victim orelse break;
-            const entry = self.entries[index].?;
-            self.entries[index] = null;
-            self.bytes -= entry.bytes;
-            released += if (entry.budget) |budget| budget.reservation.bytes else entry.bytes;
-            entry.destroy();
+            const entry = self.evictable() orelse break;
+            released += if (entry.budget) |budget| budget.reservation.bytes + (if (entry.header) |header| header.bytes else 0) else entry.bytes;
+            self.remove(entry);
         }
         return released;
     }
     pub fn get(self: *Cache, key: [32]u8) ?*Entry {
         self.lock();
         defer self.mutex.unlock();
-        for (self.entries) |slot| if (slot) |entry| {
-            if (std.mem.eql(u8, &entry.key, &key)) {
-                self.clock +%= 1;
-                entry.used = self.clock;
-                entry.refs += 1;
-                return entry;
-            }
-        };
-        return null;
+        const entry = self.find(key) orelse return null;
+        self.unlinkLru(entry);
+        self.touch(entry);
+        entry.refs += 1;
+        return entry;
     }
     /// Takes the creator's single lease. Failure to retain is a cache miss,
     /// not an inference failure; the caller still owns the entry until release.
@@ -124,31 +164,18 @@ pub const Cache = struct {
         if (entry.bytes > max_bytes) return;
         self.lock();
         defer self.mutex.unlock();
-        for (self.entries) |slot| if (slot) |old| {
-            if (std.mem.eql(u8, &old.key, &entry.key)) return;
-        };
-        while (true) {
-            var empty: ?usize = null;
-            var victim: ?usize = null;
-            for (self.entries, 0..) |slot, i| {
-                if (slot) |old| {
-                    if (old.refs == 0 and (victim == null or old.used < self.entries[victim.?].?.used)) victim = i;
-                } else empty = i;
-            }
-            if (empty != null and entry.bytes <= max_bytes - self.bytes) {
-                self.clock +%= 1;
-                entry.used = self.clock;
-                entry.retained = true;
-                self.entries[empty.?] = entry;
-                self.bytes += entry.bytes;
-                return;
-            }
-            const index = victim orelse return;
-            const old = self.entries[index].?;
-            self.bytes -= old.bytes;
-            self.entries[index] = null;
-            old.destroy();
+        if (self.find(entry.key) != null) return;
+        while (self.count >= max_entries or entry.bytes > max_bytes - self.bytes) {
+            const victim = self.evictable() orelse return;
+            self.remove(victim);
         }
+        const index = bucket(entry.key);
+        entry.hash_next = self.buckets[index];
+        self.buckets[index] = entry;
+        self.touch(entry);
+        entry.retained = true;
+        self.count += 1;
+        self.bytes += entry.bytes;
     }
     pub fn release(self: *Cache, entry: *Entry) void {
         self.lock();
@@ -163,12 +190,10 @@ pub const Cache = struct {
         if (self.manager) |manager| manager.unregisterReclaimer(self.reclaimer_id);
         self.manager = null;
         self.reclaimer_id = 0;
-        for (self.entries) |slot| if (slot) |entry| {
+        while (self.oldest) |entry| {
             std.debug.assert(entry.refs == 0);
-            entry.destroy();
-        };
-        self.entries = @splat(null);
-        self.bytes = 0;
+            self.remove(entry);
+        }
     }
 };
 
@@ -235,4 +260,38 @@ test "model aware media vocabulary cache releases idle admission under pressure 
     defer required.release();
     try std.testing.expectEqual(@as(usize, 0), cache.bytes);
     try std.testing.expect(cache.get(@splat(1)) == null);
+}
+
+test "model aware media vocabulary LRU handles hash collisions and reclaims only idle leases" {
+    const a = std.testing.allocator;
+    var cache: Cache = .{};
+    defer cache.deinit();
+    var keys: [32][32]u8 = undefined;
+    var candidate: u64 = 0;
+    for (&keys) |*key| {
+        while (true) : (candidate += 1) {
+            key.* = @splat(0);
+            std.mem.writeInt(u64, key[0..8], candidate, .little);
+            if (Cache.bucket(key.*) == 0) break;
+        }
+        candidate += 1;
+        const entry = try Cache.Entry.create(a, key.*, "{\"labels\":[{\"label\":\"speech\"}]}");
+        cache.retain(entry);
+        cache.release(entry);
+    }
+    try std.testing.expectEqual(@as(usize, 32), cache.count);
+    const pinned = cache.get(keys[1]).?;
+    const recent = cache.get(keys[0]).?;
+    cache.release(recent);
+    try std.testing.expect(Cache.reclaim(&cache, 1) > 0);
+    try std.testing.expect(cache.get(keys[2]) == null);
+    const hit = cache.get(keys[0]).?;
+    cache.release(hit);
+    _ = Cache.reclaim(&cache, Cache.max_bytes);
+    try std.testing.expectEqual(@as(usize, 1), cache.count);
+    try std.testing.expectEqualStrings("speech", pinned.config.labels[0].label);
+    cache.release(pinned);
+    _ = Cache.reclaim(&cache, Cache.max_bytes);
+    try std.testing.expectEqual(@as(usize, 0), cache.count);
+    try std.testing.expectEqual(@as(usize, 0), cache.bytes);
 }

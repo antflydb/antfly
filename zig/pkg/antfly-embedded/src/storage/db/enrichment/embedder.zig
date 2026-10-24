@@ -139,6 +139,7 @@ pub const DenseEmbedder = struct {
     /// Resolve before execution. Managed Antfly providers carry this immutable
     /// lease through native/HTTP execution, rather than observing a later alias.
     pub fn captureTextGeneration(self: DenseEmbedder, a: Allocator, name: []const u8) !TextGeneration {
+        if (self.part_lease) |lease| return .{ .revision = if (lease.capabilities) |caps| caps.model_revision else null, .lease = lease };
         if (self.dense_embed_batch_planned_fn != null and self.resolve_part_lease_fn != null) {
             const lease = self.part_lease orelse try self.resolvePartLease(a, name);
             return .{ .revision = if (lease.capabilities) |caps| caps.model_revision else null, .lease = lease };

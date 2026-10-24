@@ -14559,17 +14559,19 @@ fn prepareVectorLabelPrompts(runtime: *EnrichmentRuntime, provider: embedder_mod
         for (rows[0..initialized]) |vector| a.free(vector);
         a.free(rows);
     }
-    const capabilities = provider.capabilities(a, embedding_name) catch |err| switch (err) {
-        error.EmbeddingCapabilitiesUnavailable => null,
-        else => return err,
-    };
+    const generation = try provider.captureTextGeneration(a, embedding_name);
+    // Known generations require an executor that accepts the expected lease.
+    // Observation before/after an opaque invocation cannot detect a rollback.
+    if (generation.revision != null and provider.dense_embed_batch_planned_fn == null) return error.InvalidEmbeddingIdentity;
+    const pinned = provider.withTextGeneration(generation);
+    const capabilities = if (generation.lease) |lease| lease.capabilities else null;
     const limit = if (capabilities) |caps| @min(@as(usize, 64), @max(caps.batch.max_items, 1)) else 64;
     var start: usize = 0;
     while (start < prompts.len) {
         const end = @min(start + limit, prompts.len);
         // Reuse the existing model/recipe computation cache, cancellation,
         // deadlines, admission and provider retry accounting for prompt batches.
-        const batch = try embedDenseBatchWithRetry(provider, runtime, embedding_name, prompts[start..end], dims, true);
+        const batch = try embedDenseBatchWithRetry(pinned, runtime, embedding_name, prompts[start..end], dims, true);
         defer a.free(batch);
         if (batch.len != end - start) {
             for (batch) |vector| a.free(vector);
@@ -14585,6 +14587,7 @@ fn prepareVectorLabelPrompts(runtime: *EnrichmentRuntime, provider: embedder_mod
         }
         start = end;
     }
+    try provider.requireTextGeneration(a, embedding_name, generation);
     return rows;
 }
 
@@ -15012,26 +15015,21 @@ fn processMediaOutput(runtime: *EnrichmentRuntime, request: enrichment_types.Gen
     try retireMediaPassForAssetRequest(runtime, request);
 }
 
-/// A scoring batch must use one vector space. Authenticate the first recipe
-/// against the provider, then compare each independently validated receipt to
-/// that captured space. The caller fences the provider once more before publish.
-fn validateVectorLabelRecipes(a: Allocator, provider: embedder_mod.DenseEmbedder, request: enrichment_types.GeneratedEnrichmentRequest, recipes: []const *@import("inference_chunker").types.ModelMetadata) !?*@import("inference_chunker").types.ModelMetadata {
-    var reference: ?*@import("inference_chunker").types.ModelMetadata = null;
-    errdefer if (reference) |value| value.deinit(a);
-    for (recipes) |recipe| {
-        const selected = try modelEmbeddingMetadata(a, request, recipe);
-        var transferred = false;
-        defer if (!transferred) selected.deinit(a);
-        if (reference) |first| {
-            inline for (.{ "model", "model_identity", "model_revision", "task_type" }) |field| if (!std.mem.eql(u8, @field(first, field), @field(selected, field))) return error.IncompatibleChunkEmbeddingTarget;
-            if (first.dimensions != selected.dimensions) return error.IncompatibleChunkEmbeddingTarget;
-        } else {
-            if (!try modelChunkSelectedTargetCompatible(a, provider, request, selected)) return error.IncompatibleChunkEmbeddingTarget;
-            reference = selected;
-            transferred = true;
-        }
-    }
-    return reference;
+/// A fused vector authenticates against its selected receipt and canonical
+/// producing hash. Only one parent receipt array is live, regardless of the
+/// number of independently indexed windows in that parent.
+fn validateVectorLabelWindow(a: Allocator, provider_model: []const u8, request: enrichment_types.GeneratedEnrichmentRequest, revision: ?[32]u8, parent: *const @import("inference_chunker").types.ModelMetadata, receipt: ?@import("inference_chunker").outputs.Result, window_count: usize, index: u32, text: ?[]const u8, encoded: []const u8) ![64]u8 {
+    var window = parent.*;
+    window.output_sub_index = if (index == 0) null else index;
+    const selected = try modelEmbeddingMetadataForWindow(a, request, &window, receipt, window_count);
+    defer selected.deinit(a);
+    if (!try modelChunkSelectedTargetCompatibleAtRevision(a, provider_model, request, selected, revision)) return error.IncompatibleChunkEmbeddingTarget;
+    const actual = try enrichment_artifact_codec.sourceHash(encoded);
+    if (actual == try selectedModelChunkEmbeddingHash(a, selected, "", request)) return selected.model_identity[0..64].*;
+    // Legacy non-ordered text publication included the rendered unit in the
+    // same authenticated recipe. Ordered fused publication uses empty text.
+    if (text) |value| if (actual == try selectedModelChunkEmbeddingHash(a, selected, value, request)) return selected.model_identity[0..64].*;
+    return error.IncompatibleChunkEmbeddingTarget;
 }
 
 fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, config_json: []const u8, token: ?*@import("../artifact_producer_context.zig").Token, raw_doc: []const u8, output_key: []const u8, window: *GeneratedReplayWindow) !void {
@@ -15041,6 +15039,13 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
     const upstream = runtime.index_manager.getEnrichment(.embedding, request.upstream_artifact_name) orelse return error.InvalidEnrichmentConfig;
     if (upstream.source_artifact_name.len == 0) return error.InvalidEnrichmentConfig;
     const provider = runtime.config.dense_embedder orelse return error.MissingDenseEmbedder;
+    // Capture the producing contract before reading vectors or probing caches.
+    const generation = try provider.captureTextGeneration(a, upstream.name);
+    const pinned_provider = provider.withTextGeneration(generation);
+    const provider_model = provider.recoveryIdentity(upstream.name).model;
+    const revision_fn = provider.cache_revision_fn;
+    const revision = if (revision_fn) |resolve| try resolve(provider.ptr, a, upstream.name) else null;
+    const source_request = mediaEmbeddingComputationRequest(runtime, .{ .kind = .dense_embedding, .index_name = upstream.name, .artifact_name = upstream.source_artifact_name, .embedding_name = upstream.name, .doc_key = request.doc_key, .source_field = upstream.source_field, .expected_dims = upstream.expected_dims, .producer_json = upstream.producer_json, .reprocess_generation = try embeddingReprocessGeneration(runtime, request.doc_key, upstream.name, upstream.producer_json) });
     const manifest_key = try @import("../artifact_chunk_manifest.zig").keyAlloc(a, request.doc_key, upstream.source_artifact_name);
     defer a.free(manifest_key);
     const vector_set = @import("../artifact_vector_set.zig");
@@ -15053,11 +15058,7 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
         vectors.deinit(a);
     }
     var source_hash = std.crypto.hash.sha2.Sha256.init(.{});
-    var recipes: std.ArrayListUnmanaged(*@import("inference_chunker").types.ModelMetadata) = .empty;
-    defer {
-        for (recipes.items) |recipe| recipe.deinit(a);
-        recipes.deinit(a);
-    }
+    var fused_identity: ?[64]u8 = null;
     {
         var read = try runtime.store.beginProbe();
         defer read.abort();
@@ -15079,8 +15080,35 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
             const member = try internal_keys.chunkArtifactKeyAlloc(a, request.doc_key, upstream.source_artifact_name, @intCast(ordinal));
             defer a.free(member);
             const chunk_payload = (try @import("../artifact_chunk_generation.zig").readMember(a, &read, member)) orelse return error.ArtifactPublicationPending;
-            const indices = try vector_set.indices(a, chunk_payload);
+            const parent = try @import("../../../chunking/chunk.zig").modelMetadataAlloc(a, chunk_payload);
+            defer if (parent) |value| value.deinit(a);
+            var receipts: ?std.json.Parsed([]@import("inference_chunker").outputs.Result) = null;
+            defer if (receipts) |*value| value.deinit();
+            if (parent) |value| if (value.outputs_json) |raw| {
+                receipts = try std.json.parseFromSlice([]@import("inference_chunker").outputs.Result, a, raw, .{});
+            };
+            const results = if (receipts) |value| value.value else &.{};
+            const text = if (parent != null) try @import("../../../chunking/chunk.zig").artifactTextAlloc(a, chunk_payload, upstream.source_field) else null;
+            defer if (text) |value| a.free(value);
+            // Independently encoded text has a scalar output and its own
+            // producing hash; an older boundary receipt cannot veto it.
+            const scalar_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, member, upstream.name);
+            defer a.free(scalar_key);
+            const scalar = read.get(scalar_key) catch |err| if (err == error.NotFound) null else return err;
+            const independent = if (text != null and scalar != null) independent: {
+                const header = try @import("../../artifact_payload.zig").Metadata.decode(scalar.?);
+                break :independent header.dense_dimensions == upstream.expected_dims and header.sourceHash() == retainedTextEmbeddingHashAtRevision(source_request, text.?, generation.revision);
+            } else false;
+            const indices = if (independent) try a.dupe(u32, &.{0}) else try vector_set.indicesFromResults(a, results);
             defer a.free(indices);
+            const selected = try a.alloc(?@import("inference_chunker").outputs.Result, indices.len);
+            defer a.free(selected);
+            @memset(selected, null);
+            var window_count: usize = 0;
+            if (!independent) for (results) |result| if (result.kind == .embedding and std.mem.eql(u8, result.name, "embedding")) {
+                selected[result.sub_index] = result;
+                window_count += 1;
+            };
             for (indices) |index| {
                 const child = if (indices.len > 1) try internal_keys.mediaWindowChildKeyAlloc(a, member, index) else try internal_keys.mediaWindowKeyAlloc(a, member, index);
                 defer a.free(child);
@@ -15092,13 +15120,11 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
                     defer proof.deinit();
                     try context.inheritProof(proof.proof);
                 }
-                if (try @import("../../../chunking/chunk.zig").modelMetadataAlloc(a, chunk_payload)) |metadata| {
-                    metadata.output_sub_index = if (index == 0) null else index;
-                    recipes.append(a, metadata) catch |err| {
-                        metadata.deinit(a);
-                        return err;
-                    };
-                }
+                if (!independent) if (parent) |metadata| {
+                    const identity = try validateVectorLabelWindow(a, provider_model, source_request, generation.revision, metadata, selected[index], window_count, index, text, borrowed);
+                    if (fused_identity) |previous| if (!std.mem.eql(u8, &previous, &identity)) return error.IncompatibleChunkEmbeddingTarget;
+                    fused_identity = identity;
+                };
                 vector_set.update(&source_hash, vector_key, borrowed);
                 const vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(a, borrowed);
                 vectors.append(a, vector) catch |err| {
@@ -15110,17 +15136,14 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
         }
     }
     if (token) |context| if (context.reads.items.len + context.preconditions.items.len > ordered_publication.max_source_documents) return error.ResourceLimitExceeded;
-    // Capability discovery and inference own no storage snapshot.
-    const source_request = mediaEmbeddingComputationRequest(runtime, .{ .kind = .dense_embedding, .index_name = upstream.name, .artifact_name = upstream.source_artifact_name, .embedding_name = upstream.name, .doc_key = request.doc_key, .source_field = upstream.source_field, .expected_dims = upstream.expected_dims, .producer_json = upstream.producer_json });
-    const vector_space = try validateVectorLabelRecipes(a, provider, source_request, recipes.items);
-    defer if (vector_space) |value| value.deinit(a);
+    // Provider execution owns no storage snapshot.
     const dims: u32 = if (vectors.items.len != 0) @intCast(vectors.items[0].len) else upstream.expected_dims;
     if (vectors.items.len != 0 and dims == 0) return error.InvalidEmbeddingDimensions;
     try runtime.active_provider_guard.check();
-    const revision_fn = provider.cache_revision_fn;
-    const revision = if (revision_fn) |resolve| try resolve(provider.ptr, a, upstream.name) else null;
     var hash = std.crypto.hash.Blake3.init(.{});
-    hash.update("vector-label-scorer-v1");
+    hash.update("vector-label-scorer-v2");
+    if (generation.revision) |value| hash.update(&value);
+    hash.update(upstream.producer_json);
     if (revision) |value| hash.update(&value);
     var dimensions_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &dimensions_bytes, dims, .little);
@@ -15145,7 +15168,7 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
         const prompts = try a.alloc([]const u8, entry.config.labels.len);
         defer a.free(prompts);
         for (entry.config.labels, prompts) |label, *prompt| prompt.* = label.prompt orelse label.label;
-        const prompt_vectors = try prepareVectorLabelPrompts(runtime, provider, upstream.name, prompts, dims);
+        const prompt_vectors = try prepareVectorLabelPrompts(runtime, pinned_provider, upstream.name, prompts, dims);
         defer {
             for (prompt_vectors) |vector| a.free(vector);
             a.free(prompt_vectors);
@@ -15155,6 +15178,7 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
             if (admitted != error.ResourceBudgetExceeded or Cache.reclaim(scorer_cache, Cache.max_bytes) == 0) return admitted;
             break :blk labels.Scorer.initValidated(entry.arena.allocator(), entry.config, prompt_vectors) catch |retry| return entry.admissionError(retry);
         };
+        try provider.requireTextGeneration(a, upstream.name, generation);
         if (revision) |before| {
             const after = (try revision_fn.?(provider.ptr, a, upstream.name)) orelse return error.EmbeddingIdentityMismatch;
             if (!std.mem.eql(u8, &before, &after)) return error.EmbeddingIdentityMismatch;
@@ -15174,7 +15198,11 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
     const produced = try std.json.Stringify.valueAlloc(a, .{ .object = "vector.labels", .embedding_name = upstream.name, .vector_digest = @as([]const u8, &vector_digest), .parent_count = if (addresses.items.len == 0) @as(u32, 0) else addresses.items[addresses.items.len - 1].chunk_id + 1, .chunks = rows }, .{});
     defer a.free(produced);
     if (produced.len > 16 * 1024 * 1024) return error.ResourceLimitExceeded;
-    if (vector_space) |value| if (!try modelChunkSelectedTargetCompatible(a, provider, source_request, value)) return error.IncompatibleChunkEmbeddingTarget;
+    try provider.requireTextGeneration(a, upstream.name, generation);
+    if (revision) |before| {
+        const after = (try revision_fn.?(provider.ptr, a, upstream.name)) orelse return error.EmbeddingIdentityMismatch;
+        if (!std.mem.eql(u8, &before, &after)) return error.EmbeddingIdentityMismatch;
+    }
     if (token) |context| return enqueueAssetProducerOutput(runtime, request, context, output_key, produced);
     const state_key = try assetStateKeyAlloc(a, request.doc_key, requestArtifactName(request));
     defer a.free(state_key);
@@ -25631,23 +25659,30 @@ fn orderedPrecomputedVectorHash(a: Allocator, payload: []const u8, request: enri
 /// An embedding consumer authenticates its own output contract while the
 /// parent plan and descriptor continue to identify the boundary computation.
 fn modelEmbeddingMetadata(a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, parent: *const @import("inference_chunker").types.ModelMetadata) !*@import("inference_chunker").types.ModelMetadata {
-    var recipe_parent = parent.*;
-    recipe_parent.outputs_json = null;
-    const result = try recipe_parent.clone(a);
-    errdefer result.deinit(a);
-    const encoded = parent.outputs_json orelse return result;
-    const O = @import("inference_chunker").outputs;
-    var receipts = try std.json.parseFromSlice([]O.Result, a, encoded, .{});
+    const raw = parent.outputs_json orelse return modelEmbeddingMetadataFromResults(a, request, parent, &.{});
+    var receipts = try std.json.parseFromSlice([]@import("inference_chunker").outputs.Result, a, raw, .{});
     defer receipts.deinit();
+    return modelEmbeddingMetadataFromResults(a, request, parent, receipts.value);
+}
+fn modelEmbeddingMetadataFromResults(a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, parent: *const @import("inference_chunker").types.ModelMetadata, receipts: []const @import("inference_chunker").outputs.Result) !*@import("inference_chunker").types.ModelMetadata {
+    const O = @import("inference_chunker").outputs;
     var selected: ?O.Result = null;
     var window_count: usize = 0;
-    for (receipts.value) |value| if (value.kind == .embedding and std.mem.eql(u8, value.name, "embedding")) {
+    for (receipts) |value| if (value.kind == .embedding and std.mem.eql(u8, value.name, "embedding")) {
         window_count += 1;
         if (value.sub_index == (parent.output_sub_index orelse 0)) {
             if (selected != null) return error.InvalidChunkOutput;
             selected = value;
         }
     };
+    return modelEmbeddingMetadataForWindow(a, request, parent, selected, window_count);
+}
+fn modelEmbeddingMetadataForWindow(a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, parent: *const @import("inference_chunker").types.ModelMetadata, selected: ?@import("inference_chunker").outputs.Result, window_count: usize) !*@import("inference_chunker").types.ModelMetadata {
+    const O = @import("inference_chunker").outputs;
+    var recipe_parent = parent.*;
+    recipe_parent.outputs_json = null;
+    const result = try recipe_parent.clone(a);
+    errdefer result.deinit(a);
     const value = selected orelse return result;
     // Changing the consumer cannot reinterpret a cached result from another
     // model. The provider/capability check below also fences deployed revisions.
@@ -25715,10 +25750,13 @@ fn modelChunkEmbeddingSourceHash(a: Allocator, source: ChunkEmbeddingSource, req
     const parent = source.metadata orelse return enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
     const metadata = try modelEmbeddingMetadata(a, request, parent);
     defer metadata.deinit(a);
+    return selectedModelChunkEmbeddingHash(a, metadata, source.text, request);
+}
+fn selectedModelChunkEmbeddingHash(a: Allocator, metadata: *const @import("inference_chunker").types.ModelMetadata, text: []const u8, request: enrichment_types.GeneratedEnrichmentRequest) !u64 {
     const recipe = if (metadata.output_sub_index == null)
-        try std.json.Stringify.valueAlloc(a, .{ .text = source.text, .descriptor = metadata.descriptor, .plan_id = metadata.plan_id, .source_version = metadata.source_version, .model_identity = metadata.model_identity, .model_revision = metadata.model_revision, .task_type = metadata.task_type, .dimensions = metadata.dimensions }, .{})
+        try std.json.Stringify.valueAlloc(a, .{ .text = text, .descriptor = metadata.descriptor, .plan_id = metadata.plan_id, .source_version = metadata.source_version, .model_identity = metadata.model_identity, .model_revision = metadata.model_revision, .task_type = metadata.task_type, .dimensions = metadata.dimensions }, .{})
     else
-        try std.json.Stringify.valueAlloc(a, .{ .text = source.text, .descriptor = metadata.descriptor, .plan_id = metadata.plan_id, .source_version = metadata.source_version, .model_identity = metadata.model_identity, .model_revision = metadata.model_revision, .task_type = metadata.task_type, .dimensions = metadata.dimensions, .output_sub_index = metadata.output_sub_index }, .{});
+        try std.json.Stringify.valueAlloc(a, .{ .text = text, .descriptor = metadata.descriptor, .plan_id = metadata.plan_id, .source_version = metadata.source_version, .model_identity = metadata.model_identity, .model_revision = metadata.model_revision, .task_type = metadata.task_type, .dimensions = metadata.dimensions, .output_sub_index = metadata.output_sub_index }, .{});
     defer a.free(recipe);
     return enrichment_artifact_codec.hashEmbeddingSourceForGeneration(recipe, request.producer_json, request.reprocess_generation);
 }
@@ -25729,8 +25767,15 @@ fn modelChunkTargetCompatible(a: Allocator, provider: embedder_mod.DenseEmbedder
     return modelChunkSelectedTargetCompatible(a, provider, request, metadata);
 }
 fn modelChunkSelectedTargetCompatible(a: Allocator, provider: embedder_mod.DenseEmbedder, request: enrichment_types.GeneratedEnrichmentRequest, metadata: *const @import("inference_chunker").types.ModelMetadata) !bool {
+    const caps = provider.capabilities(a, requestEmbeddingName(request)) catch |err| switch (err) {
+        error.EmbeddingCapabilitiesUnavailable => return false,
+        else => return err,
+    };
+    return modelChunkSelectedTargetCompatibleAtRevision(a, provider.recoveryIdentity(requestEmbeddingName(request)).model, request, metadata, caps.model_revision);
+}
+fn modelChunkSelectedTargetCompatibleAtRevision(a: Allocator, provider_model: []const u8, request: enrichment_types.GeneratedEnrichmentRequest, metadata: *const @import("inference_chunker").types.ModelMetadata, revision: ?[32]u8) !bool {
     if (metadata.dimensions != request.expected_dims or metadata.model_identity.len != 64 or metadata.model_revision.len != 64) return false;
-    if (!std.mem.eql(u8, provider.recoveryIdentity(requestEmbeddingName(request)).model, metadata.model)) return false;
+    if (!std.mem.eql(u8, provider_model, metadata.model)) return false;
     var parsed = try std.json.parseFromSlice(std.json.Value, a, request.producer_json, .{});
     defer parsed.deinit();
     var config = parsed.value;
@@ -25744,14 +25789,8 @@ fn modelChunkSelectedTargetCompatible(a: Allocator, provider: embedder_mod.Dense
     if (config.object.get("model_identity")) |expected| if (expected != .string or !std.mem.eql(u8, expected.string, metadata.model_identity)) return false;
     const task: std.json.Value = config.object.get("task_type") orelse .{ .string = "RETRIEVAL_DOCUMENT" };
     if (task != .string or !std.mem.eql(u8, task.string, metadata.task_type)) return false;
-    // Capability authority pins the requested provider generation. Alias names
-    // alone cannot authorize reuse after weights or remote routing change.
-    const capabilities = provider.capabilities(a, requestEmbeddingName(request)) catch |err| {
-        if (err == error.EmbeddingCapabilitiesUnavailable) return false;
-        return err;
-    };
-    const revision = capabilities.model_revision orelse return false;
-    const expected_revision = std.fmt.bytesToHex(revision, .lower);
+    const actual_revision = revision orelse return false;
+    const expected_revision = std.fmt.bytesToHex(actual_revision, .lower);
     if (!std.mem.eql(u8, &expected_revision, metadata.model_revision)) return false;
     return true;
 }
@@ -39881,14 +39920,18 @@ test "model aware media label batches capture one vector space and fence it befo
     const provider = embedder_mod.DenseEmbedder{ .ptr = &fake, .dense_embed_fn = Fake.embed, .capabilities_fn = Fake.caps };
     var metadata = @import("inference_chunker").types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .input_tokens = 1, .coordinates = .{ .kind = .video } }, .inference_id = "plan:0", .plan_id = "plan", .source_fingerprint = "source", .source_version = "v1", .model = "model", .model_identity = "3333333333333333333333333333333333333333333333333333333333333333", .model_revision = "1111111111111111111111111111111111111111111111111111111111111111", .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{} };
     const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "model", .embedding_name = "model", .doc_key = "doc", .source_field = "body", .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\"}", .expected_dims = 2 };
-    const rows: [32]*@import("inference_chunker").types.ModelMetadata = @splat(&metadata);
-    const reference = (try validateVectorLabelRecipes(a, provider, request, &rows)).?;
-    defer reference.deinit(a);
+    const generation = try provider.captureTextGeneration(a, "model");
+    const encoded = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, try selectedModelChunkEmbeddingHash(a, &metadata, "", request), &.{ 0.6, 0.8 });
+    defer a.free(encoded);
+    for (0..32) |_| _ = try validateVectorLabelWindow(a, "model", request, generation.revision, &metadata, null, 0, 0, null, encoded);
+    const wrong = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, 123, &.{ 0.6, 0.8 });
+    defer a.free(wrong);
+    try std.testing.expectError(error.IncompatibleChunkEmbeddingTarget, validateVectorLabelWindow(a, "model", request, generation.revision, &metadata, null, 0, 0, null, wrong));
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expect(try modelChunkSelectedTargetCompatible(a, provider, request, reference));
+    try provider.requireTextGeneration(a, "model", generation);
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     fake.generation = 0x22;
-    try std.testing.expect(!try modelChunkSelectedTargetCompatible(a, provider, request, reference));
+    try std.testing.expectError(error.EnrichmentSourceChanged, provider.requireTextGeneration(a, "model", generation));
 }
 
 test "model aware media scalar replacement retires every old child vector" {
@@ -40242,4 +40285,374 @@ test "model aware media text batches reject a deployment after inference" {
     const captured = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, retainedTextEmbeddingHashAtRevision(request, "retained text", generation.revision), vector);
     defer a.free(captured);
     try std.testing.expect(!try retainedTextVectorCurrent(a, provider, request, "retained text", captured));
+}
+
+test "model aware media vocabulary cache retains 32 admitted vocabularies without repeated prompt inference" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/empty-chunk-revisions", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = undefined,
+        .failure_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    try index_manager.addEnrichment(&store, .{ .name = "clips", .kind = .chunk, .field = "body", .chunk_size = 8 });
+    try index_manager.addEnrichment(&store, .{ .name = "vectors", .kind = .embedding, .field = "body", .source_artifact_name = "clips", .expected_dims = 2 });
+    try index_manager.addEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}}" });
+    const Fake = struct {
+        calls: usize = 0,
+        generation: u8 = 1,
+        fn revision(ptr: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return @splat(self.generation);
+        }
+        fn embed(ptr: *anyopaque, a: Allocator, name: []const u8, prompt: []const u8, dims: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("vectors", name);
+            try std.testing.expectEqual(@as(u32, 2), dims);
+            return a.dupe(f32, if (std.mem.eql(u8, prompt, "speech")) &.{ 1, 0 } else &.{ 0, 1 });
+        }
+    };
+    var fake = Fake{};
+    runtime.config.dense_embedder = .{ .ptr = &fake, .dense_embed_fn = Fake.embed, .cache_revision_fn = Fake.revision };
+    defer runtime.vector_label_cache.deinit();
+    const member = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc", "clips", 0);
+    defer alloc.free(member);
+    const vector_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, member, "vectors");
+    defer alloc.free(vector_key);
+    const encoded = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 7, &.{ 0.9, 0.1 });
+    defer alloc.free(encoded);
+    const manifest_key = try @import("../artifact_chunk_manifest.zig").keyAlloc(alloc, "doc", "clips");
+    defer alloc.free(manifest_key);
+    var builder = @import("../artifact_chunk_manifest.zig").Builder.init();
+    try builder.append(0, "{}");
+    const manifest = builder.finish().encode();
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = "{}" }, .{ .key = manifest_key, .value = &manifest } }, &.{});
+    const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "labels");
+    defer alloc.free(output_key);
+    var window = GeneratedReplayWindow{ .alloc = alloc };
+    defer window.deinit();
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
+    for (0..2) |_| for (0..32) |i| {
+        const config = try std.fmt.allocPrint(alloc, "{{\"labels\":[{{\"label\":\"word-{d}\"}}],\"top_k\":1}}", .{i});
+        defer alloc.free(config);
+        try processVectorLabels(&runtime, request, config, null, "{}", output_key, &window);
+    };
+    try std.testing.expectEqual(@as(usize, 32), fake.calls);
+    std.debug.print("vocabulary prompts={d} retained={d} slots={d} budget={d}\n", .{ fake.calls, runtime.vector_label_cache.bytes, @import("vector_label_cache.zig").Cache.max_entries, @import("vector_label_cache.zig").Cache.max_bytes });
+}
+
+test "model aware media labels authenticate independently refreshed retained text vectors" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/empty-chunk-revisions", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = undefined,
+        .failure_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    try index_manager.addEnrichment(&store, .{ .name = "clips", .kind = .chunk, .field = "body", .chunk_size = 8 });
+    try index_manager.addEnrichment(&store, .{ .name = "vectors", .kind = .embedding, .field = "body", .source_artifact_name = "clips", .expected_dims = 2, .producer_json = "{\"provider\":\"antfly\",\"model\":\"vectors\"}" });
+    try index_manager.addEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}}" });
+    const Fake = struct {
+        calls: usize = 0,
+        generation: u8 = 2,
+        fn caps(ptr: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .task = .embed, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @as([32]u8, @splat(self.generation)) };
+        }
+        fn planned(raw: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, _: ?inference_request_context.RequestContext, lease: inference_work.CapabilityLease) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as([32]u8, @splat(self.generation)), lease.capabilities.?.model_revision.?);
+            const rows = try a.alloc([]const f32, texts.len);
+            var n: usize = 0;
+            errdefer {
+                for (rows[0..n]) |row| a.free(row);
+                a.free(rows);
+            }
+            for (texts, rows) |text, *row| {
+                row.* = try embed(raw, a, name, text, dims);
+                n += 1;
+            }
+            return rows;
+        }
+        fn revision(ptr: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return @splat(self.generation);
+        }
+        fn embed(ptr: *anyopaque, a: Allocator, name: []const u8, prompt: []const u8, dims: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("vectors", name);
+            try std.testing.expectEqual(@as(u32, 2), dims);
+            return a.dupe(f32, if (std.mem.eql(u8, prompt, "speech")) &.{ 1, 0 } else &.{ 0, 1 });
+        }
+    };
+    var fake = Fake{};
+    runtime.config.dense_embedder = .{ .ptr = &fake, .dense_embed_fn = Fake.embed, .cache_revision_fn = Fake.revision, .capabilities_fn = Fake.caps, .dense_embed_batch_planned_fn = Fake.planned };
+    defer runtime.vector_label_cache.deinit();
+    const member = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc", "clips", 0);
+    defer alloc.free(member);
+    const vector_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, member, "vectors");
+    defer alloc.free(vector_key);
+    const dense_request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "vectors", .artifact_name = "clips", .embedding_name = "vectors", .doc_key = "doc", .source_field = "body", .producer_json = "{\"provider\":\"antfly\",\"model\":\"vectors\"}", .expected_dims = 2 };
+    const metadata = @import("inference_chunker").types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .coordinates = .{ .kind = .video }, .input_tokens = 2 }, .inference_id = "plan:0", .source_fingerprint = "source", .source_version = "v1", .plan_id = "plan", .model = "vectors", .model_identity = "3333333333333333333333333333333333333333333333333333333333333333", .model_revision = "0101010101010101010101010101010101010101010101010101010101010101", .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{} };
+    const text = "exact text";
+    const payload = try std.json.Stringify.valueAlloc(alloc, .{ .body = text, ._chunk = metadata }, .{});
+    defer alloc.free(payload);
+    const encoded = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, try retainedTextEmbeddingHash(alloc, runtime.config.dense_embedder.?, dense_request, text), &.{ 0.9, 0.1 });
+    try std.testing.expect(try retainedTextVectorCurrent(alloc, runtime.config.dense_embedder.?, dense_request, text, encoded));
+    defer alloc.free(encoded);
+    const manifest_key = try @import("../artifact_chunk_manifest.zig").keyAlloc(alloc, "doc", "clips");
+    defer alloc.free(manifest_key);
+    var builder = @import("../artifact_chunk_manifest.zig").Builder.init();
+    try builder.append(0, payload);
+    const manifest = builder.finish().encode();
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = payload }, .{ .key = manifest_key, .value = &manifest } }, &.{});
+    const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "labels");
+    defer alloc.free(output_key);
+    var window = GeneratedReplayWindow{ .alloc = alloc };
+    defer window.deinit();
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
+    try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"}]}", null, "{}", output_key, &window);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    const output = try storeGetAlloc(&runtime, output_key);
+    defer alloc.free(output);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, output, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("speech", parsed.value.object.get("chunks").?.array.items[0].object.get("labels").?.array.items[0].object.get("label").?.string);
+    fake.generation = 3;
+    try std.testing.expectError(error.IncompatibleChunkEmbeddingTarget, processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"}]}", null, "{}", output_key, &window));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "model aware media vocabulary inference rejects a producing generation change hidden by rollback" {
+    const A = struct {
+        calls: usize = 0,
+        planned_calls: usize = 0,
+        fn caps(_: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
+            return .{ .task = .embed, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @as([32]u8, @splat(1)) };
+        }
+        fn revision(_: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
+            return @as([32]u8, @splat(1));
+        }
+        fn embed(raw: *anyopaque, a: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            // The alias moves to revision 2 during this invocation, then rolls
+            // back to 1 before capabilities/cache-revision are observed again.
+            return a.dupe(f32, &.{2});
+        }
+        fn planned(raw: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8, _: u32, _: ?inference_request_context.RequestContext, _: inference_work.CapabilityLease) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.planned_calls += 1;
+            return error.InferenceCapabilitiesStale;
+        }
+        fn lease(raw: *anyopaque, a: Allocator, name: []const u8, _: ?inference_request_context.RequestContext) !inference_work.CapabilityLease {
+            return .{ .capabilities = try caps(raw, a, name) };
+        }
+    };
+    const a = std.testing.allocator;
+    var fake = A{};
+    const provider = embedder_mod.DenseEmbedder{ .ptr = &fake, .dense_embed_fn = A.embed, .dense_embed_batch_planned_fn = A.planned, .resolve_part_lease_fn = A.lease, .capabilities_fn = A.caps, .cache_revision_fn = A.revision };
+    var runtime = EnrichmentRuntime{
+        .alloc = a,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = undefined,
+        .failure_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    const before = try A.revision(&fake, a, "vectors");
+    try std.testing.expectError(error.InferenceCapabilitiesStale, prepareVectorLabelPrompts(&runtime, provider, "vectors", &.{"label"}, 1));
+    const after = try A.revision(&fake, a, "vectors");
+    try std.testing.expectEqual(before, after);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expect(fake.planned_calls > 0);
+}
+
+test "model aware media known vocabulary generations require lease-aware execution" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/empty-chunk-revisions", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = undefined,
+        .failure_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    try index_manager.addEnrichment(&store, .{ .name = "clips", .kind = .chunk, .field = "body", .chunk_size = 8 });
+    try index_manager.addEnrichment(&store, .{ .name = "vectors", .kind = .embedding, .field = "body", .source_artifact_name = "clips", .expected_dims = 2, .producer_json = "{\"provider\":\"antfly\",\"model\":\"vectors\"}" });
+    try index_manager.addEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}}" });
+    const Fake = struct {
+        calls: usize = 0,
+        generation: u8 = 1,
+        fn caps(ptr: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .task = .embed, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @as([32]u8, @splat(self.generation)) };
+        }
+        fn revision(ptr: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return @splat(self.generation);
+        }
+        fn embed(ptr: *anyopaque, a: Allocator, name: []const u8, prompt: []const u8, dims: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("vectors", name);
+            try std.testing.expectEqual(@as(u32, 2), dims);
+            return a.dupe(f32, if (std.mem.eql(u8, prompt, "speech")) &.{ 0, 1 } else &.{ 1, 0 });
+        }
+    };
+    var fake = Fake{};
+    runtime.config.dense_embedder = .{ .ptr = &fake, .dense_embed_fn = Fake.embed, .cache_revision_fn = Fake.revision, .capabilities_fn = Fake.caps };
+    defer runtime.vector_label_cache.deinit();
+    const member = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc", "clips", 0);
+    defer alloc.free(member);
+    const vector_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, member, "vectors");
+    defer alloc.free(vector_key);
+    const dense_request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "vectors", .artifact_name = "clips", .embedding_name = "vectors", .doc_key = "doc", .source_field = "body", .producer_json = "{\"provider\":\"antfly\",\"model\":\"vectors\"}", .expected_dims = 2 };
+    const metadata = @import("inference_chunker").types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .coordinates = .{ .kind = .video }, .input_tokens = 2 }, .inference_id = "plan:0", .source_fingerprint = "source", .source_version = "v1", .plan_id = "plan", .model = "vectors", .model_identity = "3333333333333333333333333333333333333333333333333333333333333333", .model_revision = "0101010101010101010101010101010101010101010101010101010101010101", .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{} };
+    const text = "exact text";
+    const payload = try std.json.Stringify.valueAlloc(alloc, .{ .body = text, ._chunk = metadata }, .{});
+    defer alloc.free(payload);
+    const encoded = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, try retainedTextEmbeddingHash(alloc, runtime.config.dense_embedder.?, dense_request, text), &.{ 0.9, 0.1 });
+    try std.testing.expect(try retainedTextVectorCurrent(alloc, runtime.config.dense_embedder.?, dense_request, text, encoded));
+    defer alloc.free(encoded);
+    const manifest_key = try @import("../artifact_chunk_manifest.zig").keyAlloc(alloc, "doc", "clips");
+    defer alloc.free(manifest_key);
+    var builder = @import("../artifact_chunk_manifest.zig").Builder.init();
+    try builder.append(0, payload);
+    const manifest = builder.finish().encode();
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = payload }, .{ .key = manifest_key, .value = &manifest } }, &.{});
+    const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "labels");
+    defer alloc.free(output_key);
+    var window = GeneratedReplayWindow{ .alloc = alloc };
+    defer window.deinit();
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
+    try std.testing.expectError(error.InvalidEmbeddingIdentity, processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), runtime.vector_label_cache.bytes);
+}
+
+test "model aware media label subwindows verify within bounded parent metadata admission" {
+    const a = std.testing.allocator;
+    const C = @import("inference_chunker");
+    const vector: [128]f32 = @splat(0.125);
+    const target = C.outputs.Target{ .name = "embedding", .kind = .embedding, .model = "model", .dimensions = vector.len };
+    const identity: [64]u8 = @splat('3');
+    const revision: [64]u8 = @splat('1');
+    const recipe = try target.recipeIdentity(a, &identity, &revision);
+    var receipts: [32]C.outputs.Result = undefined;
+    for (&receipts, 0..) |*receipt, i| receipt.* = .{ .name = "embedding", .kind = .embedding, .model = "model", .required = true, .model_identity = &identity, .model_revision = &revision, .recipe_id = &recipe, .status = .complete, .sub_index = @intCast(i), .embedding = &vector };
+    const encoded = try std.json.Stringify.valueAlloc(a, receipts, .{});
+    defer a.free(encoded);
+    var metadata = C.types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .coordinates = .{ .kind = .video }, .input_tokens = 2 }, .inference_id = "plan:0", .source_fingerprint = "source", .source_version = "v1", .plan_id = "plan", .model = "model", .model_identity = &identity, .model_revision = &revision, .task_type = "RETRIEVAL_DOCUMENT", .dimensions = vector.len, .policy = .{}, .outputs_json = encoded };
+    const Chunk = @import("../../../chunking/chunk.zig").Chunk;
+    const chunks = [_]Chunk{.{ .chunk_id = 0, .mime_type = "video/mp4", .metadata = &metadata }};
+    var rows = try @import("../artifact_chunk_manifest.zig").PreparedRows.initRecipes(a, "doc", "clips", "body", &chunks);
+    defer rows.deinit();
+    const payload = rows.mutations[0].value.?;
+    const original = (try @import("../../../chunking/chunk.zig").modelMetadataAlloc(a, payload)).?;
+    defer original.deinit(a);
+    const identity_bytes = original.outputs_json.?.len;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.relational_preparation_working_set)] = .{ .hard_limit_bytes = 256 * 1024 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(a);
+    var allocation = resource_manager_mod.BudgetedAllocator.init(&manager, .relational_preparation_working_set, a, 1);
+    defer allocation.deinit();
+    const bounded = allocation.allocator();
+    {
+        const parent = (try @import("../../../chunking/chunk.zig").modelMetadataAlloc(bounded, payload)).?;
+        defer parent.deinit(bounded);
+        var parsed = try std.json.parseFromSlice([]C.outputs.Result, bounded, parent.outputs_json.?, .{});
+        defer parsed.deinit();
+        const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "model", .embedding_name = "model", .doc_key = "doc", .source_field = "body", .expected_dims = vector.len, .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\"}" };
+        for (parsed.value, 0..) |receipt, index| {
+            var fixture = original.*;
+            fixture.output_sub_index = if (index == 0) null else @intCast(index);
+            const fixture_hash = try modelChunkEmbeddingSourceHash(a, .{ .key = "", .text = @constCast(""), .metadata = &fixture }, request);
+            const encoded_vector = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, fixture_hash, &vector);
+            defer a.free(encoded_vector);
+            _ = try validateVectorLabelWindow(bounded, "model", request, @as([32]u8, @splat(0x11)), parent, receipt, parsed.value.len, @intCast(index), null, encoded_vector);
+        }
+        std.debug.print("label parent payload={d} one_receipt_array={d} retained_receipt_bytes={d} prior_copies={d} peak_working_bytes={d} hard_limit={d}\n", .{ payload.len, identity_bytes, parent.outputs_json.?.len, identity_bytes * 32, manager.sliceStats(.relational_preparation_working_set).peak_bytes, @as(usize, 256 * 1024) });
+        try std.testing.expectEqual(identity_bytes, parent.outputs_json.?.len);
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.relational_preparation_working_set).used_bytes);
 }

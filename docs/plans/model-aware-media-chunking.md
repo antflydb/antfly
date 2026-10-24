@@ -486,3 +486,24 @@ Throughput and p95 under concurrent load, cold setup, sampled/process memory and
 cancellation/retry are separate gates. CPU-versus-CPU and Metal-versus-MPS claims
 must name their timing boundary and measured binary; historical reports do not
 qualify a subsequent implementation.
+
+
+## Stored-vector label preparation qualification
+
+The `antfly-media-chunking-test` target includes production label-path fixtures
+for the vocabulary working set and persisted parent receipts. Two passes over
+32 small vocabularies make 32 prompt-model calls, compared with 64 under the
+former eight-entry limit, with 35,584 retained bytes. This tests the runtime
+matrix cache without the optional dense computation memo. The cache uses hashed
+lookup and LRU eviction under its 32 MiB budget and a 4,096-entry safety ceiling;
+entry headers and matrix allocations hold resource admission, and scoring
+leases prevent pressure eviction.
+
+A production `PreparedRows.initRecipes` fixture with 32 windows and 128-dimensional
+vectors persists a 14,579-byte parent containing 13,623 bytes of identity receipts.
+Label verification retains that receipt array once per parent, instead of
+435,936 bytes of repeated receipt strings. Parsing plus selected-window
+verification peaks at 215,232 admitted bytes and passes under a 256 KiB hard
+limit. Persisted recipes already omit vector and output payloads; this saving
+concerns identity metadata. These deterministic counters do not measure live
+model latency or process RSS.
