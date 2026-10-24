@@ -25,8 +25,9 @@ components:
               type: boolean
               description: >-
                 Controls whether chunk data is persisted to storage.
-                When false (default), chunks are generated in memory and only embeddings are stored.
-                When true, both chunks and embeddings are stored.
+                When false (default), fixed chunks are generated in memory and only embeddings are stored.
+                Model-aware streams always retain descriptor recipes; false omits their payloads.
+                When true, chunk payloads are also stored. Vectors remain in the embedding artifact family.
               default: false
             full_text_index:
               x-go-type-skip-optional-pointer: true
@@ -54,10 +55,10 @@ components:
               minimum: 0
               maximum: 4096
               description: >-
-                Maximum number of chunks to generate per document. Zero (or
-                omitted, the default) means unlimited — the document is
-                chunked in full with no cap. Set an explicit value up to
-                4096 to bound chunk count for very large inputs.
+                Maximum chunks per invocation. Model-aware enrichment treats
+                this as a page size and resumes until source completion;
+                zero selects the worker page size. Fixed chunking retains
+                its per-document cap, with zero meaning unlimited.
             threshold:
               type: number
               format: float
@@ -69,6 +70,8 @@ components:
               $ref: "../shared/chunking.yaml#/components/schemas/AudioChunkOptions"
             embedding:
               $ref: '../shared/chunking.yaml#/components/schemas/ChunkEmbeddingTarget'
+            outputs:
+              $ref: '../shared/chunking.yaml#/components/schemas/ChunkOutputs'
             policy:
               $ref: '../shared/chunking.yaml#/components/schemas/MediaChunkPolicy'
           required:

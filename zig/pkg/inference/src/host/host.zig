@@ -1582,13 +1582,36 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 },
             }
             const cfg = parsed.value.config;
-            const result = if (cfg.embedding) |target| aware: {
+            var output_config: ?std.json.Parsed(@import("inference_chunker").outputs.Config) = if (cfg.outputs_json.len != 0) try std.json.parseFromSlice(@import("inference_chunker").outputs.Config, alloc, cfg.outputs_json, .{}) else null;
+            defer if (output_config) |*value| value.deinit();
+            if (cfg.embedding) |legacy| if (output_config) |*value| {
+                value.value = try value.value.includingEmbedding(value.arena.allocator(), .{ .name = "embedding", .kind = .embedding, .model = legacy.model, .model_identity = legacy.model_identity, .task_type = legacy.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (legacy.dimensions) |n| std.math.cast(usize, n) orelse return error.InvalidChunkOutputs else null });
+            };
+            const boundary = if (output_config) |value| try value.value.boundary() else null;
+            const selected_target = cfg.embedding orelse if (boundary) |value| @typeInfo(@TypeOf(cfg.embedding)).optional.child{ .model = value.model, .model_identity = value.model_identity, .task_type = if (value.kind == .transcribe) "TRANSCRIBE" else value.task_type, .dimensions = if (value.dimensions) |n| @intCast(n) else null } else null;
+
+            if (cfg.page) {
+                const target = selected_target orelse return error.InvalidChunkPolicy;
                 const wire = inference.server.chunk_response;
-                const model_request: wire.Request = .{ .input = input, .policy = try wire.parsePolicy(if (cfg.policy) |policy| convert: {
+                const cursor = if (cfg.replay) |position| try std.fmt.allocPrint(alloc, "{s}:{d}", .{ position.plan_id, position.ordinal }) else null;
+                defer if (cursor) |value| alloc.free(value);
+                const request: wire.Request = .{ .outputs = if (output_config) |value| value.value else null, .input = input, .policy = try wire.parsePolicy(if (cfg.policy) |policy| convert: {
                     var converted = wire.WirePolicy{};
                     inline for (@typeInfo(wire.WirePolicy).@"struct".field_names) |name| @field(converted, name) = @field(policy, name);
                     break :convert converted;
-                } else null), .max_chunks = cfg.max_chunks, .include_content = false, .native_content = true, .execute = target.execute orelse true, .allow_partial = false };
+                } else null), .max_chunks = cfg.max_chunks, .native_content = true, .execute_outputs = target.execute orelse true, .execute = target.execute orelse true, .allow_partial = true, .continuation = cursor, .source_version = if (cfg.replay) |position| position.source_version else "" };
+                var page = try state.node.chunkModelPageDirect(alloc, state.io, execution_control, request, .{ .model = target.model, .model_identity = target.model_identity, .task_type = target.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (target.dimensions) |d| std.math.cast(usize, d) orelse return error.InvalidArguments else null });
+                defer page.deinit(alloc);
+                if (cfg.replay) |position| if (!std.mem.eql(u8, position.plan_id, page.plan_id) or !std.mem.eql(u8, position.source_fingerprint, page.source_fingerprint) or !std.mem.eql(u8, position.source_version, page.source_version)) return error.StaleChunkContinuation;
+                break :blk try std.json.Stringify.valueAlloc(alloc, page, .{});
+            }
+            const result = if (selected_target) |target| aware: {
+                const wire = inference.server.chunk_response;
+                const model_request: wire.Request = .{ .outputs = if (output_config) |value| value.value else null, .input = input, .policy = try wire.parsePolicy(if (cfg.policy) |policy| convert: {
+                    var converted = wire.WirePolicy{};
+                    inline for (@typeInfo(wire.WirePolicy).@"struct".field_names) |name| @field(converted, name) = @field(policy, name);
+                    break :convert converted;
+                } else null), .max_chunks = cfg.max_chunks, .include_content = false, .native_content = true, .execute_outputs = target.execute orelse true, .execute = target.execute orelse true, .allow_partial = false };
                 const model_target = wire.Target{ .model = target.model, .model_identity = target.model_identity, .task_type = target.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (target.dimensions) |d| std.math.cast(usize, d) orelse return error.InvalidArguments else null };
                 if (cfg.replay) |replay| {
                     var replay_request = model_request;

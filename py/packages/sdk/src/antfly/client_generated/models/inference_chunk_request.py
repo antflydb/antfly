@@ -10,6 +10,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.chunk_embedding_target import ChunkEmbeddingTarget
+    from ..models.chunk_outputs import ChunkOutputs
     from ..models.chunk_source_reference import ChunkSourceReference
     from ..models.inference_chunk_config import InferenceChunkConfig
     from ..models.media_chunk_policy import MediaChunkPolicy
@@ -32,6 +33,12 @@ class InferenceChunkRequest:
         config (InferenceChunkConfig | Unset): Configuration for chunking requests to Antfly inference.
             Combines shared text options with inference-specific audio/VAD options.
         embedding (ChunkEmbeddingTarget | Unset):
+        outputs (ChunkOutputs | Unset): Named independent media outputs. The named boundary model alone determines the
+            shared plan; adding or changing another output preserves parent IDs. The compatibility embedding target is named
+            embedding. Smaller output windows are identified by the parent ordinal and sub_index.
+        allow_partial (bool | Unset): Continue enumerating descriptors after individual output failures. Applies to
+            named outputs, including transcribe-only requests; overrides the legacy embedding.allow_partial option when
+            present.
         policy (MediaChunkPolicy | Unset): Semantic chunk policy. Execution batch size and queue depth are deliberately
             separate.
         source_id (str | Unset): Caller source identity; immutable content is independently fingerprinted.
@@ -46,6 +53,8 @@ class InferenceChunkRequest:
     input_: ChunkSourceReference | MediaContentPart | str | TextContentPart
     config: InferenceChunkConfig | Unset = UNSET
     embedding: ChunkEmbeddingTarget | Unset = UNSET
+    outputs: ChunkOutputs | Unset = UNSET
+    allow_partial: bool | Unset = UNSET
     policy: MediaChunkPolicy | Unset = UNSET
     source_id: str | Unset = UNSET
     source_version: str | Unset = UNSET
@@ -77,6 +86,12 @@ class InferenceChunkRequest:
         if not isinstance(self.embedding, Unset):
             embedding = self.embedding.to_dict()
 
+        outputs: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.outputs, Unset):
+            outputs = self.outputs.to_dict()
+
+        allow_partial = self.allow_partial
+
         policy: dict[str, Any] | Unset = UNSET
         if not isinstance(self.policy, Unset):
             policy = self.policy.to_dict()
@@ -102,6 +117,10 @@ class InferenceChunkRequest:
             field_dict["config"] = config
         if embedding is not UNSET:
             field_dict["embedding"] = embedding
+        if outputs is not UNSET:
+            field_dict["outputs"] = outputs
+        if allow_partial is not UNSET:
+            field_dict["allow_partial"] = allow_partial
         if policy is not UNSET:
             field_dict["policy"] = policy
         if source_id is not UNSET:
@@ -120,6 +139,7 @@ class InferenceChunkRequest:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.chunk_embedding_target import ChunkEmbeddingTarget
+        from ..models.chunk_outputs import ChunkOutputs
         from ..models.chunk_source_reference import ChunkSourceReference
         from ..models.inference_chunk_config import InferenceChunkConfig
         from ..models.media_chunk_policy import MediaChunkPolicy
@@ -171,6 +191,15 @@ class InferenceChunkRequest:
         else:
             embedding = ChunkEmbeddingTarget.from_dict(_embedding)
 
+        _outputs = d.pop("outputs", UNSET)
+        outputs: ChunkOutputs | Unset
+        if isinstance(_outputs, Unset):
+            outputs = UNSET
+        else:
+            outputs = ChunkOutputs.from_dict(_outputs)
+
+        allow_partial = d.pop("allow_partial", UNSET)
+
         _policy = d.pop("policy", UNSET)
         policy: MediaChunkPolicy | Unset
         if isinstance(_policy, Unset):
@@ -192,6 +221,8 @@ class InferenceChunkRequest:
             input_=input_,
             config=config,
             embedding=embedding,
+            outputs=outputs,
+            allow_partial=allow_partial,
             policy=policy,
             source_id=source_id,
             source_version=source_version,

@@ -206,6 +206,14 @@ pub const AntflyProvider = struct {
         config: chunking_types.Config,
         context: execution_context.RequestContext,
     ) anyerror![]inference_chunker.Chunk = null,
+    chunk_page_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        input: inference_chunker.Input,
+        config: chunking_types.Config,
+        context: execution_context.RequestContext,
+    ) anyerror!inference_chunker.types.ChunkPage = null,
     /// The result slice and every returned string are owned by `alloc`.
     rewrite_texts: ?*const fn (
         ptr: *anyopaque,

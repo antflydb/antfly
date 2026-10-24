@@ -44,7 +44,7 @@ pub fn fingerprint(alloc: Allocator, policy: catalog.NamespacePolicy, indexes_js
     }, .{});
     defer alloc.free(encoded);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("antfly:document-facts:semantics:v2:");
+    hash.update("antfly:document-facts:semantics:v4:");
     var len: [8]u8 = undefined;
     std.mem.writeInt(u64, &len, encoded.len, .little);
     hash.update(&len);
@@ -83,7 +83,60 @@ pub fn fingerprint(alloc: Allocator, policy: catalog.NamespacePolicy, indexes_js
         if (i != 0 and std.mem.eql(u8, &digests[i - 1], &digest)) continue;
         hash.update(&digest);
     }
+    const fields = try mediaFields(alloc, indexes_json);
+    defer freeMediaFields(alloc, fields);
+    for (fields, 0..) |field, i| {
+        if (i != 0 and std.mem.eql(u8, fields[i - 1], field)) continue;
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, field.len, .little);
+        hash.update(&length);
+        hash.update(field);
+    }
     return hash.finalResult();
+}
+
+pub fn hasModelSources(a: Allocator, indexes_json: []const u8) !bool {
+    const fields = try mediaFields(a, indexes_json);
+    defer freeMediaFields(a, fields);
+    return fields.len != 0;
+}
+
+// Only fields consumed by model-aware indexes affect media pending facts.
+fn mediaFields(a: Allocator, indexes_json: []const u8) ![][]const u8 {
+    if (std.mem.trim(u8, indexes_json, " \t\r\n").len == 0) return a.alloc([]const u8, 0);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, indexes_json, .{});
+    defer parsed.deinit();
+    var fields = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (fields.items) |field| a.free(field);
+        fields.deinit(a);
+    }
+    if (parsed.value == .object) {
+        var iter = parsed.value.object.iterator();
+        while (iter.next()) |entry| {
+            const index = entry.value_ptr.*;
+            if (index != .object) continue;
+            const embedder = index.object.get("embedder") orelse continue;
+            if (embedder != .object) continue;
+            const provider = embedder.object.get("provider") orelse continue;
+            if (provider != .string or !std.mem.eql(u8, provider.string, "antfly")) continue;
+            const field = index.object.get("field") orelse std.json.Value{ .string = "text" };
+            if (field != .string) continue;
+            const owned = try a.dupe(u8, field.string);
+            errdefer a.free(owned);
+            try fields.append(a, owned);
+        }
+    }
+    std.mem.sort([]const u8, fields.items, {}, struct {
+        fn less(_: void, lhs: []const u8, rhs: []const u8) bool {
+            return std.mem.lessThan(u8, lhs, rhs);
+        }
+    }.less);
+    return fields.toOwnedSlice(a);
+}
+fn freeMediaFields(a: Allocator, fields: [][]const u8) void {
+    for (fields) |field| a.free(field);
+    a.free(fields);
 }
 
 pub fn needsRebuild(alloc: Allocator, root: facts.Root, policy: catalog.NamespacePolicy, indexes_json: []const u8) !bool {
@@ -119,16 +172,20 @@ pub const Context = struct {
     alloc: Allocator,
     policy: catalog.NamespacePolicy,
     chunked_sources: []full_text_indexes.ChunkedFullTextSource,
+    media_fields: [][]const u8,
 
     pub fn init(alloc: Allocator, policy: catalog.NamespacePolicy, indexes_json: []const u8) !Context {
-        return .{ .alloc = alloc, .policy = policy, .chunked_sources = try full_text_indexes.listChunkedFullTextSourcesAlloc(alloc, indexes_json) };
+        const fields = try mediaFields(alloc, indexes_json);
+        errdefer freeMediaFields(alloc, fields);
+        return .{ .alloc = alloc, .policy = policy, .media_fields = fields, .chunked_sources = try full_text_indexes.listChunkedFullTextSourcesAlloc(alloc, indexes_json) };
     }
     pub fn deinit(self: *Context) void {
+        freeMediaFields(self.alloc, self.media_fields);
         full_text_indexes.freeChunkedFullTextSources(self.alloc, self.chunked_sources);
         self.* = undefined;
     }
     pub fn flags(self: *const Context, doc: materializer.Document) !Flags {
-        var projection = try document_projection.parseAlloc(self.alloc, doc.body);
+        var projection = try document_projection.parseAllocWithSourceFields(self.alloc, doc.body, self.media_fields);
         defer projection.deinit(self.alloc);
         var has_chunk_preview = projection.chunk_preview != null;
         if (!has_chunk_preview and self.chunked_sources.len != 0) {
@@ -144,14 +201,14 @@ pub const Context = struct {
             defer self.alloc.free(normalized);
             break :text normalized.len > 0;
         } else false;
-        const has_chunk_source = if (projection.chunk_preview) |chunks| chunks.len > 0 else has_text;
+        const has_chunk_source = projection.chunk_embeddings_pending or projection.model_media_source_present or (if (projection.chunk_preview) |chunks| chunks.len > 0 else has_text);
         return .{
             .present = @as(u3, @intFromBool(has_chunk_preview)) |
                 (@as(u3, @intFromBool(projection.chunk_embeddings != null)) << 1) |
                 (@as(u3, @intFromBool(projection.rerank_terms != null)) << 2),
             .pending = @as(u4, @intFromBool(policy.enrichment_enabled and has_text and (projection.lexical_sparse_version == null or projection.lexical_sparse_version.? < policy.enrichment_pipeline_version))) |
                 (@as(u4, @intFromBool(policy.chunk_preview_enabled and has_text and (projection.chunk_preview_version == null or projection.chunk_preview_version.? < policy.chunk_preview_pipeline_version))) << 1) |
-                (@as(u4, @intFromBool(policy.chunk_embeddings_enabled and has_chunk_source and (projection.chunk_embeddings_version == null or projection.chunk_embeddings_version.? < policy.chunk_embeddings_pipeline_version))) << 2) |
+                (@as(u4, @intFromBool(policy.chunk_embeddings_enabled and has_chunk_source and (projection.chunk_embeddings_pending or projection.chunk_embeddings_version == null or projection.chunk_embeddings_version.? < policy.chunk_embeddings_pipeline_version))) << 2) |
                 (@as(u4, @intFromBool(policy.rerank_terms_enabled and has_text and (projection.rerank_terms_version == null or projection.rerank_terms_version.? < policy.rerank_terms_pipeline_version))) << 3),
         };
     }
@@ -507,4 +564,13 @@ test "serverless document facts compiled normalization agrees with existing stat
             try std.testing.expectEqual(expected, actual);
         }
     }
+}
+
+test "model aware media serverless pending facts retain empty vector failures and configured source fields" {
+    const a = std.testing.allocator;
+    const policy = catalog.NamespacePolicy{ .chunk_embeddings_enabled = true, .chunk_embeddings_pipeline_version = 2 };
+    const retry = try flagsForDocumentAlloc(a, .{ .doc_id = @constCast("doc"), .last_lsn = 0, .last_timestamp_ns = 0, .body = @constCast("{\"text\":\"\",\"chunk_preview\":[],\"_enrichment\":{\"chunk_embeddings_pending\":true}}") }, policy, "{}");
+    try std.testing.expect(retry.pending & 4 != 0);
+    const initial = try flagsForDocumentAlloc(a, .{ .doc_id = @constCast("doc"), .last_lsn = 0, .last_timestamp_ns = 0, .body = @constCast("{\"text\":\"\",\"clip\":{\"uri\":\"s3://bucket/clip\"}}") }, policy, "{\"dense\":{\"field\":\"clip\",\"embedder\":{\"provider\":\"antfly\"}}}");
+    try std.testing.expect(initial.pending & 4 != 0);
 }

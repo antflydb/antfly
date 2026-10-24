@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from ..models.chunk_coordinates import ChunkCoordinates
     from ..models.chunk_embedding_error import ChunkEmbeddingError
     from ..models.chunk_embedding_object import ChunkEmbeddingObject
+    from ..models.chunk_output_coverage import ChunkOutputCoverage
     from ..models.chunk_source_reference import ChunkSourceReference
     from ..models.media_chunk_policy import MediaChunkPolicy
 
@@ -43,6 +44,10 @@ class ChunkEmbeddingResponse:
         covered_through_ordinal (int): Exclusive end of acknowledged output ordinals; failed chunk coordinates are
             reported in gaps.
         gaps (list[ChunkCoordinates]):
+        output_coverage (list[ChunkOutputCoverage] | Unset):
+        degraded (bool | Unset): Optional outputs failed without preventing required-output coverage.
+        source_complete (bool | Unset): True when source enumeration reached EOF, independently of per-output gaps.
+            Resume enumeration at covered_through_ordinal; repair gaps separately.
         source_reference (ChunkSourceReference | Unset):
         source_id (str | Unset):
         error (ChunkEmbeddingError | Unset):
@@ -64,6 +69,9 @@ class ChunkEmbeddingResponse:
     start_ordinal: int
     covered_through_ordinal: int
     gaps: list[ChunkCoordinates]
+    output_coverage: list[ChunkOutputCoverage] | Unset = UNSET
+    degraded: bool | Unset = UNSET
+    source_complete: bool | Unset = UNSET
     source_reference: ChunkSourceReference | Unset = UNSET
     source_id: str | Unset = UNSET
     error: ChunkEmbeddingError | Unset = UNSET
@@ -107,6 +115,17 @@ class ChunkEmbeddingResponse:
             gaps_item = gaps_item_data.to_dict()
             gaps.append(gaps_item)
 
+        output_coverage: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.output_coverage, Unset):
+            output_coverage = []
+            for output_coverage_item_data in self.output_coverage:
+                output_coverage_item = output_coverage_item_data.to_dict()
+                output_coverage.append(output_coverage_item)
+
+        degraded = self.degraded
+
+        source_complete = self.source_complete
+
         source_reference: dict[str, Any] | Unset = UNSET
         if not isinstance(self.source_reference, Unset):
             source_reference = self.source_reference.to_dict()
@@ -140,6 +159,12 @@ class ChunkEmbeddingResponse:
                 "gaps": gaps,
             }
         )
+        if output_coverage is not UNSET:
+            field_dict["output_coverage"] = output_coverage
+        if degraded is not UNSET:
+            field_dict["degraded"] = degraded
+        if source_complete is not UNSET:
+            field_dict["source_complete"] = source_complete
         if source_reference is not UNSET:
             field_dict["source_reference"] = source_reference
         if source_id is not UNSET:
@@ -156,6 +181,7 @@ class ChunkEmbeddingResponse:
         from ..models.chunk_coordinates import ChunkCoordinates
         from ..models.chunk_embedding_error import ChunkEmbeddingError
         from ..models.chunk_embedding_object import ChunkEmbeddingObject
+        from ..models.chunk_output_coverage import ChunkOutputCoverage
         from ..models.chunk_source_reference import ChunkSourceReference
         from ..models.media_chunk_policy import MediaChunkPolicy
 
@@ -200,6 +226,19 @@ class ChunkEmbeddingResponse:
 
             gaps.append(gaps_item)
 
+        _output_coverage = d.pop("output_coverage", UNSET)
+        output_coverage: list[ChunkOutputCoverage] | Unset = UNSET
+        if _output_coverage is not UNSET:
+            output_coverage = []
+            for output_coverage_item_data in _output_coverage:
+                output_coverage_item = ChunkOutputCoverage.from_dict(output_coverage_item_data)
+
+                output_coverage.append(output_coverage_item)
+
+        degraded = d.pop("degraded", UNSET)
+
+        source_complete = d.pop("source_complete", UNSET)
+
         _source_reference = d.pop("source_reference", UNSET)
         source_reference: ChunkSourceReference | Unset
         if isinstance(_source_reference, Unset):
@@ -234,6 +273,9 @@ class ChunkEmbeddingResponse:
             start_ordinal=start_ordinal,
             covered_through_ordinal=covered_through_ordinal,
             gaps=gaps,
+            output_coverage=output_coverage,
+            degraded=degraded,
+            source_complete=source_complete,
             source_reference=source_reference,
             source_id=source_id,
             error=error,

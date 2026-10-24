@@ -138,6 +138,20 @@ pub const Fence = struct {
         var input = try @import("artifact_chunk_generation.zig").captureInput(alloc, txn, self.scope);
         defer input.deinit();
         if (self.requires_member and input.value == null) return error.EnrichmentSourceChanged;
+        for (command.mutations) |mutation| if (mutation.value != null) {
+            const base = (try keys.derivedEmbeddingBaseKeyAlloc(alloc, mutation.key)) orelse return error.InvalidBatchRequest;
+            defer alloc.free(base);
+            if (keys.mediaWindowIndex(base)) |index| {
+                const metadata = try @import("../../chunking/chunk.zig").modelMetadataAlloc(alloc, input.value orelse return error.EnrichmentSourceChanged) orelse return error.InvalidBatchRequest;
+                defer metadata.deinit(alloc);
+                var results = try std.json.parseFromSlice([]@import("inference_chunker").outputs.Result, alloc, metadata.outputs_json orelse return error.InvalidBatchRequest, .{});
+                defer results.deinit();
+                const found = for (results.value) |result| {
+                    if (result.kind == .embedding and std.mem.eql(u8, result.name, "embedding") and result.sub_index == index and result.status == .complete) break true;
+                } else false;
+                if (!found) return error.EnrichmentSourceChanged;
+            }
+        };
         self.certificate = if (input.proofValue() != null) try @import("artifact_producer_provenance.zig").certifyInheritedArtifact(alloc, txn, input.proofKey(self.scope), input.proofValue(), command) else null;
         self.prepared = true;
     }
@@ -150,26 +164,17 @@ pub const Fence = struct {
 pub fn prepare(alloc: std.mem.Allocator, command: publication.Command, catalogs: @import("artifact_inventory.zig").Catalogs) !publication.PreparedEffects {
     try command.validate(alloc);
     if (!std.mem.eql(u8, &command.catalog_digest, &catalogs.digest())) return error.ArtifactCatalogDrift;
-    if (command.producer_kind != .index or command.mutations.len != 1 or
-        !keys.isChunkArtifactRecordKey(command.producer_scope_key) or command.mutations[0].family != .derived_vector) return error.InvalidBatchRequest;
+    if (command.producer_kind != .index or command.mutations.len == 0 or
+        !keys.isChunkArtifactRecordKey(command.producer_scope_key) or keys.mediaWindowIndex(command.producer_scope_key) != null) return error.InvalidBatchRequest;
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     const owned = arena.allocator();
-    const mutation = command.mutations[0];
-    const expected = try keys.derivedEmbeddingArtifactKeyAlloc(owned, command.producer_scope_key, command.producer_artifact_name);
-    if (!std.mem.eql(u8, expected, mutation.key)) return error.InvalidBatchRequest;
     const head = (try @import("artifact_chunk_manifest.zig").keyForMemberAlloc(owned, command.producer_scope_key)).?;
     head[keys.findComponentTerminator(head, 1).? + 2] = keys.producer_generation_head_kind;
-    // Absence before the first head is an input too. A legacy member digest
-    // alone cannot authorize output after a head supersedes the physical row.
     const has_head_guard = for (command.artifact_sources) |guard| {
         if (std.mem.eql(u8, guard.key, head)) break true;
     } else false;
-    const has_output_guard = for (command.mutation_preconditions) |guard| {
-        if (std.mem.eql(u8, guard.key, expected)) break true;
-    } else false;
-    if (!has_head_guard or !has_output_guard) return error.InvalidBatchRequest;
-    @import("online_vector_artifacts.zig").validatePayload(mutation.value) catch return error.InvalidBatchRequest;
+    if (!has_head_guard) return error.InvalidBatchRequest;
     const scope = (try @import("artifact_ids.zig").decodeArtifactRefAlloc(owned, command.producer_scope_key)).?;
     const configs = try manager.deserializeCatalog(owned, catalogs.indexes);
     const producers = if (catalogs.enrichments.len == 0) &.{} else try @import("catalog/enrichment_catalog.zig").deserializeCatalog(owned, catalogs.enrichments);
@@ -181,32 +186,41 @@ pub fn prepare(alloc: std.mem.Allocator, command: publication.Command, catalogs:
     const dims = if (producer.kind == .dense_vector) try manager.denseConfigDimensions(owned, producer) else 0;
     var dense: std.ArrayList(derived.DerivedDenseEmbeddingWrite) = .empty;
     var sparse: std.ArrayList(derived.DerivedSparseEmbeddingWrite) = .empty;
-    if (mutation.value) |value| {
-        const header = try codec.decodeHeader(value);
-        if ((producer.kind == .dense_vector and header.kind != .dense_embedding) or
-            (producer.kind == .sparse_vector and header.kind != .sparse_embedding)) return error.InvalidBatchRequest;
-        const vector = if (producer.kind == .dense_vector) try codec.decodeDenseEmbeddingAlloc(owned, value) else &.{};
-        if (producer.kind == .dense_vector and vector.len != dims) return error.InvalidBatchRequest;
-        const sparse_vector = if (producer.kind == .sparse_vector) try codec.decodeSparseEmbeddingAlloc(owned, value) else null;
-        for (configs) |config| {
-            if (config.kind != producer.kind or !try manager.consumesGeneratedChunkVector(owned, config, producers, scope.name, command.producer_artifact_name)) continue;
-            if (config.kind == .dense_vector) {
-                if (try manager.denseConfigDimensions(owned, config) != dims) continue;
-                try dense.append(owned, .{ .index_name = config.name, .parent_doc_key = scope.document_id, .doc_key = command.producer_scope_key, .artifact_key = expected, .vector = vector });
-            } else try sparse.append(owned, .{ .index_name = config.name, .doc_key = command.producer_scope_key, .artifact_key = expected, .indices = sparse_vector.?.indices, .values = sparse_vector.?.values });
-        }
+    var changed: std.ArrayList([]const u8) = .empty;
+    var deleted: std.ArrayList([]const u8) = .empty;
+    for (command.mutations) |mutation| {
+        if (mutation.family != .derived_vector or mutation.source_index != 0) return error.InvalidBatchRequest;
+        const base = (try keys.derivedEmbeddingBaseKeyAlloc(owned, mutation.key)) orelse return error.InvalidBatchRequest;
+        if (!std.mem.eql(u8, keys.mediaWindowParent(base), command.producer_scope_key) or !keys.matchesDerivedEmbeddingArtifactName(mutation.key, command.producer_artifact_name)) return error.InvalidBatchRequest;
+        if (producer.kind != .dense_vector and keys.mediaWindowIndex(base) != null) return error.InvalidBatchRequest;
+        const expected = try owned.dupe(u8, mutation.key);
+        const guarded = for (command.mutation_preconditions) |guard| {
+            if (std.mem.eql(u8, guard.key, expected)) break true;
+        } else false;
+        if (!guarded) return error.InvalidBatchRequest;
+        @import("online_vector_artifacts.zig").validatePayload(mutation.value) catch return error.InvalidBatchRequest;
+        if (mutation.value) |value| {
+            const header = try codec.decodeHeader(value);
+            if ((producer.kind == .dense_vector and header.kind != .dense_embedding) or
+                (producer.kind == .sparse_vector and header.kind != .sparse_embedding)) return error.InvalidBatchRequest;
+            const vector = if (producer.kind == .dense_vector) try codec.decodeDenseEmbeddingAlloc(owned, value) else &.{};
+            if (producer.kind == .dense_vector and vector.len != dims) return error.InvalidBatchRequest;
+            const sparse_vector = if (producer.kind == .sparse_vector) try codec.decodeSparseEmbeddingAlloc(owned, value) else null;
+            for (configs) |config| {
+                if (config.kind != producer.kind or !try manager.consumesGeneratedChunkVector(owned, config, producers, scope.name, command.producer_artifact_name)) continue;
+                if (config.kind == .dense_vector) {
+                    if (try manager.denseConfigDimensions(owned, config) != dims) continue;
+                    try dense.append(owned, .{ .index_name = config.name, .parent_doc_key = scope.document_id, .doc_key = base, .artifact_key = expected, .vector = vector });
+                } else try sparse.append(owned, .{ .index_name = config.name, .doc_key = base, .artifact_key = expected, .indices = sparse_vector.?.indices, .values = sparse_vector.?.values });
+            }
+            try changed.append(owned, expected);
+        } else try deleted.append(owned, expected);
     }
-    const artifact_keys = try owned.alloc([]const u8, 1);
-    artifact_keys[0] = expected;
-    const logical_scope = try owned.dupe(u8, command.producer_scope_key);
-    // All replay/fence bytes must outlive the transport command buffer.
-    for (dense.items) |*write| write.doc_key = logical_scope;
-    for (sparse.items) |*write| write.doc_key = logical_scope;
-    return .{ .arena = arena, .chunk_vector_fence = .{ .scope = logical_scope, .requires_member = mutation.value != null }, .batch = .{
+    return .{ .arena = arena, .chunk_vector_fence = .{ .scope = try owned.dupe(u8, command.producer_scope_key), .requires_member = changed.items.len != 0 }, .batch = .{
         .dense_embeddings = dense.items,
         .sparse_embeddings = sparse.items,
-        .changed_artifact_keys = if (mutation.value != null) artifact_keys else &.{},
-        .deleted_keys = if (mutation.value == null) artifact_keys else &.{},
+        .changed_artifact_keys = changed.items,
+        .deleted_keys = deleted.items,
     } };
 }
 
@@ -286,7 +300,29 @@ fn testPreparation(sparse_kind: bool) !void {
     inherited = command;
     inherited.authority_epoch += 1;
     try std.testing.expectError(error.ArtifactCatalogDrift, proof.proof.requireInheritedBy(inherited));
+    if (!sparse_kind) {
+        const child = try keys.mediaWindowKeyAlloc(alloc, scope, 1);
+        defer alloc.free(child);
+        const child_output = try keys.derivedEmbeddingArtifactKeyAlloc(alloc, child, "model");
+        defer alloc.free(child_output);
+        const effects = [_]publication.Mutation{ command.mutations[0], .{ .family = .derived_vector, .key = child_output, .value = payload, .source_index = 0 } };
+        const guards = [_]publication.ArtifactSource{ command.mutation_preconditions[0], .{ .key = child_output, .content_digest = null, .input_position = null, .source_index = 0 } };
+        var multi = command;
+        multi.mutations = &effects;
+        multi.mutation_preconditions = &guards;
+        multi.publication_digest = multi.digest();
+        var prepared = try prepare(alloc, multi, catalogs);
+        defer prepared.deinit();
+        try std.testing.expectEqual(@as(usize, 4), prepared.batch.dense_embeddings.len);
+        try std.testing.expectEqual(@as(usize, 2), prepared.batch.changed_artifact_keys.len);
+        try std.testing.expectEqualStrings(child, prepared.batch.dense_embeddings[2].doc_key);
+        try std.testing.expectEqualStrings("doc", prepared.batch.dense_embeddings[2].parent_doc_key.?);
+    }
     command.mutation_preconditions = &.{};
     command.publication_digest = command.digest();
     try std.testing.expectError(error.InvalidBatchRequest, prepare(alloc, command, catalogs));
+}
+
+test "model aware media chunk vector windows share parent fences and project every vector" {
+    try testPreparation(false);
 }
