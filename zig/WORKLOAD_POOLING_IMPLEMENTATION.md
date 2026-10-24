@@ -27364,3 +27364,46 @@ ReleaseFast retains the original query bounds too; minor checkpoint-count
 variation between optimization modes stays within those bounds. Formatting,
 staged source-license checks and generated error-name checks pass. The complete
 design remains open, and full GNU qualification remains waived.
+
+## Bounded retained-column widening (2026-10-24)
+
+Controlled typed-store appends now retain the original execution boundary while
+widening a column. Primitive-to-encoded conversion checks each prior row and
+uses the controlled cell reader. Fixed NUMERIC widening checks each coefficient
+and constructs its exact value directly, retaining display scale and SQL NULLs
+without filling the reader hash cache or cloning its result a second time.
+An append checks the original owner again before publishing its logical row.
+Denial at entry precedes mutation and leaves the store reusable; failure after
+mutation keeps the store failed for ordinary owned cleanup.
+
+Retained-column backfills use a controlled list-growth helper: it allocates the
+usual geometric capacity and copies at most 4 KiB before the next owner check.
+A rejected copy preserves the original buffer, length and capacity. Initialization
+also works in at most 4 KiB chunks and publishes only initialized prefixes, so
+partial tagged-value buffers remain safe to retire. This covers initial NULL
+prefixes, fixed coefficient/scale backfills, optional payload columns and the
+encoded widening buffer. Raw allocator callbacks avoid the convenience wrappers'
+whole-buffer debug poisoning scans. Allocation callbacks and unrelated ordinary append,
+hash-table and arena growth still have their separate bounded-work obligations.
+
+The new tests check original cancellation at every widening/copy/fill checkpoint,
+allocation failure during controlled growth, exact fixed NUMERIC scale, SQL NULL
+prefixes, retained primitive values and refusal to reuse a failed store.
+Final-source Debug and ReleaseFast qualification passes all five native commands
+in each receipt (`sql-widening-quantum-final-debug-v1` and
+`sql-widening-quantum-final-fast-v1`), with unchanged native input hashes. Both
+pass all ten original query regressions without changing their fixtures or work
+limits, the 125 prepared-numeric/operator tests, ABI checks and all four Bloom
+plus 45/1/8 original-error companions. The build reports 47/47 successful steps
+in each mode (141 Debug and 168 ReleaseFast standard tests, including cached
+selection differences). No failures, skips or leaks are reported. Formatting,
+source-license and generated error-name checks pass. These results do not prove
+default overload fairness or complete the full design. Full GNU qualification
+remains waived.
+
+The current normal LSM path still submits legacy maintenance callbacks. The
+runnable-aware maintenance registration API has test callers, but normal storage
+publication must first connect funded payload/pin/index construction and registered
+retirement to the coupled backend/durability commit. A per-turn work deadline is
+not a substitute for the original execution authority. That integration, relief,
+remaining variable-work audits and broad default qualification remain open.

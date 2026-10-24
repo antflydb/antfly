@@ -125,9 +125,8 @@ const Dictionary = struct {
         self.lookup.putAssumeCapacity(hash, index);
         return index;
     }
-    fn resizeNulls(self: *Dictionary, a: A, count: usize) !void {
-        try self.indices.resize(a, count);
-        @memset(self.indices.items, 0);
+    fn resizeNulls(self: *Dictionary, a: A, count: usize, control: ?Work.Control) !void {
+        try Work.resizeFill(u32, a, &self.indices, count, 0, control);
     }
     fn getText(self: Dictionary, row: usize) []const u8 {
         return if (self.flat) |values| values.items[row] else self.values.items[self.indices.items[row]];
@@ -157,9 +156,8 @@ fn Numeric(comptime T: type) type {
         fn get(self: @This(), row: usize) T {
             return if (self.encoded) self.values.items[self.indices.items[row]] else self.flat.items[row];
         }
-        fn resize(self: *@This(), a: A, count: usize) !void {
-            try self.flat.resize(a, count);
-            @memset(self.flat.items, 0);
+        fn resize(self: *@This(), a: A, count: usize, control: ?Work.Control) !void {
+            try Work.resizeFill(T, a, &self.flat, count, 0, control);
         }
         fn encodeOne(self: *@This(), a: A, value: T) !void {
             const slot = try self.lookup.getOrPut(a, key(value));
@@ -507,8 +505,8 @@ const Column = struct {
                 else => unreachable,
             };
             switch (self.values) {
-                inline .integers, .numbers => |*v| try v.resize(a, begin),
-                .strings, .decimals => |*v| try v.resizeNulls(a, begin),
+                inline .integers, .numbers => |*v| try v.resize(a, begin, control),
+                .strings, .decimals => |*v| try v.resizeNulls(a, begin, control),
                 else => unreachable,
             }
         }
@@ -600,8 +598,7 @@ const Column = struct {
             const values = try a.create(std.ArrayList(?*JsonPayload));
             values.* = .empty;
             self.json_bytes = values;
-            try values.resize(a, row);
-            @memset(values.items, null);
+            try Work.resizeFill(?*JsonPayload, a, values, row, null, control);
         }
         try self.append(a, owned, scratch, row, Datum.json(.null), control);
         self.json_bytes.?.items[row] = payload;
@@ -633,10 +630,8 @@ const Column = struct {
             const cells = try owned.create(Fixed.Cells);
             cells.* = .empty;
             self.fixed = .{ .cells = cells };
-            try self.fixed.?.values.resize(a, row);
-            @memset(self.fixed.?.values.items, 0);
-            try self.fixed.?.scales.resize(a, row);
-            @memset(self.fixed.?.scales.items, 0);
+            try Work.resizeFill(i128, a, &self.fixed.?.values, row, 0, control);
+            try Work.resizeFill(u16, a, &self.fixed.?.scales, row, 0, control);
         }
         if (self.fixed) |*fixed| {
             if (value.sql_null or (coefficient != null and value.array == null and value.patterns == null)) {
@@ -651,28 +646,37 @@ const Column = struct {
                 return;
             }
             // Widen once, retaining exact display scales and SQL NULLs.
-            try self.numerics.ensureTotalCapacity(a, row);
+            try Work.ensureTotalCapacity(@TypeOf(self.numerics.items[0]), a, &self.numerics, row, control);
             for (0..row) |i| {
-                const prior = if (self.isNull(i)) Datum{} else try fixed.cell(owned, i);
-                self.numerics.appendAssumeCapacity(if (prior.numeric != null) (try @import("operators.zig").cloneDatum(owned, prior)).numeric else null);
+                try Work.poll(control);
+                const number = if (self.isNull(i)) null else blk: {
+                    // Convert the bounded fixed coefficient directly. Populating
+                    // the reader cache here would grow a hash table and retain a
+                    // second copy of every value merely to widen this column.
+                    const numeric = @import("numeric_value.zig");
+                    var context: numeric.Context = .{ .alloc = owned, .checkpoint = if (control) |c| c.checkpoint else null, .ptr = if (control) |c| c.ptr else null };
+                    var converted = try numeric.fromScaledInteger(&context, fixed.values.items[i], fixed.scales.items[i]);
+                    errdefer converted.deinit();
+                    const result = try owned.create(numeric.Value);
+                    result.* = converted.value;
+                    break :blk result;
+                };
+                self.numerics.appendAssumeCapacity(number);
             }
             fixed.deinit(a);
             self.fixed = null;
             self.values = .{ .encoded = .empty };
-            try self.values.encoded.resize(a, row);
-            @memset(self.values.encoded.items, .null);
+            try Work.resizeFill(@TypeOf(self.values.encoded.items[0]), a, &self.values.encoded, row, .null, control);
         }
         if (self.numerics.items.len != 0 or value.numeric != null) {
             if (self.numerics.items.len == 0) {
-                try self.numerics.resize(a, row);
-                @memset(self.numerics.items, null);
+                try Work.resizeFill(@TypeOf(self.numerics.items[0]), a, &self.numerics, row, null, control);
             }
             try self.numerics.append(a, if (value.numeric != null) (try @import("operators.zig").cloneDatumControlled(owned, value, control)).numeric else null);
         }
         if (self.arrays.items.len != 0 or value.array != null) {
             if (self.arrays.items.len == 0) {
-                try self.arrays.resize(a, row);
-                @memset(self.arrays.items, null);
+                try Work.resizeFill(@TypeOf(self.arrays.items[0]), a, &self.arrays, row, null, control);
             }
             try self.arrays.append(a, if (value.array != null) (try @import("operators.zig").cloneDatumControlled(owned, value, control)).array else null);
         }
@@ -680,8 +684,7 @@ const Column = struct {
         if (value.sql_null) self.nulls.items[row / 64] |= @as(u64, 1) << @as(u6, @intCast(row % 64));
         if (self.patterns.items.len != 0 or value.patterns != null) {
             if (self.patterns.items.len == 0) {
-                try self.patterns.resize(a, row);
-                @memset(self.patterns.items, null);
+                try Work.resizeFill(@TypeOf(self.patterns.items[0]), a, &self.patterns, row, null, control);
             }
             try self.patterns.append(a, value.patterns);
         }
@@ -696,16 +699,15 @@ const Column = struct {
             };
             switch (self.values) {
                 .unknown => unreachable,
-                .strings, .decimals => |*values| try values.resizeNulls(a, row),
-                inline .integers, .numbers => |*values| try values.resize(a, row),
+                .strings, .decimals => |*values| try values.resizeNulls(a, row, control),
+                inline .integers, .numbers => |*values| try values.resize(a, row, control),
                 inline else => |*values| {
-                    try values.resize(a, row);
-                    @memset(values.items, switch (@typeInfo(@TypeOf(values.items)).pointer.child) {
+                    try Work.resizeFill(@typeInfo(@TypeOf(values.items)).pointer.child, a, values, row, switch (@typeInfo(@TypeOf(values.items)).pointer.child) {
                         i64, f64 => 0,
                         bool => false,
                         std.json.Value => .null,
                         else => &.{},
-                    });
+                    }, control);
                 },
             }
         }
@@ -721,9 +723,10 @@ const Column = struct {
         if (!compatible) {
             var encoded: std.ArrayList(std.json.Value) = .empty;
             errdefer encoded.deinit(a);
-            try encoded.ensureTotalCapacity(a, row + 1);
+            try Work.ensureTotalCapacity(std.json.Value, a, &encoded, row + 1, control);
             for (0..row) |i| {
-                const prior = try self.cell(scratch, i);
+                try Work.poll(control);
+                const prior = try self.cellControlled(scratch, i, control);
                 encoded.appendAssumeCapacity(if (prior.sql_null) .null else prior.value);
             }
             switch (self.values) {
@@ -1302,6 +1305,7 @@ pub const Store = struct {
         var scratch = std.heap.ArenaAllocator.init(self.a);
         defer scratch.deinit();
         for (self.columns, values) |*column, value| try column.append(self.a, self.arena.allocator(), scratch.allocator(), self.len, value, control);
+        try Work.poll(control);
         const index = self.len;
         self.len += 1;
         return index;

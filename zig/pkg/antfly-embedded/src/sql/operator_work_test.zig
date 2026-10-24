@@ -1164,3 +1164,102 @@ test "SQL grouping work fixed numeric read checks its owner outside the shared a
     try std.testing.expectEqual(try scalar.semanticHashDatum(Datum.typedNumeric(&number.value)), try scalar.semanticHashDatum(value));
     try std.testing.expectEqual(@as(usize, 1), owner.calls);
 }
+
+test "SQL grouping work retained buffer growth keeps its original owner through copy and fill" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        fn grow(a0: std.mem.Allocator, stop_after: usize) !usize {
+            var values: std.ArrayList(u64) = .empty;
+            defer values.deinit(a0);
+            try values.resize(a0, 2048);
+            for (values.items, 0..) |*value, i| value.* = i;
+            const old_ptr = values.items.ptr;
+            const old_capacity = values.capacity;
+            var owner: Probe = .{ .stop_after = stop_after };
+            Work.ensureTotalCapacity(u64, a0, &values, old_capacity + 1, owner.control()) catch |err| {
+                try std.testing.expectEqual(old_ptr, values.items.ptr);
+                try std.testing.expectEqual(old_capacity, values.capacity);
+                try std.testing.expectEqual(@as(usize, 2048), values.items.len);
+                for (values.items, 0..) |value, i| try std.testing.expectEqual(i, value);
+                return err;
+            };
+            for (values.items, 0..) |value, i| try std.testing.expectEqual(i, value);
+            try Work.resizeFill(u64, a0, &values, old_capacity + 1, 42, owner.control());
+            for (values.items[2048..]) |value| try std.testing.expectEqual(@as(u64, 42), value);
+            return owner.calls;
+        }
+        fn allocationFailures(a0: std.mem.Allocator) !void {
+            _ = try grow(a0, std.math.maxInt(usize));
+        }
+    };
+    const count = try Fixture.grow(a, std.math.maxInt(usize));
+    try std.testing.expect(count > 4);
+    for (1..count + 1) |at| try std.testing.expectError(error.OwnerCanceled, Fixture.grow(a, at));
+    try std.testing.checkAllAllocationFailures(a, Fixture.allocationFailures, .{});
+}
+
+test "SQL grouping work column widening retains values and stops at every original checkpoint" {
+    const Store = @import("typed_store.zig").Store;
+    const Kind = enum { integer, fixed, null_prefix };
+    const Fixture = struct {
+        fn exercise(a: std.mem.Allocator, kind: Kind, at: usize) !usize {
+            var context: @import("numeric_value.zig").Context = .{ .alloc = a };
+            var number = try @import("numeric_value.zig").parse(&context, "12.3400");
+            defer number.deinit();
+            var store = Store.init(a);
+            defer store.deinit();
+            const rows = 65;
+            for (0..rows) |i| {
+                const value: Datum = if (kind == .null_prefix or i % 3 == 0) .{} else switch (kind) {
+                    .integer => Datum.json(.{ .integer = @intCast(i) }),
+                    .fixed => Datum.typedNumeric(&number.value),
+                    .null_prefix => unreachable,
+                };
+                _ = try store.append(&.{value});
+            }
+            const prior_fixed = store.columns[0].fixed;
+            const tail = Datum.json(.{ .string = "widens the retained column" });
+            var owner: Probe = .{ .stop_after = at };
+            _ = store.appendControlled(&.{tail}, owner.control()) catch |err| {
+                try std.testing.expectEqual(@as(usize, rows), store.len);
+                if (owner.calls == 1) {
+                    // Entry denial precedes every mutation and the failure guard.
+                    try std.testing.expect(!store.failed);
+                    _ = try store.append(&.{tail});
+                } else {
+                    try std.testing.expect(store.failed);
+                    try std.testing.expectError(error.InvalidSqlBackendResponse, store.append(&.{tail}));
+                }
+                return err;
+            };
+            try std.testing.expectEqual(@as(usize, rows + 1), store.len);
+            if (prior_fixed) |fixed| try std.testing.expectEqual(@as(usize, 0), fixed.cells.count());
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            for (0..rows) |i| {
+                const actual = try store.cell(scratch.allocator(), i, 0);
+                if (kind == .null_prefix or i % 3 == 0) {
+                    try std.testing.expect(actual.sql_null);
+                } else switch (kind) {
+                    .integer => try std.testing.expectEqual(@as(i64, @intCast(i)), actual.value.integer),
+                    .fixed => {
+                        try std.testing.expectEqual(try scalar.semanticHashDatum(Datum.typedNumeric(&number.value)), try scalar.semanticHashDatum(actual));
+                        try std.testing.expectEqual(number.value.scale, actual.numeric.?.scale);
+                    },
+                    .null_prefix => unreachable,
+                }
+            }
+            try std.testing.expectEqualStrings(tail.value.string, (try store.cell(scratch.allocator(), rows, 0)).value.string);
+            return owner.calls;
+        }
+        fn allocationFailures(a: std.mem.Allocator, kind: Kind) !void {
+            _ = try exercise(a, kind, std.math.maxInt(usize));
+        }
+    };
+    for (std.enums.values(Kind)) |kind| {
+        const count = try Fixture.exercise(std.testing.allocator, kind, std.math.maxInt(usize));
+        if (kind != .null_prefix) try std.testing.expect(count > 65);
+        for (1..count + 1) |at| try std.testing.expectError(error.OwnerCanceled, Fixture.exercise(std.testing.allocator, kind, at));
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.allocationFailures, .{kind});
+    }
+}
