@@ -65,7 +65,18 @@ export class CommitCoordinator extends DurableObject {
     });
   }
   collection(op, args) {
-    return this.journal.rpc(op, args);
+    try { return this.journal.rpc(op, args); }
+    catch (error) {
+      if (/\bSQLITE_NOMEM\b/.test(String(error))) {
+        // Diagnose without allocating another frontier/result set or writing
+        // into a SQLite instance already under native-memory pressure.
+        const sample = {event: "antfly.sqlite.pressure", op, failure_code: "SQLITE_NOMEM", phase: null, database_bytes: null};
+        try { sample.phase = this.journal.state()?.phase ?? null; } catch {}
+        try { sample.database_bytes = this.ctx.storage.sql.databaseSize ?? null; } catch {}
+        try { console.error(JSON.stringify(sample)); } catch {}
+      }
+      throw error;
+    }
   }
 
   async objectCall(request, body) {
@@ -77,6 +88,13 @@ export class CommitCoordinator extends DurableObject {
       }
       const previous = this.ctx.storage.kv.get(request.key);
       if (request.op === "put") {
+        if (request.guard_key != null || request.guard_etag != null) {
+          // Job progress and HEAD must share this transaction. Comparing a
+          // lease in a preceding RPC leaves a takeover/collection race.
+          const parent = request.key.slice(0, request.key.lastIndexOf("/"));
+          if (!request.key.endsWith("/REINDEX") || request.guard_key !== `${parent}/HEAD` || typeof request.guard_etag !== "string") return {status: 3};
+          if (this.ctx.storage.kv.get(request.guard_key)?.etag !== request.guard_etag) return {status: 2};
+        }
         if ((request.if_none_match && previous) ||
           (request.if_match_etag != null && previous?.etag !== request.if_match_etag)) return { status: 2 };
         const etag = crypto.randomUUID();

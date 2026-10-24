@@ -60,7 +60,7 @@ pub const PageStore = struct {
     }
 
     pub fn store(self: *PageStore) tree.Store {
-        return .{ .domain = self.domain, .attempt = self.attempt, .prefix_keys = self.prefix_keys, .decoded_page = if (self.read_cache != null and self.read_cache.?.decoded_read != null) .{ .ptr = self, .read = readDecoded } else null, .ptr = self, .get = get, .read_many = if (self.io != null) .{ .ptr = self, .read = readMany } else null, .put = put, .put_many = if (self.io != null) putMany else null, .pack_many = if (self.pack_pages) packMany else null, .check = check };
+        return .{ .domain = self.domain, .attempt = self.attempt, .prefix_keys = self.prefix_keys, .decoded_page = if (self.read_cache != null and self.read_cache.?.decoded_read != null) .{ .ptr = self, .read = readDecoded } else null, .ptr = self, .get = get, .read_many = if (self.io != null) .{ .ptr = self, .read = readMany } else null, .put = put, .put_many = if (self.io != null or self.artifacts.vtable.put_scoped_many != null) putMany else null, .pack_many = if (self.pack_pages) packMany else null, .check = check };
     }
 
     pub fn namespaceDomain(namespace: []const u8) [32]u8 {
@@ -389,9 +389,13 @@ pub const PageStore = struct {
         var results: [tree.max_write_batch]artifacts.ArtifactMetadata = undefined;
         for (writes, contents[0..writes.len]) |write, *bytes_| bytes_.* = write.bytes;
         var backend = self.artifacts.*;
-        if (backend.upload_scope) |scope| {
-            if (!std.mem.eql(u8, &scope.domain, &self.domain) or !std.mem.eql(u8, &scope.attempt, &self.attempt)) return error.InvalidArtifactUploadScope;
-        } else backend.upload_scope = .{ .domain = self.domain, .attempt = self.attempt };
+        const scope: artifacts.UploadScope = .{ .domain = self.domain, .attempt = self.attempt };
+        if (backend.upload_scope) |authority| {
+            if (!std.mem.eql(u8, &authority.domain, &scope.domain) or authority.fencingToken() != scope.fencingToken()) return error.InvalidArtifactUploadScope;
+        }
+        // A publication can own separate family nonces under the same fence.
+        // Match putScoped's authority check and upload using the page identity.
+        backend.upload_scope = scope;
         try backend.putBatchWithCancellation(self.io, contents[0..writes.len], results[0..writes.len], self.cancellation);
         defer for (results[0..writes.len]) |*metadata| metadata.deinit(self.artifacts.allocator);
         for (writes, results[0..writes.len]) |write, metadata| {

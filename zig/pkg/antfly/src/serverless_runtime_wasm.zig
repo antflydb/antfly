@@ -104,19 +104,26 @@ pub fn requestAdditional(raw: []const u8) ![]u8 {
 fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     @import("antfly_platform").time.installHostClocks(.{ .monotonic_ns = monotonicNs, .realtime_ns = realtimeNs, .authority_ns = authorityNs });
     const Request = struct {
-        op: enum { search, mutate, publish, compact, lookup, list, count, status, enrich, gc_prepare, gc_wal, gc_trace },
+        op: enum { search, mutate, publish, compact, lookup, list, count, status, enrich, gc_prepare, gc_wal, gc_trace, reindex },
         bucket: []const u8,
         prefix: []const u8,
         namespace: []const u8,
+        reindex_action: @import("serverless/hosted_reindex.zig").Action = .start,
+        reindex_job_id: ?[]const u8 = null,
+        reindex_records: usize = 16,
         gc_task: ?@import("serverless/hosted_collection.zig").Task = null,
         gc_id: ?[]const u8 = null,
         gc_keep_from: []const u8 = "1",
         publication_records: usize = 16,
         paged_text: bool = false,
+        paged_projections: bool = false,
         compaction_max_documents: u64 = 1000,
         compaction_max_artifact_bytes: u64 = 4 * 1024 * 1024,
         mode: @import("serverless/query/request.zig").QueryMode = .text,
         vector: ?[]f32 = null,
+        sparse: ?[]@import("serverless/query/request.zig").SparseTermWeight = null,
+        num_probes: u32 = 2,
+        search_effort: ?f32 = null,
         enrichment: bool = false,
         embedding_dimensions: u32 = 384,
         embedding_identity: []const u8 = "cloudflare-default",
@@ -162,7 +169,9 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     var indexed_wal = try @import("serverless/wal/indexed_object_store.zig").IndexedObjectStore.init(a, host.client(), req.bucket, req.prefix);
     defer indexed_wal.deinit();
     var wal = indexed_wal.walStore();
-    const collection = @import("serverless/hosted_collection.zig").Context{ .alloc = a, .namespace = req.namespace, .prefix = req.prefix, .artifacts = &artifacts, .manifests = &manifests, .progress = &progress, .wal = &indexed_wal, .io = host_io };
+    const reindex_registry = @import("serverless/hosted_reindex.zig").Registry{ .client = host.client(), .bucket = req.bucket, .prefix = req.prefix, .namespace = req.namespace, .store = &artifacts };
+    if (req.op == .reindex) return (@import("serverless/hosted_reindex.zig").Context{ .alloc = a, .registry = reindex_registry, .manifests = &manifests, .progress = &progress, .wal = &wal, .io = host_io, .cancellation = .{ .io = host_io, .cooperative = cancellation } }).run(req.reindex_action, req.reindex_job_id, req.reindex_records);
+    const collection = @import("serverless/hosted_collection.zig").Context{ .alloc = a, .namespace = req.namespace, .prefix = req.prefix, .artifacts = &artifacts, .manifests = &manifests, .progress = &progress, .wal = &indexed_wal, .io = host_io, .reindex_registry = reindex_registry };
     switch (req.op) {
         .gc_prepare => return collection.prepare(),
         .gc_trace => return collection.trace(req.gc_task orelse return error.InvalidCollectionTask),
@@ -268,6 +277,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         var builder = @import("serverless/build/builder.zig").Builder.init(a, &artifacts, &manifests, &progress, &wal);
         builder.setIo(host_io);
         builder.paged_text = req.paged_text;
+        builder.paged_projections = req.paged_projections;
         builder.graph_metric_max_parallelism = 1;
         if (req.publication_records == 0 or req.publication_records > 256) return error.InvalidWalBatch;
         builder.max_wal_records = req.publication_records;
@@ -310,7 +320,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         if (req.fresh and try wal.latestLsn(req.namespace) != session.manifest.wal_end_lsn) return error.IndexPublicationPending;
         const pending = try pendingEmbeddings(a, &session);
         if ((req.fresh or req.required_visibility != null) and pending != 0) return error.EmbeddingPending;
-        const hits = try @import("serverless/query/indexed_reader.zig").searchAlloc(a, &session, .{ .text = req.text, .vector = req.vector, .mode = req.mode, .limit = req.limit });
+        const hits = try @import("serverless/query/indexed_reader.zig").searchAlloc(a, &session, .{ .text = req.text, .vector = req.vector, .sparse = req.sparse, .mode = req.mode, .limit = req.limit, .num_probes = req.num_probes, .search_effort = req.search_effort });
         defer @import("serverless/query/request.zig").freeHits(a, hits);
         return std.json.Stringify.valueAlloc(a, .{ .hits = hits, .visibility = visibility.Token.init(req.namespace, session.manifest.wal_end_lsn).encode(), .embeddings_ready = pending == 0 }, .{});
     }

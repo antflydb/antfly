@@ -35,6 +35,7 @@ pub const Client = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        supports_guarded_put: bool = false,
         supports_object_versions: ?*const fn (*anyopaque, Allocator, []const u8, ?types.CancellationToken) anyerror!bool = null,
         /// Optional provider-enforced protection of current object names against
         /// deletion AND replacement. Version retention alone is insufficient.
@@ -47,6 +48,7 @@ pub const Client = struct {
         bucket_exists: *const fn (*anyopaque, []const u8, types.BucketOptions) anyerror!bool,
         make_bucket: *const fn (*anyopaque, []const u8, types.BucketOptions) anyerror!void,
         put_object: *const fn (*anyopaque, Allocator, []const u8, []const u8, []const u8, types.PutOptions) anyerror!types.PutResult,
+        put_objects: ?*const fn (*anyopaque, Allocator, []const u8, []const types.PutObjectRequest) anyerror![]types.PutResult = null,
         put_file: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8, types.PutOptions) anyerror!types.PutResult = null,
         get_file: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8) anyerror!void = null,
         get_file_with_options: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8, types.GetOptions) anyerror!void = null,
@@ -124,16 +126,39 @@ pub const Client = struct {
 
     pub fn putObject(self: *Client, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
         if (opts.cancellation) |token| try token.check();
+        if (opts.guard != null and !self.vtable.supports_guarded_put) return error.ObjectOperationUnsupported;
         return try self.vtable.put_object(self.ptr, self.allocator, bucket, key, body, opts);
     }
 
+    /// No atomicity or ordering guarantee. Callers publish references only after
+    /// every upload succeeds and must tolerate immutable orphan objects.
+    pub fn putObjects(self: *Client, bucket: []const u8, items: []const types.PutObjectRequest) ![]types.PutResult {
+        if (items.len == 0 or items.len > 8) return error.InvalidObjectBatch;
+        for (items) |item| if (item.options.guard != null) return error.ObjectOperationUnsupported;
+        for (items) |item| if (item.options.cancellation) |token| try token.check();
+        if (self.vtable.put_objects) |call| return call(self.ptr, self.allocator, bucket, items);
+        const results = try self.allocator.alloc(types.PutResult, items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (results[0..initialized]) |*result| result.deinit(self.allocator);
+            self.allocator.free(results);
+        }
+        for (items, results) |item, *result| {
+            result.* = try self.putObject(bucket, item.key, item.body, item.options);
+            initialized += 1;
+        }
+        return results;
+    }
+
     pub fn putFile(self: *Client, bucket: []const u8, key: []const u8, src_path: []const u8, opts: types.PutOptions) !types.PutResult {
+        if (opts.guard != null) return error.ObjectOperationUnsupported;
         var io_impl = threadedIo();
         defer io_impl.deinit();
         return try self.putFileWithIo(io_impl.io(), bucket, key, src_path, opts);
     }
 
     pub fn putFileWithIo(self: *Client, io: std.Io, bucket: []const u8, key: []const u8, src_path: []const u8, opts: types.PutOptions) !types.PutResult {
+        if (opts.guard != null) return error.ObjectOperationUnsupported;
         if (opts.cancellation) |token| try token.check();
         if (self.vtable.put_file) |put_file| {
             return try put_file(self.ptr, self.allocator, io, bucket, key, src_path, opts);
@@ -463,4 +488,18 @@ var unique_counter: std.atomic.Value(u64) = .init(0);
 fn uniqueNs(io: std.Io) u64 {
     const now = std.Io.Timestamp.now(io, .awake);
     return @as(u64, @intCast(now.toNanoseconds())) +% unique_counter.fetchAdd(1, .monotonic);
+}
+
+test "guarded objectstore writes fail closed without transactional capability" {
+    const a = std.testing.allocator;
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("fixture");
+    const options: types.PutOptions = .{ .guard = .{ .key = "progress/HEAD", .etag = "old-epoch" } };
+    try std.testing.expectError(error.ObjectOperationUnsupported, client.putObject("fixture", "progress/REINDEX", "checkpoint", options));
+    try std.testing.expectError(error.ObjectOperationUnsupported, client.putObjects("fixture", &.{.{ .key = "progress/REINDEX", .body = "checkpoint", .options = options }}));
+    try std.testing.expectError(error.ObjectOperationUnsupported, client.putFile("fixture", "progress/REINDEX", "missing-file", options));
+    try std.testing.expectError(error.ObjectOperationUnsupported, client.putFileWithIo(std.testing.io, "fixture", "progress/REINDEX", "missing-file", options));
+    try std.testing.expectError(error.FileNotFound, client.statObject("fixture", "progress/REINDEX"));
 }

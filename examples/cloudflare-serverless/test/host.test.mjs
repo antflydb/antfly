@@ -246,7 +246,7 @@ test("WAL reads authenticate immutable page bytes", async () => {
 });
 
 
-for (const paged of [false, true]) test(`bounded hosted GC evicts orphan and expired pages, survives restarts and preserves receipts (paged=${paged})`, async () => {
+for (const paged of [false, true, "projections"]) test(`bounded hosted GC evicts orphan and expired pages, survives restarts and preserves receipts (paged=${paged})`, async () => {
   const f = fixture(), bucket = new Bucket();
   try {
     let journal = f.journal();
@@ -260,11 +260,11 @@ for (const paged of [false, true]) test(`bounded hosted GC evicts orphan and exp
       } catch (error) { return { status: error.status ?? 7 }; }
     } };
     let host = (await setup(bucket, t => withCommitCoordinator(t, coordinator), { clock: f.now })).host;
-    const execute = (input, token) => host.request(request(input.op, {...input, paged_text: paged}), { transport: withCommitCoordinator(base, coordinator, token) });
+    const execute = (input, token) => host.request(request(input.op, {...input, paged_text: Boolean(paged), paged_projections: paged === "projections"}), { transport: withCommitCoordinator(base, coordinator, token) });
     const first = request("mutate", { operation_id: "first", mutations: [{ kind: "upsert", doc_id: "a", body: JSON.stringify({ text: "old" }) }] });
     const receipt = await execute(first);
     for (let i = 0; i < 5; i++) {
-      await execute(request("mutate", { operation_id: `change-${i}`, mutations: [{ kind: "upsert", doc_id: "a", body: JSON.stringify({ text: `current ${i}` }) }] }));
+      await execute(request("mutate", { operation_id: `change-${i}`, mutations: [{ kind: "upsert", doc_id: "a", body: JSON.stringify({ text: `current ${i}`, ...(paged === "projections" ? {embedding: [1, i+1], sparse_embedding: {current: i+1}} : {}) }) }] }));
       await execute(request("publish"));
     }
     await execute(request("compact"));
@@ -286,6 +286,10 @@ for (const paged of [false, true]) test(`bounded hosted GC evicts orphan and exp
     const current = await execute(request("lookup", { doc_id: "a" }));
     assert.equal(JSON.parse(current.body).text, "current 4");
     assert.deepEqual((await execute(request("search", { text: "current" }))).hits.map(hit => hit.doc_id), ["a"]);
+    if (paged === "projections") {
+      assert.equal((await execute(request("search", {mode: "vector", vector: [1,5]}))).hits[0].doc_id, "a");
+      assert.equal((await execute(request("search", {mode: "sparse", sparse: [{term: "current", weight: 1}]}))).hits[0].doc_id, "a");
+    }
   } finally { f.db.close(); }
 });
 
@@ -616,4 +620,147 @@ test("corrupt embedding checkpoints fail closed and missing scratch recomputes s
   assert.equal((await host.request(settings, {inference})).yielded, true);
   assert.equal((await host.request(settings, {inference})).wal_appends, 1);
   assert.equal(calls, 3);
+});
+
+test("publication overlaps immutable body uploads without bypassing operation admission", async () => {
+  let calls = 0, active = 0, peak = 0, sample;
+  const {host} = await setup(new Bucket(), transport => async (req, body) => {
+    calls++;
+    if (req.op === "put" && req.key.includes("/artifacts/graph/")) {
+      peak = Math.max(peak, ++active);
+      try { await new Promise(resolve => setTimeout(resolve, 2)); return await transport(req, body); }
+      finally { active--; }
+    }
+    return transport(req, body);
+  });
+  await host.request(request("mutate", {operation_id: "parallel-bodies", mutations: Array.from({length: 16}, (_, i) => ({kind: "upsert", doc_id: String(i), body: JSON.stringify({text: "durable " + i})}))}));
+  calls = 0;
+  await host.request(request("publish", {paged_text: true}), {onMetrics: value => {sample = value;}});
+  assert.ok(peak > 1 && peak <= 4, "immutable bodies should upload concurrently within the connection allowance");
+  assert.equal(active, 0); assert.equal(sample.operations, calls);
+  assert.equal((await host.request(request("count"))).count, "16");
+});
+
+test("paged dense and sparse projections preserve scoring, cold edits and deletes", async () => {
+  const flat = await setup(), paged = await setup();
+  const records = Array.from({length: 160}, (_, i) => ({kind: "upsert", doc_id: `doc/${String(i).padStart(3,"0")}`, body: JSON.stringify({text: "searchable", embedding: [Math.cos(i*0.1), Math.sin(i*0.1)], sparse_embedding: {Alpha: i%7+0.5, alpha: 0.25, beta: i%3+1}})}));
+  for (const [profile, enabled] of [[flat, false], [paged, true]]) {
+    await profile.host.request(request("mutate", {operation_id: "projection-base", mutations: records}));
+    while ((await profile.host.request(request("publish", {publication_records: 32, paged_projections: enabled}))).has_more) {}
+  }
+  const vector = {mode: "vector", vector: [1,0], search_effort: 1, num_probes: 256, limit: 10};
+  const sparse = {mode: "sparse", sparse: [{term: "ALPHA", weight: 1.3}, {term: "beta", weight: 0.2}], limit: 10};
+  const identities = result => result.hits.map(hit => [hit.doc_id, hit.score]);
+  assert.deepEqual(identities(await paged.host.request(request("search", vector))), identities(await flat.host.request(request("search", vector))));
+  assert.deepEqual(identities(await paged.host.request(request("search", sparse))), identities(await flat.host.request(request("search", sparse))));
+  const cold = (await setup(paged.bucket)).host;
+  await cold.request(request("mutate", {operation_id: "projection-edit", mutations: [{kind: "delete", doc_id: "doc/000"}, {kind: "upsert", doc_id: "doc/001", body: '{"text":"changed","embedding":[1,0],"sparse_embedding":{"alpha":100}}'}]}));
+  await cold.request(request("publish")); // Existing paged roots remain incremental with the flag omitted.
+  assert.equal((await cold.request(request("count"))).count, "159");
+  assert.equal((await cold.request(request("search", vector))).hits[0].doc_id, "doc/001");
+  assert.equal((await cold.request(request("search", sparse))).hits[0].doc_id, "doc/001");
+  assert.equal((await cold.request(request("compact", {compaction_max_documents: 1}))).published, false);
+});
+
+test("adaptive vector projection shards split and remain writable after cold reopen", async () => {
+  const {host, bucket} = await setup();
+  for (let offset = 0; offset < 1500; offset += 100) {
+    await host.request(request("mutate", {operation_id: `shards/${offset}`, mutations: Array.from({length: 100}, (_, n) => {
+      const i = offset+n;
+      return {kind: "upsert", doc_id: `doc/${String(i).padStart(5,"0")}`, body: JSON.stringify({text: "large corpus", embedding: i === 0 ? [1,0,0,0] : [0,1,i/1500,0]})};
+    })}));
+    while ((await host.request(request("publish", {publication_records: 64, paged_projections: true}))).has_more) {}
+  }
+  let cold = (await setup(bucket)).host;
+  assert.equal((await cold.request(request("count"))).count, "1500");
+  const query = {mode: "vector", vector: [1,0,0,0], num_probes: 256, search_effort: 1};
+  assert.equal((await cold.request(request("search", query))).hits[0].doc_id, "doc/00000");
+  await cold.request(request("mutate", {operation_id: "shards/replace", mutations: [{kind: "delete", doc_id: "doc/00000"}, {kind: "upsert", doc_id: "needle", body: '{"text":"new","embedding":[1,0,0,0]}'}]}));
+  await cold.request(request("publish")); cold = (await setup(bucket)).host;
+  assert.equal((await cold.request(request("search", query))).hits[0].doc_id, "needle");
+  assert.equal((await cold.request(request("count"))).count, "1500");
+});
+
+test("reindex checkpoints survive cold instances, catch up live WAL and acknowledge publication once", async () => {
+  const bucket = new Bucket();
+  const transport = createR2Transport({database: bucket}, {maxPutBytes: 4 * 1024 * 1024});
+  let loseHeadResponse = false, headThreshold = Infinity, failCheckpoint = false;
+  let now = Date.now();
+  const coordinator = {async objectCall(request, body) {
+    if (failCheckpoint && request.op === "put" && request.key.endsWith("/REINDEX")) {failCheckpoint = false; return {status: 3};}
+    if (request.guard_key != null && bucket.objects.get(request.guard_key)?.etag !== request.guard_etag) return {status: 2};
+    const {guard_key, guard_etag, ...plain} = request;
+    try {
+      const result = await transport(plain, body);
+      if (loseHeadResponse && request.op === "put" && request.key.endsWith("/HEAD") && request.content_type) {
+        // Drop only the visible reindex publication, after it commits.
+        const encoded = request.content_type.split("base64url=")[1];
+        if (encoded && JSON.parse(Buffer.from(encoded, "base64url")).head_version > headThreshold) {loseHeadResponse = false; throw new Error("lost HEAD response");}
+      }
+      return {status: 0, ...result};
+    } catch (error) {if (error.status) return {status: error.status}; throw error;}
+  }};
+  const reopen = async () => (await setup(bucket, t => withCommitCoordinator(t, coordinator), {clock: () => now})).host;
+  let host = await reopen();
+  const docs = Array.from({length: 45}, (_, i) => ({kind: "upsert", doc_id: `doc/${String(i).padStart(3,"0")}`, body: JSON.stringify({text: "durable original", embedding: [1,i/45], sparse_embedding: {durable: 1}})}));
+  await host.request(request("mutate", {operation_id: "reindex-source", mutations: docs}));
+  while ((await host.request(request("publish"))).has_more) {}
+  const start = await host.request(request("reindex"));
+  assert.equal(start.phase, "scan"); assert.ok(start.job_id);
+  assert.equal((await host.request(request("reindex"))).job_id, start.job_id, "duplicate start keeps its checkpoint");
+  failCheckpoint = true;
+  await assert.rejects(host.request(request("reindex", {reindex_action: "step", reindex_job_id: start.job_id, reindex_records: 8})));
+  host = await reopen();
+  assert.equal((await host.request(request("reindex", {reindex_action: "status"}))).scanned, 0, "failed checkpoint must not advance the scan");
+  await host.request(request("reindex", {reindex_action: "step", reindex_job_id: start.job_id, reindex_records: 8}));
+  host = await reopen();
+  assert.equal((await host.request(request("reindex", {reindex_action: "status"}))).scanned, 8);
+  await host.request(request("mutate", {operation_id: "reindex-live-edit", mutations: [{kind: "delete", doc_id: "doc/000"}, {kind: "upsert", doc_id: "needle", body: '{"text":"replacementneedle","embedding":[0,1],"sparse_embedding":{"needle":2}}'}]}));
+  // The published generation may advance while the frozen source scan resumes.
+  while ((await host.request(request("publish"))).has_more) {}
+  let finished = false, published = false, injected = false;
+  for (let step = 0; step < 32; step++) {
+    host = await reopen();
+    const status = await host.request(request("reindex", {reindex_action: "status"}));
+    if (status.phase === "publish" && !injected) {
+      const head = bucket.objects.get("scope/progress/tenant/table/incarnation1/HEAD");
+      headThreshold = JSON.parse(Buffer.from(head.httpMetadata.contentType.split("base64url=")[1], "base64url")).head_version;
+      await host.request(request("mutate", {operation_id: "late-reindex-tail", mutations: [{kind: "upsert", doc_id: "doc/001", body: JSON.stringify({text: "durable original", embedding: [1,1/45], sparse_embedding: {durable: 1}})}]}));
+      loseHeadResponse = true;
+      await assert.rejects(host.request(request("reindex", {reindex_action: "step", reindex_job_id: start.job_id, reindex_records: 8})));
+      assert.equal(loseHeadResponse, false, "the injected failure followed a committed HEAD update");
+      injected = true;
+      // More than one bounded lineage page may commit before the ack retries.
+      for (let i = 0; i < 130; i++) {
+        await host.request(request("mutate", {operation_id: `post-reindex/${i}`, mutations: [{kind: "upsert", doc_id: "doc/001", body: JSON.stringify({text: "durable original", embedding: [1,1/45], sparse_embedding: {durable: 1}})}]}));
+        await host.request(request("publish"));
+      }
+      continue;
+    }
+    const result = await host.request(request("reindex", {reindex_action: "step", reindex_job_id: start.job_id, reindex_records: 8}));
+    published ||= result.published;
+    if (!result.has_more) {finished = true; break;}
+  }
+  assert.ok(finished && published && injected);
+  assert.equal((await host.request(request("count"))).count, "45");
+  assert.equal((await host.request(request("lookup", {doc_id: "doc/000"}))).body, null);
+  assert.equal((await host.request(request("search", {text: "replacementneedle"}))).hits[0].doc_id, "needle");
+  assert.equal((await host.request(request("search", {mode: "vector", vector: [0,1]}))).hits[0].doc_id, "needle");
+  assert.equal((await host.request(request("search", {mode: "sparse", sparse: [{term: "needle", weight: 1}]}))).hits[0].doc_id, "needle");
+  assert.equal((await host.request(request("compact", {compaction_max_documents: 0}))).published, false, "reindex produced fully paged serving roots");
+  assert.equal((await host.request(request("reindex", {reindex_action: "step", reindex_job_id: start.job_id}))).has_more, false);
+  const next = await host.request(request("reindex"));
+  assert.notEqual(next.job_id, start.job_id);
+  assert.equal((await host.request(request("reindex", {reindex_action: "cancel", reindex_job_id: start.job_id}))).has_more, false, "stale cancel cannot cancel its successor");
+  assert.equal((await host.request(request("reindex", {reindex_action: "status"}))).job_id, next.job_id);
+  await host.request(request("reindex", {reindex_action: "cancel", reindex_job_id: next.job_id}));
+  assert.equal((await host.request(request("reindex", {reindex_action: "status"}))).has_more, false);
+  const expiring = await host.request(request("reindex"));
+  now += 11 * 60 * 1000;
+  host = await reopen();
+  assert.equal((await host.request(request("reindex", {reindex_action: "status"}))).has_more, false);
+  assert.equal((await host.request(request("reindex", {reindex_action: "step", reindex_job_id: expiring.job_id}))).has_more, false);
+  const replacement = await host.request(request("reindex"));
+  assert.notEqual(replacement.job_id, expiring.job_id);
+  await host.request(request("reindex", {reindex_action: "cancel", reindex_job_id: replacement.job_id}));
 });

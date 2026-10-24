@@ -28,11 +28,12 @@ const Wal = @import("wal/indexed_object_store.zig").IndexedObjectStore;
 const A = std.mem.Allocator;
 
 pub const Task = struct {
-    kind: enum { manifest, facts_root, facts_page, wal_page, text_root, text_page, blob },
+    kind: enum { manifest, facts_root, facts_page, wal_page, text_root, text_page, projection_root, projection_page, vector_centroid_page, reindex_state, blob },
     version: ?[]const u8 = null,
-    artifact: ?struct { artifact_id: []const u8, byte_len: u64, checksum: []const u8, metadata_version: u16 = 0 } = null,
+    artifact: ?struct { artifact_id: []const u8, byte_len: u64, checksum: []const u8, metadata_version: u16 = 0, kind: ?manifests_mod.ArtifactKind = null } = null,
     page: ?tree.Ref = null,
     offset: usize = 0,
+    vector_dims: u32 = 0,
 };
 pub const Context = struct {
     alloc: A,
@@ -43,6 +44,7 @@ pub const Context = struct {
     progress: *progress_mod.ProgressStore,
     wal: *Wal,
     io: std.Io,
+    reindex_registry: ?@import("hosted_reindex.zig").Registry = null,
 
     pub fn prepare(self: Context) ![]u8 {
         const lease = @import("build/work_lease.zig");
@@ -54,6 +56,9 @@ pub const Context = struct {
             _ = held.release() catch false;
         };
         const retired = held.acquisition.fencing_token;
+        var registry_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer registry_arena.deinit();
+        const active_job = if (self.reindex_registry) |registry| try registry.load(registry_arena.allocator(), lease.nowUnixNs(self.io)) else @import("hosted_reindex.zig").Saved{};
         if (!try held.release()) return error.WorkLeaseLost;
         const head: ?u64 = self.progress.getHead(self.namespace) catch |err| switch (err) {
             error.FileNotFound => null,
@@ -78,6 +83,13 @@ pub const Context = struct {
             try roots.append(a, .{ .kind = .manifest, .version = try std.fmt.allocPrint(a, "{d}", .{v}) });
             floor = v;
             version = if (manifest.publication_lineage_tracked) manifest.publication_parent_version else null;
+        }
+        if (active_job.state) |state| {
+            if (existing != null and state.source_version < existing.?) return error.ReindexSourceRetired;
+            floor = @min(floor, state.source_version);
+            try roots.append(a, .{ .kind = .manifest, .version = try std.fmt.allocPrint(a, "{d}", .{state.source_version}) });
+            const ref = active_job.pointer.?.artifact;
+            try roots.append(a, .{ .kind = .reindex_state, .artifact = .{ .artifact_id = ref.artifact_id, .byte_len = ref.byte_len, .checksum = ref.checksum } });
         }
         if (head != null and (existing == null or floor > existing.?)) {
             if (!try self.progress.compareAndSwapManifestGcFloor(self.namespace, existing, floor)) return error.CollectionConflict;
@@ -135,20 +147,20 @@ pub const Context = struct {
                 // deployment profile does not yet know how to enumerate.
                 const end = @min(manifest.artifacts.len, task.offset +| 128);
                 if (task.offset > end) return error.InvalidCollectionTask;
-                for (manifest.artifacts[task.offset..end]) |artifact| switch (artifact.kind) {
-                    .document_facts => {
-                        if (artifact.metadata_version != facts.Root.metadata_version) return error.CollectionArtifactUnsupported;
-                        try children.append(a, .{ .kind = .facts_root, .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum, .metadata_version = artifact.metadata_version } });
-                    },
-                    .text_segment => try children.append(a, .{ .kind = if (artifact.metadata_version == @import("text_segment/paged.zig").metadata_version) .text_root else .blob, .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum, .metadata_version = artifact.metadata_version } }),
-                    .vector_segment, .sparse_segment, .document_segment, .mutation_segment, .doc_values, .stored_fields => try children.append(a, .{ .kind = .blob, .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum, .metadata_version = artifact.metadata_version } }),
-                    else => return error.CollectionArtifactUnsupported,
-                };
+                try appendArtifacts(a, &children, manifest.artifacts[task.offset..end]);
                 if (end < manifest.artifacts.len) {
                     var continuation = task;
                     continuation.offset = end;
                     try children.append(a, continuation);
                 }
+            },
+            .reindex_state => {
+                const artifact = task.artifact orelse return error.InvalidCollectionTask;
+                const registry = self.reindex_registry orelse return error.InvalidCollectionTask;
+                const state = try registry.readState(a, .{ .kind = .stored_fields, .artifact_id = artifact.artifact_id, .checksum = artifact.checksum, .byte_len = artifact.byte_len });
+                key = try self.artifactKey(a, artifact.artifact_id);
+                wal_keep = try std.fmt.allocPrint(a, "{d}", .{state.staged.wal_end_lsn});
+                try appendArtifacts(a, &children, state.staged.artifacts);
             },
             .facts_root => {
                 const artifact = task.artifact orelse return error.InvalidCollectionTask;
@@ -157,6 +169,14 @@ pub const Context = struct {
                 key = try self.artifactKey(a, artifact.artifact_id);
                 for ([_]?tree.Ref{root.page} ++ root.pending_pages) |ref| if (ref) |page| try children.append(a, .{ .kind = .facts_page, .page = page });
             },
+            .projection_root => {
+                const artifact = task.artifact orelse return error.InvalidCollectionTask;
+                const parsed = try @import("paged_projection.zig").load(a, &pages, .{ .kind = artifact.kind orelse return error.InvalidCollectionTask, .metadata_version = artifact.metadata_version, .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum });
+                defer parsed.deinit();
+                key = try self.artifactKey(a, artifact.artifact_id);
+                for ([_]?tree.Ref{ parsed.value.docs, parsed.value.postings, parsed.value.directory }) |ref| if (ref) |page| try children.append(a, .{ .kind = .projection_page, .page = page });
+                if (parsed.value.centroids) |page| try children.append(a, .{ .kind = .vector_centroid_page, .page = page, .vector_dims = parsed.value.dims });
+            },
             .text_root => {
                 const artifact = task.artifact orelse return error.InvalidCollectionTask;
                 const parsed = try @import("text_segment/paged.zig").loadRoot(a, &pages, .{ .kind = .text_segment, .metadata_version = artifact.metadata_version, .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum });
@@ -164,7 +184,7 @@ pub const Context = struct {
                 key = try self.artifactKey(a, artifact.artifact_id);
                 for ([_]?tree.Ref{ parsed.value.docs, parsed.value.postings }) |ref| if (ref) |page| try children.append(a, .{ .kind = .text_page, .page = page });
             },
-            .facts_page, .wal_page, .text_page => {
+            .facts_page, .wal_page, .text_page, .projection_page, .vector_centroid_page => {
                 const ref = task.page orelse return error.InvalidCollectionTask;
                 var page = if (task.kind == .wal_page) try self.wal.tracePage(a, self.namespace, ref) else try tree.readPage(a, pages.store(), ref);
                 defer page.deinit(a);
@@ -173,7 +193,12 @@ pub const Context = struct {
                 if (task.offset > page.entries.len) return error.InvalidCollectionTask;
                 for (page.entries[task.offset..end]) |entry| {
                     if (entry.child) |child| {
-                        try children.append(a, .{ .kind = task.kind, .page = child });
+                        try children.append(a, .{ .kind = task.kind, .page = child.*, .vector_dims = task.vector_dims });
+                    } else if (task.kind == .vector_centroid_page) {
+                        if (task.vector_dims == 0 or task.vector_dims > 16384 or entry.value.len != 72 + @as(usize, task.vector_dims) * 4) return error.InvalidCollectionTask;
+                        const blob = try @import("paged_projection.zig").Blob.decode(entry.value);
+                        const id = try blob.identity(pages.domain);
+                        try children.append(a, .{ .kind = .blob, .artifact = .{ .artifact_id = try a.dupe(u8, &id), .byte_len = blob.bytes, .checksum = try a.dupe(u8, &std.fmt.bytesToHex(blob.digest, .lower)) } });
                     } else if (task.kind == .facts_page) {
                         const fact = try facts.Fact.decode(entry.value);
                         const id = try fact.body.identity(pages.domain);
@@ -195,3 +220,19 @@ pub const Context = struct {
         return std.fmt.allocPrint(a, "{s}/artifacts/{s}", .{ self.prefix, suffix });
     }
 };
+
+fn appendArtifacts(a: A, children: *std.ArrayListUnmanaged(Task), refs: []const manifests_mod.ArtifactRef) !void {
+    for (refs) |artifact| switch (artifact.kind) {
+        .document_facts => {
+            if (artifact.metadata_version != facts.Root.metadata_version) return error.CollectionArtifactUnsupported;
+            try children.append(a, .{ .kind = .facts_root, .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum, .metadata_version = artifact.metadata_version } });
+        },
+        .text_segment => try children.append(a, .{ .kind = if (artifact.metadata_version == @import("text_segment/paged.zig").metadata_version) .text_root else .blob, .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum, .metadata_version = artifact.metadata_version } }),
+        .vector_segment, .sparse_segment => {
+            if (artifact.metadata_version > 2) return error.CollectionArtifactUnsupported;
+            try children.append(a, .{ .kind = if (artifact.metadata_version == 2) .projection_root else .blob, .artifact = .{ .kind = artifact.kind, .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum, .metadata_version = artifact.metadata_version } });
+        },
+        .document_segment, .mutation_segment, .doc_values, .stored_fields => try children.append(a, .{ .kind = .blob, .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum, .metadata_version = artifact.metadata_version } }),
+        else => return error.CollectionArtifactUnsupported,
+    };
+}

@@ -211,8 +211,8 @@ pub fn searchAlloc(a: A, session: *runtime.QuerySession, ref: manifest.ArtifactR
             }
         }
     }
-    var ranked = std.ArrayList(indexed.ScoredDoc).empty;
-    defer ranked.deinit(a); // identities are borrowed from the score map
+    var selected = @import("../query/top_docs.zig").TopDocs{ .capacity = req.offset +| req.limit };
+    defer selected.deinit(a); // identities are borrowed from the score map
     var iterator = scores.iterator();
     while (iterator.next()) |entry| {
         try session.checkCancellation();
@@ -231,22 +231,18 @@ pub fn searchAlloc(a: A, session: *runtime.QuerySession, ref: manifest.ArtifactR
             if (std.mem.indexOf(u8, row.value, normalized) == null) continue;
             score = try std.math.add(u32, score, 100);
         }
-        if (score >= req.min_score) try ranked.append(a, .{ .doc_id = entry.key_ptr.*, .score = score });
+        if (score >= req.min_score) try selected.add(a, .{ .doc_id = entry.key_ptr.*, .score = score });
     }
-    std.mem.sort(indexed.ScoredDoc, ranked.items, {}, struct {
-        fn less(_: void, l: indexed.ScoredDoc, r: indexed.ScoredDoc) bool {
-            return if (l.score != r.score) l.score > r.score else std.mem.lessThan(u8, l.doc_id, r.doc_id);
-        }
-    }.less);
-    const start = @min(req.offset, ranked.items.len);
-    const end = @min(ranked.items.len, start +| req.limit);
+    const ranked = selected.sorted();
+    const start = @min(req.offset, ranked.len);
+    const end = @min(ranked.len, start +| req.limit);
     const result = try a.alloc(indexed.ScoredDoc, end - start);
     var initialized: usize = 0;
     errdefer {
         for (result[0..initialized]) |hit| a.free(hit.doc_id);
         a.free(result);
     }
-    for (ranked.items[start..end], result) |hit, *owned| {
+    for (ranked[start..end], result) |hit, *owned| {
         owned.* = .{ .doc_id = try a.dupe(u8, hit.doc_id), .score = hit.score };
         initialized += 1;
     }

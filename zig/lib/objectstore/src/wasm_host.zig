@@ -90,6 +90,8 @@ pub const Host = struct {
             .op = "put",
             .bucket = bucket,
             .key = key,
+            .guard_key = if (opts.guard) |guard| guard.key else null,
+            .guard_etag = if (opts.guard) |guard| guard.etag else null,
             .content_type = opts.content_type,
             .if_match_etag = opts.if_match_etag,
             .if_none_match = opts.if_none_match,
@@ -100,6 +102,36 @@ pub const Host = struct {
         defer parsed.deinit();
         return .{ .etag = if (parsed.value.etag) |etag| try a.dupe(u8, etag) else null };
     }
+    fn putMany(raw: *anyopaque, a: A, bucket: []const u8, items: []const types.PutObjectRequest) ![]types.PutResult {
+        if (items.len == 0 or items.len > 8) return error.InvalidObjectBatch;
+        const Item = struct { key: []const u8, offset: usize, length: usize, content_type: ?[]const u8, if_match_etag: ?[]const u8, if_none_match: bool, checksum_sha256_base64: ?[]const u8 };
+        var headers: [8]Item = undefined;
+        var total: usize = 0;
+        for (items, headers[0..items.len]) |item, *header| {
+            header.* = .{ .key = item.key, .offset = total, .length = item.body.len, .content_type = item.options.content_type, .if_match_etag = item.options.if_match_etag, .if_none_match = item.options.if_none_match, .checksum_sha256_base64 = item.options.checksum_sha256_base64 };
+            total = try std.math.add(usize, total, item.body.len);
+        }
+        const body = try a.alloc(u8, total);
+        defer a.free(body);
+        for (items, headers[0..items.len]) |item, header| @memcpy(body[header.offset..][0..header.length], item.body);
+        var response = try owner(raw).call(.{ .op = "put_many", .bucket = bucket, .items = headers[0..items.len] }, body);
+        defer response.deinit();
+        const parsed = try response.parse(struct { results: []const struct { etag: ?[]const u8 = null } });
+        defer parsed.deinit();
+        if (parsed.value.results.len != items.len) return error.InvalidObjectBatch;
+        const results = try a.alloc(types.PutResult, items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (results[0..initialized]) |*result| result.deinit(a);
+            a.free(results);
+        }
+        for (parsed.value.results, results) |item, *result| {
+            result.* = .{ .etag = if (item.etag) |etag| try a.dupe(u8, etag) else null };
+            initialized += 1;
+        }
+        return results;
+    }
+
     fn get(raw: *anyopaque, a: A, bucket: []const u8, key: []const u8, opts: types.GetOptions) !types.GetResult {
         if (opts.version_id != null or opts.part_number != null) return error.ObjectOperationUnsupported;
         var response = try owner(raw).call(.{
@@ -198,10 +230,12 @@ pub const Host = struct {
         return .{ .bucket = bucket, .key = key, .etag = etag, .version_id = version, .checksum = checksum, .checksum_scope = value.checksum_scope, .content_type = content_type, .content_length = value.content_length, .last_modified_unix_ms = value.last_modified_unix_ms };
     }
     const vtable: Client.VTable = .{
+        .supports_guarded_put = true,
         .deinit = deinit,
         .bucket_exists = bucketExists,
         .make_bucket = makeBucket,
         .put_object = put,
+        .put_objects = putMany,
         .get_object = get,
         .stat_object = stat,
         .stat_object_with_options = statWithOptions,

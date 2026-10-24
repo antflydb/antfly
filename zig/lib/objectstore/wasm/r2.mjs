@@ -53,6 +53,7 @@ async function boundedBody(stream, limit) {
 export function createR2Transport(bindings, { maxResponseBytes = 8 * 1024 * 1024, maxPutBytes = 1024 * 1024 } = {}) {
   integer(maxResponseBytes, "response limit"); integer(maxPutBytes, "put limit");
   return async function objectCall(request, body = new Uint8Array()) {
+    if (request.guard_key != null || request.guard_etag != null) fail(3, "guarded writes require a transactional coordinator");
     const binding = Object.hasOwn(bindings, request.bucket) ? bindings[request.bucket] : undefined;
     if (!binding) fail(3, "unbound bucket");
     if (request.op === "bucket_exists") return { json: { exists: true } };

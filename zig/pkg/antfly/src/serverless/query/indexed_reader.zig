@@ -40,7 +40,7 @@ const ScoredDocValue = struct {
     distance: ?f32 = null,
 };
 
-const ScoredCluster = struct {
+pub const ScoredCluster = struct {
     cluster_index: usize,
     score: f32,
 };
@@ -704,6 +704,8 @@ fn searchSparseArtifactAlloc(
     sparse_index: usize,
     req: query_request.QueryRequest,
 ) ![]ScoredDoc {
+    if (session.manifest.artifacts[sparse_index].metadata_version == 2) return @import("../sparse_segment/paged.zig").searchAlloc(alloc, session, session.manifest.artifacts[sparse_index], req);
+
     const sparse_query = req.sparse orelse return error.SparseQueryRequired;
     if (sparse_query.len == 0) return try alloc.alloc(ScoredDoc, 0);
 
@@ -991,6 +993,8 @@ fn searchVectorArtifactAlloc(
     query_vector: []const f32,
     stats: *SearchExecutionStats,
 ) ![]ScoredDoc {
+    if (session.manifest.artifacts[vector_index].metadata_version == 2) return @import("../vector_segment/paged.zig").searchAlloc(alloc, session, session.manifest.artifacts[vector_index], req, stats);
+
     const header_block_id = try vectorBlockIdAlloc(alloc, .header, 0);
     defer alloc.free(header_block_id);
     const header_bytes = try session.fetchArtifactBlockRangeAlloc(vector_index, header_block_id, 0, vector_segment_mod.header_len);
@@ -1193,6 +1197,8 @@ fn warmVectorArtifact(
     req: query_request.QueryRequest,
     query_vector: []const f32,
 ) !void {
+    if (session.manifest.artifacts[vector_index].metadata_version == 2) return;
+
     const alloc = session.alloc;
     const header_block_id = try vectorBlockIdAlloc(alloc, .header, 0);
     defer alloc.free(header_block_id);
@@ -1255,6 +1261,8 @@ fn warmVectorArtifact(
 }
 
 fn warmSparseArtifact(session: *runtime_mod.QuerySession, sparse_index: usize, req: query_request.QueryRequest) !void {
+    if (session.manifest.artifacts[sparse_index].metadata_version == 2) return;
+
     const alloc = session.alloc;
     const sparse_query = req.sparse orelse return error.SparseQueryRequired;
     if (sparse_query.len == 0) return;
@@ -1365,7 +1373,7 @@ fn metricScore(lhs: []const f32, rhs: []const f32, metric: vector_types.Distance
     };
 }
 
-fn normalizedCosineQueryAlloc(
+pub fn normalizedCosineQueryAlloc(
     alloc: Allocator,
     metric: vector_types.DistanceMetric,
     query: []const f32,
@@ -1376,7 +1384,7 @@ fn normalizedCosineQueryAlloc(
     return normalized;
 }
 
-fn vectorQueryMeasure(query: []const f32, metric: vector_types.DistanceMetric) f32 {
+pub fn vectorQueryMeasure(query: []const f32, metric: vector_types.DistanceMetric) f32 {
     return switch (metric) {
         .l2_squared => vector_types.dot(query, query),
         .inner_product => 0,
@@ -1384,7 +1392,7 @@ fn vectorQueryMeasure(query: []const f32, metric: vector_types.DistanceMetric) f
     };
 }
 
-fn routingScoreForQuery(
+pub fn routingScoreForQuery(
     query: []const f32,
     query_measure: f32,
     candidate: []const f32,
@@ -1474,7 +1482,7 @@ fn optimisticDistance(candidate: ApproxCandidate) f32 {
     return @max(@as(f32, 0), candidate.distance - candidate.error_bound);
 }
 
-fn effectiveProbeCount(req: query_request.QueryRequest, minimum_hint: u32, ranked_clusters: []const ScoredCluster) usize {
+pub fn effectiveProbeCount(req: query_request.QueryRequest, minimum_hint: u32, ranked_clusters: []const ScoredCluster) usize {
     const cluster_count = ranked_clusters.len;
     if (cluster_count == 0) return 0;
     const auto = autoProbeCount(cluster_count);
@@ -1850,7 +1858,7 @@ fn lessScoredDoc(_: void, lhs: ScoredDoc, rhs: ScoredDoc) bool {
     return std.mem.order(u8, lhs.doc_id, rhs.doc_id) == .lt;
 }
 
-fn lessScoredCluster(_: void, lhs: ScoredCluster, rhs: ScoredCluster) bool {
+pub fn lessScoredCluster(_: void, lhs: ScoredCluster, rhs: ScoredCluster) bool {
     if (lhs.score != rhs.score) return lhs.score > rhs.score;
     return lhs.cluster_index < rhs.cluster_index;
 }

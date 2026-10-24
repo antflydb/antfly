@@ -26,7 +26,7 @@ const busy = {interactive: false, maintenance: false};
 const cache = createImmutableReadCache();
 class Busy extends Error {}
 async function run(env, input, signal, collection) {
-  const role = ["publish", "compact", "enrich", "gc_prepare", "gc_trace", "gc_wal"].includes(input.op) ? "maintenance" : "interactive";
+  const role = ["reindex", "publish", "compact", "enrich", "gc_prepare", "gc_trace", "gc_wal"].includes(input.op) ? "maintenance" : "interactive";
   if (busy[role]) throw new Busy("database is busy");
   busy[role] = true;
   let lane = lanes[role];
@@ -36,7 +36,7 @@ async function run(env, input, signal, collection) {
     if (!Number.isSafeInteger(configuredRecycle) || configuredRecycle < 4 * 1024 * 1024 || configuredRecycle > recycleAtBytes) throw new Error("InvalidHostedRecycleBudget");
     recycleAtBytes = configuredRecycle;
     if (!env.ANTFLY_INCARNATION) throw new Error("database incarnation is not configured");
-    if (env.EMBEDDING_MODEL && (["publish", "compact", "enrich"].includes(input.op) || (input.op === "search" && input.mode && input.mode !== "text"))) {
+    if (env.EMBEDDING_MODEL && (["reindex", "publish", "compact", "enrich"].includes(input.op) || (input.op === "search" && input.mode && input.mode !== "text"))) {
       const accepted = await env.COMMITS.getByName(env.ANTFLY_INCARNATION).ensureEmbeddingProfile({model: env.EMBEDDING_MODEL, dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 384), revision: env.EMBEDDING_REVISION ?? "1"});
       if (!accepted) throw new Error("HostedEmbeddingProfileChanged");
     }
@@ -48,10 +48,12 @@ async function run(env, input, signal, collection) {
     if (!Number.isSafeInteger(maxPutBytes) || maxPutBytes < 1 || maxPutBytes > 8 * 1024 * 1024) throw new Error("InvalidHostedObjectBudget");
     const transport = cache.wrap(withCommitCoordinator(createR2Transport({ database: env.DATABASE }, {maxPutBytes}),
       env.COMMITS.getByName(env.ANTFLY_INCARNATION), collection), env.ANTFLY_INCARNATION);
-    const publicationBudget = input.op === "publish" ? await env.COMMITS.getByName(env.ANTFLY_INCARNATION).publicationBudget(Number(env.PUBLICATION_RECORDS ?? 16)) : 16;
+    const publicationBudget = ["publish", "reindex"].includes(input.op) ? await env.COMMITS.getByName(env.ANTFLY_INCARNATION).publicationBudget(Number(env.PUBLICATION_RECORDS ?? 16)) : 16;
     const settings = input.op === "latest" ? {} : { enrichment: Boolean(env.EMBEDDING_MODEL), embedding_dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 384), publication_records: publicationBudget,
+      reindex_records: Math.min(64, publicationBudget),
       enrichment_documents: Number(env.ENRICHMENT_DOCUMENTS ?? 1),
-      paged_text: env.PAGED_TEXT === "true",
+      paged_text: env.PAGED_TEXT === "true" || env.PAGED_PROJECTIONS === "true",
+      paged_projections: env.PAGED_PROJECTIONS === "true",
       embedding_checkpoints: env.EMBEDDING_CHECKPOINTS !== "false",
       embedding_windows: Number(env.EMBEDDING_WINDOWS ?? 1),
       embedding_identity: JSON.stringify([env.EMBEDDING_MODEL ?? "", env.EMBEDDING_REVISION ?? "1", env.AI_GATEWAY ?? ""]),
@@ -99,7 +101,7 @@ async function readJson(request) {
 }
 async function enqueue(env, kind = "publish", job_id, delaySeconds = 0) {
   if (!env.MAINTENANCE) return false;
-  await env.MAINTENANCE.send({ incarnation: env.ANTFLY_INCARNATION, ...(kind === "collect" ? { kind, job_id } : kind === "compact" ? {kind} : {}) }, { delaySeconds });
+  await env.MAINTENANCE.send({ incarnation: env.ANTFLY_INCARNATION, ...(["collect", "reindex"].includes(kind) ? { kind, job_id } : kind === "compact" ? {kind} : {}) }, { delaySeconds });
   return true;
 }
 export default {
@@ -124,8 +126,12 @@ export default {
         if (result.has_more) await enqueue(env, "collect", result.job_id, result.delay_seconds);
         return Response.json(result, env.WORKER_VERSION ? {headers: {"X-Antfly-Version": env.WORKER_VERSION.id}} : undefined);
       }
-      if (!["mutate", "lookup", "list", "search", "count", "status", "publish", "compact", "enrich", "latest"].includes(args.op)) return new Response("unsupported operation", { status: 400 });
+      if (!["mutate", "lookup", "list", "search", "count", "status", "publish", "compact", "enrich", "latest", "reindex"].includes(args.op)) return new Response("unsupported operation", { status: 400 });
       const result = await run(env, args, request.signal);
+      if (args.op === "reindex" && result.has_more && args.reindex_action !== "status") {
+        try { result.maintenance_pending = !await enqueue(env, "reindex", result.job_id); }
+        catch { result.maintenance_pending = true; }
+      }
       if ((args.op === "mutate" && result.committed) || (args.op === "publish" && result.has_more) || (args.op === "enrich" && (result.wal_appends || result.yielded))) {
         try { result.maintenance_pending = !await enqueue(env); }
         catch (error) {
@@ -144,8 +150,13 @@ export default {
   async queue(batch, env) {
     for (const message of batch.messages) {
       if (message.body?.incarnation !== env.ANTFLY_INCARNATION) { message.ack(); continue; }
-      let publishing = !message.body.kind;
+      let publishing = !message.body.kind || message.body.kind === "reindex";
       try {
+        if (message.body.kind === "reindex") {
+          const result = await run(env, {op: "reindex", reindex_action: "step", reindex_job_id: message.body.job_id});
+          if (result.has_more && !await enqueue(env, "reindex", result.job_id)) throw new Error("maintenance queue is not configured");
+          message.ack(); continue;
+        }
         if (message.body.kind === "compact") {
           await run(env, {op: "compact"}); message.ack(); continue;
         }
@@ -178,6 +189,8 @@ export default {
   // Recovery also covers a crash between WAL acceptance and queue admission.
   async scheduled(controller, env) {
     await enqueue(env);
+    const reindex = await run(env, {op: "reindex", reindex_action: "status"});
+    if (reindex.has_more) await enqueue(env, "reindex", reindex.job_id);
     if (env.AUTO_GC === "true" && Math.floor(controller.scheduledTime / 60000) % 15 === 0) await enqueue(env, "collect");
     if (env.EMBEDDING_MODEL && env.EMBEDDING_CHECKPOINTS !== "false") await pruneEmbeddingCheckpoints(env);
     if (env.AUTO_COMPACT === "true" && Math.floor(controller.scheduledTime / 60000) % 60 === 0) await enqueue(env, "compact");

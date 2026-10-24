@@ -160,6 +160,34 @@ pub const Context = struct {
 /// `docs` must be sorted after-images. With no prior root, no mutations, or a
 /// changed fingerprint it must be the full document view. Otherwise only the
 /// distinct mutation IDs are looked up, and `docs` may contain only those IDs.
+const PendingBodies = struct {
+    alloc: Allocator,
+    pages: *page_store.PageStore,
+    items: [8][]const u8 = undefined,
+    length: usize = 0,
+    bytes: usize = 0,
+    seen: [64][32]u8 = undefined,
+    seen_count: usize = 0,
+    seen_next: usize = 0,
+
+    fn add(self: *@This(), body: []const u8, digest: [32]u8) !void {
+        for (self.seen[0..self.seen_count]) |prior| if (std.mem.eql(u8, &prior, &digest)) return;
+        const encoded = try std.math.add(usize, body.len, facts.body_header_bytes);
+        if (self.length == self.items.len or (self.length != 0 and encoded > 1024 * 1024 -| self.bytes)) try self.flush();
+        self.items[self.length] = body;
+        self.length += 1;
+        self.bytes = try std.math.add(usize, self.bytes, encoded);
+        self.seen[self.seen_next] = digest;
+        self.seen_next = (self.seen_next + 1) % self.seen.len;
+        self.seen_count = @min(self.seen.len, self.seen_count + 1);
+    }
+    fn flush(self: *@This()) !void {
+        try facts.putBodies(self.alloc, self.pages, self.items[0..self.length]);
+        self.length = 0;
+        self.bytes = 0;
+    }
+};
+
 pub fn publishAlloc(
     alloc: Allocator,
     pages: *page_store.PageStore,
@@ -180,6 +208,7 @@ pub fn publishAlloc(
     const source = if (rebuild) facts.Root{ .domain = pages.domain, .policy_fingerprint = policy_hash } else previous.?;
     var cache = tree.Cache{ .alloc = alloc, .underlying = pages.store() };
     defer cache.deinit();
+    var pending = PendingBodies{ .alloc = alloc, .pages = pages };
     var replacements = std.ArrayListUnmanaged(facts.Replacement).empty;
     defer replacements.deinit(alloc);
     var seen = std.StringHashMapUnmanaged(void).empty;
@@ -188,7 +217,7 @@ pub fn publishAlloc(
         try replacements.ensureTotalCapacity(alloc, docs.len);
         for (docs) |doc| {
             try pages.cancellation.check();
-            replacements.appendAssumeCapacity(.{ .id = doc.doc_id, .value = try makeFact(alloc, pages, cache.store(), previous, doc, &context) });
+            replacements.appendAssumeCapacity(.{ .id = doc.doc_id, .value = try makeFact(alloc, pages, cache.store(), previous, doc, &context, &pending) });
         }
     } else {
         for (mutations.?) |mutation| {
@@ -197,26 +226,29 @@ pub fn publishAlloc(
             if (entry.found_existing) continue;
             const doc = findDocument(docs, mutation.doc_id);
             try replacements.append(alloc, .{ .id = mutation.doc_id, .value = if (doc) |value|
-                try makeFact(alloc, pages, cache.store(), previous, value, &context)
+                try makeFact(alloc, pages, cache.store(), previous, value, &context, &pending)
             else
                 null });
         }
     }
+    try pending.flush();
     var plan = try facts.planAlloc(alloc, cache.store(), source, replacements.items, wal_end_lsn);
     defer plan.deinit();
     const root = try plan.publish(cache.store(), source);
     return facts.publishRoot(alloc, pages, root);
 }
 
-fn makeFact(alloc: Allocator, pages: *page_store.PageStore, store: tree.Store, prior: ?facts.Root, doc: materializer.Document, context: *const Context) !facts.Fact {
+fn makeFact(alloc: Allocator, pages: *page_store.PageStore, store: tree.Store, prior: ?facts.Root, doc: materializer.Document, context: *const Context, pending: *PendingBodies) !facts.Fact {
     const flags = try context.flags(doc);
     const digest = facts.bodyDigest(doc.body);
     const old = if (prior) |root| try facts.lookup(alloc, store, root, doc.doc_id) else null;
     const encoded_len = std.math.add(usize, doc.body.len, facts.body_header_bytes) catch return error.ArtifactTooLarge;
     const body = if (old != null and old.?.body.bytes == encoded_len and std.mem.eql(u8, &old.?.body.digest, &digest))
         old.?.body
-    else
-        try facts.putBody(alloc, pages, doc.body);
+    else queued: {
+        try pending.add(doc.body, digest);
+        break :queued facts.BodyRef{ .digest = digest, .attempt = pages.attempt, .bytes = encoded_len };
+    };
     return .{ .body = body, .last_lsn = doc.last_lsn, .last_timestamp_ns = doc.last_timestamp_ns, .present = flags.present, .pending = flags.pending };
 }
 

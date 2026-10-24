@@ -29,6 +29,15 @@ test("workerd persists R2 pages and coordinated commits across restart", { timeo
     modules: [{ type: "ESModule", path: join(output, "harness.mjs"), contents: `
       import worker, { CommitCoordinator as BaseCoordinator } from "./worker.js";
       export class CommitCoordinator extends BaseCoordinator {
+        async testGuardedProgress() {
+          const key = "antfly/progress/guard-fixture/HEAD", target = "antfly/progress/guard-fixture/REINDEX";
+          const first = await this.objectCall({op: "put", key}, new Uint8Array([1]));
+          const next = await this.objectCall({op: "put", key}, new Uint8Array([2]));
+          const stale = await this.objectCall({op: "put", key: target, guard_key: key, guard_etag: first.json.etag}, new Uint8Array([3]));
+          const valid = await this.objectCall({op: "put", key: target, guard_key: key, guard_etag: next.json.etag}, new Uint8Array([4]));
+          const foreign = await this.objectCall({op: "put", key: target, guard_key: "antfly/progress/other/HEAD", guard_etag: next.json.etag}, new Uint8Array([5]));
+          return {stale: stale.status, valid: valid.status, foreign: foreign.status};
+        }
         testJournalScale() {
           const j = this.journal, claim = j.claim();
           if (claim.busy) throw new Error("unexpected busy journal");
@@ -60,6 +69,8 @@ test("workerd persists R2 pages and coordinated commits across restart", { timeo
         const localEnv = { ...env, MAINTENANCE: { async send(value) { sent.push(value); } } };
         if (path === "/test/compaction-limit") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, COMPACTION_MAX_DOCUMENTS: "0"}, ctx);
         if (path === "/test/sql-pressure") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, COMMITS: {getByName() {return {async collection() {throw new Error("out of memory: SQLITE_NOMEM");}};}}}, ctx);
+        if (path === "/test/reindex") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, ANTFLY_INCARNATION: "test-reindex", PUBLICATION_RECORDS: "8"}, ctx);
+        if (path === "/test/guard") return Response.json(await env.COMMITS.getByName("test-guard").testGuardedProgress());
         if (path === "/test/journal-scale") return Response.json(await env.COMMITS.getByName("test-journal-scale").testJournalScale());
         if (path === "/test/checkpoint-gc") {
           const namespace = "test-checkpoint-gc", stub = env.COMMITS.getByName(namespace);
@@ -76,7 +87,7 @@ test("workerd persists R2 pages and coordinated commits across restart", { timeo
           const result = await worker.fetch(new Request("https://example.test/api", {method: "POST", headers: {Authorization: "Bearer local-test"}, body: JSON.stringify({op: "prune_checkpoints"})}), {...localEnv, ANTFLY_INCARNATION: namespace}, ctx);
           return Response.json({result: await result.json(), statuses: await Promise.all(keys.map(async ({key, payload}) => [(await stub.objectCall({op: "get", key}, new Uint8Array())).status, !!await env.DATABASE.head(payload)]))});
         }
-        if (path === "/test/paged") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, ANTFLY_INCARNATION: "test-paged", PAGED_TEXT: "true"}, ctx);
+        if (path === "/test/paged") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, ANTFLY_INCARNATION: "test-paged", PAGED_TEXT: "true", PAGED_PROJECTIONS: "true"}, ctx);
         if (path === "/test/recycle") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, ANTFLY_INCARNATION: "test-recycle", WASM_RECYCLE_BYTES: "4194304"}, ctx);
         if (path === "/test/embedding") {
           const dimensions = new URL(request.url).searchParams.get("dimensions") ?? "4";
@@ -239,15 +250,50 @@ test("workerd persists R2 pages and coordinated commits across restart", { timeo
       const response = await mf.dispatchFetch("https://example.test/test/paged", {method: "POST", headers: {Authorization: "Bearer local-test"}, body: JSON.stringify(body)});
       const result = await response.json(); assert.equal(response.status, 200, JSON.stringify(result)); return result;
     };
-    await pagedCall({op: "mutate", operation_id: "paged", mutations: Array.from({length: 32}, (_, i) => ({kind: "upsert", doc_id: `doc/${i}`, body: '{"text":"paged durable"}'}))});
+    await pagedCall({op: "mutate", operation_id: "paged", mutations: Array.from({length: 32}, (_, i) => ({kind: "upsert", doc_id: `doc/${i}`, body: JSON.stringify({text: "paged durable", embedding: [1,i/32], sparse_embedding: {durable: 1}})}))});
     while ((await pagedCall({op: "publish"})).has_more) {}
     await mf.dispose(); mf = new Miniflare(convertV4MiniflareOptions(options));
     assert.equal((await pagedCall({op: "search", text: "durable"})).hits.length, 10);
+    assert.equal((await pagedCall({op: "search", mode: "vector", vector: [1,0]})).hits[0].doc_id, "doc/0");
+    assert.equal((await pagedCall({op: "search", mode: "sparse", sparse: [{term: "durable", weight: 1}]})).hits.length, 10);
     await pagedCall({op: "mutate", operation_id: "paged-change", mutations: [{kind: "delete", doc_id: "doc/0"}, {kind: "upsert", doc_id: "doc/1", body: '{"text":"replacement"}'}]});
     await pagedCall({op: "publish"});
     assert.equal((await pagedCall({op: "count"})).count, "31");
     assert.equal((await pagedCall({op: "search", text: "replacement"})).hits[0].doc_id, "doc/1");
     assert.equal((await pagedCall({op: "compact"})).published, false);
+    assert.deepEqual(await (await mf.dispatchFetch("https://example.test/test/guard")).json(), {stale: 2, valid: 0, foreign: 3});
+    const reindexCall = async body => {
+      const response = await mf.dispatchFetch("https://example.test/test/reindex", {method: "POST", headers: {Authorization: "Bearer local-test"}, body: JSON.stringify(body)});
+      const result = await response.json(); assert.equal(response.status, 200, JSON.stringify(result)); return result;
+    };
+    await reindexCall({op: "mutate", operation_id: "reindex-source", mutations: Array.from({length: 24}, (_, i) => ({kind: "upsert", doc_id: `doc/${i}`, body: JSON.stringify({text: "original durable", embedding: [1,i/24], sparse_embedding: {durable: 1}})}))});
+    while ((await reindexCall({op: "publish"})).has_more) {}
+    const rebuild = await reindexCall({op: "reindex"});
+    await reindexCall({op: "reindex", reindex_action: "step", reindex_job_id: rebuild.job_id});
+    for (let i = 0; i < 3; i++) {
+      await reindexCall({op: "mutate", operation_id: `during-reindex/${i}`, mutations: [{kind: "upsert", doc_id: "needle", body: JSON.stringify({text: "replacementneedle durable", embedding: [0,1], sparse_embedding: {needle: 2}})}]});
+      while ((await reindexCall({op: "publish"})).has_more) {}
+    }
+    await mf.dispose(); mf = new Miniflare(convertV4MiniflareOptions(options));
+    assert.equal((await reindexCall({op: "reindex", reindex_action: "status"})).scanned, 8);
+    let retained = false;
+    for (let step = 0; step < 256; step++) {
+      const result = await reindexCall({op: "collect"});
+      if (result.done) {retained = true; break;}
+      if (result.delay_seconds) await new Promise(resolve => setTimeout(resolve, result.delay_seconds * 1000 + 100));
+    }
+    assert.ok(retained, "collection must retain the old source and partial reindex roots");
+    let reindexed = false;
+    for (let step = 0; step < 32; step++) {
+      const result = await reindexCall({op: "reindex", reindex_action: "step", reindex_job_id: rebuild.job_id});
+      if (!result.has_more) {reindexed = true; break;}
+    }
+    assert.ok(reindexed);
+    assert.equal((await reindexCall({op: "count"})).count, "25");
+    assert.equal((await reindexCall({op: "search", text: "replacementneedle"})).hits[0].doc_id, "needle");
+    assert.equal((await reindexCall({op: "search", mode: "vector", vector: [0,1]})).hits[0].doc_id, "needle");
+    assert.equal((await reindexCall({op: "search", mode: "sparse", sparse: [{term: "needle", weight: 1}]})).hits[0].doc_id, "needle");
+    assert.equal((await reindexCall({op: "compact"})).published, false);
     const recycleCall = async body => {
       const response = await mf.dispatchFetch("https://example.test/test/recycle", {method: "POST", headers: {Authorization: "Bearer local-test"}, body: JSON.stringify(body)});
       const result = await response.json(); assert.equal(response.status, 200, JSON.stringify(result)); return result;

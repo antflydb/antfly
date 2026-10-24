@@ -135,7 +135,7 @@ pub const Compactor = struct {
         var current = try self.manifests.getAlloc(namespace, current_head);
         defer current.deinit(self.alloc);
         if (builder_mod.hasPagedText(current) and builder_mod.findArtifactIndex(current, .document_facts) != null and
-            builder_mod.findArtifactIndex(current, .vector_segment) == null and builder_mod.findArtifactIndex(current, .sparse_segment) == null and builder_mod.findArtifactIndex(current, .graph_segment) == null)
+            builder_mod.allArtifactsPagedOrAbsent(current, .text_segment) and builder_mod.allArtifactsPagedOrAbsent(current, .vector_segment) and builder_mod.allArtifactsPagedOrAbsent(current, .sparse_segment) and builder_mod.findArtifactIndex(current, .graph_segment) == null)
         {
             // These serving trees are already maintained by bounded COW
             // updates. There is no flat corpus snapshot to reconstruct.
@@ -147,6 +147,10 @@ pub const Compactor = struct {
                 const root = try @import("../text_segment/paged.zig").loadRoot(self.alloc, &pages, ref);
                 defer root.deinit();
                 if ((if (root.value.docs) |page| page.records else 0) != current.stats.document_count) return error.DocumentFactsSourceChanged;
+            };
+            for (current.artifacts) |ref| if (ref.kind == .vector_segment or ref.kind == .sparse_segment) {
+                const root = try @import("../paged_projection.zig").load(self.alloc, &pages, ref);
+                defer root.deinit();
             };
             return .{ .namespace = try self.alloc.dupe(u8, namespace), .published = false, .version = current_head, .artifact_count = current.artifacts.len };
         }

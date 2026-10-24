@@ -919,6 +919,7 @@ pub const ObjectStore = struct {
         .put = erasedPut,
         .put_with_cancellation = erasedPutWithCancellation,
         .put_scoped = erasedPutScoped,
+        .put_scoped_many = if (@import("builtin").os.tag == .freestanding) erasedPutScopedMany else null,
         .delete = hostedDeleteUnsupported,
         .get_alloc = erasedGetAlloc,
         .get_alloc_with_cancellation = erasedGetAllocWithCancellation,
@@ -943,6 +944,7 @@ pub const ObjectStore = struct {
         .put = erasedPut,
         .put_with_cancellation = erasedPutWithCancellation,
         .put_scoped = erasedPutScoped,
+        .put_scoped_many = if (@import("builtin").os.tag == .freestanding) erasedPutScopedMany else null,
         .visit_scoped_uploads = erasedVisitScopedUploads,
         .reclaim_retired_scoped_inventory = erasedReclaimRetiredScopedInventory,
         .get_alloc = erasedGetAlloc,
@@ -972,6 +974,45 @@ pub const ObjectStore = struct {
     fn erasedPutWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return try self.putWithCancellation(alloc, contents, cancellation);
+    }
+
+    fn erasedPutScopedMany(raw: *anyopaque, alloc: std.mem.Allocator, scope: artifact_store.UploadScope, contents: []const []const u8, cancellation: CancellationToken) ![]artifact_store.ArtifactMetadata {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (self.read_only) return error.ArtifactStoreReadOnly;
+        try cancellation.check();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const metadata = try alloc.alloc(artifact_store.ArtifactMetadata, contents.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (metadata[0..initialized]) |*item| item.deinit(alloc);
+            alloc.free(metadata);
+        }
+        var requests: [8]objectstore.PutObjectRequest = undefined;
+        var count: usize = 0;
+        for (contents, metadata) |bytes, *item| {
+            try cancellation.check();
+            item.* = meta: {
+                const checksum = try sha256StringWithCancellationAlloc(alloc, bytes, cancellation);
+                errdefer alloc.free(checksum);
+                break :meta .{ .checksum = checksum, .artifact_id = try alloc.dupe(u8, &try scope.artifactId(checksum)), .byte_len = bytes.len };
+            };
+            initialized += 1;
+            const key = try keyForArtifactIdAlloc(arena.allocator(), self.prefix, item.artifact_id);
+            const duplicate = for (requests[0..count]) |request| {
+                if (std.mem.eql(u8, request.key, key)) break true;
+            } else false;
+            if (duplicate) continue;
+            requests[count] = .{ .key = key, .body = bytes, .options = .{ .if_none_match = true, .content_type = "application/octet-stream", .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn) } };
+            count += 1;
+        }
+        const uploaded = try self.client.putObjects(self.bucket, requests[0..count]);
+        defer {
+            for (uploaded) |*item| item.deinit(self.client.allocator);
+            self.client.allocator.free(uploaded);
+        }
+        try cancellation.check();
+        return metadata;
     }
 
     fn erasedPutScoped(ptr: *anyopaque, alloc: std.mem.Allocator, scope: artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {

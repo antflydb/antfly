@@ -369,6 +369,39 @@ pub fn putBody(alloc: Allocator, pages: *page_store.PageStore, bytes: []const u8
     return putEncoded(pages, encoded);
 }
 
+/// Publish a bounded set of independent immutable bodies before their facts.
+/// Their encoding and identity are unchanged; collection needs no new format.
+pub fn putBodies(alloc: Allocator, pages: *page_store.PageStore, bodies: []const []const u8) !void {
+    if (bodies.len == 0) return;
+    if (bodies.len > 8) return error.InvalidObjectBatch;
+    if (pages.artifacts.vtable.put_scoped_many == null) {
+        for (bodies) |body| _ = try putBody(alloc, pages, body);
+        return;
+    }
+    var payloads: [8][]u8 = undefined;
+    var initialized: usize = 0;
+    defer for (payloads[0..initialized]) |bytes| alloc.free(bytes);
+    var total: u64 = 0;
+    for (bodies, payloads[0..bodies.len]) |body, *payload| {
+        try pages.cancellation.check();
+        const len = try std.math.add(usize, body.len, body_header_bytes);
+        total = try std.math.add(u64, total, len);
+        if (total > pages.remaining_write_bytes.*) return error.GraphPageWriteBudgetExceeded;
+        payload.* = try alloc.alloc(u8, len);
+        initialized += 1;
+        @memcpy(payload.*[0..8], "AFDBODY1");
+        std.mem.writeInt(u64, payload.*[8..16], body.len, .little);
+        @memcpy(payload.*[16..], body);
+    }
+    pages.remaining_write_bytes.* -= total;
+    const metadata = try pages.artifacts.putScopedMany(.{ .domain = pages.domain, .attempt = pages.attempt }, payloads[0..bodies.len], pages.cancellation);
+    defer {
+        for (metadata) |*item| item.deinit(pages.artifacts.allocator);
+        pages.artifacts.allocator.free(metadata);
+    }
+    for (metadata, payloads[0..bodies.len]) |item, payload| try artifacts.validatePayloadSha256WithCancellation(payload, item.checksum, pages.cancellation);
+}
+
 fn putEncoded(pages: *page_store.PageStore, bytes: []const u8) !BodyRef {
     if (bytes.len > pages.remaining_write_bytes.*) return error.GraphPageWriteBudgetExceeded;
     pages.remaining_write_bytes.* -= bytes.len;

@@ -64,6 +64,16 @@ const manifest_object_store = @import("../manifest/object_store.zig");
 const FullTextIndexSpec = full_text_indexes.FullTextIndexSpec;
 const FullTextSourceMode = full_text_indexes.FullTextSourceMode;
 
+pub const ProjectionBuildContext = struct {
+    enabled: bool = false,
+    partial: bool = false,
+    namespace: []const u8 = "",
+    attempt: [16]u8 = @splat(0),
+};
+fn existingProjectionContext(artifacts: *artifacts_mod.ArtifactStore, current: ?manifest_mod.Manifest) ProjectionBuildContext {
+    return .{ .enabled = if (current) |source| hasPagedProjections(source) else false, .namespace = if (current) |source| source.namespace else "", .attempt = if (artifacts.upload_scope) |scope| scope.attempt else @splat(0) };
+}
+
 pub const BuildResult = struct {
     namespace: []u8,
     published: bool,
@@ -138,6 +148,7 @@ pub const Builder = struct {
     max_wal_records: ?usize = null,
     /// Opt-in paged text projection; existing paged publications retain it.
     paged_text: bool = false,
+    paged_projections: bool = false,
     max_wal_bytes: usize = 8 * 1024 * 1024,
     graph_metric_max_parallelism: usize = lake_graph_metric.default_compute_parallelism,
     publication_lifecycle_hook: ?PublicationLifecycleHook = null,
@@ -572,10 +583,11 @@ pub const Builder = struct {
         defer query_mod.freeMaterializedDocuments(self.alloc, materialized.documents);
         try maintenance_cancellation.check(cancellation);
 
-        const use_paged_text = self.paged_text or (if (current_manifest) |prior| hasPagedText(prior) else false);
+        const use_paged_projections = self.paged_projections or (if (current_manifest) |prior| hasPagedProjections(prior) else false);
+        const use_paged_text = self.paged_text or use_paged_projections or (if (current_manifest) |prior| hasPagedText(prior) else false);
         const document_ref = blk: {
             if (use_paged_text and materialized.partial and current_manifest != null and
-                findArtifactIndex(current_manifest.?, .vector_segment) == null and findArtifactIndex(current_manifest.?, .sparse_segment) == null and findArtifactIndex(current_manifest.?, .graph_segment) == null)
+                allArtifactsPagedOrAbsent(current_manifest.?, .vector_segment) and allArtifactsPagedOrAbsent(current_manifest.?, .sparse_segment) and findArtifactIndex(current_manifest.?, .graph_segment) == null)
             {
                 const payload = try document_segment_mod.encodeAlloc(self.alloc, &.{});
                 defer self.alloc.free(payload);
@@ -621,7 +633,7 @@ pub const Builder = struct {
         );
         defer freeArtifactRefs(self.alloc, text_refs);
         try maintenance_cancellation.check(cancellation);
-        const sparse_refs = try buildSparseArtifactRefsForMaterializedDocsAllocUntil(
+        const sparse_refs = try buildSparseArtifactRefsWithContextAllocUntil(
             self.alloc,
             self.artifacts,
             current_manifest,
@@ -630,10 +642,11 @@ pub const Builder = struct {
             materialized.mutations,
             targets.published_search_sources,
             cancellation,
+            .{ .enabled = use_paged_projections, .partial = materialized.partial, .namespace = namespace, .attempt = self.artifacts.upload_scope.?.attempt },
         );
         defer freeArtifactRefs(self.alloc, sparse_refs);
         try maintenance_cancellation.check(cancellation);
-        const vector_refs = try buildVectorArtifactRefsForMaterializedDocsAllocUntil(
+        const vector_refs = try buildVectorArtifactRefsWithContextAllocUntil(
             self.alloc,
             self.artifacts,
             current_manifest,
@@ -645,6 +658,7 @@ pub const Builder = struct {
             &.{},
             targets.published_search_sources,
             cancellation,
+            .{ .enabled = use_paged_projections, .partial = materialized.partial, .namespace = namespace, .attempt = self.artifacts.upload_scope.?.attempt },
         );
         defer freeArtifactRefs(self.alloc, vector_refs);
         try maintenance_cancellation.check(cancellation);
@@ -2539,7 +2553,7 @@ fn materializeWalDocumentsForPublicationAlloc(
                 defer if (owned) freeMaterializerMutations(self.alloc, mutations);
                 var touched = try document_facts_builder.materializeTouchedAlloc(self.alloc, &pages, root, mutations);
                 defer if (owned) touched.deinit();
-                if (!try requiresFullDocumentViewAlloc(self.alloc, manifest, touched.before, touched.after, mutations, plan, cancellation)) {
+                if (!try requiresFullDocumentViewAlloc(self.alloc, manifest, touched.before, touched.after, mutations, plan, cancellation, self.paged_projections)) {
                     const counts = try document_facts_builder.predictCountsAlloc(self.alloc, root, touched, plan.policy, plan.table_definition.indexes_json);
                     const count = try std.math.add(u64, std.math.sub(u64, root.document_count, touched.before.len) catch return error.InvalidDocumentFactsRoot, touched.after.len);
                     const document_count = std.math.cast(usize, count) orelse return error.LakeSidecarBuildBudgetExceeded;
@@ -2564,8 +2578,15 @@ fn requiresFullDocumentViewAlloc(
     mutations: []const query_mod.QueryMaterializerMutation,
     plan: publication_plan.TablePublicationPlan,
     cancellation: ?maintenance_cancellation.Token,
+    paged: bool,
 ) !bool {
     if (!std.mem.eql(u8, current.stats.indexes_json, plan.table_definition.indexes_json)) return true;
+    const supports_paged = paged or hasPagedProjections(current);
+    if (supports_paged) {
+        const before_sources = try @import("../paged_projection.zig").fingerprint(alloc, current.stats.published_search_sources);
+        const after_sources = try @import("../paged_projection.zig").fingerprint(alloc, plan.targets.published_search_sources);
+        if (!std.mem.eql(u8, &before_sources, &after_sources)) return true;
+    }
     const specs = try resolvePublishedTextIndexSpecsAlloc(alloc, plan.table_definition, plan.full_text_index_actions);
     defer full_text_indexes.freeFullTextIndexSpecs(alloc, specs);
     for (specs) |spec| {
@@ -2577,13 +2598,19 @@ fn requiresFullDocumentViewAlloc(
     defer search_sources.freeVectorSourceDescriptors(alloc, vectors);
     for (vectors) |source| {
         try maintenance_cancellation.check(cancellation);
-        if (try vectorProjectionChangedForMutationsAlloc(alloc, before, after, mutations, source)) return true;
+        if (try vectorProjectionChangedForMutationsAlloc(alloc, before, after, mutations, source)) {
+            const index = findNamedArtifactIndex(current, .vector_segment, source.index_name);
+            if (!supports_paged or (index != null and current.artifacts[index.?].metadata_version != 2)) return true;
+        }
     }
     const sparse = try search_sources.listSparseSourcesAlloc(alloc, plan.targets.published_search_sources);
     defer search_sources.freeSparseSourceDescriptors(alloc, sparse);
     for (sparse) |source| {
         try maintenance_cancellation.check(cancellation);
-        if (try sparseProjectionChangedForMutationsAlloc(alloc, before, after, mutations, source)) return true;
+        if (try sparseProjectionChangedForMutationsAlloc(alloc, before, after, mutations, source)) {
+            const index = findNamedArtifactIndex(current, .sparse_segment, source.index_name);
+            if (!supports_paged or (index != null and current.artifacts[index.?].metadata_version != 2)) return true;
+        }
     }
     return false;
 }
@@ -2744,6 +2771,20 @@ pub fn buildSparseArtifactRefsForMaterializedDocsAllocUntil(
     published_search_sources: search_sources.PublishedSearchSources,
     cancellation: ?maintenance_cancellation.Token,
 ) ![]manifest_mod.ArtifactRef {
+    return buildSparseArtifactRefsWithContextAllocUntil(alloc, artifacts, current, before_docs, docs, mutations, published_search_sources, cancellation, existingProjectionContext(artifacts, current));
+}
+
+pub fn buildSparseArtifactRefsWithContextAllocUntil(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    current: ?manifest_mod.Manifest,
+    before_docs: []const query_mod.QueryMaterializedDocument,
+    docs: []const query_mod.QueryMaterializedDocument,
+    mutations: []const query_mod.QueryMaterializerMutation,
+    published_search_sources: search_sources.PublishedSearchSources,
+    cancellation: ?maintenance_cancellation.Token,
+    context: ProjectionBuildContext,
+) ![]manifest_mod.ArtifactRef {
     const sparse_sources = try search_sources.listSparseSourcesAlloc(alloc, published_search_sources);
     defer search_sources.freeSparseSourceDescriptors(alloc, sparse_sources);
 
@@ -2751,10 +2792,26 @@ pub fn buildSparseArtifactRefsForMaterializedDocsAllocUntil(
     errdefer freeArtifactRefs(alloc, refs.items);
     for (sparse_sources) |source| {
         try maintenance_cancellation.check(cancellation);
-        if (current) |manifest| {
+        if (current) |manifest| if (!context.enabled or context.partial) {
             if (!try sparseProjectionChangedForMutationsAlloc(alloc, before_docs, docs, mutations, source)) {
                 if (try appendReusedNamedArtifactRefAlloc(alloc, &refs, manifest, .sparse_segment, source.index_name)) continue;
             }
+        };
+        if (context.enabled) {
+            var bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
+            var reads: u64 = 32 * 1024 * 1024;
+            var writes: u64 = 32 * 1024 * 1024;
+            var pages = graph_page_store.PageStore{ .domain = graph_page_store.PageStore.namespaceDomain(context.namespace), .attempt = context.attempt, .artifacts = artifacts, .cancellation = bridge.token(), .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+            const prior_index = if (current != null and context.partial) findNamedArtifactIndex(current.?, .sparse_segment, source.index_name) else null;
+            const prior = if (prior_index) |index| current.?.artifacts[index] else null;
+            if (prior != null and prior.?.metadata_version != 2) return error.ProjectionReindexRequired;
+            const ids = try alloc.alloc([]const u8, mutations.len);
+            defer alloc.free(ids);
+            for (mutations, ids) |mutation, *id| id.* = mutation.doc_id;
+            var delta = try allocSparseSegmentAlloc(alloc, docs, source, cancellation);
+            defer if (delta) |*value| value.deinit(alloc);
+            try refs.append(alloc, try @import("../sparse_segment/paged.zig").publishAlloc(alloc, &pages, prior, delta, ids, source.index_name, try @import("../paged_projection.zig").fingerprint(alloc, source)));
+            continue;
         }
         const built = try buildSparseSegmentAllocForSource(alloc, docs, source, cancellation);
         defer if (built.payload) |payload| alloc.free(payload);
@@ -2874,7 +2931,7 @@ fn allocQueryMutationsFromSegmentEntries(alloc: Allocator, entries: []const segm
     return mutations;
 }
 
-fn decodeWalMutationsAlloc(alloc: Allocator, records: []const wal_mod.Record) ![]query_mod.QueryMaterializerMutation {
+pub fn decodeWalMutationsAlloc(alloc: Allocator, records: []const wal_mod.Record) ![]query_mod.QueryMaterializerMutation {
     const mutations = try alloc.alloc(query_mod.QueryMaterializerMutation, records.len);
     errdefer alloc.free(mutations);
 
@@ -3346,6 +3403,15 @@ pub fn findNamedArtifactIndex(manifest: manifest_mod.Manifest, kind: manifest_mo
     return unnamed_match;
 }
 
+pub fn hasPagedProjections(source: manifest_mod.Manifest) bool {
+    for (source.artifacts) |ref| if ((ref.kind == .vector_segment or ref.kind == .sparse_segment) and ref.metadata_version == @import("../paged_projection.zig").metadata_version) return true;
+    return false;
+}
+pub fn allArtifactsPagedOrAbsent(source: manifest_mod.Manifest, kind: manifest_mod.ArtifactKind) bool {
+    for (source.artifacts) |ref| if (ref.kind == kind and ref.metadata_version != 2) return false;
+    return true;
+}
+
 pub fn hasPagedText(source: manifest_mod.Manifest) bool {
     for (source.artifacts) |ref| if (ref.kind == .text_segment and ref.metadata_version == @import("../text_segment/paged.zig").metadata_version) return true;
     return false;
@@ -3381,6 +3447,16 @@ pub fn readVectorArtifactInfoAlloc(
     artifacts: *artifacts_mod.ArtifactStore,
     artifact: manifest_mod.ArtifactRef,
 ) !VectorArtifactInfo {
+    if (artifact.metadata_version == 2) {
+        const scope = (try @import("../artifacts/store.zig").uploadScopeFromArtifactId(artifact.artifact_id)) orelse return error.InvalidArtifactUploadScope;
+        var reads: u64 = 4 * 1024 * 1024;
+        var writes: u64 = 0;
+        var pages = graph_page_store.PageStore{ .domain = scope.domain, .artifacts = artifacts, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+        const root = try @import("../paged_projection.zig").load(alloc, &pages, artifact);
+        defer root.deinit();
+        return .{ .metric = root.value.metric, .cluster_count = if (root.value.centroids) |ref| @intCast(ref.records) else 0, .base_probe_count = root.value.base_probe_count, .shortlist_multiplier = root.value.shortlist_multiplier };
+    }
+
     const header_bytes = try artifacts.getRangeAlloc(artifact.artifact_id, 0, vector_segment_mod.header_len);
     defer alloc.free(header_bytes);
     const header = try vector_segment_mod.decodeHeader(header_bytes);
@@ -3546,7 +3622,7 @@ pub fn cloneArtifactRefAlloc(alloc: Allocator, artifact: manifest_mod.ArtifactRe
     };
 }
 
-fn artifactRefFromMetadataAlloc(
+pub fn artifactRefFromMetadataAlloc(
     alloc: Allocator,
     kind: manifest_mod.ArtifactKind,
     artifact: artifacts_mod.ArtifactMetadata,
@@ -3754,7 +3830,7 @@ pub fn buildTextArtifactRefsForMaterializedDocsAllocUntil(
     return buildTextArtifactRefsForTouchedDocsAllocUntil(alloc, artifacts, current, before_docs, docs, mutations, text_index_specs, cancellation, false, if (current) |source| hasPagedText(source) else false, if (artifacts.upload_scope) |scope| scope.attempt else @splat(0), if (current) |source| source.namespace else "");
 }
 
-fn buildTextArtifactRefsForTouchedDocsAllocUntil(
+pub fn buildTextArtifactRefsForTouchedDocsAllocUntil(
     alloc: Allocator,
     artifacts: *artifacts_mod.ArtifactStore,
     current: ?manifest_mod.Manifest,
@@ -4169,19 +4245,14 @@ fn combineTextSourcesAlloc(alloc: Allocator, primary: []const u8, secondary: []c
     return out;
 }
 
-fn buildVectorSegmentAlloc(
-    alloc: Allocator,
-    fallback_metric: shared_vector.DistanceMetric,
-    docs: []const query_mod.QueryMaterializedDocument,
-    policy: ?vector_index.BuildPolicy,
-    vector_source: ?search_sources.VectorSourceDescriptor,
-    cancellation: ?maintenance_cancellation.Token,
-) !struct {
-    payload: ?[]u8,
-    vector_count: usize,
-} {
-    if (vector_source == null) return .{ .payload = null, .vector_count = 0 };
-    const metric = vector_source.?.distance_metric orelse fallback_metric;
+fn cloneVectorEntryAlloc(alloc: Allocator, id: []const u8, vector: []const f32) !vector_segment_mod.Entry {
+    const doc_id = try alloc.dupe(u8, id);
+    errdefer alloc.free(doc_id);
+    return .{ .doc_id = doc_id, .vector = try alloc.dupe(f32, vector) };
+}
+
+pub fn allocVectorEntriesForSourceAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterializedDocument, vector_source: ?search_sources.VectorSourceDescriptor, cancellation: ?maintenance_cancellation.Token) !struct { entries: []vector_segment_mod.Entry, dims: u32 } {
+    if (vector_source == null) return .{ .entries = try alloc.alloc(vector_segment_mod.Entry, 0), .dims = 0 };
     var dims: ?usize = null;
     var count: usize = 0;
     for (docs, 0..) |doc, doc_index| {
@@ -4203,7 +4274,7 @@ fn buildVectorSegmentAlloc(
         }
     }
 
-    if (count == 0) return .{ .payload = null, .vector_count = 0 };
+    if (count == 0) return .{ .entries = try alloc.alloc(vector_segment_mod.Entry, 0), .dims = 0 };
 
     const entries = try alloc.alloc(vector_segment_mod.Entry, count);
     errdefer alloc.free(entries);
@@ -4220,36 +4291,31 @@ fn buildVectorSegmentAlloc(
             .none => continue,
             .chunk_embeddings => |chunk_embeddings| {
                 for (chunk_embeddings) |chunk_embedding| {
-                    entries[initialized] = .{
-                        .doc_id = try alloc.dupe(u8, doc.doc_id),
-                        .vector = try alloc.dupe(f32, chunk_embedding.embedding),
-                    };
+                    entries[initialized] = try cloneVectorEntryAlloc(alloc, doc.doc_id, chunk_embedding.embedding);
                     initialized += 1;
                 }
             },
             .top_level => |embedding| {
-                entries[initialized] = .{
-                    .doc_id = try alloc.dupe(u8, doc.doc_id),
-                    .vector = try alloc.dupe(f32, embedding),
-                };
+                entries[initialized] = try cloneVectorEntryAlloc(alloc, doc.doc_id, embedding);
                 initialized += 1;
             },
         }
     }
 
-    var segment = try vector_index.buildClusteredSegmentWithPolicyAllocUntil(
-        alloc,
-        metric,
-        @intCast(dims.?),
-        entries,
-        policy orelse .{},
-        cancellation,
-    );
-    defer vector_segment_mod.freeSegment(alloc, &segment);
-    return .{
-        .payload = try vector_segment_mod.encodeAlloc(alloc, segment),
-        .vector_count = count,
-    };
+    return .{ .entries = entries, .dims = @intCast(dims.?) };
+}
+
+fn buildVectorSegmentAlloc(alloc: Allocator, fallback_metric: shared_vector.DistanceMetric, docs: []const query_mod.QueryMaterializedDocument, policy: ?vector_index.BuildPolicy, vector_source: ?search_sources.VectorSourceDescriptor, cancellation: ?maintenance_cancellation.Token) !struct { payload: ?[]u8, vector_count: usize } {
+    const projected = try allocVectorEntriesForSourceAlloc(alloc, docs, vector_source, cancellation);
+    const count = projected.entries.len;
+    if (count == 0) {
+        alloc.free(projected.entries);
+        return .{ .payload = null, .vector_count = 0 };
+    }
+    const metric = vector_source.?.distance_metric orelse fallback_metric;
+    var built = try vector_index.buildClusteredSegmentWithPolicyAllocUntil(alloc, metric, projected.dims, projected.entries, policy orelse .{}, cancellation);
+    defer built.deinit(alloc);
+    return .{ .payload = try vector_segment_mod.encodeAlloc(alloc, built), .vector_count = count };
 }
 
 pub fn buildVectorArtifactRefsForMaterializedDocsAlloc(
@@ -4292,6 +4358,26 @@ pub fn buildVectorArtifactRefsForMaterializedDocsAllocUntil(
     published_search_sources: search_sources.PublishedSearchSources,
     cancellation: ?maintenance_cancellation.Token,
 ) ![]manifest_mod.ArtifactRef {
+    return buildVectorArtifactRefsWithContextAllocUntil(alloc, artifacts, current, metric, before_docs, docs, mutations, policy, named_policies, published_search_sources, cancellation, existingProjectionContext(artifacts, current));
+}
+
+pub fn buildVectorArtifactRefsWithContextAllocUntil(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    current: ?manifest_mod.Manifest,
+    metric: shared_vector.DistanceMetric,
+    before_docs: []const query_mod.QueryMaterializedDocument,
+    docs: []const query_mod.QueryMaterializedDocument,
+    mutations: []const query_mod.QueryMaterializerMutation,
+    policy: ?vector_index.BuildPolicy,
+    named_policies: []const NamedVectorBuildPolicy,
+    published_search_sources: search_sources.PublishedSearchSources,
+    cancellation: ?maintenance_cancellation.Token,
+    context: ProjectionBuildContext,
+) ![]manifest_mod.ArtifactRef {
+    // Paged shards own their bounded local clustering policy. Reject explicit
+    // flat-generation tuning rather than silently dropping caller intent.
+    if (context.enabled and (policy != null or named_policies.len != 0)) return error.PagedVectorBuildPolicyUnsupported;
     const vector_sources = try search_sources.listVectorSourcesAlloc(alloc, published_search_sources);
     defer search_sources.freeVectorSourceDescriptors(alloc, vector_sources);
 
@@ -4299,10 +4385,31 @@ pub fn buildVectorArtifactRefsForMaterializedDocsAllocUntil(
     errdefer freeArtifactRefs(alloc, refs.items);
     for (vector_sources) |source| {
         try maintenance_cancellation.check(cancellation);
-        if (current) |manifest| {
+        if (current) |manifest| if (!context.enabled or context.partial) {
             if (!try vectorProjectionChangedForMutationsAlloc(alloc, before_docs, docs, mutations, source)) {
                 if (try appendReusedNamedArtifactRefAlloc(alloc, &refs, manifest, .vector_segment, source.index_name)) continue;
             }
+        };
+        if (context.enabled) {
+            var bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
+            var reads: u64 = 32 * 1024 * 1024;
+            var writes: u64 = 32 * 1024 * 1024;
+            var pages = graph_page_store.PageStore{ .domain = graph_page_store.PageStore.namespaceDomain(context.namespace), .attempt = context.attempt, .artifacts = artifacts, .cancellation = bridge.token(), .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+            const prior_index = if (current != null and context.partial) findNamedArtifactIndex(current.?, .vector_segment, source.index_name) else null;
+            const prior = if (prior_index) |index| current.?.artifacts[index] else null;
+            if (prior != null and prior.?.metadata_version != 2) return error.ProjectionReindexRequired;
+            const ids = try alloc.alloc([]const u8, mutations.len);
+            defer alloc.free(ids);
+            for (mutations, ids) |mutation, *id| id.* = mutation.doc_id;
+            const delta = try allocVectorEntriesForSourceAlloc(alloc, docs, source, cancellation);
+            defer {
+                for (delta.entries) |*entry| entry.deinit(alloc);
+                alloc.free(delta.entries);
+            }
+            const effective_metric = source.distance_metric orelse metric;
+            const fingerprint = try @import("../paged_projection.zig").fingerprint(alloc, .{ .source = source, .metric = effective_metric });
+            try refs.append(alloc, try @import("../vector_segment/paged.zig").publishAlloc(alloc, &pages, prior, delta.entries, ids, source.index_name, fingerprint, effective_metric, cancellation));
+            continue;
         }
         const built = try buildVectorSegmentAlloc(
             alloc,
@@ -5453,7 +5560,7 @@ fn lessGraphAdjacency(_: void, lhs: graph_segment_mod.Adjacency, rhs: graph_segm
     return std.mem.order(u8, lhs.node_id, rhs.node_id) == .lt;
 }
 
-fn allocSparseSegmentAlloc(
+pub fn allocSparseSegmentAlloc(
     alloc: Allocator,
     docs: []const query_mod.QueryMaterializedDocument,
     sparse_source: search_sources.SparseSourceDescriptor,

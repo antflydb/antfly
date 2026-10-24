@@ -16,6 +16,7 @@
 // A single suspended stack per instance. I/O completes exactly once; rewind
 // restores the original computation instead of re-executing writes or queries.
 import { ObjectStoreError } from "./r2.mjs";
+import { validatePutBatch, executePutBatch } from "./batch.mjs";
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 export async function instantiateHost(module, transport, { stackBytes = 1024 * 1024, onTransportError = () => {}, onLog = () => {}, onMetrics = () => {}, clock = Date.now } = {}) {
@@ -31,7 +32,7 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
     return ptr;
   }
   let lastWall = 0, invalidClock = false;
-  function exchange(ptr, len, bodyPtr, bodyLen, replyPtr, handler) {
+  function exchange(ptr, len, bodyPtr, bodyLen, replyPtr, handler, objectOperation = false) {
       if (wasm.asyncify_get_state() === 2) {
         wasm.asyncify_stop_rewind();
         const view = new DataView(wasm.memory.buffer);
@@ -48,13 +49,21 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
       if (pending) throw new Error("overlapping WASM I/O");
       if (activeOptions.signal?.aborted) return 5;
       if (clock() >= activeOptions.deadlineMs) return 9;
-      if (++operations > activeOptions.maxOperations || bodyLen + len > activeOptions.maxTransferBytes - transferred) return 8;
-      transferred += bodyLen + len;
       const request = JSON.parse(decoder.decode(bytes(ptr, len)));
+      const batch = objectOperation && request.op === "put_many";
+      let count = 1;
+      if (batch) { try { count = validatePutBatch(request, bodyLen); } catch { return 3; } }
+      operations += count;
+      if (operations > activeOptions.maxOperations || bodyLen + len > activeOptions.maxTransferBytes - transferred) return 8;
+      transferred += bodyLen + len;
       // The WASM memory may grow while preparing a completion. Do not retain
       // views across the async boundary, including upload bodies.
       const body = bytes(bodyPtr, bodyLen).slice();
-      pending = Promise.resolve().then(() => handler(request, body)).then(
+      const check = () => {
+        if (activeOptions.signal?.aborted) throw new ObjectStoreError(5, "canceled upload batch");
+        if (clock() >= activeOptions.deadlineMs) throw new ObjectStoreError(9, "upload batch deadline");
+      };
+      pending = Promise.resolve().then(() => batch ? executePutBatch(handler, request, body, check) : handler(request, body)).then(
         value => ({ status: 0, value }),
         error => { if (!(error instanceof ObjectStoreError) || error.status >= 6) onTransportError(error, request.op); return { status: error instanceof ObjectStoreError ? error.status : /10058/.test(String(error)) ? 6 : 7, value: {} }; },
       );
@@ -71,7 +80,7 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
       if (invalidClock) return 0n;
       return kind === 0 ? BigInt(Math.floor(performance.now() * 1e6)) : BigInt(wall) * 1000000n;
     },
-    object_call: (ptr, len, bodyPtr, bodyLen, replyPtr) => exchange(ptr, len, bodyPtr, bodyLen, replyPtr, activeTransport),
+    object_call: (ptr, len, bodyPtr, bodyLen, replyPtr) => exchange(ptr, len, bodyPtr, bodyLen, replyPtr, activeTransport, true),
     infer_call: (ptr, len, bodyPtr, bodyLen, replyPtr) => {
       if (wasm.asyncify_get_state() !== 2 && ++inferenceCalls > 8) return 8;
       return exchange(ptr, len, bodyPtr, bodyLen, replyPtr, activeOptions?.inference);

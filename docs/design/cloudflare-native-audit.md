@@ -8,8 +8,8 @@ host integration and workload limits.
 | Capability | Existing native implementation | Hosted integration |
 | --- | --- | --- |
 | Incremental document state | `build/document_facts_builder.zig` updates authenticated facts and pending-work trees; the builder loads touched rows when remaining vector/sparse projections are unchanged. | Used directly, including metadata-only changes. |
-| Search artifact reuse | `build/builder.zig` compares projections and reuses unchanged text, sparse, and vector artifacts. | Used directly. Text replacements now merge projections without reading unrelated bodies; changed vector/sparse projections can still require the complete view. |
-| Publication continuation | Builder publication commits a WAL watermark; subsequent passes resume from it. | Queue dispatch, bounded input prefixes, and adaptive batch admission. This checkpoints between publications, not inside a flat-index rebuild. |
+| Search artifact reuse | `build/builder.zig` compares projections and reuses unchanged text, sparse, and vector artifacts. | Used directly. Opt-in paged text/vector/sparse roots replace touched projections without reading unrelated bodies. Flat generations retain their legacy full-view boundary until migrated. |
+| Publication continuation | Builder publication commits a WAL watermark; subsequent passes resume from it. | Queue dispatch, bounded input prefixes, and adaptive batch admission. Ordinary updates checkpoint between publications; the hosted reindex job checkpoints a frozen scan and WAL catchup separately. |
 | Compaction | `build/compactor.zig` rebuilds the pinned published view, preserves document facts, reuses artifacts, fences publication, and handles retry/no-op. | Now exposed as `compact` and an optional scheduled Queue job, using host I/O and bounded preflight admission. It preserves the publication's graph families. |
 | Enrichment continuation | `enrichment/worker.zig` scans indexed pending work under a finite cycle and persists CAS-protected stage progress. Source pinning and conditional WAL append reject stale model results. | Used directly. The embedding adapter now splits a document into dimension-bounded provider windows. Only a complete document is appended. |
 | Retention and collection | Native read pins, work leases, retirement floors, manifest formats, and page validators define authority and reachability. | The durable hosted collector orchestrates these native rules over R2 and coordinated metadata. |
@@ -64,9 +64,10 @@ failures. This is a local characterization tool; in-memory fixture storage is
 outside the measured WASM budget. It does not measure Cloudflare latency, total
 isolate memory, or production throughput.
 
-The remaining build boundaries are large vector/sparse rebuilds, bulk index
-migrations and definition changes, plus production capacity/failure
-qualification. Paged text avoids whole-index rebuilds for ordinary WAL updates;
+The remaining build boundaries include definition changes and graph/external
+base migrations, plus production capacity, ANN recall and failure qualification.
+The opt-in paged projection and resumable reindex paths are described below.
+Paged text avoids whole-index rebuilds for ordinary WAL updates;
 embedding checkpoints avoid restarting all completed model windows. Joining
 separate mailbox state into ranked search remains an application/query
 extension. These changes reuse native persistence rather than replacing it.
@@ -256,3 +257,72 @@ Both Binaryen 132 packaging paths were checked. Persisted workerd validation
 covers paged reopen, model-window resume, scratch expiry, the 2,048-body mark
 frontier, and retryable SQLite-pressure responses. License headers, Apache
 product boundaries, and formatting checks passed.
+
+
+## Paged projections, resumable reindex and transport batches
+
+The hosted profile now supports opt-in `PAGED_PROJECTIONS=true`. Sparse indexes
+use native copy-on-write document and term/document trees. Dense indexes use
+bounded hash-prefix projection shards and the existing native clustering and
+quantized vector codec, with routing records and independently authenticated
+cluster payloads. Hash sharding changes clustering topology: score parity under
+exhaustive routing and self-neighbor checks do not establish ANN recall for
+production embedding distributions. Centroid routing remains a scan bounded by
+the original request budgets.
+
+The native reindex job scans a frozen document-facts source and checkpoints its
+partial paged roots. It then catches up through accepted WAL prefixes and uses
+the existing fenced manifest/HEAD publication. The collector lowers its proposed
+retirement floor to the active source and traces checkpoint roots, so GC between
+steps cannot reclaim the job's input or output. The small progress-pointer CAS
+compares the live HEAD ETag in the same coordinator transaction; providers that
+cannot perform a guarded write reject this capability. Job expiration, stale
+messages, cancellation, failed checkpoints and ambiguous HEAD responses preserve
+the last durable outcome. Lineage acknowledgement is paginated independently of
+corpus size. Definition changes, graph families and external bases fail closed.
+
+Body, page and cluster uploads now use the existing object host ABI's bounded
+batch operation: at most eight immutable objects, four uploads in flight,
+original per-object and aggregate byte admission, and joined in-flight writes
+on failure. This does not parallelize mutable authority updates.
+
+A local native WASM/R2 contract run using 384-dimensional deterministic vectors
+and sparse projections passed ingestion, cold text/vector/sparse queries, edits,
+deletes and no-rebuild compaction at both 1,000 and 10,000 rows. The 10,000-row
+publication peak was 4,086,747 B of tracked native working memory and 15,597,568 B
+of linear memory. The cold point-update stage read 1,166,563 B in total; the
+largest publication used 780 object operations. Fixture storage and total isolate
+memory are outside these measurements. This run used 16-record publication
+prefixes (input mutation batches selected to fit the JSON request limit).
+
+Reports remain ignored under `examples/cloudflare-serverless/dist/qualification/`.
+The benchmark accepts `--paged-projections --dimensions=384`, `--reindex` for a
+cold-resumed rebuild, and `--recall-queries=N` to report approximate recall@10
+against a brute-force cosine reference at explicit probe counts. Recall results
+are measurements, not assertions of a universal quality target.
+
+## Extended SQLite investigation
+
+The original live error remains unreproduced. The new lightweight qualification
+Worker runs the actual journal against SQLite, holding the actor warm and
+repeating mark/cleanup cycles. It deliberately excludes native WASM, R2 and
+inference. Legacy mode skips mutation-cursor exhaustion; drained mode exhausts
+every cursor. The live 32-cycle run completed 670,080 statements and 131,072
+body marks per mode (1,340,160 statements total). Legacy mode left 404,736
+mutation cursors undrained. Both modes completed with a peak database size of
+6,688,768 B and no `SQLITE_NOMEM`. Database size does not measure native or total
+isolate memory, and sequential A/B timing is not a controlled performance result.
+
+The ignored evidence is
+`antfly-1278-mvmnbmzg-f1070a/soak-mvmrl0c2-889302-report.json`; the lightweight
+Worker version was `2792c1a7-fe00-48f8-aa23-4eb680bacaf1`. The synthetic actor
+state was drained and the disposable Worker was deleted after qualification.
+
+[workerd's SQL cursor implementation](https://github.com/cloudflare/workerd/blob/main/src/workerd/api/sql.c%2B%2B)
+retains query state until exhaustion or cursor destruction, so draining ignored
+mutation cursors is a justified lifecycle fix.
+[workerd's SQLite wrapper](https://github.com/cloudflare/workerd/blob/main/src/workerd/util/sqlite.c%2B%2B)
+also has database/process memory admission. Neither fact identifies the cause of
+the earlier production-host error. Keep cursor draining, bounded frontier work,
+retryable 503 responses and the new non-writing pressure diagnostics; collect
+those diagnostics if the error recurs under combined application load.

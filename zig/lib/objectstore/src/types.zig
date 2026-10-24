@@ -139,6 +139,9 @@ pub const VersionRetention = struct {
 };
 
 pub const PutOptions = struct {
+    /// Atomically compare another coordination key with this write. Providers
+    /// without a transactional namespace must reject this capability.
+    guard: ?struct { key: []const u8, etag: []const u8 } = null,
     content_type: ?[]const u8 = null,
     if_match_etag: ?[]const u8 = null,
     if_none_match: bool = false,
@@ -241,6 +244,13 @@ pub const ListObjectVersionsOptions = struct {
 pub const ByteRange = struct {
     offset: u64,
     length: ?u64 = null,
+};
+
+/// Independent writes; a failed batch may leave successful uploads behind.
+pub const PutObjectRequest = struct {
+    key: []const u8,
+    body: []const u8,
+    options: PutOptions = .{},
 };
 
 pub const PutResult = struct {

@@ -209,7 +209,7 @@ do not download historical payloads. The warm cache stores copied immutable
 bytes and plain metadata; it never retains request-owned R2/DO handles or caches
 mutable HEAD/progress records.
 
-## Larger text workloads
+## Larger indexed workloads
 
 Set `PAGED_TEXT="true"` to publish text indexes as authenticated copy-on-write
 trees, reusing the native page tree, document facts, publication fencing, and
@@ -223,18 +223,73 @@ Paged text uses text artifact metadata version 2. Deploy compatible readers
 and collectors before enabling it. The setting is sticky in subsequent WAL
 publications once a paged root exists; disabling the variable does not downgrade
 existing roots. A small flat index can migrate during publication. Migrating a
-large existing flat index still requires one admitted conversion. Definition
-changes and mixed vector/sparse workloads can still require full-view builds.
+large existing flat index can use the resumable reindex job below. Definition
+changes can still require full-view builds.
 Old ranked cursors retain their original generation and remain readable until
 normal retention expires. Collection traces both document and posting trees.
 
-For text-only paged generations, `compact` validates roots and returns a no-op;
+For fully paged text/vector/sparse generations, `compact` validates roots and
+returns a no-op;
 publication has already updated the serving trees. It does not assemble a
 full-corpus body snapshot. Common-term queries still scan matching postings and
-retain ranked candidates under request budgets; paged storage is not an
-unbounded-query guarantee. Changed vector/sparse indexes, full-corpus reindex,
-application joins, and production concurrency qualification remain separate
-work. See [capacity observations](../../docs/design/cloudflare-native-audit.md).
+retain document scores under request budgets; final ranking retains only the
+requested offset plus limit. Paged storage remains subject to request budgets.
+Application joins and production concurrency qualification remain separate work.
+See [capacity observations](../../docs/design/cloudflare-native-audit.md).
+
+Set `PAGED_PROJECTIONS="true"` to enable page-based dense and sparse indexes
+and paged text together. Sparse changes replace only touched document/term
+paths. Dense changes rebuild bounded hash-prefix shards (1 MiB of raw
+projections or 1,024 entries) using the native clustering, quantization and
+reranking implementation. Routing centroids and cluster payloads are separate
+immutable objects; queries fetch selected payloads. Repeated chunks for the
+same document retain their native best-score behavior. These roots also use
+artifact metadata version 2, require compatible readers and collectors, and
+remain sticky after the environment setting is removed.
+
+Hash sharding changes clustering topology. Qualify ANN recall and latency for
+your embedding distribution and `num_probes`/`search_effort` settings. Centroid
+routing still scans the routing tree, common sparse terms retain accumulated
+scores, and existing operation/transfer/working-memory limits apply. This does
+not establish a production capacity or recall target. Explicit flat-generation
+clustering policies are rejected in paged mode.
+
+Immutable uploads use batches of at most eight objects with at most four host
+uploads in flight. Every object and byte is charged to the original request
+budgets; failures join started uploads before returning. HEAD and progress
+writes retain their existing transactional authority.
+
+## Resumable bulk reindex
+
+For an existing native document-facts generation, start a rebuild with:
+
+```json
+{"op":"reindex","reindex_action":"start"}
+```
+
+The result contains a `job_id`. Maintenance Queue messages drive bounded steps;
+cron also recovers a checkpoint whose Queue enqueue failed. Without a Queue,
+call steps explicitly using `reindex_action: "step"` and `reindex_job_id`.
+Use `reindex_action: "status"` to inspect the active job, or `"cancel"` with its
+job ID to cancel it. Duplicate/stale steps and cancellation cannot create or
+cancel a successor job. A start during an active job returns that job.
+
+The job scans a frozen facts generation, hydrates at most 4 MiB of input bodies
+per pass, and builds fully paged text/vector/sparse roots. It catches up through
+bounded WAL prefixes while ordinary writes and publications continue, then
+publishes with the native lease/fenced HEAD CAS. A lost HEAD response is
+acknowledged by walking publication lineage in bounded pages. Immutable
+checkpoints and their pointers remain valid across Worker eviction. Progress
+pointer CAS also compares the live HEAD ETag in the same coordinator SQL
+transaction, so a stale worker cannot install a checkpoint after takeover.
+
+Collection retains the source generation, unfinished roots and required WAL.
+An inactive checkpoint expires after ten minutes; expired/stale Queue messages
+finish without resurrecting it, and an explicit new start rebuilds from the
+current source. The API rebuilds the current definition; changing definitions,
+external bases and graph rebuilds are outside this hosted job's capability.
+`PUBLICATION_RECORDS` also bounds reindex input (maximum 64); resource failures
+lower the durable admission budget.
 
 ## Collection and format upgrade
 
@@ -390,3 +445,18 @@ cache charge, and per-lane/combined WASM linear-memory size. Linear memory is
 an instance high watermark and may stay large after allocations are freed.
 These logs exclude document bodies, API tokens, and model inputs. Metrics
 observer failures do not change a durable write's outcome.
+
+## SQLite pressure qualification
+
+The earlier live collector `SQLITE_NOMEM` recovered after deployment replacement.
+Cursor draining and retryable HTTP 503 responses remain in place. Coordinator
+failures now emit `antfly.sqlite.pressure` with the operation, phase and
+best-effort database size; database size is not a memory measurement.
+
+`node qualification/sqlite-soak.mjs --local --rounds=32` compares intentionally
+undrained legacy mutation cursors with drained cursors in a warm SQLite Durable
+Object. The disposable live variant accepts a run manifest and its HTTPS origin.
+A 32-cycle live run executed 1,340,160 statements across both modes without
+reproducing the error. This isolates SQLite journal work from WASM, R2 and model
+heap pressure; the original error's cause remains unconfirmed. See the
+[native audit](../../docs/design/cloudflare-native-audit.md) for the evidence.
