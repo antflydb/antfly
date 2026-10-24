@@ -120,11 +120,27 @@ fn producerDefinitions(hash: *Hash, alloc: std.mem.Allocator, enrichments: []con
         defer parsed.deinit();
         // Reader envelopes fence physical representations; the logical
         // producer identity still binds every resolver definition below.
-        const rows = if (std.mem.eql(u8, family, "resolvers"))
+        var projection_arena = std.heap.ArenaAllocator.init(alloc);
+        defer projection_arena.deinit();
+        const raw_rows = if (std.mem.eql(u8, family, "resolvers"))
             @import("../catalog/resolver_catalog.zig").catalogRows(parsed.value) catch return error.InvalidArtifactCatalogCommand
         else
             parsed.value;
+        const rows = try std.json.parseFromSliceLeaky(std.json.Value, projection_arena.allocator(), try std.json.Stringify.valueAlloc(projection_arena.allocator(), raw_rows, .{}), .{});
         if (rows != .array) return error.InvalidArtifactCatalogCommand;
+        const dictionary = if (parsed.value == .object) parsed.value.object.get("projections") else null;
+        if (dictionary) |projections| for (rows.array.items) |*row| {
+            const reference = row.object.get("projection_ref") orelse continue;
+            if (reference != .string or projections != .object) return error.InvalidArtifactCatalogCommand;
+            const projection = projections.object.get(reference.string) orelse return error.InvalidArtifactCatalogCommand;
+            // Work on an arena-owned copy; physical dictionary references are
+            // not part of the logical producer contract.
+            row.* = try std.json.parseFromSliceLeaky(std.json.Value, projection_arena.allocator(), try std.json.Stringify.valueAlloc(projection_arena.allocator(), row.*, .{}), .{});
+            _ = row.object.swapRemove("projection_ref");
+            const curation = projection.object.get("curation_json") orelse return error.InvalidArtifactCatalogCommand;
+            if (curation != .string) return error.InvalidArtifactCatalogCommand;
+            if (curation.string.len != 0) try row.object.put(projection_arena.allocator(), "curation_json", curation);
+        };
         if (rows.array.items.len == 0) continue; // Preserve main/v14 empty-family identity.
         const Entry = struct { name: []const u8, value: std.json.Value };
         const entries = try alloc.alloc(Entry, rows.array.items.len);
@@ -190,4 +206,17 @@ test "ordered artifact inventory semantic producer catalogs accept versioned res
     try std.testing.expectError(error.InvalidArtifactCatalogCommand, digest(a, "", "{\"version\":4,\"enrichments\":[]}", "[]"));
     const changed = try digest(a, "", "", "{\"version\":4,\"resolvers\":[{\"name\":\"resolver\",\"config_generation\":2}]}");
     try std.testing.expect(!std.mem.eql(u8, &legacy, &changed));
+}
+
+test "resolver catalog native snapshot references preserve logical producer identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const catalog = @import("../catalog/resolver_catalog.zig");
+    const cfg: catalog.ResolverConfig = .{ .name = "concepts", .table = "entities", .key_template = "{{_key}}", .source_artifact = "kg", .resolution_artifact = "resolved", .curation_json = "{\"suppress\":{\"keys\":[\"noise\"]}}", .namespace_curation_table_id = 7, .namespace_curation_generation = 1, .curation_revision = 1 };
+    const expanded = try std.json.Stringify.valueAlloc(a, &[_]catalog.ResolverConfig{cfg}, .{});
+    const compact = try catalog.serializeCatalog(a, &.{cfg});
+    const left = try digest(a, "", "", expanded);
+    const right = try digest(a, "", "", compact);
+    try std.testing.expectEqualSlices(u8, &left, &right);
 }

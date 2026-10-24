@@ -5123,7 +5123,7 @@ pub fn parseStorageKernelSearchResult(alloc: std.mem.Allocator, body: []const u8
 /// Decode private sources only for an admitted internal request. Both HTTP
 /// workers and compiled storage owners serialize the same authority envelope.
 pub fn restoreDocumentAuthority(alloc: std.mem.Allocator, scratch: std.mem.Allocator, group_id: u64, mode: db_mod.types.document_authority.Mode, result: *db_mod.types.SearchResult) !void {
-    if (mode == .none) return;
+    if (mode == .none or mode == .lookup) return;
     if (result.document_authority_version != 1) return error.StorageReadTemporarilyUnavailable;
     for (result.hits) |*hit| {
         if (hit.document_authority != null) return error.InvalidRemoteResponse;

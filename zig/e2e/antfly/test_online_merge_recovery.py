@@ -769,6 +769,7 @@ def faulted_merge_cluster(owner_link_fault, three_by_three_backup_cluster):
         ("snapshot", "owner"),
         ("finalize", "owner"),
         ("release", "coordinator"),
+        ("release", "donor_restart"),
         ("snapshot", "raft_quorum"),
         ("snapshot", "status_latency"),
         ("release", "reply_loss"),
@@ -922,6 +923,25 @@ def test_online_merge_recovers_after_owner_link_outage_and_crash(
                     cluster, session, table_name, tail
                 )
             documents.update(tail)
+        if crash == "donor_restart":
+            # Every source owner becomes cold after its serving range has
+            # retired. Recovery must prepare it from lifecycle authority;
+            # cached handles on another replica cannot hide the missing route.
+            for process in cluster.data_procs:
+                process.kill()
+            for process in cluster.data_procs:
+                process.wait(timeout=10)
+            fault.clear_observed()
+            try:
+                for index in range(len(cluster.data_procs)):
+                    cluster.restart_crashed_node(metadata=False, index=index)
+                assert wait_until(fault.observed, timeout_s=60, interval_s=0.1), (
+                    "cold donor never resumed release",
+                    cluster.debug_logs(),
+                )
+            finally:
+                fault.heal()
+            return online
         if crash == "status_latency":
             fault.status_delay_s = 1.1
             fault.heal()

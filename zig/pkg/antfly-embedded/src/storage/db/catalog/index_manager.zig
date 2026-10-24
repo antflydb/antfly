@@ -1443,6 +1443,8 @@ pub const IndexManager = struct {
     vector_block_projection_dirty: std.atomic.Value(bool) = .init(false),
     vector_block_candidate_sequence: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
     vector_block_candidate_since_ns: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
+    resolver_namespace_lookup: ?ResolverNamespaceLookup = null,
+    test_resolver_catalog_publications: u64 = 0,
     catalog_mutex: WriterPreferringRwLock = .{},
     /// Serialize local receipt counter preparation through its physical commit.
     /// Acquire after primary/graph/index guards; never acquire an index guard
@@ -7134,6 +7136,7 @@ pub const IndexManager = struct {
         self.graph_indexes.deinit(self.alloc);
         self.algebraic_indexes.deinit(self.alloc);
         self.enrichments.deinit(self.alloc);
+        self.invalidateResolverNamespaceLookup();
         self.resolvers.deinit(self.alloc);
         self.retired_resolvers.deinit(self.alloc);
         if (self.owned_vector_block_storage) |storage| {
@@ -12852,6 +12855,8 @@ pub const IndexManager = struct {
     fn resolverMaterialConfigChanged(existing: resolver_catalog.ResolverConfig, next: resolver_catalog.ResolverConfig) bool {
         return existing.promote != next.promote or
             existing.namespace_curation_generation != next.namespace_curation_generation or
+            existing.namespace_curation_table_id != next.namespace_curation_table_id or
+            existing.namespace_curation_missing != next.namespace_curation_missing or
             !resolver_catalog.ResolverConfig.aliasesEqual(existing.merges, next.merges) or
             !resolver_catalog.ResolverConfig.aliasesEqual(existing.aliases, next.aliases) or
             !std.mem.eql(u8, existing.table, next.table) or
@@ -12899,6 +12904,62 @@ pub const IndexManager = struct {
         if (method == .string and std.mem.eql(u8, method.string, "generated") and policy == .string and std.mem.eql(u8, policy.string, "verdict_only")) return error.InvalidResolverConfig;
     }
 
+    /// Import immutable policy once into this owner's allocator. Transient
+    /// metadata arenas never lend their lifetime to persistent catalog slots.
+    const ResolverSlot = struct { retired: bool, index: usize };
+    const ResolverNamespaceLookup = struct { arena: std.heap.ArenaAllocator, slots: std.StringHashMapUnmanaged(std.ArrayList(ResolverSlot)) };
+    fn invalidateResolverNamespaceLookup(self: *IndexManager) void {
+        if (self.resolver_namespace_lookup) |*lookup| lookup.arena.deinit();
+        self.resolver_namespace_lookup = null;
+    }
+    fn resolverNamespaceSlots(self: *IndexManager, table: []const u8, template: []const u8) ![]const ResolverSlot {
+        if (self.resolver_namespace_lookup == null) {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            errdefer arena.deinit();
+            const a = arena.allocator();
+            var slots: std.StringHashMapUnmanaged(std.ArrayList(ResolverSlot)) = .empty;
+            for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }, 0..) |definitions, retired| for (definitions, 0..) |cfg, index| {
+                if (std.mem.startsWith(u8, cfg.name, "__antfly_replacement/")) continue;
+                const identity = try std.json.Stringify.valueAlloc(a, .{ cfg.table, cfg.key_template }, .{});
+                const entry = try slots.getOrPut(a, identity);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(a, .{ .retired = retired != 0, .index = index });
+            };
+            self.resolver_namespace_lookup = .{ .arena = arena, .slots = slots };
+        }
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const identity = try std.json.Stringify.valueAlloc(scratch.allocator(), .{ table, template }, .{});
+        return if (self.resolver_namespace_lookup.?.slots.get(identity)) |slots| slots.items else &.{};
+    }
+    pub fn resolverNamespaceObservation(self: *IndexManager, a: Allocator, table: []const u8, template: []const u8) !?resolver_catalog.ResolverObservation {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const slots = try self.resolverNamespaceSlots(table, template);
+        if (slots.len == 0) return null;
+        // Prefer an already bound definition when a new consumer joined late.
+        var selected = slots[0];
+        for (slots) |slot| if ((if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index]).namespace_curation_table_id != 0) {
+            selected = slot;
+            break;
+        };
+        return try resolver_catalog.ResolverObservation.fromConfig(a, if (selected.retired) self.retired_resolvers.items[selected.index] else self.resolvers.items[selected.index]);
+    }
+    fn cloneResolverOwned(self: *IndexManager, cfg: ResolverConfig) !ResolverConfig {
+        if (cfg.shared_projection) |incoming| {
+            if (cfg.merges.ptr == incoming.merges.ptr and cfg.merges.len == incoming.merges.len and cfg.curation_json.ptr == incoming.curation_json.ptr and cfg.curation_json.len == incoming.curation_json.len) {
+                if (incoming.alloc.ptr == self.alloc.ptr and incoming.alloc.vtable == self.alloc.vtable) return ResolverConfig.cloneWithProjection(self.alloc, cfg, incoming);
+                for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }) |definitions| for (definitions) |entry| if (entry.shared_projection) |owned| {
+                    if (std.mem.eql(u8, &owned.digest, &incoming.digest)) return ResolverConfig.cloneWithProjection(self.alloc, cfg, owned);
+                };
+                const owned = try resolver_catalog.SharedProjection.create(self.alloc, incoming.merges, incoming.curation_json);
+                defer owned.release();
+                return ResolverConfig.cloneWithProjection(self.alloc, cfg, owned);
+            }
+        }
+        return ResolverConfig.clone(self.alloc, cfg);
+    }
+
     pub fn addResolver(self: *IndexManager, store: anytype, input_cfg: resolver_catalog.ResolverConfig) !void {
         var cfg = input_cfg;
         cfg.inline_managed = false;
@@ -12917,7 +12978,7 @@ pub const IndexManager = struct {
 
         const checkpoint = self.resolvers.items.len;
         errdefer self.truncateResolvers(checkpoint);
-        try self.resolvers.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
+        try self.resolvers.append(self.alloc, try self.cloneResolverOwned(cfg));
         try self.persistResolverCatalog(store, .mark_reresolve_dirty);
     }
 
@@ -12927,6 +12988,21 @@ pub const IndexManager = struct {
     /// their incremental replay hints will not fire on their own.
     pub fn upsertResolver(self: *IndexManager, store: anytype, input_cfg: resolver_catalog.ResolverConfig) !ResolverUpsertResult {
         return self.upsertResolverWithNamespaceMigration(store, input_cfg, false);
+    }
+
+    fn retainNativeProjection(cfg: *ResolverConfig, previous: ResolverConfig, migrate: bool) !void {
+        if (migrate or previous.namespace_curation_table_id == 0 or cfg.namespace_curation_table_id != 0) return;
+        if (!std.mem.eql(u8, cfg.table, previous.table) or !std.mem.eql(u8, cfg.key_template, previous.key_template)) return error.ResolverMergeNamespaceChange;
+        cfg.namespace_curation_table_id = previous.namespace_curation_table_id;
+        cfg.namespace_curation_generation = previous.namespace_curation_generation;
+        cfg.namespace_curation_missing = previous.namespace_curation_missing;
+        cfg.curation_revision = previous.curation_revision;
+        cfg.curation_json = previous.curation_json;
+        cfg.merges = previous.merges;
+        cfg.merge_generation = previous.merge_generation;
+        cfg.merge_state_version = previous.merge_state_version;
+        cfg.shared_projection = previous.shared_projection;
+        cfg.validation_proof = previous.validation_proof;
     }
 
     pub fn upsertResolverWithNamespaceMigration(self: *IndexManager, store: anytype, input_cfg: resolver_catalog.ResolverConfig, migrate_namespace: bool) !ResolverUpsertResult {
@@ -12941,13 +13017,15 @@ pub const IndexManager = struct {
         if (cfg.retired) {
             for (self.retired_resolvers.items) |*entry| {
                 if (!std.mem.eql(u8, entry.name, cfg.name)) continue;
-                if (cfg.curation_revision < entry.curation_revision) return error.ResolverCurationConflict;
+                try retainNativeProjection(&cfg, entry.*, migrate_namespace);
+                try cfg.rebaseNativeProjection(entry.*);
+                if (cfg.namespace_curation_table_id == 0 and cfg.curation_revision < entry.curation_revision) return error.ResolverCurationConflict;
                 if (!migrate_namespace and (!std.mem.eql(u8, cfg.table, entry.table) or !std.mem.eql(u8, cfg.key_template, entry.key_template))) return error.ResolverMergeNamespaceChange;
                 cfg.namespace_generation = if (migrate_namespace) @max(input_cfg.namespace_generation, try std.math.add(u64, entry.namespace_generation, 1)) else entry.namespace_generation;
                 cfg.resolution_generation = try std.math.add(u64, entry.effectiveGeneration(), 1);
                 try cfg.validate();
                 var previous = entry.*;
-                entry.* = try ResolverConfig.clone(self.alloc, cfg);
+                entry.* = try self.cloneResolverOwned(cfg);
                 self.persistResolverCatalog(store, .catalog_only) catch |err| {
                     entry.deinit(self.alloc);
                     entry.* = previous;
@@ -12981,7 +13059,9 @@ pub const IndexManager = struct {
             if (entry.inline_managed == false) cfg.inline_managed = false;
             if (cfg.inline_managed == null) cfg.inline_managed = entry.inline_managed;
             if (cfg.inline_managed == true and cfg.aliases.len == 0 and !migrate_namespace) cfg.aliases = entry.aliases;
-            if (cfg.merge_generation == 0 and cfg.curation_revision <= entry.curation_revision and !migrate_namespace) {
+            try retainNativeProjection(&cfg, entry.*, migrate_namespace);
+            try cfg.rebaseNativeProjection(entry.*);
+            if (cfg.namespace_curation_table_id == 0 and cfg.merge_generation == 0 and cfg.curation_revision <= entry.curation_revision and !migrate_namespace) {
                 cfg.merges = entry.merges;
                 if (cfg.curation_revision == 0) {
                     cfg.curation_json = entry.curation_json;
@@ -12990,8 +13070,8 @@ pub const IndexManager = struct {
                 cfg.merge_generation = entry.merge_generation;
                 cfg.merge_state_version = entry.merge_state_version;
             }
-            if (cfg.curation_revision < entry.curation_revision) return error.ResolverCurationConflict;
-            if (cfg.curation_revision == entry.curation_revision and !std.mem.eql(u8, cfg.curation_json, entry.curation_json))
+            if (cfg.namespace_curation_table_id == 0 and cfg.curation_revision < entry.curation_revision) return error.ResolverCurationConflict;
+            if (cfg.namespace_curation_table_id == 0 and cfg.curation_revision == entry.curation_revision and !std.mem.eql(u8, cfg.curation_json, entry.curation_json))
                 return error.ResolverCurationConflict;
             cfg.resolution_generation = entry.resolution_generation;
             cfg.namespace_generation = entry.namespace_generation;
@@ -13030,7 +13110,7 @@ pub const IndexManager = struct {
             if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, cfg.name)) return error.ResolverArtifactAlreadyExists;
             if (self.resolverLabelRoutingConflicts(cfg)) return error.ResolverLabelRoutingConflict;
             var previous = entry.*;
-            entry.* = try resolver_catalog.ResolverConfig.clone(self.alloc, cfg);
+            entry.* = try self.cloneResolverOwned(cfg);
             self.persistResolverCatalog(store, if (material_changed or reactivating) .mark_reresolve_dirty else .catalog_only) catch |err| {
                 entry.deinit(self.alloc);
                 entry.* = previous;
@@ -13044,7 +13124,7 @@ pub const IndexManager = struct {
         if (cfg.inline_managed == null) cfg.inline_managed = false;
         const checkpoint = self.resolvers.items.len;
         errdefer self.truncateResolvers(checkpoint);
-        try self.resolvers.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
+        try self.resolvers.append(self.alloc, try self.cloneResolverOwned(cfg));
         try self.persistResolverCatalog(store, .mark_reresolve_dirty);
         return .inserted;
     }
@@ -13078,6 +13158,107 @@ pub const IndexManager = struct {
         return false;
     }
 
+    /// One namespace snapshot, one durable catalog publication, regardless of
+    /// the number of serving/retired consumers in this owner.
+    pub fn completeResolverProjectionWork(self: *IndexManager, store: anytype, key: []const u8) !void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+        var txn = try runtime_store.store.beginWrite();
+        errdefer txn.abort();
+        try txn.delete(key);
+        try txn.put(@import("../../lite/resolver_consumers.zig").cursor_key, key);
+        try txn.commit();
+    }
+
+    pub fn publishResolverNamespaceProjection(self: *IndexManager, store: anytype, table: []const u8, table_id: u64, namespace: @import("../resolver_namespace.zig").Namespace) !bool {
+        return self.publishResolverNamespaceProjectionWork(store, table, table_id, namespace, null);
+    }
+    pub fn publishResolverNamespaceProjectionWork(self: *IndexManager, store: anytype, table: []const u8, table_id: u64, namespace: @import("../resolver_namespace.zig").Namespace, completion: ?@import("../../lite/resolver_consumers.zig").Completion) !bool {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const state = try std.json.Stringify.valueAlloc(arena.allocator(), namespace.state, .{});
+        const projection = try resolver_catalog.SharedProjection.create(self.alloc, namespace.merges, state);
+        defer projection.release();
+        var validated_profiles: std.StringHashMapUnmanaged(void) = .empty;
+        const Change = struct { slot: *ResolverConfig, before: ResolverConfig, after: ResolverConfig };
+        var changes: std.ArrayList(Change) = .empty;
+        defer changes.deinit(self.alloc);
+        var published = false;
+        defer for (changes.items) |*change| {
+            if (published) {
+                change.before.deinit(self.alloc);
+            } else {
+                change.slot.* = change.before;
+                change.after.deinit(self.alloc);
+            }
+        };
+        for (try self.resolverNamespaceSlots(table, namespace.key_template)) |slot| {
+            const entry = if (slot.retired) &self.retired_resolvers.items[slot.index] else &self.resolvers.items[slot.index];
+            try self.requireResolverNotReplacing(entry.name);
+            if (entry.namespace_curation_table_id == table_id and entry.namespace_curation_generation == namespace.revision and entry.namespace_curation_missing == !namespace.record_store) continue;
+            var next = entry.*;
+            next.merges = namespace.merges;
+            next.curation_json = state;
+            next.namespace_curation_table_id = table_id;
+            next.namespace_curation_generation = namespace.revision;
+            next.namespace_curation_missing = !namespace.record_store;
+            try next.rebaseNativeProjection(entry.*);
+            next.resolution_generation = try std.math.add(u64, entry.effectiveGeneration(), 1);
+            next.merge_generation = if (next.merges.len == 0) 0 else next.resolution_generation;
+            next.merge_state_version = if (next.merges.len == 0) 2 else 1;
+            // Execution fields are unchanged from an admitted config. Validate
+            // a shared policy once per distinct static policy profile.
+            const profile = try std.json.Stringify.valueAlloc(arena.allocator(), .{ next.aliases, next.suppress_json }, .{});
+            if (!(try validated_profiles.getOrPut(arena.allocator(), profile)).found_existing) try next.validate();
+            try changes.ensureUnusedCapacity(self.alloc, 1);
+            const owned = try ResolverConfig.cloneWithProjection(self.alloc, next, projection);
+            changes.appendAssumeCapacity(.{ .slot = entry, .before = entry.*, .after = owned });
+        }
+        if (changes.items.len == 0) {
+            if (completion) |work| {
+                var runtime_store = try initRuntimeStore(self.alloc, store);
+                defer runtime_store.deinit();
+                var txn = try runtime_store.store.beginWrite();
+                errdefer txn.abort();
+                try txn.delete(work.key);
+                try txn.put(@import("../../lite/resolver_consumers.zig").cursor_key, work.key);
+                try txn.commit();
+            }
+            return false;
+        }
+        for (changes.items) |change| change.slot.* = change.after;
+        const durable = @import("../resolver_projection.zig");
+        const slots = try self.resolverNamespaceSlots(table, namespace.key_template);
+        const bindings = try arena.allocator().alloc(durable.Binding, slots.len);
+        for (slots, bindings) |slot, *binding| {
+            const cfg = if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index];
+            binding.* = .{ .name = cfg.name, .retired = cfg.retired, .resolution_generation = cfg.resolution_generation, .merge_generation = cfg.merge_generation, .merge_state_version = cfg.merge_state_version };
+        }
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+        var txn = try runtime_store.store.beginWrite();
+        errdefer txn.abort();
+        try txn.put(try durable.key(arena.allocator(), table, namespace.key_template), try std.json.Stringify.valueAlloc(arena.allocator(), durable.Record{ .table = table, .table_id = table_id, .namespace = namespace, .bindings = bindings }, .{}));
+        const epoch = if (txn.get(durable.epoch_key)) |raw| try std.fmt.parseInt(u64, raw, 10) else |err| if (err == error.NotFound) @as(u64, 0) else return err;
+        try txn.put(durable.epoch_key, try std.fmt.allocPrint(arena.allocator(), "{d}", .{try std.math.add(u64, epoch, 1)}));
+        try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(resolver_catalog.resolver_projection_delta_reader_version));
+        try txn.put(resolver_catalog.reresolve_resume_key, "");
+        try txn.put(resolver_catalog.reresolve_repair_resume_key, "");
+        if (completion) |work| {
+            try txn.delete(work.key);
+            try txn.put(@import("../../lite/resolver_consumers.zig").cursor_key, work.key);
+        }
+        try txn.commit();
+        self.minimum_reader_version.store(resolver_catalog.resolver_projection_delta_reader_version, .release);
+        self.invalidateWritePlanSnapshot();
+        published = true;
+        return true;
+    }
+
     pub fn listResolverIdentities(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
@@ -13094,6 +13275,66 @@ pub const IndexManager = struct {
             result.appendAssumeCapacity(try ResolverConfig.clone(alloc, cfg));
         }
         return result.toOwnedSlice(alloc);
+    }
+
+    /// Admission needs static policy and generation identities, never a copy of
+    /// every destination-owned correction or its receipts.
+    pub fn listResolverStaticDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const definitions = try self.resolverDefinitionsAlloc(alloc);
+        defer alloc.free(definitions);
+        var result: std.ArrayList(ResolverConfig) = .empty;
+        errdefer {
+            for (result.items) |*cfg| cfg.deinit(alloc);
+            result.deinit(alloc);
+        }
+        for (definitions) |definition| {
+            if (std.mem.startsWith(u8, definition.name, "__antfly_replacement/")) continue;
+            var cfg = definition;
+            cfg.merges = &.{};
+            cfg.curation_json = "{}";
+            try result.append(alloc, try ResolverConfig.clone(alloc, cfg));
+        }
+        return result.toOwnedSlice(alloc);
+    }
+
+    /// One catalog pass for a batch of replay observations. Policy, providers,
+    /// aliases and extraction config never enter a wait-loop snapshot.
+    pub fn resolverObservationDescriptors(self: *IndexManager, alloc: Allocator, names: []const []const u8) ![]resolver_catalog.ResolverObservation {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        var wanted: std.StringHashMapUnmanaged(void) = .empty;
+        defer wanted.deinit(alloc);
+        for (names) |name| try wanted.put(alloc, name, {});
+        var result: std.ArrayList(resolver_catalog.ResolverObservation) = .empty;
+        errdefer {
+            for (result.items) |*cfg| cfg.deinit(alloc);
+            result.deinit(alloc);
+        }
+        for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }) |definitions| for (definitions) |definition| {
+            if (!wanted.contains(definition.name)) continue;
+            const owned = try resolver_catalog.ResolverObservation.fromConfig(alloc, definition);
+            errdefer {
+                var cleanup = owned;
+                cleanup.deinit(alloc);
+            }
+            try result.append(alloc, owned);
+        };
+        return result.toOwnedSlice(alloc);
+    }
+
+    pub fn resolverStaticDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }) |definitions| for (definitions) |definition| {
+            if (!std.mem.eql(u8, definition.name, name)) continue;
+            var cfg = definition;
+            cfg.merges = &.{};
+            cfg.curation_json = "{}";
+            return try ResolverConfig.clone(alloc, cfg);
+        };
+        return null;
     }
 
     /// Trusted admission rollback restores ownership as well as configuration.
@@ -23279,6 +23520,7 @@ pub const IndexManager = struct {
         try txn.commit();
         self.publishCatalogReaderStamp(reader_version);
         self.truncateResolvers(0);
+        self.invalidateResolverNamespaceLookup();
         self.resolvers.deinit(self.alloc);
         self.truncateRetiredResolvers(0);
         self.retired_resolvers.deinit(self.alloc);
@@ -23436,6 +23678,27 @@ pub const IndexManager = struct {
     /// them while any reservation exists, preserving the feature epoch in a
     /// separate baseline. Marker publication/removal and fencing share a txn.
     fn stampCatalogReaderVersion(self: *IndexManager, txn: anytype, catalog: []const u8) !CatalogReaderStamp {
+        if (comptime @import("builtin").is_test) self.test_resolver_catalog_publications += 1;
+        self.invalidateResolverNamespaceLookup();
+        {
+            const prefix = @import("../resolver_projection.zig").prefix;
+            var keys: std.ArrayList([]u8) = .empty;
+            defer {
+                for (keys.items) |key| self.alloc.free(key);
+                keys.deinit(self.alloc);
+            }
+            {
+                var cursor = try txn.openCursor();
+                defer cursor.close();
+                var row = try cursor.seekAtOrAfter(prefix);
+                while (row) |entry| {
+                    if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                    try keys.append(self.alloc, try self.alloc.dupe(u8, entry.key));
+                    row = try cursor.next();
+                }
+            }
+            for (keys.items) |key| try txn.delete(key);
+        }
         const current = try resolver_catalog.readMinimumReaderVersion(txn, resolver_catalog.supported_reader_version);
         const baseline_raw = try missingAsNull(txn.get(replacement_reader_base_key));
         const baseline = if (baseline_raw) |raw| try std.fmt.parseInt(u32, raw, 10) else current;
@@ -23467,7 +23730,7 @@ pub const IndexManager = struct {
             }
         }
         const pending = pending_version > 1;
-        const version = @max(authoritative, pending_version);
+        var version = @max(authoritative, pending_version);
         // Pre-epoch libraries ignore minimum_reader_version, but their strict
         // array parser rejects a versioned resolver envelope. Publish both
         // fences atomically; restore the plain array when the last shadow ends.
@@ -23480,11 +23743,21 @@ pub const IndexManager = struct {
         const stored_catalog = fenced_catalog orelse catalog;
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(txn, resolver_catalog_key, stored_catalog);
         try txn.put(resolver_catalog_key, stored_catalog);
+        // Native binding maintenance can introduce durable projection jobs in
+        // this same transaction. Preserve its reader fence and envelope.
+        const derived_version = try resolver_catalog.readMinimumReaderVersion(txn, resolver_catalog.supported_reader_version);
+        const upgraded = derived_version > version;
+        if (upgraded) {
+            version = derived_version;
+            const envelope = try resolver_catalog.versionedCatalog(self.alloc, catalog, version);
+            defer self.alloc.free(envelope);
+            try txn.put(resolver_catalog_key, envelope);
+        }
         try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(version));
         if (pending) {
-            try txn.put(replacement_reader_base_key, try resolver_catalog.readerVersionBytes(authoritative));
+            try txn.put(replacement_reader_base_key, try resolver_catalog.readerVersionBytes(@max(authoritative, if (upgraded) version else 1)));
         } else if (baseline_raw != null) try txn.delete(replacement_reader_base_key);
-        return .{ .reader = version, .format = if (fenced_catalog != null) version else catalog_version };
+        return .{ .reader = version, .format = if (fenced_catalog != null or upgraded) version else catalog_version };
     }
 
     /// Permanent requirements exclude a temporary reservation fence. Parent
@@ -23547,6 +23820,7 @@ pub const IndexManager = struct {
     }
 
     fn loadResolverCatalog(self: *IndexManager, store: anytype) !void {
+        self.invalidateResolverNamespaceLookup();
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginRead();
@@ -23574,6 +23848,36 @@ pub const IndexManager = struct {
             else => return err,
         };
         try resolver_catalog.applyMergeState(self.alloc, configs, merge_data);
+        {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const durable = @import("../resolver_projection.zig");
+            var by_name: std.StringHashMapUnmanaged(usize) = .empty;
+            for (configs, 0..) |cfg, index| try by_name.put(a, try a.dupe(u8, cfg.name), index);
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(durable.prefix);
+            while (row) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, durable.prefix)) break;
+                const record = try durable.parse(a, entry.key, entry.value);
+                const projection = try resolver_catalog.SharedProjection.create(self.alloc, record.namespace.merges, try std.json.Stringify.valueAlloc(a, record.namespace.state, .{}));
+                defer projection.release();
+                var validated: std.StringHashMapUnmanaged(void) = .empty;
+                for (record.bindings) |binding| {
+                    const index = by_name.get(binding.name) orelse return error.InvalidMetadataBatch;
+                    var next = try durable.apply(configs[index], record, binding, projection);
+                    const profile = try std.json.Stringify.valueAlloc(a, .{ next.aliases, next.suppress_json }, .{});
+                    if (!(try validated.getOrPut(a, profile)).found_existing) try next.validatePolicy();
+                    next.validation_proof = .{ .policy_digest = projection.digest, .static_digest = try resolver_catalog.policyProfileDigest(a, next.aliases, next.suppress_json) };
+                    const owned = try ResolverConfig.cloneWithProjection(self.alloc, next, projection);
+                    configs[index].deinit(self.alloc);
+                    configs[index] = owned;
+                }
+                row = try cursor.next();
+            }
+        }
+
         const active_checkpoint = self.resolvers.items.len;
         const retired_checkpoint = self.retired_resolvers.items.len;
         errdefer {
@@ -23582,7 +23886,15 @@ pub const IndexManager = struct {
         }
         for (configs) |cfg| {
             const definitions = if (cfg.retired) &self.retired_resolvers else &self.resolvers;
-            try definitions.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
+            const owned = if (cfg.shared_projection) |projection|
+                try ResolverConfig.cloneWithProjection(self.alloc, cfg, projection)
+            else
+                try ResolverConfig.clone(self.alloc, cfg);
+            errdefer {
+                var cleanup = owned;
+                cleanup.deinit(self.alloc);
+            }
+            try definitions.append(self.alloc, owned);
         }
     }
 
@@ -23634,7 +23946,35 @@ pub const IndexManager = struct {
         return try std.json.Stringify.valueAlloc(a, labels.items, .{});
     }
 
+    fn routingSignatures(a: Allocator, configs: []const ResolverConfig) !std.StringHashMapUnmanaged([]const u8) {
+        var buckets: std.StringHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
+        for (configs) |cfg| {
+            if (cfg.retired or cfg.labels.len == 0) continue;
+            for (std.enums.values(resolver_catalog.ResolverSourceArtifactKind)) |kind| {
+                if (!kind.overlaps(cfg.source_artifact_kind)) continue;
+                const identity = try std.json.Stringify.valueAlloc(a, .{ cfg.replacement_index, cfg.source_artifact, kind }, .{});
+                const entry = try buckets.getOrPut(a, identity);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.appendSlice(a, cfg.labels);
+            }
+        }
+        var result: std.StringHashMapUnmanaged([]const u8) = .empty;
+        var it = buckets.iterator();
+        while (it.next()) |entry| {
+            std.mem.sort([]const u8, entry.value_ptr.items, {}, struct {
+                fn less(_: void, l: []const u8, rhs: []const u8) bool {
+                    return std.mem.lessThan(u8, l, rhs);
+                }
+            }.less);
+            try result.put(a, entry.key_ptr.*, try std.json.Stringify.valueAlloc(a, entry.value_ptr.items, .{}));
+        }
+        return result;
+    }
     fn persistResolverCatalog(self: *IndexManager, store: anytype, mode: ResolverCatalogPersistMode) !void {
+        return self.persistResolverCatalogCompletion(store, mode, null);
+    }
+    fn persistResolverCatalogCompletion(self: *IndexManager, store: anytype, mode: ResolverCatalogPersistMode, completion: ?@import("../../lite/resolver_consumers.zig").Completion) !void {
+        self.invalidateResolverNamespaceLookup();
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
@@ -23654,20 +23994,22 @@ pub const IndexManager = struct {
         errdefer for (self.resolvers.items, generations) |*cfg, generation| {
             cfg.resolution_generation = generation;
         };
+        var routing_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer routing_arena.deinit();
+        const routing_alloc = routing_arena.allocator();
+        const old_routes = try routingSignatures(routing_alloc, previous);
+        const new_routes = try routingSignatures(routing_alloc, self.resolvers.items);
+        var prior_by_name: std.StringHashMapUnmanaged(ResolverConfig) = .empty;
+        for (previous) |cfg| try prior_by_name.put(routing_alloc, cfg.name, cfg);
         var routing_changed = false;
         for (self.resolvers.items) |*cfg| {
             if (cfg.labels.len != 0) continue;
-            for (previous) |prior| {
-                if (!std.mem.eql(u8, prior.name, cfg.name)) continue;
-                const old_labels = try resolverRoutingLabelsAlloc(self.alloc, previous, prior);
-                defer self.alloc.free(old_labels);
-                const new_labels = try resolverRoutingLabelsAlloc(self.alloc, self.resolvers.items, cfg.*);
-                defer self.alloc.free(new_labels);
-                if (!std.mem.eql(u8, old_labels, new_labels)) {
-                    cfg.resolution_generation = @max(cfg.resolution_generation, try std.math.add(u64, prior.effectiveGeneration(), 1));
-                    routing_changed = true;
-                }
-                break;
+            const prior = prior_by_name.get(cfg.name) orelse continue;
+            const old_key = try std.json.Stringify.valueAlloc(routing_alloc, .{ prior.replacement_index, prior.source_artifact, prior.source_artifact_kind }, .{});
+            const new_key = try std.json.Stringify.valueAlloc(routing_alloc, .{ cfg.replacement_index, cfg.source_artifact, cfg.source_artifact_kind }, .{});
+            if (!std.mem.eql(u8, old_routes.get(old_key) orelse "[]", new_routes.get(new_key) orelse "[]")) {
+                cfg.resolution_generation = @max(cfg.resolution_generation, try std.math.add(u64, prior.effectiveGeneration(), 1));
+                routing_changed = true;
             }
         }
         const data = try self.serializeResolverDefinitionsForMutation(self.alloc);
@@ -23681,6 +24023,10 @@ pub const IndexManager = struct {
         if (mode == .mark_reresolve_dirty or routing_changed) {
             try txn.put(resolver_catalog.reresolve_resume_key, "");
             try txn.put(resolver_catalog.reresolve_repair_resume_key, "");
+        }
+        if (completion) |work| {
+            try txn.delete(work.key);
+            try txn.put(@import("../../lite/resolver_consumers.zig").cursor_key, work.key);
         }
         try txn.commit();
         self.publishCatalogReaderStamp(reader_version);

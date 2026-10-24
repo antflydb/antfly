@@ -284,12 +284,12 @@ pub fn resolveExtraction(
         cfg.scorer_json,
     );
     defer resolver.deinit();
-    const effective_aliases = try cfg.effectiveAliasesAlloc(gpa);
-    defer gpa.free(effective_aliases);
-    try resolver.installAliases(effective_aliases);
+    const compiled_policy = try resolver_lib.policy_cache.acquire(cfg.aliases, cfg.merges, cfg.suppress_json, cfg.curation_json);
+    defer compiled_policy.release();
+    resolver.aliases = compiled_policy.aliases();
+    resolver.alias_index = compiled_policy.redirects();
     resolver.curation_enabled = cfg.suppress_json.len > 0 or cfg.curation_json.len > 0;
-    resolver.curation_index = try resolver_lib.curation.Index.init(resolver.arena.allocator(), cfg.suppress_json, cfg.curation_json);
-    try resolver.curation_index.bindRedirects(resolver.arena.allocator(), resolver.alias_index.?);
+    resolver.curation_index = compiled_policy.index();
 
     var parsed = try resolver_lib.parseExtractionEntities(gpa, extraction_bytes);
     defer parsed.deinit();
@@ -489,12 +489,12 @@ fn processChangedExtractionWithConfigOptions(
         cfg.scorer_json,
     );
     defer resolver.deinit();
-    const effective_aliases = try cfg.effectiveAliasesAlloc(gpa);
-    defer gpa.free(effective_aliases);
-    try resolver.installAliases(effective_aliases);
+    const compiled_policy = try resolver_lib.policy_cache.acquire(cfg.aliases, cfg.merges, cfg.suppress_json, cfg.curation_json);
+    defer compiled_policy.release();
+    resolver.aliases = compiled_policy.aliases();
+    resolver.alias_index = compiled_policy.redirects();
     resolver.curation_enabled = cfg.suppress_json.len > 0 or cfg.curation_json.len > 0;
-    resolver.curation_index = try resolver_lib.curation.Index.init(resolver.arena.allocator(), cfg.suppress_json, cfg.curation_json);
-    try resolver.curation_index.bindRedirects(resolver.arena.allocator(), resolver.alias_index.?);
+    resolver.curation_index = compiled_policy.index();
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(gpa, parsed.resolution_scope_key, cfg.resolution_artifact);
     errdefer gpa.free(resolution_key);
@@ -551,7 +551,7 @@ fn processChangedExtractionWithConfigOptions(
         .dims = cfg.name_embedding_dims,
     };
     const stage_embedder: ?resolver_lib.MentionEmbedder = if (cfg.name_embedding.len > 0) blk: {
-        if (embedder == null and (batch_source == null or batch_source.?.vtable.embed_mention == null)) break :blk null;
+        if (embedder == null and (batch_source == null or (batch_source.?.vtable.embed_mention == null and batch_source.?.vtable.embed_mentions == null))) break :blk null;
         break :blk mention_embedder.mentionEmbedder();
     } else null;
 
@@ -996,7 +996,25 @@ const DenseMentionEmbedder = struct {
     dims: u32,
 
     fn mentionEmbedder(self: *DenseMentionEmbedder) resolver_lib.MentionEmbedder {
-        return .{ .ptr = self, .embed_fn = embed };
+        return .{ .ptr = self, .embed_fn = embed, .embed_batch_fn = embedBatch };
+    }
+    fn embedBatch(ptr: *anyopaque, a: Allocator, texts: []const []const u8) ![]const ?[]const f32 {
+        const self: *DenseMentionEmbedder = @ptrCast(@alignCast(ptr));
+        const result = try a.alloc(?[]const f32, texts.len);
+        const vectors = if (self.source != null and self.source.?.vtable.embed_mentions != null)
+            try self.source.?.embedMentions(a, self.table, self.embedding_name, texts, self.dims)
+        else if (self.source != null and self.source.?.vtable.embed_mention != null) {
+            for (texts, result) |text, *vector| vector.* = self.source.?.embedMention(a, self.table, self.embedding_name, text, self.dims) catch null;
+            return result;
+        } else try (self.embedder orelse return error.MissingMentionEmbedder).embedDenseBatch(a, self.embedding_name, texts, self.dims);
+        if (vectors.len != texts.len) return error.InvalidArgument;
+        for (vectors, result) |vector, *out| {
+            out.* = if (vector.len == self.dims) vector else null;
+            for (vector) |value| if (!std.math.isFinite(value)) {
+                out.* = null;
+            };
+        }
+        return result;
     }
     fn embed(ptr: *anyopaque, alloc: std.mem.Allocator, text: []const u8) anyerror!?[]const f32 {
         const self: *DenseMentionEmbedder = @ptrCast(@alignCast(ptr));
@@ -1129,13 +1147,12 @@ fn appendEntityCandidateWithResolved(
     });
 }
 
-fn jsonStringFieldAlloc(allocator: std.mem.Allocator, value: []const u8, field_name: []const u8) !?[]u8 {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, value, .{}) catch return null;
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const field = parsed.value.object.get(field_name) orelse return null;
-    if (field != .string or field.string.len == 0) return null;
-    return try allocator.dupe(u8, field.string);
+fn jsonStringFieldAlloc(a: Allocator, value: []const u8, field_name: []const u8) !?[]u8 {
+    var fields: [1]?[]const u8 = undefined;
+    try @import("antfly-json").objectFields(a, value, &.{field_name}, &fields);
+    const raw = fields[0] orelse return null;
+    if (raw.len == 0 or raw[0] != '"') return null;
+    return std.json.parseFromSliceLeaky(?[]u8, a, raw, .{});
 }
 
 pub const CandidateMode = enum { exact_key, prefix, ann };
@@ -1197,27 +1214,55 @@ const SourceCandidateProvider = struct {
 
     fn candidatesForBatch(ptr: *anyopaque, alloc: std.mem.Allocator, entities: []const resolver_lib.ExtractedEntity, lists: [][]const resolver_lib.Candidate) anyerror!void {
         const self: *SourceCandidateProvider = @ptrCast(@alignCast(ptr));
-        if (self.mode == .ann) {
-            for (entities, lists) |entity, *list| {
-                var candidates = std.ArrayListUnmanaged(resolver_lib.Candidate).empty;
-                try candidatesFor(ptr, alloc, entity, &candidates);
-                list.* = candidates.items;
-            }
-            return;
-        }
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const a = scratch.allocator();
         const keys = try a.alloc([]const u8, entities.len);
         var unique = std.StringArrayHashMapUnmanaged(void).empty;
+        var queries: std.ArrayList(CandidateSource.NearestQuery) = .empty;
+        const fields = try self.resolver.candidateFields(a);
+        const vector_fields = try self.resolver.candidateVectorFields(a);
         for (entities, keys) |entity, *key| {
-            const rendered = try self.resolver.renderKeyAlloc(a, entity);
-            key.* = if (self.mode == .prefix) rendered[0..if (std.mem.indexOfScalar(u8, rendered, '/')) |i| i + 1 else rendered.len] else rendered;
-            try unique.put(a, key.*, {});
+            if (self.mode == .ann) {
+                const vector = entity.embedding orelse {
+                    key.* = "";
+                    continue;
+                };
+                key.* = try std.fmt.allocPrint(a, "{x}", .{&(try resolver_lib.fingerprint(a, vector))});
+                const slot = try unique.getOrPut(a, key.*);
+                if (!slot.found_existing) try queries.append(a, .{ .index_name = self.ann_index_name, .embedding = vector, .k = self.candidate_limit, .vector_fields = vector_fields, .fields = fields, .cache_vectors = self.cache_vectors });
+            } else {
+                const rendered = try self.resolver.renderKeyAlloc(a, entity);
+                key.* = if (self.mode == .prefix) rendered[0..if (std.mem.indexOfScalar(u8, rendered, '/')) |i| i + 1 else rendered.len] else rendered;
+                try unique.put(a, key.*, {});
+            }
         }
         var collected = BatchDocuments{ .alloc = a };
         var prefixes = std.StringHashMapUnmanaged([]const []const u8).empty;
-        if (self.mode == .exact_key) {
+        if (self.mode == .ann) {
+            var offset: usize = 0;
+            while (offset < queries.items.len) {
+                const end = @min(offset + 64, queries.items.len);
+                const found = self.source.nearestMany(a, self.table, queries.items[offset..end]) catch |err| switch (err) {
+                    error.NearestUnsupported => {
+                        for (lists) |*list| list.* = &.{};
+                        return;
+                    },
+                    else => return err,
+                };
+                if (found.len != end - offset) return error.InvalidArgument;
+                for (found, unique.keys()[offset..end]) |documents, query_key| {
+                    if (documents.len > self.candidate_limit) return error.InvalidArgument;
+                    var selected: std.StringArrayHashMapUnmanaged(void) = .empty;
+                    for (documents) |doc| {
+                        if (!collected.docs.contains(doc.key)) try BatchDocuments.consume(&collected, doc.key, doc.json);
+                        try selected.put(a, doc.key, {});
+                    }
+                    try prefixes.put(a, query_key, try a.dupe([]const u8, selected.keys()));
+                }
+                offset = end;
+            }
+        } else if (self.mode == .exact_key) {
             try self.collectKeys(&collected, unique.keys());
         } else {
             collected.limit = self.candidate_limit;
@@ -1288,7 +1333,7 @@ const SourceCandidateProvider = struct {
         }
         // Candidate records are immutable; repeated mentions share decoding and
         // allocation while the scorer still evaluates each mention separately.
-        for (keys, lists) |key, *list| list.* = prepared.get(key).?;
+        for (keys, lists) |key, *list| list.* = prepared.get(key) orelse &.{};
     }
 
     fn referenceVectors(self: *SourceCandidateProvider, a: std.mem.Allocator, candidates: []resolver_lib.Candidate) !void {
@@ -5202,7 +5247,7 @@ test "SourceCandidateProvider ann blocking generates missing mention embeddings"
     defer alloc.free(extraction_key);
     // Mention carries a query embedding; its text differs from the entity's.
     try store.put(extraction_key,
-        \\{ "entities": [ { "id": "e0", "label": "person", "text": "A Lovelace" } ] }
+        \\{ "entities": [ { "id": "e0", "label": "person", "text": "A Lovelace" }, { "id": "e1", "label": "person", "text": "A Lovelace" } ] }
     );
 
     var remote = FakeCandidateSource{ .alloc = alloc };
@@ -5212,6 +5257,14 @@ test "SourceCandidateProvider ann blocking generates missing mention embeddings"
     );
 
     const Embed = struct {
+        var batches: usize = 0;
+        fn batch(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+            batches += 1;
+            try testing.expectEqual(@as(usize, 1), texts.len);
+            const vectors = try a.alloc([]const f32, texts.len);
+            for (texts, vectors) |text, *out| out.* = try embed(ptr, a, table, name, text, dims);
+            return vectors;
+        }
         fn embed(_: *anyopaque, allocator: std.mem.Allocator, table: []const u8, name: []const u8, text: []const u8, dims: u32) ![]f32 {
             try testing.expectEqualStrings("entities", table);
             try testing.expectEqualStrings("entity_name_embedding", name);
@@ -5221,10 +5274,13 @@ test "SourceCandidateProvider ann blocking generates missing mention embeddings"
         }
     };
     var vtable = FakeCandidateSource.vtable;
-    vtable.embed_mention = Embed.embed;
+    Embed.batches = 0;
+    vtable.embed_mention = null;
+    vtable.embed_mentions = Embed.batch;
     const source: CandidateSource = .{ .ptr = &remote, .vtable = &vtable };
     const outcome = (try processChangedExtraction(alloc, &resolvers, store, null, extraction_key, source, null)).?;
     defer alloc.free(outcome.resolution_key);
+    try testing.expectEqual(@as(usize, 1), Embed.batches);
     try testing.expectEqualStrings("entities", remote.last_table);
     try testing.expectEqualStrings("entity_name_embedding", remote.last_ann_index);
     try testing.expectEqual(@as(usize, 7), remote.last_ann_k);
@@ -5599,4 +5655,52 @@ test "inline resolver replacement isolates sibling labels query routing and cano
     defer parsed.deinit();
     try testing.expectEqual(@as(usize, 1), parsed.value.object.count());
     try testing.expect(parsed.value.object.contains("id_2"));
+}
+
+test "SourceCandidateProvider ANN batches unique vectors and bulk hydrates shared redirects" {
+    const Fake = struct {
+        batches: usize = 0,
+        queries: usize = 0,
+        bulk_reads: usize = 0,
+        fn get(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!?[]u8 {
+            return error.UnexpectedPointRead;
+        }
+        fn nearest(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, queries: []const CandidateSource.NearestQuery) anyerror![]const []const CandidateSource.CandidateDocument {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batches += 1;
+            self.queries += queries.len;
+            try testing.expect(queries.len <= 64);
+            const result = try a.alloc([]const CandidateSource.CandidateDocument, queries.len);
+            for (queries, result) |query, *row| {
+                try testing.expect(query.fields.len > 0);
+                row.* = &.{.{ .key = "person/alias", .json = "{\"canonical_name\":\"Ada\",\"label\":\"person\",\"merged_into\":\"person/ada\"}" }};
+            }
+            return result;
+        }
+        fn getMany(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, keys: []const []const u8, ctx: *anyopaque, consume: CandidateSource.Consume) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.bulk_reads += 1;
+            try testing.expectEqual(@as(usize, 1), keys.len);
+            try testing.expectEqualStrings("person/ada", keys[0]);
+            try consume(ctx, keys[0], "{\"canonical_name\":\"Ada Lovelace\",\"label\":\"person\"}");
+        }
+    };
+    var fake: Fake = .{};
+    var resolver = try resolver_lib.Resolver.initFromParts(testing.allocator, "entities", "person/{{ slug _entity.text }}", .{}, false, "");
+    defer resolver.deinit();
+    var provider = SourceCandidateProvider{ .source = .{ .ptr = &fake, .vtable = &.{ .get = Fake.get, .get_many = Fake.getMany, .nearest_many = Fake.nearest } }, .resolver = &resolver, .table = "entities", .mode = .ann, .ann_index_name = "names", .candidate_limit = 2 };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var entities: [200]resolver_lib.ExtractedEntity = undefined;
+    for (&entities, 0..) |*entity, i| entity.* = .{ .local_id = "one", .label = "person", .text = "Ada", .embedding = try a.dupe(f32, &.{ @floatFromInt(i % 70), 1 }) };
+    var lists: [200][]const resolver_lib.Candidate = undefined;
+    try provider.provider().candidatesForBatch(a, &entities, &lists);
+    try testing.expectEqual(@as(usize, 70), fake.queries);
+    try testing.expectEqual(@as(usize, 2), fake.batches);
+    try testing.expectEqual(@as(usize, 1), fake.bulk_reads);
+    for (lists) |list| {
+        try testing.expectEqual(@as(usize, 1), list.len);
+        try testing.expectEqualStrings("person/ada", list[0].resolved_doc_ref.?.key);
+    }
 }

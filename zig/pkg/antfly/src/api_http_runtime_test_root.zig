@@ -44,6 +44,7 @@ test {
     _ = @import("api/sql_pgwire.zig");
     _ = @import("api/table_catalog.zig");
     _ = @import("api/table_reads.zig");
+    _ = @import("api/table_reads.zig").document_hydration_tests;
     _ = @import("api/tables.zig");
     _ = @import("antfly_local_sources").storage_db_resolution_runtime;
     _ = @import("api/distributed_candidate_source.zig");

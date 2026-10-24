@@ -801,6 +801,9 @@ pub const HandleGuard = struct {
         const root = connection.current.?;
         root.query_borrows += 1;
         self.suspended_query_root = root;
+        // Owned memory plans can release after catalog provisioning. Publish
+        // those already-committed primary changes before dropping the lease.
+        if (self.path_lease != null and root.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence != self.entry_sequence) connection.notifyMutation();
         connection.detach();
         if (self.path_lease) |lease| {
             var owned = lease;
@@ -813,9 +816,12 @@ pub const HandleGuard = struct {
     }
 
     pub fn resumeQuery(self: *HandleGuard, ptr: ?*anyopaque) bool {
+        return self.resumeAccess(ptr, .read);
+    }
+    pub fn resumeAccess(self: *HandleGuard, ptr: ?*anyopaque, access: HandleAccess) bool {
         if (self.suspended_query_root == null) return true;
         // Original registry references keep the connection/owner alive.
-        const next = enterHandle(ptr, .read) orelse return false;
+        const next = enterHandle(ptr, access) orelse return false;
         const connection = self.connection.?;
         if (!next.connection_gate_held) connection.gate.mutex.lockUncancelable(handleLockIo());
         self.suspended_query_root.?.query_borrows -= 1;
@@ -4564,6 +4570,31 @@ pub fn antfly_db_get_timestamp(
     return .ok;
 }
 
+pub fn antfly_db_memory_json(
+    handle_ptr: ?*anyopaque,
+    space: capi.Slice,
+    request_json: capi.Slice,
+    out_buf: ?*capi.Buffer,
+) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_memory_json), .{ .name = "antfly_db_memory_json" }), .{ handle_ptr, space, request_json, out_buf });
+    capi.clearLastError();
+    const out = out_buf orelse return capi.mapErrorContext(error.InvalidArgument, "memory: output pointer must not be null");
+    out.* = .{};
+    var parsed = std.json.parseFromSlice(@import("memory.zig").Request, std.heap.c_allocator, request_json.bytes(), .{ .ignore_unknown_fields = false }) catch |err| return capi.mapError(err);
+    defer parsed.deinit();
+    const access: HandleAccess = if (@import("../memory/service.zig").mutates(parsed.value.action)) .exclusive else .read;
+    var guard = enterHandle(handle_ptr, access) orelse return capi.mapErrorContext(error.InvalidArgument, "memory: invalid database handle");
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return capi.ensureError(code, @src().fn_name);
+    }
+    defer guard.leave();
+    const result = @import("memory.zig").execute(&guard, handle_ptr, std.heap.c_allocator, space.bytes(), request_json.bytes()) catch |err| return capi.mapError(err);
+    out.* = .{ .ptr = result.ptr, .len = result.len };
+    return .ok;
+}
+
 pub fn antfly_db_lookup_json(
     handle_ptr: ?*anyopaque,
     key: capi.Slice,
@@ -7306,6 +7337,7 @@ fn curateResolverWithProposals(handle: *Handle, name: []const u8, request_json: 
         error.UndefinedTable => return source.curateResolverJsonAlloc(handle.alloc, name, request_json),
         else => return err,
     };
+    if (try @import("resolver_authority.zig").owns(destination, a, cfg.key_template)) return error.ResolverNamespaceCurationRequired;
     var manifest = try proposalManifest(a, destination);
     if (manifest.queue.proposals.len == 0) return source.curateResolverJsonAlloc(handle.alloc, name, request_json);
     const was_dirty = manifest.refresh_required;
@@ -7352,19 +7384,103 @@ fn executeResolverCurationWithWait(handle_ptr: ?*anyopaque, name: []const u8, bo
     const input = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch |err| return capi.mapError(err);
     const wait = if (input == .object) input.object.get("wait") else null;
     const timeout: u64 = if (wait) |w| if (w == .object) if (w.object.get("timeout_ms")) |v| if (v == .integer and v.integer > 0 and v.integer <= 300000) @intCast(v.integer) else return capi.mapError(error.InvalidArgument) else 1000 else return capi.mapError(error.InvalidArgument) else 0;
+    var targets: []const ?CurationWaitTarget = &.{};
     {
         const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
         defer guard.leave();
         if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
         const code = executeResolverCuration(guard.handle, name, body, action, out);
         if (code != .ok or timeout == 0) return code;
+        targets = captureCurationWait(guard.handle, a, timeout, out) catch &.{};
     }
-    return waitResolverCurationResponse(handle_ptr, timeout, out);
+    return waitResolverCurationResponse(handle_ptr, timeout, out, targets);
 }
 
+const ResolverObservation = @import("../storage/db/catalog/resolver_catalog.zig").ResolverObservation;
+const CurationWaitTarget = struct {
+    source_id: u64,
+    cfg: ResolverObservation,
+    authority_id: ?u64,
+};
+const CurationObserved = struct { db: *db_mod.DB, cfg: ResolverObservation, applied: bool, authority_id: ?u64 };
+fn curationRows(result: *std.json.Value) []std.json.Value {
+    if (result.* != .object) return &.{};
+    if (result.object.getPtr("results")) |items| return if (items.* == .array) items.array.items else &.{};
+    return @as([*]std.json.Value, @ptrCast(result))[0..1];
+}
+/// Batch each source once per cut. No table opens, full policy copies or
+/// repeated replay-status probes per consumer occur while polling.
+fn curationObservationCut(root: *Handle, fallback: *db_mod.DB, a: std.mem.Allocator, rows: []std.json.Value, sample: bool) ![]?CurationObserved {
+    const Group = struct { db: *db_mod.DB, rows: std.ArrayList(usize) = .empty, names: std.ArrayList([]const u8) = .empty };
+    var groups: std.AutoArrayHashMapUnmanaged(*db_mod.DB, Group) = .empty;
+    const output = try a.alloc(?CurationObserved, rows.len);
+    @memset(output, null);
+    for (rows, 0..) |row, i| {
+        if (row != .object) continue;
+        const name = row.object.get("resolver") orelse continue;
+        if (name != .string) continue;
+        var database = fallback;
+        if (row.object.get("source_table")) |source| if (source == .string) {
+            database = if (std.mem.eql(u8, source.string, "default")) &root.db else if (root.embedded_tables.get(source.string)) |table| &table.db else continue;
+        };
+        const slot = try groups.getOrPut(a, database);
+        if (!slot.found_existing) slot.value_ptr.* = .{ .db = database };
+        try slot.value_ptr.rows.append(a, i);
+        try slot.value_ptr.names.append(a, name.string);
+    }
+    var authorities: std.StringHashMapUnmanaged(?u64) = .empty;
+    for (groups.values()) |group| {
+        const descriptors = try group.db.core.index_manager.resolverObservationDescriptors(a, group.names.items);
+        var by_name: std.StringHashMapUnmanaged(ResolverObservation) = .empty;
+        for (descriptors) |cfg| try by_name.put(a, cfg.name, cfg);
+        var stages: [2]?bool = .{ null, null };
+        for (group.rows.items, group.names.items) |row, name| {
+            const cfg = by_name.get(name) orelse continue;
+            var applied = false;
+            if (sample) {
+                if (cfg.retired) {
+                    applied = true;
+                } else {
+                    const stage: usize = @intFromBool(cfg.promote);
+                    if (stages[stage] == null) stages[stage] = @import("../storage/db/resolver_curation.zig").applied(group.db, cfg) catch false;
+                    applied = stages[stage].?;
+                }
+            }
+            const scope = try std.json.Stringify.valueAlloc(a, .{ cfg.table, cfg.key_template }, .{});
+            const authority = try authorities.getOrPut(a, scope);
+            if (!authority.found_existing) {
+                const destination = if (std.mem.eql(u8, cfg.table, "default")) &root.db else if (root.embedded_tables.get(cfg.table)) |table| &table.db else null;
+                const native = if (destination) |db| try @import("resolver_authority.zig").owns(db, a, cfg.key_template) else false;
+                authority.value_ptr.* = if (native) destination.?.core.identity_namespace.table_id else null;
+            }
+            output[row] = .{ .db = group.db, .cfg = cfg, .applied = applied, .authority_id = authority.value_ptr.* };
+        }
+    }
+    return output;
+}
+/// Capture before releasing mutation admission. These are private, immutable
+/// wait requirements; public response bytes never carry runtime ownership.
+fn captureCurationWait(handle: *Handle, a: std.mem.Allocator, timeout: u64, out: *capi.Buffer) ![]const ?CurationWaitTarget {
+    if (timeout == 0) return &.{};
+    var result = try std.json.parseFromSliceLeaky(std.json.Value, a, out.ptr.?[0..out.len], .{});
+    const root = handle.parent_handle orelse handle;
+    const observed = try curationObservationCut(root, handle.database(), a, curationRows(&result), false);
+    const targets = try a.alloc(?CurationWaitTarget, observed.len);
+    @memset(targets, null);
+    for (observed, targets) |value, *target| if (value) |current| {
+        target.* = .{ .source_id = current.db.core.identity_namespace.table_id, .cfg = current.cfg, .authority_id = current.authority_id };
+    };
+    return targets;
+}
+fn curationScopeMatches(target: CurationWaitTarget, observed: CurationObserved) bool {
+    const cfg = observed.cfg;
+    if (target.source_id != observed.db.core.identity_namespace.table_id or !std.mem.eql(u8, target.cfg.table, cfg.table) or !std.mem.eql(u8, target.cfg.key_template, cfg.key_template) or target.cfg.namespace_generation != cfg.namespace_generation or cfg.config_generation < target.cfg.config_generation) return false;
+    if (target.authority_id) |id| return observed.authority_id == id and !cfg.namespace_curation_missing and cfg.namespace_curation_table_id == id;
+    return cfg.namespace_curation_table_id == target.cfg.namespace_curation_table_id and cfg.namespace_curation_missing == target.cfg.namespace_curation_missing;
+}
 /// Observe accepted policy/review revisions without retaining writer admission.
 /// Each poll owns bounded scratch memory, even for a five-minute wait.
-fn waitResolverCurationResponse(handle_ptr: ?*anyopaque, timeout_ms: u64, out: *capi.Buffer) capi.ErrorCode {
+fn waitResolverCurationResponse(handle_ptr: ?*anyopaque, timeout_ms: u64, out: *capi.Buffer, targets: []const ?CurationWaitTarget) capi.ErrorCode {
     if (timeout_ms == 0) return .ok;
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
@@ -7380,51 +7496,43 @@ fn waitResolverCurationResponse(handle_ptr: ?*anyopaque, timeout_ms: u64, out: *
             var iteration = std.heap.ArenaAllocator.init(std.heap.c_allocator);
             defer iteration.deinit();
             const scratch = iteration.allocator();
+            const rows = curationRows(&result);
+            if (rows.len != targets.len) return .ok;
             const root = guard.handle.parent_handle orelse guard.handle;
-            var singleton = [_]std.json.Value{result};
-            const rows = if (result.object.getPtr("results")) |items| if (items.* == .array) items.array.items else singleton[0..] else singleton[0..];
-            for (rows) |*row| {
+            const cut = curationObservationCut(root, guard.handle.database(), scratch, rows, true) catch return .ok;
+            for (rows, cut, targets) |*row, observed, expected| {
                 if (row.* != .object) continue;
                 if (row.object.get("accepted")) |accepted| if (accepted == .bool and !accepted.bool) {
                     caught_up = false;
                     continue;
                 };
-                if (row.object.get("applied")) |observed| if (observed == .bool and observed.bool) continue;
-                const resolver_name = row.object.get("resolver") orelse continue;
-                if (resolver_name != .string) continue;
-                var database = guard.handle.database();
-                if (row.object.get("source_table")) |source| if (source == .string) {
-                    database = if (std.mem.eql(u8, source.string, "default")) &root.db else if (root.embedded_tables.get(source.string)) |table| &table.db else {
-                        caught_up = false;
-                        continue;
-                    };
-                };
-                const identities = database.listResolverIdentities(scratch) catch {
+                if (row.object.get("applied")) |applied| if (applied == .bool and applied.bool) continue;
+                const current = observed orelse {
                     caught_up = false;
                     continue;
                 };
-                var done = false;
-                for (identities) |cfg| if (std.mem.eql(u8, cfg.name, resolver_name.string)) {
-                    done = @import("../storage/db/resolver_curation.zig").applied(database, cfg) catch false;
-                    if (row.object.get("revision")) |revision| if (revision == .integer and revision.integer >= 0) {
-                        done = done and cfg.curation_revision >= @as(u64, @intCast(revision.integer));
+                const target = expected orelse {
+                    caught_up = false;
+                    continue;
+                };
+                var done = current.applied and curationScopeMatches(target, current);
+                if (row.object.get("revision")) |revision| if (revision == .integer and revision.integer >= 0) {
+                    const floor: u64 = @intCast(revision.integer);
+                    done = done and (if (target.authority_id != null) current.cfg.namespace_curation_generation >= floor else current.cfg.curation_revision >= floor);
+                };
+                if (row.object.get("replay_sequence_kind")) |kind| if (kind == .string and std.mem.eql(u8, kind.string, "source_journal")) {
+                    if (row.object.get("replay_sequence")) |sequence| if (sequence == .integer and sequence.integer >= 0) {
+                        const stats = current.db.pendingWorkStats();
+                        const floor: u64 = @intCast(sequence.integer);
+                        done = done and stats.resolution.applied_sequence >= floor and (!current.cfg.promote or stats.promotion.applied_sequence >= floor);
                     };
-                    if (row.object.get("replay_sequence_kind")) |kind| if (kind == .string and std.mem.eql(u8, kind.string, "source_journal")) {
-                        if (row.object.get("replay_sequence")) |sequence| if (sequence == .integer and sequence.integer >= 0) {
-                            const stats = database.pendingWorkStats();
-                            const floor: u64 = @intCast(sequence.integer);
-                            done = done and stats.resolution.applied_sequence >= floor and (!cfg.promote or stats.promotion.applied_sequence >= floor);
-                        };
-                    };
-                    break;
                 };
                 caught_up = caught_up and done;
                 if (!done) continue;
                 row.object.put(a, "applied", .{ .bool = true }) catch return .ok;
-                const progress = std.json.Stringify.valueAlloc(a, database.pendingWorkStats(), .{}) catch return .ok;
+                const progress = std.json.Stringify.valueAlloc(a, current.db.pendingWorkStats(), .{}) catch return .ok;
                 row.object.put(a, "progress", std.json.parseFromSliceLeaky(std.json.Value, a, progress, .{}) catch return .ok) catch return .ok;
             }
-            if (!result.object.contains("results")) result = singleton[0];
         }
         if (caught_up) {
             result.object.put(a, "applied", .{ .bool = true }) catch return .ok;
@@ -7436,6 +7544,66 @@ fn waitResolverCurationResponse(handle_ptr: ?*anyopaque, timeout_ms: u64, out: *
         handleLockIo().sleep(.fromMilliseconds(25), .awake) catch return .ok;
     }
     return .ok;
+}
+
+test "capi resolver curation observation batches policy-free descriptors and fences namespace moves" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = try TestDirectory.init("resolver-observation-scope");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    defer a.free(path);
+    var root = try openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    var handle = try publishHandle(root);
+    defer antfly_db_close(handle);
+    const tables = @import("tables.zig");
+    try tables.create(root, "entities", "{}", false);
+    try tables.create(root, "other", "{}", false);
+    for (0..3) |i| {
+        try root.db.addResolver(.{ .name = try std.fmt.allocPrint(scratch, "r-{d}", .{i}), .table = "entities", .source_artifact = try std.fmt.allocPrint(scratch, "source-{d}", .{i}), .resolution_artifact = try std.fmt.allocPrint(scratch, "resolved-{d}", .{i}), .key_template = "entity/{{_entity.text}}", .promote = false });
+    }
+    var out: capi.Buffer = .{};
+    defer antfly_buffer_free(&out);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_entity_suppress_json(handle, .fromSlice("entities"), .fromSlice("entity/noise"), .fromSlice("{}"), &out));
+    const targets = try captureCurationWait(root, scratch, 100, &out);
+    try std.testing.expectEqual(@as(usize, 3), targets.len);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
+    var result = try std.json.parseFromSliceLeaky(std.json.Value, scratch, out.ptr.?[0..out.len], .{});
+    var cut = try curationObservationCut(root, &root.db, scratch, curationRows(&result), true);
+    for (cut, targets) |value, target| {
+        try std.testing.expect(curationScopeMatches(target.?, value.?));
+        // Physical authority replacement is rejected even before its source
+        // projection is asynchronously invalidated.
+        var replaced = value.?;
+        replaced.authority_id = replaced.authority_id.? + 1;
+        try std.testing.expect(!curationScopeMatches(target.?, replaced));
+        replaced = value.?;
+        replaced.cfg.namespace_curation_missing = true;
+        try std.testing.expect(!curationScopeMatches(target.?, replaced));
+    }
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_resolver_namespace_json(handle, .fromSlice("r-0"), .fromSlice("{\"table\":\"other\",\"key_template\":\"entity/{{_entity.text}}\",\"reset_merges\":true,\"reset_curation\":true}")));
+    cut = try curationObservationCut(root, &root.db, scratch, curationRows(&result), true);
+    var moved = false;
+    for (cut, targets) |value, target| if (std.mem.eql(u8, value.?.cfg.name, "r-0")) {
+        // A larger numeric revision must not satisfy the old namespace wait.
+        var current = value.?;
+        current.cfg.curation_revision = 1000;
+        current.cfg.namespace_curation_generation = 1000;
+        try std.testing.expect(!curationScopeMatches(target.?, current));
+        moved = true;
+    };
+    try std.testing.expect(moved);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
+    antfly_db_close(handle);
+    root = try openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, false, null, null);
+    handle = try publishHandle(root);
+    const first = root.db.core.index_manager.getResolver("r-1").?;
+    const second = root.db.core.index_manager.getResolver("r-2").?;
+    try std.testing.expect(first.shared_projection != null);
+    try std.testing.expect(first.shared_projection == second.shared_projection);
+    try std.testing.expect(first.curation_json.ptr == second.curation_json.ptr);
 }
 
 pub fn antfly_db_unmerge_resolver_key_json(handle_ptr: ?*anyopaque, resolver_name: capi.Slice, request_json: capi.Slice, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
@@ -7519,7 +7687,13 @@ pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.
         return @call(.auto, @extern(*const @TypeOf(antfly_db_curate_entity_json), .{ .name = "antfly_db_curate_entity_json" }), .{ handle_ptr, entity_table, entity_key, request_json, out_buf });
     capi.clearLastError();
     const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
+    if (handle_ptr == null) return capi.mapError(error.InvalidArgument);
+    if (request_json.len > @import("antfly_resolver").curation.max_state_bytes) return capi.mapError(error.ResolverCurationLimitExceeded);
+    const authority = @import("resolver_authority.zig");
+    var request_arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+    defer request_arena.deinit();
+    const input = std.json.parseFromSliceLeaky(authority.Input, request_arena.allocator(), request_json.bytes(), .{}) catch |err| return capi.mapError(err);
+    const guard = enterHandle(handle_ptr, if (input.action == .redirects) .read else .exclusive) orelse return capi.mapError(error.InvalidArgument);
     var admitted = true;
     defer if (admitted) guard.leave();
     if (guard.entry_error) |value| return capi.ensureError(value, @src().fn_name);
@@ -7529,15 +7703,32 @@ pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.
     const a = arena.allocator();
     const curation = @import("../storage/db/resolver_curation.zig");
     const pure = @import("antfly_resolver");
-    const Input = struct { action: enum { redirects, merge, unmerge, suppress, unsuppress, distinct }, into: ?[]const u8 = null, replace: bool = false, pin_distinct: bool = false, absorbed: pure.curation.Absorbed = .reject, actor: []const u8 = "", reason: []const u8 = "", expected_revision: ?u64 = null, wait: ?pure.curation.Wait = null };
-    const input = std.json.parseFromSliceLeaky(Input, a, request_json.bytes(), .{}) catch |err| return capi.mapError(err);
     const tables = @import("tables.zig");
-    tables.load(handle) catch |err| return capi.mapError(err);
+    tables.loadCatalog(handle) catch |err| return capi.mapError(err);
     const entity_db = tables.get(handle, entity_table.bytes()) catch |err| return capi.mapError(err);
+    if (authority.enabled(entity_db, a) catch |err| return capi.mapError(err)) {
+        const response = authority.entity(handle, a, entity_table.bytes(), entity_key.bytes(), input, .{}) catch |err| return capi.mapError(err);
+        out.* = copyJsonBuffer(response) catch |err| return capi.mapError(err);
+        const wait_timeout = if (input.wait) |wait| wait.timeout_ms else 0;
+        const wait_targets = captureCurationWait(guard.handle, a, wait_timeout, out) catch &.{};
+        admitted = false;
+        guard.leave();
+        return waitResolverCurationResponse(handle_ptr, wait_timeout, out, wait_targets);
+    }
     var manifest = proposalManifest(a, entity_db) catch |err| return capi.mapError(err);
     const was_dirty = manifest.refresh_required;
     refreshProposalManifest(handle, a, entity_table.bytes(), &manifest) catch |err| return capi.mapError(err);
     if (input.action != .redirects and manifest.pending_id != null) return capi.mapError(error.ResolverCurationConflict);
+    if (input.action != .redirects and manifest.pending_id == null and liteOpenModeCanWrite(handle.open_mode)) {
+        const response = authority.entity(handle, a, entity_table.bytes(), entity_key.bytes(), input, manifest.queue) catch |err| return capi.mapError(err);
+        out.* = copyJsonBuffer(response) catch |err| return capi.mapError(err);
+        const wait_timeout = if (input.wait) |wait| wait.timeout_ms else 0;
+        const wait_targets = captureCurationWait(guard.handle, a, wait_timeout, out) catch &.{};
+        admitted = false;
+        guard.leave();
+        return waitResolverCurationResponse(handle_ptr, wait_timeout, out, wait_targets);
+    }
+    tables.load(handle) catch |err| return capi.mapError(err);
     const Pending = struct { db: *db_mod.DB, source: []const u8, cfg: db_mod.ResolverConfig, request: pure.curation.Request, edit: pure.curation.Plan };
     var pending: std.ArrayListUnmanaged(Pending) = .empty;
     var sources: std.ArrayListUnmanaged(struct { db: *db_mod.DB, name: []const u8 }) = .empty;
@@ -7621,9 +7812,11 @@ pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.
     }
     const response = std.json.Stringify.valueAlloc(a, .{ .entity_table = entity_table.bytes(), .key = entity_key.bytes(), .atomicity = "resolver", .complete = complete, .results = std.json.Value{ .array = results } }, .{}) catch |err| return capi.mapError(err);
     out.* = copyJsonBuffer(response) catch |err| return capi.mapError(err);
+    const wait_timeout = if (input.wait) |wait| wait.timeout_ms else 0;
+    const wait_targets = captureCurationWait(guard.handle, a, wait_timeout, out) catch &.{};
     admitted = false;
     guard.leave();
-    return waitResolverCurationResponse(handle_ptr, if (input.wait) |wait| wait.timeout_ms else 0, out);
+    return waitResolverCurationResponse(handle_ptr, wait_timeout, out, wait_targets);
 }
 
 /// Admission owns the handle's exclusive writer fence. Read only the two
@@ -7759,8 +7952,33 @@ fn proposalOperation(handle_ptr: ?*anyopaque, table: capi.Slice, id: capi.Slice,
     const pure = @import("antfly_resolver").curation;
     const owner = @import("../storage/db/resolver_curation.zig");
     const tables = @import("tables.zig");
-    (if (operation_name == .list or operation_name == .get) tables.loadCatalog(handle) else tables.load(handle)) catch |err| return capi.mapError(err);
+    tables.loadCatalog(handle) catch |err| return capi.mapError(err);
     const db = tables.get(handle, table.bytes()) catch |err| return capi.mapError(err);
+    const authority = @import("resolver_authority.zig");
+    const native_enabled = authority.enabled(db, a) catch |err| return capi.mapError(err);
+    var migration: ?ProposalManifest = null;
+    if (!native_enabled and operation_name != .list and operation_name != .get) {
+        var old = proposalManifest(a, db) catch |err| return capi.mapError(err);
+        refreshProposalManifest(handle, a, table.bytes(), &old) catch |err| return capi.mapError(err);
+        if (old.pending_id == null) migration = old;
+    }
+    if (native_enabled or migration != null) {
+        const operation: authority.Operation = switch (operation_name) {
+            .create => .create,
+            .list => .list,
+            .get => .get,
+            .decide => .decide,
+        };
+        const response = authority.proposals(handle, a, operation, table.bytes(), id.bytes(), request.bytes(), if (migration) |old| old.queue else .{}) catch |err| return capi.mapError(err);
+        out.* = copyJsonBuffer(response) catch |err| return capi.mapError(err);
+        if (operation_name != .decide) return .ok;
+        const decision = std.json.parseFromSliceLeaky(pure.ProposalDecision, a, request.bytes(), .{}) catch |err| return capi.mapError(err);
+        const wait_timeout = if (decision.wait) |wait| wait.timeout_ms else 0;
+        const wait_targets = captureCurationWait(guard.handle, a, wait_timeout, out) catch &.{};
+        admitted = false;
+        guard.leave();
+        return waitResolverCurationResponse(handle_ptr, wait_timeout, out, wait_targets);
+    }
     var policy_lease = (if (operation_name == .list or operation_name == .get) db.local_execution.row_policy_gate.enterRawRead() else db.local_execution.row_policy_gate.enterRaw()) catch |err| return capi.mapError(err);
     defer policy_lease.release();
     if (operation_name != .list and operation_name != .get) {
@@ -7815,9 +8033,11 @@ fn proposalOperation(handle_ptr: ?*anyopaque, table: capi.Slice, id: capi.Slice,
         const observation = observeProposal(handle, a, table.bytes(), proposal.id, manifest.queue.receipt_scope) catch |err| return capi.mapError(err);
         out.* = stringifyJson(.{ .proposal = proposal, .atomicity = "resolver", .changed = false, .complete = true, .applied = observation.applied, .results = observation.rows }) catch |err| return capi.mapError(err);
         policy_lease.release();
+        const wait_timeout = if (input_decision.wait) |wait| wait.timeout_ms else 0;
+        const wait_targets = captureCurationWait(guard.handle, a, wait_timeout, out) catch &.{};
         admitted = false;
         guard.leave();
-        return waitResolverCurationResponse(handle_ptr, if (input_decision.wait) |wait| wait.timeout_ms else 0, out);
+        return waitResolverCurationResponse(handle_ptr, wait_timeout, out, wait_targets);
     }
     if (!input_decision.accept and (input_decision.options != null or (input_decision.pin_distinct and proposal.action != .merge))) return capi.mapError(error.InvalidResolverCurationRequest);
     if (input_decision.wait) |wait| if (wait.timeout_ms == 0 or wait.timeout_ms > 300000) return capi.mapError(error.InvalidResolverCurationRequest);
@@ -7953,9 +8173,11 @@ fn proposalOperation(handle_ptr: ?*anyopaque, table: capi.Slice, id: capi.Slice,
     out.* = if (operation_name == .create) stringifyJson(manifest.queue.proposals[selected.?]) catch |err| return capi.mapError(err) else stringifyJson(.{ .proposal = manifest.queue.proposals[selected.?], .atomicity = "resolver", .complete = complete, .applied = applied, .results = std.json.Value{ .array = results } }) catch |err| return capi.mapError(err);
     if (operation_name == .decide) {
         policy_lease.release();
+        const wait_timeout = if (input_decision.wait) |wait| wait.timeout_ms else 0;
+        const wait_targets = captureCurationWait(guard.handle, a, wait_timeout, out) catch &.{};
         admitted = false;
         guard.leave();
-        return waitResolverCurationResponse(handle_ptr, if (input_decision.wait) |wait| wait.timeout_ms else 0, out);
+        return waitResolverCurationResponse(handle_ptr, wait_timeout, out, wait_targets);
     }
     return .ok;
 }
@@ -7994,9 +8216,13 @@ pub fn antfly_db_resolver_reviews_json(handle_ptr: ?*anyopaque, request_json: ca
     defer guard.handle.alloc.free(bytes);
     out.* = copyJsonBuffer(bytes) catch |err| return capi.mapError(err);
     if (input.value.operation != .review) return .ok;
+    const wait_timeout = if (input.value.wait) |wait| wait.timeout_ms else 0;
+    var wait_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer wait_arena.deinit();
+    const wait_targets = captureCurationWait(guard.handle, wait_arena.allocator(), wait_timeout, out) catch &.{};
     admitted = false;
     guard.leave();
-    return waitResolverCurationResponse(handle_ptr, if (input.value.wait) |wait| wait.timeout_ms else 0, out);
+    return waitResolverCurationResponse(handle_ptr, wait_timeout, out, wait_targets);
 }
 
 pub fn antfly_db_list_resolver_identities_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
@@ -9157,6 +9383,293 @@ test "inline resolver replacement C API admits the same public name with fresh a
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(id, .fromSlice(next)));
 }
 
+test "capi native memory persists receipts and forgetting across reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-reopen");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &id));
+    defer if (id != null) antfly_db_close(id);
+    const Call = struct {
+        fn call(handle: ?*anyopaque, body: []const u8) ![]u8 {
+            var output: capi.Buffer = .{};
+            const code = antfly_db_memory_json(handle, .fromSlice("personal"), .fromSlice(body), &output);
+            if (code != .ok) std.debug.print("memory C ABI: {s}\n", .{std.mem.span(capi.lastErrorDetail())});
+            try std.testing.expectEqual(capi.ErrorCode.ok, code);
+            defer std.heap.c_allocator.free(output.ptr.?[0..output.len]);
+            return std.testing.allocator.dupe(u8, output.ptr.?[0..output.len]);
+        }
+    };
+    const create = try Call.call(id, "{\"action\":\"create\",\"idempotency_key\":\"create\"}");
+    defer a.free(create);
+    var deep: std.ArrayList(u8) = .empty;
+    defer deep.deinit(a);
+    try deep.appendSlice(a, "{\"action\":\"observe\",\"idempotency_key\":\"deep-rejection\",\"body\":{\"unknown\":");
+    try deep.appendNTimes(a, '[', 6000);
+    try deep.appendSlice(a, "1e100000");
+    try deep.appendNTimes(a, ']', 6000);
+    try deep.appendSlice(a, "}}");
+    var rejected_deep: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_memory_json(id, .fromSlice("personal"), .fromSlice(deep.items), &rejected_deep));
+    defer antfly_buffer_free(&rejected_deep);
+    const observe = try Call.call(id,
+        \\{"action":"observe","idempotency_key":"evidence","body":{"evidence":[{"id":"e1","source_id":"note","source_version":"1","text":"Use Terraform"}],"assertions":[{"id":"a1","subject":"deploy","predicate":"tool","value":"Terraform","statement":"Use Terraform","evidence":[{"id":"e1"}]}]}}
+    );
+    defer a.free(observe);
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    const recalled = try Call.call(id, "{\"action\":\"recall\",\"body\":{\"query\":\"Terraform\",\"token_budget\":8192}}");
+    defer a.free(recalled);
+    try std.testing.expect(std.mem.indexOf(u8, recalled, "Use Terraform") != null);
+    const forgotten = try Call.call(id, "{\"action\":\"forget\",\"idempotency_key\":\"forget\",\"body\":{\"evidence_ids\":[\"e1\"]}}");
+    defer a.free(forgotten);
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    const hidden = try Call.call(id, "{\"action\":\"recall\",\"body\":{\"query\":\"Terraform\",\"token_budget\":8192}}");
+    defer a.free(hidden);
+    try std.testing.expect(std.mem.indexOf(u8, hidden, "Use Terraform") == null);
+    // Physical retirement, not only the evidence fence, survives native reopen.
+    for (0..10) |i| {
+        const body = try std.fmt.allocPrint(a, "{{\"action\":\"advance\",\"idempotency_key\":\"cleanup-{d}\"}}", .{i});
+        defer a.free(body);
+        const cleaned = try Call.call(id, body);
+        a.free(cleaned);
+    }
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    const fresh = try Call.call(id,
+        \\{"action":"observe","idempotency_key":"fresh","body":{"evidence":[{"id":"e2","source_id":"fresh","source_version":"1","text":"New fact"}]}}
+    );
+    defer a.free(fresh);
+    var output: capi.Buffer = .{};
+    const reused = antfly_db_memory_json(id, .fromSlice("personal"), .fromSlice(
+        \\{"action":"assertions","idempotency_key":"reuse","body":{"assertions":[{"id":"a1","subject":"other","predicate":"tool","value":"Other","statement":"Different assertion under a retired ID","evidence":[{"id":"e2"}]}]}}
+    ), &output);
+    defer if (output.ptr) |ptr| std.heap.c_allocator.free(ptr[0..output.len]);
+    try std.testing.expect(reused != .ok);
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(capi.lastErrorDetail()), "MemoryForgotten") != null);
+}
+
+test "capi native memory decision explanation provenance survives reopen and scrubbing" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-decision-reopen");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &id));
+    defer if (id != null) antfly_db_close(id);
+    const Calls = struct {
+        fn validate(_: *anyopaque, _: @import("../memory/service.zig").types.Config) !void {}
+        fn decide(_: *anyopaque, alloc: Allocator, config: @import("../memory/service.zig").types.Config, incoming: @import("../memory/service.zig").types.Assertion, prior: []const @import("../memory/service.zig").types.StoredAssertion) !@import("../memory/service.zig").types.ReconciliationDecision {
+            if (std.mem.eql(u8, config.policy_version, "v2")) return .{ .supersedes = &.{}, .reason = try alloc.dupe(u8, incoming.reconciliation_reason orelse "No replacement") };
+            return .{ .supersedes = try alloc.dupe([]const u8, &.{prior[0].assertion.id}), .reason = try std.fmt.allocPrint(alloc, "Replaces {s}", .{prior[0].assertion.statement}) };
+        }
+        fn call(handle: ?*anyopaque, body: []const u8) ![]u8 {
+            var output: capi.Buffer = .{};
+            const code = antfly_db_memory_json(handle, .fromSlice("personal"), .fromSlice(body), &output);
+            if (code != .ok) std.debug.print("memory C ABI: {s}\n", .{std.mem.span(capi.lastErrorDetail())});
+            try std.testing.expectEqual(capi.ErrorCode.ok, code);
+            defer std.heap.c_allocator.free(output.ptr.?[0..output.len]);
+            return std.testing.allocator.dupe(u8, output.ptr.?[0..output.len]);
+        }
+    };
+    {
+        // Inject the test decider only; persistence and subsequent public reads
+        // use the real native table adapter and C ABI across fresh handles.
+        const guard = enterHandle(id, .exclusive) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        try std.testing.expect(guard.entry_error == null);
+        const owner = guard.handle.parent_handle orelse guard.handle;
+        try @import("tables.zig").create(owner, "memory_personal", "{}", true);
+        const engine = @import("../memory/engine.zig");
+        const context: engine.service.Context = .{ .space = "personal", .principal = "embedded", .admin = true, .now_ms = 1 };
+        var adapter: engine.Native(db_mod.DB) = .{ .db = try @import("tables.zig").get(owner, "memory_personal"), .context = context };
+        var backend = adapter.backend();
+        backend.decide = Calls.decide;
+        backend.validate_models = Calls.validate;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var service: engine.service.Service = .{ .backend = backend, .context = context };
+        _ = try service.execute(alloc, .create, "", "{\"features\":{\"reconciliation\":\"model\"},\"models\":{\"decider\":{\"provider\":\"fixture\",\"model\":\"decider\",\"revision\":\"v1\"}},\"predicates\":[{\"name\":\"credential\",\"cardinality\":\"one\"}]}", "create");
+        service.context.now_ms = 2;
+        _ = try service.execute(alloc, .observe, "", "{\"evidence\":[{\"id\":\"old-source\",\"source_id\":\"old\",\"source_version\":\"1\",\"text\":\"Retired secret\"},{\"id\":\"new-source\",\"source_id\":\"new\",\"source_version\":\"1\",\"text\":\"Rotated\"}]}", "evidence");
+        service.context.now_ms = 3;
+        _ = try service.execute(alloc, .assertions, "", "{\"assertions\":[{\"id\":\"old\",\"subject\":\"production\",\"predicate\":\"credential\",\"value\":\"old\",\"statement\":\"Retired secret\",\"evidence\":[{\"id\":\"old-source\"}]}]}", "old");
+        service.context.now_ms = 4;
+        _ = try service.execute(alloc, .assertions, "", "{\"assertions\":[{\"id\":\"new\",\"subject\":\"production\",\"predicate\":\"credential\",\"value\":\"new\",\"statement\":\"Rotated\",\"evidence\":[{\"id\":\"new-source\"}]}]}", "new");
+        service.context.now_ms = 5;
+        const memory_types = engine.service.types;
+        const competitor: memory_types.Assertion = .{ .id = "competitor-41", .subject = "production", .predicate = "credential", .value = "third", .statement = "Independent third value", .stability = .provisional, .evidence = &.{.{ .id = "new-source" }} };
+        _ = try service.execute(alloc, .assertions, "", try std.json.Stringify.valueAlloc(alloc, .{ .assertions = &.{competitor} }, .{}), "competitor");
+        const current = try std.json.parseFromSliceLeaky(memory_types.StoredAssertion, alloc, try service.execute(alloc, .get, competitor.id, "{}", ""), .{});
+        const correction: memory_types.Correction = .{ .id = competitor.id, .expected_revision = current.revision, .lifecycle = .active, .stability = .settled, .reason = "Verified", .evidence = &.{.{ .id = "new-source" }} };
+        _ = try service.execute(alloc, .correct, "", try std.json.Stringify.valueAlloc(alloc, correction, .{}), "settle");
+        const inspected = try std.json.parseFromSliceLeaky(memory_types.Inspection, alloc, try service.execute(alloc, .inspect, "", "{}", ""), .{});
+        var config = inspected.state.config;
+        config.policy_version = "v2";
+        service.context.now_ms = 6;
+        _ = try service.execute(alloc, .configure, "", try std.json.Stringify.valueAlloc(alloc, .{ .expected_revision = inspected.state.revision, .config = config }, .{}), "rebuild");
+    }
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    const before = try Calls.call(id, "{\"action\":\"get\",\"id\":\"new\"}");
+    defer a.free(before);
+    try std.testing.expect(std.mem.indexOf(u8, before, "Retired secret") != null);
+    const forgotten = try Calls.call(id, "{\"action\":\"forget\",\"idempotency_key\":\"forget\",\"body\":{\"evidence_ids\":[\"old-source\"]}}");
+    a.free(forgotten);
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    for (0..12) |i| {
+        const body = try std.fmt.allocPrint(a, "{{\"action\":\"advance\",\"idempotency_key\":\"scrub-{d}\"}}", .{i});
+        defer a.free(body);
+        const output = try Calls.call(id, body);
+        a.free(output);
+    }
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    const after = try Calls.call(id, "{\"action\":\"get\",\"id\":\"new\"}");
+    defer a.free(after);
+    try std.testing.expect(std.mem.indexOf(u8, after, "Retired secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "Rotated") != null);
+    const history = try Calls.call(id, "{\"action\":\"history\",\"id\":\"new\"}");
+    defer a.free(history);
+    try std.testing.expect(std.mem.indexOf(u8, history, "Retired secret") == null);
+}
+
+fn nativeMemoryTestCall(handle: ?*anyopaque, alloc: Allocator, principal: []const u8, action: @import("../memory/service.zig").Action, body: anytype, token: []const u8, name: []const u8) ![]const u8 {
+    const request = try std.json.Stringify.valueAlloc(alloc, .{ .action = action, .principal = principal, .id = name, .body = body, .idempotency_key = token }, .{});
+    var output: capi.Buffer = .{};
+    const code = antfly_db_memory_json(handle, .fromSlice("personal"), .fromSlice(request), &output);
+    if (code != .ok) std.debug.print("memory C ABI: {s}\n", .{std.mem.span(capi.lastErrorDetail())});
+    try std.testing.expectEqual(capi.ErrorCode.ok, code);
+    defer std.heap.c_allocator.free(output.ptr.?[0..output.len]);
+    return alloc.dupe(u8, output.ptr.?[0..output.len]);
+}
+
+test "capi native memory source authority preserves identity and forget fences across reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-authority-reopen");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const memory = @import("../memory/service.zig");
+    for (0..3) |mode| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const path = try std.fmt.allocPrintSentinel(alloc, "{s}/db-{d}.aflite", .{ directory.path(), mode }, 0);
+        var id: ?*anyopaque = null;
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &id));
+        defer if (id != null) antfly_db_close(id);
+        const rules = [_]memory.types.SourceRule{ .{ .source_id = "high", .principal = if (mode == 0) "bob" else "alice", .producer = "connector", .authority = 100 }, .{ .source_id = "new", .principal = "bob", .producer = "connector", .authority = 10 } };
+        var config: memory.types.Config = .{ .features = .{ .reconciliation = .deterministic }, .predicates = &.{.{ .name = "deployment", .cardinality = .one }}, .source_rules = if (mode == 0) &.{} else &rules };
+        _ = try nativeMemoryTestCall(id, alloc, "alice", .create, config, "create", "");
+        const sources = [_]memory.types.Evidence{
+            .{ .id = "high", .source_id = "high", .source_version = "1", .producer = "connector", .text = "Helm", .visibility = .team },
+            .{ .id = "low", .source_id = "low", .source_version = "1", .text = "Helm", .visibility = .team },
+        };
+        _ = try nativeMemoryTestCall(id, alloc, "alice", .observe, .{ .evidence = &sources }, "old-sources", "");
+        const new_source: memory.types.Evidence = .{ .id = "new", .source_id = "new", .source_version = "1", .producer = "connector", .text = "Terraform", .visibility = .team };
+        _ = try nativeMemoryTestCall(id, alloc, "bob", .observe, .{ .evidence = &.{new_source} }, "new-source", "");
+        const old: memory.types.Assertion = .{ .id = "old", .subject = "production", .predicate = "deployment", .value = "Helm", .statement = "Helm", .visibility = .team, .valid_from = 100, .evidence = &.{.{ .id = "high" }}, .support_sets = &.{.{ .evidence = &.{.{ .id = "low" }} }} };
+        _ = try nativeMemoryTestCall(id, alloc, "alice", .assertions, .{ .assertions = &.{old} }, "old", "");
+        if (mode != 0) _ = try nativeMemoryTestCall(id, alloc, "alice", .forget, .{ .source_ids = &[_][]const u8{"high"} }, "forget", "");
+        antfly_db_close(id);
+        id = null;
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+        if (mode == 0) {
+            const inspected = try std.json.parseFromSliceLeaky(memory.types.Inspection, alloc, try nativeMemoryTestCall(id, alloc, "alice", .inspect, .{}, "", ""), .{});
+            config.source_rules = &rules;
+            _ = try nativeMemoryTestCall(id, alloc, "alice", .configure, .{ .expected_revision = inspected.state.revision, .config = config }, "policy", "");
+        } else if (mode == 2) {
+            for (0..16) |step| _ = try nativeMemoryTestCall(id, alloc, "alice", .advance, .{}, try std.fmt.allocPrint(alloc, "cleanup-{d}", .{step}), "");
+            antfly_db_close(id);
+            id = null;
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+        }
+        const new: memory.types.Assertion = .{ .id = "new", .subject = "production", .predicate = "deployment", .value = "Terraform", .statement = "Terraform", .visibility = .team, .valid_from = 200, .evidence = &.{.{ .id = "new" }} };
+        _ = try nativeMemoryTestCall(id, alloc, "bob", .assertions, .{ .assertions = &.{new} }, "new", "");
+        const result = try std.json.parseFromSliceLeaky(memory.types.StoredAssertion, alloc, try nativeMemoryTestCall(id, alloc, "bob", .get, .{}, "", "new"), .{});
+        try std.testing.expectEqual(memory.types.Lifecycle.active, result.lifecycle);
+    }
+}
+
+test "capi native memory temporal dependencies preserve history and reconciliation through maintenance and reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-temporal-reopen");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const memory = @import("../memory/service.zig");
+    for ([_]bool{ false, true }) |maintain| for ([_]bool{ false, true }) |dated| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const path = try std.fmt.allocPrintSentinel(alloc, "{s}/db-{}-{}.aflite", .{ directory.path(), maintain, dated }, 0);
+        var id: ?*anyopaque = null;
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &id));
+        defer if (id != null) antfly_db_close(id);
+        const config: memory.types.Config = .{ .retention_ms = std.math.maxInt(u64), .features = .{ .reconciliation = .deterministic }, .predicates = &.{.{ .name = "deployment", .cardinality = .one }}, .source_rules = &.{ .{ .source_id = "high", .principal = "alice", .authority = 100 }, .{ .source_id = "new", .principal = "alice", .authority = 10 } } };
+        _ = try nativeMemoryTestCall(id, alloc, "alice", .create, config, "create", "");
+        const sources = [_]memory.types.Evidence{
+            .{ .id = "high", .source_id = "high", .source_version = "1", .text = "Helm" },
+            .{ .id = "low", .source_id = "low", .source_version = "1", .text = "Premise" },
+            .{ .id = "new", .source_id = "new", .source_version = "1", .text = "Terraform" },
+        };
+        _ = try nativeMemoryTestCall(id, alloc, "alice", .observe, .{ .evidence = &sources }, "evidence", "");
+        const parent: memory.types.Assertion = .{ .id = "parent", .subject = "premise", .predicate = "status", .value = "old", .statement = "Old premise", .valid_from = 100, .valid_to = 1000, .evidence = &.{.{ .id = "low" }} };
+        _ = try nativeMemoryTestCall(id, alloc, "alice", .assertions, .{ .assertions = &.{parent} }, "parent", "");
+        const old: memory.types.Assertion = .{ .id = "old", .subject = "production", .predicate = "deployment", .value = "Helm", .statement = "Helm", .valid_from = 100, .evidence = &.{.{ .id = "high" }}, .depends_on = &.{"parent"} };
+        _ = try nativeMemoryTestCall(id, alloc, "alice", .assertions, .{ .assertions = &.{old} }, "old", "");
+        var leaf = old;
+        leaf.id = "leaf";
+        leaf.subject = "leaf";
+        leaf.predicate = "observation";
+        leaf.depends_on = &.{"old"};
+        _ = try nativeMemoryTestCall(id, alloc, "alice", .assertions, .{ .assertions = &.{leaf} }, "leaf", "");
+        var next = parent;
+        next.id = "parent-next";
+        next.value = "new";
+        next.statement = "New premise";
+        next.valid_from = if (dated) 300 else null;
+        next.valid_to = null;
+        next.supersedes = &.{"parent"};
+        _ = try nativeMemoryTestCall(id, alloc, "alice", .assertions, .{ .assertions = &.{next} }, "next", "");
+        antfly_db_close(id);
+        id = null;
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+        const inspected = try std.json.parseFromSliceLeaky(memory.types.Inspection, alloc, try nativeMemoryTestCall(id, alloc, "alice", .inspect, .{}, "", ""), .{});
+        try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), inspected.state.config.retention_ms);
+        if (maintain) {
+            for (0..24) |step| _ = try nativeMemoryTestCall(id, alloc, "alice", .advance, .{}, try std.fmt.allocPrint(alloc, "maintenance-{d}", .{step}), "");
+            antfly_db_close(id);
+            id = null;
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+        }
+        for ([_]memory.Action{ .list, .recall }) |action| for ([_][]const u8{ "production", "leaf" }) |subject| {
+            for ([_]i64{ 200, 400 }) |valid| {
+                const raw = try nativeMemoryTestCall(id, alloc, "alice", action, .{ .subject = subject, .valid_at = valid, .token_budget = @as(u32, 8192) }, "", "");
+                const page = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{});
+                try std.testing.expectEqual(@as(usize, if (dated and valid == 200) 1 else 0), page.object.get("items").?.array.items.len);
+            }
+        };
+        const claim: memory.types.Assertion = .{ .id = "new", .subject = "production", .predicate = "deployment", .value = "Terraform", .statement = "Terraform", .valid_from = 200, .evidence = &.{.{ .id = "new" }} };
+        _ = try nativeMemoryTestCall(id, alloc, "alice", .assertions, .{ .assertions = &.{claim} }, "new", "");
+        const result = try std.json.parseFromSliceLeaky(memory.types.StoredAssertion, alloc, try nativeMemoryTestCall(id, alloc, "alice", .get, .{}, "", "new"), .{});
+        try std.testing.expectEqual(if (dated) memory.types.Lifecycle.disputed else .active, result.lifecycle);
+    };
+}
+
 test "capi lite standalone snapshots retain one catalog authority across embedded edits" {
     const alloc = std.testing.allocator;
     var directory = try TestDirectory.init("standalone-catalog-authority");
@@ -9207,4 +9720,541 @@ test "capi lite standalone snapshots retain one catalog authority across embedde
         try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_schema_json(id, &output));
         try std.testing.expectEqualStrings(antfly.public_api.tables.default_schema_json, output.ptr.?[0..output.len]);
     }
+}
+
+test "capi native memory curation content is physically scrubbed across reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-curation-reopen");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/db.aflite", .{directory.path()}, 0);
+    const memory = @import("../memory/service.zig");
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &id));
+    defer if (id != null) antfly_db_close(id);
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .create, memory.types.Config{ .retention_ms = std.math.maxInt(u64) }, "create", "");
+    const evidence: memory.types.Evidence = .{ .id = "identity", .source_id = "identity-note", .source_version = "1", .text = "Identity evidence" };
+    const entities: []const memory.types.Entity = &.{
+        .{ .id = "left", .name = "Left", .evidence = &.{.{ .id = "identity" }} },
+        .{ .id = "right", .name = "Right", .evidence = &.{.{ .id = "identity" }} },
+    };
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .observe, .{ .evidence = &.{evidence}, .entities = entities }, "entities", "");
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .curate_entity, memory.types.EntityCorrection{ .action = .merge, .from = "left", .to = "right", .expected_revision = 3, .reason = "PRIVATE_CURATOR_REASON" }, "merge", "");
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .forget, .{ .all = true }, "forget", "");
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    for (0..24) |step| _ = try nativeMemoryTestCall(id, alloc, "alice", .advance, .{}, try std.fmt.allocPrint(alloc, "cleanup-{d}", .{step}), "");
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    const guard = enterHandle(id, .exclusive) orelse return error.TestUnexpectedResult;
+    defer guard.leave();
+    try std.testing.expect(guard.entry_error == null);
+    const owner = guard.handle.parent_handle orelse guard.handle;
+    var adapter: @import("../memory/engine.zig").Native(db_mod.DB) = .{
+        .db = try @import("tables.zig").get(owner, "memory_personal"),
+        .context = .{ .space = "personal", .principal = "alice", .admin = true, .now_ms = 1 },
+    };
+    const backend = adapter.backend();
+    try std.testing.expect(try backend.get(backend.ptr, alloc, "forgotten-all") != null);
+    try std.testing.expect(try backend.get(backend.ptr, alloc, "cleanup") == null);
+    try std.testing.expect(try backend.get(backend.ptr, alloc, "entity-policy") == null);
+    try std.testing.expectEqual(@as(usize, 0), (try backend.scan(backend.ptr, alloc, "entity-curation/", null, 256)).rows.len);
+    var cursor: ?[]const u8 = null;
+    while (true) {
+        const page = try backend.scan(backend.ptr, alloc, "", cursor, 256);
+        for (page.rows) |row| try std.testing.expect(std.mem.indexOf(u8, row.json, "PRIVATE_CURATOR_REASON") == null);
+        cursor = page.next;
+        if (cursor == null) break;
+    }
+}
+
+test "capi native memory outcome conflicts and retirement fences survive reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-outcome-reopen");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/db.aflite", .{directory.path()}, 0);
+    const memory = @import("../memory/service.zig");
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &id));
+    defer if (id != null) antfly_db_close(id);
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .create, memory.types.Config{ .retention_ms = std.math.maxInt(u64) }, "create", "");
+    const evidence: memory.types.Evidence = .{ .id = "e", .source_id = "source", .source_version = "1", .text = "Task evidence" };
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .observe, .{ .evidence = &.{evidence} }, "evidence", "");
+    const claim: memory.types.Assertion = .{ .id = "claim", .subject = "s", .predicate = "p", .value = "v", .statement = "Task assertion", .evidence = &.{.{ .id = "e" }} };
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .assertions, .{ .assertions = &.{claim} }, "claim", "");
+    const outcome: memory.types.Outcome = .{ .id = "result", .task_id = "task", .success = true, .used_memory_ids = &.{"claim"}, .detail = "PRIVATE_FEEDBACK" };
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .outcome, outcome, "outcome", "");
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    var changed = outcome;
+    changed.success = false;
+    const conflicting = try std.json.Stringify.valueAlloc(alloc, .{ .action = "outcome", .principal = "alice", .body = changed, .idempotency_key = "changed" }, .{});
+    var output: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.version_conflict, antfly_db_memory_json(id, .fromSlice("personal"), .fromSlice(conflicting), &output));
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(capi.lastErrorDetail()), "MemoryOutcomeConflict") != null);
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .forget, .{ .source_ids = &[_][]const u8{"source"} }, "forget", "");
+    for (0..20) |step| _ = try nativeMemoryTestCall(id, alloc, "alice", .advance, .{}, try std.fmt.allocPrint(alloc, "cleanup-{d}", .{step}), "");
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    changed.used_memory_ids = &.{};
+    const reuse = try std.json.Stringify.valueAlloc(alloc, .{ .action = "outcome", .principal = "alice", .body = changed, .idempotency_key = "reuse" }, .{});
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_memory_json(id, .fromSlice("personal"), .fromSlice(reuse), &output));
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(capi.lastErrorDetail()), "MemoryForgotten") != null);
+    // A new ID with no citations must also respect the permanent global fence.
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .forget, .{ .all = true }, "all", "");
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    changed.id = "new-result";
+    const late = try std.json.Stringify.valueAlloc(alloc, .{ .action = "outcome", .principal = "alice", .body = changed, .idempotency_key = "late" }, .{});
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_memory_json(id, .fromSlice("personal"), .fromSlice(late), &output));
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(capi.lastErrorDetail()), "MemoryForgotten") != null);
+}
+
+test "capi native memory explains ordinary row provenance across trace expiry source edits and reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-resource-provenance");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/db.aflite", .{directory.path()}, 0);
+    const memory = @import("../memory/service.zig");
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &id));
+    defer if (id != null) antfly_db_close(id);
+    var business_ref: memory.types.provenance.Resource = undefined;
+    var trace_ref: memory.types.provenance.Resource = undefined;
+    {
+        const guard = enterHandle(id, .exclusive) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        const owner = guard.handle.parent_handle orelse guard.handle;
+        const tables = @import("tables.zig");
+        for ([_][]const u8{ "business", "traces" }) |table_name| {
+            try tables.create(owner, table_name, "{}", true);
+            const db = try tables.get(owner, table_name);
+            try db.batch(.{ .writes = &.{.{ .key = "approved", .value = "{\"message\":\"APPROVED_V1\"}" }}, .sync_level = .write });
+            const row = (try db.getDocument(alloc, "approved", .{})).?;
+            const reference: memory.types.provenance.Resource = .{ .table = table_name, .table_id = db.core.identity_namespace.table_id, .kind = if (std.mem.eql(u8, table_name, "traces")) .trace else .record, .id = "approved", .revision = row.version orelse try db.getTimestamp(alloc, "approved") };
+            if (std.mem.eql(u8, table_name, "traces")) trace_ref = reference else business_ref = reference;
+        }
+    }
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .create, memory.types.Config{ .retention_ms = std.math.maxInt(u64) }, "create", "");
+    const evidence: memory.types.Evidence = .{ .id = "e", .resource_selector = .{ .table = "business", .id = "approved" } };
+    const claim: memory.types.Assertion = .{ .id = "claim", .subject = "production", .predicate = "deployment", .value = "Terraform", .statement = "Approved deployment", .evidence = &.{.{ .id = "e" }} };
+    _ = try nativeMemoryTestCall(id, alloc, "alice", .observe, .{ .origin = memory.types.provenance.Origin{ .trace = trace_ref, .agent = .{ .id = "coding-agent", .kind = .agent } }, .evidence = &.{evidence}, .assertions = &.{claim} }, "observe", "");
+    const pinned_source = try std.json.parseFromSliceLeaky(memory.types.StoredEvidence, alloc, try nativeMemoryTestCall(id, alloc, "alice", .evidence, .{}, "", "e"), .{});
+    try std.testing.expectEqual(business_ref.revision, pinned_source.evidence.resource.?.revision);
+    try std.testing.expect(pinned_source.evidence.resource_selector == null);
+    const before = try nativeMemoryTestCall(id, alloc, "alice", .explain, memory.types.provenance.ExplainRequest{}, "", "claim");
+    try std.testing.expect(std.mem.indexOf(u8, before, "APPROVED_V1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, before, "originated_in") != null);
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    {
+        const guard = enterHandle(id, .exclusive) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        const db = try @import("tables.zig").get(guard.handle.parent_handle orelse guard.handle, "traces");
+        try db.batch(.{ .deletes = &.{"approved"}, .sync_level = .write });
+    }
+    const after = try nativeMemoryTestCall(id, alloc, "alice", .explain, memory.types.provenance.ExplainRequest{}, "", "claim");
+    try std.testing.expect(std.mem.indexOf(u8, after, "coding-agent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "APPROVED_V1") != null);
+    try std.testing.expect((try std.json.parseFromSliceLeaky(std.json.Value, alloc, after, .{})).object.get("missing_evidence").?.bool);
+    {
+        const guard = enterHandle(id, .exclusive) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        const db = try @import("tables.zig").get(guard.handle.parent_handle orelse guard.handle, "business");
+        try db.batch(.{ .writes = &.{.{ .key = "approved", .value = "{\"message\":\"CHANGED_V2\"}" }}, .sync_level = .write });
+    }
+    var output: capi.Buffer = .{};
+    const request = "{\"action\":\"get\",\"principal\":\"alice\",\"id\":\"claim\"}";
+    try std.testing.expectEqual(capi.ErrorCode.not_found, antfly_db_memory_json(id, .fromSlice("personal"), .fromSlice(request), &output));
+    const historical = try nativeMemoryTestCall(id, alloc, "alice", .explain, .{ .revision = @as(u64, 3) }, "", "claim");
+    try std.testing.expect(std.mem.indexOf(u8, historical, "APPROVED_V1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, historical, "CHANGED_V2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, historical, "\"status\":\"changed\"") != null);
+    // The external reference predates memory import and has no storage hint or
+    // content digest. The retained version must still resolve after reopening.
+    const ordinary_history = try nativeMemoryTestCall(id, alloc, "alice", .explain, memory.types.provenance.ExplainRequest{ .resource = business_ref, .known_at = pinned_source.recorded_at }, "", "");
+    try std.testing.expect(std.mem.indexOf(u8, ordinary_history, "APPROVED_V1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ordinary_history, "CHANGED_V2") == null);
+}
+
+test "capi native memory grouped episodes advance without a waiting write in root and table connections" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-group-background");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    var root: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &root));
+    defer antfly_db_close(root);
+    try std.testing.expectEqual(capi.ErrorCode.ok, @import("tables.zig").antfly_db_create_table_json(root, .fromSlice("history"), .fromSlice("{}")));
+    var table: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, @import("tables.zig").antfly_db_open_table(root, .fromSlice("history"), &table));
+    defer antfly_db_close(table);
+    const work = @import("../storage/db/group_source_worker.zig");
+    const contract = @import("../storage/db/group_source_contract.zig");
+    for ([_]?*anyopaque{ root, table }, 0..) |id, namespace_index| {
+        {
+            const guard = enterHandle(id, .write) orelse return error.TestUnexpectedResult;
+            defer guard.leave();
+            const database = guard.handle.database();
+            try database.addEnrichment(.{ .name = "turns", .kind = .group, .source = .{ .group_by = "thread_id", .order_by = "ordinal", .segment_by = "turn_id", .field = "text" } });
+            try database.batch(.{ .writes = &.{.{ .key = "message", .value = "{\"thread_id\":\"thread\",\"turn_id\":\"turn\",\"ordinal\":1,\"text\":\"History episode\"}" }}, .sync_level = .write });
+        }
+        var published = false;
+        for (0..300) |_| {
+            {
+                const guard = enterHandle(id, .read) orelse return error.TestUnexpectedResult;
+                defer guard.leave();
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const temporary = arena.allocator();
+                const database = guard.handle.database();
+                const definitions = (try database.lookup(temporary, "", .{ .group_source_query_json = "{\"action\":\"definitions\"}" })).?;
+                const entries = try std.json.parseFromSliceLeaky([]work.Definition, temporary, definitions.json, .{});
+                if (entries.len > 0) {
+                    const query: contract.Query = .{ .action = .status, .artifact = "turns", .definition = entries[0].definition, .group = "thread", .segment = "turn", .cell = 0 };
+                    const response = (try database.lookup(temporary, "", .{ .group_source_query_json = try std.json.Stringify.valueAlloc(temporary, query, .{}) })).?;
+                    const status = try std.json.parseFromSliceLeaky(struct { snapshot: ?@import("../storage/db/group_source_state.zig").Snapshot = null }, temporary, response.json, .{ .ignore_unknown_fields = true });
+                    if (status.snapshot) |snapshot| if (snapshot.units.len > 0) {
+                        published = true;
+                        break;
+                    };
+                }
+            }
+            try std.testing.io.sleep(.fromMilliseconds(20), .awake);
+        }
+        if (!published) {
+            const guard = enterHandle(id, .read) orelse return error.TestUnexpectedResult;
+            defer guard.leave();
+            const stats = try pendingWorkStatsJson(guard.handle);
+            defer std.heap.c_allocator.free(stats.ptr.?[0..stats.len]);
+            std.debug.print("group background namespace={d} stats={s}\n", .{ namespace_index, stats.ptr.?[0..stats.len] });
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const temporary = arena.allocator();
+            const database = guard.handle.database();
+            const definitions = (try database.lookup(temporary, "", .{ .group_source_query_json = "{\"action\":\"definitions\"}" })).?;
+            const entries = try std.json.parseFromSliceLeaky([]work.Definition, temporary, definitions.json, .{});
+            if (entries.len > 0) {
+                const response = (try database.lookup(temporary, "", .{ .group_source_query_json = try std.json.Stringify.valueAlloc(temporary, contract.Query{ .action = .status, .artifact = "turns", .definition = entries[0].definition, .group = "thread", .segment = "turn", .cell = 0 }, .{}) })).?;
+                std.debug.print("group background status={s}\n", .{response.json});
+            }
+        }
+        try std.testing.expect(published);
+    }
+}
+
+test "capi native memory migration views episodes graph and external reviews survive reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-migration");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &id));
+    defer if (id != null) antfly_db_close(id);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const memory = @import("../memory/service.zig");
+    const temporary = arena.allocator();
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .create, memory.types.Config{ .ontology_pack = .software_team_v1 }, "create", "");
+    const observation: memory.types.ObservationRequest = .{
+        .evidence = &.{
+            .{ .id = "turn", .source_id = "history", .source_version = "1", .text = "Antfly storage uses WAL", .thread_id = "thread", .turn_id = "turn-1", .ordinal = 1, .visibility = .team },
+            .{ .id = "prefix", .source_id = "history", .source_version = "1", .text = "OWNER_ONLY_PREFIX", .thread_id = "thread", .ordinal = 0 },
+            .{ .id = "private", .source_id = "history", .source_version = "1", .text = "OWNER_ONLY_THREAD", .thread_id = "private-thread", .ordinal = 0 },
+        },
+        .entities = &.{ .{ .id = "a", .name = "Antfly", .evidence = &.{.{ .id = "turn" }} }, .{ .id = "b", .name = "storage", .evidence = &.{.{ .id = "turn" }} } },
+        .assertions = &.{.{ .id = "relation", .subject = "b", .predicate = "part_of", .value = "a", .statement = "Storage is part of Antfly", .evidence = &.{.{ .id = "turn" }} }},
+    };
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .observe, observation, "observe", "");
+    const proposed_json = try nativeMemoryTestCall(id, temporary, "alice", .propose_entity, memory.types.EntityProposalRequest{ .action = .suppress, .from = "b", .expected_revision = 3, .actor = "codex/generic-screen" }, "propose", "");
+    const proposed = try std.json.parseFromSliceLeaky(memory.types.OperationStatus, temporary, proposed_json, .{});
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .review_entity, memory.types.EntityVerdict{ .expected_revision = 4, .accept = false, .actor = "codex/judge" }, "reject", proposed.proposal_id.?);
+    for (0..2) |attempt| {
+        const view = try nativeMemoryTestCall(id, temporary, "alice", .entity_view, memory.types.EntityViewRequest{}, "", "b");
+        try std.testing.expect(std.mem.indexOf(u8, view, "Storage is part of Antfly") != null);
+        const episode = try nativeMemoryTestCall(id, temporary, "alice", .episode, memory.types.EpisodeRequest{}, "", "thread");
+        try std.testing.expect(std.mem.indexOf(u8, episode, "Antfly storage uses WAL") != null);
+        const graph_json = try nativeMemoryTestCall(id, temporary, "alice", .recall, memory.types.Recall{ .graph = .{ .entity_seeds = &.{"a"}, .max_hops = 3 }, .token_budget = 8192 }, "", "");
+        const graph = try std.json.parseFromSliceLeaky(memory.types.RecallResult, temporary, graph_json, .{});
+        try std.testing.expectEqual(@as(usize, 1), graph.items.len);
+        try std.testing.expectEqual(@as(usize, 1), graph.episodes.len);
+        const review = try nativeMemoryTestCall(id, temporary, "alice", .entity_proposal, .{}, "", proposed.proposal_id.?);
+        try std.testing.expect(std.mem.indexOf(u8, review, "\"state\":\"rejected\"") != null);
+        {
+            // The local C ABI caller is trusted as administrator. Exercise
+            // ordinary reader policy on the same persisted native table too.
+            const guard = enterHandle(id, .read) orelse return error.TestUnexpectedResult;
+            defer guard.leave();
+            const database = try @import("tables.zig").get(guard.handle.parent_handle orelse guard.handle, "memory_personal");
+            const context: memory.Context = .{ .principal = "bob", .table_id = database.core.identity_namespace.table_id, .space = "personal", .now_ms = 1 };
+            var adapter: @import("../memory/engine.zig").Native(@import("../storage/db/db.zig").DB) = .{ .db = database, .context = context };
+            const reader: memory.Service = .{ .backend = adapter.backend(), .context = context };
+            try std.testing.expectError(error.MemoryNotFound, reader.execute(temporary, .episode, "private-thread", "{\"limit\":1}", ""));
+            const public_json = try reader.execute(temporary, .episodes, "", "{}", "");
+            const public = try std.json.parseFromSliceLeaky(memory.types.EpisodePage, temporary, public_json, .{});
+            try std.testing.expectEqual(@as(usize, 1), public.items.len);
+            try std.testing.expectEqualStrings("turn", public.items[0].turns[0].evidence.evidence.id);
+            try std.testing.expect(std.mem.indexOf(u8, public_json, "OWNER_ONLY") == null);
+        }
+        if (attempt == 0) {
+            antfly_db_close(id);
+            id = null;
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+        }
+    }
+}
+
+test "capi native memory refreshed proposal attempts retain immutable explanations across reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-proposal-attempts");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &id));
+    defer if (id != null) antfly_db_close(id);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temporary = arena.allocator();
+    const memory = @import("../memory/service.zig");
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .create, memory.types.Config{}, "create", "");
+    const source: memory.types.ObservationRequest = .{
+        .evidence = &.{.{ .id = "e", .source_id = "test", .source_version = "1", .text = "Grounded concept pair" }},
+        .entities = &.{ .{ .id = "a", .name = "A", .evidence = &.{.{ .id = "e" }} }, .{ .id = "b", .name = "B", .evidence = &.{.{ .id = "e" }} } },
+    };
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .observe, source, "observe", "");
+    var request: memory.types.EntityProposalRequest = .{ .action = .merge, .from = "a", .to = "b", .expected_revision = 3, .actor = "old-judge" };
+    const first = try std.json.parseFromSliceLeaky(memory.types.OperationStatus, temporary, try nativeMemoryTestCall(id, temporary, "alice", .propose_entity, request, "first", ""), .{});
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .configure, .{ .expected_revision = @as(u64, 4), .config = memory.types.Config{ .policy_version = "new-policy" } }, "configure", "");
+    request.expected_revision = 5;
+    request.actor = "new-judge";
+    const second = try std.json.parseFromSliceLeaky(memory.types.OperationStatus, temporary, try nativeMemoryTestCall(id, temporary, "alice", .propose_entity, request, "second", ""), .{});
+    try std.testing.expectEqualStrings(first.proposal_id.?, second.proposal_id.?);
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .review_entity, memory.types.EntityVerdict{ .expected_revision = 6, .accept = false }, "reject", second.proposal_id.?);
+    for (0..2) |attempt| {
+        const current = try nativeMemoryTestCall(id, temporary, "alice", .entity_proposal, .{}, "", first.proposal_id.?);
+        try std.testing.expect(std.mem.indexOf(u8, current, "\"state\":\"rejected\"") != null);
+        for ([_]memory.types.OperationStatus{ first, second }, [_][]const u8{ "old-judge", "new-judge" }) |operation, actor| {
+            const context = try std.json.parseFromSliceLeaky(std.json.Value, temporary, current, .{});
+            const resource = try std.json.parseFromValueLeaky(memory.types.provenance.Resource, temporary, context.object.get("inputs").?.object.get("operation").?, .{});
+            var reference = resource;
+            reference.id = operation.id;
+            reference.revision = operation.revision;
+            const explanation = try nativeMemoryTestCall(id, temporary, "alice", .explain, memory.types.provenance.ExplainRequest{ .resource = reference, .max_nodes = 1, .max_bytes = 65536 }, "", "");
+            try std.testing.expect(std.mem.indexOf(u8, explanation, "entity_proposal") != null);
+            try std.testing.expect(std.mem.indexOf(u8, explanation, actor) != null);
+        }
+        if (attempt == 0) {
+            antfly_db_close(id);
+            id = null;
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+        }
+    }
+}
+
+test "capi native memory indexed candidates retain production views across reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-candidate-index");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &id));
+    defer if (id != null) antfly_db_close(id);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temporary = arena.allocator();
+    const memory = @import("../memory/service.zig");
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .create, memory.types.Config{}, "create", "");
+    const source: memory.types.ObservationRequest = .{
+        .evidence = &.{.{ .id = "e", .source_id = "test", .source_version = "1", .text = "The approvals reviewer checks approval requests" }},
+        .entities = &.{ .{ .id = "a", .name = "approval reviewer", .evidence = &.{.{ .id = "e" }} }, .{ .id = "b", .name = "approvals reviewer", .evidence = &.{.{ .id = "e" }} } },
+    };
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .observe, source, "observe", "");
+    const claim: memory.types.Assertion = .{ .id = "description", .subject = "b", .predicate = "purpose", .value = "reviews", .statement = "The approvals reviewer checks approval requests", .evidence = &.{.{ .id = "e" }} };
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .assertions, .{ .assertions = &.{claim} }, "describe", "");
+    for (0..2) |attempt| {
+        const result = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try nativeMemoryTestCall(id, temporary, "alice", .entity_candidates, memory.types.EntityCandidateRequest{}, "", "a"), .{});
+        try std.testing.expectEqualStrings("indexed_lexical", result.object.get("retrieval").?.string);
+        const items = result.object.get("items").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), items.len);
+        const view = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try nativeMemoryTestCall(id, temporary, "alice", .entity_view, memory.types.EntityViewRequest{}, "", "b"), .{});
+        try std.testing.expectEqualStrings(view.object.get("fingerprint").?.string, items[0].object.get("view").?.object.get("fingerprint").?.string);
+        if (attempt == 0) {
+            antfly_db_close(id);
+            id = null;
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+        }
+    }
+}
+
+test "capi native memory accepted judgment context and forgetting survive reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-judgment-context");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &id));
+    defer if (id != null) antfly_db_close(id);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const memory = @import("../memory/service.zig");
+    const temporary = arena.allocator();
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .create, memory.types.Config{ .ontology_pack = .software_team_v1 }, "create", "");
+    const observation: memory.types.ObservationRequest = .{
+        .evidence = &.{
+            .{ .id = "base", .source_id = "concepts", .source_version = "1", .text = "Antfly and database" },
+            .{ .id = "context", .source_id = "description", .source_version = "1", .text = "Antfly is a database" },
+            .{ .id = "fallback", .source_id = "description", .source_version = "2", .text = "Independent description support" },
+        },
+        .entities = &.{ .{ .id = "a", .name = "Antfly", .evidence = &.{.{ .id = "base" }} }, .{ .id = "b", .name = "database", .evidence = &.{.{ .id = "base" }} } },
+        .assertions = &.{.{ .id = "description", .subject = "a", .predicate = "description", .value = "database", .statement = "Antfly is a database", .evidence = &.{.{ .id = "context" }}, .support_sets = &.{.{ .evidence = &.{.{ .id = "fallback" }} }} }},
+    };
+    const observed = try std.json.parseFromSliceLeaky(memory.types.OperationStatus, temporary, try nativeMemoryTestCall(id, temporary, "alice", .observe, observation, "observe", ""), .{});
+    const request: memory.types.RelationshipProposalRequest = .{ .id = "proposal", .expected_revision = observed.revision, .assertion = .{ .id = "link", .subject = "a", .predicate = "is_a", .value = "b", .statement = "Accepted relation", .evidence = &.{.{ .id = "base" }} } };
+    const proposed = try std.json.parseFromSliceLeaky(memory.types.OperationStatus, temporary, try nativeMemoryTestCall(id, temporary, "alice", .propose_relationship, request, "propose", ""), .{});
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .review_relationship, memory.types.EntityVerdict{ .expected_revision = proposed.revision, .accept = true, .reason = "PERSISTED_VERDICT_RATIONALE" }, "accept", "proposal");
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .get, .{}, "", "link");
+    _ = try nativeMemoryTestCall(id, temporary, "alice", .forget, memory.types.Forget{ .evidence_ids = &.{"context"} }, "forget", "");
+    for (0..2) |attempt| {
+        const result = try std.json.parseFromSliceLeaky(memory.types.RecallResult, temporary, try nativeMemoryTestCall(id, temporary, "alice", .recall, memory.types.Recall{ .token_budget = 8192 }, "", ""), .{});
+        try std.testing.expectEqual(@as(usize, 1), result.items.len);
+        try std.testing.expectEqualStrings("description", result.items[0].memory.assertion.id);
+        var output: capi.Buffer = .{};
+        defer antfly_buffer_free(&output);
+        const code = antfly_db_memory_json(id, .fromSlice("personal"), .fromSlice("{\"action\":\"relationship_proposal\",\"principal\":\"alice\",\"id\":\"proposal\",\"body\":{}}"), &output);
+        if (attempt == 0 and code == .ok) {
+            try std.testing.expect(std.mem.indexOf(u8, output.ptr.?[0..output.len], "PERSISTED_VERDICT_RATIONALE") == null);
+        } else try std.testing.expectEqual(capi.ErrorCode.not_found, code);
+        if (attempt == 0) {
+            for (0..16) |i| _ = try nativeMemoryTestCall(id, temporary, "alice", .advance, .{}, try std.fmt.allocPrint(temporary, "cleanup-{d}", .{i}), "");
+            antfly_db_close(id);
+            id = null;
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+        }
+    }
+}
+
+fn nativeMemoryBranchCall(handle: ?*anyopaque, alloc: Allocator, branch: []const u8, action: @import("../memory/service.zig").Action, body: anytype, token: []const u8, name: []const u8) ![]const u8 {
+    const request = try std.json.Stringify.valueAlloc(alloc, .{ .branch = branch, .action = action, .principal = "alice", .id = name, .body = body, .idempotency_key = token }, .{});
+    var output: capi.Buffer = .{};
+    const code = antfly_db_memory_json(handle, .fromSlice("personal"), .fromSlice(request), &output);
+    if (code != .ok) std.debug.print("memory C ABI branch: {s}\n", .{std.mem.span(capi.lastErrorDetail())});
+    try std.testing.expectEqual(capi.ErrorCode.ok, code);
+    defer std.heap.c_allocator.free(output.ptr.?[0..output.len]);
+    return alloc.dupe(u8, output.ptr.?[0..output.len]);
+}
+
+test "capi native memory lineage screening feed and labelled evaluations survive reopen" {
+    const memory = @import("../memory/service.zig");
+    const t = memory.types;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var directory = try TestDirectory.init("native-memory-workflows-reopen");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer if (handle != null) antfly_db_close(handle);
+    _ = try nativeMemoryTestCall(handle, a, "alice", .create, t.Config{ .features = .{ .lineage = true }, .intake_screening = .{ .mode = .redact } }, "create", "");
+    const observed = try std.json.parseFromSliceLeaky(t.OperationStatus, a, try nativeMemoryTestCall(handle, a, "alice", .observe, t.ObservationRequest{ .evidence = &.{.{ .id = "e", .source_id = "fixture", .source_version = "1", .text = "password=synthetic-fixture" }} }, "observe", ""), .{});
+    try std.testing.expect(observed.intake_screening.redactions > 0);
+    const fact: t.Assertion = .{ .id = "fact", .subject = "deployment", .predicate = "uses", .value = "Helm", .statement = "Deployment uses Helm", .evidence = &.{.{ .id = "e" }} };
+    const asserted = try std.json.parseFromSliceLeaky(t.OperationStatus, a, try nativeMemoryTestCall(handle, a, "alice", .assertions, .{ .assertions = &.{fact} }, "assert", ""), .{});
+    const forked = try std.json.parseFromSliceLeaky(t.OperationStatus, a, try nativeMemoryTestCall(handle, a, "alice", .fork_lineage, t.LineageFork{ .id = "fork", .expected_revision = asserted.revision }, "fork", ""), .{});
+    const saved = try std.json.parseFromSliceLeaky(t.OperationStatus, a, try nativeMemoryBranchCall(handle, a, "fork", .checkpoint_lineage, t.LineageCheckpointRequest{ .id = "before", .expected_revision = forked.revision }, "checkpoint", ""), .{});
+    const corrected = try std.json.parseFromSliceLeaky(t.OperationStatus, a, try nativeMemoryBranchCall(handle, a, "fork", .correct, t.Correction{ .id = "fact", .expected_revision = asserted.revision, .lifecycle = .retracted, .reason = "Fork-only correction" }, "correct", ""), .{});
+    _ = saved;
+    const dataset = try std.json.parseFromSliceLeaky(t.OperationStatus, a, try nativeMemoryTestCall(handle, a, "alice", .put_evaluation_dataset, t.evaluation.DatasetRequest{ .id = "labels", .expected_revision = corrected.revision, .cases = &.{.{ .id = "pair", .task = .identity, .input = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"left\":\"KG\",\"right\":\"knowledge graph\"}", .{}), .expected = .same }} }, "dataset", ""), .{});
+    const started = try std.json.parseFromSliceLeaky(t.OperationStatus, a, try nativeMemoryTestCall(handle, a, "alice", .start_evaluation, t.evaluation.Start{ .id = "run", .dataset = "labels", .expected_revision = dataset.revision }, "run", ""), .{});
+    antfly_db_close(handle);
+    handle = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &handle));
+    const evidence = try nativeMemoryTestCall(handle, a, "alice", .evidence, .{}, "", "e");
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "synthetic-fixture") == null);
+    const main_fact = try std.json.parseFromSliceLeaky(t.StoredAssertion, a, try nativeMemoryTestCall(handle, a, "alice", .get, .{}, "", "fact"), .{});
+    const branch_fact = try std.json.parseFromSliceLeaky(t.StoredAssertion, a, try nativeMemoryBranchCall(handle, a, "fork", .get, .{}, "", "fact"), .{});
+    try std.testing.expectEqual(t.Lifecycle.active, main_fact.lifecycle);
+    try std.testing.expectEqual(t.Lifecycle.retracted, branch_fact.lifecycle);
+    const tasks = try std.json.parseFromSliceLeaky(t.evaluation.TaskPage, a, try nativeMemoryTestCall(handle, a, "alice", .evaluation_tasks, @import("../memory/operations.zig").Page{}, "", "run"), .{});
+    try std.testing.expectEqual(@as(usize, 1), tasks.items.len);
+    const task = tasks.items[0];
+    const judged = try std.json.parseFromSliceLeaky(t.OperationStatus, a, try nativeMemoryTestCall(handle, a, "alice", .evaluation_verdict, t.evaluation.Submit{ .expected_revision = started.revision, .verdicts = &.{.{ .case_id = task.case_id, .case_revision = task.case_revision, .input_fingerprint = task.input_fingerprint, .prediction = .{ .label = .same } }} }, "verdict", "run"), .{});
+    const status = try std.json.parseFromSliceLeaky(t.evaluation.Status, a, try nativeMemoryTestCall(handle, a, "alice", .evaluation_run, .{}, "", "run"), .{});
+    try std.testing.expectEqual(@as(f64, 1), status.identity.recall.?);
+    _ = try nativeMemoryBranchCall(handle, a, "fork", .revert_lineage, t.LineageRevert{ .checkpoint = "before", .expected_revision = judged.revision }, "revert", "");
+    const restored = try std.json.parseFromSliceLeaky(t.StoredAssertion, a, try nativeMemoryBranchCall(handle, a, "fork", .get, .{}, "", "fact"), .{});
+    try std.testing.expectEqual(t.Lifecycle.active, restored.lifecycle);
+    const changes = try std.json.parseFromSliceLeaky(t.ChangePage, a, try nativeMemoryTestCall(handle, a, "alice", .changes, t.ChangeRequest{ .start = .beginning }, "", ""), .{});
+    try std.testing.expect(changes.items.len >= 4);
+}
+
+test "capi native memory supersession uses filtered lexical indexes and durable external verdicts" {
+    const memory = @import("../memory/service.zig");
+    const t = memory.types;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var directory = try TestDirectory.init("native-memory-supersession-indexed");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer if (handle != null) antfly_db_close(handle);
+    _ = try nativeMemoryTestCall(handle, a, "alice", .create, t.Config{}, "create", "");
+    var claims: [3]t.Assertion = undefined;
+    for (&claims, 0..) |*claim, i| claim.* = .{ .id = try std.fmt.allocPrint(a, "claim-{d}", .{i}), .subject = if (i < 2) "production" else "unrelated", .predicate = "deploys", .value = try std.fmt.allocPrint(a, "value-{d}", .{i}), .statement = "Deployment uses Helm", .evidence = &.{.{ .id = "e" }} };
+    _ = try nativeMemoryTestCall(handle, a, "alice", .observe, t.ObservationRequest{ .evidence = &.{.{ .id = "e", .source_id = "fixture", .source_version = "1", .text = "Deployment uses Helm" }}, .assertions = &claims }, "observe", "");
+    for (0..16) |step| _ = try nativeMemoryTestCall(handle, a, "alice", .advance, .{}, try std.fmt.allocPrint(a, "index-{d}", .{step}), "");
+    const candidates = try std.json.parseFromSliceLeaky(t.SupersessionCandidatePage, a, try nativeMemoryTestCall(handle, a, "alice", .supersession_candidates, t.SupersessionCandidateRequest{ .mode = .lexical }, "", "claim-0"), .{});
+    try std.testing.expectEqual(.indexed, candidates.retrieval);
+    try std.testing.expectEqual(.disabled, candidates.semantic_discovery);
+    try std.testing.expectEqual(@as(usize, 1), candidates.items.len);
+    try std.testing.expectEqualStrings("claim-1", candidates.items[0].view.memory.assertion.id);
+    const seed = candidates.seed;
+    const previous = candidates.items[0].view;
+    const proposal = try std.json.parseFromSliceLeaky(t.OperationStatus, a, try nativeMemoryTestCall(handle, a, "alice", .propose_supersession, t.SupersessionProposalRequest{ .id = "pair", .expected_revision = candidates.revision, .incoming = .{ .id = seed.memory.assertion.id, .revision = seed.memory.revision, .fingerprint = seed.fingerprint }, .previous = .{ .id = previous.memory.assertion.id, .revision = previous.memory.revision, .fingerprint = previous.fingerprint } }, "proposal", ""), .{});
+    _ = try nativeMemoryTestCall(handle, a, "alice", .review_supersession, t.SupersessionVerdict{ .expected_revision = proposal.revision, .verdict = .supersedes, .reason = "Explicit external replacement verdict" }, "verdict", "pair");
+    antfly_db_close(handle);
+    handle = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &handle));
+    const record = try std.json.parseFromSliceLeaky(t.StoredAssertion, a, try nativeMemoryTestCall(handle, a, "alice", .get, .{}, "", "claim-1"), .{});
+    try std.testing.expectEqual(t.Lifecycle.superseded, record.lifecycle);
+    const detail = try std.json.parseFromSliceLeaky(t.SupersessionProposalDetail, a, try nativeMemoryTestCall(handle, a, "alice", .supersession_proposal, .{}, "", "pair"), .{});
+    try std.testing.expectEqual(t.SupersessionRelation.supersedes, detail.proposal.verdict.?);
 }

@@ -2808,7 +2808,7 @@ pub fn parseQueryRequestWithDeadline(
             var control = try std.json.parseFromValue(struct { mode: db_mod.types.document_authority.Mode, group: u64, defer_stored_projection: bool = false }, alloc, value, .{});
             defer control.deinit();
             if (control.value.mode == .none or control.value.group == 0) return error.InvalidQueryRequest;
-            owned.req.include_stored = false;
+            owned.req.include_stored = control.value.mode == .lookup;
             owned.req.document_authority_mode = control.value.mode;
             owned.req.document_authority_group = control.value.group;
             owned.req.defer_stored_projection = control.value.defer_stored_projection;

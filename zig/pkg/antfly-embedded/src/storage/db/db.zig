@@ -4986,7 +4986,8 @@ pub const DB = struct {
         self.startArtifactRepairMetadataWorkerIfNeeded();
         self.startQuarantineRetryWorkerIfNeeded();
         self.startGraphEndpointCleanupWorker();
-        self.group_source_owner.start(.{ .ptr = self, .runtime = self.backend_runtime, .run = runLocalGroupSourceSlice });
+        if (self.local_execution.optional_runtime_workers_enabled)
+            self.group_source_owner.start(.{ .ptr = self, .runtime = self.backend_runtime, .run = runLocalGroupSourceSlice });
     }
 
     pub fn closeOwned(self: *DB) void {
@@ -15664,6 +15665,47 @@ pub const DB = struct {
         return upsert_result;
     }
 
+    pub fn completeResolverProjectionWork(self: *DB, key: []const u8) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
+        var activity = try self.acquireResolverCatalogActivity(true);
+        defer activity.deinit();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        var probe = try self.core.store.beginProbeTxn();
+        defer probe.abort();
+        try self.requireOnlineArtifactCatalogMutableLocked(&probe);
+        try self.core.index_manager.completeResolverProjectionWork(self.core.store, key);
+    }
+
+    pub fn publishResolverNamespaceProjection(self: *DB, table: []const u8, table_id: u64, namespace: @import("resolver_namespace.zig").Namespace) !bool {
+        return self.publishResolverNamespaceProjectionWork(table, table_id, namespace, null);
+    }
+
+    pub fn publishResolverNamespaceProjectionWork(self: *DB, table: []const u8, table_id: u64, namespace: @import("resolver_namespace.zig").Namespace, completion: ?@import("../lite/resolver_consumers.zig").Completion) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
+        const changed = blk: {
+            var activity = try self.acquireResolverCatalogActivity(true);
+            defer activity.deinit();
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            var probe = try self.core.store.beginProbeTxn();
+            defer probe.abort();
+            try self.requireOnlineArtifactCatalogMutableLocked(&probe);
+            break :blk try self.core.index_manager.publishResolverNamespaceProjectionWork(self.core.store, table, table_id, namespace, completion);
+        };
+        if (changed) {
+            if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
+            try self.startResolverReplayRuntimes();
+        }
+        return changed;
+    }
+
     pub fn upsertResolverWithResult(self: *DB, cfg: index_manager_mod.ResolverConfig) !index_manager_mod.IndexManager.ResolverUpsertResult {
         return try self.upsertResolverWithResultOptions(cfg, .{});
     }
@@ -15681,6 +15723,11 @@ pub const DB = struct {
     pub fn resolverReviewsJsonAlloc(self: *DB, alloc: Allocator, request_json: []const u8) ![]u8 {
         if (comptime storage_engine.enabled) return storage_engine.call("resolverReviewsJsonAlloc", .{ self, alloc, request_json });
         return @import("resolver_curation.zig").reviewOperation(self, alloc, request_json);
+    }
+
+    pub fn listResolverStaticDescriptors(self: *DB, alloc: Allocator) ![]index_manager_mod.ResolverConfig {
+        if (comptime storage_engine.enabled) return storage_engine.call("listResolverStaticDescriptors", .{ self, alloc });
+        return self.core.index_manager.listResolverStaticDescriptors(alloc);
     }
 
     pub fn listResolverIdentities(self: *DB, alloc: Allocator) ![]index_manager_mod.ResolverConfig {
@@ -22064,6 +22111,34 @@ pub const DB = struct {
     }
 
     pub const searchLockedWithExecutionContext = db_search.searchLockedWithExecutionContext;
+
+    pub fn hydratePrimaryDocuments(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
+        var keys: std.ArrayList([]const u8) = .empty;
+        defer keys.deinit(alloc);
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(alloc);
+        for (req.filter_doc_ids) |key| {
+            try db_query_search.checkSearchRequestDeadline(req);
+            if (!self.core.byteRange().contains(key) or (try seen.getOrPut(alloc, key)).found_existing) continue;
+            if (try isExpiredDocumentKey(self, alloc, key)) continue;
+            try keys.append(alloc, key);
+        }
+        const values = try loadStoredSearchDocumentsMany(self, alloc, keys.items, null);
+        defer freeOptionalOwnedBytes(alloc, values);
+        var hits: std.ArrayList(types.SearchHit) = .empty;
+        errdefer {
+            for (hits.items) |*hit| hit.deinit(alloc);
+            hits.deinit(alloc);
+        }
+        for (keys.items, values) |key, *value| {
+            const json = value.* orelse continue;
+            const id = try alloc.dupe(u8, key);
+            errdefer alloc.free(id);
+            try hits.append(alloc, .{ .id = id, .score = 1, .stored_data = json });
+            value.* = null;
+        }
+        return .{ .alloc = alloc, .total_hits = @intCast(hits.items.len), .hits = try hits.toOwnedSlice(alloc), .graph_results = &.{} };
+    }
 
     pub const searchLockedWithExecutionContextImpl = db_search.searchLockedWithExecutionContextImpl;
 

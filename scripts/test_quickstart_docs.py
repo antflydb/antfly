@@ -158,16 +158,41 @@ def check_recording_coverage_wait(tape: str) -> None:
     # VHS Line waits inspect the cursor's current line. Completion prose can
     # already have scrolled away when the next directive starts, so follow the
     # prompt instead. Bind that wait to its command, not unrelated tape text.
-    waits = re.findall(
-        r"^Type(?:@\S+)? `([^`\n]*antfly index wait[^`\n]*)`\n"
-        r"((?:(?!^Type).*(?:\n|$))*)",
-        tape,
-        re.MULTILINE,
-    )
+    # Reassemble shell continuations in VHS raw Type strings before parsing
+    # flags; each physical line must be entered.
+    lines = tape.splitlines()
+    waits = []
+    for index, line in enumerate(lines):
+        typed = re.fullmatch(r"Type(?:@\S+)? `([^`]*antfly index wait[^`]*)`", line)
+        if typed is None:
+            continue
+        command = typed[1]
+        cursor = index + 1
+        while command.endswith("\\"):
+            if cursor >= len(lines) or lines[cursor] != "Enter":
+                fail("the quickstart recording must enter each continued command")
+            cursor += 1
+            continued = (
+                re.fullmatch(r"Type(?:@\S+)? `([^`]*)`", lines[cursor])
+                if cursor < len(lines)
+                else None
+            )
+            if continued is None:
+                fail("the quickstart recording has an incomplete source-coverage wait")
+            command = command[:-1] + continued[1]
+            cursor += 1
+        following = []
+        while cursor < len(lines) and not lines[cursor].startswith("Type"):
+            following.append(lines[cursor])
+            cursor += 1
+        waits.append((command, following))
     if len(waits) != 1:
         fail("the quickstart recording must have one source-coverage wait")
     command, following = waits[0]
-    args = shlex.split(command)
+    try:
+        args = shlex.split(command)
+    except ValueError as exc:
+        fail(f"invalid source-coverage command: {exc}")
     for flags, expected in (
         (("-t", "--table"), "wikipedia"),
         (("-i", "--index"), "title_body"),
@@ -179,8 +204,10 @@ def check_recording_coverage_wait(tape: str) -> None:
             fail(f"the quickstart recording wait requires {flags[-1]} {expected}")
     directives = [
         line.strip()
-        for line in following.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
+        for line in following
+        if line.strip()
+        and not line.lstrip().startswith("#")
+        and not re.fullmatch(r"(?:Hide|Show|Sleep \S+)", line.strip())
     ]
     if (
         len(directives) < 2
