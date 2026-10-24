@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -180,5 +181,73 @@ func TestS3PinnedResponseIdentity(t *testing.T) {
 				t.Fatalf("validateS3Response = %v; wantOK %v", err, tc.ok)
 			}
 		})
+	}
+}
+
+func TestS3CacheAccessRequiresContentDecryption(t *testing.T) {
+	for _, size := range []int64{0, 8} {
+		for _, behavior := range []string{"range", "ignore_range", "kms_denied", "wrong_total", "truncated"} {
+			t.Run(fmt.Sprintf("size=%d/%s", size, behavior), func(t *testing.T) {
+				var gets, heads int
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == http.MethodHead {
+						heads++ // HEAD remains readable after KMS decrypt is revoked.
+					} else {
+						gets++
+						if behavior == "kms_denied" {
+							w.WriteHeader(http.StatusForbidden)
+							return
+						}
+					}
+					if got := r.URL.Query().Get("versionId"); got != "pinned" {
+						t.Errorf("versionId = %q", got)
+					}
+					if got := r.Header.Get("If-Match"); got != `"etag"` {
+						t.Errorf("If-Match = %q", got)
+					}
+					w.Header().Set("ETag", `"etag"`)
+					w.Header().Set("x-amz-version-id", "pinned")
+					w.Header().Set("x-amz-server-side-encryption", "aws:kms")
+					w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+					if size > 0 && behavior != "ignore_range" {
+						if r.Header.Get("Range") != "bytes=0-0" {
+							t.Errorf("unbounded content probe: %q", r.Header.Get("Range"))
+						}
+						total := size
+						if behavior == "wrong_total" {
+							total++
+						}
+						w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", total))
+						w.Header().Set("Content-Length", "1")
+						w.WriteHeader(http.StatusPartialContent)
+						if behavior != "truncated" {
+							fmt.Fprint(w, "x")
+						}
+					} else {
+						if size == 0 && r.Header.Get("Range") != "" {
+							t.Error("empty object must use ordinary GET")
+						}
+						w.Header().Set("Content-Length", fmt.Sprint(size))
+						fmt.Fprint(w, strings.Repeat("x", int(size)))
+					}
+				}))
+				defer server.Close()
+				target, _ := url.Parse(server.URL)
+				client, err := minio.New(target.Host, &minio.Options{Creds: credentials.NewStaticV4("access", "secret", ""), Region: "us-east-1"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				raw, _ := json.Marshal(S3Config{Bucket: "docs"})
+				item := Item{Path: "doc.txt", Revision: "etag", Size: size, Metadata: map[string]any{"bucket": "docs", "version_id": "pinned"}}
+				err = (&S3Connector{Client: client}).CheckAccess(t.Context(), Request{Mode: ImportModeSource, Config: raw}, item)
+				wantOK := behavior != "kms_denied" && (size == 0 || behavior != "wrong_total" && behavior != "truncated")
+				if (err == nil) != wantOK {
+					t.Fatalf("CheckAccess = %v; wantOK %v", err, wantOK)
+				}
+				if heads != 0 || gets != 1 {
+					t.Fatalf("probe used %d HEADs and %d GETs", heads, gets)
+				}
+			})
+		}
 	}
 }

@@ -161,3 +161,9 @@ explicitly. Versionless snapshots are accepted only while the provider still
 returns an unversioned object with the pinned ETag and size; a versioned response
 requires a freshly enumerated snapshot. A readable replacement never authorizes
 cached bytes from another version.
+
+S3 cache authorization exercises the content data plane through a conditional GET
+of the pinned version, so revoked SSE-KMS decrypt access blocks staged plaintext
+reuse. Nonempty objects request a one-byte range; empty objects use an ordinary
+GET. Responses must match version, ETag and object size, and the probe reads at
+most one byte even when an S3-compatible server ignores Range.

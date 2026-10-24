@@ -179,15 +179,45 @@ func (c *S3Connector) CheckAccess(ctx context.Context, r Request, o Item) error 
 	if err := validatePinnedS3Source(cfg, o); err != nil {
 		return err
 	}
-	opts := minio.StatObjectOptions{VersionID: configString(o.Metadata, "version_id")}
+	// A HEAD establishes object metadata access, but does not exercise SSE-KMS
+	// decryption. Reauthorize cached plaintext through the same GET data plane
+	// as a fresh download. Request one byte for nonempty objects, and an ordinary
+	// empty GET for zero-length objects (a range would return 416).
+	opts := minio.GetObjectOptions{VersionID: configString(o.Metadata, "version_id")}
 	if err := opts.SetMatchETag(o.Revision); err != nil {
 		return err
 	}
-	info, err := c.Client.StatObject(ctx, cfg.Bucket, o.Path, opts)
+	if o.Size > 0 {
+		if err := opts.SetRange(0, 0); err != nil {
+			return err
+		}
+	}
+	reader, info, headers, err := (minio.Core{Client: c.Client}).GetObject(ctx, cfg.Bucket, o.Path, opts)
 	if err != nil {
 		return err
 	}
-	return validateS3Response(o, info)
+	defer reader.Close()
+	if contentRange := headers.Get("Content-Range"); contentRange != "" {
+		if o.Size <= 0 || contentRange != fmt.Sprintf("bytes 0-0/%d", o.Size) || info.Size != 1 {
+			return fmt.Errorf("S3 access probe returned an invalid content range")
+		}
+		// The range describes the complete object's size; Content-Length is
+		// only the one-byte payload. Version and ETag still come from this GET.
+		info.Size = o.Size
+	}
+	if err := validateS3Response(o, info); err != nil {
+		return err
+	}
+	// Read a byte to exercise content access, even on compatible servers which
+	// defer errors to the body. Bound reads when a server ignores Range.
+	data, err := io.ReadAll(io.LimitReader(reader, 1))
+	if err != nil {
+		return err
+	}
+	if o.Size > 0 && len(data) != 1 || o.Size == 0 && len(data) != 0 {
+		return fmt.Errorf("S3 access probe returned an unexpected content length")
+	}
+	return nil
 }
 func (c *S3Connector) ValidateAbsentSources(context.Context, Request, []string) error { return nil }
 
