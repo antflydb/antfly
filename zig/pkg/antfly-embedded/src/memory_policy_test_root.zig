@@ -22,4 +22,5 @@ test {
     _ = @import("memory/secret_screening.zig");
     _ = @import("memory/persistent_index.zig");
     _ = @import("memory/evaluation.zig");
+    _ = @import("storage/db/resolver_authority.zig");
 }

@@ -892,7 +892,11 @@ const Run = struct {
                 // is not evidence for a four-way semantic replacement verdict.
                 const page = try parse(t.SupersessionCandidatePage, self.a, try self.supersessionCandidates(input.seed, input.supersession_candidates));
                 if (page.retrieval != .indexed) return .{};
+                // Positive membership is conclusive even during a partial union;
+                // absence requires every requested lane to be available.
                 for (page.items) |candidate| if (eql(u8, candidate.view.memory.assertion.id, input.target)) return .{ .admitted = true };
+                const mode = input.supersession_candidates.mode;
+                if (mode == .semantic and page.semantic_discovery != .indexed or mode == .union_search and page.semantic_discovery == .not_ready) return .{};
                 return if (page.truncated) .{} else .{ .admitted = false };
             },
             .retrieval => {
@@ -1009,6 +1013,7 @@ const Run = struct {
             const old_row = try self.service.backend.get(self.service.backend.ptr, self.a, change.key);
             const old = if (old_row) |row| (try std.json.parseFromSliceLeaky(Root, self.a, row.json, .{ .ignore_unknown_fields = true })).root else null;
             if (optionalEqual(old, next)) continue;
+            try self.persistentIndex().publish(next);
             if (next) |id| try self.nodeReference(id, true);
             if (old) |id| try self.nodeReference(id, false);
         }
@@ -2647,7 +2652,7 @@ const Run = struct {
         try self.service.context.requireGrant(.curator);
         if (request.limit == 0 or request.limit > 256) return error.InvalidMemoryRequest;
         const prefix = try std.fmt.allocPrint(self.a, "supersession-open/{s}/", .{try hash(self.a, self.service.context.branch)});
-        const page = try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, try self.decodeCursor(prefix, request.cursor), request.limit);
+        const page = try self.recordPage(prefix, try self.decodeCursor(prefix, request.cursor), request.limit);
         var items: std.ArrayList(t.SupersessionProposal) = .empty;
         for (page.rows) |row| {
             const id = try parse([]const u8, self.a, row.json);
@@ -6607,7 +6612,7 @@ const Run = struct {
         if (!try self.retained(record, 0)) return error.MemoryNotFound;
         if (request.limit == 0 or request.limit > t.max_items) return error.InvalidMemoryRequest;
         const prefix = try std.fmt.allocPrint(self.a, "history/{s}/", .{try hash(self.a, id)});
-        const page = try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, try self.decodeCursor(prefix, request.cursor), request.limit);
+        const page = try self.recordPage(prefix, try self.decodeCursor(prefix, request.cursor), request.limit);
         var records: std.ArrayList(t.StoredAssertion) = .empty;
         for (page.rows) |row| {
             const value = (try self.read(t.StoredAssertion, row.key)) orelse continue;
@@ -6615,6 +6620,25 @@ const Run = struct {
             try records.append(self.a, try self.publicRecord(value));
         }
         return self.encode(.{ .items = records.items, .next_cursor = try self.encodeCursor(prefix, page.next), .complete = page.next == null, .revision = self.state.revision });
+    }
+    /// Snapshot membership is an ordered native index. Never discover branch
+    /// records by scanning unrelated primary rows and filtering afterwards.
+    fn recordPage(self: *Run, prefix: []const u8, after: ?[]const u8, limit: u32) !Page {
+        if (self.lineage_head) |head| if (head.complete and !self.lineage_raw and (std.mem.startsWith(u8, prefix, "assertion/") or std.mem.startsWith(u8, prefix, "history/") or std.mem.startsWith(u8, prefix, "evidence/") or std.mem.startsWith(u8, prefix, "entity/"))) {
+            const page = try self.persistentIndex().page(head.root, prefix, try std.mem.concat(self.a, u8, &.{ prefix, "~" }), after, @min(limit, 256));
+            const paths = try self.a.alloc([]const u8, page.items.len);
+            for (page.items, paths) |item, *path| path.* = item.value;
+            try self.prefetch(paths);
+            var rows: std.ArrayList(Row) = .empty;
+            for (page.items) |item| {
+                const json = if (self.change_positions.get(item.value)) |position| self.changes.items[position].json else if (self.backend_rows.getEntry(item.value)) |entry| entry.value_ptr.* else return error.MemoryCorruptState;
+                if (json) |value| try rows.append(self.a, .{ .key = item.key, .json = value });
+            }
+            return .{ .rows = rows.items, .next = page.next };
+        };
+        const page = try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, after, limit);
+        for (page.rows) |row| try self.backend_rows.put(self.a, row.key, row.json);
+        return page;
     }
     fn enumerate(self: *Run, request: t.Recall) ![]const u8 {
         self.historical_resource_reads = request.known_at != null;
@@ -6625,7 +6649,7 @@ const Run = struct {
         var more = true;
         while (items.items.len < request.limit and visited < 4096) {
             try self.service.context.check();
-            const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion/", after, @intCast(@min(128, 4096 - visited)));
+            const page = try self.recordPage("assertion/", after, @intCast(@min(128, 4096 - visited)));
             more = page.next != null;
             for (page.rows, 0..) |row, index| {
                 after = row.key;
@@ -6986,7 +7010,7 @@ const Run = struct {
                 after = try self.decodeCursor("assertion/", request.cursor);
                 while (!explicit_seeds) {
                     try self.service.context.check();
-                    const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion/", after, 128);
+                    const page = try self.recordPage("assertion/", after, 128);
                     for (page.rows) |row| {
                         scanned += 1;
                         const record = try parse(t.StoredAssertion, self.a, row.json);
@@ -7066,7 +7090,7 @@ const Run = struct {
     }
     fn entityList(self: *Run, request: anytype) ![]const u8 {
         if (request.limit == 0 or request.limit > t.max_items) return error.InvalidMemoryRequest;
-        const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "entity/", try self.decodeCursor("entity/", request.cursor), request.limit);
+        const page = try self.recordPage("entity/", try self.decodeCursor("entity/", request.cursor), request.limit);
         var values: std.ArrayList(std.json.Value) = .empty;
         for (page.rows) |row| {
             const stored = (try self.read(t.EntityRecord, row.key)) orelse continue;

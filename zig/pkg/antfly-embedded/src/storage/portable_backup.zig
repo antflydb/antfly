@@ -1771,6 +1771,7 @@ pub fn isPortableMetadataKey(key: []const u8) bool {
         std.mem.eql(u8, key, "\x00\x00__metadata__:enrichments") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers") or
         std.mem.eql(u8, key, @import("antfly_resolver").curation.proposal_store_key) or
+        std.mem.startsWith(u8, key, @import("db/resolver_authority.zig").lite_prefix) or
         std.mem.eql(u8, key, resolver_catalog.minimum_reader_key) or
         std.mem.eql(u8, key, resolver_catalog.merge_catalog_key) or
         std.mem.eql(u8, key, @import("db/promotion_runtime.zig").source_identity_key) or
@@ -3643,6 +3644,8 @@ const PortableArchiveValidation = struct {
     minimum_reader_version: ?u32 = null,
     saw_resolver_merges: bool = false,
     saw_curation_proposals: bool = false,
+    saw_native_resolver_records: bool = false,
+    saw_native_resolver_marker: bool = false,
     resolver_configs: ?[]resolver_catalog.ResolverConfig = null,
     resolver_merge_data: ?[]u8 = null,
 
@@ -3895,6 +3898,7 @@ const PortableArchiveValidation = struct {
     }
 
     fn finish(self: *PortableArchiveValidation, alloc: Allocator) !void {
+        if (self.saw_native_resolver_records and (!self.saw_native_resolver_marker or (self.minimum_reader_version orelse 0) < resolver_catalog.native_resolver_records_reader_version)) return error.InvalidMetadataBatch;
         if (self.saw_curation_proposals and (self.minimum_reader_version orelse 0) < resolver_catalog.scoped_curation_reader_version) return error.InvalidMetadataBatch;
         const resolver_bytes = try resolver_catalog.serializeCatalog(alloc, self.resolver_configs orelse &.{});
         defer alloc.free(resolver_bytes);
@@ -4844,6 +4848,18 @@ fn validateMetadataEntries(
             };
             archive.resolver_configs = configs;
             archive.saw_resolver_catalog = true;
+        } else if (std.mem.startsWith(u8, entry.key, @import("db/resolver_authority.zig").lite_prefix)) {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            @import("db/resolver_authority.zig").validatePortableRow(arena.allocator(), entry.key, entry.value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidMetadataBatch,
+            };
+            archive.saw_native_resolver_records = true;
+            if (std.mem.eql(u8, entry.key, @import("db/resolver_authority.zig").lite_marker)) {
+                if (archive.saw_native_resolver_marker) return error.InvalidMetadataBatch;
+                archive.saw_native_resolver_marker = true;
+            }
         } else if (std.mem.eql(u8, entry.key, @import("antfly_resolver").curation.proposal_store_key)) {
             if (archive.saw_curation_proposals) return error.InvalidMetadataBatch;
             var arena = std.heap.ArenaAllocator.init(alloc);
@@ -7586,4 +7602,58 @@ test "portable backup curation proposal metadata validates identity and reader f
     unscoped.receipt_scope = null;
     const unscoped_bytes = try std.json.Stringify.valueAlloc(a, pure.ProposalManifest{ .queue = unscoped }, .{});
     try std.testing.expectError(error.InvalidResolverCurationRequest, pure.parseProposalManifest(a, unscoped_bytes));
+}
+
+test "portable backup native resolver authority retains heads policy and queue indexes" {
+    const alloc = std.testing.allocator;
+    const native = @import("db/resolver_authority.zig");
+    const pure = @import("antfly_resolver").curation;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var source_tmp = std.testing.tmpDir(.{});
+    defer source_tmp.cleanup();
+    var source = try openTestStore(alloc, &source_tmp);
+    defer source.close();
+    const proposal = (try pure.propose(a, .{}, &.{}, .{ .action = .suppress, .key = "concept/noise" }, .{})).state.proposals[0];
+    const Bridge = native.Transaction(DocStore.Txn);
+    {
+        var txn = try source.beginWriteTxn();
+        var committed = false;
+        defer if (!committed) txn.abort();
+        var bridge: Bridge = .{ .txn = &txn };
+        const authority = bridge.store(a, native.lite_prefix);
+        try authority.adoptNamespace(.{ .key_template = "concept/{{_key}}", .revision = 1, .merges = &.{.{ .key = "concept/a", .target = "concept/b" }} });
+        try authority.applyQueue(.{ .expected_revision = 0, .revision = 1, .receipt_scope = @splat('a'), .proposals = &.{proposal} });
+        try bridge.backendPut(a, native.lite_marker, "1");
+        try bridge.backendPut(a, resolver_catalog.minimum_reader_key, "12");
+        try bridge.flush(a);
+        try txn.commit();
+        committed = true;
+    }
+    var bytes: ArrayList(u8) = .empty;
+    defer bytes.deinit(alloc);
+    try exportPortable(alloc, &source, &bytes);
+    var target_tmp = std.testing.tmpDir(.{});
+    defer target_tmp.cleanup();
+    var target = try openTestStore(alloc, &target_tmp);
+    defer target.close();
+    try importPortable(alloc, &target, bytes.items);
+    var read = try target.beginReadTxn();
+    defer read.abort();
+    var bridge: Bridge = .{ .txn = &read };
+    const restored = bridge.store(a, native.lite_prefix);
+    const component = (try restored.component("concept/{{_key}}", &.{"concept/a"})).?;
+    try std.testing.expectEqual(@as(u64, 1), component.head.revision);
+    try std.testing.expectEqualStrings("concept/b", component.namespace.merges[0].target);
+    const page = try restored.proposalPage(.open, .suppress, null, 1);
+    try std.testing.expectEqual(@as(usize, 1), page.proposals.len);
+    try std.testing.expectEqualStrings(proposal.id, page.proposals[0].id);
+    try std.testing.expect(pure.sameReceiptScope(@splat('a'), (try restored.queueHead()).receipt_scope));
+    try std.testing.expectEqualStrings("1", try target.get(a, native.lite_marker));
+    try std.testing.expectEqualStrings("12", try target.get(a, resolver_catalog.minimum_reader_key));
+    var incomplete: PortableArchiveValidation = .{ .format_version = backup_codec.format_version };
+    defer incomplete.deinit(alloc);
+    try validateMetadataEntries(alloc, &.{.{ .key = native.lite_marker, .value = "1" }}, &incomplete);
+    try std.testing.expectError(error.InvalidMetadataBatch, incomplete.finish(alloc));
 }

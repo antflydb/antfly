@@ -227,7 +227,8 @@ pub fn decide(a: std.mem.Allocator, state: State, merges: []const Redirect, effe
 pub const ProposalPage = struct { proposals: []const Proposal, next_cursor: ?[]const u8 = null };
 /// Stable keyset pagination; decision changes cannot move an item across the
 /// cursor. Queue size and evidence are bounded independently of page size.
-pub fn proposalPage(a: std.mem.Allocator, state: State, query: []const u8) !ProposalPage {
+pub const ProposalQuery = struct { state: ?ProposalState, action: ?EntityAction, cursor: []const u8, limit: u32 };
+pub fn proposalQuery(a: std.mem.Allocator, query: []const u8) !ProposalQuery {
     var wanted: ?ProposalState = .open;
     var action: ?EntityAction = null;
     var cursor: []const u8 = "";
@@ -255,6 +256,14 @@ pub fn proposalPage(a: std.mem.Allocator, state: State, query: []const u8) !Prop
         if (cursor.len != 64) return error.InvalidResolverCurationRequest;
         for (cursor) |ch| if (!std.ascii.isHex(ch)) return error.InvalidResolverCurationRequest;
     }
+    return .{ .state = wanted, .action = action, .cursor = cursor, .limit = @intCast(limit) };
+}
+pub fn proposalPage(a: std.mem.Allocator, state: State, query: []const u8) !ProposalPage {
+    const parsed = try proposalQuery(a, query);
+    const wanted = parsed.state;
+    const action = parsed.action;
+    const cursor = parsed.cursor;
+    const limit = parsed.limit;
     var items: std.ArrayListUnmanaged(Proposal) = .empty;
     for (state.proposals) |proposal| {
         if (wanted) |value| if (proposal.state != value) continue;

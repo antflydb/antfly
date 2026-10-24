@@ -13063,6 +13063,28 @@ pub const IndexManager = struct {
         return result.toOwnedSlice(alloc);
     }
 
+    /// Admission needs static policy and generation identities, never a copy of
+    /// every destination-owned correction or its receipts.
+    pub fn listResolverStaticDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const definitions = try self.resolverDefinitionsAlloc(alloc);
+        defer alloc.free(definitions);
+        var result: std.ArrayList(ResolverConfig) = .empty;
+        errdefer {
+            for (result.items) |*cfg| cfg.deinit(alloc);
+            result.deinit(alloc);
+        }
+        for (definitions) |definition| {
+            if (std.mem.startsWith(u8, definition.name, "__antfly_replacement/")) continue;
+            var cfg = definition;
+            cfg.merges = &.{};
+            cfg.curation_json = "{}";
+            try result.append(alloc, try ResolverConfig.clone(alloc, cfg));
+        }
+        return result.toOwnedSlice(alloc);
+    }
+
     /// Trusted admission rollback restores ownership as well as configuration.
     /// Public mutations must go through upsert/namespace validation instead.
     pub fn restoreResolverIdentity(self: *IndexManager, store: anytype, cfg: ResolverConfig) !void {

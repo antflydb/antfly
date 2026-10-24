@@ -71,7 +71,9 @@ const std = @import("std");
 /// understands durable queue identities on embedded resolver receipts.
 /// Version 38 preserves native service table ownership at every ingress and
 /// metadata peer, independently of resolver namespace/proposal support.
-pub const current_version: u16 = 38;
+/// Version 39 decodes native per-record resolver authority and its atomic heads.
+pub const current_version: u16 = 39;
+pub const resolver_records_version: u16 = 39;
 pub const native_service_tables_version: u16 = 38;
 pub const resolver_namespaces_version: u16 = 37;
 /// Conservative admission over canonical stored JSON, shared by catalog and

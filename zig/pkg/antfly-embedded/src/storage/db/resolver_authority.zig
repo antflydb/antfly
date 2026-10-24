@@ -1,0 +1,724 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Native destination-owned curation records. The enclosing native transaction
+//! owns revision comparison, record/index edits and publication of its head.
+//! A single-entity read touches its redirect component and incident policy only.
+const std = @import("std");
+const resolver = @import("antfly_resolver");
+const c = resolver.curation;
+const policy = @import("resolver_namespace.zig");
+const A = std.mem.Allocator;
+pub const lite_prefix = "\x00\x00__metadata__:resolver_authority:v1:";
+pub const lite_marker = lite_prefix ++ "version";
+pub const Row = struct { key: []const u8, value: []const u8 };
+pub const Page = struct { rows: []const Row, next: ?[]const u8 = null };
+pub const Backend = struct {
+    ptr: *anyopaque,
+    get: *const fn (*anyopaque, A, []const u8) anyerror!?[]const u8,
+    put: *const fn (*anyopaque, A, []const u8, []const u8) anyerror!void,
+    remove: *const fn (*anyopaque, A, []const u8) anyerror!void,
+    scan: *const fn (*anyopaque, A, []const u8, ?[]const u8, u32) anyerror!Page,
+};
+pub const Head = struct {
+    version: u8 = 1,
+    key_template: []const u8,
+    revision: u64,
+    adoption_revision: ?u64 = null,
+    adoption_standalone: bool = false,
+    min_text_chars: u32 = 0,
+    bytes: u64 = 0,
+};
+pub const Kind = enum { redirect, suppressed, suppression, distinct, redirect_origin, removed_alias, text, text_origin };
+pub const Edit = struct { kind: Kind, id: []const u8, value: ?std.json.Value };
+pub const Patch = struct { expected_revision: u64, next: Head, edits: []const Edit };
+pub const QueueHead = struct { version: u8 = 1, revision: u64 = 0, count: u32 = 0, bytes: u64 = 0, receipt_scope: ?c.ReceiptScope = null };
+pub const QueuePatch = struct { expected_revision: u64, revision: u64, receipt_scope: ?c.ReceiptScope = null, proposals: []const c.Proposal = &.{} };
+pub const Snapshot = struct { head: Head, namespace: policy.Namespace };
+fn parse(comptime T: type, a: A, bytes: []const u8) !T {
+    return std.json.parseFromSliceLeaky(T, a, bytes, .{ .allocate = .alloc_always });
+}
+fn encode(a: A, value: anytype) ![]const u8 {
+    return std.json.Stringify.valueAlloc(a, value, .{});
+}
+fn hash(a: A, value: []const u8) ![]const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
+    return a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+}
+pub const Store = struct {
+    a: A,
+    backend: Backend,
+    prefix: []const u8,
+    fn keyPath(self: Store, suffix: []const u8) ![]const u8 {
+        return std.mem.concat(self.a, u8, &.{ self.prefix, suffix });
+    }
+    fn headPath(self: Store, template: []const u8) ![]const u8 {
+        return self.keyPath(try std.fmt.allocPrint(self.a, "head/{s}", .{try hash(self.a, template)}));
+    }
+    fn records(self: Store, template: []const u8, kind: ?Kind) ![]const u8 {
+        return self.keyPath(if (kind) |k| try std.fmt.allocPrint(self.a, "record/{s}/{s}/", .{ try hash(self.a, template), @tagName(k) }) else try std.fmt.allocPrint(self.a, "record/{s}/", .{try hash(self.a, template)}));
+    }
+    fn record(self: Store, template: []const u8, kind: Kind, id: []const u8) ![]const u8 {
+        return std.mem.concat(self.a, u8, &.{ try self.records(template, kind), try hash(self.a, id) });
+    }
+    fn adjacent(self: Store, template: []const u8, name: []const u8, id: []const u8) ![]const u8 {
+        return self.keyPath(try std.fmt.allocPrint(self.a, "{s}/{s}/{s}/", .{ name, try hash(self.a, template), try hash(self.a, id) }));
+    }
+    pub fn head(self: Store, template: []const u8) !?Head {
+        return if (try self.backend.get(self.backend.ptr, self.a, try self.headPath(template))) |raw| try parse(Head, self.a, raw) else null;
+    }
+    pub fn heads(self: Store) ![]const Head {
+        const prefix = try self.keyPath("head/");
+        var result: std.ArrayList(Head) = .empty;
+        var after: ?[]const u8 = null;
+        while (true) {
+            const page = try self.backend.scan(self.backend.ptr, self.a, prefix, after, 128);
+            for (page.rows) |row| try result.append(self.a, try parse(Head, self.a, row.value));
+            after = page.next;
+            if (after == null) break;
+            if (result.items.len >= 4096) return error.ResolverCurationLimitExceeded;
+        }
+        return result.items;
+    }
+    fn get(self: Store, comptime T: type, template: []const u8, kind: Kind, id: []const u8) !?T {
+        return if (try self.backend.get(self.backend.ptr, self.a, try self.record(template, kind, id))) |raw| try parse(T, self.a, raw) else null;
+    }
+    const Values = struct {
+        aliases: std.ArrayList(resolver.KeyAlias) = .empty,
+        suppressed: std.ArrayList([]const u8) = .empty,
+        entries: std.ArrayList(c.Entry) = .empty,
+        distinct: std.ArrayList(c.Pair) = .empty,
+        origins: std.ArrayList(c.RedirectOrigin) = .empty,
+        removed: std.ArrayList([]const u8) = .empty,
+        texts: std.ArrayList([]const u8) = .empty,
+        text_entries: std.ArrayList(c.Entry) = .empty,
+        fn append(self: *Values, a: A, kind: Kind, raw: []const u8) !void {
+            switch (kind) {
+                .redirect => try self.aliases.append(a, try parse(resolver.KeyAlias, a, raw)),
+                .suppressed => try self.suppressed.append(a, try parse([]const u8, a, raw)),
+                .suppression => try self.entries.append(a, try parse(c.Entry, a, raw)),
+                .distinct => try self.distinct.append(a, try parse(c.Pair, a, raw)),
+                .redirect_origin => try self.origins.append(a, try parse(c.RedirectOrigin, a, raw)),
+                .removed_alias => try self.removed.append(a, try parse([]const u8, a, raw)),
+                .text => try self.texts.append(a, try parse([]const u8, a, raw)),
+                .text_origin => try self.text_entries.append(a, try parse(c.Entry, a, raw)),
+            }
+        }
+        fn snapshot(self: Values, h: Head) Snapshot {
+            return .{ .head = h, .namespace = .{ .key_template = h.key_template, .revision = h.revision, .adoption_revision = h.adoption_revision, .adoption_standalone = h.adoption_standalone, .merges = self.aliases.items, .state = .{ .suppress = .{ .keys = self.suppressed.items, .entries = self.entries.items, .texts = self.texts.items, .text_entries = self.text_entries.items, .min_text_chars = h.min_text_chars }, .distinct = self.distinct.items, .redirect_origins = self.origins.items, .removed_aliases = self.removed.items } } };
+        }
+    };
+    /// Full export is for derived worker configuration, never point admission.
+    pub fn exportNamespace(self: Store, template: []const u8) !?Snapshot {
+        const h = try self.head(template) orelse return null;
+        var values: Values = .{};
+        const prefix = try self.records(template, null);
+        var after: ?[]const u8 = null;
+        while (true) {
+            const page = try self.backend.scan(self.backend.ptr, self.a, prefix, after, 128);
+            for (page.rows) |row| {
+                const tail = row.key[prefix.len..];
+                const slash = std.mem.indexOfScalar(u8, tail, '/') orelse return error.InvalidCatalogRecord;
+                const kind = std.meta.stringToEnum(Kind, tail[0..slash]) orelse return error.InvalidCatalogRecord;
+                try values.append(self.a, kind, row.value);
+            }
+            after = page.next;
+            if (after == null) break;
+        }
+        return values.snapshot(h);
+    }
+    /// Forward and reverse redirect indexes bound discovery to the affected
+    /// components. Distinct endpoints add only their forward canonical paths.
+    pub fn component(self: Store, template: []const u8, seeds: []const []const u8) !?Snapshot {
+        return self.componentWithAliases(template, seeds, &.{});
+    }
+    pub fn componentWithAliases(self: Store, template: []const u8, seeds: []const []const u8, static_aliases: []const resolver.KeyAlias) !?Snapshot {
+        var forward: std.StringHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
+        var reverse: std.StringHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
+        for (static_aliases) |alias| {
+            const from = try forward.getOrPut(self.a, alias.key);
+            if (!from.found_existing) from.value_ptr.* = .empty;
+            try from.value_ptr.append(self.a, alias.target);
+            const to = try reverse.getOrPut(self.a, alias.target);
+            if (!to.found_existing) to.value_ptr.* = .empty;
+            try to.value_ptr.append(self.a, alias.key);
+        }
+        const h = try self.head(template) orelse return null;
+        var values: Values = .{};
+        var pending: std.ArrayList([]const u8) = .empty;
+        try pending.appendSlice(self.a, seeds);
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        var pairs: std.StringHashMapUnmanaged(void) = .empty;
+        var offset: usize = 0;
+        while (offset < pending.items.len) : (offset += 1) {
+            const id = pending.items[offset];
+            if ((try seen.getOrPut(self.a, id)).found_existing) continue;
+            if (seen.count() > 16384) return error.ResolverCurationLimitExceeded;
+            if (forward.get(id)) |edges| try pending.appendSlice(self.a, edges.items);
+            if (reverse.get(id)) |edges| try pending.appendSlice(self.a, edges.items);
+            if (try self.get(resolver.KeyAlias, template, .redirect, id)) |alias| {
+                try values.aliases.append(self.a, alias);
+                try pending.append(self.a, alias.target);
+            }
+            inline for (.{ Kind.suppressed, Kind.suppression, Kind.redirect_origin, Kind.removed_alias }) |kind| {
+                if (try self.backend.get(self.backend.ptr, self.a, try self.record(template, kind, id))) |raw| try values.append(self.a, kind, raw);
+            }
+            inline for (.{ "incoming", "cascade", "distinct-key" }) |name| {
+                const prefix = try self.adjacent(template, name, id);
+                var after: ?[]const u8 = null;
+                while (true) {
+                    const page = try self.backend.scan(self.backend.ptr, self.a, prefix, after, 128);
+                    for (page.rows) |row| {
+                        if (comptime std.mem.eql(u8, name, "distinct-key")) {
+                            if (!(try pairs.getOrPut(self.a, row.key[row.key.len - 64 ..])).found_existing) try values.distinct.append(self.a, try parse(c.Pair, self.a, row.value));
+                        } else try pending.append(self.a, try parse([]const u8, self.a, row.value));
+                    }
+                    after = page.next;
+                    if (after == null) break;
+                }
+            }
+        }
+        // Canonicalize incident distinctions without expanding unrelated
+        // reverse components or traversing the entire distinct graph.
+        for (values.distinct.items) |pair| for ([_][]const u8{ pair.from, pair.to }) |endpoint| {
+            var paths: std.ArrayList([]const u8) = .empty;
+            try paths.append(self.a, endpoint);
+            var path_offset: usize = 0;
+            while (path_offset < paths.items.len) : (path_offset += 1) {
+                const id = paths.items[path_offset];
+                if ((try seen.getOrPut(self.a, id)).found_existing) continue;
+                if (seen.count() > 16384) return error.ResolverCurationLimitExceeded;
+                if (forward.get(id)) |edges| try paths.appendSlice(self.a, edges.items);
+                if (try self.get(resolver.KeyAlias, template, .redirect, id)) |alias| {
+                    try values.aliases.append(self.a, alias);
+                    try paths.append(self.a, alias.target);
+                }
+            }
+        };
+        return values.snapshot(h);
+    }
+    fn indexRecord(self: Store, template: []const u8, kind: Kind, id: []const u8, raw: []const u8, add: bool) !void {
+        var paths: std.ArrayList([]const u8) = .empty;
+        var value: []const u8 = raw;
+        switch (kind) {
+            .redirect => {
+                const alias = try parse(resolver.KeyAlias, self.a, raw);
+                try paths.append(self.a, try std.mem.concat(self.a, u8, &.{ try self.adjacent(template, "incoming", alias.target), try hash(self.a, alias.key) }));
+                value = try encode(self.a, alias.key);
+            },
+            .distinct => {
+                const pair = try parse(c.Pair, self.a, raw);
+                for ([_][]const u8{ pair.from, pair.to }) |key| try paths.append(self.a, try std.mem.concat(self.a, u8, &.{ try self.adjacent(template, "distinct-key", key), try hash(self.a, id) }));
+            },
+            .suppression => {
+                const entry = try parse(c.Entry, self.a, raw);
+                if (entry.origin.cascade_from) |from| {
+                    try paths.append(self.a, try std.mem.concat(self.a, u8, &.{ try self.adjacent(template, "cascade", from), try hash(self.a, entry.key) }));
+                    value = try encode(self.a, entry.key);
+                }
+            },
+            else => {},
+        }
+        for (paths.items) |path| if (add) try self.backend.put(self.backend.ptr, self.a, path, value) else try self.backend.remove(self.backend.ptr, self.a, path);
+    }
+    pub fn queueHead(self: Store) !QueueHead {
+        return if (try self.backend.get(self.backend.ptr, self.a, try self.keyPath("queue/head"))) |raw| try parse(QueueHead, self.a, raw) else .{};
+    }
+    fn proposalPath(self: Store, id: []const u8) ![]const u8 {
+        if (id.len != 64) return error.InvalidResolverCurationRequest;
+        for (id) |byte| if (!std.ascii.isHex(byte)) return error.InvalidResolverCurationRequest;
+        return self.keyPath(try std.mem.concat(self.a, u8, &.{ "queue/proposal/", id }));
+    }
+    pub fn proposal(self: Store, id: []const u8) !?c.Proposal {
+        return if (try self.backend.get(self.backend.ptr, self.a, try self.proposalPath(id))) |raw| try parse(c.Proposal, self.a, raw) else null;
+    }
+    fn proposalIndexes(self: Store, value: c.Proposal) ![]const []const u8 {
+        const result = try self.a.alloc([]const u8, if (value.state == .open) 4 else 3);
+        result[0] = try self.keyPath(try std.fmt.allocPrint(self.a, "queue/state/{s}/{s}", .{ @tagName(value.state), value.id }));
+        result[1] = try self.keyPath(try std.fmt.allocPrint(self.a, "queue/action/{s}/{s}", .{ @tagName(value.action), value.id }));
+        result[2] = try self.keyPath(try std.fmt.allocPrint(self.a, "queue/filter/{s}/{s}/{s}", .{ @tagName(value.state), @tagName(value.action), value.id }));
+        if (value.state == .open) result[3] = try self.keyPath(try std.fmt.allocPrint(self.a, "queue/key/{s}/{s}", .{ try hash(self.a, value.key), value.id }));
+        return result;
+    }
+    pub fn proposalPage(self: Store, state: ?c.ProposalState, action: ?c.EntityAction, after: ?[]const u8, limit: u32) !c.ProposalPage {
+        if (limit == 0 or limit > 256) return error.InvalidResolverCurationRequest;
+        const suffix = if (state) |v| if (action) |w| try std.fmt.allocPrint(self.a, "queue/filter/{s}/{s}/", .{ @tagName(v), @tagName(w) }) else try std.fmt.allocPrint(self.a, "queue/state/{s}/", .{@tagName(v)}) else if (action) |v| try std.fmt.allocPrint(self.a, "queue/action/{s}/", .{@tagName(v)}) else "queue/proposal/";
+        const prefix = try self.keyPath(suffix);
+        const page = try self.backend.scan(self.backend.ptr, self.a, prefix, if (after) |id| try std.mem.concat(self.a, u8, &.{ prefix, id }) else null, limit + 1);
+        var values: std.ArrayList(c.Proposal) = .empty;
+        for (page.rows[0..@min(limit, page.rows.len)]) |row| {
+            const value = if (state == null and action == null) try parse(c.Proposal, self.a, row.value) else (try self.proposal(row.key[row.key.len - 64 ..])) orelse return error.InvalidCatalogRecord;
+            try values.append(self.a, value);
+        }
+        return .{ .proposals = values.items, .next_cursor = if (page.rows.len > limit) values.items[values.items.len - 1].id else null };
+    }
+    pub fn proposalsForKeys(self: Store, keys: []const []const u8) !c.State {
+        const h = try self.queueHead();
+        var values: std.ArrayList(c.Proposal) = .empty;
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        for (keys) |key| {
+            const prefix = try self.keyPath(try std.fmt.allocPrint(self.a, "queue/key/{s}/", .{try hash(self.a, key)}));
+            var after: ?[]const u8 = null;
+            while (true) {
+                const page = try self.backend.scan(self.backend.ptr, self.a, prefix, after, 128);
+                for (page.rows) |row| {
+                    const id = row.key[row.key.len - 64 ..];
+                    if ((try seen.getOrPut(self.a, id)).found_existing) continue;
+                    const value = (try self.proposal(id)) orelse return error.InvalidCatalogRecord;
+                    if (value.state == .open) try values.append(self.a, value);
+                }
+                after = page.next;
+                if (after == null) break;
+            }
+        }
+        return .{ .receipt_scope = h.receipt_scope, .proposals = values.items };
+    }
+    pub fn ownsKeyTemplate(self: Store, template: []const u8) !bool {
+        if (try self.head(template) != null) return true;
+        const prefix = try self.keyPath("queue/owned/");
+        var after: ?[]const u8 = null;
+        while (true) {
+            const page = try self.backend.scan(self.backend.ptr, self.a, prefix, after, 128);
+            for (page.rows) |row| if (policy.keyInNamespace(template, try parse([]const u8, self.a, row.value))) return true;
+            after = page.next;
+            if (after == null) break;
+        }
+        return false;
+    }
+    pub fn preflightQueue(self: Store, patch: QueuePatch) !void {
+        const h = try self.queueHead();
+        if (h.revision != patch.expected_revision or patch.revision <= h.revision) return error.ResolverCurationConflict;
+        if (h.revision != 0 and patch.receipt_scope != null and !c.sameReceiptScope(h.receipt_scope, patch.receipt_scope)) return error.ResolverCurationConflict;
+        var bytes = h.bytes;
+        var count = h.count;
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        for (patch.proposals) |value| {
+            const path = try self.proposalPath(value.id);
+            if ((try seen.getOrPut(self.a, path)).found_existing) return error.InvalidResolverCurationRequest;
+            _ = try c.parseState(self.a, try encode(self.a, c.State{ .receipt_scope = h.receipt_scope, .proposals = &.{value} }));
+            if (try self.backend.get(self.backend.ptr, self.a, path)) |old| {
+                const previous = try parse(c.Proposal, self.a, old);
+                if (previous.state != .open and !std.mem.eql(u8, old, try encode(self.a, value))) return error.ResolverCurationConflict;
+                bytes = try std.math.sub(u64, bytes, c.proposalCapacityBytes(.{ .proposals = &.{previous} }));
+            } else count = try std.math.add(u32, count, 1);
+            bytes = try std.math.add(u64, bytes, c.proposalCapacityBytes(.{ .proposals = &.{value} }));
+        }
+        if (bytes > c.max_state_bytes or count > 4096) return error.ResolverCurationLimitExceeded;
+    }
+    pub fn applyQueue(self: Store, patch: QueuePatch) !void {
+        try self.preflightQueue(patch);
+        var h = try self.queueHead();
+        if (h.revision == 0) h.receipt_scope = patch.receipt_scope;
+        for (patch.proposals) |value| {
+            const path = try self.proposalPath(value.id);
+            if (try self.backend.get(self.backend.ptr, self.a, path)) |raw| {
+                const old = try parse(c.Proposal, self.a, raw);
+                h.bytes -= c.proposalCapacityBytes(.{ .proposals = &.{old} });
+                for (try self.proposalIndexes(old)) |index| try self.backend.remove(self.backend.ptr, self.a, index);
+            } else h.count += 1;
+            const raw = try encode(self.a, value);
+            h.bytes += c.proposalCapacityBytes(.{ .proposals = &.{value} });
+            try self.backend.put(self.backend.ptr, self.a, path, raw);
+            try self.backend.put(self.backend.ptr, self.a, try self.keyPath(try std.fmt.allocPrint(self.a, "queue/owned/{s}", .{try hash(self.a, value.key)})), try encode(self.a, value.key));
+            for (try self.proposalIndexes(value)) |index| try self.backend.put(self.backend.ptr, self.a, index, try encode(self.a, value.id));
+        }
+        h.revision = patch.revision;
+        try self.backend.put(self.backend.ptr, self.a, try self.keyPath("queue/head"), try encode(self.a, h));
+    }
+    /// One-time import preserves the legacy revision, including revision zero.
+    /// Callers stage this in the same owner transaction as their first edit.
+    pub fn adoptNamespace(self: Store, namespace: policy.Namespace) !void {
+        if (try self.head(namespace.key_template) != null) return error.ResolverCurationConflict;
+        const rows = try flatten(self.a, namespace);
+        var h: Head = .{ .key_template = namespace.key_template, .revision = namespace.revision, .adoption_revision = namespace.adoption_revision, .adoption_standalone = namespace.adoption_standalone, .min_text_chars = namespace.state.suppress.min_text_chars };
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        _ = try c.RedirectIndex.init(self.a, namespace.merges);
+        _ = try c.Index.init(self.a, "", try encode(self.a, namespace.state));
+        for (rows) |row| {
+            try self.validateRecord(h.key_template, row.kind, row.value);
+            const path = try self.record(h.key_template, row.kind, row.id);
+            if ((try seen.getOrPut(self.a, path)).found_existing) return error.InvalidResolverCurationRequest;
+            h.bytes = try std.math.add(u64, h.bytes, row.value.len);
+        }
+        if (h.bytes > c.max_state_bytes) return error.ResolverCurationLimitExceeded;
+        for (rows) |row| {
+            try self.backend.put(self.backend.ptr, self.a, try self.record(h.key_template, row.kind, row.id), row.value);
+            try self.indexRecord(h.key_template, row.kind, row.id, row.value, true);
+        }
+        try self.backend.put(self.backend.ptr, self.a, try self.headPath(h.key_template), try encode(self.a, h));
+    }
+    fn validateRecord(self: Store, template: []const u8, kind: Kind, raw: []const u8) !void {
+        switch (kind) {
+            .redirect => {
+                const item = try parse(resolver.KeyAlias, self.a, raw);
+                try c.validKey(item.key);
+                try c.validKey(item.target);
+                if (!policy.keyInNamespace(template, item.key) or !policy.keyInNamespace(template, item.target) or std.mem.eql(u8, item.key, item.target)) return error.InvalidResolverCurationRequest;
+            },
+            .distinct => {
+                const item = try parse(c.Pair, self.a, raw);
+                try c.validKey(item.from);
+                try c.validKey(item.to);
+                if (item.origin) |origin| try origin.validate();
+                if (!policy.keyInNamespace(template, item.from) or !policy.keyInNamespace(template, item.to) or std.mem.eql(u8, item.from, item.to)) return error.InvalidResolverCurationRequest;
+            },
+            .suppression, .text_origin => {
+                const item = try parse(c.Entry, self.a, raw);
+                try c.validKey(item.key);
+                try item.origin.validate();
+                if (kind == .suppression and !policy.keyInNamespace(template, item.key)) return error.InvalidResolverCurationRequest;
+                if (item.origin.cascade_from) |key| if (!policy.keyInNamespace(template, key)) return error.InvalidResolverCurationRequest;
+            },
+            .redirect_origin => {
+                const item = try parse(c.RedirectOrigin, self.a, raw);
+                try c.validKey(item.key);
+                try c.validKey(item.target);
+                try item.origin.validate();
+                if (!policy.keyInNamespace(template, item.key) or !policy.keyInNamespace(template, item.target)) return error.InvalidResolverCurationRequest;
+            },
+            .suppressed, .removed_alias => {
+                const key = try parse([]const u8, self.a, raw);
+                try c.validKey(key);
+                if (!policy.keyInNamespace(template, key)) return error.InvalidResolverCurationRequest;
+            },
+            .text => {},
+        }
+    }
+    pub fn preflight(self: Store, patch: Patch) !void {
+        const previous = try self.head(patch.next.key_template);
+        if (patch.next.version != 1 or (if (previous) |h| h.revision else 0) != patch.expected_revision or patch.next.revision <= patch.expected_revision) return error.ResolverCurationConflict;
+        var bytes: u64 = if (previous) |h| h.bytes else 0;
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        for (patch.edits) |edit| {
+            const path = try self.record(patch.next.key_template, edit.kind, edit.id);
+            if ((try seen.getOrPut(self.a, path)).found_existing) return error.InvalidResolverCurationRequest;
+            if (try self.backend.get(self.backend.ptr, self.a, path)) |old| bytes = try std.math.sub(u64, bytes, old.len);
+            if (edit.value) |value_json| {
+                const raw = try encode(self.a, value_json);
+                try self.validateRecord(patch.next.key_template, edit.kind, raw);
+                var value: Values = .{};
+                try value.append(self.a, edit.kind, raw);
+                const namespace = value.snapshot(patch.next).namespace;
+                const entries = try flatten(self.a, namespace);
+                if (entries.len != 1 or !std.mem.eql(u8, entries[0].id, edit.id)) return error.InvalidResolverCurationRequest;
+                bytes = try std.math.add(u64, bytes, raw.len);
+            }
+        }
+        if (bytes > c.max_state_bytes) return error.ResolverCurationLimitExceeded;
+    }
+    pub fn apply(self: Store, patch: Patch) !void {
+        try self.preflight(patch);
+        const previous = try self.head(patch.next.key_template);
+        if ((if (previous) |h| h.revision else 0) != patch.expected_revision or patch.next.revision <= patch.expected_revision) return error.ResolverCurationConflict;
+        var h = patch.next;
+        h.bytes = if (previous) |old| old.bytes else 0;
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        for (patch.edits) |edit| {
+            const path = try self.record(h.key_template, edit.kind, edit.id);
+            if ((try seen.getOrPut(self.a, path)).found_existing) return error.InvalidResolverCurationRequest;
+            if (try self.backend.get(self.backend.ptr, self.a, path)) |old| {
+                h.bytes = try std.math.sub(u64, h.bytes, old.len);
+                try self.indexRecord(h.key_template, edit.kind, edit.id, old, false);
+            }
+            if (edit.value) |value_json| {
+                const raw = try encode(self.a, value_json);
+                h.bytes = try std.math.add(u64, h.bytes, raw.len);
+                if (h.bytes > c.max_state_bytes) return error.ResolverCurationLimitExceeded;
+                try self.backend.put(self.backend.ptr, self.a, path, raw);
+                try self.indexRecord(h.key_template, edit.kind, edit.id, raw, true);
+            } else try self.backend.remove(self.backend.ptr, self.a, path);
+        }
+        try self.backend.put(self.backend.ptr, self.a, try self.headPath(h.key_template), try encode(self.a, h));
+    }
+};
+
+const Flat = struct { kind: Kind, id: []const u8, value: []const u8 };
+fn flatten(a: A, namespace: policy.Namespace) ![]const Flat {
+    var result: std.ArrayList(Flat) = .empty;
+    for (namespace.merges) |v| try result.append(a, .{ .kind = .redirect, .id = v.key, .value = try encode(a, v) });
+    for (namespace.state.suppress.keys) |v| try result.append(a, .{ .kind = .suppressed, .id = v, .value = try encode(a, v) });
+    for (namespace.state.suppress.entries) |v| try result.append(a, .{ .kind = .suppression, .id = v.key, .value = try encode(a, v) });
+    for (namespace.state.redirect_origins) |v| try result.append(a, .{ .kind = .redirect_origin, .id = v.key, .value = try encode(a, v) });
+    for (namespace.state.removed_aliases) |v| try result.append(a, .{ .kind = .removed_alias, .id = v, .value = try encode(a, v) });
+    for (namespace.state.distinct) |v| try result.append(a, .{ .kind = .distinct, .id = try encode(a, .{ v.from, v.to }), .value = try encode(a, v) });
+    for (namespace.state.suppress.texts) |v| try result.append(a, .{ .kind = .text, .id = v, .value = try encode(a, v) });
+    for (namespace.state.suppress.text_entries) |v| try result.append(a, .{ .kind = .text_origin, .id = v.key, .value = try encode(a, v) });
+    return result.items;
+}
+/// Diff only the captured component, not the namespace's complete policy.
+pub fn difference(a: A, before: policy.Namespace, after: policy.Namespace) !Patch {
+    const old = try flatten(a, before);
+    const next = try flatten(a, after);
+    var by_key: std.StringHashMapUnmanaged(Flat) = .empty;
+    for (old) |v| try by_key.put(a, try std.fmt.allocPrint(a, "{s}/{s}", .{ @tagName(v.kind), v.id }), v);
+    var edits: std.ArrayList(Edit) = .empty;
+    for (next) |v| {
+        const key = try std.fmt.allocPrint(a, "{s}/{s}", .{ @tagName(v.kind), v.id });
+        const previous = by_key.fetchRemove(key);
+        if (previous == null or !std.mem.eql(u8, previous.?.value.value, v.value)) try edits.append(a, .{ .kind = v.kind, .id = v.id, .value = try parse(std.json.Value, a, v.value) });
+    }
+    var removed = by_key.valueIterator();
+    while (removed.next()) |v| try edits.append(a, .{ .kind = v.kind, .id = v.id, .value = null });
+    return .{ .expected_revision = before.revision, .next = .{ .key_template = after.key_template, .revision = after.revision, .adoption_revision = after.adoption_revision, .adoption_standalone = after.adoption_standalone, .min_text_chars = after.state.suppress.min_text_chars }, .edits = edits.items };
+}
+
+test "native resolver authority seeks a component and patches only changed records" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Memory = struct {
+        a: A,
+        rows: std.StringHashMapUnmanaged([]const u8) = .empty,
+        reads: usize = 0,
+        writes: usize = 0,
+        visited: usize = 0,
+        fn get(ptr: *anyopaque, _: A, key: []const u8) !?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reads += 1;
+            return self.rows.get(key);
+        }
+        fn put(ptr: *anyopaque, _: A, key: []const u8, raw: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.writes += 1;
+            try self.rows.put(self.a, key, raw);
+        }
+        fn remove(ptr: *anyopaque, _: A, key: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.writes += 1;
+            _ = self.rows.remove(key);
+        }
+        fn scan(ptr: *anyopaque, alloc: A, prefix: []const u8, after: ?[]const u8, limit: u32) !Page {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var rows: std.ArrayList(Row) = .empty;
+            var it = self.rows.iterator();
+            while (it.next()) |v| if (std.mem.startsWith(u8, v.key_ptr.*, prefix) and (after == null or std.mem.order(u8, v.key_ptr.*, after.?) == .gt)) {
+                try rows.append(alloc, .{ .key = v.key_ptr.*, .value = v.value_ptr.* });
+            };
+            std.mem.sort(Row, rows.items, {}, struct {
+                fn less(_: void, l: Row, r: Row) bool {
+                    return std.mem.lessThan(u8, l.key, r.key);
+                }
+            }.less);
+            const count = @min(limit, rows.items.len);
+            self.visited += count;
+            return .{ .rows = rows.items[0..count], .next = if (count < rows.items.len) rows.items[count - 1].key else null };
+        }
+    };
+    var memory: Memory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "authority/", .backend = .{ .ptr = &memory, .get = Memory.get, .put = Memory.put, .remove = Memory.remove, .scan = Memory.scan } };
+    var aliases: [10000]resolver.KeyAlias = undefined;
+    for (&aliases, 0..) |*v, i| v.* = .{ .key = try std.fmt.allocPrint(a, "entity/a{d}", .{i}), .target = try std.fmt.allocPrint(a, "entity/b{d}", .{i}) };
+    const before: policy.Namespace = .{ .key_template = "entity/{{_key}}" };
+    const imported: policy.Namespace = .{ .key_template = before.key_template, .revision = 1, .merges = &aliases };
+    try store.apply(try difference(a, before, imported));
+    memory.reads = 0;
+    memory.writes = 0;
+    memory.visited = 0;
+    const component = (try store.component(before.key_template, &.{"entity/a42"})).?;
+    try std.testing.expectEqual(@as(usize, 1), component.namespace.merges.len);
+    try std.testing.expect(memory.reads < 32 and memory.visited < 8);
+    var next = component.namespace;
+    next.revision = 2;
+    next.merges = &.{};
+    next.state.removed_aliases = &.{"entity/a42"};
+    const patch = try difference(a, component.namespace, next);
+    try std.testing.expectEqual(@as(usize, 2), patch.edits.len);
+    try store.apply(patch);
+    try std.testing.expect(memory.writes < 8);
+    try std.testing.expectError(error.ResolverCurationConflict, store.apply(patch));
+    const unrelated = (try store.component(before.key_template, &.{"entity/a43"})).?;
+    try std.testing.expectEqualStrings("entity/b43", unrelated.namespace.merges[0].target);
+    const bridged = (try store.componentWithAliases(before.key_template, &.{"entity/static"}, &.{.{ .key = "entity/static", .target = "entity/a43" }})).?;
+    try std.testing.expectEqual(@as(usize, 1), bridged.namespace.merges.len);
+    try std.testing.expectEqualStrings("entity/b43", bridged.namespace.merges[0].target);
+    try store.adoptNamespace(.{ .key_template = "legacy/{{_key}}", .merges = &.{.{ .key = "legacy/a", .target = "legacy/b" }} });
+    try std.testing.expectEqual(@as(u64, 0), (try store.head("legacy/{{_key}}")).?.revision);
+    const proposed = try c.propose(a, .{}, &.{}, .{ .action = .merge, .key = "entity/a1", .into = "entity/b1" }, .{});
+    try store.applyQueue(.{ .expected_revision = 0, .revision = 1, .proposals = proposed.state.proposals });
+    const queued = try store.proposalPage(.open, .merge, null, 1);
+    try std.testing.expectEqual(@as(usize, 1), queued.proposals.len);
+    const reservation = (try store.queueHead()).bytes;
+    try std.testing.expect(reservation > c.decision_origin_byte_budget);
+    const decision = try c.decide(a, proposed.state, &.{}, &.{}, queued.proposals[0].id, .{ .accept = false }, .{});
+    try store.applyQueue(.{ .expected_revision = 1, .revision = 2, .proposals = decision.state.proposals });
+    try std.testing.expect((try store.queueHead()).bytes < reservation);
+    try std.testing.expectEqual(@as(usize, 0), (try store.proposalPage(.open, null, null, 1)).proposals.len);
+    try std.testing.expectEqual(@as(usize, 1), (try store.proposalPage(.rejected, .merge, null, 1)).proposals.len);
+    try std.testing.expectEqual(@as(usize, 0), (try store.proposalsForKeys(&.{"entity/a1"})).proposals.len);
+    try std.testing.expectError(error.ResolverCurationConflict, store.applyQueue(.{ .expected_revision = 1, .revision = 3 }));
+    var portable = memory.rows.iterator();
+    while (portable.next()) |row| {
+        const key = try std.mem.concat(a, u8, &.{ lite_prefix, row.key_ptr.*[store.prefix.len..] });
+        try validatePortableRow(a, key, row.value_ptr.*);
+    }
+    try validatePortableRow(a, lite_marker, "1");
+    try std.testing.expectError(error.InvalidMetadataBatch, validatePortableRow(a, lite_marker, "2"));
+}
+
+pub fn Transaction(comptime Txn: type) type {
+    return struct {
+        txn: *Txn,
+        staged: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+        fn get(ptr: *anyopaque, a: std.mem.Allocator, key: []const u8) !?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.staged.getEntry(key)) |entry| return entry.value_ptr.*;
+            const raw = self.txn.get(key) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+            return try a.dupe(u8, raw);
+        }
+        fn put(ptr: *anyopaque, a: std.mem.Allocator, key: []const u8, raw: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.staged.put(a, key, raw);
+        }
+        fn remove(ptr: *anyopaque, a: std.mem.Allocator, key: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.staged.put(a, key, null);
+        }
+        fn scan(ptr: *anyopaque, a: std.mem.Allocator, prefix: []const u8, after: ?[]const u8, limit: u32) !Page {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var cursor = try self.txn.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(after orelse prefix);
+            if (after) |last| if (row) |entry| if (std.mem.eql(u8, entry.key, last)) {
+                row = try cursor.next();
+            };
+            var rows: std.ArrayList(Row) = .empty;
+            while (row) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, prefix) or rows.items.len == limit) break;
+                if (!self.staged.contains(entry.key)) try rows.append(a, .{ .key = try a.dupe(u8, entry.key), .value = try a.dupe(u8, entry.value) });
+                row = try cursor.next();
+            }
+            const more = row != null and std.mem.startsWith(u8, row.?.key, prefix);
+            var changes = self.staged.iterator();
+            while (changes.next()) |entry| if (entry.value_ptr.*) |value| {
+                if (std.mem.startsWith(u8, entry.key_ptr.*, prefix) and (after == null or std.mem.order(u8, entry.key_ptr.*, after.?) == .gt)) try rows.append(a, .{ .key = entry.key_ptr.*, .value = value });
+            };
+            std.mem.sort(Row, rows.items, {}, struct {
+                fn less(_: void, l: Row, r: Row) bool {
+                    return std.mem.lessThan(u8, l.key, r.key);
+                }
+            }.less);
+            const count = @min(limit, rows.items.len);
+            return .{ .rows = rows.items[0..count], .next = if (more or rows.items.len > limit) rows.items[count - 1].key else null };
+        }
+        pub fn flush(self: *@This(), a: std.mem.Allocator) !void {
+            var keys: std.ArrayList([]const u8) = .empty;
+            var it = self.staged.keyIterator();
+            while (it.next()) |key| try keys.append(a, key.*);
+            std.mem.sort([]const u8, keys.items, {}, struct {
+                fn less(_: void, l: []const u8, r: []const u8) bool {
+                    return std.mem.lessThan(u8, l, r);
+                }
+            }.less);
+            for (keys.items) |key| if (self.staged.get(key).?) |raw| try self.txn.put(key, raw) else self.txn.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            self.staged.clearRetainingCapacity();
+        }
+        pub fn backendGet(self: *@This(), a: A, key: []const u8) !?[]const u8 {
+            return get(self, a, key);
+        }
+        pub fn backendPut(self: *@This(), a: A, key: []const u8, raw: []const u8) !void {
+            return put(self, a, key, raw);
+        }
+        pub fn store(self: *@This(), alloc: A, prefix: []const u8) Store {
+            return .{ .a = alloc, .prefix = prefix, .backend = .{ .ptr = self, .get = get, .put = put, .remove = remove, .scan = scan } };
+        }
+    };
+}
+
+/// Validate the typed portable envelope without allocating a runtime catalog.
+/// Native snapshot/portable checksums additionally bind all record/index bytes.
+pub fn validatePortableRow(a: A, key: []const u8, raw: []const u8) !void {
+    if (!std.mem.startsWith(u8, key, lite_prefix) or raw.len > c.max_state_bytes) return error.InvalidMetadataBatch;
+    const tail = key[lite_prefix.len..];
+    if (std.mem.eql(u8, tail, "version")) {
+        if (!std.mem.eql(u8, raw, "1")) return error.InvalidMetadataBatch;
+        return;
+    }
+    var parts: [5][]const u8 = undefined;
+    var count: usize = 0;
+    var it = std.mem.splitScalar(u8, tail, '/');
+    while (it.next()) |part| {
+        if (count == parts.len or part.len == 0) return error.InvalidMetadataBatch;
+        parts[count] = part;
+        count += 1;
+    }
+    if (count == 2 and std.mem.eql(u8, parts[0], "head")) {
+        const h = try parse(Head, a, raw);
+        if (h.version != 1 or h.key_template.len == 0 or h.bytes > c.max_state_bytes or !std.mem.eql(u8, parts[1], try hash(a, h.key_template))) return error.InvalidMetadataBatch;
+        return;
+    }
+    if (count == 4 and std.mem.eql(u8, parts[0], "record")) {
+        const kind = std.meta.stringToEnum(Kind, parts[2]) orelse return error.InvalidMetadataBatch;
+        var values: Store.Values = .{};
+        try values.append(a, kind, raw);
+        const namespace = values.snapshot(.{ .key_template = "", .revision = 0 }).namespace;
+        const entries = try flatten(a, namespace);
+        if (entries.len != 1 or !std.mem.eql(u8, parts[3], try hash(a, entries[0].id))) return error.InvalidMetadataBatch;
+        _ = try c.parseState(a, try encode(a, namespace.state));
+        _ = try c.RedirectIndex.init(a, namespace.merges);
+        for (namespace.merges) |alias| {
+            try c.validKey(alias.key);
+            try c.validKey(alias.target);
+        }
+        if (parts[1].len != 64) return error.InvalidMetadataBatch;
+        for (parts[1]) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
+        return;
+    }
+    if (count == 2 and std.mem.eql(u8, parts[0], "queue") and std.mem.eql(u8, parts[1], "head")) {
+        const h = try parse(QueueHead, a, raw);
+        if (h.version != 1 or h.bytes > c.max_state_bytes or h.count > 4096) return error.InvalidMetadataBatch;
+        _ = try c.parseState(a, try encode(a, c.State{ .receipt_scope = h.receipt_scope }));
+        return;
+    }
+    if (count == 3 and std.mem.eql(u8, parts[0], "queue") and std.mem.eql(u8, parts[1], "proposal")) {
+        const proposal = try parse(c.Proposal, a, raw);
+        _ = try c.parseState(a, try encode(a, c.State{ .proposals = &.{proposal} }));
+        if (!std.mem.eql(u8, parts[2], proposal.id)) return error.InvalidMetadataBatch;
+        return;
+    }
+    // Index envelopes contain a typed key/ID or an incident distinct pair.
+    if (count == 4 and (std.mem.eql(u8, parts[0], "incoming") or std.mem.eql(u8, parts[0], "cascade") or std.mem.eql(u8, parts[0], "distinct-key"))) {
+        for (parts[1..4]) |part| {
+            if (part.len != 64) return error.InvalidMetadataBatch;
+            for (part) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
+        }
+        if (std.mem.eql(u8, parts[0], "distinct-key")) {
+            _ = try parse(c.Pair, a, raw);
+        } else try c.validKey(try parse([]const u8, a, raw));
+        return;
+    }
+    if (count >= 3 and std.mem.eql(u8, parts[0], "queue")) {
+        if (std.mem.eql(u8, parts[1], "owned")) {
+            const id = try parse([]const u8, a, raw);
+            try c.validKey(id);
+            if (count != 3 or !std.mem.eql(u8, parts[2], try hash(a, id))) return error.InvalidMetadataBatch;
+            return;
+        }
+        const id = try parse([]const u8, a, raw);
+        if (id.len != 64 or !std.mem.eql(u8, parts[count - 1], id)) return error.InvalidMetadataBatch;
+        for (id) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
+        if (std.mem.eql(u8, parts[1], "state") and count == 4 and std.meta.stringToEnum(c.ProposalState, parts[2]) != null) return;
+        if (std.mem.eql(u8, parts[1], "action") and count == 4 and std.meta.stringToEnum(c.EntityAction, parts[2]) != null) return;
+        if (std.mem.eql(u8, parts[1], "filter") and count == 5 and std.meta.stringToEnum(c.ProposalState, parts[2]) != null and std.meta.stringToEnum(c.EntityAction, parts[3]) != null) return;
+        if (std.mem.eql(u8, parts[1], "key") and count == 4 and parts[2].len == 64) return;
+    }
+    return error.InvalidMetadataBatch;
+}

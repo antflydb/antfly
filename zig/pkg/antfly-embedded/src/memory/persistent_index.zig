@@ -41,6 +41,7 @@ pub const Index = struct {
     store: Store,
     prefix: []const u8,
     nodes: std.StringHashMapUnmanaged(Node) = .empty,
+    pending: std.StringHashMapUnmanaged([]const u8) = .empty,
     steps: usize = 0,
     max_steps: usize = 65536,
     const max_height = 128;
@@ -82,10 +83,25 @@ pub const Index = struct {
         const raw = try std.json.Stringify.valueAlloc(self.a, node, .{});
         const root = try digest(self.a, raw);
         if (!self.nodes.contains(root)) {
-            try self.store.put(self.store.ptr, self.a, try std.mem.concat(self.a, u8, &.{ self.prefix, root }), raw);
+            try self.pending.put(self.a, root, raw);
             try self.nodes.put(self.a, root, node);
         }
         return root;
+    }
+    /// Publish only transaction-final reachable nodes, children before parents.
+    /// Intermediate search paths remain arena-local and create no durable GC debt.
+    pub fn publish(self: *Index, root: Root) !void {
+        try self.publishDepth(root, 0);
+    }
+    fn publishDepth(self: *Index, root: Root, depth: usize) anyerror!void {
+        const id = root orelse return;
+        if (depth >= max_height) return error.MemoryWorkLimit;
+        const raw = self.pending.get(id) orelse return;
+        const node = self.nodes.get(id) orelse return error.MemoryCorruptState;
+        try self.publishDepth(node.left, depth + 1);
+        try self.publishDepth(node.right, depth + 1);
+        try self.store.put(self.store.ptr, self.a, try std.mem.concat(self.a, u8, &.{ self.prefix, id }), raw);
+        _ = self.pending.remove(id);
     }
     fn priorityBefore(left: []const u8, right: []const u8) bool {
         var l: [32]u8 = undefined;
@@ -214,11 +230,15 @@ test "native persistent indexes fork, update, rollback and seek without enumerat
     var index: Index = .{ .a = a, .prefix = "node/", .store = .{ .ptr = &memory, .get = Memory.get, .put = Memory.put }, .max_steps = 1000000 };
     var root: Root = null;
     for (0..10000) |i| root = try index.put(root, try std.fmt.allocPrint(a, "item/{d:0>5}", .{i}), "record-reference");
+    try std.testing.expectEqual(@as(usize, 0), memory.writes);
+    try index.publish(root);
+    try std.testing.expectEqual(@as(usize, 10000), memory.writes);
     const parent = root;
     var cold: Index = .{ .a = a, .prefix = "node/", .store = index.store };
     memory.reads = 0;
     memory.writes = 0;
     root = try cold.put(root, "item/05000", "replacement-reference");
+    try cold.publish(root);
     try std.testing.expect(memory.reads < 128 and memory.writes < 128);
     try std.testing.expectEqualStrings("record-reference", (try cold.get(parent, "item/05000")).?);
     try std.testing.expectEqualStrings("replacement-reference", (try cold.get(root, "item/05000")).?);

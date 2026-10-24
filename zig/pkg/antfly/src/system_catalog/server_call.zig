@@ -54,6 +54,7 @@ pub const RelationSchemaMutation = struct {
 };
 
 pub const Call = union(enum) {
+    resolver_authority_mutate: @import("../metadata/resolver_authority.zig").Write,
     lake_index_lifecycle_read: u64,
     lake_index_lifecycle_work: ?u64,
     lake_index_lifecycle_mutate: @import("../metadata/lake_index_lifecycle.zig").Write,

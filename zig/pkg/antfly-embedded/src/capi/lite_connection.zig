@@ -86,6 +86,7 @@ pub const PreparedPublication = struct {
     source_read: ?*SourceRead,
     relational_rows: bool,
     index_inputs_changed: bool = false,
+    resolver_dependency: ?struct { table: []const u8, template: []const u8, table_id: u64, revision: u64 } = null,
 
     fn current(self: *@This()) !*h.db_mod.DB {
         const root = try self.owner.refresh();
@@ -95,6 +96,11 @@ pub const PreparedPublication = struct {
         const database = try @import("tables.zig").get(root, self.name);
         if (database.root_incarnation != self.incarnation or !std.meta.eql(database.core.identity_namespace, self.identity) or
             !std.mem.eql(u8, &(try catalogStamp(database)), &self.catalog)) return error.EnrichmentSourceChanged;
+        if (self.resolver_dependency) |dependency| {
+            const destination = try @import("tables.zig").get(root, dependency.table);
+            if (destination.core.identity_namespace.table_id != dependency.table_id or
+                (try @import("resolver_authority.zig").revision(destination, alloc, dependency.template)) != dependency.revision) return error.EnrichmentSourceChanged;
+        }
         if (self.shadow_scopes.len != 0) {
             const jobs = try database.graphReplacementStatusAlloc(alloc);
             defer jobs.deinit();
@@ -1049,6 +1055,9 @@ pub const Owner = struct {
             for (0..ordinal) |_| selected = tables.next().?.*;
             database = &selected.?.db;
         }
+        var authority_arena = std.heap.ArenaAllocator.init(alloc);
+        defer authority_arena.deinit();
+        if (self.options.open_mode == .writer and try @import("resolver_authority.zig").hasProjectionDebt(foreground, database, authority_arena.allocator())) self.maintenance_pending = true;
         const group_state = try self.groupSourceState(database);
         const schedule_entry = try self.maintenance_schedules.getOrPut(alloc, .{
             .table_id = database.core.identity_namespace.table_id,
@@ -1186,10 +1195,14 @@ pub const Owner = struct {
         // turn before replay, whose serving-index publication invalidates the
         // broad capture. Unrelated serving writes may rebase this turn, while
         // changes to any selected shadow generation still reject publication.
-        var pending = if (run_database) database.runBackgroundTurnWithCancellation(cancellation, shadow_scopes.items.len != 0) catch |err| blk: {
+        const projected = if (run_database) @import("resolver_authority.zig").pullProjection(root, database, turn_alloc) catch |err| blk: {
+            maintenance_error = err;
+            break :blk false;
+        } else false;
+        var pending = if (run_database and !projected) database.runBackgroundTurnWithCancellation(cancellation, shadow_scopes.items.len != 0) catch |err| blk: {
             maintenance_error = err;
             break :blk true;
-        } else false;
+        } else projected;
         if (run_database) if (database.enrichment_runtime) |runtime| {
             runtime.dense_result_cache = null;
             runtime.generated_publication = null;
@@ -1238,7 +1251,7 @@ pub const Owner = struct {
         // A primary rebase may have fenced immutable index work without
         // making the replay driver itself fail. Retry on a fresh snapshot
         // even when its cached replay target looked complete this turn.
-        pending = pending or publication.index_inputs_changed;
+        pending = pending or projected or publication.index_inputs_changed;
         self.maintenance_round_pending = self.maintenance_round_pending or pending;
         const ttl_pending = self.maintenance_round_ttl_pending;
         if (self.maintenance_table_cursor == 0) {

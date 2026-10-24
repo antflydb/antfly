@@ -1084,6 +1084,7 @@ const LocalStandaloneMetadata = struct {
                 .system_catalog = systemCatalog,
                 .supports_query_definitions = true,
                 .supports_resolver_catalog_read = true,
+                .supports_resolver_authority = true,
                 .supports_object_tables = true,
                 .acquire_join_planning = acquireJoinPlanning,
                 .admin_snapshot = catalogAdminSnapshot,
@@ -2609,17 +2610,17 @@ const LocalStandaloneMetadata = struct {
             try mutateLakeIndexLifecycle(ptr, write.table_id, write.expected_revision, write.mutation, context);
             return alloc.dupe(u8, "{}");
         }
-        if (call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
+        if (call == .resolver_authority_mutate or call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
             call == .policy_publication_begin or call == .policy_publication_mutate or
             call == .fk_initial_create_begin or call == .fk_initial_create_mutate) if (self.hot_standby_catalog_server) |server|
         {
             try server.hot_standby_public_gate_state.checkWrite(server.hot_standby_public_gate_state.currentGeneration());
         };
-        var lease = if (call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
+        var lease = if (call == .resolver_authority_mutate or call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
             call == .policy_publication_begin or call == .policy_publication_mutate or
             call == .fk_initial_create_begin or call == .fk_initial_create_mutate) (if (self.hot_standby_catalog_server) |server| server.hot_standby_mutation_barrier.acquireShared() else null) else null;
         defer if (lease) |*value| value.release();
-        if (call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
+        if (call == .resolver_authority_mutate or call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
             call == .policy_publication_begin or call == .policy_publication_mutate or
             call == .fk_initial_create_begin or call == .fk_initial_create_mutate) if (self.hot_standby_catalog_server) |server|
         {
@@ -2640,6 +2641,33 @@ const LocalStandaloneMetadata = struct {
             return std.json.Stringify.valueAlloc(alloc, capture.value, .{});
         }
         switch (call) {
+            .resolver_authority_mutate => |input| {
+                _ = try self.ensureNativeOwnerBindingLocked();
+                var write = input;
+                write.standalone = true;
+                try write.validate();
+                const body = try std.json.Stringify.valueAlloc(alloc, write, .{});
+                defer alloc.free(body);
+                try context.ensureActive();
+                const previous = self.durable_revision;
+                try self.lifecycle_store.?.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_resolver_authority = body });
+                const current = (try self.lifecycle_store.?.getTable(alloc, group_ids.main_metadata_group_id, write.table_id)) orelse return error.TableNotFound;
+                defer antfly.metadata.table_manager.freeTable(alloc, current);
+                const revision = try self.lifecycle_store.?.standaloneRevision();
+                if (previous != 0 and previous != std.math.maxInt(u64) and revision == previous + 1) {
+                    try self.manager.upsertTable(current);
+                    self.epoch = revision;
+                    self.durable_revision = revision;
+                } else self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                const receipt_id = try write.receipt(alloc);
+                defer alloc.free(receipt_id);
+                const result = try self.lifecycle_store.?.resolverCatalogRead(alloc, group_ids.main_metadata_group_id, .{ .table_name = "native", .table_id = write.table_id, .mode = .authority, .authority = .{ .mode = .receipt, .id = receipt_id }, .standalone = true });
+                errdefer alloc.free(result);
+                const view = try std.json.parseFromSlice(@import("../metadata/resolver_authority.zig").View, alloc, result, .{});
+                defer view.deinit();
+                if (!view.value.receipt) return error.ResolverCurationConflict;
+                return result;
+            },
             .resolver_catalog_read => |input| {
                 _ = try self.ensureNativeOwnerBindingLocked();
                 var read = input;
@@ -2916,6 +2944,12 @@ const LocalStandaloneMetadata = struct {
             },
             .table_status, .list_tables => unreachable,
             .export_snapshot => {
+                const tables = try self.manager.listTables(alloc);
+                defer self.manager.freeTables(alloc, tables);
+                if (self.lifecycle_store) |store| for (tables) |table| {
+                    if (std.mem.indexOf(u8, table.indexes_json, "\"_resolver_record_store\"") != null)
+                        return store.exportStandalonePortableCatalog(alloc);
+                };
                 if (self.systemCatalogState().policy_publications.len != 0) {
                     if (self.lifecycle_store) |store|
                         return store.exportSystemCatalog(alloc, group_ids.main_metadata_group_id);
@@ -2924,8 +2958,6 @@ const LocalStandaloneMetadata = struct {
                 // Borrowed Lite/legacy catalogs have no immutable phase
                 // snapshot journal. Never export an active-looking catalog
                 // without the exact program bytes needed for staged restore.
-                const tables = try self.manager.listTables(alloc);
-                defer self.manager.freeTables(alloc, tables);
                 const ranges = try self.manager.listRanges(alloc);
                 defer self.manager.freeRanges(alloc, ranges);
                 return std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/projection.zig").Export{

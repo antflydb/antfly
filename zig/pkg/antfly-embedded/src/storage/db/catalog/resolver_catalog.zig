@@ -75,7 +75,8 @@ pub const grouped_sources_reader_version: u32 = 8;
 pub const namespace_curation_reader_version: u32 = 9;
 pub const curation_provenance_reader_version: u32 = 10;
 pub const scoped_curation_reader_version: u32 = 11;
-pub const supported_reader_version: u32 = scoped_curation_reader_version;
+pub const native_resolver_records_reader_version: u32 = 12;
+pub const supported_reader_version: u32 = native_resolver_records_reader_version;
 
 pub fn readerVersionBytes(version: u32) ![]const u8 {
     return switch (version) {
@@ -90,6 +91,7 @@ pub fn readerVersionBytes(version: u32) ![]const u8 {
         9 => "9",
         10 => "10",
         11 => "11",
+        12 => "12",
         else => error.UnsupportedDatabaseReaderVersion,
     };
 }

@@ -418,6 +418,7 @@ fn classifyError(err: anyerror) ErrorCode {
         error.InvalidResolverCurationVersion,
         error.InvalidResolverCurationRequest,
         error.ResolverCurationLimitExceeded,
+        error.ResolverNamespaceCurationRequired,
         error.ResolverRedirectExists,
         error.SuppressedResolverRedirectTarget,
         error.ResolverDistinctPair,

@@ -486,6 +486,7 @@ pub const storage_db_replication_ingress = @import("storage/db/replication_ingre
 pub const storage_db_replication_record = @import("storage/db/replication_record.zig");
 pub const storage_db_resolution_handoff = @import("storage/db/resolution_handoff.zig");
 pub const storage_db_entity_alias_curation = @import("storage/db/entity_alias_curation.zig");
+pub const storage_db_resolver_authority = @import("storage/db/resolver_authority.zig");
 pub const storage_db_resolver_curation = @import("storage/db/resolver_curation.zig");
 pub const storage_db_resolution_runtime = @import("storage/db/resolution_runtime.zig");
 pub const storage_db_restore_generation_admissions = @import("storage/db/restore_generation_admissions.zig");

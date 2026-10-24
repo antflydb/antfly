@@ -2012,6 +2012,7 @@ pub const StatusSource = struct {
         /// Hosting requires native existence, definition CAS and policy authority.
         supports_object_tables: bool = false,
         supports_resolver_catalog_read: bool = false,
+        supports_resolver_authority: bool = false,
         acquire_join_planning: ?*const fn (*anyopaque, table_router.RouteBudget) anyerror!?*join_planning.Generation = null,
         system_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 = null,
 
@@ -2771,6 +2772,7 @@ pub const StatusSource = struct {
             .supports_query_definitions = true,
             .supports_object_tables = true,
             .supports_resolver_catalog_read = true,
+            .supports_resolver_authority = true,
             .status = Gen.status,
             .admin_snapshot = Gen.adminSnapshot,
             .control_snapshot = if (@hasDecl(T, "controlSnapshot")) Gen.controlSnapshot else null,

@@ -15,3 +15,5 @@
 
 //! Pure curation dependency for standalone memory policy tests.
 pub const curation = @import("curation.zig");
+
+pub const KeyAlias = curation.Redirect;

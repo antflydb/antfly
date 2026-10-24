@@ -7698,3 +7698,44 @@ test "memory evaluation records invalid judge outputs as abstentions and exposes
     curator.context.curator = true;
     try std.testing.expectError(error.Forbidden, curator.execute(a, .evaluation_results, "run", "{}", ""));
 }
+
+test "memory unavailable semantic supersession evaluation abstains rather than grading absence" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = IndexedRecallFixture.service(&store, 500);
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    _ = try svc.execute(a, .observe, "", source, "source");
+    _ = try svc.execute(a, .assertions, "", helm, "helm");
+    _ = try svc.execute(a, .assertions, "", terraform, "terraform");
+    try IndexedRecallFixture.drain(svc, a, "index");
+    const case: m.types.evaluation.Case = .{ .id = "pair", .task = .supersession, .input = .null, .policy = .{ .seed = "helm", .target = "terraform", .supersession_candidates = .{ .mode = .semantic } }, .expected = .supersedes };
+    _ = try svc.execute(a, .put_evaluation_dataset, "", try std.json.Stringify.valueAlloc(a, m.types.evaluation.DatasetRequest{ .id = "labels", .expected_revision = try SupersessionFixture.revision(svc, a), .cases = &.{case} }, .{}), "dataset");
+    const start = try EvaluationFixture.start(svc, a, .policy, null);
+    _ = try svc.execute(a, .advance, start.id, "{}", "advance");
+    const status = try std.json.parseFromSliceLeaky(m.types.evaluation.Status, a, try svc.execute(a, .evaluation_run, "run", "{}", ""), .{});
+    try std.testing.expectEqual(@as(u64, 0), status.supersession_admission.counts.false_negative);
+    try std.testing.expectEqual(@as(u64, 1), status.supersession.counts.abstained);
+}
+test "memory lineage batches publish only final roots and list without global primary scans" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = store.service("alice", true, 500);
+    _ = try svc.execute(a, .create, "", "{\"features\":{\"lineage\":true},\"max_output_items\":256}", "create");
+    _ = try svc.execute(a, .observe, "", source, "source");
+    var claims: [128]m.types.Assertion = undefined;
+    for (&claims, 0..) |*claim, i| claim.* = .{ .id = try std.fmt.allocPrint(a, "fact-{d}", .{i}), .subject = try std.fmt.allocPrint(a, "subject-{d}", .{i}), .predicate = "p", .value = "v", .statement = "A grounded claim", .evidence = &.{.{ .id = "e1" }} };
+    _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = claims }, .{}), "claims");
+    var nodes: usize = 0;
+    var iter = store.values.keyIterator();
+    while (iter.next()) |key| if (std.mem.startsWith(u8, key.*, "lineage-node/")) {
+        nodes += 1;
+    };
+    // Three entries per assertion, one evidence entry, and the previous tiny root.
+    try std.testing.expect(nodes <= 386);
+    const scans = store.assertion_scans;
+    const page = try std.json.parseFromSliceLeaky(m.types.RecordPage, a, try svc.execute(a, .list, "", "{\"limit\":256}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 128), page.items.len);
+    try std.testing.expectEqual(scans, store.assertion_scans);
+}

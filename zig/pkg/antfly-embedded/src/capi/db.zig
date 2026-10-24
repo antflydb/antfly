@@ -7610,6 +7610,7 @@ fn curateResolverWithProposals(handle: *Handle, name: []const u8, request_json: 
         error.UndefinedTable => return source.curateResolverJsonAlloc(handle.alloc, name, request_json),
         else => return err,
     };
+    if (try @import("resolver_authority.zig").owns(destination, a, cfg.key_template)) return error.ResolverNamespaceCurationRequired;
     var manifest = try proposalManifest(a, destination);
     if (manifest.queue.proposals.len == 0) return source.curateResolverJsonAlloc(handle.alloc, name, request_json);
     const was_dirty = manifest.refresh_required;
@@ -7823,7 +7824,13 @@ pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.
         return @call(.auto, @extern(*const @TypeOf(antfly_db_curate_entity_json), .{ .name = "antfly_db_curate_entity_json" }), .{ handle_ptr, entity_table, entity_key, request_json, out_buf });
     capi.clearLastError();
     const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
+    if (handle_ptr == null) return capi.mapError(error.InvalidArgument);
+    if (request_json.len > @import("antfly_resolver").curation.max_state_bytes) return capi.mapError(error.ResolverCurationLimitExceeded);
+    const authority = @import("resolver_authority.zig");
+    var request_arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+    defer request_arena.deinit();
+    const input = std.json.parseFromSliceLeaky(authority.Input, request_arena.allocator(), request_json.bytes(), .{}) catch |err| return capi.mapError(err);
+    const guard = enterHandle(handle_ptr, if (input.action == .redirects) .read else .exclusive) orelse return capi.mapError(error.InvalidArgument);
     var admitted = true;
     defer if (admitted) guard.leave();
     if (guard.entry_error) |value| return capi.ensureError(value, @src().fn_name);
@@ -7833,15 +7840,28 @@ pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.
     const a = arena.allocator();
     const curation = @import("../storage/db/resolver_curation.zig");
     const pure = @import("antfly_resolver");
-    const Input = struct { action: enum { redirects, merge, unmerge, suppress, unsuppress, distinct }, into: ?[]const u8 = null, replace: bool = false, pin_distinct: bool = false, absorbed: pure.curation.Absorbed = .reject, actor: []const u8 = "", reason: []const u8 = "", expected_revision: ?u64 = null, wait: ?pure.curation.Wait = null };
-    const input = std.json.parseFromSliceLeaky(Input, a, request_json.bytes(), .{}) catch |err| return capi.mapError(err);
     const tables = @import("tables.zig");
-    tables.load(handle) catch |err| return capi.mapError(err);
+    (if (input.action == .redirects) tables.loadCatalog(handle) else tables.load(handle)) catch |err| return capi.mapError(err);
     const entity_db = tables.get(handle, entity_table.bytes()) catch |err| return capi.mapError(err);
+    if (authority.enabled(entity_db, a) catch |err| return capi.mapError(err)) {
+        const response = authority.entity(handle, a, entity_table.bytes(), entity_key.bytes(), input, .{}) catch |err| return capi.mapError(err);
+        out.* = copyJsonBuffer(response) catch |err| return capi.mapError(err);
+        admitted = false;
+        guard.leave();
+        return waitResolverCurationResponse(handle_ptr, if (input.wait) |wait| wait.timeout_ms else 0, out);
+    }
     var manifest = proposalManifest(a, entity_db) catch |err| return capi.mapError(err);
     const was_dirty = manifest.refresh_required;
     refreshProposalManifest(handle, a, entity_table.bytes(), &manifest) catch |err| return capi.mapError(err);
     if (input.action != .redirects and manifest.pending_id != null) return capi.mapError(error.ResolverCurationConflict);
+    if (input.action != .redirects and manifest.pending_id == null and liteOpenModeCanWrite(handle.open_mode)) {
+        const response = authority.entity(handle, a, entity_table.bytes(), entity_key.bytes(), input, manifest.queue) catch |err| return capi.mapError(err);
+        out.* = copyJsonBuffer(response) catch |err| return capi.mapError(err);
+        admitted = false;
+        guard.leave();
+        return waitResolverCurationResponse(handle_ptr, if (input.wait) |wait| wait.timeout_ms else 0, out);
+    }
+    tables.load(handle) catch |err| return capi.mapError(err);
     const Pending = struct { db: *db_mod.DB, source: []const u8, cfg: db_mod.ResolverConfig, request: pure.curation.Request, edit: pure.curation.Plan };
     var pending: std.ArrayListUnmanaged(Pending) = .empty;
     var sources: std.ArrayListUnmanaged(struct { db: *db_mod.DB, name: []const u8 }) = .empty;
@@ -8065,6 +8085,29 @@ fn proposalOperation(handle_ptr: ?*anyopaque, table: capi.Slice, id: capi.Slice,
     const tables = @import("tables.zig");
     (if (operation_name == .list or operation_name == .get) tables.loadCatalog(handle) else tables.load(handle)) catch |err| return capi.mapError(err);
     const db = tables.get(handle, table.bytes()) catch |err| return capi.mapError(err);
+    const authority = @import("resolver_authority.zig");
+    const native_enabled = authority.enabled(db, a) catch |err| return capi.mapError(err);
+    var migration: ?ProposalManifest = null;
+    if (!native_enabled and operation_name != .list and operation_name != .get) {
+        var old = proposalManifest(a, db) catch |err| return capi.mapError(err);
+        refreshProposalManifest(handle, a, table.bytes(), &old) catch |err| return capi.mapError(err);
+        if (old.pending_id == null) migration = old;
+    }
+    if (native_enabled or migration != null) {
+        const operation: authority.Operation = switch (operation_name) {
+            .create => .create,
+            .list => .list,
+            .get => .get,
+            .decide => .decide,
+        };
+        const response = authority.proposals(handle, a, operation, table.bytes(), id.bytes(), request.bytes(), if (migration) |old| old.queue else .{}) catch |err| return capi.mapError(err);
+        out.* = copyJsonBuffer(response) catch |err| return capi.mapError(err);
+        if (operation_name != .decide) return .ok;
+        const decision = std.json.parseFromSliceLeaky(pure.ProposalDecision, a, request.bytes(), .{}) catch |err| return capi.mapError(err);
+        admitted = false;
+        guard.leave();
+        return waitResolverCurationResponse(handle_ptr, if (decision.wait) |wait| wait.timeout_ms else 0, out);
+    }
     var policy_lease = (if (operation_name == .list or operation_name == .get) db.local_execution.row_policy_gate.enterRawRead() else db.local_execution.row_policy_gate.enterRaw()) catch |err| return capi.mapError(err);
     defer policy_lease.release();
     if (operation_name != .list and operation_name != .get) {

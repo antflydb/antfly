@@ -34,16 +34,8 @@ pub const MetadataIdentity = struct {
 pub const Metadata = struct { version: u32 = 1, identities: []const MetadataIdentity = &.{} };
 /// Authoritative corrections belong to a destination table and exact key template.
 pub const namespaces_key = "_resolver_namespaces";
-pub const Namespace = struct {
-    /// One-time adoption cut; later edits use the destination-table CAS.
-    adoption_revision: ?u64 = null,
-    adoption_standalone: bool = false,
-    key_template: []const u8,
-    revision: u64 = 0,
-    merges: []const resolver.KeyAlias = &.{},
-    state: resolver.curation.State = .{},
-};
-pub const Namespaces = struct { version: u32 = 1, namespaces: []const Namespace = &.{} };
+pub const Namespace = @import("resolver_namespace.zig").Namespace;
+pub const Namespaces = @import("resolver_namespace.zig").Namespaces;
 pub const proposals_key = "_curation_proposals";
 
 /// Borrow only authority identities from the parsed catalog. Evidence and
@@ -55,6 +47,13 @@ pub const Ownership = struct {
     pub fn init(a: std.mem.Allocator, root: std.json.Value) !Ownership {
         if (root != .object) return error.InvalidResolverCurationRequest;
         var out: Ownership = .{};
+        if (root.object.get("_resolver_record_owners")) |raw| {
+            if (raw != .array or raw.array.items.len > 4096) return error.InvalidResolverCurationRequest;
+            for (raw.array.items) |item| {
+                if (item != .string) return error.InvalidResolverCurationRequest;
+                try out.templates.put(a, item.string, {});
+            }
+        }
         if (root.object.get(namespaces_key)) |raw| {
             if (raw != .object) return error.InvalidResolverCurationRequest;
             if (raw.object.get("namespaces")) |items| {
@@ -116,6 +115,13 @@ pub fn replaceNamespace(a: std.mem.Allocator, root: *std.json.Value, next: Names
 /// Upgrade folds identical legacy corrections and rejects disagreements before
 /// publishing the shared authority. Declarative aliases remain source-local.
 pub fn foldNamespace(a: std.mem.Allocator, current: Namespace, cfg: catalog.ResolverConfig) !Namespace {
+    // Worker projections are never migration authority. In particular, a
+    // dropped/recreated destination must not revive its predecessor's policy.
+    if (cfg.namespace_curation_generation != 0) {
+        var next = current;
+        next.revision = @max(current.revision, cfg.curation_revision);
+        return next;
+    }
     var next = current;
     var aliases: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
     for (current.merges) |item| try aliases.put(a, item.key, item.target);
@@ -731,13 +737,7 @@ fn reviewOriginalKey(db: anytype, a: std.mem.Allocator, cfg: catalog.ResolverCon
     return error.ResolverCurationConflict;
 }
 
-pub fn keyInNamespace(template: []const u8, key: []const u8) bool {
-    const first = std.mem.indexOf(u8, template, "{{") orelse return std.mem.eql(u8, template, key);
-    const last = std.mem.lastIndexOf(u8, template, "}}") orelse return false;
-    const prefix = template[0..first];
-    const suffix = template[last + 2 ..];
-    return key.len >= prefix.len + suffix.len and std.mem.startsWith(u8, key, prefix) and std.mem.endsWith(u8, key, suffix);
-}
+pub const keyInNamespace = @import("resolver_namespace.zig").keyInNamespace;
 
 pub const drop_marker_prefix = catalog.drop_marker_prefix;
 
@@ -854,6 +854,7 @@ pub fn retainRetiredMetadata(alloc: std.mem.Allocator, before: []const u8, after
     const reconcile = @import("../../metadata/index_reconcile.zig");
     try reconcile.collectDesiredResolvers(a, prior, &old);
     try reconcile.collectDesiredResolvers(a, next, &desired);
+    inline for (.{ "_resolver_record_store", "_resolver_record_owners" }) |key| if (prior.object.get(key)) |value| try next.object.put(a, key, value);
     if (prior.object.get(namespaces_key)) |value| try next.object.put(a, namespaces_key, value);
     if (prior.object.get("_curation_proposals")) |value| try next.object.put(a, "_curation_proposals", value);
     const metadata = try metadataFromValue(a, next);

@@ -18,11 +18,25 @@ const std = @import("std");
 const metadata = @import("table_manager.zig");
 pub const Request = struct {
     table_name: []const u8,
-    mode: enum { table, consumers } = .table,
+    table_id: u64 = 0,
+    mode: enum { table, consumers, authority } = .table,
     key: []const u8 = "",
+    authority: ?@import("resolver_authority.zig").Read = null,
     expected_revision: ?u64 = null,
     cursor: ?[]const u8 = null,
     standalone: bool = false,
+    compact_consumers: bool = false,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            const include = if (comptime std.mem.eql(u8, field, "authority")) self.authority != null else if (comptime std.mem.eql(u8, field, "table_id")) self.table_id != 0 else if (comptime std.mem.eql(u8, field, "compact_consumers")) self.compact_consumers else true;
+            if (include) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
 };
 pub const Page = struct {
     version: u8,
@@ -44,4 +58,26 @@ pub fn keyDigest(key: []const u8) [32]u8 {
     return out;
 }
 
-pub const Consumer = struct { table: metadata.TableRecord, names: []const []const u8 };
+pub const Consumer = struct {
+    table: metadata.TableRecord,
+    names: []const []const u8,
+    configs: ?[]const @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig = null,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        try writer.objectField("table");
+        try writer.write(self.table);
+        try writer.objectField("names");
+        try writer.write(self.names);
+        if (self.configs) |values| {
+            try writer.objectField("configs");
+            try writer.write(values);
+        }
+        try writer.endObject();
+    }
+};
+pub const ConsumerReference = struct {
+    version: u8 = 1,
+    source_id: u64,
+    source_name: []const u8,
+    configs: []const @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig,
+};

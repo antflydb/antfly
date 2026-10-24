@@ -2246,3 +2246,23 @@ scalars, defaulted scalar body fields, and every optional query/header parameter
 Consequently omitted options remain omitted, explicit false overrides true, epoch
 zero remains a timestamp, and the full native uint64 domain round-trips. Strict
 model schemas retain required fields and bounds without injecting wire defaults.
+
+
+### Bounded lineage publication and evaluation readiness
+
+Immutable lineage nodes are staged in the transaction arena. Publishing final
+roots walks only reachable new nodes, children before parents, and publishes a
+shared node once. Intermediate update paths create no durable node, reference or
+GC rows. The 128-claim regression caps the final index at 386 nodes rather than
+persisting thousands of intermediate paths. Existing snapshot roots remain valid.
+
+Branch-local claim, entity, evidence and history pages seek the corresponding
+snapshot root and bulk hydrate record references. They do not scan the space's
+primary rows and filter afterward; cursor keys retain primary record identity.
+Incomplete legacy lineage retains its migration fallback until its root is ready.
+
+A supersession evaluation may count a present candidate immediately. It may count
+absence only when the requested retrieval mode is complete: semantic requires an
+indexed generation, and union abstains while configured semantic discovery is not
+ready. An explicitly disabled semantic configuration permits lexical-only union.
+Unavailable ANN is reported as an abstention rather than a false negative.
