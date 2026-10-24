@@ -621,8 +621,8 @@ The gateway converts the budget to one monotonic deadline at admission. Body
 processing, quota and queue waits, authentication to providers, retries, fallback,
 and streaming all consume that deadline. Batch items inherit it. Earlier ingress
 deadlines and stricter provider limits take precedence. Compatible transports
-forward the remaining budget after quota admission; another attempt cannot
-restart it. Configure a downstream Antfly gateway's maximum to permit the forwarded
+forward the remaining budget immediately before sending headers, after quota
+admission, connection setup and send-lock waits; another attempt cannot restart it. Configure a downstream Antfly gateway's maximum to permit the forwarded
 budget as well.
 
 Task adapters without transport send proof report `upstream_submitted: null`
