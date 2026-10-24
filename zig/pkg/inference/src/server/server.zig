@@ -40967,6 +40967,11 @@ const MediaOutputExecution = struct {
                 }
             } else {
                 var value = base;
+                if (!target.wants(descriptor.ordinal, 0)) {
+                    value.status = .skipped;
+                    try results.append(a, value);
+                    continue;
+                }
                 self.run(a, target, resolved, selected_payload, &value) catch |err| {
                     if (chunks.abort(err) or (!allow_partial and target.required)) return err;
                     value.status = .failed;
@@ -41148,4 +41153,20 @@ test "model aware media prepared frame windows share decode caches and own queue
     cache.deinit();
     // Eviction cannot invalidate a queued classifier or backbone input.
     try std.testing.expect(right.pixels[1][0].?.len == 3 and right.primary[0].patches.len > 0);
+}
+
+test "model aware media masked secondary video bypasses execution" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const O = lib_chunker.outputs;
+    const targets = [_]O.Target{
+        .{ .name = "boundary", .kind = .embedding, .model = "boundary", .execute = false },
+        .{ .name = "embedding", .kind = .embedding, .model = "secondary", .skip_windows = &.{.{ .ordinal = 3, .sub_index = 0 }} },
+    };
+    var consumers = MediaOutputExecution{ .node = undefined, .io = std.testing.io, .control = .{}, .config = .{ .boundary_model = "boundary", .targets = &targets }, .initialized = 2, .frame_arena = std.heap.ArenaAllocator.init(a) };
+    consumers.resolved[0] = .{ .path = "", .identity = @splat('1'), .revision = @splat('2'), .recipe_id = @splat('3') };
+    consumers.resolved[1] = .{ .path = "", .identity = @splat('4'), .revision = @splat('5'), .recipe_id = @splat('6'), .uses_video = true };
+    const values = try MediaOutputExecution.execute(&consumers, a, .{ .video = .{ .bytes = &.{}, .policy = .{} } }, .{ .ordinal = 3, .input_tokens = 0, .coordinates = .{ .kind = .video, .start_ns = 0, .end_ns = 1, .selected_pictures = &.{7} } }, null, null, null, true);
+    try std.testing.expectEqual(@as(@FieldType(O.Result, "status"), .skipped), values[1].status);
 }

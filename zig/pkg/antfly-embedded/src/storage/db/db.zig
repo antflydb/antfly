@@ -9778,6 +9778,7 @@ pub const DB = struct {
             var read = try self.core.store.beginProbeTxn();
             defer read.abort();
             const value = (try @import("artifact_chunk_generation.zig").readMember(alloc, &read, store_key)) orelse break :blk null;
+            if (internal_keys.mediaWindowIndex(store_key)) |index| break :blk try @import("../../chunking/chunk.zig").mediaWindowPayloadAlloc(alloc, value, index);
             break :blk try alloc.dupe(u8, value);
         } orelse {
             try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
@@ -35337,6 +35338,7 @@ pub const DB = struct {
                         .name = try state.alloc.dupe(u8, source.name),
                         .kind = source.kind,
                         .chunk_id = source.chunk_id,
+                        .window_index = source.window_index,
                         .unit_id = if (source.unit_id) |unit_id| try state.alloc.dupe(u8, unit_id) else null,
                     };
                     defer source_ref.deinit(state.alloc);
@@ -46609,6 +46611,7 @@ pub const DB = struct {
         var txn = try self.core.store.beginProbeTxn();
         defer txn.abort();
         const raw = (try @import("artifact_chunk_generation.zig").readMember(alloc, &txn, store_key)) orelse return null;
+        if (internal_keys.mediaWindowIndex(store_key)) |index| return try @import("../../chunking/chunk.zig").mediaWindowPayloadAlloc(alloc, raw, index);
         return try self.core.index_manager.materializeStoredValueAlloc(alloc, store_key, raw);
     }
 

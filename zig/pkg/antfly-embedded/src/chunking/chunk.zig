@@ -649,3 +649,41 @@ test "model chunk artifact retains reconstruction coordinates independently of v
     changed.model_identity = "weights-v2";
     try std.testing.expect(!std.mem.eql(u8, &try modelMemoKey(a, replay.*), &try modelMemoKey(a, changed)));
 }
+
+/// A search hit can name a consumer window while its source remains the
+/// immutable parent chunk. Project exact receipt clocks without inventing a
+/// new plan or persisting duplicate media/chunk records.
+pub fn mediaWindowPayloadAlloc(a: Allocator, payload: []const u8, index: u32) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var object = try std.json.parseFromSliceLeaky(std.json.Value, scratch, payload, .{});
+    const metadata = try modelMetadataAlloc(scratch, payload) orelse return error.InvalidChunkSource;
+    const values = try std.json.parseFromSliceLeaky([]@import("inference_chunker").outputs.Result, scratch, metadata.outputs_json orelse return error.InvalidChunkSource, .{});
+    const selected = for (values) |value| {
+        if (value.kind == .embedding and std.mem.eql(u8, value.name, "embedding") and value.sub_index == index and value.status == .complete) break value;
+    } else return error.InvalidChunkSource;
+    var recipe = object.object.get("_chunk") orelse return error.InvalidChunkSource;
+    try recipe.object.put(scratch, "output_sub_index", .{ .integer = index });
+    try recipe.object.put(scratch, "output_windowed", .{ .bool = true });
+    const encoded = try std.json.Stringify.valueAlloc(scratch, selected, .{ .emit_null_optional_fields = false });
+    const receipt = try std.json.parseFromSliceLeaky(std.json.Value, scratch, encoded, .{});
+    var outputs = std.ArrayList(std.json.Value).empty;
+    try outputs.append(scratch, receipt);
+    try recipe.object.put(scratch, "outputs", .{ .array = outputs.toManaged(scratch) });
+    _ = recipe.object.swapRemove("outputs_json");
+    var descriptor = recipe.object.get("descriptor") orelse return error.InvalidChunkSource;
+    var coordinates = descriptor.object.get("coordinates") orelse return error.InvalidChunkSource;
+    if (selected.start_ns) |start| {
+        try coordinates.object.put(scratch, "start_ns", .{ .integer = start });
+        try object.object.put(scratch, "start_time_ms", .{ .float = @as(f64, @floatFromInt(start)) / std.time.ns_per_ms });
+    }
+    if (selected.end_ns) |end| {
+        try coordinates.object.put(scratch, "end_ns", .{ .integer = end });
+        try object.object.put(scratch, "end_time_ms", .{ .float = @as(f64, @floatFromInt(end)) / std.time.ns_per_ms });
+    }
+    try descriptor.object.put(scratch, "coordinates", coordinates);
+    try recipe.object.put(scratch, "descriptor", descriptor);
+    try object.object.put(scratch, "_chunk", recipe);
+    return std.json.Stringify.valueAlloc(a, object, .{});
+}

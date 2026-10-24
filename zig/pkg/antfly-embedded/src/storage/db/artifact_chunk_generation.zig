@@ -429,6 +429,10 @@ pub const MemberReader = struct {
     }
     pub fn override(self: *MemberReader, txn: anytype, logical: []const u8, physical_value: ?[]const u8) !?[]const u8 {
         const a = self.arena.allocator();
+        if (keys.mediaWindowIndex(logical)) |index| {
+            const parent = (try readMember(a, txn, logical)) orelse return null;
+            return try @import("../../chunking/chunk.zig").mediaWindowPayloadAlloc(a, parent, index);
+        }
         const scope = (try chunks.keyForMemberAlloc(a, logical)) orelse return physical_value;
         if (self.scope == null or !std.mem.eql(u8, scope, self.scope.?)) {
             self.scope = scope;
@@ -457,15 +461,17 @@ pub const Input = struct {
     alloc: std.mem.Allocator,
     /// Unit absence must be a certified deletion, never an incomplete upload.
     require_absence_proof: bool = false,
+    logical_override: ?[]u8 = null,
     head_key: ?[]u8 = null,
     head_value: ?[]const u8 = null,
     value: ?[]const u8 = null,
     pub fn deinit(self: *Input) void {
+        if (self.logical_override) |key| self.alloc.free(key);
         if (self.head_key) |key| self.alloc.free(key);
         self.* = undefined;
     }
     pub fn proofKey(self: Input, logical: []const u8) []const u8 {
-        return if (self.head_value != null) self.head_key.? else logical;
+        return if (self.head_value != null) self.head_key.? else self.logical_override orelse logical;
     }
     pub fn proofValue(self: Input) ?[]const u8 {
         return self.head_value orelse self.value;
@@ -474,13 +480,15 @@ pub const Input = struct {
         if (self.head_key) |key| try token.observe(key, self.head_value, try publication.artifactRevision(txn, token.namespace, key));
         // The immutable generation rows are covered by the head proof. Legacy
         // members additionally require their physical read-set witness.
-        if (self.head_value == null) try token.observe(logical, self.value, try publication.artifactRevision(txn, token.namespace, logical));
+        if (self.head_value == null) try token.observe(self.logical_override orelse logical, self.value, try publication.artifactRevision(txn, token.namespace, self.logical_override orelse logical));
     }
 };
 
-pub fn captureInput(alloc: std.mem.Allocator, txn: anytype, logical: []const u8) !Input {
+pub fn captureInput(alloc: std.mem.Allocator, txn: anytype, supplied: []const u8) !Input {
+    const logical = keys.mediaWindowParent(supplied);
     var input: Input = .{ .alloc = alloc };
     errdefer input.deinit();
+    if (logical.len != supplied.len) input.logical_override = try alloc.dupe(u8, logical);
     const scope = (try chunks.keyForMemberAlloc(alloc, logical)) orelse {
         input.value = txn.get(logical) catch |err| if (err == error.NotFound) null else return err;
         return input;
@@ -500,6 +508,22 @@ pub fn captureInput(alloc: std.mem.Allocator, txn: anytype, logical: []const u8)
             input.value = txn.get(key) catch |err| if (err == error.NotFound) return error.ArtifactCatalogCorrupt else return err;
         }
     } else input.value = txn.get(logical) catch |err| if (err == error.NotFound) null else return err;
+    if (keys.mediaWindowIndex(supplied)) |index| if (input.value) |raw| {
+        const metadata = try @import("../../chunking/chunk.zig").modelMetadataAlloc(alloc, raw);
+        defer if (metadata) |value| value.deinit(alloc);
+        const encoded = if (metadata) |value| value.outputs_json else null;
+        var found = false;
+        var windows: usize = 0;
+        if (encoded) |bytes| {
+            var results = try std.json.parseFromSlice([]@import("inference_chunker").outputs.Result, alloc, bytes, .{});
+            defer results.deinit();
+            for (results.value) |result| if (result.kind == .embedding and std.mem.eql(u8, result.name, "embedding")) {
+                windows += 1;
+                if (result.sub_index == index and result.status == .complete) found = true;
+            };
+        }
+        if (!found or windows <= 1) input.value = null;
+    };
     return input;
 }
 

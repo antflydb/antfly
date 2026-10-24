@@ -44,7 +44,8 @@ pub fn scopedKeyAlloc(alloc: std.mem.Allocator, document: []const u8, producer: 
 /// Preserve encoded binary components directly. The physical mutation hook
 /// needs one short allocation, not decoding every component of every chunk
 /// into temporary strings. Embeddings and neighboring units are excluded.
-pub fn keyForMemberAlloc(alloc: std.mem.Allocator, member: []const u8) !?[]u8 {
+pub fn keyForMemberAlloc(alloc: std.mem.Allocator, supplied: []const u8) !?[]u8 {
+    const member = keys.mediaWindowParent(supplied);
     if (!keys.isChunkArtifactRecordKey(member)) return null;
     const document_end = keys.findComponentTerminator(member, 1).? + 2;
     const name_start = keys.findComponentTerminator(member, document_end + 1).? + 2;

@@ -13508,6 +13508,11 @@ export interface components {
             kind: "chunk" | "asset" | "embedding";
             /** Format: uint32 */
             chunk_id?: number;
+            /**
+             * Format: uint32
+             * @description Independent media output sub-window within the parent chunk; omitted for an unsplit vector.
+             */
+            window_index?: number;
             unit_id?: string;
         };
         HierarchyArtifact: {
@@ -13516,6 +13521,11 @@ export interface components {
             kind: "chunk" | "asset" | "embedding";
             /** Format: uint32 */
             chunk_id?: number;
+            /**
+             * Format: uint32
+             * @description Independent media output sub-window within the parent chunk; omitted for an unsplit vector.
+             */
+            window_index?: number;
             unit_id?: string;
             source?: components["schemas"]["HierarchyArtifactSource"];
         };

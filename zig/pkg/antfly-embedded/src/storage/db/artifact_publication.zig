@@ -598,7 +598,15 @@ pub fn artifactRevision(txn: anytype, namespace: Namespace, artifact_key: []cons
 pub fn stageArtifactRevisions(txn: anytype, command: Command, position: Position) !void {
     try position.requireNamespace(namespaceFromBytes(command.namespace));
     const encoded = try position.encode();
-    for (command.mutations) |mutation| try txn.put(&artifactRevisionKey(command.namespace, mutation.key), &encoded);
+    for (command.mutations) |mutation| {
+        try txn.put(&artifactRevisionKey(command.namespace, mutation.key), &encoded);
+        const a = std.heap.smp_allocator;
+        if (try @import("artifact_vector_set.zig").forArtifactAlloc(a, mutation.key)) |witness| {
+            defer a.free(witness);
+            try txn.put(witness, &encoded);
+            try txn.put(&artifactRevisionKey(command.namespace, witness), &encoded);
+        }
+    }
 }
 
 /// Adoption of an absent output can create its first local tombstone witness
@@ -612,6 +620,7 @@ pub fn stageArtifactTombstoneRevision(txn: anytype, namespace: Namespace, artifa
 }
 
 pub fn guardedArtifactKey(key_bytes: []const u8) bool {
+    if (@import("artifact_vector_set.zig").isKey(key_bytes)) return true;
     if (@import("group_source_identity.zig").isUnitContextEpochKey(key_bytes)) return true;
     // Head bytes are valid read-set witnesses, not generic artifact mutations.
     // Only the staged-output publication path may change generation visibility.

@@ -46,6 +46,8 @@ pub const ModelMetadata = struct {
     embedding_error: ?[]const u8 = null,
     /// Owned serialized independent output results; payloads live outside recipes.
     outputs_json: ?[]const u8 = null,
+    output_sub_index: ?u32 = null,
+    output_windowed: ?bool = null,
 
     pub fn clone(self: ModelMetadata, a: std.mem.Allocator) !*ModelMetadata {
         const copy = try a.create(ModelMetadata);

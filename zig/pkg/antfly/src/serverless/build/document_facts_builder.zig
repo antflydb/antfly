@@ -44,7 +44,7 @@ pub fn fingerprint(alloc: Allocator, policy: catalog.NamespacePolicy, indexes_js
     }, .{});
     defer alloc.free(encoded);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("antfly:document-facts:semantics:v3:");
+    hash.update("antfly:document-facts:semantics:v4:");
     var len: [8]u8 = undefined;
     std.mem.writeInt(u64, &len, encoded.len, .little);
     hash.update(&len);

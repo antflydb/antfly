@@ -89,7 +89,14 @@ fn optional(txn: anytype, key: []const u8) !?[]const u8 {
     };
 }
 
+const VectorSetFence = struct {
+    embedding: []const u8,
+    producer: []const u8,
+    digest: []const u8,
+    rows: []const struct { chunk_id: u32, sub_index: u32 },
+};
 pub const UpstreamFence = struct {
+    vector_set: ?VectorSetFence = null,
     key: []const u8,
     requires_value: bool,
     expected_chunk_count: ?u32 = null,
@@ -106,6 +113,35 @@ pub const UpstreamFence = struct {
         var input = try @import("artifact_extraction_generation.zig").captureInput(alloc, txn, self.key);
         defer input.deinit();
         if (self.requires_value and input.value == null) return error.EnrichmentSourceChanged;
+        if (self.vector_set) |set| {
+            const vector_set = @import("artifact_vector_set.zig");
+            const manifest = try @import("artifact_chunk_manifest.zig").Manifest.decode(input.value orelse return error.EnrichmentSourceChanged);
+            var digest = std.crypto.hash.sha2.Sha256.init(.{});
+            digest.update(&manifest.content_digest);
+            var row: usize = 0;
+            const document = command.sources[0].document_key;
+            // The manifest fence names its configured upstream chunk producer.
+            const producer = set.producer;
+            for (0..manifest.count) |ordinal| {
+                const member = try keys.chunkArtifactKeyAlloc(alloc, document, producer, @intCast(ordinal));
+                defer alloc.free(member);
+                const payload = (try @import("artifact_chunk_generation.zig").readMember(alloc, txn, member)) orelse return error.EnrichmentSourceChanged;
+                const indices = try vector_set.indices(alloc, payload);
+                defer alloc.free(indices);
+                for (indices) |index| {
+                    if (row >= set.rows.len or set.rows[row].chunk_id != ordinal or set.rows[row].sub_index != index) return error.InvalidBatchRequest;
+                    row += 1;
+                    const child = if (indices.len > 1) try keys.mediaWindowChildKeyAlloc(alloc, member, index) else try keys.mediaWindowKeyAlloc(alloc, member, index);
+                    defer alloc.free(child);
+                    const vector = try keys.derivedEmbeddingArtifactKeyAlloc(alloc, child, set.embedding);
+                    defer alloc.free(vector);
+                    const raw = txn.get(vector) catch |err| if (err == error.NotFound) return error.EnrichmentSourceChanged else return err;
+                    vector_set.update(&digest, vector, raw);
+                    _ = try @import("artifact_producer_provenance.zig").certifyInheritedArtifact(alloc, txn, vector, raw, command);
+                }
+            }
+            if (row != set.rows.len or !std.mem.eql(u8, &std.fmt.bytesToHex(digest.finalResult(), .lower), set.digest)) return error.EnrichmentSourceChanged;
+        }
         if (self.expected_chunk_count) |expected| {
             const manifest = try @import("artifact_chunk_manifest.zig").Manifest.decode(input.value orelse return error.EnrichmentSourceChanged);
             if (manifest.count != expected) return error.EnrichmentSourceChanged;
@@ -265,7 +301,7 @@ fn requireVectorLabels(alloc: std.mem.Allocator, command: publication.Command, c
     const upstream = for (configs) |entry| {
         if (entry.kind == .embedding and std.mem.eql(u8, entry.name, config.source_artifact_name)) break entry;
     } else return error.InvalidBatchRequest;
-    const Output = struct { object: []const u8, embedding_name: []const u8, chunks: []const struct { chunk_id: u32, labels: []const @import("enrichment/vector_labels.zig").Score } };
+    const Output = struct { object: []const u8, embedding_name: []const u8, parent_count: ?u32 = null, vector_digest: ?[]const u8 = null, chunks: []const struct { chunk_id: u32, sub_index: u32 = 0, labels: []const @import("enrichment/vector_labels.zig").Score } };
     const result = try std.json.parseFromSliceLeaky(Output, alloc, effect.value orelse return error.InvalidBatchRequest, .{});
     if (!std.mem.eql(u8, result.object, "vector.labels") or !std.mem.eql(u8, result.embedding_name, upstream.name)) return error.InvalidBatchRequest;
     var producer = try @import("enrichment/asset_producer.zig").parseProducerConfig(alloc, config.producer_json);
@@ -279,18 +315,32 @@ fn requireVectorLabels(alloc: std.mem.Allocator, command: publication.Command, c
     var names = std.StringHashMap(void).init(alloc);
     defer names.deinit();
     for (vocabulary.value.labels) |label| try names.put(label.label, {});
+    const aggregate = result.vector_digest != null;
+    if (!aggregate and result.parent_count != null) return error.InvalidBatchRequest;
+    if (aggregate) {
+        const witness = try @import("artifact_vector_set.zig").keyAlloc(alloc, source.document_key, upstream.name);
+        if (!guards.contains(witness) or result.vector_digest.?.len != 64 or result.parent_count == null) return error.InvalidBatchRequest;
+    }
     for (result.chunks, 0..) |row, ordinal| {
-        if (row.chunk_id != ordinal or row.labels.len > vocabulary.value.top_k) return error.InvalidBatchRequest;
+        if ((!aggregate and row.chunk_id != ordinal) or row.labels.len > vocabulary.value.top_k) return error.InvalidBatchRequest;
         for (row.labels, 0..) |score, i| {
             if (!std.math.isFinite(score.score)) return error.InvalidBatchRequest;
             if (!names.contains(score.label)) return error.InvalidBatchRequest;
             if (i != 0 and row.labels[i - 1].score < score.score) return error.InvalidBatchRequest;
         }
-        const member = try keys.chunkArtifactKeyAlloc(alloc, source.document_key, upstream.source_artifact_name, @intCast(ordinal));
-        const vector = try keys.derivedEmbeddingArtifactKeyAlloc(alloc, member, upstream.name);
-        if (!guards.contains(vector)) return error.InvalidBatchRequest;
+        if (!aggregate) {
+            const member = try keys.chunkArtifactKeyAlloc(alloc, source.document_key, upstream.source_artifact_name, @intCast(ordinal));
+            const vector = try keys.derivedEmbeddingArtifactKeyAlloc(alloc, member, upstream.name);
+            if (!guards.contains(vector)) return error.InvalidBatchRequest;
+        }
     }
-    return .{ .key = manifest, .requires_value = true, .expected_chunk_count = std.math.cast(u32, result.chunks.len) orelse return error.InvalidBatchRequest };
+    var set: ?VectorSetFence = null;
+    if (result.vector_digest) |digest| {
+        const rows = try alloc.alloc(@typeInfo(@FieldType(VectorSetFence, "rows")).pointer.child, result.chunks.len);
+        for (rows, result.chunks) |*dest, row| dest.* = .{ .chunk_id = row.chunk_id, .sub_index = row.sub_index };
+        set = .{ .embedding = upstream.name, .producer = upstream.source_artifact_name, .digest = digest, .rows = rows };
+    }
+    return .{ .key = manifest, .requires_value = true, .vector_set = set, .expected_chunk_count = result.parent_count orelse (std.math.cast(u32, result.chunks.len) orelse return error.InvalidBatchRequest) };
 }
 
 fn sourceIsExtraction(alloc: std.mem.Allocator, configs: []const @import("catalog/enrichment_catalog.zig").EnrichmentConfig, name: []const u8) !bool {
@@ -418,6 +468,21 @@ test "model aware media vector label publication requires the complete guarded e
     try std.testing.expectError(error.InvalidBatchRequest, requireVectorLabels(owned, command, config, &configs, effect));
     command.artifact_sources = guards[1..];
     try std.testing.expectError(error.InvalidBatchRequest, requireVectorLabels(owned, command, config, &configs, effect));
+    const witness = try @import("artifact_vector_set.zig").keyAlloc(owned, "doc", "vectors");
+    const aggregate_guards = [_]publication.ArtifactSource{ guards[0], .{ .key = witness, .content_digest = @splat(4), .input_position = null, .source_index = 0 } };
+    command.artifact_sources = &aggregate_guards;
+    const Row = struct { chunk_id: u32, sub_index: u32 = 0, labels: []const @import("enrichment/vector_labels.zig").Score };
+    const rows = try owned.alloc(Row, 5000);
+    for (rows, 0..) |*row, ordinal| row.* = .{ .chunk_id = @intCast(ordinal), .labels = &.{.{ .label = "speech", .score = 0.9 }} };
+    var large_effect = effect;
+    const digest: [64]u8 = @splat('1');
+    large_effect.value = try std.json.Stringify.valueAlloc(owned, .{ .object = "vector.labels", .embedding_name = "vectors", .parent_count = 5000, .vector_digest = @as([]const u8, &digest), .chunks = rows }, .{});
+    const large = try requireVectorLabels(owned, command, config, &configs, large_effect);
+    try std.testing.expectEqual(@as(?u32, 5000), large.expected_chunk_count);
+    try std.testing.expectEqual(@as(usize, 5000), large.vector_set.?.rows.len);
+    try std.testing.expectEqual(@as(usize, 2), command.artifact_sources.len);
+    command.artifact_sources = aggregate_guards[0..1];
+    try std.testing.expectError(error.InvalidBatchRequest, requireVectorLabels(owned, command, config, &configs, large_effect));
 }
 
 test "model aware media selected chunk heads authorize downstream outputs without legacy member guards" {

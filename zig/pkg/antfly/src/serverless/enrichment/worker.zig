@@ -69,6 +69,7 @@ pub const SparseEnricherConfig = struct {
     failure_policy: catalog_mod.EnrichmentFailurePolicy = .skip_document,
     cancellation: CancellationToken = .none,
     media_output_max_attempts: u32 = 3,
+    media_pages_per_document: usize = 1,
 };
 
 const SourcePin = struct {
@@ -184,6 +185,7 @@ pub const SparseEnricher = struct {
     model_chunk_provider: ?chunking.Provider = null,
     model_chunk_field: []const u8 = "",
     media_output_max_attempts: u32 = 3,
+    media_page_limit: usize = 0,
     generation_snapshot: ?*MediaGenerationSnapshot = null,
 
     pub fn init(
@@ -385,7 +387,7 @@ pub const SparseEnricher = struct {
             const canonical = try chunking.types.stringifyAlloc(self.alloc, self.model_chunker.?);
             defer self.alloc.free(canonical);
             var hash = std.crypto.hash.sha2.Sha256.init(.{});
-            hash.update("serverless-media-audit-v1");
+            hash.update("serverless-media-audit-v2");
             hash.update(&facts.policy_fingerprint);
             hash.update(canonical);
             scan_fingerprint = hash.finalResult();
@@ -530,6 +532,7 @@ pub const SparseEnricher = struct {
         worker.alloc = working.allocator();
         worker.generation_snapshot = generations;
         worker.media_output_max_attempts = @max(cfg.media_output_max_attempts, 1);
+        worker.media_page_limit = @max(cfg.media_pages_per_document, 1);
         return worker.processAdmittedDocument(namespace, cfg, pin, pages, fact, key, head, expected_lsn, stats) catch |err| {
             if (err == error.OutOfMemory and working.limit_exceeded) return error.EnrichmentDocumentBudgetExceeded;
             return err;
@@ -972,6 +975,38 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
     var output_rows: std.ArrayList(media_outputs.Row) = .empty;
     var plan_id: []const u8 = "";
     var pending_outputs = false;
+    var preparation_complete = true;
+    var pages: usize = 0;
+    if (cached_rows.len != 0 or legacy_current) if (document.object.get("_enrichment")) |saved| if (saved == .object) {
+        const fingerprint = saved.object.get("chunk_embeddings_preparation_recipe");
+        const raw_cursor = saved.object.get("chunk_embeddings_cursor");
+        if (fingerprint != null and fingerprint.? == .string and std.mem.eql(u8, fingerprint.?.string, &recipe_fingerprint) and raw_cursor != null) {
+            const cursor = try std.json.parseFromValueLeaky(chunking.types.Replay, scratch, raw_cursor.?, .{});
+            const old_vectors = document.object.get("chunk_embeddings");
+            const legacy_prefix_rows = if (old_vectors != null and old_vectors.? == .array) old_vectors.?.array.items else &.{};
+            const cached = if (cached_rows.len != 0) document.object.get("media_outputs").?.object.get("plan_id").? else legacy_prefix_rows[0].object.get("_chunk").?.object.get("plan_id").?;
+            const prefix_count = if (cached_rows.len != 0) cached_rows.len else legacy_prefix_rows.len;
+            if (cached == .string and std.mem.eql(u8, cursor.plan_id, cached.string) and cursor.ordinal <= prefix_count) {
+                position = try chunking.types.cloneReplay(a, cursor);
+                plan_id = try scratch.dupe(u8, cursor.plan_id);
+                for (cached_rows[0..@min(cached_rows.len, @as(usize, @intCast(cursor.ordinal)))]) |row| {
+                    try output_rows.append(scratch, row);
+                    for (row.outputs) |result| pending_outputs = pending_outputs or (result.status != .complete and !result.terminal);
+                }
+                if (document.object.get("chunk_embeddings")) |old| if (old == .array) for (old.array.items) |row| {
+                    if (row != .object) continue;
+                    const descriptor = row.object.get("_chunk") orelse continue;
+                    if (descriptor != .object) continue;
+                    const unit = descriptor.object.get("descriptor") orelse continue;
+                    if (unit != .object) continue;
+                    const ordinal = unit.object.get("ordinal") orelse continue;
+                    if (ordinal != .integer or ordinal.integer < 0 or ordinal.integer >= cursor.ordinal) continue;
+                    try embeddings.append(scratch, row);
+                    try previews.append(scratch, row.object.get("chunk") orelse .{ .string = "" });
+                };
+            }
+        }
+    };
     while (input != null) {
         config = base_config;
         config.page = true;
@@ -1018,6 +1053,8 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
             if (independent.len != 0) try output_rows.append(scratch, .{ .chunk_id = chunk.id, .outputs = independent });
             try appendServerlessEmbeddingRows(scratch, wanted, metadata, independent, chunk.text orelse "", &embeddings, &previews);
         }
+        pages += 1;
+        preparation_complete = page.complete;
         if (page.complete) break;
         if (position) |cursor| {
             a.free(cursor.plan_id);
@@ -1030,6 +1067,13 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
         const fingerprint = try a.dupe(u8, page.source_fingerprint);
         errdefer a.free(fingerprint);
         position = .{ .plan_id = plan, .source_fingerprint = fingerprint, .source_version = try a.dupe(u8, page.source_version), .ordinal = page.covered_through_ordinal };
+        if (self.media_page_limit != 0 and pages >= self.media_page_limit) {
+            pending_outputs = true;
+            // Preserve unvisited receipts during a secondary-only repair; the
+            // next bounded page can skip those already accepted computations.
+            if (page.covered_through_ordinal < cached_rows.len) try output_rows.appendSlice(scratch, cached_rows[@intCast(page.covered_through_ordinal)..]);
+            break;
+        }
     }
     try document.object.put(scratch, "chunk_embeddings", .{ .array = embeddings.toManaged(scratch) });
     try document.object.put(scratch, "chunk_preview", .{ .array = previews.toManaged(scratch) });
@@ -1049,6 +1093,10 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
     try state.object.put(scratch, "chunk_embeddings", .{ .bool = !pending_outputs });
     try state.object.put(scratch, "chunk_embeddings_pending", .{ .bool = pending_outputs });
     try state.object.put(scratch, "chunk_embeddings_preparation_recipe", .{ .string = &recipe_fingerprint });
+    if (!preparation_complete and position != null) {
+        const encoded_cursor = try std.json.Stringify.valueAlloc(scratch, position.?, .{});
+        try state.object.put(scratch, "chunk_embeddings_cursor", try std.json.parseFromSliceLeaky(std.json.Value, scratch, encoded_cursor, .{}));
+    } else _ = state.object.swapRemove("chunk_embeddings_cursor");
     if (pending_outputs) {
         _ = state.object.swapRemove("chunk_embeddings_version");
         _ = state.object.swapRemove("chunk_embeddings_recipe");
@@ -2963,11 +3011,15 @@ test "model aware media serverless chunks use the shared paged provider and reta
     const a = std.testing.allocator;
     const Fake = struct {
         calls: usize = 0,
+        first_calls: usize = 0,
+        fail_second: bool = false,
         fn page(ptr: *anyopaque, alloc: Allocator, _: []const u8, input: chunking.inference.RemoteInput, cfg: chunking.types.Config, _: @import("antfly_inference_execution_context").RequestContext) anyerror!chunking.inference.ChunkPage {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try @import("std").testing.expect(input == .source);
             self.calls += 1;
             const ordinal = if (cfg.replay) |cursor| cursor.ordinal else 0;
+            if (cfg.embedding != null and ordinal == 0) self.first_calls += 1;
+            if (cfg.embedding != null and ordinal == 1 and self.fail_second) return error.ChunkRequestFailed;
             const id = try std.fmt.allocPrint(alloc, "{s}:{d}", .{ "1111111111111111111111111111111111111111111111111111111111111111", ordinal });
             defer alloc.free(id);
             const chunks = try alloc.alloc(chunking.inference.RemoteChunk, 1);
@@ -3022,6 +3074,26 @@ test "model aware media serverless chunks use the shared paged provider and reta
     const repaged = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, result.body.?, 2, .require_model);
     try std.testing.expect(repaged.body == null);
     try std.testing.expectEqual(@as(usize, 4), fake.calls);
+    // The worker publishes a bounded prefix to WAL before asking for more.
+    worker.media_page_limit = 1;
+    worker.model_chunker.?.max_chunks = 1;
+    fake.first_calls = 0;
+    const first_page = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, "{\"clip\":{\"type\":\"source\",\"uri\":\"s3://bucket/clip.mp4\",\"mime_type\":\"video/mp4\",\"version\":\"v1\",\"version_kind\":\"s3_version_id\",\"length\":100}}", 2, .require_model);
+    defer a.free(first_page.body.?);
+    var prefix = try document_projection.parseAlloc(a, first_page.body.?);
+    defer prefix.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), prefix.chunk_embeddings.?.len);
+    try std.testing.expect(prefix.chunk_embeddings_version == null);
+    fake.fail_second = true;
+    try std.testing.expectError(error.ChunkRequestFailed, buildDerivedBodyAlloc(&worker, .chunk_embeddings, first_page.body.?, 2, .require_model));
+    fake.fail_second = false;
+    const resumed = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, first_page.body.?, 2, .require_model);
+    defer a.free(resumed.body.?);
+    var complete = try document_projection.parseAlloc(a, resumed.body.?);
+    defer complete.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), complete.chunk_embeddings.?.len);
+    try std.testing.expectEqual(@as(?u32, 2), complete.chunk_embeddings_version);
+    try std.testing.expectEqual(@as(usize, 1), fake.first_calls);
 }
 
 test "model aware media serverless enrichment stages preserve independent outputs and metadata" {
