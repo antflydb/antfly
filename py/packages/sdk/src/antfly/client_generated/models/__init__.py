@@ -428,6 +428,7 @@ from .external_lake_table_source import ExternalLakeTableSource
 from .external_lake_table_source_format import ExternalLakeTableSourceFormat
 from .external_lake_table_source_kind import ExternalLakeTableSourceKind
 from .external_lake_table_source_object_mutability import ExternalLakeTableSourceObjectMutability
+from .external_lake_table_source_row_identity import ExternalLakeTableSourceRowIdentity
 from .external_lake_table_source_row_identity_version import ExternalLakeTableSourceRowIdentityVersion
 from .external_lake_table_source_write_policy import ExternalLakeTableSourceWritePolicy
 from .extraction_attribute_group import ExtractionAttributeGroup
@@ -2134,6 +2135,7 @@ __all__ = (
     "ExternalLakeTableSourceFormat",
     "ExternalLakeTableSourceKind",
     "ExternalLakeTableSourceObjectMutability",
+    "ExternalLakeTableSourceRowIdentity",
     "ExternalLakeTableSourceRowIdentityVersion",
     "ExternalLakeTableSourceWritePolicy",
     "ExtractionAttributeGroup",

@@ -186,6 +186,14 @@ check that measured storage/inference compilations fit together and that
 unmeasured hosts, CPU features, targets, modes, backend settings, and sanitizer
 settings retain conservative reservations.
 
+The unstripped native Apple Silicon Zig 0.17.0 ReleaseFast API owner reached
+27,085,701,120 bytes during the logical-input commitment qualification
+(`5eaa13cb68`). Its default macOS reservation is 28 GiB, providing over 10%
+headroom while fitting a 36 GiB developer host's default 28.8 GiB compiler
+budget. The admission regression also prevents overlap with the distributed
+owner under that budget. Qualified stripped profiles and Linux claims retain
+their separate measurements.
+
 `python3 tools/check_storage_compilation.py --report storage-compilation.json`
 checks the real compiler in an isolated source overlay. It measures cold and
 warm builds, then verifies these source changes:
