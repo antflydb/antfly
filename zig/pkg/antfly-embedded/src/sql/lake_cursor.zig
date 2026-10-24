@@ -2157,7 +2157,7 @@ test "lake SQL lazy ordered range ownership unwinds allocation failures" {
             }
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Sweep.run, .{ &lake.source, lake.table });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Sweep.run, .{ &lake.source, lake.table });
 }
 
 test "lake SQL shared immutable plans retain sparse file versions and canonical ordering" {

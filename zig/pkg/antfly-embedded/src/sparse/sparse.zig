@@ -2890,6 +2890,8 @@ pub const SparseIndex = struct {
         max_segments: usize = 128,
         scratch: ?@import("../spill_sort.zig").Options = null,
         background_publication: bool = false,
+        size_tiered: bool = false,
+        exact_forward_weights: bool = false,
     };
 
     pub const SegmentCompactionSource = struct {
@@ -2920,6 +2922,7 @@ pub const SparseIndex = struct {
         snapshot: ?backend_erased.ReadTxn = null,
         scratch: ?@import("../spill_sort.zig").Options = null,
         generation: ?u64 = null,
+        exact_forward_weights: bool = false,
         // The maintenance owner pins the store lifecycle; this copy remains
         // stable if the IndexManager's sparse entry array moves during apply.
         store: ?backend_erased.Store = null,
@@ -3017,6 +3020,27 @@ pub const SparseIndex = struct {
         var snapshot_transferred = false;
         defer if (!snapshot_transferred) txn.abort();
 
+        // Geometric tiers avoid rewriting the historical base for every small
+        // append. Only compact a pressured cohort of similarly sized roots.
+        var preferred: [2]?usize = .{ null, null };
+        if (options.size_tiered) for ([_]u8{ key_segment, key_docmap_segment }, 0..) |tag, kind| {
+            var sizes: [32]usize = @splat(0);
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var next = try cursor.seekAtOrAfter(&.{tag});
+            while (next) |entry| {
+                if (entry.key.len == 0 or entry.key[0] != tag) break;
+                sizes[try compactionTier(entry.value, kind == 1)] += 1;
+                next = try cursor.next();
+            }
+            for (sizes, 0..) |count, tier| if (count >= min_segments) {
+                preferred[kind] = tier;
+                break;
+            };
+        };
+        if (options.size_tiered and preferred[0] == null and preferred[1] == null) return null;
+        if (options.exact_forward_weights and options.scratch == null) return error.InvalidSparseSegment;
+
         // Preflight borrows immutable source bytes; reserve before any source
         // clone, hash table, decoded posting array or captured ID allocation.
         var preflight_bytes: u64 = 0;
@@ -3028,6 +3052,10 @@ pub const SparseIndex = struct {
             var entry_opt = try preflight.seekAtOrAfter(&prefix);
             while (entry_opt) |entry| {
                 if (entry.key.len == 0 or entry.key[0] != tag) break;
+                if (options.size_tiered and (preferred[kind] == null or try compactionTier(entry.value, kind == 1) != preferred[kind].?)) {
+                    entry_opt = try preflight.next();
+                    continue;
+                }
                 const bytes = if (options.scratch != null and try immutableVersion(entry.value) == SEGMENT_FORMAT_VERSION)
                     @as(u64, entry.value.len) * 4 + posting_pages.max_block_bytes + 256 * 1024
                 else
@@ -3053,6 +3081,10 @@ pub const SparseIndex = struct {
         var maybe_segment = try cur.seekAtOrAfter(taggedPrefix(key_segment));
         while (maybe_segment) |entry| {
             if (entry.key.len == 0 or entry.key[0] != key_segment) break;
+            if (options.size_tiered and (preferred[0] == null or try compactionTier(entry.value, false) != preferred[0].?)) {
+                maybe_segment = try cur.next();
+                continue;
+            }
             const id = segmentIdFromKey(entry.key) orelse return error.InvalidSparseSegment;
             const data = try alloc.dupe(u8, entry.value);
             var transferred = false;
@@ -3079,6 +3111,10 @@ pub const SparseIndex = struct {
         while (maybe_docmap) |entry| {
             if (entry.key.len == 0 or entry.key[0] != key_docmap_segment) break;
             if (entry.key.len != 9) return error.InvalidSparseDocMapSegment;
+            if (options.size_tiered and (preferred[1] == null or try compactionTier(entry.value, true) != preferred[1].?)) {
+                maybe_docmap = try docmap_cur.next();
+                continue;
+            }
             const id = std.mem.readInt(u64, entry.key[1..9], .big);
             const data = try alloc.dupe(u8, entry.value);
             var transferred = false;
@@ -3121,10 +3157,81 @@ pub const SparseIndex = struct {
             .generation = generation,
             .store = self.store,
             .scratch = options.scratch,
+            .exact_forward_weights = options.exact_forward_weights,
             .sources = owned_sources,
             .docmaps = owned_docmaps,
             .buffer_reservation = reservation,
         };
+    }
+
+    fn compactionTier(data: []const u8, docmap: bool) !usize {
+        const bytes: u64 = if (docmap and pagedDocMap(data)) @as(u64, std.mem.readInt(u32, data[12..16], .little)) * 128 else if (!docmap and posting_pages.paged(data)) try posting_pages.materializedSize(data) else data.len;
+        return @min(31, std.math.log2_int(u64, @max(1, bytes / (64 * 1024))) / 2);
+    }
+    /// Rebuild each selected posting from its exact retained forward vector.
+    /// One bounded external sort orders (term, ordinal); repeated compactions
+    /// never feed dequantized weights into another quantization generation.
+    fn compactExactForwardWeights(alloc: Allocator, task: *SegmentCompactionTask, builder: *posting_pages.Builder, chunk_size: usize) !u64 {
+        const sort_mod = @import("../spill_sort.zig");
+        var sorter = try sort_mod.Sorter.init(alloc, task.scratch orelse return error.InvalidSparseSegment);
+        defer sorter.deinit();
+        const txn = &task.snapshot.?;
+        for (task.sources) |source| {
+            const count = if (source.proofs) |disk| disk.count() else source.incarnations.len;
+            for (0..count) |i| {
+                if (task.scratch.?.cancellation) |token| try token.check();
+                const captured: CapturedIncarnation = if (source.proofs) |disk| blk: {
+                    const entry = try disk.at(i);
+                    break :blk .{ .doc_num = entry.doc_num, .epoch = entry.epoch, .live = entry.live };
+                } else source.incarnations[i];
+                if (!captured.live) continue;
+                var reverse: [9]u8 = undefined;
+                const id = try txn.get(revKey(&reverse, captured.doc_num));
+                var key: [256]u8 = undefined;
+                const forward_key = try fwdKeyWithScratch(alloc, &key, id);
+                defer if (forward_key.ptr != &key) alloc.free(forward_key);
+                const forward = txn.get(forward_key) catch |err| switch (err) {
+                    error.NotFound => (try locatedForwardBytes(alloc, txn, id)) orelse return error.InvalidSparseDocMapSegment,
+                    else => return err,
+                };
+                const vector = try decodeFwdEntry(alloc, forward);
+                defer alloc.free(vector.term_ids);
+                defer alloc.free(vector.weights);
+                if (vector.doc_num != captured.doc_num) return error.InvalidSparseDocMapSegment;
+                for (vector.term_ids, vector.weights) |term, weight| {
+                    var payload: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &payload, @bitCast(weight), .little);
+                    try sorter.add((@as(u64, term) << 32) | captured.doc_num, &payload);
+                }
+            }
+        }
+        const range = try sorter.finish() orelse return 0;
+        var cursor = sort_mod.Cursor.init(alloc, sorter.run, range);
+        defer cursor.deinit();
+        var chunk: std.ArrayListUnmanaged(BulkPosting) = .empty;
+        defer chunk.deinit(alloc);
+        var previous: ?u64 = null;
+        var previous_weight: u32 = 0;
+        var count: u64 = 0;
+        while (try cursor.next()) |entry| {
+            if (entry.payload.len != 4) return error.InvalidSparseSegment;
+            const bits = std.mem.readInt(u32, entry.payload[0..4], .little);
+            if (previous != null and previous.? == entry.key) {
+                if (bits != previous_weight) return error.InvalidSparseSegment;
+                continue;
+            }
+            const term: u32 = @intCast(entry.key >> 32);
+            if (chunk.items.len != 0 and (chunk.items[0].term_id != term or chunk.items.len >= chunk_size)) {
+                try appendCompactionBlock(alloc, builder, chunk.items);
+                chunk.clearRetainingCapacity();
+            }
+            try chunk.append(alloc, .{ .term_id = term, .doc_num = @truncate(entry.key), .weight = @bitCast(bits), .doc_id = "" });
+            previous = entry.key;
+            previous_weight = bits;
+            count += 1;
+        }
+        if (chunk.items.len != 0) try appendCompactionBlock(alloc, builder, chunk.items);
+        return count;
     }
 
     pub fn executeSegmentCompactionTask(
@@ -3172,7 +3279,9 @@ pub const SparseIndex = struct {
         defer chunk.deinit(alloc);
         const output_chunk_size = @min(@max(1, chunk_size), 65536);
         var posting_count: u64 = 0;
-        while (true) {
+        if (task.exact_forward_weights) {
+            posting_count = try compactExactForwardWeights(alloc, task, &builder, output_chunk_size);
+        } else while (true) {
             var term: ?u32 = null;
             for (term_heads) |head| if (head) |entry| {
                 const candidate = std.mem.readInt(u32, entry[0..4], .little);

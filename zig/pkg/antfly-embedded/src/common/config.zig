@@ -230,6 +230,9 @@ pub const Config = struct {
         protected_bytes: usize = 256 * 1024 * 1024,
     };
     pub const LakeIndexConfig = struct {
+        /// Optional verified identity construction owns an independent scratch
+        /// quota. Exhaustion selects physical rebuilding, never unavailability.
+        row_identity: struct { max_spill_bytes: u64 = 1024 * 1024 * 1024 } = .{},
         /// Enable retention certificates only after qualifying the configured
         /// provider's exact-version retention enforcement. Generation pinning
         /// and ordinary complete auditing do not require this option.

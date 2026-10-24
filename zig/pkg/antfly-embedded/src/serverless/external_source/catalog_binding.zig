@@ -107,9 +107,23 @@ pub const WritePolicy = enum(u8) {
 /// and deletion objects are still verified; this is an explicit source contract.
 pub const ObjectMutability = enum { mutable, immutable };
 
+/// Optional external identity adapter. Verification is publication-bound;
+/// declaring a key never assumes uniqueness or unchanged indexed values.
+pub const RowIdentity = struct {
+    key_columns: []const []const u8,
+    pub fn validate(self: RowIdentity) !void {
+        if (self.key_columns.len == 0 or self.key_columns.len > 32) return error.InvalidExternalTableBinding;
+        for (self.key_columns, 0..) |column, index| {
+            if (column.len == 0 or column.len > 4096 or std.mem.eql(u8, column, "_id")) return error.InvalidExternalTableBinding;
+            for (self.key_columns[0..index]) |previous| if (std.mem.eql(u8, previous, column)) return error.InvalidExternalTableBinding;
+        }
+    }
+};
+
 pub const Binding = struct {
     /// Durable source epoch, independent of derived index availability.
     row_identity_version: u8 = 1,
+    row_identity: ?RowIdentity = null,
     table_id: []const u8,
     format: external_source.Format,
     source_uri: []const u8,
@@ -120,7 +134,18 @@ pub const Binding = struct {
     object_mutability: ObjectMutability = .mutable,
     catalog: ?@import("lake_catalog/types.zig").Config = null,
 
+    pub fn jsonStringify(self: Binding, writer: anytype) !void {
+        // Keep existing attachment/credential/plan identities byte-for-byte
+        // stable when the optional logical adapter has not been selected.
+        if (self.row_identity) |identity| {
+            try writer.write(.{ .row_identity_version = self.row_identity_version, .table_id = self.table_id, .format = self.format, .source_uri = self.source_uri, .credential_ref = self.credential_ref, .snapshot_mode = self.snapshot_mode, .schema_fingerprint = self.schema_fingerprint, .write_policy = self.write_policy, .object_mutability = self.object_mutability, .catalog = self.catalog, .row_identity = identity });
+        } else {
+            try writer.write(.{ .row_identity_version = self.row_identity_version, .table_id = self.table_id, .format = self.format, .source_uri = self.source_uri, .credential_ref = self.credential_ref, .snapshot_mode = self.snapshot_mode, .schema_fingerprint = self.schema_fingerprint, .write_policy = self.write_policy, .object_mutability = self.object_mutability, .catalog = self.catalog });
+        }
+    }
+
     pub fn validate(self: Binding) !void {
+        if (self.row_identity) |identity| try identity.validate();
         if (self.row_identity_version != 1 and self.row_identity_version != 2) return error.InvalidExternalTableBinding;
         if (self.table_id.len == 0) return error.InvalidExternalTableBinding;
         if (self.source_uri.len == 0) return error.InvalidExternalTableBinding;

@@ -790,6 +790,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{
             "text late visibility",
             "text query drops hits",
+            "text live visibility",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),

@@ -703,7 +703,7 @@ const OwnedRead = struct {
     }
 
     fn captureStream(self: *OwnedRead, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const std.json.Value, limits: @import("antfly_local_sources").sql_runtime.Limits) !bool {
-        const stream = (try Pull.Stream.open(self.readAllocator(), backend, compiled, parameters, limits)) orelse return false;
+        const stream = (try Pull.Stream.openOwned(try @import("sql_memory_owner.zig").create(self.native_adapter.server.alloc, self.readAllocator(), self.native_adapter.server.shared_resource_manager orelse &self.native_adapter.server.local_resource_manager), backend, compiled, parameters, limits)) orelse return false;
         self.stream = stream;
         self.stream_live = true;
         return true;
@@ -3064,6 +3064,9 @@ test "SQL pgwire supervised cleanup releases foreground admission while remote u
         var parents: Parents = .{ .connection = &connection, .service = &service };
         var server: http.ApiHttpServer = undefined;
         server.alloc = service.allocator();
+        server.shared_resource_manager = null;
+        server.local_resource_manager = @import("antfly_local_sources").storage_resource_manager.ResourceManager.init(.{});
+        defer server.local_resource_manager.deinit(std.testing.allocator);
         server.cfg = .{};
         server.sql_plan_cache = @import("../sql/plan_cache.zig").Cache.init(std.testing.allocator, .{});
         const cache_io = server.sqlPlanCacheIo();

@@ -25114,3 +25114,42 @@ still need admitted ownership; completion resources and history relief under
 overload, remaining provider/legacy-generation adoption, compound tentative-grant
 retirement and full default-gate qualification remain open. No complete pooling
 gate is enabled. Full GNU qualification remains waived; the full goal stays active.
+
+### Latest main lake/paging merge
+
+Main advanced during close-status validation. The same branch now also merges
+`ff45ab6107` (lake fragment reuse and incremental maintenance). SQL aggregate
+paging, paged hash buckets, heap-owned SQL memory, packed navigation pages and
+publication-specific reads are retained alongside controlled operator callbacks,
+read fences, original execution borrowing and supervised retirement. Linux's
+pinned GNU ARM64 ReleaseSafe API reservation remains 15 GiB; macOS adopts main's
+measured 28 GiB API reservation.
+
+Scoped children retain the existing bounded vector/spill path rather than sharing
+a statement pager's wait capsule. Scoped navigation range reads use the original
+pull's serial admitted transport until those new parallel jobs own child capsules;
+unscoped callers keep main's shared pager and coalesced range workers. This is a
+compatibility boundary, not completion of scoped pager/range-worker adoption.
+Decoded navigation construction borrows the opening execution and restores its
+original cache context before the reader escapes. Covering gathers forward that
+same execution. The ordered-read fixture intercepts both whole-object and range
+reads; retained pgwire fixtures initialize the newly required memory manager.
+
+Focused qualification receipts in the cumulative integration directory:
+
+- `latest-main-lake-paging-merge-v1`: 69 selected SQL/pager/scoped cases, 6 local
+  cases and 28 supporting cases pass; preserves the initial range-fixture crash
+  and the covering-lookup/connector call-site compilation failures.
+- `latest-main-lake-paging-merge-v2`: provisioned-pool type check passes; 62/63
+  artifact cases pass, isolating the missing opening execution in decoded reads.
+- `latest-main-pgwire-read-pool-v1`: all 6 ownership/cleanup cases and 60/60 build
+  steps pass.
+- `latest-main-lake-paging-merge-v3`: all 63 artifact cases, 28 supporting cases
+  and 60/60 build steps pass after restoring construction-time authority.
+
+All receipts retain unchanged-input hashes and 45/1/8 passing error-identity
+cases. The final change after the pgwire/type-check receipts only attaches and
+restores the decoded reader's opening cache context, covered by v3. Formatting
+and whitespace checks pass. Full GNU qualification remains waived. Final admitted
+backend retirement and scoped adoption of the new pager/range workers remain
+open; the full design is still incomplete.

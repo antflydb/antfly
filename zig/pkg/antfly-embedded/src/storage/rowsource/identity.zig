@@ -17,6 +17,10 @@
 //! The digest binds identity to the immutable source snapshot; fixed-width
 //! ordinals allow ordered pagination without sorting or retaining row values.
 const std = @import("std");
+pub const logical = @import("logical.zig");
+test {
+    _ = logical;
+}
 const types = @import("types.zig");
 pub fn fileDigest(source: []const u8, snapshot: []const u8, file: []const u8) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});

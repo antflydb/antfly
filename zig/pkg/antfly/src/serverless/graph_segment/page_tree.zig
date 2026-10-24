@@ -37,21 +37,41 @@ const header_bytes = 56;
 const ref_bytes = 61;
 const magic = "AFGPT003";
 
+pub const max_pack_bytes = max_page_bytes * max_write_batch;
+pub const Pack = struct { digest: [32]u8, bytes: u32, offset: u32 };
+
 pub const Ref = struct {
     digest: [32]u8,
     attempt: [16]u8 = @splat(0),
     bytes: u32,
     height: u8,
     records: u64,
-
+    /// The page digest authenticates this exact range independently of its pack.
+    pack: ?Pack = null,
+    pub fn jsonStringify(self: Ref, writer: anytype) !void {
+        if (self.pack != null) return writer.write(.{ .digest = self.digest, .attempt = self.attempt, .bytes = self.bytes, .height = self.height, .records = self.records, .pack = self.pack });
+        return writer.write(.{ .digest = self.digest, .attempt = self.attempt, .bytes = self.bytes, .height = self.height, .records = self.records });
+    }
+    pub fn artifactDigest(self: Ref) [32]u8 {
+        return if (self.pack) |pack_| pack_.digest else self.digest;
+    }
+    pub fn artifactBytes(self: Ref) u32 {
+        return if (self.pack) |pack_| pack_.bytes else self.bytes;
+    }
+    pub fn offset(self: Ref) u32 {
+        return if (self.pack) |pack_| pack_.offset else 0;
+    }
     pub fn eql(a: Ref, b: Ref) bool {
         return a.bytes == b.bytes and a.height == b.height and a.records == b.records and
-            std.mem.eql(u8, &a.digest, &b.digest) and std.mem.eql(u8, &a.attempt, &b.attempt);
+            std.mem.eql(u8, &a.digest, &b.digest) and std.mem.eql(u8, &a.attempt, &b.attempt) and std.meta.eql(a.pack, b.pack);
     }
 
     pub fn validate(self: Ref) !void {
         if (self.bytes < header_bytes or self.bytes > max_page_bytes or
             self.height > max_height or self.records == 0) return error.InvalidGraphPage;
+        if (self.pack) |pack_| {
+            if (pack_.bytes > max_pack_bytes or pack_.bytes < self.bytes or pack_.offset > pack_.bytes - self.bytes or std.mem.allEqual(u8, &pack_.digest, 0)) return error.InvalidGraphPage;
+        }
     }
 };
 
@@ -65,6 +85,8 @@ pub const Store = struct {
     /// content deduplication from coupling independent namespace collectors.
     domain: [32]u8 = @splat(0),
     attempt: [16]u8 = @splat(0),
+    /// Opt-in page-local key prefixes. Legacy pages remain readable verbatim.
+    prefix_keys: bool = false,
     ptr: *anyopaque,
     get: *const fn (*anyopaque, Allocator, Ref) anyerror![]u8,
     /// Optional immutable decoded-page lease. The provider must authenticate
@@ -74,10 +96,19 @@ pub const Store = struct {
         ptr: *anyopaque,
         read: *const fn (*anyopaque, Allocator, Ref) anyerror!Page,
     } = null,
+    /// Independently admitted query reads. Providers authenticate every page,
+    /// join all workers, and transfer no page ownership on failure.
+    read_many: ?struct {
+        ptr: *anyopaque,
+        read: *const fn (*anyopaque, Allocator, []const Ref, []Page) anyerror!void,
+    } = null,
     put: *const fn (*anyopaque, Ref, []const u8) anyerror!void,
     /// Persist the entire bounded batch before returning. On failure no root
     /// escapes the private sorted builder; scoped orphans remain collectible.
     put_many: ?*const fn (*anyopaque, []const Write) anyerror!void = null,
+    /// Upload a bounded pack and bind its immutable locators before parent
+    /// serialization. Only SortedBuilder uses this mutable private capability.
+    pack_many: ?*const fn (*anyopaque, []Write) anyerror!void = null,
     check: *const fn (*anyopaque) anyerror!void,
     /// Pure bounded reduction, authenticated in the page and parent routing entry.
     /// Existing trees retain their original wire representation when absent.
@@ -108,7 +139,7 @@ pub const Cache = struct {
     }
 
     pub fn store(self: *Cache) Store {
-        return .{ .domain = self.underlying.domain, .attempt = self.underlying.attempt, .ptr = self, .get = get, .put = put, .check = check, .reduce = self.underlying.reduce };
+        return .{ .domain = self.underlying.domain, .attempt = self.underlying.attempt, .prefix_keys = self.underlying.prefix_keys, .decoded_page = self.underlying.decoded_page, .read_many = self.underlying.read_many, .ptr = self, .get = get, .put = put, .put_many = if (self.underlying.put_many != null) putMany else null, .pack_many = if (self.underlying.pack_many != null) packMany else null, .check = check, .reduce = self.underlying.reduce };
     }
 
     fn check(ptr: *anyopaque) !void {
@@ -159,6 +190,14 @@ pub const Cache = struct {
         const self: *Cache = @ptrCast(@alignCast(ptr));
         try self.underlying.put(self.underlying.ptr, ref, bytes);
     }
+    fn packMany(ptr: *anyopaque, writes: []Write) !void {
+        const self: *Cache = @ptrCast(@alignCast(ptr));
+        try self.underlying.pack_many.?(self.underlying.ptr, writes);
+    }
+    fn putMany(ptr: *anyopaque, writes: []const Write) !void {
+        const self: *Cache = @ptrCast(@alignCast(ptr));
+        try self.underlying.put_many.?(self.underlying.ptr, writes);
+    }
 };
 
 pub const Mutation = struct {
@@ -174,7 +213,7 @@ pub const Entry = struct {
     aggregate: []const u8 = "",
 
     fn size(self: Entry) usize {
-        return 8 + self.key.len + if (self.child != null) ref_bytes + self.aggregate.len else self.value.len;
+        return 8 + self.key.len + if (self.child != null) ref_bytes + 1 + @as(usize, if (self.child.?.pack != null) 40 else 0) + self.aggregate.len else self.value.len;
     }
 };
 
@@ -183,6 +222,7 @@ pub const Page = struct {
     entries: []const Entry,
     ref: Ref,
     aggregate: []const u8 = "",
+    expanded_keys: []const u8 = &.{},
     lease: ?struct {
         owner: *anyopaque,
         item: *anyopaque,
@@ -195,6 +235,7 @@ pub const Page = struct {
         } else {
             alloc.free(self.entries);
             alloc.free(self.bytes);
+            alloc.free(self.expanded_keys);
         }
         self.* = undefined;
     }
@@ -246,6 +287,154 @@ fn less(a: []const u8, b: []const u8) bool {
     return std.mem.order(u8, a, b) == .lt;
 }
 
+/// Exact zero-based rank from authenticated subtree counts. Inserts into an
+/// ordered map update only touched paths; stored row payloads need no rank rewrite.
+pub fn rankOf(alloc: Allocator, store: Store, root: Ref, key: []const u8) !u64 {
+    var ref = root;
+    var rank: u64 = 0;
+    while (true) {
+        var page = try readPage(alloc, store, ref);
+        defer page.deinit(alloc);
+        var position: usize = 0;
+        while (position + 1 < page.entries.len and !less(key, page.entries[position + 1].key)) : (position += 1) {}
+        if (ref.height == 0) {
+            if (!std.mem.eql(u8, page.entries[position].key, key)) return error.InvalidGraphPage;
+            return std.math.add(u64, rank, position);
+        }
+        for (page.entries[0..position]) |entry| rank = try std.math.add(u64, rank, entry.child.?.records);
+        ref = page.entries[position].child.?;
+    }
+}
+
+/// Ordered multi-seek: read each reached ancestor/leaf once for the tile,
+/// preserving duplicates and caller order without walking intervening leaves.
+pub const max_read_batch = 8;
+pub const max_lookup_batch = 512;
+pub const BatchEntry = struct {
+    key: []const u8,
+    value: []const u8,
+    rank: u64,
+    pub fn deinit(self: BatchEntry, a: Allocator) void {
+        a.free(self.key);
+        a.free(self.value);
+    }
+};
+/// Encoded prefixes can expand while decoding. Admission includes the bounded
+/// full-key buffer and entry descriptors rather than assuming a 2x wire ratio.
+pub fn readWorkspace(ref: Ref) usize {
+    const entries: usize = @intCast(@min(ref.records, ref.bytes / @as(u32, if (ref.height == 0) 8 else 69)));
+    return @as(usize, ref.bytes) + max_page_bytes + entries * @sizeOf(Entry) + 64 * 1024;
+}
+/// Exact point reads share each routing page and fetch independent children in
+/// bounded waves. Results own their bytes and preserve duplicate/input order.
+pub fn lookupMany(a: Allocator, store: Store, root: ?Ref, keys: []const []const u8) ![]?BatchEntry {
+    return lookupBatch(a, store, root, keys, false);
+}
+/// Lower-bound reads use the same wave traversal. A missing leaf successor may
+/// cross a subtree boundary; only those gaps need an ordinary cursor fallback.
+pub fn seekMany(a: Allocator, store: Store, root: ?Ref, keys: []const []const u8) ![]?BatchEntry {
+    return lookupBatch(a, store, root, keys, true);
+}
+fn lookupBatch(a: Allocator, store: Store, root: ?Ref, keys: []const []const u8, lower: bool) ![]?BatchEntry {
+    if (keys.len > max_lookup_batch) return error.InvalidGraphPage;
+    const result = try a.alloc(?BatchEntry, keys.len);
+    @memset(result, null);
+    errdefer {
+        for (result) |entry| if (entry) |value| value.deinit(a);
+        a.free(result);
+    }
+    if (root) |ref| if (keys.len != 0) {
+        var positions: [max_lookup_batch]usize = undefined;
+        sortedPositions(keys, positions[0..keys.len]);
+        var page = try readPage(a, store, ref);
+        defer page.deinit(a);
+        try batchPage(a, store, page, keys, positions[0..keys.len], result, 0, lower, true);
+        if (lower) for (result, keys) |*entry, key| if (entry.* == null) {
+            var cursor = try Cursor.init(a, store, ref, key, null);
+            defer cursor.deinit();
+            if (try cursor.next()) |record| entry.* = try ownBatchEntry(a, record.key, record.value, try rankOf(a, store, ref, record.key), true);
+        };
+    };
+    return result;
+}
+fn sortedPositions(keys: []const []const u8, positions: []usize) void {
+    for (positions, 0..) |*position, i| position.* = i;
+    std.mem.sort(usize, positions, keys, struct {
+        fn compare(values: []const []const u8, l: usize, r: usize) bool {
+            return less(values[l], values[r]);
+        }
+    }.compare);
+}
+fn ownBatchEntry(a: Allocator, key: []const u8, value: []const u8, rank: u64, copy: bool) !BatchEntry {
+    if (!copy) return .{ .key = "", .value = "", .rank = rank };
+    const owned = try a.dupe(u8, key);
+    errdefer a.free(owned);
+    return .{ .key = owned, .value = try a.dupe(u8, value), .rank = rank };
+}
+fn readPageWave(a: Allocator, store: Store, refs: []const Ref, pages: []Page) !void {
+    if (store.read_many) |batch| return batch.read(batch.ptr, a, refs, pages);
+    var initialized: usize = 0;
+    errdefer for (pages[0..initialized]) |*page| page.deinit(a);
+    for (refs, pages) |ref, *page| {
+        page.* = try readPage(a, store, ref);
+        initialized += 1;
+    }
+}
+fn batchPage(a: Allocator, store: Store, page: Page, keys: []const []const u8, positions: []const usize, result: []?BatchEntry, base: u64, lower: bool, copy: bool) anyerror!void {
+    try store.check(store.ptr);
+    if (page.ref.height == 0) {
+        var at: usize = 0;
+        for (positions) |position| {
+            while (at < page.entries.len and less(page.entries[at].key, keys[position])) at += 1;
+            if (at == page.entries.len or (!lower and !std.mem.eql(u8, page.entries[at].key, keys[position]))) continue;
+            const entry = page.entries[at];
+            result[position] = try ownBatchEntry(a, entry.key, entry.value, try std.math.add(u64, base, at), copy);
+        }
+        return;
+    }
+    const BatchChild = struct { entry: usize, begin: usize, end: usize, rank: u64 };
+    var children: [max_read_batch]BatchChild = undefined;
+    var refs: [max_read_batch]Ref = undefined;
+    var next: usize = 0;
+    var rank = base;
+    var index: usize = 0;
+    while (index < page.entries.len) {
+        var count: usize = 0;
+        while (index < page.entries.len and count < children.len) : (index += 1) {
+            const first = next;
+            while (next < positions.len and (index + 1 == page.entries.len or less(keys[positions[next]], page.entries[index + 1].key))) next += 1;
+            const child = page.entries[index].child.?;
+            if (first != next) {
+                children[count] = .{ .entry = index, .begin = first, .end = next, .rank = rank };
+                refs[count] = child;
+                count += 1;
+            }
+            rank = try std.math.add(u64, rank, child.records);
+        }
+        if (count == 0) continue;
+        var pages: [max_read_batch]Page = undefined;
+        try readPageWave(a, store, refs[0..count], pages[0..count]);
+        defer for (pages[0..count]) |*owned| owned.deinit(a);
+        for (children[0..count], pages[0..count], refs[0..count]) |child, decoded, ref| {
+            if (!decoded.ref.eql(ref) or !std.mem.eql(u8, decoded.entries[0].key, page.entries[child.entry].key)) return error.InvalidGraphPage;
+            if (child.entry + 1 < page.entries.len and !less(decoded.entries[decoded.entries.len - 1].key, page.entries[child.entry + 1].key)) return error.InvalidGraphPage;
+            try batchPage(a, store, decoded, keys, positions[child.begin..child.end], result, child.rank, lower, copy);
+        }
+    }
+    if (next != positions.len) return error.InvalidGraphPage;
+}
+pub fn ranksOf(a: Allocator, store: Store, root: Ref, keys: []const []const u8, ranks: []u64) !void {
+    if (keys.len != ranks.len or keys.len > 256) return error.InvalidGraphPage;
+    var positions: [256]usize = undefined;
+    var results: [256]?BatchEntry = @splat(null);
+    sortedPositions(keys, positions[0..keys.len]);
+    if (keys.len == 0) return;
+    var page = try readPage(a, store, root);
+    defer page.deinit(a);
+    try batchPage(a, store, page, keys, positions[0..keys.len], results[0..keys.len], 0, false, false);
+    for (results[0..keys.len], ranks) |entry, *rank| rank.* = (entry orelse return error.InvalidGraphPage).rank;
+}
+
 /// An independently owned authenticated page. Callers may retain its immutable
 /// bytes/entry views in a bounded decode cache, under the full ref and domain.
 pub fn readPage(alloc: Allocator, store: Store, ref: Ref) !Page {
@@ -256,34 +445,61 @@ fn load(alloc: Allocator, store: Store, ref: Ref) !Page {
     try store.check(store.ptr);
     try ref.validate();
     if (store.decoded_page) |cache| return cache.read(cache.ptr, alloc, ref);
-    const bytes = try store.get(store.ptr, alloc, ref);
+    return decodePage(alloc, store.domain, ref, try store.get(store.ptr, alloc, ref));
+}
+/// Consume independently read page bytes on success and failure. Batched range
+/// readers retain the same full-reference and structural validation as get.
+pub fn decodePage(alloc: Allocator, domain: [32]u8, ref: Ref, bytes: []u8) !Page {
     errdefer alloc.free(bytes);
+    try ref.validate();
     if (bytes.len != ref.bytes) return error.InvalidGraphPage;
     var digest: [32]u8 = undefined;
     Sha256.hash(bytes, &digest, .{});
     if (!std.mem.eql(u8, &digest, &ref.digest)) return error.ArtifactIntegrityMismatch;
-    if (!std.mem.eql(u8, bytes[24..56], &store.domain)) return error.GraphPageDomainMismatch;
+    if (!std.mem.eql(u8, bytes[24..56], &domain)) return error.GraphPageDomainMismatch;
     if (!std.mem.eql(u8, bytes[0..8], magic) or bytes[8] != ref.height or
-        bytes[9] > 1 or readU64(bytes, 16) != ref.records)
+        bytes[9] & ~@as(u8, 7) != 0 or readU64(bytes, 16) != ref.records)
         return error.InvalidGraphPage;
     const aggregate_len = std.mem.readInt(u16, bytes[10..12], .little);
     if (aggregate_len > max_aggregate_bytes or aggregate_len > bytes.len - header_bytes or
-        (bytes[9] == 0 and aggregate_len != 0) or (bytes[9] == 1 and aggregate_len == 0)) return error.InvalidGraphPage;
+        (bytes[9] & 1 == 0 and aggregate_len != 0) or (bytes[9] & 1 == 1 and aggregate_len == 0)) return error.InvalidGraphPage;
     const aggregate = bytes[header_bytes..][0..aggregate_len];
     const count = readU32(bytes, 12);
     if (count == 0 or count > (bytes.len - header_bytes) / 9) return error.InvalidGraphPage;
     const entries = try alloc.alloc(Entry, count);
     errdefer alloc.free(entries);
     var offset: usize = header_bytes + aggregate_len;
+    var prefix: []const u8 = "";
+    var expanded: []u8 = &.{};
+    errdefer alloc.free(expanded);
+    if (bytes[9] & 2 != 0) {
+        if (bytes.len - offset < 8) return error.InvalidGraphPage;
+        const prefix_len = readU32(bytes, offset);
+        const key_bytes = readU32(bytes, offset + 4);
+        offset += 8;
+        if (prefix_len == 0 or prefix_len > max_key_bytes or prefix_len > bytes.len - offset or
+            key_bytes > max_page_bytes or key_bytes < @as(u64, prefix_len) * count) return error.InvalidGraphPage;
+        prefix = bytes[offset..][0..prefix_len];
+        offset += prefix_len;
+        expanded = try alloc.alloc(u8, key_bytes);
+    }
+    var key_offset: usize = 0;
     var records: u64 = 0;
     for (entries, 0..) |*entry, i| {
         if (offset > bytes.len or bytes.len - offset < 8) return error.InvalidGraphPage;
         const key_len = readU32(bytes, offset);
         const value_len = readU32(bytes, offset + 4);
         offset += 8;
-        if (key_len == 0 or key_len > max_key_bytes or key_len > bytes.len - offset)
-            return error.InvalidGraphPage;
-        const key = bytes[offset..][0..key_len];
+        if (key_len > bytes.len - offset or prefix.len + @as(u64, key_len) > max_key_bytes or (prefix.len == 0 and key_len == 0)) return error.InvalidGraphPage;
+        const key: []const u8 = if (prefix.len != 0) reconstructed: {
+            const length = prefix.len + key_len;
+            if (length > expanded.len - key_offset) return error.InvalidGraphPage;
+            const target = expanded[key_offset..][0..length];
+            @memcpy(target[0..prefix.len], prefix);
+            @memcpy(target[prefix.len..], bytes[offset..][0..key_len]);
+            key_offset += length;
+            break :reconstructed target;
+        } else bytes[offset..][0..key_len];
         offset += key_len;
         if (i != 0 and !less(entries[i - 1].key, key)) return error.InvalidGraphPage;
         if (value_len > bytes.len - offset) return error.InvalidGraphPage;
@@ -294,24 +510,36 @@ fn load(alloc: Allocator, store: Store, ref: Ref) !Page {
             entry.value = value;
             records += 1;
         } else {
-            if (value_len < ref_bytes or value_len > ref_bytes + max_aggregate_bytes or (bytes[9] == 0 and value_len != ref_bytes)) return error.InvalidGraphPage;
-            const child: Ref = .{
+            if (value_len < ref_bytes or value_len > ref_bytes + 41 + max_aggregate_bytes) return error.InvalidGraphPage;
+            var child: Ref = .{
                 .digest = value[0..32].*,
                 .bytes = readU32(value, 32),
                 .height = value[36],
                 .records = readU64(value, 37),
                 .attempt = value[45..61].*,
             };
+            var child_end: usize = ref_bytes;
+            if (bytes[9] & 4 != 0) {
+                if (value_len <= child_end or value[child_end] > 1) return error.InvalidGraphPage;
+                const is_packed = value[child_end] == 1;
+                child_end += 1;
+                if (is_packed) {
+                    if (value_len - child_end < 40) return error.InvalidGraphPage;
+                    child.pack = .{ .digest = value[child_end..][0..32].*, .bytes = readU32(value, child_end + 32), .offset = readU32(value, child_end + 36) };
+                    child_end += 40;
+                }
+            }
+            if (value_len - child_end > max_aggregate_bytes or (bytes[9] & 1 == 0 and value_len != child_end)) return error.InvalidGraphPage;
             try child.validate();
             if (child.height + 1 != ref.height) return error.InvalidGraphPage;
             records = std.math.add(u64, records, child.records) catch return error.InvalidGraphPage;
             entry.child = child;
-            entry.aggregate = value[ref_bytes..];
+            entry.aggregate = value[child_end..];
         }
         if (entry.size() > max_record_bytes) return error.InvalidGraphPage;
     }
-    if (offset != bytes.len or records != ref.records) return error.InvalidGraphPage;
-    return .{ .bytes = bytes, .entries = entries, .ref = ref, .aggregate = aggregate };
+    if (offset != bytes.len or records != ref.records or key_offset != expanded.len) return error.InvalidGraphPage;
+    return .{ .bytes = bytes, .entries = entries, .ref = ref, .aggregate = aggregate, .expanded_keys = expanded };
 }
 
 fn save(alloc: Allocator, store: Store, entries: []const Entry, height: u8, aggregate_out: *[]u8) !Ref {
@@ -331,39 +559,73 @@ fn encode(alloc: Allocator, store: Store, entries: []const Entry, height: u8, ag
     const aggregate = if (store.reduce) |reduce| try reduce(alloc, entries, height) else try alloc.alloc(u8, 0);
     errdefer alloc.free(aggregate);
     if (aggregate.len > max_aggregate_bytes or (store.reduce != null and aggregate.len == 0)) return error.InvalidGraphPage;
+    const packed_children = for (entries) |entry| {
+        if (entry.child) |child| if (child.pack != null) break true;
+    } else false;
     var size: usize = header_bytes + aggregate.len;
     var records: u64 = 0;
     for (entries) |entry| {
-        size += entry.size() - (if (entry.child != null and store.reduce == null) entry.aggregate.len else 0);
+        size += entry.size() - (if (entry.child != null and store.reduce == null) entry.aggregate.len else 0) - @as(usize, if (entry.child != null and !packed_children) 1 else 0);
         records = try std.math.add(u64, records, if (entry.child) |child| child.records else 1);
     }
     if (size > max_page_bytes) return error.GraphPageTooLarge;
+    var prefix: usize = 0;
+    var key_bytes: usize = 0;
+    if (store.prefix_keys and entries.len > 1) {
+        const first = entries[0].key;
+        const last = entries[entries.len - 1].key;
+        while (prefix < @min(first.len, last.len) and first[prefix] == last[prefix]) prefix += 1;
+        if (prefix * (entries.len - 1) <= 8) prefix = 0;
+        if (prefix != 0) {
+            for (entries) |entry| key_bytes += entry.key.len;
+            size -= prefix * (entries.len - 1) - 8;
+        }
+    }
     const bytes = try alloc.alloc(u8, size);
     errdefer alloc.free(bytes);
     @memcpy(bytes[0..8], magic);
     @memcpy(bytes[24..56], &store.domain);
     bytes[8] = height;
-    bytes[9] = if (aggregate.len == 0) 0 else 1;
+    bytes[9] = @as(u8, if (aggregate.len == 0) 0 else 1) | @as(u8, if (prefix == 0) 0 else 2) | @as(u8, if (packed_children) 4 else 0);
     std.mem.writeInt(u16, bytes[10..12], @intCast(aggregate.len), .little);
     writeU32(bytes, 12, entries.len);
     writeU64(bytes, 16, records);
     @memcpy(bytes[header_bytes..][0..aggregate.len], aggregate);
     var offset: usize = header_bytes + aggregate.len;
-    for (entries) |entry| {
-        writeU32(bytes, offset, entry.key.len);
-        const child_aggregate = if (store.reduce != null) entry.aggregate else "";
-        writeU32(bytes, offset + 4, if (entry.child != null) ref_bytes + child_aggregate.len else entry.value.len);
+    if (prefix != 0) {
+        writeU32(bytes, offset, prefix);
+        writeU32(bytes, offset + 4, key_bytes);
         offset += 8;
-        @memcpy(bytes[offset..][0..entry.key.len], entry.key);
-        offset += entry.key.len;
+        @memcpy(bytes[offset..][0..prefix], entries[0].key[0..prefix]);
+        offset += prefix;
+    }
+    for (entries) |entry| {
+        writeU32(bytes, offset, entry.key.len - prefix);
+        const child_aggregate = if (store.reduce != null) entry.aggregate else "";
+        const locator_bytes: usize = if (entry.child) |child| (if (packed_children) @as(usize, 1) + @as(usize, if (child.pack != null) 40 else 0) else 0) else 0;
+        writeU32(bytes, offset + 4, if (entry.child != null) ref_bytes + locator_bytes + child_aggregate.len else entry.value.len);
+        offset += 8;
+        @memcpy(bytes[offset..][0 .. entry.key.len - prefix], entry.key[prefix..]);
+        offset += entry.key.len - prefix;
         if (entry.child) |child| {
             @memcpy(bytes[offset..][0..32], &child.digest);
             writeU32(bytes, offset + 32, child.bytes);
             bytes[offset + 36] = child.height;
             writeU64(bytes, offset + 37, child.records);
             @memcpy(bytes[offset + 45 ..][0..16], &child.attempt);
-            @memcpy(bytes[offset + ref_bytes ..][0..child_aggregate.len], child_aggregate);
-            offset += ref_bytes + child_aggregate.len;
+            offset += ref_bytes;
+            if (packed_children) {
+                bytes[offset] = if (child.pack != null) 1 else 0;
+                offset += 1;
+                if (child.pack) |pack_| {
+                    @memcpy(bytes[offset..][0..32], &pack_.digest);
+                    writeU32(bytes, offset + 32, pack_.bytes);
+                    writeU32(bytes, offset + 36, pack_.offset);
+                    offset += 40;
+                }
+            }
+            @memcpy(bytes[offset..][0..child_aggregate.len], child_aggregate);
+            offset += child_aggregate.len;
         } else {
             @memcpy(bytes[offset..][0..entry.value.len], entry.value);
             offset += entry.value.len;
@@ -391,7 +653,7 @@ fn packAt(alloc: Allocator, store: Store, entries: []const Entry, height: u8, ou
     var payload: usize = 0;
     for (entries) |entry| payload += entry.size();
     const pages = @max(1, std.math.divCeil(usize, payload, target - header_bytes) catch unreachable);
-    const balanced = if (target == target_page_bytes) target else header_bytes + (std.math.divCeil(usize, payload, pages) catch unreachable);
+    const balanced = header_bytes + (std.math.divCeil(usize, payload, pages) catch unreachable);
     var begin: usize = 0;
     while (begin < entries.len) {
         var end = begin;
@@ -424,7 +686,7 @@ fn rebalance(alloc: Allocator, store: Store, children: *Children) !void {
         const a = children.items[i];
         const b = children.items[i + 1];
         // A quarter-page threshold leaves headroom for subsequent small edits.
-        if (a.ref.bytes >= target_page_bytes / 2 and b.ref.bytes >= target_page_bytes / 2) {
+        if (a.ref.bytes >= target_page_bytes / 4 and b.ref.bytes >= target_page_bytes / 4) {
             i += 1;
             continue;
         }
@@ -751,23 +1013,22 @@ pub const SortedBuilder = struct {
     store: Store,
     target_bytes: usize = target_page_bytes,
     previous: ?[]u8 = null,
+    previous_storage: std.ArrayList(u8) = .empty,
     previous_is_upper: bool = false,
     closed: bool = false,
     pending: [max_write_batch]Write = undefined,
     pending_count: usize = 0,
+    pending_parents: [max_write_batch]struct { height: usize, index: usize } = undefined,
     // The extra slot holds the final root ref, never another persisted page.
     levels: [max_height + 2]Level = @splat(.{}),
 
     const Level = struct {
         entries: std.ArrayListUnmanaged(Entry) = .empty,
         bytes: usize = header_bytes,
+        arena: ?std.heap.ArenaAllocator = null,
 
-        fn clear(self: *Level, alloc: Allocator) void {
-            for (self.entries.items) |entry| {
-                alloc.free(entry.key);
-                if (entry.child == null) alloc.free(entry.value);
-                alloc.free(entry.aggregate);
-            }
+        fn clear(self: *Level, _: Allocator) void {
+            if (self.arena) |*arena| _ = arena.reset(.free_all);
             self.entries.clearRetainingCapacity();
             self.bytes = header_bytes;
         }
@@ -777,12 +1038,14 @@ pub const SortedBuilder = struct {
         try self.store.check(self.store.ptr);
         if (key.len == 0 or key.len > max_key_bytes or value.len > max_record_bytes - 8 - key.len) return error.GraphPageRecordTooLarge;
         try self.checkOrder(key);
-        const previous = try self.alloc.dupe(u8, key);
-        errdefer self.alloc.free(previous);
         try self.append(0, .{ .key = key, .value = value });
-        if (self.previous) |old| self.alloc.free(old);
-        self.previous = previous;
+        try self.remember(key);
         self.previous_is_upper = false;
+    }
+    fn remember(self: *SortedBuilder, key: []const u8) !void {
+        self.previous_storage.clearRetainingCapacity();
+        try self.previous_storage.appendSlice(self.alloc, key);
+        self.previous = self.previous_storage.items;
     }
     fn checkOrder(self: *SortedBuilder, key: []const u8) !void {
         if (self.closed) return error.UnsortedGraphPageMutations;
@@ -796,12 +1059,9 @@ pub const SortedBuilder = struct {
         try ref.validate();
         try self.checkOrder(first);
         if (upper) |bound| if (!less(first, bound)) return error.InvalidGraphPage;
-        const previous = if (upper) |bound| try self.alloc.dupe(u8, bound) else null;
-        errdefer if (previous) |bytes| self.alloc.free(bytes);
         for (0..@as(usize, ref.height) + 1) |height| if (self.levels[height].entries.items.len != 0) try self.flush(height);
         try self.append(@as(usize, ref.height) + 1, .{ .key = first, .child = ref, .aggregate = aggregate });
-        if (self.previous) |old| self.alloc.free(old);
-        self.previous = previous;
+        if (upper) |bound| try self.remember(bound) else self.previous = null;
         self.previous_is_upper = true;
         self.closed = upper == null;
     }
@@ -825,9 +1085,9 @@ pub const SortedBuilder = struct {
 
     pub fn deinit(self: *SortedBuilder) void {
         for (self.pending[0..self.pending_count]) |page| self.alloc.free(page.bytes);
-        if (self.previous) |previous| self.alloc.free(previous);
+        self.previous_storage.deinit(self.alloc);
         for (&self.levels) |*level| {
-            level.clear(self.alloc);
+            if (level.arena) |*arena| arena.deinit();
             level.entries.deinit(self.alloc);
         }
     }
@@ -838,21 +1098,38 @@ pub const SortedBuilder = struct {
         const minimum: usize = if (height == 0) 1 else 2;
         if (level.entries.items.len >= minimum and level.bytes + entry.size() > self.target_bytes)
             try self.flush(height);
-        const key = try self.alloc.dupe(u8, entry.key);
-        errdefer self.alloc.free(key);
-        const value = if (entry.child == null) try self.alloc.dupe(u8, entry.value) else "";
-        errdefer if (entry.child == null) self.alloc.free(value);
-        const aggregate = try self.alloc.dupe(u8, entry.aggregate);
-        errdefer self.alloc.free(aggregate);
+        if (level.arena == null) level.arena = .init(self.alloc);
+        const a = level.arena.?.allocator();
+        const key = try a.dupe(u8, entry.key);
+        const value = if (entry.child == null) try a.dupe(u8, entry.value) else "";
+        const aggregate = try a.dupe(u8, entry.aggregate);
         try level.entries.append(self.alloc, .{ .key = key, .value = value, .child = entry.child, .aggregate = aggregate });
         level.bytes += entry.size();
     }
 
     fn flush(self: *SortedBuilder, height: usize) anyerror!void {
         if (height > max_height) return error.GraphPageTreeTooDeep;
+        // A parent may be encoded only after every child's final locator is
+        // durably bound. Earlier levels can still share one bounded pack.
+        if (self.store.pack_many != null and height > 0) try self.persist();
         const level = &self.levels[height];
         var aggregate: []u8 = &.{};
         defer self.alloc.free(aggregate);
+        if (self.store.pack_many != null) {
+            const page = try encode(self.alloc, self.store, level.entries.items, @intCast(height), &aggregate);
+            var owned = true;
+            defer if (owned) self.alloc.free(page.bytes);
+            // append may recursively flush a full parent. Queue this new page
+            // only after that recursion, so every pending ref has a live slot.
+            try self.append(height + 1, .{ .key = level.entries.items[0].key, .child = page.ref, .aggregate = aggregate });
+            self.pending[self.pending_count] = page;
+            self.pending_parents[self.pending_count] = .{ .height = height + 1, .index = self.levels[height + 1].entries.items.len - 1 };
+            self.pending_count += 1;
+            owned = false;
+            if (self.pending_count == self.pending.len) try self.persist();
+            level.clear(self.alloc);
+            return;
+        }
         const ref = if (self.store.put_many != null) queued: {
             const page = try encode(self.alloc, self.store, level.entries.items, @intCast(height), &aggregate);
             self.pending[self.pending_count] = page;
@@ -867,7 +1144,16 @@ pub const SortedBuilder = struct {
     fn persist(self: *SortedBuilder) !void {
         if (self.pending_count == 0) return;
         try self.store.check(self.store.ptr);
-        try self.store.put_many.?(self.store.ptr, self.pending[0..self.pending_count]);
+        if (self.store.pack_many) |pack_many| {
+            try pack_many(self.store.ptr, self.pending[0..self.pending_count]);
+            for (self.pending[0..self.pending_count], self.pending_parents[0..self.pending_count]) |page, parent| {
+                const level = &self.levels[parent.height];
+                const entry = &level.entries.items[parent.index];
+                level.bytes -= entry.size();
+                entry.child = page.ref;
+                level.bytes += entry.size();
+            }
+        } else try self.store.put_many.?(self.store.ptr, self.pending[0..self.pending_count]);
         for (self.pending[0..self.pending_count]) |page| self.alloc.free(page.bytes);
         self.pending_count = 0;
     }
@@ -922,6 +1208,64 @@ pub fn mergeSorted(alloc: Allocator, store: Store, left: Ref, right: Ref, reduce
     }
     return (try builder.finish()) orelse error.InvalidGraphPage;
 }
+/// Apply a strictly ordered mutation stream with one bounded tree frontier.
+/// Disjoint routing intervals are adopted without reading their descendants;
+/// only intersecting leaves and new routing boundaries are encoded. No root
+/// escapes if the producer fails or supplies an invalid stream.
+pub fn applySorted(alloc: Allocator, store: Store, prior: ?Ref, source: anytype) !?Ref {
+    const Checked = struct {
+        input: @TypeOf(source),
+        previous: std.ArrayList(u8) = .empty,
+        fn next(self: *@This(), a: Allocator) !?Mutation {
+            const change = (try self.input.next()) orelse return null;
+            if (change.key.len == 0 or change.key.len > max_key_bytes or
+                (if (change.value) |value| value.len else 0) > max_record_bytes - 8 - change.key.len)
+                return error.GraphPageRecordTooLarge;
+            if (self.previous.items.len != 0 and !less(self.previous.items, change.key)) return error.UnsortedGraphPageMutations;
+            self.previous.clearRetainingCapacity();
+            try self.previous.appendSlice(a, change.key);
+            return change;
+        }
+    };
+    var checked: Checked = .{ .input = source };
+    defer checked.previous.deinit(alloc);
+    var change = try checked.next(alloc);
+    if (change == null) return prior;
+    var old = if (prior) |root| try MergeFrontier.init(alloc, store, root) else MergeFrontier{ .alloc = alloc, .store = store };
+    defer old.deinit();
+    var builder: SortedBuilder = .{ .alloc = alloc, .store = store };
+    defer builder.deinit();
+    while (true) {
+        try store.check(store.ptr);
+        const item = old.peek();
+        if (item == null and change == null) break;
+        if (change != null and (item == null or !less(item.?.first, change.?.key))) {
+            if (item != null and std.mem.eql(u8, item.?.first, change.?.key)) {
+                if (item.?.ref) |ref| {
+                    if (ref.height == 0) builder.target_bytes = @max(builder.target_bytes, packingTarget(ref.bytes));
+                    try old.expand();
+                    continue;
+                }
+                old.consume();
+            }
+            if (change.?.value) |value| try builder.add(change.?.key, value);
+            change = try checked.next(alloc);
+        } else if (item.?.ref) |ref| {
+            if (change == null or (if (item.?.end) |end| !less(change.?.key, end) else false)) {
+                try builder.addSubtree(item.?.first, item.?.end, ref, item.?.aggregate);
+                old.consume();
+            } else {
+                if (ref.height == 0) builder.target_bytes = @max(builder.target_bytes, packingTarget(ref.bytes));
+                try old.expand();
+            }
+        } else {
+            try builder.add(item.?.first, item.?.value);
+            old.consume();
+        }
+    }
+    return builder.finish();
+}
+
 const MergeFrontier = struct {
     alloc: Allocator,
     store: Store,
@@ -1114,6 +1458,159 @@ pub const BestFirst = struct {
         return null;
     }
 };
+
+/// Compare an authenticated range while pruning unchanged copy-on-write
+/// subtrees. Rebalanced boundaries use ordered cursors, so tree shape is never
+/// treated as logical equality. Memory remains bounded by the tree height.
+pub const Equivalence = struct {
+    lower: []const u8 = "",
+    upper: ?[]const u8 = null,
+    compare_values: bool = true,
+    key_bytes: ?usize = null,
+    value_bytes: ?usize = null,
+};
+/// Two lazy ordered frontiers retain authenticated subtree references until
+/// they must be opened. Unequal fences or heights only open the overlapping
+/// boundary paths; once frontiers align, shared content is skipped again.
+const RangeFrontier = struct {
+    alloc: Allocator,
+    store: Store,
+    root: ?Ref,
+    options: Equivalence,
+    frames: [max_height + 1]Frame = undefined,
+    depth: usize = 0,
+    const Frame = struct { page: Page, next: usize = 0, end: ?[]const u8 };
+    const Node = struct { ref: ?Ref, key: ?[]const u8, value: []const u8 = "", end: ?[]const u8 = null };
+    fn deinit(self: *RangeFrontier) void {
+        for (self.frames[0..self.depth]) |*frame| frame.page.deinit(self.alloc);
+        self.depth = 0;
+    }
+    fn peek(self: *RangeFrontier) ?Node {
+        if (self.root) |ref| return .{ .ref = ref, .key = null };
+        while (self.depth != 0) {
+            const frame = &self.frames[self.depth - 1];
+            if (frame.next == frame.page.entries.len) {
+                frame.page.deinit(self.alloc);
+                self.depth -= 1;
+                continue;
+            }
+            const entry = frame.page.entries[frame.next];
+            const end = if (frame.next + 1 < frame.page.entries.len) frame.page.entries[frame.next + 1].key else frame.end;
+            if (self.options.upper) |upper| if (!less(entry.key, upper)) {
+                frame.next = frame.page.entries.len;
+                continue;
+            };
+            if (entry.child != null) {
+                if (end) |bound| if (!less(self.options.lower, bound)) {
+                    frame.next += 1;
+                    continue;
+                };
+            } else if (less(entry.key, self.options.lower)) {
+                frame.next += 1;
+                continue;
+            }
+            return .{ .ref = entry.child, .key = entry.key, .value = entry.value, .end = end };
+        }
+        return null;
+    }
+    fn advance(self: *RangeFrontier) void {
+        if (self.root != null) self.root = null else self.frames[self.depth - 1].next += 1;
+    }
+    fn expand(self: *RangeFrontier, node: Node) !void {
+        if (self.depth == self.frames.len) return error.InvalidGraphPage;
+        var page = try readPage(self.alloc, self.store, node.ref.?);
+        errdefer page.deinit(self.alloc);
+        if (node.key) |first| if (!std.mem.eql(u8, first, page.entries[0].key)) return error.InvalidGraphPage;
+        if (node.end) |end| if (!less(page.entries[page.entries.len - 1].key, end)) return error.InvalidGraphPage;
+        self.advance();
+        self.frames[self.depth] = .{ .page = page, .end = node.end };
+        self.depth += 1;
+    }
+};
+fn sameContent(l: Ref, r: Ref) bool {
+    return l.bytes == r.bytes and l.height == r.height and l.records == r.records and std.mem.eql(u8, &l.digest, &r.digest);
+}
+const Difference = struct {
+    left: RangeFrontier,
+    right: RangeFrontier,
+    advance_left: bool = false,
+    advance_right: bool = false,
+    const Change = struct { left: ?Cursor.Record, right: ?Cursor.Record };
+    fn init(a: Allocator, store: Store, left: ?Ref, right: ?Ref, options: Equivalence) !Difference {
+        try store.check(store.ptr);
+        if (left) |ref| try ref.validate();
+        if (right) |ref| try ref.validate();
+        const empty = if (options.upper) |upper| !less(options.lower, upper) else false;
+        return .{ .left = .{ .alloc = a, .store = store, .root = if (empty) null else left, .options = options }, .right = .{ .alloc = a, .store = store, .root = if (empty) null else right, .options = options } };
+    }
+    fn deinit(self: *Difference) void {
+        self.left.deinit();
+        self.right.deinit();
+    }
+    fn next(self: *Difference) !?Change {
+        if (self.advance_left) self.left.advance();
+        if (self.advance_right) self.right.advance();
+        self.advance_left = false;
+        self.advance_right = false;
+        while (true) {
+            try self.left.store.check(self.left.store.ptr);
+            const l = self.left.peek();
+            const r = self.right.peek();
+            if (l == null and r == null) return null;
+            if (l != null and r != null and l.?.ref != null and r.?.ref != null and sameContent(l.?.ref.?, r.?.ref.?)) {
+                self.left.advance();
+                self.right.advance();
+                continue;
+            }
+            const order: std.math.Order = if (l == null) .gt else if (r == null) .lt else if (l.?.key == null or r.?.key == null) .eq else std.mem.order(u8, l.?.key.?, r.?.key.?);
+            // Emit earlier records without decoding a later disjoint subtree.
+            const emit_left = l != null and l.?.ref == null and (r == null or order == .lt or r.?.ref == null);
+            const emit_right = r != null and r.?.ref == null and (l == null or order == .gt or l.?.ref == null);
+            if (emit_left or emit_right) {
+                self.advance_left = emit_left and order != .gt;
+                self.advance_right = emit_right and order != .lt;
+                const le: ?Cursor.Record = if (self.advance_left) .{ .key = l.?.key.?, .value = l.?.value } else null;
+                const re: ?Cursor.Record = if (self.advance_right) .{ .key = r.?.key.?, .value = r.?.value } else null;
+                if (le != null and re != null and std.mem.eql(u8, le.?.value, re.?.value)) {
+                    self.left.advance();
+                    self.right.advance();
+                    self.advance_left = false;
+                    self.advance_right = false;
+                    continue;
+                }
+                return .{ .left = le, .right = re };
+            }
+            if (l != null and l.?.ref != null and (r == null or r.?.ref == null or l.?.ref.?.height > r.?.ref.?.height or (l.?.ref.?.height == r.?.ref.?.height and order == .lt))) {
+                try self.left.expand(l.?);
+            } else if (r != null and r.?.ref != null and (l == null or l.?.ref == null or r.?.ref.?.height > l.?.ref.?.height or order == .gt)) {
+                try self.right.expand(r.?);
+            } else {
+                try self.left.expand(l.?);
+                try self.right.expand(r.?);
+            }
+        }
+    }
+};
+pub fn equivalent(alloc: Allocator, store: Store, left: ?Ref, right: ?Ref, options: Equivalence) anyerror!bool {
+    var differences = try Difference.init(alloc, store, left, right, options);
+    defer differences.deinit();
+    while (try differences.next()) |change| {
+        const l = change.left orelse return false;
+        const r = change.right orelse return false;
+        if (options.key_bytes) |width| if (l.key.len != width or r.key.len != width) return error.InvalidGraphPage;
+        if (options.value_bytes) |width| if (l.value.len != width or r.value.len != width) return error.InvalidGraphPage;
+        if (options.compare_values) return false;
+    }
+    return true;
+}
+
+/// Visit changes in order with memory bounded by two root-to-leaf paths.
+/// Records borrow the frontiers only until the visitor returns.
+pub fn visitDifferences(alloc: Allocator, store: Store, left: ?Ref, right: ?Ref, visitor: anytype) anyerror!void {
+    var differences = try Difference.init(alloc, store, left, right, .{});
+    defer differences.deinit();
+    while (try differences.next()) |change| try visitor.change(change.left, change.right);
+}
 
 /// Ordered half-open range scan. Memory is bounded by (height + 1) pages, not
 /// degree or graph size. Returned records borrow the cursor until next/deinit.
@@ -2700,4 +3197,382 @@ test "serverless graph interval merge preserves interleaved keys and authenticat
     var page = try readPage(a, backing, root);
     defer page.deinit(a);
     try std.testing.expectEqual(sum, std.mem.readInt(u64, page.aggregate[0..8], .little));
+}
+
+test "external lake range equivalence skips unchanged COW branches and handles rebalancing" {
+    const a = std.testing.allocator;
+    var backing: TestStore = .{ .alloc = a };
+    defer backing.deinit();
+    const count = 2000;
+    const names = try a.alloc([8]u8, count + 1);
+    defer a.free(names);
+    const changes = try a.alloc(Mutation, count);
+    defer a.free(changes);
+    const value: [128]u8 = @splat(42);
+    for (names, 0..) |*name, i| std.mem.writeInt(u64, name, i, .big);
+    for (changes, names[0..count]) |*change, *name| change.* = .{ .key = name, .value = &value };
+    const root = (try apply(a, backing.store(), null, changes)).?;
+    const altered: [128]u8 = @splat(43);
+    const updated = (try apply(a, backing.store(), root, &.{.{ .key = &names[1000], .value = &altered }})).?;
+    backing.reads = 0;
+    try std.testing.expect(try equivalent(a, backing.store(), root, updated, .{ .compare_values = false, .key_bytes = 8, .value_bytes = 128 }));
+    try std.testing.expect(backing.reads < 20);
+    try std.testing.expect(!try equivalent(a, backing.store(), root, updated, .{}));
+    try std.testing.expect(try equivalent(a, backing.store(), root, updated, .{ .upper = &names[1000] }));
+    const appended = (try apply(a, backing.store(), updated, &.{.{ .key = &names[count], .value = &value }})).?;
+    try std.testing.expect(!try equivalent(a, backing.store(), root, appended, .{ .compare_values = false }));
+    try std.testing.expect(try equivalent(a, backing.store(), root, appended, .{ .upper = &names[1000] }));
+    backing.reads = 0;
+    try std.testing.expect(try equivalent(a, backing.store(), root, root, .{}));
+    try std.testing.expectEqual(@as(usize, 0), backing.reads);
+    var relocated = root;
+    relocated.attempt = @splat(9);
+    try std.testing.expect(!root.eql(relocated));
+    try std.testing.expect(try equivalent(a, backing.store(), root, relocated, .{}));
+    try std.testing.expectEqual(@as(usize, 0), backing.reads);
+    backing.canceled = true;
+    try std.testing.expectError(error.Canceled, equivalent(a, backing.store(), root, root, .{}));
+}
+
+test "external lake changed tree traversal skips COW ranges and reports rebalance insertions and deletions" {
+    const a = std.testing.allocator;
+    var backing: TestStore = .{ .alloc = a };
+    defer backing.deinit();
+    const count = 2000;
+    const names = try a.alloc([8]u8, count + 1);
+    defer a.free(names);
+    const changes = try a.alloc(Mutation, count);
+    defer a.free(changes);
+    const value: [128]u8 = @splat(42);
+    for (names, 0..) |*name, i| std.mem.writeInt(u64, name, i, .big);
+    for (changes, names[0..count]) |*change, *name| change.* = .{ .key = name, .value = &value };
+    const root = (try apply(a, backing.store(), null, changes)).?;
+    const altered: [128]u8 = @splat(43);
+    const updated = (try apply(a, backing.store(), root, &.{.{ .key = &names[1000], .value = &altered }})).?;
+    const Visitor = struct {
+        calls: usize = 0,
+        expected: []const u64,
+        removed: bool = false,
+        pub fn change(self: *@This(), left: ?Cursor.Record, right: ?Cursor.Record) !void {
+            const record = if (self.removed) left.? else right.?;
+            try std.testing.expect(self.calls < self.expected.len);
+            try std.testing.expectEqual(self.expected[self.calls], std.mem.readInt(u64, record.key[0..8], .big));
+            self.calls += 1;
+        }
+    };
+    var visitor: Visitor = .{ .expected = &.{1000} };
+    backing.reads = 0;
+    try visitDifferences(a, backing.store(), root, updated, &visitor);
+    try std.testing.expectEqual(@as(usize, 1), visitor.calls);
+    try std.testing.expect(backing.reads < 20);
+    var relocated = root;
+    relocated.attempt = @splat(9);
+    visitor.calls = 0;
+    backing.reads = 0;
+    try visitDifferences(a, backing.store(), root, relocated, &visitor);
+    try std.testing.expectEqual(@as(usize, 0), visitor.calls);
+    try std.testing.expectEqual(@as(usize, 0), backing.reads);
+    const appended = (try apply(a, backing.store(), updated, &.{.{ .key = &names[count], .value = &value }})).?;
+    const removed = (try apply(a, backing.store(), appended, &.{.{ .key = &names[17], .value = null }})).?;
+    const Mixed = struct {
+        calls: usize = 0,
+        pub fn change(self: *@This(), left: ?Cursor.Record, right: ?Cursor.Record) !void {
+            const expected: [3]u64 = .{ 17, 1000, count };
+            const record = left orelse right.?;
+            try std.testing.expect(self.calls < expected.len);
+            try std.testing.expectEqual(expected[self.calls], std.mem.readInt(u64, record.key[0..8], .big));
+            if (self.calls == 0) try std.testing.expect(right == null);
+            if (self.calls == 2) try std.testing.expect(left == null);
+            self.calls += 1;
+        }
+    };
+    var mixed: Mixed = .{};
+    try visitDifferences(a, backing.store(), root, removed, &mixed);
+    try std.testing.expectEqual(@as(usize, 3), mixed.calls);
+    const Failure = struct {
+        fn run(alloc: Allocator, store: Store, old: Ref, next: Ref) !void {
+            var visit: Mixed = .{};
+            try visitDifferences(alloc, store, old, next, &visit);
+            try std.testing.expectEqual(@as(usize, 3), visit.calls);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Failure.run, .{ backing.store(), root, removed });
+    backing.canceled = true;
+    try std.testing.expectError(error.Canceled, visitDifferences(a, backing.store(), root, root, &visitor));
+}
+
+test "external lake batched ranks share paths preserve duplicates and reject absent keys" {
+    const a = std.testing.allocator;
+    var backing: TestStore = .{ .alloc = a };
+    defer backing.deinit();
+    var names: [2000][8]u8 = undefined;
+    var mutations: [2000]Mutation = undefined;
+    const value: [128]u8 = @splat(42);
+    for (&names, &mutations, 0..) |*name, *mutation, i| {
+        std.mem.writeInt(u64, name, i, .big);
+        mutation.* = .{ .key = name, .value = &value };
+    }
+    const root = (try apply(a, backing.store(), null, &mutations)).?;
+    const keys = [_][]const u8{ &names[1023], &names[3], &names[1024], &names[3], &names[1999] };
+    var result: [keys.len]u64 = undefined;
+    backing.reads = 0;
+    try ranksOf(a, backing.store(), root, &keys, &result);
+    try std.testing.expectEqualSlices(u64, &.{ 1023, 3, 1024, 3, 1999 }, &result);
+    const batched_reads = backing.reads;
+    backing.reads = 0;
+    for (keys) |key| _ = try rankOf(a, backing.store(), root, key);
+    try std.testing.expect(batched_reads < backing.reads);
+    try std.testing.expectError(error.InvalidGraphPage, ranksOf(a, backing.store(), root, &.{"absent"}, result[0..1]));
+    const Failure = struct {
+        fn run(alloc: Allocator, store: Store, ref: Ref, input: []const []const u8) !void {
+            var ranks: [5]u64 = undefined;
+            try ranksOf(alloc, store, ref, input, &ranks);
+            try std.testing.expectEqualSlices(u64, &.{ 1023, 3, 1024, 3, 1999 }, &ranks);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Failure.run, .{ backing.store(), root, &keys });
+}
+
+test "external lake range zipper prunes shared pages after boundary insertions splits and deletions" {
+    const a = std.testing.allocator;
+    var backing: TestStore = .{ .alloc = a };
+    defer backing.deinit();
+    const count = 10000;
+    const keys = try a.alloc([8]u8, count + 2);
+    defer a.free(keys);
+    const mutations = try a.alloc(Mutation, count);
+    defer a.free(mutations);
+    const value: [128]u8 = @splat(42);
+    for (keys, 0..) |*key, i| std.mem.writeInt(u64, key, i, .big);
+    for (mutations, keys[1 .. count + 1]) |*mutation, *key| mutation.* = .{ .key = key, .value = &value };
+    const original = (try apply(a, backing.store(), null, mutations)).?;
+    const inserted = (try apply(a, backing.store(), original, &.{ .{ .key = &keys[0], .value = &value }, .{ .key = &keys[count + 1], .value = &value } })).?;
+    const Visitor = struct {
+        count: usize = 0,
+        previous: ?u64 = null,
+        fn change(self: *@This(), left: ?Cursor.Record, right: ?Cursor.Record) !void {
+            const row = right orelse left.?;
+            const key = std.mem.readInt(u64, row.key[0..8], .big);
+            if (self.previous) |old| try std.testing.expect(old < key);
+            self.previous = key;
+            self.count += 1;
+            try std.testing.expect((left == null) != (right == null));
+        }
+    };
+    for (0..2) |reverse| {
+        var visitor: Visitor = .{};
+        backing.reads = 0;
+        try visitDifferences(a, backing.store(), if (reverse == 0) original else inserted, if (reverse == 0) inserted else original, &visitor);
+        try std.testing.expectEqual(@as(usize, 2), visitor.count);
+        // The old cursor fallback read 94 pages for just the minimum insertion.
+        try std.testing.expect(backing.reads < 20);
+    }
+    backing.reads = 0;
+    try std.testing.expect(try equivalent(a, backing.store(), original, inserted, .{ .lower = &keys[1], .upper = &keys[count + 1] }));
+    try std.testing.expect(backing.reads < 20);
+    // Independent packing changes height/partitioning. Exact ordered output
+    // still agrees even when there are no identical descendant references.
+    var builder: SortedBuilder = .{ .alloc = a, .store = backing.store(), .target_bytes = bulk_target_page_bytes };
+    defer builder.deinit();
+    for (mutations) |mutation| try builder.add(mutation.key, mutation.value.?);
+    const repacked = (try builder.finish()).?;
+    try std.testing.expect(try equivalent(a, backing.store(), original, repacked, .{}));
+    var visitor: Visitor = .{};
+    try visitDifferences(a, backing.store(), original, repacked, &visitor);
+    try std.testing.expectEqual(@as(usize, 0), visitor.count);
+}
+
+test "serverless graph batched seeks preserve duplicates gaps boundaries ranks and allocation ownership" {
+    const a = std.testing.allocator;
+    var backing: TestStore = .{ .alloc = a };
+    defer backing.deinit();
+    var builder: SortedBuilder = .{ .alloc = a, .store = backing.store(), .target_bytes = 1024 };
+    defer builder.deinit();
+    for (0..1024) |i| {
+        var key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key, 2 * i + 2, .big);
+        try builder.add(&key, &key);
+    }
+    const root = (try builder.finish()).?;
+    const keys = [_][8]u8{ @splat(0), std.mem.toBytes(std.mem.nativeToBig(u64, 1025)), std.mem.toBytes(std.mem.nativeToBig(u64, 2048)), std.mem.toBytes(std.mem.nativeToBig(u64, 1024)), std.mem.toBytes(std.mem.nativeToBig(u64, 1024)), @splat(255) };
+    var pointers: [keys.len][]const u8 = undefined;
+    for (&keys, &pointers) |*key, *pointer| pointer.* = key;
+    for ([_]bool{ false, true }) |lower| {
+        const values = try lookupBatch(a, backing.store(), root, &pointers, lower);
+        defer {
+            for (values) |entry| if (entry) |value| value.deinit(a);
+            a.free(values);
+        }
+        for (values, pointers) |entry, key| {
+            var expected = try Cursor.init(a, backing.store(), root, key, null);
+            defer expected.deinit();
+            const record = try expected.next();
+            if (record != null and (lower or std.mem.eql(u8, record.?.key, key))) {
+                try std.testing.expectEqualSlices(u8, record.?.key, entry.?.key);
+                try std.testing.expectEqualSlices(u8, record.?.value, entry.?.value);
+                try std.testing.expectEqual(try rankOf(a, backing.store(), root, record.?.key), entry.?.rank);
+            } else try std.testing.expect(entry == null);
+        }
+    }
+    const Case = struct {
+        fn run(allocator: Allocator, store: Store, ref: Ref, input: []const []const u8) !void {
+            const values = try seekMany(allocator, store, ref, input);
+            defer {
+                for (values) |entry| if (entry) |value| value.deinit(allocator);
+                allocator.free(values);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Case.run, .{ backing.store(), root, &pointers });
+    backing.canceled = true;
+    try std.testing.expectError(error.Canceled, lookupMany(a, backing.store(), root, &pointers));
+}
+
+test "serverless graph prefixed pages preserve legacy cursors updates and allocation ownership" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            var backing: TestStore = .{ .alloc = a };
+            defer backing.deinit();
+            var prefixed = backing.store();
+            prefixed.prefix_keys = true;
+            const Source = struct {
+                position: u64 = 0,
+                key: [64]u8 = @splat(7),
+                pub fn next(self: *@This()) !?Cursor.Record {
+                    if (self.position == 64) return null;
+                    std.mem.writeInt(u64, self.key[56..64], self.position, .big);
+                    self.position += 1;
+                    return .{ .key = &self.key, .value = "same" };
+                }
+            };
+            var original: Source = .{};
+            const legacy = (try buildSorted(a, backing.store(), &original)).?;
+            var compressed: Source = .{};
+            const compact = (try buildSorted(a, prefixed, &compressed)).?;
+            try std.testing.expect(compact.bytes * 2 < legacy.bytes);
+            for ([_]u32{ 0, max_key_bytes + 1 }) |prefix_len| {
+                const bad = try a.dupe(u8, backing.pages.get(compact.digest).?);
+                defer a.free(bad);
+                writeU32(bad, header_bytes, prefix_len);
+                var invalid = compact;
+                Sha256.hash(bad, &invalid.digest, .{});
+                try TestStore.put(&backing, invalid, bad);
+                if (readPage(a, backing.store(), invalid)) |decoded| {
+                    var unexpected = decoded;
+                    unexpected.deinit(a);
+                    return error.TestUnexpectedResult;
+                } else |err| {
+                    if (err == error.OutOfMemory) return err;
+                    try std.testing.expectEqual(error.InvalidGraphPage, err);
+                }
+            }
+            try std.testing.expect(try equivalent(a, backing.store(), legacy, compact, .{}));
+            var key: [64]u8 = @splat(7);
+            std.mem.writeInt(u64, key[56..64], 17, .big);
+            const next = (try apply(a, prefixed, compact, &.{.{ .key = &key, .value = "changed" }})).?;
+            var cursor = try Cursor.init(a, backing.store(), next, &key, null);
+            defer cursor.deinit();
+            const row = (try cursor.next()).?;
+            try std.testing.expectEqualSlices(u8, &key, row.key);
+            try std.testing.expectEqualStrings("changed", row.value);
+            var reverse = try Cursor.initReverse(a, backing.store(), next, "", null);
+            defer reverse.deinit();
+            var count: usize = 0;
+            while (try reverse.next()) |_| count += 1;
+            try std.testing.expectEqual(@as(usize, 64), count);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "serverless graph streamed mutations retain untouched branches and match batched edits" {
+    const a = std.testing.allocator;
+    var memory: TestStore = .{ .alloc = a };
+    defer memory.deinit();
+    const Input = struct {
+        n: usize = 0,
+        key: [8]u8 = undefined,
+        value: [64]u8 = @splat(7),
+        pub fn next(self: *@This()) !?Cursor.Record {
+            if (self.n == 10000) return null;
+            std.mem.writeInt(u64, &self.key, self.n * 2, .big);
+            self.n += 1;
+            return .{ .key = &self.key, .value = &self.value };
+        }
+    };
+    var input: Input = .{};
+    const prior = (try buildSortedWithOptions(a, memory.store(), &input, .{ .target_bytes = 4096 })).?;
+    var keys: [1024][8]u8 = undefined;
+    var edits: [1024]Mutation = undefined;
+    for (&keys, &edits, 0..) |*key, *change, i| {
+        std.mem.writeInt(u64, key, 2000 + i, .big);
+        change.* = .{ .key = key, .value = if (i % 3 == 0) null else "changed" };
+    }
+    const expected = try apply(a, memory.store(), prior, &edits);
+    const Stream = struct {
+        remaining: []const Mutation,
+        pub fn next(self: *@This()) !?Mutation {
+            if (self.remaining.len == 0) return null;
+            const change = self.remaining[0];
+            self.remaining = self.remaining[1..];
+            return change;
+        }
+    };
+    var stream: Stream = .{ .remaining = &edits };
+    memory.reads = 0;
+    memory.writes = 0;
+    const result = (try applySorted(a, memory.store(), prior, &stream)).?;
+    try std.testing.expect(memory.reads < 40);
+    try std.testing.expect(memory.writes < 40);
+    var left = try Cursor.init(a, memory.store(), expected, "", null);
+    defer left.deinit();
+    var right = try Cursor.init(a, memory.store(), result, "", null);
+    defer right.deinit();
+    while (try left.next()) |record| {
+        const actual = (try right.next()).?;
+        try std.testing.expectEqualSlices(u8, record.key, actual.key);
+        try std.testing.expectEqualSlices(u8, record.value, actual.value);
+    }
+    try std.testing.expect((try right.next()) == null);
+    try std.testing.expectEqual(@as(u64, 10000), prior.records);
+    // Keep the original bulk leaf size class on an incremental rewrite. A
+    // local delta must not turn one 256 KiB leaf into eight ordinary leaves.
+    var bulk_input: Input = .{};
+    const bulk = (try buildSortedWithOptions(a, memory.store(), &bulk_input, .{ .target_bytes = bulk_target_page_bytes })).?;
+    var bulk_stream: Stream = .{ .remaining = &edits };
+    memory.writes = 0;
+    const bulk_result = (try applySorted(a, memory.store(), bulk, &bulk_stream)).?;
+    try std.testing.expect(memory.writes < 4);
+    try std.testing.expectEqual(result.records, bulk_result.records);
+    var bad: Stream = .{ .remaining = &.{ edits[1], edits[0] } };
+    try std.testing.expectError(error.UnsortedGraphPageMutations, applySorted(a, memory.store(), prior, &bad));
+    var empty: Stream = .{ .remaining = &.{} };
+    try std.testing.expect(prior.eql((try applySorted(a, memory.store(), prior, &empty)).?));
+}
+
+test "serverless graph streamed mutation failures release frontier and partial output" {
+    const Run = struct {
+        fn run(a: Allocator) !void {
+            var memory: TestStore = .{ .alloc = a };
+            defer memory.deinit();
+            var builder: SortedBuilder = .{ .alloc = a, .store = memory.store(), .target_bytes = 128 };
+            defer builder.deinit();
+            for ([_][]const u8{ "a", "c", "e", "g", "i", "k", "m", "o" }) |key| try builder.add(key, "value");
+            const prior = (try builder.finish()).?;
+            const Stream = struct {
+                n: usize = 0,
+                pub fn next(self: *@This()) !?Mutation {
+                    const edits = [_]Mutation{ .{ .key = "a", .value = null }, .{ .key = "b", .value = "new" }, .{ .key = "i", .value = "changed" }, .{ .key = "z", .value = "tail" } };
+                    if (self.n == edits.len) return null;
+                    const value = edits[self.n];
+                    self.n += 1;
+                    return value;
+                }
+            };
+            var stream: Stream = .{};
+            const result = (try applySorted(a, memory.store(), prior, &stream)).?;
+            try std.testing.expectEqual(@as(u64, 9), result.records);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }

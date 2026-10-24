@@ -1900,6 +1900,9 @@ const ProducerConstraints = struct {
 };
 
 const FastTopK = struct {
+    // Exact bounded score tags extend batching across tile boundaries.
+    // Collisions discard a hint; they never authorize a rank comparison.
+    recent_scores: [128]?u32 = @splat(null),
     tie_rank: ?scorer_mod.TieRank = null,
     alloc: Allocator,
     k: u32,
@@ -1911,6 +1914,7 @@ const FastTopK = struct {
     hits: std.ArrayListUnmanaged(scorer_mod.ScoredHit) = .empty,
     total_count: u32 = 0,
     after: ?SearchCursor = null,
+    after_hit: ?scorer_mod.ScoredHit = null,
     pruned: bool = false,
     minimum_competitive_score: ?f32 = null,
     producers: ProducerConstraints = .{},
@@ -1983,6 +1987,7 @@ const FastTopK = struct {
         defer if (include) |*bitmap| bitmap.deinit();
         var exclude = if (need_exclude) try self.producers.exclude.?.produce(self.producers.exclude.?.ptr, self.alloc, self.segment_offset, self.segment_count, &candidates) else null;
         defer if (exclude) |*bitmap| bitmap.deinit();
+        var admitted: usize = 0;
         for (self.pending[0..self.pending_count]) |hit| {
             const local_id = hit.doc_id - self.segment_offset;
             if (self.include_local) |pin| if (!pin.bitmap.contains(local_id)) continue;
@@ -1991,8 +1996,54 @@ const FastTopK = struct {
             if (exclude_global) |bitmap| if (bitmap.contains(hit.doc_id)) continue;
             if (include) |*bitmap| if (!bitmap.contains(local_id)) continue;
             if (exclude) |*bitmap| if (bitmap.contains(local_id)) continue;
-            try self.collectAdmitted(hit);
+            self.pending[admitted] = hit;
+            admitted += 1;
         }
+        // Scores rejected by the current heap/floor/cursor need no map reads.
+        // Deferring a cutoff until the next bounded tile is conservative.
+        var competitive: [64]scorer_mod.ScoredHit = undefined;
+        var positions: [64]usize = undefined;
+        var count: usize = 0;
+        for (self.pending[0..admitted], 0..) |hit, i| {
+            if (self.k == 0) continue;
+            if (self.minimum_competitive_score) |floor| if (hit.score < floor) continue;
+            if (self.hits.items.len >= self.k and hit.score < self.hits.items[0].score) continue;
+            if (self.after) |cursor| if (hit.score > cursor.score) continue;
+            competitive[count] = hit;
+            positions[count] = i;
+            count += 1;
+        }
+        // Batch repeated score classes. Unique scores need no identity work
+        // unless a later heap/cursor comparison actually encounters a tie.
+        var score_slots: [128]?usize = @splat(null);
+        var repeated: [64]bool = @splat(false);
+        for (competitive[0..count], 0..) |hit, i| {
+            const bits: u32 = if (hit.score == 0) 0 else @bitCast(hit.score);
+            var slot: usize = (bits *% 0x9e3779b1) >> 25;
+            if (self.recent_scores[slot]) |prior| {
+                if (prior == bits) repeated[i] = true;
+            }
+            self.recent_scores[slot] = bits;
+            while (score_slots[slot]) |prior| {
+                if (competitive[prior].score == hit.score) {
+                    repeated[prior] = true;
+                    repeated[i] = true;
+                    break;
+                }
+                slot = (slot + 1) % score_slots.len;
+            } else score_slots[slot] = i;
+        }
+        var tied: [64]scorer_mod.ScoredHit = undefined;
+        var tied_positions: [64]usize = undefined;
+        var tied_count: usize = 0;
+        for (competitive[0..count], repeated[0..count], 0..) |hit, tie, i| if (tie) {
+            tied[tied_count] = hit;
+            tied_positions[tied_count] = positions[i];
+            tied_count += 1;
+        };
+        try scorer_mod.prepareHits(self.alloc, tied[0..tied_count], self.tie_rank);
+        for (tied[0..tied_count], tied_positions[0..tied_count]) |hit, i| self.pending[i] = hit;
+        for (self.pending[0..admitted]) |hit| try self.collectAdmitted(hit);
         self.pending_count = 0;
     }
 
@@ -2004,7 +2055,7 @@ const FastTopK = struct {
     pub fn collect(self: *FastTopK, doc_id: u32, score: f32) !void {
         if (!self.allows(doc_id)) return;
         const hit = scorer_mod.ScoredHit{ .doc_id = doc_id, .score = score };
-        if (self.producers.present()) {
+        if (self.producers.present() or (if (self.tie_rank) |rank| rank.resolve_many != null else false)) {
             self.pending[self.pending_count] = hit;
             self.pending_count += 1;
             if (self.pending_count == self.pending.len) try self.flushPending();
@@ -2014,9 +2065,19 @@ const FastTopK = struct {
     }
     fn collectAdmitted(self: *FastTopK, hit: scorer_mod.ScoredHit) !void {
         self.total_count += 1;
-        if (self.after) |cursor| if (!scorer_mod.betterWithRank(.{ .doc_id = cursor.doc_id, .score = cursor.score }, hit, self.tie_rank)) return;
+        if (self.k == 0) return;
         if (self.minimum_competitive_score) |floor| if (hit.score < floor) return;
-        try scorer_mod.offerTopKWithRank(self.alloc, &self.hits, self.k, hit, self.tie_rank);
+        var candidate = hit;
+        if (self.after) |cursor| {
+            if (self.after_hit == null) self.after_hit = .{ .doc_id = cursor.doc_id, .score = cursor.score };
+            // Cursor score comparisons usually need no relocated identity at all.
+            if (cursor.score == hit.score) {
+                self.after_hit = try scorer_mod.prepareHit(self.alloc, self.after_hit.?, self.tie_rank);
+                candidate = try scorer_mod.prepareHit(self.alloc, hit, self.tie_rank);
+            }
+            if (!scorer_mod.betterWithRank(self.after_hit.?, candidate, self.tie_rank)) return;
+        }
+        try scorer_mod.offerLazyTopKWithRank(self.alloc, &self.hits, self.k, candidate, self.tie_rank);
     }
 
     fn allows(self: *const FastTopK, doc_id: u32) bool {
@@ -2030,6 +2091,7 @@ const FastTopK = struct {
     fn finish(self: *FastTopK) ![]scorer_mod.ScoredHit {
         try self.flushPending();
         if (self.minimum_competitive_score == null and self.k > 0 and self.hits.items.len < self.k) self.pruned = false;
+        try scorer_mod.prepareHits(self.alloc, self.hits.items, self.tie_rank);
         scorer_mod.sortScoredHitsWithRank(self.hits.items, self.tie_rank);
         return try self.alloc.dupe(scorer_mod.ScoredHit, self.hits.items);
     }
@@ -6037,11 +6099,13 @@ fn buildResult(
     if (request.tie_rank) |order| {
         const sorted = try alloc.dupe(scorer_mod.ScoredHit, scored);
         defer alloc.free(sorted);
+        try scorer_mod.prepareHits(alloc, sorted, order);
         scorer_mod.sortScoredHitsWithRank(sorted, order);
         var start: usize = 0;
         if (request.search_after) |cursor| {
             start = sorted.len;
-            for (sorted, 0..) |hit, i| if (scorer_mod.betterWithRank(.{ .doc_id = cursor.doc_id, .score = cursor.score }, hit, order)) {
+            const boundary = try scorer_mod.prepareHit(alloc, .{ .doc_id = cursor.doc_id, .score = cursor.score }, order);
+            for (sorted, 0..) |hit, i| if (scorer_mod.betterWithRank(boundary, hit, order)) {
                 start = i;
                 break;
             };
@@ -11142,6 +11206,38 @@ test "external lake global frontier patterns stream mixed scores and cursor page
     }
 }
 
+test "producer top k batches competitive relocation ranks through heap and cursor" {
+    const Context = struct {
+        batches: usize = 0,
+        scalar_calls: usize = 0,
+        fn rank(_: *const anyopaque, doc: u32) u64 {
+            return doc;
+        }
+        fn resolve(raw: *const anyopaque, _: Allocator, doc: u32) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.scalar_calls += 1;
+            return 200 - @as(u64, doc);
+        }
+        fn many(raw: *const anyopaque, _: Allocator, docs: []const u32, ranks: []u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.batches += 1;
+            try std.testing.expect(docs.len <= 64);
+            for (docs, ranks) |doc, *value| value.* = 200 - @as(u64, doc);
+        }
+    };
+    var context: Context = .{};
+    var collector: FastTopK = .{ .alloc = std.testing.allocator, .k = 3, .tie_rank = .{ .ptr = &context, .rank = Context.rank, .resolve = Context.resolve, .resolve_many = Context.many }, .after = .{ .doc_id = 127, .score = 1 } };
+    defer collector.deinit();
+    for (0..128) |doc| try collector.collect(@intCast(doc), 1);
+    const hits = try collector.finish();
+    defer std.testing.allocator.free(hits);
+    try std.testing.expectEqual(@as(u32, 126), hits[0].doc_id);
+    try std.testing.expectEqual(@as(u32, 124), hits[2].doc_id);
+    try std.testing.expectEqual(@as(usize, 2), context.batches);
+    try std.testing.expectEqual(@as(usize, 1), context.scalar_calls);
+    try std.testing.expectEqual(@as(u32, 128), collector.total_count);
+}
+
 test "logical value borrowed pages seek across segments without copying retained membership" {
     const a = std.testing.allocator;
     const count = 16384;
@@ -11262,4 +11358,148 @@ test "logical value borrowed ranked producer gates retain one pin per segment" {
     }
     try std.testing.expectEqual(include.borrows, include.releases);
     try std.testing.expectEqual(exclude.borrows, exclude.releases);
+}
+
+test "producer top k combines borrowed membership pins with batched relocation ranks" {
+    const a = std.testing.allocator;
+    const State = struct {
+        bitmap: roaring.RoaringBitmap,
+        borrows: usize = 0,
+        releases: usize = 0,
+        batches: usize = 0,
+        fn borrow(raw: *anyopaque, _: u32, _: u32) !?roaring.BorrowedBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.borrows += 1;
+            return .{ .bitmap = &self.bitmap, .context = .{ self, self }, .release = release };
+        }
+        fn release(context: [2]*anyopaque) void {
+            @as(*@This(), @ptrCast(@alignCast(context[0]))).releases += 1;
+        }
+        fn produce(_: *anyopaque, _: Allocator, _: u32, _: u32, _: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+            return error.UnexpectedMaterialization;
+        }
+        fn rank(_: *const anyopaque, doc: u32) u64 {
+            return 300000 - @as(u64, doc);
+        }
+        fn ranks(raw: *const anyopaque, _: Allocator, docs: []const u32, output: []u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.batches += 1;
+            try std.testing.expect(docs.len <= 64);
+            for (docs, output) |doc, *out| out.* = rank(raw, doc);
+        }
+    };
+    var state: State = .{ .bitmap = roaring.RoaringBitmap.init(a) };
+    defer state.bitmap.deinit();
+    for (0..256) |i| try state.bitmap.add(@intCast(i * 2));
+    {
+        var collector: FastTopK = .{ .alloc = a, .k = 3, .producers = .{ .include = .{ .ptr = &state, .borrow = State.borrow, .produce = State.produce } }, .tie_rank = .{ .ptr = &state, .rank = State.rank, .resolve_many = State.ranks } };
+        defer collector.deinit();
+        for ([_]u32{ 100000, 200000 }) |offset| {
+            try collector.beginSegment(offset, 512);
+            for (0..512) |i| try collector.collect(offset + @as(u32, @intCast(i)), 1);
+        }
+        const hits = try collector.finish();
+        defer a.free(hits);
+        try std.testing.expectEqual(@as(u32, 512), collector.total_count);
+        for (hits, [_]u32{ 200510, 200508, 200506 }) |hit, expected| try std.testing.expectEqual(expected, hit.doc_id);
+        try std.testing.expectEqual(@as(usize, 2), state.borrows);
+        try std.testing.expect(state.batches > 1);
+    }
+    try std.testing.expectEqual(state.borrows, state.releases);
+}
+
+test "producer top k resolves only final winners for distinct scores and unequal cursor boundaries" {
+    const State = struct {
+        rows: usize = 0,
+        calls: usize = 0,
+        fn rank(_: *const anyopaque, doc: u32) u64 {
+            return doc;
+        }
+        fn many(raw: *const anyopaque, _: Allocator, docs: []const u32, output: []u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            self.rows += docs.len;
+            for (docs, output) |doc, *value| value.* = 1000 - @as(u64, doc);
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]?SearchCursor{ null, .{ .doc_id = 257, .score = 130.5 } }) |after| {
+        var state: State = .{};
+        var collector: FastTopK = .{ .alloc = a, .k = 3, .after = after, .tie_rank = .{ .ptr = &state, .rank = State.rank, .resolve_many = State.many } };
+        defer collector.deinit();
+        for (0..257) |doc| try collector.collect(@intCast(doc), @floatFromInt(doc + 1));
+        try collector.flushPending();
+        try std.testing.expectEqual(@as(usize, 0), state.rows);
+        const hits = try collector.finish();
+        defer a.free(hits);
+        for (hits, 0..) |hit, i| {
+            const expected: u32 = @intCast((if (after == null) @as(usize, 256) else 129) - i);
+            try std.testing.expectEqual(expected, hit.doc_id);
+            try std.testing.expectEqual(1000 - @as(u64, expected), hit.resolved_tie);
+        }
+        try std.testing.expectEqual(@as(usize, 3), state.rows);
+        try std.testing.expectEqual(@as(usize, 1), state.calls);
+    }
+}
+
+test "producer top k batches score ties spanning distinct candidate tiles" {
+    const State = struct {
+        batches: usize = 0,
+        scalar_calls: usize = 0,
+        fn rank(_: *const anyopaque, doc: u32) u64 {
+            return 1048576 - @as(u64, doc);
+        }
+        fn resolve(raw: *const anyopaque, _: Allocator, doc: u32) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.scalar_calls += 1;
+            return rank(raw, doc);
+        }
+        fn many(raw: *const anyopaque, _: Allocator, docs: []const u32, output: []u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.batches += 1;
+            for (docs, output) |doc, *value| value.* = rank(raw, doc);
+        }
+    };
+    const a = std.testing.allocator;
+    // One candidate for each score per tile; each score recurs only after the
+    // collector flushes. Pick exact score tags in distinct history buckets.
+    var scores: [64]f32 = undefined;
+    var occupied: [128]bool = @splat(false);
+    var used: usize = 0;
+    var next: u32 = 1;
+    while (used < scores.len) : (next += 1) {
+        const score: f32 = @floatFromInt(next);
+        const bits: u32 = @bitCast(score);
+        const bucket = (bits *% 0x9e3779b1) >> 25;
+        if (occupied[bucket]) continue;
+        occupied[bucket] = true;
+        scores[used] = score;
+        used += 1;
+    }
+    var baseline_batches: usize = 0;
+    var baseline: [512]u32 = undefined;
+    for ([_]bool{ false, true }) |reuse_history| {
+        var state: State = .{};
+        var collector: FastTopK = .{ .alloc = a, .k = 512, .tie_rank = .{ .ptr = &state, .rank = State.rank, .resolve = State.resolve, .resolve_many = State.many } };
+        defer collector.deinit();
+        for (0..4096) |doc| {
+            if (!reuse_history and doc % 64 == 0) collector.recent_scores = @splat(null);
+            try collector.collect(@intCast(doc), scores[doc % scores.len]);
+        }
+        const hits = try collector.finish();
+        defer a.free(hits);
+        if (reuse_history) {
+            std.debug.print("cross-tile tie ranks: pairwise_batches={d} history_batches={d}\n", .{ baseline_batches, state.batches });
+            try std.testing.expect(state.batches * 2 < baseline_batches);
+            for (hits, baseline) |hit, expected| try std.testing.expectEqual(expected, hit.doc_id);
+        } else {
+            baseline_batches = state.batches;
+            for (hits, &baseline) |hit, *expected| expected.* = hit.doc_id;
+        }
+        for (hits[1..], hits[0 .. hits.len - 1]) |right, left| {
+            try std.testing.expect(left.score >= right.score);
+            if (left.score == right.score) try std.testing.expect(left.doc_id > right.doc_id);
+        }
+        try std.testing.expectEqual(@as(usize, 0), state.scalar_calls);
+    }
 }

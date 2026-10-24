@@ -2507,11 +2507,19 @@ pub const IndexWriter = struct {
     /// readers may be reused unchanged, but global DF caches and field totals
     /// must never alias another publication (or another selected file set).
     pub fn sealImmutableCollection(self: *IndexWriter, documents: u32, fields: []const CollectionField) !void {
+        return self.sealCollection(documents, fields, false);
+    }
+    /// Authenticated lake deltas supply exact live statistics independently of
+    /// physical reader metadata. Tombstones are installed before sealing.
+    pub fn sealVerifiedMaskedCollection(self: *IndexWriter, documents: u32, fields: []const CollectionField) !void {
+        return self.sealCollection(documents, fields, true);
+    }
+    fn sealCollection(self: *IndexWriter, documents: u32, fields: []const CollectionField, masked: bool) !void {
         self.lockMutex();
         defer self.mu.unlock();
         const old = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
         var visible: u64 = 0;
-        for (old.segments) |segment| visible += segment.reader.doc_count;
+        for (old.segments) |segment| visible += if (masked) segment.liveDocCount() else segment.reader.doc_count;
         if (documents < visible) return error.InvalidSegment;
         var collection: std.StringHashMapUnmanaged(u64) = .empty;
         errdefer {
@@ -2532,7 +2540,10 @@ pub const IndexWriter = struct {
             entry.value_ptr.* = field.total_length;
         }
         var lengths = old.global_total_field_len.iterator();
-        while (lengths.next()) |field| if ((collection.get(field.key_ptr.*) orelse return error.InvalidSegment) < field.value_ptr.*) return error.InvalidSegment;
+        while (lengths.next()) |field| {
+            const length = collection.get(field.key_ptr.*) orelse return error.InvalidSegment;
+            if (!masked and length < field.value_ptr.*) return error.InvalidSegment;
+        }
         const segments = try self.alloc.dupe(SegmentEntry, old.segments);
         errdefer self.alloc.free(segments);
         var totals = try cloneGlobalFieldLens(self.alloc, old.global_total_field_len);

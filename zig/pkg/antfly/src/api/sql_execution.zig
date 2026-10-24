@@ -26,6 +26,10 @@ const db_types = @import("antfly_local_sources").storage_db_types;
 const setting_catalog = @import("antfly_local_sources").sql_setting_catalog;
 const read_fence = @import("antfly_local_sources").sql_read_fence;
 
+test {
+    _ = @import("sql_memory_owner.zig");
+}
+
 const SettingOverlaySource = enum { durable_session, connection };
 
 fn attachedSettingOverlay(source: SettingOverlaySource, caller: []const setting_catalog.OverlayEntry, durable: []const setting_catalog.OverlayEntry) ![]const setting_catalog.OverlayEntry {
@@ -555,7 +559,7 @@ pub const Adapter = struct {
                     active_backend.coordinated_index_reads = self.range_reads != null and staged.tables.len == 0;
                     active_backend.dynamic_statement_read_set = self.dynamic_snapshot != null;
                 }
-                var output = (@import("antfly_local_sources").sql_runtime.execute(alloc, active_backend, compiled, parameters, limits) catch |zig017_err| {
+                var output = (@import("antfly_local_sources").sql_runtime.executeOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), active_backend, compiled, parameters, limits) catch |zig017_err| {
                     zig017_return_error = zig017_err;
                     return zig017_err;
                 });
@@ -610,7 +614,7 @@ pub const Adapter = struct {
         statement_backend.decision_provider = self.decision_provider;
         if (compiled.uses_current_setting and statement_backend.setting_capture == null) statement_backend.setting_capture = self.settingCapture();
         if (self.read_delivery) |delivery| if (self.session_id == null and compiled.statement == .select) {
-            if (try @import("antfly_local_sources").sql_read_stream.Stream.open(alloc, statement_backend, compiled, parameters, limits)) |stream| {
+            if (try @import("antfly_local_sources").sql_read_stream.Stream.openOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), statement_backend, compiled, parameters, limits)) |stream| {
                 defer stream.close();
                 var delivered = try delivery.deliver(delivery.ptr, alloc, stream);
                 errdefer delivered.deinit();
@@ -618,7 +622,7 @@ pub const Adapter = struct {
                 return delivered;
             }
         };
-        var result = @import("antfly_local_sources").sql_runtime.execute(alloc, statement_backend, compiled, parameters, limits) catch |zig017_err| {
+        var result = @import("antfly_local_sources").sql_runtime.executeOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), statement_backend, compiled, parameters, limits) catch |zig017_err| {
             zig017_return_error = zig017_err;
             return zig017_err;
         };

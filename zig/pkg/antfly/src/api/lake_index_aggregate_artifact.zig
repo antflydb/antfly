@@ -51,6 +51,59 @@ pub fn readArtifactFor(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancell
     if (cached) |cache| return cache.cache.readImmutableAlloc(a, cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.ArtifactTooLarge, try stores.sha256DigestFromChecksum(ref.checksum), context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
     return @TypeOf(loader).load(&loader, a);
 }
+/// Authenticate a page range independently of its containing immutable object.
+/// Range cache identities bind the pack, offset, length and page digest. A cold
+/// seek reads only that page; it never downloads the whole navigation pack.
+pub fn readPageRange(a: A, store: stores.ArtifactStore, ref: ChunkRef, offset: u64, length: usize, digest: [32]u8, cancellation: Cancellation, cached: ?CachedRead) ![]u8 {
+    return readPageRangeFor(a, store, ref, offset, length, digest, cancellation, cached, if (cached) |cache| cache.context else .{});
+}
+pub fn readPageRangeFor(a: A, store: stores.ArtifactStore, ref: ChunkRef, offset: u64, length: usize, digest: [32]u8, cancellation: Cancellation, cached: ?CachedRead, context: ReadContext) ![]u8 {
+    try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
+    if (offset > ref.byte_len or length > ref.byte_len - offset or length > @import("../serverless/graph_segment/page_tree.zig").max_page_bytes) return error.InvalidGraphPage;
+    if (offset == 0 and length == ref.byte_len) {
+        const object_digest = try stores.sha256DigestFromChecksum(ref.checksum);
+        if (!std.mem.eql(u8, &object_digest, &digest)) return error.ArtifactIntegrityMismatch;
+        return readArtifactFor(a, store, ref, cancellation, cached, context);
+    }
+    const Loader = struct {
+        store: stores.ArtifactStore,
+        ref: ChunkRef,
+        offset: u64,
+        length: usize,
+        digest: [32]u8,
+        token: Cancellation,
+        context: ReadContext,
+        fn load(raw: *anyopaque, alloc: A) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = try self.store.getRangeAllocFor(alloc, self.ref.artifact_id, self.offset, self.length, self.token, self.context);
+            errdefer alloc.free(bytes);
+            if (bytes.len != self.length) return error.ArtifactIntegrityMismatch;
+            try stores.validatePayloadSha256For(bytes, &std.fmt.bytesToHex(&self.digest, .lower), self.token, self.context);
+            return bytes;
+        }
+    };
+    var loader: Loader = .{ .store = store, .ref = ref, .offset = offset, .length = length, .digest = digest, .token = cancellation, .context = context };
+    try cancellation.check();
+    if (cached) |cache| {
+        var identity: [256]u8 = undefined;
+        const key = try std.fmt.bufPrint(&identity, "{s}:page:{x}:{x}", .{ ref.artifact_id, offset, length });
+        return cache.cache.readImmutableAlloc(a, cache.scope, key, length, digest, context, .{ .ptr = &loader, .load = Loader.load });
+    }
+    return Loader.load(&loader, a);
+}
+/// Explicit synchronous publication read. Verified transport completes and CPU
+/// admission resumes before callers parse metadata or advance reducers.
+/// Serving and asynchronous readers never borrow this serial capability.
+pub fn readPublicationArtifact(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellation: Cancellation) ![]u8 {
+    var phase = try store.beginIo(1);
+    defer phase.abort();
+    var backend = store;
+    backend.io_phase = null;
+    const bytes = readArtifact(a, backend, ref, cancellation, null) catch |err| return phase.failed(err);
+    errdefer a.free(bytes);
+    try phase.finish();
+    return bytes;
+}
 /// Borrow a verified bounded block until the caller has copied/decoded its
 /// requested range. Current authority is checked even when payloads are warm.
 pub fn readArtifactLease(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellation: Cancellation, cached: ?CachedRead) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
@@ -144,11 +197,12 @@ const Root = struct {
     bounds: ?group_keys.Bounds = null,
     key_index: ?ordered_keys.Index = null,
     state_tree: ?state_tree.Index = null,
+    row_state: ?RowState = null,
     cohort: ?ChunkRef = null,
     state_recipe: ?recipes.Recipe = null,
     state_slot: ?u16 = null,
     pub fn jsonStringify(self: Root, writer: anytype) !void {
-        if (self.state_tree != null) return writer.write(.{ .format = self.format, .name = self.name, .recipe = self.recipe, .groups = self.groups, .state_tree = self.state_tree, .state_recipe = self.state_recipe, .state_slot = self.state_slot });
+        if (self.state_tree != null) return writer.write(.{ .format = self.format, .name = self.name, .recipe = self.recipe, .groups = self.groups, .state_tree = self.state_tree, .row_state = self.row_state, .state_recipe = self.state_recipe, .state_slot = self.state_slot });
         if (self.key_index != null) return writer.write(.{ .format = self.format, .name = self.name, .recipe = self.recipe, .groups = self.groups, .blocks = self.blocks, .partitions = self.partitions, .radix_depth = self.radix_depth, .bounds = self.bounds, .key_index = self.key_index, .cohort = self.cohort, .state_recipe = self.state_recipe, .state_slot = self.state_slot });
         if (self.bounds != null) return writer.write(.{ .format = self.format, .name = self.name, .recipe = self.recipe, .groups = self.groups, .blocks = self.blocks, .partitions = self.partitions, .radix_depth = self.radix_depth, .bounds = self.bounds, .cohort = self.cohort, .state_recipe = self.state_recipe, .state_slot = self.state_slot });
         return writer.write(.{ .format = self.format, .name = self.name, .recipe = self.recipe, .groups = self.groups, .blocks = self.blocks, .partitions = self.partitions, .radix_depth = self.radix_depth, .cohort = self.cohort, .state_recipe = self.state_recipe, .state_slot = self.state_slot });
@@ -279,7 +333,15 @@ pub fn loadRecipe(a: A, store: stores.ArtifactStore, artifact: Ref, cancellation
 
 /// GC traverses authenticated root references without reading every leaf.
 /// Unknown formats fail closed rather than guessing that a root has no edges.
-pub const LeafReferences = struct { blocks: []const ChunkRef, key_index: ?ordered_keys.Index, state_tree: ?state_tree.Index };
+pub const RowState = struct {
+    rows: ?state_tree.tree.Ref = null,
+    reverse: ?state_tree.tree.Ref = null,
+    /// Ordered (group, reducer slot, typed value, row ordinal) multiset.
+    /// Version distinguishes an indexed all-NULL cohort from legacy state.
+    extrema_version: u8 = 0,
+    extrema: ?state_tree.tree.Ref = null,
+};
+pub const LeafReferences = struct { blocks: []const ChunkRef, key_index: ?ordered_keys.Index, state_tree: ?state_tree.Index, row_state: ?RowState = null };
 pub fn leafReferences(a: A, store: stores.ArtifactStore, artifact: Ref, cancellation: Cancellation) !LeafReferences {
     var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
     defer scratch.deinit();
@@ -289,7 +351,7 @@ pub fn leafReferences(a: A, store: stores.ArtifactStore, artifact: Ref, cancella
     // Embedded navigation has no external GC edge. Do not return its borrowed
     // page bytes after releasing the temporary metadata owner.
     const external_index = if (root.key_index) |index| (if (index.inline_page.len == 0) index else null) else null;
-    return .{ .blocks = refs, .key_index = external_index, .state_tree = root.state_tree };
+    return .{ .blocks = refs, .key_index = external_index, .state_tree = root.state_tree, .row_state = root.row_state };
 }
 pub fn descendantsAlloc(a: A, store: stores.ArtifactStore, artifact: Ref, cancellation: Cancellation) ![]const ChunkRef {
     return (try leafReferences(a, store, artifact, cancellation)).blocks;
@@ -364,7 +426,7 @@ pub fn publishKeyed(a: A, out: A, store: *stores.ArtifactStore, names: []const [
         return publishRadixStream(a, out, store, names, &input, recipe, &pool, token, 0, null);
     }
     var access: @import("lake_index_native_directory.zig").Access = undefined;
-    access.init(store.*, scope.domain, token, null);
+    access.initPublication(store.*, scope.domain, token);
     var builder: state_tree.tree.SortedBuilder = .{ .alloc = a, .store = access.backing() };
     defer builder.deinit();
     while (true) {
@@ -380,8 +442,9 @@ const TreeControl = struct {
     recipe: recipes.Recipe,
     names: []const []const u8,
     index: state_tree.Index,
+    row_state: ?RowState = null,
     fn root(self: @This(), name: []const u8) !Root {
-        for (self.names, 0..) |candidate, slot| if (std.mem.eql(u8, name, candidate)) return .{ .format = self.format, .name = candidate, .recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] }, .groups = self.index.count(), .state_recipe = self.recipe, .state_slot = @intCast(slot), .state_tree = self.index };
+        for (self.names, 0..) |candidate, slot| if (std.mem.eql(u8, name, candidate)) return .{ .format = self.format, .name = candidate, .recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] }, .groups = self.index.count(), .state_recipe = self.recipe, .state_slot = @intCast(slot), .state_tree = self.index, .row_state = self.row_state };
         return error.InvalidNativeAggregateArtifact;
     }
 };
@@ -389,8 +452,15 @@ fn loadTreeControl(a: A, store: stores.ArtifactStore, ref: Ref, token: Cancellat
     return loadTreeControlFor(a, store, ref, token, cached, if (cached) |cache| cache.context else .{});
 }
 fn loadTreeControlFor(a: A, store: stores.ArtifactStore, ref: Ref, token: Cancellation, cached: ?CachedRead, context: ReadContext) !TreeControl {
+    return loadTreeControlInnerFor(a, store, ref, token, cached, false, context);
+}
+fn loadTreeControlInner(a: A, store: stores.ArtifactStore, ref: Ref, token: Cancellation, cached: ?CachedRead, publication: bool) !TreeControl {
+    return loadTreeControlInnerFor(a, store, ref, token, cached, publication, if (cached) |cache| cache.context else .{});
+}
+fn loadTreeControlInnerFor(a: A, store: stores.ArtifactStore, ref: Ref, token: Cancellation, cached: ?CachedRead, publication: bool, context: ReadContext) !TreeControl {
     if (ref.kind != .algebraic_segment or !isTree(ref.metadata_version) or ref.byte_len > max_root_bytes) return error.InvalidNativeAggregateArtifact;
-    const bytes = try readArtifactFor(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cached, context);
+    const chunk: ChunkRef = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
+    const bytes = if (publication) try readPublicationArtifact(a, store, chunk, token) else try readArtifactFor(a, store, chunk, token, cached, context);
     defer a.free(bytes);
     const value = try std.json.parseFromSliceLeaky(TreeControl, a, bytes, .{ .allocate = .alloc_always });
     if (!std.mem.eql(u8, value.format, if (ref.metadata_version == 8) "native-sql-aggregate-v8" else "native-sql-aggregate-v7") or value.names.len == 0 or value.names.len > 256 or value.names.len != value.recipe.inputs.len) return error.InvalidNativeAggregateArtifact;
@@ -403,9 +473,19 @@ fn loadTreeControlFor(a: A, store: stores.ArtifactStore, ref: Ref, token: Cancel
     }
     return value;
 }
+pub const RowSeed = struct { index: state_tree.Index, rows: RowState };
+pub fn rowSeed(a: A, store: stores.ArtifactStore, ref: Ref, recipe: recipes.Recipe, token: Cancellation) !?RowSeed {
+    if (ref.metadata_version != 8) return null;
+    const control = try loadTreeControlInner(a, store, ref, token, null, true);
+    if (!control.recipe.eql(recipe) or control.index.layout != 2 or control.row_state == null) return null;
+    return .{ .index = control.index, .rows = control.row_state.? };
+}
 pub fn publishTree(a: A, out: A, store: *stores.ArtifactStore, names: []const []const u8, recipe: recipes.Recipe, index: state_tree.Index, token: Cancellation) ![]Ref {
+    return publishTreeWithRows(a, out, store, names, recipe, index, null, token);
+}
+pub fn publishTreeWithRows(a: A, out: A, store: *stores.ArtifactStore, names: []const []const u8, recipe: recipes.Recipe, index: state_tree.Index, rows: ?RowState, token: Cancellation) ![]Ref {
     if (names.len != recipe.inputs.len or names.len == 0 or !state_tree.eligible(recipe) or (index.layout != 1 and index.layout != 2)) return error.InvalidNativeAggregateArtifact;
-    const bytes = try std.json.Stringify.valueAlloc(a, TreeControl{ .format = if (index.layout == 2) "native-sql-aggregate-v8" else "native-sql-aggregate-v7", .recipe = recipe, .names = names, .index = index }, .{});
+    const bytes = try std.json.Stringify.valueAlloc(a, TreeControl{ .format = if (index.layout == 2) "native-sql-aggregate-v8" else "native-sql-aggregate-v7", .recipe = recipe, .names = names, .index = index, .row_state = rows }, .{});
     defer a.free(bytes);
     if (bytes.len > max_root_bytes) return error.NativeAggregateArtifactTooLarge;
     var saved = try store.putWithCancellation(bytes, token);
@@ -629,9 +709,17 @@ fn validateRoot(artifact: Ref, root: Root) !void {
         const scope = (try stores.uploadScopeFromArtifactId(artifact.artifact_id)) orelse return error.InvalidNativeAggregateArtifact;
         if (!std.mem.eql(u8, &index.domain, &scope.domain)) return error.InvalidNativeAggregateArtifact;
         if (index.page) |page| try page.validate();
+        if (root.row_state) |rows| {
+            if (artifact.metadata_version != 8) return error.InvalidNativeAggregateArtifact;
+            if (rows.rows) |page| try page.validate();
+            if (rows.reverse) |page| try page.validate();
+            if (rows.extrema_version > 1 or (rows.extrema_version == 0 and rows.extrema != null)) return error.InvalidNativeAggregateArtifact;
+            if (rows.extrema) |page| try page.validate();
+            if ((if (rows.rows) |page| page.records else 0) != (if (rows.reverse) |page| page.records else 0)) return error.InvalidNativeAggregateArtifact;
+        }
         return;
     }
-    if (root.state_tree != null) return error.InvalidNativeAggregateArtifact;
+    if (root.state_tree != null or root.row_state != null) return error.InvalidNativeAggregateArtifact;
     if (!isPartitioned(artifact.metadata_version) and root.partitions.len != 0) return error.InvalidNativeAggregateArtifact;
     if (isPartitioned(artifact.metadata_version) and (root.blocks.len != 0 or root.partitions.len > 64 or root.radix_depth > max_partition_depth)) return error.InvalidNativeAggregateArtifact;
     if ((artifact.metadata_version == 5) != (root.cohort != null)) return error.InvalidNativeAggregateArtifact;
