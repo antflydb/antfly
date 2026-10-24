@@ -3552,7 +3552,7 @@ const Parser = struct {
         if (self.ddlWord("COMMENT")) {
             try self.expectKeyword(.on);
             const column_comment = self.keyword(.column);
-            if (!column_comment and !self.keyword(.table)) return self.fail(error.UnsupportedSqlShape, "this comment target requires catalog annotation support");
+            const kind: @FieldType(ast.CatalogDdl, "kind") = if (column_comment or self.keyword(.table)) .table else if (self.keyword(.schema)) .namespace else if (self.keyword(.database)) .database else return self.fail(error.UnsupportedSqlShape, "this comment target requires catalog annotation support");
             var comment_column: ?[]const u8 = null;
             const target = if (column_comment) column_target: {
                 var parts: [4][]const u8 = undefined;
@@ -3567,11 +3567,13 @@ const Parser = struct {
                 comment_column = parts[count - 1];
                 break :column_target ast.Name{ .database = if (count == 4) parts[0] else null, .namespace = if (count >= 3) parts[count - 3] else null, .table = parts[count - 2] };
             } else try self.name();
+            if (kind != .table and (target.namespace != null or target.database != null))
+                return self.fail(error.InvalidSqlSyntax, "schema and database comments require a single identifier");
             try self.expectKeyword(.is);
             if (!self.peek(.string) and !(self.pos < self.tokens.len and self.tokens[self.pos].isKeyword(.null)))
                 return self.fail(error.InvalidSqlSyntax, "COMMENT requires a string literal or NULL");
             const text = try self.value();
-            return .{ .catalog_ddl = .{ .kind = .table, .action = .comment, .name = target, .comment_value = if (text == .string) text.string else null, .comment_column = comment_column } };
+            return .{ .catalog_ddl = .{ .kind = kind, .action = .comment, .name = target, .comment_value = if (text == .string) text.string else null, .comment_column = comment_column } };
         }
         if (self.keyword(.create)) {
             if (self.keyword(.@"or")) {
@@ -4888,4 +4890,26 @@ test "SQL original FK NOT VALID retains independent historical validation intent
     defer compiled.deinit();
     try std.testing.expect(compiled.statement.catalog_ddl.schema_change.?.add_foreign_key.not_valid);
     try std.testing.expectEqualStrings("usage_records_user_id_fkey", compiled.statement.catalog_ddl.schema_change.?.add_foreign_key.name);
+}
+
+test "compiler SQL COMMENT resource binds schema database and single quoted identifiers" {
+    for ([_]struct { sql: []const u8, kind: @FieldType(ast.CatalogDdl, "kind"), name: []const u8 }{
+        .{ .sql = "COMMENT ON SCHEMA public IS 'public schema';", .kind = .namespace, .name = "public" },
+        .{ .sql = "COMMENT ON DATABASE appdb IS NULL", .kind = .database, .name = "appdb" },
+        .{ .sql = "COMMENT ON SCHEMA \"scope.name\" IS 'a ''quoted'' Ω'", .kind = .namespace, .name = "scope.name" },
+    }) |case| {
+        var compiled = try compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        const ddl = compiled.statement.catalog_ddl;
+        try std.testing.expectEqual(case.kind, ddl.kind);
+        try std.testing.expectEqual(.comment, ddl.action);
+        try std.testing.expectEqualStrings(case.name, ddl.name.table);
+        try std.testing.expect(ddl.name.database == null and ddl.name.namespace == null and ddl.comment_column == null);
+    }
+    for ([_][]const u8{
+        "COMMENT ON SCHEMA app.public IS 'x'",
+        "COMMENT ON DATABASE app.public IS 'x'",
+        "COMMENT ON SCHEMA public IS $1",
+        "COMMENT ON DATABASE appdb IS lower('x')",
+    }) |sql| try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, sql, .{}));
 }

@@ -125,87 +125,233 @@
       "timeout_seconds": 180
     },
     "sql-qualified-column-comment-native-debug": {
-      "command": ["zig", "build", "antfly-api-sql-column-comment-lifecycle-test", "-Doptimize=Debug", "-j1"],
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-column-comment-lifecycle-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
       "cwd": "zig",
       "timeout_seconds": 1800
     },
     "sql-qualified-column-comment-admission-debug": {
-      "command": ["zig", "build", "antfly-metadata-sql-presentation-test", "-Doptimize=Debug", "-j1"],
+      "command": [
+        "zig",
+        "build",
+        "antfly-metadata-sql-presentation-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
       "cwd": "zig",
       "timeout_seconds": 1800
     },
     "sql-qualified-column-comment-parser-debug": {
-      "command": ["zig", "build", "sql-test", "-Dtest-filter=compiler SQL COMMENT", "-Doptimize=Debug", "-j1"],
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Dtest-filter=compiler SQL COMMENT",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
       "cwd": "zig",
       "timeout_seconds": 1800
     },
     "sql-qualified-column-comment-identity-debug": {
-      "command": ["zig", "test", "pkg/antfly-embedded/src/system_catalog/column_identities.zig", "-O", "Debug"],
+      "command": [
+        "zig",
+        "test",
+        "pkg/antfly-embedded/src/system_catalog/column_identities.zig",
+        "-O",
+        "Debug"
+      ],
       "cwd": "zig",
       "timeout_seconds": 180
     },
     "sql-qualified-column-comment-postgres": {
-      "command": ["uv", "run", "--offline", "--no-project", "--with", "psycopg[binary]==3.3.6", "python", "scripts/generate_sql_column_comment_reference.py", "--check", "zig/pkg/antfly-embedded/src/sql/fixtures/sql_column_comment_reference.json"],
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_column_comment_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_column_comment_reference.json"
+      ],
       "cwd": ".",
       "timeout_seconds": 180
     },
     "sql-qualified-sequence-native-debug": {
-      "command": ["zig", "build", "antfly-api-sql-sequence-lifecycle-test", "-Dtest-filter=mounted SQL original sequence declarations", "-Doptimize=Debug", "-j1"],
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-sequence-lifecycle-test",
+        "-Dtest-filter=mounted SQL original sequence declarations",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
       "cwd": "zig",
       "timeout_seconds": 1800
     },
     "sql-qualified-sequence-boundary-debug": {
-      "command": ["zig", "build", "system-catalog-sequence-test", "antfly-metadata-sequence-counter-test", "antfly-api-sql-sequence-admission-test", "antfly-system-catalog-sequence-seed-test", "-Doptimize=Debug", "-j1"],
+      "command": [
+        "zig",
+        "build",
+        "system-catalog-sequence-test",
+        "antfly-metadata-sequence-counter-test",
+        "antfly-api-sql-sequence-admission-test",
+        "antfly-system-catalog-sequence-seed-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
       "cwd": "zig",
       "timeout_seconds": 1800
     },
     "sql-qualified-sequence-postgres": {
-      "command": ["uv", "run", "--offline", "--no-project", "--with", "psycopg[binary]==3.3.6", "python", "scripts/generate_sql_sequence_declaration_reference.py", "--check", "zig/pkg/antfly-embedded/src/sql/fixtures/sql_sequence_declaration_reference.json"],
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_sequence_declaration_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_sequence_declaration_reference.json"
+      ],
       "cwd": ".",
       "timeout_seconds": 180
     },
     "sql-qualified-table-comment-native-debug": {
-      "command": ["zig", "build", "antfly-api-sql-table-comment-lifecycle-test", "-Dtest-filter=mounted SQL original table comment", "-Doptimize=Debug", "-j1"],
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-table-comment-lifecycle-test",
+        "-Dtest-filter=mounted SQL original table comment",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
       "cwd": "zig",
       "timeout_seconds": 1800
     },
     "sql-qualified-table-comment-boundary-debug": {
-      "command": ["zig", "build", "sql-test", "antfly-metadata-sql-presentation-test", "-Dtest-filter=compiler SQL COMMENT", "-Doptimize=Debug", "-j1"],
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "antfly-metadata-sql-presentation-test",
+        "-Dtest-filter=compiler SQL COMMENT",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
       "cwd": "zig",
       "timeout_seconds": 1800
     },
     "sql-qualified-table-comment-postgres": {
-      "command": ["uv", "run", "--offline", "--no-project", "--with", "psycopg[binary]==3.3.6", "python", "scripts/generate_sql_table_comment_reference.py", "--check", "zig/pkg/antfly-embedded/src/sql/fixtures/sql_table_comment_reference.json"],
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_table_comment_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_table_comment_reference.json"
+      ],
       "cwd": ".",
       "timeout_seconds": 180
     },
     "sql-qualified-prepared-source-native-debug": {
-      "command": ["zig", "build", "antfly-api-sql-prepared-source-lifecycle-test", "-Dtest-filter=mounted SQL original prepared CTE sources", "-Doptimize=Debug", "-j1"],
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-prepared-source-lifecycle-test",
+        "-Dtest-filter=mounted SQL original prepared CTE sources",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
       "cwd": "zig",
       "timeout_seconds": 1800
     },
     "sql-qualified-prepared-source-postgres": {
-      "command": ["uv", "run", "--offline", "--no-project", "--with", "psycopg[binary]==3.3.6", "python", "scripts/generate_sql_prepared_source_reference.py", "--check", "zig/pkg/antfly-embedded/src/sql/fixtures/sql_prepared_source_reference.json"],
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_prepared_source_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_prepared_source_reference.json"
+      ],
       "cwd": ".",
       "timeout_seconds": 180
     },
     "sql-qualified-named-conflict-native-debug": {
-      "command": ["zig", "build", "antfly-api-sql-named-conflict-lifecycle-test", "-Dtest-filter=mounted SQL original named arbiters", "-Doptimize=Debug", "-j1"],
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-named-conflict-lifecycle-test",
+        "-Dtest-filter=mounted SQL original named arbiters",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
       "cwd": "zig",
       "timeout_seconds": 1800
     },
     "sql-qualified-named-conflict-postgres": {
-      "command": ["uv", "run", "--offline", "--no-project", "--with", "psycopg[binary]==3.3.6", "python", "scripts/generate_sql_named_conflict_reference.py", "--check", "zig/pkg/antfly-embedded/src/sql/fixtures/sql_named_conflict_reference.json"],
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_named_conflict_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_named_conflict_reference.json"
+      ],
       "cwd": ".",
       "timeout_seconds": 180
     },
     "sql-qualified-role-defaults-native-debug": {
-      "command": ["zig", "build", "sql-test", "pgwire-test", "antfly-api-sql-role-defaults-test", "antfly-metadata-sql-role-defaults-test", "-Dtest-filter=role default", "-Doptimize=Debug", "-j1"],
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "pgwire-test",
+        "antfly-api-sql-role-defaults-test",
+        "antfly-metadata-sql-role-defaults-test",
+        "-Dtest-filter=role default",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
       "cwd": "zig",
       "timeout_seconds": 1800
     },
     "sql-qualified-role-defaults-postgres": {
-      "command": ["uv", "run", "--offline", "--no-project", "--with", "psycopg[binary]==3.3.6", "python", "scripts/generate_sql_role_defaults_reference.py", "--check", "zig/pkg/antfly-embedded/src/sql/fixtures/sql_role_defaults_reference.json"],
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_role_defaults_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_role_defaults_reference.json"
+      ],
       "cwd": ".",
       "timeout_seconds": 180
     },
@@ -2527,6 +2673,56 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-qualified-resource-comment-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-resource-comment-lifecycle-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-resource-comment-boundary-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-metadata-sql-presentation-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-resource-comment-parser-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Dtest-filter=compiler SQL COMMENT",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-resource-comment-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_resource_comment_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_resource_comment_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -4246,13 +4442,57 @@
     },
     {
       "id": "sql-0146",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original schema/database COMMENT runs through authenticated public SQL and the existing durable catalog authority. PostgreSQL 18 and mounted native owners agree on COMMENT tags, quoted/Unicode text, NULL/empty removal, read-only denial and missing-object outcomes. Comments retain stable resource identities through rename and disappear on drop/recreate; native catalog, session and data owners independently reopen with exact annotations and unchanged row values, versions and digests. The transaction updates the authoritative record, covering parent row and exact receipt in three steady-state catalog-projection writes, without settings inventories or schema/index publication. Every-write faults, snapshots, stale retries and mixed-version learner/batch admission are checked. This qualifies these two original COMMENT targets, not other annotations, transactional DDL or arbitrary multi-node failure.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original resource comments preserve identities authorization and cold owners",
+          "gate": "sql-qualified-resource-comment-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "system catalog resource comments use three atomic writes retain receipts and recover cold snapshots",
+          "gate": "sql-qualified-resource-comment-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "compiler SQL COMMENT resource binds schema database and single quoted identifiers",
+          "gate": "sql-qualified-resource-comment-parser-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original resource comments preserve identities authorization and cold owners",
+          "gate": "sql-qualified-resource-comment-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0147",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original schema/database COMMENT runs through authenticated public SQL and the existing durable catalog authority. PostgreSQL 18 and mounted native owners agree on COMMENT tags, quoted/Unicode text, NULL/empty removal, read-only denial and missing-object outcomes. Comments retain stable resource identities through rename and disappear on drop/recreate; native catalog, session and data owners independently reopen with exact annotations and unchanged row values, versions and digests. The transaction updates the authoritative record, covering parent row and exact receipt in three steady-state catalog-projection writes, without settings inventories or schema/index publication. Every-write faults, snapshots, stale retries and mixed-version learner/batch admission are checked. This qualifies these two original COMMENT targets, not other annotations, transactional DDL or arbitrary multi-node failure.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original resource comments preserve identities authorization and cold owners",
+          "gate": "sql-qualified-resource-comment-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "system catalog resource comments use three atomic writes retain receipts and recover cold snapshots",
+          "gate": "sql-qualified-resource-comment-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "compiler SQL COMMENT resource binds schema database and single quoted identifiers",
+          "gate": "sql-qualified-resource-comment-parser-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original resource comments preserve identities authorization and cold owners",
+          "gate": "sql-qualified-resource-comment-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0148",
@@ -7341,9 +7581,21 @@
       "status": "implemented",
       "reason": "The unchanged original sequence DDL matches PostgreSQL through authenticated public SQL and real metadata Raft. Fifteen witnesses cover absent names, allocated cached sequences and table collisions, complete definitions/counters/ownership, exact command tags and SQLSTATEs. Independent cold metadata/session/data reopening preserves sequence IDs, source primary identities, versions and digests. Native setup advances actual allocator state; this does not claim public nextval, session caches, identity columns or multi-node failover.",
       "evidence": [
-        {"path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig", "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows", "gate": "sql-qualified-sequence-native-debug"},
-        {"path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig", "test": "sequence catalog native declarations share atomic metadata standalone raft cold and snapshot owners", "gate": "sql-qualified-sequence-boundary-debug"},
-        {"path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig", "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows", "gate": "sql-qualified-sequence-postgres"}
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows",
+          "gate": "sql-qualified-sequence-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "sequence catalog native declarations share atomic metadata standalone raft cold and snapshot owners",
+          "gate": "sql-qualified-sequence-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows",
+          "gate": "sql-qualified-sequence-postgres"
+        }
       ]
     },
     {
@@ -7351,9 +7603,21 @@
       "status": "implemented",
       "reason": "The unchanged qualified CREATE SEQUENCE binds OWNED BY to the existing table and stable column identity, sharing the native definition/counter transaction. PostgreSQL definition, call state and ownership match after authenticated SQL and independent cold reopening. Source primary identities, versions and digests remain unchanged; no public nextval or identity-column claim is made.",
       "evidence": [
-        {"path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig", "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows", "gate": "sql-qualified-sequence-native-debug"},
-        {"path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig", "test": "sequence catalog native declarations share atomic metadata standalone raft cold and snapshot owners", "gate": "sql-qualified-sequence-boundary-debug"},
-        {"path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig", "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows", "gate": "sql-qualified-sequence-postgres"}
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows",
+          "gate": "sql-qualified-sequence-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "sequence catalog native declarations share atomic metadata standalone raft cold and snapshot owners",
+          "gate": "sql-qualified-sequence-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows",
+          "gate": "sql-qualified-sequence-postgres"
+        }
       ]
     },
     {
@@ -7361,9 +7625,21 @@
       "status": "implemented",
       "reason": "The original conditional CREATE matches PostgreSQL on absent names, an existing allocated CACHE 4 owned sequence and an existing table. No-op branches retain the original identity, full definition and allocated high-water/called state; the requested CACHE 32 is not applied to an existing sequence. Authenticated native SQL and independent cold owners preserve exact source and collision rows.",
       "evidence": [
-        {"path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig", "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows", "gate": "sql-qualified-sequence-native-debug"},
-        {"path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig", "test": "sequence catalog native declarations share atomic metadata standalone raft cold and snapshot owners", "gate": "sql-qualified-sequence-boundary-debug"},
-        {"path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig", "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows", "gate": "sql-qualified-sequence-postgres"}
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows",
+          "gate": "sql-qualified-sequence-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "sequence catalog native declarations share atomic metadata standalone raft cold and snapshot owners",
+          "gate": "sql-qualified-sequence-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows",
+          "gate": "sql-qualified-sequence-postgres"
+        }
       ]
     },
     {
@@ -7371,9 +7647,21 @@
       "status": "implemented",
       "reason": "The original RESTART 1000 runs against a genuinely allocated cached sequence through authenticated native SQL. It retains the immutable object ID, declared START, CACHE and stable ownership while atomically replacing the generation and resetting the running counter/call flag. Complete PostgreSQL postimages and unrelated primary identities, versions and digests survive independent cold reopening.",
       "evidence": [
-        {"path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig", "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows", "gate": "sql-qualified-sequence-native-debug"},
-        {"path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig", "test": "sequence catalog native declarations share atomic metadata standalone raft cold and snapshot owners", "gate": "sql-qualified-sequence-boundary-debug"},
-        {"path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig", "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows", "gate": "sql-qualified-sequence-postgres"}
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows",
+          "gate": "sql-qualified-sequence-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "sequence catalog native declarations share atomic metadata standalone raft cold and snapshot owners",
+          "gate": "sql-qualified-sequence-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows",
+          "gate": "sql-qualified-sequence-postgres"
+        }
       ]
     },
     {
@@ -7381,9 +7669,21 @@
       "status": "implemented",
       "reason": "The original conditional ALTER narrows the genuinely allocated sequence to integer and removes ownership through the existing metadata transaction. PostgreSQL type/bounds/START/CACHE/high-water/call-state postimages match without resetting allocation or changing the object ID. Authenticated native SQL and independent cold metadata/data/session owners retain exact unrelated primary rows.",
       "evidence": [
-        {"path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig", "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows", "gate": "sql-qualified-sequence-native-debug"},
-        {"path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig", "test": "sequence catalog native declarations share atomic metadata standalone raft cold and snapshot owners", "gate": "sql-qualified-sequence-boundary-debug"},
-        {"path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig", "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows", "gate": "sql-qualified-sequence-postgres"}
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows",
+          "gate": "sql-qualified-sequence-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "sequence catalog native declarations share atomic metadata standalone raft cold and snapshot owners",
+          "gate": "sql-qualified-sequence-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows",
+          "gate": "sql-qualified-sequence-postgres"
+        }
       ]
     },
     {
@@ -7391,9 +7691,21 @@
       "status": "implemented",
       "reason": "The original DROP matches PostgreSQL for an allocated owned sequence, absent name and table collision, including exact 42P01/42809 diagnostics. Native guarded metadata retirement removes the definition, counter and bounded outcomes atomically without changing source/collision primary identities, versions or digests. Independently reopened metadata/session/data owners retain the complete postimage.",
       "evidence": [
-        {"path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig", "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows", "gate": "sql-qualified-sequence-native-debug"},
-        {"path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig", "test": "sequence catalog native declarations share atomic metadata standalone raft cold and snapshot owners", "gate": "sql-qualified-sequence-boundary-debug"},
-        {"path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig", "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows", "gate": "sql-qualified-sequence-postgres"}
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows",
+          "gate": "sql-qualified-sequence-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "sequence catalog native declarations share atomic metadata standalone raft cold and snapshot owners",
+          "gate": "sql-qualified-sequence-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows",
+          "gate": "sql-qualified-sequence-postgres"
+        }
       ]
     },
     {
@@ -7401,9 +7713,21 @@
       "status": "implemented",
       "reason": "The original conditional DROP CASCADE matches PostgreSQL for an allocated owned sequence, absent name and wrong-kind table. Absent is a no-op; a table still raises 42809. Complete native retirement and unchanged source/collision primary identities, versions and digests survive independent cold owners. This does not qualify serial/default dependency cascades or distributed failover.",
       "evidence": [
-        {"path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig", "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows", "gate": "sql-qualified-sequence-native-debug"},
-        {"path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig", "test": "sequence catalog native declarations share atomic metadata standalone raft cold and snapshot owners", "gate": "sql-qualified-sequence-boundary-debug"},
-        {"path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig", "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows", "gate": "sql-qualified-sequence-postgres"}
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows",
+          "gate": "sql-qualified-sequence-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "sequence catalog native declarations share atomic metadata standalone raft cold and snapshot owners",
+          "gate": "sql-qualified-sequence-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows",
+          "gate": "sql-qualified-sequence-postgres"
+        }
       ]
     },
     {
@@ -7668,8 +7992,16 @@
       "status": "implemented",
       "reason": "Unchanged original ALTER ROLE SET runs through authenticated native SQL and the existing metadata Raft authority for a registered non-policy-sensitive string setting. PostgreSQL catalog postimages and future-login values agree; old connections retain their baseline. Native cancellation, invalid-value/database nonadmission, concurrent scope patches, lost committed reply, cold metadata/session-store reopening and principal-incarnation replacement pass. RLS-sensitive defaults and undeclared/custom control settings remain guarded, not qualified by this case.",
       "evidence": [
-        {"path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig", "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections", "gate": "sql-qualified-role-defaults-native-debug"},
-        {"path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig", "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections", "gate": "sql-qualified-role-defaults-postgres"}
+        {
+          "path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig",
+          "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections",
+          "gate": "sql-qualified-role-defaults-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig",
+          "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections",
+          "gate": "sql-qualified-role-defaults-postgres"
+        }
       ]
     },
     {
@@ -7677,8 +8009,16 @@
       "status": "implemented",
       "reason": "Unchanged database-scoped ALTER ROLE SET patches the registered non-policy-sensitive setting through metadata consensus without losing a concurrent global-scope patch. Exact PostgreSQL catalog postimages, scoped-over-global precedence, old/new login values and cold-owner recovery pass. Principal incarnation prevents name reuse from inheriting predecessor defaults. This does not activate policy-sensitive defaults.",
       "evidence": [
-        {"path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig", "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections", "gate": "sql-qualified-role-defaults-native-debug"},
-        {"path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig", "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections", "gate": "sql-qualified-role-defaults-postgres"}
+        {
+          "path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig",
+          "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections",
+          "gate": "sql-qualified-role-defaults-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig",
+          "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections",
+          "gate": "sql-qualified-role-defaults-postgres"
+        }
       ]
     },
     {
@@ -7686,8 +8026,16 @@
       "status": "implemented",
       "reason": "Unchanged ALTER ROLE RESET removes exactly its registered non-policy-sensitive global role-default slot through metadata Raft; complete catalog postimages agree with PostgreSQL. Existing connections retain login defaults while future logins observe RESET. Scoped reset, concurrent global/scoped edits, cold metadata/session-store recovery and recreated principal identities are qualified separately in the same native campaign; policy-sensitive defaults remain guarded.",
       "evidence": [
-        {"path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig", "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections", "gate": "sql-qualified-role-defaults-native-debug"},
-        {"path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig", "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections", "gate": "sql-qualified-role-defaults-postgres"}
+        {
+          "path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig",
+          "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections",
+          "gate": "sql-qualified-role-defaults-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig",
+          "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections",
+          "gate": "sql-qualified-role-defaults-postgres"
+        }
       ]
     },
     {
@@ -7695,8 +8043,16 @@
       "status": "implemented",
       "reason": "Unchanged role-level statement_timeout SET persists the typed millisecond default through metadata consensus and admits it only for future connections, matching PostgreSQL. Pgwire protocol tests preserve old-login timeout and RESET baselines; native HTTP persists the same connection budget, starts it at request receipt and never weakens the operator hard deadline. Negative values return 22023 without catalog change. The real native catalog/session owners recover cold; no hosted pgwire/native-role-DDL integration or wall-clock 1ms success assumption is claimed.",
       "evidence": [
-        {"path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig", "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections", "gate": "sql-qualified-role-defaults-native-debug"},
-        {"path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig", "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections", "gate": "sql-qualified-role-defaults-postgres"}
+        {
+          "path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig",
+          "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections",
+          "gate": "sql-qualified-role-defaults-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig",
+          "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections",
+          "gate": "sql-qualified-role-defaults-postgres"
+        }
       ]
     },
     {
@@ -7704,8 +8060,16 @@
       "status": "implemented",
       "reason": "Unchanged database-scoped role statement_timeout SET matches PostgreSQL's complete catalog postimage and future-login budget through real metadata consensus. Existing connection baselines remain unchanged. Shared HTTP deadline tests prove receipt-time accounting and hard-limit preservation; pgwire protocol tests prove old/new-login and RESET behavior without claiming hosted native-role-DDL integration. Cold metadata/session-store recovery is exercised by the same campaign, without relying on completing an observing SQL query within 1ms.",
       "evidence": [
-        {"path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig", "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections", "gate": "sql-qualified-role-defaults-native-debug"},
-        {"path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig", "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections", "gate": "sql-qualified-role-defaults-postgres"}
+        {
+          "path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig",
+          "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections",
+          "gate": "sql-qualified-role-defaults-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig",
+          "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections",
+          "gate": "sql-qualified-role-defaults-postgres"
+        }
       ]
     },
     {
@@ -7713,8 +8077,16 @@
       "status": "implemented",
       "reason": "Unchanged role statement_timeout RESET matches PostgreSQL's exact durable postimage and restores future connections to their base timeout without changing already-open connection defaults. Pgwire protocol tests verify RESET/RESET ALL against the captured login timeout; HTTP connection budgets preserve hard limits and include lookup time. Metadata Raft and durable connection-store cold recovery pass in the native qualification campaign; hosted pgwire/native-role-DDL integration is not claimed.",
       "evidence": [
-        {"path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig", "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections", "gate": "sql-qualified-role-defaults-native-debug"},
-        {"path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig", "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections", "gate": "sql-qualified-role-defaults-postgres"}
+        {
+          "path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig",
+          "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections",
+          "gate": "sql-qualified-role-defaults-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig",
+          "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections",
+          "gate": "sql-qualified-role-defaults-postgres"
+        }
       ]
     },
     {
@@ -7722,8 +8094,16 @@
       "status": "superseded",
       "reason": "PostgreSQL 18 rejects the unchanged ALTER ROLE SET expression with 42601: role-default syntax accepts setting constants, not current_setting calls. Native authenticated SQL returns the same SQLSTATE without changing the complete catalog postimage or old/future login values. This is a proven invalid original, not an implemented role-default expression.",
       "evidence": [
-        {"path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig", "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections", "gate": "sql-qualified-role-defaults-native-debug"},
-        {"path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig", "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections", "gate": "sql-qualified-role-defaults-postgres"}
+        {
+          "path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig",
+          "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections",
+          "gate": "sql-qualified-role-defaults-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_role_defaults_lifecycle_integration_test.zig",
+          "test": "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections",
+          "gate": "sql-qualified-role-defaults-postgres"
+        }
       ]
     },
     {
@@ -24989,8 +25369,16 @@
       "status": "superseded",
       "reason": "The original treats a partial UNIQUE index as a named constraint, which PostgreSQL rejects with 42704. Exact original SQL now matches that diagnostic over a real declared index through the native owner. Complete postimages, primary versions/digests and schema identity are unchanged on rejection. Predicate-based index inference remains valid, preserves the target identity, and enforces uniqueness before and after independent cold owner recovery. This corrects the original contract; it is not a newly supported ON CONSTRAINT form.",
       "evidence": [
-        {"path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig", "test": "mounted SQL original named arbiters distinguish constraints from indexes and retain cold enforcement", "gate": "sql-qualified-named-conflict-native-debug"},
-        {"path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig", "test": "mounted SQL original named arbiters distinguish constraints from indexes and retain cold enforcement", "gate": "sql-qualified-named-conflict-postgres"}
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original named arbiters distinguish constraints from indexes and retain cold enforcement",
+          "gate": "sql-qualified-named-conflict-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original named arbiters distinguish constraints from indexes and retain cold enforcement",
+          "gate": "sql-qualified-named-conflict-postgres"
+        }
       ]
     },
     {
@@ -25025,8 +25413,16 @@
       "status": "superseded",
       "reason": "The original treats an expression UNIQUE index as a named constraint, which PostgreSQL rejects with 42704. Exact original SQL now matches that diagnostic over a real built expression index through the native owner, without changing complete postimages, primary versions/digests or schema identity. Expression-based index inference succeeds and retains future uniqueness enforcement across independent cold owner recovery. This corrects the original contract, rather than claiming SQL permits an expression index in ON CONSTRAINT.",
       "evidence": [
-        {"path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig", "test": "mounted SQL original named arbiters distinguish constraints from indexes and retain cold enforcement", "gate": "sql-qualified-named-conflict-native-debug"},
-        {"path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig", "test": "mounted SQL original named arbiters distinguish constraints from indexes and retain cold enforcement", "gate": "sql-qualified-named-conflict-postgres"}
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original named arbiters distinguish constraints from indexes and retain cold enforcement",
+          "gate": "sql-qualified-named-conflict-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original named arbiters distinguish constraints from indexes and retain cold enforcement",
+          "gate": "sql-qualified-named-conflict-postgres"
+        }
       ]
     },
     {
@@ -25112,8 +25508,16 @@
       "status": "implemented",
       "reason": "Unchanged ON CONSTRAINT upsert binds its publicly declared custom-named primary constraint through real metadata/data owners, retains the existing logical primary identity, and matches PostgreSQL RETURNING labels/types/rows and complete postimages. Subsequent inferred-key upsert, fresh insert and duplicate rejection preserve enforcement. Independent cold owner recovery retains the exact schema owner and primary versions/digests; the duplicate probe still rejects after reopen. Index-origin declarations are independently excluded from constraint binding by the same campaign.",
       "evidence": [
-        {"path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig", "test": "mounted SQL original named arbiters distinguish constraints from indexes and retain cold enforcement", "gate": "sql-qualified-named-conflict-native-debug"},
-        {"path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig", "test": "mounted SQL original named arbiters distinguish constraints from indexes and retain cold enforcement", "gate": "sql-qualified-named-conflict-postgres"}
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original named arbiters distinguish constraints from indexes and retain cold enforcement",
+          "gate": "sql-qualified-named-conflict-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original named arbiters distinguish constraints from indexes and retain cold enforcement",
+          "gate": "sql-qualified-named-conflict-postgres"
+        }
       ]
     },
     {

@@ -282,6 +282,40 @@ pub fn captureTableAdmission(server: *server_mod.ApiHttpServer, identity: ?serve
     return .{ .table = owner.table, .guard = .{ .target = lookup.relations[selected], .logical_table = owner.logical_table, .owner = owner.owner, .incarnation = snapshot.relation_epoch.?.incarnation } };
 }
 
+fn commentResource(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, allocators: catalog.DdlAllocators, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl) !catalog.DdlOutcome {
+    if ((ddl.kind != .database and ddl.kind != .namespace) or ddl.action != .comment or ddl.conditional or ddl.cascade or ddl.comment_column != null or
+        ddl.name.database != null or ddl.name.namespace != null) return error.InvalidSqlSyntax;
+    const kind: domain.Kind = if (ddl.kind == .database) .database else .namespace;
+    const a = allocators.scratch;
+    const route: @import("../system_catalog/routes.zig").Route = .{ .kind = kind, .database = database, .name = ddl.name.table };
+    const resource = try @import("../system_catalog/routes.zig").resourceNameAlloc(a, route);
+    defer a.free(resource);
+    const permission_kind: @import("../usermgr/mod.zig").ResourceType = if (kind == .database) .database else .namespace;
+    if (identity) |authenticated| if (!server_mod.permissionsAllow(authenticated.permissions, permission_kind, resource, .admin)) return error.Forbidden;
+    var private = context;
+    private.setting_admin = true;
+    const response = server.source.systemCatalog(a, private, .{ .mutate = .{ .mutation = .{
+        .action = .comment,
+        .kind = kind,
+        .name = ddl.name.table,
+        .database = database,
+        .description = ddl.comment_value,
+    } } }) catch |err| {
+        // PostgreSQL COMMENT ON DATABASE treats an absent database as a no-op.
+        // Authorization still precedes lookup; no write was admitted here.
+        if (kind == .database and err == error.DatabaseNotFound) return .{ .mutation_outcome = null };
+        if (err == error.MetadataMutationOutcomeUnknown or err == error.OutOfMemory) return error.SqlMutationOutcomeUnknown;
+        if (err == error.CatalogCommandTooLarge) return error.ProgramLimitExceeded;
+        return err;
+    };
+    defer a.free(response);
+    var result = std.json.parseFromSlice(domain.MutationResult, a, response, .{}) catch return error.SqlMutationOutcomeUnknown;
+    defer result.deinit();
+    const committed = result.value.resource orelse return error.SqlMutationOutcomeUnknown;
+    if (result.value.revision == 0 or committed.kind != kind or !std.mem.eql(u8, committed.name, ddl.name.table)) return error.SqlMutationOutcomeUnknown;
+    return .{ .mutation_outcome = .committed };
+}
+
 fn commentTable(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, path: ?*const SearchPath) !catalog.DdlOutcome {
     if (ddl.kind != .table or ddl.action != .comment or ddl.conditional or ddl.cascade) return error.InvalidSqlSyntax;
     if (!server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
@@ -829,6 +863,8 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     if (input == .policy_ddl) return @import("sql_policy_ddl.zig").execute(server, identity, context, database, namespace, alloc, input.policy_ddl);
     if (input == .catalog_ddl and input.catalog_ddl.kind == .sequence)
         return @import("sql_sequence_ddl.zig").execute(server, identity, context, database, namespace, allocators, input.catalog_ddl, path);
+    if (input == .catalog_ddl and input.catalog_ddl.action == .comment and input.catalog_ddl.kind != .table)
+        return commentResource(server, identity, context, database, allocators, input.catalog_ddl);
     if (input == .catalog_ddl and input.catalog_ddl.action == .comment)
         return commentTable(server, identity, context, database, namespace, allocators, input.catalog_ddl, path);
     if (input == .catalog_ddl and input.catalog_ddl.kind == .role)

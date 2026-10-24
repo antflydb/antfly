@@ -2006,6 +2006,10 @@ components:
           type: string
           description: JSON-encoded database settings owned by the catalog.
           example: "{}"
+        description:
+          type: string
+          nullable: true
+          description: SQL COMMENT annotation. NULL or an empty string removes the annotation without changing the object's identity or data schema.
         tablespace_name:
           type: string
           nullable: true
@@ -2038,6 +2042,10 @@ components:
           type: string
           description: Namespace name.
           example: analytics
+        description:
+          type: string
+          nullable: true
+          description: SQL COMMENT annotation. NULL or an empty string removes the annotation without changing the object's identity or data schema.
         tablespace_name:
           type: string
           nullable: true

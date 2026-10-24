@@ -40,6 +40,7 @@ pub const document_identity_reference = @embedFile("fixtures/sql_document_identi
 pub const source_mutation_reference = @embedFile("fixtures/sql_source_mutation_reference.json");
 pub const prepared_source_reference = @embedFile("fixtures/sql_prepared_source_reference.json");
 pub const table_comment_reference = @embedFile("fixtures/sql_table_comment_reference.json");
+pub const resource_comment_reference = @embedFile("fixtures/sql_resource_comment_reference.json");
 pub const column_comment_reference = @embedFile("fixtures/sql_column_comment_reference.json");
 pub const sequence_declaration_reference = @embedFile("fixtures/sql_sequence_declaration_reference.json");
 pub const document_boundary_reference = @embedFile("fixtures/sql_document_boundary_reference.json");

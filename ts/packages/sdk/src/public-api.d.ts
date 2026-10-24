@@ -6245,6 +6245,8 @@ export interface components {
              * @example {}
              */
             settings_json: string;
+            /** @description SQL COMMENT annotation. NULL or an empty string removes the annotation without changing the object's identity or data schema. */
+            description?: string | null;
             /**
              * @description Optional durable tablespace binding inherited by new namespace/table placement policy.
              * @example fastspace
@@ -6275,6 +6277,8 @@ export interface components {
              * @example analytics
              */
             name: string;
+            /** @description SQL COMMENT annotation. NULL or an empty string removes the annotation without changing the object's identity or data schema. */
+            description?: string | null;
             /**
              * @description Optional durable tablespace binding inherited by new table placement policy in this namespace.
              * @example fastspace

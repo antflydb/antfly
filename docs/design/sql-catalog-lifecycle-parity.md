@@ -6,21 +6,49 @@ qualification checkpoints are retained below with their exact scope.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 
-## Current original-case qualification (2026-10-23)
+## Current original-case qualification (2026-10-24)
 
-The ledger now records **765 implemented / 137 rejected / 428 superseded /
-256 unresolved**. The requested next-100 batch has closed **37 original cases**:
+The ledger now records **767 implemented / 137 rejected / 428 superseded /
+254 unresolved**. The requested next-100 batch has closed **39 original cases**:
 `sql-0011`, `sql-0014`, `sql-0570`, `sql-0580`, `sql-0586`, `sql-0591`,
 `sql-0595`, `sql-0883`, `sql-0927`, `sql-0935`, `sql-0343`–`sql-0349`,
 `sql-1456`, `sql-1459`, `sql-1464`, `sql-0005`, `sql-0008`, `sql-0009`,
-`sql-0010`, `sql-0142`–`sql-0143`, `sql-0311`–`sql-0317`, `sql-0669`, `sql-0734`, and `sql-0744`–`sql-0745`;
-**63 of that target remain unfinished**. Thirty-two are implementations; five are
+`sql-0010`, `sql-0142`–`sql-0143`, `sql-0146`–`sql-0147`, `sql-0311`–`sql-0317`, `sql-0669`, `sql-0734`, and `sql-0744`–`sql-0745`;
+**61 of that target remain unfinished**. Thirty-four are implementations; five are
 PostgreSQL-invalid originals (outer recursive MERGE, 42601, and ambiguous
 `RETURNING id`, 42702, ALTER ROLE SET with an expression, 42601, and two
-index names used as constraints, 42704), not thirty-seven
+index names used as constraints, 42704), not thirty-nine
 newly supported forms. The earlier sixteen mutation witnesses are ten original
-cases, not sixteen completions. **164 unresolved DDL/catalog cases remain open**; the role
+cases, not sixteen completions. **162 unresolved DDL/catalog cases remain open**; the role
 default cohort does not complete that feature work.
+
+### Schema and database comments: two original cases closed
+
+The unchanged `sql-0146` and `sql-0147` now use the shared catalog resource
+record and authenticated SQL admission. Their PostgreSQL 18 witnesses and
+mounted native campaigns agree on command tags, Unicode/quoted annotations,
+NULL/empty removal, read-only denial and missing-object behavior. PostgreSQL
+rejects an absent schema with `3F000`; an absent database is a successful no-op.
+Exact, definitely-not-admitted naming diagnostics survive metadata forwarding.
+Public generated database/namespace models expose the optional description.
+
+A steady-state annotation uses three catalog-projection writes: the authoritative
+record, the covering parent row and the catalog receipt, alongside existing
+Raft/journal bookkeeping. It does not scan settings or
+publish a physical schema/index epoch. Structural comparison excludes the
+annotation before encoding, so long text is encoded once for both record writes.
+The covering row stays current without replacing sequential list reads with
+per-result primary lookups. Metadata decoder 68 gates annotation creation and
+removal through the existing membership-bound single/batch append authority.
+
+Tests cover stable IDs through rename, removal on drop/recreate, exact retries,
+all three write positions before/after failures, snapshot restoration and cold
+reopening. Mounted SQL independently reopens catalog, session and data owners,
+retaining annotations and every user-row value, identity, version and digest.
+The Debug SQL suite passes 1,349 local and 236 dependent tests (four existing
+opt-in skips); strict catalog and mounted comment gates have no skips or leaks.
+This closes two original cases; other COMMENT targets and transactional DDL
+remain independently qualified work.
 
 ### Combined table declaration and transaction-owned defaults
 

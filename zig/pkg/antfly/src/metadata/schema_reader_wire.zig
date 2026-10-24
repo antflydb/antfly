@@ -35,6 +35,15 @@ pub fn requiresHistoricalReferences(bytes: []const u8) bool {
     return requiresMarker(bytes, "historical_reference_coverage") or requiresMarker(bytes, "reference_coverage_ready");
 }
 
+pub fn requiresResourceComments(bytes: []const u8) bool {
+    return requiresMarker(bytes, "@catalog-resource-comments");
+}
+
+test "system catalog resource comments decoder projects actions without copying annotation text" {
+    for ([_][]const u8{ "{}", "{\"mutation\":{\"action\":\"rename\",\"description\":null}}", "{\"description\":\"action comment\"}" }) |bytes| try std.testing.expect(!requiresResourceComments(bytes));
+    for ([_][]const u8{ "{\"mutation\":{\"action\":\"comment\",\"description\":null}}", "{\"mutation\":{\"act\\u0069on\":\"comm\\u0065nt\"}}", "{" }) |bytes| try std.testing.expect(requiresResourceComments(bytes));
+}
+
 pub fn requiresRoleDefaults(bytes: []const u8) bool {
     return requiresMarker(bytes, "@sql-role-defaults");
 }
@@ -121,9 +130,10 @@ fn walk(comptime Requirements: type, comptime mode: Projection, comptime marker_
             _ = try scanner.next();
             while (try scanner.peekNextTokenType() != .object_end) {
                 const key = try scanner.nextAllocMax(alloc, .alloc_if_needed, 1024);
-                const Marker = enum { none, present, non_null, empty_database };
+                const Marker = enum { none, present, non_null, empty_database, comment_action };
                 const Match = struct {
                     fn keyKind(name: []const u8) Marker {
+                        if (comptime std.mem.eql(u8, marker_name, "@catalog-resource-comments")) return if (std.mem.eql(u8, name, "action")) .comment_action else .none;
                         if (comptime std.mem.eql(u8, marker_name, "@sql-role-defaults")) {
                             if (std.mem.eql(u8, name, "principal_instance") or std.mem.eql(u8, name, "role_defaults_only") or std.mem.eql(u8, name, "database_id")) return .present;
                             if (std.mem.eql(u8, name, "database")) return .empty_database;
@@ -142,6 +152,19 @@ fn walk(comptime Requirements: type, comptime mode: Projection, comptime marker_
                     else => return error.InvalidMetadataTransitionEncoding,
                 };
                 if (marker == .present) return true;
+                if (marker == .comment_action and try scanner.peekNextTokenType() == .string) {
+                    const value = try scanner.nextAllocMax(alloc, .alloc_if_needed, 1024);
+                    const comment = switch (value) {
+                        .string => |text| std.mem.eql(u8, text, "comment"),
+                        .allocated_string => |text| blk: {
+                            defer alloc.free(text);
+                            break :blk std.mem.eql(u8, text, "comment");
+                        },
+                        else => return error.InvalidMetadataTransitionEncoding,
+                    };
+                    if (comment) return true;
+                    continue;
+                }
                 if (marker == .empty_database and try scanner.peekNextTokenType() == .string) {
                     const value = try scanner.nextAllocMax(alloc, .alloc_if_needed, 1024);
                     const empty = switch (value) {

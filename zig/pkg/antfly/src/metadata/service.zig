@@ -3613,6 +3613,7 @@ fn resolverRequiredCoordinatedDecoderVersion(command: metadata_storage.Transitio
 }
 
 fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresResourceComments(command.apply_system_catalog)) return metadata_topology_protocol.sql_resource_comments_version;
     if (command == .apply_fk_generation_publication and @import("schema_reader_wire.zig").requiresHistoricalReferences(command.apply_fk_generation_publication)) return metadata_topology_protocol.fk_historical_references_version;
     if (command == .apply_fk_initial_create and @import("schema_reader_wire.zig").requiresHistoricalReferences(command.apply_fk_initial_create)) return metadata_topology_protocol.fk_historical_references_version;
     if (command == .comment_column) return metadata_topology_protocol.sql_column_comments_version;
@@ -14039,6 +14040,7 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     vector_storage.storage.dense_embeddings = .vector_store;
     const legacy: metadata_storage.TransitionCommand = .{ .upsert_table = plain };
     const commands = [_]metadata_storage.TransitionCommand{
+        .{ .apply_system_catalog = "{\"mutation\":{\"action\":\"comment\",\"kind\":\"namespace\",\"name\":\"public\",\"description\":null}}" },
         .{ .apply_restore_staging = "{}" },
         .{ .create_restore_job_with_staging = .{ .key = "\x00\x00__api_restore_jobs__:0000000000000001", .value = "{}", .plan_json = "{}" } },
         .{ .compare_and_set_backup_cohort = .{ .job_id = 9, .expected_revision = 0, .value = "{}" } },
@@ -14052,7 +14054,7 @@ test "relational topology admission rejects lifecycle proposals before encoding 
         .{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{vector_storage} } },
     };
     for (commands) |command| {
-        const required = metadata_topology_protocol.coordinated_lifecycle_version;
+        const required = transitionRequiredCoordinatedDecoderVersion(command);
         var service: Fake = .{ .member_versions = &.{ required, required, required - 1 } }; // Includes a lower-version learner.
         try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&service, command, .{}));
         try std.testing.expectEqual(@as(usize, 1), service.probes);
@@ -14132,7 +14134,10 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     var reader_store: metadata_table_manager.StoreRecord = .{ .store_id = 18, .node_id = 1, .reporter_incarnation = 4 };
     reader_store.schema_reader = metadata_table_manager.SchemaReaderCapabilities.current;
     const reader_command: metadata_storage.TransitionCommand = .{ .register_store = reader_store };
-    const reader_version = metadata_topology_protocol.schema_reader_capability_version;
+    // Current readers include clock-aware layouts; test the complete advertised
+    // profile rather than assuming the original reader-capability floor.
+    const reader_version = transitionRequiredCoordinatedDecoderVersion(reader_command);
+    try std.testing.expect(reader_version >= metadata_topology_protocol.schema_reader_capability_version);
     var reader_service: Fake = .{ .member_versions = &.{ reader_version, reader_version - 1, reader_version } };
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&reader_service, reader_command, .{}));
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, reader_service.propose(&.{ legacy, reader_command }));
@@ -23965,4 +23970,9 @@ test "FK historical reference decoder protects new writers without widening lega
     try std.testing.expectEqual(metadata_topology_protocol.fk_generation_column_addition_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_fk_generation_publication = "{\"plan\":{}}" }));
     try std.testing.expectEqual(metadata_topology_protocol.fk_historical_references_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_fk_generation_publication = "{\"plan\":{\"historical_reference_coverage\":true}}" }));
     try std.testing.expectEqual(metadata_topology_protocol.fk_historical_references_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_fk_initial_create = "{\"plan\":{\"historical_reference_coverage\":true}}" }));
+}
+
+test "system catalog resource comments require decoder activation for annotation removal too" {
+    try std.testing.expectEqual(metadata_topology_protocol.sql_resource_comments_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = "{\"mutation\":{\"action\":\"comment\",\"description\":null}}" }));
+    try std.testing.expect(transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = "{\"mutation\":{\"action\":\"rename\",\"description\":null}}" }) < metadata_topology_protocol.sql_resource_comments_version);
 }

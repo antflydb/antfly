@@ -136,6 +136,21 @@ pub const Resource = struct {
     /// Compatibility metadata only, never a filesystem path override.
     location_json: []const u8 = "null",
     source_json: []const u8 = "null",
+    description: ?[]const u8 = null,
+
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "description") and self.description == null;
+    }
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            if (!self.nativeJsonSkipField(field)) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 pub const default_database: Resource = .{ .kind = .database, .id = default_database_id, .name = default_database_name };
@@ -232,7 +247,7 @@ pub const TableScope = struct {
     }
 };
 
-pub const Action = enum { create, drop, rename, set_tablespace, alter };
+pub const Action = enum { create, drop, rename, set_tablespace, alter, comment };
 pub const Mutation = struct {
     action: Action,
     kind: Kind,
@@ -247,6 +262,22 @@ pub const Mutation = struct {
     /// Populated only by native table admission, never accepted from public JSON.
     table_id: u64 = 0,
     storage_name: []const u8 = "",
+    /// Only the explicit comment action changes presentation metadata.
+    description: ?[]const u8 = null,
+
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "description") and self.description == null;
+    }
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            if (!self.nativeJsonSkipField(field)) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 pub const State = struct {
@@ -314,6 +345,8 @@ pub const StateIndex = struct {
         try self.names.ensureTotalCapacity(alloc, @intCast(state.resources.len));
         try self.ids.ensureTotalCapacity(alloc, @intCast(state.resources.len));
         for (state.resources) |r| {
+            try validateDescription(r.description);
+            if (r.description) |value| if (value.len == 0) return error.InvalidCatalogRecord;
             if (namespaceRelation(r.kind)) inline for (.{ Kind.table, Kind.view, Kind.sequence }) |kind| {
                 if (kind != r.kind and self.names.contains(.{ .kind = kind, .parent = r.parent_id, .name = r.name })) return error.InvalidCatalogRecord;
             };
@@ -645,6 +678,8 @@ pub fn cloneResource(alloc: std.mem.Allocator, source: Resource) !Resource {
     errdefer alloc.free(r.source_json);
     r.location_json = try alloc.dupe(u8, source.location_json);
     errdefer alloc.free(r.location_json);
+    r.description = if (source.description) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (r.description) |value| alloc.free(value);
     if (source.placement_policy.placement_role) |role| r.placement_policy.placement_role = try alloc.dupe(u8, role);
     return r;
 }
@@ -653,6 +688,7 @@ fn freeResource(alloc: std.mem.Allocator, r: Resource) void {
     alloc.free(r.storage_name);
     alloc.free(r.location_json);
     alloc.free(r.source_json);
+    if (r.description) |value| alloc.free(value);
     if (r.placement_policy.placement_role) |role| alloc.free(role);
 }
 
@@ -662,6 +698,8 @@ pub const Delta = struct {
     upserts: []Resource,
     removes: []Resource,
     next_id: u64,
+    /// Planner-owned presentation change; not a public mutation flag.
+    presentation_only: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.upserts);
@@ -677,6 +715,13 @@ pub const PhysicalTable = struct { id: u64, name: []const u8 };
 
 /// Planning uses a transaction-pinned reader. Point mutations touch only their
 /// dependencies; dropping a database enumerates only that database's children.
+pub fn validateDescription(value: ?[]const u8) !void {
+    if (value) |text| {
+        if (text.len > 1024 * 1024) return error.CatalogCommandTooLarge;
+        if (!std.unicode.utf8ValidateSlice(text) or std.mem.indexOfScalar(u8, text, 0) != null) return error.InvalidCatalogMutation;
+    }
+}
+
 pub fn planWithReader(alloc: std.mem.Allocator, reader: anytype, next: u64, request: Mutation) !Delta {
     return planWithTopology(alloc, reader, next, request, false);
 }
@@ -689,6 +734,10 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
     if (request.kind == .view) return error.CatalogViewAdmissionRequired;
     if (request.kind == .sequence) return error.CatalogSequenceAdmissionRequired;
     if (request.action == .alter) return error.InvalidCatalogMutation;
+    try validateDescription(request.description);
+    if (request.action != .comment and request.description != null) return error.InvalidCatalogMutation;
+    if (request.action == .comment and ((request.kind != .database and request.kind != .namespace) or
+        request.new_name != null or request.tablespace != null or request.table_id != 0 or request.storage_name.len != 0)) return error.InvalidCatalogMutation;
     try validateResourceName(request.kind, request.name);
     try validateName(request.database);
     try validateName(request.namespace);
@@ -722,6 +771,11 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
     var next_id = next;
     switch (request.action) {
         .alter => unreachable,
+        .comment => {
+            var updated = found orelse return if (request.kind == .database) error.DatabaseNotFound else error.NamespaceNotFound;
+            updated.description = if (request.description) |value| if (value.len != 0) value else null else null;
+            try upserts.append(alloc, updated);
+        },
         .create => {
             if (found != null) return error.CatalogAlreadyExists;
             if (request.kind == .table and try reader.lookup(.view, parent_id, request.name) != null) return error.CatalogAlreadyExists;
@@ -798,7 +852,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
     }
     const owned_upserts = try upserts.toOwnedSlice(alloc);
     errdefer alloc.free(owned_upserts);
-    return .{ .upserts = owned_upserts, .removes = try removes.toOwnedSlice(alloc), .next_id = next_id };
+    return .{ .upserts = owned_upserts, .removes = try removes.toOwnedSlice(alloc), .next_id = next_id, .presentation_only = request.action == .comment };
 }
 
 /// Projection captured during admission and returned only after exact receipt
@@ -1144,6 +1198,7 @@ pub const SqlSource = struct {
                 alloc.free(value.storage_name);
                 alloc.free(value.location_json);
                 alloc.free(value.source_json);
+                if (value.description) |description| alloc.free(description);
                 if (value.placement_policy.placement_role) |bytes| alloc.free(bytes);
             },
         }
@@ -1337,14 +1392,14 @@ pub fn httpStatus(err: anyerror) u16 {
 /// mutation outcome. Unknown/committed responses must never become retryable
 /// admission failures merely because their bodies resemble these names.
 pub fn definiteNamingError(status: u16, body: []const u8) ?anyerror {
-    inline for (.{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady, error.UndefinedColumn, error.ForeignKeyValidationRequired }) |err| {
+    inline for (.{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady, error.UndefinedColumn, error.ForeignKeyValidationRequired, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound }) |err| {
         if (status == httpStatus(err) and std.mem.eql(u8, body, @errorName(err))) return err;
     }
     return null;
 }
 
 test "system catalog definite naming diagnostics require exact status and error identity" {
-    inline for (.{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady, error.UndefinedColumn, error.ForeignKeyValidationRequired }) |err| {
+    inline for (.{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady, error.UndefinedColumn, error.ForeignKeyValidationRequired, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound }) |err| {
         try std.testing.expectEqual(err, definiteNamingError(httpStatus(err), @errorName(err)).?);
         try std.testing.expect(definiteNamingError(200, @errorName(err)) == null);
     }
@@ -1741,4 +1796,49 @@ test "external lake catalog saved sources reject recursion and retain definition
     try std.testing.expectEqual(identity, renamed.upserts[0].id);
     try std.testing.expectEqualStrings(definition, renamed.upserts[0].source_json);
     try std.testing.expectError(error.InvalidCatalogMutation, validateQuerySource(a, "{\"saved\":\"loop\"}"));
+}
+
+test "system catalog resource comments preserve identities normalize removal and own every allocation" {
+    const a = std.testing.allocator;
+    const rows = [_]Resource{
+        .{ .kind = .database, .id = 3, .name = "appdb", .description = "old" },
+        .{ .kind = .namespace, .id = 4, .parent_id = 3, .name = "scope", .description = "old" },
+    };
+    const state: State = .{ .revision = 7, .next_id = 5, .resources = &rows };
+    for (rows) |row| {
+        for ([_]?[]const u8{ "a 'quoted' Ω", "", null }) |description| {
+            var delta = try plan(a, state, .{ .action = .comment, .kind = row.kind, .database = "appdb", .name = row.name, .description = description }, &.{});
+            defer delta.deinit(a);
+            try std.testing.expect(delta.presentation_only);
+            try std.testing.expectEqual(state.next_id, delta.next_id);
+            try std.testing.expectEqual(@as(usize, 0), delta.removes.len);
+            try std.testing.expectEqual(@as(usize, 1), delta.upserts.len);
+            var expected = row;
+            expected.description = if (description) |text| if (text.len == 0) null else text else null;
+            const wanted = try std.json.Stringify.valueAlloc(a, expected, .{});
+            defer a.free(wanted);
+            const actual = try std.json.Stringify.valueAlloc(a, delta.upserts[0], .{});
+            defer a.free(actual);
+            try std.testing.expectEqualStrings(wanted, actual);
+        }
+    }
+    try std.testing.expectError(error.InvalidCatalogMutation, plan(a, state, .{ .action = .comment, .kind = .table, .name = "x" }, &.{}));
+    try std.testing.expectError(error.InvalidCatalogMutation, plan(a, state, .{ .action = .comment, .kind = .database, .name = "appdb", .new_name = "evil" }, &.{}));
+    try std.testing.expectError(error.InvalidCatalogMutation, validateDescription("bad\x00text"));
+    try std.testing.expectError(error.InvalidCatalogMutation, validateDescription("\xff"));
+    try std.testing.expectError(error.NamespaceNotFound, plan(a, state, .{ .action = .comment, .kind = .namespace, .name = "missing" }, &.{}));
+    try std.testing.checkAllAllocationFailures(a, struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const source: Resource = .{ .kind = .database, .id = 3, .name = "appdb", .description = "owned Ω" };
+            const owned = try cloneResource(alloc, source);
+            defer freeResource(alloc, owned);
+            var state_owned = try MutableState.clone(alloc, .{ .next_id = 4, .resources = &.{source} });
+            defer state_owned.deinit();
+            var delta = try plan(alloc, state_owned.value, .{ .action = .comment, .kind = .database, .name = "appdb", .description = "new" }, &.{});
+            defer delta.deinit(alloc);
+            var change = try state_owned.apply(delta);
+            change.finish(&state_owned, false);
+            try std.testing.expectEqualStrings("owned Ω", state_owned.index.byId(.database, 3).?.description.?);
+        }
+    }.run, .{});
 }

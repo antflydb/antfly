@@ -3499,6 +3499,8 @@ pub const DatabaseCatalogRecord = struct {
     name: []const u8,
     /// JSON-encoded database settings owned by the catalog.
     settings_json: []const u8,
+    /// SQL COMMENT annotation. NULL or an empty string removes the annotation without changing the object's identity or data schema.
+    description: OpenApiOptionalNullable([]const u8) = .absent,
     /// Optional durable tablespace binding inherited by new namespace/table placement policy.
     tablespace_name: OpenApiOptionalNullable([]const u8) = .absent,
 
@@ -3510,6 +3512,17 @@ pub const DatabaseCatalogRecord = struct {
         try jw.write(self.name);
         try jw.objectField("settings_json");
         try jw.write(self.settings_json);
+        switch (self.description) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("description");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("description");
+                try jw.write(value);
+            },
+        }
         switch (self.tablespace_name) {
             .absent => {},
             .null_value => {
@@ -7650,6 +7663,8 @@ pub const NamespaceCatalogRecord = struct {
     database_name: []const u8,
     /// Namespace name.
     name: []const u8,
+    /// SQL COMMENT annotation. NULL or an empty string removes the annotation without changing the object's identity or data schema.
+    description: OpenApiOptionalNullable([]const u8) = .absent,
     /// Optional durable tablespace binding inherited by new table placement policy in this namespace.
     tablespace_name: OpenApiOptionalNullable([]const u8) = .absent,
 
@@ -7663,6 +7678,17 @@ pub const NamespaceCatalogRecord = struct {
         try jw.write(self.database_name);
         try jw.objectField("name");
         try jw.write(self.name);
+        switch (self.description) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("description");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("description");
+                try jw.write(value);
+            },
+        }
         switch (self.tablespace_name) {
             .absent => {},
             .null_value => {

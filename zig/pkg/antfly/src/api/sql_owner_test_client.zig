@@ -35,13 +35,22 @@ pub const ApiKeyHeaders = struct {
     reader: [1]http.RequestHeader = undefined,
 
     pub fn activate(self: *@This(), ctx: *fixture.Context) !void {
+        return self.activateWithCatalog(ctx, false);
+    }
+
+    pub fn activateWithCatalog(self: *@This(), ctx: *fixture.Context, catalog_admin: bool) !void {
         const users = @import("../usermgr/mod.zig");
         const api = ctx.metadata.server.owned_public_http_server orelse return error.MissingMetadataPublicApi;
         const manager = api.cfg.user_manager orelse return error.MissingUserManager;
         for ([_][]const u8{ "pk-rewriter", "pk-reader" }, 0..) |username, i| {
             var permission = try users.Permission.initOwned(ctx.alloc, .table, "*", if (i == 0) .admin else .read);
             defer permission.deinit(ctx.alloc);
-            var key = try manager.createApiKey(username, "sql-owner-campaign", &.{permission}, &.{}, null);
+            var database = try users.Permission.initOwned(ctx.alloc, .database, "*", .admin);
+            defer database.deinit(ctx.alloc);
+            var namespace = try users.Permission.initOwned(ctx.alloc, .namespace, "*", .admin);
+            defer namespace.deinit(ctx.alloc);
+            const scopes = [_]users.Permission{ permission, database, namespace };
+            var key = try manager.createApiKey(username, "sql-owner-campaign", if (catalog_admin and i == 0) &scopes else &.{permission}, &.{}, null);
             defer key.deinit(manager.alloc);
             const authorization = try std.fmt.bufPrint(&self.authorization[i], "ApiKey {s}", .{key.encoded});
             const header: http.RequestHeader = .{ .name = "authorization", .value = authorization };

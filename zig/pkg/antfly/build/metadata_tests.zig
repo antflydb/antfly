@@ -42,7 +42,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_metadata_test_step = b.step("antfly-metadata-test", "Run root-module metadata tests only");
     const presentation_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "SQL COMMENT table descriptions", "SQL COMMENT column", "metadata module compiles", "metadata storage module compiles" },
+        .filters = &.{ "SQL COMMENT table descriptions", "SQL COMMENT column", "system catalog resource comments", "system catalog definite naming diagnostics", "relational topology admission rejects lifecycle proposals before encoding on mixed metadata versions", "metadata module compiles", "metadata storage module compiles" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const presentation_run = addFilteredTestRunArtifact(b, presentation_tests);
@@ -77,7 +77,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-metadata-sql-role-defaults-test", "Verify role default decoder admission, apply, restore and cold replay barriers").dependOn(&role_default_run.step);
     const sql_column_identity_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "system catalog SQL column identities", "SQL column identities", "SQL view catalog", "metadata raft apply store snapshot key registry covers every durable projection class", "metadata module compiles", "metadata storage module compiles" },
+        .filters = &.{ "system catalog resource comments", "system catalog SQL column identities", "SQL column identities", "SQL view catalog", "metadata raft apply store snapshot key registry covers every durable projection class", "metadata module compiles", "metadata storage module compiles" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const sql_column_identity_run = addFilteredTestRunArtifact(b, sql_column_identity_tests);

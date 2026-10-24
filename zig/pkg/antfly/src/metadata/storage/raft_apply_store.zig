@@ -23823,6 +23823,7 @@ pub const RaftApplyStore = struct {
         defer txn.abort();
         if (command.sql_sequence != null) return std.json.Stringify.valueAlloc(alloc, try self.prepareSqlSequenceCatalogTxn(&txn, group_id, command), .{});
         if (command.sql_view != null) return std.json.Stringify.valueAlloc(alloc, try self.applySqlViewLifecycleTxn(&txn, group_id, command, false), .{});
+        if (command.mutation.action == .comment) _ = try self.requireTopologyActivationTxn(&txn, group_id, topology_protocol.sql_resource_comments_version);
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -24209,6 +24210,12 @@ pub const RaftApplyStore = struct {
             return;
         }
         if (command.version != 1 and command.version != 2) return error.InvalidCatalogMutation;
+        if (command.mutation.action == .comment) {
+            _ = self.requireTopologyActivationTxn(txn, group_id, topology_protocol.sql_resource_comments_version) catch |err| switch (err) {
+                error.TableTopologyProtocolUpgradeRequired => return,
+                else => return err,
+            };
+        }
         if (command.sql_view != null) {
             _ = self.applySqlViewLifecycleTxn(txn, group_id, command, true) catch |err| switch (err) {
                 error.CatalogGenerationChanged, error.CatalogAlreadyExists, error.CatalogNotFound, error.SqlDependentObjectsExist, error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.TableTopologyProtocolUpgradeRequired, error.CatalogOccupancyNotReady, error.CatalogPublicationProofPending, error.SqlViewCycle, error.SqlProgramLimitExceeded => return,
@@ -24292,6 +24299,7 @@ pub const RaftApplyStore = struct {
         hash: [32]u8,
     ) !void {
         try system_catalog_storage.applyDelta(alloc, txn, group_id, delta, meta, hash);
+        if (delta.presentation_only) return;
         // The installed physical relation root covers tables/indexes. Logical
         // views/sequences use indexed namespace ownership, not fake tables.
         const logical_only = for (delta.upserts) |resource| {
@@ -53691,4 +53699,111 @@ test "SQL COMMENT column writer fences decoder epoch and stable identity without
     var current = try store.getSqlColumnIdentities(a, group, guard);
     defer current.deinit();
     try std.testing.expectEqualStrings("application state", current.value.columnById(column.id).?.description.?);
+}
+
+test "system catalog resource comments use three atomic writes retain receipts and recover cold snapshots" {
+    const a = std.testing.allocator;
+    const group: u64 = 21;
+    const incarnation = "01010101010101010101010101010101".*;
+    const T = struct {
+        fn activate(store: *RaftApplyStore, version: u16) !void {
+            const bytes = try std.json.Stringify.valueAlloc(store.alloc, topology_protocol.Activation{ .version = version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+            defer store.alloc.free(bytes);
+            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = bytes });
+        }
+        fn verify(store: *RaftApplyStore) !void {
+            // Production catalog reads reconstruct derived covering indexes
+            // after snapshot installation before pinning the observation.
+            var txn = try store.beginQueryCatalogReadTxn(group);
+            defer txn.abort();
+            const meta = try system_catalog_storage.readMeta(store.alloc, &txn, group);
+            try std.testing.expectEqual(@as(u64, 1), meta.revision);
+            try std.testing.expectEqual(@as(u64, 3), meta.next_id);
+            var resource = (try system_catalog_storage.getById(store.alloc, &txn, group, .namespace, 2)).?;
+            defer resource.deinit();
+            try std.testing.expectEqualStrings("public", resource.value.name);
+            try std.testing.expectEqualStrings("retained Ω", resource.value.description.?);
+            var arena = std.heap.ArenaAllocator.init(store.alloc);
+            defer arena.deinit();
+            const view: system_catalog_storage.View = .{ .alloc = arena.allocator(), .txn = &txn, .group_id = group, .meta = meta };
+            const children = try view.children(.namespace, 1, 0);
+            try std.testing.expectEqual(@as(usize, 1), children.len);
+            try std.testing.expectEqualStrings("retained Ω", children[0].description.?);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/resource-comments", .{tmp.sub_path});
+    defer a.free(root);
+    const target = try std.fmt.allocPrint(a, "{s}-snapshot", .{root});
+    defer a.free(target);
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+        try T.activate(&store, topology_protocol.sql_resource_comments_version - 1);
+        const command: SystemCatalogCommand = .{ .expected_revision = 0, .mutation = .{ .action = .comment, .kind = .namespace, .name = "public", .description = "retained Ω" } };
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.validateSystemCatalog(group, command));
+        try applySystemCatalogTestCommand(&store, 1, command);
+        {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(@as(u64, 0), (try system_catalog_storage.readMeta(a, &read, group)).revision);
+        }
+        try T.activate(&store, topology_protocol.sql_resource_comments_version);
+        try store.validateSystemCatalog(group, command);
+        try applySystemCatalogTestCommand(&store, 2, command);
+        try applySystemCatalogTestCommand(&store, 3, command); // CAS retry cannot alter receipt or allocate an ID.
+        try T.verify(&store);
+        const baseline = try store.snapshotBuilder().buildSnapshot(a, group);
+        defer a.free(baseline);
+        const Writer = struct {
+            txn: *docstore.DocStore.Txn,
+            fail_at: usize,
+            after: bool,
+            writes: usize = 0,
+            pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+                self.writes += 1;
+                if (self.writes == self.fail_at and !self.after) return error.TestCommentWriteFailed;
+                try self.txn.put(key, value);
+                if (self.writes == self.fail_at and self.after) return error.TestCommentWriteFailed;
+            }
+        };
+        for ([_]bool{ false, true }) |after| for (1..4) |fail_at| {
+            var txn = try store.store.beginWriteTxn();
+            const previous = try system_catalog_storage.readMeta(a, &txn, group);
+            var row = system_catalog.default_namespace;
+            row.description = "uncommitted";
+            var writer: Writer = .{ .txn = &txn, .fail_at = fail_at, .after = after };
+            const result = system_catalog_storage.applyPresentationRecord(a, &writer, group, row, previous, @splat(9));
+            txn.abort();
+            try std.testing.expectError(error.TestCommentWriteFailed, result);
+            try std.testing.expectEqual(fail_at, writer.writes);
+            const actual = try store.snapshotBuilder().buildSnapshot(a, group);
+            defer a.free(actual);
+            try std.testing.expectEqualSlices(u8, baseline, actual);
+        };
+        // Structural edits cannot use the constant-write presentation path.
+        {
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            const previous = try system_catalog_storage.readMeta(a, &txn, group);
+            var forged = system_catalog.default_namespace;
+            forged.name = "forged";
+            var upserts = [_]system_catalog.Resource{forged};
+            try std.testing.expectError(error.InvalidCatalogMutation, system_catalog_storage.applyDelta(a, &txn, group, .{ .upserts = &upserts, .removes = &.{}, .next_id = previous.next_id, .presentation_only = true }, previous, @splat(9)));
+        }
+        var copy = try RaftApplyStore.init(a, .{ .root_dir = target });
+        defer copy.deinit();
+        try std.testing.expect(try copy.snapshotBuilder().installSnapshot(a, group, 100, baseline));
+        try T.verify(&copy);
+    }
+    {
+        var reopened = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer reopened.deinit();
+        try T.verify(&reopened);
+        var restored = try RaftApplyStore.init(a, .{ .root_dir = target });
+        defer restored.deinit();
+        try T.verify(&restored);
+    }
 }

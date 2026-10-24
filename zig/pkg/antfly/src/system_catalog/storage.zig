@@ -900,8 +900,53 @@ pub fn removeResource(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, gro
     };
 }
 
+/// Existing identities need three writes, independent of child/settings count.
+/// The authority replans this delta inside the serialized catalog transaction.
+pub fn applyPresentationRecord(alloc: std.mem.Allocator, txn: anytype, group_id: u64, resource: domain.Resource, previous: Meta, command_hash: [32]u8) !void {
+    const record_key = try recordKeyAlloc(alloc, group_id, resource.kind, resource.id);
+    defer alloc.free(record_key);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, resource, .{});
+    defer alloc.free(bytes);
+    try txn.put(record_key, bytes);
+    // Parent listings are deliberately covering: retain sequential reads and
+    // update their value in the same transaction, without rewriting bindings.
+    const child_key = try childKey(alloc, group_id, resource);
+    defer alloc.free(child_key);
+    try txn.put(child_key, bytes);
+    try writeMeta(alloc, txn, group_id, previous, previous.next_id, command_hash);
+}
+
+fn writeMeta(alloc: std.mem.Allocator, txn: anytype, group_id: u64, previous: Meta, next_id: u64, command_hash: [32]u8) !void {
+    const meta: Meta = .{ .revision = try std.math.add(u64, previous.revision, 1), .next_id = next_id, .last_command = command_hash, .sequence_outcome_head = previous.sequence_outcome_head };
+    const key = try keyAlloc(alloc, group_id, "meta");
+    defer alloc.free(key);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, meta, .{});
+    defer alloc.free(bytes);
+    try txn.put(key, bytes);
+}
+
 pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, delta: domain.Delta, previous: Meta, command_hash: [32]u8) !void {
-    {
+    if (delta.presentation_only and (delta.upserts.len != 1 or delta.removes.len != 0 or delta.next_id != previous.next_id or
+        (delta.upserts[0].kind != .database and delta.upserts[0].kind != .namespace))) return error.InvalidCatalogMutation;
+    if (delta.presentation_only and previous.revision != 0) {
+        const resource = delta.upserts[0];
+        if (try getById(alloc, txn, group_id, resource.kind, resource.id)) |existing_value| {
+            var existing = existing_value;
+            defer existing.deinit();
+            // Reject attempts to hide structural changes behind a presentation delta.
+            var structural_before = existing.value;
+            structural_before.description = null;
+            var structural_after = resource;
+            structural_after.description = null;
+            const expected = try std.json.Stringify.valueAlloc(alloc, structural_before, .{});
+            defer alloc.free(expected);
+            const actual = try std.json.Stringify.valueAlloc(alloc, structural_after, .{});
+            defer alloc.free(actual);
+            if (!std.mem.eql(u8, expected, actual)) return error.InvalidCatalogMutation;
+            return applyPresentationRecord(alloc, txn, group_id, resource, previous, command_hash);
+        }
+    }
+    if (!delta.presentation_only) {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -945,12 +990,7 @@ pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_i
     }
     for (delta.removes) |resource| try removeResource(alloc, txn, group_id, resource);
     for (delta.upserts) |resource| try writeResource(alloc, txn, group_id, resource);
-    const meta: Meta = .{ .revision = try std.math.add(u64, previous.revision, 1), .next_id = delta.next_id, .last_command = command_hash, .sequence_outcome_head = previous.sequence_outcome_head };
-    const key = try keyAlloc(alloc, group_id, "meta");
-    defer alloc.free(key);
-    const bytes = try std.json.Stringify.valueAlloc(alloc, meta, .{});
-    defer alloc.free(bytes);
-    try txn.put(key, bytes);
+    try writeMeta(alloc, txn, group_id, previous, delta.next_id, command_hash);
 }
 
 /// Bootstrap a previously published standalone row journal without renumbering

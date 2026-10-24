@@ -162,6 +162,7 @@ pub const Call = union(enum) {
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
+            .mutate => |request| request.mutation.action == .comment,
             .schema_validation_prepare, .schema_validation_status => true,
             .schema_validation_submit => |bytes| @import("../metadata/schema_validation_ledger.zig").requiresAdmissionAuthority(bytes),
             .sql_sequence_prepare, .sql_sequence_counter_mutate, .sql_sequence_counter_outcome, .sql_view_mutate, .sql_sequence_snapshot, .sql_sequence_admission_head, .sql_sequence_mutate, .sql_sequence_outcome, .relation_replace, .relation_schema_mutate, .relation_description_mutate, .constraint_name_prepare, .constraint_name_check, .relational_index_status, .relational_index_prepare, .relational_index_begin => true,
@@ -499,4 +500,11 @@ test "system catalog relation replacement wire retains exact owner and rejects i
     request.replacement = table;
     request.guard.incarnation = @splat(0);
     try std.testing.expectError(error.InvalidCatalogMutation, request.validate());
+}
+
+test "system catalog resource comments require body bound admin forwarding for NULL removal" {
+    const remove: Call = .{ .mutate = .{ .mutation = .{ .action = .comment, .kind = .namespace, .name = "public", .description = null } } };
+    try std.testing.expect(remove.requiresAdministrativeGrant());
+    const ordinary: Call = .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "appdb" } } };
+    try std.testing.expect(!ordinary.requiresAdministrativeGrant());
 }
