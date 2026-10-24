@@ -273,7 +273,31 @@ fn scanQueryCertified(a: A, binding: Binding, request: catalog.Scan, consumed: *
     if (query.clauses.len != 2 or query.clauses[0].operation != .match or query.clauses[1].operation != .project) return query;
     const original = query.clauses[1].operation.project.value;
     if (original.distinct or original.wildcard or original.order.len != 0 or original.skip != null or original.limit != null or original.predicate != null) return query;
-    for (original.items) |item| if (cypher.expressions.aggregates(item.expression)) return query;
+    const grouped = for (original.items) |item| {
+        if (cypher.expressions.aggregates(item.expression)) break true;
+    } else false;
+    if (grouped) {
+        if (request.graph_source_ordinals or request.primary_key != null or request.after != null) return query;
+        for (request.fields) |field| if (std.mem.eql(u8, field, "_id")) return query;
+        for (request.conditions) |condition| if (std.mem.eql(u8, condition.column, "_id")) return query;
+        for (request.graph_filters) |filter| if (filterNeeds(filter, "_id")) return query;
+        var order: std.ArrayList(cypher.ast.Order) = .empty;
+        for (original.items) |item| if (!cypher.expressions.aggregates(item.expression)) {
+            switch (expressionType(binding, item.expression)) {
+                .integer, .string, .boolean => {},
+                else => return query,
+            }
+            if (item.expression.value != .property and item.expression.value != .literal and item.expression.value != .parameter) return query;
+            const alias = try a.create(cypher.ast.Expr);
+            alias.* = .{ .span = item.expression.span, .value = .{ .variable = item.alias.? } };
+            try order.append(a, .{ .expression = alias });
+        };
+        if (order.items.len == 0) return query;
+        const clauses = try a.dupe(cypher.ast.Clause, query.clauses);
+        clauses[1].operation.project.value.order = order.items;
+        query.clauses = clauses;
+        return query;
+    }
     const clauses = try a.dupe(cypher.ast.Clause, query.clauses);
     const operation = &clauses[0].operation.match;
     var push = !operation.optional and !request.graph_source_ordinals and request.primary_key == null and request.after == null;
@@ -340,6 +364,9 @@ pub const Cursor = struct {
     weight_passes: []const WeightPass = &.{},
     weight_pass: usize = 0,
     scalar_fields: []const []const u8 = &.{},
+    scalar_binding: Binding,
+    scalar_admission: ?*const cypher.ast.Expr = null,
+    scalar_admission_valid: bool = false,
     const WeightPass = struct { plan: cypher.runtime.NodeCursor.WeightPlan, slots: []const usize };
     pub fn open(a: A, binding: Binding, backend: cypher.backend.Backend, parameters: []const cypher.value.Entry, request: catalog.Scan, limits: cypher.runtime.Limits) !catalog.Cursor {
         const self = try a.create(Cursor);
@@ -347,6 +374,24 @@ pub const Cursor = struct {
         var arena = std.heap.ArenaAllocator.init(a);
         errdefer arena.deinit();
         const owned = arena.allocator();
+        // Observer negotiation happens after open returns. Retain its AST and
+        // scalar type environment in the cursor, independently of caller arenas.
+        const scalar_query = try std.json.parseFromSliceLeaky(cypher.ast.Query, owned, try std.json.Stringify.valueAlloc(owned, binding.definition.query, .{}), .{});
+        const scalar_graph = try std.json.parseFromSliceLeaky(cypher.catalog.Graph, owned, try std.json.Stringify.valueAlloc(owned, binding.graph, .{}), .{});
+        const scalar_dependencies = try owned.alloc(catalog.Table, binding.dependencies.len);
+        for (binding.dependencies, scalar_dependencies) |table, *copy| {
+            const copied_columns = try owned.alloc(catalog.Column, table.columns.len);
+            for (table.columns, copied_columns) |column, *out| {
+                out.* = column;
+                out.name = try owned.dupe(u8, column.name);
+                out.path = try owned.dupe(u8, column.path);
+            }
+            copy.* = .{ .id = table.id, .physical_name = try owned.dupe(u8, table.physical_name), .schema_version = table.schema_version, .columns = copied_columns };
+        }
+        var scalar_binding = binding;
+        scalar_binding.definition.query = scalar_query;
+        scalar_binding.graph = scalar_graph;
+        scalar_binding.dependencies = scalar_dependencies;
         const fields = try owned.alloc([]const u8, request.fields.len);
         for (request.fields, fields) |field, *out| out.* = try owned.dupe(u8, field);
         const conditions = try owned.alloc(catalog.Condition, request.conditions.len);
@@ -422,7 +467,39 @@ pub const Cursor = struct {
                 else => {},
             }
         }
-        self.* = .{ .scalar_fields = scalar_fields.items, .a = a, .arena = arena, .result = result, .stream = stream, .request = copied, .position = if (stream != null) 0 else resume_position, .resume_position = resume_position, .optimized = optimized, .ordered = ordered, .empty = empty };
+        var scalar_admission = if (compiled.query.clauses[0].operation.match.predicate) |predicate| try std.json.parseFromSliceLeaky(*const cypher.ast.Expr, owned, try std.json.Stringify.valueAlloc(owned, predicate, .{}), .{}) else null;
+        var scalar_admission_valid = request.graph_conditions.len == 0 and request.graph_predicates.len == 0;
+        const original = scalar_binding.definition.query.clauses[1].operation.project.value;
+        for (request.conditions) |condition| {
+            const filter: catalog.Scan.GraphFilter = .{ .comparison = condition };
+            if (!exactFilterDomain(scalar_binding, original, filter)) {
+                scalar_admission_valid = false;
+                break;
+            }
+            const predicate = (try graphFilter(owned, scalar_binding, original, filter)) orelse {
+                scalar_admission_valid = false;
+                break;
+            };
+            scalar_admission = (if (scalar_admission) |previous| try combinePredicate(owned, previous, predicate, .@"and") else predicate) orelse {
+                scalar_admission_valid = false;
+                break;
+            };
+        }
+        for (request.graph_filters) |filter| {
+            if (!exactFilterDomain(scalar_binding, original, filter)) {
+                scalar_admission_valid = false;
+                break;
+            }
+            const predicate = (try graphFilter(owned, scalar_binding, original, filter)) orelse {
+                scalar_admission_valid = false;
+                break;
+            };
+            scalar_admission = (if (scalar_admission) |previous| try combinePredicate(owned, previous, predicate, .@"and") else predicate) orelse {
+                scalar_admission_valid = false;
+                break;
+            };
+        }
+        self.* = .{ .scalar_binding = scalar_binding, .scalar_admission = scalar_admission, .scalar_admission_valid = scalar_admission_valid, .scalar_fields = scalar_fields.items, .a = a, .arena = arena, .result = result, .stream = stream, .request = copied, .position = if (stream != null) 0 else resume_position, .resume_position = resume_position, .optimized = optimized, .ordered = ordered, .empty = empty };
         return .{ .order_satisfied = ordered, .ptr = self, .next = next, .close = close, .count_rows = countRows, .enable_weights = enableWeights, .enable_aggregate_weights = enableAggregateWeights, .estimated_rows = if (empty) 0 else if (result) |value| value.rows.len else null };
     }
     fn enableAggregateWeights(ptr: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
@@ -441,12 +518,28 @@ pub const Cursor = struct {
         for (requests, 0..) |request, i| {
             const multiplicity = request.multiplicity;
             if (request.observer) |observer| scalar: {
-                if (self.request.conditions.len != 0 or request.fields.len != 1 or multiplicity != .presence) break :scalar;
-                const compatible = for (self.scalar_fields) |field| {
-                    if (std.mem.eql(u8, field, request.fields[0])) break true;
-                } else false;
+                if (!self.scalar_admission_valid or multiplicity != .presence) break :scalar;
+                const selected = request.observer_field orelse if (request.fields.len == 1) request.fields[0] else break :scalar;
+                var compatible = false;
+                for (self.scalar_fields) |field| if (std.mem.eql(u8, field, selected)) {
+                    compatible = true;
+                    break;
+                };
                 if (!compatible) break :scalar;
-                const plan = (try stream.planScalarObserver(request.fields[0], observer)) orelse break :scalar;
+                for (request.observer_keys) |key| {
+                    const valid = for (self.scalar_fields) |field| {
+                        if (std.mem.eql(u8, field, key)) break true;
+                    } else false;
+                    if (!valid) break :scalar;
+                }
+                var predicate = self.scalar_admission;
+                if (request.observer_filter) |filter| {
+                    const original = self.scalar_binding.definition.query.clauses[1].operation.project.value;
+                    if (!exactFilterDomain(self.scalar_binding, original, filter)) break :scalar;
+                    const admission = (try graphFilter(a, self.scalar_binding, original, filter)) orelse break :scalar;
+                    predicate = (if (predicate) |previous| try combinePredicate(a, previous, admission, .@"and") else admission) orelse break :scalar;
+                }
+                const plan = (try stream.planScalarDomain(selected, request.observer_keys, observer, predicate)) orelse break :scalar;
                 var candidate: Candidate = .{ .plan = plan };
                 try candidate.slots.append(a, i);
                 try candidates.append(a, candidate);
@@ -754,6 +847,31 @@ test "SQL GRAPH_TABLE dependency partitions share quotas and resume narrow pages
         }
         try std.testing.expectEqualSlices(usize, &.{ 3, 1, 1 }, &counts);
         try std.testing.expectEqualSlices(i64, &.{ 6, 1, 3 }, &totals);
+    }
+    for ([_]bool{ false, true }) |grouped| {
+        const cursor = try Cursor.open(std.testing.allocator, ordered_binding, indexed, &.{}, .{ .fields = &.{"rank"}, .limit = 1, .conditions = if (grouped) &.{} else &.{.{ .column = "rank", .op = .gte, .value = .{ .integer = 2 } }} }, .{ .scanned_anchors = 9 });
+        defer cursor.close(cursor.ptr);
+        const keys: []const []const u8 = if (grouped) &.{"rank"} else &.{};
+        try std.testing.expect(try cursor.enable_aggregate_weights.?(cursor.ptr, &.{
+            .{ .observer = .distinct, .observer_field = "rank", .observer_keys = keys, .fields = &.{"rank"}, .multiplicity = .presence },
+            .{ .observer = .min, .observer_field = "rank", .observer_keys = keys, .fields = &.{"rank"}, .multiplicity = .presence },
+            .{ .observer = .max, .observer_field = "rank", .observer_keys = keys, .fields = &.{"rank"}, .multiplicity = .presence },
+        }));
+        var counts = [_]usize{ 0, 0, 0 };
+        var totals = [_]i64{ 0, 0, 0 };
+        while (true) {
+            const page = try cursor.next(cursor.ptr, std.testing.allocator, 1);
+            defer page.deinit();
+            const slot = page.aggregate_slots.?[0];
+            for (page.rows, page.multiplicities.?) |row, weight| {
+                try std.testing.expectEqual(@as(u64, 1), weight);
+                counts[slot] += 1;
+                totals[slot] += (try row.cell("rank")).value.integer;
+            }
+            if (page.after == null) break;
+        }
+        try std.testing.expectEqualSlices(usize, if (grouped) &.{ 3, 3, 3 } else &.{ 2, 1, 1 }, &counts);
+        try std.testing.expectEqualSlices(i64, if (grouped) &.{ 6, 6, 6 } else &.{ 5, 2, 3 }, &totals);
     }
     for ([_]bool{ true, false }) |nulls_first| {
         const cursor = try Cursor.open(std.testing.allocator, ordered_binding, indexed, &.{}, .{ .fields = &.{"rank"}, .order = &.{.{ .column = "rank", .descending = true, .nulls_first = nulls_first }}, .row_goal = 1, .limit = 1 }, .{ .scanned_anchors = 1 });

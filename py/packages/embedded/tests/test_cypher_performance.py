@@ -8770,3 +8770,96 @@ def test_total_group_wrappers_preserve_bounded_high_cardinality_windows(graph_db
         assert result["rows"] == control["rows"]
         assert len(result["rows"]) == 5
         assert result["stats"]["scanned_anchors"] < 256
+
+
+def test_bounded_group_obligations_stop_after_accepted_groups(graph_db):
+    with graph_db.open_table("docs") as table:
+        table.batch(
+            [af.WriteIntent(key=f"u{i:06}", value={"id": f"u{i:06}", "score": i % 3}) for i in range(64000)],
+            timestamp=1,
+        )
+    graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
+    graph_db.run_until_idle()
+    limits = {"scanned_anchors": 256, "memory_bytes": 2 << 20}
+    for expression, value in (("count(DISTINCT n.score)+1", "2"), ("100-count(DISTINCT n.score)", "99")):
+        result = graph_db.cypher_json(
+            "g", {"query": f"MATCH(n:D) RETURN n.id,{expression} ORDER BY n.id SKIP 2 LIMIT 5", "limits": limits}
+        )
+        assert [[cell["value"] for cell in row] for row in result["rows"]] == [[f"u{i:06}", value] for i in range(2, 7)]
+    for predicate in ("c>0", "c>=1 AND true", "NOT c<1"):
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH(n:D) WITH n.id AS g,count(DISTINCT n.score) AS c ORDER BY g SKIP 2 LIMIT 5 WHERE {predicate} RETURN g,c",
+                "limits": limits,
+            },
+        )
+        assert [[cell["value"] for cell in row] for row in result["rows"]] == [[f"u{i:06}", "1"] for i in range(2, 7)]
+        assert result["stats"]["scanned_anchors"] <= 256
+
+
+def test_sql_group_and_filter_observers_scale_with_index_domains(graph_db):
+    scope_domains(graph_db, 64000)
+    source = "GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.id AS id,n.score AS score)) q"
+    groups = [[f"g{i}", "3", "0", "2"] for i in range(8)]
+    for query, expected in (
+        (f"SELECT count(DISTINCT score),min(score),max(score) FROM {source} WHERE score>=1", [["2", "1", "2"]]),
+        (
+            f"SELECT count(DISTINCT score),min(score),max(score) FROM {source} WHERE score=0 OR score=2",
+            [["2", "0", "2"]],
+        ),
+        (f"SELECT count(DISTINCT score),min(score),max(score) FROM {source} WHERE id='g3'", [["3", "0", "2"]]),
+        (f"SELECT id,count(DISTINCT score),min(score),max(score) FROM {source} GROUP BY id ORDER BY id", groups),
+        (f"SELECT id,count(DISTINCT score),min(score),max(score) FROM {source} WHERE id='g3' GROUP BY id", [groups[3]]),
+        (
+            f"SELECT g,count(DISTINCT s),min(s),max(s) FROM (SELECT id AS g,score AS s FROM {source}) d GROUP BY g ORDER BY g",
+            groups,
+        ),
+        (
+            "SELECT id,c,lo,hi FROM GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.id AS id,count(DISTINCT n.score) AS c,min(n.score) AS lo,max(n.score) AS hi)) q ORDER BY id",
+            groups,
+        ),
+    ):
+        assert graph_db.sql(query)["rows"] == expected, query
+
+
+def test_group_observer_proofs_preserve_nulls_ordinals_and_late_errors(graph_db):
+    with graph_db.open_table("docs") as table:
+        table.batch(
+            [af.WriteIntent(key=f"k{i:06}", value={"id": f"g{7 - i % 8}", "score": i % 3}) for i in range(3000)],
+            timestamp=1,
+        )
+    graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
+    grouped = "GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.id AS id,count(DISTINCT n.score) AS c)) q"
+    assert graph_db.sql(f"SELECT q._id,id,c FROM {grouped} ORDER BY q._id")["rows"] == [
+        [str(i), f"g{7 - i}", "3"] for i in range(8)
+    ]
+    graph_db.sql("UPDATE docs SET score=NULL WHERE id IN ('g0','g2','g4','g6')")
+    graph_db.sql("UPDATE docs SET id=NULL WHERE id='g1'")
+    graph_db.run_until_idle()
+    source = "GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.id AS id,n.score AS score)) q"
+    control = source.replace("n.score AS score", "n.score+0 AS score")
+    for predicate in ("true", "score>=1", "score IS NULL", "score IS NULL OR score>=1", "id='g3' OR id IS NULL"):
+        query = f"SELECT id,count(DISTINCT score),min(score),max(score) FROM {source} WHERE {predicate} GROUP BY id ORDER BY id"
+        assert graph_db.sql(query)["rows"] == graph_db.sql(query.replace(source, control))["rows"], query
+    query = "MATCH(n:D) WITH n.id AS g,count(DISTINCT n.score) AS c ORDER BY g SKIP 1 LIMIT 2 WHERE c>0 RETURN g,c"
+    assert (
+        graph_db.cypher_json("g", {"query": query})["rows"]
+        == graph_db.cypher_json("g", {"query": query.replace("ORDER BY g", "ORDER BY CASE WHEN true THEN g END")})[
+            "rows"
+        ]
+    )
+    with pytest.raises(af.GraphError, match="CypherDivisionByZero"):
+        graph_db.cypher_json(
+            "g",
+            {
+                "query": "MATCH(n:D) WITH n.id AS g,count(DISTINCT n.score) AS c ORDER BY g LIMIT 2 WHERE g<'g6' OR 1/0>0 RETURN g,c"
+            },
+        )
+    weighted = "UNWIND range(1,1000000) AS x UNWIND range(1,1000000) AS y RETURN 0 AS g,"
+    result = graph_db.cypher_json("g", {"query": weighted + "count(*)+1 ORDER BY g LIMIT 1"})
+    assert result["rows"][0][1]["value"] == "1000000000001"
+    with pytest.raises(af.GraphError, match="CypherNumericOverflow"):
+        graph_db.cypher_json("g", {"query": weighted + "count(*)*10000000 ORDER BY g LIMIT 1"})

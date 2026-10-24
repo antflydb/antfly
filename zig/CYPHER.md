@@ -3182,8 +3182,10 @@ is proved total: checked i64 interval arithmetic covers COUNT with safe integer
 operators, and COALESCE composes total leaves. Fallible or unknown wrappers and
 predicates still evaluate losing groups so a nonzero finite window cannot hide
 errors. The existing grouped LIMIT 0 short circuit is preserved.
-The count interval uses the full i64 domain rather than a physical-anchor
-estimate, preserving safety for compressed and multi-path counts.
+The count interval uses the full i64 domain for compressed and multi-path
+counts. A certified single-input, node-only producer can instead use the
+statement anchor ceiling as its logical count bound, allowing safe expressions
+such as COUNT(DISTINCT score) + 1 to retain bounded execution.
 
 A following sort can supply the earlier aggregate's group-key order through
 transparent alias projections. Computations, filters, DISTINCT, intervening windows and
@@ -3196,11 +3198,12 @@ empty results and late pagination diagnostics.
 SQL aggregate requests can negotiate an explicit scalar MIN, MAX or DISTINCT
 domain through GRAPH_TABLE. Direct column lineage and SQL type metadata must
 survive every forwarding projection. The graph bridge accepts integer, string
-and boolean property domains only, rejects residual scan conditions and source
-ordinals, and obtains a complete native ordering certificate before any pull.
-Computed inputs, numeric/structured coercions, grouping, filters and set/join
-barriers retain ordinary execution unless their existing independent proofs
-apply. Every graph projection retained for the SQL consumer still needs a total-expression
+and boolean property domains only, rejects unproved residual conditions and
+source ordinals, and obtains a complete native ordering certificate before any
+pull. Direct group keys and complete typed comparison/NULL/AND/OR admission
+predicates travel with the observer through identity projections. Computed
+inputs, numeric/structured coercions and set/join barriers retain ordinary
+execution unless their existing independent proofs apply. Every graph projection retained for the SQL consumer still needs a total-expression
 proof. Observer negotiation cannot elide errors in demanded computations.
 
 Scalar observers use the resumable node cursor. MIN/MAX consume one authorized
@@ -3254,3 +3257,36 @@ and performance tests on the final optimized library. Antfarm builds, the
 whitespace checks also pass. The merge preserves both graph and native-memory
 SDK/UI contracts and assigns separate metadata floors and command tags to the
 new graph/session and resolver capabilities.
+
+
+#### Accepted group demand and SQL grouped scalar domains
+
+A proved total HAVING predicate can stop after SKIP + LIMIT accepted groups.
+Rejected groups do not consume that demand. Integer comparisons, boolean
+composition and aliases of proved total counts qualify; fallible or unknown
+predicates still inspect all candidate groups. Both adjacent folds and indexed
+group discovery apply this rule after reduction. LIMIT 0 retains its existing
+short circuit. Count arithmetic uses a tighter bound only for a certified
+one-row-per-anchor producer; weighted axes and multiple paths keep the full
+logical count range and their checked overflow behavior.
+
+SQL observers carry the argument, direct group-key tuple and complete admission
+predicate as one obligation. Forwarding owns and renames the entire obligation,
+including every predicate dependency. The graph cursor owns the AST and scalar
+type environment used by deferred negotiation. It keeps all demanded total
+projection fields for SQL residual checks, while adjacent membership and seeks
+use only the certified group/value tuple. SQL retains its own grouping and NULL
+semantics, including groups containing only NULL arguments.
+
+Grouped DISTINCT traverses globally ordered group/value domains. Grouped extrema
+sample the admitted key stream: sparse groups use one sequential fold; dense
+groups seek their next key and one non-NULL value boundary. A boundary provider
+that declines before pulling switches the remaining discovery stream to one
+fold without replaying previous groups. Every boundary has a recyclable
+invariant scope; allocation identities and literal hashes cannot leak into the
+next group. Narrow caller pages preserve unit multiplicities.
+
+Grouped GRAPH_TABLE COLUMNS can request intrinsic group-key order when direct
+scalar group keys are available. Native execution still certifies the index and
+reducer. Synthetic source ordinals, positional resume tokens and unsupported
+expressions remain barriers; SQL keeps its own final ordering.

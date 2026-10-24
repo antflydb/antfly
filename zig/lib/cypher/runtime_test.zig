@@ -8232,6 +8232,7 @@ test "ordered groups retire reducers across a broad exact-budget prefix" {
         reads: usize = 0,
         requests: usize = 0,
         ordered_requests: usize = 0,
+        allow_boundaries: bool = false,
         fn checkpoint(_: *anyopaque) !void {}
         fn scan(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -8243,7 +8244,24 @@ test "ordered groups retire reducers across a broad exact-budget prefix" {
             self.requests += 1;
             return .{ .items = items, .examined = items.len, .next = if (end < self.nodes.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null, .exact_keys = true, .stable_ties = false };
         }
-        fn ordered(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, _: []const b.PropertyFilter, fields: []const b.PropertyOrder, after: ?[]const u8, limit: usize, _: usize) !?b.Page(*const v.Node) {
+        fn ordered(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, filters: []const b.PropertyFilter, fields: []const b.PropertyOrder, after: ?[]const u8, limit: usize, _: usize) !?b.Page(*const v.Node) {
+            const fixture: *@This() = @ptrCast(@alignCast(ptr));
+            if (fixture.allow_boundaries and fields.len == 1 and std.mem.eql(u8, fields[0].property, "rank")) {
+                if (limit == 0) return .{ .items = &.{}, .examined = 0, .next = "0", .exact_keys = true, .stable_ties = false };
+                var candidates: std.ArrayList(*const v.Node) = .empty;
+                candidates: for (fixture.nodes) |*node| {
+                    for (filters) |filter| if (std.mem.eql(u8, filter.property, "id") and filter.op == .eq) {
+                        if (filter.value != .string or !std.mem.eql(u8, node.properties[0].value.string, filter.value.string)) continue :candidates;
+                    };
+                    try candidates.append(a, node);
+                }
+                if (fields[0].descending) std.mem.reverse(*const v.Node, candidates.items);
+                const offset = if (after) |value| try std.fmt.parseInt(usize, value, 10) else 0;
+                const end = @min(candidates.items.len, offset + limit);
+                const items = candidates.items[offset..end];
+                fixture.reads += items.len;
+                return .{ .items = items, .examined = items.len, .next = if (end < candidates.items.len) try std.fmt.allocPrint(a, "{d}", .{end}) else null, .exact_keys = true, .stable_ties = false };
+            }
             if (fields.len == 0 or fields.len > 2 or !std.mem.eql(u8, fields[0].property, "id") or fields[0].descending) return null;
             if (fields.len == 2 and !std.mem.eql(u8, fields[1].property, "rank")) return null;
             if (limit == 0) return .{ .items = &.{}, .examined = 0, .next = "0", .exact_keys = true, .stable_ties = false };
@@ -8318,7 +8336,7 @@ test "ordered groups retire reducers across a broad exact-budget prefix" {
         try std.testing.expectEqual(@as(usize, 0), result.rows.len);
         try std.testing.expectEqual(@as(usize, 0), fixture.reads);
     }
-    for ([_][]const u8{ "count(DISTINCT n.rank)+0", "coalesce(count(DISTINCT n.rank),0)", "-(-count(DISTINCT n.rank))" }) |observer| {
+    for ([_][]const u8{ "count(DISTINCT n.rank)+0", "coalesce(count(DISTINCT n.rank),0)", "-(-count(DISTINCT n.rank))", "count(DISTINCT n.rank)+1" }) |observer| {
         fixture.reads = 0;
         var diagnostic: c.Diagnostic = .{};
         const query = try std.fmt.allocPrint(a, "MATCH(n:Document) RETURN n.id,{s} AS c ORDER BY n.id SKIP 2 LIMIT 5", .{observer});
@@ -8328,8 +8346,74 @@ test "ordered groups retire reducers across a broad exact-budget prefix" {
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 5), result.rows.len);
         try std.testing.expectEqualStrings("000002", result.rows[0][0].string);
-        for (result.rows) |row| try std.testing.expectEqual(@as(i128, 1), row[1].integer);
+        for (result.rows) |row| try std.testing.expectEqual(if (std.mem.endsWith(u8, observer, "+1")) @as(i128, 2) else 1, row[1].integer);
         try std.testing.expect(fixture.reads <= 256);
+    }
+    for ([_][]const u8{ "c>0", "c>=1 AND true", "NOT c<1" }) |predicate| {
+        fixture.reads = 0;
+        const query = try std.fmt.allocPrint(a, "MATCH(n:Document) WITH n.id AS g,count(DISTINCT n.rank) AS c ORDER BY g SKIP 2 LIMIT 5 WHERE {s} RETURN g,c", .{predicate});
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 256, .memory_bytes = 2 << 20 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 5), result.rows.len);
+        try std.testing.expectEqualStrings("000002", result.rows[0][0].string);
+        try std.testing.expect(fixture.reads < 256);
+    }
+    {
+        // Dense discovery followed by a declined boundary must become one
+        // fold from the current row, without replaying the source per group.
+        for (nodes[0..64]) |*node| @constCast(node.properties)[0].value = .{ .string = "000000" };
+        defer for (nodes[0..64]) |*node| {
+            @constCast(node.properties)[0].value = .{ .string = node.identity.key };
+        };
+        fixture.reads = 0;
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, "MATCH(n:Document) RETURN n.id AS id,n.rank AS rank", .{}, &diagnostic);
+        defer compiled.deinit();
+        const cursor = (try runtime.NodeCursor.open(std.testing.allocator, backend, graph, compiled.query, &.{}, .{ .scanned_anchors = 5000, .memory_bytes = 512 << 10 })).?;
+        defer cursor.close();
+        const plan = (try cursor.planScalarDomain("rank", &.{"id"}, .min, null)).?;
+        try cursor.startWeightPlan(plan);
+        var count: usize = 0;
+        while (!cursor.done) {
+            var page = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer page.deinit();
+            const rows = try cursor.next(page.allocator(), 64);
+            for (rows) |row| {
+                try std.testing.expectEqual(@as(i64, @intCast(count)), row[1].value.integer);
+                count += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 5000), count);
+        try std.testing.expectEqual(@as(usize, 5000), fixture.reads);
+    }
+    for ([_]runtime.NodeCursor.ScalarObserver{ .min, .max }) |kind| {
+        for (nodes, 0..) |*node, index| @constCast(node.properties)[0].value = .{ .string = try std.fmt.allocPrint(a, "g{d}", .{index / 1000}) };
+        defer for (nodes) |*node| {
+            @constCast(node.properties)[0].value = .{ .string = node.identity.key };
+        };
+        fixture.allow_boundaries = true;
+        defer fixture.allow_boundaries = false;
+        fixture.reads = 0;
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, "MATCH(n:Document) RETURN n.id AS id,n.rank AS rank", .{}, &diagnostic);
+        defer compiled.deinit();
+        const cursor = (try runtime.NodeCursor.open(std.testing.allocator, backend, graph, compiled.query, &.{}, .{ .scanned_anchors = 5010, .memory_bytes = 512 << 10 })).?;
+        defer cursor.close();
+        try cursor.startWeightPlan((try cursor.planScalarDomain("rank", &.{"id"}, kind, null)).?);
+        var count: usize = 0;
+        while (!cursor.done) {
+            var page = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer page.deinit();
+            for (try cursor.next(page.allocator(), 1)) |row| {
+                try std.testing.expectEqual(@as(i64, @intCast(count * 1000 + (if (kind == .max) @as(usize, 999) else 0))), row[1].value.integer);
+                count += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 5), count);
+        try std.testing.expectEqual(@as(usize, 5005), fixture.reads);
     }
     for ([_][]const u8{ "", " LIMIT 5000" }) |suffix| {
         fixture.reads = 0;

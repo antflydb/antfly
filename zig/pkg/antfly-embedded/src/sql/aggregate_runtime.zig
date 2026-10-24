@@ -472,7 +472,26 @@ const StatisticConsumer = struct {
         return self.program.statisticProof(a, self.columns, fields, self.integers);
     }
 };
-fn aggregateRequests(a: std.mem.Allocator, bound: *const binding.Bound, table: catalog.Table, conditions: []const catalog.Condition, parameters: []const Json) ![]const catalog.AggregateWeight {
+/// Complete admission proof. Partial conjunct hints still use the ordinary
+/// reducer. Boolean trees retain SQL NULL semantics in the graph bridge.
+fn observerFilter(context: anytype, table: catalog.Table, predicate: *const ast.Predicate, depth: usize) anyerror!?catalog.Scan.GraphFilter {
+    if (depth >= 64) return null;
+    return switch (predicate.*) {
+        .comparison, .is_null => blk: {
+            const bound = try context.conditions(table, predicate);
+            if (!bound.complete or bound.empty or bound.primary_key != null or bound.terms.items.len != 1) break :blk null;
+            break :blk .{ .comparison = bound.terms.items[0] };
+        },
+        .conjunction, .disjunction => |both| blk: {
+            const left = (try observerFilter(context, table, both.left, depth + 1)) orelse break :blk null;
+            const right = (try observerFilter(context, table, both.right, depth + 1)) orelse break :blk null;
+            const children = try context.arena.dupe(catalog.Scan.GraphFilter, &.{ left, right });
+            break :blk if (predicate.* == .conjunction) .{ .all = children } else .{ .any = children };
+        },
+        else => null,
+    };
+}
+fn aggregateRequests(a: std.mem.Allocator, bound: *const binding.Bound, table: catalog.Table, conditions: []const catalog.Condition, parameters: []const Json, predicate_complete: bool, exact_filter: ?catalog.Scan.GraphFilter) ![]const catalog.AggregateWeight {
     const integers = try a.alloc(?i64, parameters.len);
     for (parameters, integers) |parameter, *integer| integer.* = if (parameter == .integer) parameter.integer else null;
     const scalars = try a.alloc(?@import("cypher").linear_numeric.Lattice, parameters.len);
@@ -572,16 +591,34 @@ fn aggregateRequests(a: std.mem.Allocator, bound: *const binding.Bound, table: c
             if (!fields.contains(key.*)) try names.append(a, key.*);
         }
         var observer: ?@import("cypher").runtime.NodeCursor.ScalarObserver = null;
-        if (bound.group_count == 0 and conditions.len == 0 and bound.input.predicate == null and filter == null and names.items.len == 1) if (input) |slot| if (bound.input.projections[slot]) |program| {
-            const root = program.instructions[program.root];
-            if (root.operation == .column and !root.input_function) observer = switch (spec.kind) {
-                .min => .min,
-                .max => .max,
-                .count => if (spec.distinct) .distinct else null,
-                else => null,
+        var observer_field: ?[]const u8 = null;
+        var observer_keys: std.ArrayList([]const u8) = .empty;
+        var direct_keys = true;
+        for (bound.input.projections[0..bound.group_count]) |optional| {
+            const program = optional orelse {
+                direct_keys = false;
+                break;
             };
+            const root = program.instructions[program.root];
+            if (root.operation != .column or root.input_function) {
+                direct_keys = false;
+                break;
+            }
+            try observer_keys.append(a, (try table.column(bound.input.columns[root.operation.column].name)).path);
+        }
+        if (direct_keys and predicate_complete and filter == null) if (input) |slot| if (bound.input.projections[slot]) |program| {
+            const root = program.instructions[program.root];
+            if (root.operation == .column and !root.input_function) {
+                observer_field = (try table.column(bound.input.columns[root.operation.column].name)).path;
+                observer = switch (spec.kind) {
+                    .min => .min,
+                    .max => .max,
+                    .count => if (spec.distinct) .distinct else null,
+                    else => null,
+                };
+            }
         };
-        request.* = .{ .observer = observer, .fields = names.items, .multiplicity = if (presence) .presence else .exact, .summary = summary, .invariants = invariants.items, .summaries = summaries.items };
+        request.* = .{ .observer_field = observer_field, .observer_keys = observer_keys.items, .observer_filter = exact_filter, .observer = observer, .fields = names.items, .multiplicity = if (presence) .presence else .exact, .summary = summary, .invariants = invariants.items, .summaries = summaries.items };
     }
     return requests;
 }
@@ -633,9 +670,11 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
             try grouped.addGlobalCount(count);
             aggregate_loaded = true;
         };
+        const exact_filter = if (statement.predicate) |predicate| try observerFilter(context, table, predicate, 0) else null;
+        const observer_admission = statement.predicate == null or exact_filter != null;
         const can_weight = !aggregate_loaded and !predicates.empty and !external and supportsWeights(bound);
         const partitioned = can_weight and bound.specs.len > 0 and
-            try scan.aggregateWeights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, try aggregateRequests(context.arena, bound, table, predicates.terms.items, context.parameters));
+            try scan.aggregateWeights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, try aggregateRequests(context.arena, bound, table, predicates.terms.items, context.parameters, observer_admission, exact_filter));
         const weighted = partitioned or (can_weight and try scan.weights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, multiplicity(bound)));
         const parallel = !weighted and bound.ordered.len == 0 and !external and !predicates.empty and !aggregate_loaded and try @import("parallel_aggregate.zig").execute(context, bound, grouped, &scan, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.executionRows() });
         while (!predicates.empty and !aggregate_loaded and !parallel) {

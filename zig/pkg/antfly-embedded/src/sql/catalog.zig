@@ -644,7 +644,7 @@ pub const SummaryCertificate = struct {
     /// prepared plan or an external transport.
     linear: ?@import("cypher").linear_bounds.Check = null,
 };
-pub const AggregateWeight = struct { observer: ?@import("cypher").runtime.NodeCursor.ScalarObserver = null, fields: []const []const u8, multiplicity: Multiplicity, summary: ?[]const u8 = null, invariants: []const []const u8 = &.{}, summaries: []const SummaryCertificate = &.{} };
+pub const AggregateWeight = struct { observer_field: ?[]const u8 = null, observer_keys: []const []const u8 = &.{}, observer_filter: ?Scan.GraphFilter = null, observer: ?@import("cypher").runtime.NodeCursor.ScalarObserver = null, fields: []const []const u8, multiplicity: Multiplicity, summary: ?[]const u8 = null, invariants: []const []const u8 = &.{}, summaries: []const SummaryCertificate = &.{} };
 /// Borrowed snapshot-local costing evidence. Providers never perform I/O for
 /// optimizer statistics; absent fields remain unknown. Frequencies and hashes
 /// describe semantic equality keys, and are advisory rather than pruning proof.
