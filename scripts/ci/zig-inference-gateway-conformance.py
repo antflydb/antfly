@@ -251,11 +251,34 @@ class Upstream(BaseHTTPRequestHandler):
                     for delta in deltas
                 )
                 events.append({"type": "content_block_stop", "index": index})
+            if model == "anthropic-usage-mixed":
+                for counts in (
+                    {"cache_creation_input_tokens": 3, "output_tokens": 2},
+                    {"cache_read_input_tokens": 5, "output_tokens": 3},
+                    {
+                        "input_tokens": 4,
+                        "cache_creation_input_tokens": None,
+                        "cache_read_input_tokens": None,
+                        "output_tokens": 4,
+                    },
+                ):
+                    events.append(
+                        {"type": "message_delta", "delta": {}, "usage": counts}
+                    )
+                final_usage = {"cache_creation_input_tokens": 0, "output_tokens": 5}
+            elif model == "anthropic-cache-only":
+                final_usage = {"cache_read_input_tokens": 5, "output_tokens": 1}
+            elif model == "anthropic-cache-debt":
+                final_usage = {"cache_read_input_tokens": 1000, "output_tokens": 1}
+            else:
+                # Supplying only the noncached input count must retain the
+                # cache count from message_start.
+                final_usage = {"input_tokens": 2, "output_tokens": 1}
             events += [
                 {
                     "type": "message_delta",
                     "delta": {"stop_reason": reason},
-                    "usage": {"output_tokens": 1},
+                    "usage": final_usage,
                 },
                 {"type": "message_stop"},
             ]
@@ -1994,6 +2017,44 @@ def verify_audio_admission(client):
             )
 
 
+def verify_anthropic_usage(client, messages):
+    for alias, expected_input, expected_output in (
+        ("anthropic-known", 4, 1),
+        ("anthropic-cache-only", 7, 1),
+        ("anthropic-usage-mixed", 9, 5),
+        ("anthropic-cache-debt", 1002, 1),
+    ):
+        usage = None
+        with client.chat.completions.create(
+            model="generators/" + alias,
+            messages=messages,
+            stream=True,
+            stream_options={"include_usage": True},
+        ) as chunks:
+            for chunk in chunks:
+                usage = chunk.usage or usage
+        assert usage is not None
+        assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens) == (
+            expected_input,
+            expected_output,
+            expected_input + expected_output,
+        ), (alias, usage)
+    # Actual cached usage is reconciled before releasing admission. A fresh
+    # caller inherits the debt even though the first request's estimate fitted.
+    before = len(Upstream.requests)
+    try:
+        client.chat.completions.create(
+            model="generators/anthropic-cache-debt",
+            messages=messages,
+            stream=True,
+            extra_headers={"X-Antfly-Inference-Timeout-Ms": "100"},
+        )
+        raise AssertionError("native cached usage debt was not retained")
+    except openai.APIStatusError as error:
+        assert error.status_code == 504, error
+    assert len(Upstream.requests) == before
+
+
 def verify_hosted_generation_contracts(base_url):
     with openai.OpenAI(
         api_key="unused", base_url=base_url + "/ai/v1", max_retries=0, timeout=30
@@ -2002,6 +2063,7 @@ def verify_hosted_generation_contracts(base_url):
         verify_bedrock_stream_replay(client, messages)
         verify_native_replay_contracts(client, messages)
         verify_audio_admission(client)
+        verify_anthropic_usage(client, messages)
         for provider in ("anthropic", "bedrock"):
             for streaming in (False, True):
                 for tool in (
@@ -2503,6 +2565,25 @@ def main() -> None:
                 config["inference_capabilities"]["generators/" + name] = {
                     "audio": "supported",
                     "streaming": "supported",
+                }
+            for alias in (
+                "anthropic-cache-only",
+                "anthropic-usage-mixed",
+                "anthropic-cache-debt",
+            ):
+                generator = {
+                    **config["generators"]["anthropic-known"],
+                    "model": alias,
+                    "max_tokens": 16,
+                }
+                if alias == "anthropic-cache-debt":
+                    generator["rate_limit"] = {
+                        "tokens_per_minute": 500,
+                        "max_concurrency": 1,
+                    }
+                config["generators"][alias] = generator
+                config["inference_capabilities"]["generators/" + alias] = {
+                    "streaming": "supported"
                 }
             credentials = root / "mock-adc.json"
             credentials.write_text(

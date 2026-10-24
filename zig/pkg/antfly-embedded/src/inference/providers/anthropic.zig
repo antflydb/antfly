@@ -355,11 +355,48 @@ pub fn finishReason(reason: []const u8) !lib.GenerationFinishReason {
     if (std.mem.eql(u8, reason, "refusal")) return .content_filter;
     return error.InvalidInferenceResponse;
 }
+/// Native usage fields are independent cumulative counters. A delta can omit
+/// any input/cache field; absence (or null) retains its previous value. Keep
+/// the counters separate until producing provider-neutral billing totals.
+pub const UsageCounters = struct {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_input_tokens: u64 = 0,
+    cache_read_input_tokens: u64 = 0,
+
+    fn optional(value: Json, name: []const u8) !?u64 {
+        if (value != .object) return error.InvalidInferenceResponse;
+        const field = value.object.get(name) orelse return null;
+        if (field == .null) return null;
+        return lib.GenerationUsage.count(value, name) orelse error.InvalidInferenceResponse;
+    }
+
+    pub fn init(value: Json) !UsageCounters {
+        return .{
+            .input_tokens = lib.GenerationUsage.count(value, "input_tokens") orelse return error.InvalidInferenceResponse,
+            .output_tokens = lib.GenerationUsage.count(value, "output_tokens") orelse return error.InvalidInferenceResponse,
+            .cache_creation_input_tokens = (try optional(value, "cache_creation_input_tokens")) orelse 0,
+            .cache_read_input_tokens = (try optional(value, "cache_read_input_tokens")) orelse 0,
+        };
+    }
+
+    pub fn apply(self: *UsageCounters, value: Json) !void {
+        var next = self.*;
+        next.output_tokens = lib.GenerationUsage.count(value, "output_tokens") orelse return error.InvalidInferenceResponse;
+        inline for (.{ "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens" }) |name| {
+            if (try optional(value, name)) |count| @field(next, name) = count;
+        }
+        self.* = next;
+    }
+
+    pub fn normalized(self: UsageCounters) lib.GenerationUsage {
+        const input = self.input_tokens +| self.cache_creation_input_tokens +| self.cache_read_input_tokens;
+        return .{ .input_tokens = input, .output_tokens = self.output_tokens, .total_tokens = input +| self.output_tokens };
+    }
+};
+
 fn usage(value: Json) !lib.GenerationUsage {
-    const input = lib.GenerationUsage.count(value, "input_tokens") orelse return error.InvalidInferenceResponse;
-    const output = lib.GenerationUsage.count(value, "output_tokens") orelse return error.InvalidInferenceResponse;
-    const cached = (lib.GenerationUsage.count(value, "cache_creation_input_tokens") orelse 0) +| (lib.GenerationUsage.count(value, "cache_read_input_tokens") orelse 0);
-    return .{ .input_tokens = input +| cached, .output_tokens = output, .total_tokens = input +| cached +| output };
+    return (try UsageCounters.init(value)).normalized();
 }
 pub fn responseAlloc(a: Allocator, body: []const u8) !inference.GenerateResult {
     var parsed = try std.json.parseFromSlice(Json, a, body, .{});

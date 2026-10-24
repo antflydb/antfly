@@ -39,7 +39,7 @@ pub const Decoder = struct {
     started: bool = false,
     stopped: bool = false,
     stop_reason: ?lib.GenerationFinishReason = null,
-    initial_usage: ?lib.GenerationUsage = null,
+    counters: ?wire.UsageCounters = null,
     usage: ?lib.GenerationUsage = null,
 
     pub fn deinit(self: *Decoder) void {
@@ -69,7 +69,7 @@ pub const Decoder = struct {
             if (self.role_seen) return error.InvalidInferenceResponse;
             const message = try get(value, "message");
             if (!std.mem.eql(u8, try string(try get(message, "role")), "assistant")) return error.InvalidInferenceResponse;
-            self.initial_usage = try wire.streamUsage(try get(message, "usage"));
+            self.counters = try wire.UsageCounters.init(try get(message, "usage"));
             self.role_seen = true;
             try self.delta(.{ .role = "assistant" });
         } else if (std.mem.eql(u8, tag, "content_block_start")) {
@@ -120,9 +120,9 @@ pub const Decoder = struct {
                 self.stop_reason = try wire.finishReason(try string(reason));
             };
             if (value.object.get("usage")) |counts| {
-                const output = lib.GenerationUsage.count(counts, "output_tokens") orelse return error.InvalidInferenceResponse;
-                const input = if (lib.GenerationUsage.count(counts, "input_tokens") != null) (try wire.streamUsage(counts)).input_tokens else (self.initial_usage orelse return error.InvalidInferenceResponse).input_tokens;
-                self.usage = .{ .input_tokens = input, .output_tokens = output, .total_tokens = input +| output };
+                const counters = if (self.counters) |*current| current else return error.InvalidInferenceResponse;
+                try counters.apply(counts);
+                self.usage = counters.normalized();
             }
         } else if (std.mem.eql(u8, tag, "message_stop")) {
             const reason = self.stop_reason orelse return error.InvalidInferenceResponse;

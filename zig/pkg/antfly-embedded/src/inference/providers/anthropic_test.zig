@@ -89,23 +89,41 @@ pub fn run() !void {
         ,
         \\{"type":"content_block_stop","index":2}
         ,
-        \\{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3}}
-        ,
-        \\{"type":"message_stop"}
-        ,
     };
     for (events) |event| {
         const framed = try std.fmt.allocPrint(a, "data: {s}\r\n\r\n", .{event});
         defer a.free(framed);
         for (framed) |byte| try decoder.push(&.{byte});
     }
+    // Every optional counter survives omission/null, changes independently,
+    // and accepts an explicit zero rather than accumulating previous totals.
+    const updates = [_]struct { json: []const u8, input: u64, output: u64 }{
+        .{ .json = "{\"input_tokens\":2,\"output_tokens\":1}", .input = 7, .output = 1 },
+        .{ .json = "{\"cache_creation_input_tokens\":3,\"output_tokens\":2}", .input = 10, .output = 2 },
+        .{ .json = "{\"cache_read_input_tokens\":8,\"output_tokens\":3}", .input = 13, .output = 3 },
+        .{ .json = "{\"input_tokens\":4,\"cache_creation_input_tokens\":null,\"cache_read_input_tokens\":null,\"output_tokens\":4}", .input = 15, .output = 4 },
+        .{ .json = "{\"cache_creation_input_tokens\":0,\"output_tokens\":5}", .input = 12, .output = 5 },
+    };
+    for (updates) |update| {
+        const framed = try std.fmt.allocPrint(a, "data: {{\"type\":\"message_delta\",\"delta\":{{}},\"usage\":{s}}}\n\n", .{update.json});
+        defer a.free(framed);
+        for (framed) |byte| try decoder.push(&.{byte});
+        try std.testing.expectEqual(update.input, decoder.usage.?.input_tokens);
+        try std.testing.expectEqual(update.output, decoder.usage.?.output_tokens);
+    }
+    try decoder.push("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":5}}\n\ndata: {\"type\":\"message_stop\"}\n\n");
     try decoder.finish();
     try std.testing.expect(sink.closed);
-    try std.testing.expectEqual(@as(u64, 10), decoder.usage.?.total_tokens.?);
+    try std.testing.expectEqual(@as(u64, 17), decoder.usage.?.total_tokens.?);
     try std.testing.expect(std.mem.indexOf(u8, sink.output.items, "signature_delta") != null);
     try std.testing.expect(std.mem.endsWith(u8, sink.output.items, "data: [DONE]\n\n"));
     try std.testing.expect(std.mem.indexOf(u8, sink.output.items, "\"content_block_index\":2") != null);
     try std.testing.expect(decoder.framer.pending.capacity < 4096);
+    const before = decoder.counters.?;
+    const malformed = try std.json.parseFromSlice(std.json.Value, a, "{\"input_tokens\":10,\"cache_read_input_tokens\":-1,\"output_tokens\":9}", .{});
+    defer malformed.deinit();
+    try std.testing.expectError(error.InvalidInferenceResponse, decoder.counters.?.apply(malformed.value));
+    try std.testing.expectEqualDeep(before, decoder.counters.?);
     var rejected: Sink = .{};
     defer rejected.output.deinit(a);
     var invalid = Decoder{ .alloc = a, .sink = rejected.view(), .model = cfg.model, .id = "invalid" };
