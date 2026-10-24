@@ -3855,3 +3855,11 @@ Maintenance cache misses share bounded, phase-admitted packed range reads; appen
 forward transfer preserves verified order without merge rewrites. Reduction state
 version 2 stores only reducers that need tree maintenance and rebuilds older state
 once. These refinements retain the existing publication and reclamation boundary.
+
+
+[Compact decoded navigation and shared probe candidates](lake-row-identity.md#compact-decoded-navigation-and-shared-probe-candidates)
+keep larger reduction working sets within the existing cache admission policy.
+Dirty-key ordering and compact read descriptors remove repeated backing reads;
+encoded fallback handles oversized decoded pages without increasing the cache
+limit. Repeated native join keys share candidate metadata decoding within a wave.
+These are in-memory refinements under the existing publication/GC contract.

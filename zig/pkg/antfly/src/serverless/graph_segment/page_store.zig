@@ -1426,7 +1426,7 @@ test "serverless graph query page waves overlap reads and drain failures cancell
     var sources: [tree.max_read_batch]tree.Store = undefined;
     const count = @min(refs_.len, page.entries.len);
     for (page.entries[0..count], refs_[0..count], sources[0..count]) |entry, *ref, *source| {
-        ref.* = entry.child.?;
+        ref.* = entry.child.?.*;
         source.* = store;
     }
     var output: [tree.max_read_batch]tree.Page = undefined;

@@ -122,11 +122,25 @@ pub fn repairMeasured(a: A, manager: *local.sql_spill.Manager, storage: tree.Sto
         defer changes.deinit();
         changes.private_pages.phase = phase;
         var parents: Dirty = .empty;
+        // Preserve leaf locality across working sets larger than the cache.
+        // Only borrowed keys enter this workspace-accounted level directory.
+        const ordered = try a.alloc([]const u8, pending.count());
+        defer a.free(ordered);
         var it = pending.keyIterator();
+        var next: usize = 0;
         while (it.next()) |entry| {
+            ordered[next] = entry.*;
+            next += 1;
+        }
+        std.mem.sort([]const u8, ordered, {}, struct {
+            fn less(_: void, left: []const u8, right: []const u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        }.less);
+        for (ordered) |entry| {
             try manager.check();
-            const group = entry.*[0 .. entry.*.len - 9];
-            const block = std.mem.readInt(u64, entry.*[entry.*.len - 8 ..][0..8], .big);
+            const group = entry[0 .. entry.len - 9];
+            const block = std.mem.readInt(u64, entry[entry.len - 8 ..][0..8], .big);
             var scratch = std.heap.ArenaAllocator.init(a);
             defer scratch.deinit();
             const sa = scratch.allocator();
@@ -153,7 +167,7 @@ pub fn repairMeasured(a: A, manager: *local.sql_spill.Manager, storage: tree.Sto
                 const value = if (level == 0 and projection.indices.len != layout.slots.len) try record.project(sa, contribution.value, layout, &projection.layout, projection.indices) else contribution.value;
                 merged = if (merged) |previous| try record.merge(sa, previous, value, &projection.layout) else try sa.dupe(u8, value);
             }
-            try changes.addRecord(entry.*, merged);
+            try changes.addRecord(entry, merged);
             try parents.put(ca, try key(ca, group, level + 1, block >> 4), {});
         }
         root = try changes.finish(root);
@@ -313,6 +327,9 @@ test "external lake exact reduction dirty keys unwind allocation failures" {
 }
 
 test "external lake high cardinality reductions bulk read each contribution page once and cache repairs" {
+    for ([_]usize{ 257, 2049 }) |count| try repairLocalityScenario(count);
+}
+fn repairLocalityScenario(count: usize) !void {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -331,7 +348,6 @@ test "external lake high cardinality reductions bulk read each contribution page
     defer rows.deinit();
     var dirty: Dirty = .empty;
     defer clear(a, &dirty);
-    const count = 257;
     var state = try local.sql_operators.Aggregate.initTyped(out, .bool_and, .boolean, null);
     defer state.deinit();
     try state.update(local.sql_scalar.Datum.json(.{ .bool = true }));
@@ -349,9 +365,35 @@ test "external lake high cardinality reductions bulk read each contribution page
     const input_pages = memory.pages.count();
     const reduced = try repair(a, &manager, memory.store(), root, null, &dirty, count, &layout, null);
     try std.testing.expectEqual(@as(usize, input_pages), memory.reads - before_reads);
-    try std.testing.expectEqual(@as(u64, 514), reduced.?.records);
+    try std.testing.expectEqual(@as(u64, @intCast(count)) * (@as(u64, levels(count)) + 1), reduced.?.records);
     const before_repair = memory.reads;
     _ = try repair(a, &manager, memory.store(), root, reduced, &dirty, count, &layout, null);
-    try std.testing.expect(memory.reads - before_repair <= 32);
-    std.debug.print("bounded reductions: groups={} fresh_reads={} repair_reads={}\n", .{ count, input_pages, memory.reads - before_repair });
+    try std.testing.expect(memory.reads - before_repair <= input_pages + 16);
+    const repair_reads = memory.reads - before_repair;
+    var changed_rows: tree.SortedBuilder = .{ .alloc = a, .store = memory.store(), .target_bytes = 4096 };
+    defer changed_rows.deinit();
+    var false_state = try local.sql_operators.Aggregate.initTyped(out, .bool_and, .boolean, null);
+    defer false_state.deinit();
+    try false_state.update(local.sql_scalar.Datum.json(.{ .bool = false }));
+    for (0..count) |i| {
+        const group: [6]u8 = .{ 0, 0, 0, 2, @intCast(i >> 8), @truncate(i) };
+        const encoded = try record.encodeWithLayout(out, .{ .keys = &.{local.sql_scalar.Datum.json(.{ .string = group[4..] })}, .aggregates = &.{}, .typed_states = &.{false_state}, .ordinal = i }, layout);
+        var row_key: [14]u8 = undefined;
+        @memcpy(row_key[0..6], &group);
+        std.mem.writeInt(u64, row_key[6..14], i, .big);
+        try changed_rows.add(&row_key, encoded);
+    }
+    const changed_root = try changed_rows.finish();
+    const before_change = memory.reads;
+    const changed = try repair(a, &manager, memory.store(), changed_root, reduced, &dirty, count, &layout, null);
+    const changed_reads = memory.reads - before_change;
+    try std.testing.expect(changed_reads <= input_pages * 2 + 32);
+    const expected = try repair(a, &manager, memory.store(), changed_root, null, &dirty, count, &layout, null);
+    try std.testing.expect(try tree.equivalent(a, memory.store(), expected, changed, .{}));
+    const first_group = &[_]u8{ 0, 0, 0, 2, 0, 0 };
+    const previous = try lookup(out, memory.store(), reduced, first_group, count, &layout);
+    const current = try lookup(out, memory.store(), changed, first_group, count, &layout);
+    try std.testing.expect((try previous.finish(out, 0, recipe.inputs[0].spec)).value.bool);
+    try std.testing.expect(!(try current.finish(out, 0, recipe.inputs[0].spec)).value.bool);
+    std.debug.print("bounded reductions: groups={} fresh_reads={} repair_reads={} changed_reads={}\n", .{ count, input_pages, repair_reads, changed_reads });
 }

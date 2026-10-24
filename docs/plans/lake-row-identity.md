@@ -1034,3 +1034,47 @@ summaries. Protocol 81 prevents older readers from interpreting the new layout. 
 
 These are structural work and correctness contracts. Archive-scale throughput,
 cold cloud latency and live-provider retention qualification remain unmeasured.
+
+
+### Compact decoded navigation and shared probe candidates
+
+Decoded page descriptors separate immutable read views from mutable serialization
+entries. A leaf descriptor uses 56 bytes on the qualified 64-bit native target,
+instead of reserving the 168-byte serialization entry's inline child reference
+for every row. Branch references live in a page-owned array; their pointers are
+borrowed for the page/lease lifetime. Mutation and serialization boundaries copy
+references by value. Encoded page bytes, checksums, publication authority and
+reader protocol 81 remain unchanged.
+
+Decoded cache accounting includes descriptors, branch-reference arrays, wire
+bytes and expanded prefix keys. The operation cache retains its 512 KiB limit.
+When a decoded page cannot fit, authenticated encoded bytes can still be retained
+within that same budget. A later read owns its decoded copy and checks authority,
+cancellation and domain before using the retained bytes. Pinned decoded leases
+remain protected during fallback and eviction; allocation failure releases every
+partial descriptor and branch allocation.
+
+Reduction repairs order the borrowed dirty keys at each level before seeking
+contribution and summary ranges. The temporary order directory charges the
+existing workspace and is freed at the end of the level. Together with compact
+pages, this preserves locality beyond the previous small-fixture working set.
+The 2,049-group no-op repair fixture with 34 contribution pages needs 45 backing
+reads instead of the measured 3,847 reads with the earlier decoded representation
+and hash-order repair. Updating every contribution in that fixture needs 47
+backing reads, compares against complete rebuilding and retains the prior
+immutable reduction root. Encoded fallback, prefix/branch
+ownership and all allocation-failure exits have separate coverage.
+
+Reusable native disk join probes group identical immutable candidate offsets
+within each existing, bounded 512-lane wave. One metadata decode serves all lanes
+that reach the record; each lane still evaluates exact typed key equality and
+retains its own next duplicate and residual/matched state. Results retain stable
+coordinates, and payload decoding remains lazy. A scalar probe oracle and a
+1,025-lane repeated-key fixture require 1,025 versus three key-record decodes,
+with no payload hydration during priming. NULL lanes and residual rejection of
+one duplicate preserve their existing behavior. A second fixture uses ordinary
+SMP allocation behind a tracked 32 MiB budget and verifies a zero live balance.
+For 8,193 repeated lanes it needs 8,193 versus seventeen metadata decodes; one
+local Debug run measured 16.29 ms versus 5.11 ms. These timings support the work
+reduction and have no timing assertion. Archive-scale throughput and cloud
+latency remain unmeasured.
