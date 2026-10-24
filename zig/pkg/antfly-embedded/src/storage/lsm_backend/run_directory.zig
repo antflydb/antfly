@@ -1704,3 +1704,99 @@ test "controlled physical sync private node summary refresh commits once after o
         }
     }
 }
+
+test "controlled physical sync retained rank insertions preserve pinned epochs through every rotation and rejection" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pins: usize = 0,
+        pub fn retainRunSnapshotRef(self: *@This(), _: *Run) !void {
+            self.pins += 1;
+        }
+        pub fn releaseRunSnapshotRef(self: *@This(), _: *Run) void {
+            self.pins -= 1;
+        }
+    };
+    const Fault = struct {
+        checks: usize = 0,
+        at: usize = std.math.maxInt(usize),
+        failure: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const at = self.checks;
+            self.checks += 1;
+            if (at == self.at) return self.failure;
+        }
+    };
+    var fixture: Fixture = .{ .allocator = a };
+    const d = try Directory.create(a);
+    defer d.destroy(a);
+    const bytes = try a.alloc(u8, 2 * run_comparison.Cursor.quantum + 5);
+    defer a.free(bytes);
+    @memset(bytes, 'i');
+    for (0..3) |i| {
+        bytes[bytes.len - 1] = @intCast('a' + i);
+        try d.put(&fixture, .{ .id = i + 1, .level = 1, .size_bytes = 1, .path = @constCast("/rank-insert.tbl"), .smallest_namespace_name = @constCast("docs"), .smallest_key = bytes, .largest_namespace_name = @constCast("docs"), .largest_key = bytes, .entry_count = 1, .tombstone_count = @intCast(i % 3), .oldest_tombstone_unix_ns = i * 11, .gc_requested = i % 2 == 1, .bloom_filter = null, .state = null, .owns_metadata = false });
+    }
+    inline for (.{ Directory.Tree, Directory.BoundsTree, Directory.IdTree }) |Tree| {
+        for ([_][3]usize{ .{ 2, 1, 0 }, .{ 0, 1, 2 }, .{ 2, 0, 1 }, .{ 0, 2, 1 } }) |order| {
+            var base: Tree = .{};
+            defer base.deinit(a);
+            for (order[0..2]) |i| {
+                const entry = d.tree.root.?.at(i);
+                try base.prepare(a);
+                base.putPrepared(a, entry);
+            }
+            const old_root = base.root;
+            const old_summary = old_root.?.summary;
+            const entry = d.tree.root.?.at(order[2]);
+            var checks: usize = 1;
+            var target: usize = 0;
+            var used: usize = 0;
+            while (target <= checks) : (target += 1) {
+                var tree = base.fork();
+                defer tree.deinit(a);
+                try tree.prepare(a);
+                const spare = tree.spare.items.len;
+                // This rank is computed on the exact root retained by the edit.
+                const rank = tree.root.?.lowerBound(entry);
+                var edit = try Tree.RankInsertion.init(&tree, entry, rank, false);
+                var fault: Fault = .{ .at = if (target == 0) std.math.maxInt(usize) else target - 1, .failure = switch (target % 3) {
+                    0 => error.Canceled,
+                    1 => error.DeadlineExceeded,
+                    else => error.FileNotFound,
+                } };
+                const payload: @import("../../common/read_admission.zig").Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+                const original = @import("../../common/read_admission.zig").Port.init(&payload);
+                var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                const result = edit.resumeWithAdmission(failing.allocator(), original);
+                if (target == 0) {
+                    try result;
+                    checks = fault.checks;
+                    used = spare - tree.spare.items.len;
+                } else {
+                    try std.testing.expectError(fault.failure, result);
+                    try edit.resumeWithAdmission(failing.allocator(), original);
+                }
+                try std.testing.expectEqual(used, spare - tree.spare.items.len);
+                try std.testing.expectEqual(@as(usize, 3), tree.root.?.count);
+                try std.testing.expectEqual(@as(u8, 2), tree.root.?.height);
+                for (0..3) |i| try std.testing.expectEqual(i + 1, tree.root.?.at(i).run.id);
+                try std.testing.expectEqual(@as(u64, 2), tree.root.?.entry.run.id);
+                try std.testing.expect((try edit.takeRetired()) == null);
+                const saved = tree.root;
+                fault.at = fault.checks;
+                try std.testing.expectError(fault.failure, edit.resumeWithAdmission(failing.allocator(), original));
+                try std.testing.expect(saved == tree.root);
+                try std.testing.expect(base.root == old_root);
+                try std.testing.expectEqual(@as(usize, 2), base.root.?.count);
+                try std.testing.expectEqualDeep(old_summary, base.root.?.summary);
+                if (Tree != Directory.IdTree) {
+                    const expected = if (Tree == Directory.Tree) Entry.summarize(tree.root.?.entry, tree.root.?.left.?.summary, tree.root.?.right.?.summary) else BoundsSummary.summarize(tree.root.?.entry, tree.root.?.left.?.summary, tree.root.?.right.?.summary);
+                    try std.testing.expectEqualDeep(expected, tree.root.?.summary);
+                }
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), fixture.pins);
+}

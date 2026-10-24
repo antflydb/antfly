@@ -340,92 +340,199 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
             return copy;
         }
 
-        fn rotateLeft(self: *Self, allocator: std.mem.Allocator, root: *Node) *Node {
-            const pivot = self.unique(allocator, root.right.?);
-            root.right = pivot.left;
-            pivot.left = root;
-            root.refresh();
-            pivot.refresh();
-            return pivot;
-        }
+        /// Borrows an exclusively owned, unpublished tree and its prepared
+        /// node pool. Entry retain/retainedBytes and policies without a retained
+        /// summary preparation must have bounded, allocation-free operations.
+        /// Every reachable subtree remains owned by the tree at every pause.
+        pub const Rebalance = struct {
+            tree: *Self,
+            slot: *?*Node,
+            stage: enum { root, plan, inner_lower, inner_upper, outer, outer_lower, outer_upper, done } = .root,
+            refresh: if (Node.Refresh != void) ?Node.Refresh else void = if (Node.Refresh != void) null else {},
+            lower: ?*Node = null,
+            upper: ?*Node = null,
+            left: bool = false,
 
-        fn rotateRight(self: *Self, allocator: std.mem.Allocator, root: *Node) *Node {
-            const pivot = self.unique(allocator, root.left.?);
-            root.left = pivot.right;
-            pivot.right = root;
-            root.refresh();
-            pivot.refresh();
-            return pivot;
-        }
-
-        fn insert(self: *Self, allocator: std.mem.Allocator, old: ?*Node, entry: Entry) *Node {
-            const root = if (old) |node| self.unique(allocator, node) else {
-                const node = self.spare.pop().?;
-                node.* = .{ .account = self.account, .entry = entry.retainShared() };
-                node.refresh();
-                return node;
-            };
-            switch (compare(entry, root.entry)) {
-                .lt => root.left = self.insert(allocator, root.left, entry),
-                .gt => root.right = self.insert(allocator, root.right, entry),
-                .eq => {
-                    root.entry.deinit(allocator);
-                    root.entry = entry.retainShared();
-                },
+            pub fn init(tree: *Self, slot: *?*Node) @This() {
+                return .{ .tree = tree, .slot = slot };
             }
-            return self.rebalance(allocator, root);
-        }
+            fn refreshNode(self: *@This(), node: *Node, original: ?@import("../../common/read_admission.zig").Port) !void {
+                if (comptime Node.Refresh != void) {
+                    if (self.refresh == null) self.refresh = try node.prepareRefresh();
+                    try self.refresh.?.resumeWithAdmission(original);
+                    self.refresh = null;
+                } else {
+                    if (original) |port| try port.checkpoint();
+                    if (node.refs.load(.acquire) != 1) return error.ResourceBudgetExceeded;
+                    node.refresh();
+                }
+            }
+            // Up to two copies and three link assignments. The checkpoint and
+            // pool check precede all ownership changes; there is no fallible
+            // gap between retaining a copy and installing its owning link.
+            fn rotate(self: *@This(), allocator: std.mem.Allocator, slot: *?*Node, left: bool, original: ?@import("../../common/read_admission.zig").Port) !void {
+                if (original) |port| try port.checkpoint();
+                const old = slot.* orelse return error.CompactionPlanningStale;
+                const pivot = (if (left) old.right else old.left) orelse return error.CompactionPlanningStale;
+                const copy_root = old.refs.load(.acquire) != 1;
+                const copy_pivot = copy_root or pivot.refs.load(.acquire) != 1;
+                const needed = @as(usize, @intFromBool(copy_root)) + @intFromBool(copy_pivot);
+                if (self.tree.spare.items.len < needed) return error.ResourceBudgetExceeded;
+                const root = self.tree.unique(allocator, old);
+                const top = self.tree.unique(allocator, if (left) root.right.? else root.left.?);
+                if (left) {
+                    root.right = top.left;
+                    top.left = root;
+                } else {
+                    root.left = top.right;
+                    top.right = root;
+                }
+                slot.* = top;
+                self.lower = root;
+                self.upper = top;
+            }
+            pub fn resumeWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
+                if (original) |port| try port.checkpoint();
+                while (self.stage != .done) {
+                    if (original) |port| try port.checkpoint();
+                    switch (self.stage) {
+                        .root => {
+                            try self.refreshNode(self.slot.* orelse return error.CompactionPlanningStale, original);
+                            self.stage = .plan;
+                        },
+                        .plan => {
+                            const root = self.slot.*.?;
+                            const balance = @as(i16, depth(root.left)) - @as(i16, depth(root.right));
+                            if (balance >= -1 and balance <= 1) {
+                                self.stage = .done;
+                                continue;
+                            }
+                            self.left = balance < -1;
+                            const child = if (self.left) root.right.? else root.left.?;
+                            const inner = if (self.left) depth(child.left) > depth(child.right) else depth(child.right) > depth(child.left);
+                            if (inner) {
+                                try self.rotate(allocator, if (self.left) &root.right else &root.left, !self.left, original);
+                                self.stage = .inner_lower;
+                            } else self.stage = .outer;
+                        },
+                        .inner_lower, .outer_lower => {
+                            try self.refreshNode(self.lower.?, original);
+                            self.stage = if (self.stage == .inner_lower) .inner_upper else .outer_upper;
+                        },
+                        .inner_upper, .outer_upper => {
+                            try self.refreshNode(self.upper.?, original);
+                            self.stage = if (self.stage == .inner_upper) .outer else .done;
+                        },
+                        .outer => {
+                            try self.rotate(allocator, self.slot, self.left, original);
+                            self.stage = .outer_lower;
+                        },
+                        .done => unreachable,
+                    }
+                }
+            }
+        };
+
+        /// A rank belongs to this exact private root. Caller pins the entry,
+        /// excludes other edits/readers, prepays prepareEdits(1), and retains
+        /// this cursor until completion. Rejected work owns all path copies in
+        /// the tree; abort retires that entire private tree before the cursor.
+        /// Replacement moves the old entry to retired without invoking its
+        /// potentially unbounded destructor. The caller must take and retire it.
+        pub const RankInsertion = struct {
+            tree: *Self,
+            entry: Entry,
+            rank: usize,
+            replace: bool,
+            slot: *?*Node,
+            path: [2 * @bitSizeOf(usize)]*?*Node = undefined,
+            len: usize = 0,
+            balancing: ?Rebalance = null,
+            retired: ?Entry = null,
+            stage: enum { descend, unwind, done } = .descend,
+
+            pub fn init(tree: *Self, entry: Entry, rank: usize, replace: bool) !@This() {
+                if (rank > size(tree.root) or (replace and rank == size(tree.root))) return error.InvalidArgument;
+                return .{ .tree = tree, .entry = entry, .rank = rank, .replace = replace, .slot = &tree.root };
+            }
+            pub fn takeRetired(self: *@This()) !?Entry {
+                // After abort, the caller first fully retires the private tree.
+                if (self.stage != .done and self.tree.root != null) return error.ResourceBudgetExceeded;
+                const out = self.retired;
+                self.retired = null;
+                return out;
+            }
+            pub fn resumeWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
+                if (original) |port| try port.checkpoint();
+                while (self.stage != .done) {
+                    if (original) |port| try port.checkpoint();
+                    switch (self.stage) {
+                        .descend => {
+                            if (self.len == self.path.len) return error.ResourceBudgetExceeded;
+                            if (self.slot.*) |old| {
+                                if (old.refs.load(.acquire) != 1 and self.tree.spare.items.len == 0) return error.ResourceBudgetExceeded;
+                                const node = self.tree.unique(allocator, old);
+                                self.slot.* = node;
+                                self.path[self.len] = self.slot;
+                                self.len += 1;
+                                const left_count = size(node.left);
+                                if (self.rank < left_count or (self.rank == left_count and !self.replace)) {
+                                    self.slot = &node.left;
+                                } else if (self.rank > left_count) {
+                                    self.rank -= left_count + 1;
+                                    self.slot = &node.right;
+                                } else {
+                                    self.retired = node.entry;
+                                    node.entry = self.entry.retainShared();
+                                    self.stage = .unwind;
+                                }
+                            } else {
+                                if (self.replace or self.rank != 0) return error.CompactionPlanningStale;
+                                const node = self.tree.spare.pop() orelse return error.ResourceBudgetExceeded;
+                                node.* = .{ .account = self.tree.account, .entry = self.entry.retainShared() };
+                                self.slot.* = node;
+                                self.path[self.len] = self.slot;
+                                self.len += 1;
+                                self.stage = .unwind;
+                            }
+                        },
+                        .unwind => {
+                            if (self.len == 0) {
+                                self.stage = .done;
+                                continue;
+                            }
+                            if (self.balancing == null) self.balancing = Rebalance.init(self.tree, self.path[self.len - 1]);
+                            try self.balancing.?.resumeWithAdmission(allocator, original);
+                            self.balancing = null;
+                            self.len -= 1;
+                        },
+                        .done => unreachable,
+                    }
+                }
+            }
+        };
 
         fn rebalance(self: *Self, allocator: std.mem.Allocator, root: *Node) *Node {
-            root.refresh();
-            const balance = @as(i16, depth(root.left)) - @as(i16, depth(root.right));
-            if (balance > 1) {
-                const left = root.left.?;
-                if (depth(left.right) > depth(left.left)) root.left = self.rotateLeft(allocator, self.unique(allocator, left));
-                return self.rotateRight(allocator, root);
-            }
-            if (balance < -1) {
-                const right = root.right.?;
-                if (depth(right.left) > depth(right.right)) root.right = self.rotateRight(allocator, self.unique(allocator, right));
-                return self.rotateLeft(allocator, root);
-            }
-            return root;
+            var slot: ?*Node = root;
+            var cursor = Rebalance.init(self, &slot);
+            cursor.resumeWithAdmission(allocator, null) catch unreachable;
+            return slot.?;
         }
 
-        /// prepare() must precede every edit. No allocation or error is possible
-        /// here, so the ordered and hash indexes can publish atomically.
+        /// Legacy comparison and retirement driver. Structural insertion and
+        /// balancing share the retained engine used by admitted private edits.
         pub fn putPrepared(self: *Self, allocator: std.mem.Allocator, entry: Entry) void {
-            self.root = self.insert(allocator, self.root, entry);
+            const rank = if (self.root) |root| Node.lowerBound(root, entry) else 0;
+            const replace = rank < size(self.root) and compare(Node.at(self.root.?, rank), entry) == .eq;
+            self.putPreparedAtRank(allocator, entry, rank, replace);
         }
-
-        /// The caller computes an insertion/replacement rank before entering
-        /// this infallible edit. In particular, arbitrarily long keys are never
-        /// compared while a shared path is being changed. The rank belongs to
-        /// this exact root; the owner must exclude intervening edits.
         pub fn putPreparedAtRank(self: *Self, allocator: std.mem.Allocator, entry: Entry, rank: usize, replace: bool) void {
-            std.debug.assert(rank <= size(self.root));
-            std.debug.assert(!replace or rank < size(self.root));
-            self.root = self.insertAtRank(allocator, self.root, entry, rank, replace);
-        }
-
-        fn insertAtRank(self: *Self, allocator: std.mem.Allocator, old: ?*Node, entry: Entry, rank: usize, replace: bool) *Node {
-            const root = if (old) |node| self.unique(allocator, node) else {
-                std.debug.assert(rank == 0 and !replace);
-                const node = self.spare.pop().?;
-                node.* = .{ .account = self.account, .entry = entry.retainShared() };
-                node.refresh();
-                return node;
-            };
-            const left_count = size(root.left);
-            if (rank < left_count or (rank == left_count and !replace)) {
-                root.left = self.insertAtRank(allocator, root.left, entry, rank, replace);
-            } else if (rank > left_count) {
-                root.right = self.insertAtRank(allocator, root.right, entry, rank - left_count - 1, replace);
-            } else {
-                root.entry.deinit(allocator);
-                root.entry = entry.retainShared();
+            var cursor = RankInsertion.init(self, entry, rank, replace) catch unreachable;
+            cursor.resumeWithAdmission(allocator, null) catch unreachable;
+            if (cursor.takeRetired() catch unreachable) |value| {
+                var retired = value;
+                retired.deinit(allocator);
             }
-            return self.rebalance(allocator, root);
         }
 
         fn remove(self: *Self, allocator: std.mem.Allocator, old: ?*Node, entry: Entry) ?*Node {
@@ -539,4 +646,104 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
             try added(node.right, previous, visitor);
         }
     };
+}
+
+test "controlled physical sync rank replacement retains retirement ownership across rejection and private tree abort" {
+    const a = std.testing.allocator;
+    const Stats = struct { refs: usize = 0, drops: usize = 0 };
+    const E = struct {
+        key: usize,
+        stats: *Stats,
+        pub fn retainShared(self: @This()) @This() {
+            self.stats.refs += 1;
+            return self;
+        }
+        pub fn deinit(self: @This(), _: std.mem.Allocator) void {
+            self.stats.refs -= 1;
+            self.stats.drops += 1;
+        }
+        pub fn retainedBytes(_: @This()) usize {
+            return 0;
+        }
+        fn compare(x: @This(), y: @This()) std.math.Order {
+            return std.math.order(x.key, y.key);
+        }
+    };
+    const Tree = SummarizedIndex(E, E.compare, void);
+    const Fault = struct {
+        checks: usize = 0,
+        at: usize = std.math.maxInt(usize),
+        failure: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const at = self.checks;
+            self.checks += 1;
+            if (at == self.at) return self.failure;
+        }
+    };
+    var old: Stats = .{};
+    var fresh: Stats = .{};
+    {
+        var base: Tree = .{};
+        defer base.deinit(a);
+        for (0..7) |key| {
+            try base.prepare(a);
+            base.putPrepared(a, .{ .key = key, .stats = &old });
+        }
+        var checkpoints: usize = 1;
+        var target: usize = 0;
+        while (target <= checkpoints) : (target += 1) {
+            for ([_]bool{ false, true }) |abort| {
+                if (target == 0 and abort) continue;
+                var tree = base.fork();
+                try tree.prepare(a);
+                var edit = try Tree.RankInsertion.init(&tree, .{ .key = 0, .stats = &fresh }, 0, true);
+                var fault: Fault = .{ .at = if (target == 0) std.math.maxInt(usize) else target - 1, .failure = switch (target % 3) {
+                    0 => error.Canceled,
+                    1 => error.DeadlineExceeded,
+                    else => error.FileNotFound,
+                } };
+                const payload: @import("../../common/read_admission.zig").Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+                const port = @import("../../common/read_admission.zig").Port.init(&payload);
+                const old_drops = old.drops;
+                const new_drops = fresh.drops;
+                var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                const result = edit.resumeWithAdmission(failing.allocator(), port);
+                if (target == 0) {
+                    try result;
+                    checkpoints = fault.checks;
+                } else try std.testing.expectError(fault.failure, result);
+                try std.testing.expectEqual(old_drops, old.drops);
+                try std.testing.expectEqual(new_drops, fresh.drops);
+                if (abort) {
+                    try std.testing.expectError(error.ResourceBudgetExceeded, edit.takeRetired());
+                    tree.deinit(a);
+                    if (try edit.takeRetired()) |entry| entry.deinit(a);
+                } else {
+                    try edit.resumeWithAdmission(failing.allocator(), port);
+                    try std.testing.expectEqual(old_drops, old.drops);
+                    try std.testing.expect(tree.root.?.at(0).stats == &fresh);
+                    const retired = (try edit.takeRetired()).?;
+                    try std.testing.expect(retired.stats == &old);
+                    retired.deinit(a);
+                    try std.testing.expect((try edit.takeRetired()) == null);
+                    tree.deinit(a);
+                }
+                try std.testing.expect(base.root.?.at(0).stats == &old);
+                try std.testing.expectEqual(@as(usize, 7), old.refs);
+                try std.testing.expectEqual(@as(usize, 0), fresh.refs);
+            }
+        }
+        try std.testing.expectError(error.InvalidArgument, Tree.RankInsertion.init(&base, .{ .key = 8, .stats = &fresh }, 8, false));
+        try std.testing.expectError(error.InvalidArgument, Tree.RankInsertion.init(&base, .{ .key = 7, .stats = &fresh }, 7, true));
+    }
+    try std.testing.expectEqual(@as(usize, 0), old.refs);
+    var empty: Tree = .{};
+    defer empty.deinit(a);
+    var edit = try Tree.RankInsertion.init(&empty, .{ .key = 0, .stats = &fresh }, 0, false);
+    try std.testing.expectError(error.ResourceBudgetExceeded, edit.resumeWithAdmission(a, null));
+    try std.testing.expect(empty.root == null and fresh.refs == 0);
+    try empty.prepare(a);
+    try edit.resumeWithAdmission(a, null);
+    try std.testing.expectEqual(@as(usize, 1), empty.root.?.count);
 }

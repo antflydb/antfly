@@ -26464,3 +26464,65 @@ summary suite. Formatting, whitespace and module licensing pass. The fetched
 `origin/main` at `fd329daaf9` is already an ancestor of this branch; merging it
 reports already up to date. Full GNU qualification remains waived, and the
 broader design work listed above remains incomplete.
+
+
+### Retained rank insertion and AVL balancing
+
+`ordered_index.RankInsertion` now retains descent, path copying, leaf
+construction or replacement, and bottom-up AVL balancing on an exclusively
+owned unpublished tree. It consumes only the prepared node pool. A fixed AVL
+path stack and one retained `Rebalance` header replace recursive insertion;
+no original port is retained. Every pause leaves all copied nodes reachable
+from the private tree, including between the two halves of a double rotation.
+The caller pins the input entry and excludes every other edit and reader until
+completion or private-tree retirement. The rank belongs to that exact root.
+
+`Rebalance` checks admission before each fixed structural step and resumes
+long directory summaries through `Node.Refresh`. Rotations preflight their
+at-most-two path copies before changing ownership, then install every moved
+link without a rejection gap. Lower and upper summaries finish in dependency
+order before the next rotation or ancestor. Scalar/unsummarized policies keep
+their bounded refresh operation; generic entry retain/retainedBytes and those
+scalar summary policies must remain bounded and allocation-free.
+
+Replacement moves the old entry into the cursor's `retired` slot rather than
+running its destructor. The caller takes that obligation after completion, or
+after fully retiring the aborted private tree; it cannot release the old entry
+while stale ancestor summaries might still refer to it. Taking is exactly once.
+Aborting never publishes a partially edited tree. These borrowed cursors do
+not themselves register a retirement obligation or prepay their fixed headers.
+The eventual owning directory mutation job must do both.
+
+Ordinary `putPrepared` computes its legacy rank and drives this same retained
+engine with a null original, then retires the replaced entry synchronously.
+Legacy deletion also uses the retained balancing engine but still has recursive
+comparison, path descent and replacement retirement. Multi-index publication,
+admitted removal, payload/file-pin/state preparation, the owning coordinator,
+durable cleanup, completion/history relief and default overload qualification
+remain required before the full design is complete.
+
+Qualification exhausts each insertion checkpoint for LL/RR/LR/RL rotations on
+shared read-order, lower-bound and ID trees with long common key prefixes.
+Rejection preserves the old pinned epoch, final rank/root/summary, and exact
+prepared-node consumption. An allocator rejecting its first allocation proves
+resume does not allocate. Replacement tests retain the displaced entry without
+calling its destructor, resume after original rejection, retire it exactly once,
+and abort at every checkpoint without leaking entry references. Invalid ranks
+and empty pools refuse before construction; completed cursors still check the
+next original's lifetime.
+
+`retained-directory-insertion-v2` passes all 99 physical-sync cases and 53/53
+steps. The v2 regression receipt passes 60/60 steps and 23 existing directory,
+mutable epoch, overwrite/OOM, obsolete-ledger, dependency and GC cases, with
+no skips or leaks. Final `retained-directory-insertion-v3-integrated` passes
+83/83 Debug steps, 99 physical-sync, 32 owner-close, 170 table/codec and 74 WAL
+recovery cases, plus the runtime ABI target (16/16 reported checks). Final v3
+ReleaseFast passes 63/63 steps and all 99/170/74 physical/table/recovery cases.
+Each receipt also passes four Bloom and 45/1/8 error-identity companions;
+companions use Debug. All 5,592 native/schema inputs and final log digests match
+the same final source; two immutable snapshots cover both changed native files.
+The v1 receipt preserves the corrected mutable-destructor generic type error.
+The v2 integrated receipt preserves two sandbox-denied localhost binds; the
+unchanged v3 rerun with socket permission passes. Formatting and whitespace
+checks pass. Full GNU qualification remains waived, and the full design remains
+incomplete.
