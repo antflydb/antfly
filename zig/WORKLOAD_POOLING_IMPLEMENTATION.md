@@ -25153,3 +25153,53 @@ restores the decoded reader's opening cache context, covered by v3. Formatting
 and whitespace checks pass. Full GNU qualification remains waived. Final admitted
 backend retirement and scoped adoption of the new pager/range workers remain
 open; the full design is still incomplete.
+
+### Scoped coalesced navigation range ownership
+
+The lake range-wave path now uses the original node's child execution scopes.
+Each accepted worker owns CPU for validation/authentication and parks only around
+its provider read. Provider cancellation checks lifetime without reacquiring CPU.
+The coordinator joins or cancels every accepted worker before retiring borrowed
+inputs. Original cancellation, deadline, source revocation, provider errors and
+rejected reentry retain their identities; a failed query cannot lend its capsule
+to a later cache consumer.
+
+Worker metadata and wave payloads have different physical lifetimes. Temporary
+range buffers/leases are funded by a reserved, non-running child whose charge
+lasts through worker joins, final copying and physical retirement. Decoded-page
+waves reserve their encoded-copy capacity separately on the same node. Temporary
+allocation is bounded and reclaiming; final copies checkpoint in 16 KiB slices.
+Scoped waves do not use the legacy process-global pull/IO allowance. Existing
+unscoped callers retain that allowance.
+
+A refused workspace keeps the required caller-funded page path. Refused worker
+capacity or unavailable dispatch keeps coalesced inline reads. Wait-only callers
+never dispatch their original wait capsule through legacy workers. Verified
+bounded reads retain their non-fanout classification. Missing child capability
+cannot silently grant new execution authority. Coalesced gaps remain charged
+against the original request's read allowance before provider IO.
+
+The two new test cases exercise thirteen ownership/refusal/error scenarios plus
+cache reuse by a different healthy connection after cancellation, deadline,
+revocation and rejected resume. A one-ordinary-slot scheduler continues to admit
+control work during provider IO. The composed decoded reader also succeeds while
+the entire legacy pull allowance is occupied, returns its node reservations before
+output escapes, and falls back to required reads under a small node budget.
+
+Receipts in the cumulative integration directory:
+
+- `scoped-navigation-range-ownership-v1` preserves an invalid scheduler policy
+  in the initial test fixture; production code and existing cases compiled.
+- `scoped-navigation-range-ownership-v2` passes the ownership/refusal scenarios.
+- `scoped-navigation-range-ownership-v3` preserves a name-shadowing compilation
+  error in the added composed-reader test.
+- `scoped-navigation-range-ownership-v4` passes 74/74 build steps, 6 focused
+  cases, 18 and 28 supporting cases, all 63 artifact regressions, the provisioned
+  SQL pool type check and 45/1/8 error-identity cases with unchanged inputs.
+
+Source snapshots, logs and hashes are retained. Formatting and whitespace checks
+pass. This closes scoped adoption of these coalesced range workers; it does not
+finish shared SQL pager ownership, final admitted backend flush/retirement,
+completion/history relief under overload, remaining provider/legacy-generation
+adoption, compound tentative-grant retirement or default-gate evidence. The full
+design remains incomplete, with full GNU qualification still waived.
