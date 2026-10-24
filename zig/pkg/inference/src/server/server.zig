@@ -7725,7 +7725,7 @@ pub const Node = struct {
     ) ![]readers_api.Result {
         const control = self.bindExecutionControl(null, supplied_control);
         try control.check();
-        const definition = try self.documentDefinition(allocator, model_name);
+        const definition = try self.documentDefinition(allocator, model_name, .read);
         defer if (definition) |bytes| allocator.free(bytes);
         if (request.documents.len > 0 or definition != null or std.mem.eql(u8, model_name, "antfly/native-document")) {
             if (request.documents.len > 0 and request.images.len > 0) return error.InvalidDocumentSource;
@@ -7928,7 +7928,7 @@ pub const Node = struct {
         try readers_api.validateEncodedRequest(request);
         const max_tokens = try validateReadMaxTokens(request.max_tokens);
         if (!std.fs.path.isAbsolute(model_name)) {
-            const definition = try self.documentDefinition(allocator, model_name);
+            const definition = try self.documentDefinition(allocator, model_name, .read);
             defer if (definition) |bytes| allocator.free(bytes);
             if (definition != null or std.mem.eql(u8, model_name, "antfly/native-document")) {
                 var probe = BorrowedReadControl{ .deadline_ns = deadline_ns, .cancellation = cancellation };
@@ -9391,7 +9391,7 @@ pub const Node = struct {
         control: InferenceExecutionControl,
     ) !extracting_api.Response {
         try control.check();
-        const definition = try self.documentDefinition(allocator, model_name);
+        const definition = try self.documentDefinition(allocator, model_name, .extract);
         defer if (definition) |bytes| allocator.free(bytes);
         if (definition != null) {
             const json = try extracting_api.requestJsonAlloc(allocator, .{ .provider = .antfly, .model = model_name }, request);
@@ -9436,7 +9436,7 @@ pub const Node = struct {
         if (control) |active| try active.check();
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, request_json, .{ .duplicate_field_behavior = .@"error" });
         defer parsed.deinit();
-        if (try self.isDocumentOperation(allocator, parsed.value)) return .{
+        if (try self.isDocumentOperation(allocator, parsed.value, .extract)) return .{
             .allocator = allocator,
             .json = try self.extractDocumentsJsonWithControl(allocator, request_json, control orelse .{}),
         };
@@ -18092,43 +18092,47 @@ pub const Node = struct {
         return self.document_artifacts.get(self.allocator, a, handle, platform.time.monotonicNs());
     }
 
-    fn isDocumentOperation(self: *Node, a: std.mem.Allocator, root: std.json.Value) !bool {
+    fn isDocumentOperation(self: *Node, a: std.mem.Allocator, root: std.json.Value, operation: document_contract.Operation) !bool {
         if (root != .object) return false;
         if (root.object.contains("documents") or root.object.contains("read_artifact")) return true;
         if (root.object.get("retain_artifact")) |value| if (value == .bool and value.bool) return true;
         const model = root.object.get("model") orelse return false;
         if (model != .string) return false;
         if (std.mem.eql(u8, model.string, "antfly/native-document")) return true;
-        const definition = try self.documentDefinition(a, model.string);
+        const definition = try self.documentDefinition(a, model.string, operation);
         defer if (definition) |bytes| a.free(bytes);
         return definition != null;
     }
 
-    pub fn documentDefinition(self: *Node, a: std.mem.Allocator, name: []const u8) !?[]const u8 {
+    /// Resolve in exactly the requested task namespace. A reader and an
+    /// extractor may intentionally share a public model identifier.
+    pub fn documentDefinition(self: *Node, a: std.mem.Allocator, name: []const u8, operation: document_contract.Operation) !?[]const u8 {
         if (std.mem.eql(u8, name, "antfly/native-document") or std.fs.path.isAbsolute(name)) return null;
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*owned| owned.deinit();
         const io = self.inferenceIo(a, null, &owned_io);
-        for ([_][]const u8{ "readers", "extractors", "deciders" }) |scope| {
-            const path = self.resolveRequestModelPath(a, io, name, scope) catch |err| switch (err) {
-                error.ModelNotFound => continue,
-                else => return err,
-            };
-            defer a.free(path);
-            const file = try std.fs.path.join(a, &.{ path, "document_agent.json" });
-            defer a.free(file);
-            const canonical_file = realPathExistingAlloc(a, io, file) catch |err| switch (err) {
-                error.FileNotFound => return null,
-                else => return err,
-            };
-            defer a.free(canonical_file);
-            if (!pathHasComponentPrefix(canonical_file, path)) return error.ModelOutsideModelsDir;
-            return @import("../util/c_file.zig").readFileMax(a, canonical_file, 1024 * 1024) catch |err| switch (err) {
-                error.FileNotFound => null,
-                else => return err,
-            };
-        }
-        return null;
+        const scope = switch (operation) {
+            .read => "readers",
+            .extract => "extractors",
+            .decide => "deciders",
+        };
+        const path = self.resolveRequestModelPath(a, io, name, scope) catch |err| switch (err) {
+            error.ModelNotFound => return null,
+            else => return err,
+        };
+        defer a.free(path);
+        const file = try std.fs.path.join(a, &.{ path, "document_agent.json" });
+        defer a.free(file);
+        const canonical_file = realPathExistingAlloc(a, io, file) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer a.free(canonical_file);
+        if (!pathHasComponentPrefix(canonical_file, path)) return error.ModelOutsideModelsDir;
+        return @import("../util/c_file.zig").readFileMax(a, canonical_file, 1024 * 1024) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
     }
 
     pub fn documentResolveBinding(self: *Node, a: std.mem.Allocator, binding: document_contract.Binding) !document_contract.Snapshot {
@@ -18154,7 +18158,7 @@ pub const Node = struct {
 
     pub fn documentTaskLimits(self: *Node, a: std.mem.Allocator, name: []const u8, is_read: bool) !?document_contract.Limits {
         if (is_read and std.mem.eql(u8, name, "antfly/native-document")) return self.documentLimits(.{});
-        const bytes = (try self.documentDefinition(a, name)) orelse return null;
+        const bytes = (try self.documentDefinition(a, name, if (is_read) .read else .extract)) orelse return null;
         defer a.free(bytes);
         var definition = try document_contract.Definition.parse(a, bytes);
         defer definition.deinit();
@@ -18229,7 +18233,7 @@ pub const Node = struct {
             const envelope = std.json.parseFromSlice(std.json.Value, ctx.allocator, raw, .{}) catch null;
             if (envelope) |parsed_document| {
                 defer parsed_document.deinit();
-                if (self.isDocumentOperation(ctx.allocator, parsed_document.value) catch |err| return documentFailureResponse(ctx, err)) {
+                if (self.isDocumentOperation(ctx.allocator, parsed_document.value, .read) catch |err| return documentFailureResponse(ctx, err)) {
                     const result = self.readDocumentsJsonWithControl(ctx.allocator, raw, httpInferenceExecutionControl(self, ctx)) catch |err| return documentFailureResponse(ctx, err);
                     defer ctx.allocator.free(result);
                     try ctx.setHeader("content-type", "application/json");
@@ -20424,7 +20428,7 @@ pub const Node = struct {
                 _ = ctx.response.body(output);
                 return ctx.response.build();
             };
-            if (self.isDocumentOperation(ctx.allocator, public_envelope.value) catch |err| return documentFailureResponse(ctx, err)) {
+            if (self.isDocumentOperation(ctx.allocator, public_envelope.value, .extract) catch |err| return documentFailureResponse(ctx, err)) {
                 if (uses_attachment_envelope) return documentFailureResponse(ctx, error.UnsupportedDocumentTransport);
                 const output = self.extractDocumentsJsonWithControl(ctx.allocator, request_json, execution_control) catch |err| return documentFailureResponse(ctx, err);
                 defer ctx.allocator.free(output);
@@ -22145,19 +22149,24 @@ pub const Node = struct {
         const native_info = try self.documentCatalogInfo(ca, null, "read");
         try catalog.value.object.getPtr("readers").?.object.put(ca, "antfly/native-document", native_info);
         for (discovered) |entry| {
-            const definition_bytes = self.documentDefinition(ca, entry.name) catch |err| {
-                if (err == error.OutOfMemory) return err;
-                continue;
-            } orelse continue;
-            const parsed = document_contract.Definition.parse(ca, definition_bytes) catch |err| {
-                if (err == error.OutOfMemory) return err;
-                continue;
-            };
-            const definition = parsed.value;
-            // Decisions remain ordinary typed providers; a document definition
-            // is advertised only for the operations implemented by this host.
-            if (definition.read != null) try catalog.value.object.getPtr("readers").?.object.put(ca, entry.name, try self.documentCatalogInfo(ca, definition, "read"));
-            if (definition.extract != null) try catalog.value.object.getPtr("extractors").?.object.put(ca, entry.name, try self.documentCatalogInfo(ca, definition, "extract"));
+            // Resolve each advertised operation independently; never let one
+            // same-named registration overwrite another task's definition.
+            for ([_]document_contract.Operation{ .read, .extract }) |operation| {
+                const definition_bytes = self.documentDefinition(ca, entry.name, operation) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    continue;
+                } orelse continue;
+                const parsed = document_contract.Definition.parse(ca, definition_bytes) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    continue;
+                };
+                const definition = parsed.value;
+                const is_read = operation == .read;
+                if ((is_read and definition.read == null) or (!is_read and definition.extract == null)) continue;
+                const scope = if (is_read) "readers" else "extractors";
+                const task = if (is_read) "read" else "extract";
+                try catalog.value.object.getPtr(scope).?.object.put(ca, entry.name, try self.documentCatalogInfo(ca, definition, task));
+            }
         }
         return std.json.Stringify.valueAlloc(a, catalog.value, .{});
     }
@@ -40869,4 +40878,58 @@ test "document native annotation coverage remains unresolved through HTTP and ty
     defer batch.deinit(a);
     try std.testing.expectEqual(readers_api.Completion.unresolved, batch.items[0].completion);
     try std.testing.expect(std.mem.indexOf(u8, batch.items[0].document_json.?, "pdf_annotation_rendering_unavailable") != null);
+}
+
+test "document task namespaces stay distinct in dispatch limits and discovery" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const reader =
+        \\{"models":[{"name":"native","model":"antfly/native-document","operation":"read"}],"read":{"reader":"native"},"budget":{"max_sources":2}}
+    ;
+    const extractor =
+        \\{"allow_remote":true,"models":[{"name":"extractor","model":"@cf/cloudflare/clairic","operation":"extract","provider":"cloudflare","account_id":"test","token_env":"ANTFLY_TEST_TASK_COLLISION_MISSING_TOKEN"}],"extract":{"model":"extractor"},"budget":{"max_sources":3}}
+    ;
+    inline for (.{ .{ "readers", reader }, .{ "extractors", extractor } }) |fixture| {
+        try tmp.dir.createDirPath(std.testing.io, fixture[0] ++ "/test/shared");
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = fixture[0] ++ "/test/shared/config.json", .data = "{}" });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = fixture[0] ++ "/test/shared/document_agent.json", .data = fixture[1] });
+    }
+    const models = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(models);
+    var node = try Node.init(a, .{ .models_dir = models });
+    defer node.deinit();
+    inline for (.{ .{ document_contract.Operation.read, reader }, .{ document_contract.Operation.extract, extractor } }) |fixture| {
+        const definition = (try node.documentDefinition(a, "test/shared", fixture[0])).?;
+        defer a.free(definition);
+        try std.testing.expectEqualStrings(fixture[1], definition);
+    }
+    try std.testing.expectEqual(@as(usize, 2), (try node.documentTaskLimits(a, "test/shared", true)).?.max_sources);
+    try std.testing.expectEqual(@as(usize, 3), (try node.documentTaskLimits(a, "test/shared", false)).?.max_sources);
+    const catalog_bytes = try node.listModelsJsonAlloc(a, std.testing.io);
+    defer a.free(catalog_bytes);
+    var catalog = try std.json.parseFromSlice(std.json.Value, a, catalog_bytes, .{});
+    defer catalog.deinit();
+    const read_info = catalog.value.object.get("readers").?.object.get("test/shared").?.object.get("inference_capabilities").?;
+    const extract_info = catalog.value.object.get("extractors").?.object.get("test/shared").?.object.get("inference_capabilities").?;
+    try std.testing.expect(!read_info.object.get("remote_execution").?.bool);
+    try std.testing.expect(extract_info.object.get("remote_execution").?.bool);
+    // HTTP extraction with text must dispatch to the extractor, not the reader.
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
+    defer request.deinit();
+    request.body =
+        \\{"model":"test/shared","schema_version":2,"schema":{"structures":{"record":{"fields":{"name":"str"}}}},"inputs":[{"content":"Alice"}]}
+    ;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.extractJSON(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 502), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "CloudflareCredentialMissing") != null);
+    // Even an ordinary reader without agent metadata must not mask extraction.
+    try tmp.dir.deleteFile(std.testing.io, "readers/test/shared/document_agent.json");
+    try std.testing.expect(try node.documentDefinition(a, "test/shared", .read) == null);
+    const definition = (try node.documentDefinition(a, "test/shared", .extract)).?;
+    defer a.free(definition);
+    try std.testing.expectEqualStrings(extractor, definition);
 }

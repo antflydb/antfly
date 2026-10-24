@@ -242,7 +242,15 @@ pub fn extractionResult(a: A, plan: ExtractionPlan, result: V, state: []const u8
         try put(a, &entry, "origin", string(if (std.mem.eql(u8, kind, "estimate")) "estimated" else "derived"));
         if (std.mem.eql(u8, kind, "estimate")) {
             var estimate = object();
-            for ([_][]const u8{ "mean", "median", "p10", "p90", "p_below", "p_above" }) |key| if (field(answer, key)) |v| try put(a, &estimate, key, v);
+            for ([_][]const u8{ "mean", "median", "p10", "p90", "p_below", "p_above" }) |key| {
+                if (field(answer, key)) |v| {
+                    // Validate at the provider boundary so every host receives
+                    // schema-valid output. Preserve the original numeric value.
+                    const n = numeric(v) catch return error.InvalidCloudflareResponse;
+                    if ((std.mem.eql(u8, key, "p_below") or std.mem.eql(u8, key, "p_above")) and (n < 0 or n > 1)) return error.InvalidCloudflareResponse;
+                    try put(a, &estimate, key, v);
+                }
+            }
             try put(a, &entry, "estimate", estimate);
         }
         if (value != .null) {
@@ -364,4 +372,48 @@ test "cloudflare provider rejects unsupported schema rather than coercing entiti
     const text_state = try a.alloc(u8, 60_001);
     @memset(text_state, 'x');
     try std.testing.expectError(error.CloudflareInputLimitExceeded, evidenceRequest(a, "@cf/cloudflare/clairic", .{ .state = text_state, .images = .{ .array = .init(a) } }, fields));
+}
+
+test "cloudflare provider validates every estimate metric before emitting typed output" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try std.json.parseFromSliceLeaky(V, a,
+        \\{"structures":{"r":{"fields":{"days":{"type":"estimate","min":0,"max":100,"step":1}}}}}
+    , .{});
+    const plan = try extractionSchema(a, schema);
+    const response = try std.json.parseFromSliceLeaky(V, a,
+        \\{"answers":{"days":{"value":42,"mean":42.5,"median":42,"p10":10,"p90":90,"p_below":0,"p_above":1}}}
+    , .{});
+    const result = try extractionResult(a, plan, response, "");
+    const row = field(field(result, "structures").?, "r").?.array.items[0];
+    const estimate = field(field(row, "days").?, "estimate").?;
+    try std.testing.expectEqual(@as(f64, 42.5), field(estimate, "mean").?.float);
+    try std.testing.expectEqual(@as(i64, 42), field(estimate, "median").?.integer);
+    for ([_][]const u8{ "mean", "median", "p10", "p90", "p_below", "p_above" }) |key| {
+        for ([_]V{ string("not-a-number"), .{ .bool = false }, object(), .{ .array = .init(a) }, .null, .{ .float = std.math.inf(f64) }, .{ .float = std.math.nan(f64) } }) |invalid| {
+            var malformed = try std.json.parseFromSliceLeaky(V, a,
+                \\{"answers":{"days":{"value":42}}}
+            , .{});
+            try malformed.object.getPtr("answers").?.object.getPtr("days").?.object.put(a, key, invalid);
+            try std.testing.expectError(error.InvalidCloudflareResponse, extractionResult(a, plan, malformed, ""));
+        }
+    }
+    for ([_][]const u8{ "p_below", "p_above" }) |key| {
+        for ([_]f64{ -0.01, 1.01 }) |invalid| {
+            var malformed = try std.json.parseFromSliceLeaky(V, a,
+                \\{"answers":{"days":{"value":42}}}
+            , .{});
+            try malformed.object.getPtr("answers").?.object.getPtr("days").?.object.put(a, key, .{ .float = invalid });
+            try std.testing.expectError(error.InvalidCloudflareResponse, extractionResult(a, plan, malformed, ""));
+        }
+    }
+    // Optional metrics remain optional; abstention never becomes a guess.
+    const abstained = try std.json.parseFromSliceLeaky(V, a,
+        \\{"answers":{"days":{"value":null}}}
+    , .{});
+    const empty_result = try extractionResult(a, plan, abstained, "");
+    const empty_row = field(field(empty_result, "structures").?, "r").?.array.items[0];
+    try std.testing.expectEqual(V.null, field(field(empty_row, "days").?, "value").?);
+    try std.testing.expectEqual(@as(usize, 0), field(field(empty_row, "days").?, "estimate").?.object.count());
 }

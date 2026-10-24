@@ -36,6 +36,11 @@ capabilities, including unavailable rendering features.
 Place a `document_agent.json` in the selected model directory, for example
 `models/readers/antfly/document-balanced/document_agent.json`. JSON is the
 configuration format; the issue's YAML examples describe the design vocabulary.
+Register extraction agents under `models/extractors/<name>/document_agent.json`.
+Resolution uses the requested operation: a reader and an extractor can share a
+name and have independent definitions and limits. Child bindings resolve using
+their declared `operation`. An extraction agent's optional `read` stage uses
+that agent's own definition, including when another reader has the same name.
 Child names below are examples and must resolve to installed models.
 
 ```json
@@ -179,6 +184,8 @@ features and oversized contexts fail explicitly. Inline PNG/JPEG/WebP evidence
 is supported by the ordinary providers within checked media limits. Null values
 remain null rather than promoting a guess. Character spans become verified UTF-8
 byte ranges; computed dates/numbers and estimates keep their distinct provenance.
+Estimate metrics must be finite numbers, and probabilities must be between zero
+and one. Malformed provider metrics fail before extraction output is returned.
 
 Native transport uses Bearer authentication and, when configured, the
 `cf-aig-gateway-id` header. Each Antfly invocation makes one upstream attempt;

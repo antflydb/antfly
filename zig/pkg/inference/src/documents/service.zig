@@ -41,7 +41,15 @@ pub fn wantsDocuments(root: V) bool {
 pub fn Service(comptime Node: type) type {
     return struct {
         const Self = @This();
-        const Plan = struct { name: []const u8, definition: c.Definition };
+        // Task is part of model identity throughout a run, including cycle checks.
+        const Key = struct {
+            name: []const u8,
+            operation: c.Operation,
+            fn eql(self: Key, other: Key) bool {
+                return self.operation == other.operation and std.mem.eql(u8, self.name, other.name);
+            }
+        };
+        const Plan = struct { key: Key, definition: c.Definition };
         const Graph = struct {
             plans: std.ArrayList(Plan) = .empty,
             visits: usize = 0,
@@ -50,8 +58,8 @@ pub fn Service(comptime Node: type) type {
                 for (self.snapshots.items) |item| if (item.binding.operation == binding.operation and std.mem.eql(u8, item.binding.model, binding.model)) return item;
                 return null;
             }
-            fn get(self: *const Graph, name: []const u8) ?c.Definition {
-                for (self.plans.items) |plan| if (std.mem.eql(u8, plan.name, name)) return plan.definition;
+            fn get(self: *const Graph, key: Key) ?c.Definition {
+                for (self.plans.items) |plan| if (plan.key.eql(key)) return plan.definition;
                 return null;
             }
         };
@@ -69,7 +77,7 @@ pub fn Service(comptime Node: type) type {
         rendered: ?struct { bytes: []const u8, mime_type: []const u8, width: u32, height: u32, effective_dpi: u16, raster_to_source: c.Transform } = null,
 
         pub fn readJson(node: *Node, backing: A, bytes: []const u8, supplied: Control) ![]u8 {
-            return readJsonWithRun(node, backing, bytes, supplied, null, null, null);
+            return readJsonWithRun(node, backing, bytes, supplied, null, null, null, .read);
         }
 
         pub fn readEncodedJson(node: *Node, backing: A, model: []const u8, request: readers.EncodedRequest, control: Control) ![]u8 {
@@ -84,17 +92,18 @@ pub fn Service(comptime Node: type) type {
                 .media_type = encoded.mime_type,
             };
             const bytes = try std.json.Stringify.valueAlloc(a, ReadRequest{ .model = model, .documents = inputs, .prompt = request.prompt, .max_tokens = request.max_tokens }, .{ .emit_null_optional_fields = false });
-            return readJsonWithRun(node, backing, bytes, control, null, null, request);
+            return readJsonWithRun(node, backing, bytes, control, null, null, request, .read);
         }
 
-        fn readJsonWithRun(node: *Node, backing: A, bytes: []const u8, supplied: Control, shared: ?*c.Run, snapshot: ?*Graph, attached: ?readers.EncodedRequest) ![]u8 {
+        fn readJsonWithRun(node: *Node, backing: A, bytes: []const u8, supplied: Control, shared: ?*c.Run, snapshot: ?*Graph, attached: ?readers.EncodedRequest, definition_operation: c.Operation) ![]u8 {
             var arena = std.heap.ArenaAllocator.init(backing);
             defer arena.deinit();
             const a = arena.allocator();
             const request = try std.json.parseFromSliceLeaky(ReadRequest, a, bytes, .{ .duplicate_field_behavior = .@"error" });
             if (request.max_tokens) |tokens| if (tokens < 1 or tokens > 1024) return error.InvalidMaxTokens;
-            const known_definition = if (snapshot) |graph| graph.get(request.model) else null;
-            const definition_bytes = if (known_definition == null) try node.documentDefinition(a, request.model) else null;
+            const key = Key{ .name = request.model, .operation = definition_operation };
+            const known_definition = if (snapshot) |graph| graph.get(key) else null;
+            const definition_bytes = if (known_definition == null) try node.documentDefinition(a, request.model, definition_operation) else null;
             const def: c.Definition = if (known_definition) |known| known else if (definition_bytes) |data| (try c.Definition.parse(a, data)).value else .{
                 .models = try a.dupe(c.Binding, &.{.{ .name = "reader", .model = request.model, .operation = .read }}),
                 .read = .{ .reader = "reader" },
@@ -106,7 +115,10 @@ pub fn Service(comptime Node: type) type {
             control.deadline_ns = if (control.deadline_ns) |d| @min(d, deadline) else deadline;
             var local_graph = Graph{};
             const graph = snapshot orelse &local_graph;
-            if (snapshot == null) try preflight(node, a, request.model, def, graph, &.{}, def.allow_remote);
+            if (snapshot == null) {
+                if (definition_bytes != null) try graph.plans.append(a, .{ .key = key, .definition = def });
+                try preflight(node, a, key, def, graph, &.{}, def.allow_remote);
+            }
             const Probe = struct {
                 fn check(raw: ?*anyopaque) !void {
                     const ctl: *Control = @ptrCast(@alignCast(raw.?));
@@ -234,12 +246,11 @@ pub fn Service(comptime Node: type) type {
             return result;
         }
 
-        fn preflight(node: *Node, a: A, parent: []const u8, def: c.Definition, graph: *Graph, stack: []const []const u8, remote_allowed: bool) !void {
+        fn preflight(node: *Node, a: A, parent: Key, def: c.Definition, graph: *Graph, stack: []const Key, remote_allowed: bool) !void {
             if (stack.len >= 16 or graph.visits >= 128) return error.DocumentGraphLimitExceeded;
-            for (stack) |name| if (std.mem.eql(u8, parent, name)) return error.DocumentDependencyCycle;
+            for (stack) |key| if (parent.eql(key)) return error.DocumentDependencyCycle;
             graph.visits += 1;
-            if (try node.documentDefinition(a, parent) != null and graph.get(parent) == null) try graph.plans.append(a, .{ .name = parent, .definition = def });
-            const next_stack = try a.alloc([]const u8, stack.len + 1);
+            const next_stack = try a.alloc(Key, stack.len + 1);
             @memcpy(next_stack[0..stack.len], stack);
             next_stack[stack.len] = parent;
             for (def.models) |binding| {
@@ -249,33 +260,35 @@ pub fn Service(comptime Node: type) type {
                     if (binding.operation == .read) return error.DocumentCapabilityMismatch;
                     continue;
                 }
-                const definition: ?c.Definition = if (graph.get(binding.model)) |known| known else if (try node.documentDefinition(a, binding.model)) |bytes| (try c.Definition.parse(a, bytes)).value else null;
+                const key = Key{ .name = binding.model, .operation = binding.operation };
+                const definition: ?c.Definition = if (graph.get(key)) |known| known else if (try node.documentDefinition(a, binding.model, binding.operation)) |bytes| (try c.Definition.parse(a, bytes)).value else null;
                 if (definition) |child| {
                     switch (binding.operation) {
                         .read => if (child.read == null) return error.DocumentCapabilityMismatch,
                         .extract => if (child.extract == null) return error.DocumentCapabilityMismatch,
                         .decide => return error.DocumentCapabilityMismatch,
                     }
-                    try preflight(node, a, binding.model, child, graph, next_stack, remote_allowed and def.allow_remote);
+                    if (graph.get(key) == null) try graph.plans.append(a, .{ .key = key, .definition = child });
+                    try preflight(node, a, key, child, graph, next_stack, remote_allowed and def.allow_remote);
                 } else if (graph.snapshot(binding) == null) {
                     try graph.snapshots.append(a, try node.documentResolveBinding(a, binding));
                 }
             }
         }
 
-        fn extractionReader(def: c.Definition, name: []const u8, graph: *const Graph) ![]const u8 {
+        fn extractionReader(def: c.Definition, name: []const u8, graph: *const Graph) !Key {
             var current = def;
             var current_name = name;
             for (0..16) |_| {
-                if (current.read != null) return current_name;
+                if (current.read != null) return .{ .name = current_name, .operation = .extract };
                 const task = current.extract orelse return error.DocumentCapabilityMismatch;
                 const binding = try current.binding(task.model, .extract);
-                if (binding.provider == .antfly) if (graph.get(binding.model)) |child| {
+                if (binding.provider == .antfly) if (graph.get(.{ .name = binding.model, .operation = binding.operation })) |child| {
                     current = child;
                     current_name = binding.model;
                     continue;
                 };
-                return "antfly/native-document";
+                return .{ .name = "antfly/native-document", .operation = .read };
             }
             return error.DocumentDependencyCycle;
         }
@@ -285,7 +298,7 @@ pub fn Service(comptime Node: type) type {
             for (0..16) |_| {
                 const task = current.extract orelse return error.DocumentCapabilityMismatch;
                 const binding = try current.binding(task.model, .extract);
-                if (binding.provider == .antfly) if (graph.get(binding.model)) |child| {
+                if (binding.provider == .antfly) if (graph.get(.{ .name = binding.model, .operation = binding.operation })) |child| {
                     current = child;
                     continue;
                 };
@@ -366,7 +379,7 @@ pub fn Service(comptime Node: type) type {
                 raster_width = right - left;
                 raster_height = bottom - top;
             }
-            if (self.graph.get(binding.model)) |child| {
+            if (self.graph.get(.{ .name = binding.model, .operation = binding.operation })) |child| {
                 const child_limits = try run.nestedViewLimits(child.budget, data.len, raster_width, raster_height);
                 var nested_source = sources.Source{ .input = .{ .id = self.source.input.id, .url = "", .media_type = mime }, .fingerprint = @splat(0), .bytes = data, .parsed = .image };
                 var nested = self.*;
@@ -602,7 +615,7 @@ pub fn Service(comptime Node: type) type {
             const content = try cf.text(cf.field(input, "content") orelse return error.UnsupportedDocumentFormat);
             try run.call();
             try run.emit(.{ .phase = .extracting, .source_id = if (cf.field(input, "id")) |id| try cf.text(id) else "", .page_number = 0, .model = binding.model });
-            if (binding.provider == .antfly) if (graph.get(binding.model)) |child| {
+            if (binding.provider == .antfly) if (graph.get(.{ .name = binding.model, .operation = binding.operation })) |child| {
                 const parent_limits = run.limits;
                 defer run.limits = parent_limits;
                 run.limits = run.nestedLimits(child.budget);
@@ -679,11 +692,13 @@ pub fn Service(comptime Node: type) type {
                 break :version @intCast(v.integer);
             } else 1;
             const schema = cf.field(root, "schema") orelse return error.InvalidDocumentSource;
-            const definition_bytes = try node.documentDefinition(a, model);
+            const definition_bytes = try node.documentDefinition(a, model, .extract);
             const def = if (definition_bytes) |data| (try c.Definition.parse(a, data)).value else c.Definition{ .models = &.{.{ .name = "extractor", .model = model, .operation = .extract }}, .extract = .{ .model = "extractor" } };
             try def.validate();
             var graph = Graph{};
-            try preflight(node, a, model, def, &graph, &.{}, def.allow_remote);
+            const root_key = Key{ .name = model, .operation = .extract };
+            if (definition_bytes != null) try graph.plans.append(a, .{ .key = root_key, .definition = def });
+            try preflight(node, a, root_key, def, &graph, &.{}, def.allow_remote);
             var extraction_control = control;
             const deadline = @import("antfly_platform").time.monotonicNs() +| def.budget.deadline_ms * std.time.ns_per_ms;
             extraction_control.deadline_ns = if (control.deadline_ns) |d| @min(d, deadline) else deadline;
@@ -723,9 +738,10 @@ pub fn Service(comptime Node: type) type {
                 // independent grouping of each source for extraction.
                 {
                     var request = cf.object();
-                    try cf.put(a, &request, "model", cf.string(try extractionReader(def, model, &graph)));
+                    const reader = try extractionReader(def, model, &graph);
+                    try cf.put(a, &request, "model", cf.string(reader.name));
                     try cf.put(a, &request, "documents", documents);
-                    const read_bytes = try readJsonWithRun(node, backing, try std.json.Stringify.valueAlloc(a, request, .{}), extraction_control, &run, &graph, null);
+                    const read_bytes = try readJsonWithRun(node, backing, try std.json.Stringify.valueAlloc(a, request, .{}), extraction_control, &run, &graph, null, reader.operation);
                     defer backing.free(read_bytes);
                     const read_result = try std.json.parseFromSliceLeaky(V, a, read_bytes, .{ .allocate = .alloc_always });
                     try inputs.appendSlice(try inputsFromRead(a, read_result));
@@ -813,7 +829,8 @@ test "document nested composites share one budget and one rendered view" {
         measured: bool = false,
         incomplete: bool = false,
         tiny_tokens: bool = false,
-        fn documentDefinition(self: *@This(), a: A, name: []const u8) !?[]const u8 {
+        fn documentDefinition(self: *@This(), a: A, name: []const u8, operation: c.Operation) !?[]const u8 {
+            if (operation != .read) return null;
             const json = if (std.mem.eql(u8, name, "parent") and self.tiny_tokens)
                 \\{"models":[{"name":"child","model":"child","operation":"read"}],"read":{"reader":"child"},"budget":{"max_total_tokens":1}}
             else if (std.mem.eql(u8, name, "parent"))
@@ -904,7 +921,8 @@ test "document extraction keeps independent sources atomic and reuses retained r
         downloads: usize = 0,
         calls: usize = 0,
         disagree: bool = false,
-        fn documentDefinition(_: *@This(), a: A, name: []const u8) !?[]const u8 {
+        fn documentDefinition(_: *@This(), a: A, name: []const u8, operation: c.Operation) !?[]const u8 {
+            if (operation != .extract) return null;
             if (std.mem.eql(u8, name, "nested-parent")) return try a.dupe(u8,
                 \\{"models":[{"name":"child","model":"nested-child","operation":"extract"}],"extract":{"model":"child"}}
             );
@@ -988,4 +1006,48 @@ test "document extraction keeps independent sources atomic and reuses retained r
         \\{"model":"nested-parent","schema_version":2,"schema":{"structures":{"record":{"fields":{"value":"str"}}}},"documents":[{"id":"two-pages","url":"fixture","media_type":"application/pdf"}]}
     , .{}));
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
+test "document graph keys separate same named tasks and retain real cycle detection" {
+    const Fake = struct {
+        definitions: usize = 0,
+        cycle: bool = false,
+        fn documentDefinition(self: *@This(), a: A, name: []const u8, operation: c.Operation) !?[]const u8 {
+            if (!std.mem.eql(u8, name, "shared") or operation != .read) return null;
+            self.definitions += 1;
+            return try a.dupe(u8, if (self.cycle)
+                \\{"models":[{"name":"again","model":"shared","operation":"read"}],"read":{"reader":"again"}}
+            else
+                \\{"models":[{"name":"native","model":"antfly/native-document","operation":"read"}],"read":{"reader":"native"}}
+            );
+        }
+        fn documentResolveBinding(_: *@This(), _: A, binding: c.Binding) !c.Snapshot {
+            return .{ .binding = binding, .path = binding.model, .identity = @splat(1) };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const S = Service(Fake);
+    const root = (try c.Definition.parse(a,
+        \\{"models":[{"name":"reader","model":"shared","operation":"read"},{"name":"extractor","model":"leaf","operation":"extract"}],"read":{"reader":"reader"},"extract":{"model":"extractor"}}
+    )).value;
+    const key = S.Key{ .name = "shared", .operation = .extract };
+    var graph = S.Graph{};
+    try graph.plans.append(a, .{ .key = key, .definition = root });
+    var fake = Fake{};
+    try S.preflight(&fake, a, key, root, &graph, &.{}, false);
+    try std.testing.expectEqual(@as(usize, 2), graph.plans.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.definitions);
+    try std.testing.expect(graph.get(key).?.extract != null);
+    try std.testing.expect(graph.get(.{ .name = "shared", .operation = .read }).?.extract == null);
+    // An extractor's embedded read stage must use its frozen definition,
+    // rather than re-resolving the same name as an independent reader.
+    try std.testing.expect((try S.extractionReader(root, "shared", &graph)).eql(key));
+    try S.preflight(&fake, a, key, root, &graph, &.{}, false);
+    try std.testing.expectEqual(@as(usize, 1), fake.definitions);
+    var cyclic = S.Graph{};
+    try cyclic.plans.append(a, .{ .key = key, .definition = root });
+    fake.cycle = true;
+    try std.testing.expectError(error.DocumentDependencyCycle, S.preflight(&fake, a, key, root, &cyclic, &.{}, false));
 }
