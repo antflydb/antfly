@@ -543,7 +543,12 @@ Entity proposals use the engine's [shared curation queue (#1233)](https://github
 including stable proposal IDs, irreversible terminal review outcomes, reversible
 merge/unmerge/suppression and reject-with-distinction. Separate service bindings
 pin input entity revisions, configuration and evidence without duplicating
-free-text prompts into the engine queue.
+free-text prompts into the engine queue. The [shared resolver authority](RESOLUTION.md)
+uses bounded static/native component closure, physical namespace projection fences,
+and durable reverse consumer indexes. Source metadata stores compact bindings;
+execution/provisioning reads share immutable snapshots, while Lite coalesces a
+namespace's consumers into one catalog publication. Continuous curation preserves
+replay progress and schedules a new pass after its tail instead of restarting it.
 
 `curator` is a shared table permission, alongside read, write and admin. It
 implies read and admitted curation, but does not imply arbitrary writes or admin.

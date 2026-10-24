@@ -40,6 +40,9 @@ pub const Head = struct {
     adoption_standalone: bool = false,
     min_text_chars: u32 = 0,
     bytes: u64 = 0,
+    /// State lineage, including adoption, fences immutable projection caches
+    /// across snapshot replacement and divergent equal-revision histories.
+    fingerprint: [32]u8 = @splat(0),
 };
 pub const Kind = enum { redirect, suppressed, suppression, distinct, redirect_origin, removed_alias, text, text_origin };
 pub const Edit = struct { kind: Kind, id: []const u8, value: ?std.json.Value };
@@ -118,7 +121,7 @@ pub const Store = struct {
             }
         }
         fn snapshot(self: Values, h: Head) Snapshot {
-            return .{ .head = h, .namespace = .{ .key_template = h.key_template, .revision = h.revision, .adoption_revision = h.adoption_revision, .adoption_standalone = h.adoption_standalone, .merges = self.aliases.items, .state = .{ .suppress = .{ .keys = self.suppressed.items, .entries = self.entries.items, .texts = self.texts.items, .text_entries = self.text_entries.items, .min_text_chars = h.min_text_chars }, .distinct = self.distinct.items, .redirect_origins = self.origins.items, .removed_aliases = self.removed.items } } };
+            return .{ .head = h, .namespace = .{ .record_store = true, .key_template = h.key_template, .revision = h.revision, .adoption_revision = h.adoption_revision, .adoption_standalone = h.adoption_standalone, .merges = self.aliases.items, .state = .{ .suppress = .{ .keys = self.suppressed.items, .entries = self.entries.items, .texts = self.texts.items, .text_entries = self.text_entries.items, .min_text_chars = h.min_text_chars }, .distinct = self.distinct.items, .redirect_origins = self.origins.items, .removed_aliases = self.removed.items } } };
         }
     };
     /// Full export is for derived worker configuration, never point admission.
@@ -253,6 +256,19 @@ pub const Store = struct {
         if (value.state == .open) result[3] = try self.keyPath(try std.fmt.allocPrint(self.a, "queue/key/{s}/{s}", .{ try hash(self.a, value.key), value.id }));
         return result;
     }
+    /// Durable effect classification, separate from actor provenance/revision.
+    /// It commits with a plain rejection and lets receipt replay avoid all
+    /// consumer work without mistaking a rejected distinct pin for queue-only.
+    pub fn markQueueOnly(self: Store, id: []const u8) !void {
+        const value = try self.proposal(id) orelse return error.NotFound;
+        if (value.state != .rejected) return error.ResolverCurationConflict;
+        try self.backend.put(self.backend.ptr, self.a, try self.keyPath(try std.fmt.allocPrint(self.a, "queue/queue-only/{s}", .{id})), try encode(self.a, id));
+    }
+    pub fn queueOnly(self: Store, id: []const u8) !bool {
+        const raw = try self.backend.get(self.backend.ptr, self.a, try self.keyPath(try std.fmt.allocPrint(self.a, "queue/queue-only/{s}", .{id}))) orelse return false;
+        if (!std.mem.eql(u8, try parse([]const u8, self.a, raw), id)) return error.InvalidMetadataBatch;
+        return true;
+    }
     pub fn proposalPage(self: Store, state: ?c.ProposalState, action: ?c.EntityAction, after: ?[]const u8, limit: u32) !c.ProposalPage {
         if (limit == 0 or limit > 256) return error.InvalidResolverCurationRequest;
         const suffix = if (state) |v| if (action) |w| try std.fmt.allocPrint(self.a, "queue/filter/{s}/{s}/", .{ @tagName(v), @tagName(w) }) else try std.fmt.allocPrint(self.a, "queue/state/{s}/", .{@tagName(v)}) else if (action) |v| try std.fmt.allocPrint(self.a, "queue/action/{s}/", .{@tagName(v)}) else "queue/proposal/";
@@ -354,6 +370,7 @@ pub const Store = struct {
             h.bytes = try std.math.add(u64, h.bytes, row.value.len);
         }
         if (h.bytes > c.max_state_bytes) return error.ResolverCurationLimitExceeded;
+        std.crypto.hash.sha2.Sha256.hash(try encode(self.a, namespace), &h.fingerprint, .{});
         for (rows) |row| {
             try self.backend.put(self.backend.ptr, self.a, try self.record(h.key_template, row.kind, row.id), row.value);
             try self.indexRecord(h.key_template, row.kind, row.id, row.value, true);
@@ -441,6 +458,7 @@ pub const Store = struct {
                 try self.indexRecord(h.key_template, edit.kind, edit.id, raw, true);
             } else try self.backend.remove(self.backend.ptr, self.a, path);
         }
+        std.crypto.hash.sha2.Sha256.hash(try encode(self.a, .{ if (previous) |old| old.fingerprint else @as([32]u8, @splat(0)), h.key_template, h.revision, h.min_text_chars, h.adoption_revision, h.adoption_standalone, patch.edits }), &h.fingerprint, .{});
         try self.backend.put(self.backend.ptr, self.a, try self.headPath(h.key_template), try encode(self.a, h));
     }
 };
@@ -479,44 +497,7 @@ test "native resolver authority seeks a component and patches only changed recor
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const Memory = struct {
-        a: A,
-        rows: std.StringHashMapUnmanaged([]const u8) = .empty,
-        reads: usize = 0,
-        writes: usize = 0,
-        visited: usize = 0,
-        fn get(ptr: *anyopaque, _: A, key: []const u8) !?[]const u8 {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.reads += 1;
-            return self.rows.get(key);
-        }
-        fn put(ptr: *anyopaque, _: A, key: []const u8, raw: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.writes += 1;
-            try self.rows.put(self.a, key, raw);
-        }
-        fn remove(ptr: *anyopaque, _: A, key: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.writes += 1;
-            _ = self.rows.remove(key);
-        }
-        fn scan(ptr: *anyopaque, alloc: A, prefix: []const u8, after: ?[]const u8, limit: u32) !Page {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            var rows: std.ArrayList(Row) = .empty;
-            var it = self.rows.iterator();
-            while (it.next()) |v| if (std.mem.startsWith(u8, v.key_ptr.*, prefix) and (after == null or std.mem.order(u8, v.key_ptr.*, after.?) == .gt)) {
-                try rows.append(alloc, .{ .key = v.key_ptr.*, .value = v.value_ptr.* });
-            };
-            std.mem.sort(Row, rows.items, {}, struct {
-                fn less(_: void, l: Row, r: Row) bool {
-                    return std.mem.lessThan(u8, l.key, r.key);
-                }
-            }.less);
-            const count = @min(limit, rows.items.len);
-            self.visited += count;
-            return .{ .rows = rows.items[0..count], .next = if (count < rows.items.len) rows.items[count - 1].key else null };
-        }
-    };
+    const Memory = TestMemory;
     var memory: Memory = .{ .a = a };
     const store: Store = .{ .a = a, .prefix = "authority/", .backend = .{ .ptr = &memory, .get = Memory.get, .put = Memory.put, .remove = Memory.remove, .scan = Memory.scan } };
     var aliases: [10000]resolver.KeyAlias = undefined;
@@ -550,10 +531,14 @@ test "native resolver authority seeks a component and patches only changed recor
     try store.applyQueue(.{ .expected_revision = 0, .revision = 1, .proposals = proposed.state.proposals });
     const queued = try store.proposalPage(.open, .merge, null, 1);
     try std.testing.expectEqual(@as(usize, 1), queued.proposals.len);
+    try std.testing.expect(!try store.queueOnly(queued.proposals[0].id));
+    try std.testing.expectError(error.ResolverCurationConflict, store.markQueueOnly(queued.proposals[0].id));
     const reservation = (try store.queueHead()).bytes;
     try std.testing.expect(reservation > c.decision_origin_byte_budget);
     const decision = try c.decide(a, proposed.state, &.{}, &.{}, queued.proposals[0].id, .{ .accept = false }, .{});
     try store.applyQueue(.{ .expected_revision = 1, .revision = 2, .proposals = decision.state.proposals });
+    try store.markQueueOnly(queued.proposals[0].id);
+    try std.testing.expect(try store.queueOnly(queued.proposals[0].id));
     try std.testing.expect((try store.queueHead()).bytes < reservation);
     try std.testing.expectEqual(@as(usize, 0), (try store.proposalPage(.open, null, null, 1)).proposals.len);
     try std.testing.expectEqual(@as(usize, 1), (try store.proposalPage(.rejected, .merge, null, 1)).proposals.len);
@@ -715,10 +700,68 @@ pub fn validatePortableRow(a: A, key: []const u8, raw: []const u8) !void {
         const id = try parse([]const u8, a, raw);
         if (id.len != 64 or !std.mem.eql(u8, parts[count - 1], id)) return error.InvalidMetadataBatch;
         for (id) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
+        if (std.mem.eql(u8, parts[1], "queue-only") and count == 3) return;
         if (std.mem.eql(u8, parts[1], "state") and count == 4 and std.meta.stringToEnum(c.ProposalState, parts[2]) != null) return;
         if (std.mem.eql(u8, parts[1], "action") and count == 4 and std.meta.stringToEnum(c.EntityAction, parts[2]) != null) return;
         if (std.mem.eql(u8, parts[1], "filter") and count == 5 and std.meta.stringToEnum(c.ProposalState, parts[2]) != null and std.meta.stringToEnum(c.EntityAction, parts[3]) != null) return;
         if (std.mem.eql(u8, parts[1], "key") and count == 4 and parts[2].len == 64) return;
     }
     return error.InvalidMetadataBatch;
+}
+
+const TestMemory = struct {
+    a: A,
+    rows: std.StringHashMapUnmanaged([]const u8) = .empty,
+    reads: usize = 0,
+    writes: usize = 0,
+    visited: usize = 0,
+    fn get(ptr: *anyopaque, _: A, key: []const u8) !?[]const u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.reads += 1;
+        return self.rows.get(key);
+    }
+    fn put(ptr: *anyopaque, _: A, key: []const u8, raw: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.writes += 1;
+        try self.rows.put(self.a, key, raw);
+    }
+    fn remove(ptr: *anyopaque, _: A, key: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.writes += 1;
+        _ = self.rows.remove(key);
+    }
+    fn scan(ptr: *anyopaque, alloc: A, prefix: []const u8, after: ?[]const u8, limit: u32) !Page {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var rows: std.ArrayList(Row) = .empty;
+        var it = self.rows.iterator();
+        while (it.next()) |v| if (std.mem.startsWith(u8, v.key_ptr.*, prefix) and (after == null or std.mem.order(u8, v.key_ptr.*, after.?) == .gt)) {
+            try rows.append(alloc, .{ .key = v.key_ptr.*, .value = v.value_ptr.* });
+        };
+        std.mem.sort(Row, rows.items, {}, struct {
+            fn less(_: void, l: Row, r: Row) bool {
+                return std.mem.lessThan(u8, l.key, r.key);
+            }
+        }.less);
+        const count = @min(limit, rows.items.len);
+        self.visited += count;
+        return .{ .rows = rows.items[0..count], .next = if (count < rows.items.len) rows.items[count - 1].key else null };
+    }
+};
+
+test "native resolver authority closes alternating static and native alias paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "authority/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    try store.apply(try difference(a, .{ .key_template = template }, .{ .key_template = template, .revision = 1, .merges = &.{ .{ .key = "entity/c", .target = "entity/d" }, .{ .key = "entity/e", .target = "entity/a" } } }));
+    const aliases = [_]resolver.KeyAlias{ .{ .key = "entity/b", .target = "entity/c" }, .{ .key = "entity/d", .target = "entity/e" } };
+    const scoped = (try store.componentWithAliases(template, &.{ "entity/a", "entity/b" }, &aliases)).?;
+    try std.testing.expectEqual(@as(usize, 2), scoped.namespace.merges.len);
+    var effective: std.ArrayList(resolver.KeyAlias) = .empty;
+    try effective.appendSlice(a, scoped.namespace.merges);
+    try effective.appendSlice(a, &aliases);
+    try effective.append(a, .{ .key = "entity/a", .target = "entity/b" });
+    try std.testing.expectError(error.InvalidResolverAliasCycle, c.RedirectIndex.init(a, effective.items));
 }

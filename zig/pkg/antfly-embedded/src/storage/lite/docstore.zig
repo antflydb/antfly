@@ -3766,8 +3766,38 @@ pub const Txn = struct {
         }
     }
 
+    fn synchronizeResolverConsumers(self: *Txn, key: []const u8, after: ?[]const u8) anyerror!void {
+        const consumers = @import("resolver_consumers.zig");
+        if (std.mem.eql(u8, key, @import("embedded_catalog.zig").key)) {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const before = self.get(key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            const source_prefix = self.prefix;
+            self.prefix = "";
+            defer self.prefix = source_prefix;
+            try consumers.directoryChanged(arena.allocator(), self, before, after);
+            return;
+        }
+        if (!std.mem.eql(u8, key, consumers.catalog_key)) return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const before = self.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const source_prefix = self.prefix;
+        self.prefix = "";
+        defer self.prefix = source_prefix;
+        try consumers.synchronize(a, self, source_prefix, before, after);
+    }
+
     pub fn put(self: *Txn, key: []const u8, value: []const u8) !void {
         if (self.read_only) return error.ReadOnly;
+        try self.synchronizeResolverConsumers(key, value);
         const owned_key = if (self.prefix.len == 0)
             try self.allocator.dupe(u8, key)
         else
@@ -3780,6 +3810,7 @@ pub const Txn = struct {
 
     pub fn delete(self: *Txn, key: []const u8) !void {
         if (self.read_only) return error.ReadOnly;
+        try self.synchronizeResolverConsumers(key, null);
         const owned_key = if (self.prefix.len == 0)
             try self.allocator.dupe(u8, key)
         else

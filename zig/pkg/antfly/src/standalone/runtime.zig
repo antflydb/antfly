@@ -2993,6 +2993,11 @@ const LocalStandaloneMetadata = struct {
                 }, .{});
             },
             .query_definition => |name| {
+                if (self.lifecycle_store) |store| {
+                    var definition = try store.queryTableDefinition(alloc, group_ids.main_metadata_group_id, name);
+                    defer if (definition) |*value| value.deinit(alloc);
+                    return std.json.Stringify.valueAlloc(alloc, definition, .{});
+                }
                 const table = self.manager.findTableByName(name);
                 const definition: ?system_catalog.QueryDefinition = if (table) |value| blk: {
                     var projected = system_catalog.QueryDefinition.fromTable(value);
@@ -3016,6 +3021,11 @@ const LocalStandaloneMetadata = struct {
                     defer resolved.deinit(alloc);
                     return std.json.Stringify.valueAlloc(alloc, resolved, .{});
                 }
+                if (request.include_query_definitions) if (self.lifecycle_store) |store| {
+                    var resolved = try store.resolveSystemCatalogIdentities(alloc, group_ids.main_metadata_group_id, request);
+                    defer resolved.deinit(alloc);
+                    return std.json.Stringify.valueAlloc(alloc, resolved, .{});
+                };
                 if (request.targets.len > 256 or request.storage_names.len > 256 - request.targets.len) return error.CatalogCommandTooLarge;
                 const revision = self.systemCatalogState().revision;
                 if (request.expected_revision) |expected| if (expected != revision) return error.CatalogGenerationChanged;

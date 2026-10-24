@@ -3645,6 +3645,7 @@ const PortableArchiveValidation = struct {
     saw_resolver_merges: bool = false,
     saw_curation_proposals: bool = false,
     saw_native_resolver_records: bool = false,
+    saw_resolver_projection_format: bool = false,
     saw_native_resolver_marker: bool = false,
     resolver_configs: ?[]resolver_catalog.ResolverConfig = null,
     resolver_merge_data: ?[]u8 = null,
@@ -3899,6 +3900,7 @@ const PortableArchiveValidation = struct {
 
     fn finish(self: *PortableArchiveValidation, alloc: Allocator) !void {
         if (self.saw_native_resolver_records and (!self.saw_native_resolver_marker or (self.minimum_reader_version orelse 0) < resolver_catalog.native_resolver_records_reader_version)) return error.InvalidMetadataBatch;
+        if (self.saw_resolver_projection_format and (self.minimum_reader_version orelse 0) < resolver_catalog.resolver_projection_bindings_reader_version) return error.InvalidMetadataBatch;
         if (self.saw_curation_proposals and (self.minimum_reader_version orelse 0) < resolver_catalog.scoped_curation_reader_version) return error.InvalidMetadataBatch;
         const resolver_bytes = try resolver_catalog.serializeCatalog(alloc, self.resolver_configs orelse &.{});
         defer alloc.free(resolver_bytes);
@@ -4856,6 +4858,11 @@ fn validateMetadataEntries(
                 else => return error.InvalidMetadataBatch,
             };
             archive.saw_native_resolver_records = true;
+            if (std.mem.startsWith(u8, entry.key, @import("db/resolver_authority.zig").lite_prefix ++ "queue/queue-only/")) archive.saw_resolver_projection_format = true;
+            if (std.mem.startsWith(u8, entry.key, @import("db/resolver_authority.zig").lite_prefix ++ "head/")) {
+                const head = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), entry.value, .{});
+                if (head.object.contains("fingerprint")) archive.saw_resolver_projection_format = true;
+            }
             if (std.mem.eql(u8, entry.key, @import("db/resolver_authority.zig").lite_marker)) {
                 if (archive.saw_native_resolver_marker) return error.InvalidMetadataBatch;
                 archive.saw_native_resolver_marker = true;
@@ -7616,6 +7623,9 @@ test "portable backup native resolver authority retains heads policy and queue i
     var source = try openTestStore(alloc, &source_tmp);
     defer source.close();
     const proposal = (try pure.propose(a, .{}, &.{}, .{ .action = .suppress, .key = "concept/noise" }, .{})).state.proposals[0];
+    var terminal = (try pure.propose(a, .{}, &.{}, .{ .action = .merge, .key = "concept/plain", .into = "concept/other" }, .{})).state.proposals[0];
+    terminal.state = .rejected;
+    terminal.decided = .{ .origin = .review };
     const Bridge = native.Transaction(DocStore.Txn);
     {
         var txn = try source.beginWriteTxn();
@@ -7625,8 +7635,10 @@ test "portable backup native resolver authority retains heads policy and queue i
         const authority = bridge.store(a, native.lite_prefix);
         try authority.adoptNamespace(.{ .key_template = "concept/{{_key}}", .revision = 1, .merges = &.{.{ .key = "concept/a", .target = "concept/b" }} });
         try authority.applyQueue(.{ .expected_revision = 0, .revision = 1, .receipt_scope = @splat('a'), .proposals = &.{proposal} });
+        try authority.applyQueue(.{ .expected_revision = 1, .revision = 2, .receipt_scope = @splat('a'), .proposals = &.{terminal} });
+        try authority.markQueueOnly(terminal.id);
         try bridge.backendPut(a, native.lite_marker, "1");
-        try bridge.backendPut(a, resolver_catalog.minimum_reader_key, "12");
+        try bridge.backendPut(a, resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(resolver_catalog.resolver_projection_bindings_reader_version));
         try bridge.flush(a);
         try txn.commit();
         committed = true;
@@ -7649,9 +7661,10 @@ test "portable backup native resolver authority retains heads policy and queue i
     const page = try restored.proposalPage(.open, .suppress, null, 1);
     try std.testing.expectEqual(@as(usize, 1), page.proposals.len);
     try std.testing.expectEqualStrings(proposal.id, page.proposals[0].id);
+    try std.testing.expect(try restored.queueOnly(terminal.id));
     try std.testing.expect(pure.sameReceiptScope(@splat('a'), (try restored.queueHead()).receipt_scope));
     try std.testing.expectEqualStrings("1", try target.get(a, native.lite_marker));
-    try std.testing.expectEqualStrings("12", try target.get(a, resolver_catalog.minimum_reader_key));
+    try std.testing.expectEqualStrings(try resolver_catalog.readerVersionBytes(resolver_catalog.resolver_projection_bindings_reader_version), try target.get(a, resolver_catalog.minimum_reader_key));
     var incomplete: PortableArchiveValidation = .{ .format_version = backup_codec.format_version };
     defer incomplete.deinit(alloc);
     try validateMetadataEntries(alloc, &.{.{ .key = native.lite_marker, .value = "1" }}, &incomplete);

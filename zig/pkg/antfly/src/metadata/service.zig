@@ -3440,10 +3440,13 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
         },
         else => "",
     };
+    if (metadata_topology_protocol.usesResolverRecords(namespace_indexes)) return metadata_topology_protocol.resolver_records_version;
     if (metadata_topology_protocol.usesResolverNamespaces(namespace_indexes)) return metadata_topology_protocol.resolver_namespaces_version;
     switch (command) {
-        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| for (delta.upsert_tables) |table| {
-            if (transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }) >= metadata_topology_protocol.resolver_namespaces_version) return metadata_topology_protocol.resolver_namespaces_version;
+        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| {
+            var required: u16 = 0;
+            for (delta.upsert_tables) |table| required = @max(required, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
+            if (required >= metadata_topology_protocol.resolver_namespaces_version) return required;
         },
         else => {},
     }

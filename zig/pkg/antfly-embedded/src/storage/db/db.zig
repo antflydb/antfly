@@ -29466,6 +29466,28 @@ pub const DB = struct {
         return upsert_result;
     }
 
+    pub fn publishResolverNamespaceProjection(self: *DB, table: []const u8, table_id: u64, namespace: @import("resolver_namespace.zig").Namespace) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
+        const changed = blk: {
+            var activity = try self.acquireResolverCatalogActivity(true);
+            defer activity.deinit();
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            var probe = try self.core.store.beginProbeTxn();
+            defer probe.abort();
+            try self.requireOnlineArtifactCatalogMutableLocked(&probe);
+            break :blk try self.core.index_manager.publishResolverNamespaceProjection(self.core.store, table, table_id, namespace);
+        };
+        if (changed) {
+            if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
+            try self.startResolverReplayRuntimes();
+        }
+        return changed;
+    }
+
     pub fn upsertResolverWithResult(self: *DB, cfg: index_manager_mod.ResolverConfig) !index_manager_mod.IndexManager.ResolverUpsertResult {
         return try self.upsertResolverWithResultOptions(cfg, .{});
     }
@@ -31152,6 +31174,9 @@ pub const DB = struct {
                 .config_generation = cfg.config_generation,
                 .effective_generation = cfg.effectiveGeneration(),
                 .curation_revision = cfg.curation_revision,
+                .namespace_curation_generation = cfg.namespace_curation_generation,
+                .namespace_curation_table_id = cfg.namespace_curation_table_id,
+                .namespace_curation_missing = cfg.namespace_curation_missing,
                 .table = table,
                 .source_artifact = source_artifact,
                 .resolution_artifact = resolution_artifact,

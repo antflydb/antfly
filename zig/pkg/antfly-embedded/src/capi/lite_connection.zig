@@ -86,7 +86,7 @@ pub const PreparedPublication = struct {
     source_read: ?*SourceRead,
     relational_rows: bool,
     index_inputs_changed: bool = false,
-    resolver_dependency: ?struct { table: []const u8, template: []const u8, table_id: u64, revision: u64 } = null,
+    resolver_dependency: ?struct { table: []const u8, template: []const u8, table_id: ?u64, head: ?@import("resolver_authority.zig").Stamp } = null,
 
     fn current(self: *@This()) !*h.db_mod.DB {
         const root = try self.owner.refresh();
@@ -97,9 +97,13 @@ pub const PreparedPublication = struct {
         if (database.root_incarnation != self.incarnation or !std.meta.eql(database.core.identity_namespace, self.identity) or
             !std.mem.eql(u8, &(try catalogStamp(database)), &self.catalog)) return error.EnrichmentSourceChanged;
         if (self.resolver_dependency) |dependency| {
-            const destination = try @import("tables.zig").get(root, dependency.table);
-            if (destination.core.identity_namespace.table_id != dependency.table_id or
-                (try @import("resolver_authority.zig").revision(destination, alloc, dependency.template)) != dependency.revision) return error.EnrichmentSourceChanged;
+            const destination = @import("tables.zig").get(root, dependency.table) catch |err| switch (err) {
+                error.UndefinedTable => null,
+                else => return err,
+            };
+            const table_id: ?u64 = if (destination) |db| db.core.identity_namespace.table_id else null;
+            const head = if (destination) |db| try @import("resolver_authority.zig").namespaceStamp(db, alloc, dependency.template) else null;
+            if (table_id != dependency.table_id or !std.meta.eql(head, dependency.head)) return error.EnrichmentSourceChanged;
         }
         if (self.shadow_scopes.len != 0) {
             const jobs = try database.graphReplacementStatusAlloc(alloc);

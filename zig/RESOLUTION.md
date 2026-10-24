@@ -1837,8 +1837,10 @@ original target in `cascade_from`; review acceptance names its proposal in
 never synthesizes per-key origins. Records may have zero creation time/revision;
 table-level proposals can also have revision zero until an individual policy edit is
 recorded. Mention-review provenance requires reader version 10; scoped legacy
-curation state and queue receipts require reader version 11. Native resolver records
-require Lite reader version 12 and coordinated metadata decoder version 39.
+curation state and queue receipts require reader version 11. Original native
+resolver records remain readable at Lite reader version 12. Physical projection
+bindings, shared catalogs and fingerprinted heads require version 13; native
+metadata commands require coordinated decoder version 40.
 Legacy blob policy publication retains its version 37 decoder fence.
 
 `/tables/{entity_table}/curation/proposals` is the entity-level review surface;
@@ -1893,7 +1895,46 @@ new decisions never create that envelope. Worker resolver configurations are der
 projections. Remote replay coalesces updates in its bounded durable namespace job;
 Lite pulls one current source projection per detached maintenance turn. Publication
 rechecks the destination identity and head after building a projection outside the
-writer lease. Manual maintenance uses the same pull operation. `complete` describes
+writer lease. Both adapters close components over alternating static aliases and
+native forward/reverse edges before planning or validating; the merge destination
+and every reached alias endpoint participate in the same traversal. Static aliases
+remain local configuration, rather than becoming shared corrections.
+
+Metadata source records carry compact physical destination/template/revision
+bindings. Raft replay reads heads and writes bindings, never full policy payloads.
+Read-only execution/provisioning cuts expand bindings from one immutable namespace
+snapshot per destination/template in that cut. A bounded immutable payload cache
+is keyed by the transaction's physical namespace revision and state fingerprint;
+warm reads do not scan policy records again. Adoption and every delta derive a
+new fingerprint, including divergent equal-revision histories after restore.
+Revision-zero native adoptions remain valid and cannot be mistaken for an
+unprojected source. Raw source records remain unchanged
+for DDL CAS; portable export materializes the policy and removes physical bindings.
+Lite pulls a namespace once per turn and publishes all of its serving/retired
+consumers in one catalog transaction. Reader-13 catalogs store shared projection
+payloads once in a content-addressed dictionary, with per-resolver references;
+legacy merge sidecars retain only source-owned policy.
+
+The source execution clock (`resolution_generation`) advances independently of
+the destination curation revision. Projection/readiness stamps include the physical
+destination ID and explicit missing-authority state, so moving to a namespace
+with a lower revision or recreating a destination cannot regress execution or
+falsely report an old projection applied. A dropped or unadopted replacement
+retracts derived corrections even while the retired authority's rows/cache remain;
+publication fences both authority presence and absence.
+Replay retains its cursor when writes arrive and marks the pass dirty. It finishes
+the tail before another pass and rotates among namespace jobs; continuous writes
+cannot repeatedly restart the first page.
+
+Native Lite maintains a durable reverse consumer index in the same physical
+transaction as resolver catalog edits. Warm mutations seek the destination and
+open only matching sources. Legacy index bootstrap reads catalog bytes without
+opening unrelated indexes/providers. Directory changes enroll/retire their own bindings atomically;
+source IDs fence dropped/recreated tables. Queue-only rejections and their receipt
+replays use point admission and no consumer discovery. Their effect classification
+is a durable native receipt witness, independent of caller-supplied retry flags or
+actor revision; rejected distinct pins still observe their policy consumers.
+Unclassified legacy receipts conservatively observe the scoped consumers. Manual maintenance uses the same pull operation. `complete` describes
 atomic authority admission; `applied` observes asynchronous consumer replay.
 
 HTTP initial decisions and terminal retries return the same decision envelope,

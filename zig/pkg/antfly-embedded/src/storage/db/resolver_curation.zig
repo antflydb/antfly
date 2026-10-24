@@ -30,6 +30,9 @@ pub const MetadataIdentity = struct {
     namespace_generation: u64 = 0,
     dropped: bool = false,
     namespace_owned: bool = false,
+    authority_table_id: u64 = 0,
+    projection_only: bool = false,
+    authority_missing: bool = false,
 };
 pub const Metadata = struct { version: u32 = 1, identities: []const MetadataIdentity = &.{} };
 /// Authoritative corrections belong to a destination table and exact key template.
@@ -93,7 +96,7 @@ pub fn namespacesFromValue(a: std.mem.Allocator, root: std.json.Value) !Namespac
     if (result.version != 1 or result.namespaces.len > 4096) return error.InvalidResolverCurationVersion;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     for (result.namespaces) |item| {
-        if (item.key_template.len == 0 or item.revision == 0) return error.InvalidResolverCurationRequest;
+        if (item.key_template.len == 0 or (item.revision == 0 and !item.record_store)) return error.InvalidResolverCurationRequest;
         if ((try seen.getOrPut(a, item.key_template)).found_existing) return error.InvalidResolverCurationRequest;
         _ = try resolver.curation.RedirectIndex.init(a, item.merges);
         _ = try resolver.curation.Index.init(a, "", try std.json.Stringify.valueAlloc(a, item.state, .{}));
@@ -117,11 +120,7 @@ pub fn replaceNamespace(a: std.mem.Allocator, root: *std.json.Value, next: Names
 pub fn foldNamespace(a: std.mem.Allocator, current: Namespace, cfg: catalog.ResolverConfig) !Namespace {
     // Worker projections are never migration authority. In particular, a
     // dropped/recreated destination must not revive its predecessor's policy.
-    if (cfg.namespace_curation_generation != 0) {
-        var next = current;
-        next.revision = @max(current.revision, cfg.curation_revision);
-        return next;
-    }
+    if (cfg.namespace_curation_table_id != 0 or cfg.namespace_curation_generation != 0) return current;
     var next = current;
     var aliases: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
     for (current.merges) |item| try aliases.put(a, item.key, item.target);
@@ -247,7 +246,7 @@ pub fn metadataFromValue(a: std.mem.Allocator, value: std.json.Value) !Metadata 
     if (metadata.version != 1 or metadata.identities.len > 4096) return error.InvalidResolverCurationVersion;
     var names: std.StringHashMapUnmanaged(void) = .empty;
     for (metadata.identities) |identity| {
-        if (identity.revision == 0 or identity.name.len == 0) return error.InvalidResolverCurationRequest;
+        if ((identity.revision == 0 and !(identity.namespace_owned and identity.authority_table_id != 0)) or identity.name.len == 0) return error.InvalidResolverCurationRequest;
         const entry = try names.getOrPut(a, identity.name);
         if (entry.found_existing) return error.InvalidResolverCurationRequest;
         _ = try overlayMetadata(a, .{ .name = identity.name, .table = identity.table, .key_template = identity.key_template, .source_artifact = "metadata", .resolution_artifact = "metadata_resolved" }, identity);
@@ -262,6 +261,8 @@ pub fn overlayMetadata(a: std.mem.Allocator, cfg: catalog.ResolverConfig, identi
     next.curation_json = try std.json.Stringify.valueAlloc(a, identity.state, .{});
     next.curation_revision = identity.revision;
     next.namespace_curation_generation = if (identity.namespace_owned) identity.revision else 0;
+    next.namespace_curation_table_id = identity.authority_table_id;
+    next.namespace_curation_missing = identity.authority_missing;
     next.namespace_generation = identity.namespace_generation;
     if (next.merges.len > 0) {
         next.merge_generation = @max(identity.revision, cfg.effectiveGeneration());
@@ -467,6 +468,9 @@ pub fn namespaceConfig(a: std.mem.Allocator, cfg: catalog.ResolverConfig, reques
     if (!std.mem.eql(u8, cfg.table, request.table) or !std.mem.eql(u8, cfg.key_template, request.key_template)) {
         state.proposals = &.{};
         state.receipt_scope = null;
+        next.namespace_curation_generation = 0;
+        next.namespace_curation_table_id = 0;
+        next.namespace_curation_missing = false;
     }
     var suppression = if (cfg.suppress_json.len > 0) try std.json.parseFromSliceLeaky(resolver.curation.Suppression, a, cfg.suppress_json, .{}) else resolver.curation.Suppression{};
     if (request.reset_merges and !request.reset_curation and (state.distinct.len > 0 or state.removed_aliases.len > 0 or state.suppress.keys.len > 0 or suppression.keys.len > 0)) return error.InvalidResolverCurationRequest;
@@ -565,6 +569,9 @@ pub const ProgressRow = struct {
     config_generation: u64,
     effective_generation: u64,
     curation_revision: u64,
+    namespace_curation_generation: u64 = 0,
+    namespace_curation_table_id: u64 = 0,
+    namespace_curation_missing: bool = false,
     backfill_pending: bool,
     empty: bool = false,
     resolution: @import("types.zig").ReplayStageStats,
@@ -589,6 +596,9 @@ pub fn progressReportAlloc(db: anytype, alloc: std.mem.Allocator) ![]u8 {
         .config_generation = cfg.config_generation,
         .effective_generation = cfg.effectiveGeneration(),
         .curation_revision = cfg.curation_revision,
+        .namespace_curation_generation = cfg.namespace_curation_generation,
+        .namespace_curation_table_id = cfg.namespace_curation_table_id,
+        .namespace_curation_missing = cfg.namespace_curation_missing,
         .backfill_pending = backlog,
         .empty = empty,
         .resolution = stats.resolution,

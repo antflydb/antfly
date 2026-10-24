@@ -12819,6 +12819,8 @@ pub const IndexManager = struct {
     fn resolverMaterialConfigChanged(existing: resolver_catalog.ResolverConfig, next: resolver_catalog.ResolverConfig) bool {
         return existing.promote != next.promote or
             existing.namespace_curation_generation != next.namespace_curation_generation or
+            existing.namespace_curation_table_id != next.namespace_curation_table_id or
+            existing.namespace_curation_missing != next.namespace_curation_missing or
             !resolver_catalog.ResolverConfig.aliasesEqual(existing.merges, next.merges) or
             !resolver_catalog.ResolverConfig.aliasesEqual(existing.aliases, next.aliases) or
             !std.mem.eql(u8, existing.table, next.table) or
@@ -12908,7 +12910,8 @@ pub const IndexManager = struct {
         if (cfg.retired) {
             for (self.retired_resolvers.items) |*entry| {
                 if (!std.mem.eql(u8, entry.name, cfg.name)) continue;
-                if (cfg.curation_revision < entry.curation_revision) return error.ResolverCurationConflict;
+                try cfg.rebaseNativeProjection(entry.*);
+                if (cfg.namespace_curation_table_id == 0 and cfg.curation_revision < entry.curation_revision) return error.ResolverCurationConflict;
                 if (!migrate_namespace and (!std.mem.eql(u8, cfg.table, entry.table) or !std.mem.eql(u8, cfg.key_template, entry.key_template))) return error.ResolverMergeNamespaceChange;
                 cfg.namespace_generation = if (migrate_namespace) @max(input_cfg.namespace_generation, try std.math.add(u64, entry.namespace_generation, 1)) else entry.namespace_generation;
                 cfg.resolution_generation = try std.math.add(u64, entry.effectiveGeneration(), 1);
@@ -12948,7 +12951,8 @@ pub const IndexManager = struct {
             if (entry.inline_managed == false) cfg.inline_managed = false;
             if (cfg.inline_managed == null) cfg.inline_managed = entry.inline_managed;
             if (cfg.inline_managed == true and cfg.aliases.len == 0 and !migrate_namespace) cfg.aliases = entry.aliases;
-            if (cfg.merge_generation == 0 and cfg.curation_revision <= entry.curation_revision and !migrate_namespace) {
+            try cfg.rebaseNativeProjection(entry.*);
+            if (cfg.namespace_curation_table_id == 0 and cfg.merge_generation == 0 and cfg.curation_revision <= entry.curation_revision and !migrate_namespace) {
                 cfg.merges = entry.merges;
                 if (cfg.curation_revision == 0) {
                     cfg.curation_json = entry.curation_json;
@@ -12957,8 +12961,8 @@ pub const IndexManager = struct {
                 cfg.merge_generation = entry.merge_generation;
                 cfg.merge_state_version = entry.merge_state_version;
             }
-            if (cfg.curation_revision < entry.curation_revision) return error.ResolverCurationConflict;
-            if (cfg.curation_revision == entry.curation_revision and !std.mem.eql(u8, cfg.curation_json, entry.curation_json))
+            if (cfg.namespace_curation_table_id == 0 and cfg.curation_revision < entry.curation_revision) return error.ResolverCurationConflict;
+            if (cfg.namespace_curation_table_id == 0 and cfg.curation_revision == entry.curation_revision and !std.mem.eql(u8, cfg.curation_json, entry.curation_json))
                 return error.ResolverCurationConflict;
             cfg.resolution_generation = entry.resolution_generation;
             cfg.namespace_generation = entry.namespace_generation;
@@ -13045,6 +13049,53 @@ pub const IndexManager = struct {
         return false;
     }
 
+    /// One namespace snapshot, one durable catalog publication, regardless of
+    /// the number of serving/retired consumers in this owner.
+    pub fn publishResolverNamespaceProjection(self: *IndexManager, store: anytype, table: []const u8, table_id: u64, namespace: @import("../resolver_namespace.zig").Namespace) !bool {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const state = try std.json.Stringify.valueAlloc(arena.allocator(), namespace.state, .{});
+        const Change = struct { slot: *ResolverConfig, before: ResolverConfig, after: ResolverConfig };
+        var changes: std.ArrayList(Change) = .empty;
+        defer changes.deinit(self.alloc);
+        var published = false;
+        defer for (changes.items) |*change| {
+            if (published) {
+                change.before.deinit(self.alloc);
+            } else {
+                change.slot.* = change.before;
+                change.after.deinit(self.alloc);
+            }
+        };
+        for ([_][]ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }) |definitions| for (definitions) |*entry| {
+            if (std.mem.startsWith(u8, entry.name, "__antfly_replacement/")) continue;
+            if (!std.mem.eql(u8, entry.table, table) or !std.mem.eql(u8, entry.key_template, namespace.key_template)) continue;
+            try self.requireResolverNotReplacing(entry.name);
+            if (entry.namespace_curation_table_id == table_id and entry.namespace_curation_generation == namespace.revision and entry.namespace_curation_missing == !namespace.record_store) continue;
+            var next = entry.*;
+            next.merges = namespace.merges;
+            next.curation_json = state;
+            next.namespace_curation_table_id = table_id;
+            next.namespace_curation_generation = namespace.revision;
+            next.namespace_curation_missing = !namespace.record_store;
+            try next.rebaseNativeProjection(entry.*);
+            next.resolution_generation = try std.math.add(u64, entry.effectiveGeneration(), 1);
+            next.merge_generation = if (next.merges.len == 0) 0 else next.resolution_generation;
+            next.merge_state_version = if (next.merges.len == 0) 2 else 1;
+            try next.validate();
+            try changes.ensureUnusedCapacity(self.alloc, 1);
+            const owned = try ResolverConfig.clone(self.alloc, next);
+            changes.appendAssumeCapacity(.{ .slot = entry, .before = entry.*, .after = owned });
+        };
+        if (changes.items.len == 0) return false;
+        for (changes.items) |change| change.slot.* = change.after;
+        try self.persistResolverCatalog(store, .mark_reresolve_dirty);
+        published = true;
+        return true;
+    }
+
     pub fn listResolverIdentities(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
@@ -13083,6 +13134,19 @@ pub const IndexManager = struct {
             try result.append(alloc, try ResolverConfig.clone(alloc, cfg));
         }
         return result.toOwnedSlice(alloc);
+    }
+
+    pub fn resolverStaticDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }) |definitions| for (definitions) |definition| {
+            if (!std.mem.eql(u8, definition.name, name)) continue;
+            var cfg = definition;
+            cfg.merges = &.{};
+            cfg.curation_json = "{}";
+            return try ResolverConfig.clone(alloc, cfg);
+        };
+        return null;
     }
 
     /// Trusted admission rollback restores ownership as well as configuration.

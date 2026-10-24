@@ -2529,3 +2529,92 @@ test "capi resolver curation finishes legacy frozen decisions before native adop
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_get_curation_proposal_json(id, .fromSlice("default"), .fromSlice(proposal.id), &out));
     try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"state\":\"accepted\"") != null);
 }
+
+test "capi resolver curation native migration and consumer seeks isolate unrelated tables" {
+    const api = @import("db.zig");
+    const table_ops = @import("tables.zig");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = try api.TestDirectory.init("resolver-native-consumer-seek");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    defer a.free(path);
+    const root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    const handle = try api.publishHandle(root);
+    defer api.antfly_db_close(handle);
+    for ([_][]const u8{ "old", "new", "unrelated" }) |name| try table_ops.create(root, name, "{}", false);
+    try root.db.addResolver(.{ .name = "moving", .table = "old", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "entity/{{_entity.text}}", .curation_revision = 100, .promote = false });
+    try root.db.addResolver(.{ .name = "seed", .table = "new", .source_artifact = "seed-kg", .resolution_artifact = "seed-resolved", .key_template = "entity/{{_entity.text}}", .promote = false });
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_suppress_json(handle, .fromSlice("old"), .fromSlice("entity/noise"), .fromSlice("{}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_propose_curation_json(handle, .fromSlice("new"), .fromSlice("{\"action\":\"suppress\",\"key\":\"entity/other\"}"), &out));
+    const proposal = try std.json.parseFromSliceLeaky(@import("antfly_resolver").curation.Proposal, scratch, out.ptr.?[0..out.len], .{ .allocate = .alloc_always });
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_suppress_json(handle, .fromSlice("new"), .fromSlice("entity/preexisting"), .fromSlice("{}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_set_resolver_namespace_json(handle, .fromSlice("moving"), .fromSlice("{\"table\":\"new\",\"key_template\":\"entity/{{_entity.text}}\",\"reset_merges\":true,\"reset_curation\":true}")));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
+    const configs = try root.db.core.index_manager.listResolverIdentities(scratch);
+    const destination = try table_ops.get(root, "new");
+    for (configs) |cfg| {
+        try std.testing.expectEqual(@as(u64, 1), cfg.namespace_curation_generation);
+        try std.testing.expectEqual(destination.core.identity_namespace.table_id, cfg.namespace_curation_table_id);
+    }
+    table_ops.closeAll(root);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("new"), .fromSlice("entity/a"), .fromSlice("{\"into\":\"entity/b\"}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(@as(usize, 1), root.embedded_tables.count());
+    try std.testing.expect(root.embedded_tables.contains("new"));
+    try table_ops.create(root, "review-source", "{}", false);
+    try (try table_ops.get(root, "review-source")).addResolver(.{ .name = "related", .table = "new", .source_artifact = "related-kg", .resolution_artifact = "related-resolved", .key_template = "entity/{{_entity.text}}", .promote = false });
+    // Complete genuine DDL recovery before measuring warm queue admission.
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
+    table_ops.closeAll(root);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_decide_curation_proposal_json(handle, .fromSlice("new"), .fromSlice(proposal.id), .fromSlice("{\"accept\":false}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(@as(usize, 1), root.embedded_tables.count());
+    try std.testing.expect(root.embedded_tables.contains("new"));
+    // The durable queue-only witness keeps receipt replay point-scoped too.
+    table_ops.closeAll(root);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_decide_curation_proposal_json(handle, .fromSlice("new"), .fromSlice(proposal.id), .fromSlice("{\"accept\":false}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(@as(usize, 1), root.embedded_tables.count());
+    // A rejected distinct pin must retain consumer observation when the retry
+    // omits pin_distinct; caller flags cannot reclassify its committed effect.
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_propose_curation_json(handle, .fromSlice("new"), .fromSlice("{\"action\":\"merge\",\"key\":\"entity/c\",\"into\":\"entity/d\"}"), &out));
+    const pinned = try std.json.parseFromSliceLeaky(@import("antfly_resolver").curation.Proposal, scratch, out.ptr.?[0..out.len], .{ .allocate = .alloc_always });
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_decide_curation_proposal_json(handle, .fromSlice("new"), .fromSlice(pinned.id), .fromSlice("{\"accept\":false,\"pin_distinct\":true}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_decide_curation_proposal_json(handle, .fromSlice("new"), .fromSlice(pinned.id), .fromSlice("{\"accept\":false}"), &out));
+    const replay = try std.json.parseFromSliceLeaky(std.json.Value, scratch, out.ptr.?[0..out.len], .{});
+    try std.testing.expect(replay.object.get("results").?.array.items.len != 0);
+    api.antfly_buffer_free(&out);
+    try table_ops.drop(root, "new", false);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
+    for (try root.db.core.index_manager.listResolverIdentities(scratch)) |cfg| {
+        try std.testing.expect(cfg.namespace_curation_missing);
+        try std.testing.expectEqual(@as(usize, 0), cfg.merges.len);
+        try std.testing.expect(std.mem.indexOf(u8, cfg.curation_json, "preexisting") == null);
+    }
+    try table_ops.create(root, "new", "{}", false);
+    const fresh_id = (try table_ops.get(root, "new")).core.identity_namespace.table_id;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
+    for (try root.db.core.index_manager.listResolverIdentities(scratch)) |cfg| {
+        try std.testing.expect(cfg.namespace_curation_missing);
+        try std.testing.expectEqual(fresh_id, cfg.namespace_curation_table_id);
+        try std.testing.expectEqual(@as(u64, 0), cfg.namespace_curation_generation);
+    }
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_propose_curation_json(handle, .fromSlice("new"), .fromSlice("{\"action\":\"suppress\",\"key\":\"entity/fresh\"}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
+    for (try root.db.core.index_manager.listResolverIdentities(scratch)) |cfg| {
+        try std.testing.expect(!cfg.namespace_curation_missing);
+        try std.testing.expectEqual(@as(u64, 0), cfg.namespace_curation_generation);
+    }
+}

@@ -7841,7 +7841,7 @@ pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.
     const curation = @import("../storage/db/resolver_curation.zig");
     const pure = @import("antfly_resolver");
     const tables = @import("tables.zig");
-    (if (input.action == .redirects) tables.loadCatalog(handle) else tables.load(handle)) catch |err| return capi.mapError(err);
+    tables.loadCatalog(handle) catch |err| return capi.mapError(err);
     const entity_db = tables.get(handle, entity_table.bytes()) catch |err| return capi.mapError(err);
     if (authority.enabled(entity_db, a) catch |err| return capi.mapError(err)) {
         const response = authority.entity(handle, a, entity_table.bytes(), entity_key.bytes(), input, .{}) catch |err| return capi.mapError(err);
@@ -8083,7 +8083,7 @@ fn proposalOperation(handle_ptr: ?*anyopaque, table: capi.Slice, id: capi.Slice,
     const pure = @import("antfly_resolver").curation;
     const owner = @import("../storage/db/resolver_curation.zig");
     const tables = @import("tables.zig");
-    (if (operation_name == .list or operation_name == .get) tables.loadCatalog(handle) else tables.load(handle)) catch |err| return capi.mapError(err);
+    tables.loadCatalog(handle) catch |err| return capi.mapError(err);
     const db = tables.get(handle, table.bytes()) catch |err| return capi.mapError(err);
     const authority = @import("resolver_authority.zig");
     const native_enabled = authority.enabled(db, a) catch |err| return capi.mapError(err);

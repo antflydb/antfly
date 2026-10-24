@@ -42,15 +42,58 @@ pub fn enabled(db: *h.db_mod.DB, a: A) !bool {
     return true;
 }
 fn consumers(root: *h.Handle, a: A, table: []const u8, key: []const u8) ![]const Consumer {
-    var sources: std.ArrayList(struct { db: *h.db_mod.DB, name: []const u8 }) = .empty;
-    try sources.append(a, .{ .db = &root.db, .name = "default" });
-    var it = root.embedded_tables.iterator();
-    while (it.next()) |entry| try sources.append(a, .{ .db = &entry.value_ptr.*.db, .name = entry.key_ptr.* });
-    var result: std.ArrayList(Consumer) = .empty;
-    for (sources.items) |source| {
-        const configs = try source.db.core.index_manager.listResolverStaticDescriptors(a);
-        for (configs) |cfg| if (std.mem.eql(u8, cfg.table, table) and policy.keyInNamespace(cfg.key_template, key)) try result.append(a, .{ .db = source.db, .source = source.name, .cfg = cfg });
+    const directory = @import("../storage/lite/resolver_consumers.zig");
+    // Native Lite stores share a physical transaction space. Bootstrap legacy
+    // bindings once from catalog bytes; warm calls seek only this destination.
+    const physical = if (root.owned_lite_backend) |*backend| backend.native_docstore else null;
+    if (physical == null) return legacyConsumers(root, a, table, key);
+    {
+        var read = try physical.?.beginRead();
+        const ready = if (read.get(directory.marker)) |_| true else |err| if (err == error.NotFound) false else return err;
+        read.abort();
+        if (!ready) {
+            var write = try physical.?.beginWrite();
+            errdefer write.abort();
+            try directory.bootstrap(a, &write);
+            try write.commit();
+            root.db.core.index_manager.minimum_reader_version.store(catalog.resolver_projection_bindings_reader_version, .release);
+        }
     }
+    var txn = try physical.?.beginRead();
+    defer txn.abort();
+    const target = try directory.targetPrefix(a, table);
+    var cursor = try txn.openCursor();
+    var bindings: std.ArrayList(directory.Binding) = .empty;
+    {
+        defer cursor.close();
+        var row = try directory.seekEntry(&cursor, target);
+        while (row) |entry| {
+            if (!std.mem.startsWith(u8, entry.key, target)) break;
+            const binding = try std.json.parseFromSliceLeaky(directory.Binding, a, entry.value, .{ .allocate = .alloc_always });
+            if (policy.keyInNamespace(binding.key_template, key)) try bindings.append(a, binding);
+            row = try directory.nextEntry(&cursor);
+        }
+    }
+    try tables.loadCatalog(root);
+    var result: std.ArrayList(Consumer) = .empty;
+    for (bindings.items) |binding| {
+        if (binding.source_id != 0 and root.embedded_table_records.get(binding.source) != binding.source_id) continue;
+        const source = try tables.get(root, binding.source);
+        const cfg = try source.core.index_manager.resolverStaticDescriptor(a, binding.resolver) orelse continue;
+        if (!std.mem.eql(u8, cfg.table, table) or !std.mem.eql(u8, cfg.key_template, binding.key_template)) return error.ResolverCurationConflict;
+        try result.append(a, .{ .db = source, .source = binding.source, .cfg = cfg });
+    }
+    return result.items;
+}
+fn legacyConsumers(root: *h.Handle, a: A, table: []const u8, key: []const u8) ![]const Consumer {
+    try tables.load(root);
+    var result: std.ArrayList(Consumer) = .empty;
+    var sources = root.embedded_tables.iterator();
+    const defaults = try root.db.core.index_manager.listResolverStaticDescriptors(a);
+    for (defaults) |cfg| if (std.mem.eql(u8, cfg.table, table) and policy.keyInNamespace(cfg.key_template, key)) try result.append(a, .{ .db = &root.db, .source = "default", .cfg = cfg });
+    while (sources.next()) |source| for (try source.value_ptr.*.db.core.index_manager.listResolverStaticDescriptors(a)) |cfg| {
+        if (std.mem.eql(u8, cfg.table, table) and policy.keyInNamespace(cfg.key_template, key)) try result.append(a, .{ .db = &source.value_ptr.*.db, .source = source.key_ptr.*, .cfg = cfg });
+    };
     return result.items;
 }
 fn ownedConsumers(a: A, store: native.Store, destination: *h.db_mod.DB, current: []const Consumer, table: []const u8, key: []const u8) ![]const Consumer {
@@ -65,11 +108,10 @@ fn ownedConsumers(a: A, store: native.Store, destination: *h.db_mod.DB, current:
     return out.items;
 }
 fn initialize(a: A, bridge: *Bridge, store: native.Store, legacy: c.State) !void {
+    try bridge.backendPut(a, catalog.minimum_reader_key, try catalog.readerVersionBytes(catalog.resolver_projection_bindings_reader_version));
     if (try bridge.backendGet(a, marker) != null) return;
     if (legacy.proposals.len != 0 or legacy.receipt_scope != null) try store.applyQueue(.{ .expected_revision = 0, .revision = 1, .receipt_scope = legacy.receipt_scope, .proposals = legacy.proposals });
     try bridge.backendPut(a, marker, "1");
-    // Older binaries must refuse to open after native authority is published.
-    try bridge.backendPut(a, catalog.minimum_reader_key, try catalog.readerVersionBytes(catalog.native_resolver_records_reader_version));
 }
 fn adopt(a: A, store: native.Store, selected: []const Consumer) !void {
     var seen: std.StringHashMapUnmanaged(void) = .empty;
@@ -162,7 +204,7 @@ fn publishQueue(a: A, store: native.Store, before: c.State, next: c.State) !void
     const head = try store.queueHead();
     try store.applyQueue(.{ .expected_revision = head.revision, .revision = try std.math.add(u64, head.revision, 1), .receipt_scope = next.receipt_scope, .proposals = changed.items });
 }
-fn results(a: A, selected: []const Consumer, store: native.Store, key: []const u8, redirects: bool, changed: bool, absorbed: AbsorbedMap) !std.json.Value {
+fn results(a: A, authority_table_id: u64, selected: []const Consumer, store: native.Store, key: []const u8, redirects: bool, changed: bool, absorbed: AbsorbedMap) !std.json.Value {
     var rows = std.json.Array.init(a);
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     var heads: std.StringHashMapUnmanaged(native.Head) = .empty;
@@ -176,7 +218,7 @@ fn results(a: A, selected: []const Consumer, store: native.Store, key: []const u
             if (source.synthetic) continue;
             const slot = try heads.getOrPut(a, source.cfg.key_template);
             if (!slot.found_existing) slot.value_ptr.* = (try store.head(source.cfg.key_template)) orelse return error.ResolverNotFound;
-            try rows.append(try value(a, .{ .source_table = source.source, .resolver = source.cfg.name, .revision = slot.value_ptr.revision, .accepted = true, .changed = changed, .absorbed = absorbed.get(source.cfg.key_template) orelse &.{}, .applied = source.cfg.namespace_curation_generation >= slot.value_ptr.revision and try policy.applied(source.db, source.cfg), .replay_sequence = source.db.core.store.lastReplaySequence(0), .replay_sequence_kind = "source_journal" }));
+            try rows.append(try value(a, .{ .source_table = source.source, .resolver = source.cfg.name, .revision = slot.value_ptr.revision, .accepted = true, .changed = changed, .absorbed = absorbed.get(source.cfg.key_template) orelse &.{}, .applied = !source.cfg.namespace_curation_missing and source.cfg.namespace_curation_table_id == authority_table_id and source.cfg.namespace_curation_generation >= slot.value_ptr.revision and try policy.applied(source.db, source.cfg), .replay_sequence = source.db.core.store.lastReplaySequence(0), .replay_sequence_kind = "source_journal" }));
         }
     }
     return .{ .array = rows };
@@ -185,7 +227,7 @@ fn finish(a: A, bridge: *Bridge, txn: *docstore.DocStore.Txn, db: *h.db_mod.DB, 
     try lease.checkAt(@intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
     try bridge.flush(a);
     try txn.commit();
-    db.core.index_manager.minimum_reader_version.store(catalog.native_resolver_records_reader_version, .release);
+    db.core.index_manager.minimum_reader_version.store(catalog.resolver_projection_bindings_reader_version, .release);
 }
 pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: Input, legacy: c.State) ![]const u8 {
     const db = try tables.get(root, table);
@@ -195,7 +237,6 @@ pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: 
     if (!reading and try db.maintenanceRequiresOrderedApply()) return error.OrderedResolverReviewRequired;
     var selected: []const Consumer = &.{};
     if (!reading) {
-        try tables.load(root);
         selected = try consumers(root, a, table, key);
     }
     var txn = if (reading) try db.core.store.beginReadTxn() else try db.core.store.beginWriteTxn();
@@ -246,7 +287,7 @@ pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: 
         try publishQueue(a, store, queue, next_queue);
         changed = changed or plan.changed;
     }
-    const rows = try results(a, selected, store, key, input.action == .redirects, changed, absorbed);
+    const rows = try results(a, db.core.identity_namespace.table_id, selected, store, key, input.action == .redirects, changed, absorbed);
     if (!reading) {
         try finish(a, &bridge, &txn, db, &lease);
         txn_live = false;
@@ -260,6 +301,28 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
     var lease = if (reading) try db.local_execution.row_policy_gate.enterRawRead() else try db.local_execution.row_policy_gate.enterRaw();
     defer lease.release();
     if (!reading and try db.maintenanceRequiresOrderedApply()) return error.OrderedResolverReviewRequired;
+    // Open matching sources before the destination write transaction. All
+    // namespaces share the native file writer; queue-only decisions need none.
+    var selected: []const Consumer = &.{};
+    if (!reading) {
+        const create = if (operation == .create) try std.json.parseFromSliceLeaky(c.ProposalRequest, a, raw, .{}) else null;
+        const decision = if (operation == .decide) try std.json.parseFromSliceLeaky(c.ProposalDecision, a, raw, .{}) else null;
+        const pid = if (create) |request| try c.proposalId(a, request) else id;
+        var read = try db.core.store.beginReadTxn();
+        var probe: Bridge = .{ .txn = &read };
+        const existing = try probe.store(a, prefix).proposal(pid);
+        const queue_only_receipt = try probe.store(a, prefix).queueOnly(pid);
+        read.abort();
+        const current = existing orelse for (legacy.proposals) |proposal| {
+            if (std.mem.eql(u8, proposal.id, pid)) break proposal;
+        } else null;
+        const terminal_policy = if (current) |proposal| proposal.state != .open and !(queue_only_receipt or (proposal.state == .rejected and proposal.action != .merge)) else false;
+        const need_sources = if (create != null) current == null else decision.?.accept or decision.?.pin_distinct or decision.?.expected_revision != null or terminal_policy;
+        if (need_sources) {
+            const key = if (current) |proposal| proposal.key else if (create) |request| request.key else return error.NotFound;
+            selected = try consumers(root, a, table, key);
+        }
+    }
     var txn = if (reading) try db.core.store.beginReadTxn() else try db.core.store.beginWriteTxn();
     var txn_live = true;
     defer if (txn_live) txn.abort();
@@ -282,8 +345,32 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
         try lease.checkAt(@intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
         return json(a, proposal);
     }
+    if (operation == .decide) {
+        const proposal = existing orelse return error.NotFound;
+        const decision = try std.json.parseFromSliceLeaky(c.ProposalDecision, a, raw, .{});
+        if (decision.wait) |wait| if (wait.timeout_ms == 0 or wait.timeout_ms > 300000) return error.InvalidResolverCurationRequest;
+        const queue_only_receipt = try store.queueOnly(proposal.id) or (proposal.state == .rejected and proposal.action != .merge);
+        if (!decision.accept and !decision.pin_distinct and decision.expected_revision == null and (proposal.state == .open or queue_only_receipt)) {
+            if (decision.options != null) return error.InvalidResolverCurationRequest;
+            if (proposal.state != .open and proposal.state != .rejected) return error.ResolverCurationConflict;
+            var decided = proposal;
+            const changed = proposal.state == .open;
+            if (changed) {
+                var origin = policy.manualOrigin(.{ .action = .suppress, .actor = decision.actor, .reason = decision.reason }, 0);
+                origin.origin = .review;
+                origin.proposal_id = proposal.id;
+                decided.state = .rejected;
+                decided.decided = origin;
+                try publishQueue(a, store, .{ .proposals = &.{proposal} }, .{ .receipt_scope = (try store.queueHead()).receipt_scope, .proposals = &.{decided} });
+                try store.markQueueOnly(proposal.id);
+                try finish(a, &bridge, &txn, db, &lease);
+                txn_live = false;
+            } else try lease.checkAt(@intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+            return json(a, .{ .proposal = decided, .atomicity = "namespace", .changed = changed, .complete = true, .applied = true, .results = std.json.Value{ .array = std.json.Array.init(a) } });
+        }
+    }
     const key = if (existing) |proposal| proposal.key else if (creation) |request| request.key else return error.NotFound;
-    const selected = try ownedConsumers(a, store, db, try consumers(root, a, table, key), table, key);
+    selected = try ownedConsumers(a, store, db, selected, table, key);
     if (selected.len == 0 and creation != null) return error.ResolverNotFound;
     if (creation) |request| if (request.into) |target| for (selected) |source| if (!policy.keyInNamespace(source.cfg.key_template, target)) return error.InvalidResolverCurationRequest;
     if (operation == .decide and existing.?.state != .open) {
@@ -295,8 +382,8 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
         if (proposal.state != wanted) return error.ResolverCurationConflict;
         var consumers_with_heads: std.ArrayList(Consumer) = .empty;
         for (selected) |source| if (try store.head(source.cfg.key_template) != null) try consumers_with_heads.append(a, source);
-        const rows = try results(a, consumers_with_heads.items, store, key, false, false, .empty);
-        const applied = if (!decision.accept and !decision.pin_distinct) true else for (rows.array.items) |row| {
+        const rows = try results(a, db.core.identity_namespace.table_id, consumers_with_heads.items, store, key, false, false, .empty);
+        const applied = if (try store.queueOnly(proposal.id) or (!decision.accept and proposal.action != .merge)) true else for (rows.array.items) |row| {
             if (!row.object.get("applied").?.bool) break false;
         } else true;
         try lease.checkAt(@intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
@@ -378,7 +465,7 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
         decided.decided = decision_origin;
         try publishQueue(a, store, .{ .proposals = &.{proposal} }, .{ .receipt_scope = head.receipt_scope, .proposals = &.{decided} });
     }
-    const rows = try results(a, selected, store, key, false, changed, absorbed);
+    const rows = try results(a, db.core.identity_namespace.table_id, selected, store, key, false, changed, absorbed);
     try finish(a, &bridge, &txn, db, &lease);
     txn_live = false;
     const applied = if (!decision.accept and !decision.pin_distinct) true else for (rows.array.items) |row| {
@@ -386,53 +473,67 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
     } else true;
     return json(a, .{ .proposal = decided, .atomicity = "namespace", .changed = changed, .complete = true, .applied = applied, .results = if (!decision.accept and !decision.pin_distinct) std.json.Value{ .array = std.json.Array.init(a) } else rows });
 }
-/// A source pulls at most one current namespace projection per maintenance
-/// turn. Called on the detached owner snapshot, outside the writer path lease.
+const Projection = struct { destination: ?*h.db_mod.DB, head: ?native.Head, table_id: u64, revision: u64, missing: bool, changed: bool };
+fn projection(root: *h.Handle, a: A, cfg: h.db_mod.ResolverConfig) !?Projection {
+    const destination = tables.get(root, cfg.table) catch |err| switch (err) {
+        error.UndefinedTable => null,
+        else => return err,
+    };
+    if (destination == null) {
+        if (cfg.namespace_curation_table_id == 0) return null;
+        return .{ .destination = null, .head = null, .table_id = cfg.namespace_curation_table_id, .revision = cfg.namespace_curation_generation, .missing = true, .changed = !cfg.namespace_curation_missing };
+    }
+    const db = destination.?;
+    var txn = try db.core.store.beginReadTxn();
+    defer txn.abort();
+    var bridge: Bridge = .{ .txn = &txn };
+    const head = try bridge.store(a, prefix).head(cfg.key_template);
+    const table_id = db.core.identity_namespace.table_id;
+    if (head == null and cfg.namespace_curation_table_id == 0) return null;
+    if (head == null and cfg.namespace_curation_table_id == table_id and !cfg.namespace_curation_missing and cfg.namespace_curation_generation != 0) return error.InvalidMetadataBatch;
+    const projected_revision = if (head) |authority_head| authority_head.revision else 0;
+    const missing = head == null;
+    return .{ .destination = db, .head = head, .table_id = table_id, .revision = projected_revision, .missing = missing, .changed = cfg.namespace_curation_table_id != table_id or cfg.namespace_curation_generation != projected_revision or cfg.namespace_curation_missing != missing };
+}
+/// Build one current namespace outside writer leases and publish all local
+/// consumers atomically. Missing/recreated destinations retract old projections
+/// immediately, independent of physical cleanup of the retired authority.
 pub fn pullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
     const configs = try database.core.index_manager.listResolverStaticDescriptors(a);
     for (configs) |cfg| {
-        const destination = tables.get(root, cfg.table) catch |err| switch (err) {
-            error.UndefinedTable => continue,
-            else => return err,
-        };
-        var txn = try destination.core.store.beginReadTxn();
-        var snapshot: native.Snapshot = undefined;
-        {
+        const desired = (try projection(root, a, cfg)) orelse continue;
+        if (!desired.changed) continue;
+        var namespace: policy.Namespace = .{ .key_template = cfg.key_template, .revision = desired.revision };
+        if (!desired.missing) {
+            var txn = try desired.destination.?.core.store.beginReadTxn();
             defer txn.abort();
             var bridge: Bridge = .{ .txn = &txn };
-            const store = bridge.store(a, prefix);
-            const head = try store.head(cfg.key_template) orelse continue;
-            if (cfg.namespace_curation_generation == head.revision and cfg.curation_revision == head.revision) continue;
-            if (cfg.namespace_curation_generation > head.revision) return error.ResolverCurationConflict;
-            snapshot = (try store.exportNamespace(cfg.key_template)) orelse continue;
+            const snapshot = (try bridge.store(a, prefix).exportNamespace(cfg.key_template)) orelse return error.EnrichmentSourceChanged;
+            if (snapshot.head.revision != desired.revision or !std.mem.eql(u8, &snapshot.head.fingerprint, &desired.head.?.fingerprint)) return error.EnrichmentSourceChanged;
+            namespace = snapshot.namespace;
+            namespace.state.receipt_scope = (try queueHead(desired.destination.?, a)).receipt_scope;
         }
-        const head = snapshot.head;
-        var next = cfg;
-        var state = snapshot.namespace.state;
-        state.receipt_scope = (try queueHead(destination, a)).receipt_scope;
-        next.curation_json = try json(a, state);
-        next.curation_revision = head.revision;
-        next.namespace_curation_generation = head.revision;
-        next.merges = snapshot.namespace.merges;
-        next.merge_generation = try std.math.add(u64, cfg.effectiveGeneration(), 1);
-        next.merge_state_version = if (next.merges.len == 0) 2 else 1;
-        try next.validate();
-        if (root.maintenance_publication) |publication| publication.resolver_dependency = .{ .table = cfg.table, .template = cfg.key_template, .table_id = destination.core.identity_namespace.table_id, .revision = head.revision };
+        if (root.maintenance_publication) |publication| publication.resolver_dependency = .{ .table = cfg.table, .template = cfg.key_template, .table_id = if (desired.destination != null) desired.table_id else null, .head = if (desired.head) |authority_head| .{ .revision = authority_head.revision, .fingerprint = authority_head.fingerprint } else null };
         defer if (root.maintenance_publication) |publication| {
             publication.resolver_dependency = null;
         };
-        _ = try database.upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .wait_for_activity = true });
+        _ = try database.publishResolverNamespaceProjection(cfg.table, desired.table_id, namespace);
         return true;
     }
     return false;
 }
-pub fn revision(db: *h.db_mod.DB, alloc: A, template: []const u8) !?u64 {
+pub const Stamp = struct { revision: u64, fingerprint: [32]u8 };
+pub fn namespaceStamp(db: *h.db_mod.DB, alloc: A, template: []const u8) !?Stamp {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     var txn = try db.core.store.beginReadTxn();
     defer txn.abort();
     var bridge: Bridge = .{ .txn = &txn };
-    return if (try bridge.store(arena.allocator(), prefix).head(template)) |head| head.revision else null;
+    const head = (try bridge.store(arena.allocator(), prefix).head(template)) orelse return null;
+    return .{ .revision = head.revision, .fingerprint = head.fingerprint };
+}
+pub fn revision(db: *h.db_mod.DB, alloc: A, template: []const u8) !?u64 {
+    return if (try namespaceStamp(db, alloc, template)) |authority_head| authority_head.revision else null;
 }
 pub fn queueHead(db: *h.db_mod.DB, a: A) !native.QueueHead {
     var txn = try db.core.store.beginReadTxn();
@@ -447,17 +548,8 @@ pub fn owns(db: *h.db_mod.DB, a: A, template: []const u8) !bool {
     return bridge.store(a, prefix).ownsKeyTemplate(template);
 }
 pub fn hasProjectionDebt(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
-    const configs = try database.core.index_manager.listResolverStaticDescriptors(a);
-    for (configs) |cfg| {
-        const destination = tables.get(root, cfg.table) catch |err| switch (err) {
-            error.UndefinedTable => continue,
-            else => return err,
-        };
-        var txn = try destination.core.store.beginReadTxn();
-        defer txn.abort();
-        var bridge: Bridge = .{ .txn = &txn };
-        const head = try bridge.store(a, prefix).head(cfg.key_template) orelse continue;
-        if (cfg.namespace_curation_generation != head.revision or cfg.curation_revision != head.revision) return true;
-    }
+    for (try database.core.index_manager.listResolverStaticDescriptors(a)) |cfg| if (try projection(root, a, cfg)) |desired| {
+        if (desired.changed) return true;
+    };
     return false;
 }

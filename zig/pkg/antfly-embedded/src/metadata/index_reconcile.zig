@@ -640,6 +640,7 @@ pub fn ensureResolversWithOptions(
     defer curation_arena.deinit();
     const curation = @import("../storage/db/resolver_curation.zig");
     const identity_state = try curation.metadataFromValue(curation_arena.allocator(), parsed.value);
+    for (identity_state.identities) |identity| if (identity.projection_only) return error.ResolverNamespaceCurationRequired;
 
     const before = try db.listResolvers(alloc);
     defer {

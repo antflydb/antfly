@@ -42,11 +42,38 @@ pub const Page = struct {
     version: u8,
     revision: u64,
     table: metadata.TableRecord,
+    configs: ?[]const @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig = null,
     ranges: []metadata.RangeRecord = &.{},
     consumers: []const Consumer = &.{},
     visited: usize = 0,
     next_cursor: ?[]const u8 = null,
     indexed: bool = false,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            if (comptime std.mem.eql(u8, field, "configs")) {
+                if (self.configs) |values| {
+                    try writer.objectField(field);
+                    try writer.beginArray();
+                    for (values) |cfg| {
+                        try writer.beginObject();
+                        // Durable definition serialization excludes merges;
+                        // this private execution view must carry them.
+                        inline for (@typeInfo(@TypeOf(cfg)).@"struct".field_names) |name| {
+                            try writer.objectField(name);
+                            try writer.write(@field(cfg, name));
+                        }
+                        try writer.endObject();
+                    }
+                    try writer.endArray();
+                }
+            } else {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
     pub fn snapshot(self: *const Page) @import("api.zig").AdminSnapshot {
         return .{ .status = .{ .metadata_group_id = 0, .metrics = .{} }, .tables = @constCast((&self.table)[0..1]), .ranges = self.ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
     }
