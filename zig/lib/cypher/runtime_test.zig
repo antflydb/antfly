@@ -8304,6 +8304,20 @@ test "ordered groups retire reducers across a broad exact-budget prefix" {
         try std.testing.expectEqual(@as(i64, 63), result.rows[0][1].integer);
         try std.testing.expectEqual(@as(usize, 1), fixture.ordered_requests);
     }
+    for ([_][]const u8{
+        "MATCH(n:Document) RETURN n.id,count(DISTINCT n.rank)/0 ORDER BY n.id LIMIT 0",
+        "MATCH(n:Document) WITH n.id AS g,count(DISTINCT n.rank) AS c ORDER BY g LIMIT 0 WHERE c/0>0 RETURN g,c",
+        "MATCH(n:Document) RETURN n.id,count(DISTINCT n.rank)/0 ORDER BY n.id LIMIT $zero",
+    }) |query| {
+        fixture.reads = 0;
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend, graph, &compiled, &.{.{ .name = "zero", .value = .{ .integer = 0 } }}, .{ .scanned_anchors = 256 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 0), result.rows.len);
+        try std.testing.expectEqual(@as(usize, 0), fixture.reads);
+    }
     for ([_][]const u8{ "count(DISTINCT n.rank)+0", "coalesce(count(DISTINCT n.rank),0)", "-(-count(DISTINCT n.rank))" }) |observer| {
         fixture.reads = 0;
         var diagnostic: c.Diagnostic = .{};

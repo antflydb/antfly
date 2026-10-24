@@ -7786,6 +7786,11 @@ const Engine = struct {
     /// of group size; COUNT consumes the complete domain and extrema may seek.
     noinline fn indexedGroups(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) anyerror!?[]const Row {
         if (!self.read_only or input.len != 1 or projection.wildcard or projection.distinct or projection.order.len == 0 or middle.len + 2 > self.limits.recursion_depth -| self.recursion or self.limits.scanned_anchors > std.math.maxInt(i64)) return null;
+        // Grouped zero windows use the ordinary executor's no-demand path.
+        // Do not make a newly available certificate evaluate discarded output.
+        if (projection.limit) |limit| if (self.constant(limit, &.{})) |value| {
+            if (value == .integer and value.integer == 0) return null;
+        };
         const read = self.backend.vtable.scan_ordered orelse return null;
         var keys: std.ArrayList(ast.Item) = .empty;
         var observers: std.ArrayList(ast.Item) = .empty;
