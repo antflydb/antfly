@@ -26220,3 +26220,63 @@ lifecycle. Formatting, whitespace and the new module's license header pass.
 Full GNU qualification remains waived. Live-directory rebuild, combined and
 default coordinator admission, admitted durable cleanup, remaining relief and
 full default-gate evidence remain outstanding; the full design is incomplete.
+
+
+### Retained run metadata before directory rebuilding
+
+The live-directory rebuild boundary also depends on run metadata ownership and
+the process-wide file-pin registry. `run_metadata_clone.Clone` now retains the
+five metadata fields through per-allocation preparation, 16 KiB copies and
+16 KiB physical retirement, preserving null versus present-empty namespace
+identities. Each original rejection leaves the exact cursor and allocations
+owned; retirement fences further copying. Successful take moves one independent
+metadata owner with the original read identity and scalar routing/tombstone
+metadata, without taking filter, table-index, state, writer-owner or file-pin
+authority. Input metadata remains borrowed only until its bytes have copied;
+no original admission port is retained.
+
+`Owned` reserves construction credit before the first payload allocation and
+keeps it through every partial copy or retirement refusal. Once copying is
+ready, it adopts the exact resident byte count into a preprepared stable caller
+usage identity and transfers metadata without another fallible checkpoint.
+The caller then owns physical retirement and usage reconciliation. Private
+abandonment releases credit only after all allocations retire; busy parent
+accounting leaves the exact debt in the manager's stable cleanup slots after
+the metadata itself is physically gone. The caller prepays the fixed owner
+header and retains allocator, manager and input authorities.
+
+The existing `repository.cloneRunCompactionSnapshot` now drives the same copier
+with a null original for its legacy synchronous metadata phase, including the
+real directory/compaction path. Its shared-memory pin fast path and unshared
+state clone behavior remain explicit legacy steps. This removes duplicate
+metadata copying implementations without relabeling legacy pin/state work as
+admitted. Large metadata keys remain supported; there is no size restriction
+substituting for resumable byte work.
+
+Tests independently witness funding before every allocation/free, reject all
+construction/adoption/abandonment/output-retirement checkpoints with three
+original error identities, cover null, empty and populated namespaces, retry
+or abandon each allocation failure, deny unfunded construction before any
+allocation, and hold parent accounting busy through physical destruction.
+
+The full directory rebuild still needs retained preparation/publication for
+all six indexes and their key comparisons/summaries, admitted file-pin registry
+registration/release, and unshared-memory-state handling where needed. Then the
+combined/default coordinator can adopt these owners. Admitted durable cleanup,
+remaining completion/history relief and full default-gate evidence also remain
+required. Full GNU qualification stays waived; the full design is incomplete.
+
+
+Final `retained-run-metadata-v2-integrated` passes 83/83 Debug build steps,
+87 physical-IO, 32 close, 170 table/codec, 74 WAL/recovery and 18 host/ABI
+checks. `retained-run-metadata-v2-fast` passes 63/63 optimized steps and all
+87/170/74 physical/table/recovery cases. `retained-run-metadata-v2-legacy`
+passes 60/60 steps and four existing snapshot/directory regressions, including
+unshared-state clone failure and directory pin/epoch ownership under OOM.
+All three pass four standalone Bloom and 45/1/8 error-identity companions
+(companions use Debug). All 5,589 native/schema inputs and each log digest
+match the unchanged final source; three immutable native snapshots preserve
+every changed native file. The v1 receipt passes the initial lifecycle tests.
+Formatting, whitespace and the new module license pass. Full GNU qualification
+remains waived. The index/pin/unshared-state rebuild phases and the broader
+default coordinator, cleanup, relief and default-gate work remain incomplete.

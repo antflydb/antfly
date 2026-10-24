@@ -311,41 +311,10 @@ pub fn cloneRunSnapshot(allocator: Allocator, source: Run) !Run {
 
 pub fn cloneRunCompactionSnapshot(allocator: Allocator, source: Run) !Run {
     if (source.retainMemory()) |pinned| return pinned;
-    var metadata_owned = true;
-    const smallest_namespace_name = if (source.smallest_namespace_name) |name| try allocator.dupe(u8, name) else null;
-    errdefer if (metadata_owned) if (smallest_namespace_name) |name| allocator.free(name);
-    const smallest_key = try allocator.dupe(u8, source.smallest_key);
-    errdefer if (metadata_owned) allocator.free(smallest_key);
-    const largest_namespace_name = if (source.largest_namespace_name) |name| try allocator.dupe(u8, name) else null;
-    errdefer if (metadata_owned) if (largest_namespace_name) |name| allocator.free(name);
-    const largest_key = try allocator.dupe(u8, source.largest_key);
-    errdefer if (metadata_owned) allocator.free(largest_key);
-
-    var out = Run{
-        .id = source.id,
-        .read_identity = source.read_identity,
-        .level = source.level,
-        .size_bytes = source.size_bytes,
-        .compression_stats = source.compression_stats,
-        .path = if (source.path) |path| try allocator.dupe(u8, path) else null,
-        .smallest_namespace_name = smallest_namespace_name,
-        .smallest_key = smallest_key,
-        .largest_namespace_name = largest_namespace_name,
-        .largest_key = largest_key,
-        .entry_count = source.entry_count,
-        .tombstone_count = source.tombstone_count,
-        .oldest_tombstone_unix_ns = source.oldest_tombstone_unix_ns,
-        .visibility_id = source.visibility_id,
-        .gc_requested = source.gc_requested,
-        .bloom_filter = null,
-        .owns_bloom_filter = false,
-        .cached_state_index = null,
-        .cached_index_index = null,
-        .cached_table_index = null,
-        .table_index = null,
-        .state = null,
-    };
-    metadata_owned = false;
+    var clone = @import("run_metadata_clone.zig").Clone.init(source);
+    defer clone.deinit(allocator);
+    try clone.resumeWithAdmission(allocator, null);
+    var out = try clone.take();
     errdefer out.deinit(allocator);
 
     if (source.path == null) {
