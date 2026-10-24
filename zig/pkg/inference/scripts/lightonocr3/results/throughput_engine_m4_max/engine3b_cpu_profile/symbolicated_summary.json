@@ -1,0 +1,767 @@
+{
+  "binary_sha256": "b9a3c0ed5cd7b1d6f08553cf2f446b885f5df143653b742b338fc1e0d8e0d304",
+  "object_sha256": "990e79b07aa1a09c2a463f293ac866c9177fed9bd6b61da9eacfe62802050ee9",
+  "method": "Map main-relative addresses with compiler object symbols; verify first 32 bytes against linked executable, ignoring relocation words. 7616/7617 function prefixes match. Repeated recursive libBLAS unwind frames are excluded from attribution.",
+  "top_recursive_counts": [
+    {
+      "samples": 84,
+      "main_offset": 0,
+      "symbol": "_main+0"
+    },
+    {
+      "samples": 55,
+      "main_offset": 28316,
+      "symbol": "l_Io.Threaded.sleep+356"
+    },
+    {
+      "samples": 43,
+      "main_offset": 807312,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.decoderRuntimeApplyLinearOp+640"
+    },
+    {
+      "samples": 36,
+      "main_offset": 722924,
+      "symbol": "l_backends.metal_runtime.tryApplyDenseRuntimeLinear__func_1128+3816"
+    },
+    {
+      "samples": 32,
+      "main_offset": 2605512,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.linearNoBiasOpWithPlannedDispatch+1696"
+    },
+    {
+      "samples": 28,
+      "main_offset": 157344,
+      "symbol": "l_backends.metal_tensor.MetalTensor.deviceAllocateImpl+300"
+    },
+    {
+      "samples": 28,
+      "main_offset": 2888208,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.audioTapeRmsNorm+84"
+    },
+    {
+      "samples": 26,
+      "main_offset": 201176,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.toFloat32Op+940"
+    },
+    {
+      "samples": 25,
+      "main_offset": 2629280,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.audioTapeLinearNoBias+100"
+    },
+    {
+      "samples": 22,
+      "main_offset": 3517172,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.fromFloat32ShapeOp+1036"
+    },
+    {
+      "samples": 21,
+      "main_offset": 650204,
+      "symbol": "l_backends.metal_tensor.MetalTensor.copyInto+332"
+    },
+    {
+      "samples": 21,
+      "main_offset": 650844,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.ownedDeviceMetalTensorFromCtImpl+540"
+    },
+    {
+      "samples": 21,
+      "main_offset": 8193012,
+      "symbol": "l_architectures.gpt.applyNormAt+304"
+    },
+    {
+      "samples": 20,
+      "main_offset": 1431480,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.rmsNormOp+556"
+    },
+    {
+      "samples": 18,
+      "main_offset": 786576,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.submitAndWaitDecoderRuntimeFrame+284"
+    },
+    {
+      "samples": 18,
+      "main_offset": 826328,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.decoderRuntimeSubmitAndWaitFrameOp+72"
+    },
+    {
+      "samples": 17,
+      "main_offset": 1897532,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.audioTapeAdd+64"
+    },
+    {
+      "samples": 17,
+      "main_offset": 204808,
+      "symbol": "l_backends.metal_tensor.noteDeviceOwnedCreate+552"
+    },
+    {
+      "samples": 17,
+      "main_offset": 8181104,
+      "symbol": "l_execution_control.InferenceExecutionControl.lockWithPoll+836"
+    },
+    {
+      "samples": 16,
+      "main_offset": 15328104,
+      "symbol": "l_server.server.Node.LightOnStreamContext.check+84"
+    },
+    {
+      "samples": 16,
+      "main_offset": 157216,
+      "symbol": "l_backends.metal_tensor.MetalTensor.deviceAllocateImpl+172"
+    },
+    {
+      "samples": 15,
+      "main_offset": 650748,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.ownedDeviceMetalTensorFromCtImpl+444"
+    },
+    {
+      "samples": 14,
+      "main_offset": 1431548,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.rmsNormOp+624"
+    },
+    {
+      "samples": 13,
+      "main_offset": 11203740,
+      "symbol": "l_architectures.gpt.forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides+5316"
+    },
+    {
+      "samples": 13,
+      "main_offset": 11208616,
+      "symbol": "l_architectures.gpt.forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides+10192"
+    },
+    {
+      "samples": 13,
+      "main_offset": 11237812,
+      "symbol": "l_architectures.gpt.forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesAndTrace+188"
+    },
+    {
+      "samples": 13,
+      "main_offset": 2632668,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.linearOpWithPlannedDispatch+472"
+    },
+    {
+      "samples": 13,
+      "main_offset": 2634568,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.linearOp+68"
+    },
+    {
+      "samples": 13,
+      "main_offset": 6972996,
+      "symbol": "l_architectures.qwen3vl_projector.linearNamed+3900"
+    },
+    {
+      "samples": 13,
+      "main_offset": 8339600,
+      "symbol": "l_architectures.gpt.decoderBlockImpl+4540"
+    },
+    {
+      "samples": 13,
+      "main_offset": 8403480,
+      "symbol": "l_architectures.gpt.decoderBlock+1440"
+    },
+    {
+      "samples": 13,
+      "main_offset": 965208,
+      "symbol": "l_backends.metal_runtime.decoderRuntimeApplyRmsNormWeightDevice__func_1489+444"
+    },
+    {
+      "samples": 12,
+      "main_offset": 1407232,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.addOp+1096"
+    },
+    {
+      "samples": 11,
+      "main_offset": 2927860,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.embeddingLookupOp+492"
+    },
+    {
+      "samples": 11,
+      "main_offset": 8294084,
+      "symbol": "l_architectures.gpt.feedForward+1124"
+    },
+    {
+      "samples": 11,
+      "main_offset": 924852,
+      "symbol": "l_backends.metal_runtime.decoderRuntimeNativeBf16EmbeddingLookup__func_1449+468"
+    },
+    {
+      "samples": 10,
+      "main_offset": 112380,
+      "symbol": "l_heap.PageAllocator.unmap+24"
+    },
+    {
+      "samples": 10,
+      "main_offset": 2089708,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.gatedFfnNoBiasOp+820"
+    },
+    {
+      "samples": 10,
+      "main_offset": 2639384,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.ensureDeviceResidentOp+136"
+    },
+    {
+      "samples": 10,
+      "main_offset": 74032,
+      "symbol": "l_Io.Threaded.dirRealPathFilePosix+640"
+    },
+    {
+      "samples": 10,
+      "main_offset": 8181056,
+      "symbol": "l_execution_control.InferenceExecutionControl.lockWithPoll+788"
+    },
+    {
+      "samples": 9,
+      "main_offset": 14248,
+      "symbol": "l_Io.Threaded.Thread.futexWaitInner+136"
+    },
+    {
+      "samples": 9,
+      "main_offset": 722664,
+      "symbol": "l_backends.metal_runtime.tryApplyDenseRuntimeLinear__func_1128+3556"
+    },
+    {
+      "samples": 9,
+      "main_offset": 8192968,
+      "symbol": "l_architectures.gpt.applyNormAt+260"
+    },
+    {
+      "samples": 9,
+      "main_offset": 8338008,
+      "symbol": "l_architectures.gpt.decoderBlockImpl+2948"
+    },
+    {
+      "samples": 9,
+      "main_offset": 8339708,
+      "symbol": "l_architectures.gpt.decoderBlockImpl+4648"
+    },
+    {
+      "samples": 9,
+      "main_offset": 8340984,
+      "symbol": "l_architectures.gpt.decoderBlockImpl+5924"
+    },
+    {
+      "samples": 9,
+      "main_offset": 92980,
+      "symbol": "l_Io.Threaded.futexWait+280"
+    },
+    {
+      "samples": 8,
+      "main_offset": 12607832,
+      "symbol": "l_architectures.gpt.forwardHiddenTensorWithCudaReplay+248"
+    },
+    {
+      "samples": 8,
+      "main_offset": 12608432,
+      "symbol": "l_architectures.gpt.forwardHiddenTensorWithCudaReplay+848"
+    },
+    {
+      "samples": 8,
+      "main_offset": 13064040,
+      "symbol": "l_pipelines.generation.NativeGenerationPipeline.runScheduledDecodeBatch+1652"
+    },
+    {
+      "samples": 8,
+      "main_offset": 13064784,
+      "symbol": "l_pipelines.generation.NativeGenerationPipeline.runScheduledDecodeBatch+2396"
+    },
+    {
+      "samples": 8,
+      "main_offset": 13064856,
+      "symbol": "l_pipelines.generation.NativeGenerationPipeline.runScheduledDecodeBatch+2468"
+    },
+    {
+      "samples": 8,
+      "main_offset": 13065036,
+      "symbol": "l_pipelines.generation.NativeGenerationPipeline.runScheduledDecodeBatch+2648"
+    },
+    {
+      "samples": 8,
+      "main_offset": 13072576,
+      "symbol": "l_pipelines.generation.NativeGenerationPipeline.standardDecode+5384"
+    },
+    {
+      "samples": 8,
+      "main_offset": 13081480,
+      "symbol": "l_pipelines.generation.NativeGenerationPipeline.standardDecode+14288"
+    },
+    {
+      "samples": 8,
+      "main_offset": 13139132,
+      "symbol": "l_pipelines.generation.NativeGenerationPipeline.generateWithCallback+42992"
+    },
+    {
+      "samples": 8,
+      "main_offset": 13175892,
+      "symbol": "l_server.server.Node.readQwen3VlImagesWithAdmission+7008"
+    },
+    {
+      "samples": 8,
+      "main_offset": 13463324,
+      "symbol": "l_server.server.Node.readEncodedImagesReportedDirectWithContext+3068"
+    },
+    {
+      "samples": 8,
+      "main_offset": 13624740,
+      "symbol": "l_Thread.PosixThreadImpl.spawn__func_13566.Instance.entryFn+412"
+    },
+    {
+      "samples": 8,
+      "main_offset": 14529712,
+      "symbol": "l_pipelines.generation.NativeGenerationPipeline.executeClaimedStep+764"
+    },
+    {
+      "samples": 8,
+      "main_offset": 14530404,
+      "symbol": "l_pipelines.generation.stepBudgetFromState+540"
+    },
+    {
+      "samples": 8,
+      "main_offset": 14535552,
+      "symbol": "l_pipelines.generation.NativeGenerationPipeline.executeClaimedStepPooled+4944"
+    },
+    {
+      "samples": 8,
+      "main_offset": 14535736,
+      "symbol": "l_pipelines.generation.NativeGenerationPipeline.executeClaimedStepPooled+5128"
+    },
+    {
+      "samples": 8,
+      "main_offset": 15303532,
+      "symbol": "l_server.server.Node.readLightOnContinuousImages.Task.run+260"
+    },
+    {
+      "samples": 8,
+      "main_offset": 15314084,
+      "symbol": "l_server.server.Node.readLightOnContinuousPage.Scope.run+7980"
+    },
+    {
+      "samples": 8,
+      "main_offset": 15579248,
+      "symbol": "l_server.server.Node.BorrowedReadControl.check+76"
+    },
+    {
+      "samples": 8,
+      "main_offset": 201804,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.toFloat32Op+1568"
+    },
+    {
+      "samples": 8,
+      "main_offset": 2087640,
+      "symbol": "l_backends.metal_runtime.decoderRuntimeTryApplyBf16GateUp__func_2801+264"
+    },
+    {
+      "samples": 8,
+      "main_offset": 2618904,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.linearNoBiasArgmaxRowsSuppressOp+848"
+    },
+    {
+      "samples": 8,
+      "main_offset": 650144,
+      "symbol": "l_backends.metal_tensor.MetalTensor.copyInto+272"
+    },
+    {
+      "samples": 8,
+      "main_offset": 6842664,
+      "symbol": "l_architectures.gpt.qwen35LinearAttention+1736"
+    },
+    {
+      "samples": 8,
+      "main_offset": 6890468,
+      "symbol": "l_architectures.gpt.applyAttentionWithSink+4496"
+    },
+    {
+      "samples": 8,
+      "main_offset": 6905100,
+      "symbol": "l_architectures.gpt.runPreparedAttentionWithSinkMetadata+968"
+    },
+    {
+      "samples": 8,
+      "main_offset": 8363124,
+      "symbol": "l_architectures.gpt.decoderBlockImpl+28064"
+    },
+    {
+      "samples": 7,
+      "main_offset": 15328204,
+      "symbol": "l_server.server.Node.LightOnStreamContext.check+184"
+    },
+    {
+      "samples": 7,
+      "main_offset": 2501752,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.gqaPagedAttentionOp+6976"
+    },
+    {
+      "samples": 7,
+      "main_offset": 2619036,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.linearNoBiasArgmaxRowsSuppressOp+980"
+    },
+    {
+      "samples": 7,
+      "main_offset": 3408288,
+      "symbol": "l_backends.metal_runtime.argmaxLogitsRowsSuppressDevice__func_4115+276"
+    },
+    {
+      "samples": 7,
+      "main_offset": 3408648,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.argmaxRowsSuppressOp+344"
+    },
+    {
+      "samples": 7,
+      "main_offset": 6621680,
+      "symbol": "l_models.manifest.findFileInSubdirs+280"
+    },
+    {
+      "samples": 7,
+      "main_offset": 722988,
+      "symbol": "l_backends.metal_runtime.tryApplyDenseRuntimeLinear__func_1128+3880"
+    },
+    {
+      "samples": 6,
+      "main_offset": 11204040,
+      "symbol": "l_architectures.gpt.forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides+5616"
+    },
+    {
+      "samples": 6,
+      "main_offset": 11995988,
+      "symbol": "l_pipelines.generation.encodeNativeGenerationPrompt+244"
+    },
+    {
+      "samples": 6,
+      "main_offset": 13083404,
+      "symbol": "l_pipelines.generation.NativeGenerationPipeline.standardDecode+16212"
+    },
+    {
+      "samples": 6,
+      "main_offset": 2087832,
+      "symbol": "l_backends.metal_runtime.decoderRuntimeTryApplyBf16GateUp__func_2801+456"
+    },
+    {
+      "samples": 6,
+      "main_offset": 2448668,
+      "symbol": "l_backends.metal_runtime.decoderRuntimeApplyPagedKvAttentionSlotOnActiveFrame__func_3131+68"
+    },
+    {
+      "samples": 6,
+      "main_offset": 2516036,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.gqaPagedAttentionOp+21260"
+    },
+    {
+      "samples": 6,
+      "main_offset": 2716576,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.layerNormOp+920"
+    },
+    {
+      "samples": 6,
+      "main_offset": 2889408,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.concatOp+360"
+    },
+    {
+      "samples": 6,
+      "main_offset": 5997808,
+      "symbol": "l_ops.ops.ComputeBackend.partialMrope+516"
+    },
+    {
+      "samples": 6,
+      "main_offset": 6311104,
+      "symbol": "l_runtime.kv.manager.KvManager.appendTokens+352"
+    },
+    {
+      "samples": 6,
+      "main_offset": 6826632,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.lightOnPackedCore__func_6677+3200"
+    },
+    {
+      "samples": 6,
+      "main_offset": 6826700,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.lightOnPackedCore__func_6677+3268"
+    },
+    {
+      "samples": 6,
+      "main_offset": 6967316,
+      "symbol": "l_architectures.qwen3vl_projector.layerNormNamed+248"
+    },
+    {
+      "samples": 6,
+      "main_offset": 8192184,
+      "symbol": "l_architectures.gpt.maybeAdjustNormWeight+360"
+    },
+    {
+      "samples": 6,
+      "main_offset": 8305484,
+      "symbol": "l_architectures.gpt.maybeApplyQKHeadNorm+352"
+    },
+    {
+      "samples": 6,
+      "main_offset": 8402144,
+      "symbol": "l_architectures.gpt.decoderBlock+104"
+    },
+    {
+      "samples": 5,
+      "main_offset": 12494328,
+      "symbol": "l_architectures.qwen3vl_projector.encodeProjectedImagesResident+204"
+    },
+    {
+      "samples": 5,
+      "main_offset": 12588112,
+      "symbol": "l_architectures.gpt.forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides+88"
+    },
+    {
+      "samples": 5,
+      "main_offset": 12588932,
+      "symbol": "l_pipelines.generation.NativeGenerationPipeline.executePreparedQwen3VlPrefill+208"
+    },
+    {
+      "samples": 5,
+      "main_offset": 12589152,
+      "symbol": "l_pipelines.generation.NativeGenerationPipeline.executePreparedQwen3VlPrefill+428"
+    },
+    {
+      "samples": 5,
+      "main_offset": 12589508,
+      "symbol": "l_pipelines.generation.NativeGenerationPipeline.executePreparedQwen3VlPrefill+784"
+    },
+    {
+      "samples": 5,
+      "main_offset": 13062552,
+      "symbol": "l_pipelines.generation.NativeGenerationPipeline.runScheduledDecodeBatch+164"
+    },
+    {
+      "samples": 5,
+      "main_offset": 13124984,
+      "symbol": "l_pipelines.generation.NativeGenerationPipeline.generateWithCallback+28844"
+    },
+    {
+      "samples": 5,
+      "main_offset": 13144580,
+      "symbol": "l_pipelines.generation.NativeGenerationPipeline.generateWithCallback+48440"
+    },
+    {
+      "samples": 5,
+      "main_offset": 13144968,
+      "symbol": "l_pipelines.generation.NativeGenerationPipeline.generateWithCallback+48828"
+    },
+    {
+      "samples": 5,
+      "main_offset": 133816,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.hostAliasSource+348"
+    },
+    {
+      "samples": 5,
+      "main_offset": 13462744,
+      "symbol": "l_server.server.Node.readEncodedImagesReportedDirectWithContext+2488"
+    },
+    {
+      "samples": 5,
+      "main_offset": 1395096,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.tryAnyDeviceEqualSizeBinaryRuntimeOp__func_1904+308"
+    },
+    {
+      "samples": 5,
+      "main_offset": 1409240,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.addOp+3104"
+    },
+    {
+      "samples": 5,
+      "main_offset": 14529288,
+      "symbol": "l_pipelines.generation.NativeGenerationPipeline.executeClaimedStep+340"
+    },
+    {
+      "samples": 5,
+      "main_offset": 14723512,
+      "symbol": "l_pipelines.generation.pendingWorkOptionsFromState+224"
+    },
+    {
+      "samples": 5,
+      "main_offset": 15309520,
+      "symbol": "l_server.server.Node.readLightOnContinuousPage.Scope.run+3416"
+    },
+    {
+      "samples": 5,
+      "main_offset": 15314868,
+      "symbol": "l_server.server.Node.readLightOnContinuousPage.Scope.run+8764"
+    },
+    {
+      "samples": 5,
+      "main_offset": 15328444,
+      "symbol": "l_server.server.Node.LightOnStreamContext.check+424"
+    },
+    {
+      "samples": 5,
+      "main_offset": 193592,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.hostSliceForBuf+1144"
+    },
+    {
+      "samples": 5,
+      "main_offset": 201296,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.toFloat32Op+1060"
+    },
+    {
+      "samples": 5,
+      "main_offset": 3430040,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.audioTapeSliceLastDim+76"
+    },
+    {
+      "samples": 5,
+      "main_offset": 6308896,
+      "symbol": "l_architectures.gpt.Qwen35LinearCache.init+384"
+    },
+    {
+      "samples": 5,
+      "main_offset": 6418952,
+      "symbol": "l_pipelines.generation.NativeDecodeState.deinit+276"
+    },
+    {
+      "samples": 5,
+      "main_offset": 6429272,
+      "symbol": "l_runtime.kv.storage.hostAcquire+120"
+    },
+    {
+      "samples": 5,
+      "main_offset": 6429564,
+      "symbol": "l_runtime.kv.storage.hostAcquire+412"
+    },
+    {
+      "samples": 5,
+      "main_offset": 6442032,
+      "symbol": "l_runtime.scheduler.native_generate.NativeGenerateCoordinator.awaitTurn+160"
+    },
+    {
+      "samples": 5,
+      "main_offset": 6525444,
+      "symbol": "l_registry.managed_receipt.resolveContainedArtifactFromCanonicalRoot+180"
+    },
+    {
+      "samples": 5,
+      "main_offset": 6595632,
+      "symbol": "l_registry.managed_receipt.resolveContainedArtifactPath+108"
+    },
+    {
+      "samples": 5,
+      "main_offset": 6595872,
+      "symbol": "l_registry.managed_receipt.resolveContainedArtifactPath+348"
+    },
+    {
+      "samples": 5,
+      "main_offset": 6843844,
+      "symbol": "l_architectures.gpt.qwen35LinearAttention+2916"
+    },
+    {
+      "samples": 5,
+      "main_offset": 6943664,
+      "symbol": "l_architectures.qwen3vl_projector.assembleVisualPromptTensor+280"
+    },
+    {
+      "samples": 5,
+      "main_offset": 6946600,
+      "symbol": "l_architectures.qwen3vl_projector.prepareExpandedPromptEmbeddings+2116"
+    },
+    {
+      "samples": 5,
+      "main_offset": 8180944,
+      "symbol": "l_execution_control.InferenceExecutionControl.lockWithPoll+676"
+    },
+    {
+      "samples": 5,
+      "main_offset": 821152,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.decoderRuntimeApplyLayerNormOp+576"
+    },
+    {
+      "samples": 5,
+      "main_offset": 8488248,
+      "symbol": "l_pipelines.image.decode+824"
+    },
+    {
+      "samples": 5,
+      "main_offset": 8498592,
+      "symbol": "l_processing.preprocessDecodedRectWithResample+360"
+    },
+    {
+      "samples": 5,
+      "main_offset": 8498736,
+      "symbol": "l_pipelines.image.preprocessImageViewRectScaledWithResample+76"
+    },
+    {
+      "samples": 5,
+      "main_offset": 8499060,
+      "symbol": "l_pipelines.image.preprocessDecodedRectScaledWithResample+80"
+    },
+    {
+      "samples": 5,
+      "main_offset": 8503552,
+      "symbol": "l_architectures.qwen3vl_projector.addInterpolatedPositionsTensor+780"
+    },
+    {
+      "samples": 5,
+      "main_offset": 8504328,
+      "symbol": "l_architectures.qwen3vl_projector.addInterpolatedPositionsTensor+1556"
+    },
+    {
+      "samples": 5,
+      "main_offset": 8504396,
+      "symbol": "l_architectures.qwen3vl_projector.addInterpolatedPositionsTensor+1624"
+    },
+    {
+      "samples": 5,
+      "main_offset": 8507772,
+      "symbol": "l_architectures.qwen3vl_projector.mergeProjectedNamed+160"
+    },
+    {
+      "samples": 5,
+      "main_offset": 8507908,
+      "symbol": "l_architectures.qwen3vl_projector.mergeProjectedNamed+296"
+    },
+    {
+      "samples": 5,
+      "main_offset": 8508396,
+      "symbol": "l_architectures.qwen3vl_projector.encodeSingleImage+328"
+    },
+    {
+      "samples": 5,
+      "main_offset": 8509420,
+      "symbol": "l_architectures.qwen3vl_projector.encodeSingleImage+1352"
+    },
+    {
+      "samples": 5,
+      "main_offset": 8510924,
+      "symbol": "l_architectures.qwen3vl_projector.encodeSingleImage+2856"
+    },
+    {
+      "samples": 5,
+      "main_offset": 8512212,
+      "symbol": "l_architectures.qwen3vl_projector.encodeSingleImage+4144"
+    },
+    {
+      "samples": 5,
+      "main_offset": 8512560,
+      "symbol": "l_architectures.qwen3vl_projector.encodeSingleImage+4492"
+    },
+    {
+      "samples": 5,
+      "main_offset": 8514972,
+      "symbol": "l_architectures.qwen3vl_projector.encodeSingleImage+6904"
+    },
+    {
+      "samples": 5,
+      "main_offset": 8515020,
+      "symbol": "l_architectures.qwen3vl_projector.encodeSingleImage+6952"
+    },
+    {
+      "samples": 5,
+      "main_offset": 8517528,
+      "symbol": "l_architectures.qwen3vl_projector.encodeSingleImage+9460"
+    },
+    {
+      "samples": 5,
+      "main_offset": 8519504,
+      "symbol": "l_architectures.qwen3vl_projector.encodeSingleImage+11436"
+    },
+    {
+      "samples": 5,
+      "main_offset": 8522332,
+      "symbol": "l_architectures.qwen3vl_projector.encodeProjectedImagesFromWeightsQualified+600"
+    },
+    {
+      "samples": 5,
+      "main_offset": 854952,
+      "symbol": "l_ops.metal_compute.MetalCompute__struct_357.sliceLastDimOp+384"
+    }
+  ]
+}

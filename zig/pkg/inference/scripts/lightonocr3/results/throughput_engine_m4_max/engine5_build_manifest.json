@@ -1,0 +1,22 @@
+{
+  "benchmark_script_sha256": "8036bf3057201ff0f8351e9067ea07f8eca821e97d04c0915c44527c1a14db9e",
+  "runtime_commit": "3e21b5a5636ef8a45328a2b1e805108277c7b304",
+  "runtime_source_diff_sha256": "32f5f56a27a6d5b5e73e559e22bdb247cd31870a4fa68015525980ed8e1ceb19",
+  "runtime_files_sha256": {
+    "zig/pkg/inference/src/backends/metal_kernels.m": "1af56715e67aec41f28f4630ca6b49b11e55c4b362eb59752bb6691fcccc61d7",
+    "zig/pkg/inference/src/backends/metal_runtime.zig": "6ca3f8c5034022c041a9f279b10af901c72de90cb044ffa4514c64fd1c121888",
+    "zig/pkg/inference/src/architectures/gpt.zig": "ea6a4c28210b4e14b74fbb4903841163998d7353d3f008bd70a38be889ba6e9c",
+    "zig/pkg/inference/src/ops/metal_compute.zig": "3ca238fdcd9b27539cf9440629d6bde0f68a3a04748f5c44ef585ccdd612595e",
+    "zig/pkg/inference/src/server/server.zig": "a0cf94181ac646c40874edebd0f288a0d05861857ff5a002e7cb9c71e929c71d",
+    "zig/pkg/inference/src/server/model_manager.zig": "b005bcdea0a92419fa61d7db09786344c22a0b8b1a40ae1ad99297bfe1b744fc",
+    "zig/pkg/inference/src/server/reader_execution_pool.zig": "6cdbcfa6e443473350364f21ee7af2ecf1f098b6b1ec9742edad37d281ed9814",
+    "zig/pkg/inference/src/architectures/qwen3vl_projector.zig": "8a24b1203bc73ab3fc141ab7a97b00e9a39538b542ab76a21f68b5c28ae157fa",
+    "zig/pkg/inference/src/pipelines/generation.zig": "630e125146bd944abbdfed45fda5aa34c4c6c1082b946433929474ce7b8db104",
+    "zig/pkg/inference/src/runtime/scheduler/native_generate.zig": "8bc8e10c7e5eddd39d96eee84169222ae8ecbf2b271bbf59cfed0606127ee012",
+    "zig/pkg/inference/src/execution_control.zig": "605cc3aa5b88b5107807b52ffd6c0ccb3d1b4a0eaba5625fdc2519400147bd76",
+    "zig/pkg/inference/src/pipelines/reading.zig": "dcfa9c8240fcd73e3e06987fcaa03831234647af1a5712c5d5dfcc5577bfd9f2",
+    "zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m": "4cc2f096a4565198f348c4490c84fa797f7c7b7803645929a982b78b1678861d"
+  },
+  "binary_sha256": "a1c85f79770c81e98a0953425218c963f3f7ccfaeedd39c0841ea8c6cc066b37",
+  "binary_path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/.zig-cache/o/73a094dc6c6ea68ec4f89c92921079d7/test"
+}

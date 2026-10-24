@@ -1,0 +1,33 @@
+{
+  "created_at": "2026-10-23T23:44:17.193443+00:00",
+  "binary_sha256": "63b3ddfde03bdde6aa7c5c38630991c9ba410edec9d17977345422df63e49eea",
+  "kernel_sha256": "511240c3faefdae4228533d7d62bf516f2ca74494f727e75c84b1891b1b4afd5",
+  "checker_sha256": "d65321f2b20dd330176391739c806df27dad46e449e442c589fa2dbaead925b0",
+  "functional_only": true,
+  "own_cpu_compile_overlap": true,
+  "commands": [
+    {
+      "flag": "full-functional",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine21-c-full-functional.txt",
+      "log_sha256": "6df40b8d5aedc22c066c37c997e00ea42db71408971ced36c57e4a4097bd3caf"
+    },
+    {
+      "flag": "--check-batch-attention",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine21-c-check-batch-attention.txt",
+      "log_sha256": "1b7b1789053ccc7204c510520bc0d280e9208552ded9cf0255ddc5d113a29d8d"
+    },
+    {
+      "flag": "--check-prefill-pack-reuse",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine21-c-check-prefill-pack-reuse.txt",
+      "log_sha256": "eb1acfbd742656735021f2f5b279da917f5261b150f172cc99b47c55e7f99a17"
+    }
+  ],
+  "preset_probe": {
+    "binary_sha256": "30b8692e1cce543cf2042a62da25a9b083d09c02357934755fb81bd9edb97f9d",
+    "source_sha256": "a5de14e3a197b00c0040a27fcfda5ccdf7897e33c6b2b38a955d51ef058b4753",
+    "log_sha256": "a85ad4bd9578582c773b3991d9d85f0028247249565905f91c020cd6ca451d32"
+  }
+}

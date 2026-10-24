@@ -1,0 +1,15 @@
+{
+  "command": [
+    "/usr/bin/sample",
+    "91707",
+    "8",
+    "1",
+    "-file",
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max/engine3b_cpu_profile/sample.txt"
+  ],
+  "exit_code": 0,
+  "stdout": "Sampling process 91707 for 8 seconds with 1 millisecond of run time between samples\nSampling completed, processing symbols...\nSample analysis of process 91707 written to file /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max/engine3b_cpu_profile/sample.txt\n",
+  "profiled_pid": 91707,
+  "diagnostic_only": true,
+  "own_cpu_compile_overlap": true
+}

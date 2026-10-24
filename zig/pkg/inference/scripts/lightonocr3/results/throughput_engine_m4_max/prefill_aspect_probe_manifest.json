@@ -1,0 +1,11 @@
+{
+  "binary_sha256": "ebd3a5466e75b5df9a81d421fad41810ca7bfb6d58d3ac660208f1ecaf1bd4ee",
+  "kernel_sha256": "6018c6113af4df05f52a5511122ca66f5c23f03c8363ab1380db36d8319ceb41",
+  "checker_sha256": "d65321f2b20dd330176391739c806df27dad46e449e442c589fa2dbaead925b0",
+  "probe_source_sha256": "0a258483b135f762568e5bccb0da910554a6535e9e0556ea5ea0e2a424871be6",
+  "log_sha256": "dd5209bdfaab59f25d5c52639774230d54b44ae10d0f84e6ff2d3b14088c4c7f",
+  "own_cpu_compile_overlap": false,
+  "qualified_cases": 72,
+  "promoted": false,
+  "reason": "No broad aspect-ratio speedup; full output comparisons and CPU corners passed"
+}

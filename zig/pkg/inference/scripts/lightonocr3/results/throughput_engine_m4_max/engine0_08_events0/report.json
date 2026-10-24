@@ -1,0 +1,494 @@
+{
+  "created_at": "2026-10-23T17:44:22.680694+00:00",
+  "hardware": {
+    "processor": "Apple M4 Max",
+    "physical_memory_bytes": 38654705664
+  },
+  "runtime_commit": "3e21b5a5636ef8a45328a2b1e805108277c7b304",
+  "runtime_source_diff_sha256": "1db039eaba5573370c5d9beb1450fdc3f9b1d4f0ca2c8345b8916c1615eb5b74",
+  "binary_sha256": "de6111aeb12dcd58b48004c365707e63facc64ddc4936819a3be8931f82deafc",
+  "models": {
+    "lighton08": {
+      "directory": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton08",
+      "weight_bytes": 1706030528,
+      "weight_files": [
+        {
+          "name": "model.safetensors",
+          "bytes": 1706030528
+        }
+      ],
+      "metadata": {
+        "config.json": {
+          "architectures": [
+            "Qwen3_5ForConditionalGeneration"
+          ],
+          "bos_token_id": null,
+          "dtype": "bfloat16",
+          "eos_token_id": 248046,
+          "image_token_id": 248056,
+          "model_type": "qwen3_5",
+          "pad_token_id": 248044,
+          "text_config": {
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "attn_output_gate": true,
+            "bos_token_id": null,
+            "dtype": "bfloat16",
+            "eos_token_id": 248044,
+            "full_attention_interval": 4,
+            "head_dim": 256,
+            "hidden_act": "silu",
+            "hidden_size": 1024,
+            "initializer_range": 0.02,
+            "intermediate_size": 3584,
+            "layer_types": [
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention"
+            ],
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 16,
+            "linear_value_head_dim": 128,
+            "mamba_ssm_dtype": "float32",
+            "max_position_embeddings": 262144,
+            "mlp_only_layers": [],
+            "model_type": "qwen3_5_text",
+            "mtp_num_hidden_layers": 0,
+            "mtp_use_dedicated_embeddings": false,
+            "num_attention_heads": 8,
+            "num_hidden_layers": 24,
+            "num_key_value_heads": 2,
+            "pad_token_id": null,
+            "partial_rotary_factor": 0.25,
+            "rms_norm_eps": 1e-06,
+            "rope_parameters": {
+              "mrope_interleaved": true,
+              "mrope_section": [
+                11,
+                11,
+                10
+              ],
+              "partial_rotary_factor": 0.25,
+              "rope_theta": 10000000,
+              "rope_type": "default"
+            },
+            "tie_word_embeddings": true,
+            "use_cache": false,
+            "vocab_size": 248320
+          },
+          "tie_word_embeddings": true,
+          "transformers_version": "5.5.4",
+          "video_token_id": 248057,
+          "vision_config": {
+            "deepstack_visual_indexes": [],
+            "depth": 12,
+            "dtype": "bfloat16",
+            "hidden_act": "gelu_pytorch_tanh",
+            "hidden_size": 768,
+            "in_channels": 3,
+            "initializer_range": 0.02,
+            "intermediate_size": 3072,
+            "model_type": "qwen3_5",
+            "num_heads": 12,
+            "num_position_embeddings": 2304,
+            "out_hidden_size": 1024,
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2
+          },
+          "vision_end_token_id": 248054,
+          "vision_start_token_id": 248053
+        },
+        "preprocessor_config.json": {
+          "size": {
+            "longest_edge": 16777216,
+            "shortest_edge": 65536
+          },
+          "patch_size": 16,
+          "temporal_patch_size": 2,
+          "merge_size": 2,
+          "image_mean": [
+            0.5,
+            0.5,
+            0.5
+          ],
+          "image_std": [
+            0.5,
+            0.5,
+            0.5
+          ],
+          "processor_class": "Qwen3VLProcessor",
+          "image_processor_type": "Qwen2VLImageProcessorFast"
+        },
+        "model_manifest.json": {
+          "type": "generator",
+          "tasks": [
+            "generate",
+            "read"
+          ],
+          "inputs": [
+            "text",
+            "image"
+          ],
+          "capabilities": [
+            "ocr",
+            "lightonocr3"
+          ]
+        }
+      }
+    }
+  },
+  "images": [
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/src/models/testdata/lightonocr3/invoice.png",
+      "sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e"
+    },
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/corpus/receipt.png",
+      "sha256": "4ccfc5a949e85643492606a95832a3f7630877fd334fece0b4fe4dc6a3291e03"
+    },
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/corpus/shipping.png",
+      "sha256": "3bfab6d55f212b14fcd91a4663e2a7aa9e031ccd1242fd236728af99836d0007"
+    }
+  ],
+  "benchmark_script_sha256": "9a678e230a60c2e7ffc7fa86f4cdad1cd1a6cc33ab8e4f2762f6c3356ad5e4c5",
+  "settings": {
+    "model": [
+      "lighton08=/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton08"
+    ],
+    "concurrency": [
+      16
+    ],
+    "modes": [
+      "batch"
+    ],
+    "requests": 32,
+    "pages_per_request": 1,
+    "max_tokens": 256,
+    "admission_units": 256,
+    "batch_rows": 8,
+    "batch_window": 16,
+    "batch_wait_us": 20000,
+    "florence_batch_wait_us": 5000,
+    "profile_reader": false,
+    "require_small_tail_fusion": false,
+    "prefill_sg_attention": false,
+    "bf16_prefill_inputs": false,
+    "prefill_direct_kv": false,
+    "decode_wait_us": 1000,
+    "deferred_attention": "auto",
+    "disable_batch_projections": false,
+    "disable_tiled_projections": false,
+    "policy_rounds": [
+      "default",
+      "default"
+    ],
+    "prefill_core_norm": true,
+    "disable_prefill_core_norm": false,
+    "require_prefill_core_norm": true,
+    "disable_direct_core_output": false,
+    "disable_compute_copies": false,
+    "trace_compute_copies": false,
+    "disable_packed_core": false,
+    "trace_packed_core": true,
+    "require_packed_core": true,
+    "require_weight_handles": false,
+    "weight_handles": false,
+    "require_execution_gate_wait": false,
+    "frame_policy": false,
+    "require_frame_policy": false,
+    "disable_prefill_direct_kv_mpp": false,
+    "static_work_assignment": false,
+    "contention_wait_us": null,
+    "prefill_attention_mpp": true,
+    "disable_prefill_attention_mpp": false,
+    "require_prefill_attention_mpp": true,
+    "recurrent_parallel": true,
+    "disable_recurrent_parallel": false,
+    "recurrent_coalescing": false,
+    "require_recurrent_parallel": true,
+    "disable_recurrent_batch": false,
+    "disable_recurrent_fusion": false,
+    "disable_ffn_small_tile": false,
+    "disable_qkv_small_tile": false,
+    "disable_down_split": false,
+    "disable_four_row_tile": false,
+    "disable_f16_encoder_mpp": false,
+    "weight_residency": true,
+    "disable_local_kernels": false,
+    "disable_vision_mpp": false,
+    "disable_prefill_projections": false,
+    "require_vision_mpp": false,
+    "require_prefill_gates": false,
+    "require_decode_projections": false,
+    "disable_prefill_conv_vec4": false,
+    "continuous": true,
+    "vision_batch": false,
+    "disable_shared_vision_peak": false,
+    "prefill_batch": false,
+    "vision_wait_us": 2000,
+    "prefill_wait_us": 5000,
+    "disable_tail_split": false,
+    "disable_partial_qkv_split": false,
+    "disable_partial_down_split": false,
+    "disable_gate_up_split": false,
+    "disable_batch_gate_up": false,
+    "disable_prefill_columns": false,
+    "disable_single_down_tile": false,
+    "disable_four_row_split": false,
+    "disable_prefill_norm": false,
+    "disable_ocr_attention": false,
+    "disable_florence_window_softmax": false,
+    "disable_florence_no_repeat_argmax": false,
+    "require_florence_no_repeat_argmax": false,
+    "disable_ocr_ffn_fusion": false,
+    "disable_florence_channel_reduction": false,
+    "disable_recurrent_encoder": false,
+    "disable_recurrent_norm": false,
+    "disable_step_pool": false,
+    "small_mpp": false,
+    "florence_encoder_mirrors": false,
+    "disable_florence_encoder_mirrors": false,
+    "bf16_projection_inputs": false,
+    "native_read_batch_size": 8,
+    "memory_gib": 24,
+    "shared_memory_gib": 28,
+    "backend_memory_gib": 16,
+    "kv_memory_gib": 4,
+    "scratch_memory_gib": 4,
+    "timeout": 900,
+    "reference_report": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/results/throughput_epoch_m4_max/vllm_08_reference/report.json",
+    "build_manifest": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max/engine0_build_manifest.json"
+  },
+  "scope": "One resident Node; timed native encoded-image API requests including preprocessing, queueing and inference; excludes loading, reference reads, HTTP, PDF rendering and indexing. Other machine workloads uncontrolled. Every timed output must match its same-model serial reference.",
+  "results": [
+    {
+      "model": "lighton08",
+      "mode": "batch",
+      "concurrency": 16,
+      "log": "lighton08-batch-c16.txt",
+      "exit_code": 0,
+      "status": "ok",
+      "serial_reference_parity": true,
+      "policy_rounds": [
+        {
+          "round": 0,
+          "policy": "default",
+          "concurrency": 16,
+          "requests": 32,
+          "pages_per_request": 1,
+          "completed": 32,
+          "elapsed_ms": 14468,
+          "pages_per_second": 2.2117,
+          "p50_ms": 5396,
+          "p95_ms": 13574,
+          "native_items": 32,
+          "retained_weight_handles_observed": false,
+          "execution_gate_wait_ns": [
+            100000
+          ],
+          "frame_policy_snapshot_lifetime_totals": [
+            0
+          ],
+          "frame_policy_snapshots": 0,
+          "framed_runtime_totals": {
+            "frames": 972,
+            "gpu_ns": 7923555054,
+            "wait_ns": 9693180000
+          },
+          "packed_core_rows_observed": [
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8
+          ],
+          "registered_window_peak": 16,
+          "physical_rows_limit": 8,
+          "process_cpu_ms": 12629
+        },
+        {
+          "round": 1,
+          "policy": "default",
+          "concurrency": 16,
+          "requests": 32,
+          "pages_per_request": 1,
+          "completed": 32,
+          "elapsed_ms": 14422,
+          "pages_per_second": 2.2187,
+          "p50_ms": 5713,
+          "p95_ms": 13503,
+          "native_items": 32,
+          "retained_weight_handles_observed": false,
+          "execution_gate_wait_ns": [
+            100000
+          ],
+          "frame_policy_snapshot_lifetime_totals": [
+            0
+          ],
+          "frame_policy_snapshots": 0,
+          "framed_runtime_totals": {
+            "frames": 977,
+            "gpu_ns": 8044263769,
+            "wait_ns": 9611731000
+          },
+          "packed_core_rows_observed": [
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8
+          ],
+          "registered_window_peak": 16,
+          "physical_rows_limit": 8,
+          "process_cpu_ms": 12505
+        }
+      ],
+      "prefill_core_norm_observed_including_warmup": true,
+      "prefill_attention_mpp_observed_including_warmup": true,
+      "packed_core_rows_observed_including_warmup": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "recurrent_parallel_observed_including_warmup": true,
+      "recurrent_parallel_rows_observed_including_warmup": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "references": [
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>"
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\n**Tracking:** 987654321012  \n**Weight:** 2.40 kg  \n**Service:** NEXT DAY"
+        }
+      ],
+      "cross_runtime_content_parity": true,
+      "reference_report_sha256": "5f8f92e156238702470291c2d474d20f47186a8a11b89c6342d7fa9aa819f074",
+      "registered_windows_including_untimed_warmup": [
+        {
+          "registered_window_peak": 1,
+          "physical_rows_limit": 8
+        },
+        {
+          "registered_window_peak": 1,
+          "physical_rows_limit": 8
+        },
+        {
+          "registered_window_peak": 1,
+          "physical_rows_limit": 8
+        },
+        {
+          "registered_window_peak": 1,
+          "physical_rows_limit": 8
+        },
+        {
+          "registered_window_peak": 16,
+          "physical_rows_limit": 8
+        },
+        {
+          "registered_window_peak": 16,
+          "physical_rows_limit": 8
+        }
+      ],
+      "cohorts_including_untimed_warmup": [
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 32,
+          "decode_steps": 538,
+          "batched_steps": 517,
+          "singleton_steps": 21,
+          "decode_items": 3044
+        },
+        {
+          "items": 32,
+          "decode_steps": 554,
+          "batched_steps": 530,
+          "singleton_steps": 24,
+          "decode_items": 3055
+        }
+      ]
+    }
+  ],
+  "worktree_runtime_commit": "3e21b5a5636ef8a45328a2b1e805108277c7b304",
+  "worktree_runtime_source_diff_sha256": "d420960dd444af295e5c6782ce69a36e62192cc1be2a377283166a5cd454cfbc",
+  "build_manifest_sha256": "2c9aef4416d667ead4eb32ce7acf2c210841f737e29ca9fa43442b2c0fb0c36e",
+  "engine_features": {
+    "ANTFLY_LIGHTONOCR3_STEP_EVENTS": true,
+    "ANTFLY_LIGHTONOCR3_DECODE_WORKSPACE": true,
+    "ANTFLY_LIGHTONOCR3_WIDE_DECODE": false
+  },
+  "driver_sha256": "f36bccd73a8c5bb73bf1cd06f6702e29e5d0f00970c9bc710368d125dc98a49f"
+}
