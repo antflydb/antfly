@@ -9094,9 +9094,14 @@ pub const Node = struct {
     }
 
     fn transcribeDecodedPcmFromPath(self: *Node, allocator: std.mem.Allocator, model_path: []const u8, request: transcribing_api.Request, pcm: @import("../pipelines/audio.zig").PcmAudio, control: InferenceExecutionControl, max_working_bytes: usize) !transcribing_api.Response {
+        return self.transcribeDecodedPcmFromPathPinned(allocator, model_path, request, pcm, control, max_working_bytes, null);
+    }
+
+    fn transcribeDecodedPcmFromPathPinned(self: *Node, allocator: std.mem.Allocator, model_path: []const u8, request: transcribing_api.Request, pcm: @import("../pipelines/audio.zig").PcmAudio, control: InferenceExecutionControl, max_working_bytes: usize, expected_revision: ?[64]u8) !transcribing_api.Response {
         var model_handle = try self.model_manager.acquireFromDirWithControl(model_path, control);
         defer model_handle.release();
         const model = model_handle.get();
+        if (expected_revision) |expected| try validateLoadedMediaRevision(expected, model.resolution_revision);
         const whisper_config = session_factory.getWhisperConfig(model.session) orelse return error.UnsupportedTranscriberProvider;
 
         const transcription = @import("../pipelines/transcription.zig");
@@ -40555,6 +40560,19 @@ const MediaFramePreparationCache = struct {
     }
 };
 
+/// Disk identity cannot certify the generation already loaded in a session.
+fn validateLoadedMediaRevision(expected: [64]u8, loaded: ?[32]u8) !void {
+    const actual = std.fmt.bytesToHex(loaded orelse return error.ModelConfigurationChanged, .lower);
+    if (!std.mem.eql(u8, &expected, &actual)) return error.ModelConfigurationChanged;
+}
+
+test "model aware media output pins the loaded session even when disk advertises a newer revision" {
+    const expected = std.fmt.bytesToHex(@as([32]u8, @splat(2)), .lower);
+    try validateLoadedMediaRevision(expected, @splat(2));
+    try std.testing.expectError(error.ModelConfigurationChanged, validateLoadedMediaRevision(expected, @splat(1)));
+    try std.testing.expectError(error.ModelConfigurationChanged, validateLoadedMediaRevision(expected, null));
+}
+
 fn validateMediaOutputGeneration(expected_identity: [64]u8, expected_revision: [64]u8, identity: [64]u8, revision: [64]u8) !void {
     if (!std.mem.eql(u8, &expected_identity, &identity) or !std.mem.eql(u8, &expected_revision, &revision)) return error.ModelConfigurationChanged;
 }
@@ -40964,8 +40982,7 @@ const MediaOutputExecution = struct {
         var handle = try self.node.model_manager.acquireFromDirWithControl(resolved.path, self.control);
         defer handle.release();
         const loaded = handle.get();
-        const actual = std.fmt.bytesToHex(try self.node.model_manager.modelIdentityForManifest(resolved.path, loaded.manifest), .lower);
-        if (!std.mem.eql(u8, &actual, &resolved.revision)) return error.ModelConfigurationChanged;
+        try validateLoadedMediaRevision(resolved.revision, loaded.resolution_revision);
         const rows = try classification.classifyPreparedFrames(a, loaded.session, resolved.classifier_profile.?, loaded.manifest.id2label orelse return error.UnsupportedMediaClassifier, frames[0..pictures.len], target.top_k, self.control);
         errdefer {
             for (rows) |row| {
@@ -40986,8 +41003,7 @@ const MediaOutputExecution = struct {
         var handle = try self.node.model_manager.acquireFromDirWithControl(resolved.path, self.control);
         defer handle.release();
         const loaded = handle.get();
-        const actual = std.fmt.bytesToHex(try self.node.model_manager.modelIdentityForManifest(resolved.path, loaded.manifest), .lower);
-        if (!std.mem.eql(u8, &actual, &resolved.revision)) return error.ModelConfigurationChanged;
+        try validateLoadedMediaRevision(resolved.revision, loaded.resolution_revision);
         value.labels = try @import("../pipelines/media_classification.zig").classifyPrepared(a, loaded.session, resolved.classifier_profile.?, loaded.manifest.id2label orelse return error.UnsupportedMediaClassifier, pixels, target.top_k, self.control);
         var manifest = try manifest_mod.loadFromDir(a, resolved.path);
         defer manifest.deinit();
@@ -41018,7 +41034,7 @@ const MediaOutputExecution = struct {
             },
             .transcribe => {
                 if (payload != .pcm) return error.ModelDoesNotSupportAudioInput;
-                const response = try self.node.transcribeDecodedPcmFromPath(a, resolved.path, .{ .url = "", .language = target.language, .timestamps = true, .diarization = target.diarize }, payload.pcm, self.control, self.node.config.chunking_limits.max_working_bytes);
+                const response = try self.node.transcribeDecodedPcmFromPathPinned(a, resolved.path, .{ .url = "", .language = target.language, .timestamps = true, .diarization = target.diarize }, payload.pcm, self.control, self.node.config.chunking_limits.max_working_bytes, resolved.revision);
                 var spans = std.ArrayList(outputs.Span).empty;
                 const origin = value.start_ns orelse return error.InvalidChunkCoordinates;
                 const end = value.end_ns orelse return error.InvalidChunkCoordinates;
@@ -41039,6 +41055,7 @@ const MediaOutputExecution = struct {
                 var handle = try self.node.model_manager.acquireFromDirWithControl(resolved.path, self.control);
                 defer handle.release();
                 const loaded = handle.get();
+                try validateLoadedMediaRevision(resolved.revision, loaded.resolution_revision);
                 const profile = loaded.manifest.media_classifier orelse return error.UnsupportedMediaClassifier;
                 const labels = loaded.manifest.id2label orelse return error.UnsupportedMediaClassifier;
                 const input: @import("../pipelines/media_classification.zig").Input = switch (payload) {

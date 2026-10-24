@@ -592,13 +592,12 @@ pub const Runner = struct {
                 defer if (cached) |entry| self.request.index_cache.?.release(entry);
                 if (cached) |entry| {
                     var reader = entry.data.webm.reader(self.allocator, &source);
-                    try self.webmWindows(&reader);
+                    if (entry.webm_plan) |*snapshot| try self.webmWindowsSnapshot(&reader, snapshot) else try self.webmWindows(&reader);
                     return;
                 }
                 var reader = try media.webm.Reader.init(self.allocator, &source, .{ .max_packets = self.request.limits.max_index_packets });
                 defer reader.deinit();
-                if (identity) |key| if (self.request.index_cache) |cache| if (self.request.index_cache_admission) |admission| cache.remember(std.heap.smp_allocator, key, .{ .webm = reader }, admission);
-                try self.webmWindows(&reader);
+                try self.webmWindowsCached(&reader, identity);
                 return;
             } else {
                 var audio_track: ?@import("media_chunking_audio_source.zig").Track = if (self.request.needs_audio) @import("media_chunking_audio_source.zig").Track.init(self.allocator, &source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets) catch |err| blk: {
@@ -614,16 +613,16 @@ pub const Runner = struct {
                 defer if (cached) |entry| self.request.index_cache.?.release(entry);
                 if (cached) |entry| {
                     var reader = entry.data.mp4.reader(self.allocator, &source);
-                    var owner = try @import("media_chunking_video.zig").Owner.init(self.allocator, &reader, &self.pool, self.request.limits);
+                    var owner = if (entry.mp4_plan) |*snapshot| try @import("media_chunking_video.zig").Owner.fromSnapshot(self.allocator, &reader, &self.pool, self.request.limits, snapshot) else try @import("media_chunking_video.zig").Owner.init(self.allocator, &reader, &self.pool, self.request.limits);
                     defer owner.deinit();
                     try self.videoWindows(&.{}, &reader, try owner.durationNs(), owner.origin, reader.track.timescale, &owner, null);
                     return;
                 }
                 var reader = try media.mp4.Reader.init(self.allocator, &source, .{ .max_samples = self.request.limits.max_index_packets, .max_index_bytes = @min(self.request.max_working_bytes, try std.math.mul(usize, self.request.limits.max_index_packets, @sizeOf(media.mp4.Packet))) });
                 defer reader.deinit();
-                if (identity) |key| if (self.request.index_cache) |cache| if (self.request.index_cache_admission) |admission| cache.remember(std.heap.smp_allocator, key, .{ .mp4 = reader }, admission);
                 var owner = try @import("media_chunking_video.zig").Owner.init(self.allocator, &reader, &self.pool, self.request.limits);
                 defer owner.deinit();
+                if (identity) |key| if (self.request.index_cache) |cache| if (self.request.index_cache_admission) |admission| cache.rememberPlanned(std.heap.smp_allocator, key, .{ .mp4 = reader }, admission, .{ .mp4 = &owner });
                 try self.videoWindows(&.{}, &reader, try owner.durationNs(), owner.origin, reader.track.timescale, &owner, null);
                 return;
             }
@@ -689,6 +688,9 @@ pub const Runner = struct {
         }
     }
     fn webmWindows(self: *Runner, reader: *media.webm.Reader) !void {
+        return self.webmWindowsCached(reader, null);
+    }
+    fn webmWindowsCached(self: *Runner, reader: *media.webm.Reader, identity: ?[32]u8) !void {
         var end: i128 = std.math.minInt(i128);
         var origin: i64 = std.math.maxInt(i64);
         var indexed = try video.webm_pictures.index(self.allocator, reader, .{ .max_packets = self.request.limits.max_index_packets, .max_pictures = self.request.limits.max_index_packets, .decoder = .{ .av1_all_layers = false, .control = reader.input.control } });
@@ -716,11 +718,21 @@ pub const Runner = struct {
         for (timed, indexed.pictures) |*dest, picture| dest.* = .{ .pts = picture.pts, .duration = picture.duration };
         var timeline = try video.sampling.Timeline.init(self.allocator, timed, reader.input.control);
         defer timeline.deinit();
+        const snapshot = @import("media_index_cache.zig").Cache.WebmSnapshot{ .index = indexed, .source_bound = indexed.reader != null, .timeline = timeline, .origin = origin, .duration = end - origin };
+        if (identity) |key| if (self.request.index_cache) |cache| if (self.request.index_cache_admission) |admission| cache.rememberPlanned(std.heap.smp_allocator, key, .{ .webm = reader.* }, admission, .{ .webm = snapshot });
+        try self.webmWindowsSnapshot(reader, &snapshot);
+    }
+    fn webmWindowsSnapshot(self: *Runner, reader: *media.webm.Reader, snapshot: *const @import("media_index_cache.zig").Cache.WebmSnapshot) !void {
+        try self.control.check();
+        var indexed = snapshot.index;
+        indexed.allocator = self.allocator;
+        indexed.reader = if (snapshot.source_bound) reader else null;
+        var timeline = snapshot.timeline;
         var continuation = video.webm_pictures.Continuation{ .allocator = self.allocator, .reader = reader };
         defer continuation.deinit();
         var apple_continuation = @import("embedding_gemma2_video.zig").WebmDecoderContinuation{ .allocator = self.allocator, .reader = reader };
         defer apple_continuation.deinit();
-        try self.videoWindows(&.{}, null, end - origin, origin, 1_000_000_000, null, .{ .reader = reader, .index = &indexed, .timeline = &timeline, .continuation = &continuation, .apple_continuation = &apple_continuation });
+        try self.videoWindows(&.{}, null, snapshot.duration, snapshot.origin, 1_000_000_000, null, .{ .reader = reader, .index = &indexed, .timeline = &timeline, .continuation = &continuation, .apple_continuation = &apple_continuation });
     }
     const VideoSource = struct { bytes: []const u8, reader: ?*const media.mp4.Reader, origin: i64, timescale: u32, owner: ?*@import("media_chunking_video.zig").Owner, webm: ?@import("embedding_gemma2_video.zig").WebmInput };
     const VideoSlot = struct {
@@ -1593,4 +1605,61 @@ test "model aware media outputs preserve boundary plans and distinguish required
     try std.testing.expectError(error.BrokenPipe, runner.run());
     try std.testing.expectEqual(@as(u64, 0), runner.summary.next_ordinal);
     try std.testing.expectEqual(@as(usize, 0), runner.summary.output_counts[1].failed);
+}
+
+test "model aware media cached planning owns indexes and rebinds sources across paged MP4 AVC and WebM requests" {
+    const Cache = @import("media_index_cache.zig").Cache;
+    const memory = @import("../runtime/tier/memory.zig");
+    const Provider = struct {
+        bytes: []const u8,
+        reads: usize = 0,
+        controller: memory.AdmissionController = .{},
+        fn acquire(raw: *anyopaque, bytes: usize) !memory.AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.controller.tryAcquire(.cpu, .{ .host_limit_bytes = Cache.max_bytes }, .{ .host_scratch_bytes = bytes }, false);
+        }
+        fn read(raw: *anyopaque, offset: u64, out: []u8, control: media.source.Control) !usize {
+            try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            const first: usize = @intCast(offset);
+            const count = @min(out.len, self.bytes.len - first);
+            @memcpy(out[0..count], self.bytes[first..][0..count]);
+            return count;
+        }
+    };
+    const a = std.testing.allocator;
+    inline for (.{ "mjpeg-vfr.mov", "h264-frameonly.mp4", "vp8.webm" }) |name| {
+        const webm = std.mem.endsWith(u8, name, ".webm");
+        var cache: Cache = .{};
+        defer cache.deinit();
+        var provider = Provider{ .bytes = @embedFile("../testdata/video/" ++ name) };
+        var next_provider = Provider{ .bytes = provider.bytes };
+        var source = media.source.Source{ .allocator = a, .identity = name, .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = provider.bytes.len, .immutable_binding = @splat(1) } } };
+        const request = Request{ .input = .{ .binary = .{ .mime_type = if (webm) "video/webm" else "video/mp4", .data = &.{} } }, .native_source = &source, .source_version = "v1", .index_cache = &cache, .index_cache_admission = .{ .context = &provider, .acquire = Provider.acquire }, .policy = .{ .window_ns = 250 * std.time.ns_per_ms, .step_ns = 250 * std.time.ns_per_ms, .max_frames = 1 }, .max_chunks = 1 };
+        var first = Qualification{};
+        var runner = try Runner.init(a, request, first.executor(), .{}, .{ .context = &first, .accept = Qualification.accept });
+        const summary = try runner.run();
+        const hit = cache.get(Cache.key(&source, webm, request.limits.max_index_packets, request.max_working_bytes).?).?;
+        if (webm) {
+            try std.testing.expect(hit.webm_plan != null);
+            try std.testing.expect(hit.webm_plan.?.index.reader == null);
+        } else try std.testing.expect(hit.mp4_plan != null);
+        cache.release(hit);
+        var cursor: [85]u8 = undefined;
+        var resumed = request;
+        resumed.continuation = summary.identity.cursor(summary.next_ordinal, &cursor);
+        // The old request transport becomes unusable. A cached snapshot must
+        // never access it, even when picture headers required range reads.
+        source.storage.range.context = &next_provider;
+        const old_reads = provider.reads;
+        var second = Qualification{};
+        var replay = try Runner.init(a, resumed, second.executor(), .{}, .{ .context = &second, .accept = Qualification.accept });
+        _ = try replay.run();
+        try std.testing.expectEqual(old_reads, provider.reads);
+        try std.testing.expectEqual(@as(usize, 1), second.seen);
+        try std.testing.expectEqual(@as(u64, summary.next_ordinal + 1), replay.summary.next_ordinal);
+        try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) > 0);
+        try std.testing.expectEqual(@as(usize, 0), provider.controller.snapshot().hostTotalBytes());
+    }
 }

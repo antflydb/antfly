@@ -38832,6 +38832,20 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
         defer a.free(member);
         try std.testing.expect((try generations.readMember(a, &read, member)) != null);
         try std.testing.expectError(error.NotFound, read.get(member));
+        // Downstream assets consume the selected head proof, not nonexistent
+        // logical member rows. Exercise its real accepted provenance on disk.
+        const assets = @import("../artifact_asset_publication.zig");
+        var consumer = try Harness.capture(runtime, request, scope);
+        defer consumer.deinit();
+        const payload = (try assets.readUpstream(a, &consumer, &read, member)).?;
+        defer a.free(payload);
+        const head = consumer.reads.items[consumer.reads.items.len - 1].key;
+        var fence: assets.UpstreamFence = .{ .key = scope, .requires_value = true, .expected_chunk_count = 5000, .selected_chunk_head = head };
+        const command = try consumer.command(&.{});
+        try fence.bind(a, &read, command);
+        try fence.requireCurrent(&read);
+        fence.expected_chunk_count = 5001;
+        try std.testing.expectError(error.EnrichmentSourceChanged, fence.bind(a, &read, command));
     }
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(u32, 5000), db.core.index_manager.textIndex("text").?.snapshot().liveDocCount());

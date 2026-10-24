@@ -93,6 +93,7 @@ pub const UpstreamFence = struct {
     key: []const u8,
     requires_value: bool,
     expected_chunk_count: ?u32 = null,
+    selected_chunk_head: ?[]const u8 = null,
     certificate: ?@import("artifact_producer_provenance.zig").ArtifactCertificate = null,
     prepared: bool = false,
 
@@ -108,6 +109,18 @@ pub const UpstreamFence = struct {
         if (self.expected_chunk_count) |expected| {
             const manifest = try @import("artifact_chunk_manifest.zig").Manifest.decode(input.value orelse return error.EnrichmentSourceChanged);
             if (manifest.count != expected) return error.EnrichmentSourceChanged;
+            if (self.selected_chunk_head) |head| {
+                const raw = txn.get(head) catch |err| if (err == error.NotFound) return error.EnrichmentSourceChanged else return err;
+                const generations = @import("artifact_chunk_generation.zig");
+                const spec = try generations.Spec.decode(raw);
+                var plan = try generations.Plan.init(alloc, self.key, spec);
+                defer plan.deinit();
+                const state = try plan.load(txn);
+                if (state.retiring or !std.meta.eql(state.progress, spec.output) or !std.meta.eql(manifest, spec.output)) return error.EnrichmentSourceChanged;
+                self.certificate = try @import("artifact_producer_provenance.zig").certifyInheritedArtifact(alloc, txn, head, raw, command);
+                self.prepared = true;
+                return;
+            }
         }
         if (input.proofValue() != null) self.certificate = try @import("artifact_producer_provenance.zig").certifyInheritedArtifact(alloc, txn, input.proofKey(self.key), input.proofValue(), command);
         self.prepared = true;
@@ -188,6 +201,17 @@ pub fn prepare(alloc: std.mem.Allocator, command: publication.Command, catalogs:
     return prepared;
 }
 
+/// Compile membership once per source; repeated row checks do no linear scans.
+const GuardLookup = std.StringHashMap(void);
+fn guardedKeys(a: std.mem.Allocator, command: publication.Command, source_index: u32) !GuardLookup {
+    var result = GuardLookup.init(a);
+    errdefer result.deinit();
+    for (command.artifact_sources) |guard| {
+        if (guard.source_index == source_index and guard.content_digest != null) try result.put(guard.key, {});
+    }
+    return result;
+}
+
 fn requireMediaOutput(alloc: std.mem.Allocator, command: publication.Command, config: @import("catalog/enrichment_catalog.zig").EnrichmentConfig, configs: []const @import("catalog/enrichment_catalog.zig").EnrichmentConfig, effect: publication.Mutation) !UpstreamFence {
     const source = command.sources[effect.source_index];
     const upstream = for (configs) |entry| {
@@ -207,10 +231,12 @@ fn requireMediaOutput(alloc: std.mem.Allocator, command: publication.Command, co
     const result = try std.json.parseFromSliceLeaky(Output, alloc, effect.value orelse return error.InvalidBatchRequest, .{ .ignore_unknown_fields = true });
     if (!std.mem.eql(u8, result.object, "media.output.list") or !std.mem.eql(u8, result.source_artifact_name, upstream.name) or !std.mem.eql(u8, result.output_name, target.name)) return error.InvalidBatchRequest;
     const manifest = try @import("artifact_chunk_manifest.zig").keyAlloc(alloc, source.document_key, upstream.name);
-    const manifest_guarded = for (command.artifact_sources) |guard| {
-        if (guard.source_index == effect.source_index and std.mem.eql(u8, guard.key, manifest) and guard.content_digest != null) break true;
-    } else false;
-    if (!manifest_guarded) return error.InvalidBatchRequest;
+    var guards = try guardedKeys(alloc, command, effect.source_index);
+    defer guards.deinit();
+    if (!guards.contains(manifest)) return error.InvalidBatchRequest;
+    const head = try alloc.dupe(u8, manifest);
+    head[keys.findComponentTerminator(head, 1).? + 2] = keys.producer_generation_head_kind;
+    const selected_head: ?[]const u8 = if (guards.contains(head)) head else null;
     for (result.chunks, 0..) |row, ordinal| {
         if (row.chunk_id != ordinal or row.outputs.len == 0) return error.InvalidBatchRequest;
         for (row.outputs, 0..) |value, sub_index| {
@@ -222,10 +248,7 @@ fn requireMediaOutput(alloc: std.mem.Allocator, command: publication.Command, co
             if (value.sub_index != sub_index or (value.required and value.status != .complete and !value.terminal)) return error.InvalidBatchRequest;
         }
         const member = try keys.chunkArtifactKeyAlloc(alloc, source.document_key, upstream.name, @intCast(ordinal));
-        const guarded = for (command.artifact_sources) |guard| {
-            if (guard.source_index == effect.source_index and std.mem.eql(u8, guard.key, member) and guard.content_digest != null) break true;
-        } else false;
-        if (!guarded) return error.InvalidBatchRequest;
+        if (selected_head == null and !guards.contains(member)) return error.InvalidBatchRequest;
     }
     const claimed = try std.json.parseFromSliceLeaky(@import("enrichment/media_output.zig").Projection, alloc, effect.value.?, .{ .ignore_unknown_fields = true });
     const projection_rows = try alloc.alloc(@import("enrichment/media_output.zig").Row, result.chunks.len);
@@ -234,7 +257,7 @@ fn requireMediaOutput(alloc: std.mem.Allocator, command: publication.Command, co
     const expected_projection = try std.json.Stringify.valueAlloc(alloc, projected, .{ .emit_null_optional_fields = false });
     const claimed_projection = try std.json.Stringify.valueAlloc(alloc, claimed, .{ .emit_null_optional_fields = false });
     if (!std.mem.eql(u8, expected_projection, claimed_projection)) return error.InvalidBatchRequest;
-    return .{ .key = manifest, .requires_value = true, .expected_chunk_count = std.math.cast(u32, result.chunks.len) orelse return error.InvalidBatchRequest };
+    return .{ .key = manifest, .requires_value = true, .expected_chunk_count = std.math.cast(u32, result.chunks.len) orelse return error.InvalidBatchRequest, .selected_chunk_head = selected_head };
 }
 
 fn requireVectorLabels(alloc: std.mem.Allocator, command: publication.Command, config: @import("catalog/enrichment_catalog.zig").EnrichmentConfig, configs: []const @import("catalog/enrichment_catalog.zig").EnrichmentConfig, effect: publication.Mutation) !UpstreamFence {
@@ -250,28 +273,22 @@ fn requireVectorLabels(alloc: std.mem.Allocator, command: publication.Command, c
     var vocabulary = try @import("enrichment/vector_labels.zig").parse(alloc, producer.config_json);
     defer vocabulary.deinit();
     const manifest = try @import("artifact_chunk_manifest.zig").keyAlloc(alloc, source.document_key, upstream.source_artifact_name);
-    var has_manifest = false;
-    for (command.artifact_sources) |guard| if (guard.source_index == effect.source_index and std.mem.eql(u8, guard.key, manifest) and guard.content_digest != null) {
-        has_manifest = true;
-        break;
-    };
-    if (!has_manifest) return error.InvalidBatchRequest;
+    var guards = try guardedKeys(alloc, command, effect.source_index);
+    defer guards.deinit();
+    if (!guards.contains(manifest)) return error.InvalidBatchRequest;
+    var names = std.StringHashMap(void).init(alloc);
+    defer names.deinit();
+    for (vocabulary.value.labels) |label| try names.put(label.label, {});
     for (result.chunks, 0..) |row, ordinal| {
         if (row.chunk_id != ordinal or row.labels.len > vocabulary.value.top_k) return error.InvalidBatchRequest;
         for (row.labels, 0..) |score, i| {
             if (!std.math.isFinite(score.score)) return error.InvalidBatchRequest;
-            const known = for (vocabulary.value.labels) |candidate| {
-                if (std.mem.eql(u8, candidate.label, score.label)) break true;
-            } else false;
-            if (!known) return error.InvalidBatchRequest;
+            if (!names.contains(score.label)) return error.InvalidBatchRequest;
             if (i != 0 and row.labels[i - 1].score < score.score) return error.InvalidBatchRequest;
         }
         const member = try keys.chunkArtifactKeyAlloc(alloc, source.document_key, upstream.source_artifact_name, @intCast(ordinal));
         const vector = try keys.derivedEmbeddingArtifactKeyAlloc(alloc, member, upstream.name);
-        const guarded = for (command.artifact_sources) |guard| {
-            if (guard.source_index == effect.source_index and std.mem.eql(u8, guard.key, vector) and guard.content_digest != null) break true;
-        } else false;
-        if (!guarded) return error.InvalidBatchRequest;
+        if (!guards.contains(vector)) return error.InvalidBatchRequest;
     }
     return .{ .key = manifest, .requires_value = true, .expected_chunk_count = std.math.cast(u32, result.chunks.len) orelse return error.InvalidBatchRequest };
 }
@@ -401,4 +418,36 @@ test "model aware media vector label publication requires the complete guarded e
     try std.testing.expectError(error.InvalidBatchRequest, requireVectorLabels(owned, command, config, &configs, effect));
     command.artifact_sources = guards[1..];
     try std.testing.expectError(error.InvalidBatchRequest, requireVectorLabels(owned, command, config, &configs, effect));
+}
+
+test "model aware media selected chunk heads authorize downstream outputs without legacy member guards" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const C = @import("catalog/enrichment_catalog.zig").EnrichmentConfig;
+    const config = C{ .name = "speech", .kind = .asset, .source_field = "", .source_artifact_name = "clips", .producer_json = "{\"type\":\"media_output\",\"config\":{\"output_name\":\"speech\"}}" };
+    const configs = [_]C{ config, .{ .name = "clips", .kind = .chunk, .source_field = "body", .chunker_json = "{\"provider\":\"antfly\",\"outputs\":{\"boundary_model\":\"speech\",\"targets\":[{\"name\":\"speech\",\"kind\":\"transcribe\",\"model\":\"whisper\"}]}}" } };
+    const manifest = try @import("artifact_chunk_manifest.zig").keyAlloc(a, "doc", "clips");
+    const member = try keys.chunkArtifactKeyAlloc(a, "doc", "clips", 0);
+    const head = try a.dupe(u8, manifest);
+    head[keys.findComponentTerminator(head, 1).? + 2] = keys.producer_generation_head_kind;
+    const O = @import("inference_chunker").outputs;
+    const rows = [_]O.Row{.{ .chunk_id = 0, .outputs = &.{.{ .name = "speech", .kind = .transcribe, .required = true, .model = "whisper", .model_identity = "", .model_revision = "", .recipe_id = "", .status = .failed, .code = "Unavailable", .terminal = true }} }};
+    const projection = try O.project(a, &rows);
+    const value = try std.json.Stringify.valueAlloc(a, .{ .object = "media.output.list", .source_artifact_name = "clips", .output_name = "speech", .chunks = rows, .text = projection.text, .transcript_spans = projection.transcript_spans, .complete_chunks = projection.complete_chunks, .failed_chunks = projection.failed_chunks, .terminal_chunks = projection.terminal_chunks, .status = projection.status }, .{ .emit_null_optional_fields = false });
+    const effect = publication.Mutation{ .family = .document_artifact, .key = "unused", .source_index = 0, .value = value };
+    const sources = [_]publication.Source{.{ .document_key = "doc", .timestamp = 1, .content_digest = @splat(1), .input_position = null }};
+    var guards = [_]publication.ArtifactSource{ .{ .key = manifest, .content_digest = @splat(2), .input_position = null, .source_index = 0 }, .{ .key = member, .content_digest = @splat(3), .input_position = null, .source_index = 0 } };
+    var command = publication.Command{ .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_name = "speech", .producer_generation = 1, .sources = &sources, .artifact_sources = &guards, .mutations = &.{effect}, .publication_digest = @splat(0) };
+    try std.testing.expect((try requireMediaOutput(a, command, config, &configs, effect)).selected_chunk_head == null);
+    guards[1].key = head;
+    const selected = try requireMediaOutput(a, command, config, &configs, effect);
+    try std.testing.expectEqualStrings(head, selected.selected_chunk_head.?);
+    guards[1].content_digest = null;
+    try std.testing.expectError(error.InvalidBatchRequest, requireMediaOutput(a, command, config, &configs, effect));
+    guards[1].content_digest = @splat(3);
+    guards[1].key = try keys.chunkArtifactKeyAlloc(a, "another-doc", "clips", 0);
+    try std.testing.expectError(error.InvalidBatchRequest, requireMediaOutput(a, command, config, &configs, effect));
+    command.artifact_sources = guards[1..];
+    try std.testing.expectError(error.InvalidBatchRequest, requireMediaOutput(a, command, config, &configs, effect));
 }

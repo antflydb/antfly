@@ -18,6 +18,8 @@
 //! always rebound to the current request. Unpinned ranges bypass the cache.
 const std = @import("std");
 const media = @import("antfly_media");
+const video = @import("antfly_video");
+const video_owner = @import("media_chunking_video.zig");
 const admitted = @import("../backends/admitted_allocator.zig");
 pub const Cache = struct {
     pub const max_bytes = 64 * 1024 * 1024;
@@ -51,11 +53,33 @@ pub const Cache = struct {
             }
         },
     };
+    pub const WebmSnapshot = struct {
+        index: video.webm_pictures.Index,
+        source_bound: bool,
+        timeline: video.sampling.Timeline,
+        origin: i64,
+        duration: i128,
+        fn copy(a: std.mem.Allocator, value: WebmSnapshot) !WebmSnapshot {
+            var result = value;
+            result.index.reader = null;
+            result.index.reservation = .{};
+            result.index.allocator = a;
+            result.index.pictures = try a.dupe(video.webm_pictures.Picture, value.index.pictures);
+            result.index.restarts = try a.dupe(video.webm_pictures.Restart, value.index.restarts);
+            result.timeline.allocator = a;
+            result.timeline.entries = try a.dupe(@typeInfo(@TypeOf(value.timeline.entries)).pointer.child, value.timeline.entries);
+            result.timeline.maxima = try a.dupe(i128, value.timeline.maxima);
+            return result;
+        }
+    };
+    pub const Planning = union(enum) { mp4: *const video_owner.Owner, webm: WebmSnapshot };
     pub const Entry = struct {
         allocation: admitted.AdmittedAllocator,
         arena: std.heap.ArenaAllocator,
         key: [32]u8,
         data: Data,
+        mp4_plan: ?video_owner.Snapshot = null,
+        webm_plan: ?WebmSnapshot = null,
         refs: usize = 1,
         used: u64 = 0,
         bytes: usize = 0,
@@ -104,6 +128,9 @@ pub const Cache = struct {
     /// Best-effort retention after admitted parsing. The cache holds its own
     /// node host-memory reservation rather than borrowing a request's permit.
     pub fn remember(self: *Cache, a: std.mem.Allocator, identity: [32]u8, data: Input, admission: Admission) void {
+        self.rememberPlanned(a, identity, data, admission, null);
+    }
+    pub fn rememberPlanned(self: *Cache, a: std.mem.Allocator, identity: [32]u8, data: Input, admission: Admission, planning: ?Planning) void {
         const estimate = switch (data) {
             .mp4 => |r| std.math.mul(usize, r.packets.len, @sizeOf(media.mp4.Packet)) catch return,
             .webm => |r| (std.math.mul(usize, r.packets.len, @sizeOf(media.webm.Packet)) catch return) +| (std.math.mul(usize, r.cues.len, @sizeOf(media.webm.Cue)) catch return),
@@ -115,6 +142,19 @@ pub const Cache = struct {
         self.copy(entry, data) catch {
             entry.destroy();
             return;
+        };
+        if (planning) |value| switch (value) {
+            .mp4 => |owner| {
+                // In-band parameter registries own mutable request context.
+                if (owner.registry == null) entry.mp4_plan = video_owner.Snapshot.copy(entry.arena.allocator(), owner) catch {
+                    entry.destroy();
+                    return;
+                };
+            },
+            .webm => |snapshot| entry.webm_plan = WebmSnapshot.copy(entry.arena.allocator(), snapshot) catch {
+                entry.destroy();
+                return;
+            },
         };
         entry.bytes = entry.allocation.reserved_bytes + @sizeOf(Entry);
         if (entry.bytes > max_bytes) {
@@ -259,4 +299,30 @@ test "model aware media immutable container cache owns metadata and fences sourc
     try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) > 0);
     try std.testing.expectEqual(@as(usize, 0), cache.bytes);
     try std.testing.expectEqual(@as(usize, 0), provider.controller.snapshot().hostTotalBytes());
+}
+
+test "model aware media cached planning allocation failures release every host lease" {
+    const a = std.testing.allocator;
+    const memory = @import("../runtime/tier/memory.zig");
+    const Admission = struct {
+        fn acquire(raw: *anyopaque, bytes: usize) !memory.AdmissionLease {
+            const controller: *memory.AdmissionController = @ptrCast(@alignCast(raw));
+            return controller.tryAcquire(.cpu, .{ .host_limit_bytes = Cache.max_bytes }, .{ .host_scratch_bytes = bytes }, false);
+        }
+    };
+    var source = media.source.Source{ .allocator = a, .identity = "immutable", .storage = .{ .borrowed = &.{} } };
+    var packets = [_]media.mp4.Packet{.{ .offset = 0, .size = 1, .dts = 0, .media_pts = 0, .pts = 0, .duration = 1, .sync = true }};
+    var reader = media.mp4.Reader{ .allocator = a, .input = &source, .metadata = .{ .bytes = &.{}, .source = null }, .track = .{ .id = 1, .codec = .mjpeg, .timescale = 1, .width = 1, .height = 1, .avcc = &.{}, .nal_length_bytes = 4, .display_matrix = @splat(0) }, .packets = &packets, .limits = .{} };
+    var pool: media.admission.Pool = .{ .limits = .{ .host_bytes = 1024 * 1024 } };
+    var owner = try video_owner.Owner.init(a, &reader, &pool, .{});
+    defer owner.deinit();
+    for (0..32) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        var controller: memory.AdmissionController = .{};
+        var cache: Cache = .{};
+        cache.rememberPlanned(failing.allocator(), @splat(1), .{ .mp4 = reader }, .{ .context = &controller, .acquire = Admission.acquire }, .{ .mp4 = &owner });
+        cache.deinit();
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+    }
 }
