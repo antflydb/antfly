@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {tenantEnvs} from "./tenants.mjs";
 import {encode as encodeCoordinatorValue} from "./r2-coordinator-store.mjs";
 import {openAuthority} from "./coordinator-authority.mjs";
 import { DurableObject } from "cloudflare:workers";
@@ -20,7 +21,7 @@ import { CollectionJournal } from "./collection-journal.mjs";
 // Small WAL/progress metadata and the bounded collection journal live here.
 // Immutable database pages remain in R2, avoiding a hot R2 HEAD overwrite.
 export class CommitCoordinator extends DurableObject {
-  constructor(ctx, env) { super(ctx, env); this.journal = new CollectionJournal(ctx.storage); this.namespace = env.ANTFLY_INCARNATION;
+  constructor(ctx, env) { super(ctx, env); if(env.ANTFLY_TENANTS){const binding=env.LEGACY_COMMITS??env.COMMITS;env=tenantEnvs(env).find(candidate=>binding.idFromName(candidate.ANTFLY_INCARNATION).equals(ctx.id));if(!env)throw new Error("UnknownTenant");} this.journal = new CollectionJournal(ctx.storage); this.namespace = env.ANTFLY_INCARNATION;
     ctx.blockConcurrencyWhile(async () => {await openAuthority(env, "sqlite", {allowRetired: !!ctx.storage.kv.get("__antfly_r2_migration"), allowExistingSqlite: ctx.storage.kv.list({limit:1}).size > 0});});
   }
   assertNotMigrating() {

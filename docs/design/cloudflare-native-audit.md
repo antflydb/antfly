@@ -22,6 +22,10 @@ frontiers and metadata directly in R2, and supports explicit frozen migration
 from the SQLite compatibility profile. See the
 [backend design](antfly-object-storage-backend.md) and
 [current qualification evidence](cloudflare-qualification.md#antfly-native-r2-coordinator-2026-10-24).
+The [optimized R2 path](cloudflare-performance.md) adds one-RPC read views,
+whole-operation mutation commits, body packs, bounded warm caches and tenant
+routing; its live fixture records 124 ms median warm reads before namespace
+replacement and 132 ms afterward.
 The SQLite pressure measurements below describe the compatibility profile;
 its recovered memory error was not root-caused. The new profile removes
 application SQL/KV queries. The ANN recall limitation remains independent.

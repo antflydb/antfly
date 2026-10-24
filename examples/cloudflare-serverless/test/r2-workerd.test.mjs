@@ -47,9 +47,9 @@ async function fixture(namespace, migration = false) {
   `},{type:"ESModule",path:join(output,"worker.js")},...wasm.map(name=>({type:"CompiledWasm",path:join(output,name)}))],compatibilityDate:"2026-10-23",bindings:{API_TOKEN:"test-r2",ANTFLY_INCARNATION:namespace,PAGED_PROJECTIONS:"true",PUBLICATION_RECORDS:"8",COORDINATOR_BACKEND:migration?"sqlite":"r2"},r2Buckets:["DATABASE"],durableObjects:{COMMITS:{className:migration?"CommitCoordinator":"R2CommitCoordinator",useSQLite:true,unsafeUniqueKey:migration?"legacy":"native"}},resourcePersistencePath:join(persist,"resources"),isolatedResourcePersistencePath:join(persist,"isolated")};
   let mf;
   const reopen=async()=>{if(mf)await mf.dispose();mf=new Miniflare(convertV4MiniflareOptions(options));};
-  const call=async(body,path="/api",allowed=200)=>{
+  const call=async(body,path="/api",allowed=200,tenant)=>{
     for(let attempt=0;attempt<20;attempt++){
-      const response=await mf.dispatchFetch("https://test.invalid"+path,{method:"POST",headers:{Authorization:"Bearer test-r2"},body:JSON.stringify(body)});
+      const response=await mf.dispatchFetch("https://test.invalid"+path,{method:"POST",headers:{Authorization:"Bearer test-r2",...(tenant?{"X-Antfly-Tenant":tenant}:{})},body:JSON.stringify(body)});
       const result=await response.json();
       if(response.status===503&&/CoordinatorRecovering|ObjectStoreTransportFailed/.test(result.error)&&allowed===200){continue;}
       assert.equal(response.status,allowed,JSON.stringify(result));return result;
@@ -68,10 +68,12 @@ test("R2-native coordination survives eviction, both collectors, reindex and era
     await f.reopen();
     assert.deepEqual(await f.call(mutation),receipt);
     assert.equal((await f.call({op:"count"})).count,"40");
+    const pinnedPage=await f.call({op:"search",text:"durable",limit:2,required_visibility:receipt.visibility});assert.ok(pinnedPage.cursor);
     const reindex=await f.call({op:"reindex"});
     await f.call({op:"reindex",reindex_action:"step",reindex_job_id:reindex.job_id});
     await f.call({op:"mutate",operation_id:"native-edit",mutations:[{kind:"upsert",doc_id:"needle",body:'{"text":"replacementneedle","embedding":[0,1],"sparse_embedding":{"needle":1}}'}]});
     while((await f.call({op:"publish"})).has_more){}
+    const nextPage=await f.call({op:"search",text:"durable",limit:2,required_visibility:receipt.visibility,cursor:pinnedPage.cursor});assert.equal(nextPage.visibility,pinnedPage.visibility);assert.equal(new Set([...pinnedPage.hits,...nextPage.hits].map(hit=>hit.doc_id)).size,4);
     let dataDone=false,metaDone=false,dataDelay=0,metaDelay=0;
     for(let i=0;i<128;i++){const r=await f.call({op:"collect"});if(r.done){dataDone=true;break;}if(r.delay_seconds){dataDelay=r.delay_seconds;break;}}
     for(let i=0;i<128;i++){const r=await f.call({op:"collect_metadata"});if(r.done){metaDone=true;break;}if(r.delay_seconds){metaDelay=r.delay_seconds;break;}}
@@ -121,4 +123,19 @@ test("SQLite migration freezes the source and preserves receipts, profiles and a
     assert.equal(await f.call({},"/profile"),true);
     assert.match((await f.call({},"/source-frozen-write")).error,/CoordinatorMigrationFrozen/);
   }finally{await f.close();}
+});
+
+
+test("tenant commit domains isolate identical IDs and admit grouped writers",{timeout:120000},async()=>{
+ const f=await fixture("tenant-root");try{
+  f.options.bindings.ANTFLY_TENANTS=JSON.stringify({a:{incarnation:"tenant-a",storage_id:"tenant-store-a"},b:{incarnation:"tenant-b",storage_id:"tenant-store-b"}});await f.reopen();
+  const mutation=label=>({op:"mutate",operation_id:"same-operation",mutations:[{kind:"upsert",doc_id:"same-document",body:JSON.stringify({text:label})}]});
+  const a=await f.call(mutation("first"),"/api",200,"a"),b=await f.call(mutation("second"),"/api",200,"b");assert.notEqual(a.visibility,b.visibility);
+  while((await f.call({op:"publish"},"/api",200,"a")).has_more){}while((await f.call({op:"publish"},"/api",200,"b")).has_more){}
+  assert.equal(JSON.parse((await f.call({op:"lookup",doc_id:"same-document"},"/api",200,"a")).body).text,"first");assert.equal(JSON.parse((await f.call({op:"lookup",doc_id:"same-document"},"/api",200,"b")).body).text,"second");
+  await Promise.all(Array.from({length:8},(_,i)=>f.call({op:"mutate",operation_id:`concurrent/${i}`,mutations:[{kind:"upsert",doc_id:`writer/${i}`,body:'{"text":"concurrent"}'}]},"/api",200,"a")));
+  assert.equal((await f.call({op:"count"},"/api",200,"a")).count,"9");assert.equal((await f.call({op:"count"},"/api",200,"b")).count,"1");assert.equal((await f.call({op:"count"})).count,"0");
+  assert.match((await f.call({op:"lookup",doc_id:"same-document",required_visibility:a.visibility},"/api",409,"b")).error,/VisibilityIncarnationMismatch/);
+  await f.reopen();assert.deepEqual(await f.call(mutation("first"),"/api",200,"a"),a);assert.match((await f.call({op:"count"},"/api",409,"missing")).error,/UnknownTenant/);
+ }finally{await f.close();}
 });

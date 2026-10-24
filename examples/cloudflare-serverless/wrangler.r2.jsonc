@@ -35,7 +35,8 @@
   ],
   "vars": {
     "ANTFLY_INCARNATION": "example-r2-v1",
-    "COORDINATOR_BACKEND": "r2"
+    "COORDINATOR_BACKEND": "r2",
+    "AUTO_GC": "true"
   },
   "ai": {
     "binding": "AI"

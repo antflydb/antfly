@@ -64,12 +64,13 @@ export async function collectCoordinator(store, bucket, now = Date.now, expected
       // Physical deletion precedes the cursor commit. Repeating this bounded
       // page after an ambiguous outcome is safe; only retired identities qualify.
       if (deletable.length) await bucket.delete(deletable);
+      state.stats??={scanned:0,deleted:0,reclaimed_bytes:0};state.stats.scanned+=page.objects.length;state.stats.deleted+=deletable.length;const deleted=new Set(deletable);state.stats.reclaimed_bytes+=page.objects.reduce((n,item)=>n+(deleted.has(item.key)?item.size:0),0);
       state.cursor = page.truncated ? page.cursor : null;
       if (!page.truncated) state.phase = state.phase === "pages" ? "logs" : "cleanup";
     } else if (state.phase === "cleanup") {
       const marks = [...await tx.list({prefix: MARK, limit: 128})];
       for (const [key] of marks) tx.delete(key);
-      if (!(await tx.list({prefix: MARK, limit: 1})).size) {tx.delete(STATE); return {done: true,job_id:state.id};}
+      if (!(await tx.list({prefix: MARK, limit: 1})).size) {tx.delete(STATE); return {done: true,job_id:state.id,stats:state.stats??{scanned:0,deleted:0,reclaimed_bytes:0}};}
     } else throw new Error("InvalidCoordinatorCollection");
     tx.put(STATE,state);
     return {has_more: true, job_id:state.id, phase: state.phase};

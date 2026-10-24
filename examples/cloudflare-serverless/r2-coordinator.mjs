@@ -13,6 +13,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {metadataCollectionDue} from "./maintenance-policy.mjs";
+import {instrumentTransport} from "./performance.mjs";
+import {PublicationScheduler} from "./publication-scheduler.mjs";
+import {tenantEnvs} from "./tenants.mjs";
+import {openReadView} from "./read-view.mjs";
+import {instantiateHost} from "../../zig/lib/objectstore/wasm/asyncify.mjs";
+import {createR2Transport} from "../../zig/lib/objectstore/wasm/r2.mjs";
+import {withCommitCoordinator} from "../../zig/lib/objectstore/wasm/coordinated.mjs";
 import {openAuthority, activateR2} from "./coordinator-authority.mjs";
 import {DurableObject} from "cloudflare:workers";
 import module from "./dist/antfly-serverless.wasm";
@@ -24,19 +32,27 @@ export class R2CommitCoordinator extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     if (!env.ANTFLY_INCARNATION) throw new Error("CoordinatorNamespaceRequired");
+    if(env.ANTFLY_TENANTS){const binding=env.COMMITS;env=tenantEnvs(env).find(candidate=>binding.idFromName(candidate.ANTFLY_INCARNATION).equals(ctx.id));if(!env)throw new Error("UnknownTenant");}
     this.env = env;
-    this.store = new R2CoordinatorStore(module, env.DATABASE, env.COORDINATOR_STORAGE_ID ?? env.ANTFLY_INCARNATION);
+    this.store = new R2CoordinatorStore(module, env.DATABASE, env.COORDINATOR_STORAGE_ID ?? env.ANTFLY_INCARNATION,{onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.coordinator",...sample}));}});
     this.serviceStore = Object.create(this.store);
     this.serviceStore.transaction = run => this.transaction(run);
-    this.journal = new R2CollectionJournal(this.serviceStore);
+    this.maintenanceStore=Object.create(this.store);this.maintenanceStore.transaction=run=>this.transaction(run,{priority:"maintenance"});
+    this.publication=new PublicationScheduler(this.maintenanceStore,env.ANTFLY_INCARNATION);
+    this.journal = new R2CollectionJournal(this.maintenanceStore);
     ctx.blockConcurrencyWhile(async () => {this.authority = await openAuthority(env, "r2");});
   }
-  transaction(run) {
+  requestPublication(force=false){return this.publication.request({force});}
+  validPublication(id){return this.publication.valid(id);}
+  abandonPublication(id){return this.publication.abandon(id);}
+  finishPublication(id,watermark){return this.publication.finish(id,watermark);}
+  openReadView(options) {return openReadView(this,this.env.ANTFLY_INCARNATION,options);}
+  transaction(run,options) {
     return this.store.transaction(async tx => {
       const migration = await tx.get(MIGRATION);
       if ((migration && migration.phase !== "active") || (this.env.COORDINATOR_MIGRATION_REQUIRED === "true" && !migration) || this.authority.descriptor.mode !== "r2") throw new Error("CoordinatorMigrationRequired");
       return run(tx);
-    });
+    },options);
   }
   async migrationStatus() {
     const state = await this.store.transaction(async tx => await tx.get(MIGRATION) ?? {phase:"none"});
@@ -53,7 +69,19 @@ export class R2CommitCoordinator extends DurableObject {
     }
     return result;
   }
-  collectMetadata(jobId) {return collectCoordinator(this.serviceStore, this.store.bucket, Date.now, jobId);}
+  async collectMetadata(jobId,{scheduled=false}={}) {
+    const key="__antfly_coord_gc/policy",now=Date.now();
+    if(scheduled&&!jobId){const due=await this.maintenanceStore.transaction(async tx=>{
+      if(await tx.get("__antfly_coord_gc/state"))return true;
+      const prior=await tx.get(key),revision=tx.snapshot().revision;
+      if(!prior){tx.put(key,{at:now,revision:revision+1});return false;}
+      return metadataCollectionDue(prior,revision,now);
+    });if(!due)return{done:true,skipped:true};}
+    const result=await collectCoordinator(this.maintenanceStore,this.store.bucket,Date.now,jobId);
+    if(result.done&&result.stats)await this.maintenanceStore.transaction(async tx=>{
+      const prior=await tx.get(key);if(prior?.job_id!==result.job_id)tx.put(key,{at:Date.now(),revision:tx.snapshot().revision+1,job_id:result.job_id,stats:result.stats});
+    });return result;
+  }
   publicationBudget(maximum) {
     if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 256) throw new Error("InvalidPublicationBudget");
     return this.transaction(async tx => Math.min(maximum, await tx.get("__antfly_publication_budget") ?? maximum));
@@ -74,7 +102,11 @@ export class R2CommitCoordinator extends DurableObject {
   objectCall(request, body) {
     if (!(/\/wal-v1\/[a-f0-9]{64}\/HEAD$/.test(request.key ?? "") || /\/progress\//.test(request.key ?? ""))) return {status: 3};
     if (body.byteLength > 4096) return {status: 4};
-    return this.transaction(async tx => {
+    return this.transaction(tx=>this.objectCallInTransaction(tx,request,body));
+  }
+  async objectCallInTransaction(tx,request,body) {
+      if(!(/\/wal-v1\/[a-f0-9]{64}\/HEAD$/.test(request.key??"")||/\/progress\//.test(request.key??"")))return{status:3};
+      if(body.byteLength>4096)return{status:4};
       if (request.collection != null) {try {await this.journal.valid(tx, request.collection);} catch {return {status: 5};}}
       const previous = await tx.get(request.key);
       if (request.op === "put") {
@@ -93,7 +125,20 @@ export class R2CommitCoordinator extends DurableObject {
         return {status: 0, json: {bucket: request.bucket, key: request.key, etag: previous.etag, content_length: previous.body.byteLength, content_type: previous.contentType}, body: request.op === "get" ? previous.body : undefined};
       }
       return {status: 3};
-    });
+  }
+  async mutateBatch(input) {
+    const bytes=new TextEncoder().encode(JSON.stringify(input)).byteLength;
+    if(bytes>1024*1024)throw new Error("RequestTooLarge");
+    if((this.pendingMutations??0)>=16||(this.pendingMutationBytes??0)+bytes>4*1024*1024)throw new Error("CoordinatorCommitBusy");
+    this.pendingMutations=(this.pendingMutations??0)+1;this.pendingMutationBytes=(this.pendingMutationBytes??0)+bytes;
+    // Immutable uploads finish inside this callback. HEADs and publication
+    // admission stay in its overlay until the shared metadata commit is durable.
+    try{return await this.transaction(async tx=>{
+      const transport=this.store.cache.wrap(withCommitCoordinator(instrumentTransport(createR2Transport({database:this.env.DATABASE},{maxPutBytes:4*1024*1024}),this.store.physical),{objectCall:(request,body)=>this.objectCallInTransaction(tx,request,body)}),this.env.ANTFLY_INCARNATION);
+      this.mutationHost??=await instantiateHost(module,transport);
+      try{const result=await this.mutationHost.request({...input,op:"mutate",namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly"},{transport,deadlineMs:this.store.deadline,maxOperations:1024-this.store.usedOperations,maxTransferBytes:32*1024*1024-this.store.usedBytes,onMetrics:sample=>this.store.chargeMetrics(sample)});result.__publication=await this.publication.reserve(tx,String(BigInt("0x"+result.visibility.slice(-16))));return result;}
+      finally{if(!this.mutationHost.usable()||this.mutationHost.memoryBytes()>=24*1024*1024)this.mutationHost=null;}
+    });}finally{this.pendingMutations--;this.pendingMutationBytes-=bytes;}
   }
   pruneEmbeddingCheckpointMetadata(namespace, today) {
     if (namespace !== this.env.ANTFLY_INCARNATION || !Number.isSafeInteger(today) || today < 0) throw new Error("InvalidEmbeddingCheckpointSweep");

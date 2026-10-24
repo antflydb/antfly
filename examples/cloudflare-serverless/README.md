@@ -53,6 +53,36 @@ retain the freeze/authority checks; pre-migration code is not a supported rollba
 target. Its records are preserved for inspection; automatic migration does not delete them.
 
 
+## R2 performance and tenant routing
+
+The native profile opens one metadata snapshot per query, reuses durable
+reader pins, executes whole mutations in the writer, coalesces publication
+messages and prioritizes interactive metadata work. Immutable manifests/pages
+and bounded decoded rows remain warm. Recovery overlaps independent reads.
+See [the performance design](../../docs/design/cloudflare-performance.md).
+
+`PACK_SMALL_BODIES=false` disables creation of new facts-v4 body packs. Deploy
+new readers/collectors with packing disabled before enabling it on an existing
+rolling deployment. Existing v4 roots continue to require a v4-capable runtime.
+The fresh R2 profile enables application GC; metadata GC uses revision growth,
+observed reclamation yield and elapsed time to avoid repeated idle passes.
+
+Configure up to 32 independent tenant routes with `ANTFLY_TENANTS`:
+
+```json
+{"north":{"incarnation":"north-v1","storage_id":"north-store-v1"}}
+```
+
+Authenticated operator requests select one with `X-Antfly-Tenant: north`.
+Unknown/colliding routes are rejected; Queue and cron dispatch stay scoped.
+This is storage routing, with no cross-tenant transactions. End-user identity
+and authorization must be enforced by the app before selecting a route.
+
+`qualification/performance.mjs RUN_JSON HTTPS_ORIGIN` records 100 warm fenced
+reads and eight concurrent writers. Run again with `--reopen` after replacing
+the coordinator namespace against the same R2 data. Reports include retries
+and exact-body/count checks, not just successful-attempt timings.
+
 ## Build and test
 
 Use the repository's pinned Zig 0.17 toolchain and Node 24:

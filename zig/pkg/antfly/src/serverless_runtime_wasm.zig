@@ -105,6 +105,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     @import("antfly_platform").time.installHostClocks(.{ .monotonic_ns = monotonicNs, .realtime_ns = realtimeNs, .authority_ns = authorityNs });
     const Request = struct {
         op: enum { search, mutate, publish, compact, lookup, list, count, status, enrich, gc_prepare, gc_wal, gc_trace, reindex, coordinate },
+        pack_small_bodies: bool = false,
         coordinate: ?@import("serverless/coordinator_store.zig").Request = null,
         bucket: []const u8,
         prefix: []const u8,
@@ -157,6 +158,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     defer a.free(artifact_prefix);
     var object_artifacts = try @import("serverless/artifacts/object_store.zig").ObjectStore.initWithClient(a, host.client(), req.bucket, artifact_prefix);
     var artifacts = object_artifacts.artifactStore();
+    artifacts.pack_document_bodies = req.pack_small_bodies;
     defer artifacts.deinit();
     const manifest_prefix = try std.fmt.allocPrint(a, "{s}/manifests", .{req.prefix});
     defer a.free(manifest_prefix);

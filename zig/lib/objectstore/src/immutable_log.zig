@@ -155,6 +155,7 @@ pub const Log = struct {
         };
         try self.authenticate(a, state, checkpoint_value);
         for (0..max_steps) |_| {
+            if (!takeover and !std.mem.eql(u8, &state.owner, &self.owner)) return error.ImmutableLogFenced;
             if (self.cancellation) |token| try token.check();
             const sealed_key = try self.key(a, state.epoch, null);
             if (try self.read(a, sealed_key)) |stored| {
@@ -187,6 +188,7 @@ pub const Log = struct {
             if (state.next == epoch_commits) state = try self.seal(a, state, self.owner);
             return .{ .state = state };
         }
+        if (!takeover and !std.mem.eql(u8, &state.owner, &self.owner)) return error.ImmutableLogFenced;
         return .{ .state = state, .has_more = true };
     }
     fn seal(self: Log, a: A, source: State, owner: [16]u8) !State {

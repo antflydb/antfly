@@ -14,7 +14,7 @@
 // limitations under the License.
 
 //! Bounded native graph tracing for a durable hosted collector. Scheduling,
-//! marks and its frontier live in the coordinator's SQLite database; every
+//! marks and its frontier live in the coordinator's transactional store; every
 //! object is decoded/authenticated by the same native serving formats.
 const std = @import("std");
 const tree = @import("graph_segment/page_tree.zig");
@@ -202,7 +202,7 @@ pub const Context = struct {
                     } else if (task.kind == .facts_page) {
                         const fact = try facts.Fact.decode(entry.value);
                         const id = try fact.body.identity(pages.domain);
-                        try children.append(a, .{ .kind = .blob, .artifact = .{ .artifact_id = try a.dupe(u8, &id), .byte_len = fact.body.bytes, .checksum = try a.dupe(u8, &std.fmt.bytesToHex(fact.body.digest, .lower)) } });
+                        try children.append(a, .{ .kind = .blob, .artifact = .{ .artifact_id = try a.dupe(u8, &id), .byte_len = if (fact.body.pack) |pack| pack.bytes else fact.body.bytes, .checksum = try a.dupe(u8, &std.fmt.bytesToHex(if (fact.body.pack) |pack| pack.digest else fact.body.digest, .lower)) } });
                     }
                 }
                 if (end < page.entries.len) {
@@ -224,7 +224,7 @@ pub const Context = struct {
 fn appendArtifacts(a: A, children: *std.ArrayListUnmanaged(Task), refs: []const manifests_mod.ArtifactRef) !void {
     for (refs) |artifact| switch (artifact.kind) {
         .document_facts => {
-            if (artifact.metadata_version != facts.Root.metadata_version) return error.CollectionArtifactUnsupported;
+            if (artifact.metadata_version != facts.Root.metadata_version and artifact.metadata_version != 4) return error.CollectionArtifactUnsupported;
             try children.append(a, .{ .kind = .facts_root, .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum, .metadata_version = artifact.metadata_version } });
         },
         .text_segment => try children.append(a, .{ .kind = if (artifact.metadata_version == @import("text_segment/paged.zig").metadata_version) .text_root else .blob, .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum, .metadata_version = artifact.metadata_version } }),

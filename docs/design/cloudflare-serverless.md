@@ -175,3 +175,8 @@ or hierarchical routing layer remains necessary where the measured
 recall/latency tradeoff does not meet application requirements. The resumable
 reindex operation rebuilds current native definitions; it does not implement
 DDL migration or graph/external-source reconstruction.
+
+
+The [performance design](cloudflare-performance.md) documents one-RPC read
+snapshots, whole mutation batches, body packing, tenant routing and the
+measurement/rollout contract for the native R2 coordinator.

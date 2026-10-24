@@ -296,6 +296,15 @@ module boundary. Live R2 latency, throttling, cost and sustained workload eviden
 must be recorded separately from in-memory contract fixtures.
 
 
+## Hosted performance integration
+
+The subsequent [performance implementation](cloudflare-performance.md) adds
+atomic read views and shared pins, whole mutation execution, parallel recovery
+prefetch, bounded decoded caches, publication coalescing, adaptive maintenance,
+packed bodies and independently routed tenant commit domains. Its live results
+are recorded separately in the qualification document; the initial slow-read
+fixture below is not a forecast for that optimized path.
+
 ## Local scale evidence (2026-10-24)
 
 `node qualification/r2-scale.mjs 100000` exercises the compiled WASM backend with

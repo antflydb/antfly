@@ -22,7 +22,7 @@ export function createImmutableReadCache({ maxBytes = 8 * 1024 * 1024, maxEntrie
   // Commit log names are immutable within the native checkpoint floor.
   // Only the coordinator opts in; it reads that mutable floor uncached before
   // accepting cached cursors or acknowledging a write to a retired epoch.
-  const eligible = key => (includeCommitLog && /\/coord-v1\/[a-f0-9]{64}\/epochs\/[a-f0-9]{32}\/(?:[0-9]{20}\.json|START|SEALED)$/.test(key)) || /\/wal-v1\/[a-f0-9]{64}\/pages\/(?:[a-f0-9]{32}\/)?[a-f0-9]{64}$/.test(key) ||
+  const eligible = key => /\/manifests\/.+\/manifests\/[0-9]+\.bin$/.test(key) || (includeCommitLog && /\/coord-v1\/[a-f0-9]{64}\/epochs\/[a-f0-9]{32}\/(?:[0-9]{20}\.json|START|SEALED)$/.test(key)) || /\/wal-v1\/[a-f0-9]{64}\/pages\/(?:[a-f0-9]{32}\/)?[a-f0-9]{64}$/.test(key) ||
     /\/artifacts\/(?:sha256\/[a-f0-9]{2}\/[a-f0-9]{62}|graph\/[a-f0-9]{64}\/[a-f0-9]{32}\/[a-f0-9]{64})$/.test(key);
   function evict(key) { const item = entries.get(key); if (item) retained -= item.charge; entries.delete(key); }
   return {

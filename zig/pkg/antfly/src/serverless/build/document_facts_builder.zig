@@ -169,6 +169,7 @@ const PendingBodies = struct {
     seen: [64][32]u8 = undefined,
     seen_count: usize = 0,
     seen_next: usize = 0,
+    packed_bodies: std.AutoHashMapUnmanaged([32]u8, facts.BodyPack) = .empty,
 
     fn add(self: *@This(), body: []const u8, digest: [32]u8) !void {
         for (self.seen[0..self.seen_count]) |prior| if (std.mem.eql(u8, &prior, &digest)) return;
@@ -182,7 +183,11 @@ const PendingBodies = struct {
         self.seen_count = @min(self.seen.len, self.seen_count + 1);
     }
     fn flush(self: *@This()) !void {
-        try facts.putBodies(self.alloc, self.pages, self.items[0..self.length]);
+        if (self.length != 0 and self.pages.artifacts.pack_document_bodies and self.bytes + 16 <= facts.max_body_pack_bytes) {
+            var refs_out: [8]facts.BodyRef = undefined;
+            try facts.putBodyPack(self.alloc, self.pages, self.items[0..self.length], refs_out[0..self.length]);
+            for (refs_out[0..self.length]) |ref| try self.packed_bodies.put(self.alloc, ref.digest, ref.pack.?);
+        } else try facts.putBodies(self.alloc, self.pages, self.items[0..self.length]);
         self.length = 0;
         self.bytes = 0;
     }
@@ -209,6 +214,7 @@ pub fn publishAlloc(
     var cache = tree.Cache{ .alloc = alloc, .underlying = pages.store() };
     defer cache.deinit();
     var pending = PendingBodies{ .alloc = alloc, .pages = pages };
+    defer pending.packed_bodies.deinit(alloc);
     var replacements = std.ArrayListUnmanaged(facts.Replacement).empty;
     defer replacements.deinit(alloc);
     var seen = std.StringHashMapUnmanaged(void).empty;
@@ -232,6 +238,9 @@ pub fn publishAlloc(
         }
     }
     try pending.flush();
+    for (replacements.items) |*replacement| if (replacement.value) |*fact| {
+        if (fact.body.pack == null and std.mem.eql(u8, &fact.body.attempt, &pages.attempt)) fact.body.pack = pending.packed_bodies.get(fact.body.digest);
+    };
     var plan = try facts.planAlloc(alloc, cache.store(), source, replacements.items, wal_end_lsn);
     defer plan.deinit();
     const root = try plan.publish(cache.store(), source);
@@ -591,4 +600,44 @@ test "serverless packed body snapshots hydrate only mismatches and facts retain 
     try std.testing.expectEqualStrings(docs[1].body, result[1].body);
     try std.testing.expectEqualStrings("c", result[2].doc_id);
     try std.testing.expectEqual(@as(u64, root.page.?.bytes) + b.body.bytes + c.body.bytes, before - reads);
+}
+
+test "serverless document facts packed after-images reuse bodies and retain shared packs through GC" {
+    const a = std.testing.allocator;
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    var impl = try @import("../artifacts/object_store.zig").ObjectStore.initWithClient(a, memory.client(), "artifacts", "tenant");
+    var artifacts = impl.artifactStore();
+    defer artifacts.deinit();
+    artifacts.pack_document_bodies = true;
+    var reads: u64 = 16 * 1024 * 1024;
+    var writes: u64 = reads;
+    var pages = page_store.PageStore{ .domain = page_store.PageStore.namespaceDomain("packed-docs"), .attempt = @splat(1), .artifacts = &artifacts, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const docs = [_]materializer.Document{
+        .{ .doc_id = @constCast("a"), .body = @constCast("{\"text\":\"first\"}"), .last_lsn = 1, .last_timestamp_ns = 1 },
+        .{ .doc_id = @constCast("b"), .body = @constCast("{\"text\":\"second\"}"), .last_lsn = 2, .last_timestamp_ns = 2 },
+    };
+    const first = try publishAlloc(a, &pages, null, &docs, null, .{}, "{}", 2);
+    defer freeRef(a, first);
+    const root = try facts.loadRoot(a, &pages, first);
+    const original = (try facts.lookup(a, pages.store(), root, "a")).?;
+    try std.testing.expect(original.body.pack != null);
+    pages.attempt = @splat(2);
+    var changed = docs[0];
+    changed.last_lsn = 3;
+    const second = try publishAlloc(a, &pages, first, &.{changed}, &.{.{ .doc_id = "a", .body = docs[0].body, .kind = .upsert, .lsn = 3, .timestamp_ns = 3 }}, .{}, "{}", 3);
+    defer freeRef(a, second);
+    const next = try facts.loadRoot(a, &pages, second);
+    try std.testing.expectEqual(original.body, (try facts.lookup(a, pages.store(), next, "a")).?.body);
+    var retained = std.StringHashMapUnmanaged(void).empty;
+    defer {
+        var keys = retained.keyIterator();
+        while (keys.next()) |key| a.free(key.*);
+        retained.deinit(a);
+    }
+    try facts.retainRoot(a, &pages, second, &retained);
+    _ = try facts.reclaimRoot(a, &pages, first, &retained);
+    const body = try facts.readBodyAlloc(a, &pages, (try facts.lookup(a, pages.store(), next, "b")).?.body);
+    defer a.free(body);
+    try std.testing.expectEqualStrings(docs[1].body, body);
 }

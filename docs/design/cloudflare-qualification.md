@@ -134,3 +134,42 @@ removed, and the test storage was drained. The Worker, both Queues and R2 bucket
 were deleted. Removing a consumer from local Wrangler configuration alone does
 not remove the remote Queue consumer. The native-profile drain route avoids
 waking an empty coordinator, which would otherwise recreate authority metadata.
+
+
+## Optimized R2 read and write path (2026-10-24)
+
+The [performance implementation](cloudflare-performance.md) was qualified on
+fresh disposable resources using incarnation
+`qualification-antfly-1278-mvmnbmzg-f1070a-performance`.
+The initial measurement ran on Worker version
+`30e1cf47-5c8e-4c5b-b41a-e15f56bb818c`; recovery into a fresh
+`ReopenedR2CommitCoordinator` namespace ran on
+`4ddbcba7-c403-4595-8c54-fee8eb6b3d6d` against the same R2 data.
+
+Each run checked 100 warm fenced lookups after 32 warmups. Initial median/p95/p99
+were 124/386/499 ms; recovered values were 132/350/593 ms. No admission retries
+occurred. Every body and the original receipt were verified, with an exact
+final count of 264. The initial eight-writer burst took 13.51 seconds. The
+single-snapshot path used one coordinator RPC per lookup. The recovered run's
+warm measurements must not be presented as cold-start measurements.
+
+The earlier 7,524 ms median came from only three successful lookups in a
+different fixture. These results establish a substantial fixture improvement,
+not a production speedup ratio or sustained-QPS target. Writes still construct
+WAL updates serially, publication still makes multiple metadata exchanges, and
+ANN recall remains a separate limitation.
+
+Local checks passed 68 Node tests, the native serverless suite (538 passed, six
+skipped, no failures or leaks), thirteen focused document-facts tests, and the
+workerd recovery, migration, collection and tenant-isolation fixtures. They
+cover packed-body corruption, shared-pack retention, pin reuse, decoded-cache
+eviction, parallel-prefetch fencing, publication admission recovery, idle job
+suppression and pending-enrichment continuation.
+
+
+The final fencing audit also tests an old warm owner after 5,000 commits by its
+replacement under a frozen checkpoint clock. Recovery without takeover authority
+must fail before handing that owner another owner's bounded continuation. Both
+the native loop and adapter enforce this invariant. After measurement, Queue
+delivery was paused, its consumer removed, storage drained, and the disposable
+Worker, both Queues and bucket deleted.
