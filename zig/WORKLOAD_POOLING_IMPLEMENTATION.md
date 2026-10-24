@@ -26346,3 +26346,62 @@ Formatting, whitespace and the new module license pass. Full GNU qualification
 remains waived. Key comparison/publication, payload/pin and state preparation,
 and the broader default coordinator/cleanup/relief/default-gate work remain
 incomplete; the full design is not yet achieved.
+
+
+### Retained directory comparisons and immutable rank searches
+
+`run_comparison.Cursor` now preserves directory read-order, ID, lower-bound,
+upper-endpoint and domain ordering through original checkpoints. It captures a
+fixed scalar/byte comparison plan, compares at most 16 KiB of namespace, key or
+domain bytes between checkpoints, and retains the exact field/offset through
+rejection. Null namespaces still precede present-empty namespaces; L0 visibility
+remains descending with the physical-ID fallback and final ID tie breaks.
+The standalone endpoint-bound comparison uses the same retained byte engine.
+Completed cursors still check the next original's lifetime before returning a
+cached result. No key-size restriction, heap allocation or retained original
+port is introduced. Caller-owned fixed headers and all operand bytes stay pinned.
+
+The generic ordered index now exposes a retained immutable-root `Search` with
+rank, matched node and visited-node count. A comparison rejected inside a large
+prefix remains attached to its current node; successful descent and rank
+advancement have no fallible gap. Directory read-order/ID/lower/upper searches
+bind the appropriate comparison policy. Roots and probes are borrowed, and the
+caller must pin the immutable root for the entire continuation. The rank is
+valid only for that exact epoch and cannot be reused on a mutable successor.
+
+Legacy directory comparisons, read-order lookup and by-ID lookup drive the
+same cursors synchronously with a null original. Existing summaries also use
+the shared bound comparison. This removes duplicated ordering rules while
+leaving synchronous summary refresh/publication explicitly legacy; the new
+search cursor does not make a tree mutation admitted. The next coordinator can
+compute ranks under original admission before any mutation begins.
+
+Differential tests use independent copies of the previous ordering rules over
+null/empty/named namespaces, large common prefixes, multiple levels, visibility
+fallbacks, physical IDs, endpoint ties and domains. Rejection tests cover every
+original checkpoint with three exact errors, witness the byte quantum, and
+prove no prefix replay by comparing visited-byte totals. Immutable-root tests
+cover every rank-search checkpoint, successful hits, insertion misses, empty
+roots, all four indexes and an old epoch pinned across successor publication;
+visited-node counts must match the uninterrupted traversal.
+
+Still required: retained summary recomputation and atomic index publication,
+payload/file-pin registration/release and unshared-state handling for a complete
+directory rebuild; combined/default coordinator wiring; admitted durable cleanup;
+remaining completion/history relief and full default-gate evidence. Full GNU
+qualification remains waived. The full design is incomplete.
+
+
+Final `retained-directory-comparison-v3-integrated` passes 83/83 Debug steps,
+94 physical-IO, 32 close, 170 table/codec, 74 WAL/recovery and 18 host/ABI
+checks. `retained-directory-comparison-v3-fast` passes 63/63 optimized steps
+and all 94/170/74 physical/table/recovery cases. The focused v3 legacy receipt
+passes 60/60 steps and six existing endpoint/epoch/accounting/point-planning
+regressions. All three pass four Bloom and 45/1/8 error-identity companions
+(companions use Debug). All 5,591 native/schema input hashes and log digests
+match the unchanged final source; four immutable snapshots preserve every
+changed native file. The v1 receipt records the corrected enum inference error;
+v2 passes the initial complete ordering/search lifecycle. Formatting, whitespace
+and the new module license pass. Full GNU qualification stays waived. Summary
+refresh/publication, payload/pin/state preparation and the broader default
+coordinator, cleanup, relief and default-gate work remain incomplete.

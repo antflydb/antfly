@@ -403,6 +403,53 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
             self.root = self.remove(allocator, self.root, entry);
         }
 
+        /// Borrowed immutable-root search. Comparison supplies init(Entry,
+        /// Entry) and resumeWithAdmission(?Port). Caller pins root and probe;
+        /// rank/match apply only to this exact root until publication.
+        pub fn Search(comptime Comparison: type) type {
+            return struct {
+                root: ?*const Node,
+                current: ?*const Node,
+                probe: Entry,
+                rank: usize = 0,
+                matched: ?*const Node = null,
+                comparison: ?Comparison = null,
+                visited: usize = 0,
+                done: bool = false,
+                pub fn init(root: ?*const Node, probe: Entry) @This() {
+                    return .{ .root = root, .current = root, .probe = probe };
+                }
+                pub fn resumeWithAdmission(self: *@This(), original: ?@import("../../common/read_admission.zig").Port) !void {
+                    if (original) |port| try port.checkpoint();
+                    if (self.done) return;
+                    while (self.current) |node| {
+                        if (original) |port| try port.checkpoint();
+                        if (self.comparison == null) {
+                            self.comparison = Comparison.init(node.entry, self.probe);
+                            self.visited += 1;
+                        }
+                        const order = try self.comparison.?.resumeWithAdmission(original);
+                        // No rejection gap between comparison and descent.
+                        self.comparison = null;
+                        switch (order) {
+                            .lt => {
+                                self.rank += size(node.left) + 1;
+                                self.current = node.right;
+                            },
+                            .gt => self.current = node.left,
+                            .eq => {
+                                self.rank += size(node.left);
+                                self.matched = node;
+                                self.done = true;
+                                return;
+                            },
+                        }
+                    }
+                    self.done = true;
+                }
+            };
+        }
+
         pub fn find(root: ?*const Node, probe: Entry) ?*const Node {
             var current = root;
             while (current) |node| switch (compare(probe, node.entry)) {

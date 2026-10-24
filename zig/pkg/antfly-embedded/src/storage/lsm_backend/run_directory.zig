@@ -17,6 +17,7 @@
 //! A publication copies only changed search paths. Readers pin a root in O(1)
 //! and materialize their shared read/planning projection outside the writer lock.
 const std = @import("std");
+const run_comparison = @import("run_comparison.zig");
 const repository = @import("repository.zig");
 const state = @import("state.zig");
 const Account = @import("memory_account.zig").Account;
@@ -181,31 +182,23 @@ const BoundsSummary = struct {
 };
 
 fn compareBound(a_ns: ?[]const u8, a: []const u8, b_ns: ?[]const u8, b: []const u8) std.math.Order {
-    const ns = state.compareNamespace(.{ .name = a_ns }, .{ .name = b_ns });
-    return if (ns == .eq) std.mem.order(u8, a, b) else ns;
+    var cursor = run_comparison.Cursor.bound(a_ns, a, b_ns, b);
+    return cursor.resumeWithAdmission(null) catch unreachable;
 }
-
+fn comparison(comptime mode: run_comparison.Mode, a: Entry, b: Entry) std.math.Order {
+    return run_comparison.compare(mode, .{ .run = a.run, .domain = a.domain }, .{ .run = b.run, .domain = b.domain });
+}
 fn compareDomain(a: Entry, b: Entry) std.math.Order {
-    const ns = state.compareNamespace(.{ .name = a.run.smallest_namespace_name }, .{ .name = b.run.smallest_namespace_name });
-    if (ns != .eq) return ns;
-    const domain = std.mem.order(u8, a.domain, b.domain);
-    return if (domain != .eq) domain else compare(a, b);
+    return comparison(.domain, a, b);
 }
-
 fn compareId(a: Entry, b: Entry) std.math.Order {
-    return std.math.order(a.run.id, b.run.id);
+    return comparison(.id, a, b);
 }
-
 fn compareBounds(a: Entry, b: Entry) std.math.Order {
-    const ns = state.compareNamespace(.{ .name = a.run.smallest_namespace_name }, .{ .name = b.run.smallest_namespace_name });
-    if (ns != .eq) return ns;
-    const key = std.mem.order(u8, a.run.smallest_key, b.run.smallest_key);
-    return if (key != .eq) key else compare(a, b);
+    return comparison(.lower, a, b);
 }
-
 fn compareEnds(a: Entry, b: Entry) std.math.Order {
-    const order = compareBound(a.run.largest_namespace_name, a.run.largest_key, b.run.largest_namespace_name, b.run.largest_key);
-    return if (order != .eq) order else compare(a, b);
+    return comparison(.upper, a, b);
 }
 
 pub const LevelAggregate = struct {
@@ -227,19 +220,7 @@ fn compareLevel(a: LevelAggregate, b: LevelAggregate) std.math.Order {
 }
 
 fn compare(a: Entry, b: Entry) std.math.Order {
-    const lhs = a.run;
-    const rhs = b.run;
-    if (lhs.level != rhs.level) return std.math.order(lhs.level, rhs.level);
-    if (lhs.level == 0) {
-        const av = if (lhs.visibility_id == 0) lhs.id else lhs.visibility_id;
-        const bv = if (rhs.visibility_id == 0) rhs.id else rhs.visibility_id;
-        if (av != bv) return std.math.order(bv, av);
-    }
-    const ns = state.compareNamespace(.{ .name = lhs.smallest_namespace_name }, .{ .name = rhs.smallest_namespace_name });
-    if (ns != .eq) return ns;
-    const key = std.mem.order(u8, lhs.smallest_key, rhs.smallest_key);
-    if (key != .eq) return key;
-    return std.math.order(lhs.id, rhs.id);
+    return comparison(.read, a, b);
 }
 
 pub const Directory = struct {
@@ -269,6 +250,34 @@ pub const Directory = struct {
     total_run_bytes: u64 = 0,
     memory_run_count: usize = 0,
     retired_next: ?*Directory = null,
+
+    fn Comparison(comptime mode: run_comparison.Mode) type {
+        return struct {
+            cursor: run_comparison.Cursor,
+            pub fn init(a: Entry, b: Entry) @This() {
+                return .{ .cursor = .init(mode, .{ .run = a.run, .domain = a.domain }, .{ .run = b.run, .domain = b.domain }) };
+            }
+            pub fn resumeWithAdmission(self: *@This(), original: ?@import("../../common/read_admission.zig").Port) !std.math.Order {
+                return self.cursor.resumeWithAdmission(original);
+            }
+        };
+    }
+    pub const ReadSearch = Tree.Search(Comparison(.read));
+    pub const IdSearch = IdTree.Search(Comparison(.id));
+    pub const LowerSearch = BoundsTree.Search(Comparison(.lower));
+    pub const UpperSearch = EndsTree.Search(Comparison(.upper));
+    pub fn locateRead(self: *const Directory, run: *const Run) ReadSearch {
+        return .init(self.tree.root, .{ .run = run });
+    }
+    pub fn locateId(self: *const Directory, run: *const Run) IdSearch {
+        return .init(self.ids.root, .{ .run = run });
+    }
+    pub fn locateLower(self: *const Directory, run: *const Run) LowerSearch {
+        return .init(self.bounds.root, .{ .run = run });
+    }
+    pub fn locateUpper(self: *const Directory, run: *const Run) UpperSearch {
+        return .init(self.ends.root, .{ .run = run });
+    }
 
     pub fn create(allocator: std.mem.Allocator) !*Directory {
         const self = try allocator.create(Directory);
@@ -956,13 +965,9 @@ pub const Directory = struct {
     }
 
     fn find(root: ?*Tree.Node, entry: Entry) ?*Tree.Node {
-        var current = root;
-        while (current) |node| switch (compare(entry, node.entry)) {
-            .eq => return node,
-            .lt => current = node.left,
-            .gt => current = node.right,
-        };
-        return null;
+        var search = ReadSearch.init(root, entry);
+        search.resumeWithAdmission(null) catch unreachable;
+        return if (search.matched) |node| @constCast(node) else null;
     }
 
     fn visitRemoved(root: ?*Tree.Node, other: ?*Tree.Node, visitor: anytype) !void {
@@ -1016,20 +1021,12 @@ pub const Directory = struct {
     pub const PlanningOrder = struct { domain: []usize, bounds: []usize };
 
     pub fn byId(self: *const Directory, id: u64) ?*const Run {
-        var node = self.ids.root;
-        while (node) |current| {
-            switch (std.math.order(id, current.entry.run.id)) {
-                .lt => node = current.left,
-                .gt => node = current.right,
-                .eq => return current.entry.run,
-            }
-        }
-        return null;
+        const probe: Run = .{ .id = id, .level = 0, .size_bytes = 0, .path = null, .smallest_namespace_name = null, .smallest_key = &.{}, .largest_namespace_name = null, .largest_key = &.{}, .entry_count = 0, .bloom_filter = null, .state = null, .owns_metadata = false };
+        var search = self.locateId(&probe);
+        search.resumeWithAdmission(null) catch unreachable;
+        return if (search.matched) |node| node.entry.run else null;
     }
 
-    /// Scheduling is independent of component discovery. In particular, a
-    /// clock rollback makes any future-dated tombstone immediately eligible;
-    /// retaining only the minimum timestamp would lose that condition.
     pub fn tombstoneGcDelay(self: *const Directory, age: u64, now: u64) ?u64 {
         const summary = (self.tree.root orelse return null).summary;
         if (summary.gc_requested) return 0;
@@ -1509,4 +1506,111 @@ test "directory direct point traversal matches overlap sort and preserves forked
             }
         }
     }
+}
+
+test "controlled physical sync retained directory rank searches preserve original rejection and pinned root identity" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pins: usize = 0,
+        pub fn retainRunSnapshotRef(self: *@This(), _: *Run) !void {
+            self.pins += 1;
+        }
+        pub fn releaseRunSnapshotRef(self: *@This(), _: *Run) void {
+            self.pins -= 1;
+        }
+        fn check(comptime mode: run_comparison.Mode, d: *const Directory, probe: *const Run) !void {
+            const tree = switch (mode) {
+                .read => &d.tree,
+                .id => &d.ids,
+                .lower => &d.bounds,
+                .upper => &d.ends,
+                .domain => unreachable,
+            };
+            var rank: usize = 0;
+            var matched: ?u64 = null;
+            while (rank < d.count()) : (rank += 1) {
+                const entry = tree.root.?.at(rank);
+                const order = run_comparison.compare(mode, .{ .run = entry.run }, .{ .run = probe });
+                if (order == .lt) continue;
+                if (order == .eq) matched = entry.run.id;
+                break;
+            }
+            const Search = switch (mode) {
+                .read => Directory.ReadSearch,
+                .id => Directory.IdSearch,
+                .lower => Directory.LowerSearch,
+                .upper => Directory.UpperSearch,
+                .domain => unreachable,
+            };
+            const Fault = struct {
+                checks: usize = 0,
+                at: usize = std.math.maxInt(usize),
+                failure: anyerror = error.Canceled,
+                fn check(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const at = self.checks;
+                    self.checks += 1;
+                    if (at == self.at) return self.failure;
+                }
+            };
+            var checks: usize = 1;
+            var target: usize = 0;
+            var visited: usize = 0;
+            while (target <= checks) : (target += 1) {
+                var search = Search.init(tree.root, .{ .run = probe });
+                var fault: Fault = .{ .at = if (target == 0) std.math.maxInt(usize) else target - 1, .failure = switch (target % 3) {
+                    0 => error.Canceled,
+                    1 => error.DeadlineExceeded,
+                    else => error.FileNotFound,
+                } };
+                const payload: @import("../../common/read_admission.zig").Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+                const original = @import("../../common/read_admission.zig").Port.init(&payload);
+                const result = search.resumeWithAdmission(original);
+                if (target == 0) {
+                    try result;
+                    checks = fault.checks;
+                    visited = search.visited;
+                } else {
+                    try std.testing.expectError(fault.failure, result);
+                    try search.resumeWithAdmission(original);
+                }
+                try std.testing.expect(search.done and search.root == tree.root);
+                try std.testing.expectEqual(rank, search.rank);
+                try std.testing.expectEqual(matched, if (search.matched) |node| node.entry.run.id else null);
+                try std.testing.expectEqual(visited, search.visited);
+            }
+        }
+    };
+    var fixture: Fixture = .{ .allocator = a };
+    const d = try Directory.create(a);
+    defer d.destroy(a);
+    const bytes = try a.alloc(u8, 2 * run_comparison.Cursor.quantum + 3);
+    defer a.free(bytes);
+    @memset(bytes, 'k');
+    for (0..8) |i| {
+        bytes[bytes.len - 1] = @intCast('a' + i);
+        try d.put(&fixture, .{ .id = 2 * i + 2, .level = @intCast(i % 2), .size_bytes = 1, .path = @constCast("/rank-search.tbl"), .smallest_namespace_name = @constCast("docs"), .smallest_key = bytes, .largest_namespace_name = @constCast("docs"), .largest_key = bytes, .entry_count = 1, .bloom_filter = null, .state = null, .owns_metadata = false });
+    }
+    const pinned = try d.fork(a);
+    defer pinned.destroy(a);
+    const root = pinned.tree.root;
+    // The borrowed searches below apply to this pinned epoch even after live
+    // metadata publishes a successor. The rank is never reused on that successor.
+    bytes[bytes.len - 1] = 'x';
+    try d.put(&fixture, .{ .id = 31, .level = 1, .size_bytes = 1, .path = @constCast("/rank-search.tbl"), .smallest_namespace_name = @constCast("docs"), .smallest_key = bytes, .largest_namespace_name = @constCast("docs"), .largest_key = bytes, .entry_count = 1, .bloom_filter = null, .state = null, .owns_metadata = false });
+    try std.testing.expect(pinned.tree.root == root and d.tree.root != root);
+    for (0..18) |i| {
+        bytes[bytes.len - 1] = @intCast('a' + i / 2);
+        const probe: Run = .{ .id = i, .level = @intCast((i / 2 + 1) % 2), .size_bytes = 1, .path = null, .smallest_namespace_name = @constCast("docs"), .smallest_key = bytes, .largest_namespace_name = @constCast("docs"), .largest_key = bytes, .entry_count = 1, .bloom_filter = null, .state = null, .owns_metadata = false };
+        inline for (.{ run_comparison.Mode.read, .id, .lower, .upper }) |mode| try Fixture.check(mode, pinned, &probe);
+    }
+    for (0..pinned.count()) |i| {
+        const hit = pinned.at(i).run;
+        inline for (.{ run_comparison.Mode.read, .id, .lower, .upper }) |mode| try Fixture.check(mode, pinned, hit);
+    }
+    try std.testing.expectEqual(@as(usize, 9), fixture.pins);
+    var empty: Directory = .{};
+    const probe = pinned.at(0).run;
+    inline for (.{ run_comparison.Mode.read, .id, .lower, .upper }) |mode| try Fixture.check(mode, &empty, probe);
 }
