@@ -225,7 +225,22 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
         return authored;
     // Run 38693574492: 16,964,825,088 and 11,133,898,752 bytes.
     // Each floor includes >=25% headroom and fits CI's 22 GiB budget alone.
-    const gib: usize = if (std.mem.eql(u8, name, "public-api-parity")) 20 else if (std.mem.eql(u8, name, "data-runtime-tests")) 14 else return authored;
+    // Native Nix glibc-linked Zig 0.17.0, baseline x86_64 GNU Debug:
+    // run 40093707715 independently measured each compiler process. These
+    // are distinct test closures, not the runtime archive reservations above.
+    // Round each peak + 10% to whole GiB rather than applying a blanket bump
+    // that would suppress unrelated compilation parallelism. See COMPILATION.md.
+    const floors = [_]struct { name: []const u8, gib: usize }{
+        .{ .name = "public-api-parity", .gib = 20 },
+        .{ .name = "data-runtime-tests", .gib = 14 },
+        .{ .name = "standalone-runtime-owner-tests", .gib = 16 },
+        .{ .name = "data-runtime-implementation-tests", .gib = 18 },
+        .{ .name = "antfly-hosted-initial-fk-recovery", .gib = 14 },
+        .{ .name = "sql-tests-local", .gib = 9 },
+    };
+    const gib: usize = for (floors) |floor| {
+        if (std.mem.eql(u8, name, floor.name)) break floor.gib;
+    } else return authored;
     return @max(authored, gib * 1024 * 1024 * 1024);
 }
 
@@ -462,7 +477,9 @@ test "native Darwin Debug test reservations cover measured peaks without unsafe 
         try std.testing.expectEqual(12 * gib, testCompileMaxRss(name, macos, macos, .safe, 12 * gib));
         try std.testing.expectEqual(12 * gib, testCompileMaxRss(name, macos, linux, .debug, 12 * gib));
         try std.testing.expectEqual(12 * gib, testCompileMaxRss(name, linux, macos, .debug, 12 * gib));
-        try std.testing.expectEqual(7 * gib, testCompileMaxRss(name, linux, linux, .debug, 7 * gib));
+        // Some implementation closures now have independent Linux evidence.
+        const linux_floor: usize = if (std.mem.eql(u8, name, "data-runtime-implementation-tests")) 18 else if (std.mem.eql(u8, name, "antfly-hosted-initial-fk-recovery")) 14 else 7;
+        try std.testing.expectEqual(linux_floor * gib, testCompileMaxRss(name, linux, linux, .debug, 7 * gib));
     }
 }
 
@@ -478,4 +495,27 @@ test "Linux release API reservations cover ARM64 GNU and musl peaks within the r
         try std.testing.expect(claim >= peak + peak / 6);
         try std.testing.expect(claim + runtimeCompileMaxRss(.enrichment_compute, profile) <= 20 * gib);
     }
+}
+
+test "native Linux implementation reservations retain useful overlap within CI admission" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
+    const gib: usize = 1024 * 1024 * 1024;
+    const measurements = [_]struct { name: []const u8, peak: usize }{
+        .{ .name = "standalone-runtime-owner-tests", .peak = 15_286_923_264 },
+        .{ .name = "data-runtime-implementation-tests", .peak = 17_153_777_664 },
+        .{ .name = "antfly-hosted-initial-fk-recovery", .peak = 13_219_102_720 },
+        .{ .name = "sql-tests-local", .peak = 8_168_538_112 },
+    };
+    for (measurements) |sample| {
+        const claim = testCompileMaxRss(sample.name, linux, linux, .debug, 0);
+        try std.testing.expect(claim >= sample.peak + sample.peak / 10);
+        // Every measured root can overlap a 2 GiB compiler within the actual
+        // main unit runner's 20 GiB aggregate budget. Smaller roots can also
+        // overlap ordinary 7 GiB tests instead of serializing the whole gate.
+        try std.testing.expect(claim + 2 * gib <= 20 * gib);
+        try std.testing.expectEqual(24 * gib, testCompileMaxRss(sample.name, linux, linux, .debug, 24 * gib));
+        try std.testing.expectEqual(7 * gib, testCompileMaxRss(sample.name, linux, linux, .fast, 7 * gib));
+    }
+    try std.testing.expect(testCompileMaxRss("sql-tests-local", linux, linux, .debug, 0) + 7 * gib <= 20 * gib);
+    try std.testing.expect(testCompileMaxRss("antfly-hosted-initial-fk-recovery", linux, linux, .debug, 0) + 6 * gib <= 20 * gib);
 }
