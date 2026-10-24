@@ -52,6 +52,7 @@ test "cold warmup reopens transient owners without disturbing resident siblings"
                 .tables = @constCast(&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 71,
                     .name = "warmup_probe",
+                    .schema_json = "{}",
                     .placement_role = "data",
                     .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
                 }}),

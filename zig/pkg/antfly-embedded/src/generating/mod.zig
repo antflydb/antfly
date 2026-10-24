@@ -1330,6 +1330,7 @@ pub fn generateAntflyTextBatchResponse(
         .json = body,
         .headers = if (authorization != null) &headers else null,
         .timeout_ms = if (options.request_context) |context| try context.remainingTimeoutMs() else 300_000,
+        .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
         .cancellation = if (options.request_context) |context|
             if (context.cancellation) |token|
                 httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
