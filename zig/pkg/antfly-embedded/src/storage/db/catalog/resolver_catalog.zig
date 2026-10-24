@@ -82,25 +82,14 @@ pub const resolver_projection_delta_reader_version: u32 = 15;
 pub const resolver_static_profiles_reader_version: u32 = 16;
 pub const supported_reader_version: u32 = resolver_static_profiles_reader_version;
 
+const reader_version_encodings = blk: {
+    var encodings: [supported_reader_version + 1][]const u8 = undefined;
+    for (&encodings, 0..) |*encoding, version| encoding.* = std.fmt.comptimePrint("{d}", .{version});
+    break :blk encodings;
+};
 pub fn readerVersionBytes(version: u32) ![]const u8 {
-    return switch (version) {
-        1 => "1",
-        2 => "2",
-        3 => "3",
-        4 => "4",
-        5 => "5",
-        6 => "6",
-        7 => "7",
-        8 => "8",
-        9 => "9",
-        10 => "10",
-        11 => "11",
-        12 => "12",
-        13 => "13",
-        14 => "14",
-        15 => "15",
-        else => error.UnsupportedDatabaseReaderVersion,
-    };
+    if (version == 0 or version > supported_reader_version) return error.UnsupportedDatabaseReaderVersion;
+    return reader_version_encodings[version];
 }
 
 pub fn versionedCatalog(a: Allocator, data: []const u8, version: u32) ![]u8 {
@@ -1462,4 +1451,13 @@ test "resolver catalog shares immutable native policy in memory and after reopen
     }
     // No JSON input can manufacture a runtime ownership reference.
     try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(ResolverConfig, a, "{\"name\":\"r\",\"table\":\"t\",\"source_artifact\":\"s\",\"resolution_artifact\":\"o\",\"key_template\":\"{{_key}}\",\"shared_projection\":{}}", .{}));
+}
+
+test "resolver curation reader floors encode every supported version" {
+    for (1..supported_reader_version + 1) |version| {
+        const encoded = try readerVersionBytes(@intCast(version));
+        try std.testing.expectEqual(version, try std.fmt.parseInt(usize, encoded, 10));
+    }
+    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readerVersionBytes(0));
+    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readerVersionBytes(supported_reader_version + 1));
 }
