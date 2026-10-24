@@ -1918,7 +1918,11 @@ pub const Client = struct {
     }
 
     fn normalizeH2ResponseError(err: anyerror) anyerror {
-        return if (err == error.StreamDataOverflow) error.ResponseTooLarge else err;
+        return switch (err) {
+            error.StreamDataOverflow => error.ResponseTooLarge,
+            error.H2PreSendTimeout => error.Timeout,
+            else => err,
+        };
     }
 
     fn configureH2ResponseStream(self: *const Self, stream: *Stream, req: *const Request) void {
@@ -2013,6 +2017,9 @@ pub const Client = struct {
                     // A caller cancellation only reset its own stream. The
                     // shared H2 connection remains usable by other requests.
                     error.Cancelled,
+                    // This request expired before HEADERS publication. Other
+                    // streams and the connection's transport remain healthy.
+                    error.H2PreSendTimeout,
                     error.MaxConcurrentStreamsExceeded,
                     error.ContentLengthMismatch,
                     error.StreamDataOverflow,
@@ -2646,7 +2653,12 @@ pub const Client = struct {
     /// Caller holds the connection write lock. Refresh only after all setup
     /// and lock waits, before HPACK sees the request's remaining budget.
     fn sendH2RequestHead(self: *Self, entry: *H2PoolEntry, req: *Request, stream_id: u31, deadline_ms: ?i64) !void {
-        try self.prepareRequestSend(req, deadline_ms);
+        self.prepareRequestSend(req, deadline_ms) catch |err| {
+            // Keep expiry during local setup distinct from a Timeout raised
+            // by TLS, framing or socket I/O. Only the former preserves the
+            // pooled connection; the public boundary still returns Timeout.
+            return if (err == error.Timeout) error.H2PreSendTimeout else err;
+        };
         // Build request pseudo-headers.
         const method_str = if (req.method == .CUSTOM)
             req.custom_method orelse "CUSTOM"
@@ -6912,25 +6924,89 @@ test "admitted transport refreshes forwarded budgets after TLS setup for buffere
     try std.testing.expect(term == .exited and term.exited == 0);
 }
 
-test "admitted transport H2 deadline expiry does not publish an idle stream" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var client = Client.init(a, io);
-    defer client.deinit();
-    var entry: H2PoolEntry = .{
-        // Expiry must return before either transport is accessed.
-        .socket = undefined,
-        .session = undefined,
-        .h2 = H2Connection.initClient(a, io),
-        .is_tls = false,
+test "admitted transport H2 pre-send expiry retains the cached connection and transport timeouts invalidate it" {
+    const TestServer = @import("../testing.zig").TestServer;
+    const Clock = struct {
+        var reads: usize = 0;
+        var expire: bool = true;
+        fn now(_: ?*anyopaque, _: Io.Clock) Io.Timestamp {
+            const n = reads;
+            reads += 1;
+            // Expire between admission and HEADERS preparation, without
+            // sleeps, watchdog races or actual connection failure.
+            return .{ .nanoseconds = if (expire and n > 0) 2 * std.time.ns_per_ms else 0 };
+        }
     };
-    defer entry.h2.deinit();
-    var req = try Request.init(a, .POST, "http://fixture/generate");
-    defer req.deinit();
-    req.remaining_timeout_header = "X-Remaining-Ms";
-    try req.headers.set("X-Remaining-Ms", "5000");
-    var interrupt: RequestInterrupt = .{};
-    const expired = @as(i64, @intCast(@divFloor(Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms))) - 1;
-    try std.testing.expectError(error.Timeout, client.executeH2OnPooled(&entry, &req, expired, &interrupt));
-    try std.testing.expectEqual(@as(u32, 0), entry.h2.stream_manager.activeStreamCount());
+    const Probe = struct {
+        entry: *H2PoolEntry,
+        sends: usize = 0,
+        transport_timeout: bool = false,
+        fn beforeSend(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.sends += 1;
+            if (self.transport_timeout) {
+                // The callback runs under write_mutex, like receive-side
+                // stream error publication. sendHeaders surfaces this error
+                // from the transport, after deadline preparation succeeded.
+                var streams = self.entry.h2.stream_manager.streams.valueIterator();
+                const stream = streams.next().?.*;
+                stream.stream_error = error.Timeout;
+            }
+        }
+    };
+    const a = std.testing.allocator;
+    const host_io = std.testing.io;
+    for ([_]bool{ false, true }) |multiplexed| {
+        var server = try TestServer.start(a, host_io, &.{});
+        defer server.deinit();
+        var socket = try Socket.connect(server.listener.getLocalAddress(), host_io);
+        defer socket.close();
+        const accepted = try server.listener.accept();
+        var peer = accepted.socket;
+        defer peer.close();
+        var vtable = host_io.vtable.*;
+        vtable.now = Clock.now;
+        const io: Io = .{ .userdata = host_io.userdata, .vtable = &vtable };
+        var client = Client.initWithConfig(a, io, .{ .force_http2 = true });
+        defer client.deinit();
+        var entry: H2PoolEntry = .{
+            .socket = socket,
+            .session = TlsSession.init(TlsConfig.insecure(a), host_io),
+            .h2 = H2Connection.initClient(a, io),
+            .is_tls = false,
+            .recv_running = multiplexed,
+            // A sibling request retains the same connection throughout.
+            .active_requests = 1,
+        };
+        defer entry.session.deinit();
+        defer entry.h2.deinit();
+        try client.h2_conns.put(a, "fixture:80", &entry);
+        defer _ = client.h2_conns.remove("fixture:80");
+        var req = try Request.init(a, .POST, "http://fixture/generate");
+        defer req.deinit();
+        req.remaining_timeout_header = "X-Remaining-Ms";
+        var probe: Probe = .{ .entry = &entry };
+        req.delivery_observer = .{ .context = &probe, .before_send = Probe.beforeSend };
+        var interrupt: RequestInterrupt = .{};
+        Clock.reads = 0;
+        Clock.expire = true;
+        try std.testing.expectError(error.Timeout, client.executeRequestOnceUnobserved(&req, 1, 1, &interrupt));
+        try std.testing.expect(!entry.broken);
+        try std.testing.expectEqual(@as(usize, 0), probe.sends);
+        try std.testing.expectEqual(@as(u32, 0), entry.h2.stream_manager.activeStreamCount());
+        try std.testing.expectEqual(@as(u32, 1), entry.active_requests);
+        var reused = try client.getOrCreateH2Conn("fixture", 80, false);
+        try std.testing.expectEqual(&entry, reused.entry);
+        reused.release();
+        // A transport-originated Timeout must still invalidate the connection;
+        // do not implement expiry preservation by blanket-ignoring Timeout.
+        Clock.reads = 0;
+        Clock.expire = false;
+        probe.transport_timeout = true;
+        try std.testing.expectError(error.Timeout, client.executeRequestOnceUnobserved(&req, 1, 1, &interrupt));
+        try std.testing.expect(entry.broken);
+        try std.testing.expectEqual(@as(usize, 1), probe.sends);
+        try std.testing.expectEqual(@as(u32, 0), entry.h2.stream_manager.activeStreamCount());
+        try std.testing.expectEqual(@as(u32, 1), entry.active_requests);
+    }
 }
