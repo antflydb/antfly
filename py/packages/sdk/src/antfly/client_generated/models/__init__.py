@@ -269,7 +269,6 @@ from .date_range_string_query import DateRangeStringQuery
 from .decider_config import DeciderConfig
 from .decider_config_decision_method import DeciderConfigDecisionMethod
 from .decider_config_embedding_options import DeciderConfigEmbeddingOptions
-from .decider_config_embedding_options_dimensions import DeciderConfigEmbeddingOptionsDimensions
 from .decider_config_embedding_options_task_type import DeciderConfigEmbeddingOptionsTaskType
 from .decider_config_provider import DeciderConfigProvider
 from .decision_batch_item import DecisionBatchItem
@@ -2697,7 +2696,6 @@ __all__ = (
     "DeciderConfig",
     "DeciderConfigDecisionMethod",
     "DeciderConfigEmbeddingOptions",
-    "DeciderConfigEmbeddingOptionsDimensions",
     "DeciderConfigEmbeddingOptionsTaskType",
     "DeciderConfigProvider",
     "DecisionBatchItem",

@@ -45,9 +45,10 @@ class DeciderConfig:
         embedder (str | Unset): Named dense embedder for provider-neutral embedding_similarity routing. Specify matching
             embedding_options.dimensions. Native fitted calibrations require the original Antfly model path; hosted routes
             use explicit thresholds and estimated token admission.
-        embedding_options (DeciderConfigEmbeddingOptions | Unset): EmbeddingGemma 2 geometry and acceptance defaults.
-            Acceptance is serialized onto each question and can be overridden per question. Other models reject these
-            options. Raw cosine similarities never represent probabilities.
+        embedding_options (DeciderConfigEmbeddingOptions | Unset): Geometry and acceptance defaults for
+            embedding_similarity decisions. Named embedders require dimensions matching their configured dense output.
+            Direct Antfly model routes support EmbeddingGemma 2 dimensions and fitted calibrations. Acceptance is serialized
+            onto each question and can be overridden per question. Raw cosine similarities never represent probabilities.
         url (str | Unset): Provider base URL; endpoint path is selected by provider. OpenAI defaults to
             https://api.openai.com/v1 and appends /decisions.
         api_key (str | Unset): API key or secret reference. Defaults to the provider environment variable.

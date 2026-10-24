@@ -570,13 +570,26 @@ pub fn Service(comptime Node: type) type {
             if (!std.mem.eql(u8, try cf.text(cf.field(document, "status") orelse return error.InvalidDocumentArtifact), "complete")) return error.DocumentUnresolved;
             const pages = cf.field(root, "data") orelse return error.InvalidDocumentArtifact;
             if (pages != .array) return error.InvalidDocumentArtifact;
+            const manifest = cf.field(document, "sources") orelse return error.InvalidDocumentArtifact;
+            if (manifest != .array or manifest.array.items.len == 0) return error.InvalidDocumentArtifact;
             var grouped: std.StringArrayHashMapUnmanaged(std.array_list.Managed(V)) = .{};
+            // The source manifest owns cardinality and order, including sources
+            // with no emitted pages (for example, a hidden-only slide selection).
+            // Validate every source before any extraction call; never succeed
+            // with a silently shortened batch, including for retained readings.
+            try grouped.ensureTotalCapacity(a, manifest.array.items.len);
+            for (manifest.array.items) |source| {
+                const id = try cf.text(cf.field(source, "id") orelse return error.InvalidDocumentArtifact);
+                const entry = try grouped.getOrPut(a, id);
+                if (entry.found_existing) return error.InvalidDocumentArtifact;
+                entry.value_ptr.* = .init(a);
+            }
             for (pages.array.items) |page| {
                 const id = try cf.text(cf.field(page, "source_id") orelse return error.InvalidDocumentArtifact);
-                const entry = try grouped.getOrPut(a, id);
-                if (!entry.found_existing) entry.value_ptr.* = .init(a);
-                try entry.value_ptr.append(page);
+                const source_pages = grouped.getPtr(id) orelse return error.InvalidDocumentArtifact;
+                try source_pages.append(page);
             }
+            for (grouped.values()) |source_pages| if (source_pages.items.len == 0) return error.DocumentUnresolved;
             var inputs: std.array_list.Managed(V) = .init(a);
             for (grouped.keys(), grouped.values()) |id, source_pages| {
                 var joined = std.Io.Writer.Allocating.init(a);
@@ -1047,13 +1060,14 @@ test "document extraction keeps independent sources atomic and reuses retained r
         fn documentResolveBinding(_: *@This(), _: A, binding: c.Binding) !c.Snapshot {
             return .{ .binding = binding, .path = binding.model, .identity = @splat(1) };
         }
-        fn documentDownload(self: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
+        fn documentDownload(self: *@This(), _: A, url: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
             self.downloads += 1;
+            if (std.mem.eql(u8, url, "hidden-slides")) return .{ .data = @embedFile("testdata/hidden-slides.pptx") };
             return .{ .data = if (self.slides) @embedFile("testdata/line-breaks.pptx") else @embedFile("testdata/two-pages.pdf") };
         }
         fn readDocumentArtifact(_: *@This(), a: A, _: []const u8) ![]u8 {
             return a.dupe(u8,
-                \\{"document":{"status":"complete"},"data":[{"source_id":"retained","number":3,"text":"Total 12.50"}]}
+                \\{"document":{"status":"complete","sources":[{"id":"retained"}]},"data":[{"source_id":"retained","number":3,"text":"Total 12.50"}]}
             );
         }
         fn extractDirectWithControl(self: *@This(), a: A, name: []const u8, request: extracting.Request, _: Control) !extracting.Response {
@@ -1128,6 +1142,23 @@ test "document extraction keeps independent sources atomic and reuses retained r
     , .{});
     defer a.free(retained);
     try std.testing.expectEqual(@as(usize, 0), fake.downloads);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    // The visible source comes first: preflight must reject the entire batch
+    // before even extracting that source. Explicit inclusion restores both rows.
+    fake.calls = 0;
+    const hidden_request =
+        \\{"model":"leaf","schema_version":2,"schema":{"structures":{"record":{"fields":{"value":"str"}}}},"documents":[{"id":"visible","url":"fixture","media_type":"application/pdf"},{"id":"hidden","url":"hidden-slides","media_type":"application/vnd.openxmlformats-officedocument.presentationml.presentation","pages":[1]}]}
+    ;
+    try std.testing.expectError(error.DocumentUnresolved, Service(Fake).extractJson(&fake, a, hidden_request, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    const include_hidden = try std.mem.replaceOwned(u8, a, hidden_request, "\"pages\":[1]", "\"pages\":[1],\"include_hidden\":true");
+    defer a.free(include_hidden);
+    const hidden_response = try Service(Fake).extractJson(&fake, a, include_hidden, .{});
+    defer a.free(hidden_response);
+    const hidden_result = try std.json.parseFromSlice(V, a, hidden_response, .{});
+    defer hidden_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), hidden_result.value.object.get("data").?.array.items.len);
+    try std.testing.expectEqualStrings("hidden", hidden_result.value.object.get("data").?.array.items[1].object.get("id").?.string);
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     fake.disagree = true;
     try std.testing.expectError(error.DocumentUnresolved, Service(Fake).extractJson(&fake, a, request, .{}));
@@ -1254,4 +1285,40 @@ test "document graph keys separate same named tasks and retain real cycle detect
     try cyclic.plans.append(a, .{ .key = key, .definition = root });
     fake.cycle = true;
     try std.testing.expectError(error.DocumentDependencyCycle, S.preflight(&fake, a, key, root, &cyclic, &.{}, false));
+}
+
+test "document extraction validates retained manifests and preserves manifest source order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const service = Service(struct {});
+    const complete = try std.json.parseFromSliceLeaky(V, a,
+        \\{"document":{"status":"complete","sources":[{"id":"one"},{"id":"two"}]},"data":[{"source_id":"two","number":1,"text":"Second"},{"source_id":"one","number":1,"text":"First"}]}
+    , .{});
+    const inputs = try service.inputsFromRead(a, complete);
+    try std.testing.expectEqual(@as(usize, 2), inputs.len);
+    try std.testing.expectEqualStrings("one", inputs[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("First", inputs[0].object.get("content").?.string);
+    try std.testing.expectEqualStrings("two", inputs[1].object.get("id").?.string);
+    const empty_source = try std.json.parseFromSliceLeaky(V, a,
+        \\{"document":{"status":"complete","sources":[{"id":"one"},{"id":"two"}]},"data":[{"source_id":"one","number":1,"text":"First"}]}
+    , .{});
+    try std.testing.expectError(error.DocumentUnresolved, service.inputsFromRead(a, empty_source));
+    const all_empty = try std.json.parseFromSliceLeaky(V, a,
+        \\{"document":{"status":"complete","sources":[{"id":"hidden"}]},"data":[]}
+    , .{});
+    try std.testing.expectError(error.DocumentUnresolved, service.inputsFromRead(a, all_empty));
+    inline for (.{
+        \\{"document":{"status":"complete"},"data":[]}
+        ,
+        \\{"document":{"status":"complete","sources":[]},"data":[]}
+        ,
+        \\{"document":{"status":"complete","sources":[{"id":"one"},{"id":"one"}]},"data":[]}
+        ,
+        \\{"document":{"status":"complete","sources":[{"id":"one"}]},"data":[{"source_id":"other","text":"Unknown"}]}
+        ,
+    }) |json| {
+        const malformed = try std.json.parseFromSliceLeaky(V, a, json, .{});
+        try std.testing.expectError(error.InvalidDocumentArtifact, service.inputsFromRead(a, malformed));
+    }
 }

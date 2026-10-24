@@ -16793,7 +16793,7 @@ export interface components {
             model_identity?: string;
             /** @description Named dense embedder for provider-neutral embedding_similarity routing. Specify matching embedding_options.dimensions. Native fitted calibrations require the original Antfly model path; hosted routes use explicit thresholds and estimated token admission. */
             embedder?: string;
-            /** @description EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto each question and can be overridden per question. Other models reject these options. Raw cosine similarities never represent probabilities. */
+            /** @description Geometry and acceptance defaults for embedding_similarity decisions. Named embedders require dimensions matching their configured dense output. Direct Antfly model routes support EmbeddingGemma 2 dimensions and fitted calibrations. Acceptance is serialized onto each question and can be overridden per question. Raw cosine similarities never represent probabilities. */
             embedding_options?: {
                 /** @description Qualified fitted raw thresholds in model/calibrations/{id}.json. Bound to the exact asset identity, task, renderer, dimensions and category prototypes; mutually exclusive with manual thresholds. Does not produce probabilities. */
                 calibration_id?: string;
@@ -16803,10 +16803,10 @@ export interface components {
                  */
                 task_type?: "CLUSTERING" | "CLASSIFICATION";
                 /**
+                 * @description Must match the named embedder's configured dimensions. Without embedder, the direct EmbeddingGemma 2 route accepts only 768, 512, 256 or 128.
                  * @default 768
-                 * @enum {integer}
                  */
-                dimensions?: 768 | 512 | 256 | 128;
+                dimensions?: number;
                 min_similarity?: number;
                 min_margin?: number;
             };

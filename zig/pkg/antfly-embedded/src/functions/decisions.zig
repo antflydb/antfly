@@ -644,6 +644,20 @@ test "decision provider embeddinggemma2 scored decisions require configured capa
     try std.testing.expectError(error.InvalidDeciderConfig, (DeciderConfig{ .provider = .jev, .decision_method = .embedding_similarity }).validate());
 }
 
+test "decision provider dimensions match named embedders while direct routes retain native geometry" {
+    for ([_]u16{ 1, 384, 1024, 65535 }) |dimensions| {
+        const named: DeciderConfig = .{ .decision_method = .embedding_similarity, .embedder = "dense", .embedding_options = .{ .dimensions = dimensions } };
+        try named.validate();
+        const native: DeciderConfig = .{ .decision_method = .embedding_similarity, .model = "embeddinggemma2", .embedding_options = .{ .dimensions = dimensions } };
+        try std.testing.expectError(error.InvalidDeciderConfig, native.validate());
+    }
+    for ([_]u16{ 128, 256, 512, 768 }) |dimensions| {
+        try (DeciderConfig{ .decision_method = .embedding_similarity, .model = "embeddinggemma2", .embedding_options = .{ .dimensions = dimensions } }).validate();
+    }
+    try std.testing.expectError(error.InvalidDeciderConfig, (DeciderConfig{ .decision_method = .embedding_similarity, .embedder = "dense", .embedding_options = .{ .dimensions = 0 } }).validate());
+    try std.testing.expectError(error.InvalidDeciderConfig, (DeciderConfig{ .decision_method = .embedding_similarity, .embedder = "dense", .embedding_options = .{ .dimensions = 1024, .calibration_id = "native-only" } }).validate());
+}
+
 test "decision provider embeddinggemma2 SQL configuration owns calibration and renders the pinned request" {
     const a = std.testing.allocator;
     const identity: [64]u8 = @splat('a');

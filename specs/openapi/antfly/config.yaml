@@ -104,7 +104,7 @@ components:
         embedding_options:
           type: object
           additionalProperties: false
-          description: EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto each question and can be overridden per question. Other models reject these options. Raw cosine similarities never represent probabilities.
+          description: Geometry and acceptance defaults for embedding_similarity decisions. Named embedders require dimensions matching their configured dense output. Direct Antfly model routes support EmbeddingGemma 2 dimensions and fitted calibrations. Acceptance is serialized onto each question and can be overridden per question. Raw cosine similarities never represent probabilities.
           properties:
             calibration_id:
               type: string
@@ -116,8 +116,10 @@ components:
               default: CLUSTERING
             dimensions:
               type: integer
-              enum: [768, 512, 256, 128]
+              minimum: 1
+              maximum: 65535
               default: 768
+              description: Must match the named embedder's configured dimensions. Without embedder, the direct EmbeddingGemma 2 route accepts only 768, 512, 256 or 128.
             min_similarity:
               type: number
               minimum: -1

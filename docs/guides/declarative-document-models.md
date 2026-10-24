@@ -27,6 +27,11 @@ unselected slides are not decompressed or composed. Selection never renumbers so
 results follow original source order, regardless of selection order. Independent
 sources remain independent extraction contexts. URLs inherit the deployment's
 existing content security restrictions.
+Extraction validates the complete source manifest before invoking an extractor,
+including when reusing a retained reading. Every source must have at least one
+read page; a source with no visible selected slides causes `DocumentUnresolved`
+for the entire batch. Select visible slides or set `include_hidden: true` to
+extract hidden slides. Successful results preserve source order and cardinality.
 Encoded images use the ordinary reader MIME contract: type matching ignores
 case, validated parameters are removed before dispatch, and declared types are
 checked against the encoded bytes. Normalization borrows the existing bytes.
