@@ -69,7 +69,10 @@ pub const SparseEnricherConfig = struct {
     failure_policy: catalog_mod.EnrichmentFailurePolicy = .skip_document,
     cancellation: CancellationToken = .none,
     media_output_max_attempts: u32 = 3,
-    media_pages_per_document: usize = 1,
+    /// Maximum pages between WAL acknowledgements. Start with one page and
+    /// grow with the durable prefix, preserving a hard replay-work bound.
+    media_pages_per_document: usize = 8,
+    media_checkpoint_interval_ms: u64 = 1000,
 };
 
 const SourcePin = struct {
@@ -186,6 +189,7 @@ pub const SparseEnricher = struct {
     model_chunk_field: []const u8 = "",
     media_output_max_attempts: u32 = 3,
     media_page_limit: usize = 0,
+    media_checkpoint_interval_ms: u64 = 1000,
     generation_snapshot: ?*MediaGenerationSnapshot = null,
 
     pub fn init(
@@ -533,6 +537,7 @@ pub const SparseEnricher = struct {
         worker.generation_snapshot = generations;
         worker.media_output_max_attempts = @max(cfg.media_output_max_attempts, 1);
         worker.media_page_limit = @max(cfg.media_pages_per_document, 1);
+        worker.media_checkpoint_interval_ms = @max(cfg.media_checkpoint_interval_ms, 1);
         return worker.processAdmittedDocument(namespace, cfg, pin, pages, fact, key, head, expected_lsn, stats) catch |err| {
             if (err == error.OutOfMemory and working.limit_exceeded) return error.EnrichmentDocumentBudgetExceeded;
             return err;
@@ -977,6 +982,7 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
     var pending_outputs = false;
     var preparation_complete = true;
     var pages: usize = 0;
+    var completed_pages: usize = 0;
     if (cached_rows.len != 0 or legacy_current) if (document.object.get("_enrichment")) |saved| if (saved == .object) {
         const fingerprint = saved.object.get("chunk_embeddings_preparation_recipe");
         const raw_cursor = saved.object.get("chunk_embeddings_cursor");
@@ -986,7 +992,16 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
             const legacy_prefix_rows = if (old_vectors != null and old_vectors.? == .array) old_vectors.?.array.items else &.{};
             const cached = if (cached_rows.len != 0) document.object.get("media_outputs").?.object.get("plan_id").? else legacy_prefix_rows[0].object.get("_chunk").?.object.get("plan_id").?;
             const prefix_count = if (cached_rows.len != 0) cached_rows.len else legacy_prefix_rows.len;
-            if (cached == .string and std.mem.eql(u8, cursor.plan_id, cached.string) and cursor.ordinal <= prefix_count) {
+            const prefix_current = current: {
+                for (cached_rows[0..@min(cached_rows.len, @as(usize, @intCast(cursor.ordinal)))]) |row| {
+                    for (consumers.targets) |target| if (needsServerlessOutput(target, row.outputs, current_identities)) break :current false;
+                }
+                break :current true;
+            };
+            if (prefix_current and cached == .string and std.mem.eql(u8, cursor.plan_id, cached.string) and cursor.ordinal <= prefix_count) {
+                if (saved.object.get("chunk_embeddings_pages")) |count| if (count == .integer and count.integer > 0) {
+                    completed_pages = std.math.cast(usize, count.integer) orelse return error.InvalidChunkerResponse;
+                };
                 position = try chunking.types.cloneReplay(a, cursor);
                 plan_id = try scratch.dupe(u8, cursor.plan_id);
                 for (cached_rows[0..@min(cached_rows.len, @as(usize, @intCast(cursor.ordinal)))]) |row| {
@@ -1007,6 +1022,8 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
             }
         }
     };
+    const page_limit = @min(self.media_page_limit, @max(completed_pages, 1));
+    const checkpoint_deadline = @import("antfly_platform").time.monotonicNs() +| (std.math.mul(u64, self.media_checkpoint_interval_ms, std.time.ns_per_ms) catch std.math.maxInt(u64));
     while (input != null) {
         config = base_config;
         config.page = true;
@@ -1017,7 +1034,7 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
             const first: usize = @intCast(if (position) |cursor| cursor.ordinal else 0);
             for (targets) |*target| {
                 target.execute = false;
-                for (first..@min(first + config.max_chunks, cached_rows.len)) |ordinal| {
+                for (@min(first, cached_rows.len)..@min(first +| config.max_chunks, cached_rows.len)) |ordinal| {
                     if (needsServerlessOutput(target.*, cached_rows[ordinal].outputs, current_identities)) {
                         target.execute = true;
                         break;
@@ -1028,7 +1045,7 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
                 const current_recipe = for (current_identities) |identity| {
                     if (std.mem.eql(u8, identity.name, target.name)) break identity.recipe_id;
                 } else "";
-                for (first..@min(first + config.max_chunks, cached_rows.len)) |ordinal| {
+                for (@min(first, cached_rows.len)..@min(first +| config.max_chunks, cached_rows.len)) |ordinal| {
                     for (cached_rows[ordinal].outputs) |value| {
                         if (skips.items.len < 4096 and std.mem.eql(u8, value.name, target.name) and std.mem.eql(u8, value.recipe_id, current_recipe) and value.reusable()) try skips.append(scratch, .{ .ordinal = ordinal, .sub_index = value.sub_index });
                     }
@@ -1045,6 +1062,9 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
             const metadata = chunk.metadata orelse return error.InvalidChunkerResponse;
             if (plan_id.len == 0) plan_id = try scratch.dupe(u8, page.plan_id);
             const fresh: []const media_outputs.Result = if (metadata.outputs_json) |bytes| try std.json.parseFromSliceLeaky([]media_outputs.Result, scratch, bytes, .{ .allocate = .alloc_always }) else &.{};
+            // Every page is another deployed-generation observation. A model
+            // can change after the planning probe or between page requests.
+            if (fresh.len != 0) current_identities = fresh;
             const cached: []const media_outputs.Result = if (chunk.id < cached_rows.len and cached_rows[chunk.id].chunk_id == chunk.id) cached_rows[chunk.id].outputs else &.{};
             const independent = try mergeServerlessOutputs(scratch, fresh, cached, self.media_output_max_attempts);
             for (independent) |result| if (result.status != .complete and !result.terminal) {
@@ -1067,7 +1087,7 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
         const fingerprint = try a.dupe(u8, page.source_fingerprint);
         errdefer a.free(fingerprint);
         position = .{ .plan_id = plan, .source_fingerprint = fingerprint, .source_version = try a.dupe(u8, page.source_version), .ordinal = page.covered_through_ordinal };
-        if (self.media_page_limit != 0 and pages >= self.media_page_limit) {
+        if (self.media_page_limit != 0 and (pages >= page_limit or (self.media_checkpoint_interval_ms != 0 and @import("antfly_platform").time.monotonicNs() >= checkpoint_deadline))) {
             pending_outputs = true;
             // Preserve unvisited receipts during a secondary-only repair; the
             // next bounded page can skip those already accepted computations.
@@ -1075,6 +1095,11 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
             break;
         }
     }
+    // Mark a mixed-generation traversal pending even if its source tail was
+    // reached. The next pass repairs only receipts outside the latest space.
+    for (output_rows.items) |row| for (consumers.targets) |target| {
+        if (needsServerlessOutput(target, row.outputs, current_identities)) pending_outputs = true;
+    };
     try document.object.put(scratch, "chunk_embeddings", .{ .array = embeddings.toManaged(scratch) });
     try document.object.put(scratch, "chunk_preview", .{ .array = previews.toManaged(scratch) });
     // These fields belong to this stage. Removing a configured consumer must
@@ -1096,7 +1121,11 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
     if (!preparation_complete and position != null) {
         const encoded_cursor = try std.json.Stringify.valueAlloc(scratch, position.?, .{});
         try state.object.put(scratch, "chunk_embeddings_cursor", try std.json.parseFromSliceLeaky(std.json.Value, scratch, encoded_cursor, .{}));
-    } else _ = state.object.swapRemove("chunk_embeddings_cursor");
+        try state.object.put(scratch, "chunk_embeddings_pages", .{ .integer = @intCast(try std.math.add(usize, completed_pages, pages)) });
+    } else {
+        _ = state.object.swapRemove("chunk_embeddings_cursor");
+        _ = state.object.swapRemove("chunk_embeddings_pages");
+    }
     if (pending_outputs) {
         _ = state.object.swapRemove("chunk_embeddings_version");
         _ = state.object.swapRemove("chunk_embeddings_recipe");
@@ -3254,6 +3283,9 @@ test "model aware media serverless consumer edits preserve healthy model work" {
 
 const ServerlessMediaTestProvider = struct {
     speech_revision_changed: bool = false,
+    parent_count: usize = 1,
+    change_speech_at: ?u64 = null,
+    fail_ordinal: ?u64 = null,
     pages: usize = 0,
     boundary_revision_changed: bool = false,
     calls: [3]usize = @splat(0),
@@ -3261,6 +3293,11 @@ const ServerlessMediaTestProvider = struct {
     fn page(raw: *anyopaque, a: Allocator, _: []const u8, _: chunking.inference.RemoteInput, cfg: chunking.types.Config, _: @import("antfly_inference_execution_context").RequestContext) anyerror!chunking.inference.ChunkPage {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.pages += 1;
+        const ordinal = if (cfg.replay) |cursor| cursor.ordinal else 0;
+        if (self.fail_ordinal) |failed| if (cfg.replay != null and ordinal == failed) return error.ChunkRequestFailed;
+        if (self.change_speech_at) |after| if (cfg.replay != null and ordinal >= after) {
+            self.speech_revision_changed = true;
+        };
         var config = try std.json.parseFromSlice(media_outputs.Config, a, cfg.outputs_json, .{});
         defer config.deinit();
         var arena = std.heap.ArenaAllocator.init(a);
@@ -3284,17 +3321,17 @@ const ServerlessMediaTestProvider = struct {
         }
         const encoded = try std.json.Stringify.valueAlloc(scratch, results.items, .{ .emit_null_optional_fields = false });
         const plan = if (self.boundary_revision_changed) "6666666666666666666666666666666666666666666666666666666666666666" else "1111111111111111111111111111111111111111111111111111111111111111";
-        const inference_id = try std.fmt.allocPrint(scratch, "{s}:0", .{plan});
+        const inference_id = try std.fmt.allocPrint(scratch, "{s}:{d}", .{ plan, ordinal });
         const fingerprint = "2222222222222222222222222222222222222222222222222222222222222222";
         const chunks = try a.alloc(chunking.inference.RemoteChunk, 1);
         errdefer a.free(chunks);
-        chunks[0] = .{ .id = 0, .mime_type = "audio/wav", .metadata = try (chunking.inference.RemoteMetadata{ .descriptor = .{ .ordinal = 0, .input_tokens = 1, .coordinates = .{ .kind = .audio, .start_ns = 0, .end_ns = 100 } }, .inference_id = inference_id, .plan_id = plan, .source_fingerprint = fingerprint, .source_version = "v1", .model = "boundaryB", .model_identity = results.items[0].model_identity, .model_revision = results.items[0].model_revision, .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .embedding = if (config.value.targets[0].execute) &.{ 1, 0 } else null, .outputs_json = encoded }).clone(a), .owns_metadata = true };
+        chunks[0] = .{ .id = @intCast(ordinal), .mime_type = "audio/wav", .metadata = try (chunking.inference.RemoteMetadata{ .descriptor = .{ .ordinal = ordinal, .input_tokens = 1, .coordinates = .{ .kind = .audio, .start_ns = 0, .end_ns = 100 } }, .inference_id = inference_id, .plan_id = plan, .source_fingerprint = fingerprint, .source_version = "v1", .model = "boundaryB", .model_identity = results.items[0].model_identity, .model_revision = results.items[0].model_revision, .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .embedding = if (config.value.targets[0].execute) &.{ 1, 0 } else null, .outputs_json = encoded }).clone(a), .owns_metadata = true };
         errdefer chunks[0].deinit(a);
         const owned_plan = try a.dupe(u8, plan);
         errdefer a.free(owned_plan);
         const owned_fingerprint = try a.dupe(u8, fingerprint);
         errdefer a.free(owned_fingerprint);
-        return .{ .chunks = chunks, .plan_id = owned_plan, .source_fingerprint = owned_fingerprint, .source_version = try a.dupe(u8, "v1"), .start_ordinal = 0, .covered_through_ordinal = 1, .complete = true };
+        return .{ .chunks = chunks, .plan_id = owned_plan, .source_fingerprint = owned_fingerprint, .source_version = try a.dupe(u8, "v1"), .start_ordinal = ordinal, .covered_through_ordinal = ordinal + 1, .complete = ordinal + 1 == self.parent_count };
     }
 };
 test "model aware media serverless skipped placeholder preserves every cached subwindow" {
@@ -3399,4 +3436,137 @@ test "model aware media completed namespace discovers secondary generations thro
     const continued = try enricher.runNamespaceWithConfig("docs", .{ .batch_size = 4, .scan_batch_size = 1, .pipeline_version = 1, .stage = .chunk_embeddings });
     try std.testing.expectEqual(@as(usize, 1), continued.enriched_documents);
     try std.testing.expectEqualDeep([_]usize{ 0, 0, 2 }, fake.calls);
+}
+
+test "model aware media serverless prefix repairs changed secondary generations" {
+    const Fake = ServerlessMediaTestProvider;
+    const a = std.testing.allocator;
+    var fake = Fake{ .fail = false, .parent_count = 2 };
+    var worker = SparseEnricher{ .alloc = a, .artifacts = undefined, .manifests = undefined, .progress = undefined, .wal = undefined };
+    defer worker.deinit();
+    const Boundary = @import("antfly_runtime_abi").callback_abi.Boundary(struct { chunk_page_with_context: ?*const @TypeOf(Fake.page) = null });
+    try worker.setModelChunker(.{ .provider = .antfly, .embedding = .{ .model = "indexA", .dimensions = 2 }, .outputs_json = "{\"boundary_model\":\"boundary\",\"targets\":[{\"name\":\"boundary\",\"kind\":\"embedding\",\"model\":\"boundaryB\",\"dimensions\":2},{\"name\":\"embedding\",\"kind\":\"embedding\",\"model\":\"indexA\",\"dimensions\":2},{\"name\":\"speech\",\"kind\":\"transcribe\",\"model\":\"speech\"}]}" }, "clip", .{ .ptr = &fake, .boundary_dispatch = Boundary.local_dispatch, .chunk_page_with_context_callback = @ptrCast(&Fake.page) });
+    worker.media_page_limit = 1;
+    const first = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, "{\"clip\":\"audio source\"}", 1, .require_model);
+    defer a.free(first.body.?);
+    fake.speech_revision_changed = true;
+    const second = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, first.body.?, 1, .require_model);
+    defer a.free(second.body.?);
+    var pending = try std.json.parseFromSlice(std.json.Value, a, second.body.?, .{});
+    defer pending.deinit();
+    try std.testing.expect(pending.value.object.get("_enrichment").?.object.get("chunk_embeddings_pending").?.bool);
+    const third = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, second.body.?, 1, .require_model);
+    defer a.free(third.body.?);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, third.body.?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("_enrichment").?.object.get("chunk_embeddings_version").?.integer);
+    try std.testing.expectEqual([3]usize{ 2, 2, 3 }, fake.calls);
+    for (parsed.value.object.get("media_outputs").?.object.get("chunks").?.array.items) |row| {
+        for (row.object.get("outputs").?.array.items) |output| {
+            if (std.mem.eql(u8, output.object.get("name").?.string, "speech")) try std.testing.expectEqualStrings("5555555555555555555555555555555555555555555555555555555555555555", output.object.get("model_revision").?.string);
+        }
+    }
+}
+
+test "model aware media serverless geometric checkpoints reduce body bytes with bounded replay work" {
+    const Fake = ServerlessMediaTestProvider;
+    const a = std.testing.allocator;
+    var fake = Fake{ .fail = false, .parent_count = 64 };
+    var worker = SparseEnricher{ .alloc = a, .artifacts = undefined, .manifests = undefined, .progress = undefined, .wal = undefined };
+    defer worker.deinit();
+    const Boundary = @import("antfly_runtime_abi").callback_abi.Boundary(struct { chunk_page_with_context: ?*const @TypeOf(Fake.page) = null });
+    try worker.setModelChunker(.{ .provider = .antfly, .embedding = .{ .model = "indexA", .dimensions = 2 }, .outputs_json = "{\"boundary_model\":\"boundary\",\"targets\":[{\"name\":\"boundary\",\"kind\":\"embedding\",\"model\":\"boundaryB\",\"dimensions\":2},{\"name\":\"embedding\",\"kind\":\"embedding\",\"model\":\"indexA\",\"dimensions\":2},{\"name\":\"speech\",\"kind\":\"transcribe\",\"model\":\"speech\"}]}" }, "clip", .{ .ptr = &fake, .boundary_dispatch = Boundary.local_dispatch, .chunk_page_with_context_callback = @ptrCast(&Fake.page) });
+
+    var reference: ?[]u8 = null;
+    defer if (reference) |bytes| a.free(bytes);
+    var totals: [3]usize = @splat(0);
+    var commits: [3]usize = @splat(0);
+    for ([_]usize{ 1, 8, 64 }, 0..) |limit, mode| {
+        fake = .{ .fail = false, .parent_count = 64 };
+        worker.media_page_limit = limit;
+        worker.media_checkpoint_interval_ms = 0;
+        var body = try a.dupe(u8, "{\"clip\":\"audio source\"}");
+        defer a.free(body);
+        while (true) {
+            const before = fake.calls[0];
+            const next = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, body, 1, .require_model);
+            try std.testing.expect(fake.calls[0] - before <= limit);
+            const produced = next.body orelse break;
+            a.free(body);
+            body = produced;
+            totals[mode] += body.len;
+            commits[mode] += 1;
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+            defer parsed.deinit();
+            if (!parsed.value.object.get("_enrichment").?.object.get("chunk_embeddings_pending").?.bool) break;
+        }
+        try std.testing.expectEqual([3]usize{ 64, 64, 64 }, fake.calls);
+        var final = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+        defer final.deinit();
+        const output = try std.json.Stringify.valueAlloc(a, .{ .vectors = final.value.object.get("chunk_embeddings").?, .outputs = final.value.object.get("media_outputs").? }, .{});
+        defer a.free(output);
+        if (reference) |bytes| try std.testing.expectEqualStrings(bytes, output) else reference = try a.dupe(u8, output);
+    }
+    try std.testing.expect(totals[1] < totals[0] / 4);
+    try std.testing.expect(totals[2] < totals[0] / 12);
+    std.debug.print("media checkpoint bytes={any} commits={any}\n", .{ totals, commits });
+}
+
+test "model aware media serverless detects a secondary deployment during one page group" {
+    const Fake = ServerlessMediaTestProvider;
+    const a = std.testing.allocator;
+    var fake = Fake{ .fail = false, .parent_count = 2, .change_speech_at = 1 };
+    var worker = SparseEnricher{ .alloc = a, .artifacts = undefined, .manifests = undefined, .progress = undefined, .wal = undefined };
+    defer worker.deinit();
+    const Boundary = @import("antfly_runtime_abi").callback_abi.Boundary(struct { chunk_page_with_context: ?*const @TypeOf(Fake.page) = null });
+    try worker.setModelChunker(.{ .provider = .antfly, .embedding = .{ .model = "indexA", .dimensions = 2 }, .outputs_json = "{\"boundary_model\":\"boundary\",\"targets\":[{\"name\":\"boundary\",\"kind\":\"embedding\",\"model\":\"boundaryB\",\"dimensions\":2},{\"name\":\"embedding\",\"kind\":\"embedding\",\"model\":\"indexA\",\"dimensions\":2},{\"name\":\"speech\",\"kind\":\"transcribe\",\"model\":\"speech\"}]}" }, "clip", .{ .ptr = &fake, .boundary_dispatch = Boundary.local_dispatch, .chunk_page_with_context_callback = @ptrCast(&Fake.page) });
+    worker.media_page_limit = 0;
+    const first = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, "{\"clip\":\"audio source\"}", 1, .require_model);
+    defer a.free(first.body.?);
+    var pending = try document_projection.parseAlloc(a, first.body.?);
+    defer pending.deinit(a);
+    try std.testing.expect(pending.chunk_embeddings_pending);
+    try std.testing.expect(pending.chunk_embeddings_version == null);
+    const repaired = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, first.body.?, 1, .require_model);
+    defer a.free(repaired.body.?);
+    var complete = try document_projection.parseAlloc(a, repaired.body.?);
+    defer complete.deinit(a);
+    try std.testing.expect(!complete.chunk_embeddings_pending);
+    try std.testing.expectEqual(@as(?u32, 1), complete.chunk_embeddings_version);
+    try std.testing.expectEqual([3]usize{ 2, 2, 3 }, fake.calls);
+}
+
+test "model aware media serverless grouped failure resumes only the unacknowledged tail after restart" {
+    const Fake = ServerlessMediaTestProvider;
+    const a = std.testing.allocator;
+    var fake = Fake{ .fail = false, .parent_count = 8 };
+    var worker = SparseEnricher{ .alloc = a, .artifacts = undefined, .manifests = undefined, .progress = undefined, .wal = undefined };
+    defer worker.deinit();
+    const Boundary = @import("antfly_runtime_abi").callback_abi.Boundary(struct { chunk_page_with_context: ?*const @TypeOf(Fake.page) = null });
+    try worker.setModelChunker(.{ .provider = .antfly, .embedding = .{ .model = "indexA", .dimensions = 2 }, .outputs_json = "{\"boundary_model\":\"boundary\",\"targets\":[{\"name\":\"boundary\",\"kind\":\"embedding\",\"model\":\"boundaryB\",\"dimensions\":2},{\"name\":\"embedding\",\"kind\":\"embedding\",\"model\":\"indexA\",\"dimensions\":2},{\"name\":\"speech\",\"kind\":\"transcribe\",\"model\":\"speech\"}]}" }, "clip", .{ .ptr = &fake, .boundary_dispatch = Boundary.local_dispatch, .chunk_page_with_context_callback = @ptrCast(&Fake.page) });
+    worker.media_page_limit = 8;
+    worker.media_checkpoint_interval_ms = 0;
+    const first = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, "{\"clip\":\"audio source\"}", 1, .require_model);
+    defer a.free(first.body.?);
+    const second = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, first.body.?, 1, .require_model);
+    defer a.free(second.body.?);
+    // The next group owns two pages. Fail its second page, after one new
+    // computation, without losing the earlier two durable page receipts.
+    fake.fail_ordinal = 3;
+    try std.testing.expectError(error.ChunkRequestFailed, buildDerivedBodyAlloc(&worker, .chunk_embeddings, second.body.?, 1, .require_model));
+    try std.testing.expectEqual([3]usize{ 3, 3, 3 }, fake.calls);
+    fake.fail_ordinal = null;
+    var restarted = SparseEnricher{ .alloc = a, .artifacts = undefined, .manifests = undefined, .progress = undefined, .wal = undefined, .media_page_limit = 8, .media_checkpoint_interval_ms = 0 };
+    defer restarted.deinit();
+    try restarted.setModelChunker(worker.model_chunker.?, "clip", worker.model_chunk_provider);
+    const resumed = try buildDerivedBodyAlloc(&restarted, .chunk_embeddings, second.body.?, 1, .require_model);
+    defer a.free(resumed.body.?);
+    const complete = try buildDerivedBodyAlloc(&restarted, .chunk_embeddings, resumed.body.?, 1, .require_model);
+    defer a.free(complete.body.?);
+    var projection = try document_projection.parseAlloc(a, complete.body.?);
+    defer projection.deinit(a);
+    try std.testing.expectEqual(@as(?u32, 1), projection.chunk_embeddings_version);
+    try std.testing.expectEqual(@as(usize, 16), projection.chunk_embeddings.?.len);
+    // Only the one unacknowledged successful page executes twice.
+    try std.testing.expectEqual([3]usize{ 9, 9, 9 }, fake.calls);
 }

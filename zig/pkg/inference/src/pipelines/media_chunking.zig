@@ -38,7 +38,7 @@ pub const Payload = union(enum) {
     text: []const u8,
     raster: image.BorrowedRasterAttachment,
     pcm: audio.PcmAudio,
-    video: struct { preparation_join: ?struct { context: *anyopaque, join: *const fn (*anyopaque) void } = null, prepared_outputs: ?PreparedVideoOutputs = null, audio: ?audio.PcmAudio = null, audio_start_ns: ?i64 = null, audio_failure: ?anyerror = null, webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8, reader: ?*const media.mp4.Reader = null, policy: video.sampling.TimestampPolicy, source_timestamps: bool = false, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, packet_base: usize = 0, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*@import("embedding_gemma2.zig").VideoAhead = null, prepared: ?@import("embedding_gemma2.zig").VideoPreparedHook = null },
+    video: struct { ordinal: ?u64 = null, preparation_join: ?struct { context: *anyopaque, join: *const fn (*anyopaque) void } = null, prepared_outputs: ?PreparedVideoOutputs = null, audio: ?audio.PcmAudio = null, audio_start_ns: ?i64 = null, audio_failure: ?anyerror = null, webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8, reader: ?*const media.mp4.Reader = null, policy: video.sampling.TimestampPolicy, source_timestamps: bool = false, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, packet_base: usize = 0, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*@import("embedding_gemma2.zig").VideoAhead = null, prepared: ?@import("embedding_gemma2.zig").VideoPreparedHook = null },
 };
 pub const Preflight = struct { video_plan: ?@import("embedding_gemma2_video.zig").Plan = null, input_tokens: usize, picture_count: ?u32 = null, selected_pictures: ?[]const u64 = null, picture_basis: ?planning.PictureBasis = null };
 pub const Output = struct { vector: []f32, input_tokens: usize };
@@ -796,8 +796,8 @@ pub const Runner = struct {
                 selection.continuation = &owner.continuation;
                 selection.packet_base = window.packet_base;
             }
-            slot.payload = .{ .video = .{ .bytes = &.{}, .reader = &window.coded.reader, .policy = policy, .source_timestamps = true, .selection = if (window.selection) |*selection| selection else null, .packet_base = window.packet_base } };
-        } else slot.payload = .{ .video = .{ .bytes = source.bytes, .reader = source.reader, .webm = source.webm, .policy = policy } };
+            slot.payload = .{ .video = .{ .ordinal = shape.ordinal, .bytes = &.{}, .reader = &window.coded.reader, .policy = policy, .source_timestamps = true, .selection = if (window.selection) |*selection| selection else null, .packet_base = window.packet_base } };
+        } else slot.payload = .{ .video = .{ .ordinal = shape.ordinal, .bytes = source.bytes, .reader = source.reader, .webm = source.webm, .policy = policy } };
         slot.initialized = true;
     }
     fn cacheVideoPreflight(self: *Runner, slot: *VideoSlot) !void {

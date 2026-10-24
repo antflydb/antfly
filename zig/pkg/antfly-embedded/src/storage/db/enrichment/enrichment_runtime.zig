@@ -32045,7 +32045,7 @@ fn deleteStaleChunkEmbeddingArtifacts(
     for (existing) |entry| {
         if (!internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) continue;
         if (!internal_keys.matchesDerivedEmbeddingArtifactName(entry.key, embedding_artifact_name)) continue;
-        if (derivedEmbeddingBelongsToDesiredChunk(entry.key, desired_chunk_keys)) continue;
+        if (try derivedEmbeddingBelongsToDesiredChunk(runtime.alloc, entry.key, desired_chunk_keys)) continue;
         try appendUniqueDupeKey(runtime.alloc, &artifact_delete_keys, entry.key);
     }
     return .{
@@ -32697,9 +32697,11 @@ fn appendUniqueOwnedConstKey(alloc: Allocator, keys: *std.ArrayListUnmanaged([]c
     try keys.append(alloc, key);
 }
 
-fn derivedEmbeddingBelongsToDesiredChunk(key: []const u8, desired_chunk_keys: []const []const u8) bool {
+fn derivedEmbeddingBelongsToDesiredChunk(a: Allocator, key: []const u8, desired_chunk_keys: []const []const u8) !bool {
+    const base = (try internal_keys.derivedEmbeddingBaseKeyAlloc(a, key)) orelse return false;
+    defer a.free(base);
     for (desired_chunk_keys) |chunk_key| {
-        if (std.mem.startsWith(u8, key, chunk_key)) return true;
+        if (std.mem.eql(u8, base, chunk_key)) return true;
     }
     return false;
 }
@@ -39717,6 +39719,23 @@ test "model aware media ordered vector windows are searchable with exact clocks 
         defer cache.deinit();
         try std.testing.expect(try publishMediaWindowVectors(runtime, a, vector_request, provider, &input, input.value.?, &cache));
         try db.runUntilIdle();
+        {
+            var lookup = (try db.lookup(a, "doc", .{ .fields = &.{"_artifacts"}, .include_all_fields = false })).?;
+            defer lookup.deinit(a);
+            var projected = try std.json.parseFromSlice(std.json.Value, a, lookup.json, .{});
+            defer projected.deinit();
+            try std.testing.expect(projected.value.object.get("_artifacts").?.object.contains("model"));
+            const projected_model = projected.value.object.get("_artifacts").?.object.get("model").?;
+            if (round == 0) {
+                const items = projected_model.object.get("items").?.array.items;
+                try std.testing.expectEqual(@as(usize, 2), items.len);
+                for (items, 0..) |item, index| {
+                    const ref = item.object.get("artifact_ref").?;
+                    try std.testing.expectEqual(@as(i64, @intCast(index)), ref.object.get("source").?.object.get("window_index").?.integer);
+                }
+            } else try std.testing.expect(projected_model.object.get("artifact_ref").?.object.get("source").?.object.get("window_index") == null);
+        }
+
         if (round == 0) for (0..2) |index| {
             const child = try internal_keys.mediaWindowChildKeyAlloc(a, member, @intCast(index));
             defer a.free(child);
@@ -39782,4 +39801,21 @@ test "model aware media label batches capture one vector space and fence it befo
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     fake.generation = 0x22;
     try std.testing.expect(!try modelChunkSelectedTargetCompatible(a, provider, request, reference));
+}
+
+test "model aware media scalar replacement retires every old child vector" {
+    const a = std.testing.allocator;
+    const parent = try internal_keys.chunkArtifactKeyAlloc(a, "doc", "clips", 0);
+    defer a.free(parent);
+    const scalar = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, parent, "model");
+    defer a.free(scalar);
+    try std.testing.expect(try derivedEmbeddingBelongsToDesiredChunk(a, scalar, &.{parent}));
+    for (0..2) |index| {
+        const child = try internal_keys.mediaWindowChildKeyAlloc(a, parent, @intCast(index));
+        defer a.free(child);
+        const vector = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, child, "model");
+        defer a.free(vector);
+        try std.testing.expect(!try derivedEmbeddingBelongsToDesiredChunk(a, vector, &.{parent}));
+        try std.testing.expect(try derivedEmbeddingBelongsToDesiredChunk(a, vector, &.{child}));
+    }
 }

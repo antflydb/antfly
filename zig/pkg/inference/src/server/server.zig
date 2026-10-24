@@ -40422,7 +40422,10 @@ const ChunkEmbeddingAdapter = struct {
         try adapter.control.check();
         try adapter.model.?.verifyEmbeddingIdentityWithControl(adapter.control);
         const shared: ?*MediaOutputExecution.FrameWindow = if (payload == .video and payload.video.prepared_outputs != null) @ptrCast(@alignCast(payload.video.prepared_outputs.?.context)) else null;
-        if (payload == .video and shared == null) if (adapter.media_outputs) |consumers| consumers.beginVideo(adapter.a);
+        if (payload == .video and shared == null) if (adapter.media_outputs) |consumers| {
+            consumers.beginVideo(adapter.a);
+            consumers.frame_ordinal = payload.video.ordinal;
+        };
         const options = grouped.Options{ .video_prepared_frames = if (shared) |window| window.primary[0..window.count] else adapter.prepared_frames, .video_observer = if (shared == null) (if (adapter.media_outputs) |consumers| if (consumers.hasFrameConsumers()) .{ .context = consumers, .accept = MediaOutputExecution.observeFrame } else null else null) else null, .task_type = @tagName(adapter.task), .dimensions = adapter.dimensions, .video_ahead = if (payload == .video) payload.video.ahead else null, .video_prepared = if (payload == .video) payload.video.prepared else null };
         var vector: []f32 = undefined;
         var input_tokens: usize = 0;
@@ -40521,9 +40524,10 @@ const MediaFramePreparationCache = struct {
             frame.patches = try a.dupe(f32, frame.patches);
             execution.video_frames[slot] = frame;
             for (value.pixels, 0..) |pixels, index| if (pixels) |values| {
+                if (index >= execution.initialized or !execution.needsFramePixels(execution.config.targets[index], slot)) continue;
                 execution.prepared_frames[index][slot] = try a.dupe(f32, values);
             };
-            return true;
+            return execution.frameComplete(slot);
         };
         return false;
     }
@@ -40545,6 +40549,11 @@ const MediaFramePreparationCache = struct {
         };
         spinLock(&self.lock);
         defer self.lock.unlock();
+        for (&self.entries) |*entry| if (entry.*) |*old| if (old.picture == picture) {
+            self.bytes -= old.bytes;
+            old.arena.deinit();
+            entry.* = null;
+        };
         while (self.bytes + bytes > max_bytes or self.entries[self.next] != null) {
             if (self.entries[self.next]) |*entry| {
                 self.bytes -= entry.bytes;
@@ -40601,6 +40610,7 @@ const MediaOutputExecution = struct {
     picture_ids: []const u64 = &.{},
     frame_cache: ?*MediaFramePreparationCache = null,
     capture_primary: bool = false,
+    frame_ordinal: ?u64 = null,
     const FrameWindow = struct {
         allocator: std.mem.Allocator,
         arena: ?std.heap.ArenaAllocator,
@@ -40623,6 +40633,7 @@ const MediaOutputExecution = struct {
         if (pictures.len > 32 or payload != .video) return error.InvalidChunkCoordinates;
         var worker = MediaOutputExecution{ .node = self.node, .io = self.io, .control = self.control, .config = self.config, .resolved = self.resolved, .initialized = self.initialized, .frame_cache = self.frame_cache, .capture_primary = true };
         worker.beginVideo(a);
+        worker.frame_ordinal = payload.video.ordinal;
         defer worker.endVideo();
         worker.picture_ids = pictures;
         var cached = true;
@@ -40678,6 +40689,7 @@ const MediaOutputExecution = struct {
         if (self.frame_arena) |*arena| arena.deinit();
         self.frame_arena = null;
         self.picture_ids = &.{};
+        self.frame_ordinal = null;
     }
     fn beginVideo(self: *MediaOutputExecution, a: std.mem.Allocator) void {
         self.endVideo();
@@ -40687,13 +40699,34 @@ const MediaOutputExecution = struct {
         self.video_frames = @splat(null);
         self.video_failure = null;
     }
+    fn wantsFrame(self: *const MediaOutputExecution, target: outputs.Target, slot: usize) bool {
+        return if (self.frame_ordinal) |ordinal| target.wants(ordinal, @intCast(slot)) else target.execute;
+    }
+    fn needsFramePixels(self: *const MediaOutputExecution, target: outputs.Target, slot: usize) bool {
+        if (self.wantsFrame(target, slot)) return true;
+        // Held/repeated pictures may only be observed once by the decoder.
+        // Prepare a representative if any of its output slots needs pixels.
+        if (slot < self.picture_ids.len) for (self.picture_ids, 0..) |picture, other| {
+            if (picture == self.picture_ids[slot] and self.wantsFrame(target, other)) return true;
+        };
+        return false;
+    }
+    fn frameComplete(self: *const MediaOutputExecution, slot: usize) bool {
+        if (self.video_frames[slot] == null and (self.capture_primary or self.hasVideoEmbeddingConsumers())) return false;
+        for (self.config.targets, self.resolved[0..self.initialized], 0..) |target, resolved, index| {
+            if (!self.needsFramePixels(target, slot) or resolved.failure != null) continue;
+            const profile = resolved.classifier_profile orelse continue;
+            if (profile.input == .pixels and self.prepared_frames[index][slot] == null and self.frame_errors[index] == null) return false;
+        }
+        return true;
+    }
     fn observeFrame(raw: *anyopaque, slot: usize, frame: @import("antfly_video").preparation.BorrowedFrame, options: @import("antfly_video").preparation.Options, control: @import("antfly_media").source.Control) !void {
         const self: *MediaOutputExecution = @ptrCast(@alignCast(raw));
         if (slot >= 32 or self.frame_arena == null) return error.InvalidInputShape;
         const a = self.frame_arena.?.allocator();
-        if (self.video_frames[slot] != null) return;
+        if (self.frameComplete(slot)) return;
         const pixel_consumers = for (self.config.targets, self.resolved[0..self.initialized]) |target, resolved| {
-            if (target.execute and resolved.failure == null) if (resolved.classifier_profile) |profile| if (profile.input == .pixels) break true;
+            if (self.needsFramePixels(target, slot) and resolved.failure == null) if (resolved.classifier_profile) |profile| if (profile.input == .pixels) break true;
         } else false;
         defer if (self.frame_cache) |cache| if (slot < self.picture_ids.len) {
             cache.insert(self, cache.allocator, slot, self.picture_ids[slot]) catch {};
@@ -40705,7 +40738,7 @@ const MediaOutputExecution = struct {
             break :failed null;
         } else null;
         defer if (displayed) |*value| value.deinit(a);
-        if ((self.capture_primary or self.hasVideoEmbeddingConsumers()) and self.video_failure == null) {
+        if (self.video_frames[slot] == null and (self.capture_primary or self.hasVideoEmbeddingConsumers()) and self.video_failure == null) {
             const patches: ?[]f32 = (if (displayed) |value| frame.prepareDisplayed(a, value, options, control) else frame.prepare(a, options, control)) catch |err| failed: {
                 if (chunks.abort(err)) return err;
                 self.video_failure = err;
@@ -40719,9 +40752,20 @@ const MediaOutputExecution = struct {
         }
         const pixels = displayed orelse return;
         for (self.config.targets, self.resolved[0..self.initialized], 0..) |target, resolved, index| {
-            if (!target.execute or resolved.failure != null or self.frame_errors[index] != null) continue;
+            if (!self.needsFramePixels(target, slot) or resolved.failure != null or self.frame_errors[index] != null or self.prepared_frames[index][slot] != null) continue;
             const profile = resolved.classifier_profile orelse continue;
             if (profile.input != .pixels) continue;
+            // Equal preprocessing contracts share the same arena-owned tensor,
+            // regardless of classifier model or vocabulary.
+            for (self.resolved[0..index], 0..) |previous, earlier| {
+                if (previous.classifier_profile) |other| if (std.meta.eql(profile, other)) {
+                    if (self.prepared_frames[earlier][slot]) |prepared| {
+                        self.prepared_frames[index][slot] = prepared;
+                        break;
+                    }
+                };
+            }
+            if (self.prepared_frames[index][slot] != null) continue;
             self.prepared_frames[index][slot] = @import("../pipelines/media_classification.zig").prepareImage(a, profile, pixels.view()) catch |err| {
                 if (chunks.abort(err)) return err;
                 self.frame_errors[index] = err;
@@ -40819,8 +40863,11 @@ const MediaOutputExecution = struct {
             self.video_frames = window.frames;
             self.video_failure = null;
         };
+        self.picture_ids = descriptor.coordinates.selected_pictures orelse &.{};
         if (payload == .video and self.hasFrameConsumers() and self.frame_arena == null) {
             self.beginVideo(a);
+            self.frame_ordinal = descriptor.ordinal;
+            self.picture_ids = descriptor.coordinates.selected_pictures orelse &.{};
             const movie = payload.video;
             @import("../pipelines/embedding_gemma2_video.zig").observeConfigured(a, movie.bytes, movie.reader, self.control, .{ .observer = .{ .context = self, .accept = observeFrame }, .sampling = if (movie.source_timestamps) .{ .source_timestamps = movie.policy } else .{ .timestamps = movie.policy }, .selection = movie.selection, .webm = movie.webm }) catch |err| {
                 if (chunks.abort(err)) return err;
@@ -41123,7 +41170,7 @@ test "model aware media planning-only boundaries capture frames for otherwise id
 test "model aware media prepared frame windows share decode caches and own queued pixels" {
     const a = std.testing.allocator;
     const chunks = @import("../pipelines/media_chunking.zig");
-    const targets = [_]lib_chunker.outputs.Target{
+    var targets = [_]lib_chunker.outputs.Target{
         .{ .name = "clip", .kind = .embedding, .model = "clip" },
         .{ .name = "objects", .kind = .classify, .model = "objects" },
     };
@@ -41153,6 +41200,20 @@ test "model aware media prepared frame windows share decode caches and own queue
     cache.deinit();
     // Eviction cannot invalidate a queued classifier or backbone input.
     try std.testing.expect(right.pixels[1][0].?.len == 3 and right.primary[0].patches.len > 0);
+    targets[1].skip_windows = &.{.{ .ordinal = 7, .sub_index = 0 }};
+    var masked_payload = payload;
+    masked_payload.video.ordinal = 7;
+    const masked = try MediaOutputExecution.prepareVideo(&adapter, a, masked_payload, measured);
+    defer masked.deinit(masked.context);
+    const partial: *MediaOutputExecution.FrameWindow = @ptrCast(@alignCast(masked.context));
+    try std.testing.expect(partial.pixels[1][0] == null);
+    const partial_bytes = cache.bytes;
+    masked_payload.video.ordinal = 8;
+    const upgraded = try MediaOutputExecution.prepareVideo(&adapter, a, masked_payload, measured);
+    defer upgraded.deinit(upgraded.context);
+    const full: *MediaOutputExecution.FrameWindow = @ptrCast(@alignCast(upgraded.context));
+    try std.testing.expect(full.pixels[1][0] != null);
+    try std.testing.expect(cache.bytes > partial_bytes);
 }
 
 test "model aware media masked secondary video bypasses execution" {
@@ -41169,4 +41230,48 @@ test "model aware media masked secondary video bypasses execution" {
     consumers.resolved[1] = .{ .path = "", .identity = @splat('4'), .revision = @splat('5'), .recipe_id = @splat('6'), .uses_video = true };
     const values = try MediaOutputExecution.execute(&consumers, a, .{ .video = .{ .bytes = &.{}, .policy = .{} } }, .{ .ordinal = 3, .input_tokens = 0, .coordinates = .{ .kind = .video, .start_ns = 0, .end_ns = 1, .selected_pictures = &.{7} } }, null, null, null, true);
     try std.testing.expectEqual(@as(@FieldType(O.Result, "status"), .skipped), values[1].status);
+}
+
+test "model aware media sparse frame repairs prepare only needed classifier tensors and share equal profiles" {
+    const a = std.testing.allocator;
+    var skips: [31]lib_chunker.outputs.Target.Window = undefined;
+    for (&skips, 0..) |*skip, i| skip.* = .{ .ordinal = 7, .sub_index = @intCast(i) };
+    var targets = [_]lib_chunker.outputs.Target{
+        .{ .name = "boundary", .kind = .embedding, .model = "boundary", .execute = false },
+        .{ .name = "objects", .kind = .classify, .model = "one" },
+        .{ .name = "scenes", .kind = .classify, .model = "two" },
+    };
+    var counts: [2]usize = @splat(0);
+    for (0..2) |mode| {
+        targets[1].skip_windows = if (mode == 1) &skips else &.{};
+        targets[2].skip_windows = targets[1].skip_windows;
+        var execution = MediaOutputExecution{ .node = undefined, .io = std.testing.io, .control = .{}, .config = .{ .boundary_model = "boundary", .targets = &targets }, .initialized = 3 };
+        for (execution.resolved[0..3], 0..) |*resolved, index| resolved.* = .{ .path = "", .identity = @splat('1'), .revision = @splat('2'), .recipe_id = @splat('3'), .classifier_profile = if (index == 0) null else .{ .input = .pixels, .score_transform = .softmax, .width = 4, .height = 4 } };
+        execution.beginVideo(a);
+        defer execution.endVideo();
+        execution.frame_ordinal = 7;
+        var pictures: [32]u64 = undefined;
+        for (&pictures, 0..) |*picture, i| picture.* = i;
+        execution.picture_ids = &pictures;
+        const frame = @import("antfly_video").preparation.BorrowedFrame{ .rgba = .{ .bytes = &.{ 255, 0, 0, 255 }, .width = 1, .height = 1 } };
+        for (0..32) |slot| {
+            try MediaOutputExecution.observeFrame(&execution, slot, frame, .{ .width = 1, .height = 1, .matrix = .bt709 }, .{});
+            if (execution.prepared_frames[1][slot]) |pixels| {
+                counts[mode] += 1;
+                try std.testing.expect(pixels.ptr == execution.prepared_frames[2][slot].?.ptr);
+            }
+        }
+        if (mode == 1) {
+            // Held pictures can be observed only at a masked representative.
+            // Its pixels still supply a later unmasked output slot.
+            execution.beginVideo(a);
+            execution.frame_ordinal = 7;
+            @memset(&pictures, 0);
+            execution.picture_ids = &pictures;
+            try std.testing.expect(!targets[1].wants(7, 0));
+            try MediaOutputExecution.observeFrame(&execution, 0, frame, .{ .width = 1, .height = 1, .matrix = .bt709 }, .{});
+            try std.testing.expect(execution.prepared_frames[1][0] != null);
+        }
+    }
+    try std.testing.expectEqual([2]usize{ 32, 1 }, counts);
 }
