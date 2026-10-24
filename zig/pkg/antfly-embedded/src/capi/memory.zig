@@ -443,6 +443,8 @@ test "capi native memory projection manifests survive reopen and retire curation
             if (phase == 1) {
                 const state = try std.json.parseFromSliceLeaky(memory.types.State, alloc, (try backend.get(backend.ptr, alloc, "control")).?.json, .{});
                 _ = try service.execute(alloc, .curate_entity, "", try std.json.Stringify.valueAlloc(alloc, .{ .expected_revision = state.revision, .action = "suppress", .from = "kg" }, .{}), "suppress");
+                const current = try std.json.parseFromSliceLeaky(memory.types.EntityCandidatePage, alloc, try service.execute(alloc, .entity_candidates, "graph", "{}", ""), .{});
+                for (current.items) |candidate| try std.testing.expect(!std.mem.eql(u8, candidate.entity.entity.id, "kg"));
             } else {
                 const business = try @import("tables.zig").get(root, "business");
                 try business.batch(.{ .writes = &.{.{ .key = "approval", .value = "{\"message\":\"Changed source\"}" }}, .sync_level = .write });
@@ -453,7 +455,9 @@ test "capi native memory projection manifests survive reopen and retire curation
         for (0..32) |i| {
             _ = try service.execute(alloc, .advance, "", "{}", try std.fmt.allocPrint(alloc, "phase-{d}-{d}", .{ phase, i }));
             const page = try std.json.parseFromSliceLeaky(memory.types.EntityCandidatePage, alloc, try service.execute(alloc, .entity_candidates, "graph", "{}", ""), .{});
-            if (page.semantic_discovery == .indexed) {
+            // Indexed reads remain available while unrelated incremental work
+            // drains. Physical retirement additionally waits for that queue.
+            if (page.semantic_discovery == .indexed and (try backend.scan(backend.ptr, alloc, "entity-semantic-work/", null, 1)).rows.len == 0) {
                 try std.testing.expectEqual(phase != 2, std.mem.indexOf(u8, page.seed_view.description, "Source-backed") != null);
                 break;
             }

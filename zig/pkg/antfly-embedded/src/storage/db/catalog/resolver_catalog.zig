@@ -77,7 +77,8 @@ pub const curation_provenance_reader_version: u32 = 10;
 pub const scoped_curation_reader_version: u32 = 11;
 pub const native_resolver_records_reader_version: u32 = 12;
 pub const resolver_projection_bindings_reader_version: u32 = 13;
-pub const supported_reader_version: u32 = resolver_projection_bindings_reader_version;
+pub const resolver_projection_work_reader_version: u32 = 14;
+pub const supported_reader_version: u32 = resolver_projection_work_reader_version;
 
 pub fn readerVersionBytes(version: u32) ![]const u8 {
     return switch (version) {
@@ -94,6 +95,7 @@ pub fn readerVersionBytes(version: u32) ![]const u8 {
         11 => "11",
         12 => "12",
         13 => "13",
+        14 => "14",
         else => error.UnsupportedDatabaseReaderVersion,
     };
 }
@@ -190,6 +192,23 @@ pub const ResolverSourceArtifactKind = enum {
         return self.matches(other) or other.matches(self);
     }
 };
+
+/// In-process validation evidence. It is never deserialized or persisted.
+pub const PolicyValidation = struct {
+    policy_digest: [64]u8,
+    static_digest: [32]u8,
+    pub fn jsonParse(_: Allocator, _: anytype, _: std.json.ParseOptions) !PolicyValidation {
+        return error.UnexpectedToken;
+    }
+    pub fn jsonParseFromValue(_: Allocator, _: std.json.Value, _: std.json.ParseOptions) !PolicyValidation {
+        return error.UnexpectedToken;
+    }
+};
+pub fn policyProfileDigest(a: Allocator, aliases: []const resolver_lib.KeyAlias, suppress_json: []const u8) ![32]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ aliases, suppress_json }, .{}), &digest, .{});
+    return digest;
+}
 
 /// Immutable policy owned once by a catalog generation. Ordinary `clone`
 /// remains detached (including arena callers); only persistent catalog slots
@@ -297,6 +316,7 @@ pub const ResolverConfig = struct {
     /// API-created redirects are durable identity state, never inline config.
     merges: []const resolver_lib.KeyAlias = &.{},
     shared_projection: ?*SharedProjection = null,
+    validation_proof: ?PolicyValidation = null,
     /// Combined resolution revision after the first merge. Advanced on either
     /// config changes or merges; the field name retains catalog compatibility.
     merge_generation: u64 = 0,
@@ -429,19 +449,27 @@ pub const ResolverConfig = struct {
         return value;
     }
 
+    fn sharedPolicyDigest(self: ResolverConfig) ?[64]u8 {
+        const projection = self.shared_projection orelse return null;
+        if (self.merges.ptr != projection.merges.ptr or self.merges.len != projection.merges.len or self.curation_json.ptr != projection.curation_json.ptr or self.curation_json.len != projection.curation_json.len) return null;
+        return projection.digest;
+    }
     pub fn eql(self: ResolverConfig, other: ResolverConfig) bool {
+        const shared_equal = if (self.sharedPolicyDigest()) |left| if (other.sharedPolicyDigest()) |right| std.mem.eql(u8, &left, &right) else false else false;
         inline for (@typeInfo(ResolverConfig).@"struct".field_names, @typeInfo(ResolverConfig).@"struct".field_types) |reflected_name, field_type| {
-            if (comptime std.mem.eql(u8, reflected_name, "shared_projection")) continue;
-            if (field_type == []const u8) {
-                if (!std.mem.eql(u8, @field(self, reflected_name), @field(other, reflected_name))) return false;
-            } else if (field_type == []const []const u8) {
-                const a = @field(self, reflected_name);
-                const b = @field(other, reflected_name);
-                if (a.len != b.len) return false;
-                for (a, b) |as, bs| if (!std.mem.eql(u8, as, bs)) return false;
-            } else if (field_type == []const resolver_lib.KeyAlias) {
-                if (!aliasesEqual(@field(self, reflected_name), @field(other, reflected_name))) return false;
-            } else if (!std.meta.eql(@field(self, reflected_name), @field(other, reflected_name))) return false;
+            if (comptime std.mem.eql(u8, reflected_name, "shared_projection") or std.mem.eql(u8, reflected_name, "validation_proof")) continue;
+            if (!shared_equal or (comptime !std.mem.eql(u8, reflected_name, "merges") and !std.mem.eql(u8, reflected_name, "curation_json"))) {
+                if (field_type == []const u8) {
+                    if (!std.mem.eql(u8, @field(self, reflected_name), @field(other, reflected_name))) return false;
+                } else if (field_type == []const []const u8) {
+                    const a = @field(self, reflected_name);
+                    const b = @field(other, reflected_name);
+                    if (a.len != b.len) return false;
+                    for (a, b) |as, bs| if (!std.mem.eql(u8, as, bs)) return false;
+                } else if (field_type == []const resolver_lib.KeyAlias) {
+                    if (!aliasesEqual(@field(self, reflected_name), @field(other, reflected_name))) return false;
+                } else if (!std.meta.eql(@field(self, reflected_name), @field(other, reflected_name))) return false;
+            }
         }
         return true;
     }
@@ -482,7 +510,7 @@ pub const ResolverConfig = struct {
     pub fn jsonStringify(self: ResolverConfig, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(ResolverConfig).@"struct".field_names) |field| {
-            if (comptime !std.mem.eql(u8, field, "merges") and !std.mem.eql(u8, field, "shared_projection")) {
+            if (comptime !std.mem.eql(u8, field, "merges") and !std.mem.eql(u8, field, "shared_projection") and !std.mem.eql(u8, field, "validation_proof")) {
                 const omit = switch (comptime @field(ResolverConfigField, field)) {
                     .adjudicate_json, .suppress_json, .curation_json => @field(self, field).len == 0,
                     .namespace_curation_missing, .retired => !@field(self, field),
@@ -508,7 +536,7 @@ pub const ResolverConfig = struct {
     pub fn jsonExecution(self: ResolverConfig, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(ResolverConfig).@"struct".field_names) |field| {
-            if (comptime !std.mem.eql(u8, field, "shared_projection")) {
+            if (comptime !std.mem.eql(u8, field, "shared_projection") and !std.mem.eql(u8, field, "validation_proof")) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
             }
@@ -637,25 +665,20 @@ pub const ResolverConfig = struct {
     /// prior outside [0, 1]) collapses every edge weight toward 0, which a
     /// weighted traversal with a positive `min_weight` would silently drop.
     pub fn validate(self: ResolverConfig) !void {
-        if (self.suppress_json.len > 0 or self.curation_json.len > 0) {
-            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-            defer arena.deinit();
-            const a = arena.allocator();
-            const policy = try resolver_lib.curation.Index.init(a, self.suppress_json, self.curation_json);
-            const aliases = try self.effectiveAliasesAlloc(a);
-            const state = try resolver_lib.curation.parseState(a, self.curation_json);
-            const redirects = try resolver_lib.curation.RedirectIndex.init(a, aliases);
-            for (state.distinct) |pair| {
-                const from = redirects.canonical(pair.from);
-                const to = redirects.canonical(pair.to);
-                if (std.mem.eql(u8, from, to)) return error.ResolverDistinctPair;
-            }
-            for (aliases) |alias| {
-                const target = redirects.canonical(alias.target);
-                if (policy.keySuppressed(target)) return error.SuppressedResolverRedirectTarget;
-                if (try policy.pinnedDistinct(a, alias.key, target)) return error.ResolverDistinctPair;
-            }
-        }
+        try self.validateDefinition();
+        try self.validatePolicy();
+    }
+    pub fn validatePolicy(self: ResolverConfig) !void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        if (self.shared_projection) |projection| if (self.validation_proof) |proof| {
+            const static_digest = try policyProfileDigest(a, self.aliases, self.suppress_json);
+            if (self.merges.ptr == projection.merges.ptr and self.merges.len == projection.merges.len and self.curation_json.ptr == projection.curation_json.ptr and self.curation_json.len == projection.curation_json.len and std.mem.eql(u8, &proof.policy_digest, &projection.digest) and std.mem.eql(u8, &proof.static_digest, &static_digest)) return;
+        };
+        try @import("../resolver_authority.zig").validateProfile(a, .{ .key_template = self.key_template, .merges = self.merges, .state = try resolver_lib.curation.parseState(a, self.curation_json) }, self.aliases, self.suppress_json);
+    }
+    pub fn validateDefinition(self: ResolverConfig) !void {
         if (self.adjudicate_json.len > 0) {
             if (self.scorer_json.len == 0) return error.InvalidResolverConfig;
             try @import("../../../functions/resolver_adjudication.zig").validate(std.heap.page_allocator, self.adjudicate_json);
@@ -665,13 +688,8 @@ pub const ResolverConfig = struct {
                 if (self.source_artifact_kind != .asset or std.mem.eql(u8, artifact, self.source_artifact) or std.mem.eql(u8, artifact, self.resolution_artifact)) return error.InvalidResolverConfig;
             }
         }
-        try resolver_lib.validateAliases(self.aliases);
-        try resolver_lib.validateAliases(self.merges);
         if (self.max_work_bytes > 16 * 1024 * 1024) return error.InvalidResolverConfig;
         if (self.merge_state_version > 2) return error.UnsupportedResolverCatalogVersion;
-        const effective = try self.effectiveAliasesAlloc(std.heap.page_allocator);
-        defer std.heap.page_allocator.free(effective);
-        try resolver_lib.validateAliases(effective);
         if (self.name.len == 0 or
             self.table.len == 0 or
             self.source_artifact.len == 0 or

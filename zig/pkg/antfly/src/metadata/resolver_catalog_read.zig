@@ -43,11 +43,15 @@ pub const Page = struct {
     revision: u64,
     table: metadata.TableRecord,
     configs: ?[]const @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig = null,
+    execution_indexes: ?[]const u8 = null,
     ranges: []metadata.RangeRecord = &.{},
     consumers: []const Consumer = &.{},
     visited: usize = 0,
     next_cursor: ?[]const u8 = null,
     indexed: bool = false,
+    pub fn executionIndexes(self: @This()) []const u8 {
+        return self.execution_indexes orelse self.table.indexes_json;
+    }
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
@@ -60,7 +64,7 @@ pub const Page = struct {
                         // Durable definition serialization excludes merges;
                         // this private execution view must carry them.
                         inline for (@typeInfo(@TypeOf(cfg)).@"struct".field_names) |name| {
-                            if (comptime !std.mem.eql(u8, name, "shared_projection")) {
+                            if (comptime !std.mem.eql(u8, name, "shared_projection") and !std.mem.eql(u8, name, "validation_proof")) {
                                 try writer.objectField(name);
                                 try writer.write(@field(cfg, name));
                             }

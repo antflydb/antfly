@@ -2087,6 +2087,30 @@ test "memory generation plans mark client sources as distillation context and re
     try std.testing.expectError(error.MemoryUngroundedOutput, plan.validatePublication(.{ .assertions = &.{claim} }));
 }
 
+fn identitySnapshot(store: *Store) !@import("../storage/db/resolver_namespace.zig").Namespace {
+    const native = @import("../storage/db/resolver_authority.zig");
+    const Bridge = struct {
+        fn get(ptr: *anyopaque, _: A, path: []const u8) !?[]const u8 {
+            const source_store: *Store = @ptrCast(@alignCast(ptr));
+            return source_store.values.get(path);
+        }
+        fn put(_: *anyopaque, _: A, _: []const u8, _: []const u8) !void {
+            return error.ReadOnly;
+        }
+        fn remove(_: *anyopaque, _: A, _: []const u8) !void {
+            return error.ReadOnly;
+        }
+        fn scan(ptr: *anyopaque, a: A, prefix: []const u8, after: ?[]const u8, limit: u32) !native.Page {
+            const page = try Store.scan(ptr, a, prefix, after, limit);
+            const rows = try a.alloc(native.Row, page.rows.len);
+            for (page.rows, rows) |row, *out| out.* = .{ .key = row.key, .value = row.json };
+            return .{ .rows = rows, .next = page.next };
+        }
+    };
+    const records: native.Store = .{ .a = store.arena.allocator(), .prefix = "entity-authority/", .backend = .{ .ptr = store, .get = Bridge.get, .put = Bridge.put, .remove = Bridge.remove, .scan = Bridge.scan } };
+    return (try records.exportNamespace("{{_key}}")).?.namespace;
+}
+
 fn curationPayloadSetup(store: *Store, expires: bool) ![]const u8 {
     const a = store.arena.allocator();
     try discard(store, .create, "", "{}", "create", 1);
@@ -2100,12 +2124,12 @@ fn curationPayloadSetup(store: *Store, expires: bool) ![]const u8 {
         \\{"action":"merge","from":"left","to":"right","expected_revision":3,"reason":"PRIVATE_CURATOR_REASON"}
     ;
     try discard(store, .curate_entity, "", body, "merge", 3);
-    const policy = store.values.get("entity-policy").?;
-    try std.testing.expect(std.mem.indexOf(u8, policy, "PRIVATE_CURATOR_REASON") == null);
-    const value = try std.json.parseFromSliceLeaky(std.json.Value, a, policy, .{});
-    const origin = value.object.get("state").?.object.get("redirect_origins").?.array.items[0].object.get("origin").?;
-    try std.testing.expectEqualStrings("alice", origin.object.get("actor").?.string);
-    try std.testing.expectEqual(@as(i64, 4), origin.object.get("revision").?.integer);
+    const policy = try identitySnapshot(store);
+    try std.testing.expect(store.values.get("entity-policy") == null);
+    try std.testing.expect(std.mem.indexOf(u8, try std.json.Stringify.valueAlloc(a, policy, .{}), "PRIVATE_CURATOR_REASON") == null);
+    const origin = policy.state.redirect_origins[0].origin;
+    try std.testing.expectEqualStrings("alice", origin.actor);
+    try std.testing.expectEqual(@as(u64, 4), origin.revision);
     try std.testing.expectEqual(@as(usize, 1), (try Store.scan(store, a, "entity-curation/", null, 256)).rows.len);
     return body;
 }
@@ -2141,11 +2165,10 @@ test "memory curation content retires on global source evidence forgetting and e
         if (mode != 0) {
             // Retention of decision metadata is independent of free-text audit
             // content. A future rebuild cannot silently reverse this decision.
-            const policy = try std.json.parseFromSliceLeaky(std.json.Value, a, store.values.get("entity-policy").?, .{});
-            const redirects = policy.object.get("redirects").?.array.items;
-            try std.testing.expectEqual(@as(usize, 1), redirects.len);
-            try std.testing.expectEqualStrings("left", redirects[0].object.get("key").?.string);
-            try std.testing.expectEqualStrings("right", redirects[0].object.get("target").?.string);
+            const policy = try identitySnapshot(&store);
+            try std.testing.expectEqual(@as(usize, 1), policy.merges.len);
+            try std.testing.expectEqualStrings("left", policy.merges[0].key);
+            try std.testing.expectEqualStrings("right", policy.merges[0].target);
         }
     }
 }

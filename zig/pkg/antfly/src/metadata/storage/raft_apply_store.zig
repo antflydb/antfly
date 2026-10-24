@@ -12256,12 +12256,13 @@ pub const RaftApplyStore = struct {
             if (table.indexes_json.len == 0) continue;
             var root = try std.json.parseFromSliceLeaky(std.json.Value, a, table.indexes_json, .{});
             const identities = try resolver_curation.metadataFromValue(a, root);
-            for (identities.identities) |identity| if (identity.authority_table_id != 0) {
-                var portable = identity;
+            const detached = try a.dupe(resolver_curation.MetadataIdentity, identities.identities);
+            for (detached) |*portable| {
                 portable.authority_table_id = 0;
+                portable.projection_ref = null;
                 portable.revision = @max(@as(u64, 1), portable.revision);
-                try resolver_curation.replaceMetadata(a, &root, portable);
-            };
+            }
+            try root.object.put(a, resolver_curation.metadata_key, try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, resolver_curation.Metadata{ .identities = detached }, .{}), .{}));
             table.indexes_json = try std.json.Stringify.valueAlloc(a, root, .{});
             if (!@import("../resolver_authority.zig").isNative(root)) continue;
             var bridge: NativeResolverTxn = .{ .txn = txn };
@@ -23326,7 +23327,7 @@ pub const RaftApplyStore = struct {
             result.ranges = ranges;
             var projections: ResolverProjectionCache = .empty;
             const execution_indexes = try self.resolverExecutionIndexesTxn(a, &txn, group_id, table.indexes_json, &projections);
-            result.configs = try resolverConfigs(a, try std.json.parseFromSliceLeaky(std.json.Value, a, if (execution_indexes.len == 0) "{}" else execution_indexes, .{}));
+            result.execution_indexes = execution_indexes;
             return std.json.Stringify.valueAlloc(alloc, result, .{});
         }
         const indexed = try stagingGet(&txn, try resolverNamespaceBootstrapKey(a, group_id)) != null;
@@ -23478,15 +23479,16 @@ pub const RaftApplyStore = struct {
         var desired: std.ArrayListUnmanaged(Config) = .empty;
         try @import("antfly_local_sources").metadata_local_index_reconcile.collectDesiredResolvers(a, root, &desired);
         const identities = try resolver_curation.metadataFromValue(a, root);
+        var profiles: std.StringHashMapUnmanaged(void) = .empty;
         for (desired.items) |*cfg| for (identities.identities) |identity| {
-            if (!identity.dropped and std.mem.eql(u8, identity.name, cfg.name)) cfg.* = try resolver_curation.overlayMetadata(a, cfg.*, identity);
+            if (!identity.dropped and std.mem.eql(u8, identity.name, cfg.name)) cfg.* = try resolver_curation.overlayMetadataCached(a, cfg.*, identity, &profiles);
         };
         for (identities.identities) |identity| {
             if (identity.dropped) continue;
             const found = for (desired.items) |cfg| {
                 if (std.mem.eql(u8, cfg.name, identity.name)) break true;
             } else false;
-            if (!found) try desired.append(a, try resolver_curation.overlayMetadata(a, .{ .name = identity.name, .table = identity.table, .key_template = identity.key_template, .source_artifact = "retired_source", .resolution_artifact = "retired_resolution", .retired = true, .promote = false }, identity));
+            if (!found) try desired.append(a, try resolver_curation.overlayMetadataCached(a, .{ .name = identity.name, .table = identity.table, .key_template = identity.key_template, .source_artifact = "retired_source", .resolution_artifact = "retired_resolution", .retired = true, .promote = false }, identity, &profiles));
         }
         return desired.items;
     }
@@ -23636,24 +23638,37 @@ pub const RaftApplyStore = struct {
         var root = try std.json.parseFromSliceLeaky(std.json.Value, a, indexes, .{});
         const identities = try resolver_curation.metadataFromValue(a, root);
         var changed = false;
-        for (identities.identities) |identity| {
+        var attachments: std.StringHashMapUnmanaged(resolver_curation.MetadataProjection) = .empty;
+        const hydrated_identities = try a.dupe(resolver_curation.MetadataIdentity, identities.identities);
+        for (hydrated_identities) |*identity| {
             if (!identity.projection_only or identity.dropped) continue;
             const cache_key = try std.json.Stringify.valueAlloc(a, .{ identity.authority_table_id, identity.key_template }, .{});
             const entry = try cache.getOrPut(a, cache_key);
             if (!entry.found_existing) {
-                entry.value_ptr.* = try self.resolverProjectionPayloadTxn(a, txn, group, identity);
+                entry.value_ptr.* = try self.resolverProjectionPayloadTxn(a, txn, group, identity.*);
             }
             const namespace = entry.value_ptr.*;
-            var hydrated = identity;
-            hydrated.projection_only = false;
-            hydrated.revision = namespace.revision;
-            hydrated.merges = namespace.merges;
-            hydrated.state = namespace.state;
-            hydrated.authority_missing = !namespace.record_store;
-            try resolver_curation.replaceMetadata(a, &root, hydrated);
+            const attachment = try attachments.getOrPut(a, cache_key);
+            if (!attachment.found_existing) {
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, namespace, .{}), &digest, .{});
+                attachment.value_ptr.* = .{ .id = try a.dupe(u8, &std.fmt.bytesToHex(digest, .lower)), .namespace = namespace };
+            }
+            identity.projection_ref = attachment.value_ptr.id;
+            identity.projection_only = false;
+            identity.revision = namespace.revision;
+            identity.merges = namespace.merges;
+            identity.state = namespace.state;
+            identity.authority_missing = !namespace.record_store;
             changed = true;
         }
-        return if (changed) try std.json.Stringify.valueAlloc(a, root, .{}) else indexes;
+        if (!changed) return indexes;
+        var unique: std.StringArrayHashMapUnmanaged(resolver_curation.MetadataProjection) = .empty;
+        var values = attachments.valueIterator();
+        while (values.next()) |item| try unique.put(a, item.id, item.*);
+        const projections = unique.values();
+        try root.object.put(a, resolver_curation.metadata_key, try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, resolver_curation.Metadata{ .identities = hydrated_identities, .projections = projections }, .{}), .{}));
+        return std.json.Stringify.valueAlloc(a, root, .{});
     }
     fn projectResolverNamespacesTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.TableRecord) !metadata.TableRecord {
         if (record.indexes_json.len == 0) return record;
@@ -40241,11 +40256,30 @@ test "resolver curation namespace propagation persists compact bindings and mate
         try std.testing.expectEqual(@as(usize, 1000), identities.identities[0].merges.len);
     };
     const page = try std.json.parseFromSliceLeaky(@import("../resolver_catalog_read.zig").Page, a, try store.resolverCatalogRead(a, group, .{ .table_name = "source-0" }), .{});
-    try std.testing.expectEqual(@as(usize, 1000), page.configs.?[0].merges.len);
+    const page_configs = try RaftApplyStore.resolverConfigs(a, try std.json.parseFromSliceLeaky(std.json.Value, a, page.executionIndexes(), .{}));
+    try std.testing.expectEqual(@as(usize, 1000), page_configs[0].merges.len);
     try std.testing.expect(page.table.indexes_json.len < 4096);
     try std.testing.expectEqual(@as(usize, 1), store.resolver_projection_exports);
-    try std.testing.expectEqual(@as(u64, 0), page.configs.?[0].namespace_curation_generation);
-    try std.testing.expectEqual(@as(u64, 1), page.configs.?[0].namespace_curation_table_id);
+    try std.testing.expectEqual(@as(u64, 0), page_configs[0].namespace_curation_generation);
+    try std.testing.expectEqual(@as(u64, 1), page_configs[0].namespace_curation_table_id);
+    // Many resolvers in one execution document carry the policy once.
+    {
+        const identities = try a.alloc(resolver_curation.MetadataIdentity, 20);
+        for (identities, 0..) |*identity, i| identity.* = .{ .name = try std.fmt.allocPrint(a, "consumer-{d}", .{i}), .table = "entities", .key_template = template, .revision = 0, .namespace_owned = true, .authority_table_id = 1, .projection_only = true };
+        const raw = try std.json.Stringify.valueAlloc(a, .{ ._resolver_curation = resolver_curation.Metadata{ .identities = identities } }, .{});
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        var cache: RaftApplyStore.ResolverProjectionCache = .empty;
+        const expanded = try store.resolverExecutionIndexesTxn(a, &read, group, raw, &cache);
+        try std.testing.expect(expanded.len < 160 * 1024);
+        const shared_metadata = try resolver_curation.metadataFromValue(a, try std.json.parseFromSliceLeaky(std.json.Value, a, expanded, .{}));
+        try std.testing.expectEqual(@as(usize, 1), shared_metadata.projections.len);
+        for (shared_metadata.identities) |identity| {
+            try std.testing.expectEqual(@as(usize, 1000), identity.merges.len);
+            try std.testing.expect(identity.merges.ptr == shared_metadata.identities[0].merges.ptr);
+            try std.testing.expect(identity.state_json.ptr == shared_metadata.identities[0].state_json.ptr);
+        }
+    }
     // Withdraw the physical destination before its bounded native-row cleanup.
     // A cached head must not make its retired policy appear live.
     {
@@ -40257,7 +40291,8 @@ test "resolver curation namespace propagation persists compact bindings and mate
         try write.commit();
     }
     const missing = try std.json.parseFromSliceLeaky(@import("../resolver_catalog_read.zig").Page, a, try store.resolverCatalogRead(a, group, .{ .table_name = "source-0" }), .{});
-    try std.testing.expect(missing.configs.?[0].namespace_curation_missing);
-    try std.testing.expectEqual(@as(usize, 0), missing.configs.?[0].merges.len);
+    const missing_configs = try RaftApplyStore.resolverConfigs(a, try std.json.parseFromSliceLeaky(std.json.Value, a, missing.executionIndexes(), .{}));
+    try std.testing.expect(missing_configs[0].namespace_curation_missing);
+    try std.testing.expectEqual(@as(usize, 0), missing_configs[0].merges.len);
     try std.testing.expectEqual(@as(usize, 1), store.resolver_projection_exports);
 }

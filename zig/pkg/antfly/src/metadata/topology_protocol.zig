@@ -73,8 +73,9 @@ const std = @import("std");
 /// metadata peer, independently of resolver namespace/proposal support.
 /// Version 39 decodes native per-record resolver authority and its atomic heads.
 /// Version 40 carries compact physical namespace bindings and projection reads.
-pub const current_version: u16 = 40;
-pub const resolver_records_version: u16 = 40;
+/// Version 41 carries shared content-addressed namespace execution attachments.
+pub const current_version: u16 = 41;
+pub const resolver_records_version: u16 = 41;
 pub const native_service_tables_version: u16 = 38;
 pub const resolver_namespaces_version: u16 = 37;
 /// Conservative admission over canonical stored JSON, shared by catalog and

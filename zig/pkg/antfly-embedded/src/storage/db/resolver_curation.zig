@@ -33,8 +33,43 @@ pub const MetadataIdentity = struct {
     authority_table_id: u64 = 0,
     projection_only: bool = false,
     authority_missing: bool = false,
+    projection_ref: ?[]const u8 = null,
+    // Per-read borrowed policy cache; never accepted as serialized authority.
+    state_json: []const u8 = "",
+    policy_validated: bool = false,
+    shared_projection: ?*catalog.SharedProjection = null,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            if (comptime !std.mem.eql(u8, field, "state_json") and !std.mem.eql(u8, field, "policy_validated") and !std.mem.eql(u8, field, "shared_projection")) {
+                const include = if (comptime std.mem.eql(u8, field, "projection_ref")) self.projection_ref != null else if (comptime std.mem.eql(u8, field, "state") or std.mem.eql(u8, field, "merges")) self.projection_ref == null else true;
+                if (include) {
+                    try writer.objectField(field);
+                    try writer.write(@field(self, field));
+                }
+            }
+        }
+        try writer.endObject();
+    }
 };
-pub const Metadata = struct { version: u32 = 1, identities: []const MetadataIdentity = &.{} };
+pub const MetadataProjection = struct { id: []const u8, namespace: Namespace };
+pub const Metadata = struct {
+    version: u32 = 1,
+    identities: []const MetadataIdentity = &.{},
+    projections: []const MetadataProjection = &.{},
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        try writer.objectField("version");
+        try writer.write(self.version);
+        try writer.objectField("identities");
+        try writer.write(self.identities);
+        if (self.projections.len > 0) {
+            try writer.objectField("projections");
+            try writer.write(self.projections);
+        }
+        try writer.endObject();
+    }
+};
 /// Authoritative corrections belong to a destination table and exact key template.
 pub const namespaces_key = "_resolver_namespaces";
 pub const Namespace = @import("resolver_namespace.zig").Namespace;
@@ -242,23 +277,51 @@ pub fn planMetadataBatch(a: std.mem.Allocator, indexes_json: []const u8, request
 pub fn metadataFromValue(a: std.mem.Allocator, value: std.json.Value) !Metadata {
     if (value != .object) return .{};
     const raw = value.object.get(metadata_key) orelse return .{};
-    const metadata = try std.json.parseFromSliceLeaky(Metadata, a, try std.json.Stringify.valueAlloc(a, raw, .{}), .{ .allocate = .alloc_always });
-    if (metadata.version != 1 or metadata.identities.len > 4096) return error.InvalidResolverCurationVersion;
+    var metadata = try std.json.parseFromSliceLeaky(Metadata, a, try std.json.Stringify.valueAlloc(a, raw, .{}), .{ .allocate = .alloc_always });
+    if (metadata.version != 1 or metadata.identities.len > 4096 or metadata.projections.len > 4096) return error.InvalidResolverCurationVersion;
+    const Payload = struct { namespace: Namespace, projection: *catalog.SharedProjection };
+    var shared: std.StringHashMapUnmanaged(Payload) = .empty;
+    for (metadata.projections) |projection| {
+        const slot = try shared.getOrPut(a, projection.id);
+        if (slot.found_existing or projection.id.len != 64) return error.InvalidResolverCurationRequest;
+        const encoded = try std.json.Stringify.valueAlloc(a, projection.namespace, .{});
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
+        if (!std.mem.eql(u8, projection.id, &std.fmt.bytesToHex(digest, .lower))) return error.InvalidResolverCurationRequest;
+        const probe: catalog.ResolverConfig = .{ .name = "projection", .table = "entities", .source_artifact = "source", .resolution_artifact = "resolved", .key_template = projection.namespace.key_template, .merges = projection.namespace.merges, .curation_json = try std.json.Stringify.valueAlloc(a, projection.namespace.state, .{}) };
+        try probe.validatePolicy();
+        slot.value_ptr.* = .{ .namespace = projection.namespace, .projection = try catalog.SharedProjection.create(a, projection.namespace.merges, probe.curation_json) };
+    }
     var names: std.StringHashMapUnmanaged(void) = .empty;
-    for (metadata.identities) |identity| {
+    const identities = try a.dupe(MetadataIdentity, metadata.identities);
+    metadata.identities = identities;
+    for (identities) |*identity| {
+        identity.state_json = "";
+        identity.policy_validated = false;
+        identity.shared_projection = null;
         if ((identity.revision == 0 and !(identity.namespace_owned and identity.authority_table_id != 0)) or identity.name.len == 0) return error.InvalidResolverCurationRequest;
-        const entry = try names.getOrPut(a, identity.name);
-        if (entry.found_existing) return error.InvalidResolverCurationRequest;
-        _ = try overlayMetadata(a, .{ .name = identity.name, .table = identity.table, .key_template = identity.key_template, .source_artifact = "metadata", .resolution_artifact = "metadata_resolved" }, identity);
+        if ((try names.getOrPut(a, identity.name)).found_existing) return error.InvalidResolverCurationRequest;
+        if (identity.projection_ref) |id| {
+            const payload = shared.get(id) orelse return error.InvalidResolverCurationRequest;
+            if (!identity.namespace_owned or identity.projection_only or !std.mem.eql(u8, identity.key_template, payload.namespace.key_template) or identity.revision != payload.namespace.revision or identity.authority_missing == payload.namespace.record_store) return error.InvalidResolverCurationRequest;
+            identity.merges = payload.projection.merges;
+            identity.state = payload.namespace.state;
+            identity.state_json = payload.projection.curation_json;
+            identity.shared_projection = payload.projection;
+            identity.policy_validated = true;
+        } else _ = try overlayMetadata(a, .{ .name = identity.name, .table = identity.table, .key_template = identity.key_template, .source_artifact = "metadata", .resolution_artifact = "metadata_resolved" }, identity.*);
     }
     return metadata;
 }
-
 pub fn overlayMetadata(a: std.mem.Allocator, cfg: catalog.ResolverConfig, identity: MetadataIdentity) !catalog.ResolverConfig {
+    return overlayMetadataCached(a, cfg, identity, null);
+}
+pub fn overlayMetadataCached(a: std.mem.Allocator, cfg: catalog.ResolverConfig, identity: MetadataIdentity, profiles: ?*std.StringHashMapUnmanaged(void)) !catalog.ResolverConfig {
     if (!std.mem.eql(u8, identity.name, cfg.name) or !std.mem.eql(u8, identity.table, cfg.table) or !std.mem.eql(u8, identity.key_template, cfg.key_template)) return error.ResolverMergeNamespaceChange;
     var next = cfg;
     next.merges = identity.merges;
-    next.curation_json = try std.json.Stringify.valueAlloc(a, identity.state, .{});
+    next.shared_projection = identity.shared_projection;
+    next.curation_json = if (identity.state_json.len > 0) identity.state_json else try std.json.Stringify.valueAlloc(a, identity.state, .{});
     next.curation_revision = identity.revision;
     next.namespace_curation_generation = if (identity.namespace_owned) identity.revision else 0;
     next.namespace_curation_table_id = identity.authority_table_id;
@@ -268,7 +331,16 @@ pub fn overlayMetadata(a: std.mem.Allocator, cfg: catalog.ResolverConfig, identi
         next.merge_generation = @max(identity.revision, cfg.effectiveGeneration());
         next.merge_state_version = 1;
     }
-    try next.validate();
+    try next.validateDefinition();
+    if (!identity.policy_validated or next.aliases.len > 0 or next.suppress_json.len > 0) {
+        var validate = true;
+        if (identity.projection_ref) |reference| if (profiles) |cache| {
+            const key = try std.json.Stringify.valueAlloc(a, .{ reference, next.aliases, next.suppress_json }, .{});
+            validate = !(try cache.getOrPut(a, key)).found_existing;
+        };
+        if (validate) try next.validatePolicy();
+    }
+    if (next.shared_projection) |projection| next.validation_proof = .{ .policy_digest = projection.digest, .static_digest = try catalog.policyProfileDigest(a, next.aliases, next.suppress_json) };
     return next;
 }
 
@@ -281,7 +353,7 @@ pub fn replaceMetadata(a: std.mem.Allocator, root: *std.json.Value, identity: Me
         replaced = replaced or std.mem.eql(u8, previous.name, identity.name);
     }
     if (!replaced) try records.append(a, identity);
-    try root.object.put(a, metadata_key, try json(a, Metadata{ .identities = records.items }));
+    try root.object.put(a, metadata_key, try json(a, Metadata{ .identities = records.items, .projections = old.projections }));
 }
 
 pub fn manualOrigin(request: resolver.curation.Request, revision: u64) resolver.curation.Origin {

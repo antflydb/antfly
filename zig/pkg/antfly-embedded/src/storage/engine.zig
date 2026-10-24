@@ -219,6 +219,7 @@ pub const VTable = struct {
     resolverCurationJsonAlloc: *const fn (self: *DB, alloc: std.mem.Allocator, name: []const u8) Outcome([]u8),
     resolverReviewsJsonAlloc: *const fn (self: *DB, alloc: std.mem.Allocator, request_json: []const u8) Outcome([]u8),
     listResolverIdentities: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome([]@import("db/catalog/resolver_catalog.zig").ResolverConfig),
+    listResolverStaticDescriptors: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome([]@import("db/catalog/resolver_catalog.zig").ResolverConfig),
     consumeResolverMetadataDrop: *const fn (self: *DB, alloc: std.mem.Allocator, identity: @import("db/resolver_curation.zig").MetadataIdentity) Outcome(void),
     pendingWorkStats: *const fn (self: *DB) Outcome(@import("db/core.zig").PendingWorkStats),
     runArtifactRepairMetadataMaintenanceUntilIdle: *const fn (self: *DB) Outcome(void),

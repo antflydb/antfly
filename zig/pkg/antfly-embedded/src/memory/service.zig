@@ -26,6 +26,7 @@ const prov = t.provenance;
 const A = std.mem.Allocator;
 const eql = std.mem.eql;
 const curation = @import("antfly_resolver").curation;
+const identity_records = @import("../storage/db/resolver_authority.zig");
 const recall_filters = @import("recall_filters.zig");
 const recall_windows = @import("recall_windows.zig");
 const graph_recall = @import("graph_recall.zig");
@@ -224,6 +225,7 @@ pub const Service = struct {
         } else {
             const row = state_row orelse return error.MemorySpaceNotFound;
             run.state = try parse(t.State, a, row.json);
+            if (run.state.identity_format > 1) return error.MemoryCorruptState;
             if (run.state.table_id != 0 and self.context.table_id != 0 and run.state.table_id != self.context.table_id) return error.MemorySpaceBindingChanged;
             if (run.state.space.len > 0 and self.context.space.len > 0 and (!eql(u8, run.state.space, self.context.space) or !eql(u8, run.state.database, self.context.database) or !eql(u8, run.state.namespace, self.context.namespace))) return error.MemorySpaceBindingChanged;
         }
@@ -504,6 +506,10 @@ const Run = struct {
     projection_rows: std.StringHashMapUnmanaged(t.EntityProjection) = .empty,
     identity_members: std.StringHashMapUnmanaged([]const []const u8) = .empty,
     identity_policy: ?EntityPolicy = null,
+    identity_native: bool = false,
+    identity_loaded: ResourceSet = .empty,
+    identity_components: ResourceSet = .empty,
+    reviewing_entity: ?[]const u8 = null,
     identity_index: ?curation.RedirectIndex = null,
     suppression_index: ?curation.Index = null,
     dependency_depths: std.StringHashMapUnmanaged(u8) = .empty,
@@ -546,7 +552,7 @@ const Run = struct {
     fn publishKnowledgeRevision(self: *Run, action: Action) !void {
         var changed = action == .revert_lineage or action == .curate_entity or action == .forget;
         for (self.changes.items) |change| {
-            if (!std.mem.startsWith(u8, change.key, "assertion/") and !std.mem.startsWith(u8, change.key, "evidence/") and !std.mem.startsWith(u8, change.key, "entity/") and !eql(u8, change.key, "entity-policy")) continue;
+            if (!std.mem.startsWith(u8, change.key, "assertion/") and !std.mem.startsWith(u8, change.key, "evidence/") and !std.mem.startsWith(u8, change.key, "entity/") and !eql(u8, change.key, "entity-policy") and !std.mem.startsWith(u8, change.key, "entity-authority/")) continue;
             const old = if (self.backend_rows.getEntry(change.key)) |cached| cached.value_ptr.* else blk: {
                 const row = try self.service.backend.get(self.service.backend.ptr, self.a, change.key);
                 break :blk if (row) |value| value.json else null;
@@ -1240,9 +1246,7 @@ const Run = struct {
             var proposal_kind: t.ChangeKind = if (std.mem.startsWith(u8, operation.action, "propose_")) .proposal_opened else .proposal_decided;
             if (proposal_kind == .proposal_decided) {
                 const open = if (supersession) ((try self.read(t.SupersessionProposal, try key(self.a, "supersession-proposal", id))) orelse return error.MemoryCorruptState).verdict == null else if (relationship) ((try self.read(t.RelationshipProposal, try key(self.a, "relationship-proposal", id))) orelse return error.MemoryCorruptState).state == .open else blk: {
-                    const policy = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
-                    for (policy.state.proposals) |proposal| if (eql(u8, proposal.id, id)) break :blk proposal.state == .open;
-                    break :blk false;
+                    break :blk if (try self.identityProposal(id)) |proposal| proposal.state == .open else false;
                 };
                 if (open) proposal_kind = .proposal_deferred;
             }
@@ -1436,10 +1440,12 @@ const Run = struct {
         try self.stageChange(path, null);
     }
     fn stageChange(self: *Run, path: []const u8, json: ?[]const u8) !void {
-        if (eql(u8, path, "entity-policy")) {
+        if (eql(u8, path, "entity-policy") or std.mem.startsWith(u8, path, "entity-authority/head/")) {
             self.identity_policy = null;
             self.identity_index = null;
             self.suppression_index = null;
+            self.identity_loaded.clearRetainingCapacity();
+            self.identity_components.clearRetainingCapacity();
             self.identity_members.clearRetainingCapacity();
         }
         _ = self.assertion_rows.remove(path);
@@ -1473,6 +1479,8 @@ const Run = struct {
         self.identity_policy = null;
         self.identity_index = null;
         self.suppression_index = null;
+        self.identity_loaded.clearRetainingCapacity();
+        self.identity_components.clearRetainingCapacity();
         self.identity_members.clearRetainingCapacity();
         self.views.clearRetainingCapacity();
         self.historical.clearRetainingCapacity();
@@ -2755,20 +2763,160 @@ const Run = struct {
         for (self.state.config.predicates) |definition| if (eql(u8, definition.name, predicate)) return definition.object_type != null;
         return false;
     }
-    fn prepareIdentityIndex(self: *Run) !void {
-        if (self.identity_index != null) return;
-        const policy = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
-        if (policy.redirects.len > 4096) return error.MemoryWorkLimit;
-        const redirects = try curation.RedirectIndex.init(self.a, policy.redirects);
-        var suppression = try curation.Index.init(self.a, "", try self.encode(policy.state));
+    const identity_template = "{{_key}}";
+    fn identityGet(ptr: *anyopaque, _: A, path: []const u8) !?[]const u8 {
+        const self: *Run = @ptrCast(@alignCast(ptr));
+        if (self.change_positions.get(path)) |position| return self.changes.items[position].json;
+        if (self.backend_rows.getEntry(path)) |entry| return entry.value_ptr.*;
+        const row = try self.service.backend.get(self.service.backend.ptr, self.a, path);
+        const raw = if (row) |value| value.json else null;
+        try self.backend_rows.put(self.a, try self.a.dupe(u8, path), raw);
+        return raw;
+    }
+    fn identityPut(ptr: *anyopaque, _: A, path: []const u8, raw: []const u8) !void {
+        const self: *Run = @ptrCast(@alignCast(ptr));
+        try self.stageChange(path, raw);
+    }
+    fn identityRemove(ptr: *anyopaque, _: A, path: []const u8) !void {
+        const self: *Run = @ptrCast(@alignCast(ptr));
+        try self.stageChange(path, null);
+    }
+    fn identityScan(ptr: *anyopaque, _: A, prefix: []const u8, after: ?[]const u8, limit: u32) !identity_records.Page {
+        const self: *Run = @ptrCast(@alignCast(ptr));
+        const page = try self.scanOverlay(prefix, after, limit);
+        const rows = try self.a.alloc(identity_records.Row, page.rows.len);
+        for (page.rows, rows) |row, *out| out.* = .{ .key = row.key, .value = row.json };
+        return .{ .rows = rows, .next = page.next };
+    }
+    fn identityStore(self: *Run) identity_records.Store {
+        return .{ .a = self.a, .prefix = "entity-authority/", .backend = .{ .ptr = self, .get = identityGet, .put = identityPut, .remove = identityRemove, .scan = identityScan }, .max_namespace_bytes = null, .max_queue_bytes = null, .max_queue_count = null };
+    }
+    fn ensureIdentityAuthority(self: *Run) !void {
+        const store = self.identityStore();
+        self.state.identity_format = 1;
+        if (try store.head(identity_template) != null) return;
+        const legacy = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
+        var state = legacy.state;
+        state.proposals = &.{};
+        state.receipt_scope = null;
+        try store.adoptNamespace(.{ .record_store = true, .key_template = identity_template, .revision = self.state.revision -| 1, .merges = legacy.redirects, .state = state });
+        if (legacy.state.proposals.len > 0 or legacy.state.receipt_scope != null) {
+            try store.applyQueue(.{ .expected_revision = 0, .revision = 1, .receipt_scope = legacy.state.receipt_scope, .proposals = legacy.state.proposals });
+            for (legacy.state.proposals) |proposal| try self.put(try std.fmt.allocPrint(self.a, "proposal-binding-id/{s}", .{try hash(self.a, proposal.id)}), proposal.id);
+        }
+        try self.remove("entity-policy");
+    }
+    fn identityProposal(self: *Run, id: []const u8) !?curation.Proposal {
+        const store = self.identityStore();
+        if (try store.head(identity_template) != null) return store.proposal(id);
+        const legacy = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
+        for (legacy.state.proposals) |proposal| if (eql(u8, proposal.id, id)) return proposal;
+        return null;
+    }
+    fn identityPolicy(self: *Run, seeds: []const []const u8, proposal_id: ?[]const u8) !EntityPolicy {
+        const store = self.identityStore();
+        const snapshot = (try store.component(identity_template, seeds)) orelse return (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
+        var keys: std.ArrayList([]const u8) = .empty;
+        try keys.appendSlice(self.a, seeds);
+        for (snapshot.namespace.merges) |alias| {
+            try keys.append(self.a, alias.key);
+            try keys.append(self.a, alias.target);
+        }
+        try keys.appendSlice(self.a, snapshot.namespace.state.suppress.keys);
+        var state = snapshot.namespace.state;
+        const queue = try store.proposalsForKeys(keys.items);
+        var proposals: std.ArrayList(curation.Proposal) = .empty;
+        for (queue.proposals) |proposal| {
+            if (self.reviewing_entity) |selected| if (eql(u8, selected, proposal.id)) continue;
+            try proposals.append(self.a, proposal);
+        }
+        if (proposal_id) |id| if (try store.proposal(id)) |proposal| {
+            if (for (proposals.items) |value| {
+                if (eql(u8, value.id, id)) break false;
+            } else true) try proposals.append(self.a, proposal);
+        };
+        state.proposals = proposals.items;
+        state.receipt_scope = queue.receipt_scope;
+        return .{ .state = state, .redirects = snapshot.namespace.merges };
+    }
+    fn writeIdentityPolicy(self: *Run, before: EntityPolicy, next: EntityPolicy, seeds: []const []const u8) !void {
+        const store = self.identityStore();
+        const current = (try store.component(identity_template, seeds)) orelse return error.MemoryCorruptState;
+        var state = next.state;
+        state.proposals = &.{};
+        state.receipt_scope = null;
+        var namespace = current.namespace;
+        namespace.state = state;
+        namespace.merges = next.redirects;
+        namespace.revision = try std.math.add(u64, current.head.revision, 1);
+        const patch = try identity_records.difference(self.a, current.namespace, namespace);
+        if (patch.edits.len > 0 or patch.next.min_text_chars != current.head.min_text_chars) try store.apply(patch);
+        var old: std.StringHashMapUnmanaged(curation.Proposal) = .empty;
+        for (before.state.proposals) |proposal| try old.put(self.a, proposal.id, proposal);
+        var changed: std.ArrayList(curation.Proposal) = .empty;
+        for (next.state.proposals) |proposal| {
+            if (old.get(proposal.id)) |previous| if (eql(u8, try self.encode(previous), try self.encode(proposal))) continue;
+            try changed.append(self.a, proposal);
+            try self.put(try std.fmt.allocPrint(self.a, "proposal-binding-id/{s}", .{try hash(self.a, proposal.id)}), proposal.id);
+        }
+        if (changed.items.len > 0) {
+            const head = try store.queueHead();
+            try store.applyQueue(.{ .expected_revision = head.revision, .revision = try std.math.add(u64, head.revision, 1), .receipt_scope = next.state.receipt_scope, .proposals = changed.items });
+        }
+    }
+    fn prepareIdentityIndex(self: *Run, seeds: []const []const u8, full: bool) !void {
+        if (self.identity_index == null) {
+            self.identity_loaded = .empty;
+            self.identity_components = .empty;
+        }
+        if (self.identity_index != null) {
+            if (!self.identity_native) return;
+            const loaded = for (seeds) |id| {
+                if (!(if (full) self.identity_components.contains(id) else self.identity_loaded.contains(id))) break false;
+            } else true;
+            if (loaded) return;
+        }
+        const store = self.identityStore();
+        const native = try store.head(identity_template) != null;
+        var namespace: @import("../storage/db/resolver_namespace.zig").Namespace = .{ .key_template = identity_template };
+        if (!native) {
+            const legacy = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
+            namespace.merges = legacy.redirects;
+            namespace.state = legacy.state;
+        } else {
+            if (self.identity_policy) |previous| {
+                namespace.merges = previous.redirects;
+                namespace.state = previous.state;
+            }
+            for (seeds) |id| {
+                if (if (full) self.identity_components.contains(id) else self.identity_loaded.contains(id)) continue;
+                const scoped = (if (full) try store.component(identity_template, &.{id}) else try store.forwardScope(identity_template, &.{id})) orelse return error.MemoryCorruptState;
+                namespace = try identity_records.unionNamespaces(self.a, namespace, scoped.namespace);
+                try self.identity_loaded.put(self.a, id, {});
+                if (full) {
+                    const paths = try curation.RedirectIndex.init(self.a, scoped.namespace.merges);
+                    const canonical_id = paths.canonical(id);
+                    try self.identity_components.put(self.a, id, {});
+                    try self.identity_components.put(self.a, canonical_id, {});
+                    for (scoped.namespace.merges) |alias| if (eql(u8, paths.canonical(alias.key), canonical_id)) {
+                        try self.identity_components.put(self.a, alias.key, {});
+                        try self.identity_loaded.put(self.a, alias.key, {});
+                    };
+                }
+            }
+        }
+        const redirects = try curation.RedirectIndex.init(self.a, namespace.merges);
+        var suppression = try curation.Index.init(self.a, "", try self.encode(namespace.state));
         try suppression.bindRedirects(self.a, redirects);
-        self.identity_policy = policy;
+        self.identity_native = native;
+        self.identity_policy = .{ .redirects = namespace.merges, .state = namespace.state };
         self.identity_index = redirects;
         self.suppression_index = suppression;
         self.identity_members.clearRetainingCapacity();
         var components: std.StringHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
-        for (policy.redirects) |redirect| {
+        for (namespace.merges) |redirect| {
             const target = redirects.canonical(redirect.key);
+            if (native and !self.identity_components.contains(target)) continue;
             const entry = try components.getOrPut(self.a, target);
             if (!entry.found_existing) {
                 entry.value_ptr.* = .empty;
@@ -2778,18 +2926,16 @@ const Run = struct {
         }
         var entries = components.iterator();
         while (entries.next()) |entry| {
-            const members = entry.value_ptr.items;
-            std.mem.sort([]const u8, members, {}, stringLess);
-            try self.identity_members.put(self.a, entry.key_ptr.*, members);
+            std.mem.sort([]const u8, entry.value_ptr.items, {}, stringLess);
+            try self.identity_members.put(self.a, entry.key_ptr.*, entry.value_ptr.items);
         }
     }
     fn identityMembers(self: *Run, id: []const u8) ![]const []const u8 {
-        try self.prepareIdentityIndex();
+        try self.prepareIdentityIndex(&.{id}, true);
         const target = self.identity_index.?.canonical(id);
         if (self.identity_members.get(target)) |members| return members;
-        // An identity outside the redirect graph is its own component.
         const result = try self.a.alloc([]const u8, 1);
-        result[0] = try self.a.dupe(u8, id);
+        result[0] = try self.a.dupe(u8, target);
         try self.identity_members.put(self.a, result[0], result);
         return result;
     }
@@ -2957,7 +3103,7 @@ const Run = struct {
             self.authorize(record.owner, record.entity.visibility) catch return null;
             if (!try self.entityVisible(record)) return null;
         }
-        try self.prepareIdentityIndex();
+        try self.prepareIdentityIndex(&.{id}, false);
         const redirects = self.identity_index.?;
         const index = self.suppression_index.?;
         if (index.keySuppressed(id)) return null;
@@ -3672,7 +3818,10 @@ const Run = struct {
         var result: std.StringHashMapUnmanaged(void) = .empty;
         for (try self.identityMembers(id)) |name| {
             const record = (try self.read(t.EntityRecord, try key(self.a, "entity", name))) orelse continue;
-            for (record.entity.distinct_from) |other| try result.put(self.a, self.identity_index.?.canonical(other), {});
+            for (record.entity.distinct_from) |other| {
+                try self.prepareIdentityIndex(&.{other}, false);
+                try result.put(self.a, self.identity_index.?.canonical(other), {});
+            }
         }
         return result;
     }
@@ -4694,10 +4843,7 @@ const Run = struct {
         try self.put(path, ProposalAttempt{ .proposal = proposal, .inputs = inputs });
     }
     fn storeProposalAttempt(self: *Run, id: []const u8, binding: ProposalBinding, receipt: t.Operation, previous: ?prov.Resource) !void {
-        const policy = (try self.read(EntityPolicy, "entity-policy")) orelse return error.MemoryCorruptState;
-        const proposal = for (policy.state.proposals) |value| {
-            if (eql(u8, value.id, id)) break value;
-        } else return error.MemoryCorruptState;
+        const proposal = (try self.identityProposal(id)) orelse return error.MemoryCorruptState;
         try self.put(try key(self.a, "proposal-input", id), binding);
         try self.put(try key(self.a, "proposal-attempt", receipt.id), ProposalAttempt{ .proposal = proposal, .inputs = binding, .previous = previous });
     }
@@ -4708,7 +4854,6 @@ const Run = struct {
         if (request.actor.len > 0) try t.validateId(request.actor);
         try self.reviewEvidence(request.evidence);
         if (request.actor.len > 0) receipt.origin = .{ .agent = .{ .id = request.actor, .kind = .agent } };
-        const stored = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
         const ids = if (request.to) |target| &[_][]const u8{ request.from, target } else &[_][]const u8{request.from};
         var entities: std.ArrayList(std.meta.Child(@FieldType(ProposalBinding, "entities"))) = .empty;
         for (ids) |id| {
@@ -4719,6 +4864,8 @@ const Run = struct {
         }
         const input: curation.ProposalRequest = .{ .action = std.meta.stringToEnum(curation.EntityAction, @tagName(request.action)).?, .key = request.from, .into = request.to, .options = .{ .replace = request.replace, .pin_distinct = request.pin_distinct, .absorbed = std.meta.stringToEnum(curation.Absorbed, @tagName(request.absorbed)).? } };
         const proposal_id = try curation.proposalId(self.a, input);
+        try self.ensureIdentityAuthority();
+        const stored = try self.identityPolicy(ids, proposal_id);
         const prior = for (stored.state.proposals) |value| {
             if (eql(u8, value.id, proposal_id)) break @as(?curation.Proposal, value);
         } else null;
@@ -4746,7 +4893,7 @@ const Run = struct {
         } else if (previous_binding != null) return error.MemoryCorruptState;
         const stamp: curation.Origin = .{ .actor = self.service.context.principal, .created_at_ms = @intCast(@max(0, self.service.context.now_ms)), .revision = self.state.revision };
         const plan = if (prior != null) try curation.refreshProposal(self.a, stored.state, stored.redirects, input, stamp) else try curation.propose(self.a, stored.state, stored.redirects, input, stamp);
-        try self.put("entity-policy", EntityPolicy{ .state = plan.state, .redirects = plan.merges });
+        try self.writeIdentityPolicy(stored, .{ .state = plan.state, .redirects = plan.merges }, ids);
         try self.storeProposalAttempt(proposal_id, binding, receipt.*, previous);
         for (entities.items) |entity_ref| try self.decision_targets.append(self.a, try self.resourceRef(.entity, entity_ref.id, entity_ref.revision));
         receipt.proposal_id = proposal_id;
@@ -4755,21 +4902,25 @@ const Run = struct {
         try self.service.context.requireGrant(.curator);
         if (request.limit == 0 or request.limit > t.max_items) return error.InvalidMemoryRequest;
         const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "proposal-input/", try self.decodeCursor("proposal-input/", request.cursor), request.limit);
-        const stored = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
-        var available: std.StringHashMapUnmanaged(void) = .empty;
-        for (page.rows) |row| if (try self.proposalInputsRetained(try parse(ProposalBinding, self.a, row.json))) try available.put(self.a, row.key, {});
+        const native = try self.identityStore().head(identity_template) != null;
+        const legacy = if (!native) ((try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{}) else EntityPolicy{};
         var proposals: std.ArrayList(curation.Proposal) = .empty;
-        for (stored.state.proposals) |proposal| if (available.contains(try key(self.a, "proposal-input", proposal.id))) try proposals.append(self.a, proposal);
+        for (page.rows) |row| if (try self.proposalInputsRetained(try parse(ProposalBinding, self.a, row.json))) {
+            if (native) {
+                const id = (try self.read([]const u8, try std.fmt.allocPrint(self.a, "proposal-binding-id/{s}", .{row.key["proposal-input/".len..]}))) orelse return error.MemoryCorruptState;
+                if (try self.identityProposal(id)) |proposal| try proposals.append(self.a, proposal);
+            } else for (legacy.state.proposals) |proposal| if (eql(u8, try key(self.a, "proposal-input", proposal.id), row.key)) {
+                try proposals.append(self.a, proposal);
+                break;
+            };
+        };
         return self.encode(t.EntityProposalPage{ .items = proposals.items, .next_cursor = try self.encodeCursor("proposal-input/", page.next), .complete = page.next == null, .revision = self.state.revision });
     }
     fn entityProposal(self: *Run, id: []const u8) ![]const u8 {
         try self.service.context.requireGrant(.curator);
         const binding = (try self.read(ProposalBinding, try key(self.a, "proposal-input", id))) orelse return error.MemoryNotFound;
         if (!try self.proposalInputsRetained(binding)) return error.MemoryNotFound;
-        const stored = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
-        const proposal = for (stored.state.proposals) |proposal| {
-            if (eql(u8, proposal.id, id)) break proposal;
-        } else return error.MemoryNotFound;
+        const proposal = (try self.identityProposal(id)) orelse return error.MemoryNotFound;
         const reason = if (binding.verdict_revision) |revision| blk: {
             const provenance = (try self.read(EntityCurationProvenance, try std.fmt.allocPrint(self.a, "entity-curation/{d:0>20}", .{revision}))) orelse break :blk @as(?[]const u8, null);
             break :blk if (try self.curationProvenanceRetained(provenance)) provenance.reason else null;
@@ -4795,10 +4946,10 @@ const Run = struct {
         // requires every original context source to remain current. Space
         // revision fences do not cover edits in ordinary source tables.
         try self.reviewEvidence(binding.evidence);
-        const stored = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
-        const proposal = for (stored.state.proposals) |proposal| {
-            if (eql(u8, proposal.id, id)) break proposal;
-        } else return error.MemoryNotFound;
+        try self.ensureIdentityAuthority();
+        const proposal = (try self.identityProposal(id)) orelse return error.MemoryNotFound;
+        const policy_seeds = if (proposal.into) |target| &[_][]const u8{ proposal.key, target } else &[_][]const u8{proposal.key};
+        const stored = try self.identityPolicy(policy_seeds, id);
         if (proposal.state != .open) return error.MemoryEntityConflict;
         try self.bindJudgedViews(binding.views, request.views);
         const previous = try self.proposalOperation(proposal, binding);
@@ -4810,8 +4961,11 @@ const Run = struct {
         const artifact = try self.storeJudgment(binding.views orelse return error.MemoryResourceChanged, inputs, null, .private, request.reason, receipt.*, null);
         if (request.accept) |accept| {
             const plan = try curation.decide(self.a, stored.state, stored.redirects, stored.redirects, id, .{ .accept = accept, .pin_distinct = request.pin_distinct }, .{ .actor = self.service.context.principal, .created_at_ms = @intCast(@max(0, self.service.context.now_ms)), .revision = self.state.revision });
+            const previous_review = self.reviewing_entity;
+            self.reviewing_entity = id;
+            defer self.reviewing_entity = previous_review;
             if (accept or request.pin_distinct) try self.curateEntity(.{ .action = if (!accept) .distinct else std.meta.stringToEnum(@FieldType(t.EntityCorrection, "action"), @tagName(proposal.action)).?, .from = proposal.key, .to = proposal.into, .expected_revision = request.expected_revision, .replace = if (accept) proposal.options.replace else false, .pin_distinct = if (accept) proposal.options.pin_distinct else false, .absorbed = if (accept) std.meta.stringToEnum(@FieldType(t.EntityCorrection, "absorbed"), @tagName(proposal.options.absorbed)).? else .reject });
-            try self.put("entity-policy", EntityPolicy{ .state = plan.state, .redirects = plan.merges });
+            try self.writeIdentityPolicy(stored, .{ .state = plan.state, .redirects = plan.merges }, policy_seeds);
             self.identity_policy = null;
             self.identity_index = null;
             self.suppression_index = null;
@@ -4832,7 +4986,9 @@ const Run = struct {
         try self.service.context.requireGrant(.curator);
         if (try self.read(bool, "forgotten-all") != null) return error.MemoryForgotten;
         if (request.expected_revision != self.state.revision - 1) return error.MemoryRevisionConflict;
-        const stored = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
+        try self.ensureIdentityAuthority();
+        const policy_seeds = if (request.to) |target| &[_][]const u8{ request.from, target } else &[_][]const u8{request.from};
+        const stored = try self.identityPolicy(policy_seeds, null);
         const from = (try self.read(t.EntityRecord, try key(self.a, "entity", request.from))) orelse return error.MemoryNotFound;
         try self.authorize(from.owner, from.entity.visibility);
         if (!try self.entityVisible(from)) return error.MemoryForgotten;
@@ -4895,7 +5051,7 @@ const Run = struct {
         try self.requireDistinctIdentities(&affected_names, redirects);
         var index = try curation.Index.init(self.a, "", try self.encode(plan.state));
         try index.bindRedirects(self.a, redirects);
-        try self.put("entity-policy", EntityPolicy{ .state = plan.state, .redirects = plan.merges });
+        try self.writeIdentityPolicy(stored, .{ .state = plan.state, .redirects = plan.merges }, policy_seeds);
         self.identity_policy = null;
         self.identity_index = null;
         self.suppression_index = null;
@@ -5827,7 +5983,9 @@ const Run = struct {
         }
     }
     fn maintainRow(self: *Run, row: Row) anyerror!void {
-        if (eql(u8, row.key, "entity-policy")) {
+        if (std.mem.startsWith(u8, row.key, "entity-authority/") or std.mem.startsWith(u8, row.key, "proposal-binding-id/")) {
+            if (try self.read(bool, "forgotten-all") != null) try self.remove(row.key);
+        } else if (eql(u8, row.key, "entity-policy")) {
             // Also scrub policy rows left by earlier implementations
             // or a restored pre-cleanup snapshot of a forgotten space.
             if (try self.read(bool, "forgotten-all") != null) try self.remove(row.key);
@@ -6106,16 +6264,14 @@ const Run = struct {
                     .rejected => .rejected,
                 };
             } else {
-                const policy = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
-                for (policy.state.proposals) |proposal| if (eql(u8, proposal.id, proposal_id)) {
+                if (try self.identityProposal(proposal_id)) |proposal| {
                     status = switch (proposal.state) {
                         .open => .proposed,
                         .accepted => .applied,
                         .rejected => .rejected,
                         .superseded => .cancelled,
                     };
-                    break;
-                };
+                }
             }
         }
         const decision: prov.Decision = .{
@@ -7263,7 +7419,12 @@ fn nameNumbers(a: A, value: []const u8) ![]const u8 {
 }
 
 fn performanceTestRun(a: A) Run {
-    return .{ .a = a, .lexical_allocator = a, .service = .{ .backend = .{ .ptr = undefined, .get = undefined, .scan = undefined, .commit = undefined }, .context = .{ .principal = "alice", .admin = true, .now_ms = 10 } }, .state = .{ .config = .{}, .owner = "alice", .created_at = 1 }, .explanation_snapshot_scratch = .init(a) };
+    const Empty = struct {
+        fn get(_: *anyopaque, _: A, _: []const u8) !?Row {
+            return null;
+        }
+    };
+    return .{ .a = a, .lexical_allocator = a, .service = .{ .backend = .{ .ptr = undefined, .get = Empty.get, .scan = undefined, .commit = undefined }, .context = .{ .principal = "alice", .admin = true, .now_ms = 10 } }, .state = .{ .config = .{}, .owner = "alice", .created_at = 1 }, .explanation_snapshot_scratch = .init(a) };
 }
 
 test "memory performance decoded records allocate once and replay temporal dependency tracking" {
@@ -7470,4 +7631,32 @@ fn screenBody(a: A, action: Action, body: []const u8, config: screening.Config) 
 
 fn checkScreenedEmbeddings(original: []const t.Assertion, admitted: []const t.Assertion) !void {
     for (original, admitted) |before, after| if (before.embedding != null and !eql(u8, before.statement, after.statement)) return error.MemoryEmbeddingMismatch;
+}
+
+test "memory performance indexed identity scope excludes ten thousand unrelated redirects" {
+    const Empty = struct {
+        var scans: usize = 0;
+        fn scan(_: *anyopaque, _: A, prefix: []const u8, _: ?[]const u8, _: u32) !Page {
+            try std.testing.expect(prefix.len != 0);
+            scans += 1;
+            return .{ .rows = &.{}, .next = null };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = performanceTestRun(a);
+    run.service.backend.scan = Empty.scan;
+    const redirects = try a.alloc(curation.Redirect, 10000);
+    for (redirects, 0..) |*redirect, i| redirect.* = .{ .key = try std.fmt.allocPrint(a, "alias-{d}", .{i}), .target = try std.fmt.allocPrint(a, "canonical-{d}", .{i}) };
+    try run.identityStore().adoptNamespace(.{ .key_template = Run.identity_template, .revision = 1, .merges = redirects });
+    Empty.scans = 0;
+    try run.prepareIdentityIndex(&.{"alias-123"}, false);
+    try std.testing.expectEqual(@as(usize, 0), Empty.scans);
+    try std.testing.expectEqual(@as(usize, 1), run.identity_policy.?.redirects.len);
+    try std.testing.expectEqualStrings("canonical-123", run.identity_index.?.canonical("alias-123"));
+    const members = try run.identityMembers("alias-123");
+    try std.testing.expectEqual(@as(usize, 2), members.len);
+    try std.testing.expect(Empty.scans <= 6);
+    try std.testing.expectEqual(@as(usize, 1), run.identity_policy.?.redirects.len);
 }

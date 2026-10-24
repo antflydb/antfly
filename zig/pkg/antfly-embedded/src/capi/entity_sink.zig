@@ -2631,3 +2631,127 @@ test "capi resolver curation native migration and consumer seeks isolate unrelat
         try std.testing.expectEqual(@as(u64, 0), cfg.namespace_curation_generation);
     }
 }
+
+test "capi resolver curation shared profiles plan independently of consumer order" {
+    const api = @import("db.zig");
+    const table_ops = @import("tables.zig");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = try api.TestDirectory.init("resolver-shared-profiles");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    defer a.free(path);
+    const root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    const handle = try api.publishHandle(root);
+    defer api.antfly_db_close(handle);
+    try table_ops.create(root, "entities", "{}", false);
+    // Reverse bindings sort by the source/resolver digest. Put declarations
+    // exclusively on the later consumer to exercise the old order dependence.
+    const names = [_][]const u8{ "first", "second" };
+    var digests: [2][32]u8 = undefined;
+    for (names, &digests) |name, *digest| std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(scratch, .{ "", name }, .{}), digest, .{});
+    const declared: usize = if (std.mem.order(u8, &digests[0], &digests[1]) == .gt) 0 else 1;
+    for (names, 0..) |name, i| try root.db.addResolver(.{ .name = name, .table = "entities", .source_artifact = name, .resolution_artifact = try std.fmt.allocPrint(scratch, "{s}-resolved", .{name}), .key_template = "entity/{{_key}}", .promote = false, .aliases = if (i == declared) &.{ .{ .key = "entity/a", .target = "entity/b" }, .{ .key = "entity/c", .target = "entity/d" } } else &.{} });
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_unmerge_json(handle, .fromSlice("entities"), .fromSlice("entity/a"), .fromSlice("{}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
+    for (try root.db.core.index_manager.listResolverIdentities(scratch)) |cfg| {
+        const aliases = try cfg.effectiveAliasesAlloc(scratch);
+        for (aliases) |alias| try std.testing.expect(!std.mem.eql(u8, alias.key, "entity/a"));
+    }
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("entities"), .fromSlice("entity/c"), .fromSlice("{\"into\":\"entity/d\",\"actor\":\"curator\"}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
+    for (try root.db.core.index_manager.listResolverIdentities(scratch)) |cfg| {
+        try std.testing.expectEqual(@as(usize, 1), cfg.merges.len);
+        try std.testing.expectEqualStrings("entity/c", cfg.merges[0].key);
+        try std.testing.expect(std.mem.indexOf(u8, cfg.curation_json, "curator") != null);
+    }
+}
+
+test "capi resolver curation fair coalesced projection work survives a continuously dirty namespace" {
+    const api = @import("db.zig");
+    const table_ops = @import("tables.zig");
+    const authority = @import("resolver_authority.zig");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = try api.TestDirectory.init("resolver-fair-projection-jobs");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    defer a.free(path);
+    const root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    const handle = try api.publishHandle(root);
+    defer api.antfly_db_close(handle);
+    try table_ops.create(root, "entities", "{}", false);
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&out);
+    for (0..8) |i| {
+        const name = try std.fmt.allocPrint(scratch, "r-{d}", .{i});
+        try root.db.addResolver(.{ .name = name, .table = "entities", .source_artifact = name, .resolution_artifact = try std.fmt.allocPrint(scratch, "resolved-{d}", .{i}), .key_template = try std.fmt.allocPrint(scratch, "p-{d}/{{{{_key}}}}", .{i}), .promote = false });
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_suppress_json(handle, .fromSlice("entities"), .fromSlice(try std.fmt.allocPrint(scratch, "p-{d}/seed", .{i})), .fromSlice("{}"), &out));
+        api.antfly_buffer_free(&out);
+    }
+    try root.db.addResolver(.{ .name = "unowned", .table = "entities", .source_artifact = "unowned", .resolution_artifact = "unowned-resolved", .key_template = "unowned/{{_key}}", .promote = false });
+    for (0..12) |i| {
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_suppress_json(handle, .fromSlice("entities"), .fromSlice(try std.fmt.allocPrint(scratch, "p-0/hot-{d}", .{i})), .fromSlice("{}"), &out));
+        api.antfly_buffer_free(&out);
+        try std.testing.expect(try authority.pullProjection(root, &root.db, scratch));
+    }
+    for (try root.db.core.index_manager.listResolverIdentities(scratch)) |cfg| {
+        if (std.mem.eql(u8, cfg.name, "r-0") or std.mem.eql(u8, cfg.name, "unowned")) continue;
+        try std.testing.expect(cfg.namespace_curation_generation >= 1);
+    }
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
+    try std.testing.expect(!try authority.hasProjectionDebt(root, &root.db, scratch));
+    const destination = try table_ops.get(root, "entities");
+    try std.testing.expectEqual((try authority.revision(destination, scratch, "p-0/{{_key}}")).?, root.db.core.index_manager.getResolver("r-0").?.namespace_curation_generation);
+    // Acknowledging an empty namespace does not prevent later adoption from
+    // enrolling the same namespace again.
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_suppress_json(handle, .fromSlice("entities"), .fromSlice("unowned/later"), .fromSlice("{}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expect(try authority.hasProjectionDebt(root, &root.db, scratch));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
+    try std.testing.expect(!try authority.hasProjectionDebt(root, &root.db, scratch));
+    try std.testing.expect(root.db.core.index_manager.getResolver("unowned").?.namespace_curation_generation > 0);
+}
+
+test "capi resolver curation shared remote policies acquire persistent ownership once" {
+    const api = @import("db.zig");
+    const catalog = @import("../storage/db/catalog/resolver_catalog.zig");
+    const curation = @import("../storage/db/resolver_curation.zig");
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("resolver-remote-policy-owner");
+    defer tmp.cleanup();
+    const root = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
+    const handle = try api.publishHandle(root);
+    defer api.antfly_db_close(handle);
+    {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const incoming = try catalog.SharedProjection.create(scratch, &.{.{ .key = "a", .target = "b" }}, "{}");
+        var profiles: std.StringHashMapUnmanaged(void) = .empty;
+        for ([_][]const u8{ "first", "second" }) |name| {
+            const cfg = try curation.overlayMetadataCached(scratch, .{ .name = name, .table = "default", .source_artifact = name, .resolution_artifact = try std.fmt.allocPrint(scratch, "{s}-resolved", .{name}), .key_template = "{{_key}}", .promote = false }, .{ .name = name, .table = "default", .key_template = "{{_key}}", .revision = 1, .merges = incoming.merges, .state_json = incoming.curation_json, .shared_projection = incoming, .policy_validated = true, .projection_ref = &incoming.digest, .namespace_owned = true, .authority_table_id = 7 }, &profiles);
+            _ = try root.db.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false, .wait_for_activity = true });
+        }
+        const first = root.db.core.index_manager.getResolver("first").?;
+        const second = root.db.core.index_manager.getResolver("second").?;
+        try std.testing.expect(first.shared_projection.? != incoming);
+        try std.testing.expect(first.shared_projection.? == second.shared_projection.?);
+    }
+    // Both definitions outlive the metadata read arena; detached caller edits
+    // must invalidate validation evidence rather than bypass graph checks.
+    const first = root.db.core.index_manager.getResolver("first").?;
+    try first.validate();
+    try std.testing.expectEqualStrings("b", first.merges[0].target);
+    var changed = first.*;
+    changed.aliases = &.{.{ .key = "b", .target = "a" }};
+    try std.testing.expectError(error.InvalidResolverAliasCycle, changed.validate());
+}

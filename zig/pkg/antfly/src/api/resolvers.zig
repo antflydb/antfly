@@ -332,9 +332,10 @@ fn configs(a: std.mem.Allocator, indexes_json: []const u8) ![]const Config {
     const root = try std.json.parseFromSliceLeaky(std.json.Value, a, indexes_json, .{});
     const metadata = try curation.metadataFromValue(a, root);
     var out: std.ArrayListUnmanaged(Config) = .empty;
+    var profiles: std.StringHashMapUnmanaged(void) = .empty;
     try local.metadata_local_index_reconcile.collectDesiredResolvers(a, root, &out);
     for (out.items) |*cfg| for (metadata.identities) |identity| if (!identity.dropped and std.mem.eql(u8, cfg.name, identity.name)) {
-        cfg.* = try curation.overlayMetadata(a, cfg.*, identity);
+        cfg.* = try curation.overlayMetadataCached(a, cfg.*, identity, &profiles);
         break;
     };
     for (metadata.identities) |identity| {
@@ -344,7 +345,7 @@ fn configs(a: std.mem.Allocator, indexes_json: []const u8) ![]const Config {
             found = true;
             break;
         };
-        if (!found) try out.append(a, try curation.overlayMetadata(a, .{ .name = identity.name, .table = identity.table, .key_template = identity.key_template, .source_artifact = "retired_source", .resolution_artifact = "retired_resolution", .promote = false, .retired = true }, identity));
+        if (!found) try out.append(a, try curation.overlayMetadataCached(a, .{ .name = identity.name, .table = identity.table, .key_template = identity.key_template, .source_artifact = "retired_source", .resolution_artifact = "retired_resolution", .promote = false, .retired = true }, identity, &profiles));
     }
     return out.items;
 }
@@ -480,7 +481,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
         return proposalOperation(server, alloc, a, &snapshot, table, op, key, body, query, request, adoption_revision);
     if (op == .entity_redirects or op == .entity_merge or op == .entity_unmerge or op == .entity_suppress or op == .entity_unsuppress or op == .entity_distinct)
         return entityOperation(server, alloc, a, &snapshot, table, op, key, body, request, adoption_revision, null);
-    const all = if (page) |value| value.configs orelse try configs(a, table.indexes_json) else try configs(a, table.indexes_json);
+    const all = if (page) |value| value.configs orelse try configs(a, value.executionIndexes()) else try configs(a, table.indexes_json);
     if (op == .list) {
         const observation = try sample(server, a, &snapshot, table, request, true);
         var out = std.json.Array.init(a);
@@ -601,6 +602,7 @@ const EntityDiscovery = struct {
     folded: std.StringHashMapUnmanaged(std.json.Parsed(curation.Namespace)) = .empty,
     local_targets: std.StringHashMapUnmanaged(LocalTarget) = .empty,
     profiles: std.ArrayListUnmanaged(@import("../metadata/resolver_authority.zig").AliasProfile) = .empty,
+    profile_keys: std.StringHashMapUnmanaged(void) = .empty,
 
     fn deinit(self: *EntityDiscovery) void {
         var values = self.folded.valueIterator();
@@ -629,11 +631,13 @@ const EntityDiscovery = struct {
             prior.value_ptr.* = owned;
             entry.value_ptr.* = owned.value;
         }
-        if (self.observations) {
-            const static_aliases = try cfg.effectiveAliasesAlloc(scratch);
+        const static_aliases = if (self.observations) try cfg.effectiveAliasesAlloc(scratch) else &.{};
+        const profile_key = if (self.observations) try std.json.Stringify.valueAlloc(scratch, .{ template, static_aliases, cfg.suppress_json }, .{}) else "";
+        if (self.observations and !self.profile_keys.contains(profile_key)) {
+            try self.profile_keys.put(self.a, try self.a.dupe(u8, profile_key), {});
             const owned = try self.a.alloc(resolver.KeyAlias, static_aliases.len);
             for (static_aliases, owned) |alias, *copy| copy.* = .{ .key = try self.a.dupe(u8, alias.key), .target = try self.a.dupe(u8, alias.target) };
-            try self.profiles.append(self.a, .{ .key_template = template, .aliases = owned });
+            try self.profiles.append(self.a, .{ .key_template = template, .aliases = owned, .suppress_json = try self.a.dupe(u8, cfg.suppress_json) });
         }
         if (self.aliases) for (try cfg.effectiveAliasesAlloc(scratch)) |alias| {
             if (!std.mem.eql(u8, alias.key, self.key)) continue;
@@ -654,57 +658,8 @@ const EntityDiscovery = struct {
 /// corrections override declarations; tombstones mask them. Ambiguity outside
 /// the affected component cannot block an unrelated correction.
 fn entityEffectiveAliases(a: std.mem.Allocator, namespace: curation.Namespace, profiles: []const native_authority.AliasProfile, key: []const u8, into: ?[]const u8) ![]const resolver.KeyAlias {
-    const Edge = struct { target: []const u8, conflict: bool = false };
-    var authoritative: std.StringHashMapUnmanaged(void) = .empty;
-    var removed: std.StringHashMapUnmanaged(void) = .empty;
-    var edges: std.StringHashMapUnmanaged(Edge) = .empty;
-    var adjacent: std.StringHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
-    for (namespace.merges) |alias| try authoritative.put(a, alias.key, {});
-    for (namespace.state.removed_aliases) |id| try removed.put(a, id, {});
-    var aliases: std.ArrayList(resolver.KeyAlias) = .empty;
-    for (profiles) |profile| if (std.mem.eql(u8, profile.key_template, namespace.key_template)) {
-        for (profile.aliases) |alias| if (!authoritative.contains(alias.key) and !removed.contains(alias.key)) try aliases.append(a, alias);
-    };
-    try aliases.appendSlice(a, namespace.merges);
-    for (aliases.items) |alias| {
-        const slot = try edges.getOrPut(a, alias.key);
-        if (!slot.found_existing) slot.value_ptr.* = .{ .target = alias.target } else if (!std.mem.eql(u8, slot.value_ptr.target, alias.target)) slot.value_ptr.conflict = true;
-        const outgoing = try adjacent.getOrPut(a, alias.key);
-        if (!outgoing.found_existing) outgoing.value_ptr.* = .empty;
-        try outgoing.value_ptr.append(a, alias.target);
-        const incoming = try adjacent.getOrPut(a, alias.target);
-        if (!incoming.found_existing) incoming.value_ptr.* = .empty;
-        try incoming.value_ptr.append(a, alias.key);
-    }
-    var pending: std.ArrayList([]const u8) = .empty;
-    try pending.append(a, key);
-    if (into) |target| try pending.append(a, target);
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    var offset: usize = 0;
-    while (offset < pending.items.len) : (offset += 1) {
-        const id = pending.items[offset];
-        if ((try seen.getOrPut(a, id)).found_existing) continue;
-        if (seen.count() > 16384) return error.ResolverCurationLimitExceeded;
-        if (adjacent.get(id)) |neighbors| try pending.appendSlice(a, neighbors.items);
-    }
-    var result: std.ArrayList(resolver.KeyAlias) = .empty;
-    var iterator = edges.iterator();
-    while (iterator.next()) |edge| if (seen.contains(edge.key_ptr.*)) {
-        if (edge.value_ptr.conflict) return error.ResolverNamespaceMigrationConflict;
-        try result.append(a, .{ .key = edge.key_ptr.*, .target = edge.value_ptr.target });
-    };
-    return result.items;
+    return native_authority.records.effectiveAliases(a, namespace, profiles, key, into);
 }
-const EntityValidation = struct {
-    namespaces: *std.StringArrayHashMapUnmanaged(curation.Namespace),
-    fn consume(self: *EntityValidation, scratch: std.mem.Allocator, _: []const u8, cfg: Config) !void {
-        const namespace = self.namespaces.get(cfg.key_template) orelse return error.InvalidCatalogRecord;
-        var projected = cfg;
-        projected.merges = namespace.merges;
-        projected.curation_json = try std.json.Stringify.valueAlloc(scratch, namespace.state, .{});
-        try projected.validate();
-    }
-};
 
 /// Both passes read the same revision-fenced catalog cut. A page arena owns
 /// transport bytes, table schemas and parsed configs; callbacks retain only
@@ -1059,31 +1014,8 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
     for (namespaces.values()) |*namespace| {
         if (input.into) |target| if (!curation.keyInNamespace(namespace.key_template, target)) return error.InvalidResolverCurationRequest;
         if (input.expected_revision) |expected| if (expected != namespace.revision) return error.ResolverCurationConflict;
-        var materialized_alias = false;
-        var policy_merges = namespace.merges;
-        var effective: std.ArrayListUnmanaged(resolver.KeyAlias) = .empty;
-        try effective.appendSlice(a, try entityEffectiveAliases(a, namespace.*, discovery.profiles.items, key, input.into));
-        const masked = for (namespace.state.removed_aliases) |id| {
-            if (std.mem.eql(u8, id, key)) break true;
-        } else false;
-        const redirected = for (namespace.merges) |alias| {
-            if (std.mem.eql(u8, alias.key, key)) break true;
-        } else false;
-        if (!redirected and !masked and (action == .merge or action == .unmerge)) {
-            if (discovery.local_targets.get(namespace.key_template)) |local_target| {
-                if (local_target.conflict) return error.ResolverNamespaceMigrationConflict;
-                if (action == .merge and std.mem.eql(u8, local_target.target, input.into.?)) {
-                    // An identical source-local alias is not yet a shared
-                    // correction. Publish that explicit assertion for every
-                    // consumer, including when this namespace is already owned.
-                    var materialized: std.ArrayListUnmanaged(resolver.KeyAlias) = .empty;
-                    try materialized.appendSlice(a, namespace.merges);
-                    try materialized.append(a, .{ .key = key, .target = local_target.target });
-                    policy_merges = materialized.items;
-                    materialized_alias = true;
-                }
-            }
-        }
+        const policy_merges = namespace.merges;
+        const effective = try native_authority.records.planningAliases(a, namespace.*, try entityEffectiveAliases(a, namespace.*, discovery.profiles.items, key, input.into), action, key, input.into);
         var planning_state = namespace.state;
         const stamp = curation.manualOrigin(intent, try std.math.add(u64, namespace.revision, 1));
         if (proposal_edit) |edit| {
@@ -1092,9 +1024,9 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
             planning_state.proposals = try a.dupe(resolver.curation.Proposal, &.{proposal});
         }
         var plan = if (proposal_edit) |edit|
-            try resolver.curation.decide(a, planning_state, policy_merges, effective.items, edit.id, edit.decision, stamp)
+            try resolver.curation.decide(a, planning_state, policy_merges, effective, edit.id, edit.decision, stamp)
         else
-            try resolver.curation.planWithOrigin(a, try std.json.Stringify.valueAlloc(a, planning_state, .{}), policy_merges, effective.items, intent, stamp);
+            try resolver.curation.planWithOrigin(a, try std.json.Stringify.valueAlloc(a, planning_state, .{}), policy_merges, effective, intent, stamp);
         const local_decision = if (proposal_edit != null) plan.state.proposals[0] else @as(?resolver.curation.Proposal, null);
         plan.state.proposals = namespace.state.proposals;
         const policy_changed = !Config.aliasesEqual(namespace.merges, plan.merges) or !std.mem.eql(u8, try std.json.Stringify.valueAlloc(a, namespace.state, .{}), try std.json.Stringify.valueAlloc(a, plan.state, .{}));
@@ -1117,7 +1049,7 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
         try absorbed_results.put(a, namespace.key_template, plan.absorbed);
         const check: Config = .{ .name = "namespace", .table = entity_table.name, .source_artifact = "metadata", .resolution_artifact = "resolved", .key_template = namespace.key_template, .merges = plan.merges, .curation_json = try std.json.Stringify.valueAlloc(a, plan.state, .{}) };
         try check.validate();
-        if (policy_changed or materialized_alias or !namespaceAdopted(stored, namespace.key_template)) {
+        if (policy_changed or !namespaceAdopted(stored, namespace.key_template)) {
             namespace.adoption_revision = adoption_revision;
             namespace.adoption_standalone = server.cfg.deployment_mode == .standalone;
             namespace.state = plan.state;
@@ -1127,8 +1059,7 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
             changed = true;
         }
     }
-    var validation: EntityValidation = .{ .namespaces = &namespaces };
-    try scanEntityConsumers(server, alloc, snapshot, entity_table, key, request, adoption_revision, stored, &validation);
+    for (namespaces.values()) |namespace| try native_authority.records.validateProfiles(a, namespace, discovery.profiles.items);
     if (changed) {
         _ = try resolver.curation.parseState(a, try std.json.Stringify.valueAlloc(a, proposal_state, .{}));
         try root.object.put(a, proposals_key, try json(a, proposal_state));

@@ -640,9 +640,10 @@ pub fn ensureResolversWithOptions(
     defer curation_arena.deinit();
     const curation = @import("../storage/db/resolver_curation.zig");
     const identity_state = try curation.metadataFromValue(curation_arena.allocator(), parsed.value);
+    var validation_profiles: std.StringHashMapUnmanaged(void) = .empty;
     for (identity_state.identities) |identity| if (identity.projection_only) return error.ResolverNamespaceCurationRequired;
 
-    const before = try db.listResolvers(alloc);
+    const before = try db.listResolverStaticDescriptors(alloc);
     defer {
         for (before) |*cfg| cfg.deinit(alloc);
         alloc.free(before);
@@ -655,7 +656,7 @@ pub fn ensureResolversWithOptions(
     for (desired.items) |cfg| {
         var next = cfg;
         for (identity_state.identities) |identity| if (!identity.dropped and std.mem.eql(u8, identity.name, cfg.name)) {
-            next = try curation.overlayMetadata(curation_arena.allocator(), cfg, identity);
+            next = try curation.overlayMetadataCached(curation_arena.allocator(), cfg, identity, &validation_profiles);
             break;
         };
         const result = try db.upsertResolverWithResultOptions(next, .{
@@ -669,12 +670,13 @@ pub fn ensureResolversWithOptions(
         }
     }
 
-    const existing = try db.listResolvers(alloc);
+    const existing = try db.listResolverStaticDescriptors(alloc);
     defer {
         for (existing) |*cfg| cfg.deinit(alloc);
         alloc.free(existing);
     }
     for (existing) |cfg| {
+        if (cfg.retired) continue;
         if (desiredResolverContains(desired.items, cfg.name)) continue;
         const removed = if (options.drain_backfill)
             try db.removeResolver(cfg.name)
@@ -684,7 +686,7 @@ pub fn ensureResolversWithOptions(
     }
     // Runtime edits of retired identities remain durable without reactivating
     // their extraction/promotion contracts.
-    const identities = try db.listResolverIdentities(alloc);
+    const identities = try db.listResolverStaticDescriptors(alloc);
     defer {
         for (identities) |*cfg| cfg.deinit(alloc);
         alloc.free(identities);
@@ -693,7 +695,7 @@ pub fn ensureResolversWithOptions(
         if (identity.dropped or desiredResolverContains(desired.items, identity.name)) continue;
         for (identities) |cfg| {
             if (!cfg.retired or !std.mem.eql(u8, cfg.name, identity.name)) continue;
-            const next = try curation.overlayMetadata(curation_arena.allocator(), cfg, identity);
+            const next = try curation.overlayMetadataCached(curation_arena.allocator(), cfg, identity, &validation_profiles);
             _ = try db.upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .migrate_namespace = next.namespace_generation > cfg.namespace_generation });
             break;
         }

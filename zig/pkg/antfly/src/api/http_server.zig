@@ -59116,7 +59116,7 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
     source.stress_pages = 64;
     var bounded = try resources.handle(&server, budget.allocator(), .entity_suppress, "entities", "", "concept/bounded", "{}", "", .{});
     try std.testing.expectEqual(@as(u16, 202), bounded.status);
-    try std.testing.expectEqual(@as(usize, 128), source.stress_reads);
+    try std.testing.expectEqual(@as(usize, 64), source.stress_reads);
     const bounded_result = try std.json.parseFromSlice(std.json.Value, alloc, bounded.body, .{});
     defer bounded_result.deinit();
     try std.testing.expectEqual(@as(usize, 64), bounded_result.value.object.get("results").?.array.items.len);
@@ -59126,7 +59126,8 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
     try std.testing.expectEqual(@as(u16, 200), bounded_get.status);
     bounded_get.deinit(budget.allocator());
     try std.testing.expectEqual(@as(usize, 0), budget.live);
-    // A policy conflict in the final page must be found by the validation pass
+    // A policy conflict in the final discovery page must be validated from
+    // the retained revision-fenced profiles, without a second catalog pass,
     // before any authoritative namespace CAS, even when earlier pages are valid.
     source.stress_pages = 2;
     source.incompatible_last_page = true;

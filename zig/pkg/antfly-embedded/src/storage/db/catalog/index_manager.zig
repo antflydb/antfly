@@ -12900,6 +12900,23 @@ pub const IndexManager = struct {
         if (method == .string and std.mem.eql(u8, method.string, "generated") and policy == .string and std.mem.eql(u8, policy.string, "verdict_only")) return error.InvalidResolverConfig;
     }
 
+    /// Import immutable policy once into this owner's allocator. Transient
+    /// metadata arenas never lend their lifetime to persistent catalog slots.
+    fn cloneResolverOwned(self: *IndexManager, cfg: ResolverConfig) !ResolverConfig {
+        if (cfg.shared_projection) |incoming| {
+            if (cfg.merges.ptr == incoming.merges.ptr and cfg.merges.len == incoming.merges.len and cfg.curation_json.ptr == incoming.curation_json.ptr and cfg.curation_json.len == incoming.curation_json.len) {
+                if (incoming.alloc.ptr == self.alloc.ptr and incoming.alloc.vtable == self.alloc.vtable) return ResolverConfig.cloneWithProjection(self.alloc, cfg, incoming);
+                for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }) |definitions| for (definitions) |entry| if (entry.shared_projection) |owned| {
+                    if (std.mem.eql(u8, &owned.digest, &incoming.digest)) return ResolverConfig.cloneWithProjection(self.alloc, cfg, owned);
+                };
+                const owned = try resolver_catalog.SharedProjection.create(self.alloc, incoming.merges, incoming.curation_json);
+                defer owned.release();
+                return ResolverConfig.cloneWithProjection(self.alloc, cfg, owned);
+            }
+        }
+        return ResolverConfig.clone(self.alloc, cfg);
+    }
+
     pub fn addResolver(self: *IndexManager, store: anytype, input_cfg: resolver_catalog.ResolverConfig) !void {
         var cfg = input_cfg;
         cfg.inline_managed = false;
@@ -12918,7 +12935,7 @@ pub const IndexManager = struct {
 
         const checkpoint = self.resolvers.items.len;
         errdefer self.truncateResolvers(checkpoint);
-        try self.resolvers.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
+        try self.resolvers.append(self.alloc, try self.cloneResolverOwned(cfg));
         try self.persistResolverCatalog(store, .mark_reresolve_dirty);
     }
 
@@ -12949,7 +12966,7 @@ pub const IndexManager = struct {
                 cfg.resolution_generation = try std.math.add(u64, entry.effectiveGeneration(), 1);
                 try cfg.validate();
                 var previous = entry.*;
-                entry.* = try ResolverConfig.clone(self.alloc, cfg);
+                entry.* = try self.cloneResolverOwned(cfg);
                 self.persistResolverCatalog(store, .catalog_only) catch |err| {
                     entry.deinit(self.alloc);
                     entry.* = previous;
@@ -13033,7 +13050,7 @@ pub const IndexManager = struct {
             if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, cfg.name)) return error.ResolverArtifactAlreadyExists;
             if (self.resolverLabelRoutingConflicts(cfg)) return error.ResolverLabelRoutingConflict;
             var previous = entry.*;
-            entry.* = try resolver_catalog.ResolverConfig.clone(self.alloc, cfg);
+            entry.* = try self.cloneResolverOwned(cfg);
             self.persistResolverCatalog(store, if (material_changed or reactivating) .mark_reresolve_dirty else .catalog_only) catch |err| {
                 entry.deinit(self.alloc);
                 entry.* = previous;
@@ -13047,7 +13064,7 @@ pub const IndexManager = struct {
         if (cfg.inline_managed == null) cfg.inline_managed = false;
         const checkpoint = self.resolvers.items.len;
         errdefer self.truncateResolvers(checkpoint);
-        try self.resolvers.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
+        try self.resolvers.append(self.alloc, try self.cloneResolverOwned(cfg));
         try self.persistResolverCatalog(store, .mark_reresolve_dirty);
         return .inserted;
     }
@@ -13083,7 +13100,16 @@ pub const IndexManager = struct {
 
     /// One namespace snapshot, one durable catalog publication, regardless of
     /// the number of serving/retired consumers in this owner.
+    pub fn completeResolverProjectionWork(self: *IndexManager, store: anytype, key: []const u8) !void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.persistResolverCatalogCompletion(store, .catalog_only, .{ .key = key });
+    }
+
     pub fn publishResolverNamespaceProjection(self: *IndexManager, store: anytype, table: []const u8, table_id: u64, namespace: @import("../resolver_namespace.zig").Namespace) !bool {
+        return self.publishResolverNamespaceProjectionWork(store, table, table_id, namespace, null);
+    }
+    pub fn publishResolverNamespaceProjectionWork(self: *IndexManager, store: anytype, table: []const u8, table_id: u64, namespace: @import("../resolver_namespace.zig").Namespace, completion: ?@import("../../lite/resolver_consumers.zig").Completion) !bool {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -13127,9 +13153,12 @@ pub const IndexManager = struct {
             const owned = try ResolverConfig.cloneWithProjection(self.alloc, next, projection);
             changes.appendAssumeCapacity(.{ .slot = entry, .before = entry.*, .after = owned });
         };
-        if (changes.items.len == 0) return false;
+        if (changes.items.len == 0) {
+            if (completion != null) try self.persistResolverCatalogCompletion(store, .catalog_only, completion);
+            return false;
+        }
         for (changes.items) |change| change.slot.* = change.after;
-        try self.persistResolverCatalog(store, .mark_reresolve_dirty);
+        try self.persistResolverCatalogCompletion(store, .mark_reresolve_dirty, completion);
         published = true;
         return true;
     }
@@ -23592,7 +23621,7 @@ pub const IndexManager = struct {
             }
         }
         const pending = pending_version > 1;
-        const version = @max(authoritative, pending_version);
+        var version = @max(authoritative, pending_version);
         // Pre-epoch libraries ignore minimum_reader_version, but their strict
         // array parser rejects a versioned resolver envelope. Publish both
         // fences atomically; restore the plain array when the last shadow ends.
@@ -23605,11 +23634,21 @@ pub const IndexManager = struct {
         const stored_catalog = fenced_catalog orelse catalog;
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(txn, resolver_catalog_key, stored_catalog);
         try txn.put(resolver_catalog_key, stored_catalog);
+        // Native binding maintenance can introduce durable projection jobs in
+        // this same transaction. Preserve its reader fence and envelope.
+        const derived_version = try resolver_catalog.readMinimumReaderVersion(txn, resolver_catalog.supported_reader_version);
+        const upgraded = derived_version > version;
+        if (upgraded) {
+            version = derived_version;
+            const envelope = try resolver_catalog.versionedCatalog(self.alloc, catalog, version);
+            defer self.alloc.free(envelope);
+            try txn.put(resolver_catalog_key, envelope);
+        }
         try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(version));
         if (pending) {
-            try txn.put(replacement_reader_base_key, try resolver_catalog.readerVersionBytes(authoritative));
+            try txn.put(replacement_reader_base_key, try resolver_catalog.readerVersionBytes(@max(authoritative, if (upgraded) version else 1)));
         } else if (baseline_raw != null) try txn.delete(replacement_reader_base_key);
-        return .{ .reader = version, .format = if (fenced_catalog != null) version else catalog_version };
+        return .{ .reader = version, .format = if (fenced_catalog != null or upgraded) version else catalog_version };
     }
 
     /// Permanent requirements exclude a temporary reservation fence. Parent
@@ -23771,6 +23810,9 @@ pub const IndexManager = struct {
     }
 
     fn persistResolverCatalog(self: *IndexManager, store: anytype, mode: ResolverCatalogPersistMode) !void {
+        return self.persistResolverCatalogCompletion(store, mode, null);
+    }
+    fn persistResolverCatalogCompletion(self: *IndexManager, store: anytype, mode: ResolverCatalogPersistMode, completion: ?@import("../../lite/resolver_consumers.zig").Completion) !void {
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
@@ -23820,6 +23862,10 @@ pub const IndexManager = struct {
         if (mode == .mark_reresolve_dirty or routing_changed) {
             try txn.put(resolver_catalog.reresolve_resume_key, "");
             try txn.put(resolver_catalog.reresolve_repair_resume_key, "");
+        }
+        if (completion) |work| {
+            try txn.delete(work.key);
+            try txn.put(@import("../../lite/resolver_consumers.zig").cursor_key, work.key);
         }
         try txn.commit();
         self.publishCatalogReaderStamp(reader_version);

@@ -1840,7 +1840,9 @@ recorded. Mention-review provenance requires reader version 10; scoped legacy
 curation state and queue receipts require reader version 11. Original native
 resolver records remain readable at Lite reader version 12. Physical projection
 bindings, shared catalogs and fingerprinted heads require version 13; native
-metadata commands require coordinated decoder version 40.
+metadata commands and shared execution attachments require coordinated decoder
+version 41.
+Coalesced native Lite projection jobs require reader version 14.
 Legacy blob policy publication retains its version 37 decoder fence.
 
 `/tables/{entity_table}/curation/proposals` is the entity-level review surface;
@@ -2027,3 +2029,34 @@ native discovery markers. Live catalog projections keep compact native reference
 Lite portable backups retain typed native authority rows and require reader version
 12 plus the native marker; native file backups retain their original indexes and
 heads. Durable authority is never reconstructed from a possibly lagging worker.
+
+### Scoped admission and projection work
+
+HTTP and embedded entity mutations build the same effective graph from all
+consumer static profiles, native overrides and tombstones. Planning never
+selects a consumer as the namespace authority. Static-profile compatibility is
+validated once per distinct profile from the admitted catalog cut; HTTP retains
+those profiles rather than fetching consumers again. Explicitly asserting an
+identical source-local alias publishes a shared redirect with its own origin.
+
+Private execution/provisioning catalogs carry one content-addressed namespace
+attachment and compact references from resolver identities. Hydration and
+validation are batched; repeated references borrow the same parsed policy and
+encoded state. Raw source records remain compact for CAS. Portable exports
+expand attachments and detach physical bindings in one pass. Persistent owners
+copy each policy out of the metadata arena once, then retain shared immutable
+ownership across consumers. Runtime validation evidence binds the policy digest
+and static profile, is never serialized, and is invalidated by caller edits;
+unchanged shared policies compare by digest.
+
+Native Lite maintains coalesced per-owner namespace jobs in the same physical
+transaction as authority-head changes, binding changes and destination directory
+changes. A durable cursor rotates work, so a hot namespace cannot pin the tail.
+Catalog publication acknowledges the selected job and advances its cursor
+atomically, under the same namespace dependency fence. Reader-14 fences cover
+both pending jobs and cursor records, including portable restore. Work discovery
+seeks the pending-job prefix instead of opening or polling every destination.
+
+The native transaction overlay keeps an ordered staged index. Prefix reads merge
+bounded base and staged ranges, including replacements and tombstones; unrelated
+staged writes do not participate in adjacency scans during adoption or curation.

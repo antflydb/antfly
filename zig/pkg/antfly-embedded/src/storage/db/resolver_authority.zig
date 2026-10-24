@@ -49,6 +49,92 @@ pub const Edit = struct { kind: Kind, id: []const u8, value: ?std.json.Value };
 pub const Patch = struct { expected_revision: u64, next: Head, edits: []const Edit };
 pub const QueueHead = struct { version: u8 = 1, revision: u64 = 0, count: u32 = 0, bytes: u64 = 0, receipt_scope: ?c.ReceiptScope = null };
 pub const QueuePatch = struct { expected_revision: u64, revision: u64, receipt_scope: ?c.ReceiptScope = null, proposals: []const c.Proposal = &.{} };
+pub const AliasProfile = struct { key_template: []const u8, aliases: []const resolver.KeyAlias, suppress_json: []const u8 = "" };
+pub fn effectiveAliases(a: A, namespace: policy.Namespace, profiles: []const AliasProfile, key: []const u8, into: ?[]const u8) ![]const resolver.KeyAlias {
+    const Edge = struct { target: []const u8, conflict: bool = false };
+    var authoritative: std.StringHashMapUnmanaged(void) = .empty;
+    var removed: std.StringHashMapUnmanaged(void) = .empty;
+    var edges: std.StringHashMapUnmanaged(Edge) = .empty;
+    var adjacent: std.StringHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
+    for (namespace.merges) |alias| try authoritative.put(a, alias.key, {});
+    for (namespace.state.removed_aliases) |id| try removed.put(a, id, {});
+    var aliases: std.ArrayList(resolver.KeyAlias) = .empty;
+    for (profiles) |profile| if (std.mem.eql(u8, profile.key_template, namespace.key_template)) {
+        for (profile.aliases) |alias| if (!authoritative.contains(alias.key) and !removed.contains(alias.key)) try aliases.append(a, alias);
+    };
+    try aliases.appendSlice(a, namespace.merges);
+    for (aliases.items) |alias| {
+        const slot = try edges.getOrPut(a, alias.key);
+        if (!slot.found_existing) slot.value_ptr.* = .{ .target = alias.target } else if (!std.mem.eql(u8, slot.value_ptr.target, alias.target)) slot.value_ptr.conflict = true;
+        const outgoing = try adjacent.getOrPut(a, alias.key);
+        if (!outgoing.found_existing) outgoing.value_ptr.* = .empty;
+        try outgoing.value_ptr.append(a, alias.target);
+        const incoming = try adjacent.getOrPut(a, alias.target);
+        if (!incoming.found_existing) incoming.value_ptr.* = .empty;
+        try incoming.value_ptr.append(a, alias.key);
+    }
+    var pending: std.ArrayList([]const u8) = .empty;
+    try pending.append(a, key);
+    if (into) |target| try pending.append(a, target);
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var offset: usize = 0;
+    while (offset < pending.items.len) : (offset += 1) {
+        const id = pending.items[offset];
+        if ((try seen.getOrPut(a, id)).found_existing) continue;
+        if (seen.count() > 16384) return error.ResolverCurationLimitExceeded;
+        if (adjacent.get(id)) |neighbors| try pending.appendSlice(a, neighbors.items);
+    }
+    var result: std.ArrayList(resolver.KeyAlias) = .empty;
+    var iterator = edges.iterator();
+    while (iterator.next()) |edge| if (seen.contains(edge.key_ptr.*)) {
+        if (edge.value_ptr.conflict) return error.ResolverNamespaceMigrationConflict;
+        try result.append(a, .{ .key = edge.key_ptr.*, .target = edge.value_ptr.target });
+    };
+    return result.items;
+}
+
+/// A repeated source-local declaration is still a new shared assertion. Let
+/// the planner record its origin rather than taking the static-alias retry path.
+pub fn planningAliases(a: A, namespace: policy.Namespace, effective: []const resolver.KeyAlias, action: c.Action, key: []const u8, into: ?[]const u8) ![]const resolver.KeyAlias {
+    if (action != .merge or into == null) return effective;
+    for (namespace.merges) |alias| if (std.mem.eql(u8, alias.key, key)) return effective;
+    for (effective) |alias| if (std.mem.eql(u8, alias.key, key) and std.mem.eql(u8, alias.target, into.?)) {
+        var filtered: std.ArrayList(resolver.KeyAlias) = .empty;
+        for (effective) |item| if (!std.mem.eql(u8, item.key, key)) try filtered.append(a, item);
+        return filtered.items;
+    };
+    return effective;
+}
+
+pub fn validateProfile(a: A, namespace: policy.Namespace, static: []const resolver.KeyAlias, suppress_json: []const u8) !void {
+    var curated: std.StringHashMapUnmanaged(void) = .empty;
+    var removed: std.StringHashMapUnmanaged(void) = .empty;
+    for (namespace.merges) |alias| try curated.put(a, alias.key, {});
+    for (namespace.state.removed_aliases) |id| try removed.put(a, id, {});
+    var aliases: std.ArrayList(resolver.KeyAlias) = .empty;
+    for (static) |alias| if (!curated.contains(alias.key) and !removed.contains(alias.key)) try aliases.append(a, alias);
+    try aliases.appendSlice(a, namespace.merges);
+    _ = try c.RedirectIndex.init(a, static);
+    _ = try c.RedirectIndex.init(a, namespace.merges);
+    const redirects = try c.RedirectIndex.init(a, aliases.items);
+    var index = try c.Index.init(a, suppress_json, try encode(a, namespace.state));
+    try index.bindRedirects(a, redirects);
+    for (namespace.state.distinct) |pair| if (std.mem.eql(u8, redirects.canonical(pair.from), redirects.canonical(pair.to))) return error.ResolverDistinctPair;
+    for (aliases.items) |alias| {
+        const target = redirects.canonical(alias.target);
+        if (index.keySuppressed(target)) return error.SuppressedResolverRedirectTarget;
+        if (try index.pinnedDistinct(a, alias.key, target)) return error.ResolverDistinctPair;
+    }
+}
+pub fn validateProfiles(a: A, namespace: policy.Namespace, profiles: []const AliasProfile) !void {
+    var checked: std.StringHashMapUnmanaged(void) = .empty;
+    for (profiles) |profile| if (std.mem.eql(u8, namespace.key_template, profile.key_template)) {
+        const key = try encode(a, .{ profile.aliases, profile.suppress_json });
+        if ((try checked.getOrPut(a, key)).found_existing) continue;
+        try validateProfile(a, namespace, profile.aliases, profile.suppress_json);
+    };
+}
+
 pub const Snapshot = struct { head: Head, namespace: policy.Namespace };
 fn parse(comptime T: type, a: A, bytes: []const u8) !T {
     return std.json.parseFromSliceLeaky(T, a, bytes, .{ .allocate = .alloc_always });
@@ -65,6 +151,9 @@ pub const Store = struct {
     a: A,
     backend: Backend,
     prefix: []const u8,
+    max_namespace_bytes: ?u64 = c.max_state_bytes,
+    max_queue_bytes: ?u64 = c.max_state_bytes,
+    max_queue_count: ?u32 = 4096,
     fn keyPath(self: Store, suffix: []const u8) ![]const u8 {
         return std.mem.concat(self.a, u8, &.{ self.prefix, suffix });
     }
@@ -145,6 +234,23 @@ pub const Store = struct {
     }
     /// Forward and reverse redirect indexes bound discovery to the affected
     /// components. Distinct endpoints add only their forward canonical paths.
+    pub fn forwardScope(self: Store, template: []const u8, seeds: []const []const u8) !?Snapshot {
+        const h = try self.head(template) orelse return null;
+        var values: Values = .{};
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        for (seeds) |seed| {
+            var id = seed;
+            while (true) {
+                if ((try seen.getOrPut(self.a, id)).found_existing) break;
+                if (seen.count() > 16384) return error.ResolverCurationLimitExceeded;
+                inline for (.{ Kind.suppressed, Kind.suppression, Kind.redirect_origin, Kind.removed_alias }) |kind| if (try self.backend.get(self.backend.ptr, self.a, try self.record(template, kind, id))) |raw| try values.append(self.a, kind, raw);
+                const alias = (try self.get(resolver.KeyAlias, template, .redirect, id)) orelse break;
+                try values.aliases.append(self.a, alias);
+                id = alias.target;
+            }
+        }
+        return values.snapshot(h);
+    }
     pub fn component(self: Store, template: []const u8, seeds: []const []const u8) !?Snapshot {
         return self.componentWithAliases(template, seeds, &.{});
     }
@@ -249,11 +355,14 @@ pub const Store = struct {
         return if (try self.backend.get(self.backend.ptr, self.a, try self.proposalPath(id))) |raw| try parse(c.Proposal, self.a, raw) else null;
     }
     fn proposalIndexes(self: Store, value: c.Proposal) ![]const []const u8 {
-        const result = try self.a.alloc([]const u8, if (value.state == .open) 4 else 3);
+        const result = try self.a.alloc([]const u8, if (value.state == .open) (if (value.into != null) @as(usize, 5) else 4) else 3);
         result[0] = try self.keyPath(try std.fmt.allocPrint(self.a, "queue/state/{s}/{s}", .{ @tagName(value.state), value.id }));
         result[1] = try self.keyPath(try std.fmt.allocPrint(self.a, "queue/action/{s}/{s}", .{ @tagName(value.action), value.id }));
         result[2] = try self.keyPath(try std.fmt.allocPrint(self.a, "queue/filter/{s}/{s}/{s}", .{ @tagName(value.state), @tagName(value.action), value.id }));
-        if (value.state == .open) result[3] = try self.keyPath(try std.fmt.allocPrint(self.a, "queue/key/{s}/{s}", .{ try hash(self.a, value.key), value.id }));
+        if (value.state == .open) {
+            result[3] = try self.keyPath(try std.fmt.allocPrint(self.a, "queue/key/{s}/{s}", .{ try hash(self.a, value.key), value.id }));
+            if (value.into) |target| result[4] = try self.keyPath(try std.fmt.allocPrint(self.a, "queue/key/{s}/{s}", .{ try hash(self.a, target), value.id }));
+        }
         return result;
     }
     /// Durable effect classification, separate from actor provenance/revision.
@@ -332,7 +441,8 @@ pub const Store = struct {
             } else count = try std.math.add(u32, count, 1);
             bytes = try std.math.add(u64, bytes, c.proposalCapacityBytes(.{ .proposals = &.{value} }));
         }
-        if (bytes > c.max_state_bytes or count > 4096) return error.ResolverCurationLimitExceeded;
+        if (self.max_queue_bytes) |maximum| if (bytes > maximum) return error.ResolverCurationLimitExceeded;
+        if (self.max_queue_count) |maximum| if (count > maximum) return error.ResolverCurationLimitExceeded;
     }
     pub fn applyQueue(self: Store, patch: QueuePatch) !void {
         try self.preflightQueue(patch);
@@ -369,7 +479,7 @@ pub const Store = struct {
             if ((try seen.getOrPut(self.a, path)).found_existing) return error.InvalidResolverCurationRequest;
             h.bytes = try std.math.add(u64, h.bytes, row.value.len);
         }
-        if (h.bytes > c.max_state_bytes) return error.ResolverCurationLimitExceeded;
+        if (self.max_namespace_bytes) |maximum| if (h.bytes > maximum) return error.ResolverCurationLimitExceeded;
         std.crypto.hash.sha2.Sha256.hash(try encode(self.a, namespace), &h.fingerprint, .{});
         for (rows) |row| {
             try self.backend.put(self.backend.ptr, self.a, try self.record(h.key_template, row.kind, row.id), row.value);
@@ -434,7 +544,7 @@ pub const Store = struct {
                 bytes = try std.math.add(u64, bytes, raw.len);
             }
         }
-        if (bytes > c.max_state_bytes) return error.ResolverCurationLimitExceeded;
+        if (self.max_namespace_bytes) |maximum| if (bytes > maximum) return error.ResolverCurationLimitExceeded;
     }
     pub fn apply(self: Store, patch: Patch) !void {
         try self.preflight(patch);
@@ -453,7 +563,7 @@ pub const Store = struct {
             if (edit.value) |value_json| {
                 const raw = try encode(self.a, value_json);
                 h.bytes = try std.math.add(u64, h.bytes, raw.len);
-                if (h.bytes > c.max_state_bytes) return error.ResolverCurationLimitExceeded;
+                if (self.max_namespace_bytes) |maximum| if (h.bytes > maximum) return error.ResolverCurationLimitExceeded;
                 try self.backend.put(self.backend.ptr, self.a, path, raw);
                 try self.indexRecord(h.key_template, edit.kind, edit.id, raw, true);
             } else try self.backend.remove(self.backend.ptr, self.a, path);
@@ -477,6 +587,21 @@ fn flatten(a: A, namespace: policy.Namespace) ![]const Flat {
     return result.items;
 }
 /// Diff only the captured component, not the namespace's complete policy.
+/// Union scopes from one immutable read cut without duplicating policy records.
+pub fn unionNamespaces(a: A, left: policy.Namespace, right: policy.Namespace) !policy.Namespace {
+    var records: std.StringHashMapUnmanaged(Flat) = .empty;
+    for ([_]policy.Namespace{ left, right }) |namespace| for (try flatten(a, namespace)) |row| {
+        const id = try std.fmt.allocPrint(a, "{s}/{s}", .{ @tagName(row.kind), row.id });
+        const entry = try records.getOrPut(a, id);
+        if (entry.found_existing and !std.mem.eql(u8, entry.value_ptr.value, row.value)) return error.InvalidCatalogRecord;
+        entry.value_ptr.* = row;
+    };
+    var values: Store.Values = .{};
+    var it = records.valueIterator();
+    while (it.next()) |row| try values.append(a, row.kind, row.value);
+    return values.snapshot(.{ .key_template = right.key_template, .revision = right.revision, .min_text_chars = right.state.suppress.min_text_chars }).namespace;
+}
+
 pub fn difference(a: A, before: policy.Namespace, after: policy.Namespace) !Patch {
     const old = try flatten(a, before);
     const next = try flatten(a, after);
@@ -555,8 +680,23 @@ test "native resolver authority seeks a component and patches only changed recor
 
 pub fn Transaction(comptime Txn: type) type {
     return struct {
+        const Tree = std.Treap([]const u8, struct {
+            fn order(l: []const u8, r: []const u8) std.math.Order {
+                return std.mem.order(u8, l, r);
+            }
+        }.order);
         txn: *Txn,
         staged: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+        ordered: Tree = .{},
+        scan_steps: usize = 0,
+        fn stage(self: *@This(), a: A, key: []const u8, raw: ?[]const u8) !void {
+            const slot = try self.staged.getOrPut(a, key);
+            slot.value_ptr.* = raw;
+            if (!slot.found_existing) {
+                var entry = self.ordered.getEntryFor(slot.key_ptr.*);
+                entry.set(try a.create(Tree.Node));
+            }
+        }
         fn get(ptr: *anyopaque, a: std.mem.Allocator, key: []const u8) !?[]const u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.staged.getEntry(key)) |entry| return entry.value_ptr.*;
@@ -568,11 +708,11 @@ pub fn Transaction(comptime Txn: type) type {
         }
         fn put(ptr: *anyopaque, a: std.mem.Allocator, key: []const u8, raw: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try self.staged.put(a, key, raw);
+            try self.stage(a, key, raw);
         }
         fn remove(ptr: *anyopaque, a: std.mem.Allocator, key: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try self.staged.put(a, key, null);
+            try self.stage(a, key, null);
         }
         fn scan(ptr: *anyopaque, a: std.mem.Allocator, prefix: []const u8, after: ?[]const u8, limit: u32) !Page {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -582,25 +722,43 @@ pub fn Transaction(comptime Txn: type) type {
             if (after) |last| if (row) |entry| if (std.mem.eql(u8, entry.key, last)) {
                 row = try cursor.next();
             };
-            var rows: std.ArrayList(Row) = .empty;
-            while (row) |entry| {
-                if (!std.mem.startsWith(u8, entry.key, prefix) or rows.items.len == limit) break;
-                if (!self.staged.contains(entry.key)) try rows.append(a, .{ .key = try a.dupe(u8, entry.key), .value = try a.dupe(u8, entry.value) });
-                row = try cursor.next();
-            }
-            const more = row != null and std.mem.startsWith(u8, row.?.key, prefix);
-            var changes = self.staged.iterator();
-            while (changes.next()) |entry| if (entry.value_ptr.*) |value| {
-                if (std.mem.startsWith(u8, entry.key_ptr.*, prefix) and (after == null or std.mem.order(u8, entry.key_ptr.*, after.?) == .gt)) try rows.append(a, .{ .key = entry.key_ptr.*, .value = value });
-            };
-            std.mem.sort(Row, rows.items, {}, struct {
-                fn less(_: void, l: Row, r: Row) bool {
-                    return std.mem.lessThan(u8, l.key, r.key);
+            if (limit == 0) return error.InvalidResolverCurationRequest;
+            const lower = after orelse prefix;
+            var search = self.ordered.root;
+            var pending: ?*Tree.Node = null;
+            while (search) |node| {
+                if (@import("builtin").is_test) self.scan_steps += 1;
+                if (std.mem.order(u8, node.key, lower) == .lt or (after != null and std.mem.eql(u8, node.key, lower))) search = node.children[1] else {
+                    pending = node;
+                    search = node.children[0];
                 }
-            }.less);
+            }
+            var rows: std.ArrayList(Row) = .empty;
+            while (rows.items.len <= limit) {
+                if (row) |entry| if (!std.mem.startsWith(u8, entry.key, prefix)) {
+                    row = null;
+                };
+                if (pending) |node| if (!std.mem.startsWith(u8, node.key, prefix)) {
+                    pending = null;
+                };
+                if (row == null and pending == null) break;
+                const order = if (row == null) std.math.Order.lt else if (pending == null) std.math.Order.gt else std.mem.order(u8, pending.?.key, row.?.key);
+                if (order != .gt) {
+                    const node = pending.?;
+                    if (@import("builtin").is_test) self.scan_steps += 1;
+                    if (self.staged.get(node.key).?) |raw| try rows.append(a, .{ .key = node.key, .value = raw });
+                    pending = node.next();
+                    if (order == .eq) row = try cursor.next();
+                } else {
+                    const entry = row.?;
+                    try rows.append(a, .{ .key = try a.dupe(u8, entry.key), .value = try a.dupe(u8, entry.value) });
+                    row = try cursor.next();
+                }
+            }
             const count = @min(limit, rows.items.len);
-            return .{ .rows = rows.items[0..count], .next = if (more or rows.items.len > limit) rows.items[count - 1].key else null };
+            return .{ .rows = rows.items[0..count], .next = if (rows.items.len > count) rows.items[count - 1].key else null };
         }
+
         pub fn flush(self: *@This(), a: std.mem.Allocator) !void {
             var keys: std.ArrayList([]const u8) = .empty;
             var it = self.staged.keyIterator();
@@ -615,6 +773,7 @@ pub fn Transaction(comptime Txn: type) type {
                 else => return err,
             };
             self.staged.clearRetainingCapacity();
+            self.ordered = .{};
         }
         pub fn backendGet(self: *@This(), a: A, key: []const u8) !?[]const u8 {
             return get(self, a, key);
@@ -764,4 +923,59 @@ test "native resolver authority closes alternating static and native alias paths
     try effective.appendSlice(a, &aliases);
     try effective.append(a, .{ .key = "entity/a", .target = "entity/b" });
     try std.testing.expectError(error.InvalidResolverAliasCycle, c.RedirectIndex.init(a, effective.items));
+}
+
+test "resolver curation shared planning sees every static profile independent of order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const namespace: policy.Namespace = .{ .key_template = "entity/{{_key}}" };
+    const empty: AliasProfile = .{ .key_template = namespace.key_template, .aliases = &.{} };
+    const declared: AliasProfile = .{ .key_template = namespace.key_template, .aliases = &.{.{ .key = "entity/a", .target = "entity/b" }} };
+    for ([_][2]AliasProfile{ .{ empty, declared }, .{ declared, empty } }) |profiles| {
+        const effective = try effectiveAliases(a, namespace, &profiles, "entity/a", null);
+        const unmerge = try c.plan(a, "{}", namespace.merges, effective, .{ .action = .unmerge, .key = "entity/a" });
+        try std.testing.expect(unmerge.changed);
+        try std.testing.expectEqualStrings("entity/a", unmerge.state.removed_aliases[0]);
+        const shared = try c.planWithOrigin(a, "{}", namespace.merges, try planningAliases(a, namespace, effective, .merge, "entity/a", "entity/b"), .{ .action = .merge, .key = "entity/a", .to = "entity/b" }, .{ .actor = "curator", .revision = 7 });
+        try std.testing.expect(shared.changed);
+        try std.testing.expectEqualStrings("curator", shared.state.redirect_origins[0].origin.actor);
+        try validateProfiles(a, .{ .key_template = namespace.key_template, .state = unmerge.state }, &profiles);
+    }
+}
+
+test "resolver curation transactional range scans ignore ten thousand unrelated staged writes" {
+    const Cursor = struct {
+        fn seekAtOrAfter(_: *@This(), _: []const u8) !?Row {
+            return null;
+        }
+        fn next(_: *@This()) !?Row {
+            return null;
+        }
+        fn close(_: *@This()) void {}
+    };
+    const Txn = struct {
+        fn get(_: *@This(), _: []const u8) anyerror![]const u8 {
+            return error.NotFound;
+        }
+        fn openCursor(_: *@This()) !Cursor {
+            return .{};
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var txn: Txn = .{};
+    var overlay: Transaction(Txn) = .{ .txn = &txn };
+    const store = overlay.store(a, "");
+    for (0..10000) |i| try store.backend.put(&overlay, a, try std.fmt.allocPrint(a, "unrelated/{d:0>5}", .{i}), "false");
+    try store.backend.put(&overlay, a, "narrow/a", "true");
+    try store.backend.put(&overlay, a, "narrow/b", "true");
+    const first = try store.backend.scan(&overlay, a, "narrow/", null, 1);
+    try std.testing.expectEqualStrings("narrow/a", first.rows[0].key);
+    try std.testing.expect(first.next != null);
+    const second = try store.backend.scan(&overlay, a, "narrow/", first.next, 1);
+    try std.testing.expectEqualStrings("narrow/b", second.rows[0].key);
+    try std.testing.expect(second.next == null);
+    try std.testing.expect(overlay.scan_steps < 128);
 }

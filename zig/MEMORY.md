@@ -2277,3 +2277,28 @@ absence only when the requested retrieval mode is complete: semantic requires an
 indexed generation, and union abstains while configured semantic discovery is not
 ready. An explicitly disabled semantic configuration permits lexical-only union.
 Unavailable ANN is reported as an abstention rather than a false negative.
+
+### Indexed identity authority
+
+Memory identity corrections and proposal receipts use the shared native resolver
+record/index implementation under the space's private `entity-authority/` prefix.
+Canonical lookup follows forward records; membership, distinctions and proposal
+supersession read only the affected components and incident queue indexes.
+Unrelated space-wide corrections are never hydrated for a candidate page.
+Namespace and queue totals are not bounded by the old whole-space 4,096-redirect
+blob limit; per-operation component, proposal and work budgets still apply.
+
+The first authorized curation or proposal mutation adopts legacy `entity-policy`
+state and receipts in its revision-fenced space transaction, writes the control
+row's private identity-format fence, and removes the legacy blob. Read-only
+legacy spaces remain readable until adoption. Current canonical identity policy
+remains space-wide as before; branch snapshots still own entity/assertion views,
+and branch curation admission remains unchanged. No process cache or independent
+commit can override a lineage root or an external-verdict view fence.
+
+Proposal detail, list, audit and feed paths use point receipt lookups. Open
+proposals are indexed by both endpoints, so target changes find their incident
+proposals without scanning the queue. Reconciliation publishes component deltas
+and queue verdicts atomically with the space revision. Forget-all closes admission
+immediately; bounded retention cleanup physically retires native authority rows
+and receipt-pointer indexes alongside the existing curation provenance records.

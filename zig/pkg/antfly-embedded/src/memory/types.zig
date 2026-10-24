@@ -260,6 +260,9 @@ pub const Recall = struct {
     embedding_model: ?Model = null,
 };
 pub const State = struct {
+    /// Omitted for legacy spaces. Indexed identity publication sets this fence;
+    /// older strict control-row readers then refuse to write a legacy blob.
+    identity_format: u8 = 0,
     // Private native HMAC key: inspection and public schemas never expose it.
     input_digest_key: []const u8 = &.{},
     persistent_roots: bool = false,
@@ -282,6 +285,17 @@ pub const State = struct {
     revision: u64 = 1,
     owner: []const u8,
     created_at: i64,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            const include = if (comptime std.mem.eql(u8, field, "identity_format")) self.identity_format != 0 else true;
+            if (include) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
 };
 pub const IntakeMaterialization = struct { screening: @import("secret_screening.zig").Report, text_redacted: bool, text_sha256: []const u8 };
 pub const StoredEvidence = struct { materialization: ?IntakeMaterialization = null, context_only: bool = false, evidence: Evidence, owner: []const u8, recorded_at: i64, revision: u64, forgotten: bool = false };

@@ -29587,7 +29587,25 @@ pub const DB = struct {
         return upsert_result;
     }
 
+    pub fn completeResolverProjectionWork(self: *DB, key: []const u8) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
+        var activity = try self.acquireResolverCatalogActivity(true);
+        defer activity.deinit();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        var probe = try self.core.store.beginProbeTxn();
+        defer probe.abort();
+        try self.requireOnlineArtifactCatalogMutableLocked(&probe);
+        try self.core.index_manager.completeResolverProjectionWork(self.core.store, key);
+    }
+
     pub fn publishResolverNamespaceProjection(self: *DB, table: []const u8, table_id: u64, namespace: @import("resolver_namespace.zig").Namespace) !bool {
+        return self.publishResolverNamespaceProjectionWork(table, table_id, namespace, null);
+    }
+    pub fn publishResolverNamespaceProjectionWork(self: *DB, table: []const u8, table_id: u64, namespace: @import("resolver_namespace.zig").Namespace, completion: ?@import("../lite/resolver_consumers.zig").Completion) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -29600,7 +29618,7 @@ pub const DB = struct {
             var probe = try self.core.store.beginProbeTxn();
             defer probe.abort();
             try self.requireOnlineArtifactCatalogMutableLocked(&probe);
-            break :blk try self.core.index_manager.publishResolverNamespaceProjection(self.core.store, table, table_id, namespace);
+            break :blk try self.core.index_manager.publishResolverNamespaceProjectionWork(self.core.store, table, table_id, namespace, completion);
         };
         if (changed) {
             if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
@@ -29626,6 +29644,11 @@ pub const DB = struct {
     pub fn resolverReviewsJsonAlloc(self: *DB, alloc: Allocator, request_json: []const u8) ![]u8 {
         if (comptime storage_engine.enabled) return storage_engine.call("resolverReviewsJsonAlloc", .{ self, alloc, request_json });
         return @import("resolver_curation.zig").reviewOperation(self, alloc, request_json);
+    }
+
+    pub fn listResolverStaticDescriptors(self: *DB, alloc: Allocator) ![]index_manager_mod.ResolverConfig {
+        if (comptime storage_engine.enabled) return storage_engine.call("listResolverStaticDescriptors", .{ self, alloc });
+        return self.core.index_manager.listResolverStaticDescriptors(alloc);
     }
 
     pub fn listResolverIdentities(self: *DB, alloc: Allocator) ![]index_manager_mod.ResolverConfig {

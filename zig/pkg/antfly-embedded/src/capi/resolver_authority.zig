@@ -41,24 +41,32 @@ pub fn enabled(db: *h.db_mod.DB, a: A) !bool {
     _ = db.core.store.get(a, marker) catch |err| return if (err == error.NotFound) false else err;
     return true;
 }
+fn ensureConsumerIndex(root: *h.Handle, a: A) !void {
+    const directory = @import("../storage/lite/resolver_consumers.zig");
+    const physical = if (root.owned_lite_backend) |*backend| backend.native_docstore else null;
+    if (physical == null) return;
+    {
+        const ready = blk: {
+            var read = try physical.?.beginRead();
+            defer read.abort();
+            break :blk if (read.get(directory.marker)) |_| true else |err| if (err == error.NotFound) false else return err;
+        };
+        if (!ready) {
+            var write = try physical.?.beginWrite();
+            errdefer write.abort();
+            try directory.bootstrap(a, &write);
+            try write.commit();
+            root.db.core.index_manager.minimum_reader_version.store(catalog.resolver_projection_work_reader_version, .release);
+        }
+    }
+}
 fn consumers(root: *h.Handle, a: A, table: []const u8, key: []const u8) ![]const Consumer {
     const directory = @import("../storage/lite/resolver_consumers.zig");
     // Native Lite stores share a physical transaction space. Bootstrap legacy
     // bindings once from catalog bytes; warm calls seek only this destination.
     const physical = if (root.owned_lite_backend) |*backend| backend.native_docstore else null;
     if (physical == null) return legacyConsumers(root, a, table, key);
-    {
-        var read = try physical.?.beginRead();
-        const ready = if (read.get(directory.marker)) |_| true else |err| if (err == error.NotFound) false else return err;
-        read.abort();
-        if (!ready) {
-            var write = try physical.?.beginWrite();
-            errdefer write.abort();
-            try directory.bootstrap(a, &write);
-            try write.commit();
-            root.db.core.index_manager.minimum_reader_version.store(catalog.resolver_projection_bindings_reader_version, .release);
-        }
-    }
+    try ensureConsumerIndex(root, a);
     var txn = try physical.?.beginRead();
     defer txn.abort();
     const target = try directory.targetPrefix(a, table);
@@ -108,7 +116,7 @@ fn ownedConsumers(a: A, store: native.Store, destination: *h.db_mod.DB, current:
     return out.items;
 }
 fn initialize(a: A, bridge: *Bridge, store: native.Store, legacy: c.State) !void {
-    try bridge.backendPut(a, catalog.minimum_reader_key, try catalog.readerVersionBytes(catalog.resolver_projection_bindings_reader_version));
+    try bridge.backendPut(a, catalog.minimum_reader_key, try catalog.readerVersionBytes(catalog.resolver_projection_work_reader_version));
     if (try bridge.backendGet(a, marker) != null) return;
     if (legacy.proposals.len != 0 or legacy.receipt_scope != null) try store.applyQueue(.{ .expected_revision = 0, .revision = 1, .receipt_scope = legacy.receipt_scope, .proposals = legacy.proposals });
     try bridge.backendPut(a, marker, "1");
@@ -145,28 +153,29 @@ fn inspectionScope(a: A, store: native.Store, selected: []const Consumer, source
     }
     return .{ .head = .{ .key_template = namespace.key_template, .revision = namespace.revision }, .namespace = namespace };
 }
+fn consumerProfiles(a: A, selected: []const Consumer, template: []const u8) ![]const native.AliasProfile {
+    var profiles: std.ArrayList(native.AliasProfile) = .empty;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    for (selected) |source| if (std.mem.eql(u8, source.cfg.key_template, template)) {
+        const key = try json(a, .{ source.cfg.aliases, source.cfg.suppress_json });
+        if ((try seen.getOrPut(a, key)).found_existing) continue;
+        try profiles.append(a, .{ .key_template = template, .aliases = source.cfg.aliases, .suppress_json = source.cfg.suppress_json });
+    };
+    return profiles.items;
+}
 fn profileScope(a: A, store: native.Store, selected: []const Consumer, template: []const u8, key: []const u8, into: ?[]const u8) !native.Snapshot {
     if (into) |target| if (!policy.keyInNamespace(template, target)) return error.InvalidResolverCurationRequest;
     var static_aliases: std.ArrayList(@import("antfly_resolver").KeyAlias) = .empty;
-    for (selected) |source| if (std.mem.eql(u8, source.cfg.key_template, template)) try static_aliases.appendSlice(a, try source.cfg.effectiveAliasesAlloc(a));
+    for (try consumerProfiles(a, selected, template)) |profile| try static_aliases.appendSlice(a, profile.aliases);
     return (try store.componentWithAliases(template, if (into) |target| &.{ key, target } else &.{key}, static_aliases.items)) orelse error.ResolverNotFound;
 }
-fn aliases(a: A, cfg: h.db_mod.ResolverConfig, namespace: policy.Namespace) ![]const @import("antfly_resolver").KeyAlias {
-    var projected = cfg;
-    projected.merges = namespace.merges;
-    projected.curation_json = try json(a, namespace.state);
-    return projected.effectiveAliasesAlloc(a);
+fn aliases(a: A, selected: []const Consumer, namespace: policy.Namespace, key: []const u8, into: ?[]const u8) ![]const @import("antfly_resolver").KeyAlias {
+    return native.effectiveAliases(a, namespace, try consumerProfiles(a, selected, namespace.key_template), key, into);
 }
 fn validate(a: A, selected: []const Consumer, namespace: policy.Namespace) !void {
-    for (selected) |source| if (std.mem.eql(u8, source.cfg.key_template, namespace.key_template)) {
-        var cfg = source.cfg;
-        cfg.merges = namespace.merges;
-        cfg.curation_json = try json(a, namespace.state);
-        cfg.curation_revision = namespace.revision;
-        try cfg.validate();
-        _ = try cfg.effectiveAliasesAlloc(a);
-    };
+    try native.validateProfiles(a, namespace, try consumerProfiles(a, selected, namespace.key_template));
 }
+
 fn queueScope(a: A, store: native.Store, namespace: policy.Namespace, key: []const u8, into: ?[]const u8) !c.State {
     var keys: std.ArrayList([]const u8) = .empty;
     try keys.append(a, key);
@@ -227,7 +236,7 @@ fn finish(a: A, bridge: *Bridge, txn: *docstore.DocStore.Txn, db: *h.db_mod.DB, 
     try lease.checkAt(@intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
     try bridge.flush(a);
     try txn.commit();
-    db.core.index_manager.minimum_reader_version.store(catalog.resolver_projection_bindings_reader_version, .release);
+    db.core.index_manager.minimum_reader_version.store(catalog.resolver_projection_work_reader_version, .release);
 }
 pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: Input, legacy: c.State) ![]const u8 {
     const db = try tables.get(root, table);
@@ -279,7 +288,7 @@ pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: 
         const stamp = policy.manualOrigin(request, try std.math.add(u64, before.head.revision, 1));
         const queue = try queueScope(a, store, before.namespace, key, input.into);
         const state = c.bindReceiptScope(before.namespace.state, queue.receipt_scope);
-        var plan = try c.planWithOrigin(a, try json(a, state), before.namespace.merges, try aliases(a, source.cfg, before.namespace), request, stamp);
+        var plan = try c.planWithOrigin(a, try json(a, state), before.namespace.merges, try native.planningAliases(a, before.namespace, try aliases(a, selected, before.namespace, key, input.into), action, key, input.into), request, stamp);
         _ = try c.recordSupersessions(a, &plan, queue.proposals, request, stamp);
         _ = try publishPlan(a, store, selected, before, plan);
         try absorbed.put(a, source.cfg.key_template, plan.absorbed);
@@ -432,7 +441,7 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
         var state = c.bindReceiptScope(before.namespace.state, queue.receipt_scope);
         state.proposals = queue.proposals;
         const origin = policy.manualOrigin(.{ .action = .suppress, .actor = decision.actor, .reason = decision.reason }, try std.math.add(u64, before.head.revision, 1));
-        var plan = try c.decide(a, state, before.namespace.merges, try aliases(a, source.cfg, before.namespace), proposal.id, decision, origin);
+        var plan = try c.decide(a, state, before.namespace.merges, try native.planningAliases(a, before.namespace, try aliases(a, selected, before.namespace, key, proposal.into), c.decisionRequest(proposal, decision).action, key, proposal.into), proposal.id, decision, origin);
         var review_origin = origin;
         review_origin.origin = .review;
         review_origin.proposal_id = proposal.id;
@@ -500,6 +509,56 @@ fn projection(root: *h.Handle, a: A, cfg: h.db_mod.ResolverConfig) !?Projection 
 /// consumers atomically. Missing/recreated destinations retract old projections
 /// immediately, independent of physical cleanup of the retired authority.
 pub fn pullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
+    const physical = if (root.owned_lite_backend) |*backend| backend.native_docstore else null;
+    if (physical == null) return legacyPullProjection(root, database, a);
+    try ensureConsumerIndex(root, a);
+    const jobs = @import("../storage/lite/resolver_consumers.zig");
+    var txn = try database.core.store.beginReadTxn();
+    var live = true;
+    defer if (live) txn.abort();
+    var bridge: Bridge = .{ .txn = &txn };
+    const after = try bridge.backendGet(a, jobs.cursor_key);
+    var page = try bridge.store(a, "").backend.scan(&bridge, a, jobs.work_prefix, after, 1);
+    if (page.rows.len == 0 and after != null) page = try bridge.store(a, "").backend.scan(&bridge, a, jobs.work_prefix, null, 1);
+    if (page.rows.len == 0) return false;
+    const row = page.rows[0];
+    const work = try std.json.parseFromSliceLeaky(jobs.Work, a, row.value, .{});
+    try jobs.validateWork(a, row.key, work);
+    txn.abort();
+    live = false;
+    const cfg: h.db_mod.ResolverConfig = .{ .name = "projection_work", .table = work.table, .key_template = work.key_template, .source_artifact = "source", .resolution_artifact = "resolved", .namespace_curation_table_id = work.namespace_curation_table_id, .namespace_curation_generation = work.namespace_curation_generation, .namespace_curation_missing = work.namespace_curation_missing };
+    const desired = (try projection(root, a, cfg)) orelse {
+        // Empty work is still a publication: a concurrent destination creation
+        // or authority adoption must leave its newly queued work outstanding.
+        const destination = tables.get(root, cfg.table) catch |err| switch (err) {
+            error.UndefinedTable => null,
+            else => return err,
+        };
+        if (root.maintenance_publication) |publication| publication.resolver_dependency = .{ .table = cfg.table, .template = cfg.key_template, .table_id = if (destination) |db| db.core.identity_namespace.table_id else null, .head = null };
+        defer if (root.maintenance_publication) |publication| {
+            publication.resolver_dependency = null;
+        };
+        try database.completeResolverProjectionWork(row.key);
+        return true;
+    };
+    var namespace: policy.Namespace = .{ .key_template = cfg.key_template, .revision = desired.revision };
+    if (!desired.missing) {
+        var read = try desired.destination.?.core.store.beginReadTxn();
+        defer read.abort();
+        var source: Bridge = .{ .txn = &read };
+        const snapshot = (try source.store(a, prefix).exportNamespace(cfg.key_template)) orelse return error.EnrichmentSourceChanged;
+        if (snapshot.head.revision != desired.revision or !std.mem.eql(u8, &snapshot.head.fingerprint, &desired.head.?.fingerprint)) return error.EnrichmentSourceChanged;
+        namespace = snapshot.namespace;
+        namespace.state.receipt_scope = (try queueHead(desired.destination.?, a)).receipt_scope;
+    }
+    if (root.maintenance_publication) |publication| publication.resolver_dependency = .{ .table = cfg.table, .template = cfg.key_template, .table_id = if (desired.destination != null) desired.table_id else null, .head = if (desired.head) |head| .{ .revision = head.revision, .fingerprint = head.fingerprint } else null };
+    defer if (root.maintenance_publication) |publication| {
+        publication.resolver_dependency = null;
+    };
+    _ = try database.publishResolverNamespaceProjectionWork(cfg.table, desired.table_id, namespace, .{ .key = row.key });
+    return true;
+}
+fn legacyPullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
     const configs = try database.core.index_manager.listResolverStaticDescriptors(a);
     for (configs) |cfg| {
         const desired = (try projection(root, a, cfg)) orelse continue;
@@ -549,6 +608,14 @@ pub fn owns(db: *h.db_mod.DB, a: A, template: []const u8) !bool {
     return bridge.store(a, prefix).ownsKeyTemplate(template);
 }
 pub fn hasProjectionDebt(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
+    const physical = if (root.owned_lite_backend) |*backend| backend.native_docstore else null;
+    if (physical != null) {
+        try ensureConsumerIndex(root, a);
+        var read = try database.core.store.beginReadTxn();
+        defer read.abort();
+        var bridge: Bridge = .{ .txn = &read };
+        return (try bridge.store(a, "").backend.scan(&bridge, a, @import("../storage/lite/resolver_consumers.zig").work_prefix, null, 1)).rows.len != 0;
+    }
     for (try database.core.index_manager.listResolverStaticDescriptors(a)) |cfg| if (try projection(root, a, cfg)) |desired| {
         if (desired.changed) return true;
     };

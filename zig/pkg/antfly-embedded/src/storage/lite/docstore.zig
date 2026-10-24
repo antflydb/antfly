@@ -3781,6 +3781,16 @@ pub const Txn = struct {
             try consumers.directoryChanged(arena.allocator(), self, before, after);
             return;
         }
+        if (after) |raw| if (std.mem.startsWith(u8, key, "\x00\x00__metadata__:resolver_authority:v1:head/")) {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const head = try std.json.parseFromSliceLeaky(struct { key_template: []const u8 }, arena.allocator(), raw, .{ .ignore_unknown_fields = true });
+            const destination = self.prefix;
+            self.prefix = "";
+            defer self.prefix = destination;
+            try consumers.authorityChanged(arena.allocator(), self, destination, head.key_template);
+            return;
+        };
         if (!std.mem.eql(u8, key, consumers.catalog_key)) return;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();

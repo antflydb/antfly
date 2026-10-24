@@ -1772,6 +1772,8 @@ pub fn isPortableMetadataKey(key: []const u8) bool {
         std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers") or
         std.mem.eql(u8, key, @import("antfly_resolver").curation.proposal_store_key) or
         std.mem.startsWith(u8, key, @import("db/resolver_authority.zig").lite_prefix) or
+        std.mem.startsWith(u8, key, @import("lite/resolver_consumers.zig").work_prefix) or
+        std.mem.eql(u8, key, @import("lite/resolver_consumers.zig").cursor_key) or
         std.mem.eql(u8, key, resolver_catalog.minimum_reader_key) or
         std.mem.eql(u8, key, resolver_catalog.merge_catalog_key) or
         std.mem.eql(u8, key, @import("db/promotion_runtime.zig").source_identity_key) or
@@ -3646,6 +3648,7 @@ const PortableArchiveValidation = struct {
     saw_curation_proposals: bool = false,
     saw_native_resolver_records: bool = false,
     saw_resolver_projection_format: bool = false,
+    saw_resolver_projection_work: bool = false,
     saw_native_resolver_marker: bool = false,
     resolver_configs: ?[]resolver_catalog.ResolverConfig = null,
     resolver_merge_data: ?[]u8 = null,
@@ -3901,6 +3904,7 @@ const PortableArchiveValidation = struct {
     fn finish(self: *PortableArchiveValidation, alloc: Allocator) !void {
         if (self.saw_native_resolver_records and (!self.saw_native_resolver_marker or (self.minimum_reader_version orelse 0) < resolver_catalog.native_resolver_records_reader_version)) return error.InvalidMetadataBatch;
         if (self.saw_resolver_projection_format and (self.minimum_reader_version orelse 0) < resolver_catalog.resolver_projection_bindings_reader_version) return error.InvalidMetadataBatch;
+        if (self.saw_resolver_projection_work and (self.minimum_reader_version orelse 0) < resolver_catalog.resolver_projection_work_reader_version) return error.InvalidMetadataBatch;
         if (self.saw_curation_proposals and (self.minimum_reader_version orelse 0) < resolver_catalog.scoped_curation_reader_version) return error.InvalidMetadataBatch;
         const resolver_bytes = try resolver_catalog.serializeCatalog(alloc, self.resolver_configs orelse &.{});
         defer alloc.free(resolver_bytes);
@@ -4876,6 +4880,22 @@ fn validateMetadataEntries(
                 else => return error.InvalidMetadataBatch,
             };
             archive.saw_curation_proposals = true;
+        } else if (std.mem.startsWith(u8, entry.key, @import("lite/resolver_consumers.zig").work_prefix)) {
+            const jobs = @import("lite/resolver_consumers.zig");
+            const suffix = entry.key[jobs.work_prefix.len..];
+            if (suffix.len != 64) return error.InvalidMetadataBatch;
+            for (suffix) |c| if (!std.ascii.isHex(c)) return error.InvalidMetadataBatch;
+            const work = try std.json.parseFromSlice(jobs.Work, alloc, entry.value, .{});
+            defer work.deinit();
+            var work_arena = std.heap.ArenaAllocator.init(alloc);
+            defer work_arena.deinit();
+            try jobs.validateWork(work_arena.allocator(), entry.key, work.value);
+            archive.saw_resolver_projection_work = true;
+        } else if (std.mem.eql(u8, entry.key, @import("lite/resolver_consumers.zig").cursor_key)) {
+            const jobs = @import("lite/resolver_consumers.zig");
+            if (!std.mem.startsWith(u8, entry.value, jobs.work_prefix) or entry.value.len != jobs.work_prefix.len + 64) return error.InvalidMetadataBatch;
+            for (entry.value[jobs.work_prefix.len..]) |c| if (!std.ascii.isHex(c)) return error.InvalidMetadataBatch;
+            archive.saw_resolver_projection_work = true;
         } else if (std.mem.eql(u8, entry.key, resolver_catalog.minimum_reader_key)) {
             if (archive.minimum_reader_version != null) return error.InvalidMetadataBatch;
             const version = std.fmt.parseInt(u32, entry.value, 10) catch return error.InvalidMetadataBatch;
@@ -7615,6 +7635,7 @@ test "portable backup native resolver authority retains heads policy and queue i
     const alloc = std.testing.allocator;
     const native = @import("db/resolver_authority.zig");
     const pure = @import("antfly_resolver").curation;
+    const jobs = @import("lite/resolver_consumers.zig");
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -7626,6 +7647,10 @@ test "portable backup native resolver authority retains heads policy and queue i
     var terminal = (try pure.propose(a, .{}, &.{}, .{ .action = .merge, .key = "concept/plain", .into = "concept/other" }, .{})).state.proposals[0];
     terminal.state = .rejected;
     terminal.decided = .{ .origin = .review };
+    var job_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ "default", "concept/{{_key}}" }, .{}), &job_digest, .{});
+    const job_key = try std.mem.concat(a, u8, &.{ jobs.work_prefix, &std.fmt.bytesToHex(job_digest, .lower) });
+    const job = try std.json.Stringify.valueAlloc(a, jobs.Work{ .table = "default", .key_template = "concept/{{_key}}" }, .{});
     const Bridge = native.Transaction(DocStore.Txn);
     {
         var txn = try source.beginWriteTxn();
@@ -7638,7 +7663,9 @@ test "portable backup native resolver authority retains heads policy and queue i
         try authority.applyQueue(.{ .expected_revision = 1, .revision = 2, .receipt_scope = @splat('a'), .proposals = &.{terminal} });
         try authority.markQueueOnly(terminal.id);
         try bridge.backendPut(a, native.lite_marker, "1");
-        try bridge.backendPut(a, resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(resolver_catalog.resolver_projection_bindings_reader_version));
+        try bridge.backendPut(a, job_key, job);
+        try bridge.backendPut(a, jobs.cursor_key, job_key);
+        try bridge.backendPut(a, resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(resolver_catalog.resolver_projection_work_reader_version));
         try bridge.flush(a);
         try txn.commit();
         committed = true;
@@ -7664,7 +7691,9 @@ test "portable backup native resolver authority retains heads policy and queue i
     try std.testing.expect(try restored.queueOnly(terminal.id));
     try std.testing.expect(pure.sameReceiptScope(@splat('a'), (try restored.queueHead()).receipt_scope));
     try std.testing.expectEqualStrings("1", try target.get(a, native.lite_marker));
-    try std.testing.expectEqualStrings(try resolver_catalog.readerVersionBytes(resolver_catalog.resolver_projection_bindings_reader_version), try target.get(a, resolver_catalog.minimum_reader_key));
+    try std.testing.expectEqualStrings(try resolver_catalog.readerVersionBytes(resolver_catalog.resolver_projection_work_reader_version), try target.get(a, resolver_catalog.minimum_reader_key));
+    try std.testing.expectEqualStrings(job, try target.get(a, job_key));
+    try std.testing.expectEqualStrings(job_key, try target.get(a, jobs.cursor_key));
     var incomplete: PortableArchiveValidation = .{ .format_version = backup_codec.format_version };
     defer incomplete.deinit(alloc);
     try validateMetadataEntries(alloc, &.{.{ .key = native.lite_marker, .value = "1" }}, &incomplete);
