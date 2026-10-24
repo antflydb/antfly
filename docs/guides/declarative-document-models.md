@@ -224,13 +224,25 @@ coverage. Missing coverage triggers whole-page escalation and prevents a router
 from accepting an incomplete transcription. Known broken font mappings can be
 superseded only through source verification. Regional revisions preserve page
 text outside the corrected region, nested regions, tables and structured fields;
-ambiguous table ownership is reported as unresolved.
+ambiguous table ownership is reported as unresolved. An accepted regional revision
+replaces its owned table set, including when the replacement contains no tables.
 
 Region `text_start` and `text_end` are UTF-8 byte offsets within the page text.
 Nested regions retain source coordinates and qualified identities. Page origin
 provides the default provenance, with mapped regional origins overriding it, so
 literal fields remain extractable alongside interpreted captions. Interpreted
-values never acquire literal source spans.
+values never acquire literal source spans. Fields without offsets use a single
+summary of the input's effective provenance. If interpretation remains in that
+input, unlocated fields are marked derived and obey `allow_derived_values` even
+when literal span support is optional. Located literal fields on mixed pages
+still use their precise regional provenance.
+
+Local reader results carry explicit per-item completion state and measured token
+counts through direct execution and batching. A token count equal to a requested
+limit does not establish truncation; decoder completion does. Document composition
+can retain incomplete output for escalation or report it as truncated. Ordinary
+Qwen reading continues to reject incomplete output. Measured local usage consumes
+the shared token budget without estimating tokens from OCR text length.
 
 Responses include bounded events and measured aggregate usage separately from
 physical batch reports. Artifact reuse is implemented; durable checkpoint/resume,

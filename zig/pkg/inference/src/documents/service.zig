@@ -413,6 +413,7 @@ pub fn Service(comptime Node: type) type {
             const pinned = try self.verifyBinding(a, binding);
             run.usage.physical_model_calls += 1;
             const batch = try self.node.readEncodedImagesReportedDirectWithContext(a, pinned.path, .{
+                .allow_incomplete = true,
                 .images = &.{.{ .bytes = data, .mime_type = mime, .item_id = self.source.input.id, .page_number = @intCast(self.number) }},
                 .prompt = self.prompt,
                 .max_tokens = self.max_tokens,
@@ -440,7 +441,7 @@ pub fn Service(comptime Node: type) type {
                     region.* = .{ .id = i, .text = item.text, .bbox = box, .confidence = item.confidence, .label = item.label, .model = binding.model, .origin = binding.output_origin };
                 }
             }
-            return .{ .text = result.text, .model = binding.model, .origin = binding.output_origin, .truncated = if (batch.usage) |usage| usage.completion_tokens >= (self.max_tokens orelse 256) else false, .regions = regions, .fields = if (result.fields_json) |json| try std.json.parseFromSliceLeaky(V, a, json, .{}) else null };
+            return .{ .text = result.text, .model = binding.model, .origin = binding.output_origin, .truncated = result.completion == .length, .regions = regions, .fields = if (result.fields_json) |json| try std.json.parseFromSliceLeaky(V, a, json, .{}) else null };
         }
 
         fn decide(raw: *anyopaque, a: A, binding: c.Binding, observation: executor.Observation, run: *c.Run) !executor.Action {
@@ -813,8 +814,13 @@ test "document nested composites share one budget and one rendered view" {
     const Fake = struct {
         reads: usize = 0,
         narrow_child: bool = false,
+        measured: bool = false,
+        incomplete: bool = false,
+        tiny_tokens: bool = false,
         fn documentDefinition(self: *@This(), a: A, name: []const u8) !?[]const u8 {
-            const json = if (std.mem.eql(u8, name, "parent"))
+            const json = if (std.mem.eql(u8, name, "parent") and self.tiny_tokens)
+                \\{"models":[{"name":"child","model":"child","operation":"read"}],"read":{"reader":"child"},"budget":{"max_total_tokens":1}}
+            else if (std.mem.eql(u8, name, "parent"))
                 "{\"models\":[{\"name\":\"child\",\"model\":\"child\",\"operation\":\"read\"}],\"read\":{\"reader\":\"child\"},\"budget\":{\"max_model_calls\":2}}"
             else if (std.mem.eql(u8, name, "child"))
                 if (self.narrow_child)
@@ -836,8 +842,8 @@ test "document nested composites share one budget and one rendered view" {
             try std.testing.expectEqual(@as(usize, 1), request.images.len);
             self.reads += 1;
             const results = try a.alloc(readers.Result, 1);
-            results[0] = .{ .text = "Receipt total 12.50" };
-            return .{ .items = results, .execution = .{ .requested_items = 1, .serial_items = 1 } };
+            results[0] = .{ .text = "Receipt total 12.50", .completion = if (self.incomplete) .length else .complete, .prompt_tokens = if (self.measured) @as(usize, 10) else null, .completion_tokens = if (self.measured) @as(usize, 256) else null };
+            return .{ .items = results, .usage = try readers.measuredUsage(results), .execution = .{ .requested_items = 1, .serial_items = 1 } };
         }
         fn invokeCloudflare(_: *@This(), _: A, _: c.Binding, _: V, _: Control, _: *c.Run) anyerror!V {
             return error.UnexpectedCall;
@@ -866,11 +872,29 @@ test "document nested composites share one budget and one rendered view" {
     try std.testing.expectEqual(@as(i64, 1), usage.get("physical_model_calls").?.integer);
     try std.testing.expectEqual(@as(i64, 1), usage.get("rendered_pixels").?.integer);
     try std.testing.expectEqualStrings("complete", parsed.value.object.get("document").?.object.get("status").?.string);
+    fake.measured = true;
+    const complete = try Service(Fake).readEncodedJson(&fake, a, "parent", .{ .images = &.{.{ .bytes = @embedFile("testdata/one-pixel.png"), .mime_type = "image/png" }}, .max_tokens = 256 }, .{});
+    defer a.free(complete);
+    var measured = try std.json.parseFromSlice(V, a, complete, .{});
+    defer measured.deinit();
+    try std.testing.expectEqualStrings("complete", measured.value.object.get("document").?.object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 266), measured.value.object.get("usage").?.object.get("total_tokens").?.integer);
+    fake.incomplete = true;
+    const incomplete = try Service(Fake).readEncodedJson(&fake, a, "parent", .{ .images = &.{.{ .bytes = @embedFile("testdata/one-pixel.png"), .mime_type = "image/png" }} }, .{});
+    defer a.free(incomplete);
+    var partial = try std.json.parseFromSlice(V, a, incomplete, .{});
+    defer partial.deinit();
+    try std.testing.expectEqualStrings("unresolved", partial.value.object.get("document").?.object.get("status").?.string);
+    try std.testing.expectEqualStrings("truncated", partial.value.object.get("data").?.array.items[0].object.get("status").?.string);
+    fake.incomplete = false;
+    fake.tiny_tokens = true;
+    try std.testing.expectError(error.DocumentTokenLimitExceeded, Service(Fake).readEncodedJson(&fake, a, "parent", .{ .images = &.{.{ .bytes = @embedFile("testdata/one-pixel.png"), .mime_type = "image/png" }} }, .{}));
+    fake.tiny_tokens = false;
     fake.narrow_child = true;
     const wide = try image.png.encodeRgba(a, 2, 1, &.{ 0, 0, 0, 255, 0, 0, 0, 255 });
     defer a.free(wide);
     try std.testing.expectError(error.DocumentPixelLimitExceeded, Service(Fake).readEncodedJson(&fake, a, "parent", .{ .images = &.{.{ .bytes = wide, .mime_type = "image/png" }} }, .{}));
-    try std.testing.expectEqual(@as(usize, 2), fake.reads);
+    try std.testing.expectEqual(@as(usize, 5), fake.reads);
 }
 
 test "document extraction keeps independent sources atomic and reuses retained readings" {

@@ -24,6 +24,11 @@ fn field(value: V, key: []const u8) ?V {
 
 pub fn attach(a: A, item: *V, state: []const u8, metadata: ?V, required: bool, allow_derived: bool) !bool {
     var supported = true;
+    // Summarize effective source provenance once per input, not once per field.
+    // Without offsets a value cannot disambiguate literal and interpreted regions.
+    var source_references: std.array_list.Managed(V) = .init(a);
+    if (!required) try mapSpan(a, &source_references, metadata, .{ 0, state.len });
+    const unlocated_interpretation = interpreted(source_references.items);
     const unit_value = field(item.*, "offset_unit") orelse V{ .string = "utf8_bytes" };
     if (unit_value != .string) return error.InvalidDocumentEvidence;
     const unit = unit_value.string;
@@ -36,9 +41,9 @@ pub fn attach(a: A, item: *V, state: []const u8, metadata: ?V, required: bool, a
                 if (record.* != .object) return error.InvalidDocumentModelResult;
                 for (record.object.values()) |*value| {
                     if (value.* == .object) {
-                        supported = try attachField(a, value, "value", state, metadata, required, allow_derived, unit) and supported;
+                        supported = try attachField(a, value, "value", state, metadata, required, allow_derived, unit, unlocated_interpretation) and supported;
                     } else if (value.* == .array) {
-                        for (value.array.items) |*element| supported = try attachField(a, element, "value", state, metadata, required, allow_derived, unit) and supported;
+                        for (value.array.items) |*element| supported = try attachField(a, element, "value", state, metadata, required, allow_derived, unit, unlocated_interpretation) and supported;
                     } else if (required) supported = false;
                 }
             }
@@ -46,12 +51,12 @@ pub fn attach(a: A, item: *V, state: []const u8, metadata: ?V, required: bool, a
     }
     if (item.object.getPtr("entities")) |entities| {
         if (entities.* != .array) return error.InvalidDocumentModelResult;
-        for (entities.array.items) |*entity| supported = try attachField(a, entity, "text", state, metadata, required, false, unit) and supported;
+        for (entities.array.items) |*entity| supported = try attachField(a, entity, "text", state, metadata, required, false, unit, unlocated_interpretation) and supported;
     }
     return supported;
 }
 
-fn attachField(a: A, item: *V, key: []const u8, state: []const u8, metadata: ?V, required: bool, allow_derived: bool, unit: []const u8) !bool {
+fn attachField(a: A, item: *V, key: []const u8, state: []const u8, metadata: ?V, required: bool, allow_derived: bool, unit: []const u8, unlocated_interpretation: bool) !bool {
     const value = field(item.*, key) orelse return error.InvalidDocumentModelResult;
     if (value == .null) return true;
     if (field(item.*, "source")) |source| if (source == .string and std.mem.eql(u8, source.string, "schema")) return allow_derived;
@@ -59,14 +64,17 @@ fn attachField(a: A, item: *V, key: []const u8, state: []const u8, metadata: ?V,
     if (origin) |o| {
         if (o != .string) return error.InvalidDocumentModelResult;
         if (std.mem.eql(u8, o.string, "derived") or std.mem.eql(u8, o.string, "estimated")) return allow_derived;
+        if (std.mem.eql(u8, o.string, "interpretation")) return markDerived(a, item, allow_derived);
     }
     if (value == .array) {
-        const spans = field(item.*, "spans") orelse return !required;
+        const spans = field(item.*, "spans") orelse return unlocated(a, item, required, allow_derived, unlocated_interpretation);
         if (spans != .array or spans.array.items.len != value.array.items.len) return error.InvalidDocumentModelResult;
         var evidence: std.array_list.Managed(V) = .init(a);
+        var unlocated_items = false;
         for (value.array.items, spans.array.items) |element, span| {
             if (span == .null) {
                 if (required) return false;
+                unlocated_items = true;
                 continue;
             }
             if (span != .array or span.array.items.len != 2 or element != .string) return error.InvalidDocumentModelResult;
@@ -74,11 +82,12 @@ fn attachField(a: A, item: *V, key: []const u8, state: []const u8, metadata: ?V,
             try mapSpan(a, &evidence, metadata, range);
         }
         try item.object.put(a, "evidence", .{ .array = evidence });
+        if (unlocated_items and unlocated_interpretation) return markDerived(a, item, allow_derived);
         return preserveOrigin(a, item, evidence.items, allow_derived);
     }
-    const start = field(item.*, "start") orelse return !required;
-    const end = field(item.*, "end") orelse return !required;
-    if (start == .null or end == .null) return !required;
+    const start = field(item.*, "start") orelse return unlocated(a, item, required, allow_derived, unlocated_interpretation);
+    const end = field(item.*, "end") orelse return unlocated(a, item, required, allow_derived, unlocated_interpretation);
+    if (start == .null or end == .null) return unlocated(a, item, required, allow_derived, unlocated_interpretation);
     if (value != .string) return false;
     const range = (try exactSpan(state, value.string, start, end, unit)) orelse return false;
     var evidence: std.array_list.Managed(V) = .init(a);
@@ -86,17 +95,25 @@ fn attachField(a: A, item: *V, key: []const u8, state: []const u8, metadata: ?V,
     try item.object.put(a, "evidence", .{ .array = evidence });
     return preserveOrigin(a, item, evidence.items, allow_derived);
 }
-fn preserveOrigin(a: A, item: *V, references: []const V, allow_derived: bool) !bool {
+fn interpreted(references: []const V) bool {
     for (references) |reference| if (field(reference, "origin")) |origin| {
-        if (origin == .string and std.mem.eql(u8, origin.string, "interpretation")) {
-            try item.object.put(a, "origin", .{ .string = "derived" });
-            _ = item.object.swapRemove("start");
-            _ = item.object.swapRemove("end");
-            _ = item.object.swapRemove("spans");
-            return allow_derived;
-        }
+        if (origin == .string and (std.mem.eql(u8, origin.string, "interpretation") or std.mem.eql(u8, origin.string, "derived") or std.mem.eql(u8, origin.string, "estimated"))) return true;
     };
-    return true;
+    return false;
+}
+fn markDerived(a: A, item: *V, allowed: bool) !bool {
+    try item.object.put(a, "origin", .{ .string = "derived" });
+    _ = item.object.swapRemove("start");
+    _ = item.object.swapRemove("end");
+    _ = item.object.swapRemove("spans");
+    return allowed;
+}
+fn unlocated(a: A, item: *V, required: bool, allowed: bool, source_interpreted: bool) !bool {
+    if (required) return false;
+    return if (source_interpreted) markDerived(a, item, allowed) else true;
+}
+fn preserveOrigin(a: A, item: *V, references: []const V, allow_derived: bool) !bool {
+    return if (interpreted(references)) markDerived(a, item, allow_derived) else true;
 }
 fn exactSpan(state: []const u8, text: []const u8, first: V, last: V, unit: []const u8) !?[2]usize {
     const start = try byteOffset(state, try offset(first), unit);
@@ -271,4 +288,30 @@ test "document extraction preserves interpretation provenance without inventing 
     try std.testing.expect(field(value, "start") == null);
     var strict = try std.json.parseFromSliceLeaky(V, a, json, .{});
     try std.testing.expect(!try attach(a, &strict, "caption", metadata, true, false));
+}
+
+test "document unlocated extraction preserves interpreted provenance independently of span policy" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const metadata = try std.json.parseFromSliceLeaky(V, a,
+        \\{"source_id":"photo","segments":[{"number":1,"start":0,"end":7,"origin":"interpretation"}]}
+    , .{});
+    for ([_]bool{ false, true }) |allowed| {
+        var item = try std.json.parseFromSliceLeaky(V, a,
+            \\{"structures":{"r":[{"caption":{"value":"Caption"},"empty":{"value":null},"list":{"value":["Caption"],"spans":[null]}}]}}
+        , .{});
+        try std.testing.expectEqual(allowed, try attach(a, &item, "Caption", metadata, false, allowed));
+        const record = item.object.get("structures").?.object.get("r").?.array.items[0];
+        try std.testing.expectEqualStrings("derived", record.object.get("caption").?.object.get("origin").?.string);
+        try std.testing.expectEqualStrings("derived", record.object.get("list").?.object.get("origin").?.string);
+        try std.testing.expect(!record.object.get("list").?.object.contains("spans"));
+    }
+    const literal = try std.json.parseFromSliceLeaky(V, a,
+        \\{"source_id":"photo","segments":[{"number":1,"start":0,"end":7,"origin":"interpretation","regions":[{"id":0,"text_start":0,"text_end":7,"origin":"transcription"}]}]}
+    , .{});
+    var item = try std.json.parseFromSliceLeaky(V, a,
+        \\{"structures":{"r":[{"caption":{"value":"Caption"}}]}}
+    , .{});
+    try std.testing.expect(try attach(a, &item, "Caption", literal, false, false));
 }

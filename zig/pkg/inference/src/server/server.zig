@@ -7574,6 +7574,7 @@ pub const Node = struct {
     }
 
     const Qwen3VlReadResult = struct {
+        truncated: bool = false,
         text: []u8,
         prompt_tokens: usize,
         completion_tokens: usize,
@@ -7597,7 +7598,7 @@ pub const Node = struct {
             allocator.free(out);
         }
         for (results, images, out) |result, image, *item| {
-            item.* = .{ .text = try allocator.dupe(u8, result.text) };
+            item.* = .{ .text = try allocator.dupe(u8, result.text), .completion = if (result.truncated) .length else .complete, .prompt_tokens = result.prompt_tokens, .completion_tokens = result.completion_tokens };
             initialized += 1;
             item.item_id = if (image.item_id.len > 0) try allocator.dupe(u8, image.item_id) else "";
             item.source_fingerprint = if (image.source_fingerprint) |value| try allocator.dupe(u8, value) else null;
@@ -7605,6 +7606,7 @@ pub const Node = struct {
         }
         return .{
             .items = out,
+            .usage = try readers_api.measuredUsage(out),
             .execution = .{ .requested_items = out.len, .serial_items = out.len },
         };
     }
@@ -7618,6 +7620,7 @@ pub const Node = struct {
         requested_max_tokens: ?usize,
         reserved_units: *usize,
         control: InferenceExecutionControl,
+        allow_incomplete: bool,
     ) ![]Qwen3VlReadResult {
         try control.update(.loading_model, 0, 1);
         const prompt = qwen3vl_reader_mod.resolvePrompt(requested_prompt);
@@ -7689,12 +7692,13 @@ pub const Node = struct {
                 "qwen3vl_read_timing_ms: page={d} resolve={d} load={d} setup={d} generate={d} total={d}",
                 .{ i, read_timing.resolve_ms, read_timing.load_ms, read_timing.setup_ms, read_timing.generate_ms, read_timing.total_ms },
             );
-            if (generated.truncated) {
+            if (generated.truncated and !allow_incomplete) {
                 allocator.free(generated.text);
                 return error.ReadOutputTruncated;
             }
             out[i] = .{
                 .text = generated.text,
+                .truncated = generated.truncated,
                 .prompt_tokens = generated.prompt_tokens,
                 .completion_tokens = generated.completion_tokens,
             };
@@ -7824,6 +7828,7 @@ pub const Node = struct {
                 max_tokens,
                 &reserved_units,
                 control,
+                false,
             );
             defer {
                 for (qwen_results) |*result| result.deinit(allocator);
@@ -8028,6 +8033,7 @@ pub const Node = struct {
                     max_tokens,
                     &reserved_units,
                     execution_control,
+                    request.allow_incomplete,
                 );
                 defer {
                     for (results) |*result| result.deinit(allocator);
@@ -8193,6 +8199,9 @@ pub const Node = struct {
         errdefer if (source_fingerprint) |value| allocator.free(value);
         return .{
             .text = text,
+            .completion = source.completion,
+            .prompt_tokens = source.prompt_tokens,
+            .completion_tokens = source.completion_tokens,
             .fields_json = fields_json,
             .regions_json = regions_json,
             .item_id = item_id,
@@ -8724,7 +8733,7 @@ pub const Node = struct {
         if (execution.fallback_items > 0)
             execution.fallback_reason = "native reader microbatch fallback";
         try execution.validate(items.len);
-        return .{ .items = items, .execution = execution };
+        return .{ .items = items, .execution = execution, .usage = try readers_api.measuredUsage(items) };
     }
 
     fn runReadImageBatchDirect(
@@ -8850,7 +8859,7 @@ pub const Node = struct {
         }
         for (results, rasters, out, 0..) |result, raster, *item, index| {
             const result_allocator = if (result_allocators) |allocators| allocators[index] else allocator;
-            item.* = .{ .text = try result_allocator.dupe(u8, result.text) };
+            item.* = .{ .text = try result_allocator.dupe(u8, result.text), .completion = result.completion, .prompt_tokens = exact_prompt_tokens, .completion_tokens = result.completion_tokens };
             errdefer readers_api.deinitResult(result_allocator, item);
             item.fields_json = try readerFieldsJsonAlloc(result_allocator, result.fields);
             item.regions_json = try readerRegionsJsonAlloc(result_allocator, result.regions);
@@ -8861,6 +8870,7 @@ pub const Node = struct {
         }
         return .{
             .items = out,
+            .usage = try readers_api.measuredUsage(out),
             .execution = switch (raw_batch.mode) {
                 .native => .{
                     .requested_items = rasters.len,
@@ -8984,6 +8994,9 @@ pub const Node = struct {
             const result_allocator = if (result_allocators) |allocators| allocators[i] else allocator;
             var item: readers_api.Result = .{
                 .text = try result_allocator.dupe(u8, result.text),
+                .completion = result.completion,
+                .prompt_tokens = exact_prompt_tokens,
+                .completion_tokens = result.completion_tokens,
             };
             errdefer readers_api.deinitResult(result_allocator, &item);
             item.fields_json = try readerFieldsJsonAlloc(result_allocator, result.fields);
@@ -8998,6 +9011,7 @@ pub const Node = struct {
         }
         return .{
             .items = out,
+            .usage = try readers_api.measuredUsage(out),
             .execution = switch (batch.mode) {
                 .native => .{
                     .requested_items = image_datas.len,
@@ -18474,6 +18488,7 @@ pub const Node = struct {
                 max_tokens,
                 &reserved_units,
                 execution_control,
+                false,
             ) catch |err| switch (err) {
                 error.ReadOutputTruncated => return ctx.status(400).json(.{
                     .@"error" = "OUTPUT_TRUNCATED",
@@ -29660,6 +29675,7 @@ test "Qwen3-VL read and prepared generation stop cancelled work before model loa
         null,
         &reserved_units,
         cancelled,
+        false,
     ));
     try std.testing.expectEqual(@as(usize, 1), reserved_units);
 
@@ -29688,6 +29704,7 @@ test "Qwen3-VL read and prepared generation stop cancelled work before model loa
         null,
         &reserved_units,
         .{ .deadline_ns = 0 },
+        false,
     ));
 }
 
@@ -29973,7 +29990,7 @@ test "Qwen3-VL encoded read results own page identities and report serial execut
             var fingerprint = [_]u8{ 'd', 'o', 'c' };
             const results = [_]Node.Qwen3VlReadResult{
                 .{ .text = &text, .prompt_tokens = 10, .completion_tokens = 2 },
-                .{ .text = &text, .prompt_tokens = 11, .completion_tokens = 2 },
+                .{ .text = &text, .prompt_tokens = 11, .completion_tokens = 2, .truncated = true },
             };
             const images = [_]readers_api.EncodedImage{
                 .{ .bytes = "image", .mime_type = "image/png", .item_id = &item_id, .source_fingerprint = &fingerprint, .page_number = 2 },
@@ -29981,6 +29998,16 @@ test "Qwen3-VL encoded read results own page identities and report serial execut
             };
             var batch = try Node.qwen3VlEncodedReadBatchResult(allocator, &results, &images);
             defer batch.deinit(allocator);
+            try std.testing.expectEqual(@as(i64, 21), batch.usage.?.prompt_tokens);
+            try std.testing.expectEqual(@as(i64, 4), batch.usage.?.completion_tokens);
+            try std.testing.expectEqual(readers_api.Completion.complete, batch.items[0].completion);
+            try std.testing.expectEqual(readers_api.Completion.length, batch.items[1].completion);
+            try std.testing.expectEqual(@as(?usize, 11), batch.items[1].prompt_tokens);
+            const cloned = try Node.cloneReaderApiResult(allocator, batch.items[1]);
+            var owned_clone = cloned;
+            defer readers_api.deinitResult(allocator, &owned_clone);
+            try std.testing.expectEqual(readers_api.Completion.length, cloned.completion);
+            try std.testing.expectEqual(@as(?usize, 2), cloned.completion_tokens);
             @memset(&text, 'x');
             @memset(&item_id, 'x');
             @memset(&fingerprint, 'x');

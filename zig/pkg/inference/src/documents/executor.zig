@@ -77,7 +77,7 @@ fn defaultAction(r: c.Read, page: c.Page, region: ?c.Region) Action {
             return if (r.accurate_reader != null) .accurate else .unresolved;
         return .accept;
     }
-    if (!meaningful(page.text) or ir.hasFinding(page, "native_text_coverage_incomplete")) return if (r.accurate_reader != null) .accurate else .unresolved;
+    if (page.status != .complete or !meaningful(page.text) or ir.hasFinding(page, "native_text_coverage_incomplete")) return if (r.accurate_reader != null) .accurate else .unresolved;
     return .accept;
 }
 
@@ -113,7 +113,8 @@ pub fn readPage(a: A, def: c.Definition, driver: Driver, page_index: usize, supp
     try ir.finding(a, &page, "native_text_coverage_incomplete", missing_native and !verified_repair);
     if (missing_native and !verified_repair) page.status = .unresolved;
     var refined_whole = false;
-    if (missing_native and !verified_repair) {
+    if ((missing_native and !verified_repair) or page.status == .truncated) {
+        // A truncated region list cannot identify the missing page tail.
         page = try refine(a, def, driver, page_index, page, null, run);
         refined_whole = true;
     }
@@ -211,7 +212,7 @@ fn refine(a: A, def: c.Definition, driver: Driver, page_index: usize, supplied: 
         }
         if (action == .accept) break;
         if (action == .unresolved) {
-            page.status = .unresolved;
+            if (page.status != .truncated) page.status = .unresolved;
             break;
         }
         const binding = (try selectedBinding(def, action)).?;
@@ -445,4 +446,47 @@ test "document missing native coverage routes a whole-page repair before accepta
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expectEqualStrings("Header\nBody", page.text);
     try std.testing.expect(!ir.hasFinding(page, "native_text_coverage_incomplete"));
+}
+
+test "document accepted regional revision can remove a previously projected table" {
+    const Fake = struct {
+        fn read(_: *anyopaque, _: A, binding: c.Binding, _: usize, _: ?[4]f64, _: *c.Run) !Candidate {
+            if (std.mem.eql(u8, binding.name, "fast")) return .{ .text = "Incorrect", .regions = &.{.{ .id = 7, .text = "Incorrect", .label = "table", .bbox = .{ 0, 0, 10, 10 } }}, .tables = &.{.{ .id = 0, .region_id = 7, .rows = 1, .columns = 1, .cells = &.{.{ .row = 0, .column = 0, .text = "Incorrect" }} }} };
+            return .{ .text = "Correct prose", .tables = &.{} };
+        }
+        fn validate(_: *anyopaque, _: c.Page, _: ?c.Region, _: Candidate, _: *c.Run) !bool {
+            return true;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var run = c.Run{ .limits = .{} };
+    const def = c.Definition{ .models = &.{ .{ .name = "fast", .model = "fast", .operation = .read }, .{ .name = "table", .model = "table", .operation = .read } }, .read = .{ .reader = "fast", .table_reader = "table" } };
+    const page = try readPage(arena.allocator(), def, .{ .ptr = undefined, .read_fn = Fake.read, .validate_fn = Fake.validate }, 0, .{ .source_id = "photo", .number = 1, .kind = .image }, &run);
+    try std.testing.expectEqual(@as(usize, 0), page.tables.len);
+}
+
+test "document truncated region lists require whole-page repair" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn read(raw: *anyopaque, _: A, binding: c.Binding, _: usize, box: ?[4]f64, _: *c.Run) !Candidate {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expect(box == null);
+            if (std.mem.eql(u8, binding.name, "fast")) return .{ .text = "Header", .truncated = true, .regions = &.{.{ .id = 0, .text = "Header" }} };
+            return .{ .text = "Header\nTail" };
+        }
+        fn validate(_: *anyopaque, _: c.Page, _: ?c.Region, _: Candidate, _: *c.Run) !bool {
+            return true;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var fake = Fake{};
+    var run = c.Run{ .limits = .{} };
+    const def = c.Definition{ .models = &.{ .{ .name = "fast", .model = "fast", .operation = .read }, .{ .name = "accurate", .model = "accurate", .operation = .read } }, .read = .{ .reader = "fast", .accurate_reader = "accurate" } };
+    const page = try readPage(arena.allocator(), def, .{ .ptr = &fake, .read_fn = Fake.read, .validate_fn = Fake.validate }, 0, .{ .source_id = "photo", .number = 1, .kind = .image }, &run);
+    try std.testing.expectEqual(c.Status.complete, page.status);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqualStrings("Header\nTail", page.text);
 }

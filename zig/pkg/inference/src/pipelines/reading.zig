@@ -87,6 +87,8 @@ pub const ReadConfig = struct {
 };
 
 pub const ReadResult = struct {
+    completion: @import("antfly_readers").Completion = .complete,
+    completion_tokens: ?usize = null,
     text: []const u8,
     allocator: std.mem.Allocator,
 
@@ -640,7 +642,7 @@ pub const ReadingPipeline = struct {
         }
         if (max_len == 0) {
             for (out) |*result| {
-                result.* = .{ .text = try allocator.dupe(u8, ""), .allocator = allocator };
+                result.* = .{ .text = try allocator.dupe(u8, ""), .allocator = allocator, .completion = .length, .completion_tokens = 0 };
                 filled += 1;
             }
             return out;
@@ -902,7 +904,7 @@ pub const ReadingPipeline = struct {
         if (max_len == 0) {
             for (out, 0..) |*result, i| {
                 _ = i;
-                result.* = .{ .text = try allocator.dupe(u8, ""), .allocator = allocator };
+                result.* = .{ .text = try allocator.dupe(u8, ""), .allocator = allocator, .completion = .length, .completion_tokens = 0 };
                 filled += 1;
             }
             return out;
@@ -1165,7 +1167,7 @@ pub const ReadingPipeline = struct {
         @memset(encoder_attention_mask, 1);
 
         const max_len = self.config.max_length;
-        if (max_len == 0) return .{ .text = try allocator.dupe(u8, ""), .allocator = allocator };
+        if (max_len == 0) return .{ .text = try allocator.dupe(u8, ""), .allocator = allocator, .completion = .length, .completion_tokens = 0 };
         var dec_ids = try allocator.alloc(i64, max_len);
         defer allocator.free(dec_ids);
         dec_ids[0] = self.config.decoder_start_token_id;
@@ -1243,7 +1245,7 @@ pub const ReadingPipeline = struct {
         const text = try self.tokenizer.decode(allocator, token_ids);
         const cleaned = try cleanupPureText(allocator, text);
         allocator.free(text);
-        return .{ .text = cleaned, .allocator = allocator };
+        return .{ .text = cleaned, .allocator = allocator, .completion = if (dec_len >= self.config.max_length) .length else .complete, .completion_tokens = text_len };
     }
 
     fn readPixelValuesFlorenceResident(self: *ReadingPipeline, pixel_values: []const f32) !?ReadResult {
@@ -1306,7 +1308,7 @@ pub const ReadingPipeline = struct {
         @memset(encoder_attention_mask, 1);
 
         const max_len = self.config.max_length;
-        if (max_len == 0) return .{ .text = try allocator.dupe(u8, ""), .allocator = allocator };
+        if (max_len == 0) return .{ .text = try allocator.dupe(u8, ""), .allocator = allocator, .completion = .length, .completion_tokens = 0 };
         var dec_ids = try allocator.alloc(i64, max_len);
         defer allocator.free(dec_ids);
         dec_ids[0] = self.config.decoder_start_token_id;
@@ -1666,7 +1668,7 @@ pub const ReadingPipeline = struct {
 
         // 3. Autoregressive decode
         const max_len = self.config.max_length;
-        if (max_len == 0) return .{ .text = try allocator.dupe(u8, ""), .allocator = allocator };
+        if (max_len == 0) return .{ .text = try allocator.dupe(u8, ""), .allocator = allocator, .completion = .length, .completion_tokens = 0 };
         var dec_ids = try allocator.alloc(i64, max_len);
         defer allocator.free(dec_ids);
         dec_ids[0] = self.config.decoder_start_token_id;
@@ -1783,7 +1785,7 @@ pub const ReadingPipeline = struct {
         const text = try self.tokenizer.decode(allocator, token_ids);
         const cleaned = try cleanupPureText(allocator, text);
         allocator.free(text);
-        return .{ .text = cleaned, .allocator = allocator };
+        return .{ .text = cleaned, .allocator = allocator, .completion = if (dec_len >= self.config.max_length) .length else .complete, .completion_tokens = text_len };
     }
 
     pub fn deinit(_: *ReadingPipeline) void {

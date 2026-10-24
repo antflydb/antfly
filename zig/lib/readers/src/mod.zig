@@ -92,6 +92,8 @@ pub const EncodedImage = struct {
 };
 
 pub const EncodedRequest = struct {
+    /// Composition may inspect incomplete output; ordinary callers keep strict behavior.
+    allow_incomplete: bool = false,
     images: []const EncodedImage,
     prompt: ?[]const u8 = null,
     max_tokens: ?i64 = null,
@@ -161,7 +163,12 @@ test "encoded reader validation is execution-mode independent" {
     );
 }
 
+pub const Completion = enum { complete, length };
+
 pub const Result = struct {
+    completion: Completion = .complete,
+    prompt_tokens: ?usize = null,
+    completion_tokens: ?usize = null,
     document_json: ?[]const u8 = null,
     text: []const u8,
     fields_json: ?[]const u8 = null,
@@ -214,6 +221,25 @@ pub const BatchResult = struct {
         self.* = undefined;
     }
 };
+
+/// Aggregate measured counters only. Text-length estimates never establish completion.
+pub fn measuredUsage(items: []const Result) !?inference_api.GenerateUsage {
+    var prompt: usize = 0;
+    var output: usize = 0;
+    var measured = false;
+    for (items) |item| {
+        if (item.prompt_tokens) |n| {
+            prompt = try std.math.add(usize, prompt, n);
+            measured = true;
+        }
+        if (item.completion_tokens) |n| {
+            output = try std.math.add(usize, output, n);
+            measured = true;
+        }
+    }
+    if (!measured) return null;
+    return .{ .prompt_tokens = std.math.cast(i64, prompt) orelse return error.InvalidReadExecutionReport, .completion_tokens = std.math.cast(i64, output) orelse return error.InvalidReadExecutionReport, .total_tokens = std.math.cast(i64, try std.math.add(usize, prompt, output)) orelse return error.InvalidReadExecutionReport };
+}
 
 pub const Reader = struct {
     ptr: *anyopaque,

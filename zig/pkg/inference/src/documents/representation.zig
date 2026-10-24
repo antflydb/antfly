@@ -110,21 +110,24 @@ pub fn projectTables(a: A, initial: []const c.Table, regions: []const c.Region, 
     for (initial) |table| {
         var replaced = false;
         for (regions) |region| {
-            if (region.tables.len == 0) continue;
+            // Accepted revisions replace their owned structure, including an empty table set.
+            if (!region.validated and region.tables.len == 0) continue;
             if (table.region_id) |owner| {
                 if (owner == region.id) replaced = true;
             } else if (region.bbox) |box| {
                 var located = table.cells.len > 0;
                 var inside = true;
+                var intersects = false;
                 for (table.cells) |cell| {
                     const cell_box = cell.bbox orelse {
                         located = false;
                         break;
                     };
+                    intersects = intersects or (cell_box[0] < box[2] and cell_box[2] > box[0] and cell_box[1] < box[3] and cell_box[3] > box[1]);
                     inside = inside and cell_box[0] >= box[0] and cell_box[1] >= box[1] and cell_box[2] <= box[2] and cell_box[3] <= box[3];
                 }
                 if (located and inside) replaced = true;
-                if (!located) resolved = false;
+                if (!located or (intersects and !inside)) resolved = false;
             } else resolved = false;
         }
         if (!replaced) try out.append(a, table);
