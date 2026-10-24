@@ -314,7 +314,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // transitive tests require different owner roots. Select the SQL and
     // row-policy contract namespaces at compile time, while allowing explicit
     // caller filters.
-    const sql_tests = b.addTest(.{ .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "common.sql_array_layout", "system_catalog.policies" }) });
+    const sql_tests = b.addTest(.{ .name = "sql-tests", .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "common.sql_array_layout", "system_catalog.policies" }) });
     // Use the same exact-filter runner as extracted SQL owners. Besides
     // consistent failure/leak attribution, this keeps compile-only anonymous
     // reachability anchors out of runtime selection.
@@ -756,10 +756,14 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     runtime_abi_mod.addImport("httpx", httpx_mod);
     runtime_abi_mod.addImport("antfly_platform", platform_mod);
     const inference_api_source = inference_runtime_build.addInferenceApiOverride(b, openapi_build, b.path("../scripts"), openapi_codegen);
+    // Model kernels have a serving-latency contract independently of Debug
+    // storage/API validation. CI can qualify that mixed product without
+    // optimizing the much larger database and server ownership graph.
+    const inference_optimize = b.option(std.lang.Optimize, "inference-optimize", "Optimization mode for the model execution graph (defaults to the product mode)") orelse optimize;
     const inference_config: inference_runtime_build.Config = .{
         .b = b,
         .target = target,
-        .optimize = optimize,
+        .optimize = inference_optimize,
         .paths = .{
             .inference_root = "pkg/inference",
             .shared_lib_root = "",

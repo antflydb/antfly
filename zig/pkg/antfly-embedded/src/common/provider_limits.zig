@@ -127,7 +127,7 @@ pub const DeferredUsageAttempt = struct {
     delegate: httpx.AttemptObserver,
     admitted: bool = false,
     pub fn observer(self: *@This()) httpx.AttemptObserver {
-        return .{ .ptr = self, .before = before, .after = after, .output_tokens = self.delegate.output_tokens };
+        return .{ .ptr = self, .before = before, .after = after, .output_tokens = self.delegate.output_tokens, .delivery = self.delegate.delivery };
     }
     fn before(ptr: *anyopaque, context: httpx.AttemptObserver.Context) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));

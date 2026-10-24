@@ -140,9 +140,9 @@ def cli(cli_server):
     env["ANTFLY_URL"] = cli_server.url
 
     def run_cli(
-        *args: str, check: bool = True, timeout_s: float = 30.0
+        *args: str, check: bool = True, timeout_s: float = 30.0, output: str = "json"
     ) -> subprocess.CompletedProcess[str]:
-        cmd = [binary] + list(args)
+        cmd = [binary, "--no-agent", "--output", output] + list(args)
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -196,11 +196,13 @@ def test_table_create_list_get_drop(cli):
     # create
     cli("table", "create", "--table", table, "--shards", "1")
 
-    # list defaults to a compact summary rather than dumping full metadata
-    result = cli("table", "list")
-    lines = result.stdout.strip().splitlines()
-    assert lines[0] == "NAME\tSHARDS\tINDEXES\tSTORAGE"
-    assert any(line.startswith(f"{table}\t1\t") for line in lines[1:])
+    # Human discovery is a compact table; structured data is selected explicitly.
+    result = cli("table", "list", output="auto")
+    assert all(
+        column.lower() in result.stdout.lower()
+        for column in ("NAME", "SHARDS", "INDEXES", "STORAGE")
+    )
+    assert table in result.stdout
 
     # detailed machine-readable output remains available explicitly
     result = cli("table", "list", "--output", "json")
@@ -416,6 +418,7 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             "--poll-interval",
             "25ms",
             timeout_s=30.0,
+            output="auto",
         )
         assert (
             f"Index {full_text_name} (full_text) reached searchable-artifacts=1:"
@@ -436,6 +439,7 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             "--poll-interval",
             "25ms",
             timeout_s=30.0,
+            output="auto",
         )
         assert (
             "Index title_body (embeddings) reached searchable-artifacts=1:"
@@ -464,6 +468,7 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             "--poll-interval",
             "25ms",
             timeout_s=30.0,
+            output="auto",
         )
         assert "Index title_body (embeddings) reached complete:" in text_complete.stdout
 
@@ -684,6 +689,7 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             "25ms",
             timeout_s=30.0,
             check=False,
+            output="auto",
         )
         assert image_wait.returncode == 0, (
             f"{image_wait.stderr}\nindex diagnostics:\n"
@@ -898,6 +904,7 @@ def test_cli_index_wait_survives_retry_exhaustion_and_restart(
                 "--poll-interval",
                 "25ms",
                 timeout_s=30.0,
+                output="auto",
             )
 
         # A retry-exhausted ClipClap request is a per-source terminal outcome,
@@ -1011,6 +1018,7 @@ def test_cli_index_wait_survives_retry_exhaustion_and_restart(
         )
         wait_env = os.environ.copy()
         wait_env["ANTFLY_URL"] = cli_server.url
+        wait_env["ANTFLY_AGENT_MODE"] = "0"
         later_wait = subprocess.Popen(
             [
                 binary,

@@ -4389,6 +4389,7 @@ pub const AntflyApiHandler = struct {
     fn gatewayFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         if (ctx.h1_stream_sent or ctx.h2_stream_sent or err == error.InferenceResponseCommitted) return err;
         // Stream errors propagate through the boundary once committed.
+        if (err == error.Timeout) return inference_gateway.timeoutResponse(ctx);
         const status: u16 = switch (err) {
             error.InferenceRequestTooLarge, error.ConstrainedInputTooLarge => 413,
             error.ConnectionCapabilityMissing, error.PublicInferenceDisabled => 403,
@@ -4417,6 +4418,7 @@ pub const AntflyApiHandler = struct {
             inference_gateway.prepare(self.api_server, ctx) catch |err| return gatewayFailure(ctx, err);
             return inference_gateway.executeOperation(self.api_server, ctx, task, operation) catch |err| gatewayFailure(ctx, err);
         }
+        inference_gateway.prepare(self.api_server, ctx) catch |err| return gatewayFailure(ctx, err);
         comptime std.debug.assert(request_admission_policy.publicOperationClass("invokeInferenceConnection").? == .inference);
         const admission_owner = self.api_server.inferenceConnectionAdmissionOwner(connection_id, operation) catch |err| switch (err) {
             error.ConnectionCapabilityMissing => return textResponse(ctx, 403, @errorName(err)),
@@ -4432,9 +4434,9 @@ pub const AntflyApiHandler = struct {
                 return request_context.isCancellationRequested();
             }
         }.isCancelled);
-        const deadline_ns = connections_api.inferenceInvocationDeadlineNs();
+        const deadline_ns = ctx.application_deadline_ns orelse connections_api.inferenceInvocationDeadlineNs();
         var transport = runtime_http_bridge.Outbound{ .context = ctx };
-        var result = self.api_server.invokeInferenceConnection(
+        var result = self.api_server.invokeInferenceConnectionObserved(
             ctx.allocator,
             connection_id,
             operation,
@@ -4442,6 +4444,7 @@ pub const AntflyApiHandler = struct {
             cancellation,
             deadline_ns,
             transport.stream(),
+            inference_gateway.observeAttempt(ctx, null),
         ) catch |err| {
             // Once a stream has committed its headers, the listener must close
             // that stream on failure; attempting to synthesize a second HTTP
@@ -4451,7 +4454,7 @@ pub const AntflyApiHandler = struct {
                 error.ConnectionCapabilityMissing => textResponse(ctx, 403, @errorName(err)),
                 error.ConnectionNotFound, error.ConnectionNotInference, error.InvalidConfig, error.ConnectionURLMissing, error.InvalidConnectionURL, error.ProviderNotAntflyCompatible, error.UnsupportedInferenceOperation => textResponse(ctx, 400, @errorName(err)),
                 error.Canceled, error.Cancelled => error.Canceled,
-                error.Timeout => textResponse(ctx, 504, "inference invocation deadline exceeded"),
+                error.Timeout => inference_gateway.timeoutResponse(ctx),
                 else => textResponse(ctx, 502, @errorName(err)),
             };
         };
