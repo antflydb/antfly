@@ -2185,9 +2185,9 @@ edges, consistently for routed and embedded execution. Suppression policies and
 source publication fences still apply. Legacy adoption folds source-owned state
 once; warm native operations use the index.
 
-Metadata publishes v4 consumer/profile readiness only after its bounded backfill
-finishes, under topology protocol 44. Lite bootstraps the same layout atomically
-and installs reader floor 16. Embedded planning builds the static component
+Metadata publishes v5 consumer/profile readiness only after its bounded backfill
+finishes, under topology protocol 45. Lite bootstraps the same layout atomically
+and installs reader floor 17. Embedded planning builds the static component
 outside writer ownership, checks source/catalog generations and validates the
 observed curated head again inside the final transaction. Routed publication
 retains the catalog revision, physical authority and head fences.
@@ -2205,3 +2205,49 @@ removal and directory changes fence publication even when no initially selected
 source changes. Read-only redirect inspection retains curated-only traversal.
 Progress routing uses identity and range directories directly; it neither loads
 DDL bodies nor builds runtime snapshots.
+
+### Scoped native publication and admission proofs
+
+The v5 directory additionally retains each immutable static definition separately
+from its adjacency and lightweight head. Before a namespace has a native head,
+authorized adoption reads the complete selected declarations once. Private
+consumer pages carry a deduplicated cold-profile dictionary, so shared static
+arrays are not repeated for every resolver; Lite uses the same profile identities. This applies
+both to the first native correction and to new namespaces on an already native
+destination. Warm consumer pages retain only profile references and incident
+edges; an indexed-readiness flag never substitutes for a missing namespace head.
+
+A private admission proof is maintained atomically with table DDL, containing
+physical identity, native-authority status and the exact schema fingerprint.
+Native entity and proposal APIs receive this proof with a minimal table descriptor.
+Authority component reads and warm publication do not decode the table definition.
+The final transaction checks the physical proof, catalog revision and individual
+head/queue revisions. New namespace membership and legacy adoption retain their
+cold DDL path; ordinary corrections never enumerate all heads to rebuild headers.
+Table removal removes the derived proof in the same transaction. A bounded v5
+backfill installs proofs before indexed readiness is advertised.
+
+Native corrections enqueue the changed namespaces. A scoped job owns one active
+namespace cursor; separate durable rows index its pending namespaces. Repeated changes mark its active
+pass dirty without rewinding it; after its tail it rotates through pending namespaces before repeating a dirty
+namespace. Table lifecycle and bootstrap invalidations subsume scoped
+work and retain the destination-wide path. Scoped ticks use namespace postings,
+so unrelated source namespaces do not receive replay/projection work.
+
+Validation compiles curated canonical paths, suppression and distinct adjacency
+once per affected namespace. Each source profile adds a compressed overlay at
+curated terminal nodes and checks only its changed paths and incident distinct
+pairs. Source-local suppression remains independent. This avoids copying the
+curated graph and parsing the namespace state for every profile.
+
+Owner observation requests are partitioned by both the 4,096-name receiver bound
+and a 512 KiB encoded request budget, with the same bounded fan-out across groups
+and chunks. Partial or failed chunks cannot certify absent owner facts. This
+contract is the same for non-waiting observations and bounded waits.
+
+Grouped-source retirement caches only the semantic digest of an exact immutable
+catalog content generation. Every lookup hashes the current transaction's catalog
+bytes; publication, rollback and restored histories therefore miss immediately
+when content changes. A cold calculation retains the maintenance allocation
+budget. The cache owns only two digests and never retains transaction buffers,
+provider objects, readiness decisions or authorization.

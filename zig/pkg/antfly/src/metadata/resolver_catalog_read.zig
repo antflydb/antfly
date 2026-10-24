@@ -31,10 +31,11 @@ pub const Request = struct {
     routing_siblings: bool = false,
     /// Progress routing needs identity/ranges, never DDL or policy bodies.
     identity_only: bool = false,
+    authority_admission: bool = false,
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
-            const include = if (comptime std.mem.eql(u8, field, "identity_only")) self.identity_only else if (comptime std.mem.eql(u8, field, "authority")) self.authority != null else if (comptime std.mem.eql(u8, field, "table_id")) self.table_id != 0 else if (comptime std.mem.eql(u8, field, "compact_consumers")) self.compact_consumers else true;
+            const include = if (comptime std.mem.eql(u8, field, "authority_admission")) self.authority_admission else if (comptime std.mem.eql(u8, field, "identity_only")) self.identity_only else if (comptime std.mem.eql(u8, field, "authority")) self.authority != null else if (comptime std.mem.eql(u8, field, "table_id")) self.table_id != 0 else if (comptime std.mem.eql(u8, field, "compact_consumers")) self.compact_consumers else true;
             if (include) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
@@ -45,12 +46,14 @@ pub const Request = struct {
 };
 pub const Page = struct {
     version: u8,
+    admission: ?@import("resolver_authority.zig").Admission = null,
     revision: u64,
     table: metadata.TableRecord,
     configs: ?[]const @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig = null,
     execution_indexes: ?[]const u8 = null,
     ranges: []metadata.RangeRecord = &.{},
     consumers: []const Consumer = &.{},
+    cold_profiles: []const @import("resolver_authority.zig").AliasProfile = &.{},
     visited: usize = 0,
     next_cursor: ?[]const u8 = null,
     indexed: bool = false,
@@ -60,7 +63,17 @@ pub const Page = struct {
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
-            if (comptime std.mem.eql(u8, field, "configs")) {
+            if (comptime std.mem.eql(u8, field, "admission")) {
+                if (self.admission) |proof| {
+                    try writer.objectField(field);
+                    try writer.write(proof);
+                }
+            } else if (comptime std.mem.eql(u8, field, "cold_profiles")) {
+                if (self.cold_profiles.len > 0) {
+                    try writer.objectField(field);
+                    try writer.write(self.cold_profiles);
+                }
+            } else if (comptime std.mem.eql(u8, field, "configs")) {
                 if (self.configs) |values| {
                     try writer.objectField(field);
                     try writer.beginArray();

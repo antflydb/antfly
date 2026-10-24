@@ -109,32 +109,100 @@ pub fn planningAliases(a: A, namespace: policy.Namespace, effective: []const res
     return effective;
 }
 
-pub fn validateProfile(a: A, namespace: policy.Namespace, static: []const resolver.KeyAlias, suppress_json: []const u8) !void {
-    var curated: std.StringHashMapUnmanaged(void) = .empty;
-    var removed: std.StringHashMapUnmanaged(void) = .empty;
-    for (namespace.merges) |alias| try curated.put(a, alias.key, {});
-    for (namespace.state.removed_aliases) |id| try removed.put(a, id, {});
-    var aliases: std.ArrayList(resolver.KeyAlias) = .empty;
-    for (static) |alias| if (!curated.contains(alias.key) and !removed.contains(alias.key)) try aliases.append(a, alias);
-    try aliases.appendSlice(a, namespace.merges);
-    _ = try c.RedirectIndex.init(a, static);
-    _ = try c.RedirectIndex.init(a, namespace.merges);
-    const redirects = try c.RedirectIndex.init(a, aliases.items);
-    var index = try c.Index.init(a, suppress_json, try encode(a, namespace.state));
-    try index.bindRedirects(a, redirects);
-    for (namespace.state.distinct) |pair| if (std.mem.eql(u8, redirects.canonical(pair.from), redirects.canonical(pair.to))) return error.ResolverDistinctPair;
-    for (aliases.items) |alias| {
-        const target = redirects.canonical(alias.target);
-        if (index.keySuppressed(target)) return error.SuppressedResolverRedirectTarget;
-        if (try index.pinnedDistinct(a, alias.key, target)) return error.ResolverDistinctPair;
+/// An overlay only adds outgoing edges at terminal nodes of the validated
+/// curated graph. Base paths can therefore jump straight to their terminal;
+/// profile-local compression never copies the curated canonical map.
+const ProfileRedirects = struct {
+    base: c.RedirectIndex,
+    canonical_keys: std.StringHashMapUnmanaged([]const u8) = .empty,
+    fn init(a: A, base: c.RedirectIndex, aliases: []const resolver.KeyAlias) !ProfileRedirects {
+        var result: ProfileRedirects = .{ .base = base };
+        var edges: std.StringHashMapUnmanaged([]const u8) = .empty;
+        for (aliases) |alias| try edges.put(a, alias.key, alias.target);
+        var path: std.ArrayList([]const u8) = .empty;
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        for (aliases) |alias| {
+            path.clearRetainingCapacity();
+            seen.clearRetainingCapacity();
+            var current = alias.key;
+            const target = walk: while (true) {
+                if (result.canonical_keys.get(current)) |known| break :walk known;
+                const next = edges.get(current) orelse break :walk current;
+                if ((try seen.getOrPut(a, current)).found_existing) return error.InvalidResolverAliasCycle;
+                try path.append(a, current);
+                current = base.canonical(next);
+            };
+            for (path.items) |key| try result.canonical_keys.put(a, key, target);
+        }
+        return result;
     }
+    fn canonical(self: ProfileRedirects, key: []const u8) []const u8 {
+        const terminal = self.base.canonical(key);
+        return self.canonical_keys.get(terminal) orelse terminal;
+    }
+};
+const ProfileValidation = struct {
+    namespace: policy.Namespace,
+    base: c.RedirectIndex,
+    negative: c.Index,
+    incoming: std.StringHashMapUnmanaged(void) = .empty,
+    blocked: std.ArrayList([]const u8) = .empty,
+    distinct: std.StringHashMapUnmanaged(std.ArrayList(c.Pair)) = .empty,
+    fn init(a: A, namespace: policy.Namespace) !ProfileValidation {
+        var result: ProfileValidation = .{
+            .namespace = namespace,
+            .base = try c.RedirectIndex.init(a, namespace.merges),
+            .negative = try c.Index.init(a, "", try encode(a, namespace.state)),
+        };
+        for (namespace.merges) |alias| {
+            const target = result.base.canonical(alias.target);
+            const slot = try result.incoming.getOrPut(a, target);
+            if (!slot.found_existing and result.negative.keySuppressed(target)) try result.blocked.append(a, target);
+        }
+        for (namespace.state.distinct) |pair| {
+            const from = result.base.canonical(pair.from);
+            const to = result.base.canonical(pair.to);
+            if (std.mem.eql(u8, from, to)) return error.ResolverDistinctPair;
+            for ([_][]const u8{ from, to }) |endpoint| {
+                const slot = try result.distinct.getOrPut(a, endpoint);
+                if (!slot.found_existing) slot.value_ptr.* = .empty;
+                try slot.value_ptr.append(a, pair);
+            }
+        }
+        return result;
+    }
+    fn validate(self: ProfileValidation, a: A, static: []const resolver.KeyAlias, suppress_json: []const u8) !void {
+        _ = try c.RedirectIndex.init(a, static);
+        var added: std.ArrayList(resolver.KeyAlias) = .empty;
+        for (static) |alias| if (!self.base.canonical_keys.contains(alias.key) and !self.negative.removed_aliases.contains(alias.key)) try added.append(a, alias);
+        const overlay = try ProfileRedirects.init(a, self.base, added.items);
+        const local_negative = try c.Index.init(a, suppress_json, "");
+        for (self.blocked.items) |terminal| if (std.mem.eql(u8, overlay.canonical(terminal), terminal)) return error.SuppressedResolverRedirectTarget;
+        // Every changed curated path ends at the target of an added edge.
+        // Unchanged paths were checked once; source-local key rules can check
+        // their terminal directly through the shared incoming directory.
+        for (added.items) |alias| {
+            const target = overlay.canonical(alias.target);
+            if (self.negative.keySuppressed(target) or local_negative.keySuppressed(target)) return error.SuppressedResolverRedirectTarget;
+            if (self.distinct.get(alias.key)) |pairs| for (pairs.items) |pair| {
+                if (std.mem.eql(u8, overlay.canonical(pair.from), overlay.canonical(pair.to))) return error.ResolverDistinctPair;
+            };
+        }
+        var keys = local_negative.keys.keyIterator();
+        while (keys.next()) |key| if (std.mem.eql(u8, overlay.canonical(key.*), key.*) and self.incoming.contains(key.*)) return error.SuppressedResolverRedirectTarget;
+    }
+};
+pub fn validateProfile(a: A, namespace: policy.Namespace, static: []const resolver.KeyAlias, suppress_json: []const u8) !void {
+    const context = try ProfileValidation.init(a, namespace);
+    try context.validate(a, static, suppress_json);
 }
 pub fn validateProfiles(a: A, namespace: policy.Namespace, profiles: []const AliasProfile) !void {
+    const context = try ProfileValidation.init(a, namespace);
     var checked: std.StringHashMapUnmanaged(void) = .empty;
     for (profiles) |profile| if (std.mem.eql(u8, namespace.key_template, profile.key_template)) {
-        const key = try encode(a, .{ profile.aliases, profile.suppress_json });
+        const key = if (profile.id.len > 0) profile.id else try encode(a, .{ profile.aliases, profile.suppress_json });
         if ((try checked.getOrPut(a, key)).found_existing) continue;
-        try validateProfile(a, namespace, profile.aliases, profile.suppress_json);
+        try context.validate(a, profile.aliases, profile.suppress_json);
     };
 }
 
@@ -150,6 +218,7 @@ fn hash(a: A, value: []const u8) ![]const u8 {
     std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
     return a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
 }
+pub var test_head_enumerations: std.atomic.Value(usize) = .init(0);
 pub const Store = struct {
     a: A,
     backend: Backend,
@@ -221,6 +290,7 @@ pub const Store = struct {
         return result.items;
     }
     pub fn heads(self: Store) ![]const Head {
+        if (comptime @import("builtin").is_test) _ = test_head_enumerations.fetchAdd(1, .monotonic);
         const prefix = try self.keyPath("head/");
         var result: std.ArrayList(Head) = .empty;
         var after: ?[]const u8 = null;
@@ -1079,4 +1149,70 @@ test "native resolver authority prefix routes exclude ten thousand unrelated nam
     const matches = try store.matchingHeads("scope-123/item");
     try std.testing.expectEqual(@as(usize, 2), matches.len);
     try std.testing.expect(memory.reads < 32 and memory.scans <= 2 and memory.visited == 2);
+}
+
+test "resolver curation shared profile overlays preserve composed graph validation" {
+    const Reference = struct {
+        fn validate(a: A, namespace: policy.Namespace, static: []const resolver.KeyAlias, suppress: []const u8) !void {
+            var curated: std.StringHashMapUnmanaged(void) = .empty;
+            var removed: std.StringHashMapUnmanaged(void) = .empty;
+            for (namespace.merges) |alias| try curated.put(a, alias.key, {});
+            for (namespace.state.removed_aliases) |key| try removed.put(a, key, {});
+            var aliases: std.ArrayList(resolver.KeyAlias) = .empty;
+            for (static) |alias| if (!curated.contains(alias.key) and !removed.contains(alias.key)) try aliases.append(a, alias);
+            try aliases.appendSlice(a, namespace.merges);
+            _ = try c.RedirectIndex.init(a, static);
+            _ = try c.RedirectIndex.init(a, namespace.merges);
+            const redirects = try c.RedirectIndex.init(a, aliases.items);
+            var negative = try c.Index.init(a, suppress, try encode(a, namespace.state));
+            try negative.bindRedirects(a, redirects);
+            for (namespace.state.distinct) |pair| if (std.mem.eql(u8, redirects.canonical(pair.from), redirects.canonical(pair.to))) return error.ResolverDistinctPair;
+            for (aliases.items) |alias| {
+                const target = redirects.canonical(alias.target);
+                if (negative.keySuppressed(target)) return error.SuppressedResolverRedirectTarget;
+                if (try negative.pinnedDistinct(a, alias.key, target)) return error.ResolverDistinctPair;
+            }
+        }
+    };
+    var rng = std.Random.DefaultPrng.init(93821);
+    const random = rng.random();
+    for (0..256) |_| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var names: [32][]const u8 = undefined;
+        for (&names, 0..) |*name, i| name.* = try std.fmt.allocPrint(a, "n{d}", .{i});
+        var curated: [16]resolver.KeyAlias = undefined;
+        for (&curated, 0..) |*alias, i| alias.* = .{ .key = names[i], .target = names[random.intRangeAtMost(usize, i + 1, 31)] };
+        var static: [8]resolver.KeyAlias = undefined;
+        for (&static, 0..) |*alias, i| alias.* = .{ .key = names[i + 16], .target = names[random.uintLessThan(usize, 32)] };
+        var pairs: [4]c.Pair = undefined;
+        for (&pairs) |*pair| pair.* = .{ .from = names[random.uintLessThan(usize, 32)], .to = names[random.uintLessThan(usize, 32)] };
+        var suppressed: [3][]const u8 = undefined;
+        var local_keys: [3][]const u8 = undefined;
+        var removed: [3][]const u8 = undefined;
+        for (&suppressed, &local_keys, &removed) |*global, *local_key, *tombstone| {
+            global.* = names[random.uintLessThan(usize, 32)];
+            local_key.* = names[random.uintLessThan(usize, 32)];
+            tombstone.* = names[random.uintLessThan(usize, 32)];
+        }
+        const namespace: policy.Namespace = .{ .key_template = "n{{_key}}", .merges = &curated, .state = .{ .distinct = &pairs, .suppress = .{ .keys = &suppressed }, .removed_aliases = &removed } };
+        const suppress = try encode(a, .{ .keys = local_keys });
+        const expected = if (Reference.validate(a, namespace, &static, suppress)) |_| true else |_| false;
+        const actual = if (validateProfile(a, namespace, &static, suppress)) |_| true else |_| false;
+        try std.testing.expectEqual(expected, actual);
+    }
+}
+
+test "resolver curation shared profile validation keeps a large curated graph once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const merged = try a.alloc(resolver.KeyAlias, 500);
+    for (merged, 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "base-{d}", .{i}), .target = "terminal" };
+    const profiles = try a.alloc(AliasProfile, 500);
+    for (profiles, 0..) |*profile, i| profile.* = .{ .id = try std.fmt.allocPrint(a, "profile-{d}", .{i}), .key_template = "{{_key}}", .aliases = &.{}, .suppress_json = try encode(a, .{ .keys = &[_][]const u8{try std.fmt.allocPrint(a, "unrelated-{d}", .{i})} }) };
+    const buffer = try a.alloc(u8, 2 * 1024 * 1024);
+    var bounded = std.heap.FixedBufferAllocator.init(buffer);
+    try validateProfiles(bounded.allocator(), .{ .key_template = "{{_key}}", .merges = merged }, profiles);
 }

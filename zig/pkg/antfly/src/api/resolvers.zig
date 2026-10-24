@@ -214,6 +214,27 @@ fn sample(server: anytype, a: std.mem.Allocator, snapshot: anytype, table: anyty
 fn sampleForReplay(server: anytype, a: std.mem.Allocator, snapshot: anytype, table: anytype, request: operation.RequestContext, probe_owners: bool, required: ?ReplayRequirement) !Sample {
     return sampleForRequirements(server, a, snapshot, table, request, probe_owners, if (required) |value| &.{value} else &.{});
 }
+/// Keep both receiver admission and transport allocation bounded. Each group
+/// proof remains independent; an absent/failed chunk cannot certify its names.
+fn progressNameBatches(a: std.mem.Allocator, names: []const []const u8) ![]const []const []const u8 {
+    var result: std.ArrayList([]const []const u8) = .empty;
+    var start: usize = 0;
+    while (start < names.len) {
+        var end = start;
+        var bytes: usize = 64;
+        while (end < names.len and end - start < 4096) {
+            const size = resolver.curation.jsonSize(names[end]) + 1;
+            if (size > 512 * 1024 - 64) return error.InvalidResolverCurationRequest;
+            if (bytes + size > 512 * 1024) break;
+            bytes += size;
+            end += 1;
+        }
+        try result.append(a, names[start..end]);
+        start = end;
+    }
+    return result.items;
+}
+
 fn sampleForRequirements(server: anytype, a: std.mem.Allocator, snapshot: anytype, table: anytype, request: operation.RequestContext, probe_owners: bool, required: []const ReplayRequirement) !Sample {
     var result: Sample = .{};
     for (snapshot.ranges) |range| if (range.table_id == table.table_id) try result.groups.put(a, range.group_id, {});
@@ -247,9 +268,10 @@ fn sampleForRequirements(server: anytype, a: std.mem.Allocator, snapshot: anytyp
     };
     var probes: std.ArrayListUnmanaged(Probe) = .empty;
     defer for (probes.items) |probe| if (probe.bytes) |bytes| std.heap.smp_allocator.free(bytes);
-    for (result.groups.keys()) |group| {
-        if (selected_names.count() > 0) try probes.append(a, .{ .group = group, .names = selected_names.keys() });
-    }
+    const selections = try progressNameBatches(a, selected_names.keys());
+    for (result.groups.keys()) |group| for (selections) |names| {
+        try probes.append(a, .{ .group = group, .names = names });
+    };
     var offset: usize = 0;
     while (offset < probes.items.len) {
         const batch = probes.items[offset..@min(probes.items.len, offset + 16)];
@@ -428,7 +450,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
     // All resolver resources use the same scoped source cut. Full snapshots
     // remain only for sources without the private catalog-read capability.
     const page: ?catalog_read.Page = if (server.source.vtable.supports_resolver_catalog_read)
-        try readResolverCatalog(server, a, .{ .table_name = table_name, .projection_names = if (op == .list) null else if (resolver_name.len > 0) &.{resolver_name} else &.{}, .routing_siblings = op == .resolve }, request)
+        try readResolverCatalog(server, a, .{ .table_name = table_name, .projection_names = if (op == .list) null else if (resolver_name.len > 0) &.{resolver_name} else &.{}, .routing_siblings = op == .resolve, .authority_admission = server.source.vtable.supports_resolver_authority and (entity_mutation or op == .entity_redirects or op == .proposals or op == .proposal) }, request)
     else
         null;
     const adoption_revision = if (page) |value| @as(?u64, value.revision) else if (entity_mutation and server.source.vtable.linearizable_routing_snapshot != null) blk: {
@@ -440,9 +462,9 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
     defer if (page == null) server.source.freeAdminSnapshot(&snapshot);
     const table = try tableByName(&snapshot, table_name);
     if (op == .proposals or op == .proposal or op == .proposal_create or op == .proposal_accept or op == .proposal_reject)
-        return proposalOperation(server, alloc, a, &snapshot, table, op, key, body, query, request, adoption_revision);
+        return proposalOperation(server, alloc, a, &snapshot, table, op, key, body, query, request, adoption_revision, if (page) |value| value.admission else null);
     if (op == .entity_redirects or op == .entity_merge or op == .entity_unmerge or op == .entity_suppress or op == .entity_unsuppress or op == .entity_distinct)
-        return entityOperation(server, alloc, a, &snapshot, table, op, key, body, request, adoption_revision, null);
+        return entityOperation(server, alloc, a, &snapshot, table, op, key, body, request, adoption_revision, null, if (page) |value| value.admission else null);
     const all = if (page) |value| value.configs orelse try configs(a, value.executionIndexes()) else try configs(a, table.indexes_json);
     if (op == .list) {
         const observation = try sample(server, a, &snapshot, table, request, true);
@@ -589,7 +611,7 @@ const EntityDiscovery = struct {
     }
     fn consume(self: *EntityDiscovery, scratch: std.mem.Allocator, table_name: []const u8, original: Config) !void {
         var cfg = original;
-        if (self.profiles_indexed and cfg.admission_profile.len > 0) cfg.aliases = self.indexed_profiles.get(cfg.admission_profile) orelse &.{};
+        if (self.profiles_indexed and namespaceAdopted(self.stored, cfg.key_template) and cfg.admission_profile.len > 0) cfg.aliases = self.indexed_profiles.get(cfg.admission_profile) orelse &.{};
         const entry = try self.namespaces.getOrPut(self.a, cfg.key_template);
         if (!entry.found_existing) {
             entry.key_ptr.* = try self.a.dupe(u8, cfg.key_template);
@@ -665,9 +687,13 @@ fn scanEntityConsumers(server: anytype, owner: std.mem.Allocator, snapshot: anyt
             const page = try readResolverCatalog(server, scratch, .{ .table_name = entity_table.name, .mode = .consumers, .key = key, .expected_revision = adoption_revision, .cursor = cursor, .compact_consumers = server.source.vtable.supports_resolver_authority }, request);
             var pending: std.ArrayList(ConsumerConfig) = .empty;
             var source_reads: std.ArrayList([]const u8) = .empty;
+            var cold_profiles: std.StringHashMapUnmanaged([]const resolver.KeyAlias) = .empty;
+            for (page.cold_profiles) |profile| try cold_profiles.put(scratch, profile.id, profile.aliases);
             for (page.consumers) |consumer| {
                 var needs_source_read = false;
-                for (try consumerAdmissionConfigs(scratch, consumer)) |cfg| {
+                for (try consumerAdmissionConfigs(scratch, consumer)) |original| {
+                    var cfg = original;
+                    if (cold_profiles.get(cfg.admission_profile)) |aliases| cfg.aliases = aliases;
                     const identity = try std.json.Stringify.valueAlloc(scratch, .{ consumer.table.table_id, cfg.name }, .{});
                     if (seen.contains(identity)) continue;
                     try seen.put(owner, try owner.dupe(u8, identity), {});
@@ -763,13 +789,13 @@ fn withNativeAuthority(a: std.mem.Allocator, root: *std.json.Value, view: native
     try root.object.put(a, curation.namespaces_key, try json(a, curation.Namespaces{ .namespaces = namespaces.items }));
     try root.object.put(a, proposals_key, try json(a, view.proposals));
 }
-fn publishAuthority(server: anytype, a: std.mem.Allocator, table: anytype, root: std.json.Value, view: ?native_authority.View, owned: []const []const u8, cut: ?u64, request: operation.RequestContext) !?@import("../metadata/api.zig").CatalogMutationStamp {
+fn publishAuthority(server: anytype, a: std.mem.Allocator, table: anytype, root: std.json.Value, view: ?native_authority.View, owned: []const []const u8, cut: ?u64, request: operation.RequestContext, admission: ?native_authority.Admission) !?@import("../metadata/api.zig").CatalogMutationStamp {
     var replacement = table.*;
     if (!server.source.vtable.supports_resolver_authority) {
         replacement.indexes_json = try std.json.Stringify.valueAlloc(a, root, .{});
         return server.source.replaceTableDefinitionStamped(table.*, replacement);
     }
-    var write: native_authority.Write = .{ .table_id = table.table_id, .schema = try native_authority.schemaFingerprint(a, table.*), .catalog_revision = cut, .standalone = server.cfg.deployment_mode == .standalone, .owned_templates = owned };
+    var write: native_authority.Write = .{ .table_id = table.table_id, .schema = if (admission) |proof| proof.schema else try native_authority.schemaFingerprint(a, table.*), .catalog_revision = cut, .standalone = server.cfg.deployment_mode == .standalone, .owned_templates = owned };
     const before = view orelse legacy: {
         const old_root = try std.json.parseFromSliceLeaky(std.json.Value, a, if (table.indexes_json.len == 0) "{}" else table.indexes_json, .{});
         const old_namespaces = try curation.namespacesFromValue(a, old_root);
@@ -865,7 +891,7 @@ fn observeProposalDecision(server: anytype, alloc: std.mem.Allocator, a: std.mem
     return response(alloc, if (applied) 200 else 202, .{ .proposal = proposal, .changed = false, .complete = true, .atomicity = "namespace", .applied = applied, .results = std.json.Value{ .array = results } });
 }
 
-fn proposalOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, snapshot: anytype, table: anytype, op: Operation, id: []const u8, body: []const u8, query: []const u8, request: operation.RequestContext, adoption_revision: ?u64) !@import("public_table_http.zig").OwnedResponse {
+fn proposalOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, snapshot: anytype, table: anytype, op: Operation, id: []const u8, body: []const u8, query: []const u8, request: operation.RequestContext, adoption_revision: ?u64, admission: ?native_authority.Admission) !@import("public_table_http.zig").OwnedResponse {
     if (readOnly(op)) try server.authorizeTableReads(a, request, &.{table.name}) else try server.authorizeIntegrityMutations(request, &.{.{ .table_name = table.name, .deletes = &.{id} }});
     var root = try std.json.parseFromSliceLeaky(std.json.Value, a, if (table.indexes_json.len == 0) "{}" else table.indexes_json, .{});
     var native: ?native_authority.View = null;
@@ -932,7 +958,7 @@ fn proposalOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Alloc
                 .distinct => .entity_distinct,
             };
             const bytes = try std.json.Stringify.valueAlloc(a, .{ .into = proposal.into, .replace = options.replace, .pin_distinct = options.pin_distinct, .absorbed = options.absorbed, .actor = input.actor, .reason = input.reason, .expected_revision = input.expected_revision, .wait = input.wait }, .{});
-            return entityOperation(server, alloc, a, snapshot, table, action, proposal.key, bytes, request, adoption_revision, .{ .id = id, .decision = decision });
+            return entityOperation(server, alloc, a, snapshot, table, action, proposal.key, bytes, request, adoption_revision, .{ .id = id, .decision = decision }, admission);
         }
         state = (try resolver.curation.decide(a, state, &.{}, &.{}, id, decision, curation.manualOrigin(.{ .action = .suppress, .actor = input.actor, .reason = input.reason }, 0))).state;
     }
@@ -941,14 +967,14 @@ fn proposalOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Alloc
     replacement.indexes_json = try std.json.Stringify.valueAlloc(a, root, .{});
     if (op == .proposal_create and !server.source.vtable.supports_resolver_authority) try validateProposalPublicationCapacity(alloc, replacement, state);
     try request.ensureActive();
-    _ = try publishAuthority(server, a, table, root, native, owned_templates.items, adoption_revision, request);
+    _ = try publishAuthority(server, a, table, root, native, owned_templates.items, adoption_revision, request, admission);
     if (op == .proposal_create) return response(alloc, 200, try findProposal(state, try resolver.curation.proposalId(a, try std.json.parseFromSliceLeaky(resolver.curation.ProposalRequest, a, body, .{}))));
     return response(alloc, 200, .{ .proposal = try findProposal(state, id), .changed = true, .complete = true, .atomicity = "namespace", .applied = true, .results = @as([]const std.json.Value, &.{}) });
 }
 
 /// One destination-table CAS owns every matching exact-template namespace.
 /// Sources are observations of asynchronous replay, never curation authorities.
-fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, snapshot: anytype, entity_table: anytype, op: Operation, key: []const u8, body: []const u8, request: operation.RequestContext, adoption_revision: ?u64, proposal_edit: ?ProposalEdit) !@import("public_table_http.zig").OwnedResponse {
+fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, snapshot: anytype, entity_table: anytype, op: Operation, key: []const u8, body: []const u8, request: operation.RequestContext, adoption_revision: ?u64, proposal_edit: ?ProposalEdit, admission: ?native_authority.Admission) !@import("public_table_http.zig").OwnedResponse {
     if (op == .entity_redirects) {
         try server.authorizeTableReads(a, request, &.{entity_table.name});
     } else try server.authorizeIntegrityMutations(request, &.{.{ .table_name = entity_table.name, .deletes = &.{key} }});
@@ -1054,7 +1080,7 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
         try root.object.put(a, proposals_key, try json(a, proposal_state));
     }
     try request.ensureActive();
-    const stamp = if (changed) try publishAuthority(server, a, entity_table, root, native, namespaces.keys(), adoption_revision, request) else null;
+    const stamp = if (changed) try publishAuthority(server, a, entity_table, root, native, namespaces.keys(), adoption_revision, request, admission) else null;
     var results = std.json.Array.init(a);
     var applied = true;
     const observations = try observeConsumers(server, a, discovery.consumers.items, namespaces, input.wait, request);
@@ -1967,4 +1993,77 @@ test "resolver curation progress without wait selects retired owner proofs and n
     const progress = try observeReplayTargetsMode(&server, a, "source", &.{.{ .target = .{ .name = "retired", .config_generation = 7, .promote = true, .authority_table_id = 42 }, .revision = 9, .floor = null }}, null, .{}, true);
     try std.testing.expectEqual(@as(usize, 1), server.calls);
     try std.testing.expect(progress[0].applied);
+}
+
+test "resolver curation progress batches count and escaped wire bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const names = try a.alloc([]const u8, 10000);
+    for (names, 0..) |*name, i| name.* = try std.fmt.allocPrint(a, "resolver-{d}", .{i});
+    const batches = try progressNameBatches(a, names);
+    try std.testing.expectEqual(@as(usize, 3), batches.len);
+    var count: usize = 0;
+    for (batches) |batch| {
+        try std.testing.expect(batch.len <= 4096);
+        count += batch.len;
+    }
+    try std.testing.expectEqual(names.len, count);
+    const quoted: [1024]u8 = @splat('"');
+    @memset(names, &quoted);
+    const large = try progressNameBatches(a, names);
+    try std.testing.expect(large.len > batches.len);
+    count = 0;
+    for (large) |batch| {
+        const body = try std.json.Stringify.valueAlloc(a, .{ .operation = "progress", .resolver_names = batch }, .{});
+        try std.testing.expect(body.len <= 512 * 1024);
+        count += batch.len;
+    }
+    try std.testing.expectEqual(names.len, count);
+}
+
+test "resolver curation HTTP cold indexed declarations remain available before native head adoption" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var namespaces: std.StringArrayHashMapUnmanaged(curation.Namespace) = .empty;
+    var discovery: EntityDiscovery = .{ .a = a, .owner = a, .namespaces = &namespaces, .stored = .{}, .adoption_revision = 1, .standalone = true, .key = "concept/b", .observations = true, .aliases = true };
+    defer discovery.deinit();
+    try discovery.bindProfiles(.{ .native = true, .table_id = 1, .profiles_indexed = true });
+    const cfg: Config = .{ .name = "cold", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{_key}}", .admission_profile = "cold-profile", .aliases = &.{.{ .key = "concept/a", .target = "concept/b" }} };
+    try discovery.consume(a, "source", cfg);
+    try discovery.finish();
+    try std.testing.expectEqual(@as(usize, 1), discovery.profiles.items[0].aliases.len);
+    var next = namespaces.get(cfg.key_template).?;
+    next.merges = &.{.{ .key = "concept/b", .target = "concept/a" }};
+    try std.testing.expectError(error.InvalidResolverAliasCycle, native_authority.records.validateProfiles(a, next, discovery.profiles.items));
+}
+
+test "resolver curation progress merges all owner chunks above receiver name limit" {
+    const Server = struct {
+        calls: usize = 0,
+        pub fn executeResolverOperation(self: *@This(), a: std.mem.Allocator, _: []const u8, _: u64, body: []const u8, _: operation.RequestContext) ![]u8 {
+            self.calls += 1;
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const input = try std.json.parseFromSliceLeaky(struct { operation: []const u8, resolver_names: []const []const u8 }, scratch, body, .{});
+            if (input.resolver_names.len > 4096 or body.len > 512 * 1024) return error.InvalidResolverCurationRequest;
+            const rows = try scratch.alloc(curation.ProgressRow, input.resolver_names.len);
+            for (input.resolver_names, rows) |name, *row| row.* = .{ .name = name, .retired = true, .config_generation = 1, .effective_generation = 1, .curation_revision = 1, .backfill_pending = false, .resolution = .{}, .promotion = .{} };
+            return std.json.Stringify.valueAlloc(a, curation.ProgressReport{ .resolvers = rows }, .{});
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var server: Server = .{};
+    const targets = try a.alloc(ReplayRequirement, 10000);
+    for (targets, 0..) |*target, i| target.* = .{ .target = .{ .name = try std.fmt.allocPrint(a, "r-{d}", .{i}), .config_generation = 1, .promote = false }, .revision = 1, .floor = null };
+    var tables = [_]@import("../metadata/table_manager.zig").TableRecord{.{ .table_id = 1, .name = "source" }};
+    var ranges = [_]@import("../metadata/table_manager.zig").RangeRecord{.{ .range_id = 1, .table_id = 1, .group_id = 7, .start_key = "" }};
+    var snapshot: @import("../metadata/api.zig").AdminSnapshot = .{ .status = .{ .metadata_group_id = 0, .metrics = .{} }, .tables = &tables, .ranges = &ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+    const sample_state = try sampleForRequirements(&server, a, &snapshot, &tables[0], .{}, true, targets);
+    try std.testing.expectEqual(@as(usize, 3), server.calls);
+    for (targets) |target| try std.testing.expect((try sample_state.progressForReplay(a, target)).applied);
 }

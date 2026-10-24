@@ -24,6 +24,9 @@ const A = std.mem.Allocator;
 pub const marker = "_resolver_record_store";
 pub const owners_key = "_resolver_record_owners";
 pub const AliasProfile = records.AliasProfile;
+/// Private proof captured atomically with the physical table definition.
+/// It is never accepted from public table/index JSON or client actors.
+pub const Admission = struct { table_id: u64, name: []const u8, native: bool, schema: [32]u8 };
 pub const Read = struct {
     mode: enum { entity, proposal, proposals, receipt } = .entity,
     key: []const u8 = "",

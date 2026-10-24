@@ -1447,6 +1447,7 @@ pub const IndexManager = struct {
     test_resolver_lookup_builds: usize = 0,
     test_resolver_reservation_visits: usize = 0,
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
+    artifact_semantic_cache: @import("../artifact_inventory.zig").SemanticDigestCache = .{},
     /// Serialize local receipt counter preparation through its physical commit.
     /// Acquire after primary/graph/index guards; never acquire an index guard
     /// while holding this mutex. Provider execution happens before acquisition.
@@ -13379,6 +13380,19 @@ pub const IndexManager = struct {
         const slot = self.resolver_namespace_lookup.?.names.get(name) orelse return null;
         const cfg = if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index];
         return try resolver_catalog.ResolverAdmission.cloneConfig(alloc, cfg, namespace_owned);
+    }
+    /// Cold adoption/inspection reads only legacy curated state. Static
+    /// declarations come from the immutable profile directory independently.
+    pub fn resolverLegacyPolicyDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.ensureResolverLookup();
+        const slot = self.resolver_namespace_lookup.?.names.get(name) orelse return null;
+        const cfg = if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index];
+        var descriptor = resolver_catalog.ResolverAdmission.fromConfig(cfg, false);
+        descriptor.aliases = &.{};
+        descriptor.suppress_json = "";
+        return try ResolverConfig.clone(alloc, descriptor.config());
     }
     /// Indexed consumers need source clocks and suppression, not the complete
     /// alias universe. The physical static-profile directory supplies adjacency.

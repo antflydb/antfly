@@ -119,6 +119,7 @@ fn prepareStaticProfiles(root: *h.Handle, a: A, destination: *h.db_mod.DB, table
     var bridge: Bridge = .{ .txn = &read };
     const store = bridge.store(a, prefix);
     var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var cold_profiles: std.StringHashMapUnmanaged([]const @import("antfly_resolver").KeyAlias) = .empty;
     for (selected) |source| {
         const template = source.cfg.key_template;
         if ((try seen.getOrPut(a, template)).found_existing) continue;
@@ -127,9 +128,9 @@ fn prepareStaticProfiles(root: *h.Handle, a: A, destination: *h.db_mod.DB, table
             // Legacy adoption is one cold fold. Until it owns a native head,
             // source-owned redirects may connect any static declarations.
             for (selected) |*entry| if (std.mem.eql(u8, entry.cfg.key_template, template)) {
-                const cfg = try entry.db.core.index_manager.resolverAdmissionDescriptor(a, entry.cfg.name, true) orelse return error.ResolverCurationConflict;
-                if (cfg.effectiveGeneration() != entry.cfg.effectiveGeneration()) return error.ResolverCurationConflict;
-                entry.cfg.aliases = cfg.aliases;
+                const profile = try cold_profiles.getOrPut(a, entry.cfg.admission_profile);
+                if (!profile.found_existing) profile.value_ptr.* = try native.static_profiles.definitionAliases(a, &physical_read, try @import("../storage/lite/resolver_consumers.zig").profileRoot(a, table, template), entry.cfg.admission_profile);
+                entry.cfg.aliases = profile.value_ptr.*;
             };
             continue;
         }
@@ -201,7 +202,7 @@ fn prepareAdoption(a: A, destination: *h.db_mod.DB, selected: []const Consumer) 
         const identity = try source.db.core.index_manager.resolverAdmissionIdentity(a, source.cfg.name) orelse return error.ResolverCurationConflict;
         if (identity.effectiveGeneration() != source.cfg.effectiveGeneration() or identity.retired != source.cfg.retired or !std.mem.eql(u8, identity.table, source.cfg.table) or !std.mem.eql(u8, identity.key_template, source.cfg.key_template)) return error.ResolverCurationConflict;
         if (try store.head(source.cfg.key_template) != null) continue;
-        const cfg = try source.db.core.index_manager.resolverAdmissionDescriptor(a, source.cfg.name, false) orelse return error.ResolverCurationConflict;
+        const cfg = try source.db.core.index_manager.resolverLegacyPolicyDescriptor(a, source.cfg.name) orelse return error.ResolverCurationConflict;
         if (cfg.config_generation != source.cfg.config_generation or cfg.retired != source.cfg.retired or !std.mem.eql(u8, cfg.table, source.cfg.table) or !std.mem.eql(u8, cfg.key_template, source.cfg.key_template)) return error.ResolverCurationConflict;
         const profile = try json(a, .{ cfg.key_template, cfg.merges, cfg.curation_json, cfg.curation_revision });
         if ((try profiles.getOrPut(a, profile)).found_existing) continue;
@@ -236,7 +237,7 @@ fn inspectionScope(a: A, store: native.Store, selected: []const Consumer, source
     var builder: policy.NamespaceBuilder = .{ .template = source.cfg.key_template };
     for (selected) |consumer| {
         if (consumer.synthetic or !std.mem.eql(u8, consumer.cfg.key_template, source.cfg.key_template)) continue;
-        const cfg = try consumer.db.core.index_manager.resolverAdmissionDescriptor(a, consumer.cfg.name, false) orelse return error.ResolverCurationConflict;
+        const cfg = try consumer.db.core.index_manager.resolverLegacyPolicyDescriptor(a, consumer.cfg.name) orelse return error.ResolverCurationConflict;
         try builder.add(a, a, cfg);
     }
     const namespace = try builder.finish(a);
@@ -797,7 +798,7 @@ test "capi resolver curation indexed static profiles exclude seventeen thousand 
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_unmerge_json(handle, .fromSlice("entities"), .fromSlice("concept/seed"), .fromSlice("{\"pin_distinct\":true}"), &out));
     api.antfly_buffer_free(&out);
     try std.testing.expect(native.static_profiles.test_edge_visits.load(.monotonic) <= 8);
-    try std.testing.expectEqualStrings("16", try root.db.core.store.get(a, catalog.minimum_reader_key));
+    try std.testing.expectEqualStrings("17", try root.db.core.store.get(a, catalog.minimum_reader_key));
 }
 
 test "capi resolver curation static directory fences consumers enrolled after discovery" {

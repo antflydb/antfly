@@ -67,6 +67,8 @@ pub fn synchronize(a: A, txn: anytype, root: []const u8, before: []const Definit
         head.refs = if (delta > 0) try std.math.add(u64, head.refs, @intCast(delta)) else try std.math.sub(u64, head.refs, @intCast(-delta));
         if (head.refs == 0) try txn.delete(key) else try txn.put(key, try std.json.Stringify.valueAlloc(a, head, .{}));
         if ((prior == 0) == (head.refs == 0)) continue;
+        const definition_key = try std.fmt.allocPrint(a, "{s}definition/{s}", .{ root, id });
+        if (head.refs == 0) try txn.delete(definition_key) else try txn.put(definition_key, try std.json.Stringify.valueAlloc(a, definition, .{}));
         for (definition.aliases) |alias| {
             const out = try edgeKey(a, root, "out", alias.key, id, alias.key);
             const in = try edgeKey(a, root, "in", alias.target, id, alias.key);
@@ -81,6 +83,13 @@ pub fn synchronize(a: A, txn: anytype, root: []const u8, before: []const Definit
         }
     }
 }
+/// Only cold namespace adoption needs complete declarations. Warm reads use
+/// adjacency and never decode this separately stored immutable definition.
+pub fn definitionAliases(a: A, txn: anytype, root: []const u8, id: []const u8) ![]const resolver.KeyAlias {
+    const raw = try txn.get(try std.fmt.allocPrint(a, "{s}definition/{s}", .{ root, id }));
+    return (try std.json.parseFromSliceLeaky(Definition, a, raw, .{ .allocate = .alloc_always })).aliases;
+}
+
 pub const Reader = struct {
     a: A,
     backend: records.Backend,
