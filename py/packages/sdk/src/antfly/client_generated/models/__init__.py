@@ -2171,6 +2171,11 @@ from .runtime_decl_mode import RuntimeDeclMode
 from .runtime_resolver_suppression import RuntimeResolverSuppression
 from .saved_query_source import SavedQuerySource
 from .scan_keys_request import ScanKeysRequest
+from .scoped_linear_merge_page import ScopedLinearMergePage
+from .scoped_linear_merge_page_key_range import ScopedLinearMergePageKeyRange
+from .scoped_linear_merge_page_records import ScopedLinearMergePageRecords
+from .scoped_linear_merge_page_records_additional_property import ScopedLinearMergePageRecordsAdditionalProperty
+from .scoped_linear_merge_request import ScopedLinearMergeRequest
 from .scoped_row_filter import ScopedRowFilter
 from .scoped_row_filter_filter import ScopedRowFilterFilter
 from .score_decision_question import ScoreDecisionQuestion
@@ -4360,6 +4365,11 @@ __all__ = (
     "RuntimeResolverSuppression",
     "SavedQuerySource",
     "ScanKeysRequest",
+    "ScopedLinearMergePage",
+    "ScopedLinearMergePageKeyRange",
+    "ScopedLinearMergePageRecords",
+    "ScopedLinearMergePageRecordsAdditionalProperty",
+    "ScopedLinearMergeRequest",
     "ScopedRowFilter",
     "ScopedRowFilterFilter",
     "ScoreDecisionQuestion",

@@ -50058,6 +50058,73 @@ pub const ScanKeysRequest = struct {
     }
 };
 
+/// Merge within explicit exclusive key bounds. Records and retained IDs must be inside the range and after last_merged_id. Overlapping writers still require external serialization. Upsert pages normally set delete_missing=false. After a complete authoritative inventory has been written and verified, an empty-record page with retain_ids reconciles the entire bounded range without retransmitting document content.
+pub const ScopedLinearMergePage = struct {
+    key_range: std.json.Value,
+    records: std.json.ArrayHashMap(std.json.ArrayHashMap(std.json.Value)),
+    /// Valid only with empty records. Keep these already-written IDs while reconciling the bounded range. Missing retained records abort the request before any mutation. Use an empty list for an empty corpus.
+    retain_ids: ?[]const []const u8 = null,
+    /// Exclusive page cursor within key_range; defaults to key_range.from.
+    last_merged_id: ?[]const u8 = null,
+    /// Explicitly authorize deletion of records absent from this page or retain_ids.
+    delete_missing: ?bool = null,
+    dry_run: ?bool = null,
+    sync_level: ?SyncLevel = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "key_range", "key_range", false },
+        .{ "records", "records", false },
+        .{ "retain_ids", "retain_ids", true },
+        .{ "last_merged_id", "last_merged_id", true },
+        .{ "delete_missing", "delete_missing", true },
+        .{ "dry_run", "dry_run", true },
+        .{ "sync_level", "sync_level", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("key_range");
+        try jw.write(self.key_range);
+        try jw.objectField("records");
+        try jw.write(self.records);
+        if (self.retain_ids) |value| {
+            try jw.objectField("retain_ids");
+            try jw.write(value);
+        }
+        if (self.last_merged_id) |value| {
+            try jw.objectField("last_merged_id");
+            try jw.write(value);
+        }
+        if (self.delete_missing) |value| {
+            try jw.objectField("delete_missing");
+            try jw.write(value);
+        }
+        if (self.dry_run) |value| {
+            try jw.objectField("dry_run");
+            try jw.write(value);
+        }
+        if (self.sync_level) |value| {
+            try jw.objectField("sync_level");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Bounded LinearMerge v1 envelope. Legacy servers reject this envelope before mutation because it has no top-level records field. Never fall back to an unbounded merge when a server rejects this request.
+pub const ScopedLinearMergeRequest = struct {
+    scoped_merge: ScopedLinearMergePage,
+};
+
 pub const ScopedRowFilter = struct {
     table_target: CatalogTableScope,
     filter: std.json.ArrayHashMap(std.json.Value),
