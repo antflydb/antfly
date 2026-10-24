@@ -112,7 +112,8 @@ const builtin = @import("builtin");
 // Retirement cannot yield under its registry; SQL workspace preserves shared IO headroom.
 // Final status owns manifest admission, frozen append resources and retry-safe publication.
 // Close retains tentative durability grants and empty-status sync through admitted retirement.
-pub const abi_version: u32 = 108;
+// Close reclaims retired memory in original CPU quanta before persistence.
+pub const abi_version: u32 = 109;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

@@ -2479,6 +2479,55 @@ pub const Backend = struct {
         }
     };
 
+    /// Reclaim obsolete memory before close needs final persistence headroom.
+    /// Serving, producer and accounting admission must remain permanently
+    /// fenced. Only retired queues are consumed; live mutable/immutable data,
+    /// ledger roots and durable finalization obligations remain backend-owned.
+    /// The original finite execution is borrowed on each call, never retained.
+    pub const QuiescedClosePreparation = struct {
+        phase: enum { observe, memtables, ledgers, reconcile, done } = .observe,
+        before: QuiescedClosePreflight = .{},
+        after: QuiescedClosePreflight = .{},
+
+        pub fn resumeWithAdmission(self: *@This(), backend: *Backend, io: std.Io, original: read_admission.Port) !void {
+            try original.checkpoint();
+            if (self.before.backend) |bound| std.debug.assert(bound == backend);
+            while (self.phase != .done) {
+                try original.checkpoint();
+                switch (self.phase) {
+                    .observe => {
+                        // Establish the full retained charge before destroying
+                        // anything, including cold legacy snapshot accounting.
+                        try self.before.resumeWithAdmission(backend, io, original);
+                        if (backend.memtable_reclaimer == null and backend.retired_memory_head == null and backend.retired_ledger_snapshots == null) {
+                            // No physical ownership changed. Reuse the first
+                            // observation instead of scanning live state twice.
+                            self.after = self.before;
+                            self.phase = .done;
+                        } else self.phase = .memtables;
+                    },
+                    .memtables => {
+                        var credits: usize = 64;
+                        if (@import("lsm_backend/memtable_reclamation.zig").reclaimQuiescedStep(backend, &credits)) self.phase = .ledgers;
+                    },
+                    .ledgers => {
+                        var credits: usize = 64;
+                        if (@import("lsm_backend/ledger_reclamation.zig").reclaimQuiescedStep(backend, &credits)) self.phase = .reconcile;
+                    },
+                    .reconcile => {
+                        // Shared allocation accounts may still be referenced
+                        // by live generations. Reobserve once in bounded CPU
+                        // slices; never subtract a whole retired generation or
+                        // rescan the backend after every destructor quantum.
+                        try self.after.resumeWithAdmission(backend, io, original);
+                        self.phase = .done;
+                    },
+                    .done => unreachable,
+                }
+            }
+        }
+    };
+
     /// Own construction credit and a bounded mutable successor through WAL
     /// publication and old-state retirement. The backend, its observed usage
     /// identity and every unrelated account mutation must remain quiesced and
@@ -30552,4 +30601,232 @@ test "controlled physical sync tentative WAL grants survive publication races an
         try std.testing.expectEqual(@as(u64, 0), backend.write_stats.wal_append_records);
         try std.testing.expect(!backend.manifest_recovery_required);
     };
+}
+
+test "controlled physical sync close preparation reclaims retired memory under original CPU without early refund" {
+    const cpu = @import("../common/runnable_scheduler.zig");
+    const ledger_mod = @import("lsm_backend/ledger_reclamation.zig");
+    const Control = struct {
+        backend: *Backend,
+        preparation: *Backend.QuiescedClosePreparation,
+        cleanup: *cpu.Execution,
+        slots: *cpu.Scheduler,
+        calls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        failure: anyerror,
+        progress_turns: usize = 0,
+        apply_pressure: bool = false,
+        pressure_checked: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.cleanup.checkLifetime();
+            try std.testing.expectEqual(cpu.State.running, self.slots.state(&self.cleanup.entry.?));
+            try std.testing.expect(self.backend.mu.tryLock());
+            self.backend.mu.unlock();
+            if (self.preparation.phase == .memtables or self.preparation.phase == .ledgers) {
+                // Physical frees never refund shared allocations piecemeal.
+                try std.testing.expectEqual(self.preparation.before.bytes, self.backend.tracked_in_memory_state_bytes);
+                if (self.apply_pressure and !self.pressure_checked) {
+                    const manager = self.backend.options.resource_manager.?;
+                    manager.memory.budget.hard_limit_bytes = manager.snapshot().memory.used_bytes;
+                    try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserve(.lsm_wal_write_working_set, 1));
+                    self.pressure_checked = true;
+                }
+                try self.cleanup.park(.resource_blocked);
+                var control: cpu.Execution = .{};
+                defer control.finish();
+                try control.start(self.slots, .{ .io = std.testing.io, .native_now_ns = platform.time.monotonicNs }, .control);
+                self.progress_turns += 1;
+                control.finish();
+                try self.cleanup.enter(.write);
+            }
+            const call = self.calls;
+            self.calls += 1;
+            if (call == self.fail_at) return self.failure;
+        }
+        fn lifetime(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.cleanup.checkLifetime();
+        }
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(_: *anyopaque) !void {
+            return error.TestUnexpectedWait;
+        }
+        fn end(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var count: usize = 0;
+    var offset: usize = 0;
+    while (offset <= count) : (offset += 1) {
+        for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.FileNotFound }) |failure| {
+            var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+            defer manager.deinit(a);
+            var failing = std.testing.FailingAllocator.init(a, .{});
+            const allocator = failing.allocator();
+            var backend = Backend.init(allocator, .{ .resource_manager = &manager, .wal_enabled = false });
+            defer backend.close();
+            for (0..96) |i| {
+                var key: [8]u8 = undefined;
+                std.mem.writeInt(u64, &key, i, .big);
+                try backend.mutable.upsert(allocator, .{}, &key, "live", false);
+            }
+            for (0..3) |kind| {
+                const retired = try allocator.create(State);
+                retired.* = switch (kind) {
+                    0 => try backend.mutable.snapshot(allocator),
+                    1 => try backend.mutable.clone(allocator),
+                    else => try backend.mutable.cloneArena(allocator),
+                };
+                retired.freezeMemoryAccounting();
+                @import("lsm_backend/memtable_reclamation.zig").retire(&backend, retired);
+            }
+            const cached = try backend.snapshotMutableState();
+            backend.releaseMutableReadSnapshot(cached);
+            // Preserve a live ledger root shared by one retired snapshot and
+            // an old-only root owned solely by another retired snapshot.
+            var old: repository_mod.ObsoleteLedger = .empty;
+            defer old.deinit(allocator);
+            for (0..96) |i| {
+                const path = try std.fmt.allocPrint(allocator, "live-{d}", .{i});
+                try backend.obsolete_paths.append(allocator, .{ .path = path, .delete_after_ns = 0 });
+                const retired_path = try std.fmt.allocPrint(allocator, "old-{d}", .{i});
+                try old.append(allocator, .{ .path = retired_path, .delete_after_ns = 0 });
+            }
+            const active = try ledger_mod.Snapshot.capture(&backend, &backend.obsolete_paths);
+            defer active.retire(&backend);
+            const shared = try ledger_mod.Snapshot.capture(&backend, &backend.obsolete_paths);
+            shared.retire(&backend);
+            const unique = try ledger_mod.Snapshot.capture(&backend, &old);
+            unique.retire(&backend);
+            old.deinit(allocator);
+            var slots = try cpu.Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 });
+            defer slots.close();
+            var cleanup: cpu.Execution = .{};
+            defer cleanup.finish();
+            try cleanup.reserveCleanupRoot(&slots, .{ .io = std.testing.io, .native_now_ns = platform.time.monotonicNs, .allow_wait = true }, 10 * std.time.ns_per_s);
+            try cleanup.activateCleanup();
+            // Ordinary work holds its only slot throughout every destructor
+            // quantum; the cleanup owner can still yield to reserved control.
+            var query: cpu.Execution = .{};
+            defer query.finish();
+            try query.start(&slots, .{ .io = std.testing.io, .native_now_ns = platform.time.monotonicNs }, .query);
+            var preparation: Backend.QuiescedClosePreparation = .{};
+            var control: Control = .{ .backend = &backend, .preparation = &preparation, .cleanup = &cleanup, .slots = &slots, .failure = failure, .apply_pressure = offset == 0 };
+            const payload: read_admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+            const original = read_admission.Port.init(&payload);
+            if (offset != 0) control.fail_at = offset - 1;
+            const allocs = failing.alloc_index;
+            failing.fail_index = allocs;
+            preparation.resumeWithAdmission(&backend, std.testing.io, original) catch |cause| {
+                try std.testing.expectEqual(failure, cause);
+                // The same backend queues/partial destructors survive retry;
+                // the caller never constructs replacement retirement owners.
+                control.fail_at = std.math.maxInt(usize);
+                try preparation.resumeWithAdmission(&backend, std.testing.io, original);
+            };
+            failing.fail_index = std.math.maxInt(usize);
+            if (offset == 0) count = control.calls;
+            try std.testing.expectEqual(allocs, failing.alloc_index);
+            try std.testing.expect(preparation.phase == .done);
+            try std.testing.expect(control.progress_turns > 4);
+            try std.testing.expect(backend.retired_memory_head == null and backend.retired_memory_tail == null and backend.memtable_reclaimer == null);
+            try std.testing.expectEqual(@as(usize, 0), backend.memtable_reclaim_pending);
+            try std.testing.expect(backend.ledger_snapshots == active and backend.retired_ledger_snapshots == null and backend.retired_ledger_tail == null);
+            try std.testing.expect(!active.retired and active.active_next == null and active.active_previous == null);
+            try std.testing.expectEqual(@as(usize, 96), active.value.count());
+            try std.testing.expect(preparation.after.bytes < preparation.before.bytes);
+            try std.testing.expectEqual(backend.estimateInMemoryStateBytesLocked(), backend.tracked_in_memory_state_bytes);
+            try std.testing.expectEqual(preparation.after.bytes, backend.tracked_in_memory_state_bytes);
+            try std.testing.expectEqual(@as(usize, 96), backend.obsolete_paths.count());
+            try std.testing.expectEqualStrings("live", try backend.mutable.get(.{}, &@as([8]u8, @splat(0))));
+            try std.testing.expectEqual(cpu.State.running, slots.state(&query.entry.?));
+            if (control.apply_pressure) {
+                try std.testing.expect(control.pressure_checked);
+                // The aggregate ceiling has not increased: only physical
+                // reclamation and reconciliation permit fresh WAL capacity.
+                var completion = try manager.reserve(.lsm_wal_write_working_set, 64);
+                completion.release();
+            }
+            try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+        }
+    }
+    try std.testing.expect(count > 20);
+}
+
+test "controlled physical sync interrupted close reclamation retains legacy destruction ownership" {
+    const Phase = enum { memtables, ledgers, reconcile };
+    const Control = struct {
+        backend: *Backend,
+        preparation: *Backend.QuiescedClosePreparation,
+        phase: Phase,
+        rejected: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const ready = switch (self.phase) {
+                .memtables => self.preparation.phase == .memtables and self.backend.memtable_reclaimer != null,
+                .ledgers => self.preparation.phase == .ledgers and self.backend.ledger_reclaim_slices != 0,
+                .reconcile => self.preparation.phase == .reconcile,
+            };
+            if (ready) {
+                self.rejected = true;
+                return error.Canceled;
+            }
+        }
+        fn lifetime(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(_: *anyopaque) !void {
+            return error.TestUnexpectedWait;
+        }
+        fn end(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    for (std.enums.values(Phase)) |phase| {
+        var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+        defer manager.deinit(a);
+        var failing = std.testing.FailingAllocator.init(a, .{});
+        const allocator = failing.allocator();
+        var backend = Backend.init(allocator, .{ .resource_manager = &manager, .wal_enabled = false });
+        var live = true;
+        defer if (live) backend.close();
+        for (0..96) |i| {
+            var key: [8]u8 = undefined;
+            std.mem.writeInt(u64, &key, i, .big);
+            try backend.mutable.upsert(allocator, .{}, &key, "live", false);
+        }
+        const retired = try allocator.create(State);
+        retired.* = try backend.mutable.clone(allocator);
+        retired.freezeMemoryAccounting();
+        @import("lsm_backend/memtable_reclamation.zig").retire(&backend, retired);
+        var ledger: repository_mod.ObsoleteLedger = .empty;
+        defer ledger.deinit(allocator);
+        for (0..96) |i| {
+            const path = try std.fmt.allocPrint(allocator, "old-{d}", .{i});
+            try ledger.append(allocator, .{ .path = path, .delete_after_ns = 0 });
+        }
+        const snapshot = try @import("lsm_backend/ledger_reclamation.zig").Snapshot.capture(&backend, &ledger);
+        snapshot.retire(&backend);
+        ledger.deinit(allocator);
+        var preparation: Backend.QuiescedClosePreparation = .{};
+        var control: Control = .{ .backend = &backend, .preparation = &preparation, .phase = phase };
+        const payload: read_admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+        const original = read_admission.Port.init(&payload);
+        failing.fail_index = failing.alloc_index;
+        try std.testing.expectError(error.Canceled, preparation.resumeWithAdmission(&backend, std.testing.io, original));
+        try std.testing.expect(control.rejected);
+        try std.testing.expectEqual(preparation.before.bytes, backend.tracked_in_memory_state_bytes);
+        if (phase == .reconcile) {
+            try std.testing.expect(backend.memtable_reclaimer == null and backend.retired_memory_head == null and backend.retired_ledger_snapshots == null);
+        }
+        // Explicit legacy teardown must finish the same partial destructors;
+        // it has no admission callback and cannot allocate replacement owners.
+        backend.close();
+        live = false;
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_in_memory_state).used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }

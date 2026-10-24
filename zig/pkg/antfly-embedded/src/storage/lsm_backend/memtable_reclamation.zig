@@ -103,6 +103,35 @@ pub fn reclaimSliceLocked(backend: anytype) void {
     backend.syncTrackedInMemoryStateUsageCurrentLocked();
 }
 
+/// Exclusive close has fenced every producer, reader and accounting mutation.
+/// The backend retains the queue and partial destructor across rejection. This
+/// performs no observer scan or refund: close reconciles after physical release.
+pub fn reclaimQuiescedStep(backend: anytype, credits: *usize) bool {
+    std.debug.assert(backend.active_readers == 0 and !backend.memtable_reclaim_in_flight);
+    const started = runtime.workNowNs(backend);
+    const before = credits.*;
+    while (credits.* != 0) {
+        if (backend.memtable_reclaimer == null) {
+            const state = backend.retired_memory_head orelse break;
+            credits.* -= 1;
+            backend.retired_memory_head = state.retired_next;
+            if (backend.retired_memory_head == null) backend.retired_memory_tail = null;
+            backend.memtable_reclaimer = .init(state);
+        }
+        if (credits.* == 0) break;
+        // Reserve a unit for fixed header/account retirement before stepping.
+        credits.* -= 1;
+        if (!backend.memtable_reclaimer.?.reclaimer.step(backend.allocator, credits)) break;
+        backend.memtable_reclaimer.?.finish(backend.allocator);
+        backend.memtable_reclaimer = null;
+        backend.memtable_reclaim_pending -= 1;
+    }
+    backend.memtable_reclaim_slices +|= 1;
+    backend.memtable_reclaim_units +|= before - credits.*;
+    backend.memtable_reclaim_max_slice_ns = @max(backend.memtable_reclaim_max_slice_ns, runtime.workNowNs(backend) -| started);
+    return backend.memtable_reclaimer == null and backend.retired_memory_head == null;
+}
+
 /// All external owners have stopped. Drain through the same bounded primitive
 /// before destroying allocator, accounting, and storage dependencies.
 pub fn drain(backend: anytype) void {

@@ -54,7 +54,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Retirement cannot yield under its registry; SQL workspace preserves shared IO headroom.
 // Final status owns manifest admission, frozen append resources and retry-safe publication.
 // Close retains tentative durability grants and empty-status sync through admitted retirement.
-pub const abi_version: u32 = 168;
+// Close reclaims retired memory in original CPU quanta before persistence.
+pub const abi_version: u32 = 169;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

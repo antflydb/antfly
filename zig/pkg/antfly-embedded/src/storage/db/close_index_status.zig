@@ -55,7 +55,7 @@ pub const Program = struct {
     const Row = state.OwnedEntry;
     const Chunk = struct { next: ?*Chunk = null, used: usize = 0, rows: [32]Row = undefined };
     busy: std.atomic.Value(bool) = .init(false),
-    store_preflight: Backend.QuiescedClosePreflight = .{},
+    store_preflight: Backend.QuiescedClosePreparation = .{},
     mutable_publication: ?Backend.QuiescedMutablePublication = null,
     manifest_preparation: Backend.QuiescedCommitPreparation = .{},
     manifest_ticket: ?Backend.CommitAdmission = null,

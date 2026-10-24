@@ -109,6 +109,32 @@ pub fn reclaimSliceLocked(backend: anytype) void {
     backend.syncTrackedInMemoryStateUsageCurrentLocked();
 }
 
+/// Exclusive close retains accounting until the entire physical queue retires.
+/// No backend mutex, filesystem work, allocation or unbounded observer belongs
+/// to this credit-bounded quantum. Partial snapshots stay in their owning lists.
+pub fn reclaimQuiescedStep(backend: anytype, credits: *usize) bool {
+    std.debug.assert(backend.active_readers == 0 and !backend.ledger_reclaim_in_flight);
+    const started = runtime.workNowNs(backend);
+    const before = credits.*;
+    while (credits.* != 0) {
+        const pending = backend.retired_ledger_snapshots orelse break;
+        // Fixed list/header retirement must fit even when the tree spends all
+        // remaining credits. The destructor itself is retained on rejection.
+        credits.* -= 1;
+        if (!pending.reclaimer.?.step(backend.allocator, credits)) break;
+        backend.retired_ledger_snapshots = pending.retired_next;
+        if (pending.retired_next == null) backend.retired_ledger_tail = null;
+        if (pending.active_previous) |previous| previous.active_next = pending.active_next else backend.ledger_snapshots = pending.active_next;
+        if (pending.active_next) |next| next.active_previous = pending.active_previous;
+        if (pending.account) |account| account.release();
+        backend.allocator.destroy(pending);
+    }
+    backend.ledger_reclaim_slices +|= 1;
+    backend.ledger_reclaim_units +|= before - credits.*;
+    backend.ledger_reclaim_max_slice_ns = @max(backend.ledger_reclaim_max_slice_ns, runtime.workNowNs(backend) -| started);
+    return backend.retired_ledger_snapshots == null;
+}
+
 const Slice = struct { done: bool, units: usize, ns: u64 };
 
 fn step(backend: anytype, reclaimer: *Ledger.Reclaimer, limit: usize, deadline: u64) Slice {

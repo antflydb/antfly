@@ -25305,3 +25305,55 @@ physical retirement; the existing backend's early accounting release is not
 proof of that funding. Completion/history relief under overload, remaining
 provider/legacy-generation adoption and default-gate evidence also remain open.
 Full GNU qualification remains waived and the full design is incomplete.
+
+### Retired-memory relief before final persistence
+
+Controlled close now owns a preparation phase before status WAL publication or
+legacy fallback persistence. It first detaches the cached mutable snapshot and
+establishes the full existing accounting baseline. It then drains backend-owned
+retired memtable and ledger-snapshot queues in 64-credit CPU quanta, checkpointing
+the original finite cleanup execution between quanta. No allocation, filesystem
+operation, backend mutex or unbounded accounting scan occurs inside reclamation.
+Partial destructors remain in the backend's existing queues for retry or explicit
+legacy physical teardown; no detached task retains an admission borrow.
+
+A retired generation can share allocation accounts with live mutable, immutable
+or ledger roots. Its nominal size is therefore never refunded on detachment or
+per-quantum destruction. After physical queues finish, one fresh bounded observer
+pass reconciles actual remaining ownership. Original checkpoint or ledger refusal
+keeps the old charge reachable until that pass completes. The observer is not
+restarted after every destructor quantum. If no retired queue exists, the
+first observation is reused without a second scan. Live data, active ledger
+roots and filesystem finalization obligations remain owned by the backend.
+
+The default DB close program uses this phase for both owning WAL publication and
+fallback preflight. Native ABI 109 and storage-owner ABI 169 fence the expanded
+retained close state. This provides actual retired-memory headroom before final
+persistence; it does not authorize early release of the backend's live charge.
+
+Qualification receipts in the cumulative integration directory:
+
+- `owned-close-relief-v1` preserves an incorrect scheduler-module import in the
+  initial test fixture; the error-identity suites passed.
+- `owned-close-relief-v2` passes the original reclamation and interruption matrix.
+- `owned-close-relief-v3` passes 73/73 build steps, 39 physical-IO cases, 32
+  embedded close cases, 18 host/ABI cases and 45/1/8 error-identity cases, with
+  unchanged native inputs. Formatting and whitespace checks pass. Logs, hashes
+  and changed-source snapshots remain preserved.
+
+The new matrix enumerates every original checkpoint rejection for cancellation,
+deadline and FileNotFound. It checks tree, flat and arena snapshots, retired
+roots shared with live data, live ledger-snapshot preservation, no new backend
+allocations and reserved-control progress while ordinary capacity is occupied.
+An aggregate ceiling refuses fresh WAL capacity before physical release and
+admits it after reconciliation without raising the ceiling. Explicit legacy
+teardown finishes interrupted memtable/ledger destructors or pending accounting
+reconciliation without replacing owners or leaking allocations. Existing native
+close and durable WAL retry/reopen cases remain green.
+
+Full admitted run encoding, physical file publication, deferred finalization and
+final backend teardown still require funded completion and retained phase
+ownership. Broader
+completion/history relief, remaining provider/legacy-generation adoption and
+default-gate evidence remain open. Full GNU qualification remains waived; the
+full goal is incomplete.
