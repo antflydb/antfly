@@ -1894,6 +1894,11 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.exportSystemCatalog(a, group_id) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .catalog_export_standalone_portable => {
+                    if (group_id != @import("antfly_local_sources").common_group_ids.main_metadata_group_id) break :blk .invalid_argument;
+                    const value = handle.store.exportStandalonePortableCatalog(a) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .catalog_list_tables => |input| {
                     const value = handle.store.listSystemCatalogTables(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
