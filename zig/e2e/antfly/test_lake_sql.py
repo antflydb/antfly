@@ -1257,7 +1257,9 @@ def test_native_remote_ordered_index_exact_bounds_and_restart(tmp_path, covering
                     damaged[start:end] = b"\xff" * (end - start)
             server.pause()
             object_path.write_bytes(header + damaged)
-            os.utime(object_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            os.utime(
+                object_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns)
+            )
             for cached in list(server.root.rglob("lake-ranges")):
                 if cached.is_dir():
                     shutil.rmtree(cached)
