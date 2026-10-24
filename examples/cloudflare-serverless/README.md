@@ -24,8 +24,8 @@ npm test
 npm run test:workerd
 ```
 
-`build` compiles `zig build serverless-wasm` and instruments its single
-asynchronous object-store import with Binaryen 132 Asyncify. The npm Binaryen
+`build` compiles `zig build serverless-wasm` and instruments its asynchronous
+object-store and typed inference imports with Binaryen 132 Asyncify. The npm Binaryen
 implementation can take several minutes. Set `ANTFLY_WASM_OPT` to a native
 Binaryen 132 `wasm-opt` for faster packaging. Use a trusted release and verify
 its published checksum. `dist` includes the module and license notices.
@@ -107,6 +107,7 @@ WAL durability; index publication occurs separately.
 | `search` | additionally `fresh:true`, scalar `filters`, or `required_visibility` | Merges published text candidates with recent mutations before limiting; suppresses stale hits and admits newly matching documents. Returns observed `visibility`. |
 | `count` | optional `required_visibility` | Exact current document count as a decimal string, including unique recent updates and tombstones. Filtered counts are not supported. |
 | `status` | none | Accepted visibility token, published watermark, and published pending-embedding count. |
+| `compact` | none | Run the existing native compactor on the published head, subject to deployment admission limits; unpublished WAL remains separate. |
 | `collect` | optional `job_id` | Runs one durable GC step; returns phase, job ID, continuation and any grace-period delay. |
 | `enrich` | none | Runs a configured native embedding batch with source validation and durable progress. |
 | `publish` | none | Runs one fenced publication prefix. Returns decimal-string `version`, `wal_end_lsn`, and `has_more`. The next invocation resumes from the committed watermark. |
@@ -152,10 +153,24 @@ this admitted profile.
   entries. The isolate's remaining memory must also accommodate JS, R2 streams,
   copied buffers, and assets. The linear-memory cap is not a measurement of
   total isolate usage.
+- Lanes are recycled between requests once their linear-memory high watermark
+  reaches 24 MiB. `WASM_RECYCLE_BYTES` can lower that threshold to 4 MiB. This
+  releases the instance reference for GC while keeping durable state and the
+  bounded immutable JS cache. An invocation can still exhaust its 32 MiB cap;
+  Queue retry then uses a fresh instance. Recycling does not extend a request's
+  live allocation allowance or establish total isolate memory usage.
+- Full-runtime requests use the native working-set allocator with a 20 MiB default
+  limit on live requested allocations. `WORKING_SET_BYTES` can lower it to at
+  least 4,096 bytes; the runtime rejects values above 20 MiB. Exhaustion returns
+  `HostedWorkingSetBudgetExceeded`. Allocator padding, ABI transfer buffers,
+  envelope parsing/result handoff, the suspension stack, and JS memory are
+  outside this counter and remain
+  subject to the separate WASM and transport caps.
 - Request JSON: 1 MiB. Storage operation count: 1,024. Aggregate object header,
   upload, and download traffic: 32 MiB. Host deadline: 30 seconds, checked at
   I/O and native cancellation checkpoints.
-- An object upload is at most 1 MiB and a single read at most 8 MiB. A larger
+- An object upload defaults to at most 4 MiB; `OBJECT_MAX_PUT_BYTES` can set a
+  ceiling up to 8 MiB. A single read is at most 8 MiB. A larger
   serving artifact requires a different admitted workload or transport budget;
   the host returns an error instead of buffering without a bound.
 - WAL batches: at most 1,024 records/8 MiB (the HTTP envelope is tighter).
@@ -168,6 +183,19 @@ this admitted profile.
   prefix, so eviction does not reset tuning. These input bounds do not promise that every
   possible index build fits Workers CPU or memory; large workloads fail and
   need a different maintenance profile.
+
+`compact` calls the existing native `Compactor`, with host I/O, its existing
+work lease, and guarded publication. `COMPACTION_MAX_DOCUMENTS` defaults to
+1,000 and `COMPACTION_MAX_ARTIFACT_BYTES` to 4 MiB of manifest-declared artifacts.
+These coarse preflight bounds supplement the allocation and transport limits;
+they do not bound every transitive body read. Exceeding them returns
+`CompactionBudgetExceeded`. An unpublished empty database is a no-op. Set
+`AUTO_COMPACT="true"` to dispatch a compaction Queue job hourly. Whole-pass
+retries are safe, but a flat-index rebuild has no intra-build checkpoint; making
+the WAL input batch smaller does not make every full rebuild fit.
+
+The [native reuse audit](../../docs/design/cloudflare-native-audit.md) identifies
+which parts already exist and the actual remaining execution boundaries.
 
 Publication and immutable content reuse come from the native engine. The
 portable indexed WAL copies only affected tree paths, and indexed tail reads
@@ -225,10 +253,15 @@ which batches bounded chunk windows through the provider, captures a finite
 pending cycle, persists progress, and conditionally
 appends derived mutations only while its source WAL boundary is still current.
 The next publication makes those vectors searchable. Model failures never
-substitute deterministic vectors. Each invocation admits four documents and
-at most eight host inference calls. Each model batch admits at most 64 chunks
-and a conservative dimension-dependent vector-output budget. Larger documents
-fail clearly and remain pending; they need a different admitted chunking profile.
+substitute deterministic vectors. Each invocation defaults to one document and
+at most eight host inference calls. `ENRICHMENT_DOCUMENTS` may admit 1–4 documents
+when their combined calls fit that allowance. Each provider window admits at
+most 64 chunks and a conservative dimension-dependent vector-output budget;
+the adapter splits a document across at most eight windows. Failed windows
+publish no partial embedding set. Retry recomputes the document under native
+source validation. Larger documents fail clearly and remain pending; they need
+a different admitted chunking profile. Derived WAL records must also fit the
+existing page-tree record bound.
 The coordinator fixes the embedding model and dimensions for the physical
 incarnation, preventing accidental reuse of vectors after a provider change.
 Changing that profile requires a new incarnation or an explicit migration.
@@ -261,7 +294,7 @@ its R2 bucket and two Queues, install the token with Wrangler, then run
 `qualification/snapshot.mjs RUN_JSON` to seal a self-contained, validated bundle.
 Deploy that configuration and run `qualification/run.mjs RUN_JSON HTTPS_ORIGIN`.
 It exercises real R2/DO/Queue durability, concurrent writers, publication,
-collection, and a Workers AI embedding through Gateway, and saves latencies
+native compaction, collection, and a Workers AI embedding through Gateway, and saves latencies
 and deployment version IDs. It performs real billable service operations.
 
 The qualification wrapper alone has a token-protected drain route, restricted
@@ -270,3 +303,33 @@ before `run.mjs ... --drain`; then delete the generated Worker, Queues, and empt
 bucket. Production `worker.mjs` has no drain route. Reports contain no API token.
 A successful fixture and absence of resource-limit errors do not measure total
 isolate memory or establish all-workload production qualification.
+For a fresh incarnation with `EMBEDDING_MODEL` and `EMBEDDING_DIMENSIONS`
+configured, `run.mjs RUN_JSON HTTPS_ORIGIN --enrichment --windows` validates a
+48-chunk document across provider windows, native compaction, and fenced vector
+search. Use a separate incarnation to avoid embedding the larger durability
+fixture as part of this small model test.
+
+For local capacity characterization after building, run:
+
+```sh
+node qualification/benchmark.mjs --sizes=100,1000,5000
+```
+
+This exercises actual native WASM publication, cold/warm reads, and compaction
+over the in-process R2 contract fixture. It writes memory/object counts and
+explicit admission failures to ignored `dist/qualification/local-capacity.json`.
+It does not measure deployed R2 latency or total isolate memory.
+Defaults match the host's 4 MiB upload cap, 16-record publication prefix,
+24 MiB recycling threshold, and 1,000-document compaction preflight. Override
+`--max-put-bytes`, `--publication-records`, `--recycle-at-bytes`, and
+`--compaction-documents` to compare admitted profiles. For example, the measured
+5,000-document compaction case uses `--compaction-documents=5000`; the default
+host still rejects that compaction unless configured for it.
+
+Set `LOG_METRICS="true"` to emit numeric structured `antfly.operation` logs for
+runtime operations. Samples include outcome, operations, inference calls,
+transferred bytes, elapsed/I/O-wait time, working allocation peak, retained
+cache charge, and per-lane/combined WASM linear-memory size. Linear memory is
+an instance high watermark and may stay large after allocations are freed.
+These logs exclude document bodies, API tokens, and model inputs. Metrics
+observer failures do not change a durable write's outcome.

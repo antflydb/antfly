@@ -23,7 +23,28 @@ pub const Dense = struct {
         return @constCast(vectors[0]);
     }
     pub fn batch(_: *anyopaque, a: std.mem.Allocator, _: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
-        if (dims == 0 or dims > 1536 or texts.len == 0 or texts.len > @min(64, (256 * 1024) / (@as(usize, dims) * 16))) return error.HostedEmbeddingBatchExceeded;
+        if (dims == 0 or dims > 1536 or texts.len == 0) return error.HostedEmbeddingBatchExceeded;
+        const window: usize = @min(64, (256 * 1024) / (@as(usize, dims) * 16));
+        // The invocation's existing eight-call allowance bounds the complete
+        // document. Split provider responses without changing native progress
+        // or publishing any partially embedded document.
+        if (texts.len > window * 8) return error.HostedEmbeddingBatchExceeded;
+        const vectors = try a.alloc([]const f32, texts.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (vectors[0..initialized]) |vector| a.free(vector);
+            a.free(vectors);
+        }
+        while (initialized < texts.len) {
+            const end = @min(texts.len, initialized + window);
+            const part = try batchWindow(a, texts[initialized..end], dims);
+            defer a.free(part);
+            @memcpy(vectors[initialized..end], part);
+            initialized = end;
+        }
+        return vectors;
+    }
+    fn batchWindow(a: std.mem.Allocator, texts: []const []const u8, dims: u32) ![]const []const f32 {
         const request = try std.json.Stringify.valueAlloc(a, .{ .task = "embedding", .texts = texts, .dimensions = dims }, .{});
         defer a.free(request);
         var reply: Reply = .{};

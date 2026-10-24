@@ -26,14 +26,16 @@ extern "antfly_host" fn object_call(request_ptr: [*]const u8, request_len: usize
 
 pub const Host = struct {
     alloc: A,
-    /// All transferred buffers must be allocated with this allocator. A host
-    /// supplies one serialized lane per instance; callers may use a bounded pool.
+    /// The ABI allocator can differ from a request's bounded working allocator.
+    /// Null preserves the contract for hosts that transfer through `alloc`.
+    transfer_allocator: ?A = null,
     pub fn client(self: *@This()) Client {
         return .{ .allocator = self.alloc, .ptr = self, .vtable = &vtable };
     }
 
     const Response = struct {
         alloc: A,
+        parse_alloc: A,
         json: []u8,
         body: []u8,
         fn deinit(self: *@This()) void {
@@ -41,7 +43,7 @@ pub const Host = struct {
             self.alloc.free(self.body);
         }
         fn parse(self: *@This(), comptime T: type) !std.json.Parsed(T) {
-            return std.json.parseFromSlice(T, self.alloc, self.json, .{ .ignore_unknown_fields = true });
+            return std.json.parseFromSlice(T, self.parse_alloc, self.json, .{ .ignore_unknown_fields = true });
         }
     };
     fn call(self: *@This(), request: anytype, body: []const u8) !Response {
@@ -50,7 +52,8 @@ pub const Host = struct {
         var reply: Reply = .{};
         const status = object_call(encoded.ptr, encoded.len, body.ptr, body.len, &reply);
         var response = Response{
-            .alloc = self.alloc,
+            .alloc = self.transfer_allocator orelse self.alloc,
+            .parse_alloc = self.alloc,
             .json = if (reply.json_len == 0) &.{} else @as([*]u8, @ptrFromInt(reply.json_ptr))[0..reply.json_len],
             .body = if (reply.body_len == 0) &.{} else @as([*]u8, @ptrFromInt(reply.body_ptr))[0..reply.body_len],
         };

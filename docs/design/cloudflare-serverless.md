@@ -146,7 +146,9 @@ across complete runtime restarts. CI runs these in the WASM qualification job.
 
 These tests establish local protocol behavior. A disposable deployed fixture
 also passed; see the [measurements and limits](cloudflare-qualification.md).
-The current Wrangler dry-run bundle is about 3.7 MiB uncompressed / 1.1 MiB
+The [native reuse audit](cloudflare-native-audit.md) records subsequent adapter
+changes, larger local workloads, native compaction, and live windowed enrichment.
+The current Wrangler dry-run bundle is about 4.0 MiB uncompressed / 1.2 MiB
 gzip; sizes vary with the toolchain. The interactive and maintenance instances each cap WASM memory at 32 MiB
 and share an 8 MiB immutable JS cache. Total isolate memory, startup, CPU,
 real R2 throttling, broad deployment failure injection, and sustained

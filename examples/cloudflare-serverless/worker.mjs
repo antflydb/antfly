@@ -25,13 +25,17 @@ const busy = {interactive: false, maintenance: false};
 const cache = createImmutableReadCache();
 class Busy extends Error {}
 async function run(env, input, signal, collection) {
-  const role = ["publish", "enrich", "gc_prepare", "gc_trace", "gc_wal"].includes(input.op) ? "maintenance" : "interactive";
+  const role = ["publish", "compact", "enrich", "gc_prepare", "gc_trace", "gc_wal"].includes(input.op) ? "maintenance" : "interactive";
   if (busy[role]) throw new Busy("database is busy");
   busy[role] = true;
   let lane = lanes[role];
+  let recycleAtBytes = 24 * 1024 * 1024;
   try {
+    const configuredRecycle = Number(env.WASM_RECYCLE_BYTES ?? recycleAtBytes);
+    if (!Number.isSafeInteger(configuredRecycle) || configuredRecycle < 4 * 1024 * 1024 || configuredRecycle > recycleAtBytes) throw new Error("InvalidHostedRecycleBudget");
+    recycleAtBytes = configuredRecycle;
     if (!env.ANTFLY_INCARNATION) throw new Error("database incarnation is not configured");
-    if (env.EMBEDDING_MODEL && (["publish", "enrich"].includes(input.op) || (input.op === "search" && input.mode && input.mode !== "text"))) {
+    if (env.EMBEDDING_MODEL && (["publish", "compact", "enrich"].includes(input.op) || (input.op === "search" && input.mode && input.mode !== "text"))) {
       const accepted = await env.COMMITS.getByName(env.ANTFLY_INCARNATION).ensureEmbeddingProfile({model: env.EMBEDDING_MODEL, dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 384)});
       if (!accepted) throw new Error("HostedEmbeddingProfileChanged");
     }
@@ -39,21 +43,34 @@ async function run(env, input, signal, collection) {
       onTransportError: (error, op) => console.error("Antfly object operation failed", op, String(error)),
       onLog: message => console.error("Antfly runtime", message),
     });
-    const transport = cache.wrap(withCommitCoordinator(createR2Transport({ database: env.DATABASE }),
+    const maxPutBytes = Number(env.OBJECT_MAX_PUT_BYTES ?? 4 * 1024 * 1024);
+    if (!Number.isSafeInteger(maxPutBytes) || maxPutBytes < 1 || maxPutBytes > 8 * 1024 * 1024) throw new Error("InvalidHostedObjectBudget");
+    const transport = cache.wrap(withCommitCoordinator(createR2Transport({ database: env.DATABASE }, {maxPutBytes}),
       env.COMMITS.getByName(env.ANTFLY_INCARNATION), collection), env.ANTFLY_INCARNATION);
     const publicationBudget = input.op === "publish" ? await env.COMMITS.getByName(env.ANTFLY_INCARNATION).publicationBudget(Number(env.PUBLICATION_RECORDS ?? 16)) : 16;
-    const settings = ["publish", "enrich"].includes(input.op) ? { enrichment: Boolean(env.EMBEDDING_MODEL), embedding_dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 384), publication_records: publicationBudget } : {};
+    const settings = input.op === "latest" ? {} : { enrichment: Boolean(env.EMBEDDING_MODEL), embedding_dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 384), publication_records: publicationBudget,
+      enrichment_documents: Number(env.ENRICHMENT_DOCUMENTS ?? 1),
+      working_set_bytes: Number(env.WORKING_SET_BYTES ?? 20 * 1024 * 1024),
+      compaction_max_documents: Number(env.COMPACTION_MAX_DOCUMENTS ?? 1000),
+      compaction_max_artifact_bytes: Number(env.COMPACTION_MAX_ARTIFACT_BYTES ?? 4 * 1024 * 1024) };
     const inference = async request => {
       if (request.task !== "embedding" || !env.EMBEDDING_MODEL?.startsWith("@cf/") || !env.AI_GATEWAY ||
         request.dimensions !== Number(env.EMBEDDING_DIMENSIONS ?? 384) || !Array.isArray(request.texts) || request.texts.length < 1 || request.texts.length > 64 || request.texts.some(text => typeof text !== "string" || text.length > 16384)) throw new Error("HostedEmbeddingCapabilityUnsupported");
       return {json: await env.AI.run(env.EMBEDDING_MODEL, {text: request.texts}, {gateway: {id: env.AI_GATEWAY}})};
     };
-    return await lane.request({ ...input, ...settings, bucket: "database", prefix: "antfly", namespace: env.ANTFLY_INCARNATION }, { transport, signal, inference });
+    return await lane.request({ ...input, ...settings, bucket: "database", prefix: "antfly", namespace: env.ANTFLY_INCARNATION }, { transport, signal, inference,
+      onMetrics: metrics => {
+        if (env.LOG_METRICS === "true") console.log(JSON.stringify({event: "antfly.operation", op: input.op, role, ...metrics,
+          cache_retained_bytes: cache.retainedBytes(), wasm_linear_total_bytes: Object.values(lanes).reduce((sum, instance) => sum + (instance?.memoryBytes() ?? 0), 0)}));
+      } });
   } catch (error) {
     if (/IntegrityMismatch/.test(String(error))) cache.clear();
     throw error;
   } finally {
-    if (lane && !lane.usable()) lanes[role] = null;
+    // Linear memory cannot shrink. Recycle between requests before allocator
+    // size-class churn consumes the cap despite a small live working set.
+    // Durable state and the immutable JS cache survive lane replacement.
+    if (lane && (!lane.usable() || lane.memoryBytes() >= recycleAtBytes)) lanes[role] = null;
     busy[role] = false;
   }
 }
@@ -77,7 +94,7 @@ async function readJson(request) {
 }
 async function enqueue(env, kind = "publish", job_id, delaySeconds = 0) {
   if (!env.MAINTENANCE) return false;
-  await env.MAINTENANCE.send({ incarnation: env.ANTFLY_INCARNATION, ...(kind === "collect" ? { kind, job_id } : {}) }, { delaySeconds });
+  await env.MAINTENANCE.send({ incarnation: env.ANTFLY_INCARNATION, ...(kind === "collect" ? { kind, job_id } : kind === "compact" ? {kind} : {}) }, { delaySeconds });
   return true;
 }
 export default {
@@ -101,7 +118,7 @@ export default {
         if (result.has_more) await enqueue(env, "collect", result.job_id, result.delay_seconds);
         return Response.json(result, env.WORKER_VERSION ? {headers: {"X-Antfly-Version": env.WORKER_VERSION.id}} : undefined);
       }
-      if (!["mutate", "lookup", "list", "search", "count", "status", "publish", "enrich", "latest"].includes(args.op)) return new Response("unsupported operation", { status: 400 });
+      if (!["mutate", "lookup", "list", "search", "count", "status", "publish", "compact", "enrich", "latest"].includes(args.op)) return new Response("unsupported operation", { status: 400 });
       const result = await run(env, args, request.signal);
       if ((args.op === "mutate" && result.committed) || (args.op === "publish" && result.has_more) || (args.op === "enrich" && result.wal_appends)) {
         try { result.maintenance_pending = !await enqueue(env); }
@@ -120,8 +137,11 @@ export default {
   async queue(batch, env) {
     for (const message of batch.messages) {
       if (message.body?.incarnation !== env.ANTFLY_INCARNATION) { message.ack(); continue; }
-      let publishing = message.body.kind !== "collect";
+      let publishing = !message.body.kind;
       try {
+        if (message.body.kind === "compact") {
+          await run(env, {op: "compact"}); message.ack(); continue;
+        }
         if (message.body.kind === "collect") {
           const result = await collect(env, (input, token) => run(env, input, undefined, token), message.body.job_id);
           if (result.has_more && !await enqueue(env, "collect", result.job_id, result.delay_seconds)) throw new Error("maintenance queue is not configured");
@@ -141,7 +161,7 @@ export default {
         message.ack();
       } catch (error) {
         console.error("Antfly publication deferred", String(error));
-        if (publishing && /Canceled|DeadlineExceeded|ObjectIoBudgetExceeded|OutOfMemory|ResponseTooLarge/.test(String(error))) {
+        if (publishing && /Canceled|DeadlineExceeded|ObjectIoBudgetExceeded|OutOfMemory|HostedWorkingSetBudgetExceeded|ResponseTooLarge/.test(String(error))) {
           await env.COMMITS.getByName(env.ANTFLY_INCARNATION).lowerPublicationBudget(Number(env.PUBLICATION_RECORDS ?? 16));
         }
         message.retry({ delaySeconds: 10 });
@@ -152,5 +172,6 @@ export default {
   async scheduled(controller, env) {
     await enqueue(env);
     if (env.AUTO_GC === "true" && Math.floor(controller.scheduledTime / 60000) % 15 === 0) await enqueue(env, "collect");
+    if (env.AUTO_COMPACT === "true" && Math.floor(controller.scheduledTime / 60000) % 60 === 0) await enqueue(env, "compact");
   },
 };

@@ -45,24 +45,30 @@ if (process.argv.includes("--drain")) {
   throw new Error("cleanup limit exceeded");
 }
 if (process.argv.includes("--enrichment")) {
-  const receipt = await call({op: "mutate", operation_id: `${run.id}/embedding`, mutations: [{kind: "upsert", doc_id: "message/a", body: JSON.stringify({text: "Cloudflare stores durable searchable messages."})}]});
+  const windowed = process.argv.includes("--windows"), docId = windowed ? "message/windows" : "message/a";
+  const source = windowed ? Array.from({length: 48 * 8}, (_, i) => ["durable", "cloudflare", "message"][i % 3]).join(" ") : "Cloudflare stores durable searchable messages.";
+  const baseReport = windowed ? "window-enrichment-report.json" : "enrichment-report.json";
+  const receipt = await call({op: "mutate", operation_id: `${run.id}/embedding${windowed ? "/windows" : ""}`, mutations: [{kind: "upsert", doc_id: docId, body: JSON.stringify({text: source})}]});
   if (process.argv.includes("--reopen")) {
-    const before = JSON.parse(await readFile(`${run.dir}/enrichment-report.json`, "utf8"));
+    const before = JSON.parse(await readFile(`${run.dir}/${baseReport}`, "utf8"));
     assert.equal(receipt.visibility, before.visibility, "reopen must preserve the original retry receipt");
     assert.notEqual(measurements[0].version, before.measurements[0].version, "reopen fixture requires a replacement deployment");
   }
   let ready = false;
   for (let i = 0; i < 180; i++) {
     const status = await call({op: "status"});
-    if (status.published && BigInt(status.published_lsn) >= 2n && status.pending_embeddings === "0") {ready = true; break;}
+    if (status.published && BigInt(status.published_lsn) > BigInt(`0x${receipt.visibility.slice(-16)}`) && status.pending_embeddings === "0") {ready = true; break;}
     await new Promise(resolve => setTimeout(resolve, 1000));
   }
   assert.ok(ready, "native enrichment did not converge");
+  await call({op: "compact"});
+  const document = JSON.parse((await call({op: "lookup", doc_id: docId, required_visibility: receipt.visibility})).body);
+  assert.ok(document.chunk_embeddings.length >= (windowed ? 48 : 1));
   const vector = (await call({text: ["durable messages"]}, "/ai")).data[0];
   const hits = await call({op: "search", mode: "vector", vector, required_visibility: receipt.visibility, fresh: true});
-  assert.ok(hits.hits.some(hit => hit.doc_id === "message/a"));
-  const filename = process.argv.includes("--reopen") ? "reopen-report.json" : "enrichment-report.json";
-  await writeFile(`${run.dir}/${filename}`, JSON.stringify({visibility: receipt.visibility, checks: {native_gateway_enrichment: true, fenced_vector: true, reopen: process.argv.includes("--reopen")}, measurements}, null, 2));
+  assert.ok(hits.hits.some(hit => hit.doc_id === docId));
+  const filename = process.argv.includes("--reopen") ? `reopen-${baseReport}` : baseReport;
+  await writeFile(`${run.dir}/${filename}`, JSON.stringify({visibility: receipt.visibility, chunks: document.chunk_embeddings.length, checks: {native_gateway_enrichment: true, fenced_vector: true, native_compaction: true, windowed, reopen: process.argv.includes("--reopen")}, measurements}, null, 2));
   console.log("live native Gateway enrichment and fenced vector search passed");
   process.exit(0);
 }
@@ -81,6 +87,7 @@ assert.ok(published, "durable Queue publication did not converge");
 assert.ok((await call({op: "search", text: "durable"})).hits.length);
 await Promise.all(Array.from({length: 8}, (_, i) => call({op: "mutate", operation_id: `${run.id}/race/${i}`, mutations: [{kind: "upsert", doc_id: `race/${i}`, body: JSON.stringify({text: `racing ${i}`})}]})));
 for (let i = 0; i < 30; i++) await call({op: "lookup", doc_id: `doc/${String(i % 10).padStart(4, "0")}`});
+await call({op: "compact"});
 let job, complete = false;
 for (let i = 0; i < 1000; i++) {
   const result = await call({op: "collect", ...(job ? {job_id: job} : {})}); job = result.job_id;
@@ -95,6 +102,6 @@ const embedding = await call({text: ["Antfly Cloudflare qualification"]}, "/ai")
 assert.equal(embedding.data?.[0]?.length, 384);
 assert.ok(embedding.data[0].every(Number.isFinite));
 const durations = measurements.filter(item => item.op === "lookup").map(item => item.duration_ms).sort((a,b) => a-b);
-const report = {run: run.id, origin, started_at: new Date(start).toISOString(), finished_at: new Date().toISOString(), checks: {idempotent_batch: true, fenced_lookup: true, publication: true, racing_writers: true, collection: true, gateway_embedding: true}, lookup_ms: {p50: durations[Math.floor(durations.length*.5)], p95: durations[Math.floor(durations.length*.95)]}, memory: {total_isolate_bytes: null, qualification: "No resource-limit error in this fixture; total isolate memory was not measured"}, measurements};
+const report = {run: run.id, origin, started_at: new Date(start).toISOString(), finished_at: new Date().toISOString(), checks: {idempotent_batch: true, fenced_lookup: true, publication: true, racing_writers: true, compaction: true, collection: true, gateway_embedding: true}, lookup_ms: {p50: durations[Math.floor(durations.length*.5)], p95: durations[Math.floor(durations.length*.95)]}, memory: {total_isolate_bytes: null, qualification: "No resource-limit error in this fixture; total isolate memory was not measured"}, measurements};
 await writeFile(`${run.dir}/report.json`, JSON.stringify(report, null, 2));
 console.log(JSON.stringify({...report, measurements: `${measurements.length} recorded`}, null, 2));

@@ -124,6 +124,7 @@ fn execute(raw: []const u8) ![]u8 {
 
 /// Packed pointer/length of an owned JSON response. The host frees it once.
 export fn antfly_host_request(ptr: [*]const u8, len: usize) u64 {
+    if (comptime @hasDecl(@import("root"), "resetWorkingSetMetrics")) @import("root").resetWorkingSetMetrics();
     const result = execute(ptr[0..len]) catch |err| json(.{ .err = @errorName(err) }) catch return 0;
     return (@as(u64, result.len) << 32) | @as(u64, @intFromPtr(result.ptr));
 }

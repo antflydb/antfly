@@ -15,7 +15,14 @@
 
 const std = @import("std");
 const objects = @import("objectstore");
-const a = std.heap.wasm_allocator;
+const wasm_allocator = std.heap.wasm_allocator;
+var working_set_peak: usize = 0;
+pub fn resetWorkingSetMetrics() void {
+    working_set_peak = 0;
+}
+export fn antfly_host_working_set_peak_bytes() usize {
+    return working_set_peak;
+}
 pub const panic = std.debug.FullPanic(hostPanic);
 fn hostPanic(message: []const u8, _: ?usize) noreturn {
     log(message.ptr, message.len);
@@ -79,9 +86,25 @@ const host_io_vtable: std.Io.VTable = blk: {
 };
 const host_io: std.Io = .{ .userdata = null, .vtable = &host_io_vtable };
 pub fn requestAdditional(raw: []const u8) ![]u8 {
+    const envelope = try std.json.parseFromSlice(struct { working_set_bytes: usize = 20 * 1024 * 1024 }, wasm_allocator, raw, .{ .ignore_unknown_fields = true });
+    defer envelope.deinit();
+    const maximum = envelope.value.working_set_bytes;
+    if (maximum < 4096 or maximum > 20 * 1024 * 1024) return error.InvalidHostedWorkingSetBudget;
+    var working = try @import("serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(wasm_allocator, .{ .max_working_set_bytes = maximum });
+    working_set_peak = 0;
+    defer working_set_peak = working.peak_live_bytes;
+    const result = executeAdditional(working.allocator(), raw) catch |err| {
+        if (err == error.OutOfMemory and working.limit_exceeded) return error.HostedWorkingSetBudgetExceeded;
+        return err;
+    };
+    defer working.allocator().free(result);
+    // The ABI response outlives this request's allocator wrapper.
+    return wasm_allocator.dupe(u8, result);
+}
+fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     @import("antfly_platform").time.installHostClocks(.{ .monotonic_ns = monotonicNs, .realtime_ns = realtimeNs, .authority_ns = authorityNs });
     const Request = struct {
-        op: enum { search, mutate, publish, lookup, list, count, status, enrich, gc_prepare, gc_wal, gc_trace },
+        op: enum { search, mutate, publish, compact, lookup, list, count, status, enrich, gc_prepare, gc_wal, gc_trace },
         bucket: []const u8,
         prefix: []const u8,
         namespace: []const u8,
@@ -89,10 +112,14 @@ pub fn requestAdditional(raw: []const u8) ![]u8 {
         gc_id: ?[]const u8 = null,
         gc_keep_from: []const u8 = "1",
         publication_records: usize = 16,
+        compaction_max_documents: u64 = 1000,
+        compaction_max_artifact_bytes: u64 = 4 * 1024 * 1024,
         mode: @import("serverless/query/request.zig").QueryMode = .text,
         vector: ?[]f32 = null,
         enrichment: bool = false,
         embedding_dimensions: u32 = 384,
+        enrichment_documents: usize = 1,
+        working_set_bytes: usize = 20 * 1024 * 1024,
         filters: []const @import("serverless/query/live_filter.zig").Clause = &.{},
         fresh: bool = false,
         required_visibility: ?[]const u8 = null,
@@ -112,7 +139,7 @@ pub fn requestAdditional(raw: []const u8) ![]u8 {
     try filter.validate();
     if (req.filters.len != 0 and req.op != .list and req.op != .search) return error.FilterCapabilityUnsupported;
     if (req.cursor != null and req.op != .list and !(req.op == .search and req.mode == .text)) return error.QueryCursorCapabilityUnsupported;
-    var host = objects.wasm_host.Host{ .alloc = a };
+    var host = objects.wasm_host.Host{ .alloc = a, .transfer_allocator = wasm_allocator };
     const artifact_prefix = try std.fmt.allocPrint(a, "{s}/artifacts", .{req.prefix});
     defer a.free(artifact_prefix);
     var object_artifacts = try @import("serverless/artifacts/object_store.zig").ObjectStore.initWithClient(a, host.client(), req.bucket, artifact_prefix);
@@ -194,8 +221,9 @@ pub fn requestAdditional(raw: []const u8) ![]u8 {
         defer enricher.deinit();
         var context: u8 = 0;
         try enricher.setChunkEmbedder(.{ .ptr = &context, .dense_embed_fn = @import("serverless/hosted_embedding.zig").Dense.embed, .dense_embed_batch_fn = @import("serverless/hosted_embedding.zig").Dense.batch }, "cloudflare", req.embedding_dimensions);
+        if (req.enrichment_documents == 0 or req.enrichment_documents > 4) return error.InvalidEnrichmentBudget;
         const stats = try enricher.runNamespaceWithConfigUntil(req.namespace, .{
-            .batch_size = 4,
+            .batch_size = req.enrichment_documents,
             .scan_batch_size = 32,
             .max_source_read_bytes = 4 * 1024 * 1024,
             .stage = .chunk_embeddings,
@@ -204,6 +232,19 @@ pub fn requestAdditional(raw: []const u8) ![]u8 {
             .cancellation = cancellation,
         }, .{ .io = host_io, .cooperative = cancellation });
         return std.json.Stringify.valueAlloc(a, stats, .{});
+    }
+    if (req.op == .compact) {
+        _ = progress.getHead(req.namespace) catch |err| switch (err) {
+            error.FileNotFound => return std.json.Stringify.valueAlloc(a, .{ .published = false, .version = "0", .artifact_count = @as(usize, 0) }, .{}),
+            else => return err,
+        };
+        var compactor = @import("serverless/build/compactor.zig").Compactor.init(a, &artifacts, &manifests, &progress);
+        compactor.max_documents = req.compaction_max_documents;
+        compactor.max_artifact_bytes = req.compaction_max_artifact_bytes;
+        var result = try compactor.compactHeadGuardedUntil(req.namespace, null, .{ .io = host_io, .cooperative = cancellation });
+        defer result.deinit(a);
+        var version: [20]u8 = undefined;
+        return std.json.Stringify.valueAlloc(a, .{ .published = result.published, .version = try std.fmt.bufPrint(&version, "{d}", .{result.version}), .artifact_count = result.artifact_count }, .{});
     }
     if (req.op == .publish) {
         var builder = @import("serverless/build/builder.zig").Builder.init(a, &artifacts, &manifests, &progress, &wal);
@@ -234,7 +275,7 @@ pub fn requestAdditional(raw: []const u8) ![]u8 {
         defer session.deinit();
         const published_lsn = try std.fmt.allocPrint(a, "{d}", .{session.manifest.wal_end_lsn});
         defer a.free(published_lsn);
-        const pending = try std.fmt.allocPrint(a, "{d}", .{try pendingEmbeddings(&session)});
+        const pending = try std.fmt.allocPrint(a, "{d}", .{try pendingEmbeddings(a, &session)});
         defer a.free(pending);
         return std.json.Stringify.valueAlloc(a, .{ .published = true, .published_lsn = published_lsn, .pending_embeddings = pending, .visibility = @import("serverless/visibility.zig").Token.init(req.namespace, latest).encode() }, .{});
     }
@@ -248,7 +289,7 @@ pub fn requestAdditional(raw: []const u8) ![]u8 {
             try required.require(req.namespace, session.manifest.wal_end_lsn);
         }
         if (req.fresh and try wal.latestLsn(req.namespace) != session.manifest.wal_end_lsn) return error.IndexPublicationPending;
-        const pending = try pendingEmbeddings(&session);
+        const pending = try pendingEmbeddings(a, &session);
         if ((req.fresh or req.required_visibility != null) and pending != 0) return error.EmbeddingPending;
         const hits = try @import("serverless/query/indexed_reader.zig").searchAlloc(a, &session, .{ .text = req.text, .vector = req.vector, .mode = req.mode, .limit = req.limit });
         defer @import("serverless/query/request.zig").freeHits(a, hits);
@@ -307,7 +348,7 @@ pub fn requestAdditional(raw: []const u8) ![]u8 {
     return std.json.Stringify.valueAlloc(a, .{ .hits = hits }, .{});
 }
 
-fn pendingEmbeddings(session: *@import("serverless/query/runtime.zig").QuerySession) !u64 {
+fn pendingEmbeddings(a: std.mem.Allocator, session: *@import("serverless/query/runtime.zig").QuerySession) !u64 {
     var remaining: u64 = 4 * 1024 * 1024;
     const reader = (try @import("serverless/query/document_facts_reader.zig").Reader.create(a, session, &remaining)) orelse return error.HostedDocumentFactsRequired;
     defer reader.destroy();

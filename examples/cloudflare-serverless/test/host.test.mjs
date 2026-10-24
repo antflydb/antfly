@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import { Bucket } from "./object-fixture.mjs";
 import { fixture } from "./collection-fixture.mjs";
 import { collect } from "../collect.mjs";
 import { withCommitCoordinator } from "../../../zig/lib/objectstore/wasm/coordinated.mjs";
@@ -23,39 +24,6 @@ import { instantiateHost } from "../../../zig/lib/objectstore/wasm/asyncify.mjs"
 import { createImmutableReadCache } from "../../../zig/lib/objectstore/wasm/cache.mjs";
 import { createR2Transport, ObjectStoreError } from "../../../zig/lib/objectstore/wasm/r2.mjs";
 const module = await WebAssembly.compile(await readFile(new URL("../dist/antfly-serverless.wasm", import.meta.url)));
-class Bucket {
-  objects = new Map(); revision = 0; writes = 0; readBytes = 0; reads = 0;
-  metadata(key, object) { return { key, size: object.body.length, etag: object.etag, uploaded: new Date(0), httpMetadata: object.httpMetadata ?? {} }; }
-  async put(key, body, options = {}) {
-    await Promise.resolve();
-    const old = this.objects.get(key), condition = options.onlyIf;
-    if ((condition?.etagDoesNotMatch === "*" && old) || (condition?.etagMatches != null && old?.etag !== condition.etagMatches)) return null;
-    const value = { body: body.slice(), etag: `e${++this.revision}`, httpMetadata: options.httpMetadata };
-    this.objects.set(key, value); this.writes++;
-    return this.metadata(key, value);
-  }
-  async get(key, options = {}) {
-    await Promise.resolve(); this.reads++;
-    const value = this.objects.get(key);
-    if (!value) return null;
-    const meta = this.metadata(key, value);
-    if (options.onlyIf?.etagMatches != null && value.etag !== options.onlyIf.etagMatches) return meta;
-    const offset = options.range?.offset ?? 0;
-    const data = value.body.slice(offset, options.range?.length == null ? undefined : offset + options.range.length);
-    this.readBytes += data.length;
-    return { ...meta, range: options.range ? { offset, length: data.length } : undefined,
-      body: new ReadableStream({ start(controller) { controller.enqueue(data); controller.close(); } }) };
-  }
-  async head(key) { const value = this.objects.get(key); return value ? this.metadata(key, value) : null; }
-  async delete(key) { for (const item of Array.isArray(key) ? key : [key]) this.objects.delete(item); }
-  async list(options = {}) {
-    const keys = [...this.objects.keys()].sort().filter(key => key.startsWith(options.prefix ?? "") && (!options.startAfter || key > options.startAfter));
-    const start = options.cursor ? Number(options.cursor) : 0;
-    const selected = keys.slice(start, start + (options.limit ?? 1000));
-    const truncated = start + selected.length < keys.length;
-    return { objects: selected.map(key => this.metadata(key, this.objects.get(key))), truncated, cursor: truncated ? String(start + selected.length) : undefined };
-  }
-}
 const payloadText = record => Buffer.from(record.payload_base64, "base64").toString("utf8");
 const request = (op, args = {}) => ({ op, bucket: "database", prefix: "scope", namespace: "tenant/table/incarnation1", ...args });
 const append = (id, payload = id) => request("append", { operation_id: id, payload, timestamp_ns: "9007199254740993" });
@@ -299,6 +267,7 @@ test("bounded hosted GC evicts orphan and expired pages, survives restarts and p
       await execute(request("mutate", { operation_id: `change-${i}`, mutations: [{ kind: "upsert", doc_id: "a", body: JSON.stringify({ text: `current ${i}` }) }] }));
       await execute(request("publish"));
     }
+    await execute(request("compact"));
     const before = bucket.objects.size;
     // Expire the native reader pins with the same host clock as the journal.
     f.tick(11 * 60 * 1000);
@@ -462,4 +431,109 @@ test("cold flat-index publication reuses the authenticated packed snapshot inste
   assert.ok(bucket.reads < 64, `${bucket.reads} GETs for a 256-document base`);
   t.diagnostic(`cold publication of 44 mutations over 256 documents: ${bucket.reads} GETs, ${bucket.readBytes} bytes`);
   assert.equal((await reopened.request(request("count"))).count, "300");
+});
+
+test("host metrics preserve accepted outcomes and account native work separately from linear memory", async () => {
+  const metrics = [];
+  const {host} = await setup(new Bucket(), undefined, {onMetrics: sample => { metrics.push(sample); throw new Error("observer failed"); }});
+  const mutation = request("mutate", {operation_id: "measured", mutations: [{kind: "upsert", doc_id: "a", body: '{"text":"measured body"}'}]});
+  const accepted = await host.request(mutation);
+  assert.equal((await host.request(mutation)).visibility, accepted.visibility);
+  assert.equal(metrics[0].outcome, "ok");
+  assert.ok(metrics[0].operations > 0);
+  assert.ok(metrics[0].transferred_bytes > 0);
+  assert.ok(metrics[0].working_set_peak_bytes > 0);
+  assert.ok(metrics[0].working_set_peak_bytes <= 20 * 1024 * 1024);
+  assert.ok(metrics[0].wasm_linear_bytes <= 32 * 1024 * 1024);
+  assert.ok(metrics[0].elapsed_ms >= metrics[0].io_wait_ms);
+  await host.request(request("latest"));
+  assert.equal(metrics.at(-1).working_set_peak_bytes, 0, "WAL-only requests must not report a previous request's peak");
+  await assert.rejects(host.request(request("lookup", {required_visibility: "invalid"})), /InvalidVisibilityToken/);
+  assert.equal(metrics.at(-1).outcome, "error");
+  assert.equal(host.usable(), true);
+});
+
+test("native compaction enforces hosted admission, survives an ambiguous publication and preserves facts and pending work", async () => {
+  const {host, bucket} = await setup();
+  assert.deepEqual(await host.request(request("compact")), {published: false, version: "0", artifact_count: 0});
+  const mutation = request("mutate", {operation_id: "compact-source", mutations: ["a", "b"].map(doc_id => ({kind: "upsert", doc_id, body: JSON.stringify({text: `compact ${doc_id}`, owner: "alice"})}))});
+  const receipt = await host.request(mutation);
+  await host.request(request("publish", {enrichment: true}));
+  const before = await host.request(request("status"));
+  await assert.rejects(host.request(request("compact", {compaction_max_documents: 1})), /CompactionBudgetExceeded/);
+  await assert.rejects(host.request(request("compact", {compaction_max_artifact_bytes: 1})), /CompactionBudgetExceeded/);
+  assert.deepEqual(await host.request(request("status")), before);
+  let lose = true;
+  const writer = (await setup(bucket, transport => async (req, body) => {
+    const response = await transport(req, body);
+    if (lose && req.op === "put" && req.key.includes("/progress/") && req.key.endsWith("/HEAD") && Number(new TextDecoder().decode(body).trim()) > 1) {
+      lose = false; throw new Error("lost compaction response after CAS");
+    }
+    return response;
+  })).host;
+  await assert.rejects(writer.request(request("compact")), /ObjectStoreTransportFailed/);
+  assert.equal(lose, false, "fixture must cross the compactor's commit boundary");
+  const reopened = (await setup(bucket)).host;
+  assert.equal((await reopened.request(request("status"))).pending_embeddings, "2");
+  assert.equal((await reopened.request(request("count", {required_visibility: receipt.visibility}))).count, "2");
+  assert.equal((await reopened.request(request("search", {text: "compact", filters: [{field: "owner", eq: "alice"}]}))).hits.length, 2);
+  assert.equal((await reopened.request(mutation)).visibility, receipt.visibility);
+  assert.equal((await reopened.request(request("compact"))).published, false, "retry should reuse the already compacted head");
+  const enriched = await reopened.request(request("enrich", {enrichment: true, embedding_dimensions: 4}), {inference: async req => ({json: {data: req.texts.map(() => [1, 0, 0, 0])}})});
+  assert.equal(enriched.wal_appends, 1, "native pending work must remain runnable after compaction");
+});
+
+test("working-set rejection preserves the accepted WAL and leaves the instance reusable", async () => {
+  const {host} = await setup();
+  const mutation = request("mutate", {operation_id: "bounded-source", mutations: [{kind: "upsert", doc_id: "a", body: JSON.stringify({text: "bounded publication ".repeat(200)})}]});
+  const accepted = await host.request(mutation);
+  await assert.rejects(host.request(request("publish", {working_set_bytes: 4096})), /HostedWorkingSetBudgetExceeded/);
+  assert.equal(host.usable(), true);
+  assert.equal((await host.request(mutation)).visibility, accepted.visibility);
+  await host.request(request("publish"));
+  assert.equal((await host.request(request("count", {required_visibility: accepted.visibility}))).count, "1");
+});
+
+test("clock rollback fails closed and retires the lane so fresh compute can recover", async () => {
+  let now = 10000;
+  const bucket = new Bucket();
+  const host = (await setup(bucket, undefined, {clock: () => now})).host;
+  const mutation = request("mutate", {operation_id: "clock-source", mutations: [{kind: "upsert", doc_id: "a", body: '{"text":"clock recovery"}'}]});
+  const accepted = await host.request(mutation);
+  await host.request(request("publish"));
+  now = 9000;
+  await assert.rejects(host.request(request("status")), /ManifestReadLeaseExpired|WorkLeaseLost/);
+  assert.equal(host.usable(), false);
+  now = 10001;
+  await assert.rejects(host.request(request("count")), /instance is unusable/);
+  const recovered = (await setup(bucket, undefined, {clock: () => now})).host;
+  assert.equal((await recovered.request(mutation)).visibility, accepted.visibility);
+  assert.equal((await recovered.request(request("count"))).count, "1");
+});
+
+test("hosted embedding windows preserve chunk order and never publish partially completed model output", async () => {
+  const {host} = await setup();
+  const text = Array.from({length: 70 * 8}, (_, i) => `word${i}`).join(" ");
+  await host.request(request("mutate", {operation_id: "window-source", mutations: [{kind: "upsert", doc_id: "large", body: JSON.stringify({text})}]}));
+  await host.request(request("publish", {enrichment: true}));
+  const settings = request("enrich", {enrichment: true, embedding_dimensions: 4});
+  let calls = 0, position = 0;
+  const inference = async req => {
+    calls++;
+    if (calls === 2) throw new Error("second window failed");
+    return {json: {data: req.texts.map(() => [position++, 0, 0, 1])}};
+  };
+  await assert.rejects(host.request(settings, {inference}), /HostedEmbeddingFailed/);
+  assert.equal((await host.request(request("status"))).pending_embeddings, "1");
+  assert.equal(JSON.parse((await host.request(request("lookup", {doc_id: "large"}))).body).chunk_embeddings, undefined);
+  calls = 0; position = 0;
+  const success = await host.request(settings, {inference: async req => {
+    calls++; assert.ok(req.texts.length <= 64);
+    return {json: {data: req.texts.map(() => [position++, 0, 0, 1])}};
+  }});
+  assert.equal(success.wal_appends, 1);
+  assert.ok(calls > 1);
+  const body = JSON.parse((await host.request(request("lookup", {doc_id: "large"}))).body);
+  assert.equal(body.chunk_embeddings.length, position);
+  assert.deepEqual(body.chunk_embeddings.map(chunk => chunk.embedding[0]), Array.from({length: position}, (_, i) => i));
 });

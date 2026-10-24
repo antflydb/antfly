@@ -18,7 +18,7 @@
 import { ObjectStoreError } from "./r2.mjs";
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
-export async function instantiateHost(module, transport, { stackBytes = 1024 * 1024, onTransportError = () => {}, onLog = () => {}, clock = Date.now } = {}) {
+export async function instantiateHost(module, transport, { stackBytes = 1024 * 1024, onTransportError = () => {}, onLog = () => {}, onMetrics = () => {}, clock = Date.now } = {}) {
   if (!(module instanceof WebAssembly.Module)) throw new TypeError("a precompiled WebAssembly.Module is required");
   if (!Number.isSafeInteger(stackBytes) || stackBytes < 4096 || stackBytes > 8 * 1024 * 1024) throw new TypeError("invalid suspension stack size");
   let wasm, pending, completed, activeTransport, activeOptions, operations, inferenceCalls, transferred, busy = false, poisoned = false;
@@ -93,8 +93,9 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
   new DataView(wasm.memory.buffer).setUint32(stackDescriptor, stackDescriptor + 8, true);
   new DataView(wasm.memory.buffer).setUint32(stackDescriptor + 4, stackDescriptor + 8 + stackBytes, true);
   async function request(value, { transport: requestTransport = transport, signal,
-    inference, deadlineMs = clock() + 30000, maxOperations = 1024, maxTransferBytes = 32 * 1024 * 1024 } = {}) {
-    if (busy || poisoned) throw new Error(poisoned ? "WASM instance is unusable" : "WASM instance is busy");
+    inference, onMetrics: requestMetrics = onMetrics, deadlineMs = clock() + 30000, maxOperations = 1024, maxTransferBytes = 32 * 1024 * 1024 } = {}) {
+    const unusable = poisoned || invalidClock;
+    if (busy || unusable) throw new Error(unusable ? "WASM instance is unusable" : "WASM instance is busy");
     if (typeof requestTransport !== "function") throw new TypeError("request transport required");
     if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 0 || !Number.isSafeInteger(maxOperations) || maxOperations < 1 ||
       !Number.isSafeInteger(maxTransferBytes) || maxTransferBytes < 1) throw new TypeError("invalid request budget");
@@ -105,7 +106,8 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
     activeTransport = requestTransport;
     activeOptions = { signal, deadlineMs, maxOperations, maxTransferBytes, inference };
     operations = 0; inferenceCalls = 0; transferred = 0;
-    let requestPtr = 0, protocolError = false;
+    let requestPtr = 0, protocolError = false, outcome = "error", failureCode = null, waitMs = 0;
+    const started = performance.now();
     try {
       requestPtr = allocate(input);
       while (true) {
@@ -117,12 +119,15 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
           try {
             const response = JSON.parse(decoder.decode(bytes(ptr, len)));
             if (response.err) { protocolError = true; throw new Error(response.err); }
+            outcome = "ok";
             return response;
           } finally { wasm.antfly_host_free(ptr, len); }
         }
         if (wasm.asyncify_get_state() !== 1 || !pending) throw new Error("invalid WASM suspension");
         wasm.asyncify_stop_unwind();
+        const waitStarted = performance.now();
         const completion = await pending;
+        waitMs += performance.now() - waitStarted;
         pending = null;
         const header = encoder.encode(JSON.stringify(completion.value.json ?? {}));
         const body = completion.value.body ?? new Uint8Array();
@@ -142,6 +147,7 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
         wasm.asyncify_start_rewind(stackDescriptor);
       }
     } catch (error) {
+      failureCode = protocolError && /^[A-Za-z][A-Za-z0-9_]{0,95}$/.test(error.message) ? error.message : "HostFailure";
       // Ordinary database errors are returned with an idle stack. A trap or
       // incomplete unwind poisons the instance; never reuse its mutable state.
       // A foreign JS exception may bypass Zig defers even with an idle
@@ -153,7 +159,13 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
       activeTransport = null;
       activeOptions = null;
       busy = false;
+      const metrics = Object.freeze({outcome, failure_code: failureCode, clock_valid: !invalidClock, operations, inference_calls: inferenceCalls,
+        transferred_bytes: transferred, elapsed_ms: performance.now() - started, io_wait_ms: waitMs,
+        wasm_linear_bytes: wasm.memory.buffer.byteLength,
+        working_set_peak_bytes: wasm.antfly_host_working_set_peak_bytes?.() ?? null});
+      // Observation must never alter an accepted mutation or poison its lane.
+      try { requestMetrics(metrics); } catch {}
     }
   }
-  return { request, usable: () => !poisoned, memoryBytes: () => wasm.memory.buffer.byteLength };
+  return { request, usable: () => !poisoned && !invalidClock, memoryBytes: () => wasm.memory.buffer.byteLength };
 }

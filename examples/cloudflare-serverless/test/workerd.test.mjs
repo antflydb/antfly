@@ -34,6 +34,8 @@ test("workerd persists R2 pages and coordinated commits across restart", { timeo
         const path = new URL(request.url).pathname;
         const sent = [];
         const localEnv = { ...env, MAINTENANCE: { async send(value) { sent.push(value); } } };
+        if (path === "/test/compaction-limit") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, COMPACTION_MAX_DOCUMENTS: "0"}, ctx);
+        if (path === "/test/recycle") return worker.fetch(new Request("https://example.test/api", request), {...localEnv, ANTFLY_INCARNATION: "test-recycle", WASM_RECYCLE_BYTES: "4194304"}, ctx);
         if (path === "/test/embedding") {
           const dimensions = new URL(request.url).searchParams.get("dimensions") ?? "4";
           const embeddingEnv = {...localEnv, ANTFLY_INCARNATION: "test-embedding", EMBEDDING_MODEL: "@cf/test/embedding", EMBEDDING_DIMENSIONS: dimensions, AI_GATEWAY: "test-gateway",
@@ -43,12 +45,13 @@ test("workerd persists R2 pages and coordinated commits across restart", { timeo
         }
         if (path === "/test/queue") {
           let ack = false, retry = false;
-          await worker.queue({messages: [{body: {incarnation: env.ANTFLY_INCARNATION},
+          await worker.queue({messages: [{body: {incarnation: env.ANTFLY_INCARNATION, ...(new URL(request.url).searchParams.has("compact") ? {kind: "compact"} : {})},
             ack() { ack = true; }, retry() { retry = true; }}]}, localEnv);
           return Response.json({ack, retry, sent});
         }
         if (path === "/test/scheduled") {
-          await worker.scheduled({}, localEnv);
+          if (new URL(request.url).searchParams.has("compact")) localEnv.AUTO_COMPACT = "true";
+          await worker.scheduled({scheduledTime: 3600000}, localEnv);
           return Response.json(sent);
         }
         if (path === "/test/ai") {
@@ -103,6 +106,13 @@ test("workerd persists R2 pages and coordinated commits across restart", { timeo
     assert.equal(JSON.parse((await call({ op: "lookup", doc_id: "a", required_visibility: committed.visibility })).body).text, "durable cloudflare");
     const scheduled = await mf.dispatchFetch("https://example.test/test/scheduled");
     assert.deepEqual(await scheduled.json(), [{ incarnation: "test-incarnation" }]);
+    const scheduleCompaction = await mf.dispatchFetch("https://example.test/test/scheduled?compact");
+    assert.deepEqual(await scheduleCompaction.json(), [{incarnation: "test-incarnation"}, {incarnation: "test-incarnation", kind: "compact"}]);
+    const deniedCompaction = await mf.dispatchFetch("https://example.test/test/compaction-limit", {method: "POST", headers: {Authorization: "Bearer local-test"}, body: JSON.stringify({op: "compact", compaction_max_documents: 999999})});
+    assert.equal(deniedCompaction.status, 409);
+    assert.match((await deniedCompaction.json()).error, /CompactionBudgetExceeded/);
+    const compactQueue = await mf.dispatchFetch("https://example.test/test/queue?compact");
+    assert.deepEqual(await compactQueue.json(), {ack: true, retry: false, sent: []});
     const ai = await mf.dispatchFetch("https://example.test/test/ai", { method: "POST",
       headers: { Authorization: "Bearer local-test" }, body: JSON.stringify({ text: "task input" }) });
     assert.deepEqual(await ai.json(), { args: ["@cf/test/task", { text: "task input" }, { gateway: { id: "test-gateway" } }] });
@@ -150,6 +160,9 @@ test("workerd persists R2 pages and coordinated commits across restart", { timeo
     const enriched = await embeddingCall({op: "enrich"});
     assert.equal(enriched.status, 200); assert.equal(enriched.headers.get("X-Model-Calls"), "1");
     assert.equal((await embeddingCall({op: "publish"})).status, 200);
+    assert.equal((await embeddingCall({op: "compact"})).status, 200);
+    const compactedStatus = await embeddingCall({op: "status"});
+    assert.equal((await compactedStatus.json()).pending_embeddings, "0");
     await embeddingCall({op: "mutate", operation_id: "state", mutations: [{kind: "upsert", doc_id: "state/a", body: JSON.stringify({text: "", message_ref: "message/a", read: true})}]});
     await embeddingCall({op: "publish"});
     const idle = await embeddingCall({op: "enrich"});
@@ -157,6 +170,17 @@ test("workerd persists R2 pages and coordinated commits across restart", { timeo
     const changedProfile = await embeddingCall({op: "publish"}, "8");
     assert.equal(changedProfile.status, 409);
     assert.match((await changedProfile.json()).error, /HostedEmbeddingProfileChanged/);
+    const recycleCall = async body => {
+      const response = await mf.dispatchFetch("https://example.test/test/recycle", {method: "POST", headers: {Authorization: "Bearer local-test"}, body: JSON.stringify(body)});
+      const result = await response.json(); assert.equal(response.status, 200, JSON.stringify(result)); return result;
+    };
+    const recycledMutation = {op: "mutate", operation_id: "recycled-write", mutations: [{kind: "upsert", doc_id: "a", body: '{"text":"recycled compute"}'}]};
+    const recycledReceipt = await recycleCall(recycledMutation);
+    await recycleCall({op: "publish"});
+    assert.equal((await recycleCall(recycledMutation)).visibility, recycledReceipt.visibility);
+    assert.equal(JSON.parse((await recycleCall({op: "lookup", doc_id: "a", required_visibility: recycledReceipt.visibility})).body).text, "recycled compute");
+    assert.equal((await recycleCall({op: "compact"})).published, true);
+    assert.equal((await recycleCall({op: "count"})).count, "1");
 
   } finally {
     if (mf) await mf.dispose();

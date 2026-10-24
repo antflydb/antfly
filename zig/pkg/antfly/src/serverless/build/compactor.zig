@@ -50,6 +50,10 @@ pub const Compactor = struct {
     artifacts: *artifacts_mod.ArtifactStore,
     manifests: *manifest_mod.ManifestStore,
     progress: *catalog_mod.ProgressStore,
+    /// Optional hosted preflight admission. Native callers keep their existing
+    /// behavior; these bounds do not replace allocator and transport limits.
+    max_documents: ?u64 = null,
+    max_artifact_bytes: ?u64 = null,
 
     pub fn init(
         alloc: Allocator,
@@ -83,9 +87,23 @@ pub const Compactor = struct {
         publication_guard: ?work_lease.PublicationGuard,
         cancellation: ?maintenance_cancellation.Token,
     ) !CompactionResult {
-        var fallback: ?std.Io.Threaded = if (cancellation == null) std.Io.Threaded.init(std.heap.page_allocator, .{}) else null;
-        defer if (fallback) |*value| value.deinit();
-        const io = if (cancellation) |token| token.io else fallback.?.io();
+        if (cancellation) |token| return self.compactHeadWithIo(namespace, publication_guard, token);
+        if (comptime @import("builtin").os.tag == .freestanding) {
+            return error.MaintenanceIoRequired;
+        } else {
+            var fallback = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer fallback.deinit();
+            return self.compactHeadWithIo(namespace, publication_guard, .{ .io = fallback.io() });
+        }
+    }
+
+    fn compactHeadWithIo(
+        self: *Compactor,
+        namespace: []const u8,
+        publication_guard: ?work_lease.PublicationGuard,
+        cancellation: maintenance_cancellation.Token,
+    ) !CompactionResult {
+        const io = cancellation.io;
         if (publication_guard == null) {
             var owner_bytes: [16]u8 = undefined;
             io.random(&owner_bytes);
@@ -93,7 +111,7 @@ pub const Compactor = struct {
             var held = (try work_lease.acquireHeld(try self.progress.workLeaseProvider(), io, namespace, &owner, 30 * std.time.ns_per_s)) orelse
                 return error.WorkLeaseLost;
             defer _ = held.release() catch false;
-            return self.compactHeadGuardedUntil(namespace, held.guard(), held.cancellation(cancellation orelse .{ .io = io }));
+            return self.compactHeadGuardedUntil(namespace, held.guard(), held.cancellation(cancellation));
         }
         var protection = try builder_mod.GraphSourceProtection.init(self.progress, namespace, cancellation);
         var scoped_artifacts = self.artifacts.*;
@@ -116,6 +134,12 @@ pub const Compactor = struct {
         const current_head = try self.progress.getHead(namespace);
         var current = try self.manifests.getAlloc(namespace, current_head);
         defer current.deinit(self.alloc);
+        if (self.max_documents) |maximum| if (current.stats.document_count > maximum) return error.CompactionBudgetExceeded;
+        if (self.max_artifact_bytes) |maximum| {
+            var bytes: u64 = 0;
+            for (current.artifacts) |artifact| bytes = std.math.add(u64, bytes, artifact.byte_len) catch return error.CompactionBudgetExceeded;
+            if (bytes > maximum) return error.CompactionBudgetExceeded;
+        }
         const facts_index = builder_mod.findArtifactIndex(current, .document_facts);
         const mutation_index = if (facts_index != null) null else builder_mod.findArtifactIndex(current, .mutation_segment);
         const before_docs = if (facts_index) |idx|
@@ -221,7 +245,7 @@ pub const Compactor = struct {
             latest_docs,
             overlay_mutations,
             graph_index_names,
-            true,
+            builder_mod.findArtifactIndex(current, .graph_segment) != null,
             try builder_mod.graphPublicationAttempt(publication_guard, namespace, cancellation.?.io),
             cancellation,
         );
@@ -741,6 +765,14 @@ test "serverless compactor rewrites head into compacted searchable artifacts" {
     defer before.deinit(alloc);
 
     var compactor = Compactor.init(alloc, &artifact_store, &manifest_store, &progress_store);
+    compactor.max_documents = 1;
+    try std.testing.expectError(error.CompactionBudgetExceeded, compactor.compactHead("docs"));
+    try std.testing.expectEqual(build.version, try progress_store.getHead("docs"));
+    compactor.max_documents = null;
+    compactor.max_artifact_bytes = 1;
+    try std.testing.expectError(error.CompactionBudgetExceeded, compactor.compactHead("docs"));
+    try std.testing.expectEqual(build.version, try progress_store.getHead("docs"));
+    compactor.max_artifact_bytes = null;
     var result = try compactor.compactHead("docs");
     defer result.deinit(alloc);
     try std.testing.expect(result.published);
