@@ -74,8 +74,8 @@ const std = @import("std");
 /// Version 39 decodes native per-record resolver authority and its atomic heads.
 /// Version 40 carries compact physical namespace bindings and projection reads.
 /// Version 41 carries shared content-addressed namespace execution attachments.
-pub const current_version: u16 = 41;
-pub const resolver_records_version: u16 = 41;
+pub const current_version: u16 = 42;
+pub const resolver_records_version: u16 = 42;
 pub const native_service_tables_version: u16 = 38;
 pub const resolver_namespaces_version: u16 = 37;
 /// Conservative admission over canonical stored JSON, shared by catalog and

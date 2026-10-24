@@ -2687,7 +2687,8 @@ test "capi resolver curation fair coalesced projection work survives a continuou
     defer a.free(path);
     const root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
     const handle = try api.publishHandle(root);
-    defer api.antfly_db_close(handle);
+    var live = true;
+    defer if (live) api.antfly_db_close(handle);
     try table_ops.create(root, "entities", "{}", false);
     var out: h.capi.Buffer = .{};
     defer api.antfly_buffer_free(&out);
@@ -2698,9 +2699,13 @@ test "capi resolver curation fair coalesced projection work survives a continuou
         api.antfly_buffer_free(&out);
     }
     try root.db.addResolver(.{ .name = "unowned", .table = "entities", .source_artifact = "unowned", .resolution_artifact = "unowned-resolved", .key_template = "unowned/{{_key}}", .promote = false });
+    const static_publications = root.db.core.index_manager.test_resolver_catalog_publications;
     for (0..12) |i| {
+        const reverse = @import("../storage/lite/resolver_consumers.zig");
+        reverse.test_binding_visits.store(0, .monotonic);
         try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_suppress_json(handle, .fromSlice("entities"), .fromSlice(try std.fmt.allocPrint(scratch, "p-0/hot-{d}", .{i})), .fromSlice("{}"), &out));
         api.antfly_buffer_free(&out);
+        try std.testing.expectEqual(@as(usize, 1), reverse.test_binding_visits.load(.monotonic));
         try std.testing.expect(try authority.pullProjection(root, &root.db, scratch));
     }
     for (try root.db.core.index_manager.listResolverIdentities(scratch)) |cfg| {
@@ -2719,6 +2724,25 @@ test "capi resolver curation fair coalesced projection work survives a continuou
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
     try std.testing.expect(!try authority.hasProjectionDebt(root, &root.db, scratch));
     try std.testing.expect(root.db.core.index_manager.getResolver("unowned").?.namespace_curation_generation > 0);
+    try std.testing.expectEqual(static_publications, root.db.core.index_manager.test_resolver_catalog_publications);
+    const revision = root.db.core.index_manager.getResolver("r-0").?.namespace_curation_generation;
+    api.antfly_db_close(handle);
+    live = false;
+    const reopened = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, false, null, null);
+    const reopened_handle = try api.publishHandle(reopened);
+    defer api.antfly_db_close(reopened_handle);
+    try std.testing.expectEqual(revision, reopened.db.core.index_manager.getResolver("r-0").?.namespace_curation_generation);
+    for (try reopened.db.core.index_manager.listResolverIdentities(scratch)) |cfg| try std.testing.expect(cfg.namespace_curation_generation > 0);
+    // A static config edit folds deltas without discarding native ownership.
+    _ = try reopened.db.upsertResolverWithResultOptions(.{ .name = "r-0", .table = "entities", .source_artifact = "r-0", .resolution_artifact = "resolved-0", .key_template = "p-0/{{_key}}", .promote = false, .min_confidence = 0.5 }, .{ .drain_backfill = false, .wait_for_activity = true });
+    const configured = reopened.db.core.index_manager.getResolver("r-0").?;
+    try std.testing.expectEqual(revision, configured.namespace_curation_generation);
+    try std.testing.expect(configured.namespace_curation_table_id != 0);
+    const Native = @import("../storage/db/resolver_authority.zig");
+    var read = try reopened.db.core.store.beginReadTxn();
+    defer read.abort();
+    var overlay: Native.Transaction(@import("../storage/docstore.zig").DocStore.Txn) = .{ .txn = &read };
+    try std.testing.expectEqual(@as(usize, 0), (try overlay.store(scratch, "").backend.scan(&overlay, scratch, @import("../storage/db/resolver_projection.zig").prefix, null, 1)).rows.len);
 }
 
 test "capi resolver curation shared remote policies acquire persistent ownership once" {

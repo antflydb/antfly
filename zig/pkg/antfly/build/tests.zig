@@ -723,6 +723,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "export and import documents preserve timestamps",
             "portable backup round trips relational rows and schema metadata",
             "portable backup curation proposal metadata",
+            "portable backup native resolver authority",
             "portable backup refuses retained retirement and topology authority without a catalog",
             "portable accepted-generation proof requires a sealed v3 reader and canonical unique scope",
             "portable accepted-generation proof page reads only canonical sealed decoder metadata",

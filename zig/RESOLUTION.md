@@ -1841,7 +1841,8 @@ curation state and queue receipts require reader version 11. Original native
 resolver records remain readable at Lite reader version 12. Physical projection
 bindings, shared catalogs and fingerprinted heads require version 13; native
 metadata commands and shared execution attachments require coordinated decoder
-version 41.
+version 42. Version 41 introduced shared attachments; version 42 adds selective
+execution cuts and indexed namespace routes.
 Coalesced native Lite projection jobs require reader version 14.
 Legacy blob policy publication retains its version 37 decoder fence.
 
@@ -2052,11 +2053,38 @@ unchanged shared policies compare by digest.
 Native Lite maintains coalesced per-owner namespace jobs in the same physical
 transaction as authority-head changes, binding changes and destination directory
 changes. A durable cursor rotates work, so a hot namespace cannot pin the tail.
-Catalog publication acknowledges the selected job and advances its cursor
-atomically, under the same namespace dependency fence. Reader-14 fences cover
-both pending jobs and cursor records, including portable restore. Work discovery
+Projection publication acknowledges the selected job and advances its cursor
+atomically, under the same namespace dependency fence. Reader 14 introduced
+pending jobs and cursor records; reader 15 fences the durable namespace routes
+and projection delta records, including portable restore. Work discovery
 seeks the pending-job prefix instead of opening or polling every destination.
 
 The native transaction overlay keeps an ordered staged index. Prefix reads merge
 bounded base and staged ranges, including replacements and tombstones; unrelated
 staged writes do not participate in adjacency scans during adoption or curation.
+
+
+### Incremental projection publication and scoped reads
+
+Native projection replay writes one namespace snapshot and its execution clocks
+under a private projection prefix. Static resolver catalogs are unchanged by
+replay. Empty work acknowledgements write only their job/cursor records. A source
+owner loads the static catalog and namespace snapshots at one read cut; structural
+edits fold serving snapshots into the catalog and retire their delta records in
+the same transaction. Publication epochs fence prepared work across reopen and
+snapshot replacement. Portable imports validate the snapshot bindings against the
+static catalog before publication.
+
+Namespace routing uses an atomically populated prefix index; legacy read-only
+spaces retain the scan fallback until an authorized writer completes adoption.
+Native Lite consumer lookup and invalidation use namespace-specific reverse
+bindings. Projection clocks are read from the source owner's namespace index,
+not a second copy in reverse bindings. Structural routing comparisons group
+labels once per routing domain rather than rescanning sibling catalogs for each
+resolver.
+
+HTTP descriptor/status cuts export no execution policies. Execution cuts hydrate
+only named resolvers and, for query resolution, the siblings that can consume the
+same extraction. Consumer pages own strings independently of storage cursor
+movement. Progress observation runs in bounded groups of 16 source tables, with a
+shared deadline and per-worker allocation ownership.

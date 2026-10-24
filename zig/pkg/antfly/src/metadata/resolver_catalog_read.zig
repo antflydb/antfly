@@ -26,6 +26,9 @@ pub const Request = struct {
     cursor: ?[]const u8 = null,
     standalone: bool = false,
     compact_consumers: bool = false,
+    /// null expands all policies; an empty list is a descriptor/status cut.
+    projection_names: ?[]const []const u8 = null,
+    routing_siblings: bool = false,
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
@@ -131,12 +134,30 @@ pub const ConsumerReference = struct {
     }
 };
 
+/// Metadata cursors may release or reuse a row at the next seek/advance.
+pub fn decodeConsumerReference(a: std.mem.Allocator, bytes: []const u8) !ConsumerReference {
+    const value = try std.json.parseFromSliceLeaky(ConsumerReference, a, bytes, .{ .allocate = .alloc_always });
+    if (value.version != 1) return error.InvalidCatalogRecord;
+    return value;
+}
+
 test "resolver curation namespace propagation compact consumers retain unadopted merges" {
     const a = std.testing.allocator;
     const Config = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
     const cfg: Config = .{ .name = "legacy", .table = "entities", .key_template = "other/{{_entity.text}}", .source_artifact = "source", .resolution_artifact = "resolved", .merges = &.{.{ .key = "other/a", .target = "other/b" }}, .merge_generation = 7, .merge_state_version = 1 };
     const bytes = try std.json.Stringify.valueAlloc(a, ConsumerReference{ .source_id = 2, .source_name = "source", .configs = &.{cfg} }, .{});
     defer a.free(bytes);
+    {
+        var row_arena = std.heap.ArenaAllocator.init(a);
+        defer row_arena.deinit();
+        const reused_row = try a.dupe(u8, bytes);
+        defer a.free(reused_row);
+        const retained = try decodeConsumerReference(row_arena.allocator(), reused_row);
+        @memset(reused_row, 0);
+        try std.testing.expectEqualStrings("source", retained.source_name);
+        try std.testing.expectEqualStrings("legacy", retained.configs[0].name);
+        try std.testing.expectEqualStrings("other/b", retained.configs[0].merges[0].target);
+    }
     const reference = try std.json.parseFromSlice(ConsumerReference, a, bytes, .{});
     defer reference.deinit();
     try std.testing.expect(Config.aliasesEqual(cfg.merges, reference.value.configs[0].merges));

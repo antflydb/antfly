@@ -1772,6 +1772,8 @@ pub fn isPortableMetadataKey(key: []const u8) bool {
         std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers") or
         std.mem.eql(u8, key, @import("antfly_resolver").curation.proposal_store_key) or
         std.mem.startsWith(u8, key, @import("db/resolver_authority.zig").lite_prefix) or
+        std.mem.startsWith(u8, key, @import("db/resolver_projection.zig").prefix) or
+        std.mem.eql(u8, key, @import("db/resolver_projection.zig").epoch_key) or
         std.mem.startsWith(u8, key, @import("lite/resolver_consumers.zig").work_prefix) or
         std.mem.eql(u8, key, @import("lite/resolver_consumers.zig").cursor_key) or
         std.mem.eql(u8, key, resolver_catalog.minimum_reader_key) or
@@ -3649,6 +3651,8 @@ const PortableArchiveValidation = struct {
     saw_native_resolver_records: bool = false,
     saw_resolver_projection_format: bool = false,
     saw_resolver_projection_work: bool = false,
+    saw_resolver_projection_deltas: bool = false,
+    resolver_projection_rows: std.ArrayListUnmanaged(struct { key: []u8, value: []u8 }) = .empty,
     saw_native_resolver_marker: bool = false,
     resolver_configs: ?[]resolver_catalog.ResolverConfig = null,
     resolver_merge_data: ?[]u8 = null,
@@ -3802,6 +3806,11 @@ const PortableArchiveValidation = struct {
     }
 
     pub fn deinit(self: *PortableArchiveValidation, alloc: Allocator) void {
+        for (self.resolver_projection_rows.items) |row| {
+            alloc.free(row.key);
+            alloc.free(row.value);
+        }
+        self.resolver_projection_rows.deinit(alloc);
         if (self.resolver_configs) |configs| {
             for (configs) |*cfg| cfg.deinit(alloc);
             alloc.free(configs);
@@ -3905,6 +3914,7 @@ const PortableArchiveValidation = struct {
         if (self.saw_native_resolver_records and (!self.saw_native_resolver_marker or (self.minimum_reader_version orelse 0) < resolver_catalog.native_resolver_records_reader_version)) return error.InvalidMetadataBatch;
         if (self.saw_resolver_projection_format and (self.minimum_reader_version orelse 0) < resolver_catalog.resolver_projection_bindings_reader_version) return error.InvalidMetadataBatch;
         if (self.saw_resolver_projection_work and (self.minimum_reader_version orelse 0) < resolver_catalog.resolver_projection_work_reader_version) return error.InvalidMetadataBatch;
+        if (self.saw_resolver_projection_deltas and (self.minimum_reader_version orelse 0) < resolver_catalog.resolver_projection_delta_reader_version) return error.InvalidMetadataBatch;
         if (self.saw_curation_proposals and (self.minimum_reader_version orelse 0) < resolver_catalog.scoped_curation_reader_version) return error.InvalidMetadataBatch;
         const resolver_bytes = try resolver_catalog.serializeCatalog(alloc, self.resolver_configs orelse &.{});
         defer alloc.free(resolver_bytes);
@@ -3920,6 +3930,25 @@ const PortableArchiveValidation = struct {
             error.OutOfMemory => return err,
             else => return error.InvalidMetadataBatch,
         };
+        {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const durable = @import("db/resolver_projection.zig");
+            var definitions: std.StringHashMapUnmanaged(resolver_catalog.ResolverConfig) = .empty;
+            for (configs) |cfg| try definitions.put(a, cfg.name, cfg);
+            for (self.resolver_projection_rows.items) |row| {
+                const record = try durable.parse(a, row.key, row.value);
+                const shared = try resolver_catalog.SharedProjection.create(a, record.namespace.merges, try std.json.Stringify.valueAlloc(a, record.namespace.state, .{}));
+                var profiles: std.StringHashMapUnmanaged(void) = .empty;
+                for (record.bindings) |binding| {
+                    const cfg = definitions.get(binding.name) orelse return error.InvalidMetadataBatch;
+                    const next = try durable.apply(cfg, record, binding, shared);
+                    const profile = try std.json.Stringify.valueAlloc(a, .{ next.aliases, next.suppress_json }, .{});
+                    if (!(try profiles.getOrPut(a, profile)).found_existing) try next.validatePolicy();
+                }
+            }
+        }
         if (self.cohort != null and !self.saw_cohort) return error.BackupIntegrityFailure;
         if (self.source_copy != null and !self.saw_source_copy) return error.BackupIntegrityFailure;
         if (self.source_integrity != null and (self.source_integrity_catalog == null or !self.source_integrity_activation)) return error.BackupIntegrityFailure;
@@ -4862,6 +4891,7 @@ fn validateMetadataEntries(
                 else => return error.InvalidMetadataBatch,
             };
             archive.saw_native_resolver_records = true;
+            if (std.mem.startsWith(u8, entry.key, @import("db/resolver_authority.zig").lite_prefix ++ "head-route")) archive.saw_resolver_projection_deltas = true;
             if (std.mem.startsWith(u8, entry.key, @import("db/resolver_authority.zig").lite_prefix ++ "queue/queue-only/")) archive.saw_resolver_projection_format = true;
             if (std.mem.startsWith(u8, entry.key, @import("db/resolver_authority.zig").lite_prefix ++ "head/")) {
                 const head = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), entry.value, .{});
@@ -4880,6 +4910,19 @@ fn validateMetadataEntries(
                 else => return error.InvalidMetadataBatch,
             };
             archive.saw_curation_proposals = true;
+        } else if (std.mem.startsWith(u8, entry.key, @import("db/resolver_projection.zig").prefix)) {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            _ = try @import("db/resolver_projection.zig").parse(arena.allocator(), entry.key, entry.value);
+            const key_copy = try alloc.dupe(u8, entry.key);
+            errdefer alloc.free(key_copy);
+            const value_copy = try alloc.dupe(u8, entry.value);
+            errdefer alloc.free(value_copy);
+            try archive.resolver_projection_rows.append(alloc, .{ .key = key_copy, .value = value_copy });
+            archive.saw_resolver_projection_deltas = true;
+        } else if (std.mem.eql(u8, entry.key, @import("db/resolver_projection.zig").epoch_key)) {
+            _ = std.fmt.parseInt(u64, entry.value, 10) catch return error.InvalidMetadataBatch;
+            archive.saw_resolver_projection_deltas = true;
         } else if (std.mem.startsWith(u8, entry.key, @import("lite/resolver_consumers.zig").work_prefix)) {
             const jobs = @import("lite/resolver_consumers.zig");
             const suffix = entry.key[jobs.work_prefix.len..];
@@ -7636,6 +7679,7 @@ test "portable backup native resolver authority retains heads policy and queue i
     const native = @import("db/resolver_authority.zig");
     const pure = @import("antfly_resolver").curation;
     const jobs = @import("lite/resolver_consumers.zig");
+    const durable = @import("db/resolver_projection.zig");
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -7651,6 +7695,16 @@ test "portable backup native resolver authority retains heads policy and queue i
     std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ "default", "concept/{{_key}}" }, .{}), &job_digest, .{});
     const job_key = try std.mem.concat(a, u8, &.{ jobs.work_prefix, &std.fmt.bytesToHex(job_digest, .lower) });
     const job = try std.json.Stringify.valueAlloc(a, jobs.Work{ .table = "default", .key_template = "concept/{{_key}}" }, .{});
+    const catalog_key = "\x00\x00__metadata__:resolvers";
+    const catalog_bytes = try resolver_catalog.serializeCatalog(a, &.{.{ .name = "concepts", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{_key}}", .promote = false }});
+    var projection: durable.Record = .{
+        .table = "default",
+        .table_id = 7,
+        .namespace = .{ .record_store = true, .key_template = "concept/{{_key}}", .revision = 1, .merges = &.{.{ .key = "concept/a", .target = "concept/b" }} },
+        .bindings = &.{.{ .name = "concepts", .retired = false, .resolution_generation = 2, .merge_generation = 2, .merge_state_version = 1 }},
+    };
+    const projection_key = try durable.key(a, projection.table, projection.namespace.key_template);
+    const projection_bytes = try std.json.Stringify.valueAlloc(a, projection, .{});
     const Bridge = native.Transaction(DocStore.Txn);
     {
         var txn = try source.beginWriteTxn();
@@ -7663,9 +7717,12 @@ test "portable backup native resolver authority retains heads policy and queue i
         try authority.applyQueue(.{ .expected_revision = 1, .revision = 2, .receipt_scope = @splat('a'), .proposals = &.{terminal} });
         try authority.markQueueOnly(terminal.id);
         try bridge.backendPut(a, native.lite_marker, "1");
+        try bridge.backendPut(a, catalog_key, catalog_bytes);
+        try bridge.backendPut(a, projection_key, projection_bytes);
+        try bridge.backendPut(a, durable.epoch_key, "1");
         try bridge.backendPut(a, job_key, job);
         try bridge.backendPut(a, jobs.cursor_key, job_key);
-        try bridge.backendPut(a, resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(resolver_catalog.resolver_projection_work_reader_version));
+        try bridge.backendPut(a, resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(resolver_catalog.resolver_projection_delta_reader_version));
         try bridge.flush(a);
         try txn.commit();
         committed = true;
@@ -7691,9 +7748,21 @@ test "portable backup native resolver authority retains heads policy and queue i
     try std.testing.expect(try restored.queueOnly(terminal.id));
     try std.testing.expect(pure.sameReceiptScope(@splat('a'), (try restored.queueHead()).receipt_scope));
     try std.testing.expectEqualStrings("1", try target.get(a, native.lite_marker));
-    try std.testing.expectEqualStrings(try resolver_catalog.readerVersionBytes(resolver_catalog.resolver_projection_work_reader_version), try target.get(a, resolver_catalog.minimum_reader_key));
+    try std.testing.expectEqualStrings(try resolver_catalog.readerVersionBytes(resolver_catalog.resolver_projection_delta_reader_version), try target.get(a, resolver_catalog.minimum_reader_key));
     try std.testing.expectEqualStrings(job, try target.get(a, job_key));
     try std.testing.expectEqualStrings(job_key, try target.get(a, jobs.cursor_key));
+    try std.testing.expectEqualStrings(projection_bytes, try target.get(a, projection_key));
+    try std.testing.expectEqualStrings("1", try target.get(a, durable.epoch_key));
+    // An otherwise well-formed delta cannot bind an absent static definition.
+    projection.bindings = &.{.{ .name = "missing", .retired = false, .resolution_generation = 2, .merge_generation = 2, .merge_state_version = 1 }};
+    var orphan: PortableArchiveValidation = .{ .format_version = backup_codec.format_version };
+    defer orphan.deinit(alloc);
+    try validateMetadataEntries(alloc, &.{
+        .{ .key = catalog_key, .value = catalog_bytes },
+        .{ .key = resolver_catalog.minimum_reader_key, .value = "15" },
+        .{ .key = projection_key, .value = try std.json.Stringify.valueAlloc(a, projection, .{}) },
+    }, &orphan);
+    try std.testing.expectError(error.InvalidMetadataBatch, orphan.finish(alloc));
     var incomplete: PortableArchiveValidation = .{ .format_version = backup_codec.format_version };
     defer incomplete.deinit(alloc);
     try validateMetadataEntries(alloc, &.{.{ .key = native.lite_marker, .value = "1" }}, &incomplete);

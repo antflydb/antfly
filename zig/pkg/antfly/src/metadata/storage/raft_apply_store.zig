@@ -23168,7 +23168,7 @@ pub const RaftApplyStore = struct {
                 if (read.into) |id| try seeds.append(a, id);
                 try seeds.appendSlice(a, read.seeds);
                 for (read.seeds) |id| try keys.put(a, id, {});
-                for (try store.heads()) |h| {
+                for (try store.matchingHeads(read.key)) |h| {
                     if (!resolver_curation.keyInNamespace(h.key_template, read.key)) continue;
                     var aliases: std.ArrayList(@import("antfly_resolver").KeyAlias) = .empty;
                     if (read.profiles.len > 4096) return error.ResolverCurationLimitExceeded;
@@ -23211,6 +23211,7 @@ pub const RaftApplyStore = struct {
         try write.validate();
         var bridge: NativeResolverTxn = .{ .txn = txn };
         const store = try nativeResolverStore(a, &bridge, group, write.table_id);
+        try store.ensureHeadRoutes();
         const receipt = try std.fmt.allocPrint(a, "{s}receipt/{s}", .{ store.prefix, try write.receipt(a) });
         if (try stagingGet(txn, receipt) != null) return;
         var table_buf: [160]u8 = undefined;
@@ -23326,8 +23327,23 @@ pub const RaftApplyStore = struct {
             }
             result.ranges = ranges;
             var projections: ResolverProjectionCache = .empty;
-            const execution_indexes = try self.resolverExecutionIndexesTxn(a, &txn, group_id, table.indexes_json, &projections);
-            result.execution_indexes = execution_indexes;
+            var selected_names = input.projection_names;
+            if (input.routing_siblings and selected_names != null and selected_names.?.len != 0) {
+                var desired: std.ArrayListUnmanaged(@import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig) = .empty;
+                try @import("antfly_local_sources").metadata_local_index_reconcile.collectDesiredResolvers(a, try std.json.parseFromSliceLeaky(std.json.Value, a, table.indexes_json, .{}), &desired);
+                var names: std.StringHashMapUnmanaged(void) = .empty;
+                for (selected_names.?) |name| {
+                    try names.put(a, name, {});
+                    for (desired.items) |cfg| if (std.mem.eql(u8, cfg.name, name)) {
+                        for (desired.items) |sibling| if (cfg.sharesRoutingDomain(sibling) and std.mem.eql(u8, cfg.source_artifact, sibling.source_artifact) and sibling.source_artifact_kind.matches(.asset)) try names.put(a, sibling.name, {});
+                    };
+                }
+                const values = try a.alloc([]const u8, names.count());
+                var it = names.keyIterator();
+                for (values) |*name| name.* = it.next().?.*;
+                selected_names = values;
+            }
+            if (selected_names == null or selected_names.?.len > 0) result.execution_indexes = try self.resolverSelectedExecutionIndexesTxn(a, &txn, group_id, table.indexes_json, &projections, selected_names);
             return std.json.Stringify.valueAlloc(alloc, result, .{});
         }
         const indexed = try stagingGet(&txn, try resolverNamespaceBootstrapKey(a, group_id)) != null;
@@ -23351,8 +23367,7 @@ pub const RaftApplyStore = struct {
             result.visited += 1;
             last = try a.dupe(u8, entry.key);
             if (input.compact_consumers and result.indexed and entry.value.len > 0 and entry.value[0] == '{') {
-                const reference = try std.json.parseFromSliceLeaky(wire.ConsumerReference, a, entry.value, .{});
-                if (reference.version != 1) return error.InvalidCatalogRecord;
+                const reference = try wire.decodeConsumerReference(a, entry.value);
                 if (!(try seen.getOrPut(a, reference.source_id)).found_existing) {
                     var selected: std.ArrayList(@import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig) = .empty;
                     var names: std.ArrayList([]const u8) = .empty;
@@ -23634,6 +23649,10 @@ pub const RaftApplyStore = struct {
     /// immutable snapshot is shared across all consumers in this read cut;
     /// source metadata and Raft updates never serialize the policy payload.
     fn resolverExecutionIndexesTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, indexes: []const u8, cache: *ResolverProjectionCache) ![]const u8 {
+        return self.resolverSelectedExecutionIndexesTxn(a, txn, group, indexes, cache, null);
+    }
+    fn resolverSelectedExecutionIndexesTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, indexes: []const u8, cache: *ResolverProjectionCache, names: ?[]const []const u8) ![]const u8 {
+        if (names) |selected| if (selected.len == 0) return indexes;
         if (indexes.len == 0) return indexes;
         var root = try std.json.parseFromSliceLeaky(std.json.Value, a, indexes, .{});
         const identities = try resolver_curation.metadataFromValue(a, root);
@@ -23642,6 +23661,12 @@ pub const RaftApplyStore = struct {
         const hydrated_identities = try a.dupe(resolver_curation.MetadataIdentity, identities.identities);
         for (hydrated_identities) |*identity| {
             if (!identity.projection_only or identity.dropped) continue;
+            if (names) |selected| {
+                const found = for (selected) |name| {
+                    if (std.mem.eql(u8, name, identity.name)) break true;
+                } else false;
+                if (!found) continue;
+            }
             const cache_key = try std.json.Stringify.valueAlloc(a, .{ identity.authority_table_id, identity.key_template }, .{});
             const entry = try cache.getOrPut(a, cache_key);
             if (!entry.found_existing) {
@@ -40262,6 +40287,10 @@ test "resolver curation namespace propagation persists compact bindings and mate
     try std.testing.expectEqual(@as(usize, 1), store.resolver_projection_exports);
     try std.testing.expectEqual(@as(u64, 0), page_configs[0].namespace_curation_generation);
     try std.testing.expectEqual(@as(u64, 1), page_configs[0].namespace_curation_table_id);
+    const before_descriptors = store.resolver_projection_exports;
+    const descriptors = try std.json.parseFromSliceLeaky(@import("../resolver_catalog_read.zig").Page, a, try store.resolverCatalogRead(a, group, .{ .table_name = "source-0", .projection_names = &.{} }), .{});
+    try std.testing.expect(descriptors.execution_indexes == null);
+    try std.testing.expectEqual(before_descriptors, store.resolver_projection_exports);
     // Many resolvers in one execution document carry the policy once.
     {
         const identities = try a.alloc(resolver_curation.MetadataIdentity, 20);
@@ -40272,6 +40301,12 @@ test "resolver curation namespace propagation persists compact bindings and mate
         var cache: RaftApplyStore.ResolverProjectionCache = .empty;
         const expanded = try store.resolverExecutionIndexesTxn(a, &read, group, raw, &cache);
         try std.testing.expect(expanded.len < 160 * 1024);
+        const selective = try store.resolverSelectedExecutionIndexesTxn(a, &read, group, raw, &cache, &.{"consumer-3"});
+        const selective_metadata = try resolver_curation.metadataFromValue(a, try std.json.parseFromSliceLeaky(std.json.Value, a, selective, .{}));
+        for (selective_metadata.identities) |identity| {
+            try std.testing.expectEqual(!std.mem.eql(u8, identity.name, "consumer-3"), identity.projection_only);
+            try std.testing.expectEqual(@as(usize, if (identity.projection_only) 0 else 1000), identity.merges.len);
+        }
         const shared_metadata = try resolver_curation.metadataFromValue(a, try std.json.parseFromSliceLeaky(std.json.Value, a, expanded, .{}));
         try std.testing.expectEqual(@as(usize, 1), shared_metadata.projections.len);
         for (shared_metadata.identities) |identity| {

@@ -56,14 +56,15 @@ fn catalogStamp(database: *h.db_mod.DB) ![32]u8 {
         }
     }.less);
     hash.update(try std.json.Stringify.valueAlloc(a, indexes, .{}));
-    const resolvers = try database.core.listResolvers(a);
-    std.mem.sort(@TypeOf(resolvers[0]), resolvers, {}, struct {
-        fn less(_: void, lhs: @TypeOf(resolvers[0]), rhs: @TypeOf(resolvers[0])) bool {
-            return std.mem.lessThan(u8, lhs.name, rhs.name);
-        }
-    }.less);
-    hash.update("resolvers\x00");
-    hash.update(try std.json.Stringify.valueAlloc(a, resolvers, .{}));
+    var txn = try database.core.store.beginReadTxn();
+    defer txn.abort();
+    inline for (.{ "\x00\x00__metadata__:resolvers", @import("../storage/db/catalog/resolver_catalog.zig").merge_catalog_key }) |key| {
+        hash.update(key);
+        if (txn.get(key)) |raw| hash.update(raw) else |err| if (err != error.NotFound) return err;
+    }
+    // Hash native immutable snapshot identities through lightweight descriptors;
+    // policy bytes remain in the storage owner.
+    if (txn.get(@import("../storage/db/resolver_projection.zig").epoch_key)) |raw| hash.update(raw) else |err| if (err != error.NotFound) return err;
     var digest: [32]u8 = undefined;
     hash.final(&digest);
     return digest;

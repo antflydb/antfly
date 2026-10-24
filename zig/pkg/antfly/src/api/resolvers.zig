@@ -466,7 +466,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
     // All resolver resources use the same scoped source cut. Full snapshots
     // remain only for sources without the private catalog-read capability.
     const page: ?catalog_read.Page = if (server.source.vtable.supports_resolver_catalog_read)
-        try readResolverCatalog(server, a, .{ .table_name = table_name }, request)
+        try readResolverCatalog(server, a, .{ .table_name = table_name, .projection_names = if (op == .list) null else if (resolver_name.len > 0) &.{resolver_name} else &.{}, .routing_siblings = op == .resolve }, request)
     else
         null;
     const adoption_revision = if (page) |value| @as(?u64, value.revision) else if (entity_mutation and server.source.vtable.linearizable_routing_snapshot != null) blk: {
@@ -1098,21 +1098,91 @@ fn observeConsumers(server: anytype, a: std.mem.Allocator, consumers: []const En
         if (!slot.found_existing) slot.value_ptr.* = .empty;
         try slot.value_ptr.append(a, i);
     }
-    const result = try a.alloc(Progress, consumers.len);
     const clock = @import("antfly_platform").time;
     const deadline = clock.monotonicNs() +| @as(u64, if (wait) |value| value.timeout_ms else 0) * std.time.ns_per_ms;
-    for (tables.keys(), tables.values()) |table, selected| {
-        const targets = try a.alloc(ReplayRequirement, selected.items.len);
-        for (selected.items, targets) |index, *target| {
-            const consumer = consumers[index];
-            target.* = .{ .target = consumer.target, .revision = namespaces.get(consumer.key_template).?.revision, .floor = null };
+    const Probe = struct {
+        arena: std.heap.ArenaAllocator = .init(std.heap.smp_allocator),
+        table: []const u8,
+        indices: []const usize,
+        progress: ?[]const Progress = null,
+        failure: ?anyerror = null,
+        done: bool = false,
+        fn run(self: *@This(), srv: @TypeOf(server), inputs: []const EntityConsumer, policy: @TypeOf(namespaces), requested_wait: @TypeOf(wait), context: operation.RequestContext, end: u64) void {
+            self.arena.deinit();
+            self.arena = .init(std.heap.smp_allocator);
+            self.progress = null;
+            self.failure = null;
+            const scratch = self.arena.allocator();
+            const targets = scratch.alloc(ReplayRequirement, self.indices.len) catch |err| {
+                self.failure = err;
+                return;
+            };
+            for (self.indices, targets) |index, *target| {
+                const consumer = inputs[index];
+                target.* = .{ .target = consumer.target, .revision = policy.get(consumer.key_template).?.revision, .floor = null };
+            }
+            const remaining = (end -| @import("antfly_platform").time.monotonicNs() +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms;
+            if (requested_wait != null and remaining == 0) {
+                self.failure = error.DeadlineExceeded;
+                return;
+            }
+            var bounded = context;
+            if (requested_wait != null) bounded.deadline_ns = @min(bounded.deadline_ns orelse std.math.maxInt(u64), end);
+            self.progress = observeReplayTargetsMode(srv, scratch, self.table, targets, if (requested_wait != null) .{ .timeout_ms = @intCast(remaining) } else null, bounded, true) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.done = for (self.progress.?) |value| {
+                if (!value.applied) break false;
+            } else true;
         }
-        const remaining = (deadline -| clock.monotonicNs() +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms;
-        const progress = observeReplayTargets(server, a, table, targets, if (remaining > 0) .{ .timeout_ms = @intCast(remaining) } else null, request) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => try pendingProgress(a, targets.len, @errorName(err)),
-        };
-        for (selected.items, progress) |index, value| result[index] = value;
+    };
+    const probes = try a.alloc(Probe, tables.count());
+    for (tables.keys(), tables.values(), probes) |table, selected, *probe| probe.* = .{ .table = table, .indices = selected.items };
+    defer for (probes) |*probe| probe.arena.deinit();
+    while (true) {
+        var offset: usize = 0;
+        while (offset < probes.len) {
+            var batch: [16]*Probe = undefined;
+            var count: usize = 0;
+            while (offset < probes.len and count < batch.len) : (offset += 1) {
+                if (probes[offset].done) continue;
+                batch[count] = &probes[offset];
+                count += 1;
+            }
+            if (request.fanout_io orelse request.deadline_io) |borrow| {
+                var receiver = try borrow.receive();
+                const io = receiver.io();
+                var tasks: std.Io.Group = .init;
+                defer tasks.cancel(io);
+                for (batch[0..count]) |probe| tasks.async(io, Probe.run, .{ probe, server, consumers, namespaces, wait, request, deadline });
+                tasks.await(io) catch return error.Canceled;
+            } else for (batch[0..count]) |probe| Probe.run(probe, server, consumers, namespaces, wait, request, deadline);
+            try request.ensureActive();
+            for (batch[0..count]) |probe| if (probe.failure) |failure| {
+                if (failure == error.OutOfMemory) return error.OutOfMemory;
+            };
+        }
+        const complete = for (probes) |probe| {
+            if (!probe.done) break false;
+        } else true;
+        const borrow = request.fanout_io orelse request.deadline_io;
+        if (complete or wait == null or clock.monotonicNs() >= deadline or borrow == null) break;
+        var receiver = try borrow.?.receive();
+        try receiver.io().sleep(.fromNanoseconds(@intCast(@min(100 * std.time.ns_per_ms, deadline -| clock.monotonicNs()))), .awake);
+    }
+    const result = try a.alloc(Progress, consumers.len);
+    for (probes) |probe| {
+        if (probe.progress) |progress| {
+            for (probe.indices, progress) |index, value| {
+                const rows = try a.dupe(GroupProgress, value.shards);
+                for (rows) |*row| {
+                    row.resolution.blocked_reason = try a.dupe(u8, row.resolution.blocked_reason);
+                    row.promotion.blocked_reason = try a.dupe(u8, row.promotion.blocked_reason);
+                }
+                result[index] = .{ .applied = value.applied, .shards = rows, .observation_error = try a.dupe(u8, value.observation_error) };
+            }
+        } else for (probe.indices) |index| result[index] = .{ .applied = false, .shards = &.{}, .observation_error = if (probe.failure) |err| @errorName(err) else "Unavailable" };
     }
     return result;
 }
@@ -1126,6 +1196,9 @@ fn observeReplayUntil(server: anytype, a: std.mem.Allocator, table_name: []const
     return (try observeReplayTargets(server, a, table_name, &.{.{ .target = cfg, .revision = revision, .floor = floor }}, wait, request))[0];
 }
 fn observeReplayTargets(server: anytype, a: std.mem.Allocator, table_name: []const u8, targets: []const ReplayRequirement, wait: ?resolver.curation.Wait, request: operation.RequestContext) ![]const Progress {
+    return observeReplayTargetsMode(server, a, table_name, targets, wait, request, false);
+}
+fn observeReplayTargetsMode(server: anytype, a: std.mem.Allocator, table_name: []const u8, targets: []const ReplayRequirement, wait: ?resolver.curation.Wait, request: operation.RequestContext, once: bool) ![]const Progress {
     const clock = @import("antfly_platform").time;
     const deadline = clock.monotonicNs() +| @as(u64, if (wait) |w| w.timeout_ms else 0) * std.time.ns_per_ms;
     while (true) {
@@ -1136,7 +1209,7 @@ fn observeReplayTargets(server: anytype, a: std.mem.Allocator, table_name: []con
         var observation_request = try request.platformDeadline();
         if (wait != null) observation_request.deadline_ns = @min(observation_request.deadline_ns orelse std.math.maxInt(u64), deadline);
         const scoped = server.source.vtable.supports_resolver_catalog_read;
-        const page: ?catalog_read.Page = if (scoped) readResolverCatalog(server, scratch, .{ .table_name = table_name }, observation_request) catch |err| {
+        const page: ?catalog_read.Page = if (scoped) readResolverCatalog(server, scratch, .{ .table_name = table_name, .projection_names = &.{} }, observation_request) catch |err| {
             try request.ensureActive();
             if (err == error.DeadlineExceeded and clock.monotonicNs() >= deadline) return pendingProgress(a, targets.len, @errorName(err));
             return err;
@@ -1164,7 +1237,7 @@ fn observeReplayTargets(server: anytype, a: std.mem.Allocator, table_name: []con
             applied = applied and out.applied;
         }
         const borrow = request.fanout_io orelse request.deadline_io;
-        if (applied or clock.monotonicNs() >= deadline or borrow == null) {
+        if (once or applied or clock.monotonicNs() >= deadline or borrow == null) {
             const owned = try a.alloc(Progress, progress.len);
             for (progress, owned) |value, *out| {
                 const rows = try a.dupe(GroupProgress, value.shards);
@@ -1382,7 +1455,7 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
 /// Query-time embedding configuration and final source validation share the
 /// scoped definition path, including nested reads after candidate execution.
 fn readResolverIndexes(server: anytype, a: std.mem.Allocator, name: []const u8, request: operation.RequestContext) ![]const u8 {
-    if (server.source.vtable.supports_resolver_catalog_read) return (try readResolverCatalog(server, a, .{ .table_name = name }, request)).table.indexes_json;
+    if (server.source.vtable.supports_resolver_catalog_read) return (try readResolverCatalog(server, a, .{ .table_name = name, .projection_names = &.{} }, request)).table.indexes_json;
     var snapshot = (try server.source.linearizableSnapshot(request)) orelse return error.TableNotFound;
     defer server.source.freeAdminSnapshot(&snapshot);
     return a.dupe(u8, (try tableByName(&snapshot, name)).indexes_json);
@@ -1716,4 +1789,64 @@ test "resolver curation HTTP plans static absorbed releases without unrelated al
     try std.testing.expectEqualStrings("entity/b", plan.absorbed[0].key);
     try std.testing.expectEqualStrings("entity/b", plan.state.removed_aliases[0]);
     try std.testing.expectError(error.ResolverNamespaceMigrationConflict, entityEffectiveAliases(a, namespace, &profiles, "entity/x", null));
+}
+
+test "resolver curation progress observes source tables with bounded parallel ownership" {
+    const Snapshot = @import("../metadata/api.zig").AdminSnapshot;
+    const Source = struct {
+        vtable: struct { supports_resolver_catalog_read: bool = false } = .{},
+        reads: std.atomic.Value(usize) = .init(0),
+        snapshot: Snapshot,
+        pub fn systemCatalog(_: *@This(), _: std.mem.Allocator, _: operation.RequestContext, _: anytype) ![]u8 {
+            return error.UnsupportedOperation;
+        }
+        pub fn linearizableSnapshot(self: *@This(), _: operation.RequestContext) !?Snapshot {
+            _ = self.reads.fetchAdd(1, .monotonic);
+            return self.snapshot;
+        }
+        pub fn freeAdminSnapshot(_: *@This(), _: *Snapshot) void {}
+    };
+    const Server = struct {
+        alloc: std.mem.Allocator = std.heap.smp_allocator,
+        source: Source,
+        active: std.atomic.Value(usize) = .init(0),
+        maximum: std.atomic.Value(usize) = .init(0),
+        pub fn localTableRuntimeStatusesWithSnapshot(self: *@This(), name: []const u8, _: anytype) !?runtime_status.LocalTableRuntimeStatuses {
+            const active = self.active.fetchAdd(1, .monotonic) + 1;
+            defer _ = self.active.fetchSub(1, .monotonic);
+            var prior = self.maximum.load(.monotonic);
+            while (prior < active) prior = self.maximum.cmpxchgWeak(prior, active, .monotonic, .monotonic) orelse break;
+            try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+            const index = try std.fmt.parseInt(u64, name[7..], 10);
+            var row: runtime_status.LocalTableRuntimeStatus = .{ .group_id = index + 100, .metadata = .{ .source = .remote_store, .freshness = .fresh }, .stats = .{} };
+            row.stats.resolution = .{ .enabled = true };
+            row.stats.resolver_replay.resolvers = &.{.{ .name = "concepts", .curation_revision = 4 }};
+            var rows = [_]runtime_status.LocalTableRuntimeStatus{row};
+            return try (runtime_status.LocalTableRuntimeStatuses{ .items = &rows }).clone(self.alloc);
+        }
+        pub fn executeResolverOperation(_: *@This(), _: std.mem.Allocator, _: []const u8, _: u64, _: []const u8, _: operation.RequestContext) ![]u8 {
+            return error.UnsupportedOperation;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tables = try a.alloc(@import("../metadata/table_manager.zig").TableRecord, 32);
+    const ranges = try a.alloc(@import("../metadata/table_manager.zig").RangeRecord, 32);
+    const consumers = try a.alloc(EntityConsumer, 32);
+    for (tables, ranges, consumers, 0..) |*table, *range, *consumer, i| {
+        const name = try std.fmt.allocPrint(a, "source-{d}", .{i});
+        table.* = .{ .name = name, .table_id = i + 1, .indexes_json = "{}" };
+        range.* = .{ .table_id = i + 1, .group_id = i + 100, .start_key = "" };
+        consumer.* = .{ .table_name = name, .key_template = "concept/{{_key}}", .target = .{ .name = "concepts", .config_generation = 0, .promote = false } };
+    }
+    var server: Server = .{ .source = .{ .snapshot = .{ .status = .{ .metadata_group_id = 0, .metrics = .{} }, .tables = tables, .ranges = ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} } } };
+    var namespaces: std.StringArrayHashMapUnmanaged(curation.Namespace) = .empty;
+    try namespaces.put(a, "concept/{{_key}}", .{ .key_template = "concept/{{_key}}", .revision = 4 });
+    const io = std.testing.io;
+    const progress = try observeConsumers(&server, a, consumers, namespaces, null, .{ .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io) });
+    for (progress) |value| try std.testing.expect(value.applied);
+    try std.testing.expectEqual(@as(usize, 32), server.source.reads.load(.monotonic));
+    try std.testing.expect(server.maximum.load(.monotonic) > 1 and server.maximum.load(.monotonic) <= 16);
+    try std.testing.expectEqual(@as(usize, 0), server.active.load(.monotonic));
 }

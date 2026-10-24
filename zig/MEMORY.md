@@ -2302,3 +2302,11 @@ proposals without scanning the queue. Reconciliation publishes component deltas
 and queue verdicts atomically with the space revision. Forget-all closes admission
 immediately; bounded retention cleanup physically retires native authority rows
 and receipt-pointer indexes alongside the existing curation provenance records.
+
+
+Identity hydration caches immutable indexes per requested component or forward
+path within the revision-fenced operation. Visiting a new component does not
+serialize or rebuild previously visited components. Membership, canonical lookup
+and distinct checks explicitly select the appropriate scope; a changed authority
+head or rollback discards the cache. Scale coverage includes hundreds of distinct
+scopes in one operation, alongside single-scope reads in a large space.

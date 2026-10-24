@@ -56,7 +56,7 @@ fn ensureConsumerIndex(root: *h.Handle, a: A) !void {
             errdefer write.abort();
             try directory.bootstrap(a, &write);
             try write.commit();
-            root.db.core.index_manager.minimum_reader_version.store(catalog.resolver_projection_work_reader_version, .release);
+            root.db.core.index_manager.minimum_reader_version.store(catalog.resolver_projection_delta_reader_version, .release);
         }
     }
 }
@@ -69,16 +69,14 @@ fn consumers(root: *h.Handle, a: A, table: []const u8, key: []const u8) ![]const
     try ensureConsumerIndex(root, a);
     var txn = try physical.?.beginRead();
     defer txn.abort();
-    const target = try directory.targetPrefix(a, table);
-    var cursor = try txn.openCursor();
     var bindings: std.ArrayList(directory.Binding) = .empty;
-    {
+    for (try directory.matchingNamespacePrefixes(a, &txn, table, key)) |target| {
+        var cursor = try txn.openCursor();
         defer cursor.close();
         var row = try directory.seekEntry(&cursor, target);
         while (row) |entry| {
             if (!std.mem.startsWith(u8, entry.key, target)) break;
-            const binding = try std.json.parseFromSliceLeaky(directory.Binding, a, entry.value, .{ .allocate = .alloc_always });
-            if (policy.keyInNamespace(binding.key_template, key)) try bindings.append(a, binding);
+            try bindings.append(a, try std.json.parseFromSliceLeaky(directory.Binding, a, entry.value, .{ .allocate = .alloc_always }));
             row = try directory.nextEntry(&cursor);
         }
     }
@@ -109,14 +107,15 @@ fn ownedConsumers(a: A, store: native.Store, destination: *h.db_mod.DB, current:
     try out.appendSlice(a, current);
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     for (current) |source| try seen.put(a, source.cfg.key_template, {});
-    for (try store.heads()) |head| {
+    for (try store.matchingHeads(key)) |head| {
         if (seen.contains(head.key_template) or !policy.keyInNamespace(head.key_template, key)) continue;
         try out.append(a, .{ .db = destination, .source = "", .synthetic = true, .cfg = .{ .name = "native_authority", .table = table, .key_template = head.key_template, .source_artifact = "authority_source", .resolution_artifact = "authority_resolution", .promote = false } });
     }
     return out.items;
 }
 fn initialize(a: A, bridge: *Bridge, store: native.Store, legacy: c.State) !void {
-    try bridge.backendPut(a, catalog.minimum_reader_key, try catalog.readerVersionBytes(catalog.resolver_projection_work_reader_version));
+    try bridge.backendPut(a, catalog.minimum_reader_key, try catalog.readerVersionBytes(catalog.resolver_projection_delta_reader_version));
+    try store.ensureHeadRoutes();
     if (try bridge.backendGet(a, marker) != null) return;
     if (legacy.proposals.len != 0 or legacy.receipt_scope != null) try store.applyQueue(.{ .expected_revision = 0, .revision = 1, .receipt_scope = legacy.receipt_scope, .proposals = legacy.proposals });
     try bridge.backendPut(a, marker, "1");
@@ -236,7 +235,7 @@ fn finish(a: A, bridge: *Bridge, txn: *docstore.DocStore.Txn, db: *h.db_mod.DB, 
     try lease.checkAt(@intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
     try bridge.flush(a);
     try txn.commit();
-    db.core.index_manager.minimum_reader_version.store(catalog.resolver_projection_work_reader_version, .release);
+    db.core.index_manager.minimum_reader_version.store(catalog.resolver_projection_delta_reader_version, .release);
 }
 pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: Input, legacy: c.State) ![]const u8 {
     const db = try tables.get(root, table);
@@ -526,7 +525,11 @@ pub fn pullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
     try jobs.validateWork(a, row.key, work);
     txn.abort();
     live = false;
-    const cfg: h.db_mod.ResolverConfig = .{ .name = "projection_work", .table = work.table, .key_template = work.key_template, .source_artifact = "source", .resolution_artifact = "resolved", .namespace_curation_table_id = work.namespace_curation_table_id, .namespace_curation_generation = work.namespace_curation_generation, .namespace_curation_missing = work.namespace_curation_missing };
+    const observation = (try database.core.index_manager.resolverNamespaceObservation(a, work.table, work.key_template)) orelse {
+        try database.completeResolverProjectionWork(row.key);
+        return true;
+    };
+    const cfg: h.db_mod.ResolverConfig = .{ .name = "projection_work", .table = work.table, .key_template = work.key_template, .source_artifact = "source", .resolution_artifact = "resolved", .namespace_curation_table_id = observation.namespace_curation_table_id, .namespace_curation_generation = observation.namespace_curation_generation, .namespace_curation_missing = observation.namespace_curation_missing };
     const desired = (try projection(root, a, cfg)) orelse {
         // Empty work is still a publication: a concurrent destination creation
         // or authority adoption must leave its newly queued work outstanding.

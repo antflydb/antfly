@@ -483,6 +483,8 @@ pub const Service = struct {
 const valueEqual = @import("value_equal.zig").equal;
 
 const Run = struct {
+    const IdentityScope = struct { policy: EntityPolicy, redirects: curation.RedirectIndex, suppression: curation.Index };
+
     const ChangeTree = std.Treap([]const u8, struct {
         fn order(a: []const u8, b: []const u8) std.math.Order {
             return std.mem.order(u8, a, b);
@@ -507,8 +509,9 @@ const Run = struct {
     identity_members: std.StringHashMapUnmanaged([]const []const u8) = .empty,
     identity_policy: ?EntityPolicy = null,
     identity_native: bool = false,
-    identity_loaded: ResourceSet = .empty,
-    identity_components: ResourceSet = .empty,
+    identity_scopes: std.StringHashMapUnmanaged(*IdentityScope) = .empty,
+    identity_full_scopes: std.StringHashMapUnmanaged(*IdentityScope) = .empty,
+    identity_legacy_scope: ?*IdentityScope = null,
     reviewing_entity: ?[]const u8 = null,
     identity_index: ?curation.RedirectIndex = null,
     suppression_index: ?curation.Index = null,
@@ -1444,9 +1447,10 @@ const Run = struct {
             self.identity_policy = null;
             self.identity_index = null;
             self.suppression_index = null;
-            self.identity_loaded.clearRetainingCapacity();
-            self.identity_components.clearRetainingCapacity();
-            self.identity_members.clearRetainingCapacity();
+            self.identity_scopes = .empty;
+            self.identity_full_scopes = .empty;
+            self.identity_legacy_scope = null;
+            self.identity_members = .empty;
         }
         _ = self.assertion_rows.remove(path);
         _ = self.evidence_rows.remove(path);
@@ -1479,9 +1483,10 @@ const Run = struct {
         self.identity_policy = null;
         self.identity_index = null;
         self.suppression_index = null;
-        self.identity_loaded.clearRetainingCapacity();
-        self.identity_components.clearRetainingCapacity();
-        self.identity_members.clearRetainingCapacity();
+        self.identity_scopes = .empty;
+        self.identity_full_scopes = .empty;
+        self.identity_legacy_scope = null;
+        self.identity_members = .empty;
         self.views.clearRetainingCapacity();
         self.historical.clearRetainingCapacity();
         for (checkpoint) |change| try self.stageChange(change.key, change.json);
@@ -2865,79 +2870,78 @@ const Run = struct {
         }
     }
     fn prepareIdentityIndex(self: *Run, seeds: []const []const u8, full: bool) !void {
+        if (seeds.len != 1) return error.MemoryCorruptState;
+        const id = seeds[0];
+        // A copied/rolled-back Run must not inherit newer overlay scopes.
         if (self.identity_index == null) {
-            self.identity_loaded = .empty;
-            self.identity_components = .empty;
+            self.identity_scopes = .empty;
+            self.identity_full_scopes = .empty;
+            self.identity_legacy_scope = null;
+            self.identity_members = .empty;
         }
-        if (self.identity_index != null) {
-            if (!self.identity_native) return;
-            const loaded = for (seeds) |id| {
-                if (!(if (full) self.identity_components.contains(id) else self.identity_loaded.contains(id))) break false;
-            } else true;
-            if (loaded) return;
-        }
-        const store = self.identityStore();
-        const native = try store.head(identity_template) != null;
-        var namespace: @import("../storage/db/resolver_namespace.zig").Namespace = .{ .key_template = identity_template };
-        if (!native) {
-            const legacy = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
-            namespace.merges = legacy.redirects;
-            namespace.state = legacy.state;
-        } else {
-            if (self.identity_policy) |previous| {
-                namespace.merges = previous.redirects;
-                namespace.state = previous.state;
-            }
-            for (seeds) |id| {
-                if (if (full) self.identity_components.contains(id) else self.identity_loaded.contains(id)) continue;
-                const scoped = (if (full) try store.component(identity_template, &.{id}) else try store.forwardScope(identity_template, &.{id})) orelse return error.MemoryCorruptState;
-                namespace = try identity_records.unionNamespaces(self.a, namespace, scoped.namespace);
-                try self.identity_loaded.put(self.a, id, {});
-                if (full) {
-                    const paths = try curation.RedirectIndex.init(self.a, scoped.namespace.merges);
-                    const canonical_id = paths.canonical(id);
-                    try self.identity_components.put(self.a, id, {});
-                    try self.identity_components.put(self.a, canonical_id, {});
-                    for (scoped.namespace.merges) |alias| if (eql(u8, paths.canonical(alias.key), canonical_id)) {
-                        try self.identity_components.put(self.a, alias.key, {});
-                        try self.identity_loaded.put(self.a, alias.key, {});
-                    };
+        const cached = self.identity_legacy_scope orelse self.identity_full_scopes.get(id) orelse if (!full) self.identity_scopes.get(id) else null;
+        const scope = cached orelse blk: {
+            const store = self.identityStore();
+            const snapshot = if (full) try store.component(identity_template, seeds) else try store.forwardScope(identity_template, seeds);
+            self.identity_native = snapshot != null;
+            const policy = if (snapshot) |value| EntityPolicy{ .redirects = value.namespace.merges, .state = value.namespace.state } else (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
+            const result = try self.a.create(IdentityScope);
+            const redirects = try curation.RedirectIndex.init(self.a, policy.redirects);
+            var suppression = try curation.Index.init(self.a, "", try self.encode(policy.state));
+            try suppression.bindRedirects(self.a, redirects);
+            result.* = .{ .policy = policy, .redirects = redirects, .suppression = suppression };
+            if (snapshot == null) {
+                // Legacy blobs are decoded and indexed once per operation.
+                self.identity_legacy_scope = result;
+                var groups: std.StringHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
+                for (policy.redirects) |alias| {
+                    const target = redirects.canonical(alias.key);
+                    const entry = try groups.getOrPut(self.a, target);
+                    if (!entry.found_existing) {
+                        entry.value_ptr.* = .empty;
+                        try entry.value_ptr.append(self.a, target);
+                    }
+                    if (!eql(u8, alias.key, target)) try entry.value_ptr.append(self.a, alias.key);
                 }
+                var it = groups.iterator();
+                while (it.next()) |entry| {
+                    std.mem.sort([]const u8, entry.value_ptr.items, {}, stringLess);
+                    try self.identity_members.put(self.a, entry.key_ptr.*, entry.value_ptr.items);
+                }
+            } else if (full) {
+                const target = redirects.canonical(id);
+                var members: std.ArrayList([]const u8) = .empty;
+                try members.append(self.a, target);
+                try self.identity_full_scopes.put(self.a, target, result);
+                for (policy.redirects) |alias| if (eql(u8, redirects.canonical(alias.key), target)) {
+                    try self.identity_full_scopes.put(self.a, alias.key, result);
+                    if (!eql(u8, alias.key, target)) try members.append(self.a, alias.key);
+                };
+                std.mem.sort([]const u8, members.items, {}, stringLess);
+                try self.identity_members.put(self.a, target, members.items);
+                try self.identity_full_scopes.put(self.a, id, result);
+            } else try self.identity_scopes.put(self.a, id, result);
+            break :blk result;
+        };
+        if (full and self.identity_legacy_scope != null) {
+            const target = scope.redirects.canonical(id);
+            if (!self.identity_members.contains(target)) {
+                const member = try self.a.alloc([]const u8, 1);
+                member[0] = target;
+                try self.identity_members.put(self.a, target, member);
             }
         }
-        const redirects = try curation.RedirectIndex.init(self.a, namespace.merges);
-        var suppression = try curation.Index.init(self.a, "", try self.encode(namespace.state));
-        try suppression.bindRedirects(self.a, redirects);
-        self.identity_native = native;
-        self.identity_policy = .{ .redirects = namespace.merges, .state = namespace.state };
-        self.identity_index = redirects;
-        self.suppression_index = suppression;
-        self.identity_members.clearRetainingCapacity();
-        var components: std.StringHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
-        for (namespace.merges) |redirect| {
-            const target = redirects.canonical(redirect.key);
-            if (native and !self.identity_components.contains(target)) continue;
-            const entry = try components.getOrPut(self.a, target);
-            if (!entry.found_existing) {
-                entry.value_ptr.* = .empty;
-                try entry.value_ptr.append(self.a, target);
-            }
-            if (!eql(u8, redirect.key, target)) try entry.value_ptr.append(self.a, redirect.key);
-        }
-        var entries = components.iterator();
-        while (entries.next()) |entry| {
-            std.mem.sort([]const u8, entry.value_ptr.items, {}, stringLess);
-            try self.identity_members.put(self.a, entry.key_ptr.*, entry.value_ptr.items);
-        }
+        self.identity_policy = scope.policy;
+        self.identity_index = scope.redirects;
+        self.suppression_index = scope.suppression;
     }
     fn identityMembers(self: *Run, id: []const u8) ![]const []const u8 {
         try self.prepareIdentityIndex(&.{id}, true);
-        const target = self.identity_index.?.canonical(id);
-        if (self.identity_members.get(target)) |members| return members;
-        const result = try self.a.alloc([]const u8, 1);
-        result[0] = try self.a.dupe(u8, target);
-        try self.identity_members.put(self.a, result[0], result);
-        return result;
+        return self.identity_members.get(self.identity_index.?.canonical(id)) orelse return error.MemoryCorruptState;
+    }
+    fn identityPinnedDistinct(self: *Run, from: []const u8, to: []const u8) !bool {
+        try self.prepareIdentityIndex(&.{from}, true);
+        return self.suppression_index.?.pinnedDistinct(self.a, from, to);
     }
     fn sameCanonicalGroup(self: *Run, left: t.Assertion, right: t.Assertion) !bool {
         var lhs = left;
@@ -4771,7 +4775,7 @@ const Run = struct {
                 distinct = true;
             };
             if (request.kind == .identity) {
-                if (distinct or seed_distinctions.contains(canonical_id) or try self.suppression_index.?.pinnedDistinct(self.a, id, candidate.entity.id)) continue;
+                if (distinct or seed_distinctions.contains(canonical_id) or try self.identityPinnedDistinct(id, candidate.entity.id)) continue;
                 const candidate_distinctions = try self.declaredDistinct(candidate.entity.id);
                 if (candidate_distinctions.contains(canonical_seed)) continue;
             }
@@ -7655,6 +7659,14 @@ test "memory performance indexed identity scope excludes ten thousand unrelated 
     try std.testing.expectEqual(@as(usize, 0), Empty.scans);
     try std.testing.expectEqual(@as(usize, 1), run.identity_policy.?.redirects.len);
     try std.testing.expectEqualStrings("canonical-123", run.identity_index.?.canonical("alias-123"));
+    const first_scope = run.identity_index.?.source.ptr;
+    for (0..512) |i| {
+        try run.prepareIdentityIndex(&.{try std.fmt.allocPrint(a, "alias-{d}", .{i})}, false);
+        try std.testing.expectEqual(@as(usize, 1), run.identity_policy.?.redirects.len);
+    }
+    try run.prepareIdentityIndex(&.{"alias-123"}, false);
+    try std.testing.expect(first_scope == run.identity_index.?.source.ptr);
+    try std.testing.expectEqual(@as(usize, 512), run.identity_scopes.count());
     const members = try run.identityMembers("alias-123");
     try std.testing.expectEqual(@as(usize, 2), members.len);
     try std.testing.expect(Empty.scans <= 6);

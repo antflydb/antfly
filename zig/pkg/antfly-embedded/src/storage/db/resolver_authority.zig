@@ -172,6 +172,51 @@ pub const Store = struct {
     pub fn head(self: Store, template: []const u8) !?Head {
         return if (try self.backend.get(self.backend.ptr, self.a, try self.headPath(template))) |raw| try parse(Head, self.a, raw) else null;
     }
+    fn headRoutePrefix(template: []const u8) []const u8 {
+        return template[0 .. std.mem.indexOf(u8, template, "{{") orelse template.len];
+    }
+    fn indexHead(self: Store, h: Head) !void {
+        const prefix = headRoutePrefix(h.key_template);
+        for (0..prefix.len + 1) |length| {
+            const node = try self.keyPath(try std.fmt.allocPrint(self.a, "head-route-node/{s}", .{try hash(self.a, prefix[0..length])}));
+            if (length == prefix.len) {
+                try self.backend.put(self.backend.ptr, self.a, node, "1");
+            } else if (try self.backend.get(self.backend.ptr, self.a, node) == null) try self.backend.put(self.backend.ptr, self.a, node, "0");
+        }
+        try self.backend.put(self.backend.ptr, self.a, try self.keyPath(try std.fmt.allocPrint(self.a, "head-route/{s}/{s}", .{ try hash(self.a, prefix), try hash(self.a, h.key_template) })), try encode(self.a, h.key_template));
+    }
+    pub fn ensureHeadRoutes(self: Store) !void {
+        const ready = try self.keyPath("head-routes-ready");
+        if (try self.backend.get(self.backend.ptr, self.a, ready) != null) return;
+        for (try self.heads()) |h| try self.indexHead(h);
+        try self.backend.put(self.backend.ptr, self.a, ready, "1");
+    }
+    pub fn matchingHeads(self: Store, key: []const u8) ![]const Head {
+        var result: std.ArrayList(Head) = .empty;
+        if (try self.backend.get(self.backend.ptr, self.a, try self.keyPath("head-routes-ready")) == null) {
+            // Read-only legacy files remain readable until authorized adoption.
+            for (try self.heads()) |h| if (policy.keyInNamespace(h.key_template, key)) try result.append(self.a, h);
+            return result.items;
+        }
+        for (0..key.len + 1) |length| {
+            const prefix_hash = try hash(self.a, key[0..length]);
+            const node = (try self.backend.get(self.backend.ptr, self.a, try self.keyPath(try std.fmt.allocPrint(self.a, "head-route-node/{s}", .{prefix_hash})))) orelse break;
+            if (std.mem.eql(u8, node, "0")) continue;
+            if (!std.mem.eql(u8, node, "1")) return error.InvalidCatalogRecord;
+            const prefix = try self.keyPath(try std.fmt.allocPrint(self.a, "head-route/{s}/", .{prefix_hash}));
+            var after: ?[]const u8 = null;
+            while (true) {
+                const page = try self.backend.scan(self.backend.ptr, self.a, prefix, after, 128);
+                for (page.rows) |row| {
+                    const template = try parse([]const u8, self.a, row.value);
+                    if (policy.keyInNamespace(template, key)) try result.append(self.a, (try self.head(template)) orelse return error.InvalidCatalogRecord);
+                }
+                after = page.next;
+                if (after == null) break;
+            }
+        }
+        return result.items;
+    }
     pub fn heads(self: Store) ![]const Head {
         const prefix = try self.keyPath("head/");
         var result: std.ArrayList(Head) = .empty;
@@ -485,6 +530,7 @@ pub const Store = struct {
             try self.backend.put(self.backend.ptr, self.a, try self.record(h.key_template, row.kind, row.id), row.value);
             try self.indexRecord(h.key_template, row.kind, row.id, row.value, true);
         }
+        try self.indexHead(h);
         try self.backend.put(self.backend.ptr, self.a, try self.headPath(h.key_template), try encode(self.a, h));
     }
     fn validateRecord(self: Store, template: []const u8, kind: Kind, raw: []const u8) !void {
@@ -569,6 +615,7 @@ pub const Store = struct {
             } else try self.backend.remove(self.backend.ptr, self.a, path);
         }
         std.crypto.hash.sha2.Sha256.hash(try encode(self.a, .{ if (previous) |old| old.fingerprint else @as([32]u8, @splat(0)), h.key_template, h.revision, h.min_text_chars, h.adoption_revision, h.adoption_standalone, patch.edits }), &h.fingerprint, .{});
+        if (previous == null) try self.indexHead(h);
         try self.backend.put(self.backend.ptr, self.a, try self.headPath(h.key_template), try encode(self.a, h));
     }
 };
@@ -796,6 +843,10 @@ pub fn validatePortableRow(a: A, key: []const u8, raw: []const u8) !void {
         if (!std.mem.eql(u8, raw, "1")) return error.InvalidMetadataBatch;
         return;
     }
+    if (std.mem.eql(u8, tail, "head-routes-ready")) {
+        if (!std.mem.eql(u8, raw, "1")) return error.InvalidMetadataBatch;
+        return;
+    }
     var parts: [5][]const u8 = undefined;
     var count: usize = 0;
     var it = std.mem.splitScalar(u8, tail, '/');
@@ -803,6 +854,16 @@ pub fn validatePortableRow(a: A, key: []const u8, raw: []const u8) !void {
         if (count == parts.len or part.len == 0) return error.InvalidMetadataBatch;
         parts[count] = part;
         count += 1;
+    }
+    if (count == 2 and std.mem.eql(u8, parts[0], "head-route-node")) {
+        if (parts[1].len != 64 or (!std.mem.eql(u8, raw, "0") and !std.mem.eql(u8, raw, "1"))) return error.InvalidMetadataBatch;
+        for (parts[1]) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
+        return;
+    }
+    if (count == 3 and std.mem.eql(u8, parts[0], "head-route")) {
+        const template = try parse([]const u8, a, raw);
+        if (!std.mem.eql(u8, parts[1], try hash(a, Store.headRoutePrefix(template))) or !std.mem.eql(u8, parts[2], try hash(a, template))) return error.InvalidMetadataBatch;
+        return;
     }
     if (count == 2 and std.mem.eql(u8, parts[0], "head")) {
         const h = try parse(Head, a, raw);
@@ -874,6 +935,7 @@ const TestMemory = struct {
     reads: usize = 0,
     writes: usize = 0,
     visited: usize = 0,
+    scans: usize = 0,
     fn get(ptr: *anyopaque, _: A, key: []const u8) !?[]const u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.reads += 1;
@@ -891,6 +953,7 @@ const TestMemory = struct {
     }
     fn scan(ptr: *anyopaque, alloc: A, prefix: []const u8, after: ?[]const u8, limit: u32) !Page {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.scans += 1;
         var rows: std.ArrayList(Row) = .empty;
         var it = self.rows.iterator();
         while (it.next()) |v| if (std.mem.startsWith(u8, v.key_ptr.*, prefix) and (after == null or std.mem.order(u8, v.key_ptr.*, after.?) == .gt)) {
@@ -978,4 +1041,21 @@ test "resolver curation transactional range scans ignore ten thousand unrelated 
     try std.testing.expectEqualStrings("narrow/b", second.rows[0].key);
     try std.testing.expect(second.next == null);
     try std.testing.expect(overlay.scan_steps < 128);
+}
+
+test "native resolver authority prefix routes exclude ten thousand unrelated namespaces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "authority/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    try store.ensureHeadRoutes();
+    for (0..10000) |i| try store.adoptNamespace(.{ .key_template = try std.fmt.allocPrint(a, "scope-{d}/{{{{_key}}}}", .{i}) });
+    try store.adoptNamespace(.{ .key_template = "{{_key}}" });
+    memory.reads = 0;
+    memory.scans = 0;
+    memory.visited = 0;
+    const matches = try store.matchingHeads("scope-123/item");
+    try std.testing.expectEqual(@as(usize, 2), matches.len);
+    try std.testing.expect(memory.reads < 32 and memory.scans <= 2 and memory.visited == 2);
 }

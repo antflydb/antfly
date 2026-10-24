@@ -19,8 +19,11 @@ const std = @import("std");
 const directory = @import("embedded_catalog.zig");
 const A = std.mem.Allocator;
 pub const catalog_key = "\x00\x00__metadata__:resolvers";
-pub const marker = "\x00antfly/embedded/resolver-consumers/v2/ready";
+pub const marker = "\x00antfly/embedded/resolver-consumers/v3/ready";
+pub const routes_prefix = "\x00antfly/embedded/resolver-consumers/v3/routes/";
+pub const namespace_prefix = "\x00antfly/embedded/resolver-consumers/v3/namespace/";
 pub const prefix = "\x00antfly/embedded/resolver-consumers/v1/target/";
+pub var test_binding_visits: std.atomic.Value(usize) = .init(0);
 pub const Binding = struct { source: []const u8, source_id: u64, resolver: []const u8, table: []const u8, key_template: []const u8, namespace_curation_table_id: u64 = 0, namespace_curation_generation: u64 = 0, namespace_curation_missing: bool = false };
 pub const work_prefix = "\x00\x00__metadata__:resolver_projection_work:v1/";
 pub const cursor_key = "\x00\x00__metadata__:resolver_projection_cursor:v1";
@@ -49,11 +52,11 @@ fn enqueue(a: A, txn: anytype, source_prefix: []const u8, work: Work) !void {
         } else |err| if (err != error.NotFound) return err;
     }
     try txn.put(key, try std.json.Stringify.valueAlloc(a, desired, .{}));
-    try txn.put("\x00\x00__metadata__:minimum_reader_version", "14");
-    if (source_prefix.len > 0) try txn.put(try std.mem.concat(a, u8, &.{ source_prefix, "\x00\x00__metadata__:minimum_reader_version" }), "14");
+    try txn.put("\x00\x00__metadata__:minimum_reader_version", "15");
+    if (source_prefix.len > 0) try txn.put(try std.mem.concat(a, u8, &.{ source_prefix, "\x00\x00__metadata__:minimum_reader_version" }), "15");
 }
 pub fn invalidateTarget(a: A, txn: anytype, table: []const u8, template: ?[]const u8) !void {
-    const target = try targetPrefix(a, table);
+    const target = if (template) |value| try namespacePrefix(a, table, value) else try targetPrefix(a, table);
     var cursor = try txn.openCursor();
     defer cursor.close();
     const Pending = struct { source: []const u8, work: Work };
@@ -61,6 +64,7 @@ pub fn invalidateTarget(a: A, txn: anytype, table: []const u8, template: ?[]cons
     var row = try seekEntry(&cursor, target);
     while (row) |entry| {
         if (!std.mem.startsWith(u8, entry.key, target)) break;
+        if (comptime @import("builtin").is_test) _ = test_binding_visits.fetchAdd(1, .monotonic);
         // Pending work survives cursor.next()/close(); its strings must too.
         const binding = try std.json.parseFromSliceLeaky(Binding, a, entry.value, .{ .allocate = .alloc_always });
         if (template == null or std.mem.eql(u8, template.?, binding.key_template)) {
@@ -119,17 +123,84 @@ pub fn targetPrefix(a: A, table: []const u8) ![]u8 {
     std.crypto.hash.sha2.Sha256.hash(table, &hash, .{});
     return std.fmt.allocPrint(a, "{s}{s}/", .{ prefix, std.fmt.bytesToHex(hash, .lower) });
 }
+pub fn namespacePrefix(a: A, table: []const u8, template: []const u8) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ table, template }, .{}), &digest, .{});
+    return std.fmt.allocPrint(a, "{s}{s}/", .{ namespace_prefix, std.fmt.bytesToHex(digest, .lower) });
+}
+fn namespaceBindingKey(a: A, source: []const u8, cfg: Definition) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ source, cfg.name }, .{}), &digest, .{});
+    return std.fmt.allocPrint(a, "{s}{s}", .{ try namespacePrefix(a, cfg.table, cfg.key_template), std.fmt.bytesToHex(digest, .lower) });
+}
+const RouteNode = struct { refs: u64 = 0, terminal: u64 = 0 };
+fn routeDigest(a: A, raw: []const u8) ![]const u8 {
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw, &hash, .{});
+    return a.dupe(u8, &std.fmt.bytesToHex(hash, .lower));
+}
+fn routeRoot(a: A, table: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "\x00antfly/embedded/resolver-consumers/v3/routes/{s}/", .{try routeDigest(a, table)});
+}
+fn updateRoute(a: A, txn: anytype, cfg: Definition, add: bool) !void {
+    const root = try routeRoot(a, cfg.table);
+    const static_prefix = cfg.key_template[0 .. std.mem.indexOf(u8, cfg.key_template, "{{") orelse cfg.key_template.len];
+    const edge = try std.fmt.allocPrint(a, "{s}route/{s}/{s}", .{ root, try routeDigest(a, static_prefix), try routeDigest(a, cfg.key_template) });
+    const exists = if (txn.get(edge)) |_| true else |err| if (err == error.NotFound) false else return err;
+    if (exists == add) return;
+    for (0..static_prefix.len + 1) |length| {
+        const path = try std.fmt.allocPrint(a, "{s}node/{s}", .{ root, try routeDigest(a, static_prefix[0..length]) });
+        var node = if (txn.get(path)) |raw| try std.json.parseFromSliceLeaky(RouteNode, a, raw, .{}) else |err| if (err == error.NotFound and add) RouteNode{} else return err;
+        if (add) {
+            node.refs = try std.math.add(u64, node.refs, 1);
+            if (length == static_prefix.len) node.terminal = try std.math.add(u64, node.terminal, 1);
+        } else {
+            node.refs = try std.math.sub(u64, node.refs, 1);
+            if (length == static_prefix.len) node.terminal = try std.math.sub(u64, node.terminal, 1);
+        }
+        if (node.refs == 0) try txn.delete(path) else try txn.put(path, try std.json.Stringify.valueAlloc(a, node, .{}));
+    }
+    if (add) try txn.put(edge, try std.json.Stringify.valueAlloc(a, cfg.key_template, .{})) else try txn.delete(edge);
+}
+pub fn matchingNamespacePrefixes(a: A, txn: anytype, table: []const u8, key: []const u8) ![]const []const u8 {
+    const root = try routeRoot(a, table);
+    var result: std.ArrayList([]const u8) = .empty;
+    for (0..key.len + 1) |length| {
+        const prefix_digest = try routeDigest(a, key[0..length]);
+        const node_raw = txn.get(try std.fmt.allocPrint(a, "{s}node/{s}", .{ root, prefix_digest })) catch |err| switch (err) {
+            error.NotFound => break,
+            else => return err,
+        };
+        const node = try std.json.parseFromSliceLeaky(RouteNode, a, node_raw, .{});
+        if (node.terminal == 0) continue;
+        const bucket = try std.fmt.allocPrint(a, "{s}route/{s}/", .{ root, prefix_digest });
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var row = try seekEntry(&cursor, bucket);
+        while (row) |entry| {
+            if (!std.mem.startsWith(u8, entry.key, bucket)) break;
+            const template = try std.json.parseFromSliceLeaky([]const u8, a, entry.value, .{ .allocate = .alloc_always });
+            if (@import("../db/resolver_namespace.zig").keyInNamespace(template, key)) try result.append(a, try namespacePrefix(a, table, template));
+            row = try nextEntry(&cursor);
+        }
+    }
+    return result.items;
+}
 fn bindingKey(a: A, source: []const u8, cfg: Definition) ![]u8 {
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ source, cfg.name }, .{}), &hash, .{});
     return std.fmt.allocPrint(a, "{s}{s}", .{ try targetPrefix(a, cfg.table), std.fmt.bytesToHex(hash, .lower) });
 }
+fn writeBinding(a: A, txn: anytype, source_prefix: []const u8, cfg: Definition, name: []const u8, id: u64) !void {
+    if (std.mem.startsWith(u8, cfg.name, "__antfly_replacement/")) return;
+    const binding: Binding = .{ .source = name, .source_id = id, .resolver = cfg.name, .table = cfg.table, .key_template = cfg.key_template };
+    const encoded = try std.json.Stringify.valueAlloc(a, binding, .{});
+    try txn.put(try bindingKey(a, source_prefix, cfg), encoded);
+    try txn.put(try namespaceBindingKey(a, source_prefix, cfg), encoded);
+    try updateRoute(a, txn, cfg, true);
+}
 fn writeBindings(a: A, txn: anytype, source_prefix: []const u8, raw: []const u8, name: []const u8, id: u64) !void {
-    for (try definitions(a, raw)) |cfg| {
-        if (std.mem.startsWith(u8, cfg.name, "__antfly_replacement/")) continue;
-        const binding: Binding = .{ .source = name, .source_id = id, .resolver = cfg.name, .table = cfg.table, .key_template = cfg.key_template, .namespace_curation_table_id = cfg.namespace_curation_table_id, .namespace_curation_generation = cfg.namespace_curation_generation, .namespace_curation_missing = cfg.namespace_curation_missing };
-        try txn.put(try bindingKey(a, source_prefix, cfg), try std.json.Stringify.valueAlloc(a, binding, .{}));
-    }
+    for (try definitions(a, raw)) |cfg| try writeBinding(a, txn, source_prefix, cfg, name, id);
 }
 /// Enroll hidden/restored namespaces and retire dropped sources in the same
 /// directory transaction. Ordinary DDL never invalidates the whole index.
@@ -162,38 +233,47 @@ pub fn directoryChanged(a: A, txn: anytype, before: ?[]const u8, after: ?[]const
 }
 /// `txn` exposes the physical file view. Callers preserve their logical prefix.
 pub fn synchronize(a: A, txn: anytype, source_prefix: []const u8, before: ?[]const u8, after: ?[]const u8) !void {
-    if (before) |raw| for (try definitions(a, raw)) |cfg| {
+    const old = if (before) |raw| try definitions(a, raw) else &.{};
+    const next = if (after) |raw| try definitions(a, raw) else &.{};
+    var prior: std.StringHashMapUnmanaged(Definition) = .empty;
+    var desired: std.StringHashMapUnmanaged(Definition) = .empty;
+    for (old) |cfg| try prior.put(a, cfg.name, cfg);
+    for (next) |cfg| try desired.put(a, cfg.name, cfg);
+    for (old) |cfg| {
+        if (desired.get(cfg.name)) |item| if (std.mem.eql(u8, item.table, cfg.table) and std.mem.eql(u8, item.key_template, cfg.key_template)) continue;
         try txn.delete(try bindingKey(a, source_prefix, cfg));
-    };
-    if (after) |raw| {
-        var name: []const u8 = "default";
-        var id: u64 = 0;
-        if (source_prefix.len != 0) {
-            const bytes = txn.get(directory.key) catch |err| switch (err) {
-                error.NotFound => return,
-                else => return err,
-            };
-            const tables = try std.json.parseFromSliceLeaky(directory.Catalog, a, bytes, .{});
-            var found = false;
-            for (tables.tables) |table| {
-                const candidate = try std.fmt.allocPrint(a, "\x02db/embedded/tables/{d}\x00", .{table.id});
-                if (!std.mem.eql(u8, candidate, source_prefix)) continue;
-                name = table.name;
-                id = table.id;
-                found = true;
-                break;
-            }
-            if (!found) return; // Hidden/unpublished namespaces are not consumers.
+        try txn.delete(try namespaceBindingKey(a, source_prefix, cfg));
+        {
+            const namespace_scope = try namespacePrefix(a, cfg.table, cfg.key_template);
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            const first = try seekEntry(&cursor, namespace_scope);
+            if (first == null or !std.mem.startsWith(u8, first.?.key, namespace_scope)) try updateRoute(a, txn, cfg, false);
         }
-        try writeBindings(a, txn, source_prefix, raw, name, id);
-        const old = if (before) |bytes| try definitions(a, bytes) else &.{};
-        for (try definitions(a, raw)) |cfg| {
-            if (std.mem.startsWith(u8, cfg.name, "__antfly_replacement/")) continue;
-            const existed = for (old) |prior| {
-                if (std.mem.eql(u8, prior.name, cfg.name) and std.mem.eql(u8, prior.table, cfg.table) and std.mem.eql(u8, prior.key_template, cfg.key_template)) break true;
-            } else false;
-            if (!existed) try enqueue(a, txn, source_prefix, .{ .table = cfg.table, .key_template = cfg.key_template, .namespace_curation_table_id = cfg.namespace_curation_table_id, .namespace_curation_generation = cfg.namespace_curation_generation, .namespace_curation_missing = cfg.namespace_curation_missing });
+    }
+    var name: []const u8 = "default";
+    var id: u64 = 0;
+    if (source_prefix.len != 0 and next.len != 0) {
+        const bytes = txn.get(directory.key) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        const tables = try std.json.parseFromSliceLeaky(directory.Catalog, a, bytes, .{});
+        var found = false;
+        for (tables.tables) |table| {
+            const candidate = try std.fmt.allocPrint(a, "\x02db/embedded/tables/{d}\x00", .{table.id});
+            if (!std.mem.eql(u8, candidate, source_prefix)) continue;
+            name = table.name;
+            id = table.id;
+            found = true;
+            break;
         }
+        if (!found) return;
+    }
+    for (next) |cfg| {
+        if (prior.get(cfg.name)) |item| if (std.mem.eql(u8, item.table, cfg.table) and std.mem.eql(u8, item.key_template, cfg.key_template)) continue;
+        try writeBinding(a, txn, source_prefix, cfg, name, id);
+        if (!std.mem.startsWith(u8, cfg.name, "__antfly_replacement/")) try enqueue(a, txn, source_prefix, .{ .table = cfg.table, .key_template = cfg.key_template });
     }
 }
 /// Upgrade reads catalog records directly, without opening DBs, indexes or
@@ -204,13 +284,15 @@ pub fn bootstrap(a: A, txn: anytype) !void {
             // Pre-bootstrap rows are only hints: an older compatible writer
             // may have changed a source before the reader fence was installed.
             {
-                var cursor = try txn.openCursor();
-                defer cursor.close();
-                var row = try seekEntry(&cursor, prefix);
-                while (row) |entry| {
-                    if (!std.mem.startsWith(u8, entry.key, prefix)) break;
-                    try txn.delete(entry.key);
-                    row = try nextEntry(&cursor);
+                for ([_][]const u8{ prefix, namespace_prefix, routes_prefix }) |scope| {
+                    var cursor = try txn.openCursor();
+                    defer cursor.close();
+                    var row = try seekEntry(&cursor, scope);
+                    while (row) |entry| {
+                        if (!std.mem.startsWith(u8, entry.key, scope)) break;
+                        try txn.delete(entry.key);
+                        row = try nextEntry(&cursor);
+                    }
                 }
             }
             if (txn.get(catalog_key)) |raw| try synchronize(a, txn, "", null, raw) else |e| if (e != error.NotFound) return e;
@@ -231,7 +313,7 @@ pub fn bootstrap(a: A, txn: anytype) !void {
                 try enqueue(a, txn, source, .{ .table = binding.table, .key_template = binding.key_template, .namespace_curation_table_id = binding.namespace_curation_table_id, .namespace_curation_generation = binding.namespace_curation_generation, .namespace_curation_missing = binding.namespace_curation_missing });
                 binding_row = try nextEntry(&cursor);
             }
-            try txn.put("\x00\x00__metadata__:minimum_reader_version", "14");
+            try txn.put("\x00\x00__metadata__:minimum_reader_version", "15");
             try txn.put(marker, "1");
             break :blk "1";
         },
