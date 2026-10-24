@@ -37,7 +37,10 @@ class DeciderConfig:
         probabilities (ConstrainedProbabilities | Unset): Token probabilities require complete decoder evidence for the
             allowed values. Verdict-only is explicit opt-in; model-reported confidence is never used.
         batch (ConstrainedGenerationBatch | Unset):
-        model (str | Unset): Required for Antfly and OpenAI; Jev defaults to jev-latest.
+        model (str | Unset): Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Cloudflare uses
+            @cf/cloudflare/clef or @cf/cloudflare/clef-flash.
+        account_id (str | Unset): Required with the cloudflare provider; Workers AI account identifier.
+        gateway_id (str | Unset): Optional Cloudflare AI Gateway identifier.
         model_identity (str | Unset): Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity.
         embedding_options (DeciderConfigEmbeddingOptions | Unset): EmbeddingGemma 2 geometry and acceptance defaults.
             Acceptance is serialized onto each question and can be overridden per question. Other models reject these
@@ -67,6 +70,8 @@ class DeciderConfig:
     probabilities: ConstrainedProbabilities | Unset = UNSET
     batch: ConstrainedGenerationBatch | Unset = UNSET
     model: str | Unset = UNSET
+    account_id: str | Unset = UNSET
+    gateway_id: str | Unset = UNSET
     model_identity: str | Unset = UNSET
     embedding_options: DeciderConfigEmbeddingOptions | Unset = UNSET
     url: str | Unset = UNSET
@@ -105,6 +110,10 @@ class DeciderConfig:
             batch = self.batch.to_dict()
 
         model = self.model
+
+        account_id = self.account_id
+
+        gateway_id = self.gateway_id
 
         model_identity = self.model_identity
 
@@ -147,6 +156,10 @@ class DeciderConfig:
             field_dict["batch"] = batch
         if model is not UNSET:
             field_dict["model"] = model
+        if account_id is not UNSET:
+            field_dict["account_id"] = account_id
+        if gateway_id is not UNSET:
+            field_dict["gateway_id"] = gateway_id
         if model_identity is not UNSET:
             field_dict["model_identity"] = model_identity
         if embedding_options is not UNSET:
@@ -222,6 +235,10 @@ class DeciderConfig:
 
         model = d.pop("model", UNSET)
 
+        account_id = d.pop("account_id", UNSET)
+
+        gateway_id = d.pop("gateway_id", UNSET)
+
         model_identity = d.pop("model_identity", UNSET)
 
         _embedding_options = d.pop("embedding_options", UNSET)
@@ -259,6 +276,8 @@ class DeciderConfig:
             probabilities=probabilities,
             batch=batch,
             model=model,
+            account_id=account_id,
+            gateway_id=gateway_id,
             model_identity=model_identity,
             embedding_options=embedding_options,
             url=url,

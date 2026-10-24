@@ -31,7 +31,7 @@ pub const WirePayload = struct {
     content_type: []const u8 = "application/json",
     headers: []const [2][]const u8 = &.{},
 };
-pub const Provider = enum { antfly, jev, openai };
+pub const Provider = enum { antfly, jev, openai, cloudflare };
 pub const Kind = enum { choice, multi_choice, score, noul };
 pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability };
 pub const Capabilities = struct { max_questions: usize = 64, max_choices: usize = 64, max_levels: usize, max_input_bytes: usize = 1024 * 1024, images: bool = false, messages: bool = false, full_distribution: bool = true, embedding_similarity: bool = false, generated: bool = false };
@@ -77,6 +77,8 @@ pub const DeciderConfig = struct {
     embedding_options: ?EmbeddingOptions = null,
     url: []const u8 = "",
     api_key: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
+    gateway_id: ?[]const u8 = null,
     max_rows: u32 = 10000,
     max_input_tokens: u64 = 1000000,
     /// Operator-supplied upper bound for one image's token contribution for
@@ -85,6 +87,13 @@ pub const DeciderConfig = struct {
     batch_size: u16 = 32,
     rate_limit: ?RateLimit = null,
     pub fn validate(self: @This()) !void {
+        if (self.provider == .cloudflare) {
+            if (self.account_id == null or self.decision_method != .typed) return error.InvalidDeciderConfig;
+            if (!std.mem.eql(u8, self.model, "@cf/cloudflare/clef") and !std.mem.eql(u8, self.model, "@cf/cloudflare/clef-flash")) return error.UnsupportedCloudflareModel;
+            var buf: [1024]u8 = undefined;
+            var fixed = std.heap.FixedBufferAllocator.init(&buf);
+            _ = try contract.cloudflare.endpoint(fixed.allocator(), self.account_id.?, self.model);
+        } else if (self.account_id != null or self.gateway_id != null) return error.InvalidDeciderConfig;
         if (self.decision_method == .generated) {
             const generator = self.generator orelse return error.InvalidDeciderConfig;
             try generator.validate();
@@ -136,10 +145,15 @@ pub const DeciderConfig = struct {
             .antfly => "http://127.0.0.1:8082",
             .jev => "https://api.typesafe.ai",
             .openai => "https://api.openai.com/v1",
+            .cloudflare => "https://api.cloudflare.com",
         };
     }
     pub fn clone(self: @This(), a: std.mem.Allocator) !@This() {
         var result = self;
+        result.account_id = if (self.account_id) |v| try a.dupe(u8, v) else null;
+        errdefer if (result.account_id) |v| a.free(v);
+        result.gateway_id = if (self.gateway_id) |v| try a.dupe(u8, v) else null;
+        errdefer if (result.gateway_id) |v| a.free(v);
         result.model = try a.dupe(u8, self.model);
         errdefer a.free(result.model);
         result.url = try a.dupe(u8, self.url);
@@ -160,6 +174,8 @@ pub const DeciderConfig = struct {
     pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
         if (self.generator) |*generator| generator.deinit(a);
         a.free(self.instructions);
+        if (self.account_id) |v| a.free(v);
+        if (self.gateway_id) |v| a.free(v);
         a.free(self.model);
         a.free(self.url);
         if (self.api_key) |key| a.free(key);
@@ -172,7 +188,7 @@ pub fn wireRequest(a: std.mem.Allocator, cfg: DeciderConfig, input: []const u8, 
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const temporary = arena.allocator();
-    if (cfg.provider == .jev) {
+    if (cfg.provider == .jev or cfg.provider == .cloudflare) {
         // Public score labels are response metadata, not Jev input fields.
         var upstream = jsonObject();
         const original = try object(questions);
@@ -184,7 +200,9 @@ pub fn wireRequest(a: std.mem.Allocator, cfg: DeciderConfig, input: []const u8, 
             }
             try put(temporary, &upstream, name, question);
         }
-        return std.json.Stringify.valueAlloc(a, .{ .model = cfg.modelName(), .state = input, .questions = upstream }, .{});
+        const model = cfg.modelName();
+        const selector = if (cfg.provider == .cloudflare) model[(std.mem.lastIndexOfScalar(u8, model, '/') orelse return error.InvalidDeciderConfig) + 1 ..] else model;
+        return std.json.Stringify.valueAlloc(a, .{ .model = selector, .state = input, .questions = upstream }, .{});
     }
     const options: ?Json = if (cfg.embedding_options) |configured| try std.json.parseFromSliceLeaky(Json, temporary, try std.json.Stringify.valueAlloc(temporary, configured, .{ .emit_null_optional_fields = false }), .{}) else null;
     return contract.requestJson(a, cfg.modelName(), input, questions, options, cfg.model_identity);

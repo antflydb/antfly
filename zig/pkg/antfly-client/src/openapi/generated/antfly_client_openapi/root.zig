@@ -213,6 +213,7 @@ pub const DocumentArtifactTableReprocessRequest = types.DocumentArtifactTableRep
 pub const DocumentArtifactTableReprocessResponse = types.DocumentArtifactTableReprocessResponse;
 pub const DocumentFieldMapping = types.DocumentFieldMapping;
 pub const DocumentSchema = types.DocumentSchema;
+pub const DocumentSource = types.DocumentSource;
 pub const DocumentSubfieldMapping = types.DocumentSubfieldMapping;
 pub const DropExtensionRequest = types.DropExtensionRequest;
 pub const DropExtensionResponse = types.DropExtensionResponse;

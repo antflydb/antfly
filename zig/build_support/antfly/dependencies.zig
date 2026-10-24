@@ -682,6 +682,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
 
     const image_mod = image_build.createModule(b, b.path("lib/image"), target, optimize, hash_mod);
     structured_mod.addImport("antfly_image", image_mod);
+    extracting_mod.addImport("antfly_image", image_mod);
     const pdf_standard_fonts_mod = @import("fonts.zig").create(b, target, optimize);
     const font_mod = b.createModule(.{
         .root_source_file = b.path("lib/font/src/mod.zig"),
@@ -842,11 +843,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
 
     const transcribing_mod = inference_graph.transcribing_mod;
     const reader_config_mod = inference_graph.reader_config_mod;
-    const readers_mod = b.createModule(.{
-        .root_source_file = b.path("lib/readers/src/mod.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const readers_mod = inference_graph.inference_mod.import_table.get("antfly_readers").?;
     readers_mod.addImport("httpx", httpx_mod);
     readers_mod.addImport("inference_api", inference_api_mod);
     readers_mod.addImport("antfly_google", google_mod);

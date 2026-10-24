@@ -377,16 +377,66 @@ components:
           description: Rewritten texts (array of arrays, one per input, multiple per beam)
 
     # Reader Types (OCR/Document Understanding)
+    DocumentSource:
+      type: object
+      additionalProperties: false
+      required: [id, url, media_type]
+      properties:
+        id:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Unique source identity within the request. Separate sources are never implicitly merged.
+        url:
+          type: string
+          description: Inline data URI or location allowed by the deployment content security policy.
+        media_type:
+          type: string
+          enum:
+          - application/pdf
+          - application/vnd.openxmlformats-officedocument.presentationml.presentation
+          - image/png
+          - image/jpeg
+          - image/webp
+        pages:
+          type: array
+          minItems: 1
+          maxItems: 1024
+          uniqueItems: true
+          description: Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide.
+          items:
+            type: integer
+            minimum: 1
+        include_notes:
+          type: boolean
+          default: false
+          description: Include slide speaker notes as separate evidence, never silently as visible slide text.
+        include_hidden:
+          type: boolean
+          default: false
+          description: Include hidden slides.
     ReadRequest:
       type: object
       required:
         - model
-        - images
+      description: Read exactly one of images or documents. The server rejects absent or simultaneous input forms before inference.
+      x-antfly-exactly-one-of: [images, documents]
       properties:
         model:
           type: string
           description: Name of reader model from models_dir/readers/
           example: "microsoft/trocr-base-printed"
+        retain_artifact:
+          type: boolean
+          default: false
+          description: Request an opaque, process-local reading handle for extraction reuse. Retention is best effort; inspect document.artifact_id and artifact_ttl_ms.
+        documents:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: Complete documents, mutually exclusive with images. Each source is independent; selected pages are read in original source order.
+          items:
+            $ref: '#/components/schemas/DocumentSource'
         images:
           type: array
           minItems: 1
@@ -443,12 +493,55 @@ components:
       required:
         - text
       properties:
+        source_id:
+          type: string
+          description: Original document source ID.
+        number:
+          type: integer
+          minimum: 1
+          description: One-based original page or slide number.
+        kind:
+          type: string
+          enum: [page, slide, image]
+        native_text:
+          type: string
+        notes:
+          type: string
+          description: Speaker notes, separate from slide text.
+        status:
+          type: string
+          enum: [complete, unresolved, truncated]
+        origin:
+          type: string
+          enum: [native, transcription, interpretation, derived, estimated]
+        coordinate_space:
+          type: string
+          description: Coordinate space of regions; PDF points, slide EMUs or image pixels.
+        transform:
+          type: object
+          additionalProperties: true
+          description: Projective source transform.
+        raster_to_source:
+          type: object
+          additionalProperties: true
+          description: Mapping from rendered pixels to original source coordinates, including page rotation and actual render DPI.
+        tables:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Tables and cells in source coordinates with provenance.
+        findings:
+          type: array
+          items:
+            type: string
         text:
           type: string
           description: Extracted text from the image
           example: "Invoice Total: $123.45"
         fields:
           type: object
+          nullable: true
           additionalProperties:
             type: string
           description: |
@@ -473,6 +566,16 @@ components:
         - model
         - results
       properties:
+        document:
+          type: object
+          additionalProperties: true
+          description: Versioned reading metadata containing status, source fingerprints, definition fingerprint, pinned model identities, adapter version and optional artifact retention handle.
+        events:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Bounded progress and audit events. These contain model names and source IDs, never credentials.
         model:
           type: string
           description: Name of model used for reading

@@ -488,7 +488,8 @@ antfly_error_code antfly_open_options_init(antfly_open_options *);
         source = self.root / "api.c"
         source.write_text("""
 #include "antfly.h"
-uint32_t antfly_abi_version(void) { return 1; }
+extern uint32_t release_value(void);
+uint32_t antfly_abi_version(void) { return release_value(); }
 int antfly_open_options_init(antfly_open_options *options) { options->size = sizeof(*options); return 0; }
 int antfly_private(void) { return 7; }
 int termite_metal_buffer_alloc(void) { return 8; }
@@ -497,6 +498,16 @@ int termite_metal_buffer_alloc(void) { return 8; }
         cc = shutil.which("clang") or shutil.which("cc")
         subprocess.run(
             [cc, "-fPIC", "-c", str(source), "-o", str(object_file)], check=True
+        )
+        # This final-image object is absent from the provider archive.
+        metadata_source = self.root / "metadata.c"
+        metadata_source.write_text(
+            "#include <stdint.h>\nuint32_t release_value(void) { return 1; }\n"
+        )
+        metadata_object = self.root / "metadata.o"
+        subprocess.run(
+            [cc, "-fPIC", "-c", str(metadata_source), "-o", str(metadata_object)],
+            check=True,
         )
         macho = platform.system() == "Darwin"
         fmt = "macho" if macho else "elf"
@@ -523,7 +534,8 @@ int termite_metal_buffer_alloc(void) { return 8; }
                     output=library,
                     map=self.root / "library.map",
                     archive=archive,
-                    link_args=[str(object_file)],
+                    object=[metadata_object],
+                    link_args=[str(object_file), str(metadata_object)],
                 )
             )
             self.assertIn(
@@ -536,6 +548,7 @@ int termite_metal_buffer_alloc(void) { return 8; }
                     cc,
                     "-shared",
                     str(object_file),
+                    str(metadata_object),
                     "-Xlinker",
                     "--version-script",
                     "-Xlinker",

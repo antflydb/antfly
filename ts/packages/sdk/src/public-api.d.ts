@@ -14865,7 +14865,14 @@ export interface components {
         };
         ExtractionStructureField: string | ({
             /** @enum {string} */
-            type?: "str" | "string" | "list" | "array";
+            type?: "str" | "string" | "list" | "array" | "text" | "number" | "date" | "estimate";
+            /** @description Decimal precision for compatible hosted number fields. */
+            decimals?: number;
+            unit?: string;
+            /** @description Minimum of a hosted estimate distribution. */
+            min?: number;
+            max?: number;
+            step?: number;
             enum?: string[];
             /** @enum {string} */
             dtype?: "str" | "list";
@@ -15830,7 +15837,7 @@ export interface components {
         };
         DeciderConfig: {
             /** @enum {string} */
-            provider?: "antfly" | "jev" | "openai";
+            provider?: "antfly" | "jev" | "openai" | "cloudflare";
             /**
              * @description Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities.
              * @default typed
@@ -15843,8 +15850,12 @@ export interface components {
             output?: components["schemas"]["ConstrainedOutput"];
             probabilities?: components["schemas"]["ConstrainedProbabilities"];
             batch?: components["schemas"]["ConstrainedGenerationBatch"];
-            /** @description Required for Antfly and OpenAI; Jev defaults to jev-latest. */
+            /** @description Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Cloudflare uses @cf/cloudflare/clef or @cf/cloudflare/clef-flash. */
             model?: string;
+            /** @description Required with the cloudflare provider; Workers AI account identifier. */
+            account_id?: string;
+            /** @description Optional Cloudflare AI Gateway identifier. */
+            gateway_id?: string;
             /** @description Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity. */
             model_identity?: string;
             /** @description EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto each question and can be overridden per question. Other models reject these options. Raw cosine similarities never represent probabilities. */
@@ -21558,12 +21569,20 @@ export interface components {
             /** @description Rewritten texts for this input, one per beam. */
             texts: string[];
         };
+        /** @description Read exactly one of images or documents. The server rejects absent or simultaneous input forms before inference. */
         InferenceReadRequest: {
             /**
              * @description Name of reader model from models_dir/readers/
              * @example microsoft/trocr-base-printed
              */
             model: string;
+            /**
+             * @description Request an opaque, process-local reading handle for extraction reuse. Retention is best effort; inspect document.artifact_id and artifact_ttl_ms.
+             * @default false
+             */
+            retain_artifact?: boolean;
+            /** @description Complete documents, mutually exclusive with images. Each source is independent; selected pages are read in original source order. */
+            documents?: components["schemas"]["DocumentSource"][];
             /**
              * @description Images to read text from. Supports:
              *     - Data URIs: `data:image/png;base64,...`
@@ -21574,7 +21593,7 @@ export interface components {
              *       }
              *     ]
              */
-            images: components["schemas"]["InferenceImageURL"][];
+            images?: components["schemas"]["InferenceImageURL"][];
             /**
              * @description Optional task prompt for document understanding models.
              *     - TrOCR: Not used (pure OCR)
@@ -21604,6 +21623,34 @@ export interface components {
             label?: string;
         };
         InferenceReadResult: {
+            /** @description Original document source ID. */
+            source_id?: string;
+            /** @description One-based original page or slide number. */
+            number?: number;
+            /** @enum {string} */
+            kind?: "page" | "slide" | "image";
+            native_text?: string;
+            /** @description Speaker notes, separate from slide text. */
+            notes?: string;
+            /** @enum {string} */
+            status?: "complete" | "unresolved" | "truncated";
+            /** @enum {string} */
+            origin?: "native" | "transcription" | "interpretation" | "derived" | "estimated";
+            /** @description Coordinate space of regions; PDF points, slide EMUs or image pixels. */
+            coordinate_space?: string;
+            /** @description Projective source transform. */
+            transform?: {
+                [key: string]: unknown;
+            };
+            /** @description Mapping from rendered pixels to original source coordinates, including page rotation and actual render DPI. */
+            raster_to_source?: {
+                [key: string]: unknown;
+            } | null;
+            /** @description Tables and cells in source coordinates with provenance. */
+            tables?: {
+                [key: string]: unknown;
+            }[];
+            findings?: string[];
             /**
              * @description Extracted text from the image
              * @example Invoice Total: $123.45
@@ -21621,7 +21668,7 @@ export interface components {
              */
             fields?: {
                 [key: string]: string;
-            };
+            } | null;
             /**
              * @description Individual text regions with bounding boxes and recognized text.
              *     Populated by multi-stage OCR models (Surya, PaddleOCR).
@@ -21636,6 +21683,14 @@ export interface components {
             object: "list";
             /** @description Read result objects, one per input image. */
             data: components["schemas"]["InferenceReadObject"][];
+            /** @description Versioned reading metadata containing status, source fingerprints, definition fingerprint, pinned model identities, adapter version and optional artifact retention handle. */
+            document?: {
+                [key: string]: unknown;
+            };
+            /** @description Bounded progress and audit events. These contain model names and source IDs, never credentials. */
+            events?: {
+                [key: string]: unknown;
+            }[];
             /** @description Name of model used for reading */
             model: string;
             usage?: components["schemas"]["InferenceGenerateUsage"];
@@ -22445,6 +22500,18 @@ export interface components {
             completion_tokens: number;
             /** @description Total tokens used (prompt + completion) */
             total_tokens: number;
+            /** @description Cumulative logical child invocations for a document run. */
+            model_calls?: number;
+            /** @description Physical child operation invocations, separate from logical composite calls. */
+            physical_model_calls?: number;
+            /** @description Cumulative rendered or decoded pixels charged by document work. */
+            rendered_pixels?: number;
+            /** @description Cumulative document text bytes charged before envelope serialization. */
+            output_bytes?: number;
+            /** @description Selected pages completed successfully. */
+            completed_pages?: number;
+            /** @description Selected pages visited, including unresolved work. */
+            visited_pages?: number;
             /** @description Prompt tokens served from inference-native prefix KV cache */
             cached_prompt_tokens?: number;
         };
@@ -23462,6 +23529,26 @@ export interface components {
          * @enum {integer}
          */
         ExtractionSchemaVersion: 1 | 2;
+        DocumentSource: {
+            /** @description Unique source identity within the request. Separate sources are never implicitly merged. */
+            id: string;
+            /** @description Inline data URI or location allowed by the deployment content security policy. */
+            url: string;
+            /** @enum {string} */
+            media_type: "application/pdf" | "application/vnd.openxmlformats-officedocument.presentationml.presentation" | "image/png" | "image/jpeg" | "image/webp";
+            /** @description Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide. */
+            pages?: number[];
+            /**
+             * @description Include slide speaker notes as separate evidence, never silently as visible slide text.
+             * @default false
+             */
+            include_notes?: boolean;
+            /**
+             * @description Include hidden slides.
+             * @default false
+             */
+            include_hidden?: boolean;
+        };
         ExtractionToken: {
             text: string;
             box?: number[];
@@ -23478,11 +23565,15 @@ export interface components {
             /** @description Version 2 only. Replaces the complete shared options; omitted fields use runtime defaults. */
             options?: components["schemas"]["ExtractionOptions"];
         };
-        /** @description Atomic extraction request. Every input is validated before inference; failures return no partial data. */
+        /** @description Atomic extraction request. Supply exactly one of inputs, documents or read_artifact. Every input is validated before inference; failures return no partial data. */
         ExtractionRequest: {
             model: string;
             schema_version?: components["schemas"]["ExtractionSchemaVersion"];
-            inputs: components["schemas"]["ExtractionInput"][];
+            /** @description Opaque handle returned by read with retain_artifact. Mutually exclusive with inputs and documents. Reuses the immutable complete reading without downloading or running OCR again. Handles expire and are local to the serving process. */
+            read_artifact?: string;
+            /** @description Complete PDF/PPTX/image sources. Mutually exclusive with inputs. Reading and extraction share document adapters and preserve independent source grouping. */
+            documents?: components["schemas"]["DocumentSource"][];
+            inputs?: components["schemas"]["ExtractionInput"][];
             schema: components["schemas"]["ExtractionSchema"];
             options?: components["schemas"]["ExtractionOptions"];
         };

@@ -50,7 +50,7 @@ components:
       properties:
         provider:
           type: string
-          enum: [antfly, jev, openai]
+          enum: [antfly, jev, openai, cloudflare]
         decision_method:
           type: string
           enum: [typed, embedding_similarity, generated]
@@ -70,7 +70,13 @@ components:
           $ref: '../shared/generating.yaml#/components/schemas/ConstrainedGenerationBatch'
         model:
           type: string
-          description: Required for Antfly and OpenAI; Jev defaults to jev-latest.
+          description: Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Cloudflare uses @cf/cloudflare/clef or @cf/cloudflare/clef-flash.
+        account_id:
+          type: string
+          description: Required with the cloudflare provider; Workers AI account identifier.
+        gateway_id:
+          type: string
+          description: Optional Cloudflare AI Gateway identifier.
         model_identity:
           type: string
           pattern: '^[0-9a-f]{64}$'

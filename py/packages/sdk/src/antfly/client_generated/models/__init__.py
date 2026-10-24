@@ -316,6 +316,8 @@ from .document_field_mapping_fields import DocumentFieldMappingFields
 from .document_field_mapping_missing_null_policy import DocumentFieldMappingMissingNullPolicy
 from .document_schema import DocumentSchema
 from .document_schema_schema import DocumentSchemaSchema
+from .document_source import DocumentSource
+from .document_source_media_type import DocumentSourceMediaType
 from .document_subfield_mapping import DocumentSubfieldMapping
 from .document_subfield_mapping_missing_null_policy import DocumentSubfieldMappingMissingNullPolicy
 from .drop_extension_request import DropExtensionRequest
@@ -1030,9 +1032,17 @@ from .inference_read_object import InferenceReadObject
 from .inference_read_object_object import InferenceReadObjectObject
 from .inference_read_request import InferenceReadRequest
 from .inference_read_response import InferenceReadResponse
+from .inference_read_response_document import InferenceReadResponseDocument
+from .inference_read_response_events_item import InferenceReadResponseEventsItem
 from .inference_read_response_object import InferenceReadResponseObject
 from .inference_read_result import InferenceReadResult
-from .inference_read_result_fields import InferenceReadResultFields
+from .inference_read_result_fields_type_0 import InferenceReadResultFieldsType0
+from .inference_read_result_kind import InferenceReadResultKind
+from .inference_read_result_origin import InferenceReadResultOrigin
+from .inference_read_result_raster_to_source_type_0 import InferenceReadResultRasterToSourceType0
+from .inference_read_result_status import InferenceReadResultStatus
+from .inference_read_result_tables_item import InferenceReadResultTablesItem
+from .inference_read_result_transform import InferenceReadResultTransform
 from .inference_request_admission_config import InferenceRequestAdmissionConfig
 from .inference_rerank_object import InferenceRerankObject
 from .inference_rerank_object_object import InferenceRerankObjectObject
@@ -2016,6 +2026,8 @@ __all__ = (
     "DocumentFieldMappingMissingNullPolicy",
     "DocumentSchema",
     "DocumentSchemaSchema",
+    "DocumentSource",
+    "DocumentSourceMediaType",
     "DocumentSubfieldMapping",
     "DocumentSubfieldMappingMissingNullPolicy",
     "DropExtensionRequest",
@@ -2722,9 +2734,17 @@ __all__ = (
     "InferenceReadObjectObject",
     "InferenceReadRequest",
     "InferenceReadResponse",
+    "InferenceReadResponseDocument",
+    "InferenceReadResponseEventsItem",
     "InferenceReadResponseObject",
     "InferenceReadResult",
-    "InferenceReadResultFields",
+    "InferenceReadResultFieldsType0",
+    "InferenceReadResultKind",
+    "InferenceReadResultOrigin",
+    "InferenceReadResultRasterToSourceType0",
+    "InferenceReadResultStatus",
+    "InferenceReadResultTablesItem",
+    "InferenceReadResultTransform",
     "InferenceRequestAdmissionConfig",
     "InferenceRerankObject",
     "InferenceRerankObjectObject",

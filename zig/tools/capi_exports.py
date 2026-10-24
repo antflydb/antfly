@@ -135,6 +135,7 @@ def link_macho(args: argparse.Namespace) -> None:
         str(args.output),
         "-force_load",
         str(args.archive),
+        *[str(path) for path in getattr(args, "object", [])],
         *link_args,
         "-lSystem",
     ]
@@ -230,6 +231,7 @@ def main() -> None:
     link.add_argument("--arch", choices=["arm64", "x86_64"], required=True)
     link.add_argument("--exports", type=Path, required=True)
     link.add_argument("--archive", type=Path, required=True)
+    link.add_argument("--object", type=Path, action="append", default=[])
     link.add_argument("--output", type=Path, required=True)
     link.add_argument("--map", type=Path)
     link.add_argument("link_args", nargs=argparse.REMAINDER)

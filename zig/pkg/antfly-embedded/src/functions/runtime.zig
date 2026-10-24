@@ -61,6 +61,7 @@ fn requestPayload(a: std.mem.Allocator, io: std.Io, cfg: decisions.DeciderConfig
         return .{ .body = try std.json.Stringify.valueAlloc(a, .{ .input = request.input.jsonValue(a), .questions = request.questions, .instructions = cfg.instructions }, .{}), .image_bytes = request.input.inlineImageBytes() };
     }
     if (cfg.provider == .openai) return .{ .body = try openai.requestBody(a, cfg.modelName(), request.input, request.questions), .image_bytes = request.input.inlineImageBytes() };
+    if (cfg.provider == .cloudflare) return @import("cloudflare.zig").request(a, cfg, request.input, request.questions);
     if (cfg.provider == .jev) return jev.request(a, io, cfg, request.input, request.questions);
     return .{ .body = try decisions.wireRequest(a, cfg, try request.input.requireText(), request.questions) };
 }
@@ -360,20 +361,22 @@ pub const Runtime = struct {
             const payload = try requestPayload(a, self.runtime.io, cfg, self.request);
             const body = payload.body;
             const base = if (cfg.provider == .antfly and cfg.url.len == 0) if (self.runtime.antfly_url) |endpoint| try registry_mod.gateway.apiBaseAlloc(a, endpoint) else cfg.baseUrl() else cfg.baseUrl();
-            const url = try std.fmt.allocPrint(a, "{s}{s}", .{ std.mem.trimEnd(u8, base, "/"), switch (cfg.provider) {
+            const url = if (cfg.provider == .cloudflare) (if (cfg.url.len != 0) cfg.url else try @import("antfly_decisions").cloudflare.endpoint(a, cfg.account_id.?, cfg.modelName())) else try std.fmt.allocPrint(a, "{s}{s}", .{ std.mem.trimEnd(u8, base, "/"), switch (cfg.provider) {
                 .antfly => "/decisions",
                 .jev => "/v1/systemone",
                 .openai => "/decisions",
+                .cloudflare => unreachable,
             } });
             var key_source = try secrets.SecretValue.initConfigOrEnv(a, cfg.api_key orelse (if (cfg.provider == .antfly and cfg.url.len == 0) self.runtime.antfly_api_key else null), switch (cfg.provider) {
                 .antfly => "ANTFLY_INFERENCE_API_KEY",
                 .jev => "TYPESAFE_API_KEY",
                 .openai => "OPENAI_API_KEY",
+                .cloudflare => "CLOUDFLARE_API_TOKEN",
             });
             defer key_source.deinit(a);
             var quota = try self.runtime.limits.acquire(.{ .operation = .decision, .endpoint = .{
                 .provider = std.meta.stringToEnum(quotas.Provider, @tagName(cfg.provider)).?,
-                .endpoint = base,
+                .endpoint = if (cfg.provider == .cloudflare) url else base,
                 .model = cfg.modelName(),
                 .credentials = @import("../common/credential_source_identity.zig").fromSecretValue(key_source),
             } }, try quotas.Policy.fromConfig(cfg.rate_limit));
@@ -405,7 +408,7 @@ pub const Runtime = struct {
             };
             const key = key_source.resolveOwned(a, self.runtime.secret_store) catch |err| return operationalError(err);
             if (cfg.provider != .antfly and key == null) return error.MissingDecisionApiKey;
-            const headers = try a.alloc([2][]const u8, payload.headers.len + 3);
+            const headers = try a.alloc([2][]const u8, payload.headers.len + 4);
             var count: usize = 0;
             if (key) |value| {
                 headers[count] = .{ "Authorization", try std.fmt.allocPrint(a, "Bearer {s}", .{value}) };
@@ -417,6 +420,10 @@ pub const Runtime = struct {
                 headers[count] = header;
                 count += 1;
             }
+            if (cfg.provider == .cloudflare) if (cfg.gateway_id) |id| {
+                headers[count] = .{ "cf-aig-gateway-id", id };
+                count += 1;
+            };
             const source_table = if (self.request.source_table.len > 0) self.request.source_table else self.runtime.source_table;
             if (cfg.provider == .antfly and source_table.len > 0) {
                 headers[count] = .{ execution.source_table_header, source_table };
@@ -438,13 +445,15 @@ pub const Runtime = struct {
             const parsed = parseResponse(a, bytes) catch |err| return if (response.ok()) err else upstreamFailure(response.status.code);
             // Account usage before semantic output validation, including refused
             // or invalid answers for which the provider has already spent tokens.
-            self.observeUsage(&reservation, parsed);
+            const measured = if (cfg.provider == .cloudflare and parsed == .object) parsed.object.get("result") orelse parsed else parsed;
+            self.observeUsage(&reservation, measured);
             if (!response.ok()) return upstreamFailure(response.status.code);
             if (cfg.provider == .antfly) {
                 const root = try decisions.object(parsed);
                 const answers = root.get("answers") orelse return error.InvalidDecisionOutput;
                 if (answers != .array) return error.InvalidDecisionOutput;
             }
+            if (cfg.provider == .cloudflare) return @import("antfly_decisions").cloudflare.unwrap(parsed);
             return if (cfg.provider == .openai) openai.response(a, self.request.questions, parsed) else parsed;
         }
     };
@@ -1993,5 +2002,64 @@ test "decision functions late stale responses preserve a renewed execution lease
         try std.testing.expectEqualStrings(replacement_token, retained.?.slice());
         servers.cancel(io);
         if (server_failure) |err| return err;
+    }
+}
+
+test "decision functions Cloudflare native run transport supports gateway routing and preserves measured usage" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Fixture = struct {
+        fn check(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer fixture-token", req.header("Authorization").?);
+            try std.testing.expect(req.header(execution.source_table_header) == null);
+            if (req.header("cf-aig-gateway-id")) |id| try std.testing.expectEqualStrings("gateway", id);
+            var parsed = try std.json.parseFromSlice(decisions.Json, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("clef", parsed.value.object.get("model").?.string);
+            try std.testing.expectEqualStrings("Refund?", parsed.value.object.get("questions").?.object.get("answer").?.object.get("instructions").?.string);
+            try std.testing.expect(parsed.value.object.contains("state"));
+            try std.testing.expect(!parsed.value.object.contains("messages"));
+        }
+        fn run(runtime: *Runtime, alloc: std.mem.Allocator, questions: decisions.Json, failure: *?anyerror) void {
+            const values = runtime.provider().withSourceTable("private-source").evaluateBatch(alloc, &.{.{ .input = .{ .text = "refund" }, .decider = "cloudflare", .questions = questions }}) catch |err| {
+                failure.* = err;
+                return;
+            };
+            const probability = decisions.selectResult(.ai_probability, values[0]) catch |err| {
+                failure.* = err;
+                return;
+            };
+            std.testing.expectApproxEqAbs(@as(f64, 0.9), probability.float, 1e-9) catch |err| {
+                failure.* = err;
+            };
+        }
+    };
+    for ([_]?[]const u8{ null, "gateway" }) |gateway| {
+        var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/client/v4/accounts/account/ai/run/@cf/cloudflare/clef", .assert_request = Fixture.check, .respond = .{ .body = "{\"success\":true,\"result\":{\"model\":\"clef\",\"answers\":{\"answer\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":7,\"output_tokens\":0}}}" } }});
+        defer server.deinit();
+        var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+        defer client.deinit();
+        var registry = registry_mod.Registry.init(a);
+        defer registry.deinit();
+        const url = try std.fmt.allocPrint(a, "{s}/client/v4/accounts/account/ai/run/@cf/cloudflare/clef", .{server.baseUrl()});
+        defer a.free(url);
+        try registry.registerDeciderConfig("cloudflare", .{ .provider = .cloudflare, .account_id = "account", .model = "@cf/cloudflare/clef", .url = url, .api_key = "fixture-token", .gateway_id = gateway });
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var runtime = Runtime{ .registry = &registry, .http = &client, .io = io };
+        defer runtime.deinit();
+        const questions = try decisions.questionsFor(alloc, .ai_probability, &.{ .{ .string = "refund" }, .{ .string = "Refund?" }, .{ .string = "cloudflare" } });
+        var failure: ?anyerror = null;
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        try group.concurrent(io, Fixture.run, .{ &runtime, alloc, questions, &failure });
+        try server.handleOne();
+        try group.await(io);
+        if (failure) |err| return err;
+        try std.testing.expectEqual(@as(u64, 7), runtime.input_tokens);
+        try std.testing.expectEqual(@as(u64, 1), runtime.rows);
     }
 }

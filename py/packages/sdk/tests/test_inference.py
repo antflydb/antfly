@@ -459,3 +459,28 @@ def test_generated_request_models_preserve_nested_configuration(extraction: bool
         assert isinstance(request, GeneratedDecideRequest)
         result = client.decide(request)
     assert result.model == "registered"
+
+
+def test_direct_document_read_preserves_page_identity_and_artifact():
+    request = {
+        "model": "balanced",
+        "retain_artifact": True,
+        "documents": [
+            {"id": "receipt", "url": "data:application/pdf;base64,ZmFrZQ==", "media_type": "application/pdf"}
+        ],
+    }
+    payload = {
+        "object": "list",
+        "model": "balanced",
+        "data": [{"object": "read", "index": 0, "source_id": "receipt", "number": 2, "text": "Total 12.50"}],
+        "document": {"artifact_id": "a" * 64},
+    }
+
+    def handler(incoming):
+        assert incoming.url.path == "/ai/v1/read"
+        assert json.loads(incoming.read()) == request
+        return httpx.Response(200, json=payload)
+
+    client = AntflyClient("http://test")
+    client._client.set_httpx_client(httpx.Client(base_url="http://test", transport=httpx.MockTransport(handler)))
+    assert client.read(request).to_dict() == payload

@@ -478,6 +478,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_structured_tests = b.addRunArtifact(structured_tests);
     b.step("lib-structured-test", "Run constrained output, evidence and generated extraction tests").dependOn(&run_structured_tests.step);
     const decisions_test_module = b.createModule(.{ .root_source_file = b.path("lib/decisions/root.zig"), .target = target, .optimize = optimize });
+    decisions_test_module.addImport("antfly_cloudflare", b.modules.get("antfly_cloudflare").?);
     decisions_test_module.addImport("antfly_structured", b.modules.get("antfly_structured").?);
     const decisions_tests = b.addTest(.{ .root_module = decisions_test_module });
     const run_decisions_tests = b.addRunArtifact(decisions_tests);

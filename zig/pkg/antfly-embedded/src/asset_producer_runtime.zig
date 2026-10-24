@@ -628,6 +628,16 @@ pub const Runtime = struct {
     }
 
     fn routeExtractorConfig(self: *const Runtime, alloc: Allocator, cfg: *extracting.Config) !void {
+        if (cfg.provider == .cloudflare) {
+            var secret = try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.bearer_token orelse cfg.api_key, "CLOUDFLARE_API_TOKEN");
+            defer secret.deinit(alloc);
+            const token = (try secret.resolveOwned(alloc, self.secret_store)) orelse return error.CloudflareCredentialMissing;
+            if (cfg.api_key) |value| alloc.free(value);
+            if (cfg.bearer_token) |value| alloc.free(value);
+            cfg.api_key = token;
+            cfg.bearer_token = null;
+            return;
+        }
         if (cfg.provider != .antfly or cfg.resolvedUrl() != null or self.linkedExtractorAvailable()) return;
         const endpoint = self.execution.resolveAntflyEndpoint(null, false) orelse return;
         cfg.url = try alloc.dupe(u8, endpoint);
@@ -5087,14 +5097,39 @@ fn validateExtractionAttribute(item: std.json.Value) !void {
 }
 
 fn validateExtractionField(alloc: Allocator, item: std.json.Value) !void {
-    _ = try extractionString(item, "value");
+    if (item != .object) return error.InvalidExtractorResponse;
+    const value = item.object.get("value") orelse return error.InvalidExtractorResponse;
+    if (value != .string) {
+        // Typed hosted fields must explicitly distinguish a derivation or an
+        // estimate from literal source evidence. Legacy span fields stay text.
+        try extractionStringChoice(item, "origin", &.{ "transcription", "derived", "estimated" });
+        switch (value) {
+            .null => if (item.object.get("score")) |score| if (score != .null) return error.InvalidExtractorResponse,
+            .integer, .float, .number_string => _ = try extractionNumber(value, false),
+            .bool => {},
+            .array => |values| for (values.items) |element| if (element != .string) return error.InvalidExtractorResponse,
+            else => return error.InvalidExtractorResponse,
+        }
+        if (item.object.get("start")) |start| if (start != .null) return error.InvalidExtractorResponse;
+        if (item.object.get("end")) |end| if (end != .null) return error.InvalidExtractorResponse;
+        if (item.object.get("spans")) |spans| {
+            if (value != .array or spans != .array or value.array.items.len != spans.array.items.len) return error.InvalidExtractorResponse;
+            for (spans.array.items) |span| {
+                if (span == .null) continue;
+                if (span != .array or span.array.items.len != 2) return error.InvalidExtractorResponse;
+                const start = try extractionInteger(alloc, span.array.items[0]);
+                const end = try extractionInteger(alloc, span.array.items[1]);
+                if (start < 0 or end < start) return error.InvalidExtractorResponse;
+            }
+        }
+    }
     try extractionOptionalNumber(item, "score", true);
     try extractionOffsets(alloc, item, true, false);
     if (item.object.get("source")) |source| if (source != .null) {
         try extractionStringChoice(item, "source", &.{ "document", "schema" });
         if (std.mem.eql(u8, source.string, "schema")) {
-            if (item.object.get("start")) |value| if (value != .null) return error.InvalidExtractorResponse;
-            if (item.object.get("end")) |value| if (value != .null) return error.InvalidExtractorResponse;
+            if (item.object.get("start")) |start_value| if (start_value != .null) return error.InvalidExtractorResponse;
+            if (item.object.get("end")) |end_value| if (end_value != .null) return error.InvalidExtractorResponse;
         }
     };
 }
@@ -7978,4 +8013,33 @@ test "decision functions materialized enrichment records version model and sourc
     try std.testing.expectEqualStrings("resolved-model", provenance.get("model").?.string);
     try std.testing.expectEqualStrings("revision-2", provenance.get("source_fingerprint").?.string);
     try std.testing.expect(provenance.get("specification_hash").?.string.len > 0);
+}
+
+test "decision functions Cloudflare extraction resolves secret references before transport" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "secrets.json", .data =
+        \\{"secrets":[{"key":"cloudflare.api_token","value":"fixture-token","created_at_ns":1,"updated_at_ns":1}]}
+    });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "secrets.json", a);
+    defer a.free(path);
+    var store = try common_secrets.FileStore.initWithIo(a, std.testing.io, path);
+    defer store.deinit();
+    var client = httpx.Client.initWithConfig(a, std.testing.io, .{});
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(a, &client, .{ .secret_store = &store });
+    defer runtime.deinit();
+    var cfg = try extracting.parseConfigFromSlice(a,
+        \\{"provider":"cloudflare","account_id":"account","model":"@cf/cloudflare/clairic","api_key":"${secret:cloudflare.api_token}"}
+    );
+    defer cfg.deinit(a);
+    try runtime.routeExtractorConfig(a, &cfg);
+    try std.testing.expectEqualStrings("fixture-token", cfg.api_key.?);
+    try std.testing.expect(cfg.bearer_token == null);
+    var missing = try extracting.parseConfigFromSlice(a,
+        \\{"provider":"cloudflare","account_id":"account","model":"@cf/cloudflare/clairic","api_key":"${secret:cloudflare.missing}"}
+    );
+    defer missing.deinit(a);
+    try std.testing.expectError(error.SecretNotFound, runtime.routeExtractorConfig(a, &missing));
 }

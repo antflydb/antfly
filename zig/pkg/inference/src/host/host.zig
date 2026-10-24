@@ -2976,6 +2976,28 @@ fn localModelCapabilitiesInScope(
             .borrowed_attachments = true,
         };
     }
+    if (task == .read or task == .extract) {
+        if (try node.documentTaskLimits(node.allocator, model, task == .read)) |limits| {
+            const mimes = inference_work.MimeTypes{ .text_plain = task == .extract, .image_png = task == .read, .image_jpeg = task == .read, .image_webp = task == .read, .application_pdf = false };
+            return .{
+                .task = task,
+                .input_modalities = .{ .text = task == .extract, .image = task == .read, .document = false },
+                .accepted_mime_types = mimes,
+                .input_granularity = if (task == .read) .page else .item,
+                .batch = .{
+                    .mode = .serial_compatibility,
+                    .preferred_items = 1,
+                    .max_items = limits.max_sources,
+                    .max_encoded_media_bytes = limits.max_source_bytes,
+                    .max_decoded_pixels = @min(limits.max_total_pixels, inference.server.requestMediaMaxDecodedPixels(node, limits.max_sources)),
+                    .max_media_parts_per_item = 1,
+                },
+                .output = if (task == .read) .read_result else .extraction,
+                .prompt_policy = if (task == .read) .model_default else .structured_schema,
+                .borrowed_attachments = task == .read,
+            };
+        }
+    }
     const scope = scope_override orelse switch (task) {
         .read => "readers",
         .generate => "generators",

@@ -176,6 +176,8 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
         .optimize = .safe,
         .single_threaded = true,
     });
+    const cloudflare_mod = b.createModule(.{ .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/cloudflare/root.zig" })), .target = wasm_target, .optimize = .safe });
+    wasm_decisions_mod.addImport("antfly_cloudflare", cloudflare_mod);
     wasm_lib.root_module.addImport("antfly_decisions", wasm_decisions_mod);
     // Boundary preprocessing needs shared text/window contracts, not hosted
     // provider clients or their generated API and HTTP dependencies.

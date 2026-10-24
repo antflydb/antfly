@@ -296,6 +296,7 @@ pub fn create(config: Config) Graph {
     };
     structured_mod.addImport("antfly_generating", generating_mod);
     structured_mod.addImport("antfly_extracting", extracting_mod);
+    structured_mod.addImport("antfly_image", image_mod);
     const transcribing_mod = b.createModule(.{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/transcribing/src/mod.zig")),
         .target = target,
@@ -316,6 +317,15 @@ pub fn create(config: Config) Graph {
     apple_native_mod.addImport("httpx", httpx_mod);
     transcribing_mod.addImport("antfly_apple_native", apple_native_mod);
     if (shared.generating == null) generating_mod.addImport("antfly_apple_native", apple_native_mod);
+    const readers_mod = createSharedModule(config, "lib/readers/src/mod.zig");
+    readers_mod.addImport("httpx", httpx_mod);
+    readers_mod.addImport("inference_api", inference_api_mod);
+    readers_mod.addImport("antfly_google", google_mod);
+    readers_mod.addImport("antfly_reader_config", reader_config_mod);
+    readers_mod.addImport("antfly_scraping", scraping_mod);
+    readers_mod.addImport("antfly_image", image_mod);
+    readers_mod.addImport("antfly_platform", platform_mod);
+    readers_mod.addImport("apple_reader_options", apple_native_mod.import_table.get("apple_native_options").?);
     const inference_client_mod = shared.inference_client orelse if (!backend.skip_openapi) blk: {
         const mod = addOrCreateModule(b, config.register_public_modules, "inference_client", .{
             .root_source_file = b.path(pathJoin(b, paths.inference_root, "../inference-client/src/root.zig")),
@@ -380,6 +390,16 @@ pub fn create(config: Config) Graph {
     const decisions_mod = b.modules.get("antfly_decisions") orelse b.addModule("antfly_decisions", .{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/decisions/root.zig")),
     });
+    const cloudflare_mod = b.modules.get("antfly_cloudflare") orelse b.addModule("antfly_cloudflare", .{
+        .root_source_file = b.path(b.pathJoin(&.{ paths.shared_lib_root, "lib/cloudflare/root.zig" })),
+        .target = target,
+        .optimize = optimize,
+    });
+    cloudflare_mod.addImport("httpx", httpx_mod);
+    extracting_mod.addImport("antfly_cloudflare", cloudflare_mod);
+    extracting_mod.addImport("antfly_image", image_mod);
+    decisions_mod.addImport("antfly_cloudflare", cloudflare_mod);
+    inference_mod.addImport("antfly_cloudflare", cloudflare_mod);
     inference_mod.addImport("antfly_decisions", decisions_mod);
     inference_mod.addImport("antfly_structured", structured_mod);
     decisions_mod.addImport("antfly_structured", structured_mod);
@@ -440,6 +460,7 @@ pub fn create(config: Config) Graph {
     inference_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     inference_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
     inference_mod.addImport("antfly_extracting", extracting_mod);
+    inference_mod.addImport("antfly_readers", readers_mod);
     inference_mod.addImport("antfly_transcribing", transcribing_mod);
     configureRuntimeLinks(b, inference_mod, target, backend, paths);
     inference_mod.link_libc = backend.link_libc;
@@ -478,6 +499,12 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.link_libc = backend.link_libc;
 
     inference_mod.addImport("inference_internal", inference_mod);
+    // Native task CLIs share document ingestion and composition with HTTP.
+    // Reuse every dependency's source identity in the internal CLI owner.
+    var shared_imports = inference_mod.import_table.iterator();
+    while (shared_imports.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "inference_internal")) inference_internal_mod.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    }
     inference_internal_mod.addImport("inference_internal", inference_internal_mod);
 
     return .{

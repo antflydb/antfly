@@ -740,8 +740,12 @@ pub const DeciderConfig = struct {
     output: ?antfly_generating_openapi.ConstrainedOutput = null,
     probabilities: ?antfly_generating_openapi.ConstrainedProbabilities = null,
     batch: ?antfly_generating_openapi.ConstrainedGenerationBatch = null,
-    /// Required for Antfly and OpenAI; Jev defaults to jev-latest.
+    /// Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Cloudflare uses @cf/cloudflare/clef or @cf/cloudflare/clef-flash.
     model: ?[]const u8 = null,
+    /// Required with the cloudflare provider; Workers AI account identifier.
+    account_id: ?[]const u8 = null,
+    /// Optional Cloudflare AI Gateway identifier.
+    gateway_id: ?[]const u8 = null,
     /// Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity.
     model_identity: ?[]const u8 = null,
     /// EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto each question and can be overridden per question. Other models reject these options. Raw cosine similarities never represent probabilities.
@@ -767,6 +771,8 @@ pub const DeciderConfig = struct {
         .{ "probabilities", "probabilities", false },
         .{ "batch", "batch", false },
         .{ "model", "model", true },
+        .{ "account_id", "account_id", true },
+        .{ "gateway_id", "gateway_id", true },
         .{ "model_identity", "model_identity", true },
         .{ "embedding_options", "embedding_options", true },
         .{ "url", "url", true },
@@ -830,6 +836,14 @@ pub const DeciderConfig = struct {
         }
         if (self.model) |value| {
             try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
             try jw.write(value);
         }
         if (self.model_identity) |value| {

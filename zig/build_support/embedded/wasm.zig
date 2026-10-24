@@ -442,7 +442,11 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     wasm_apple_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_apple_mod.addImport("httpx", httpx_mod);
     wasm_generating_mod.addImport("antfly_apple_native", wasm_apple_mod);
+    const wasm_cloudflare_mod = b.createModule(.{ .root_source_file = b.path("lib/cloudflare/root.zig"), .target = wasm_target, .optimize = optimize });
+    wasm_decisions_mod.addImport("antfly_cloudflare", wasm_cloudflare_mod);
     const wasm_extracting_mod = b.createModule(.{ .root_source_file = b.path("lib/extracting/src/mod.zig"), .target = wasm_target, .optimize = optimize });
+    wasm_extracting_mod.addImport("antfly_cloudflare", wasm_cloudflare_mod);
+    wasm_extracting_mod.addImport("antfly_image", wasm_image_mod);
     wasm_extracting_mod.addImport("httpx", httpx_mod);
     wasm_extracting_mod.addImport("antfly_extraction_openapi", api.extraction);
     const wasm_structured_mod = b.createModule(.{ .root_source_file = b.path("lib/structured/root.zig"), .target = wasm_target, .optimize = optimize });

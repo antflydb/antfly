@@ -545,19 +545,31 @@ export class InferenceClient {
     });
   }
 
+  /** Read images or complete PDF/PPTX documents with a registered reader/composite. */
+  async read(
+    request: components["schemas"]["InferenceReadRequest"]
+  ): Promise<components["schemas"]["InferenceReadResponse"]> {
+    const { data, error, response } = await this.client.POST("/ai/v1/read", { body: request });
+    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!data) throw new Error("Read failed: unexpected empty response");
+    return data;
+  }
+
   /**
    * Run the canonical schema-driven extraction API.
    */
   async extractRaw(request: ExtractRequest): Promise<ExtractResponse> {
     const expectedModel = request.model;
     const expectedIds =
-      request.schema_version === 2 ? request.inputs.map((input) => input.id) : undefined;
+      request.schema_version === 2
+        ? (request.inputs ?? request.documents)?.map((input) => input.id)
+        : undefined;
     const { data, error, response } = await this.client.POST("/ai/v1/extract", {
       body: request,
     });
     if (!response.ok) throw inferenceAPIError(response.status, error);
     if (!data) throw new Error("Extract failed: unexpected empty response");
-    if (expectedIds !== undefined) {
+    if (request.schema_version === 2) {
       validateExtractionV2Response(data, expectedModel, expectedIds);
     }
     return data;
@@ -810,7 +822,7 @@ export class InferenceClient {
 function validateExtractionV2Response(
   response: unknown,
   expectedModel: string,
-  expectedIds: readonly (string | undefined)[]
+  expectedIds?: readonly (string | undefined)[]
 ): void {
   if (typeof response !== "object" || response === null || Array.isArray(response)) {
     throw new Error("Invalid extraction v2 response: expected an extraction object");
@@ -822,17 +834,23 @@ function validateExtractionV2Response(
   if (envelope.model !== expectedModel) {
     throw new Error("Invalid extraction v2 response: model mismatch");
   }
-  if (!Array.isArray(envelope.data) || envelope.data.length !== expectedIds.length) {
+  if (
+    !Array.isArray(envelope.data) ||
+    (expectedIds !== undefined && envelope.data.length !== expectedIds.length)
+  ) {
     throw new Error("Invalid extraction v2 response: item cardinality");
   }
-  for (let index = 0; index < expectedIds.length; index++) {
+  for (let index = 0; index < envelope.data.length; index++) {
     const row: unknown = envelope.data[index];
     if (typeof row !== "object" || row === null || Array.isArray(row)) {
       throw new Error(`Invalid extraction v2 response: item ${index} must be an object`);
     }
     const item = row as Record<string, unknown>;
     const hasId = Object.getOwnPropertyDescriptor(item, "id") !== undefined;
-    if ((hasId && typeof item.id !== "string") || item.id !== expectedIds[index]) {
+    if (
+      (hasId && typeof item.id !== "string") ||
+      (expectedIds !== undefined && item.id !== expectedIds[index])
+    ) {
       throw new Error(`Invalid extraction v2 response: item ${index} id mismatch`);
     }
   }

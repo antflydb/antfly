@@ -19,7 +19,10 @@ const std = @import("std");
 /// std-only module inherits the consumer's target and optimization settings.
 pub fn create(b: *std.Build, root: std.Build.LazyPath) *std.Build.Module {
     if (b.modules.get("antfly_decisions")) |existing| return existing;
-    return b.addModule("antfly_decisions", .{ .root_source_file = root });
+    const module = b.addModule("antfly_decisions", .{ .root_source_file = root });
+    const cloudflare = b.modules.get("antfly_cloudflare") orelse b.addModule("antfly_cloudflare", .{ .root_source_file = root.dirname().path(b, "../cloudflare/root.zig") });
+    module.addImport("antfly_cloudflare", cloudflare);
+    return module;
 }
 
 const WireBinding = struct { generator: *std.Build.Module, module: *std.Build.Module };

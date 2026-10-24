@@ -9125,8 +9125,12 @@ pub const DeciderConfig = struct {
     output: ?ConstrainedOutput = null,
     probabilities: ?ConstrainedProbabilities = null,
     batch: ?ConstrainedGenerationBatch = null,
-    /// Required for Antfly and OpenAI; Jev defaults to jev-latest.
+    /// Required for Antfly, OpenAI, and Cloudflare; Jev defaults to jev-latest. Cloudflare uses @cf/cloudflare/clef or @cf/cloudflare/clef-flash.
     model: ?[]const u8 = null,
+    /// Required with the cloudflare provider; Workers AI account identifier.
+    account_id: ?[]const u8 = null,
+    /// Optional Cloudflare AI Gateway identifier.
+    gateway_id: ?[]const u8 = null,
     /// Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity.
     model_identity: ?[]const u8 = null,
     /// EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto each question and can be overridden per question. Other models reject these options. Raw cosine similarities never represent probabilities.
@@ -9152,6 +9156,8 @@ pub const DeciderConfig = struct {
         .{ "probabilities", "probabilities", true },
         .{ "batch", "batch", true },
         .{ "model", "model", true },
+        .{ "account_id", "account_id", true },
+        .{ "gateway_id", "gateway_id", true },
         .{ "model_identity", "model_identity", true },
         .{ "embedding_options", "embedding_options", true },
         .{ "url", "url", true },
@@ -9203,6 +9209,14 @@ pub const DeciderConfig = struct {
         }
         if (self.model) |value| {
             try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.account_id) |value| {
+            try jw.objectField("account_id");
+            try jw.write(value);
+        }
+        if (self.gateway_id) |value| {
+            try jw.objectField("gateway_id");
             try jw.write(value);
         }
         if (self.model_identity) |value| {
@@ -10782,6 +10796,61 @@ pub const DocumentSchema = struct {
         }
         if (self.schema) |value| {
             try jw.objectField("schema");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const DocumentSource = struct {
+    /// Unique source identity within the request. Separate sources are never implicitly merged.
+    id: []const u8,
+    /// Inline data URI or location allowed by the deployment content security policy.
+    url: []const u8,
+    media_type: []const u8,
+    /// Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide.
+    pages: ?[]const i64 = null,
+    /// Include slide speaker notes as separate evidence, never silently as visible slide text.
+    include_notes: ?bool = null,
+    /// Include hidden slides.
+    include_hidden: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "url", "url", false },
+        .{ "media_type", "media_type", false },
+        .{ "pages", "pages", true },
+        .{ "include_notes", "include_notes", true },
+        .{ "include_hidden", "include_hidden", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("url");
+        try jw.write(self.url);
+        try jw.objectField("media_type");
+        try jw.write(self.media_type);
+        if (self.pages) |value| {
+            try jw.objectField("pages");
+            try jw.write(value);
+        }
+        if (self.include_notes) |value| {
+            try jw.objectField("include_notes");
+            try jw.write(value);
+        }
+        if (self.include_hidden) |value| {
+            try jw.objectField("include_hidden");
             try jw.write(value);
         }
         try jw.endObject();
@@ -14847,6 +14916,8 @@ pub const ExtractionInputRequest = union(enum) {
         if (objectHasAnyKey(source.object, &.{
             "model",
             "schema_version",
+            "read_artifact",
+            "documents",
             "inputs",
             "schema",
             "options",
@@ -15969,11 +16040,15 @@ pub const ExtractionRelationSchema = struct {
     }
 };
 
-/// Atomic extraction request. Every input is validated before inference; failures return no partial data.
+/// Atomic extraction request. Supply exactly one of inputs, documents or read_artifact. Every input is validated before inference; failures return no partial data.
 pub const ExtractionRequest = struct {
     model: []const u8,
     schema_version: ?std.json.Value = null,
-    inputs: []const ExtractionInput,
+    /// Opaque handle returned by read with retain_artifact. Mutually exclusive with inputs and documents. Reuses the immutable complete reading without downloading or running OCR again. Handles expire and are local to the serving process.
+    read_artifact: ?[]const u8 = null,
+    /// Complete PDF/PPTX/image sources. Mutually exclusive with inputs. Reading and extraction share document adapters and preserve independent source grouping.
+    documents: ?[]const DocumentSource = null,
+    inputs: ?[]const ExtractionInput = null,
     schema: ExtractionSchema,
     options: ?ExtractionOptions = null,
 
@@ -15981,7 +16056,9 @@ pub const ExtractionRequest = struct {
     pub const openApiFieldMetadata = .{
         .{ "model", "model", false },
         .{ "schema_version", "schema_version", true },
-        .{ "inputs", "inputs", false },
+        .{ "read_artifact", "read_artifact", true },
+        .{ "documents", "documents", true },
+        .{ "inputs", "inputs", true },
         .{ "schema", "schema", false },
         .{ "options", "options", true },
     };
@@ -16002,8 +16079,18 @@ pub const ExtractionRequest = struct {
             try jw.objectField("schema_version");
             try jw.write(value);
         }
-        try jw.objectField("inputs");
-        try jw.write(self.inputs);
+        if (self.read_artifact) |value| {
+            try jw.objectField("read_artifact");
+            try jw.write(value);
+        }
+        if (self.documents) |value| {
+            try jw.objectField("documents");
+            try jw.write(value);
+        }
+        if (self.inputs) |value| {
+            try jw.objectField("inputs");
+            try jw.write(value);
+        }
         try jw.objectField("schema");
         try jw.write(self.schema);
         if (self.options) |value| {
@@ -28536,6 +28623,18 @@ pub const InferenceGenerateUsage = struct {
     completion_tokens: i64,
     /// Total tokens used (prompt + completion)
     total_tokens: i64,
+    /// Cumulative logical child invocations for a document run.
+    model_calls: ?i64 = null,
+    /// Physical child operation invocations, separate from logical composite calls.
+    physical_model_calls: ?i64 = null,
+    /// Cumulative rendered or decoded pixels charged by document work.
+    rendered_pixels: ?i64 = null,
+    /// Cumulative document text bytes charged before envelope serialization.
+    output_bytes: ?i64 = null,
+    /// Selected pages completed successfully.
+    completed_pages: ?i64 = null,
+    /// Selected pages visited, including unresolved work.
+    visited_pages: ?i64 = null,
     /// Prompt tokens served from inference-native prefix KV cache
     cached_prompt_tokens: ?i64 = null,
 
@@ -28544,6 +28643,12 @@ pub const InferenceGenerateUsage = struct {
         .{ "prompt_tokens", "prompt_tokens", false },
         .{ "completion_tokens", "completion_tokens", false },
         .{ "total_tokens", "total_tokens", false },
+        .{ "model_calls", "model_calls", true },
+        .{ "physical_model_calls", "physical_model_calls", true },
+        .{ "rendered_pixels", "rendered_pixels", true },
+        .{ "output_bytes", "output_bytes", true },
+        .{ "completed_pages", "completed_pages", true },
+        .{ "visited_pages", "visited_pages", true },
         .{ "cached_prompt_tokens", "cached_prompt_tokens", true },
     };
 
@@ -28563,6 +28668,30 @@ pub const InferenceGenerateUsage = struct {
         try jw.write(self.completion_tokens);
         try jw.objectField("total_tokens");
         try jw.write(self.total_tokens);
+        if (self.model_calls) |value| {
+            try jw.objectField("model_calls");
+            try jw.write(value);
+        }
+        if (self.physical_model_calls) |value| {
+            try jw.objectField("physical_model_calls");
+            try jw.write(value);
+        }
+        if (self.rendered_pixels) |value| {
+            try jw.objectField("rendered_pixels");
+            try jw.write(value);
+        }
+        if (self.output_bytes) |value| {
+            try jw.objectField("output_bytes");
+            try jw.write(value);
+        }
+        if (self.completed_pages) |value| {
+            try jw.objectField("completed_pages");
+            try jw.write(value);
+        }
+        if (self.visited_pages) |value| {
+            try jw.objectField("visited_pages");
+            try jw.write(value);
+        }
         if (self.cached_prompt_tokens) |value| {
             try jw.objectField("cached_prompt_tokens");
             try jw.write(value);
@@ -29309,10 +29438,29 @@ pub const InferenceProviderType = enum {
 };
 
 pub const InferenceReadObject = struct {
+    /// Original document source ID.
+    source_id: ?[]const u8 = null,
+    /// One-based original page or slide number.
+    number: ?i64 = null,
+    kind: ?[]const u8 = null,
+    native_text: ?[]const u8 = null,
+    /// Speaker notes, separate from slide text.
+    notes: ?[]const u8 = null,
+    status: ?[]const u8 = null,
+    origin: ?[]const u8 = null,
+    /// Coordinate space of regions; PDF points, slide EMUs or image pixels.
+    coordinate_space: ?[]const u8 = null,
+    /// Projective source transform.
+    transform: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Mapping from rendered pixels to original source coordinates, including page rotation and actual render DPI.
+    raster_to_source: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
+    /// Tables and cells in source coordinates with provenance.
+    tables: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
+    findings: ?[]const []const u8 = null,
     /// Extracted text from the image
     text: []const u8,
     /// Structured fields extracted by document understanding models (Donut, Florence-2). Fields are flattened with dot notation for nested structures. Only present for models that output structured data.
-    fields: ?std.json.ArrayHashMap([]const u8) = null,
+    fields: OpenApiOptionalNullable(std.json.ArrayHashMap([]const u8)) = .absent,
     /// Individual text regions with bounding boxes and recognized text. Populated by multi-stage OCR models (Surya, PaddleOCR).
     regions: ?[]const InferenceTextRegion = null,
     object: []const u8,
@@ -29321,8 +29469,20 @@ pub const InferenceReadObject = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "source_id", "source_id", true },
+        .{ "number", "number", true },
+        .{ "kind", "kind", true },
+        .{ "native_text", "native_text", true },
+        .{ "notes", "notes", true },
+        .{ "status", "status", true },
+        .{ "origin", "origin", true },
+        .{ "coordinate_space", "coordinate_space", true },
+        .{ "transform", "transform", true },
+        .{ "raster_to_source", "raster_to_source", false },
+        .{ "tables", "tables", true },
+        .{ "findings", "findings", true },
         .{ "text", "text", false },
-        .{ "fields", "fields", true },
+        .{ "fields", "fields", false },
         .{ "regions", "regions", true },
         .{ "object", "object", false },
         .{ "index", "index", false },
@@ -29338,11 +29498,73 @@ pub const InferenceReadObject = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.source_id) |value| {
+            try jw.objectField("source_id");
+            try jw.write(value);
+        }
+        if (self.number) |value| {
+            try jw.objectField("number");
+            try jw.write(value);
+        }
+        if (self.kind) |value| {
+            try jw.objectField("kind");
+            try jw.write(value);
+        }
+        if (self.native_text) |value| {
+            try jw.objectField("native_text");
+            try jw.write(value);
+        }
+        if (self.notes) |value| {
+            try jw.objectField("notes");
+            try jw.write(value);
+        }
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        if (self.origin) |value| {
+            try jw.objectField("origin");
+            try jw.write(value);
+        }
+        if (self.coordinate_space) |value| {
+            try jw.objectField("coordinate_space");
+            try jw.write(value);
+        }
+        if (self.transform) |value| {
+            try jw.objectField("transform");
+            try jw.write(value);
+        }
+        switch (self.raster_to_source) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("raster_to_source");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("raster_to_source");
+                try jw.write(value);
+            },
+        }
+        if (self.tables) |value| {
+            try jw.objectField("tables");
+            try jw.write(value);
+        }
+        if (self.findings) |value| {
+            try jw.objectField("findings");
+            try jw.write(value);
+        }
         try jw.objectField("text");
         try jw.write(self.text);
-        if (self.fields) |value| {
-            try jw.objectField("fields");
-            try jw.write(value);
+        switch (self.fields) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("fields");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("fields");
+                try jw.write(value);
+            },
         }
         if (self.regions) |value| {
             try jw.objectField("regions");
@@ -29356,11 +29578,16 @@ pub const InferenceReadObject = struct {
     }
 };
 
+/// Read exactly one of images or documents. The server rejects absent or simultaneous input forms before inference.
 pub const InferenceReadRequest = struct {
     /// Name of reader model from models_dir/readers/
     model: []const u8,
+    /// Request an opaque, process-local reading handle for extraction reuse. Retention is best effort; inspect document.artifact_id and artifact_ttl_ms.
+    retain_artifact: ?bool = null,
+    /// Complete documents, mutually exclusive with images. Each source is independent; selected pages are read in original source order.
+    documents: ?[]const DocumentSource = null,
     /// Images to read text from. Supports: - Data URIs: `data:image/png;base64,...` - URLs (if content_security allows)
-    images: []const InferenceImageURL,
+    images: ?[]const InferenceImageURL = null,
     /// Optional task prompt for document understanding models. - TrOCR: Not used (pure OCR) - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning - Pix2Struct: "What type of document is this?" - Moondream: "Describe this image."
     prompt: ?[]const u8 = null,
     /// Maximum tokens to generate
@@ -29369,7 +29596,9 @@ pub const InferenceReadRequest = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "model", "model", false },
-        .{ "images", "images", false },
+        .{ "retain_artifact", "retain_artifact", true },
+        .{ "documents", "documents", true },
+        .{ "images", "images", true },
         .{ "prompt", "prompt", true },
         .{ "max_tokens", "max_tokens", true },
     };
@@ -29386,8 +29615,18 @@ pub const InferenceReadRequest = struct {
         try jw.beginObject();
         try jw.objectField("model");
         try jw.write(self.model);
-        try jw.objectField("images");
-        try jw.write(self.images);
+        if (self.retain_artifact) |value| {
+            try jw.objectField("retain_artifact");
+            try jw.write(value);
+        }
+        if (self.documents) |value| {
+            try jw.objectField("documents");
+            try jw.write(value);
+        }
+        if (self.images) |value| {
+            try jw.objectField("images");
+            try jw.write(value);
+        }
         if (self.prompt) |value| {
             try jw.objectField("prompt");
             try jw.write(value);
@@ -29405,6 +29644,10 @@ pub const InferenceReadResponse = struct {
     object: []const u8,
     /// Read result objects, one per input image.
     data: []const InferenceReadObject,
+    /// Versioned reading metadata containing status, source fingerprints, definition fingerprint, pinned model identities, adapter version and optional artifact retention handle.
+    document: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Bounded progress and audit events. These contain model names and source IDs, never credentials.
+    events: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
     /// Name of model used for reading
     model: []const u8,
     usage: ?InferenceGenerateUsage = null,
@@ -29415,6 +29658,8 @@ pub const InferenceReadResponse = struct {
     pub const openApiFieldMetadata = .{
         .{ "object", "object", false },
         .{ "data", "data", false },
+        .{ "document", "document", true },
+        .{ "events", "events", true },
         .{ "model", "model", false },
         .{ "usage", "usage", true },
         .{ "execution", "execution", true },
@@ -29434,6 +29679,14 @@ pub const InferenceReadResponse = struct {
         try jw.write(self.object);
         try jw.objectField("data");
         try jw.write(self.data);
+        if (self.document) |value| {
+            try jw.objectField("document");
+            try jw.write(value);
+        }
+        if (self.events) |value| {
+            try jw.objectField("events");
+            try jw.write(value);
+        }
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.usage) |value| {
@@ -29449,17 +29702,48 @@ pub const InferenceReadResponse = struct {
 };
 
 pub const InferenceReadResult = struct {
+    /// Original document source ID.
+    source_id: ?[]const u8 = null,
+    /// One-based original page or slide number.
+    number: ?i64 = null,
+    kind: ?[]const u8 = null,
+    native_text: ?[]const u8 = null,
+    /// Speaker notes, separate from slide text.
+    notes: ?[]const u8 = null,
+    status: ?[]const u8 = null,
+    origin: ?[]const u8 = null,
+    /// Coordinate space of regions; PDF points, slide EMUs or image pixels.
+    coordinate_space: ?[]const u8 = null,
+    /// Projective source transform.
+    transform: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Mapping from rendered pixels to original source coordinates, including page rotation and actual render DPI.
+    raster_to_source: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
+    /// Tables and cells in source coordinates with provenance.
+    tables: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
+    findings: ?[]const []const u8 = null,
     /// Extracted text from the image
     text: []const u8,
     /// Structured fields extracted by document understanding models (Donut, Florence-2). Fields are flattened with dot notation for nested structures. Only present for models that output structured data.
-    fields: ?std.json.ArrayHashMap([]const u8) = null,
+    fields: OpenApiOptionalNullable(std.json.ArrayHashMap([]const u8)) = .absent,
     /// Individual text regions with bounding boxes and recognized text. Populated by multi-stage OCR models (Surya, PaddleOCR).
     regions: ?[]const InferenceTextRegion = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "source_id", "source_id", true },
+        .{ "number", "number", true },
+        .{ "kind", "kind", true },
+        .{ "native_text", "native_text", true },
+        .{ "notes", "notes", true },
+        .{ "status", "status", true },
+        .{ "origin", "origin", true },
+        .{ "coordinate_space", "coordinate_space", true },
+        .{ "transform", "transform", true },
+        .{ "raster_to_source", "raster_to_source", false },
+        .{ "tables", "tables", true },
+        .{ "findings", "findings", true },
         .{ "text", "text", false },
-        .{ "fields", "fields", true },
+        .{ "fields", "fields", false },
         .{ "regions", "regions", true },
     };
 
@@ -29473,11 +29757,73 @@ pub const InferenceReadResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.source_id) |value| {
+            try jw.objectField("source_id");
+            try jw.write(value);
+        }
+        if (self.number) |value| {
+            try jw.objectField("number");
+            try jw.write(value);
+        }
+        if (self.kind) |value| {
+            try jw.objectField("kind");
+            try jw.write(value);
+        }
+        if (self.native_text) |value| {
+            try jw.objectField("native_text");
+            try jw.write(value);
+        }
+        if (self.notes) |value| {
+            try jw.objectField("notes");
+            try jw.write(value);
+        }
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        if (self.origin) |value| {
+            try jw.objectField("origin");
+            try jw.write(value);
+        }
+        if (self.coordinate_space) |value| {
+            try jw.objectField("coordinate_space");
+            try jw.write(value);
+        }
+        if (self.transform) |value| {
+            try jw.objectField("transform");
+            try jw.write(value);
+        }
+        switch (self.raster_to_source) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("raster_to_source");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("raster_to_source");
+                try jw.write(value);
+            },
+        }
+        if (self.tables) |value| {
+            try jw.objectField("tables");
+            try jw.write(value);
+        }
+        if (self.findings) |value| {
+            try jw.objectField("findings");
+            try jw.write(value);
+        }
         try jw.objectField("text");
         try jw.write(self.text);
-        if (self.fields) |value| {
-            try jw.objectField("fields");
-            try jw.write(value);
+        switch (self.fields) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("fields");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("fields");
+                try jw.write(value);
+            },
         }
         if (self.regions) |value| {
             try jw.objectField("regions");

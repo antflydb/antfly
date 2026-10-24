@@ -11,6 +11,7 @@ components:
       enum:
       - antfly
       - pioneer
+      - cloudflare
       - openai
       - mock
     ExtractionConfig:
@@ -30,6 +31,12 @@ components:
           type: string
         api_url:
           type: string
+        account_id:
+          type: string
+          description: Cloudflare Workers AI account identifier.
+        gateway_id:
+          type: string
+          description: Optional Cloudflare AI Gateway identifier.
         api_key:
           type: string
         bearer_token:
@@ -239,6 +246,26 @@ components:
             - string
             - list
             - array
+            - text
+            - number
+            - date
+            - estimate
+          decimals:
+            type: integer
+            minimum: 0
+            maximum: 15
+            description: Decimal precision for compatible hosted number fields.
+          unit:
+            type: string
+          min:
+            type: number
+            description: Minimum of a hosted estimate distribution.
+          max:
+            type: number
+          step:
+            type: number
+            minimum: 0
+            exclusiveMinimum: true
           enum:
             type: array
             minItems: 2
@@ -509,12 +536,11 @@ components:
           $ref: '#/components/schemas/ExtractionOptions'
     ExtractionRequest:
       type: object
-      description: Atomic extraction request. Every input is validated before inference; failures return no partial
-        data.
+      description: Atomic extraction request. Supply exactly one of inputs, documents or read_artifact. Every input is validated before inference; failures return no partial data.
       required:
       - model
-      - inputs
       - schema
+      x-antfly-exactly-one-of: [inputs, documents, read_artifact]
       properties:
         model:
           type: string
@@ -523,6 +549,17 @@ components:
           allOf:
           - $ref: '#/components/schemas/ExtractionSchemaVersion'
           x-go-type-skip-optional-pointer: false
+        read_artifact:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Opaque handle returned by read with retain_artifact. Mutually exclusive with inputs and documents. Reuses the immutable complete reading without downloading or running OCR again. Handles expire and are local to the serving process.
+        documents:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: Complete PDF/PPTX/image sources. Mutually exclusive with inputs. Reading and extraction share document adapters and preserve independent source grouping.
+          items:
+            $ref: '#/components/schemas/DocumentSource'
         inputs:
           type: array
           minItems: 1
@@ -1603,7 +1640,47 @@ components:
       - value
       properties:
         value:
+          nullable: true
+          description: Source text for span models, or a native typed value for compatible hosted extraction providers.
+          anyOf:
+          - type: string
+          - type: number
+          - type: boolean
+          - type: array
+            items: {}
+        origin:
           type: string
+          enum: [transcription, derived, estimated]
+          description: Provenance of hosted extraction values; never treat a derivation or estimate as verbatim source evidence.
+        estimate:
+          type: object
+          additionalProperties:
+            type: number
+        spans:
+          x-zig-type: std.json.Value
+          type: array
+          description: Per-item UTF-8 byte ranges for list values, rebased against the exact submitted source. Null entries have no literal span.
+          items:
+            type: array
+            nullable: true
+            minItems: 2
+            maxItems: 2
+            items:
+              type: integer
+              minimum: 0
+        evidence:
+          type: array
+          description: Literal text ranges mapped back to the original document pages or explicitly included speaker notes. Derived and estimated values have no fabricated literal references.
+          items:
+            type: object
+            required: [source_id, page_number, start, end]
+            properties:
+              source_id: { type: string }
+              offset_unit: { type: string, enum: [utf8_bytes] }
+              page_number: { type: integer, minimum: 1 }
+              start: { type: integer, minimum: 0 }
+              end: { type: integer, minimum: 0 }
+              role: { type: string, enum: [speaker_notes] }
         score:
           allOf:
           - $ref: '#/components/schemas/ExtractionProbability'
@@ -1688,3 +1765,41 @@ components:
           - $ref: '#/components/schemas/ExtractionSolverStatus'
           x-go-type-skip-optional-pointer: false
       additionalProperties: false
+    DocumentSource:
+      type: object
+      additionalProperties: false
+      required: [id, url, media_type]
+      properties:
+        id:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Unique source identity within the request. Separate sources are never implicitly merged.
+        url:
+          type: string
+          description: Inline data URI or location allowed by the deployment content security policy.
+        media_type:
+          type: string
+          enum:
+          - application/pdf
+          - application/vnd.openxmlformats-officedocument.presentationml.presentation
+          - image/png
+          - image/jpeg
+          - image/webp
+        pages:
+          type: array
+          minItems: 1
+          maxItems: 1024
+          uniqueItems: true
+          description: Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide.
+          items:
+            type: integer
+            minimum: 1
+        include_notes:
+          type: boolean
+          default: false
+          description: Include slide speaker notes as separate evidence, never silently as visible slide text.
+        include_hidden:
+          type: boolean
+          default: false
+          description: Include hidden slides.
