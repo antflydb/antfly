@@ -105,10 +105,18 @@ pub fn readPage(a: A, def: c.Definition, driver: Driver, page_index: usize, supp
     // demonstrate coverage of source text that the adapter already observed.
     const missing_native = !support.coversNative(page.native_text, candidate.text);
     var verified_repair = false;
+    var verification_interruption: ?anyerror = null;
     if (missing_native and ir.hasFinding(page, "native_font_fallback")) {
-        if (driver.validate_fn) |validate| verified_repair = try validate(driver.ptr, page, null, candidate, run);
+        if (driver.validate_fn) |validate| verified_repair = validate(driver.ptr, page, null, candidate, run) catch |err| switch (err) {
+            error.DocumentBudgetExhausted, error.DocumentRendererUnavailable => blk: {
+                verification_interruption = err;
+                break :blk false;
+            },
+            else => return err,
+        };
     }
     page = try applyPage(a, page, candidate, initial.model, run.limits.max_regions);
+    if (verification_interruption) |err| page = try interrupted(a, page, err);
     try ir.finding(a, &page, "native_text_superseded_by_verification", verified_repair);
     try ir.finding(a, &page, "native_text_coverage_incomplete", missing_native and !verified_repair);
     if (missing_native and !verified_repair) page.status = .unresolved;
@@ -128,6 +136,10 @@ pub fn readPage(a: A, def: c.Definition, driver: Driver, page_index: usize, supp
             const revised = try refine(a, def, driver, page_index, page, region.*, run);
             if (revised.status != .complete) page.status = revised.status;
             if (revised.regions.len == 1) region.* = revised.regions[0];
+            // Refinement owns findings as well as revisions. Once the shared
+            // call budget is exhausted no later region can make model progress.
+            page.findings = revised.findings;
+            if (ir.hasFinding(page, "model_call_budget_exhausted")) break;
         }
         page.regions = regions;
         page.text = ir.assemble(a, original_text, original_regions, regions) catch |err| switch (err) {
@@ -168,9 +180,31 @@ fn applyPage(a: A, supplied: c.Page, candidate: Candidate, model: []const u8, li
 }
 
 fn refine(a: A, def: c.Definition, driver: Driver, page_index: usize, supplied: c.Page, region: ?c.Region, run: *c.Run) !c.Page {
-    const r = def.read.?;
     var page = supplied;
     var current = region;
+    refineInto(a, def, driver, page_index, &page, &current, run) catch |err| {
+        page = try interrupted(a, page, err);
+    };
+    if (current) |v| page.regions = try a.dupe(c.Region, &.{v});
+    return page;
+}
+
+/// Recoverable orchestration interruptions retain the latest accepted data.
+/// Cancellation, deadlines, memory and hard resource limits still propagate.
+pub fn interrupted(a: A, supplied: c.Page, err: anyerror) !c.Page {
+    const reason = switch (err) {
+        error.DocumentBudgetExhausted => "model_call_budget_exhausted",
+        error.DocumentRendererUnavailable => "renderer_unavailable_for_visual_content",
+        else => return err,
+    };
+    var page = supplied;
+    if (page.status != .truncated) page.status = .unresolved;
+    try ir.finding(a, &page, reason, true);
+    return page;
+}
+
+fn refineInto(a: A, def: c.Definition, driver: Driver, page_index: usize, page: *c.Page, current: *?c.Region, run: *c.Run) !void {
+    const r = def.read.?;
     var attempted: [3]Action = undefined;
     var attempts: usize = 0;
     while (attempts < @min(run.limits.max_region_attempts, attempted.len)) {
@@ -189,19 +223,19 @@ fn refine(a: A, def: c.Definition, driver: Driver, page_index: usize, supplied: 
                 count += 1;
             }
         }
-        var action = defaultAction(r, page, current);
+        var action = defaultAction(r, page.*, current.*);
         if (r.router) |router| {
             const decide = driver.decide_fn orelse return error.DocumentDecisionUnavailable;
             try run.call();
-            try run.emit(.{ .phase = .decision, .source_id = page.source_id, .page_number = page.number, .model = (try def.binding(router, .decide)).model, .region_id = if (current) |v| v.id else null });
+            try run.emit(.{ .phase = .decision, .source_id = page.source_id, .page_number = page.number, .model = (try def.binding(router, .decide)).model, .region_id = if (current.*) |v| v.id else null });
             action = try decide(driver.ptr, a, try def.binding(router, .decide), .{
-                .page = page,
-                .region = current,
+                .page = page.*,
+                .region = current.*,
                 .allowed = allowed[0..count],
                 .remaining_calls = run.limits.max_model_calls - run.usage.model_calls,
             }, run);
         }
-        try run.emit(.{ .phase = .decision, .source_id = page.source_id, .page_number = page.number, .model = if (r.router) |name| (try def.binding(name, .decide)).model else null, .region_id = if (current) |v| v.id else null, .action = action });
+        try run.emit(.{ .phase = .decision, .source_id = page.source_id, .page_number = page.number, .model = if (r.router) |name| (try def.binding(name, .decide)).model else null, .region_id = if (current.*) |v| v.id else null, .action = action });
         var permitted = false;
         for (allowed[0..count]) |v| if (v == action) {
             permitted = true;
@@ -221,13 +255,13 @@ fn refine(a: A, def: c.Definition, driver: Driver, page_index: usize, supplied: 
         try run.call();
         var scratch = std.heap.ArenaAllocator.init(run.work_allocator orelse a);
         defer scratch.deinit();
-        const candidate = try driver.read_fn(driver.ptr, scratch.allocator(), binding, page_index, if (current) |v| v.bbox else null, run);
-        try run.emit(.{ .phase = .verification, .source_id = page.source_id, .page_number = page.number, .model = binding.model, .region_id = if (current) |v| v.id else null });
+        const candidate = try driver.read_fn(driver.ptr, scratch.allocator(), binding, page_index, if (current.*) |v| v.bbox else null, run);
+        try run.emit(.{ .phase = .verification, .source_id = page.source_id, .page_number = page.number, .model = binding.model, .region_id = if (current.*) |v| v.id else null });
         // A second answer is not evidence of improvement. Keep the original if
         // no validator can establish support for the replacement.
-        const supported = if (driver.validate_fn) |validate| try validate(driver.ptr, page, current, candidate, run) else false;
+        const supported = if (driver.validate_fn) |validate| try validate(driver.ptr, page.*, current.*, candidate, run) else false;
         if (supported and meaningful(candidate.text) and !candidate.truncated and (candidate.status == null or candidate.status.? == .complete)) {
-            if (current) |*v| {
+            if (current.*) |*v| {
                 v.text = try a.dupe(u8, candidate.text);
                 v.model = binding.model;
                 v.origin = candidate.origin;
@@ -237,19 +271,17 @@ fn refine(a: A, def: c.Definition, driver: Driver, page_index: usize, supplied: 
                 v.tables = try ir.cloneTables(a, candidate.tables, run.limits.max_regions);
                 v.fields = try ir.cloneValue(a, candidate.fields);
             } else {
-                const repaired_native = ir.hasFinding(page, "native_font_fallback") and !std.mem.eql(u8, page.text, candidate.text);
-                page = try applyPage(a, page, candidate, binding.model, run.limits.max_regions);
-                if (repaired_native) try ir.finding(a, &page, "native_text_superseded_by_verification", true);
-                try ir.finding(a, &page, "native_text_coverage_incomplete", !support.coversNative(page.native_text, page.text) and !ir.hasFinding(page, "native_text_superseded_by_verification"));
+                const repaired_native = ir.hasFinding(page.*, "native_font_fallback") and !std.mem.eql(u8, page.text, candidate.text);
+                page.* = try applyPage(a, page.*, candidate, binding.model, run.limits.max_regions);
+                if (repaired_native) try ir.finding(a, page, "native_text_superseded_by_verification", true);
+                try ir.finding(a, page, "native_text_coverage_incomplete", !support.coversNative(page.native_text, page.text) and !ir.hasFinding(page.*, "native_text_superseded_by_verification"));
             }
             page.status = .complete;
             break;
         }
         page.status = .unresolved;
-        try run.emit(.{ .phase = .unresolved, .source_id = page.source_id, .page_number = page.number, .region_id = if (current) |v| v.id else null, .model = binding.model, .status = .unresolved, .finding = "replacement_not_supported_by_source" });
+        try run.emit(.{ .phase = .unresolved, .source_id = page.source_id, .page_number = page.number, .region_id = if (current.*) |v| v.id else null, .model = binding.model, .status = .unresolved, .finding = "replacement_not_supported_by_source" });
     }
-    if (current) |v| page.regions = try a.dupe(c.Region, &.{v});
-    return page;
 }
 
 test "document escalation cannot replace correct source with plausible unsupported text" {
@@ -489,4 +521,46 @@ test "document truncated region lists require whole-page repair" {
     try std.testing.expectEqual(c.Status.complete, page.status);
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expectEqualStrings("Header\nTail", page.text);
+}
+
+test "document interruptions retain accepted regional work and propagate cancellation" {
+    const Fake = struct {
+        calls: usize = 0,
+        failure: anyerror = error.DocumentBudgetExhausted,
+        fn read(raw: *anyopaque, a: A, _: c.Binding, _: usize, _: ?[4]f64, run: *c.Run) !Candidate {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            run.usage.physical_model_calls += 1;
+            if (self.calls == 1) return .{ .text = "Bad\nLater", .regions = &.{
+                .{ .id = 10, .text = "Bad", .label = "table", .bbox = .{ 0, 0, 10, 10 } },
+                .{ .id = 11, .text = "Later", .label = "table", .bbox = .{ 0, 10, 10, 20 } },
+            } };
+            if (self.calls > 2) return self.failure;
+            return .{ .text = try a.dupe(u8, "Correct"), .tables = try a.dupe(c.Table, &.{.{ .id = 0, .rows = 1, .columns = 1, .cells = try a.dupe(c.Cell, &.{.{ .row = 0, .column = 0, .text = try a.dupe(u8, "Correct") }}) }}), .fields = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"amount\":9007199254740993.01}", .{ .parse_numbers = false }) };
+        }
+        fn validate(_: *anyopaque, _: c.Page, _: ?c.Region, _: Candidate, _: *c.Run) !bool {
+            return true;
+        }
+    };
+    const def = c.Definition{ .models = &.{ .{ .name = "fast", .model = "fast", .operation = .read }, .{ .name = "table", .model = "table", .operation = .read } }, .read = .{ .reader = "fast", .table_reader = "table" } };
+    for ([_]anyerror{ error.DocumentBudgetExhausted, error.DocumentRendererUnavailable, error.Canceled }) |failure| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var fake = Fake{ .failure = failure };
+        var run = c.Run{ .limits = .{ .max_model_calls = if (failure == error.DocumentBudgetExhausted) 2 else 3 }, .work_allocator = std.testing.allocator };
+        const result = readPage(arena.allocator(), def, .{ .ptr = &fake, .read_fn = Fake.read, .validate_fn = Fake.validate }, 0, .{ .source_id = "receipt", .number = 1, .kind = .image }, &run);
+        if (failure == error.Canceled) {
+            try std.testing.expectError(error.Canceled, result);
+            continue;
+        }
+        const page = try result;
+        try std.testing.expectEqual(c.Status.unresolved, page.status);
+        try std.testing.expectEqualStrings("Correct\nLater", page.text);
+        try std.testing.expectEqual(@as(usize, 2), page.regions.len);
+        try std.testing.expectEqualStrings("9007199254740993.01", page.regions[0].fields.?.object.get("amount").?.number_string);
+        try std.testing.expectEqualStrings("Correct", page.tables[0].cells[0].text);
+        try std.testing.expectEqual(@as(?usize, 10), page.tables[0].region_id);
+        try std.testing.expect(ir.hasFinding(page, if (failure == error.DocumentBudgetExhausted) "model_call_budget_exhausted" else "renderer_unavailable_for_visual_content"));
+        try std.testing.expectEqual(@as(usize, if (failure == error.DocumentBudgetExhausted) 2 else 3), fake.calls);
+    }
 }

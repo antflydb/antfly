@@ -50,6 +50,13 @@ pub const Provider = config.Provider;
 pub const Config = config.Config;
 pub const apple = @import("apple.zig");
 
+/// Validated, borrowed MIME essence shared by transport and source adapters.
+/// Parameters do not participate in media dispatch; the bytes still establish
+/// the actual image format at the source boundary.
+pub fn mediaTypeEssence(value: []const u8) ![]const u8 {
+    return data_uri.mediaTypeEssence(value);
+}
+
 pub const InlineContentTrust = enum {
     untrusted,
     trusted_internal,
@@ -128,8 +135,8 @@ pub fn validateEncodedRequest(request: EncodedRequest) !void {
         if (image.bytes.len == 0) return error.InvalidImageInput;
         const mime_type = std.mem.trim(u8, image.mime_type, &std.ascii.whitespace);
         if (mime_type.len != image.mime_type.len) return error.InvalidArguments;
-        const parsed = data_uri.parseMediaType(mime_type) catch return error.InvalidArguments;
-        if (!std.ascii.startsWithIgnoreCase(parsed.essence, "image/")) {
+        const essence = mediaTypeEssence(mime_type) catch return error.InvalidArguments;
+        if (!std.ascii.startsWithIgnoreCase(essence, "image/")) {
             return error.InvalidArguments;
         }
     }

@@ -2093,8 +2093,16 @@ test "decision provider embedding similarity batches and deduplicates named embe
     const Fake = struct {
         calls: usize = 0,
         texts: usize = 0,
-        fn dense(raw: *anyopaque, a: std.mem.Allocator, _: []const u8, texts: []const []const u8) ![][]f32 {
+        tasks: [2]usize = .{ 0, 0 },
+        fn dense(raw: *anyopaque, a: std.mem.Allocator, _: []const u8, texts: []const []const u8, context: managed.EmbeddingRequestContext) ![][]f32 {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            self.tasks[
+                switch (context.task_type) {
+                    .clustering => @as(usize, 0),
+                    .classification => @as(usize, 1),
+                    else => return error.UnsupportedEmbeddingTaskType,
+                }
+            ] += 1;
             self.calls += 1;
             self.texts += texts.len;
             const vectors = try a.alloc([]f32, texts.len);
@@ -2117,7 +2125,7 @@ test "decision provider embedding similarity batches and deduplicates named embe
     defer io_impl.deinit();
     var client = httpx.Client.init(a, io_impl.io());
     defer client.deinit();
-    var runtime = Runtime{ .registry = &registry, .http = &client, .io = io_impl.io(), .antfly_provider = .{ .ptr = &fake, .embed_dense_texts = Fake.dense, .embed_sparse_texts = Fake.sparse } };
+    var runtime = Runtime{ .registry = &registry, .http = &client, .io = io_impl.io(), .antfly_provider = .{ .ptr = &fake, .embed_dense_texts = undefined, .embed_dense_texts_with_context = Fake.dense, .embed_sparse_texts = Fake.sparse } };
     defer runtime.deinit();
     const questions = try std.json.parseFromSliceLeaky(decisions.Json, a,
         \\{"route":{"type":"choice","instructions":"Choose category","criteria":{"account":"account","billing":"billing"}}}
@@ -2131,6 +2139,18 @@ test "decision provider embedding similarity batches and deduplicates named embe
         try std.testing.expectEqualStrings("account", answer.object.get("choice").?.string);
         try std.testing.expect(!answer.object.contains("probabilities"));
     }
+    try registry.registerDeciderConfig("classification", .{ .decision_method = .embedding_similarity, .embedder = "dense", .embedding_options = .{ .dimensions = 2, .task_type = .CLASSIFICATION } });
+    const classification = decisions.Request{ .decider = "classification", .input = .{ .text = "account" }, .questions = questions };
+    const classified = try runtime.provider().evaluateBatch(a, &.{ classification, classification });
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 6), fake.texts);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 1 }, &fake.tasks);
+    const classified_answer = classified[0].object.get("answers").?.array.items[0];
+    try std.testing.expectEqualStrings("account", classified_answer.object.get("choice").?.string);
+    try std.testing.expect(!std.mem.eql(u8, results[0].object.get("answers").?.array.items[0].object.get("prototype_set_hash").?.string, classified_answer.object.get("prototype_set_hash").?.string));
+    runtime.antfly_provider.?.embed_dense_texts_with_context = null;
+    try std.testing.expectError(error.UnsupportedEmbeddingTaskType, runtime.provider().evaluateBatch(a, &.{request}));
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
 }
 
 test "decision provider embedding similarity partial batches isolate invalid query vectors and retain usage" {
@@ -2138,7 +2158,8 @@ test "decision provider embedding similarity partial batches isolate invalid que
         calls: usize = 0,
         texts: usize = 0,
         invalid_prototypes: bool = false,
-        fn dense(raw: *anyopaque, a: std.mem.Allocator, _: []const u8, texts: []const []const u8) ![][]f32 {
+        fn dense(raw: *anyopaque, a: std.mem.Allocator, _: []const u8, texts: []const []const u8, context: managed.EmbeddingRequestContext) ![][]f32 {
+            try std.testing.expectEqual(managed.EmbeddingTaskType.clustering, context.task_type);
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             self.texts += texts.len;
@@ -2162,7 +2183,7 @@ test "decision provider embedding similarity partial batches isolate invalid que
     defer io_impl.deinit();
     var client = httpx.Client.init(a, io_impl.io());
     defer client.deinit();
-    var runtime = Runtime{ .registry = &registry, .http = &client, .io = io_impl.io(), .antfly_provider = .{ .ptr = &fake, .embed_dense_texts = Fake.dense, .embed_sparse_texts = Fake.sparse } };
+    var runtime = Runtime{ .registry = &registry, .http = &client, .io = io_impl.io(), .antfly_provider = .{ .ptr = &fake, .embed_dense_texts = undefined, .embed_dense_texts_with_context = Fake.dense, .embed_sparse_texts = Fake.sparse } };
     defer runtime.deinit();
     const questions = try std.json.parseFromSliceLeaky(decisions.Json, a,
         \\{"route":{"type":"choice","instructions":"Choose category","criteria":{"account":"account","billing":"billing"}}}
@@ -2244,7 +2265,8 @@ test "decision provider materialized named embedders use frozen dependencies and
     const Fake = struct {
         calls: usize = 0,
         texts: usize = 0,
-        fn dense(raw: *anyopaque, a: std.mem.Allocator, _: []const u8, texts: []const []const u8) ![][]f32 {
+        fn dense(raw: *anyopaque, a: std.mem.Allocator, _: []const u8, texts: []const []const u8, context: managed.EmbeddingRequestContext) ![][]f32 {
+            try std.testing.expectEqual(managed.EmbeddingTaskType.clustering, context.task_type);
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             self.texts += texts.len;
@@ -2265,7 +2287,7 @@ test "decision provider materialized named embedders use frozen dependencies and
     var client = httpx.Client.init(a, io_impl.io());
     defer client.deinit();
     const Assets = @import("../asset_producer_runtime.zig").Runtime;
-    var assets = Assets.initWithOptions(a, &client, .{ .antfly_provider = .{ .ptr = &fake, .owns_invocation_admission = true, .embed_dense_texts = Fake.dense, .embed_sparse_texts = Fake.sparse } });
+    var assets = Assets.initWithOptions(a, &client, .{ .antfly_provider = .{ .ptr = &fake, .owns_invocation_admission = true, .embed_dense_texts = undefined, .embed_dense_texts_with_context = Fake.dense, .embed_sparse_texts = Fake.sparse } });
     defer assets.deinit();
     const spec =
         \\{"version":"v1","decider":{"decision_method":"embedding_similarity","embedder":"dense","embedding_options":{"dimensions":2}},"embedders":{"dense":{"provider":"antfly","model":"test","dimensions":2}},"questions":[{"name":"route","type":"choice","instructions":"Choose category","choices":[{"value":"account","description":"account"},{"value":"billing","description":"billing"}]}]}

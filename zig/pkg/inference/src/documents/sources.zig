@@ -43,6 +43,9 @@ pub const Source = struct {
     pub fn init(a: A, input: Input, bytes: []const u8, limits: c.Limits, control: c.Control) !Source {
         try control.check();
         if (input.id.len == 0 or input.id.len > 256 or bytes.len > limits.max_source_bytes) return error.InvalidDocumentSource;
+        const essence = @import("antfly_readers").mediaTypeEssence(input.media_type) catch return error.InvalidDocumentSource;
+        var normalized = input;
+        normalized.media_type = if (std.ascii.eqlIgnoreCase(essence, "application/pdf")) "application/pdf" else if (std.ascii.eqlIgnoreCase(essence, "application/vnd.openxmlformats-officedocument.presentationml.presentation")) "application/vnd.openxmlformats-officedocument.presentationml.presentation" else if (image.inferenceFormatForMimeEssence(essence)) |format| image.inferenceMimeEssenceForFormat(format).? else return error.UnsupportedDocumentFormat;
         const selection: ?[]const usize = if (input.pages) |pages| blk: {
             if (pages.len == 0) return error.InvalidDocumentSelection;
             if (pages.len > limits.max_pages) return error.DocumentPageLimitExceeded;
@@ -57,7 +60,7 @@ pub const Source = struct {
         std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
         const fingerprint = std.fmt.bytesToHex(hash, .lower);
         var result: Source = undefined;
-        if (std.mem.eql(u8, input.media_type, "application/pdf")) {
+        if (std.mem.eql(u8, normalized.media_type, "application/pdf")) {
             if (!std.mem.startsWith(u8, bytes, "%PDF-")) return error.DocumentMediaTypeMismatch;
             const Probe = struct {
                 fn cancelled(raw: ?*const anyopaque) bool {
@@ -68,8 +71,8 @@ pub const Source = struct {
             };
             const persistent_control = try a.create(c.Control);
             persistent_control.* = control;
-            result = .{ .input = input, .bytes = bytes, .fingerprint = fingerprint, .parsed = .{ .pdf = try pdf.reader.Reader.initWithDecodeLimitsAndCancellation(a, bytes, .{}, .{ .context = persistent_control, .is_cancelled_fn = Probe.cancelled }) } };
-        } else if (std.mem.eql(u8, input.media_type, "application/vnd.openxmlformats-officedocument.presentationml.presentation")) {
+            result = .{ .input = normalized, .bytes = bytes, .fingerprint = fingerprint, .parsed = .{ .pdf = try pdf.reader.Reader.initWithDecodeLimitsAndCancellation(a, bytes, .{}, .{ .context = persistent_control, .is_cancelled_fn = Probe.cancelled }) } };
+        } else if (std.mem.eql(u8, normalized.media_type, "application/vnd.openxmlformats-officedocument.presentationml.presentation")) {
             const archive = try ooxml.Archive.initWithControl(a, bytes, limits.max_source_bytes, control);
             const presentation = try archive.get(a, "ppt/presentation.xml");
             const relationships = try archive.get(a, "ppt/_rels/presentation.xml.rels");
@@ -101,13 +104,13 @@ pub const Source = struct {
                 try slides.append(a, slide);
             }
             if (slides.items.len == 0) return error.InvalidDocumentSource;
-            result = .{ .input = input, .bytes = bytes, .fingerprint = fingerprint, .parsed = .{ .slides = .{ .archive = archive, .slides = try slides.toOwnedSlice(a) } } };
-        } else if (std.mem.startsWith(u8, input.media_type, "image/")) {
-            const expected = image.inferenceFormatForMimeEssence(input.media_type) orelse return error.UnsupportedDocumentFormat;
+            result = .{ .input = normalized, .bytes = bytes, .fingerprint = fingerprint, .parsed = .{ .slides = .{ .archive = archive, .slides = try slides.toOwnedSlice(a) } } };
+        } else if (std.mem.startsWith(u8, normalized.media_type, "image/")) {
+            const expected = image.inferenceFormatForMimeEssence(normalized.media_type) orelse return error.UnsupportedDocumentFormat;
             if (image.detectFormat(bytes) != expected) return error.DocumentMediaTypeMismatch;
             const info = try image.inspectEncoded(bytes);
             if (info.width > limits.max_dimension or info.height > limits.max_dimension or try info.pixels() > limits.max_pixels) return error.DocumentPixelLimitExceeded;
-            result = .{ .input = input, .bytes = bytes, .fingerprint = fingerprint, .parsed = .image };
+            result = .{ .input = normalized, .bytes = bytes, .fingerprint = fingerprint, .parsed = .image };
         } else return error.UnsupportedDocumentFormat;
         errdefer result.deinit();
         result.page_selection = selection;
@@ -236,6 +239,26 @@ fn relationship(a: A, xml: []const u8, id: []const u8, base: []const u8) ![]cons
     return error.MissingDocumentPart;
 }
 const normalizedPart = slide_parts.normalizedPart;
+
+test "document sources normalize validated image MIME while enforcing byte identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes: []const u8 = @embedFile("testdata/one-pixel.png");
+    const readers = @import("antfly_readers");
+    for ([_][]const u8{ "image/png", "IMAGE/PNG", "image/png; charset=binary", "Image/PNG; charset=\"binary\"" }) |mime| {
+        try readers.validateEncodedRequest(.{ .images = &.{.{ .bytes = bytes, .mime_type = mime }} });
+        var source = try Source.init(a, .{ .id = "image", .url = "", .media_type = mime }, bytes, .{}, .{});
+        defer source.deinit();
+        try std.testing.expectEqualStrings("image/png", source.input.media_type);
+        var run = c.Run{ .limits = .{} };
+        const rendered = try source.render(a, 1, &run);
+        try std.testing.expectEqualStrings("image/png", rendered.mime_type);
+        try std.testing.expectEqual(bytes.ptr, rendered.bytes.ptr);
+    }
+    try std.testing.expectError(error.DocumentMediaTypeMismatch, Source.init(a, .{ .id = "image", .url = "", .media_type = "IMAGE/JPEG; charset=binary" }, bytes, .{}, .{}));
+    try std.testing.expectError(error.InvalidDocumentSource, Source.init(a, .{ .id = "image", .url = "", .media_type = "image/png;" }, bytes, .{}, .{}));
+}
 
 test "document selections spend page budget only on selected PDF pages and slides" {
     inline for (.{ .{ @embedFile("testdata/two-pages.pdf"), "application/pdf" }, .{ @embedFile("testdata/ordered-slides.pptx"), "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, .{ @embedFile("testdata/inherited-slides.pptx"), "application/vnd.openxmlformats-officedocument.presentationml.presentation" } }) |fixture| {

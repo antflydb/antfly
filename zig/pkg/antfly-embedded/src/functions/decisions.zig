@@ -90,7 +90,7 @@ pub const DeciderConfig = struct {
             else => return error.InvalidDeciderConfig,
         };
         if (self.embedder) |name| {
-            if (name.len == 0 or self.decision_method != .embedding_similarity or self.model.len != 0 or self.model_identity != null or self.url.len != 0 or self.api_key != null or self.rate_limit != null or (self.embedding_options != null and (self.embedding_options.?.calibration_id != null or self.embedding_options.?.task_type != .CLUSTERING))) return error.InvalidDeciderConfig;
+            if (name.len == 0 or self.decision_method != .embedding_similarity or self.model.len != 0 or self.model_identity != null or self.url.len != 0 or self.api_key != null or self.rate_limit != null or (self.embedding_options != null and self.embedding_options.?.calibration_id != null)) return error.InvalidDeciderConfig;
         }
         if (self.provider == .cloudflare) {
             if (self.account_id == null or self.decision_method != .typed) return error.InvalidDeciderConfig;

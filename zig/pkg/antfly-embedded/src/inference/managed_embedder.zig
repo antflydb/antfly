@@ -1706,13 +1706,29 @@ pub const ManagedEmbedder = struct {
         context: RequestContext,
     ) ![]const []const f32 {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        return self.embedTaskBatchUnchecked(alloc, embedding_name, texts, dims, .retrieval_document, context);
+    }
+
+    /// Explicit task execution shares the same provider, quota, credentials,
+    /// deadlines and sanitization as indexing, without imposing a retrieval role.
+    pub fn embedTaskBatchWithContext(self: *ManagedEmbedder, alloc: std.mem.Allocator, embedding_name: []const u8, texts: []const []const u8, dims: u32, task_type: EmbeddingTaskType, context: RequestContext) ![]const []const f32 {
+        try context.check();
+        var sanitized = try db_embedder.sanitizeUtf8BatchForEmbeddingAlloc(alloc, texts);
+        defer sanitized.deinit(alloc);
+        const vectors = try self.embedTaskBatchUnchecked(alloc, embedding_name, sanitized.texts(), dims, task_type, context);
+        errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
+        try context.check();
+        return vectors;
+    }
+
+    fn embedTaskBatchUnchecked(self: *ManagedEmbedder, alloc: std.mem.Allocator, embedding_name: []const u8, texts: []const []const u8, dims: u32, task_type: EmbeddingTaskType, context: RequestContext) ![]const []const f32 {
         const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
         if (configured.sparse) return error.UnsupportedEmbeddingProvider;
         var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
         var entry = configured.requestOverlay(alloc);
         defer entry.auth_header_cache.deinit(alloc);
         applyRequestContext(&entry, context, &cancellation);
-        return try embedBatchWithEntry(alloc, &entry, texts, dims);
+        return try embedBatchWithEntryForTask(alloc, &entry, texts, dims, task_type);
     }
 
     fn embedDenseParts(
@@ -6670,9 +6686,13 @@ fn embedBatchWithEntry(
 }
 
 fn effectiveInputType(entry: *const ManagedEmbeddingEntry, task_type: EmbeddingTaskType) []const u8 {
+    // Retrieval overrides must not change an explicitly requested routing task.
+    if (task_type == .clustering) return "clustering";
+    if (task_type == .classification) return "classification";
     const role_override = switch (task_type) {
         .retrieval_query => entry.query_input_type,
         .retrieval_document => entry.document_input_type,
+        else => unreachable,
     };
     if (role_override.len > 0) return role_override;
     // Backward-compatible expert override: the legacy field applies to both
@@ -6681,6 +6701,7 @@ fn effectiveInputType(entry: *const ManagedEmbeddingEntry, task_type: EmbeddingT
     return switch (task_type) {
         .retrieval_query => "search_query",
         .retrieval_document => "search_document",
+        else => unreachable,
     };
 }
 
@@ -6703,6 +6724,13 @@ pub fn testEmbeddingTaskRouting() !void {
     try std.testing.expectEqualStrings("search_document", effectiveInputType(&entry, .retrieval_document));
     try std.testing.expect(effectiveInstruction(&entry, .retrieval_query) == null);
     try std.testing.expect(effectiveInstruction(&entry, .retrieval_document) == null);
+    var overridden = entry;
+    overridden.input_type = @constCast("search_document");
+    overridden.document_input_type = @constCast("custom_document");
+    try std.testing.expectEqualStrings("clustering", effectiveInputType(&overridden, .clustering));
+    try std.testing.expectEqualStrings("classification", effectiveInputType(&overridden, .classification));
+    try std.testing.expectEqualStrings("CLUSTERING", effectiveProviderTaskType(&overridden, .clustering));
+    try std.testing.expectEqualStrings("CLASSIFICATION", effectiveProviderTaskType(&overridden, .classification));
 
     const query_context = embeddingRequestContext(&entry, .retrieval_query);
     try std.testing.expectEqual(EmbeddingTaskType.retrieval_query, query_context.task_type);
@@ -6820,6 +6848,7 @@ fn embedBatchWithEntryForTaskOnce(
                 try checkEntryDispatchDeadline(entry);
                 const context = embeddingRequestContext(entry, task_type);
                 try context.check();
+                if ((task_type == .clustering or task_type == .classification) and local.embed_dense_texts_with_context == null) return error.UnsupportedEmbeddingTaskType;
                 if (context.model_identity != null and local.embed_dense_texts_with_context == null) return error.InvalidEmbeddingIdentity;
                 if (trace_batch) provider_started = monotonicNowNs();
                 const vectors = (if (local.embed_dense_texts_with_context) |embed_with_context|
@@ -6898,6 +6927,7 @@ fn effectiveProviderTaskType(entry: *const ManagedEmbeddingEntry, task_type: Emb
     const role_override = switch (task_type) {
         .retrieval_query => entry.query_input_type,
         .retrieval_document => entry.document_input_type,
+        .clustering, .classification => "",
     };
     return if (role_override.len > 0) role_override else task_type.canonical();
 }

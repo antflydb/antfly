@@ -146,6 +146,12 @@ query vector fails its own row; valid siblings remain available, and the batch's
 conservative token estimate is retained even if scoring or dispatch fails. SQL
 and HTTP execution borrow service-owned provider clients. Standalone enrichment
 owners retain their own provider runtime across batches.
+The batch's `embedding_options.task_type` selects `CLUSTERING` or
+`CLASSIFICATION`. Task-aware providers receive that task through both linked
+and hosted execution; retrieval-specific overrides do not replace it. The task
+participates in prototype provenance while all compatible rows and questions
+share one deduplicated embedding call. Legacy linked callbacks without task
+context reject these decisions before inference.
 
 Generator-backed rewriting requires a complete generation result. Embedded
 Antfly generators use the JSON callback to preserve finish reasons and usage;

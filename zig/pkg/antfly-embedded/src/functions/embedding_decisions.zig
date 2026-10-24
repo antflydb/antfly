@@ -21,6 +21,7 @@ const contract = @import("antfly_decisions");
 const scoring = contract.scoring;
 const A = std.mem.Allocator;
 const V = std.json.Value;
+const Task = @import("../inference/managed_embedder.zig").EmbeddingTaskType;
 
 const Texts = struct {
     values: std.ArrayList([]const u8) = .empty,
@@ -45,6 +46,7 @@ pub const PartialBatch = struct {
 };
 
 const Plan = struct {
+    task: Task,
     first: contract.Request,
     dimensions: u32,
     texts: Texts,
@@ -59,19 +61,22 @@ fn prepare(a: A, cfg: d.DeciderConfig, embedder: @import("antfly_embeddings").Co
     const dimensions = (cfg.embedding_options orelse d.EmbeddingOptions{}).dimensions;
     if ((embedder.dimensions orelse embedder.dimension orelse return error.InvalidDeciderConfig) != dimensions or (embedder.sparse orelse false)) return error.InvalidDeciderConfig;
     const first = try contract.parse(a, try d.wireRequest(a, cfg, try requests[0].input.requireText(), requests[0].questions));
+    const task: Task = if (std.mem.eql(u8, first.policies[0].options.task_type, "CLUSTERING")) .clustering else .classification;
     var output_bound: usize = 0;
     for (first.inner.questions) |question| output_bound = try std.math.add(usize, output_bound, try std.math.mul(usize, question.labels.len + 1, 256));
     if (try std.math.mul(usize, output_bound, requests.len) > 1024 * 1024) return error.DecisionLimitExceeded;
     var texts = Texts{};
     const questions = try a.alloc(Question, first.inner.questions.len);
     for (first.inner.questions, first.policies, questions) |question, policy, *plan| {
+        if (policy.options.dimensions != dimensions) return error.InvalidDeciderConfig;
+        if (!std.mem.eql(u8, policy.options.task_type, task.canonical())) return error.InvalidDeciderConfig;
         if (policy.options.calibration_id != null) return error.UnsupportedEmbeddingCalibration;
         if (policy.kind != .choice and policy.kind != .multi_choice) return error.UnsupportedDecisionKind;
         if (policy.kind == .multi_choice and policy.thresholds == null) return error.EmbeddingMultiLabelThresholdRequired;
         const categories = try a.alloc([]const usize, question.labels.len);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("antfly-hosted-prototypes-v1");
-        hash.update(try std.json.Stringify.valueAlloc(a, .{ .model = embedder.model, .provider = @tagName(embedder.provider), .dimensions = dimensions, .question = question, .url = embedder.url, .account_id = embedder.account_id, .project_id = embedder.project_id, .location = embedder.location, .region = embedder.region, .request_format = embedder.request_format, .model_identity = embedder.model_identity, .input_type = embedder.input_type, .document_input_type = embedder.document_input_type, .truncate = embedder.truncate }, .{}));
+        hash.update(try std.json.Stringify.valueAlloc(a, .{ .model = embedder.model, .provider = @tagName(embedder.provider), .dimensions = dimensions, .task_type = task.canonical(), .renderer_version = scoring.renderer_version, .question = question, .url = embedder.url, .account_id = embedder.account_id, .gateway_id = embedder.gateway_id, .project_id = embedder.project_id, .location = embedder.location, .region = embedder.region, .request_format = embedder.request_format, .model_identity = embedder.model_identity, .input_type = embedder.input_type, .document_input_type = embedder.document_input_type, .truncate = embedder.truncate }, .{}));
         for (question.descriptions, categories, 0..) |description, *indices, label_index| {
             const examples = if (question.examples.len == 0) &.{} else question.examples[label_index];
             const ids = try a.alloc(usize, @max(examples.len, 1));
@@ -88,7 +93,7 @@ fn prepare(a: A, cfg: d.DeciderConfig, embedder: @import("antfly_embeddings").Co
     // Bound vector materialization before dispatch, independently of JSON size.
     const vector_bytes = try std.math.mul(usize, try std.math.mul(usize, texts.values.items.len, dimensions), @sizeOf(f32));
     if (vector_bytes > 32 * 1024 * 1024) return error.DecisionLimitExceeded;
-    return .{ .first = first, .dimensions = dimensions, .texts = texts, .questions = questions, .vector_bytes = vector_bytes };
+    return .{ .task = task, .first = first, .dimensions = dimensions, .texts = texts, .questions = questions, .vector_bytes = vector_bytes };
 }
 
 pub fn workingBytes(a: A, cfg: d.DeciderConfig, embedder: @import("antfly_embeddings").Config, requests: []const d.Request) !usize {
@@ -138,7 +143,7 @@ pub fn batchPartial(backing: A, runtime: anytype, cfg: d.DeciderConfig, requests
     @memset(partial.failures, null);
     // This estimate remains available when dispatch or shared prototype work
     // fails. Admission is conservative and never presents it as measured usage.
-    const vectors = executor.embed(a, name, texts.values.items, dimensions) catch |err| {
+    const vectors = executor.embedForTask(a, name, texts.values.items, dimensions, plan.task) catch |err| {
         @memset(partial.failures, err);
         return partial;
     };

@@ -265,6 +265,10 @@ pub const Executor = struct {
     }
 
     pub fn embed(self: Executor, a: std.mem.Allocator, name: []const u8, texts: []const []const u8, dimensions: ?u32) ![]const []const f32 {
+        return self.embedForTask(a, name, texts, dimensions, .retrieval_document);
+    }
+
+    pub fn embedForTask(self: Executor, a: std.mem.Allocator, name: []const u8, texts: []const []const u8, dimensions: ?u32, task_type: managed.EmbeddingTaskType) ![]const []const f32 {
         try self.context.check();
         var cfg = try self.view.providers.getEmbedderConfig(name);
         if (dimensions) |d| {
@@ -275,7 +279,7 @@ pub const Executor = struct {
         defer embedder.deinit();
         if (!embedder.hasDenseEntries() or embedder.hasSparseEntries()) return error.UnsupportedInferenceFeature;
         const dims = cfg.dimensions orelse cfg.dimension orelse embedder.entries[0].dimensions;
-        return embedder.denseInterface().embedDenseBatchWithContext(a, "gateway", texts, dims, self.context);
+        return embedder.embedTaskBatchWithContext(a, "gateway", texts, dims, task_type, self.context);
     }
 
     pub const NativeEmbedding = struct {

@@ -172,6 +172,7 @@ pub fn Service(comptime Node: type) type {
                     return err;
                 };
                 defer source.deinit();
+                inputs.items[source_index].media_type = source.input.media_type;
                 try fingerprints.append(a, .{ .id = input.id, .sha256 = try a.dupe(u8, &source.fingerprint), .page_number = if (attached) |attachments| attachments.images[source_index].page_number else null });
                 const count = try source.pageCount();
                 for (0..count) |index| {
@@ -201,8 +202,7 @@ pub fn Service(comptime Node: type) type {
                         error.DocumentRendererUnavailable, error.DocumentBudgetExhausted => blk: {
                             var unresolved = page;
                             unresolved.text = page.native_text;
-                            unresolved.status = .unresolved;
-                            try @import("representation.zig").finding(sa, &unresolved, if (err == error.DocumentBudgetExhausted) "model_call_budget_exhausted" else "renderer_unavailable_for_visual_content", true);
+                            unresolved = try executor.interrupted(sa, unresolved, err);
                             try run.output(unresolved.text.len);
                             break :blk unresolved;
                         },
@@ -899,6 +899,8 @@ test "document nested composites share one budget and one rendered view" {
             if (operation != .read) return null;
             const json = if (std.mem.eql(u8, name, "cloudflare-reader"))
                 \\{"allow_remote":true,"models":[{"name":"vision","provider":"cloudflare","model":"@cf/mistralai/mistral-small-3.1-24b-instruct","operation":"read","account_id":"account","token_env":"CLOUDFLARE_API_TOKEN"}],"read":{"reader":"vision","min_confidence":0}}
+            else if (std.mem.eql(u8, name, "limited"))
+                \\{"models":[{"name":"fast","model":"leaf","operation":"read"},{"name":"router","model":"router","operation":"decide"}],"read":{"reader":"fast","router":"router"},"budget":{"max_model_calls":1}}
             else if (std.mem.eql(u8, name, "parent") and self.tiny_tokens)
                 \\{"models":[{"name":"child","model":"child","operation":"read"}],"read":{"reader":"child"},"budget":{"max_total_tokens":1}}
             else if (std.mem.eql(u8, name, "parent"))
@@ -923,6 +925,7 @@ test "document nested composites share one budget and one rendered view" {
         fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, model: []const u8, request: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
             try std.testing.expectEqualStrings("leaf", model);
             try std.testing.expectEqual(@as(usize, 1), request.images.len);
+            try std.testing.expectEqualStrings("image/png", request.images[0].mime_type);
             self.reads += 1;
             const results = try a.alloc(readers.Result, 1);
             results[0] = .{ .text = "Receipt total 12.50", .completion = if (self.incomplete) .length else .complete, .prompt_tokens = if (self.measured) @as(usize, 10) else null, .completion_tokens = if (self.measured) @as(usize, 256) else null };
@@ -960,7 +963,7 @@ test "document nested composites share one budget and one rendered view" {
     var parsed = try std.json.parseFromSlice(V, a, result, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), fake.reads);
-    const encoded = try Service(Fake).readEncodedJson(&fake, a, "parent", .{ .images = &.{.{ .bytes = @embedFile("testdata/one-pixel.png"), .mime_type = "image/png", .item_id = "receipt", .page_number = 11 }} }, .{});
+    const encoded = try Service(Fake).readEncodedJson(&fake, a, "parent", .{ .images = &.{.{ .bytes = @embedFile("testdata/one-pixel.png"), .mime_type = "IMAGE/PNG; charset=binary", .item_id = "receipt", .page_number = 11 }} }, .{});
     defer a.free(encoded);
     var encoded_result = try std.json.parseFromSlice(V, a, encoded, .{});
     defer encoded_result.deinit();
@@ -986,6 +989,14 @@ test "document nested composites share one budget and one rendered view" {
     try std.testing.expectEqualStrings("unresolved", partial.value.object.get("document").?.object.get("status").?.string);
     try std.testing.expectEqualStrings("truncated", partial.value.object.get("data").?.array.items[0].object.get("status").?.string);
     fake.incomplete = false;
+    const limited = try Service(Fake).readEncodedJson(&fake, a, "limited", .{ .allow_incomplete = true, .images = &.{.{ .bytes = @embedFile("testdata/one-pixel.png"), .mime_type = "image/png" }} }, .{});
+    defer a.free(limited);
+    var limited_result = try std.json.parseFromSlice(V, a, limited, .{});
+    defer limited_result.deinit();
+    const limited_page = limited_result.value.object.get("data").?.array.items[0];
+    try std.testing.expectEqualStrings("unresolved", limited_page.object.get("status").?.string);
+    try std.testing.expectEqualStrings("Receipt total 12.50", limited_page.object.get("text").?.string);
+    try std.testing.expectEqual(@as(i64, 1), limited_result.value.object.get("usage").?.object.get("physical_model_calls").?.integer);
     fake.tiny_tokens = true;
     try std.testing.expectError(error.DocumentTokenLimitExceeded, Service(Fake).readEncodedJson(&fake, a, "parent", .{ .images = &.{.{ .bytes = @embedFile("testdata/one-pixel.png"), .mime_type = "image/png" }} }, .{}));
     fake.tiny_tokens = false;
@@ -996,7 +1007,7 @@ test "document nested composites share one budget and one rendered view" {
     const wide = try image.png.encodeRgba(a, 2, 1, &.{ 0, 0, 0, 255, 0, 0, 0, 255 });
     defer a.free(wide);
     try std.testing.expectError(error.DocumentPixelLimitExceeded, Service(Fake).readEncodedJson(&fake, a, "parent", .{ .images = &.{.{ .bytes = wide, .mime_type = "image/png" }} }, .{}));
-    try std.testing.expectEqual(@as(usize, 5), fake.reads);
+    try std.testing.expectEqual(@as(usize, 6), fake.reads);
 }
 
 test "document extraction keeps independent sources atomic and reuses retained readings" {

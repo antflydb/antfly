@@ -27,6 +27,9 @@ unselected slides are not decompressed or composed. Selection never renumbers so
 results follow original source order, regardless of selection order. Independent
 sources remain independent extraction contexts. URLs inherit the deployment's
 existing content security restrictions.
+Encoded images use the ordinary reader MIME contract: type matching ignores
+case, validated parameters are removed before dispatch, and declared types are
+checked against the encoded bytes. Normalization borrows the existing bytes.
 
 `antfly/native-document` reads native PDF and slide content without loading an
 OCR model. A composite can retain trustworthy native text and render uncertain
@@ -156,6 +159,10 @@ them.
 Best-effort reading discloses unresolved pages. Extraction fails atomically when
 reading, evidence validation, disagreement or execution budgets prevent a valid
 result. It never presents a partial document as successful extraction.
+If a call budget or unavailable renderer interrupts refinement, reading retains
+the latest accepted text, fields and tables and reports the interruption as a
+finding. Earlier accepted regional revisions survive later interruptions.
+Cancellation, deadlines and hard resource limits still propagate as failures.
 
 ## Cloudflare providers
 

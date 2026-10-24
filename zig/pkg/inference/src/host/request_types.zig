@@ -18,11 +18,15 @@ const RequestContext = @import("antfly_inference_execution_control").RequestCont
 pub const EmbeddingTaskType = enum {
     retrieval_query,
     retrieval_document,
+    clustering,
+    classification,
 
     pub fn canonical(self: EmbeddingTaskType) []const u8 {
         return switch (self) {
             .retrieval_query => "RETRIEVAL_QUERY",
             .retrieval_document => "RETRIEVAL_DOCUMENT",
+            .clustering => "CLUSTERING",
+            .classification => "CLASSIFICATION",
         };
     }
 };
