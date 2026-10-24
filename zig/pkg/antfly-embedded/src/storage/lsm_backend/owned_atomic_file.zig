@@ -380,12 +380,11 @@ test "controlled physical sync table metadata publishes through owning file with
     var sink = memory.sink();
     var encoder = try table.StreamingEncoder.init(a, &sink, 192, .{});
     defer encoder.deinit();
-    for (0..192) |i| {
-        var key: [32]u8 = undefined;
-        try encoder.appendEntry(.{ .namespace_name = "docs", .key = try std.fmt.bufPrint(&key, "doc:{d:0>8}", .{i}), .value = "retained value" });
-    }
-    var block = try encoder.prepareBlock();
-    defer block.deinit();
+    var block: table.StreamingEncoder.Block = undefined;
+    var have_block = false;
+    // The owning file, declared below, joins accepted borrows before this
+    // producer may retire on an error path.
+    defer if (have_block) block.deinit();
     var pool = storage_io.NativeStoragePool.initWithCapacityForTest(a, 16);
     defer pool.deinit();
     var native = try storage_io.NativeStorage.initWithPool(a, .threaded, &pool);
@@ -411,6 +410,8 @@ test "controlled physical sync table metadata publishes through owning file with
         slots: *cpu.Scheduler,
         file: *File,
         physical_waits: usize = 0,
+        reject_entry: bool = false,
+        entry_rejected: bool = false,
         reject_block_write: bool = false,
         block_rejected: bool = false,
         reject_metadata_write: bool = false,
@@ -419,6 +420,11 @@ test "controlled physical sync table metadata publishes through owning file with
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.execution.checkLifetime();
             try std.testing.expectEqual(cpu.State.running, self.slots.state(&self.execution.entry.?));
+            if (self.reject_entry) {
+                self.reject_entry = false;
+                self.entry_rejected = true;
+                return error.Canceled;
+            }
             if (self.reject_block_write and self.file.phase == .writing) {
                 self.reject_block_write = false;
                 self.block_rejected = true;
@@ -477,6 +483,30 @@ test "controlled physical sync table metadata publishes through owning file with
         try file.writeWithAdmission(offset, memory.out.items[offset..][0..n], original);
         offset += n;
     }
+    control.reject_entry = true;
+    const before_entries = storage_io.NativeSyncTestControl.metadata.load(.acquire);
+    for (0..192) |i| {
+        var key: [32]u8 = undefined;
+        const input: table.Entry = .{ .namespace_name = "docs", .key = try std.fmt.bufPrint(&key, "doc:{d:0>8}", .{i}), .value = "retained value" };
+        try std.testing.expect(!try encoder.needsBlockBeforeEntry(input));
+        var entry = try encoder.prepareEntry(input);
+        defer entry.deinit();
+        while (true) {
+            const ready = entry.step(original) catch |cause| {
+                try std.testing.expectEqual(error.Canceled, cause);
+                try std.testing.expect(control.entry_rejected and encoder.entry_count == i);
+                continue;
+            };
+            if (ready) break;
+        }
+        entry.adopt();
+        try entry.retireWithAdmission(original);
+    }
+    try std.testing.expect(control.entry_rejected);
+    try std.testing.expectEqual(before_entries, storage_io.NativeSyncTestControl.metadata.load(.acquire));
+    try std.testing.expectEqual(@as(u64, table.header_len), file.logical_len);
+    block = try encoder.prepareBlock();
+    have_block = true;
     control.reject_block_write = true;
     const block_writes_before = storage_io.NativeSyncTestControl.metadata.load(.acquire);
     var block_written: usize = 0;

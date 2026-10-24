@@ -25630,3 +25630,76 @@ against the final source; compressed snapshots include all changed native files.
 Earlier receipts remain as evidence of discovered and corrected failures and
 source-audit revisions. Full GNU qualification remains waived and the full
 design remains incomplete.
+
+
+## Retained table entry preparation and adoption
+
+`StreamingEncoder.prepareEntry()` returns a movable pure-CPU owner and freezes
+the encoder until retirement. The caller retains the encoder and immutable
+input through adoption, prepays `EntryPreparation.memoryBound()`, and serializes
+methods. No admission borrow escapes a call. Length-only `needsBlockBeforeEntry()`
+requires an owning caller to flush/retire a full block explicitly; entry
+preparation never calls the sink or silently dispatches physical work. The
+legacy synchronous append wrapper drives the same owner and retains its explicit
+legacy block-flush behavior.
+
+Prefix scanning, namespace/key hashing and row/bound copying advance in bounded
+stages. Incremental Wyhash preserves the original namespace/key framing, four
+seeds and separator-inclusive prefix encoding. Exact consecutive-prefix
+deduplication runs after hashing. Size planning now conservatively counts a
+possible distinct prefix from lengths alone instead of scanning/hashing a large
+candidate merely to calculate an upper bound.
+
+Raw data, offsets and hash-vector growth retain private new arrays and copy at
+most 16 KiB per stage. Largest bounds alternate between reusable current/spare
+buffers, preserving current bounds while preparing the next row without per-row
+allocation. The first row's smallest bound is private until adoption. Raw
+allocation avoids implicit whole-buffer safety poisoning. Existing logical
+counts, Bloom bits, current bounds and list lengths remain unchanged through
+preparation rejection and unwritten abandonment. The fixed adoption moves
+prepared capacity/bounds, appends offsets/hashes and updates the Bloom/counts
+once before another checkpoint. Original arrays stay charged through retirement.
+
+Both entry and block owners share the audited raw allocation and bounded
+poison/release helpers. Retirement preserves its byte offset and slot through
+original rejection, keeps the encoder frozen, fences further preparation, and
+releases each allocation/account once. Abandoning an unwritten entry leaves the
+original encoder reusable; input is no longer read after successful adoption.
+The encoder working-set counter includes both reusable bound buffers. Native
+ABI 112 and storage-owner ABI 172 fence the extended encoder layout.
+
+Low-level entry/block/metadata production and owning-file composition are now
+available. Prepaid encoder/run initialization, real run/output construction and
+backend adoption still need implementation: the memory-bound interfaces do not
+create or enforce a fresh application budget. Cold-write policy, manifest/close
+adoption, remaining allocation/teardown and completion/history relief, provider
+and legacy adoption, and default-gate evidence remain open. Full GNU
+qualification remains waived and the full design remains incomplete.
+
+Qualification `retained-entry-v3-integrated` passes 83/83 build steps, 55
+physical-IO cases, 32 embedded close cases, 167 table/codec cases, 74 WAL/recovery
+cases and 18 host/ABI checks. `retained-entry-v3-fast` passes the focused
+optimized table/WAL target (60/60 build steps, 167/74 cases). Both runners pass
+four standalone Bloom cases and 45/1/8 error-identity cases. Native input hashes
+and log digests were rechecked against the final source; snapshots preserve all
+changed native files. Earlier v1/v2 receipts preserve the corrected integer-type
+and mutable-empty-destination compile errors. Formatting and whitespace pass.
+
+The rejection matrix covers Canceled/DeadlineExceeded/FileNotFound before every
+CPU stage, movable continuation, unchanged original counts/filter/sink, unwritten
+abandon/retry and interruption after each bounded retirement stage. Large
+namespaces, keys, prefixes and values preserve the original hashes and decoded
+bytes after caller input mutation following adoption. The fixed-buffer test
+prepays the reported additional bound while growing raw data and index/hash
+vectors containing 9,000 existing rows; each copy step stays within 16 KiB.
+Allocation-fault injection uses deterministic no-remap backing. The existing
+4,096-row allocation test observes 56 allocations, below its exclusive 512
+limit. The real file composition now prepares/adopts/retires all 192 entries
+under the original CPU scope, rejects preparation, proves no file IO during
+ingestion, then publishes through block/metadata owners and fully decodes the
+result while preserving sole-FD completion and reserved control progress.
+
+The production `repository.StreamingRunFileWriter` still uses the legacy adapter
+and observational working-set accounting. Prepaid initialization and its real
+run/output ownership adoption are the next integration boundary. Full GNU
+qualification remains waived and the full design remains incomplete.
