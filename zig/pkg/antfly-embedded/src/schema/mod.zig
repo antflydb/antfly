@@ -1853,13 +1853,23 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
 
     // Reject unsupported key types/collations before the metadata API accepts
     // a schema, using the same compiler as physical index publication.
-    if (schema.relational_indexes != null or schema.coveringConstraintCount() != 0) {
+    const logical_keys = if (schema.external_base_source) |source| source.binding.row_identity else null;
+    if (schema.relational_indexes != null or logical_keys != null or schema.coveringConstraintCount() != 0) {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const index_schema = expression_schema;
         var layout = try @import("../storage/db/algebraic/relational_row_codec.zig").PhysicalLayout.init(alloc, index_schema);
         defer layout.deinit();
-        for ((try schema.relationalIndexDefinitions(arena.allocator())).?) |definition| {
+        if (logical_keys) |adapter| {
+            const keys = try arena.allocator().alloc(@import("../storage/relational_index.zig").RelationalIndexKey, adapter.key_columns.len);
+            for (adapter.key_columns, keys) |column, *key| key.* = .{ .column = column };
+            var tuple = @import("../storage/db/relational_index_keys.zig").TuplePlan.init(alloc, index_schema, &layout, keys) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidSchemaUpdateRequest,
+            };
+            tuple.deinit();
+        }
+        for ((try schema.relationalIndexDefinitions(arena.allocator())) orelse &.{}) |definition| {
             var tuple = @import("../storage/db/relational_index_keys.zig").TuplePlan.init(alloc, index_schema, &layout, definition.keys) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidSchemaUpdateRequest,
@@ -4078,4 +4088,20 @@ test "external lake schema binding survives durable serialization and preserves 
     const text_schema = try storage_schema.deserializeSchema(alloc, projection);
     defer storage_schema.freeSchema(alloc, text_schema);
     try std.testing.expect(text_schema.external_base_source == null);
+}
+
+test "external lake logical key adapters validate native typed schema columns" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "id", "missing", "payload" }, 0..) |key, ordinal| {
+        const json = try std.fmt.allocPrint(a,
+            \\{{"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","row_identity":{{"key_columns":["{s}"]}}}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"id":{{"type":"integer"}},"payload":{{"type":"object"}}}},"additionalProperties":false}}}}}}}}
+        , .{key});
+        defer a.free(json);
+        var parsed = try parseValidatedTableSchema(a, json);
+        defer parsed.deinit(a);
+        if (ordinal == 0) {
+            const runtime = try deriveRuntimeTableSchema(a, parsed);
+            @import("../storage/schema.zig").freeSchema(a, runtime);
+        } else try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(a, parsed));
+    }
 }

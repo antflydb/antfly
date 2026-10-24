@@ -34,6 +34,10 @@ pub const Node = struct {
     visited: bool = false,
     reachable: bool = false,
 };
+/// Ordinary defaults retain deterministic row failures for INSERT/UPDATE.
+/// Generated/index expressions still require successful immutable planning.
+pub const Policy = enum { strict, defer_row_errors };
+
 const State = struct {
     memory: @import("memory_budget.zig"),
     arena: std.heap.ArenaAllocator,
@@ -44,12 +48,17 @@ nodes: []Node,
 constants: []?scalar.Datum,
 evaluator: scalar.Program.ConstantEvaluation,
 limits: Limits,
+policy: Policy,
 
 pub fn init(a: std.mem.Allocator, program: *const scalar.Program) !Plan {
     return initWithLimits(a, program, .{});
 }
 
 pub fn initWithLimits(a: std.mem.Allocator, program: *const scalar.Program, limits: Limits) !Plan {
+    return initWithPolicy(a, program, limits, .strict);
+}
+
+pub fn initWithPolicy(a: std.mem.Allocator, program: *const scalar.Program, limits: Limits, policy: Policy) !Plan {
     if (program.instructions.len > limits.nodes) return error.SqlProgramLimitExceeded;
     const state = try a.create(State);
     state.memory = .{ .backing = a, .limit = limits.bytes };
@@ -63,7 +72,7 @@ pub fn initWithLimits(a: std.mem.Allocator, program: *const scalar.Program, limi
     const constants = alloc.alloc(?scalar.Datum, program.instructions.len) catch |err| return if (err == error.OutOfMemory and state.memory.isExhausted()) error.SqlProgramLimitExceeded else err;
     @memset(constants, null);
     for (nodes, program.instructions) |*node, instruction| node.* = .{ .operation = instruction.operation };
-    var result: Plan = .{ .state = state, .program = program, .nodes = nodes, .constants = constants, .limits = limits, .evaluator = .init(program, alloc, constants, .{ .steps = limits.steps, .output_bytes = limits.bytes, .checkpoint = limits.checkpoint, .checkpoint_context = limits.checkpoint_context }) };
+    var result: Plan = .{ .state = state, .program = program, .nodes = nodes, .constants = constants, .limits = limits, .policy = policy, .evaluator = .init(program, alloc, constants, .{ .steps = limits.steps, .output_bytes = limits.bytes, .checkpoint = limits.checkpoint, .checkpoint_context = limits.checkpoint_context }) };
     result.visit(program.root, 0) catch |err| return if (err == error.OutOfMemory and state.memory.isExhausted()) error.SqlProgramLimitExceeded else err;
     try result.mark(program.root, 0);
     return result;
@@ -196,7 +205,12 @@ fn visit(self: *Plan, index: u32, depth: usize) anyerror!void {
             }
         },
     }
-    if (constant and self.nodes[index].volatility == .immutable) self.constants[index] = try self.evaluator.evaluate(index);
+    if (constant and self.nodes[index].volatility == .immutable) self.constants[index] = self.evaluator.evaluate(index) catch |err| {
+        // Keep the failing operation in the durable default program. Quota,
+        // cancellation, corruption and allocation errors must still abort.
+        if (self.policy == .defer_row_errors and @import("errors.zig").isRowEvaluationError(err)) return;
+        return err;
+    };
 }
 
 fn mark(self: *Plan, index: u32, depth: usize) anyerror!void {
@@ -319,4 +333,38 @@ test "SQL immutable schema planning cancels every phase and rejects malformed de
     malformed = program;
     malformed.instructions = instructions;
     try std.testing.expectError(error.InvalidSqlProgram, init(a, &malformed));
+}
+
+test "SQL default planning defers row failures but preserves resource and cancellation failures" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const kind: scalar.Type = .{ .kind = .integer, .element_type = .int64 };
+    const instructions = [_]scalar.Instruction{
+        .{ .type = kind, .operation = .{ .literal = .{ .integer = 1 } } },
+        .{ .type = kind, .operation = .{ .literal = .{ .integer = 0 } } },
+        .{ .type = kind, .operation = .{ .binary = .{ .op = .divide, .left = 0, .right = 1 } } },
+    };
+    const program: scalar.Program = .{ .arena = &arena, .instructions = &instructions, .root = 2, .output_type = kind, .parameter_types = &.{}, .parameter_descriptors = &.{}, .required_columns = &.{} };
+    try std.testing.expectError(error.SqlDivisionByZero, init(a, &program));
+    {
+        var plan = try initWithPolicy(a, &program, .{}, .defer_row_errors);
+        defer plan.deinit();
+        try std.testing.expect(plan.constants[program.root] == null);
+        try std.testing.expect(plan.nodes[program.root].reachable);
+    }
+    try std.testing.expectError(error.SqlProgramLimitExceeded, initWithPolicy(a, &program, .{ .steps = 1 }, .defer_row_errors));
+    const canceled = struct {
+        fn check(_: ?*anyopaque) anyerror!void {
+            return error.Canceled;
+        }
+    }.check;
+    try std.testing.expectError(error.Canceled, initWithPolicy(a, &program, .{ .checkpoint = canceled }, .defer_row_errors));
+    const Scenario = struct {
+        fn run(alloc: std.mem.Allocator, value: *const scalar.Program) !void {
+            var plan = try initWithPolicy(alloc, value, .{}, .defer_row_errors);
+            defer plan.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Scenario.run, .{&program});
 }

@@ -83,8 +83,9 @@ const Validation = struct {
         // but produces no timing change and must not scan staged rows.
         if (!self.immediate or self.modes.len == 0 or candidate.tables.len == 0) return;
         if (!try self.server.transactionRequestAuthorized(self.identity, candidate.*)) return error.Forbidden;
-        const requests = try candidate.distributedTables(alloc);
-        defer alloc.free(requests);
+        const requests_view = try candidate.distributedTables(alloc);
+        defer requests_view.deinit();
+        const requests = requests_view.tables;
         const selected = (try self.server.selectIntegritySnapshot(alloc, requests, self.context)) orelse return error.IntegrityCatalogUnavailable;
         var snapshot = selected.snapshot;
         defer self.server.source.freeAdminSnapshot(&snapshot);

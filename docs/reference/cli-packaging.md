@@ -14,6 +14,9 @@ runtime archives produced by the main release workflow.
 
 `antfly` is the public database and inference CLI. It exposes `lite` file commands,
 `inference` model commands and serving, and database server commands.
+Remote client commands support [CLI agent mode](cli-agent-mode.md) for compact
+results, display budgets, explicit completeness, and structured diagnostics.
+
 `libantfly` is the embedding library; the embedded language packages install
 no CLI commands. All first-party products use Apache-2.0.
 

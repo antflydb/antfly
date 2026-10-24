@@ -9655,10 +9655,9 @@ fn rejectUnsupportedGraphQueryMode(
     req: db_mod.types.SearchRequest,
 ) !void {
     if (req.graph_queries.len > 0 and
-        !distributed_graph.supportsCrossRange(req) and
         (group_count > 1 or req.graph_table_read_authorizer != null))
     {
-        return error.GraphQueryModeUnsupported;
+        try distributed_graph.rejectUnsupportedCrossRange(req);
     }
 }
 

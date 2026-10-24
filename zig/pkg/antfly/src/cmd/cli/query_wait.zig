@@ -15,6 +15,7 @@
 
 //! A wake barrier must execute the selected query, not just fetch the catalog.
 const std = @import("std");
+const cli = @import("mod.zig");
 const client_mod = @import("antfly-client");
 
 fn retryableStatus(status: i32) bool {
@@ -61,7 +62,7 @@ pub fn wait(io: std.Io, client: *client_mod.AntflyClient, table: []const u8, bod
                     return response;
                 },
                 .failed => {
-                    std.debug.print("Serving query failed (HTTP {d}): {s}\n", .{ response.status_code, response.err_body orelse "query operation failed" });
+                    cli.output.notice("Serving query failed (HTTP {d}): {s}\n", .{ response.status_code, response.err_body orelse "query operation failed" });
                     return error.ApiError;
                 },
                 .retry => response.deinit(),

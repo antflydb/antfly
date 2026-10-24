@@ -685,9 +685,9 @@ pub fn stageReferenceCoveragePending(txn: anytype, digest: [32]u8) !void {
 }
 
 pub fn requireReferenceCoverageAcknowledged(txn: anytype) !void {
-    _ = txn.get(pending_reference_coverage_key) catch |err| switch (err) {
-        error.NotFound => return,
-        else => return err,
+    _ = txn.get(pending_reference_coverage_key) catch |err| {
+        if (err == error.NotFound) return;
+        return err;
     };
     return error.ConstraintActivationInProgress;
 }

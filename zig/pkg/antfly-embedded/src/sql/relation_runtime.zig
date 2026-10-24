@@ -1053,6 +1053,8 @@ fn Engine(comptime Context: type) type {
         }
 
         const Iterator = struct {
+            profile_id: ?usize = null,
+            profile_depth: usize = 0,
             engine: *Self,
             node: *const binding.Node,
             arena: std.heap.ArenaAllocator,
@@ -1141,6 +1143,7 @@ fn Engine(comptime Context: type) type {
                 const self = try alloc.create(Iterator);
                 self.* = .{ .engine = engine, .node = node, .arena = .init(alloc), .scratch = .init(alloc), .filter_arena = .init(alloc), .projection_arena = .init(alloc), .probe_arena = .init(alloc), .recursive_id = recursive_id, .apply_mode = apply_mode };
                 errdefer self.deinit();
+                if (engine.context.limits.profile) |profile| self.profile_id = try profile.register(node, engine.context.binding.relation.?.scans);
                 if (recursive_id) |id| if (node.replay_policy != .streaming and !dependsOn(node, id)) {
                     self.cached_reader = try (try engine.prefixRows(node)).openReader();
                     return self;
@@ -1206,6 +1209,20 @@ fn Engine(comptime Context: type) type {
                 self.engine.context.alloc.destroy(self);
             }
             pub fn nextBatch(self: *Iterator, a: Allocator, maximum: usize, failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
+                const profile = self.engine.context.limits.profile;
+                if (profile == null) return self.nextBatchMeasured(a, maximum, failure);
+                const top = self.profile_depth == 0;
+                self.profile_depth += 1;
+                defer self.profile_depth -= 1;
+                const start = if (profile) |p| p.now() else null;
+                const result = self.nextBatchMeasured(a, maximum, failure) catch |err| {
+                    if (top) if (profile) |p| p.record(self.profile_id, start, 0, false, true);
+                    return err;
+                };
+                if (top) if (profile) |p| p.record(self.profile_id, start, result.len(), result.len() == 0, if (failure) |f| f.* != null else false);
+                return result;
+            }
+            fn nextBatchMeasured(self: *Iterator, a: Allocator, maximum: usize, failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
                 if (maximum == 0) return .{ .rows = &.{} };
                 if (self.node.row_filter != null) return self.nextRowsBatch(a, maximum, failure);
                 if (self.sampled) |sample| {
@@ -1371,6 +1388,20 @@ fn Engine(comptime Context: type) type {
             }
 
             pub fn next(self: *Iterator, alloc: Allocator) anyerror!?[]const Datum {
+                const profile = self.engine.context.limits.profile;
+                if (profile == null) return self.nextMeasured(alloc);
+                const top = self.profile_depth == 0;
+                self.profile_depth += 1;
+                defer self.profile_depth -= 1;
+                const start = if (profile) |p| p.now() else null;
+                const result = self.nextMeasured(alloc) catch |err| {
+                    if (top) if (profile) |p| p.record(self.profile_id, start, 0, false, true);
+                    return err;
+                };
+                if (top) if (profile) |p| p.record(self.profile_id, start, @intFromBool(result != null), result == null, false);
+                return result;
+            }
+            fn nextMeasured(self: *Iterator, alloc: Allocator) anyerror!?[]const Datum {
                 const filter = self.node.row_filter orelse return self.nextUnfiltered(alloc);
                 while (true) {
                     try self.engine.checkpoint();

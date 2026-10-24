@@ -222,7 +222,12 @@ fn defaultArgument(plan: *const @import("immutable_plan.zig"), root: u32) !scala
 }
 
 fn lowerProgramPolicy(alloc: std.mem.Allocator, program: *const scalar.Program, columns: []const scalar.Column, immutable: ?ExpressionContext, limits: @import("immutable_plan.zig").Limits) !Lowered {
-    var plan: ?@import("immutable_plan.zig") = if (immutable != null) try .initWithLimits(alloc, program, limits) else null;
+    // Planning scratch never escapes: literal packets and operator children
+    // are owned by the output arena below. Small bound keys should not grow
+    // that arena with a nested, already-dead planning region.
+    var planning_buffer: [16 * 1024]u8 = undefined;
+    var planning_scratch: std.heap.BufferFirstAllocator = .init(&planning_buffer, alloc);
+    var plan: ?@import("immutable_plan.zig") = if (immutable != null) try .initWithPolicy(planning_scratch.allocator(), program, limits, if (immutable == .column_default) .defer_row_errors else .strict) else null;
     defer if (plan) |*value| value.deinit();
     if (plan) |*value| if (immutable != .column_default and value.nodes[program.root].volatility != .immutable) return switch (immutable.?) {
         .generation => error.SqlMutableGenerationExpression,
@@ -698,7 +703,9 @@ test "SQL index key lowering benchmark bounds candidate rebinding overhead" {
     const Stats = struct { allocations: usize, bytes: usize, elapsed_ns: i96 };
     var stats: [2]Stats = undefined;
     for (&stats, 0..) |*result, mode| {
-        var tracked = std.testing.FailingAllocator.init(a, .{});
+        // Compare allocation work with identical arena growth. Heap-dependent
+        // in-place remapping otherwise changes either path's accounting.
+        var tracked = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
         const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
         for (0..16) |_| {
             var arena = std.heap.ArenaAllocator.init(tracked.allocator());

@@ -135,7 +135,10 @@ const Campaign = struct {
         while (true) {
             try ctx.checkDrivers();
             const state = self.status(ctx) catch |err| switch (err) {
-                error.SchemaValidationObservationPending => {
+                // Recovery can outlast one status request's transport budget.
+                // Poll within the existing overall deadline; a transient
+                // request timeout is not terminal publication state.
+                error.SchemaValidationObservationPending, error.Timeout, error.ReadIndexTimeout => {
                     if (platform.time.monotonicNs() >= deadline) return error.SchemaValidationPublicationTimeout;
                     try ctx.io.sleep(.fromMilliseconds(20), .awake);
                     continue;

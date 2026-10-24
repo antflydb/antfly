@@ -5292,6 +5292,44 @@ test "unsupported graph diagnostics identify the rejected operation feature" {
     }
 }
 
+test "unsupported graph diagnostics identify the rejected operation feature across named operations" {
+    const distributed_graph = @import("distributed_graph.zig");
+    var diagnostic_context: query_request_diagnostics.Context = .{};
+    const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
+    defer diagnostic_scope.deinit();
+    const queries = [_]db_mod.types.NamedGraphQuery{
+        .{ .name = "supported_incoming", .query = .{
+            .query_type = .traverse,
+            .index_name = "knowledge",
+            .start_nodes = .{ .identities = &.{.{ .table = "concepts", .key = "antfly" }} },
+            .params = .{ .direction = .in },
+        } },
+        .{ .name = "seed_paths", .query = .{
+            .query_type = .traverse,
+            .index_name = "knowledge",
+            .start_nodes = .{ .identities = &.{.{ .table = "concepts", .key = "antfly" }} },
+            .params = .{ .direction = .in, .deduplicate = false },
+        } },
+    };
+    const req: db_mod.types.SearchRequest = .{
+        .graph_queries = &queries,
+        .graph_query_diagnostic_sink = graph_query_diagnostic.sink(),
+    };
+    try std.testing.expect(!distributed_graph.supportsCrossRange(req));
+    // Planning probes must not publish a rejection into another execution.
+    try std.testing.expect(graph_query_diagnostic.take() == null);
+    try std.testing.expectError(error.GraphQueryModeUnsupported, distributed_graph.rejectUnsupportedCrossRange(req));
+    const body = try graphQueryUnsupportedBody(std.testing.allocator,
+        \\{"graph_queries":{"supported_incoming":{"index":"knowledge","traverse":{"start":{"identities":[{"table":"concepts","key":"antfly"}]},"direction":"in"}},"seed_paths":{"index":"knowledge","traverse":{"start":{"identities":[{"table":"concepts","key":"antfly"}]},"direction":"in","deduplicate_nodes":false}}}}
+    );
+    defer std.testing.allocator.free(body);
+    var parsed = try ant_json.parseFromSlice(metadata_openapi.GraphQueryUnsupportedError, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("seed_paths", parsed.value.operation);
+    try std.testing.expectEqualStrings("traverse", parsed.value.feature);
+    try std.testing.expectEqualStrings("deduplicate_nodes_must_be_true", parsed.value.reason);
+}
+
 test "runtime graph capability diagnostics preserve the failing named operation" {
     var diagnostic_context: query_request_diagnostics.Context = .{};
     const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);

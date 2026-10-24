@@ -119,9 +119,18 @@ statement before any mutation.
   restart. DDL inside an explicit transaction remains rejected.
 - Dry-run `EXPLAIN` for admitted SELECT/INSERT/UPDATE/DELETE/MERGE binds the
   underlying statement with its normal authority and emits bounded text or
-  versioned JSON. `FORMAT JSON`, `VERBOSE`, and `COSTS OFF` are supported;
-  `ANALYZE` and requested cost estimates reject until instrumentation and a
-  cost model exist. EXPLAIN never opens row cursors or publishes mutations.
+  versioned JSON. `FORMAT JSON`, `VERBOSE`, and `COSTS OFF` are supported.
+  Read-only `EXPLAIN ANALYZE` (or `ANALYZE ON` in the options list) executes
+  SELECT once under its original result/work limits and reports measured root
+  execution and SQL pull-boundary counters, inclusive times, retained-memory
+  peak and spill writes. Storage I/O and parallel/provider internals remain
+  explicitly unmeasured. Mutation ANALYZE rejects before binding or capture.
+  `COSTS ON` for SELECT uses a dedicated metadata-only provider, never cursor
+  capture, row reads, search execution or tracking activation, and reports
+  versioned algebraic logical-work estimates with unknowns left
+  null; it does not predict time. Default EXPLAIN opens no cursor. COSTS and
+  ANALYZE require separate statements, whose snapshots may differ. Neither
+  planning mode publishes mutations.
 
 Names can be `table`, `namespace.table`, or `database.namespace.table`. Unquoted
 identifiers fold ASCII case; quoted identifiers preserve their exact names.

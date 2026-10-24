@@ -202,7 +202,7 @@ pub fn merge(a: A, store: *stores.ArtifactStore, recipe: Recipe, left: Index, ri
     if (left.page == null) return right;
     if (right.page == null) return left;
     var access: directory.Access = undefined;
-    access.init(store.*, scope.domain, token, null);
+    access.initPublication(store.*, scope.domain, token);
     var cache: tree.Cache = .{ .alloc = a, .underlying = access.backing() };
     defer cache.deinit();
     const backing = cache.store();
