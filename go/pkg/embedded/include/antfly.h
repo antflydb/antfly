@@ -463,6 +463,10 @@ antfly_error_code antfly_db_render_resolver_key_json(antfly_db *db, antfly_slice
  * mention embeddings, ANN candidates and scoring. Returns {extraction,resolution}
  * with canonical doc_refs and decisions. Does not write documents or artifacts.
  * Requires an asset-scoped resolver; text requires an extractor producer. */
+/** Execute the native memory/v1 contract on a named space. Request includes
+ * action, body and idempotency_key for mutations. The embedded database owner
+ * is the authority; principal is local attribution, never a remote identity. */
+antfly_error_code antfly_db_memory_json(antfly_db *db, antfly_slice space, antfly_slice request_json, antfly_buffer *out_json);
 antfly_error_code antfly_db_resolve_query_json(antfly_db *db, antfly_slice resolver_name, antfly_slice request_json, antfly_buffer *out_json);
 /** Merge fully rendered keys: {"key":"concept/old","target":"concept/new"}.
  * Durable and idempotent. Cycles/redirect replacement are rejected. Drain with
