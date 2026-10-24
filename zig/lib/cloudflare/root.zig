@@ -128,6 +128,50 @@ pub fn text(value: V) ![]const u8 {
     return if (value == .string) value.string else error.InvalidCloudflareRequest;
 }
 
+pub const ChatReading = struct {
+    text: []const u8,
+    finish: enum { stop, length, other },
+};
+
+/// Vision transcription consumes one textual choice. Validate response values
+/// here rather than using request-side coercions, so every host reports an
+/// invalid successful upstream response consistently.
+pub fn chatReading(response: V) !ChatReading {
+    const choices = field(response, "choices") orelse return error.InvalidCloudflareResponse;
+    if (choices != .array or choices.array.items.len != 1) return error.InvalidCloudflareResponse;
+    const choice = choices.array.items[0];
+    const message = field(choice, "message") orelse return error.InvalidCloudflareResponse;
+    const content = field(message, "content") orelse return error.InvalidCloudflareResponse;
+    if (content != .string) return error.InvalidCloudflareResponse;
+    const reason = field(choice, "finish_reason") orelse .null;
+    if (reason != .null and reason != .string) return error.InvalidCloudflareResponse;
+    return .{
+        .text = content.string,
+        .finish = if (reason == .string and std.mem.eql(u8, reason.string, "stop")) .stop else if (reason == .string and std.mem.eql(u8, reason.string, "length")) .length else .other,
+    };
+}
+
+test "cloudflare vision readings distinguish upstream shape errors and incomplete output" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_][]const u8{
+        "{}",
+        "{\"choices\":[]}",
+        "{\"choices\":[{}]}",
+        "{\"choices\":[{\"message\":{\"content\":null}}]}",
+        "{\"choices\":[{\"message\":{\"content\":17}}]}",
+        "{\"choices\":[{\"message\":{\"content\":\"ok\"},\"finish_reason\":17}]}",
+    }) |bytes| try std.testing.expectError(error.InvalidCloudflareResponse, chatReading(try std.json.parseFromSliceLeaky(V, arena.allocator(), bytes, .{})));
+    for ([_][]const u8{ "stop", "length", "content_filter" }, [_]@FieldType(ChatReading, "finish"){ .stop, .length, .other }) |reason, expected| {
+        const bytes = try std.fmt.allocPrint(arena.allocator(), "{{\"choices\":[{{\"message\":{{\"content\":\"ok\"}},\"finish_reason\":\"{s}\"}}]}}", .{reason});
+        const result = try chatReading(try std.json.parseFromSliceLeaky(V, arena.allocator(), bytes, .{}));
+        try std.testing.expectEqualStrings("ok", result.text);
+        try std.testing.expectEqual(expected, result.finish);
+    }
+    const unknown = try chatReading(try std.json.parseFromSliceLeaky(V, arena.allocator(), "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}", .{}));
+    try std.testing.expectEqual(.other, unknown.finish);
+}
+
 pub fn endpoint(a: A, account: []const u8, model: []const u8) ![]const u8 {
     if (account.len == 0 or account.len > 64) return error.InvalidCloudflareConfig;
     for (account) |b| if (!std.ascii.isAlphanumeric(b) and b != '_' and b != '-') return error.InvalidCloudflareConfig;

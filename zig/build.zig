@@ -491,6 +491,12 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_decisions_tests = b.addRunArtifact(decisions_tests);
     b.step("lib-decisions-test", "Run shared decision wire and generated contract tests").dependOn(&run_decisions_tests.step);
 
+    const cloudflare_test_module = b.createModule(.{ .root_source_file = b.path("lib/cloudflare/root.zig"), .target = target, .optimize = optimize });
+    var cloudflare_imports = b.modules.get("antfly_cloudflare").?.import_table.iterator();
+    while (cloudflare_imports.next()) |entry| cloudflare_test_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    const cloudflare_tests = b.addTest(.{ .root_module = cloudflare_test_module });
+    b.step("lib-cloudflare-test", "Run Cloudflare wire and response validation tests").dependOn(&b.addRunArtifact(cloudflare_tests).step);
+
     const lib_generating_tests = b.addTest(.{
         .root_module = generating_mod,
     });

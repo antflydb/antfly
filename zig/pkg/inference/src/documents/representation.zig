@@ -20,7 +20,29 @@ const A = std.mem.Allocator;
 
 pub fn cloneValue(a: A, value: ?std.json.Value) !?std.json.Value {
     const v = value orelse return null;
-    return try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, v, .{}), .{ .allocate = .alloc_always });
+    return try cloneJson(a, v, 0);
+}
+// Copy the tree once, without an intermediate serialization or conversion of
+// exact number strings to floating point. The caller owns an arena.
+fn cloneJson(a: A, value: std.json.Value, depth: usize) error{ OutOfMemory, InvalidDocumentModelResult }!std.json.Value {
+    if (depth > 64) return error.InvalidDocumentModelResult;
+    return switch (value) {
+        .string => |s| .{ .string = try a.dupe(u8, s) },
+        .number_string => |s| .{ .number_string = try a.dupe(u8, s) },
+        .array => |items| blk: {
+            var copied = std.json.Array.init(a);
+            try copied.ensureTotalCapacity(items.items.len);
+            for (items.items) |item| copied.appendAssumeCapacity(try cloneJson(a, item, depth + 1));
+            break :blk .{ .array = copied };
+        },
+        .object => |fields| blk: {
+            var copied: std.json.ObjectMap = .empty;
+            try copied.ensureTotalCapacity(a, fields.count());
+            for (fields.keys(), fields.values()) |key, item| try copied.put(a, try a.dupe(u8, key), try cloneJson(a, item, depth + 1));
+            break :blk .{ .object = copied };
+        },
+        else => value,
+    };
 }
 pub fn cloneTables(a: A, tables: []const c.Table, limit: usize) ![]c.Table {
     if (tables.len > limit) return error.DocumentRegionLimitExceeded;
@@ -164,4 +186,31 @@ fn translatedBox(transform: c.Transform, supplied: [4]f64, offset: [2]f64) ![4]f
     box[1] += offset[1];
     box[3] += offset[1];
     return transform.box(box);
+}
+
+test "document JSON copies preserve exact numeric types and own nested values" {
+    const Fixture = struct {
+        fn check(backing: A) !void {
+            var target = std.heap.ArenaAllocator.init(backing);
+            defer target.deinit();
+            const copied = blk: {
+                var source = std.heap.ArenaAllocator.init(std.testing.allocator);
+                defer source.deinit();
+                const value = try std.json.parseFromSliceLeaky(std.json.Value, source.allocator(),
+                    \\{"amount":9007199254740993.01,"items":[{"tiny":1e-999,"big":18446744073709551616}],"text":"owned"}
+                , .{ .parse_numbers = false });
+                break :blk (try cloneValue(target.allocator(), value)).?;
+            };
+            const encoded = try std.json.Stringify.valueAlloc(target.allocator(), copied, .{});
+            try std.testing.expectEqualStrings(
+                \\{"amount":9007199254740993.01,"items":[{"tiny":1e-999,"big":18446744073709551616}],"text":"owned"}
+            , encoded);
+            const integer = (try cloneValue(target.allocator(), .{ .integer = 7 })).?;
+            try std.testing.expect(integer == .integer and integer.integer == 7);
+            const float = (try cloneValue(target.allocator(), .{ .float = 1.25 })).?;
+            try std.testing.expect(float == .float and float.float == 1.25);
+        }
+    };
+    try Fixture.check(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{});
 }

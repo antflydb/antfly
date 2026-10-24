@@ -275,6 +275,9 @@ still use their precise regional provenance.
 
 Document response decoding preserves unresolved/truncated page status and
 aggregate usage for both HTTP and native readers, parsing the envelope once.
+Composition and retained-page copies preserve exact JSON number tokens and
+numeric types, including nested fields. Values are copied directly into the
+owning arena without intermediate serialization or floating-point conversion.
 
 Local reader results carry explicit per-item completion state and measured token
 counts through direct execution and batching. A token count equal to a requested

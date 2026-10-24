@@ -353,8 +353,8 @@ pub fn Service(comptime Node: type) type {
                 part.tables = try @import("representation.zig").cloneTables(a, part.tables, 65536);
             }
             out.inherited_parts = inherited;
-            if (page.fields) |fields| out.fields = try std.json.parseFromSliceLeaky(V, a, try std.json.Stringify.valueAlloc(a, fields, .{}), .{ .parse_numbers = false });
             const ir = @import("representation.zig");
+            out.fields = try ir.cloneValue(a, page.fields);
             out.regions = try ir.cloneRegions(a, page.regions, 65536);
             out.tables = try ir.cloneTables(a, page.tables, 65536);
             const findings = try a.dupe([]const u8, page.findings);
@@ -419,14 +419,8 @@ pub fn Service(comptime Node: type) type {
                 run.usage.physical_model_calls += 1;
                 const result = try self.node.invokeCloudflare(a, binding, payload, self.control, run);
                 try recordUsage(run, result);
-                const choices = cf.field(result, "choices") orelse return error.InvalidCloudflareResponse;
-                if (choices != .array or choices.array.items.len != 1) return error.InvalidCloudflareResponse;
-                const choice = choices.array.items[0];
-                const message = cf.field(choice, "message") orelse return error.InvalidCloudflareResponse;
-                const text = try cf.text(cf.field(message, "content") orelse return error.InvalidCloudflareResponse);
-                const finish = cf.field(choice, "finish_reason") orelse .null;
-                const stopped = finish == .string and std.mem.eql(u8, finish.string, "stop");
-                return .{ .model = binding.model, .text = text, .origin = .interpretation, .truncated = finish == .string and std.mem.eql(u8, finish.string, "length"), .status = if (stopped) .complete else .unresolved };
+                const reading = try cf.chatReading(result);
+                return .{ .model = binding.model, .text = reading.text, .origin = .interpretation, .truncated = reading.finish == .length, .status = if (reading.finish == .stop) .complete else .unresolved };
             }
             if (self.graph.get(.{ .name = binding.model, .operation = binding.operation })) |child| {
                 const child_limits = try run.nestedViewLimits(child.budget, data.len, raster_width, raster_height);
@@ -900,6 +894,7 @@ test "document nested composites share one budget and one rendered view" {
         measured: bool = false,
         incomplete: bool = false,
         tiny_tokens: bool = false,
+        malformed_vision: bool = false,
         fn documentDefinition(self: *@This(), a: A, name: []const u8, operation: c.Operation) !?[]const u8 {
             if (operation != .read) return null;
             const json = if (std.mem.eql(u8, name, "cloudflare-reader"))
@@ -933,9 +928,12 @@ test "document nested composites share one budget and one rendered view" {
             results[0] = .{ .text = "Receipt total 12.50", .completion = if (self.incomplete) .length else .complete, .prompt_tokens = if (self.measured) @as(usize, 10) else null, .completion_tokens = if (self.measured) @as(usize, 256) else null };
             return .{ .items = results, .usage = try readers.measuredUsage(results), .execution = .{ .requested_items = 1, .serial_items = 1 } };
         }
-        fn invokeCloudflare(_: *@This(), a: A, binding: c.Binding, payload: V, _: Control, _: *c.Run) anyerror!V {
+        fn invokeCloudflare(self: *@This(), a: A, binding: c.Binding, payload: V, _: Control, _: *c.Run) anyerror!V {
             try std.testing.expectEqual(c.Operation.read, binding.operation);
             try std.testing.expectEqualStrings(binding.model, cf.field(payload, "model").?.string);
+            if (self.malformed_vision) return std.json.parseFromSliceLeaky(V, a,
+                \\{"choices":[{"message":{"content":17},"finish_reason":"stop"}]}
+            , .{});
             return std.json.parseFromSliceLeaky(V, a,
                 \\{"choices":[{"message":{"content":"Receipt total 12.50"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}
             , .{ .parse_numbers = false });
@@ -952,6 +950,9 @@ test "document nested composites share one budget and one rendered view" {
     defer remote.deinit();
     try std.testing.expectEqualStrings("interpretation", remote.value.object.get("data").?.array.items[0].object.get("origin").?.string);
     try std.testing.expectEqual(@as(i64, 15), remote.value.object.get("usage").?.object.get("total_tokens").?.integer);
+    fake.malformed_vision = true;
+    try std.testing.expectError(error.InvalidCloudflareResponse, Service(Fake).readEncodedJson(&fake, a, "cloudflare-reader", .{ .images = &.{.{ .bytes = @embedFile("testdata/one-pixel.png"), .mime_type = "image/png" }} }, .{}));
+    fake.malformed_vision = false;
     const result = try Service(Fake).readJson(&fake, a,
         \\{"model":"parent","documents":[{"id":"receipt","url":"fixture","media_type":"image/png"}]}
     , .{});

@@ -101,7 +101,7 @@ pub const Config = struct {
             _ = try cloudflare.endpoint(fixed.allocator(), self.account_id orelse return error.InvalidExtractionConfig, self.model);
             if (!std.mem.eql(u8, self.model, "@cf/cloudflare/clairic")) return error.InvalidExtractionConfig;
         } else if (self.account_id != null or self.gateway_id != null) return error.InvalidExtractionConfig;
-        if (self.schema_version != 1 and self.schema_version != 2) return error.UnsupportedExtractionSchemaVersion;
+        _ = try validateSchemaVersion(self.schema_version);
         if (self.provider != .mock and self.model.len == 0) return error.InvalidExtractionConfig;
         if ((self.provider == .pioneer or self.provider == .openai) and self.url.len == 0) return error.InvalidExtractionConfig;
     }
@@ -352,6 +352,36 @@ pub const RemoteOptions = struct {
     cancellation: ?httpx.CancellationToken = null,
 };
 
+fn validateSchemaVersion(version: u32) !u32 {
+    return if (version == 1 or version == 2) version else error.UnsupportedExtractionSchemaVersion;
+}
+
+/// A logical extraction owns one deadline, including preflight and every
+/// serial upstream call. Use the transport's clock and inherited defaults.
+const ExtractionControl = struct {
+    io: std.Io,
+    deadline_ns: ?i96,
+    cancellation: ?httpx.CancellationToken,
+
+    fn init(client: *httpx.Client, options: RemoteOptions) ExtractionControl {
+        const timeout = options.timeout_ms orelse client.config.timeouts.request_ms;
+        return .{
+            .io = client.io,
+            .deadline_ns = if (timeout == 0) null else std.Io.Clock.awake.now(client.io).nanoseconds +| @as(i96, timeout) * std.time.ns_per_ms,
+            .cancellation = options.cancellation orelse client.config.request_cancellation,
+        };
+    }
+    fn remainingAt(self: ExtractionControl, now_ns: i96) !?u64 {
+        if (self.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        const deadline = self.deadline_ns orelse return 0;
+        if (now_ns >= deadline) return error.Timeout;
+        return @intCast(@divFloor(deadline - now_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+    }
+    fn remaining(self: ExtractionControl) !?u64 {
+        return self.remainingAt(std.Io.Clock.awake.now(self.io).nanoseconds);
+    }
+};
+
 pub fn initExtractor(alloc: Allocator, http: *httpx.Client, cfg: Config) !Extractor {
     return initExtractorWithOptions(alloc, http, cfg, .{});
 }
@@ -483,6 +513,9 @@ const CloudflareExtractor = struct {
     }
     fn extract(raw: *anyopaque, backing: Allocator, req: Request) !Response {
         const self: *CloudflareExtractor = @ptrCast(@alignCast(raw));
+        const control = ExtractionControl.init(self.http, self.options);
+        _ = try control.remaining();
+        const version = try validateSchemaVersion(req.schema_version orelse self.config.schema_version);
         var arena = std.heap.ArenaAllocator.init(backing);
         defer arena.deinit();
         const a = arena.allocator();
@@ -502,6 +535,7 @@ const CloudflareExtractor = struct {
         // Atomic preflight: unsupported schema/input/options in the last row
         // must fail before the first upstream invocation.
         for (req.inputs, states, 0..) |input, *state, i| {
+            _ = try control.remaining();
             if (input.schema_json != null or input.options_json != null or input.tokens_json != null) return error.UnsupportedCloudflareSchema;
             const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, input.content_json, .{});
             state.* = try cloudflare.evidence(a, parsed, req.attachments, i, Inspect.image);
@@ -521,10 +555,11 @@ const CloudflareExtractor = struct {
                 .gateway_id = cfg.gateway_id,
                 .url = cfg.resolvedUrl(),
             }, try cloudflare.evidenceRequest(a, cfg.model, state, plan.fields), .{
-                .timeout_ms = self.options.timeout_ms,
-                .cancellation = self.options.cancellation,
+                .timeout_ms = try control.remaining(),
+                .cancellation = control.cancellation,
                 .max_response_bytes = req.max_response_bytes orelse 16 * 1024 * 1024,
             });
+            _ = try control.remaining();
             var row = try cloudflare.extractionResult(a, plan, result, state.state);
             if (input.id) |id| try cloudflare.put(a, &row, "id", cloudflare.string(id));
             try rows.append(row);
@@ -535,11 +570,12 @@ const CloudflareExtractor = struct {
         const json = try std.json.Stringify.valueAlloc(backing, .{
             .object = "extraction",
             .model = cfg.model,
-            .schema_version = req.schema_version orelse cfg.schema_version,
+            .schema_version = version,
             .data = rows.items,
             .usage = .{ .input_tokens = input_tokens, .output_tokens = output_tokens },
         }, .{});
         errdefer backing.free(json);
+        _ = try control.remaining();
         if (json.len > (req.max_response_bytes orelse 16 * 1024 * 1024)) return error.ResponseTooLarge;
         return .{ .allocator = backing, .json = json };
     }
@@ -856,8 +892,7 @@ const RequestByteCount = struct {
 };
 
 fn requestJsonAllocCapacity(alloc: Allocator, cfg: Config, req: Request, capacity: ?usize) ![]u8 {
-    const schema_version = req.schema_version orelse cfg.schema_version;
-    if (schema_version != 1 and schema_version != 2) return error.UnsupportedExtractionSchemaVersion;
+    const schema_version = try validateSchemaVersion(req.schema_version orelse cfg.schema_version);
     for (req.inputs) |input| if (schema_version == 1 and (input.schema_json != null or input.options_json != null))
         return error.AdvancedExtractionSchemaRequiresVersion2;
     try validateAttachments(req);
@@ -1389,6 +1424,71 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
 test {
     _ = text_processing.windows;
     _ = text_processing.alignment;
+}
+
+test "cloudflare extraction validates request versions before transport" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    var client = httpx.Client.init(a, threaded.io());
+    defer client.deinit();
+    const cfg = Config{ .provider = .cloudflare, .account_id = "account", .model = "@cf/cloudflare/clairic", .api_key = "fixture", .url = "http://127.0.0.1:1" };
+    for ([_]u32{ 0, 3, std.math.maxInt(u32) }) |version| {
+        // No valid schema or live endpoint: version admission must happen first.
+        try std.testing.expectError(error.UnsupportedExtractionSchemaVersion, extractWithConfig(a, &client, cfg, .{ .schema_version = version, .inputs = &.{.{ .content_json = "\"receipt\"" }} }));
+    }
+}
+
+test "cloudflare extraction shares deadline and cancellation across serial calls" {
+    const control = ExtractionControl{ .io = undefined, .deadline_ns = 500 * std.time.ns_per_ms, .cancellation = null };
+    try std.testing.expectEqual(@as(?u64, 500), try control.remainingAt(0));
+    try std.testing.expectEqual(@as(?u64, 200), try control.remainingAt(300 * std.time.ns_per_ms));
+    try std.testing.expectEqual(@as(?u64, 1), try control.remainingAt(500 * std.time.ns_per_ms - 1));
+    try std.testing.expectError(error.Timeout, control.remainingAt(500 * std.time.ns_per_ms));
+    const cancelled = ExtractionControl{ .io = undefined, .deadline_ns = null, .cancellation = .{ .ptr = &control, .is_cancelled_fn = struct {
+        fn check(_: *const anyopaque) bool {
+            return true;
+        }
+    }.check } };
+    try std.testing.expectError(error.Cancelled, cancelled.remainingAt(0));
+
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const body =
+        \\{"success":true,"result":{"answers":{"total":{"value":12.5}},"usage":{"input_tokens":1,"output_tokens":1}}}
+    ;
+    var server = try httpx.TestServer.start(a, io, &.{
+        .{ .method = .POST, .path = "/run", .respond = .{ .body = body, .delay_ns = 300 * std.time.ns_per_ms } },
+        .{ .method = .POST, .path = "/run", .respond = .{ .body = body, .delay_ns = 300 * std.time.ns_per_ms } },
+    });
+    defer server.deinit();
+    const Serve = struct {
+        fn run(srv: *httpx.TestServer) void {
+            srv.handleOne() catch return;
+            srv.handleOne() catch return;
+        }
+    };
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Serve.run, .{&server});
+    var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+    defer client.deinit();
+    const url = try std.fmt.allocPrint(a, "{s}/run", .{server.baseUrl()});
+    defer a.free(url);
+    if (extractWithConfigAndOptions(a, &client, .{
+        .provider = .cloudflare,
+        .account_id = "account",
+        .model = "@cf/cloudflare/clairic",
+        .api_key = "fixture",
+        .url = url,
+        .schema_json = "{\"structures\":{\"receipt\":{\"fields\":{\"total\":\"number\"}}}}",
+    }, .{ .inputs = &.{ .{ .content_json = "\"12.50\"" }, .{ .content_json = "\"12.50\"" } } }, .{ .timeout_ms = 500 })) |response| {
+        var unexpected = response;
+        unexpected.deinit();
+        return error.TestExpectedError;
+    } else |err| try std.testing.expectEqual(error.Timeout, err);
 }
 
 test "cloudflare extraction provider uses native typed protocol with optional gateway routing" {

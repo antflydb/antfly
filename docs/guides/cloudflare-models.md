@@ -94,6 +94,13 @@ Model support for tools, images and structured output remains model-specific.
 Clairic's native decimal precision is limited to 0–6. Whisper rejects diarization;
 MP3 synthesis rejects unsupported speed and container overrides before dispatch.
 
+Clairic validates the effective extraction schema version (1 or 2) before
+dispatch. One extraction deadline covers input validation and all rows in a
+serial batch; each upstream request receives only the remaining time. Explicit
+request controls take precedence over the shared client's timeout and
+cancellation defaults. Malformed successful vision responses are upstream
+failures, reported as HTTP 502 by document endpoints.
+
 See [declarative document models](declarative-document-models.md) for whole PDF,
 slide and receipt sources and bounded reading/extraction policies. The provider
 wire types are generated from pinned official model schemas; transport fixtures
