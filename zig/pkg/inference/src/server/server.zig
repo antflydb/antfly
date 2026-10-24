@@ -40649,8 +40649,21 @@ const MediaOutputExecution = struct {
         if (slot >= 32 or self.frame_arena == null) return error.InvalidInputShape;
         const a = self.frame_arena.?.allocator();
         if (self.video_frames[slot] != null) return;
+        const pixel_consumers = for (self.config.targets, self.resolved[0..self.initialized]) |target, resolved| {
+            if (target.execute and resolved.failure == null) if (resolved.classifier_profile) |profile| if (profile.input == .pixels) break true;
+        } else false;
+        defer if (self.frame_cache) |cache| if (slot < self.picture_ids.len) {
+            cache.insert(self, cache.allocator, slot, self.picture_ids[slot]) catch {};
+        };
+        var displayed: ?@import("antfly_video").preparation.DisplayImage = if (pixel_consumers) frame.display(a, options, control) catch |err| failed: {
+            if (chunks.abort(err)) return err;
+            for (&self.frame_errors) |*failure| failure.* = err;
+            if (self.capture_primary or self.hasVideoEmbeddingConsumers()) self.video_failure = err;
+            break :failed null;
+        } else null;
+        defer if (displayed) |*value| value.deinit(a);
         if ((self.capture_primary or self.hasVideoEmbeddingConsumers()) and self.video_failure == null) {
-            const patches: ?[]f32 = frame.prepare(a, options, control) catch |err| failed: {
+            const patches: ?[]f32 = (if (displayed) |value| frame.prepareDisplayed(a, value, options, control) else frame.prepare(a, options, control)) catch |err| failed: {
                 if (chunks.abort(err)) return err;
                 self.video_failure = err;
                 break :failed null;
@@ -40661,24 +40674,12 @@ const MediaOutputExecution = struct {
                 self.video_frames[slot] = .{ .patches = values, .options = retained_options };
             }
         }
-        const pixel_consumers = for (self.config.targets, self.resolved[0..self.initialized]) |target, resolved| {
-            if (target.execute and resolved.failure == null) if (resolved.classifier_profile) |profile| if (profile.input == .pixels) break true;
-        } else false;
-        defer if (self.frame_cache) |cache| if (slot < self.picture_ids.len) {
-            cache.insert(self, cache.allocator, slot, self.picture_ids[slot]) catch {};
-        };
-        if (!pixel_consumers) return;
-        var displayed = frame.display(a, options, control) catch |err| {
-            if (chunks.abort(err)) return err;
-            for (&self.frame_errors) |*failure| failure.* = err;
-            return;
-        };
-        defer displayed.deinit(a);
+        const pixels = displayed orelse return;
         for (self.config.targets, self.resolved[0..self.initialized], 0..) |target, resolved, index| {
             if (!target.execute or resolved.failure != null or self.frame_errors[index] != null) continue;
             const profile = resolved.classifier_profile orelse continue;
             if (profile.input != .pixels) continue;
-            self.prepared_frames[index][slot] = @import("../pipelines/media_classification.zig").prepareImage(a, profile, displayed.view()) catch |err| {
+            self.prepared_frames[index][slot] = @import("../pipelines/media_classification.zig").prepareImage(a, profile, pixels.view()) catch |err| {
                 if (chunks.abort(err)) return err;
                 self.frame_errors[index] = err;
                 continue;
@@ -40824,6 +40825,12 @@ const MediaOutputExecution = struct {
             }
             if (payload == .video and resolved.classifier_profile != null and resolved.classifier_profile.?.input == .pixels) {
                 const pictures = descriptor.coordinates.selected_pictures orelse return error.InvalidChunkCoordinates;
+                const batched = self.runFrameBatch(a, target, resolved, index, pictures) catch |err| failed: {
+                    if (chunks.abort(err) or (!allow_partial and target.required)) return err;
+                    // Preserve independent frame receipts when a batch fails.
+                    break :failed null;
+                };
+                defer if (batched) |rows| a.free(rows);
                 for (pictures, 0..) |picture, slot| {
                     var value = base;
                     value.sub_index = @intCast(slot);
@@ -40835,7 +40842,9 @@ const MediaOutputExecution = struct {
                             break;
                         }
                     };
-                    self.runFrame(a, target, resolved, prepared, self.frame_errors[index], &value) catch |err| {
+                    if (batched) |rows| {
+                        value.labels = rows[slot];
+                    } else self.runFrame(a, target, resolved, prepared, self.frame_errors[index], &value) catch |err| {
                         if (chunks.abort(err) or (!allow_partial and target.required)) return err;
                         value.status = .failed;
                         value.labels = null;
@@ -40912,6 +40921,39 @@ const MediaOutputExecution = struct {
             }
         }
         return results.toOwnedSlice(a);
+    }
+    fn runFrameBatch(self: *MediaOutputExecution, a: std.mem.Allocator, target: outputs.Target, resolved: *const Resolved, index: usize, pictures: []const u64) !?[][]outputs.Label {
+        const classification = @import("../pipelines/media_classification.zig");
+        if (self.frame_errors[index] != null or pictures.len < 2 or pictures.len > 32) return null;
+        var frames: [32][]const f32 = undefined;
+        for (pictures, 0..) |picture, slot| {
+            var pixels = self.prepared_frames[index][slot];
+            if (pixels == null) for (pictures[0..slot], 0..) |earlier, previous| {
+                if (earlier == picture) {
+                    pixels = self.prepared_frames[index][previous];
+                    break;
+                }
+            };
+            frames[slot] = pixels orelse return null;
+        }
+        var handle = try self.node.model_manager.acquireFromDirWithControl(resolved.path, self.control);
+        defer handle.release();
+        const loaded = handle.get();
+        const actual = std.fmt.bytesToHex(try self.node.model_manager.modelIdentityForManifest(resolved.path, loaded.manifest), .lower);
+        if (!std.mem.eql(u8, &actual, &resolved.revision)) return error.ModelConfigurationChanged;
+        const rows = try classification.classifyPreparedFrames(a, loaded.session, resolved.classifier_profile.?, loaded.manifest.id2label orelse return error.UnsupportedMediaClassifier, frames[0..pictures.len], target.top_k, self.control);
+        errdefer {
+            for (rows) |row| {
+                for (row) |label| a.free(label.label);
+                a.free(row);
+            }
+            a.free(rows);
+        }
+        var manifest = try manifest_mod.loadFromDir(a, resolved.path);
+        defer manifest.deinit();
+        const after = std.fmt.bytesToHex(try self.node.model_manager.modelIdentityForManifest(resolved.path, manifest), .lower);
+        if (!std.mem.eql(u8, &after, &resolved.revision)) return error.ModelConfigurationChanged;
+        return rows;
     }
     fn runFrame(self: *MediaOutputExecution, a: std.mem.Allocator, target: outputs.Target, resolved: *const Resolved, prepared: ?[]const f32, failure: ?anyerror, value: *outputs.Result) !void {
         if (failure) |err| return err;

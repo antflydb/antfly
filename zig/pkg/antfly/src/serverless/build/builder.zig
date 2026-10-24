@@ -2347,6 +2347,7 @@ pub fn predictPendingEnrichmentAlloc(
             false;
         const has_chunk_source = blk: {
             if (!requested.needsChunkSource()) break :blk false;
+            if (projection.chunk_embeddings_pending) break :blk true;
             break :blk if (projection.chunk_preview) |chunks|
                 chunks.len > 0
             else
@@ -2364,7 +2365,7 @@ pub fn predictPendingEnrichmentAlloc(
             prediction.chunk_preview_pending_documents += 1;
         }
         if (requested.chunk_embeddings and policy.chunk_embeddings_enabled and has_chunk_source and
-            (projection.chunk_embeddings_version == null or projection.chunk_embeddings_version.? < policy.chunk_embeddings_pipeline_version))
+            (projection.chunk_embeddings_pending or projection.chunk_embeddings_version == null or projection.chunk_embeddings_version.? < policy.chunk_embeddings_pipeline_version))
         {
             prediction.chunk_embeddings_pending_documents += 1;
         }

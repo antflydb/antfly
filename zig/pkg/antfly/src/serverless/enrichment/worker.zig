@@ -68,6 +68,7 @@ pub const SparseEnricherConfig = struct {
     model_preference: catalog_mod.EnrichmentModelPreference = .prefer_model,
     failure_policy: catalog_mod.EnrichmentFailurePolicy = .skip_document,
     cancellation: CancellationToken = .none,
+    media_output_max_attempts: u32 = 3,
 };
 
 const SourcePin = struct {
@@ -130,6 +131,7 @@ pub const SparseEnricher = struct {
     model_chunker: ?chunking.types.Config = null,
     model_chunk_provider: ?chunking.Provider = null,
     model_chunk_field: []const u8 = "",
+    media_output_max_attempts: u32 = 3,
 
     pub fn init(
         alloc: Allocator,
@@ -180,7 +182,21 @@ pub const SparseEnricher = struct {
         if (model != .string or model.string.len == 0) return error.InvalidChunkerConfig;
         var config = if (index.object.get("chunker")) |value| try chunking.types.parseConfigFromValue(self.alloc, value) else chunking.types.Config{ .provider = .antfly };
         defer config.deinit(self.alloc);
+        const task = embedder.object.get("task_type") orelse std.json.Value{ .string = "RETRIEVAL_DOCUMENT" };
+        const pin = embedder.object.get("model_identity");
+        if (task != .string or (pin != null and pin.? != .string and pin.? != .null)) return error.InvalidChunkerConfig;
         if (config.embedding == null) config.embedding = .{ .model = try self.alloc.dupe(u8, model.string), .dimensions = self.chunk_embedding_dims };
+        const selected = &config.embedding.?;
+        if (!std.mem.eql(u8, selected.model, model.string) or (selected.dimensions != null and selected.dimensions.? != self.chunk_embedding_dims)) return error.InvalidChunkerConfig;
+        if (selected.task_type) |configured| {
+            if (!std.mem.eql(u8, configured, task.string)) return error.InvalidChunkerConfig;
+        } else selected.task_type = try self.alloc.dupe(u8, task.string);
+        if (pin) |value| if (value == .string) {
+            if (selected.model_identity) |configured| {
+                if (!std.mem.eql(u8, configured, value.string)) return error.InvalidChunkerConfig;
+            } else selected.model_identity = try self.alloc.dupe(u8, value.string);
+        };
+        selected.dimensions = self.chunk_embedding_dims;
         if (config.api_url.len == 0) if (embedder.object.get("url")) |url| {
             if (url != .string) return error.InvalidChunkerConfig;
             if (url.string.len != 0 and !std.mem.eql(u8, url.string, "antfly:embedded")) config.api_url = try self.alloc.dupe(u8, url.string);
@@ -444,6 +460,7 @@ pub const SparseEnricher = struct {
         var working = try build_limits.WorkingSetAllocator.init(self.alloc, cfg.document_limits);
         var worker = self.*;
         worker.alloc = working.allocator();
+        worker.media_output_max_attempts = @max(cfg.media_output_max_attempts, 1);
         return worker.processAdmittedDocument(namespace, cfg, pin, pages, fact, key, head, expected_lsn, stats) catch |err| {
             if (err == error.OutOfMemory and working.limit_exceeded) return error.EnrichmentDocumentBudgetExceeded;
             return err;
@@ -683,6 +700,89 @@ fn buildDerivedSparseBodyAlloc(
     };
 }
 
+fn serverlessMediaPending(state: std.json.Value) bool {
+    if (state != .object) return false;
+    const value = state.object.get("chunk_embeddings_pending") orelse return false;
+    return value == .bool and value.bool;
+}
+
+fn needsServerlessOutput(target: media_outputs.Target, cached: []const media_outputs.Result, current: []const media_outputs.Result) bool {
+    const identity = for (current) |value| {
+        if (std.mem.eql(u8, value.name, target.name)) break value.recipe_id;
+    } else return true;
+    var seen = false;
+    for (cached) |value| if (std.mem.eql(u8, value.name, target.name)) {
+        seen = true;
+        if (!std.mem.eql(u8, identity, value.recipe_id) or (value.status != .complete and !value.terminal)) return true;
+    };
+    return !seen;
+}
+
+fn mergeServerlessOutputs(a: Allocator, fresh: []const media_outputs.Result, cached: []const media_outputs.Result, max_attempts: u32) ![]const media_outputs.Result {
+    const results = try a.dupe(media_outputs.Result, fresh);
+    for (results) |*value| {
+        const previous: ?media_outputs.Result = for (cached) |old| {
+            if (std.mem.eql(u8, old.name, value.name) and old.sub_index == value.sub_index and std.mem.eql(u8, old.recipe_id, value.recipe_id)) break old;
+        } else null;
+        if (previous) |old| if (old.status == .complete or old.terminal) {
+            const required = value.required;
+            value.* = old;
+            value.required = required;
+            continue;
+        };
+        if (value.status == .skipped) return error.IncompleteChunkCoverage;
+        value.attempts = (if (previous) |old| old.attempts else @as(u32, 0)) +| 1;
+        value.terminal = value.status == .failed and value.attempts >= @max(max_attempts, 1);
+    }
+    return results;
+}
+
+fn appendServerlessEmbeddingRows(a: Allocator, target: chunking.types.EmbeddingTarget, metadata: *const chunking.inference.RemoteMetadata, results: []const media_outputs.Result, text: []const u8, rows: *std.ArrayListUnmanaged(std.json.Value), previews: *std.ArrayListUnmanaged(std.json.Value)) !void {
+    var matched = false;
+    for (results) |output| if (output.kind == .embedding and std.mem.eql(u8, output.name, "embedding")) {
+        matched = true;
+        if (output.status != .complete) continue;
+        if (!std.mem.eql(u8, output.model, target.model)) return error.InvalidChunkerResponse;
+        const selected = media_outputs.Target{ .name = "embedding", .kind = .embedding, .model = target.model, .model_identity = target.model_identity, .task_type = target.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (target.dimensions) |n| @intCast(n) else null, .required = output.required };
+        try output.validate(selected);
+        const recipe = try selected.recipeIdentity(a, output.model_identity, output.model_revision);
+        if (!std.mem.eql(u8, &recipe, output.recipe_id)) return error.InvalidChunkerResponse;
+        try appendServerlessEmbeddingRow(a, metadata, output.embedding.?, output, text, rows, previews);
+    };
+    if (matched) return;
+    // Legacy responses have one vector belonging to the boundary. It is only
+    // eligible when its complete computation contract matches the index.
+    if (!std.mem.eql(u8, metadata.model, target.model) or !std.mem.eql(u8, metadata.task_type, target.task_type orelse "RETRIEVAL_DOCUMENT")) return error.InvalidChunkerResponse;
+    if (target.model_identity) |pin| if (!std.mem.eql(u8, pin, metadata.model_identity)) return error.EmbeddingIdentityMismatch;
+    const vector = metadata.embedding orelse return error.IncompleteChunkCoverage;
+    if (vector.len == 0 or (target.dimensions != null and target.dimensions.? != vector.len)) return error.InvalidEmbeddingDimensions;
+    for (vector) |value| if (!std.math.isFinite(value)) return error.InvalidEmbeddingResponse;
+    try appendServerlessEmbeddingRow(a, metadata, vector, null, text, rows, previews);
+}
+
+fn appendServerlessEmbeddingRow(a: Allocator, metadata: *const chunking.inference.RemoteMetadata, vector: []const f32, output: ?media_outputs.Result, text: []const u8, rows: *std.ArrayListUnmanaged(std.json.Value), previews: *std.ArrayListUnmanaged(std.json.Value)) !void {
+    var row = std.json.ObjectMap.empty;
+    try row.put(a, "chunk", .{ .string = try a.dupe(u8, text) });
+    var descriptor = metadata.*;
+    descriptor.embedding = null;
+    descriptor.outputs_json = null;
+    const encoded = try std.json.Stringify.valueAlloc(a, descriptor, .{ .emit_null_optional_fields = false });
+    var recipe = try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{});
+    if (output) |value| {
+        try recipe.object.put(a, "output_name", .{ .string = value.name });
+        try recipe.object.put(a, "output_sub_index", .{ .integer = value.sub_index });
+        try recipe.object.put(a, "output_model_identity", .{ .string = value.model_identity });
+        if (value.start_ns) |start| try recipe.object.put(a, "output_start_ns", .{ .integer = start });
+        if (value.end_ns) |end| try recipe.object.put(a, "output_end_ns", .{ .integer = end });
+    }
+    try row.put(a, "_chunk", recipe);
+    var values = std.ArrayList(std.json.Value).empty;
+    for (vector) |value| try values.append(a, .{ .float = value });
+    try row.put(a, "embedding", .{ .array = values.toManaged(a) });
+    try rows.append(a, .{ .object = row });
+    try previews.append(a, .{ .string = try a.dupe(u8, text) });
+}
+
 fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeline_version: u32) !DerivedBodyResult {
     const a = self.alloc;
     var source = try std.json.parseFromSlice(std.json.Value, a, body, .{});
@@ -715,10 +815,11 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
         };
         if (caps) |value| if (value.model_revision) |revision| recipe_hash.update(&revision);
     }
+    recipe_hash.update(&std.mem.toBytes(std.mem.nativeToLittle(u32, pipeline_version)));
     const recipe_fingerprint = std.fmt.bytesToHex(recipe_hash.finalResult(), .lower);
     if (document.object.get("_enrichment")) |state| if (state == .object) {
         const old_recipe = state.object.get("chunk_embeddings_recipe");
-        if (state.object.get("chunk_embeddings_version")) |version| if (version == .integer and version.integer >= pipeline_version and old_recipe != null and old_recipe.? == .string and std.mem.eql(u8, old_recipe.?.string, &recipe_fingerprint)) return .{};
+        if (state.object.get("chunk_embeddings_version")) |version| if (version == .integer and version.integer >= pipeline_version and !serverlessMediaPending(state) and old_recipe != null and old_recipe.? == .string and std.mem.eql(u8, old_recipe.?.string, &recipe_fingerprint)) return .{};
     };
     const selected = try chunking.chunk.modelSourceFromValue(field);
     var decoded: ?[]u8 = null;
@@ -735,7 +836,27 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
             break :blk .{ .binary = .{ .mime_type = media.mime_type, .data = bytes } };
         },
     };
-    var config = self.model_chunker.?;
+    const wanted = self.model_chunker.?.embedding orelse return error.InvalidChunkerConfig;
+    const base_config = self.model_chunker.?;
+    var consumers: ?media_outputs.Config = if (base_config.outputs_json.len != 0) try std.json.parseFromSliceLeaky(media_outputs.Config, scratch, base_config.outputs_json, .{}) else null;
+    if (consumers) |*value| value.* = try value.includingEmbedding(scratch, .{ .name = "embedding", .kind = .embedding, .model = wanted.model, .model_identity = wanted.model_identity, .task_type = wanted.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (wanted.dimensions) |n| @intCast(n) else null });
+    var cached_rows: []const media_outputs.Row = &.{};
+    var current_identities: []const media_outputs.Result = &.{};
+    if (consumers != null) if (document.object.get("_enrichment")) |state| if (state == .object) {
+        const old = state.object.get("chunk_embeddings_preparation_recipe");
+        if (old != null and old.? == .string and std.mem.eql(u8, old.?.string, &recipe_fingerprint)) if (document.object.get("media_outputs")) |cached| {
+            if (cached == .object and cached.object.contains("chunks")) {
+                const parsed = try std.json.parseFromValueLeaky(struct { chunks: []const media_outputs.Row, plan_id: []const u8 }, scratch, cached, .{ .ignore_unknown_fields = true });
+                var probe = try chunking.inference.probeModelPageWithProvider(a, base_config, input, self.model_chunk_provider);
+                defer probe.deinit(a);
+                if (std.mem.eql(u8, probe.plan_id, parsed.plan_id) and probe.chunks.len != 0) {
+                    cached_rows = parsed.chunks;
+                    current_identities = try std.json.parseFromSliceLeaky([]media_outputs.Result, scratch, probe.chunks[0].metadata.?.outputs_json orelse return error.InvalidChunkerResponse, .{ .allocate = .alloc_always });
+                }
+            }
+        };
+    };
+    var config = base_config;
     config.page = true;
     config.max_chunks = if (config.max_chunks == 0) 64 else @min(config.max_chunks, 64);
     var position: ?chunking.types.Replay = null;
@@ -747,37 +868,43 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
     var embeddings: std.ArrayListUnmanaged(std.json.Value) = .empty;
     var previews: std.ArrayListUnmanaged(std.json.Value) = .empty;
     var output_rows: std.ArrayList(media_outputs.Row) = .empty;
+    var plan_id: []const u8 = "";
+    var pending_outputs = false;
     while (true) {
+        config = base_config;
+        config.page = true;
+        config.max_chunks = if (config.max_chunks == 0) 64 else @min(config.max_chunks, 64);
         config.replay = position;
+        if (cached_rows.len != 0) if (consumers) |value| {
+            const targets = try scratch.dupe(media_outputs.Target, value.targets);
+            const first: usize = @intCast(if (position) |cursor| cursor.ordinal else 0);
+            for (targets) |*target| {
+                target.execute = false;
+                for (first..@min(first + config.max_chunks, cached_rows.len)) |ordinal| {
+                    if (needsServerlessOutput(target.*, cached_rows[ordinal].outputs, current_identities)) {
+                        target.execute = true;
+                        break;
+                    }
+                }
+                if (first >= cached_rows.len) target.execute = true;
+            }
+            config.embedding = null;
+            config.outputs_json = try std.json.Stringify.valueAlloc(scratch, media_outputs.Config{ .boundary_model = value.boundary_model, .targets = targets }, .{ .emit_null_optional_fields = false });
+        };
+
         var page = try chunking.inference.chunkPageWithProvider(a, config, input, self.model_chunk_provider);
         defer page.deinit(a);
         for (page.chunks) |chunk| {
             const metadata = chunk.metadata orelse return error.InvalidChunkerResponse;
-            const independent = if (metadata.outputs_json) |bytes| try std.json.parseFromSliceLeaky([]media_outputs.Result, scratch, bytes, .{ .allocate = .alloc_always }) else &.{};
-            if (independent.len != 0) try output_rows.append(scratch, .{ .chunk_id = chunk.id, .outputs = independent });
-            const vector = metadata.embedding orelse blk: {
-                const target = config.embedding orelse return error.IncompleteChunkCoverage;
-                for (independent) |output| if (output.kind == .embedding and output.status == .complete and std.mem.eql(u8, output.name, "embedding") and std.mem.eql(u8, output.model, target.model)) {
-                    const selected_vector = output.embedding orelse return error.IncompleteChunkCoverage;
-                    if (target.dimensions) |width| if (width != selected_vector.len) return error.InvalidEmbeddingDimensions;
-                    if (target.model_identity) |identity| if (!std.mem.eql(u8, identity, output.model_identity)) return error.EmbeddingIdentityMismatch;
-                    break :blk selected_vector;
-                };
-                return error.IncompleteChunkCoverage;
+            if (plan_id.len == 0) plan_id = try scratch.dupe(u8, page.plan_id);
+            const fresh: []const media_outputs.Result = if (metadata.outputs_json) |bytes| try std.json.parseFromSliceLeaky([]media_outputs.Result, scratch, bytes, .{ .allocate = .alloc_always }) else &.{};
+            const cached: []const media_outputs.Result = if (chunk.id < cached_rows.len and cached_rows[chunk.id].chunk_id == chunk.id) cached_rows[chunk.id].outputs else &.{};
+            const independent = try mergeServerlessOutputs(scratch, fresh, cached, self.media_output_max_attempts);
+            for (independent) |result| if (result.status != .complete and !result.terminal) {
+                pending_outputs = true;
             };
-            var row = std.json.ObjectMap.empty;
-            try row.put(scratch, "chunk", .{ .string = try scratch.dupe(u8, chunk.text orelse "") });
-            const recipe = metadata.*;
-            var descriptor = recipe;
-            descriptor.embedding = null;
-            descriptor.outputs_json = null;
-            const encoded = try std.json.Stringify.valueAlloc(scratch, descriptor, .{ .emit_null_optional_fields = false });
-            try row.put(scratch, "_chunk", try std.json.parseFromSliceLeaky(std.json.Value, scratch, encoded, .{}));
-            var values: std.ArrayList(std.json.Value) = .empty;
-            for (vector) |value| try values.append(scratch, .{ .float = value });
-            try row.put(scratch, "embedding", .{ .array = values.toManaged(scratch) });
-            try embeddings.append(scratch, .{ .object = row });
-            try previews.append(scratch, .{ .string = try scratch.dupe(u8, chunk.text orelse "") });
+            if (independent.len != 0) try output_rows.append(scratch, .{ .chunk_id = chunk.id, .outputs = independent });
+            try appendServerlessEmbeddingRows(scratch, wanted, metadata, independent, chunk.text orelse "", &embeddings, &previews);
         }
         if (page.complete) break;
         if (position) |cursor| {
@@ -799,7 +926,7 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
     for ([_][]const u8{ "media_outputs", "transcript", "transcript_spans" }) |name| _ = document.object.swapRemove(name);
     if (output_rows.items.len != 0) {
         const projection = try media_outputs.project(scratch, output_rows.items);
-        const encoded_outputs = try std.json.Stringify.valueAlloc(scratch, .{ .chunks = output_rows.items, .complete_chunks = projection.complete_chunks, .failed_chunks = projection.failed_chunks, .terminal_chunks = projection.terminal_chunks, .status = projection.status }, .{ .emit_null_optional_fields = false });
+        const encoded_outputs = try std.json.Stringify.valueAlloc(scratch, .{ .plan_id = plan_id, .chunks = output_rows.items, .complete_chunks = projection.complete_chunks, .failed_chunks = projection.failed_chunks, .terminal_chunks = projection.terminal_chunks, .status = projection.status }, .{ .emit_null_optional_fields = false });
         try document.object.put(scratch, "media_outputs", try std.json.parseFromSliceLeaky(std.json.Value, scratch, encoded_outputs, .{}));
         try document.object.put(scratch, "transcript", .{ .string = projection.text });
         const encoded_spans = try std.json.Stringify.valueAlloc(scratch, projection.transcript_spans, .{ .emit_null_optional_fields = false });
@@ -807,9 +934,16 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
     }
     var state = document.object.get("_enrichment") orelse std.json.Value{ .object = .empty };
     if (state != .object) return error.InvalidChunkSource;
-    try state.object.put(scratch, "chunk_embeddings", .{ .bool = true });
-    try state.object.put(scratch, "chunk_embeddings_version", .{ .integer = pipeline_version });
-    try state.object.put(scratch, "chunk_embeddings_recipe", .{ .string = &recipe_fingerprint });
+    try state.object.put(scratch, "chunk_embeddings", .{ .bool = !pending_outputs });
+    try state.object.put(scratch, "chunk_embeddings_pending", .{ .bool = pending_outputs });
+    try state.object.put(scratch, "chunk_embeddings_preparation_recipe", .{ .string = &recipe_fingerprint });
+    if (pending_outputs) {
+        _ = state.object.swapRemove("chunk_embeddings_version");
+        _ = state.object.swapRemove("chunk_embeddings_recipe");
+    } else {
+        try state.object.put(scratch, "chunk_embeddings_version", .{ .integer = pipeline_version });
+        try state.object.put(scratch, "chunk_embeddings_recipe", .{ .string = &recipe_fingerprint });
+    }
     try document.object.put(scratch, "_enrichment", state);
     return .{ .body = try std.json.Stringify.valueAlloc(a, document, .{}), .used_model = true };
 }
@@ -2780,4 +2914,103 @@ test "model aware media serverless enrichment stages preserve independent output
     const state = parsed.value.object.get("_enrichment").?.object;
     try std.testing.expectEqual(@as(i64, 3), state.get("lexical_sparse_version").?.integer);
     try std.testing.expectEqualStrings("recipe", state.get("chunk_embeddings_recipe").?.string);
+}
+
+test "model aware media serverless named vectors and failed outputs resume independently to success or terminal" {
+    const Fake = struct {
+        calls: [3]usize = @splat(0),
+        fail: bool = true,
+        fn page(raw: *anyopaque, a: Allocator, _: []const u8, _: chunking.inference.RemoteInput, cfg: chunking.types.Config, _: @import("antfly_inference_execution_context").RequestContext) anyerror!chunking.inference.ChunkPage {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var config = try std.json.parseFromSlice(media_outputs.Config, a, cfg.outputs_json, .{});
+            defer config.deinit();
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var results = std.ArrayList(media_outputs.Result).empty;
+            for (config.value.targets, 0..) |target, index| {
+                if (target.execute) self.calls[index] += 1;
+                const identity = "3333333333333333333333333333333333333333333333333333333333333333";
+                const revision = "4444444444444444444444444444444444444444444444444444444444444444";
+                const recipe = try target.recipeIdentity(scratch, identity, revision);
+                const copies: usize = if (index == 1) 2 else 1;
+                for (0..copies) |sub_index| {
+                    var result = media_outputs.Result{ .name = target.name, .kind = target.kind, .required = target.required, .model = target.model, .model_identity = identity, .model_revision = revision, .recipe_id = try scratch.dupe(u8, &recipe), .sub_index = @intCast(sub_index), .start_ns = @intCast(sub_index * 50), .end_ns = @intCast((sub_index + 1) * 50), .status = if (!target.execute) .skipped else if (index == 2 and self.fail) .failed else .complete };
+                    if (result.status == .failed) result.code = "SpeechUnavailable";
+                    if (result.status == .complete) {
+                        if (target.kind == .embedding) result.embedding = if (index == 0) &.{ 1, 0 } else &.{ 0, 1 } else result.spans = &.{.{ .text = "hello", .start_ns = 0, .end_ns = 50 }};
+                    }
+                    try results.append(scratch, result);
+                }
+            }
+            const encoded = try std.json.Stringify.valueAlloc(scratch, results.items, .{ .emit_null_optional_fields = false });
+            const plan = "1111111111111111111111111111111111111111111111111111111111111111";
+            const fingerprint = "2222222222222222222222222222222222222222222222222222222222222222";
+            const chunks = try a.alloc(chunking.inference.RemoteChunk, 1);
+            errdefer a.free(chunks);
+            chunks[0] = .{ .id = 0, .mime_type = "audio/wav", .metadata = try (chunking.inference.RemoteMetadata{ .descriptor = .{ .ordinal = 0, .input_tokens = 1, .coordinates = .{ .kind = .audio, .start_ns = 0, .end_ns = 100 } }, .inference_id = plan ++ ":0", .plan_id = plan, .source_fingerprint = fingerprint, .source_version = "v1", .model = "boundaryB", .model_identity = results.items[0].model_identity, .model_revision = results.items[0].model_revision, .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .embedding = if (config.value.targets[0].execute) &.{ 1, 0 } else null, .outputs_json = encoded }).clone(a), .owns_metadata = true };
+            errdefer chunks[0].deinit(a);
+            const owned_plan = try a.dupe(u8, plan);
+            errdefer a.free(owned_plan);
+            const owned_fingerprint = try a.dupe(u8, fingerprint);
+            errdefer a.free(owned_fingerprint);
+            return .{ .chunks = chunks, .plan_id = owned_plan, .source_fingerprint = owned_fingerprint, .source_version = try a.dupe(u8, "v1"), .start_ordinal = 0, .covered_through_ordinal = 1, .complete = true };
+        }
+    };
+    const a = std.testing.allocator;
+    var fake = Fake{};
+    var worker = SparseEnricher{ .alloc = a, .artifacts = undefined, .manifests = undefined, .progress = undefined, .wal = undefined };
+    defer worker.deinit();
+    const Boundary = @import("antfly_runtime_abi").callback_abi.Boundary(struct { chunk_page_with_context: ?*const @TypeOf(Fake.page) = null });
+    try worker.setModelChunker(.{ .provider = .antfly, .embedding = .{ .model = "indexA", .dimensions = 2 }, .outputs_json = "{\"boundary_model\":\"boundary\",\"targets\":[{\"name\":\"boundary\",\"kind\":\"embedding\",\"model\":\"boundaryB\",\"dimensions\":2},{\"name\":\"embedding\",\"kind\":\"embedding\",\"model\":\"indexA\",\"dimensions\":2},{\"name\":\"speech\",\"kind\":\"transcribe\",\"model\":\"speech\"}]}" }, "clip", .{ .ptr = &fake, .boundary_dispatch = Boundary.local_dispatch, .chunk_page_with_context_callback = @ptrCast(&Fake.page) });
+    const first = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, "{\"text\":\"\",\"clip\":\"audio source\"}", 1, .require_model);
+    defer a.free(first.body.?);
+    var projection = try document_projection.parseAlloc(a, first.body.?);
+    defer projection.deinit(a);
+    try std.testing.expect(projection.chunk_embeddings_pending);
+    try std.testing.expect(projection.chunk_embeddings_version == null);
+    try std.testing.expectEqual(@as(usize, 2), projection.chunk_embeddings.?.len);
+    for (projection.chunk_embeddings.?) |row| try std.testing.expectEqualSlices(f32, &.{ 0, 1 }, row.embedding);
+    const second = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, first.body.?, 1, .require_model);
+    defer a.free(second.body.?);
+    try std.testing.expectEqualDeep([_]usize{ 1, 1, 2 }, fake.calls);
+    fake.fail = false;
+    const success = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, second.body.?, 1, .require_model);
+    defer a.free(success.body.?);
+    var success_projection = try document_projection.parseAlloc(a, success.body.?);
+    defer success_projection.deinit(a);
+    try std.testing.expect(!success_projection.chunk_embeddings_pending);
+    try std.testing.expectEqual(@as(?u32, 1), success_projection.chunk_embeddings_version);
+    try std.testing.expectEqualDeep([_]usize{ 1, 1, 3 }, fake.calls);
+    fake.fail = true;
+    const terminal = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, second.body.?, 1, .require_model);
+    defer a.free(terminal.body.?);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, terminal.body.?, .{});
+    defer parsed.deinit();
+    const outputs = parsed.value.object.get("media_outputs").?.object;
+    const speech = outputs.get("chunks").?.array.items[0].object.get("outputs").?.array.items[3].object;
+    try std.testing.expect(speech.get("terminal").?.bool);
+    try std.testing.expectEqual(@as(i64, 3), speech.get("attempts").?.integer);
+    try std.testing.expectEqualStrings("failed", speech.get("status").?.string);
+    const settled = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, terminal.body.?, 1, .require_model);
+    try std.testing.expect(settled.body == null);
+}
+
+test "model aware media serverless index contract retains tasks and model pins" {
+    const a = std.testing.allocator;
+    var worker = SparseEnricher{ .alloc = a, .artifacts = undefined, .manifests = undefined, .progress = undefined, .wal = undefined, .chunk_embedding_dims = 2 };
+    defer worker.deinit();
+    const pin: [64]u8 = @splat('a');
+    const encoded = try std.fmt.allocPrint(a, "{{\"dense\":{{\"field\":\"clip\",\"embedder\":{{\"provider\":\"antfly\",\"model\":\"model\",\"task_type\":\"CLASSIFICATION\",\"model_identity\":\"{s}\"}}}}}}", .{pin});
+    defer a.free(encoded);
+    var indexes = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
+    defer indexes.deinit();
+    try worker.configureModelChunkerFromIndexes(indexes.value, "dense", .{});
+    try std.testing.expectEqualStrings("CLASSIFICATION", worker.model_chunker.?.embedding.?.task_type.?);
+    try std.testing.expectEqualStrings(&pin, worker.model_chunker.?.embedding.?.model_identity.?);
+    try std.testing.expectEqual(@as(?i64, 2), worker.model_chunker.?.embedding.?.dimensions);
+    const conflicting = "{\"dense\":{\"embedder\":{\"provider\":\"antfly\",\"model\":\"model\",\"task_type\":\"CLASSIFICATION\"},\"chunker\":{\"provider\":\"antfly\",\"embedding\":{\"model\":\"model\",\"task_type\":\"RETRIEVAL_DOCUMENT\",\"dimensions\":2}}}}";
+    var bad = try std.json.parseFromSlice(std.json.Value, a, conflicting, .{});
+    defer bad.deinit();
+    try std.testing.expectError(error.InvalidChunkerConfig, worker.configureModelChunkerFromIndexes(bad.value, "dense", .{}));
 }

@@ -29,6 +29,8 @@ pub const Projection = struct {
     lexical_sparse_version: ?u32 = null,
     chunk_preview_version: ?u32 = null,
     chunk_embeddings_version: ?u32 = null,
+    chunk_embeddings_pending: bool = false,
+    model_media_source_present: bool = false,
     rerank_terms_version: ?u32 = null,
 
     pub fn deinit(self: *Projection, alloc: Allocator) void {
@@ -149,6 +151,10 @@ pub const NamedSparseEmbedding = struct {
 };
 
 pub fn parseAlloc(alloc: Allocator, body: []const u8) !Projection {
+    return parseAllocWithSourceFields(alloc, body, &.{});
+}
+
+pub fn parseAllocWithSourceFields(alloc: Allocator, body: []const u8, source_fields: []const []const u8) !Projection {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return .{ .text = try alloc.dupe(u8, body) },
@@ -209,6 +215,14 @@ pub fn parseAlloc(alloc: Allocator, body: []const u8) !Projection {
         .lexical_sparse_version = findLexicalSparseVersion(obj),
         .chunk_preview_version = findChunkPreviewVersion(obj),
         .chunk_embeddings_version = findChunkEmbeddingsVersion(obj),
+        .chunk_embeddings_pending = pendingMediaOutputs(obj),
+        .model_media_source_present = source: {
+            for (source_fields) |field| {
+                const value = obj.get(field) orelse continue;
+                if ((value == .string and value.string.len != 0) or value == .object) break :source true;
+            }
+            break :source false;
+        },
         .rerank_terms_version = findRerankTermsVersion(obj),
     };
 }
@@ -378,6 +392,13 @@ fn findChunkEmbeddings(obj: std.json.ObjectMap) ?[]const std.json.Value {
     const value = obj.get("chunk_embeddings") orelse return null;
     if (value != .array) return null;
     return value.array.items;
+}
+
+fn pendingMediaOutputs(obj: std.json.ObjectMap) bool {
+    const state = obj.get("_enrichment") orelse return false;
+    if (state != .object) return false;
+    const pending = state.object.get("chunk_embeddings_pending") orelse return false;
+    return pending == .bool and pending.bool;
 }
 
 fn findChunkEmbeddingsVersion(obj: std.json.ObjectMap) ?u32 {

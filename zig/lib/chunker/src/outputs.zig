@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Media outputs have independent recipes. Only the selected boundary recipe
 //! participates in planning; adding consumers cannot change parent identities.
@@ -39,6 +51,17 @@ pub const Config = struct {
     pub fn includingEmbedding(self: Config, a: std.mem.Allocator, legacy: Target) !Config {
         for (self.targets) |target| if (std.mem.eql(u8, target.name, "embedding")) {
             if (target.kind != .embedding or !std.mem.eql(u8, target.model, legacy.model) or target.dimensions != legacy.dimensions or !std.mem.eql(u8, target.task_type, legacy.task_type)) return error.InvalidChunkOutputs;
+            if (legacy.model_identity) |pin| {
+                if (target.model_identity) |named| {
+                    if (!std.mem.eql(u8, pin, named)) return error.InvalidChunkOutputs;
+                } else {
+                    const targets = try a.dupe(Target, self.targets);
+                    for (targets) |*value| if (std.mem.eql(u8, value.name, "embedding")) {
+                        value.model_identity = pin;
+                    };
+                    return .{ .boundary_model = self.boundary_model, .targets = targets };
+                }
+            }
             return self;
         };
         if (self.targets.len >= 16) return error.InvalidChunkOutputs;
@@ -271,3 +294,17 @@ pub const CoverageCounts = struct {
         return result;
     }
 };
+
+test "model aware media legacy embedding pins merge without weakening either declaration" {
+    const a = std.testing.allocator;
+    const pin: [64]u8 = @splat('a');
+    const other: [64]u8 = @splat('b');
+    const legacy = Target{ .name = "embedding", .kind = .embedding, .model = "model", .model_identity = &pin, .dimensions = 2 };
+    var named = legacy;
+    named.model_identity = &other;
+    try std.testing.expectError(error.InvalidChunkOutputs, (Config{ .boundary_model = "embedding", .targets = &.{named} }).includingEmbedding(a, legacy));
+    named.model_identity = null;
+    const merged = try (Config{ .boundary_model = "embedding", .targets = &.{named} }).includingEmbedding(a, legacy);
+    defer a.free(merged.targets);
+    try std.testing.expectEqualStrings(&pin, merged.targets[0].model_identity.?);
+}

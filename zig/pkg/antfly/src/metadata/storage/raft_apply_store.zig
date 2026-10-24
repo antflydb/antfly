@@ -25502,6 +25502,9 @@ fn storeHasDenseNativeStorageStatus(record: metadata.StoreRecord) bool {
 
 fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
     for (record.runtime_statuses) |status| {
+        if (status.enrichment.output_counts_available or !std.meta.eql(status.enrichment.output_counts, @as(@TypeOf(status.enrichment.output_counts), .{}))) return runtime_status_protocol.media_output_record_version;
+    }
+    for (record.runtime_statuses) |status| {
         if (status.schema_epoch != 0) return runtime_status_protocol.schema_epoch_record_version;
     }
     if (record.relational_topology_protocol_version != 0) return runtime_status_protocol.framed_index_record_version;
@@ -27453,6 +27456,7 @@ fn appendRuntimeGroupStatusRecord(
 
 fn runtimeGroupStatusRecordVersion(record: metadata.RuntimeGroupStatusReport) u16 {
     var version = runtime_status_protocol.legacy_record_version;
+    if (record.enrichment.output_counts_available or !std.meta.eql(record.enrichment.output_counts, @as(@TypeOf(record.enrichment.output_counts), .{}))) return runtime_status_protocol.media_output_record_version;
     if (record.schema_epoch != 0)
         version = runtime_status_protocol.schema_epoch_record_version;
     for (record.indexes) |index| {
@@ -39589,4 +39593,22 @@ test "runtime status media output counts preserve the v18 wire profile and round
             try std.testing.expectEqual(@as(u64, 0), decoded.output_counts.embedding.complete);
         }
     }
+}
+
+test "runtime status automatic store profile retains v19 media counters" {
+    const a = std.testing.allocator;
+    const report = metadata.RuntimeGroupStatusReport{ .schema_epoch = 9, .enrichment = .{ .output_counts_available = true, .output_counts = .{ .transcribe = .{ .complete = 7 } } } };
+    var reports = [_]metadata.RuntimeGroupStatusReport{report};
+    const store = metadata.StoreRecord{ .store_id = 1, .node_id = 2, .runtime_statuses = &reports };
+    const version = storeRuntimeStatusRecordVersion(store).?;
+    try std.testing.expectEqual(runtime_status_protocol.media_output_record_version, version);
+    try std.testing.expectEqual(version, runtimeGroupStatusRecordVersion(report));
+    var bytes = std.ArrayListUnmanaged(u8).empty;
+    defer bytes.deinit(a);
+    try appendStoreRecord(a, &bytes, store);
+    var position: usize = 0;
+    const decoded = try readStoreRecord(a, bytes.items, &position);
+    defer metadata_table_manager.freeStore(a, decoded);
+    try std.testing.expect(decoded.runtime_statuses[0].enrichment.output_counts_available);
+    try std.testing.expectEqualDeep(report.enrichment.output_counts, decoded.runtime_statuses[0].enrichment.output_counts);
 }

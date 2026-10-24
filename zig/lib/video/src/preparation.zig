@@ -469,6 +469,16 @@ pub const BorrowedFrame = union(enum) {
             .rgba => |raster| referenceRgba(allocator, raster.bytes, raster.width, raster.height, options, control),
         };
     }
+    /// Derive patches from the RGB display already shared with frame classifiers.
+    pub fn prepareDisplayed(self: BorrowedFrame, allocator: std.mem.Allocator, displayed: DisplayImage, options: Options, control: media.source.Control) ![]f32 {
+        const dimensions: [2]u32 = switch (self) {
+            .host => |host| .{ host.width, host.height },
+            .surface => |surface| .{ surface.width, surface.height },
+            .rgba => |raster| .{ raster.width, raster.height },
+        };
+        const g = try geometry(dimensions[0], dimensions[1], options);
+        return prepareRgb(allocator, displayed.bytes, displayed.width, displayed.height, g, options, control);
+    }
     pub fn display(self: BorrowedFrame, allocator: std.mem.Allocator, options: Options, control: media.source.Control) !DisplayImage {
         return switch (self) {
             .host => |host| displayHostImpl(allocator, host, options, control, true),
@@ -1319,4 +1329,27 @@ test "video identity GBR preserves independent all-code high-depth RGB24 oracle"
         }
     };
     try std.testing.expectEqual(expected.len, at);
+}
+
+test "shared displayed RGB preserves embedding patch geometry and values" {
+    const a = std.testing.allocator;
+    const rgba = [_]u8{ 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 127, 127, 127, 255 };
+    const y = [_]u8{ 16, 235, 81, 145 };
+    const uv = [_]u8{ 90, 240 };
+    const frames = [_]BorrowedFrame{
+        .{ .rgba = .{ .bytes = &rgba, .width = 2, .height = 2 } },
+        .{ .host = .{ .width = 2, .height = 2, .format = .nv12_video, .planes = .{ .{ .bytes = &y, .width = 2, .height = 2, .stride = 2 }, .{ .bytes = &uv, .width = 1, .height = 1, .stride = 2 } } } },
+    };
+    for (frames) |frame| {
+        for ([_]Rotation{ .none, .clockwise90, .half_turn, .clockwise270 }) |rotation| {
+            const options = Options{ .width = 16, .height = 16, .matrix = .bt709, .rotation = rotation, .max_soft_tokens = 140 };
+            var displayed = try frame.display(a, options, .{});
+            defer displayed.deinit(a);
+            const shared = try frame.prepareDisplayed(a, displayed, options, .{});
+            defer a.free(shared);
+            const reference_values = try frame.prepare(a, options, .{});
+            defer a.free(reference_values);
+            try std.testing.expectEqualSlices(f32, reference_values, shared);
+        }
+    }
 }

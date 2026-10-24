@@ -154,6 +154,26 @@ pub fn supportsPagedCalls(cfg: chunking_types.Config, provider: ?chunk_provider.
     return resolved.execution.resolveAntflyEndpoint(if (trimmed.len != 0) trimmed else null, has_legacy) != null or !has_legacy;
 }
 
+/// Discover current output generations without executing any model output.
+pub fn probeModelPageWithProvider(a: Allocator, supplied: chunking_types.Config, input: RemoteInput, provider: ?chunk_provider.Provider) !ChunkPage {
+    const outputs = inference_chunker.outputs;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var cfg = supplied;
+    var consumers = if (cfg.outputs_json.len != 0) try std.json.parseFromSliceLeaky(outputs.Config, scratch, cfg.outputs_json, .{}) else outputs.Config{ .boundary_model = "embedding", .targets = &.{} };
+    if (cfg.embedding) |legacy| consumers = try consumers.includingEmbedding(scratch, .{ .name = "embedding", .kind = .embedding, .model = legacy.model, .model_identity = legacy.model_identity, .task_type = legacy.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (legacy.dimensions) |n| std.math.cast(usize, n) orelse return error.InvalidChunkOutputs else null });
+    const targets = try scratch.dupe(outputs.Target, consumers.targets);
+    for (targets) |*target| target.execute = false;
+    consumers.targets = targets;
+    cfg.outputs_json = try std.json.Stringify.valueAlloc(scratch, consumers, .{ .emit_null_optional_fields = false });
+    cfg.embedding = null;
+    cfg.page = true;
+    cfg.max_chunks = 1;
+    cfg.replay = null;
+    return chunkPageWithProvider(a, cfg, input, provider);
+}
+
 pub fn chunkPageWithProvider(alloc: Allocator, cfg: chunking_types.Config, input: RemoteInput, provider: ?chunk_provider.Provider) !ChunkPage {
     if (!cfg.page or cfg.max_chunks == 0 or !cfg.isModelAware()) return error.InvalidChunkerConfig;
     const empty = switch (input) {
