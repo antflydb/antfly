@@ -174,3 +174,129 @@
     unsigned int in_dim, \
     unsigned int q_out_dim, \
     unsigned int kv_out_dim
+
+#define ANTFLY_CUDA_TQ_SPLIT_STAGE1_PARAMS \
+float* partial_acc, \
+float* partial_meta, \
+const float* q, \
+const unsigned char* k, \
+const unsigned char* v, \
+const unsigned int* block_table, \
+unsigned int kv_seq_len, \
+unsigned int num_heads, \
+unsigned int num_kv_heads, \
+unsigned int head_dim, \
+unsigned int query_position_offset, \
+unsigned int kv_position_offset, \
+unsigned int sliding_window, \
+unsigned int key_row_bytes, \
+unsigned int value_row_bytes, \
+unsigned int block_count, \
+unsigned int page_size_tokens, \
+unsigned int format, \
+unsigned int value_format, \
+unsigned int physical_token_capacity, \
+const unsigned int* decode_scalars, \
+unsigned int chunk_size, \
+unsigned int chunk_count
+
+#define ANTFLY_CUDA_DEBERTA_ATTENTION_PARAMS \
+float* dst, \
+const float* q, \
+const float* k, \
+const float* v, \
+const float* q_r, \
+const float* k_r, \
+const long long* mask, \
+unsigned int batch, \
+unsigned int seq_len, \
+unsigned int num_heads, \
+unsigned int head_dim
+
+#define ANTFLY_CUDA_KV_SUFFIX_DENSE_PARAMS \
+float* k_dst, \
+float* v_dst, \
+const float* k_src, \
+const float* v_src, \
+const unsigned int* decode_scalars, \
+unsigned int suffix_token_count, \
+unsigned int row_width, \
+unsigned int fallback_total_token_count
+
+#define ANTFLY_CUDA_KV_SUFFIX_TQ_PARAMS \
+unsigned char* k_dst, \
+unsigned char* v_dst, \
+const unsigned int* block_table, \
+const float* k_src, \
+const float* v_src, \
+const unsigned int* decode_scalars, \
+unsigned int suffix_token_count, \
+unsigned int row_width, \
+unsigned int num_kv_heads, \
+unsigned int head_dim, \
+unsigned int key_row_bytes, \
+unsigned int base_key_row_bytes, \
+unsigned int value_row_bytes, \
+unsigned int fallback_total_token_count, \
+unsigned int block_count, \
+unsigned int page_size_tokens, \
+unsigned int format, \
+unsigned int value_format, \
+unsigned int physical_token_capacity
+
+#define ANTFLY_CUDA_Q8_QUANT_ARGMAX_PARAMS \
+float* partial_values, \
+unsigned int* partial_indices, \
+const unsigned char* input_q8_1, \
+const unsigned char* weight, \
+const int* suppress_token_ids, \
+unsigned int rows, \
+unsigned int in_dim, \
+unsigned int out_dim, \
+unsigned int suppress_count
+
+#define ANTFLY_CUDA_TRAIN_ADAMW_PARAMS \
+float* weight, \
+const float* grad, \
+float* m, \
+float* v, \
+unsigned int count, \
+float lr, \
+float beta1, \
+float beta2, \
+float eps, \
+float weight_decay, \
+float bias_correction1, \
+float bias_correction2, \
+float grad_scale
+
+#define ANTFLY_CUDA_LAYER_NORM_BACKWARD_PARAMS \
+float* output, \
+const float* input, \
+const float* gamma, \
+const float* d_y, \
+unsigned int rows, \
+unsigned int dim, \
+float eps
+
+#define ANTFLY_CUDA_PRIMITIVE_SOFTMAX_PARAMS \
+float* output, \
+const float* input, \
+unsigned int count, \
+unsigned int last_dim, \
+unsigned int log_softmax
+
+#define ANTFLY_CUDA_GLINER_BOUNDARY_PARAMS \
+    const float* q, \
+    const float* k, \
+    const float* v, \
+    const float* q_r, \
+    const float* k_r, \
+    const float* bucket_values, \
+    const float* mask_values, \
+    const float* unused7, \
+    const float* unused8, \
+    const float* unused9, \
+    float* dst, \
+    Gliner25BoundaryParams p, \
+    unsigned int work_items

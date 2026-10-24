@@ -8262,23 +8262,23 @@ ANTFLY_FLASH_REFERENCE_KERNEL(
 #undef ANTFLY_FLASH_NAMESPACE
 // quant-kernel-codegen:end generated CUDA attention kernels
 
-extern "C" __global__ void termite_kv_write_suffix_decode_scalars_f32(
-    float* k_dst,
-    float* v_dst,
-    const float* k_src,
-    const float* v_src,
-    const unsigned int* decode_scalars,
-    unsigned int suffix_token_count,
-    unsigned int row_width,
-    unsigned int fallback_total_token_count
-) {
+// Read the device count during execution, including each graph replay.
+__device__ __forceinline__ bool termite_kv_suffix_start(const unsigned int* decode_scalars,
+    unsigned int suffix_token_count, unsigned int fallback_total_token_count,
+    unsigned int& token_start) {
+    unsigned int total_token_count = fallback_total_token_count;
+    if (decode_scalars != 0) total_token_count = decode_scalars[2];
+    if (total_token_count < suffix_token_count) return false;
+    token_start = total_token_count - suffix_token_count;
+    return true;
+}
+
+extern "C" __global__ void termite_kv_write_suffix_decode_scalars_f32(ANTFLY_CUDA_KV_SUFFIX_DENSE_PARAMS) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int total = suffix_token_count * row_width;
     if (idx >= total || suffix_token_count == 0u || row_width == 0u) return;
-    unsigned int total_token_count = fallback_total_token_count;
-    if (decode_scalars != 0) total_token_count = decode_scalars[2];
-    if (total_token_count < suffix_token_count) return;
-    unsigned int token_start = total_token_count - suffix_token_count;
+    unsigned int token_start;
+    if (!termite_kv_suffix_start(decode_scalars, suffix_token_count, fallback_total_token_count, token_start)) return;
     unsigned int dst_idx = token_start * row_width + idx;
     k_dst[dst_idx] = k_src[idx];
     v_dst[dst_idx] = v_src[idx];
@@ -8529,33 +8529,11 @@ __device__ __forceinline__ float termite_tq_value_at(
     return 0.0f;
 }
 
-extern "C" __global__ void termite_kv_write_suffix_turboquant_f32(
-    unsigned char* k_dst,
-    unsigned char* v_dst,
-    const unsigned int* block_table,
-    const float* k_src,
-    const float* v_src,
-    const unsigned int* decode_scalars,
-    unsigned int suffix_token_count,
-    unsigned int row_width,
-    unsigned int num_kv_heads,
-    unsigned int head_dim,
-    unsigned int key_row_bytes,
-    unsigned int base_key_row_bytes,
-    unsigned int value_row_bytes,
-    unsigned int fallback_total_token_count,
-    unsigned int block_count,
-    unsigned int page_size_tokens,
-    unsigned int format,
-    unsigned int value_format,
-    unsigned int physical_token_capacity
-) {
+extern "C" __global__ void termite_kv_write_suffix_turboquant_f32(ANTFLY_CUDA_KV_SUFFIX_TQ_PARAMS) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (suffix_token_count == 0u || row_width == 0u || key_row_bytes == 0u || base_key_row_bytes == 0u || value_row_bytes == 0u) return;
-    unsigned int total_token_count = fallback_total_token_count;
-    if (decode_scalars != 0) total_token_count = decode_scalars[2];
-    if (total_token_count < suffix_token_count) return;
-    unsigned int token_start = total_token_count - suffix_token_count;
+    unsigned int token_start;
+    if (!termite_kv_suffix_start(decode_scalars, suffix_token_count, fallback_total_token_count, token_start)) return;
 
     unsigned int key_total = suffix_token_count * key_row_bytes;
     if (idx < key_total) {
@@ -9935,31 +9913,10 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_mma_m32_f32(
     }
 }
 
-extern "C" __global__ void termite_gqa_attention_decode_turboquant_split_stage1_f32(
-    float* partial_acc,
-    float* partial_meta,
-    const float* q,
-    const unsigned char* k,
-    const unsigned char* v,
-    const unsigned int* block_table,
-    unsigned int kv_seq_len,
-    unsigned int num_heads,
-    unsigned int num_kv_heads,
-    unsigned int head_dim,
-    unsigned int query_position_offset,
-    unsigned int kv_position_offset,
-    unsigned int sliding_window,
-    unsigned int key_row_bytes,
-    unsigned int value_row_bytes,
-    unsigned int block_count,
-    unsigned int page_size_tokens,
-    unsigned int format,
-    unsigned int value_format,
-    unsigned int physical_token_capacity,
-    const unsigned int* decode_scalars,
-    unsigned int chunk_size,
-    unsigned int chunk_count
-) {
+// The online update and split publication are one schedule; the identity
+// specialization keeps its direct mapping and fixed codecs at compile time.
+template<bool Identity>
+__device__ __forceinline__ void termite_tq_split_stage1_impl(ANTFLY_CUDA_TQ_SPLIT_STAGE1_PARAMS) {
     if (decode_scalars != 0) {
         kv_position_offset = decode_scalars[4];
         query_position_offset = decode_scalars[1];
@@ -9975,7 +9932,7 @@ extern "C" __global__ void termite_gqa_attention_decode_turboquant_split_stage1_
     unsigned int lane = threadIdx.x;
     unsigned int head = blockIdx.x;
     unsigned int chunk = blockIdx.y;
-    if ((format != 0u && format != 2u) ||
+    if ((!Identity && format != 0u && format != 2u) ||
         head >= num_heads ||
         chunk >= chunk_count ||
         head_dim > 512u ||
@@ -10033,13 +9990,13 @@ extern "C" __global__ void termite_gqa_attention_decode_turboquant_split_stage1_
 
     float acc = 0.0f;
     for (unsigned int ki = chunk_start; ki < chunk_end; ++ki) {
-        unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);
-        bool valid = physical_token != 0xffffffffu;
+        unsigned int physical_token = Identity ? ki : termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);
+        bool valid = Identity ? ki < physical_token_capacity : physical_token != 0xffffffffu;
         const unsigned char* k_row = valid ? k + physical_token * key_row_bytes : k;
         float partial = 0.0f;
         if (valid && lane < head_dim) {
             unsigned int value_index = kv_head * head_dim + lane;
-            float key_value = format == 0u
+            float key_value = Identity || format == 0u
                 ? termite_tq_decode_polar4_at(k_row, value_index)
                 : termite_tq_f16_value(k_row, value_index);
             partial = q[q_base + lane] * key_value;
@@ -10063,7 +10020,7 @@ extern "C" __global__ void termite_gqa_attention_decode_turboquant_split_stage1_
             acc *= shared_alpha;
             if (valid) {
                 const unsigned char* v_row = v + physical_token * value_row_bytes;
-                float value = termite_tq_value_at(v_row, kv_head, lane, head_dim, value_format);
+                float value = Identity ? termite_tq_value_int8_per_head(v_row, kv_head, lane, head_dim) : termite_tq_value_at(v_row, kv_head, lane, head_dim, value_format);
                 acc += shared_beta * value;
             }
         }
@@ -10077,148 +10034,12 @@ extern "C" __global__ void termite_gqa_attention_decode_turboquant_split_stage1_
     }
 }
 
-extern "C" __global__ void termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32(
-    float* partial_acc,
-    float* partial_meta,
-    const float* q,
-    const unsigned char* k,
-    const unsigned char* v,
-    const unsigned int* block_table,
-    unsigned int kv_seq_len,
-    unsigned int num_heads,
-    unsigned int num_kv_heads,
-    unsigned int head_dim,
-    unsigned int query_position_offset,
-    unsigned int kv_position_offset,
-    unsigned int sliding_window,
-    unsigned int key_row_bytes,
-    unsigned int value_row_bytes,
-    unsigned int block_count,
-    unsigned int page_size_tokens,
-    unsigned int format,
-    unsigned int value_format,
-    unsigned int physical_token_capacity,
-    const unsigned int* decode_scalars,
-    unsigned int chunk_size,
-    unsigned int chunk_count
-) {
-    if (decode_scalars != 0) {
-        kv_position_offset = decode_scalars[4];
-        query_position_offset = decode_scalars[1];
-        kv_seq_len = decode_scalars[2];
-    }
+extern "C" __global__ void termite_gqa_attention_decode_turboquant_split_stage1_f32(ANTFLY_CUDA_TQ_SPLIT_STAGE1_PARAMS) {
+    termite_tq_split_stage1_impl<false >(partial_acc, partial_meta, q, k, v, block_table, kv_seq_len, num_heads, num_kv_heads, head_dim, query_position_offset, kv_position_offset, sliding_window, key_row_bytes, value_row_bytes, block_count, page_size_tokens, format, value_format, physical_token_capacity, decode_scalars, chunk_size, chunk_count);
+}
 
-    const float neg_inf = -3.402823466e+38f;
-    __shared__ float warp_sums[16];
-    __shared__ float shared_max_score;
-    __shared__ float shared_denom;
-    __shared__ float shared_alpha;
-    __shared__ float shared_beta;
-    unsigned int lane = threadIdx.x;
-    unsigned int head = blockIdx.x;
-    unsigned int chunk = blockIdx.y;
-    if (head >= num_heads ||
-        chunk >= chunk_count ||
-        head_dim > 512u ||
-        (head_dim & 31u) != 0u ||
-        blockDim.x < head_dim ||
-        num_kv_heads == 0u ||
-        (num_heads % num_kv_heads) != 0u ||
-        key_row_bytes == 0u ||
-        value_row_bytes == 0u ||
-        chunk_size == 0u) return;
-
-    unsigned int chunk_start = chunk * chunk_size;
-    if (chunk_start >= kv_seq_len) return;
-    unsigned int chunk_end = chunk_start + chunk_size;
-
-    unsigned int key_start = 0u;
-    unsigned int key_end = 0u;
-    unsigned int query_pos = query_position_offset;
-    if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
-        unsigned int visible = query_pos - kv_position_offset + 1u;
-        key_end = visible < kv_seq_len ? visible : kv_seq_len;
-        if (sliding_window != 0u) {
-            unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
-            if (window_start_abs > kv_position_offset) {
-                key_start = window_start_abs - kv_position_offset;
-                if (key_start > key_end) key_start = key_end;
-            }
-        }
-    }
-
-    if (chunk_start < key_start) chunk_start = key_start;
-    if (chunk_end > key_end) chunk_end = key_end;
-
-    unsigned int partial_index = head * chunk_count + chunk;
-    float* acc_out = partial_acc + partial_index * head_dim;
-    float* meta_out = partial_meta + partial_index * 2u;
-    if (chunk_start >= chunk_end) {
-        if (lane < head_dim) acc_out[lane] = 0.0f;
-        if (lane == 0u) {
-            meta_out[0] = neg_inf;
-            meta_out[1] = 0.0f;
-        }
-        return;
-    }
-
-    unsigned int heads_per_group = num_heads / num_kv_heads;
-    unsigned int kv_head = head / heads_per_group;
-    unsigned int q_base = head * head_dim;
-    float scale = rsqrtf((float)head_dim);
-    if (lane == 0u) {
-        shared_max_score = neg_inf;
-        shared_denom = 0.0f;
-    }
-    __syncthreads();
-
-    float acc = 0.0f;
-    for (unsigned int ki = chunk_start; ki < chunk_end; ++ki) {
-        bool valid = ki < physical_token_capacity;
-        const unsigned char* k_row = valid ? k + ki * key_row_bytes : k;
-        float partial = 0.0f;
-        if (valid && lane < head_dim) {
-            unsigned int value_index = kv_head * head_dim + lane;
-            float key_value = termite_tq_decode_polar4_at(k_row, value_index);
-            partial = q[q_base + lane] * key_value;
-        }
-        float dot = termite_block_reduce_sum_f32(partial, warp_sums);
-        if (lane == 0u) {
-            if (valid) {
-                float score = dot * scale;
-                float next_max = fmaxf(shared_max_score, score);
-                shared_alpha = expf(shared_max_score - next_max);
-                shared_beta = expf(score - next_max);
-                shared_denom = shared_denom * shared_alpha + shared_beta;
-                shared_max_score = next_max;
-            } else {
-                shared_alpha = 1.0f;
-                shared_beta = 0.0f;
-            }
-        }
-        __syncthreads();
-        if (lane < head_dim) {
-            acc *= shared_alpha;
-            if (valid) {
-                const unsigned char* v_row = v + ki * value_row_bytes;
-                float value = termite_tq_value_int8_per_head(v_row, kv_head, lane, head_dim);
-                acc += shared_beta * value;
-            }
-        }
-        __syncthreads();
-    }
-
-    if (lane < head_dim) acc_out[lane] = acc;
-    if (lane == 0u) {
-        meta_out[0] = shared_max_score;
-        meta_out[1] = shared_denom;
-    }
-
-    (void)block_table;
-    (void)block_count;
-    (void)page_size_tokens;
-    (void)format;
-    (void)value_format;
+extern "C" __global__ void termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32(ANTFLY_CUDA_TQ_SPLIT_STAGE1_PARAMS) {
+    termite_tq_split_stage1_impl<true >(partial_acc, partial_meta, q, k, v, block_table, kv_seq_len, num_heads, num_kv_heads, head_dim, query_position_offset, kv_position_offset, sliding_window, key_row_bytes, value_row_bytes, block_count, page_size_tokens, format, value_format, physical_token_capacity, decode_scalars, chunk_size, chunk_count);
 }
 
 extern "C" __global__ void termite_gqa_attention_decode_turboquant_split_stage2_f32(
@@ -11767,26 +11588,16 @@ extern "C" __global__ void termite_linear_q4_0_f32_tile8(ANTFLY_CUDA_QUANT_LINEA
 
 // Keep activation in the exported epilogue: factoring it into the shared
 // dot helper changes NVCC libdevice inlining and raises SM89/SM90 register use.
-extern "C" __global__ void termite_linear_q4_0_activation_slice_last_dim_f32_tile4(
-    float* dst,
-    const float* input,
-    const unsigned char* weight,
-    const float* source,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim,
-    unsigned int source_cols,
-    unsigned int source_start,
-    unsigned int activation
+// Only the matching dot traversal is shared. Activation stays in the exported
+// epilogue to preserve libdevice inlining and architecture register budgets.
+template <unsigned int WARPS>
+__device__ __forceinline__ void termite_q4_0_activation_slice_partials(
+    const float* input, const unsigned char* weight,
+    unsigned int in_dim, unsigned int out_dim, unsigned int row,
+    unsigned int col_tile, unsigned int tid, unsigned int lane, unsigned int warp,
+    float (&warp_partial)[4][WARPS]
 ) {
-    unsigned int col_tile = blockIdx.x * 4u;
-    unsigned int row = blockIdx.y;
-    if (row >= rows) return;
-    unsigned int tid = threadIdx.x;
-    unsigned int lane = tid & 31u;
-    unsigned int warp = tid >> 5;
     unsigned int row_blocks = in_dim / 32u;
-    __shared__ float warp_partial[4][8];
     float acc[4];
     #pragma unroll
     for (unsigned int c = 0; c < 4u; ++c) acc[c] = 0.0f;
@@ -11810,8 +11621,30 @@ extern "C" __global__ void termite_linear_q4_0_activation_slice_last_dim_f32_til
     #pragma unroll
     for (unsigned int c = 0; c < 4u; ++c) {
         float sum = termite_warp_reduce_sum(acc[c]);
-        if (lane == 0u) warp_partial[c][warp] = sum;
+        if (lane == 0u && (WARPS == 8u || warp < WARPS)) warp_partial[c][warp] = sum;
     }
+}
+
+extern "C" __global__ void termite_linear_q4_0_activation_slice_last_dim_f32_tile4(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    const float* source,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int source_cols,
+    unsigned int source_start,
+    unsigned int activation
+) {
+    unsigned int col_tile = blockIdx.x * 4u;
+    unsigned int row = blockIdx.y;
+    if (row >= rows) return;
+    unsigned int tid = threadIdx.x;
+    unsigned int lane = tid & 31u;
+    unsigned int warp = tid >> 5;
+    __shared__ float warp_partial[4][8];
+    termite_q4_0_activation_slice_partials<8u>(input, weight, in_dim, out_dim, row, col_tile, tid, lane, warp, warp_partial);
     __syncthreads();
     if (tid == 0u) {
         #pragma unroll
@@ -11847,33 +11680,8 @@ extern "C" __global__ void termite_linear_q4_0_activation_slice_last_dim_f32_til
     unsigned int tid = threadIdx.x;
     unsigned int lane = tid & 31u;
     unsigned int warp = tid >> 5;
-    unsigned int row_blocks = in_dim / 32u;
     __shared__ float warp_partial[4][4];
-    float acc[4];
-    #pragma unroll
-    for (unsigned int c = 0; c < 4u; ++c) acc[c] = 0.0f;
-
-    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
-        float x = input[row * in_dim + i];
-        unsigned int block = i / 32u;
-        unsigned int lane = i - block * 32u;
-        unsigned int q_offset = 2u + (lane & 15u);
-        unsigned int high_nibble = lane >> 4u;
-        #pragma unroll
-        for (unsigned int c = 0; c < 4u; ++c) {
-            unsigned int col = col_tile + c;
-            if (col < out_dim) {
-                const unsigned char* bp = weight + (col * row_blocks + block) * 18u;
-                acc[c] += x * termite_q4_0_value_nibble(bp, q_offset, high_nibble);
-            }
-        }
-    }
-
-    #pragma unroll
-    for (unsigned int c = 0; c < 4u; ++c) {
-        float sum = termite_warp_reduce_sum(acc[c]);
-        if (lane == 0u && warp < 4u) warp_partial[c][warp] = sum;
-    }
+    termite_q4_0_activation_slice_partials<4u>(input, weight, in_dim, out_dim, row, col_tile, tid, lane, warp, warp_partial);
     __syncthreads();
     if (tid == 0u) {
         #pragma unroll
@@ -15127,17 +14935,7 @@ extern "C" __global__ void termite_linear_q6_k_argmax_rows_stage1_tile16(ANTFLY_
     termite_k_projection_argmax_impl<true, 16u>(partial_values, partial_indices, input, weight, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
 }
 
-extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8(
-    float* partial_values,
-    unsigned int* partial_indices,
-    const unsigned char* input_q8_1,
-    const unsigned char* weight,
-    const int* suppress_token_ids,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim,
-    unsigned int suppress_count
-) {
+extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8(ANTFLY_CUDA_Q8_QUANT_ARGMAX_PARAMS) {
     const unsigned int cols = 8u;
     unsigned int col_tiles = (out_dim + cols - 1u) / cols;
     unsigned int global_tile = blockIdx.x;
@@ -15318,17 +15116,7 @@ __device__ __forceinline__ int termite_q6k_q8_1_dot16_exact_2816(
 // lets ptxas hoist Q6_K address arithmetic and avoids the generic kernel's
 // dynamic shape/suppression branches. Six warps cover the 176 useful
 // block/sub-block tasks without an inactive tail warp.
-extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b(
-    float* partial_values,
-    unsigned int* partial_indices,
-    const unsigned char* input_q8_1,
-    const unsigned char* weight,
-    const int* suppress_token_ids,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim,
-    unsigned int suppress_count
-) {
+extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b(ANTFLY_CUDA_Q8_QUANT_ARGMAX_PARAMS) {
     (void)suppress_token_ids;
     if (rows != 1u || in_dim != 2816u || out_dim == 0u || (out_dim & 7u) != 0u ||
         suppress_count != 0u || blockDim.x != 192u) return;
@@ -15396,17 +15184,7 @@ extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b
     partial_indices[global_tile] = best_index;
 }
 
-extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b(
-    float* partial_values,
-    unsigned int* partial_indices,
-    const unsigned char* input_q8_1,
-    const unsigned char* weight,
-    const int* suppress_token_ids,
-    unsigned int rows,
-    unsigned int in_dim,
-    unsigned int out_dim,
-    unsigned int suppress_count
-) {
+extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b(ANTFLY_CUDA_Q8_QUANT_ARGMAX_PARAMS) {
     (void)suppress_token_ids;
     (void)rows;
     (void)in_dim;
@@ -15858,8 +15636,11 @@ extern "C" __global__ void termite_linear_q8_0_qkv_nobias_f32_tile4(ANTFLY_CUDA_
     }
 }
 
-extern "C" __global__ void termite_linear_q4_0_qkv_nobias_f32_tile4(ANTFLY_CUDA_QUANT_QKV_PARAMS) {
-    const unsigned int cols = 4u;
+// F32 QKV variants select the projection here, then use the existing ordinary
+// Q4_0 dot schedule with their exact column and warp extents.
+template <unsigned int COLS, unsigned int WARPS>
+__device__ __forceinline__ void termite_q4_0_qkv_projection_impl(ANTFLY_CUDA_QUANT_QKV_PARAMS) {
+    const unsigned int cols = COLS;
     unsigned int q_tiles = (q_out_dim + cols - 1u) / cols;
     unsigned int kv_tiles = (kv_out_dim + cols - 1u) / cols;
     unsigned int tiles_per_row = q_tiles + kv_tiles * 2u;
@@ -15889,89 +15670,15 @@ extern "C" __global__ void termite_linear_q4_0_qkv_nobias_f32_tile4(ANTFLY_CUDA_
         col_tile = (tile - q_tiles - kv_tiles) * cols;
     }
 
-    unsigned int tid = threadIdx.x;
-    unsigned int lane = tid & 31u;
-    unsigned int warp = tid >> 5;
-    unsigned int row_blocks = in_dim / 32u;
-    __shared__ float warp_partial[4][8];
-    float acc[4];
-    #pragma unroll
-    for (unsigned int c = 0; c < 4u; ++c) acc[c] = 0.0f;
+    termite_q4_0_tile_cols_at<COLS, WARPS>(dst, input, weight, rows, in_dim, out_dim, row, col_tile);
+}
 
-    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
-        float x = input[row * in_dim + i];
-        unsigned int block = i / 32u;
-        unsigned int lane = i - block * 32u;
-        unsigned int q_offset = 2u + (lane & 15u);
-        unsigned int high_nibble = lane >> 4u;
-        #pragma unroll
-        for (unsigned int c = 0; c < 4u; ++c) {
-            unsigned int col = col_tile + c;
-            if (col < out_dim) {
-                const unsigned char* bp = weight + (col * row_blocks + block) * 18u;
-                acc[c] += x * termite_q4_0_value_nibble(bp, q_offset, high_nibble);
-            }
-        }
-    }
-    termite_store_q4_0_cols_warp_sum_warps<4u, 8u, false>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
+extern "C" __global__ void termite_linear_q4_0_qkv_nobias_f32_tile4(ANTFLY_CUDA_QUANT_QKV_PARAMS) {
+    termite_q4_0_qkv_projection_impl<4u, 8u>(dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
 }
 
 extern "C" __global__ void termite_linear_q4_0_qkv_nobias_f32_tile4_w4(ANTFLY_CUDA_QUANT_QKV_PARAMS) {
-    const unsigned int cols = 4u;
-    unsigned int q_tiles = (q_out_dim + cols - 1u) / cols;
-    unsigned int kv_tiles = (kv_out_dim + cols - 1u) / cols;
-    unsigned int tiles_per_row = q_tiles + kv_tiles * 2u;
-    unsigned int global = blockIdx.x;
-    unsigned int row = global / tiles_per_row;
-    if (row >= rows) return;
-    unsigned int tile = global - row * tiles_per_row;
-
-    const unsigned char* weight;
-    float* dst;
-    unsigned int out_dim;
-    unsigned int col_tile;
-    if (tile < q_tiles) {
-        weight = weight_q;
-        dst = dst_q;
-        out_dim = q_out_dim;
-        col_tile = tile * cols;
-    } else if (tile < q_tiles + kv_tiles) {
-        weight = weight_k;
-        dst = dst_k;
-        out_dim = kv_out_dim;
-        col_tile = (tile - q_tiles) * cols;
-    } else {
-        weight = weight_v;
-        dst = dst_v;
-        out_dim = kv_out_dim;
-        col_tile = (tile - q_tiles - kv_tiles) * cols;
-    }
-
-    unsigned int tid = threadIdx.x;
-    unsigned int lane = tid & 31u;
-    unsigned int warp = tid >> 5;
-    unsigned int row_blocks = in_dim / 32u;
-    __shared__ float warp_partial[4][4];
-    float acc[4];
-    #pragma unroll
-    for (unsigned int c = 0; c < 4u; ++c) acc[c] = 0.0f;
-
-    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
-        float x = input[row * in_dim + i];
-        unsigned int block = i / 32u;
-        unsigned int lane = i - block * 32u;
-        unsigned int q_offset = 2u + (lane & 15u);
-        unsigned int high_nibble = lane >> 4u;
-        #pragma unroll
-        for (unsigned int c = 0; c < 4u; ++c) {
-            unsigned int col = col_tile + c;
-            if (col < out_dim) {
-                const unsigned char* bp = weight + (col * row_blocks + block) * 18u;
-                acc[c] += x * termite_q4_0_value_nibble(bp, q_offset, high_nibble);
-            }
-        }
-    }
-    termite_store_q4_0_cols_warp_sum_warps<4u, 4u>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
+    termite_q4_0_qkv_projection_impl<4u, 4u>(dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
 }
 
 template<unsigned int Columns>
@@ -16259,61 +15966,7 @@ extern "C" __global__ void termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8(ANTF
 }
 
 extern "C" __global__ void termite_linear_q4_0_qkv_nobias_f32_tile8(ANTFLY_CUDA_QUANT_QKV_PARAMS) {
-    const unsigned int cols = 8u;
-    unsigned int q_tiles = (q_out_dim + cols - 1u) / cols;
-    unsigned int kv_tiles = (kv_out_dim + cols - 1u) / cols;
-    unsigned int tiles_per_row = q_tiles + kv_tiles * 2u;
-    unsigned int global = blockIdx.x;
-    unsigned int row = global / tiles_per_row;
-    if (row >= rows) return;
-    unsigned int tile = global - row * tiles_per_row;
-
-    const unsigned char* weight;
-    float* dst;
-    unsigned int out_dim;
-    unsigned int col_tile;
-    if (tile < q_tiles) {
-        weight = weight_q;
-        dst = dst_q;
-        out_dim = q_out_dim;
-        col_tile = tile * cols;
-    } else if (tile < q_tiles + kv_tiles) {
-        weight = weight_k;
-        dst = dst_k;
-        out_dim = kv_out_dim;
-        col_tile = (tile - q_tiles) * cols;
-    } else {
-        weight = weight_v;
-        dst = dst_v;
-        out_dim = kv_out_dim;
-        col_tile = (tile - q_tiles - kv_tiles) * cols;
-    }
-
-    unsigned int tid = threadIdx.x;
-    unsigned int lane = tid & 31u;
-    unsigned int warp = tid >> 5;
-    unsigned int row_blocks = in_dim / 32u;
-    __shared__ float warp_partial[8][8];
-    float acc[8];
-    #pragma unroll
-    for (unsigned int c = 0; c < 8u; ++c) acc[c] = 0.0f;
-
-    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
-        float x = input[row * in_dim + i];
-        unsigned int block = i / 32u;
-        unsigned int lane = i - block * 32u;
-        unsigned int q_offset = 2u + (lane & 15u);
-        unsigned int high_nibble = lane >> 4u;
-        #pragma unroll
-        for (unsigned int c = 0; c < 8u; ++c) {
-            unsigned int col = col_tile + c;
-            if (col < out_dim) {
-                const unsigned char* bp = weight + (col * row_blocks + block) * 18u;
-                acc[c] += x * termite_q4_0_value_nibble(bp, q_offset, high_nibble);
-            }
-        }
-    }
-    termite_store_q4_0_cols_warp_sum_warps<8u, 8u, false>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
+    termite_q4_0_qkv_projection_impl<8u, 8u>(dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
 }
 
 extern "C" __global__ void termite_linear_q4_k_qkv_nobias_f32_tiled(ANTFLY_CUDA_QUANT_QKV_PARAMS) {
@@ -16762,21 +16415,7 @@ extern "C" __global__ void termite_training_accumulate_f32(
     accum[i] = first ? value : accum[i] + value;
 }
 
-extern "C" __global__ void termite_training_adamw_f32(
-    float* weight,
-    const float* grad,
-    float* m,
-    float* v,
-    unsigned int count,
-    float lr,
-    float beta1,
-    float beta2,
-    float eps,
-    float weight_decay,
-    float bias_correction1,
-    float bias_correction2,
-    float grad_scale
-) {
+extern "C" __global__ void termite_training_adamw_f32(ANTFLY_CUDA_TRAIN_ADAMW_PARAMS) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     float g = grad[i] * grad_scale;
@@ -16979,15 +16618,7 @@ extern "C" __global__ void termite_primitive_broadcast_f32(
     output[out_idx] = input[input_flat];
 }
 
-extern "C" __global__ void termite_layer_norm_backward_f32(
-    float* output,
-    const float* input,
-    const float* gamma,
-    const float* d_y,
-    unsigned int rows,
-    unsigned int dim,
-    float eps
-) {
+extern "C" __global__ void termite_layer_norm_backward_f32(ANTFLY_CUDA_LAYER_NORM_BACKWARD_PARAMS) {
     unsigned int row = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int input_count = rows * dim;
     if (row >= rows) return;
@@ -17018,13 +16649,7 @@ extern "C" __global__ void termite_layer_norm_backward_f32(
     }
 }
 
-extern "C" __global__ void termite_primitive_softmax_f32(
-    float* output,
-    const float* input,
-    unsigned int count,
-    unsigned int last_dim,
-    unsigned int log_softmax
-) {
+extern "C" __global__ void termite_primitive_softmax_f32(ANTFLY_CUDA_PRIMITIVE_SOFTMAX_PARAMS) {
     unsigned int row = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int rows = count / last_dim;
     if (row >= rows) return;
@@ -17786,224 +17411,11 @@ extern "C" __global__ void termite_deberta_attention_stream_f16(
 // softmax state, and output value is F32.  The fixed D=64 / S<=256 envelope
 // matches DeBERTa-base and leaves the general fused-F32 implementation as the
 // correctness fallback for all other shapes.
-extern "C" __global__ __launch_bounds__(256) void termite_deberta_attention_tc_f16_m16n32(
-    float* dst,
-    const float* q,
-    const float* k,
-    const float* v,
-    const float* q_r,
-    const float* k_r,
-    const long long* mask,
-    unsigned int batch,
-    unsigned int seq_len,
-    unsigned int num_heads,
-    unsigned int head_dim
-) {
-    constexpr unsigned int kThreads = 256u;
-    constexpr unsigned int kQueryTile = 16u;
-    constexpr unsigned int kKeyTile = 32u;
-    constexpr unsigned int kHeadDim = 64u;
-    constexpr unsigned int kRelTile = kQueryTile + kKeyTile - 1u;
-    constexpr unsigned int kRelPitch = 48u; // WMMA requires a 16-column tail.
-    constexpr float kNegInf = -3.402823466e+38f;
-    if (seq_len == 0u || seq_len > 256u || head_dim != kHeadDim || blockDim.x != kThreads) return;
 
-    const unsigned int tid = threadIdx.x;
-    const unsigned int lane = tid & 31u;
-    const unsigned int warp = tid >> 5u;
-    const unsigned int query_tiles = (seq_len + kQueryTile - 1u) / kQueryTile;
-    const unsigned int block = blockIdx.x;
-    const unsigned int query_tile = block % query_tiles;
-    const unsigned int matrix = block / query_tiles;
-    const unsigned int head = matrix % num_heads;
-    const unsigned int b = matrix / num_heads;
-    if (b >= batch) return;
 
-    const unsigned int hidden = num_heads * kHeadDim;
-    const unsigned int head_off = head * kHeadDim;
-    const unsigned int query_start = query_tile * kQueryTile;
-    const float scale = rsqrtf((float)(kHeadDim * 3u));
-
-    __shared__ __align__(16) half q_tile[kQueryTile * kHeadDim];
-    // K is transposed so it is directly consumable as a row-major WMMA B.
-    __shared__ __align__(16) half k_tile[kHeadDim * kKeyTile];
-    // The p2c term uses K as a WMMA A operand, so retain its native [N, D]
-    // layout as well.  Both layouts are CTA-local and replace the old global
-    // head-packing buffer.
-    __shared__ __align__(16) half k_rows[kKeyTile * kHeadDim];
-    __shared__ __align__(16) half v_tile[kKeyTile * kHeadDim];
-    // Relative tensors are [D, R] matrices. R is padded to 48 to retain
-    // WMMA's 16-wide fragment contract without special tail code.
-    __shared__ __align__(16) half qr_tile[kHeadDim * kRelPitch];
-    __shared__ __align__(16) half kr_tile[kHeadDim * kRelPitch];
-    __shared__ __align__(16) float scores[kQueryTile * kKeyTile];
-    __shared__ __align__(16) float c2p_scores[kQueryTile * kRelPitch];
-    __shared__ __align__(16) float p2c_scores[kKeyTile * kRelPitch];
-    __shared__ __align__(16) half probabilities[kQueryTile * kKeyTile];
-    __shared__ __align__(16) float output[kQueryTile * kHeadDim];
-    __shared__ float running_max[kQueryTile];
-    __shared__ float running_sum[kQueryTile];
-    __shared__ float row_alpha[kQueryTile];
-
-    for (unsigned int index = tid; index < kQueryTile * kHeadDim; index += kThreads) {
-        const unsigned int row = index / kHeadDim;
-        const unsigned int d = index - row * kHeadDim;
-        const unsigned int qi = query_start + row;
-        q_tile[index] = qi < seq_len ? __float2half_rn(q[(b * seq_len + qi) * hidden + head_off + d]) : __float2half_rn(0.0f);
-        output[index] = 0.0f;
-    }
-    if (tid < kQueryTile) {
-        running_max[tid] = kNegInf;
-        running_sum[tid] = 0.0f;
-    }
-    __syncthreads();
-
-    for (unsigned int key_start = 0u; key_start < seq_len; key_start += kKeyTile) {
-        // The relative window spans r=(query_start - key_start) +
-        // [-(N-1), M-1], exactly the values needed by this score tile.
-        const int rel_low = (int)query_start + (int)seq_len - 1 - ((int)key_start + (int)kKeyTile - 1);
-        for (unsigned int index = tid; index < kHeadDim * kKeyTile; index += kThreads) {
-            const unsigned int d = index / kKeyTile;
-            const unsigned int n = index - d * kKeyTile;
-            const unsigned int ki = key_start + n;
-            const float kval = ki < seq_len ? k[(b * seq_len + ki) * hidden + head_off + d] : 0.0f;
-            k_tile[index] = __float2half_rn(kval);
-            k_rows[n * kHeadDim + d] = __float2half_rn(kval);
-            v_tile[n * kHeadDim + d] = __float2half_rn(ki < seq_len ? v[(b * seq_len + ki) * hidden + head_off + d] : 0.0f);
-        }
-        for (unsigned int index = tid; index < kHeadDim * kRelPitch; index += kThreads) {
-            const unsigned int d = index / kRelPitch;
-            const unsigned int r = index - d * kRelPitch;
-            const int rel = rel_low + (int)r;
-            const float qrv = r < kRelTile && rel >= 0 && rel < (int)(seq_len * 2u - 1u) ? q_r[(unsigned int)rel * hidden + head_off + d] : 0.0f;
-            const float krv = r < kRelTile && rel >= 0 && rel < (int)(seq_len * 2u - 1u) ? k_r[(unsigned int)rel * hidden + head_off + d] : 0.0f;
-            qr_tile[index] = __float2half_rn(qrv);
-            kr_tile[index] = __float2half_rn(krv);
-        }
-        __syncthreads();
-
-        // Q*K^T: two 16x16 fragments, one per warp.
-        if (warp < 2u) {
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-            wmma::fill_fragment(acc, 0.0f);
-            #pragma unroll
-            for (unsigned int d0 = 0u; d0 < kHeadDim; d0 += 16u) {
-                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-                wmma::load_matrix_sync(a_frag, q_tile + d0, kHeadDim);
-                wmma::load_matrix_sync(b_frag, k_tile + d0 * kKeyTile + warp * 16u, kKeyTile);
-                wmma::mma_sync(acc, a_frag, b_frag, acc);
-            }
-            wmma::store_matrix_sync(scores + warp * 16u, acc, kKeyTile, wmma::mem_row_major);
-        }
-
-        // Q*Kr^T: three compact relative columns. Warp 2 handles chunks 0/2
-        // and warp 3 handles chunk 1, keeping all relative gathers local.
-        if (warp == 2u || warp == 3u) {
-            const unsigned int first_chunk = warp == 2u ? 0u : 1u;
-            for (unsigned int chunk = first_chunk; chunk < 3u; chunk += 2u) {
-                wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-                wmma::fill_fragment(acc, 0.0f);
-                #pragma unroll
-                for (unsigned int d0 = 0u; d0 < kHeadDim; d0 += 16u) {
-                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-                    wmma::load_matrix_sync(a_frag, q_tile + d0, kHeadDim);
-                    wmma::load_matrix_sync(b_frag, kr_tile + d0 * kRelPitch + chunk * 16u, kRelPitch);
-                    wmma::mma_sync(acc, a_frag, b_frag, acc);
-                }
-                wmma::store_matrix_sync(c2p_scores + chunk * 16u, acc, kRelPitch, wmma::mem_row_major);
-            }
-        }
-
-        // K*Qr^T: six compact relative fragments.  The result is indexed by
-        // key row so the p2c diagonal is a simple shared-memory gather.
-        if (warp >= 4u) {
-            for (unsigned int work = warp - 4u; work < 6u; work += 4u) {
-                const unsigned int key_chunk = work / 3u;
-                const unsigned int rel_chunk = work - key_chunk * 3u;
-                wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-                wmma::fill_fragment(acc, 0.0f);
-                #pragma unroll
-                for (unsigned int d0 = 0u; d0 < kHeadDim; d0 += 16u) {
-                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-                    wmma::load_matrix_sync(a_frag, k_rows + (key_chunk * 16u) * kHeadDim + d0, kHeadDim);
-                    wmma::load_matrix_sync(b_frag, qr_tile + d0 * kRelPitch + rel_chunk * 16u, kRelPitch);
-                    wmma::mma_sync(acc, a_frag, b_frag, acc);
-                }
-                wmma::store_matrix_sync(p2c_scores + (key_chunk * 16u) * kRelPitch + rel_chunk * 16u, acc, kRelPitch, wmma::mem_row_major);
-            }
-        }
-        __syncthreads();
-
-        // Eight warps each normalize two query rows.  Scores are kept F32;
-        // only the matrix-A probabilities are narrowed for the P*V MMA.
-        #pragma unroll
-        for (unsigned int sub = 0u; sub < 2u; ++sub) {
-            const unsigned int m = warp * 2u + sub;
-            const unsigned int qi = query_start + m;
-            const unsigned int ki = key_start + lane;
-            float score = kNegInf;
-            if (qi < seq_len && ki < seq_len && mask[b * seq_len + ki] != 0ll) {
-                const unsigned int rel = m + kKeyTile - 1u - lane;
-                score = (scores[m * kKeyTile + lane] + c2p_scores[m * kRelPitch + rel] + p2c_scores[lane * kRelPitch + rel]) * scale;
-            }
-            scores[m * kKeyTile + lane] = score;
-            float tile_max = score;
-            #pragma unroll
-            for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) tile_max = fmaxf(tile_max, __shfl_down_sync(0xffffffffu, tile_max, offset));
-            tile_max = __shfl_sync(0xffffffffu, tile_max, 0u);
-            const float old_max = running_max[m];
-            const float next_max = fmaxf(old_max, tile_max);
-            const float alpha = old_max > kNegInf * 0.5f ? expf(old_max - next_max) : 0.0f;
-            const float beta = score > kNegInf * 0.5f ? expf(score - next_max) : 0.0f;
-            float tile_sum = beta;
-            #pragma unroll
-            for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) tile_sum += __shfl_down_sync(0xffffffffu, tile_sum, offset);
-            tile_sum = __shfl_sync(0xffffffffu, tile_sum, 0u);
-            probabilities[m * kKeyTile + lane] = __float2half_rn(beta);
-            if (lane == 0u) {
-                running_max[m] = next_max;
-                running_sum[m] = running_sum[m] * alpha + tile_sum;
-                row_alpha[m] = alpha;
-            }
-        }
-        __syncthreads();
-
-        for (unsigned int index = tid; index < kQueryTile * kHeadDim; index += kThreads) {
-            output[index] *= row_alpha[index / kHeadDim];
-        }
-        __syncthreads();
-
-        // P*V: four output-D fragments, accumulated into the online F32
-        // output state.  This is the only value path; no probability tensor
-        // ever reaches device memory.
-        if (warp < 4u) {
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-            wmma::load_matrix_sync(acc, output + warp * 16u, kHeadDim, wmma::mem_row_major);
-            #pragma unroll
-            for (unsigned int key_chunk = 0u; key_chunk < 2u; ++key_chunk) {
-                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
-                wmma::load_matrix_sync(p_frag, probabilities + key_chunk * 16u, kKeyTile);
-                wmma::load_matrix_sync(v_frag, v_tile + (key_chunk * 16u) * kHeadDim + warp * 16u, kHeadDim);
-                wmma::mma_sync(acc, p_frag, v_frag, acc);
-            }
-            wmma::store_matrix_sync(output + warp * 16u, acc, kHeadDim, wmma::mem_row_major);
-        }
-        __syncthreads();
-    }
-
-    for (unsigned int index = tid; index < kQueryTile * kHeadDim; index += kThreads) {
-        const unsigned int m = index / kHeadDim;
-        const unsigned int d = index - m * kHeadDim;
-        const unsigned int qi = query_start + m;
-        if (qi < seq_len) {
-            const float denom = running_sum[m];
-            dst[(b * seq_len + qi) * hidden + head_off + d] = denom > 0.0f ? output[index] / denom : 0.0f;
-        }
-    }
+extern "C" __global__ __launch_bounds__(256) void termite_deberta_attention_tc_f16_m16n32(ANTFLY_CUDA_DEBERTA_ATTENTION_PARAMS) {
+    constexpr unsigned int QueryTile = 16u, KeyTile = 32u;
+#include "../kernels/deberta_tc_tiles.cuh"
 }
 
 // Larger-query generated tensor-core DeBERTa prefill schedule.  The M16xN32
@@ -18012,207 +17424,9 @@ extern "C" __global__ __launch_bounds__(256) void termite_deberta_attention_tc_f
 // tensor-core work while halving CTA count and K/V rereads.  Its 42 KiB static
 // shared footprint remains below the portable 48 KiB limit, so it needs no
 // occupancy or shared-memory carveout API special case on SM80+.
-extern "C" __global__ __launch_bounds__(256) void termite_deberta_attention_tc_f16_m32n16(
-    float* dst,
-    const float* q,
-    const float* k,
-    const float* v,
-    const float* q_r,
-    const float* k_r,
-    const long long* mask,
-    unsigned int batch,
-    unsigned int seq_len,
-    unsigned int num_heads,
-    unsigned int head_dim
-) {
-    constexpr unsigned int kThreads = 256u;
-    constexpr unsigned int kQueryTile = 32u;
-    constexpr unsigned int kKeyTile = 16u;
-    constexpr unsigned int kHeadDim = 64u;
-    constexpr unsigned int kRelTile = kQueryTile + kKeyTile - 1u;
-    constexpr unsigned int kRelPitch = 48u;
-    constexpr float kNegInf = -3.402823466e+38f;
-    if (seq_len == 0u || seq_len > 256u || head_dim != kHeadDim || blockDim.x != kThreads) return;
-
-    const unsigned int tid = threadIdx.x;
-    const unsigned int lane = tid & 31u;
-    const unsigned int warp = tid >> 5u;
-    const unsigned int query_tiles = (seq_len + kQueryTile - 1u) / kQueryTile;
-    const unsigned int block = blockIdx.x;
-    const unsigned int query_tile = block % query_tiles;
-    const unsigned int matrix = block / query_tiles;
-    const unsigned int head = matrix % num_heads;
-    const unsigned int b = matrix / num_heads;
-    if (b >= batch) return;
-
-    const unsigned int hidden = num_heads * kHeadDim;
-    const unsigned int head_off = head * kHeadDim;
-    const unsigned int query_start = query_tile * kQueryTile;
-    const float scale = rsqrtf((float)(kHeadDim * 3u));
-
-    __shared__ __align__(16) half q_tile[kQueryTile * kHeadDim];
-    __shared__ __align__(16) half k_tile[kHeadDim * kKeyTile];
-    __shared__ __align__(16) half k_rows[kKeyTile * kHeadDim];
-    __shared__ __align__(16) half v_tile[kKeyTile * kHeadDim];
-    __shared__ __align__(16) half qr_tile[kHeadDim * kRelPitch];
-    __shared__ __align__(16) half kr_tile[kHeadDim * kRelPitch];
-    __shared__ __align__(16) float scores[kQueryTile * kKeyTile];
-    __shared__ __align__(16) float c2p_scores[kQueryTile * kRelPitch];
-    __shared__ __align__(16) float p2c_scores[kKeyTile * kRelPitch];
-    __shared__ __align__(16) half probabilities[kQueryTile * kKeyTile];
-    __shared__ __align__(16) float output[kQueryTile * kHeadDim];
-    __shared__ float running_max[kQueryTile];
-    __shared__ float running_sum[kQueryTile];
-    __shared__ float row_alpha[kQueryTile];
-
-    for (unsigned int index = tid; index < kQueryTile * kHeadDim; index += kThreads) {
-        const unsigned int row = index / kHeadDim;
-        const unsigned int d = index - row * kHeadDim;
-        const unsigned int qi = query_start + row;
-        q_tile[index] = qi < seq_len ? __float2half_rn(q[(b * seq_len + qi) * hidden + head_off + d]) : __float2half_rn(0.0f);
-        output[index] = 0.0f;
-    }
-    if (tid < kQueryTile) {
-        running_max[tid] = kNegInf;
-        running_sum[tid] = 0.0f;
-    }
-    __syncthreads();
-
-    for (unsigned int key_start = 0u; key_start < seq_len; key_start += kKeyTile) {
-        const int rel_low = (int)query_start + (int)seq_len - 1 - ((int)key_start + (int)kKeyTile - 1);
-        for (unsigned int index = tid; index < kHeadDim * kKeyTile; index += kThreads) {
-            const unsigned int d = index / kKeyTile;
-            const unsigned int n = index - d * kKeyTile;
-            const unsigned int ki = key_start + n;
-            const float kval = ki < seq_len ? k[(b * seq_len + ki) * hidden + head_off + d] : 0.0f;
-            k_tile[index] = __float2half_rn(kval);
-            k_rows[n * kHeadDim + d] = __float2half_rn(kval);
-            v_tile[n * kHeadDim + d] = __float2half_rn(ki < seq_len ? v[(b * seq_len + ki) * hidden + head_off + d] : 0.0f);
-        }
-        for (unsigned int index = tid; index < kHeadDim * kRelPitch; index += kThreads) {
-            const unsigned int d = index / kRelPitch;
-            const unsigned int r = index - d * kRelPitch;
-            const int rel = rel_low + (int)r;
-            const float qrv = r < kRelTile && rel >= 0 && rel < (int)(seq_len * 2u - 1u) ? q_r[(unsigned int)rel * hidden + head_off + d] : 0.0f;
-            const float krv = r < kRelTile && rel >= 0 && rel < (int)(seq_len * 2u - 1u) ? k_r[(unsigned int)rel * hidden + head_off + d] : 0.0f;
-            qr_tile[index] = __float2half_rn(qrv);
-            kr_tile[index] = __float2half_rn(krv);
-        }
-        __syncthreads();
-
-        // Q*K^T has two M fragments.  The remaining warps produce the six
-        // M32xR48 content-to-position fragments in parallel.
-        if (warp < 2u) {
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-            wmma::fill_fragment(acc, 0.0f);
-            #pragma unroll
-            for (unsigned int d0 = 0u; d0 < kHeadDim; d0 += 16u) {
-                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-                wmma::load_matrix_sync(a_frag, q_tile + warp * 16u * kHeadDim + d0, kHeadDim);
-                wmma::load_matrix_sync(b_frag, k_tile + d0 * kKeyTile, kKeyTile);
-                wmma::mma_sync(acc, a_frag, b_frag, acc);
-            }
-            wmma::store_matrix_sync(scores + warp * 16u * kKeyTile, acc, kKeyTile, wmma::mem_row_major);
-        }
-        if (warp >= 2u) {
-            const unsigned int work = warp - 2u;
-            const unsigned int query_chunk = work / 3u;
-            const unsigned int rel_chunk = work - query_chunk * 3u;
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-            wmma::fill_fragment(acc, 0.0f);
-            #pragma unroll
-            for (unsigned int d0 = 0u; d0 < kHeadDim; d0 += 16u) {
-                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-                wmma::load_matrix_sync(a_frag, q_tile + query_chunk * 16u * kHeadDim + d0, kHeadDim);
-                wmma::load_matrix_sync(b_frag, kr_tile + d0 * kRelPitch + rel_chunk * 16u, kRelPitch);
-                wmma::mma_sync(acc, a_frag, b_frag, acc);
-            }
-            wmma::store_matrix_sync(c2p_scores + query_chunk * 16u * kRelPitch + rel_chunk * 16u, acc, kRelPitch, wmma::mem_row_major);
-        }
-        __syncthreads();
-
-        // K*Qr^T is M16xR48. It reuses warps after the first score phase.
-        if (warp < 3u) {
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-            wmma::fill_fragment(acc, 0.0f);
-            #pragma unroll
-            for (unsigned int d0 = 0u; d0 < kHeadDim; d0 += 16u) {
-                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-                wmma::load_matrix_sync(a_frag, k_rows + d0, kHeadDim);
-                wmma::load_matrix_sync(b_frag, qr_tile + d0 * kRelPitch + warp * 16u, kRelPitch);
-                wmma::mma_sync(acc, a_frag, b_frag, acc);
-            }
-            wmma::store_matrix_sync(p2c_scores + warp * 16u, acc, kRelPitch, wmma::mem_row_major);
-        }
-        __syncthreads();
-
-        // Two independent 16-lane reductions let every warp update four
-        // query rows while all lanes remain useful on the N=16 score tile.
-        #pragma unroll
-        for (unsigned int group = 0u; group < 2u; ++group) {
-            const unsigned int lane_group = lane >> 4u;
-            const unsigned int m = warp * 4u + group * 2u + lane_group;
-            const unsigned int qi = query_start + m;
-            const unsigned int ki = key_start + (lane & 15u);
-            const unsigned int group_mask = lane_group == 0u ? 0x0000ffffu : 0xffff0000u;
-            float score = kNegInf;
-            if (qi < seq_len && ki < seq_len && mask[b * seq_len + ki] != 0ll) {
-                const unsigned int rel = m + kKeyTile - 1u - (lane & 15u);
-                score = (scores[m * kKeyTile + (lane & 15u)] + c2p_scores[m * kRelPitch + rel] + p2c_scores[(lane & 15u) * kRelPitch + rel]) * scale;
-            }
-            scores[m * kKeyTile + (lane & 15u)] = score;
-            float tile_max = score;
-            #pragma unroll
-            for (unsigned int offset = 8u; offset > 0u; offset >>= 1u) tile_max = fmaxf(tile_max, __shfl_down_sync(group_mask, tile_max, offset));
-            const unsigned int leader = lane_group * 16u;
-            tile_max = __shfl_sync(group_mask, tile_max, leader);
-            const float old_max = running_max[m];
-            const float next_max = fmaxf(old_max, tile_max);
-            const float alpha = old_max > kNegInf * 0.5f ? expf(old_max - next_max) : 0.0f;
-            const float beta = score > kNegInf * 0.5f ? expf(score - next_max) : 0.0f;
-            float tile_sum = beta;
-            #pragma unroll
-            for (unsigned int offset = 8u; offset > 0u; offset >>= 1u) tile_sum += __shfl_down_sync(group_mask, tile_sum, offset);
-            tile_sum = __shfl_sync(group_mask, tile_sum, leader);
-            probabilities[m * kKeyTile + (lane & 15u)] = __float2half_rn(beta);
-            if ((lane & 15u) == 0u) {
-                running_max[m] = next_max;
-                running_sum[m] = running_sum[m] * alpha + tile_sum;
-                row_alpha[m] = alpha;
-            }
-        }
-        __syncthreads();
-
-        for (unsigned int index = tid; index < kQueryTile * kHeadDim; index += kThreads) output[index] *= row_alpha[index / kHeadDim];
-        __syncthreads();
-
-        // Eight warps cover the two M fragments and four output-D fragments
-        // of the M32xD64 P*V matrix in a single tensor-core pass.
-        const unsigned int output_query_chunk = warp >> 2u;
-        const unsigned int output_d_chunk = warp & 3u;
-        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-        wmma::load_matrix_sync(acc, output + output_query_chunk * 16u * kHeadDim + output_d_chunk * 16u, kHeadDim, wmma::mem_row_major);
-        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
-        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
-        wmma::load_matrix_sync(p_frag, probabilities + output_query_chunk * 16u * kKeyTile, kKeyTile);
-        wmma::load_matrix_sync(v_frag, v_tile + output_d_chunk * 16u, kHeadDim);
-        wmma::mma_sync(acc, p_frag, v_frag, acc);
-        wmma::store_matrix_sync(output + output_query_chunk * 16u * kHeadDim + output_d_chunk * 16u, acc, kHeadDim, wmma::mem_row_major);
-        __syncthreads();
-    }
-
-    for (unsigned int index = tid; index < kQueryTile * kHeadDim; index += kThreads) {
-        const unsigned int m = index / kHeadDim;
-        const unsigned int d = index - m * kHeadDim;
-        const unsigned int qi = query_start + m;
-        if (qi < seq_len) {
-            const float denom = running_sum[m];
-            dst[(b * seq_len + qi) * hidden + head_off + d] = denom > 0.0f ? output[index] / denom : 0.0f;
-        }
-    }
+extern "C" __global__ __launch_bounds__(256) void termite_deberta_attention_tc_f16_m32n16(ANTFLY_CUDA_DEBERTA_ATTENTION_PARAMS) {
+    constexpr unsigned int QueryTile = 32u, KeyTile = 16u;
+#include "../kernels/deberta_tc_tiles.cuh"
 }
 
 // Pack graph-layout [B, S, H, D] tensors into the head-major layout consumed
@@ -20567,12 +19781,7 @@ extern "C" __global__ void termite_gliner_boundary_attention_f32(
 
 // Diagnostic boundary FP16 attention: compact relative tiles use the exact
 // processor bucket map. Model storage, heads, softmax, and outputs remain F32.
-extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attention_tc_f16(
-    const float* q, const float* k, const float* v, const float* q_r,
-    const float* k_r, const float* bucket_values, const float* mask_values,
-    const float* unused7, const float* unused8, const float* unused9,
-    float* dst, Gliner25BoundaryParams p, unsigned int work_items
-) {
+extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attention_tc_f16(ANTFLY_CUDA_GLINER_BOUNDARY_PARAMS) {
     const unsigned int batch = p.dims[0], seq_len = p.dims[1], num_heads = p.dims[2], head_dim = p.dims[3];
     const int* mask = reinterpret_cast<const int*>(mask_values);
     const int* buckets = reinterpret_cast<const int*>(bucket_values);
@@ -20920,408 +20129,23 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_encoder_attenti
 // Query/key fragments stay in registers; 16-column relative tiles scatter
 // only their diagonal gathers. This requires no global relative-product cache
 // and preserves the same admitted workspace contract as the short tile.
-extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attention_tc_f16_m64(
-    const float* q, const float* k, const float* v, const float* q_r,
-    const float* k_r, const float* bucket_values, const float* mask_values,
-    const float* unused7, const float* unused8, const float* unused9,
-    float* dst, Gliner25BoundaryParams p, unsigned int work_items
-) {
-    const unsigned int batch=p.dims[0], seq=p.dims[1], heads=p.dims[2], dim=p.dims[3], relative_rows=p.dims[4];
-    const int* mask=reinterpret_cast<const int*>(mask_values);
-    const int* buckets=reinterpret_cast<const int*>(bucket_values);
-    constexpr unsigned int M = 64u, N = 64u, D = 64u, P = 72u, S = 68u, C = 20u, T = 256u;
-    if (!seq || seq > 16384u || dim != D || blockDim.x != T) return;
-    const unsigned int tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
-    const unsigned int tiles = (seq + M - 1u) / M;
-    const unsigned int start = (blockIdx.x % tiles) * M;
-    const unsigned int matrix = blockIdx.x / tiles, head = matrix % heads, b = matrix / heads;
-    if (b >= batch) return;
-    const unsigned int hidden = heads * D, head_off = head * D;
-    __shared__ __align__(16) half kv[N * P], qr[16u * P], kr[16u * P];
-    __shared__ __align__(16) float shared_scores[M * P / 2u + 32u * S];
-    __shared__ __align__(16) float relative_scores[2u * M * C];
-    half* qt = reinterpret_cast<half*>(shared_scores);
-    half* probabilities = reinterpret_cast<half*>(shared_scores);
-    float* scratch = shared_scores + M * P / 2u;
-    __shared__ float maximum[M], denominator[M], alpha[M];
-    __shared__ unsigned int invalid[M];
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> output[2];
-    wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> rows[4];
-    #pragma unroll
-    for (unsigned int g = 0u; g < 2u; ++g) wmma::fill_fragment(output[g], 0.0f);
-    for (unsigned int i = tid; i < M * D; i += T) {
-        const unsigned int row = i / D, d = i % D;
-        qt[row * P + d] = __float2half_rn(start + row < seq ? q[(b * seq + start + row) * hidden + head_off + d] : 0.0f);
-    }
-    if (tid < M) { maximum[tid] = -INFINITY; denominator[tid] = 0.0f; invalid[tid] = 0u; }
-    __syncthreads();
-    if (warp < 4u) {
-        #pragma unroll
-        for (unsigned int d=0u;d<4u;++d) wmma::load_matrix_sync(rows[d], qt+warp*16u*P+d*16u, P);
-    }
-    __syncthreads();
-    for (unsigned int key_start = 0u; key_start < seq; key_start += N) {
-        for (unsigned int i = tid; i < N * D; i += T) {
-            const unsigned int row = i / D, d = i % D, key = key_start + row;
-            const bool valid = key < seq && (!mask || mask[b * seq + key] != 0ll);
-            const unsigned int offset = (b * seq + key) * hidden + head_off + d;
-            kv[row * P + d] = __float2half_rn(valid ? k[offset] : 0.0f);
-        }
-        __syncthreads();
-        if (warp < 4u) {
-            #pragma unroll
-            for (unsigned int kc=0u;kc<4u;++kc) {
-                wmma::fragment<wmma::accumulator,16,16,16,float> dot;
-                wmma::fill_fragment(dot,0.0f);
-                #pragma unroll
-                for (unsigned int d=0u;d<4u;++d) {
-                    wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> keys;
-                    wmma::load_matrix_sync(keys,kv+kc*16u*P+d*16u,P);
-                    wmma::mma_sync(dot,rows[d],keys,dot);
-                }
-                wmma::store_matrix_sync(shared_scores+warp*16u*S+kc*16u,dot,S,wmma::mem_row_major);
-            }
-        } else {
-            #pragma unroll
-            for (unsigned int d=0u;d<4u;++d) wmma::load_matrix_sync(rows[d],kv+(warp-4u)*16u*P+d*16u,P);
-        }
-        __syncthreads();
-        // Both relative products are computed in compact 16-column tiles.
-        // Scatter only their exact diagonal gather into QK before reusing the
-        // tile. No token-by-relative or quadratic global buffer is needed.
-        for (unsigned int rs=0u;rs<M+N-1u;rs+=16u) {
-            for (unsigned int i=tid;i<16u*D;i+=T) {
-                const unsigned int r=i/D,d=i%D;
-                const int offset=(int)start+(int)seq-1-(int)key_start-(int)(N-1u)+(int)rs+(int)r;
-                const int bucket=offset>=0 && offset<(int)(2u*seq-1u)?buckets[offset]:-1;
-                const bool valid=bucket>=0 && (unsigned int)bucket<relative_rows;
-                qr[r*P+d]=__float2half_rn(valid?q_r[(unsigned int)bucket*hidden+head_off+d]:0.0f);
-                kr[r*P+d]=__float2half_rn(valid?k_r[(unsigned int)bucket*hidden+head_off+d]:0.0f);
-            }
-            __syncthreads();
-            wmma::fragment<wmma::accumulator,16,16,16,float> relative;
-            wmma::fill_fragment(relative,0.0f);
-            #pragma unroll
-            for (unsigned int d=0u;d<4u;++d) {
-                wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> rf;
-                wmma::load_matrix_sync(rf,(warp<4u?kr:qr)+d*16u,P);
-                wmma::mma_sync(relative,rows[d],rf,relative);
-            }
-            wmma::store_matrix_sync(relative_scores+warp*16u*C,relative,C,wmma::mem_row_major);
-            __syncthreads();
-            for (unsigned int i=tid;i<M*16u;i+=T) {
-                const unsigned int row=i/16u,r=rs+i%16u;
-                const int col=(int)row+(int)N-1-(int)r;
-                if (col>=0 && col<(int)N)
-                    shared_scores[row*S+col]=(shared_scores[row*S+col]+relative_scores[row*C+i%16u])+relative_scores[M*C+(unsigned int)col*C+i%16u];
-            }
-            __syncthreads();
-        }
-        float staged_probabilities[8][2];
-        #pragma unroll
-        for (unsigned int g = 0u; g < 8u; ++g) {
-            const unsigned int row = warp * 8u + g;
-            float values[2], next_max = -INFINITY;
-            #pragma unroll
-            for (unsigned int j = 0u; j < 2u; ++j) {
-                const unsigned int n = lane + j * 32u, key = key_start + n;
-                const bool valid = start + row < seq && key < seq && (!mask || mask[b * seq + key] != 0ll);
-                float score=-INFINITY;
-                if (valid) {
-                    const int bucket=buckets[start+row+seq-1u-key];
-                    if (bucket<0 || (unsigned int)bucket>=relative_rows) atomicOr(&invalid[row],1u);
-                    else {
-                        score=shared_scores[row*S+n]*rsqrtf(192.0f);
-                        if (!isfinite(score)) atomicOr(&invalid[row],1u);
-                    }
-                }
-                values[j] = score;
-                next_max = fmaxf(next_max, values[j]);
-            }
-            for (unsigned int shift = 16u; shift; shift >>= 1u)
-                next_max = fmaxf(next_max, __shfl_down_sync(0xffffffffu, next_max, shift));
-            next_max = fmaxf(maximum[row], __shfl_sync(0xffffffffu, next_max, 0u));
-            const float a = isfinite(maximum[row]) ? expf(maximum[row] - next_max) : 0.0f;
-            float sum = 0.0f;
-            #pragma unroll
-            for (unsigned int j = 0u; j < 2u; ++j) {
-                const float p = isfinite(next_max) ? expf(values[j] - next_max) : 0.0f;
-                staged_probabilities[g][j] = p;
-                sum += p;
-            }
-            for (unsigned int shift = 16u; shift; shift >>= 1u)
-                sum += __shfl_down_sync(0xffffffffu, sum, shift);
-            if (lane == 0u) {
-                alpha[row] = a;
-                denominator[row] = denominator[row] * a + sum;
-                maximum[row] = next_max;
-            }
-        }
-        // Half probabilities alias the lower half of shared score storage.
-        // No writer may reuse it before every warp has read all of its rows.
-        __syncthreads();
-        #pragma unroll
-        for (unsigned int g = 0u; g < 8u; ++g) {
-            const unsigned int row = warp * 8u + g;
-            #pragma unroll
-            for (unsigned int j = 0u; j < 2u; ++j)
-                probabilities[row * P + lane + j * 32u] = __float2half_rn(staged_probabilities[g][j]);
-        }
-        __syncthreads();
-        for (unsigned int i=tid;i<N*D;i+=T) {
-            const unsigned int row=i/D,d=i%D,key=key_start+row;
-            const bool valid=key<seq && (!mask||mask[b*seq+key]!=0);
-            kv[row*P+d]=__float2half_rn(valid?v[(b*seq+key)*hidden+head_off+d]:0.0f);
-        }
-        __syncthreads();
-        #pragma unroll
-        for (unsigned int g = 0u; g < 2u; ++g) {
-            const unsigned int qr = warp / 4u, dc = warp % 4u;
-            // WMMA's fragment layout is opaque. Store, rescale by row, and
-            // reload through the public API instead of assuming lane mapping.
-            wmma::store_matrix_sync(scratch + qr * 16u * S + dc * 16u, output[g], S, wmma::mem_row_major);
-            __syncthreads();
-            for (unsigned int i = tid; i < 32u * D; i += T) scratch[(i / D) * S + i % D] *= alpha[g * 32u + i / D];
-            __syncthreads();
-            wmma::load_matrix_sync(output[g], scratch + qr * 16u * S + dc * 16u, S, wmma::mem_row_major);
-            #pragma unroll
-            for (unsigned int n = 0u; n < N; n += 16u) {
-                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> vf;
-                wmma::load_matrix_sync(pf, probabilities + (g * 32u + qr * 16u) * P + n, P);
-                wmma::load_matrix_sync(vf, kv + n * P + dc * 16u, P);
-                wmma::mma_sync(output[g], pf, vf, output[g]);
-            }
-            __syncthreads();
-        }
-    }
-    #pragma unroll
-    for (unsigned int g = 0u; g < 2u; ++g) {
-        wmma::store_matrix_sync(scratch + (warp / 4u) * 16u * S + (warp % 4u) * 16u, output[g], S, wmma::mem_row_major);
-        __syncthreads();
-        for (unsigned int i = tid; i < 32u * D; i += T) {
-            const unsigned int row = g * 32u + i / D, d = i % D;
-            if (start + row < seq)
-                dst[(b * seq + start + row) * hidden + head_off + d] = (mask && mask[b*seq+start+row]==0) ? 0.0f : (invalid[row]==0u && denominator[row] > 0.0f ? scratch[(i / D) * S + i % D] / denominator[row] : NAN);
-        }
-        __syncthreads();
-    }
+// M64 attention owns one acquisition/online-update/publication schedule.
+// Compact run discovery and relative scatter remain distinct static policies;
+// the ordinary policy allocates none of the compact policy's run workspace.
+
+
+extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attention_tc_f16_m64(ANTFLY_CUDA_GLINER_BOUNDARY_PARAMS) {
+    constexpr bool Compact = false;
+#include "../kernels/gliner_boundary_m64.cuh"
 }
 
 // Long-sequence direct attention. Adjacent equal relative buckets share one
 // product; the run list is derived from every actual bucket, so arbitrary
 // non-monotonic maps remain correct. Products, score addition and expf retain
 // the wider tile's arithmetic. No global cache or additional workspace.
-extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attention_tc_f16_compact(
-    const float* q, const float* k, const float* v, const float* q_r,
-    const float* k_r, const float* bucket_values, const float* mask_values,
-    const float* unused7, const float* unused8, const float* unused9,
-    float* dst, Gliner25BoundaryParams p, unsigned int work_items
-) {
-    const unsigned int batch=p.dims[0], seq=p.dims[1], heads=p.dims[2], dim=p.dims[3], relative_rows=p.dims[4];
-    const int* mask=reinterpret_cast<const int*>(mask_values);
-    const int* buckets=reinterpret_cast<const int*>(bucket_values);
-    constexpr unsigned int M = 64u, N = 64u, D = 64u, P = 72u, S = 68u, C = 20u, T = 256u;
-    if (!seq || seq > 16384u || dim != D || blockDim.x != T) return;
-    const unsigned int tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
-    const unsigned int tiles = (seq + M - 1u) / M;
-    const unsigned int start = (blockIdx.x % tiles) * M;
-    const unsigned int matrix = blockIdx.x / tiles, head = matrix % heads, b = matrix / heads;
-    if (b >= batch) return;
-    const unsigned int hidden = heads * D, head_off = head * D;
-    __shared__ __align__(16) half kv[N * P], qr[16u * P], kr[16u * P];
-    __shared__ __align__(16) float shared_scores[M * P / 2u + 32u * S];
-    __shared__ __align__(16) float relative_scores[2u * M * C];
-    half* qt = reinterpret_cast<half*>(shared_scores);
-    half* probabilities = reinterpret_cast<half*>(shared_scores);
-    float* scratch = shared_scores + M * P / 2u;
-    __shared__ float maximum[M], denominator[M], alpha[M];
-    __shared__ unsigned int invalid[M], warp_counts[8], run_start[128], run_count;
-    __shared__ int run_bucket[128];
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> output[2];
-    wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> rows[4];
-    #pragma unroll
-    for (unsigned int g = 0u; g < 2u; ++g) wmma::fill_fragment(output[g], 0.0f);
-    for (unsigned int i = tid; i < M * D; i += T) {
-        const unsigned int row = i / D, d = i % D;
-        qt[row * P + d] = __float2half_rn(start + row < seq ? q[(b * seq + start + row) * hidden + head_off + d] : 0.0f);
-    }
-    if (tid < M) { maximum[tid] = -INFINITY; denominator[tid] = 0.0f; invalid[tid] = 0u; }
-    __syncthreads();
-    if (warp < 4u) {
-        #pragma unroll
-        for (unsigned int d=0u;d<4u;++d) wmma::load_matrix_sync(rows[d], qt+warp*16u*P+d*16u, P);
-    }
-    __syncthreads();
-    for (unsigned int key_start = 0u; key_start < seq; key_start += N) {
-        for (unsigned int i = tid; i < N * D; i += T) {
-            const unsigned int row = i / D, d = i % D, key = key_start + row;
-            const bool valid = key < seq && (!mask || mask[b * seq + key] != 0ll);
-            const unsigned int offset = (b * seq + key) * hidden + head_off + d;
-            kv[row * P + d] = __float2half_rn(valid ? k[offset] : 0.0f);
-        }
-        __syncthreads();
-        if (warp < 4u) {
-            #pragma unroll
-            for (unsigned int kc=0u;kc<4u;++kc) {
-                wmma::fragment<wmma::accumulator,16,16,16,float> dot;
-                wmma::fill_fragment(dot,0.0f);
-                #pragma unroll
-                for (unsigned int d=0u;d<4u;++d) {
-                    wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> keys;
-                    wmma::load_matrix_sync(keys,kv+kc*16u*P+d*16u,P);
-                    wmma::mma_sync(dot,rows[d],keys,dot);
-                }
-                wmma::store_matrix_sync(shared_scores+warp*16u*S+kc*16u,dot,S,wmma::mem_row_major);
-            }
-        } else {
-            #pragma unroll
-            for (unsigned int d=0u;d<4u;++d) wmma::load_matrix_sync(rows[d],kv+(warp-4u)*16u*P+d*16u,P);
-        }
-        __syncthreads();
-        // Both relative products are computed in compact 16-column tiles.
-        // Scatter only their exact diagonal gather into QK before reusing the
-        // tile. No token-by-relative or quadratic global buffer is needed.
-        const int first_offset=(int)start+(int)seq-1-(int)key_start-(int)(N-1u);
-        const int here=first_offset+(int)tid;
-        const int bucket_value=here>=0 && here<(int)(2u*seq-1u)?buckets[here]:-1;
-        const int previous=here>0 && here<=(int)(2u*seq-1u)?buckets[here-1]:-1;
-        const bool begins=tid<M+N-1u && (tid==0 || bucket_value!=previous);
-        unsigned int prefix=begins?1u:0u;
-        #pragma unroll
-        for (unsigned int d=1;d<32;d*=2) { unsigned int earlier=__shfl_up_sync(0xffffffffu,prefix,d); if(lane>=d)prefix+=earlier; }
-        if (lane==31u)warp_counts[warp]=prefix;
-        __syncthreads();
-        for (unsigned int w=0;w<warp;++w)prefix+=warp_counts[w];
-        if (begins) { run_start[prefix-1u]=tid;run_bucket[prefix-1u]=bucket_value; }
-        if (tid==M+N-2u)run_count=prefix;
-        __syncthreads();
-        const bool uniform=run_count==1u;
-        const unsigned int relative_count=run_count;
-        for (unsigned int rs=0u;rs<relative_count;rs+=16u) {
-            for (unsigned int i=tid;i<16u*D;i+=T) {
-                const unsigned int r=i/D,d=i%D;
-                const int bucket=rs+r<run_count?run_bucket[rs+r]:-1;
-                const bool valid=bucket>=0 && (unsigned int)bucket<relative_rows;
-                qr[r*P+d]=__float2half_rn(valid?q_r[(unsigned int)bucket*hidden+head_off+d]:0.0f);
-                kr[r*P+d]=__float2half_rn(valid?k_r[(unsigned int)bucket*hidden+head_off+d]:0.0f);
-            }
-            __syncthreads();
-            wmma::fragment<wmma::accumulator,16,16,16,float> relative;
-            wmma::fill_fragment(relative,0.0f);
-            #pragma unroll
-            for (unsigned int d=0u;d<4u;++d) {
-                wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> rf;
-                wmma::load_matrix_sync(rf,(warp<4u?kr:qr)+d*16u,P);
-                wmma::mma_sync(relative,rows[d],rf,relative);
-            }
-            wmma::store_matrix_sync(relative_scores+warp*16u*C,relative,C,wmma::mem_row_major);
-            __syncthreads();
-            if (uniform) {
-                for (unsigned int i=tid;i<M*N;i+=T) {
-                    const unsigned int row=i/N,col=i%N;
-                    shared_scores[row*S+col]=(shared_scores[row*S+col]+relative_scores[row*C])+relative_scores[M*C+col*C];
-                }
-            } else for (unsigned int i=tid;i<M*16u;i+=T) {
-                const unsigned int row=i/16u,r=rs+i%16u;
-                if (r<run_count) {
-                    const int lo=max(0,(int)row+(int)N-(int)(r+1u<run_count?run_start[r+1u]:M+N-1u));
-                    const int hi=min((int)N,(int)row+(int)N-(int)run_start[r]);
-                    for (int col=lo;col<hi;++col)
-                        shared_scores[row*S+col]=(shared_scores[row*S+col]+relative_scores[row*C+i%16u])+relative_scores[M*C+(unsigned int)col*C+i%16u];
-                }
-            }
-            __syncthreads();
-        }
-        float staged_probabilities[8][2];
-        #pragma unroll
-        for (unsigned int g = 0u; g < 8u; ++g) {
-            const unsigned int row = warp * 8u + g;
-            float values[2], next_max = -INFINITY;
-            #pragma unroll
-            for (unsigned int j = 0u; j < 2u; ++j) {
-                const unsigned int n = lane + j * 32u, key = key_start + n;
-                const bool valid = start + row < seq && key < seq && (!mask || mask[b * seq + key] != 0ll);
-                float score=-INFINITY;
-                if (valid) {
-                    const int bucket=buckets[start+row+seq-1u-key];
-                    if (bucket<0 || (unsigned int)bucket>=relative_rows) atomicOr(&invalid[row],1u);
-                    else {
-                        score=shared_scores[row*S+n]*rsqrtf(192.0f);
-                        if (!isfinite(score)) atomicOr(&invalid[row],1u);
-                    }
-                }
-                values[j] = score;
-                next_max = fmaxf(next_max, values[j]);
-            }
-            for (unsigned int shift = 16u; shift; shift >>= 1u)
-                next_max = fmaxf(next_max, __shfl_down_sync(0xffffffffu, next_max, shift));
-            next_max = fmaxf(maximum[row], __shfl_sync(0xffffffffu, next_max, 0u));
-            const float a = isfinite(maximum[row]) ? expf(maximum[row] - next_max) : 0.0f;
-            float sum = 0.0f;
-            #pragma unroll
-            for (unsigned int j = 0u; j < 2u; ++j) {
-                const float p = isfinite(next_max) ? expf(values[j] - next_max) : 0.0f;
-                staged_probabilities[g][j] = p;
-                sum += p;
-            }
-            for (unsigned int shift = 16u; shift; shift >>= 1u)
-                sum += __shfl_down_sync(0xffffffffu, sum, shift);
-            if (lane == 0u) {
-                alpha[row] = a;
-                denominator[row] = denominator[row] * a + sum;
-                maximum[row] = next_max;
-            }
-        }
-        // Half probabilities alias the lower half of shared score storage.
-        // No writer may reuse it before every warp has read all of its rows.
-        __syncthreads();
-        #pragma unroll
-        for (unsigned int g = 0u; g < 8u; ++g) {
-            const unsigned int row = warp * 8u + g;
-            #pragma unroll
-            for (unsigned int j = 0u; j < 2u; ++j)
-                probabilities[row * P + lane + j * 32u] = __float2half_rn(staged_probabilities[g][j]);
-        }
-        __syncthreads();
-        for (unsigned int i=tid;i<N*D;i+=T) {
-            const unsigned int row=i/D,d=i%D,key=key_start+row;
-            const bool valid=key<seq && (!mask||mask[b*seq+key]!=0);
-            kv[row*P+d]=__float2half_rn(valid?v[(b*seq+key)*hidden+head_off+d]:0.0f);
-        }
-        __syncthreads();
-        #pragma unroll
-        for (unsigned int g = 0u; g < 2u; ++g) {
-            const unsigned int qr = warp / 4u, dc = warp % 4u;
-            // WMMA's fragment layout is opaque. Store, rescale by row, and
-            // reload through the public API instead of assuming lane mapping.
-            wmma::store_matrix_sync(scratch + qr * 16u * S + dc * 16u, output[g], S, wmma::mem_row_major);
-            __syncthreads();
-            for (unsigned int i = tid; i < 32u * D; i += T) scratch[(i / D) * S + i % D] *= alpha[g * 32u + i / D];
-            __syncthreads();
-            wmma::load_matrix_sync(output[g], scratch + qr * 16u * S + dc * 16u, S, wmma::mem_row_major);
-            #pragma unroll
-            for (unsigned int n = 0u; n < N; n += 16u) {
-                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> vf;
-                wmma::load_matrix_sync(pf, probabilities + (g * 32u + qr * 16u) * P + n, P);
-                wmma::load_matrix_sync(vf, kv + n * P + dc * 16u, P);
-                wmma::mma_sync(output[g], pf, vf, output[g]);
-            }
-            __syncthreads();
-        }
-    }
-    #pragma unroll
-    for (unsigned int g = 0u; g < 2u; ++g) {
-        wmma::store_matrix_sync(scratch + (warp / 4u) * 16u * S + (warp % 4u) * 16u, output[g], S, wmma::mem_row_major);
-        __syncthreads();
-        for (unsigned int i = tid; i < 32u * D; i += T) {
-            const unsigned int row = g * 32u + i / D, d = i % D;
-            if (start + row < seq)
-                dst[(b * seq + start + row) * hidden + head_off + d] = (mask && mask[b*seq+start+row]==0) ? 0.0f : (invalid[row]==0u && denominator[row] > 0.0f ? scratch[(i / D) * S + i % D] / denominator[row] : NAN);
-        }
-        __syncthreads();
-    }
+extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attention_tc_f16_compact(ANTFLY_CUDA_GLINER_BOUNDARY_PARAMS) {
+    constexpr bool Compact = true;
+#include "../kernels/gliner_boundary_m64.cuh"
 }
 
 // Append inference-only kernels so existing kernel numbering stays stable.

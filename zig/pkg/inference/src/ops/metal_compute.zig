@@ -24,6 +24,7 @@ const builtin = @import("builtin");
 const ml = @import("ml");
 const build_options = @import("build_options");
 const ops = @import("ops.zig");
+const kernel_geometry = @import("kernel_geometry.zig");
 /// Static target legality is shared by preparation and direct invocation.
 /// Tensor residency remains a runtime property checked by the invocation hook.
 pub fn supportsAssignedDescriptor(descriptor: *const ops.kernel_descriptor.Descriptor) bool {
@@ -15336,17 +15337,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         const dst_elems = dst_tensor_ptr.elemCount();
         const src_elems = src_tensor.elemCount();
-        if (dst_elems % cols != 0 or src_elems % cols != 0) return error.InvalidTensorShape;
-        const dst_rows = dst_elems / cols;
-        const src_rows = src_elems / cols;
-        if (dst_start_row > dst_rows or row_count > dst_rows - dst_start_row) return error.InvalidTensorShape;
-        if (src_start_row > src_rows or row_count > src_rows - src_start_row) return error.InvalidTensorShape;
+        const region = kernel_geometry.RowCopy.init(dst_elems, src_elems, dst_start_row, src_start_row, row_count, cols) catch return error.InvalidTensorShape;
         if (row_count == 0) return true;
-
-        const row_bytes = std.math.mul(usize, cols, @sizeOf(f32)) catch return error.InvalidTensorShape;
-        const byte_len = std.math.mul(usize, row_count, row_bytes) catch return error.InvalidTensorShape;
-        const dst_offset = std.math.mul(usize, dst_start_row, row_bytes) catch return error.InvalidTensorShape;
-        const src_offset = std.math.mul(usize, src_start_row, row_bytes) catch return error.InvalidTensorShape;
+        const byte_len = std.math.mul(usize, region.elements, @sizeOf(f32)) catch return error.InvalidTensorShape;
+        const dst_offset = std.math.mul(usize, region.destination, @sizeOf(f32)) catch return error.InvalidTensorShape;
+        const src_offset = std.math.mul(usize, region.source, @sizeOf(f32)) catch return error.InvalidTensorShape;
         const shape = [_]i32{ @intCast(row_count), @intCast(cols) };
 
         var src_view = try src_tensor.retainedView(src_offset, byte_len, &shape);

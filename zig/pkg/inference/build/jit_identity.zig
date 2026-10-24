@@ -80,6 +80,11 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
     // Native includes and host ABI consumers affect qualification even when
     // the translation-unit text is unchanged. Declare the complete local
     // include closure so Zig's watch/cache graph sees those edits as well.
+    const metal_dependencies = [_][]const u8{
+        "src/backends/metal_buffer_observation.h",
+        "src/backends/metal_mtp_head.h",
+        "src/backends/metal_mtp_head_impl.h",
+    };
     const cuda_dependencies = [_][]const u8{
         "src/ops/cuda/launch_abi.zig",
         "src/ops/cuda/kernels/kernel_abi.cuh",
@@ -87,15 +92,17 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         "src/ops/cuda/kernels/embedding_gemma2_training_rope.cuh",
         "src/ops/cuda/kernels/embedding_gemma2_optimized.cuh",
         "src/ops/cuda/kernels/gliner25_boundary.cuh",
+        "src/ops/cuda/kernels/gliner_boundary_m64.cuh",
+        "src/ops/cuda/kernels/deberta_tc_tiles.cuh",
         "src/ops/cuda/kernels/training_validation.cuh",
         "src/ops/cuda/kernels/gliner25_layer_norm.cuh",
         "src/ops/cuda/kernels/gliner25_softmax.cuh",
         "src/ops/cuda/kernels/gliner25_attention.cuh",
     };
-    run.addArg(b.fmt("{d}", .{qualification.len + contracts.len + if (backend == .cuda) cuda_dependencies.len else @as(usize, 0)}));
+    run.addArg(b.fmt("{d}", .{qualification.len + contracts.len + if (backend == .cuda) cuda_dependencies.len else metal_dependencies.len}));
     for (qualification) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
     for (contracts) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
-    if (backend == .cuda) for (cuda_dependencies) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
+    for (if (backend == .cuda) &cuda_dependencies else &metal_dependencies) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
     if (backend == .cuda) {
         run.addArgs(&.{ "dispatch", "8" });
         for ([_][]const u8{

@@ -4727,37 +4727,13 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q8_0_block_bytes));
         try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
 
-        var partial_values_ptr = partial_values.ptr;
-        var partial_indices_ptr = partial_indices.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var suppress_ptr = suppress_token_ids.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var suppress_count_u32 = try toU32(suppress_count);
-        var stage1_params = [_]?*anyopaque{
-            @ptrCast(&partial_values_ptr),
-            @ptrCast(&partial_indices_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&suppress_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&suppress_count_u32),
-        };
+        var arguments = try quantArgmaxArguments(false, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
+        var stage1_params = launch_abi.fieldsFor("QUANT_ARGMAX", &arguments);
         try launchBlocks(stage1, ctx, partial_count, q8_0_tiled_threads, &stage1_params);
 
         var dst_ptr = dst.ptr;
         var col_tiles_u32 = try toU32(col_tiles);
-        var reduce_params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&partial_values_ptr),
-            @ptrCast(&partial_indices_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&col_tiles_u32),
-        };
+        var reduce_params = launch_abi.addresses(.{ &dst_ptr, &arguments.partial_values, &arguments.partial_indices, &arguments.rows, &col_tiles_u32 });
         try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
     }
 
@@ -4788,37 +4764,13 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
         try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
 
-        var partial_values_ptr = partial_values.ptr;
-        var partial_indices_ptr = partial_indices.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var suppress_ptr = suppress_token_ids.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var suppress_count_u32 = try toU32(suppress_count);
-        var stage1_params = [_]?*anyopaque{
-            @ptrCast(&partial_values_ptr),
-            @ptrCast(&partial_indices_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&suppress_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&suppress_count_u32),
-        };
+        var arguments = try quantArgmaxArguments(false, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
+        var stage1_params = launch_abi.fieldsFor("QUANT_ARGMAX", &arguments);
         try launchBlocks(stage1, ctx, partial_count, q8_0_tiled_threads, &stage1_params);
 
         var dst_ptr = dst.ptr;
         var col_tiles_u32 = try toU32(col_tiles);
-        var reduce_params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&partial_values_ptr),
-            @ptrCast(&partial_indices_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&col_tiles_u32),
-        };
+        var reduce_params = launch_abi.addresses(.{ &dst_ptr, &arguments.partial_values, &arguments.partial_indices, &arguments.rows, &col_tiles_u32 });
         try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
     }
 
@@ -4849,37 +4801,13 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
         try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
 
-        var partial_values_ptr = partial_values.ptr;
-        var partial_indices_ptr = partial_indices.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var suppress_ptr = suppress_token_ids.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var suppress_count_u32 = try toU32(suppress_count);
-        var stage1_params = [_]?*anyopaque{
-            @ptrCast(&partial_values_ptr),
-            @ptrCast(&partial_indices_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&suppress_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&suppress_count_u32),
-        };
+        var arguments = try quantArgmaxArguments(false, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
+        var stage1_params = launch_abi.fieldsFor("QUANT_ARGMAX", &arguments);
         try launchBlocks(stage1, ctx, partial_count, q8_0_tiled_threads, &stage1_params);
 
         var dst_ptr = dst.ptr;
         var col_tiles_u32 = try toU32(col_tiles);
-        var reduce_params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&partial_values_ptr),
-            @ptrCast(&partial_indices_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&col_tiles_u32),
-        };
+        var reduce_params = launch_abi.addresses(.{ &dst_ptr, &arguments.partial_values, &arguments.partial_indices, &arguments.rows, &col_tiles_u32 });
         try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
     }
 
@@ -4974,37 +4902,13 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_k_block_bytes));
         try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
 
-        var partial_values_ptr = partial_values.ptr;
-        var partial_indices_ptr = partial_indices.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var suppress_ptr = suppress_token_ids.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var suppress_count_u32 = try toU32(suppress_count);
-        var stage1_params = [_]?*anyopaque{
-            @ptrCast(&partial_values_ptr),
-            @ptrCast(&partial_indices_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&suppress_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&suppress_count_u32),
-        };
+        var arguments = try quantArgmaxArguments(false, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
+        var stage1_params = launch_abi.fieldsFor("QUANT_ARGMAX", &arguments);
         try launchBlocks(stage1, ctx, partial_count, q4_k_tiled_threads, &stage1_params);
 
         var dst_ptr = dst.ptr;
         var col_tiles_u32 = try toU32(col_tiles);
-        var reduce_params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&partial_values_ptr),
-            @ptrCast(&partial_indices_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&col_tiles_u32),
-        };
+        var reduce_params = launch_abi.addresses(.{ &dst_ptr, &arguments.partial_values, &arguments.partial_indices, &arguments.rows, &col_tiles_u32 });
         try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
     }
 
@@ -5035,37 +4939,13 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q6_k_block_bytes));
         try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
 
-        var partial_values_ptr = partial_values.ptr;
-        var partial_indices_ptr = partial_indices.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var suppress_ptr = suppress_token_ids.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var suppress_count_u32 = try toU32(suppress_count);
-        var stage1_params = [_]?*anyopaque{
-            @ptrCast(&partial_values_ptr),
-            @ptrCast(&partial_indices_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&suppress_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&suppress_count_u32),
-        };
+        var arguments = try quantArgmaxArguments(false, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
+        var stage1_params = launch_abi.fieldsFor("QUANT_ARGMAX", &arguments);
         try launchBlocks(stage1, ctx, partial_count, q4_k_tiled_threads, &stage1_params);
 
         var dst_ptr = dst.ptr;
         var col_tiles_u32 = try toU32(col_tiles);
-        var reduce_params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&partial_values_ptr),
-            @ptrCast(&partial_indices_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&col_tiles_u32),
-        };
+        var reduce_params = launch_abi.addresses(.{ &dst_ptr, &arguments.partial_values, &arguments.partial_indices, &arguments.rows, &col_tiles_u32 });
         try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
     }
 
@@ -5096,37 +4976,13 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q6_k_block_bytes));
         try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
 
-        var partial_values_ptr = partial_values.ptr;
-        var partial_indices_ptr = partial_indices.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var suppress_ptr = suppress_token_ids.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var suppress_count_u32 = try toU32(suppress_count);
-        var stage1_params = [_]?*anyopaque{
-            @ptrCast(&partial_values_ptr),
-            @ptrCast(&partial_indices_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&suppress_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&suppress_count_u32),
-        };
+        var arguments = try quantArgmaxArguments(false, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
+        var stage1_params = launch_abi.fieldsFor("QUANT_ARGMAX", &arguments);
         try launchBlocks(stage1, ctx, partial_count, q4_k_tiled_threads, &stage1_params);
 
         var dst_ptr = dst.ptr;
         var col_tiles_u32 = try toU32(col_tiles);
-        var reduce_params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&partial_values_ptr),
-            @ptrCast(&partial_indices_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&col_tiles_u32),
-        };
+        var reduce_params = launch_abi.addresses(.{ &dst_ptr, &arguments.partial_values, &arguments.partial_indices, &arguments.rows, &col_tiles_u32 });
         try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
     }
 
@@ -5157,37 +5013,13 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q6_k_block_bytes));
         try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
 
-        var partial_values_ptr = partial_values.ptr;
-        var partial_indices_ptr = partial_indices.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var suppress_ptr = suppress_token_ids.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var suppress_count_u32 = try toU32(suppress_count);
-        var stage1_params = [_]?*anyopaque{
-            @ptrCast(&partial_values_ptr),
-            @ptrCast(&partial_indices_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&suppress_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&suppress_count_u32),
-        };
+        var arguments = try quantArgmaxArguments(false, partial_values, partial_indices, input, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
+        var stage1_params = launch_abi.fieldsFor("QUANT_ARGMAX", &arguments);
         try launchBlocks(stage1, ctx, partial_count, q4_k_tiled_threads, &stage1_params);
 
         var dst_ptr = dst.ptr;
         var col_tiles_u32 = try toU32(col_tiles);
-        var reduce_params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&partial_values_ptr),
-            @ptrCast(&partial_indices_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&col_tiles_u32),
-        };
+        var reduce_params = launch_abi.addresses(.{ &dst_ptr, &arguments.partial_values, &arguments.partial_indices, &arguments.rows, &col_tiles_u32 });
         try launchBlocks(reduce, ctx, rows, f32_tiled_threads, &reduce_params);
     }
 
@@ -5254,38 +5086,14 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q6_k_block_bytes));
         try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
 
-        var partial_values_ptr = partial_values.ptr;
-        var partial_indices_ptr = partial_indices.ptr;
-        var input_ptr = input_q8_1.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var suppress_ptr = suppress_token_ids.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var suppress_count_u32 = try toU32(suppress_count);
-        var stage1_params = [_]?*anyopaque{
-            @ptrCast(&partial_values_ptr),
-            @ptrCast(&partial_indices_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&suppress_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            @ptrCast(&suppress_count_u32),
-        };
+        var arguments = try quantArgmaxArguments(true, partial_values, partial_indices, input_q8_1, weight_raw, suppress_token_ids, rows, in_dim, out_dim, suppress_count);
+        var stage1_params = launch_abi.fieldsFor("Q8_QUANT_ARGMAX", &arguments);
         const stage1_threads: usize = if (use_a4b_stage1) 192 else if (use_e4b_stage1) 160 else q6KQ8_1Tile8Stage1Threads(row_blocks);
         try launchBlocks(stage1, ctx, partial_count, stage1_threads, &stage1_params);
 
         var dst_ptr = dst.ptr;
         var col_tiles_u32 = try toU32(col_tiles);
-        var reduce_params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&partial_values_ptr),
-            @ptrCast(&partial_indices_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&col_tiles_u32),
-        };
+        var reduce_params = launch_abi.addresses(.{ &dst_ptr, &arguments.partial_values, &arguments.partial_indices, &arguments.rows, &col_tiles_u32 });
         const reduce_threads: usize = if (self.argmax_reduce_rows_pairs_f32_w16 != null) 512 else f32_tiled_threads;
         try launchBlocks(reduce, ctx, rows, reduce_threads, &reduce_params);
     }
@@ -9001,27 +8809,29 @@ pub const KernelModule = struct {
         try checkBytes(k_dst, try checkedTensorElements(fallback_total_token_count, row_width));
         try checkBytes(v_dst, try checkedTensorElements(fallback_total_token_count, row_width));
 
-        var k_dst_ptr = k_dst.ptr;
-        var v_dst_ptr = v_dst.ptr;
-        var k_src_ptr = k_src.ptr;
-        var v_src_ptr = v_src.ptr;
-        var decode_scalars_ptr = decode_scalars.ptr;
-        var suffix_token_count_u32 = try toU32(suffix_token_count);
-        var row_width_u32 = try toU32(row_width);
-        var fallback_total_token_count_u32 = try toU32(fallback_total_token_count);
-        var params = launch_abi.addresses(.{ &k_dst_ptr, &v_dst_ptr, &k_src_ptr, &v_src_ptr, &decode_scalars_ptr, &suffix_token_count_u32, &row_width_u32, &fallback_total_token_count_u32 });
+        var arguments: launch_abi.ArgumentsFor("KV_SUFFIX_DENSE") = .{
+            .k_dst = k_dst.ptr,
+            .v_dst = v_dst.ptr,
+            .k_src = k_src.ptr,
+            .v_src = v_src.ptr,
+            .decode_scalars = decode_scalars.ptr,
+            .suffix_token_count = try toU32(suffix_token_count),
+            .row_width = try toU32(row_width),
+            .fallback_total_token_count = try toU32(fallback_total_token_count),
+        };
+        var params = launch_abi.fieldsFor("KV_SUFFIX_DENSE", &arguments);
         if (captureParamTraceIndex(ctx)) |trace_index| {
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=kv_write_suffix_decode_scalars k_dst=0x{x} v_dst=0x{x} k_src=0x{x} v_src=0x{x} scalars=0x{x} suffix={d} row_width={d} fallback_total_token_count={d}", .{
                 ctx.debug_graph_capture_id,
                 trace_index,
-                k_dst_ptr,
-                v_dst_ptr,
-                k_src_ptr,
-                v_src_ptr,
-                decode_scalars_ptr,
-                suffix_token_count_u32,
-                row_width_u32,
-                fallback_total_token_count_u32,
+                arguments.k_dst,
+                arguments.v_dst,
+                arguments.k_src,
+                arguments.v_src,
+                arguments.decode_scalars,
+                arguments.suffix_token_count,
+                arguments.row_width,
+                arguments.fallback_total_token_count,
             });
         }
         try launch1d(function, ctx, total, &params);
@@ -9061,46 +8871,48 @@ pub const KernelModule = struct {
         if (block_count != 0) try checkRawBytes(block_table, try checkedTensorElements(block_count, @sizeOf(u32)));
         if (decode_scalars.ptr != 0) try checkRawBytes(decode_scalars, 5 * @sizeOf(u32));
 
-        var k_dst_ptr = k_dst.ptr;
-        var v_dst_ptr = v_dst.ptr;
-        var block_table_ptr = block_table.ptr;
-        var k_src_ptr = k_src.ptr;
-        var v_src_ptr = v_src.ptr;
-        var decode_scalars_ptr = decode_scalars.ptr;
-        var suffix_token_count_u32 = try toU32(suffix_token_count);
-        var row_width_u32 = try toU32(row_width);
-        var num_kv_heads_u32 = try toU32(num_kv_heads);
-        var head_dim_u32 = try toU32(head_dim);
-        var key_row_bytes_u32 = try toU32(key_row_bytes);
-        var base_key_row_bytes_u32 = try toU32(base_key_row_bytes);
-        var value_row_bytes_u32 = try toU32(value_row_bytes);
-        var fallback_total_token_count_u32 = try toU32(fallback_total_token_count);
-        var block_count_u32 = try toU32(block_count);
-        var page_size_tokens_u32 = try toU32(page_size_tokens);
-        var format_u32 = format;
-        var value_format_u32 = value_format;
-        var physical_token_capacity_u32 = try toU32(physical_token_capacity);
-        var params = launch_abi.addresses(.{ &k_dst_ptr, &v_dst_ptr, &block_table_ptr, &k_src_ptr, &v_src_ptr, &decode_scalars_ptr, &suffix_token_count_u32, &row_width_u32, &num_kv_heads_u32, &head_dim_u32, &key_row_bytes_u32, &base_key_row_bytes_u32, &value_row_bytes_u32, &fallback_total_token_count_u32, &block_count_u32, &page_size_tokens_u32, &format_u32, &value_format_u32, &physical_token_capacity_u32 });
+        var arguments: launch_abi.ArgumentsFor("KV_SUFFIX_TQ") = .{
+            .k_dst = k_dst.ptr,
+            .v_dst = v_dst.ptr,
+            .block_table = block_table.ptr,
+            .k_src = k_src.ptr,
+            .v_src = v_src.ptr,
+            .decode_scalars = decode_scalars.ptr,
+            .suffix_token_count = try toU32(suffix_token_count),
+            .row_width = try toU32(row_width),
+            .num_kv_heads = try toU32(num_kv_heads),
+            .head_dim = try toU32(head_dim),
+            .key_row_bytes = try toU32(key_row_bytes),
+            .base_key_row_bytes = try toU32(base_key_row_bytes),
+            .value_row_bytes = try toU32(value_row_bytes),
+            .fallback_total_token_count = try toU32(fallback_total_token_count),
+            .block_count = try toU32(block_count),
+            .page_size_tokens = try toU32(page_size_tokens),
+            .format = format,
+            .value_format = value_format,
+            .physical_token_capacity = try toU32(physical_token_capacity),
+        };
+        var params = launch_abi.fieldsFor("KV_SUFFIX_TQ", &arguments);
         if (captureParamTraceIndex(ctx)) |trace_index| {
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=kv_write_suffix_turboquant k_dst=0x{x} v_dst=0x{x} block_table=0x{x} k_src=0x{x} v_src=0x{x} scalars=0x{x} suffix={d} row_width={d} key_row_bytes={d} base_key_row_bytes={d} value_row_bytes={d} fallback_total_token_count={d} block_count={d} page_size={d} format={d} value_format={d}", .{
                 ctx.debug_graph_capture_id,
                 trace_index,
-                k_dst_ptr,
-                v_dst_ptr,
-                block_table_ptr,
-                k_src_ptr,
-                v_src_ptr,
-                decode_scalars_ptr,
-                suffix_token_count_u32,
-                row_width_u32,
-                key_row_bytes_u32,
-                base_key_row_bytes_u32,
-                value_row_bytes_u32,
-                fallback_total_token_count_u32,
-                block_count_u32,
-                page_size_tokens_u32,
-                format_u32,
-                value_format_u32,
+                arguments.k_dst,
+                arguments.v_dst,
+                arguments.block_table,
+                arguments.k_src,
+                arguments.v_src,
+                arguments.decode_scalars,
+                arguments.suffix_token_count,
+                arguments.row_width,
+                arguments.key_row_bytes,
+                arguments.base_key_row_bytes,
+                arguments.value_row_bytes,
+                arguments.fallback_total_token_count,
+                arguments.block_count,
+                arguments.page_size_tokens,
+                arguments.format,
+                arguments.value_format,
             });
         }
         const work_items = @max(try checkedTensorElements(suffix_token_count, key_row_bytes), try checkedTensorElements(suffix_token_count, value_row_bytes));
@@ -10181,69 +9993,36 @@ pub const KernelModule = struct {
         try checkBytes(partial_acc, try checkedTensorElements(try checkedTensorElements(num_heads, chunk_count), head_dim));
         try checkBytes(partial_meta, try checkedTensorElements(try checkedTensorElements(num_heads, chunk_count), @as(usize, 2)));
 
-        var partial_acc_ptr = partial_acc.ptr;
-        var partial_meta_ptr = partial_meta.ptr;
-        var dst_ptr = dst.ptr;
-        var q_ptr = q.ptr;
-        var k_ptr = k.ptr;
-        var v_ptr = v.ptr;
-        var block_table_ptr = block_table.ptr;
-        var kv_seq_len_u32 = try toU32(kv_seq_len);
-        var num_heads_u32 = try toU32(num_heads);
-        var num_kv_heads_u32 = try toU32(num_kv_heads);
-        var head_dim_u32 = try toU32(head_dim);
-        var query_position_offset_u32 = try toU32(query_position_offset);
-        var kv_position_offset_u32 = try toU32(kv_position_offset);
-        var sliding_window_u32 = try toU32(sliding_window);
-        var key_row_bytes_u32 = try toU32(key_row_bytes);
-        var value_row_bytes_u32 = try toU32(value_row_bytes);
-        var block_count_u32 = try toU32(block_count);
-        var page_size_tokens_u32 = try toU32(page_size_tokens);
-        var format_u32 = format;
-        var value_format_u32 = value_format;
-        var physical_token_capacity_u32 = try toU32(physical_token_capacity);
-        var decode_scalars_ptr = decode_scalars.ptr;
-        var chunk_size_u32 = try toU32(chunk_size);
-        var chunk_count_u32 = try toU32(chunk_count);
-
-        var stage1_params = [_]?*anyopaque{
-            @ptrCast(&partial_acc_ptr),
-            @ptrCast(&partial_meta_ptr),
-            @ptrCast(&q_ptr),
-            @ptrCast(&k_ptr),
-            @ptrCast(&v_ptr),
-            @ptrCast(&block_table_ptr),
-            @ptrCast(&kv_seq_len_u32),
-            @ptrCast(&num_heads_u32),
-            @ptrCast(&num_kv_heads_u32),
-            @ptrCast(&head_dim_u32),
-            @ptrCast(&query_position_offset_u32),
-            @ptrCast(&kv_position_offset_u32),
-            @ptrCast(&sliding_window_u32),
-            @ptrCast(&key_row_bytes_u32),
-            @ptrCast(&value_row_bytes_u32),
-            @ptrCast(&block_count_u32),
-            @ptrCast(&page_size_tokens_u32),
-            @ptrCast(&format_u32),
-            @ptrCast(&value_format_u32),
-            @ptrCast(&physical_token_capacity_u32),
-            @ptrCast(&decode_scalars_ptr),
-            @ptrCast(&chunk_size_u32),
-            @ptrCast(&chunk_count_u32),
+        var stage1_arguments: launch_abi.ArgumentsFor("TQ_SPLIT_STAGE1") = .{
+            .partial_acc = partial_acc.ptr,
+            .partial_meta = partial_meta.ptr,
+            .q = q.ptr,
+            .k = k.ptr,
+            .v = v.ptr,
+            .block_table = block_table.ptr,
+            .kv_seq_len = try toU32(kv_seq_len),
+            .num_heads = try toU32(num_heads),
+            .num_kv_heads = try toU32(num_kv_heads),
+            .head_dim = try toU32(head_dim),
+            .query_position_offset = try toU32(query_position_offset),
+            .kv_position_offset = try toU32(kv_position_offset),
+            .sliding_window = try toU32(sliding_window),
+            .key_row_bytes = try toU32(key_row_bytes),
+            .value_row_bytes = try toU32(value_row_bytes),
+            .block_count = try toU32(block_count),
+            .page_size_tokens = try toU32(page_size_tokens),
+            .format = format,
+            .value_format = value_format,
+            .physical_token_capacity = try toU32(physical_token_capacity),
+            .decode_scalars = decode_scalars.ptr,
+            .chunk_size = try toU32(chunk_size),
+            .chunk_count = try toU32(chunk_count),
         };
+        var stage1_params = launch_abi.fieldsFor("TQ_SPLIT_STAGE1", &stage1_arguments);
         try launch2d(stage1, ctx, num_heads, chunk_count, if (head_dim <= 256) 256 else 512, &stage1_params);
 
-        var stage2_params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&partial_acc_ptr),
-            @ptrCast(&partial_meta_ptr),
-            @ptrCast(&num_heads_u32),
-            @ptrCast(&head_dim_u32),
-            @ptrCast(&kv_seq_len_u32),
-            @ptrCast(&decode_scalars_ptr),
-            @ptrCast(&chunk_size_u32),
-            @ptrCast(&chunk_count_u32),
-        };
+        var dst_ptr = dst.ptr;
+        var stage2_params = launch_abi.addresses(.{ &dst_ptr, &stage1_arguments.partial_acc, &stage1_arguments.partial_meta, &stage1_arguments.num_heads, &stage1_arguments.head_dim, &stage1_arguments.kv_seq_len, &stage1_arguments.decode_scalars, &stage1_arguments.chunk_size, &stage1_arguments.chunk_count });
         try launchBlocks(stage2, ctx, num_heads, if (head_dim <= 256) 256 else 512, &stage2_params);
         return true;
     }
@@ -10585,20 +10364,22 @@ pub const KernelModule = struct {
         try checkBytes(m, count);
         try checkBytes(v, count);
         if (count == 0) return;
-        var weight_ptr = weight.ptr;
-        var grad_ptr = grad.ptr;
-        var m_ptr = m.ptr;
-        var v_ptr = v.ptr;
-        var count_u32 = try toU32(count);
-        var lr_value = lr;
-        var beta1_value = beta1;
-        var beta2_value = beta2;
-        var eps_value = eps;
-        var weight_decay_value = weight_decay;
-        var correction1_value = bias_correction1;
-        var correction2_value = bias_correction2;
-        var grad_scale_value = grad_scale;
-        var params = launch_abi.addresses(.{ &weight_ptr, &grad_ptr, &m_ptr, &v_ptr, &count_u32, &lr_value, &beta1_value, &beta2_value, &eps_value, &weight_decay_value, &correction1_value, &correction2_value, &grad_scale_value });
+        var arguments: launch_abi.ArgumentsFor("TRAIN_ADAMW") = .{
+            .weight = weight.ptr,
+            .grad = grad.ptr,
+            .m = m.ptr,
+            .v = v.ptr,
+            .count = try toU32(count),
+            .lr = lr,
+            .beta1 = beta1,
+            .beta2 = beta2,
+            .eps = eps,
+            .weight_decay = weight_decay,
+            .bias_correction1 = bias_correction1,
+            .bias_correction2 = bias_correction2,
+            .grad_scale = grad_scale,
+        };
+        var params = launch_abi.fieldsFor("TRAIN_ADAMW", &arguments);
         try launch1d(function, ctx, count, &params);
     }
 
@@ -10797,14 +10578,16 @@ pub const KernelModule = struct {
         try checkBytes(gamma, dim);
         try checkBytes(d_y, input_count);
         if (output_count == 0) return;
-        var output_ptr = output.ptr;
-        var input_ptr = input.ptr;
-        var gamma_ptr = gamma.ptr;
-        var d_y_ptr = d_y.ptr;
-        var rows_u32 = try toU32(rows);
-        var dim_u32 = try toU32(dim);
-        var eps_mut = eps;
-        var params = launch_abi.addresses(.{ &output_ptr, &input_ptr, &gamma_ptr, &d_y_ptr, &rows_u32, &dim_u32, &eps_mut });
+        var arguments: launch_abi.ArgumentsFor("LAYER_NORM_BACKWARD") = .{
+            .output = output.ptr,
+            .input = input.ptr,
+            .gamma = gamma.ptr,
+            .d_y = d_y.ptr,
+            .rows = try toU32(rows),
+            .dim = try toU32(dim),
+            .eps = eps,
+        };
+        var params = launch_abi.fieldsFor("LAYER_NORM_BACKWARD", &arguments);
         try launch1d(function, ctx, rows, &params);
     }
 
@@ -10821,12 +10604,14 @@ pub const KernelModule = struct {
         try checkBytes(output, count);
         try checkBytes(input, count);
         if (count == 0) return;
-        var output_ptr = output.ptr;
-        var input_ptr = input.ptr;
-        var count_u32 = try toU32(count);
-        var last_dim_u32 = try toU32(last_dim);
-        var log_u32: u32 = @intFromBool(log_softmax);
-        var params = launch_abi.addresses(.{ &output_ptr, &input_ptr, &count_u32, &last_dim_u32, &log_u32 });
+        var arguments: launch_abi.ArgumentsFor("PRIMITIVE_SOFTMAX") = .{
+            .output = output.ptr,
+            .input = input.ptr,
+            .count = try toU32(count),
+            .last_dim = try toU32(last_dim),
+            .log_softmax = @intFromBool(log_softmax),
+        };
+        var params = launch_abi.fieldsFor("PRIMITIVE_SOFTMAX", &arguments);
         const rows = count / last_dim;
         try launch1d(function, ctx, rows, &params);
     }
@@ -14436,18 +14221,8 @@ pub const KernelModule = struct {
         const total_with_v = try checkedTensorElements(total + kv_count, 1);
         if (total_with_v == 0) return;
 
-        var dst_q_ptr = dst_q.ptr;
-        var dst_k_ptr = dst_k.ptr;
-        var dst_v_ptr = dst_v.ptr;
-        var input_ptr = input.ptr;
-        var weight_q_ptr = weight_q.ptr;
-        var weight_k_ptr = weight_k.ptr;
-        var weight_v_ptr = weight_v.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var q_out_dim_u32 = try toU32(q_out_dim);
-        var kv_out_dim_u32 = try toU32(kv_out_dim);
-        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
+        var arguments = try quantQkvArguments(false, dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
+        var params = launch_abi.fieldsFor("QUANT_QKV", &arguments);
         try launchBlocks(function, ctx, total_with_v, q4_k_tiled_threads, &params);
     }
 
@@ -14531,18 +14306,8 @@ pub const KernelModule = struct {
         const total_tiles = try checkedTensorElements(rows, tiles_with_v);
         if (total_tiles == 0) return;
 
-        var dst_q_ptr = dst_q.ptr;
-        var dst_k_ptr = dst_k.ptr;
-        var dst_v_ptr = dst_v.ptr;
-        var input_ptr = input.ptr;
-        var weight_q_ptr = weight_q.ptr;
-        var weight_k_ptr = weight_k.ptr;
-        var weight_v_ptr = weight_v.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var q_out_dim_u32 = try toU32(q_out_dim);
-        var kv_out_dim_u32 = try toU32(kv_out_dim);
-        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
+        var arguments = try quantQkvArguments(false, dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
+        var params = launch_abi.fieldsFor("QUANT_QKV", &arguments);
         try launchBlocks(function, ctx, total_tiles, q8_0_tiled_threads, &params);
     }
 
@@ -14582,18 +14347,8 @@ pub const KernelModule = struct {
         const total_tiles = try checkedTensorElements(rows, tiles_with_v);
         if (total_tiles == 0) return;
 
-        var dst_q_ptr = dst_q.ptr;
-        var dst_k_ptr = dst_k.ptr;
-        var dst_v_ptr = dst_v.ptr;
-        var input_ptr = input.ptr;
-        var weight_q_ptr = weight_q.ptr;
-        var weight_k_ptr = weight_k.ptr;
-        var weight_v_ptr = weight_v.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var q_out_dim_u32 = try toU32(q_out_dim);
-        var kv_out_dim_u32 = try toU32(kv_out_dim);
-        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
+        var arguments = try quantQkvArguments(false, dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
+        var params = launch_abi.fieldsFor("QUANT_QKV", &arguments);
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
     }
 
@@ -14633,18 +14388,8 @@ pub const KernelModule = struct {
         const total_tiles = try checkedTensorElements(rows, tiles_with_v);
         if (total_tiles == 0) return;
 
-        var dst_q_ptr = dst_q.ptr;
-        var dst_k_ptr = dst_k.ptr;
-        var dst_v_ptr = dst_v.ptr;
-        var input_ptr = input.ptr;
-        var weight_q_ptr = weight_q.ptr;
-        var weight_k_ptr = weight_k.ptr;
-        var weight_v_ptr = weight_v.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var q_out_dim_u32 = try toU32(q_out_dim);
-        var kv_out_dim_u32 = try toU32(kv_out_dim);
-        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
+        var arguments = try quantQkvArguments(false, dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
+        var params = launch_abi.fieldsFor("QUANT_QKV", &arguments);
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
     }
 
@@ -14684,18 +14429,8 @@ pub const KernelModule = struct {
         const total_tiles = try checkedTensorElements(rows, tiles_with_v);
         if (total_tiles == 0) return;
 
-        var dst_q_ptr = dst_q.ptr;
-        var dst_k_ptr = dst_k.ptr;
-        var dst_v_ptr = dst_v.ptr;
-        var input_ptr = input_q8_1.ptr;
-        var weight_q_ptr = weight_q.ptr;
-        var weight_k_ptr = weight_k.ptr;
-        var weight_v_ptr = weight_v.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var q_out_dim_u32 = try toU32(q_out_dim);
-        var kv_out_dim_u32 = try toU32(kv_out_dim);
-        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
+        var arguments = try quantQkvArguments(true, dst_q, dst_k, dst_v, input_q8_1, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
+        var params = launch_abi.fieldsFor("Q8_INPUT_QKV", &arguments);
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
     }
 
@@ -14734,26 +14469,16 @@ pub const KernelModule = struct {
         const total_tiles = try checkedTensorElements(rows, tiles_with_v);
         if (total_tiles == 0) return;
 
-        var dst_q_ptr = dst_q.ptr;
-        var dst_k_ptr = dst_k.ptr;
-        var dst_v_ptr = dst_v.ptr;
-        var input_ptr = input_q8_1.ptr;
-        var weight_q_ptr = weight_q.ptr;
-        var weight_k_ptr = weight_k.ptr;
-        var weight_v_ptr = weight_v.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var q_out_dim_u32 = try toU32(q_out_dim);
-        var kv_out_dim_u32 = try toU32(kv_out_dim);
+        var arguments = try quantQkvArguments(true, dst_q, dst_k, dst_v, input_q8_1, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
         if (rows > 1) {
             if (self.linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4) |function| {
-                var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
+                var params = launch_abi.fieldsFor("Q8_INPUT_QKV", &arguments);
                 try launchBlocks(function, ctx, try checkedTensorElements((rows + 3) / 4, tiles_with_v), q4_0_tiled_threads_w4, &params);
                 return;
             }
         }
         const function = self.linear_q4_0_qkv_nobias_q8_1_f32_tile8 orelse return error.CudaKernelUnavailable;
-        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
+        var params = launch_abi.fieldsFor("Q8_INPUT_QKV", &arguments);
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
     }
 
@@ -14793,18 +14518,8 @@ pub const KernelModule = struct {
         const total_tiles = try checkedTensorElements(rows, tiles_with_v);
         if (total_tiles == 0) return;
 
-        var dst_q_ptr = dst_q.ptr;
-        var dst_k_ptr = dst_k.ptr;
-        var dst_v_ptr = dst_v.ptr;
-        var input_ptr = input_q8_1.ptr;
-        var weight_q_ptr = weight_q.ptr;
-        var weight_k_ptr = weight_k.ptr;
-        var weight_v_ptr = weight_v.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var q_out_dim_u32 = try toU32(q_out_dim);
-        var kv_out_dim_u32 = try toU32(kv_out_dim);
-        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
+        var arguments = try quantQkvArguments(true, dst_q, dst_k, dst_v, input_q8_1, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
+        var params = launch_abi.fieldsFor("Q8_INPUT_QKV", &arguments);
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
     }
 
@@ -14844,18 +14559,8 @@ pub const KernelModule = struct {
         const total_tiles = try checkedTensorElements(rows, tiles_with_v);
         if (total_tiles == 0) return;
 
-        var dst_q_ptr = dst_q.ptr;
-        var dst_k_ptr = dst_k.ptr;
-        var dst_v_ptr = dst_v.ptr;
-        var input_ptr = input.ptr;
-        var weight_q_ptr = weight_q.ptr;
-        var weight_k_ptr = weight_k.ptr;
-        var weight_v_ptr = weight_v.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var q_out_dim_u32 = try toU32(q_out_dim);
-        var kv_out_dim_u32 = try toU32(kv_out_dim);
-        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
+        var arguments = try quantQkvArguments(false, dst_q, dst_k, dst_v, input, weight_q, weight_k, weight_v, rows, in_dim, q_out_dim, kv_out_dim);
+        var params = launch_abi.fieldsFor("QUANT_QKV", &arguments);
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
     }
 
@@ -15412,10 +15117,40 @@ const q_tc_hmma_cols: usize = 32;
 
 // Semantic dimensions come from the descriptor; native wire order is still
 // checked against kernel_abi.cuh by fieldsFor at the actual launch site.
-const QuantLinearArguments = struct { dst: u64, input: u64, weight: u64, rows: u32, in_dim: u32, out_dim: u32 };
+const QuantLinearArguments = launch_abi.ArgumentsFor("QUANT_LINEAR");
 fn quantLinearArguments(dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) driver_mod.Error!QuantLinearArguments {
     const shape = @import("../kernel_descriptor.zig").Linear.init(rows, in_dim, out_dim, false) catch return error.InvalidCudaState;
     return .{ .dst = dst.ptr, .input = input.ptr, .weight = weight.ptr, .rows = shape.rows, .in_dim = shape.in_dim, .out_dim = shape.out_dim };
+}
+
+fn quantQkvArguments(comptime packed_input: bool, dst_q: buffer_mod.DeviceBuffer, dst_k: buffer_mod.DeviceBuffer, dst_v: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight_q: buffer_mod.DeviceBuffer, weight_k: buffer_mod.DeviceBuffer, weight_v: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, q_out_dim: usize, kv_out_dim: usize) driver_mod.Error!launch_abi.ArgumentsFor(if (packed_input) "Q8_INPUT_QKV" else "QUANT_QKV") {
+    var result: launch_abi.ArgumentsFor(if (packed_input) "Q8_INPUT_QKV" else "QUANT_QKV") = undefined;
+    result.dst_q = dst_q.ptr;
+    result.dst_k = dst_k.ptr;
+    result.dst_v = dst_v.ptr;
+    @field(result, if (packed_input) "q8_input" else "input") = input.ptr;
+    result.weight_q = weight_q.ptr;
+    result.weight_k = weight_k.ptr;
+    result.weight_v = weight_v.ptr;
+    result.rows = try toU32(rows);
+    result.in_dim = try toU32(in_dim);
+    result.q_out_dim = try toU32(q_out_dim);
+    result.kv_out_dim = try toU32(kv_out_dim);
+    return result;
+}
+
+fn quantArgmaxArguments(comptime packed_input: bool, partial_values: buffer_mod.DeviceBuffer, partial_indices: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, suppression: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize, suppress_count: usize) driver_mod.Error!launch_abi.ArgumentsFor(if (packed_input) "Q8_QUANT_ARGMAX" else "QUANT_ARGMAX") {
+    var result: launch_abi.ArgumentsFor(if (packed_input) "Q8_QUANT_ARGMAX" else "QUANT_ARGMAX") = undefined;
+    result.partial_values = partial_values.ptr;
+    result.partial_indices = partial_indices.ptr;
+    @field(result, if (packed_input) "input_q8_1" else "input") = input.ptr;
+    result.weight = weight.ptr;
+    result.suppress_token_ids = suppression.ptr;
+    result.rows = try toU32(rows);
+    result.in_dim = try toU32(in_dim);
+    result.out_dim = try toU32(out_dim);
+    result.suppress_count = try toU32(suppress_count);
+    return result;
 }
 
 fn checkedQuantLinearOutput(comptime values_per_block: usize, comptime block_bytes: usize, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) driver_mod.Error!usize {
@@ -22098,6 +21833,14 @@ test "CUDA launch ABI typed slots and native records survive captured replay" {
     defer weights.free(&ctx);
     var output = try buffer_mod.DeviceBuffer.alloc(&ctx, 8 * 4);
     defer output.free(&ctx);
+    var argmax_output = try buffer_mod.DeviceBuffer.alloc(&ctx, 4 * 4);
+    defer argmax_output.free(&ctx);
+    var partial_values = try buffer_mod.DeviceBuffer.alloc(&ctx, 2 * 4);
+    defer partial_values.free(&ctx);
+    var partial_indices = try buffer_mod.DeviceBuffer.alloc(&ctx, 2 * 4);
+    defer partial_indices.free(&ctx);
+    var suppression = try buffer_mod.DeviceBuffer.alloc(&ctx, 4);
+    defer suppression.free(&ctx);
     var x: [64]f32 = undefined;
     for (&x, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2)) * 0.25;
     var raw: [3 * 34]u8 = @splat(0);
@@ -22121,6 +21864,8 @@ test "CUDA launch ABI typed slots and native records survive captured replay" {
     };
     try module.launchFillF32(&ctx, output, 8, -777);
     try module.launchLinearQ8_0F32(&ctx, output, input, weights, 2, 32, 3);
+    try module.launchFillF32(&ctx, argmax_output, 4, -777);
+    try module.launchLinearQ8_0ArgmaxRowsTile4F32(&ctx, argmax_output, partial_values, partial_indices, input, weights, suppression, 2, 32, 3, 0);
     var graph = try graph_mod.endCapture(&ctx);
     capturing = false;
     defer graph.deinit(&ctx);
@@ -22134,6 +21879,165 @@ test "CUDA launch ABI typed slots and native records survive captured replay" {
         try std.testing.expectEqualSlices(f32, &expected, actual[0..6]);
         try std.testing.expectEqual(@as(f32, -777), actual[6]);
         try std.testing.expectEqual(@as(f32, -777), actual[7]);
+        var indices: [4]u32 = undefined;
+        try argmax_output.copyToHost(&ctx, std.mem.sliceAsBytes(&indices));
+        try ctx.synchronize();
+        for (0..2) |row| {
+            var best: usize = 0;
+            for (1..3) |col| if (expected[row * 3 + col] > expected[row * 3 + best]) {
+                best = col;
+            };
+            try std.testing.expectEqual(@as(u32, @intCast(best)), indices[row]);
+        }
+        try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, -777))), indices[2]);
+        try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, -777))), indices[3]);
+    }
+}
+
+test "CUDA launch ABI packed argmax records preserve suppression and exact native schedules" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    var ctx = context_mod.CudaContext.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+    try std.testing.expect(module.linear_q6_k_q8_1_argmax_rows_stage1_tile8 != null);
+    try std.testing.expect(module.linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b != null);
+    try std.testing.expect(module.linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b != null);
+    try std.testing.expectEqual(@as(usize, 2816), a4b_qualification.hidden_size);
+    const Shape = struct { rows: usize, k: usize, n: usize, a4b: bool, suppress: bool };
+    for ([_]Shape{
+        .{ .rows = 2, .k = 256, .n = 17, .a4b = false, .suppress = true },
+        .{ .rows = 1, .k = 2816, .n = 16, .a4b = true, .suppress = false },
+        .{ .rows = 1, .k = 2560, .n = 262144, .a4b = false, .suppress = false },
+    }) |shape| {
+        const blocks = shape.k / 256;
+        const weight_bytes = shape.n * blocks * 210;
+        const raw = try std.testing.allocator.alloc(u8, weight_bytes);
+        defer std.testing.allocator.free(raw);
+        @memset(raw, 0);
+        // All Q6 codes are -32; only the final output row has negative scales.
+        // With x=0.125 every score is -K/8 except the final score +K/8.
+        for (0..shape.n * blocks) |block| {
+            @memset(raw[block * 210 + 192 ..][0..16], if (block / blocks == shape.n - 1) 0xff else 1);
+            std.mem.writeInt(u16, raw[block * 210 + 208 ..][0..2], @bitCast(@as(f16, 0.03125)), .little);
+        }
+        const packed_input = try std.testing.allocator.alloc(u8, shape.rows * (shape.k / 32) * 36);
+        defer std.testing.allocator.free(packed_input);
+        for (0..shape.rows * (shape.k / 32)) |block| {
+            std.mem.writeInt(u16, packed_input[block * 36 ..][0..2], @bitCast(@as(f16, 0.125)), .little);
+            std.mem.writeInt(u16, packed_input[block * 36 + 2 ..][0..2], @bitCast(@as(f16, 4)), .little);
+            @memset(packed_input[block * 36 + 4 ..][0..32], 1);
+        }
+        var weight = try buffer_mod.DeviceBuffer.alloc(&ctx, raw.len);
+        defer weight.free(&ctx);
+        var input = try buffer_mod.DeviceBuffer.alloc(&ctx, packed_input.len);
+        defer input.free(&ctx);
+        const partial_count = shape.rows * ((shape.n + 7) / 8);
+        var partial_values = try buffer_mod.DeviceBuffer.alloc(&ctx, partial_count * 4);
+        defer partial_values.free(&ctx);
+        var partial_indices = try buffer_mod.DeviceBuffer.alloc(&ctx, partial_count * 4);
+        defer partial_indices.free(&ctx);
+        var output = try buffer_mod.DeviceBuffer.alloc(&ctx, (shape.rows + 2) * 4);
+        defer output.free(&ctx);
+        var suppression = try buffer_mod.DeviceBuffer.alloc(&ctx, 2 * 4);
+        defer suppression.free(&ctx);
+        const excluded = [_]i32{ 0, @intCast(shape.n - 1) };
+        try weight.copyFromHost(&ctx, raw);
+        try input.copyFromHost(&ctx, packed_input);
+        try suppression.copyFromHost(&ctx, std.mem.sliceAsBytes(&excluded));
+        try module.launchFillF32(&ctx, output, shape.rows + 2, -777);
+        try module.launchLinearQ6KQ8_1ArgmaxRowsTile8F32(&ctx, output, partial_values, partial_indices, input, weight, suppression, shape.rows, shape.k, shape.n, if (shape.suppress) 2 else 0, shape.a4b);
+        var actual: [4]u32 = undefined;
+        try output.copyToHost(&ctx, std.mem.sliceAsBytes(actual[0 .. shape.rows + 2]));
+        try ctx.synchronize();
+        const expected: u32 = if (shape.suppress) 1 else @intCast(shape.n - 1);
+        for (actual[0..shape.rows]) |index| try std.testing.expectEqual(expected, index);
+        for (actual[shape.rows .. shape.rows + 2]) |guard| try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, -777))), guard);
+    }
+}
+
+test "CUDA launch ABI KV suffix records reread device positions on replay" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    var ctx = context_mod.CudaContext.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+    const graph_mod = @import("graph.zig");
+    const capacity = 8;
+    const dim = 32;
+    const suffix = 2;
+    const pages = [_]u32{ 3, 0, 2, 1 };
+    inline for (.{ false, true }) |packed_kv| {
+        const key_width = dim * (if (packed_kv) @as(usize, 2) else 4);
+        var key_dst = try buffer_mod.DeviceBuffer.alloc(&ctx, capacity * key_width + 64);
+        defer key_dst.free(&ctx);
+        var value_dst = try buffer_mod.DeviceBuffer.alloc(&ctx, capacity * dim * 4 + 64);
+        defer value_dst.free(&ctx);
+        var key_src = try buffer_mod.DeviceBuffer.alloc(&ctx, suffix * dim * 4);
+        defer key_src.free(&ctx);
+        var value_src = try buffer_mod.DeviceBuffer.alloc(&ctx, suffix * dim * 4);
+        defer value_src.free(&ctx);
+        var scalars = try buffer_mod.DeviceBuffer.alloc(&ctx, 5 * 4);
+        defer scalars.free(&ctx);
+        var table = try buffer_mod.DeviceBuffer.alloc(&ctx, pages.len * 4);
+        defer table.free(&ctx);
+        var expected_key: [capacity * key_width + 64]u8 = @splat(0xa5);
+        var expected_value: [capacity * dim * 4 + 64]u8 = @splat(0xa5);
+        try key_dst.copyFromHost(&ctx, &expected_key);
+        try value_dst.copyFromHost(&ctx, &expected_value);
+        try table.copyFromHost(&ctx, std.mem.sliceAsBytes(&pages));
+        try ctx.synchronize();
+        try graph_mod.beginCapture(&ctx);
+        var capturing = true;
+        errdefer if (capturing) {
+            const abandoned = ctx.endStreamCapture() catch null;
+            if (abandoned != null) ctx.destroyGraph(abandoned);
+        };
+        if (packed_kv) {
+            try module.launchKvWriteSuffixTurboquantF32(&ctx, key_dst, value_dst, table, key_src, value_src, scalars, suffix, dim, 1, dim, key_width, key_width, dim * 4, capacity, pages.len, 2, 2, 0, capacity);
+        } else {
+            try module.launchKvWriteSuffixDecodeScalarsF32(&ctx, key_dst, value_dst, key_src, value_src, scalars, suffix, dim, capacity);
+        }
+        var graph = try graph_mod.endCapture(&ctx);
+        capturing = false;
+        defer graph.deinit(&ctx);
+        for ([_]u32{ 2, 5 }) |total| {
+            var keys: [suffix * dim]f32 = undefined;
+            var values: [suffix * dim]f32 = undefined;
+            for (&keys, &values, 0..) |*key, *value, index| {
+                key.* = @as(f32, @floatFromInt(total)) + @as(f32, @floatFromInt(index % 13)) * 0.125;
+                value.* = -key.* - 0.5;
+                const logical = total - suffix + index / dim;
+                const physical = if (packed_kv) pages[logical / 2] * 2 + logical % 2 else logical;
+                const column = index % dim;
+                const key_offset = physical * key_width + column * (if (packed_kv) @as(usize, 2) else 4);
+                if (packed_kv) {
+                    std.mem.writeInt(u16, expected_key[key_offset..][0..2], @bitCast(@as(f16, @floatCast(key.*))), .little);
+                } else {
+                    std.mem.writeInt(u32, expected_key[key_offset..][0..4], @bitCast(key.*), .little);
+                }
+                const value_offset = (physical * dim + column) * 4;
+                std.mem.writeInt(u32, expected_value[value_offset..][0..4], @bitCast(value.*), .little);
+            }
+            const words = [_]u32{ 0, total - 1, total, total, 0 };
+            try key_src.copyFromHost(&ctx, std.mem.sliceAsBytes(&keys));
+            try value_src.copyFromHost(&ctx, std.mem.sliceAsBytes(&values));
+            try scalars.copyFromHost(&ctx, std.mem.sliceAsBytes(&words));
+            try graph.launch(&ctx);
+            var actual_key: [capacity * key_width + 64]u8 = undefined;
+            var actual_value: [capacity * dim * 4 + 64]u8 = undefined;
+            try key_dst.copyToHost(&ctx, &actual_key);
+            try value_dst.copyToHost(&ctx, &actual_value);
+            try ctx.synchronize();
+            try std.testing.expectEqualSlices(u8, &expected_key, &actual_key);
+            try std.testing.expectEqualSlices(u8, &expected_value, &actual_value);
+        }
     }
 }
 

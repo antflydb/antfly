@@ -58,6 +58,37 @@ fn signature(comptime family: []const u8) []const u8 {
     const end = std.mem.indexOf(u8, native_signatures[begin..], "\n\n") orelse native_signatures.len - begin;
     return native_signatures[begin .. begin + end];
 }
+/// Derive named value records directly from the native parameter list. Device
+/// addresses use u64 and scalar wires use u32/i32/f32. fieldsFor validates
+/// and order-packs the final storage.
+/// This is compile-time construction, with no per-launch parser or allocation.
+pub fn ArgumentsFor(comptime family: []const u8) type {
+    @setEvalBranchQuota(20000);
+    const declarations = signature(family);
+    const count = comptime blk: {
+        var lines = std.mem.splitScalar(u8, declarations, '\n');
+        var count: usize = 0;
+        while (lines.next()) |raw| if (std.mem.trim(u8, raw, " \t\r\\,").len != 0) {
+            count += 1;
+        };
+        break :blk count;
+    };
+    var names: [count][]const u8 = undefined;
+    var types: [count]type = undefined;
+    var lines = std.mem.splitScalar(u8, declarations, '\n');
+    var index: usize = 0;
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r\\,");
+        if (line.len == 0) continue;
+        const split = std.mem.lastIndexOfScalar(u8, line, ' ').?;
+        names[index] = line[split + 1 ..];
+        const declaration = line[0..split];
+        types[index] = if (std.mem.indexOfScalar(u8, declaration, '*') != null) u64 else if (std.mem.eql(u8, declaration, "unsigned int")) u32 else if (std.mem.eql(u8, declaration, "int")) i32 else if (std.mem.eql(u8, declaration, "float")) f32 else @compileError("unsupported native CUDA value type: " ++ declaration);
+        index += 1;
+    }
+    return @Struct(.auto, null, &names, &types, &@splat(.{}));
+}
+
 fn matchesWire(comptime declaration: []const u8, comptime T: type) bool {
     if (std.mem.indexOfScalar(u8, declaration, '*') != null)
         return @sizeOf(T) == 8 and (T == u64 or @typeInfo(T) == .pointer or (@typeInfo(T) == .optional and @typeInfo(@typeInfo(T).optional.child) == .pointer));
@@ -110,4 +141,19 @@ test "CUDA launch ABI preserves wire order addresses and live scalar updates" {
     try std.testing.expectEqual(pointer, @as(*u64, @ptrCast(@alignCast(named[0].?))).*);
     try std.testing.expectEqual(count, @as(*u32, @ptrCast(@alignCast(named[1].?))).*);
     try std.testing.expectEqual(scale, @as(*f32, @ptrCast(@alignCast(named[2].?))).*);
+}
+
+test "CUDA launch ABI native-derived records preserve live slots and wire widths" {
+    var arguments = std.mem.zeroes(ArgumentsFor("TQ_SPLIT_STAGE1"));
+    arguments.partial_acc = 0x123456789abcdef0;
+    arguments.chunk_count = 7;
+    arguments.decode_scalars = 0x7777;
+    const slots = fieldsFor("TQ_SPLIT_STAGE1", &arguments);
+    try std.testing.expectEqual(@as(usize, 23), slots.len);
+    try std.testing.expectEqual(@as(u64, 0x123456789abcdef0), @as(*u64, @ptrCast(@alignCast(slots[0].?))).*);
+    try std.testing.expectEqual(@as(u64, 0x7777), @as(*u64, @ptrCast(@alignCast(slots[20].?))).*);
+    arguments.chunk_count = 19;
+    try std.testing.expectEqual(@as(u32, 19), @as(*u32, @ptrCast(@alignCast(slots[22].?))).*);
+    try std.testing.expectEqual(u32, @FieldType(ArgumentsFor("QUANT_QKV"), "kv_out_dim"));
+    try std.testing.expectEqual(u64, @FieldType(ArgumentsFor("Q8_INPUT_QKV"), "q8_input"));
 }

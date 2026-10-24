@@ -20,6 +20,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const ops = @import("ops.zig");
+const kernel_geometry = @import("kernel_geometry.zig");
 const linalg = @import("inference_linalg");
 const backend_contracts = @import("../graph/backend_contracts.zig");
 const quant_matmul = @import("../graph/quant_matmul.zig");
@@ -4021,9 +4022,15 @@ fn shouldBorrowTypedWeightTensor(self: *const NativeCompute, name: []const u8, t
         std.mem.endsWith(u8, name, ".mlp.down_proj.weight");
 }
 
+// This existing lease also covers dense inputs: borrowed views do no cleanup,
+// and each conversion owns only its own allocation, even for aliased inputs.
 const WeightF32View = struct {
     data: []const f32,
     owned: ?[]f32 = null,
+
+    inline fn deinit(view: @This(), allocator: std.mem.Allocator) void {
+        if (view.owned) |owned| allocator.free(owned);
+    }
 };
 
 fn denseWeightView(self: *NativeCompute, weight: CT) !WeightF32View {
@@ -4042,6 +4049,41 @@ fn denseTensorView(self: *NativeCompute, tensor: CT) !WeightF32View {
         return .{ .data = converted, .owned = converted };
     }
     return .{ .data = try getDataChecked(tensor) };
+}
+
+test "native dense input leases unwind converted aliased and borrowed inputs" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+            defer store.deinitOwned();
+            var compute = NativeCompute.init(a, &store, null);
+            defer compute.deinit();
+            var half = [_]f16{ 1, 2, 3, 4 };
+            const source = tensor_mod.Tensor{
+                .data = std.mem.sliceAsBytes(half[0..]),
+                .shape = &.{4},
+                .dtype = .f16,
+                .name = "lease",
+                .allocator = a,
+                .owns_data = false,
+                .owns_shape = false,
+            };
+            const converted = try compute.makeBufWithEntry(empty_f32[0..], false, "lease", null, null, &source);
+            defer freeTensor(&compute, converted);
+            var values = [_]f32{ 1, 2, 3, 4 };
+            const borrowed = try compute.makeBuf(&values, false);
+            defer freeTensor(&compute, borrowed);
+            for ([_]CT{ converted, borrowed }) |other| {
+                const difference = try subtractOp(&compute, converted, other);
+                defer freeTensor(&compute, difference);
+                try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0 }, getData(difference));
+                const quotient = try divideOp(&compute, converted, other);
+                defer freeTensor(&compute, quotient);
+                try std.testing.expectEqualSlices(f32, &.{ 1, 1, 1, 1 }, getData(quotient));
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 fn borrowTensorF32IfAligned(tensor: *const tensor_mod.Tensor) ?[]const f32 {
@@ -5479,7 +5521,7 @@ fn makeBufFromWeightView(
         quantized_storage,
         null,
     ) catch |err| {
-        if (view.owned) |owned| self.allocator.free(owned);
+        view.deinit(self.allocator);
         return err;
     };
 }
@@ -6723,14 +6765,14 @@ fn linearInto(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_
             }
         } else {
             const weight_view = try denseWeightView(self, weight);
-            defer if (weight_view.owned) |owned| self.allocator.free(owned);
+            defer weight_view.deinit(self.allocator);
             if (try preparedEmbeddingGemma2Linear(self, getData(input), weight_view.data, output, rows, out_dim, in_dim)) {
                 addLinearBiasRows(output, getData(bias), rows, out_dim);
             } else try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, getData(input), weight_view.data, 1.0, output);
         }
     } else {
         const weight_view = try denseWeightView(self, weight);
-        defer if (weight_view.owned) |owned| self.allocator.free(owned);
+        defer weight_view.deinit(self.allocator);
         if (try preparedEmbeddingGemma2Linear(self, getData(input), weight_view.data, output, rows, out_dim, in_dim)) {
             addLinearBiasRows(output, getData(bias), rows, out_dim);
         } else try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, getData(input), weight_view.data, 1.0, output);
@@ -7112,6 +7154,21 @@ test "native owned dense output adapters release every partial allocation" {
                 defer freeTensor(&compute, result);
                 try std.testing.expectEqual(getData(source).len + 8, getData(result).len);
             }
+            inline for (.{ reluOp, siluOp, quickGeluOp, sigmoidOp, primSqrtOp, primRsqrtOp, primExpOp, primLogOp, primSinOp, primCosOp, primTanhOp, primAbsOp, primErfOp, negateOp }) |operation| {
+                const result = try operation(&compute, input);
+                defer freeTensor(&compute, result);
+                try std.testing.expectEqual(values.len, getData(result).len);
+            }
+            inline for (.{ primSoftmaxOp, primLogSoftmaxOp }) |operation| {
+                const result = try operation(&compute, input, 4);
+                defer freeTensor(&compute, result);
+                try std.testing.expectEqual(values.len, getData(result).len);
+            }
+            inline for (.{ ops.kernel_descriptor.ReductionMode.sum, .max, .mean }) |mode| {
+                const result = try primReduceOp(&compute, input, &.{1}, &.{ 2, 4 }, mode);
+                defer freeTensor(&compute, result);
+                try std.testing.expectEqualSlices(i64, &.{ 2, 1 }, tensorStoredShape(result).?);
+            }
             // Exercise the extra shape-allocation failure beyond inline storage.
             var output = try OwnedDenseOutput.alloc(&compute, 1);
             defer output.deinit();
@@ -7185,9 +7242,9 @@ fn validateLayerNormBackward(input: []const f32, gamma: []const f32, dy: []const
     return count;
 }
 
-/// Outputs are disjoint, caller-owned planes. Validation precedes all writes;
+/// Fresh output planes alias neither inputs nor one another. Validation precedes all writes;
 /// the packed backend result can use one allocation without temporary copies.
-fn layerNormBackwardInto(comptime initialize_planes: bool, input: []const f32, gamma: []const f32, dy: []const f32, rows: usize, dim: usize, eps: f32, dx: []f32, dgamma_plane: []f32, dbeta_plane: []f32) !void {
+fn layerNormBackwardInto(comptime initialize_planes: bool, input: []const f32, gamma: []const f32, dy: []const f32, rows: usize, dim: usize, eps: f32, noalias dx: []f32, noalias dgamma_plane: []f32, noalias dbeta_plane: []f32) !void {
     const count = try validateLayerNormBackward(input, gamma, dy, rows, dim);
     if (dx.len < count or dgamma_plane.len < dim or dbeta_plane.len < dim) return error.InvalidTensorShape;
     const dgamma = dgamma_plane[0..dim];
@@ -7563,9 +7620,9 @@ fn addOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
         return result;
     }
     const a_view = try denseTensorView(self, a);
-    defer if (a_view.owned) |owned| self.allocator.free(owned);
+    defer a_view.deinit(self.allocator);
     const b_view = try denseTensorView(self, b);
-    defer if (b_view.owned) |owned| self.allocator.free(owned);
+    defer b_view.deinit(self.allocator);
     const a_data = a_view.data;
     const b_data = b_view.data;
     // Handle implicit broadcasting for primitive add (bias in lowered linear).
@@ -8605,7 +8662,7 @@ fn linearNoBiasInto(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim:
         }
     }
     const weight_view = try denseWeightView(self, weight);
-    defer if (weight_view.owned) |owned| self.allocator.free(owned);
+    defer weight_view.deinit(self.allocator);
     if (!try preparedEmbeddingGemma2Linear(self, getData(input), weight_view.data, output, rows, out_dim, in_dim))
         try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, getData(input), weight_view.data, 0.0, output);
     return;
@@ -35885,33 +35942,38 @@ fn rmsNormConsumeInputOp(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps
 
 fn reluOp(ctx: *anyopaque, input: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    const output = try self.allocator.dupe(f32, getData(input));
+    var owned_output = try OwnedDenseOutput.copy(self, getData(input));
+    defer owned_output.deinit();
+    const output = owned_output.storage.?;
     activations_mod.relu(output);
-    const result = try self.makeOwnedBuf(output);
-    errdefer freeTensor(ctx, result);
-    return propagateLogicalShapeLike(self, result, input);
+    return owned_output.intoLike(input);
 }
 
 fn siluOp(ctx: *anyopaque, input: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    const output = try self.allocator.dupe(f32, getData(input));
+    var owned_output = try OwnedDenseOutput.copy(self, getData(input));
+    defer owned_output.deinit();
+    const output = owned_output.storage.?;
     activations_mod.silu(output);
-    const result = try self.makeBuf(output, true);
-    return propagateLogicalShapeLike(self, result, input);
+    return owned_output.intoLike(input);
 }
 
 fn quickGeluOp(ctx: *anyopaque, input: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    const output = try self.allocator.dupe(f32, getData(input));
+    var owned_output = try OwnedDenseOutput.copy(self, getData(input));
+    defer owned_output.deinit();
+    const output = owned_output.storage.?;
     activations_mod.quickGelu(output);
-    return self.makeBuf(output, true);
+    return owned_output.intoResult();
 }
 
 fn sigmoidOp(ctx: *anyopaque, input: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    const output = try self.allocator.dupe(f32, getData(input));
+    var owned_output = try OwnedDenseOutput.copy(self, getData(input));
+    defer owned_output.deinit();
+    const output = owned_output.storage.?;
     activations_mod.sigmoid(output);
-    return self.makeBuf(output, true);
+    return owned_output.intoResult();
 }
 
 fn tanhOp(ctx: *anyopaque, input: CT) anyerror!CT {
@@ -35949,9 +36011,9 @@ fn linearRowsNative(
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     defer maybeDiscardMappedWeightAfterUse(self, bias);
     const weight_view = try denseWeightView(self, weight);
-    defer if (weight_view.owned) |owned| self.allocator.free(owned);
+    defer weight_view.deinit(self.allocator);
     const bias_view = try denseWeightView(self, bias);
-    defer if (bias_view.owned) |owned| self.allocator.free(owned);
+    defer bias_view.deinit(self.allocator);
 
     const output = try self.allocator.alloc(f32, rows * out_dim);
     errdefer self.allocator.free(output);
@@ -36262,9 +36324,9 @@ fn debertaTrainingAttentionV1Op(ctx: *anyopaque, qkv: CT, relative: CT, control_
     const words = try debertaTrainingControl(control_i32, layout.controlShape());
     _ = try deberta_training.validateControl(attrs, words, .{ .control = control, .io = self.io });
     const qkv_data = try debertaTrainingF32(self, qkv, layout.qkvShape());
-    defer if (qkv_data.owned) |data| self.allocator.free(data);
+    defer qkv_data.deinit(self.allocator);
     const relative_data = try debertaTrainingF32(self, relative, layout.relativeShape());
-    defer if (relative_data.owned) |data| self.allocator.free(data);
+    defer relative_data.deinit(self.allocator);
     const output = try deberta_training.forward(self.allocator, attrs, qkv_data.data, relative_data.data, words, .{ .control = control, .io = self.io });
     const result = try self.makeOwnedBuf(output);
     errdefer freeTensor(self, result);
@@ -36280,11 +36342,11 @@ fn debertaTrainingAttentionBackwardV1Op(ctx: *anyopaque, qkv: CT, relative: CT, 
     const words = try debertaTrainingControl(control_i32, layout.controlShape());
     _ = try deberta_training.validateControl(attrs, words, .{ .control = control, .io = self.io });
     const qkv_data = try debertaTrainingF32(self, qkv, layout.qkvShape());
-    defer if (qkv_data.owned) |data| self.allocator.free(data);
+    defer qkv_data.deinit(self.allocator);
     const relative_data = try debertaTrainingF32(self, relative, layout.relativeShape());
-    defer if (relative_data.owned) |data| self.allocator.free(data);
+    defer relative_data.deinit(self.allocator);
     const cotangent = try debertaTrainingF32(self, dout, layout.outputShape());
-    defer if (cotangent.owned) |data| self.allocator.free(data);
+    defer cotangent.deinit(self.allocator);
     const output = try deberta_training.backward(self.allocator, attrs, qkv_data.data, relative_data.data, words, cotangent.data, .{ .control = control, .io = self.io });
     const result = try self.makeOwnedBuf(output);
     errdefer freeTensor(self, result);
@@ -36327,7 +36389,7 @@ fn segmentTrainingAttentionV1Op(ctx: *anyopaque, qkv: CT, control_i32: CT, attrs
     const layout = try attrs.layout();
     const words = try segmentTrainingControl(control_i32, layout.controlShape());
     const qkv_data = try segmentTrainingF32(self, qkv, layout.qkvShape());
-    defer if (qkv_data.owned) |data| self.allocator.free(data);
+    defer qkv_data.deinit(self.allocator);
     const output = try segment_training.forward(self.allocator, attrs, qkv_data.data, words, .{ .control = control, .io = self.io });
     const result = try self.makeOwnedBuf(output);
     errdefer freeTensor(self, result);
@@ -36341,9 +36403,9 @@ fn segmentTrainingAttentionBackwardV1Op(ctx: *anyopaque, qkv: CT, control_i32: C
     const layout = try attrs.layout();
     const words = try segmentTrainingControl(control_i32, layout.controlShape());
     const qkv_data = try segmentTrainingF32(self, qkv, layout.qkvShape());
-    defer if (qkv_data.owned) |data| self.allocator.free(data);
+    defer qkv_data.deinit(self.allocator);
     const cotangent = try segmentTrainingF32(self, dout, layout.outputShape());
-    defer if (cotangent.owned) |data| self.allocator.free(data);
+    defer cotangent.deinit(self.allocator);
     const output = try segment_training.backward(self.allocator, attrs, qkv_data.data, words, cotangent.data, .{ .control = control, .io = self.io });
     const result = try self.makeOwnedBuf(output);
     errdefer freeTensor(self, result);
@@ -36357,7 +36419,7 @@ fn modernBertTrainingAttentionV1Op(ctx: *anyopaque, qkv: CT, control_i32: CT, at
     const layout = try attrs.layout();
     const words = try debertaTrainingControl(control_i32, layout.controlShape());
     const qkv_data = try debertaTrainingF32(self, qkv, layout.qkvShape());
-    defer if (qkv_data.owned) |data| self.allocator.free(data);
+    defer qkv_data.deinit(self.allocator);
     const output = try modernbert_training.forward(self.allocator, attrs, qkv_data.data, words, control);
     const result = try self.makeOwnedBuf(output);
     errdefer freeTensor(self, result);
@@ -36371,9 +36433,9 @@ fn modernBertTrainingAttentionBackwardV1Op(ctx: *anyopaque, qkv: CT, control_i32
     const layout = try attrs.layout();
     const words = try debertaTrainingControl(control_i32, layout.controlShape());
     const qkv_data = try debertaTrainingF32(self, qkv, layout.qkvShape());
-    defer if (qkv_data.owned) |data| self.allocator.free(data);
+    defer qkv_data.deinit(self.allocator);
     const cotangent = try debertaTrainingF32(self, dout, layout.outputShape());
-    defer if (cotangent.owned) |data| self.allocator.free(data);
+    defer cotangent.deinit(self.allocator);
     const output = try modernbert_training.backward(self.allocator, attrs, qkv_data.data, words, cotangent.data, control);
     const result = try self.makeOwnedBuf(output);
     errdefer freeTensor(self, result);
@@ -37082,9 +37144,9 @@ fn multiplyOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
         return result;
     }
     const a_view = try denseTensorView(self, a);
-    defer if (a_view.owned) |owned| self.allocator.free(owned);
+    defer a_view.deinit(self.allocator);
     const b_view = try denseTensorView(self, b);
-    defer if (b_view.owned) |owned| self.allocator.free(owned);
+    defer b_view.deinit(self.allocator);
     const a_data = a_view.data;
     const b_data = b_view.data;
     if (a_data.len != b_data.len) {
@@ -37173,9 +37235,8 @@ fn conv2dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_c
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     if (batch == 0 or in_channels == 0 or out_channels == 0 or height == 0 or width == 0 or kernel_h == 0 or kernel_w == 0 or stride_h == 0 or stride_w == 0 or groups == 0 or in_channels % groups != 0 or out_channels % groups != 0) return error.InvalidInputShape;
 
-    const padded_h = std.math.add(usize, height, std.math.mul(usize, padding_h, 2) catch return error.InvalidInputShape) catch return error.InvalidInputShape;
-    const padded_w = std.math.add(usize, width, std.math.mul(usize, padding_w, 2) catch return error.InvalidInputShape) catch return error.InvalidInputShape;
-    if (kernel_h > padded_h or kernel_w > padded_w) return error.InvalidInputShape;
+    const out_h = kernel_geometry.convolutionOutput(height, kernel_h, stride_h, padding_h) catch return error.InvalidInputShape;
+    const out_w = kernel_geometry.convolutionOutput(width, kernel_w, stride_w, padding_w) catch return error.InvalidInputShape;
 
     const input_data = getData(input);
     const weight_data = getData(weight);
@@ -37185,8 +37246,6 @@ fn conv2dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_c
     const weight_elems = std.math.mul(usize, std.math.mul(usize, out_channels, in_channels / groups) catch return error.InvalidInputShape, kernel_elems) catch return error.InvalidInputShape;
     if (input_data.len != input_elems or weight_data.len != weight_elems or bias_data.len != out_channels) return error.InvalidInputShape;
 
-    const out_h = (padded_h - kernel_h) / stride_h + 1;
-    const out_w = (padded_w - kernel_w) / stride_w + 1;
     const output_area = std.math.mul(usize, out_h, out_w) catch return error.InvalidInputShape;
     const output_elems = std.math.mul(usize, std.math.mul(usize, batch, out_channels) catch return error.InvalidInputShape, output_area) catch return error.InvalidInputShape;
     const conv_temp_limit_elems: usize = 64 * 1024 * 1024;
@@ -37458,7 +37517,7 @@ fn averagePoolOp(ctx: *anyopaque, input: CT, attrs: *const @import("ml").graph.n
     const output_elems = std.math.mul(usize, planes, output_area) catch return error.InvalidInputShape;
     if (output_elems > 64 * 1024 * 1024) return error.UnsupportedShape;
     const view = try denseTensorView(self, input);
-    defer if (view.owned) |owned| self.allocator.free(owned);
+    defer view.deinit(self.allocator);
     if (view.data.len != input_elems) return error.InvalidInputShape;
     const output = try self.allocator.alloc(f32, output_elems);
 
@@ -37574,9 +37633,9 @@ fn convTransposeOp(ctx: *anyopaque, request: *const ops.ConvTransposeRequest) an
         return error.UnsupportedShape;
     }
     const input_view = try denseTensorView(self, request.input);
-    defer if (input_view.owned) |owned| self.allocator.free(owned);
+    defer input_view.deinit(self.allocator);
     const weight_view = try denseTensorView(self, request.weight);
-    defer if (weight_view.owned) |owned| self.allocator.free(owned);
+    defer weight_view.deinit(self.allocator);
     const input_data = input_view.data;
     const weight_data = weight_view.data;
     if (input_data.len != input_elems or weight_data.len != weight_elems) return error.InvalidInputShape;
@@ -38532,9 +38591,9 @@ fn subtractOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
         return result;
     }
     const a_view = try denseTensorView(self, a);
-    defer if (a_view.owned) |owned| self.allocator.free(owned);
+    defer a_view.deinit(self.allocator);
     const b_view = try denseTensorView(self, b);
-    defer if (b_view.owned) |owned| self.allocator.free(owned);
+    defer b_view.deinit(self.allocator);
     const output = try primBinaryBroadcast(self.allocator, a_view.data, b_view.data, .sub);
     const result = try self.makeOwnedBuf(output);
     errdefer freeTensor(self, result);
@@ -38547,9 +38606,9 @@ fn divideOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
         return result;
     }
     const a_view = try denseTensorView(self, a);
-    defer if (a_view.owned) |owned| self.allocator.free(owned);
+    defer a_view.deinit(self.allocator);
     const b_view = try denseTensorView(self, b);
-    defer if (b_view.owned) |owned| self.allocator.free(owned);
+    defer b_view.deinit(self.allocator);
     const output = try primBinaryBroadcast(self.allocator, a_view.data, b_view.data, .div);
     const result = try self.makeOwnedBuf(output);
     errdefer freeTensor(self, result);
@@ -38597,11 +38656,11 @@ fn primitiveUnaryInto(comptime op: ops.kernel_descriptor.Unary, input: []const f
 fn primUnaryOp(comptime op: ops.kernel_descriptor.Unary, ctx: *anyopaque, input: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const data = getData(input);
-    const output = try self.allocator.alloc(f32, data.len);
+    var owned_output = try OwnedDenseOutput.alloc(self, data.len);
+    defer owned_output.deinit();
+    const output = owned_output.storage.?;
     primitiveUnaryInto(op, data, output);
-    const result = try self.makeOwnedBuf(output);
-    errdefer freeTensor(self, result);
-    return propagateLogicalShapeLike(self, result, input);
+    return owned_output.intoLike(input);
 }
 
 fn primSqrtOp(ctx: *anyopaque, a: CT) anyerror!CT {
@@ -38640,9 +38699,9 @@ fn lessThanOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
         return result;
     }
     const a_view = try denseTensorView(self, a);
-    defer if (a_view.owned) |owned| self.allocator.free(owned);
+    defer a_view.deinit(self.allocator);
     const b_view = try denseTensorView(self, b);
-    defer if (b_view.owned) |owned| self.allocator.free(owned);
+    defer b_view.deinit(self.allocator);
     const a_data = a_view.data;
     const b_data = b_view.data;
     const output = try primBinaryBroadcast(self.allocator, a_data, b_data, .lt);
@@ -39095,15 +39154,12 @@ fn primReduceOp(self: *NativeCompute, input: CT, axes: []const u8, input_shape: 
     };
     const geometry = try ops.kernel_descriptor.ReductionGeometry.init(resolved_input_shape, axes);
     if (in_data.len != geometry.input_count) return error.InvalidTensorShape;
-    const output = try self.allocator.alloc(f32, geometry.output_count);
-    var raw_output: ?[]f32 = output;
-    errdefer if (raw_output) |raw| self.allocator.free(raw);
+    var owned_output = try OwnedDenseOutput.alloc(self, geometry.output_count);
+    defer owned_output.deinit();
+    const output = owned_output.storage.?;
     reduceInto(in_data, output, geometry, mode);
 
-    const result = try self.makeBuf(output, true);
-    raw_output = null;
-    errdefer freeTensor(self, result);
-    return self.withLogicalShape(result, geometry.output_dims[0..geometry.rank]);
+    return owned_output.intoShape(geometry.output_dims[0..geometry.rank]);
 }
 
 fn primReshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT {
@@ -39123,7 +39179,7 @@ fn primReshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT
         if (inferReshapeShapeWithNumel(shape, new_shape, in_data.len)) |resolved| {
             return aliasDenseBufWithShape(self, input, resolved[0..new_shape.len]) catch blk: {
                 const in_view = try denseWeightView(self, input);
-                defer if (in_view.owned) |owned| self.allocator.free(owned);
+                defer in_view.deinit(self.allocator);
                 const output = try self.allocator.dupe(f32, in_view.data);
                 const result = try self.makeOwnedBuf(output);
                 errdefer freeTensor(self, result);
@@ -39136,7 +39192,7 @@ fn primReshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT
         if (inferReshapeShapeWithNumel(runtime_shape, new_shape, in_data.len)) |resolved| {
             return aliasDenseBufWithShape(self, input, resolved[0..new_shape.len]) catch blk: {
                 const in_view = try denseWeightView(self, input);
-                defer if (in_view.owned) |owned| self.allocator.free(owned);
+                defer in_view.deinit(self.allocator);
                 const output = try self.allocator.dupe(f32, in_view.data);
                 const result = try self.makeOwnedBuf(output);
                 errdefer freeTensor(self, result);
@@ -39147,7 +39203,7 @@ fn primReshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT
     if (resolveShapeFromDataLen(new_shape, in_data.len)) |resolved| {
         return aliasDenseBufWithShape(self, input, resolved[0..new_shape.len]) catch blk: {
             const dense_view = try denseWeightView(self, input);
-            defer if (dense_view.owned) |owned| self.allocator.free(owned);
+            defer dense_view.deinit(self.allocator);
             const output = try self.allocator.dupe(f32, dense_view.data);
             const result = try self.makeOwnedBuf(output);
             errdefer freeTensor(self, result);
@@ -39171,7 +39227,7 @@ fn primReshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT
     }
     return aliasDenseBufWithShape(self, input, symbolic_shape[0..new_shape.len]) catch blk: {
         const dense_view = try denseWeightView(self, input);
-        defer if (dense_view.owned) |owned| self.allocator.free(owned);
+        defer dense_view.deinit(self.allocator);
         const output = try self.allocator.dupe(f32, dense_view.data);
         const result = try self.makeOwnedBuf(output);
         errdefer freeTensor(self, result);
@@ -39241,7 +39297,7 @@ fn primTransposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []
     }
 
     const in_view = try denseWeightView(self, input);
-    defer if (in_view.owned) |owned| self.allocator.free(owned);
+    defer in_view.deinit(self.allocator);
     const in_data = in_view.data;
     const output = try self.allocator.alloc(f32, numel);
     var raw_output: ?[]f32 = output;
@@ -39339,7 +39395,7 @@ fn primBroadcastInDimOp(ctx: *anyopaque, input: CT, target_shape: []const i64, b
     }
     if (axis_count == 0) {
         const view = try denseTensorView(self, input);
-        defer if (view.owned) |owned| self.allocator.free(owned);
+        defer view.deinit(self.allocator);
         if (view.data.len > 0) {
             const in_data = view.data;
             const output = try self.allocator.alloc(f32, out_numel);
@@ -39387,7 +39443,7 @@ fn primBroadcastInDimOp(ctx: *anyopaque, input: CT, target_shape: []const i64, b
     }
 
     const view = try denseTensorView(self, input);
-    defer if (view.owned) |owned| self.allocator.free(owned);
+    defer view.deinit(self.allocator);
     const in_data = view.data;
     // Materialization returns contiguous logical data, including source tensors.
     computeStrides(resolved_input_shape, in_strides[0..in_rank]);
@@ -39488,9 +39544,9 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
     if (lhs_batch.len == 0 and rhs_batch.len == 0 and lhs_contracting.len == 0 and rhs_contracting.len == 0) {
         if (lhs_effective_shape.len == 1 and rhs_effective_shape.len == 1) {
             const lhs_view = try denseWeightView(self, lhs);
-            defer if (lhs_view.owned) |owned| self.allocator.free(owned);
+            defer lhs_view.deinit(self.allocator);
             const rhs_view = try denseWeightView(self, rhs);
-            defer if (rhs_view.owned) |owned| self.allocator.free(owned);
+            defer rhs_view.deinit(self.allocator);
 
             const m = positiveShapeDim(lhs_effective_shape, 0) catch lhs_view.data.len;
             const n = positiveShapeDim(rhs_effective_shape, 0) catch rhs_view.data.len;
@@ -39567,7 +39623,7 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
 
             if (rhs_buf.source_tensor) |rhs_tensor| {
                 const rhs_view = try tensorF32View(self, rhs_tensor);
-                defer if (rhs_view.owned) |owned| self.allocator.free(owned);
+                defer rhs_view.deinit(self.allocator);
                 for (0..m) |i| {
                     for (0..n) |j| {
                         var acc: f64 = 0.0;
@@ -39661,7 +39717,7 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
                 matmulRhsSourceTensorChunked(self, lhs_data, rhs_buf2.source_tensor.?, output, effective_rows, effective_k, n) catch |err| switch (err) {
                     error.ShapeMismatch => {
                         const rhs_view = try tensorF32View(self, rhs_buf2.source_tensor.?);
-                        defer if (rhs_view.owned) |owned| self.allocator.free(owned);
+                        defer rhs_view.deinit(self.allocator);
                         if (rhs_buf2.source_tensor.?.shape.len != 2) return err;
 
                         const rhs_rows: usize = @intCast(rhs_buf2.source_tensor.?.shape[0]);
@@ -39686,7 +39742,7 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
                 const lhs_strides = logicalStridesOrContiguous(lhs, lhs_effective_shape, lhs_stride_scratch[0..lhs_effective_shape.len]);
                 if (rhs_buf2.source_tensor) |rhs_tensor| {
                     const rhs_view = try tensorF32View(self, rhs_tensor);
-                    defer if (rhs_view.owned) |owned| self.allocator.free(owned);
+                    defer rhs_view.deinit(self.allocator);
                     for (0..effective_rows) |row| {
                         for (0..n) |col| {
                             var acc: f64 = 0.0;
@@ -39719,7 +39775,7 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
 
         const rhs_buf2 = toBuf(rhs);
         const rhs_view = if (rhs_buf2.view_strides != null or rhs_buf2.source_tensor != null) try denseWeightView(self, rhs) else null;
-        defer if (rhs_view) |view| if (view.owned) |owned| self.allocator.free(owned);
+        defer if (rhs_view) |view| view.deinit(self.allocator);
         const rhs_raw_data = if (rhs_view) |view| view.data else rhs_buf2.data;
 
         // Find the non-batch, non-contracting dims.
@@ -39878,7 +39934,7 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
         };
         const lhs_buf2 = toBuf(lhs);
         const lhs_view = if (lhs_buf2.view_strides != null or lhs_buf2.source_tensor != null) try denseWeightView(self, lhs) else null;
-        defer if (lhs_view) |view| if (view.owned) |owned| self.allocator.free(owned);
+        defer if (lhs_view) |view| view.deinit(self.allocator);
         const lhs_data = if (lhs_view) |view| view.data else lhs_buf2.data;
         var effective_rhs_raw_data = rhs_raw_data;
         if (symbolic_batch_dims and lhs_batch_elems != rhs_batch_elems) {
@@ -40147,9 +40203,9 @@ fn exactLessThan(self: *NativeCompute, a: CT, b: CT) !CT {
     const lhs = if (integerSource(a) != null) try IndexReader.init(a) else null;
     const rhs = if (integerSource(b) != null) try IndexReader.init(b) else null;
     const lf = if (lhs == null) try denseTensorView(self, a) else null;
-    defer if (lf) |view| if (view.owned) |owned| self.allocator.free(owned);
+    defer if (lf) |view| view.deinit(self.allocator);
     const rf = if (rhs == null) try denseTensorView(self, b) else null;
-    defer if (rf) |view| if (view.owned) |owned| self.allocator.free(owned);
+    defer if (rf) |view| view.deinit(self.allocator);
     const ln = if (lhs) |reader| reader.len else lf.?.data.len;
     const rn = if (rhs) |reader| reader.len else rf.?.data.len;
     const lflat = [_]i64{@intCast(ln)};
@@ -40264,7 +40320,7 @@ fn exactWhereSelect(self: *NativeCompute, cond: CT, yes: CT, no: CT) !CT {
     if (dtype != false_dtype) return error.UnsupportedTensorType;
     var views: [3]?WeightF32View = @splat(null);
     defer for (&views) |*view| {
-        if (view.*) |v| if (v.owned) |owned| self.allocator.free(owned);
+        if (view.*) |v| v.deinit(self.allocator);
     };
     var shapes: [3][]const i64 = undefined;
     var flat: [3][1]i64 = undefined;
@@ -40545,7 +40601,7 @@ fn typedScatterAdd(self: *NativeCompute, input: CT, indices: CT, input_shape: []
     if (width == 0 or input_shape[1] != output_shape[1] or index.len != n) return error.ShapeMismatch;
     for (0..n) |i| _ = try index.normalized(i, out_rows);
     const input_view = try denseTensorView(self, input);
-    defer if (input_view.owned) |owned| self.allocator.free(owned);
+    defer input_view.deinit(self.allocator);
     if (input_view.data.len != count) return error.ShapeMismatch;
     const output = try self.allocator.alloc(f32, output_count);
     errdefer self.allocator.free(output);
@@ -41058,7 +41114,7 @@ fn primSliceOp(ctx: *anyopaque, input: CT, starts: []const i64, limits: []const 
     if (full_range_passthrough) {
         return aliasDenseBufWithShape(self, input, effective_input_shape) catch blk: {
             const dense_view = try denseWeightView(self, input);
-            defer if (dense_view.owned) |owned| self.allocator.free(owned);
+            defer dense_view.deinit(self.allocator);
             const output = try self.allocator.dupe(f32, dense_view.data);
             const result = try self.makeOwnedBuf(output);
             errdefer freeTensor(self, result);
@@ -41130,9 +41186,9 @@ fn primSliceOp(ctx: *anyopaque, input: CT, starts: []const i64, limits: []const 
 fn primConcatPrimOp(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i64, b_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const a_view = try denseTensorView(self, a);
-    defer if (a_view.owned) |owned| self.allocator.free(owned);
+    defer a_view.deinit(self.allocator);
     const b_view = try denseTensorView(self, b);
-    defer if (b_view.owned) |owned| self.allocator.free(owned);
+    defer b_view.deinit(self.allocator);
     const a_data = a_view.data;
     const b_data = b_view.data;
     const effective_a_shape_raw = storedOrDeclaredShape(a, a_shape);
@@ -41307,8 +41363,9 @@ fn primConcatPrimOp(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i6
 }
 
 /// Shared numerical loop for allocating and assigned-output execution.
-fn softmaxInto(data: []const f32, output: []f32, d: usize) void {
-    const rows = data.len / d;
+fn softmaxInto(data: []const f32, output: []f32, geometry: kernel_geometry.DenseRows) void {
+    const d = geometry.width;
+    const rows = geometry.rows;
     for (0..rows) |r| {
         const row = data[r * d ..][0..d];
         const out = output[r * d ..][0..d];
@@ -41334,23 +41391,20 @@ fn primSoftmaxOp(ctx: *anyopaque, input: CT, dim: u32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const data = getData(input);
     const d = resolveSoftmaxLastDim(input, dim) orelse return error.InvalidTensorShape;
-    if (d == 0 or data.len % d != 0) return error.InvalidTensorShape;
-    const output = try self.allocator.alloc(f32, data.len);
-    var raw_output: ?[]f32 = output;
-    errdefer if (raw_output) |raw| self.allocator.free(raw);
+    const geometry = kernel_geometry.DenseRows.init(data.len, d) catch return error.InvalidTensorShape;
+    var owned_output = try OwnedDenseOutput.alloc(self, data.len);
+    defer owned_output.deinit();
+    const output = owned_output.storage.?;
 
-    softmaxInto(data, output, d);
-    const result = try self.makeBuf(output, true);
-    raw_output = null;
-    errdefer freeTensor(self, result);
-    return propagateLogicalShapeLike(self, result, input);
+    softmaxInto(data, output, geometry);
+    return owned_output.intoLike(input);
 }
 
 fn softmaxConsumeOp(_: *anyopaque, input: CT, dim: u32) anyerror!?CT {
     const buf = ownedDenseBufWithMaxSharedRefs(input, 2) orelse return null;
     const d = resolveSoftmaxLastDim(input, dim) orelse return error.InvalidTensorShape;
-    if (d == 0 or buf.data.len % d != 0) return error.InvalidTensorShape;
-    activations_mod.softmax(buf.data, d);
+    const geometry = kernel_geometry.DenseRows.init(buf.data.len, d) catch return error.InvalidTensorShape;
+    activations_mod.softmax(buf.data, geometry.width);
     return input;
 }
 
@@ -41358,20 +41412,19 @@ fn primLogSoftmaxOp(ctx: *anyopaque, input: CT, dim: u32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const data = getData(input);
     const d = resolveSoftmaxLastDim(input, dim) orelse return error.InvalidTensorShape;
-    if (d == 0 or data.len % d != 0) return error.InvalidTensorShape;
-    const output = try self.allocator.dupe(f32, data);
-    errdefer self.allocator.free(output);
-    activations_mod.logSoftmaxInPlace(output, d);
-    const result = try self.makeBuf(output, true);
-    errdefer freeTensor(self, result);
-    return propagateLogicalShapeLike(self, result, input);
+    const geometry = kernel_geometry.DenseRows.init(data.len, d) catch return error.InvalidTensorShape;
+    var owned_output = try OwnedDenseOutput.copy(self, data);
+    defer owned_output.deinit();
+    const output = owned_output.storage.?;
+    activations_mod.logSoftmaxInPlace(output, geometry.width);
+    return owned_output.intoLike(input);
 }
 
 fn logSoftmaxConsumeOp(_: *anyopaque, input: CT, dim: u32) anyerror!?CT {
     const buf = ownedDenseBufWithMaxSharedRefs(input, 2) orelse return null;
     const d = resolveSoftmaxLastDim(input, dim) orelse return error.InvalidTensorShape;
-    if (d == 0 or buf.data.len % d != 0) return error.InvalidTensorShape;
-    activations_mod.logSoftmaxInPlace(buf.data, d);
+    const geometry = kernel_geometry.DenseRows.init(buf.data.len, d) catch return error.InvalidTensorShape;
+    activations_mod.logSoftmaxInPlace(buf.data, geometry.width);
     return input;
 }
 
@@ -41761,7 +41814,7 @@ fn readFloat32IntoOp(ctx: *anyopaque, tensor: CT, output: []f32) anyerror!bool {
     const source = toBuf(tensor);
     if (source.quantized_storage != null or source.lazy_entry != null) return false;
     const view = try denseTensorView(self, tensor);
-    defer if (view.owned) |owned| self.allocator.free(owned);
+    defer view.deinit(self.allocator);
     if (output.len != view.data.len) return error.InvalidTensorShape;
     @memcpy(output, view.data);
     return true;
@@ -41928,12 +41981,12 @@ fn copyRows2DOp(ctx: *anyopaque, dst: CT, dst_row: usize, src: CT, src_row: usiz
     if (!target.owned or target.source_tensor != null or target.view_strides != null or target.weight_handle_name != null or
         (target.shared_data_refcount != null and target.shared_data_refcount.?.* != 1)) return error.InvalidTensorShape;
     const source = try getDataChecked(src);
-    const begin = try std.math.mul(usize, dst_row, cols);
-    const from = try std.math.mul(usize, src_row, cols);
-    const count = try std.math.mul(usize, rows, cols);
-    if (cols == 0 or target.data.len % cols != 0 or source.len % cols != 0 or begin > target.data.len or count > target.data.len - begin or from > source.len or count > source.len - from) return error.InvalidTensorShape;
-    const output = target.data[begin..][0..count];
-    const input = source[from..][0..count];
+    const region = kernel_geometry.RowCopy.init(target.data.len, source.len, dst_row, src_row, rows, cols) catch |err| switch (err) {
+        error.InvalidShape => return error.InvalidTensorShape,
+        else => return err,
+    };
+    const output = target.data[region.destination..][0..region.elements];
+    const input = source[region.source..][0..region.elements];
     if (@intFromPtr(output.ptr) > @intFromPtr(input.ptr)) std.mem.copyBackwards(f32, output, input) else std.mem.copyForwards(f32, output, input);
     return true;
 }
@@ -53889,7 +53942,7 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
             if (softmax.logarithmic) {
                 if (output.ptr != input.ptr) @memcpy(output, input);
                 activations_mod.logSoftmaxInPlace(output, softmax.width);
-            } else softmaxInto(input, output, softmax.width);
+            } else softmaxInto(input, output, kernel_geometry.DenseRows.init(input.len, softmax.width) catch unreachable);
         },
         .linear => |linear| {
             const bias = if (linear.bias) request.inputs[2] else null;

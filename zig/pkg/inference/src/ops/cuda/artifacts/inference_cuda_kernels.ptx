@@ -171,16 +171,6 @@
 // _ZZ48termite_gqa_attention_prefill_turboquant_mma_f32E8alpha_sh has been demoted
 // _ZZ52termite_gqa_attention_prefill_turboquant_mma_m32_f32E9tile_phys has been demoted
 // _ZZ52termite_gqa_attention_prefill_turboquant_mma_m32_f32E8alpha_sh has been demoted
-// _ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E9warp_sums has been demoted
-// _ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E16shared_max_score has been demoted
-// _ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E12shared_denom has been demoted
-// _ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E12shared_alpha has been demoted
-// _ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E11shared_beta has been demoted
-// _ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E9warp_sums has been demoted
-// _ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E16shared_max_score has been demoted
-// _ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E12shared_denom has been demoted
-// _ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E12shared_alpha has been demoted
-// _ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E11shared_beta has been demoted
 // _ZZ56termite_gqa_attention_decode_turboquant_split_stage2_f32E16shared_max_score has been demoted
 // _ZZ56termite_gqa_attention_decode_turboquant_split_stage2_f32E12shared_denom has been demoted
 // _ZZ43termite_gqa_attention_decode_turboquant_f32E6reduce has been demoted
@@ -251,11 +241,8 @@
 // _ZZ35termite_linear_f32_qkv_nobias_tiledE7partial has been demoted
 // _ZZ47termite_linear_bf16_weight_f32_qkv_nobias_tiledE7partial has been demoted
 // _ZZ40termite_linear_q8_0_qkv_nobias_f32_tile4E7partial has been demoted
-// _ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial has been demoted
-// _ZZ43termite_linear_q4_0_qkv_nobias_f32_tile4_w4E12warp_partial has been demoted
 // _ZZ51termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_rows4E12warp_partial has been demoted
 // _ZZ48termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8E12warp_partial has been demoted
-// _ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial has been demoted
 // _ZZ40termite_linear_q4_k_qkv_nobias_f32_tiledE7partial has been demoted
 // _ZZ45termite_linear_q4_k_q4_k_f32_qkv_nobias_tiledE7partial has been demoted
 // _ZZ52termite_rms_norm_add_weighted_embedding_i32_q6_k_f32E7partial has been demoted
@@ -459,6 +446,16 @@
 // _ZZN20antfly_splitk_common18splitk_online_bodyILj512ELj0ELj4096EEEvPfPjPVfS4_S4_PKfPKhS8_PKjjjjjjjjjjjjjjjjjjjjSA_E11merge_alpha has been demoted
 // _ZZN20antfly_splitk_common18splitk_online_bodyILj512ELj0ELj4096EEEvPfPjPVfS4_S4_PKfPKhS8_PKjjjjjjjjjjjjjjjjjjjjSA_E10merge_beta has been demoted
 // _ZZN20antfly_splitk_common18splitk_online_bodyILj512ELj0ELj4096EEEvPfPjPVfS4_S4_PKfPKhS8_PKjjjjjjjjjjjjjjjjjjjjSA_E11final_denom has been demoted
+// _ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE9warp_sums has been demoted
+// _ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE16shared_max_score has been demoted
+// _ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_denom has been demoted
+// _ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_alpha has been demoted
+// _ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE11shared_beta has been demoted
+// _ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE9warp_sums has been demoted
+// _ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE16shared_max_score has been demoted
+// _ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_denom has been demoted
+// _ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_alpha has been demoted
+// _ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE11shared_beta has been demoted
 // _ZZ27termite_q8_0_tile_rows_colsILj2ELj4ELj0EEvPfPKfPKhS2_S2_jjjE7partial has been demoted
 // _ZZ27termite_q8_0_tile_rows_colsILj2ELj4ELj1EEvPfPKfPKhS2_S2_jjjE7partial has been demoted
 // _ZZ27termite_q8_0_tile_rows_colsILj2ELj4ELj2EEvPfPKfPKhS2_S2_jjjE7partial has been demoted
@@ -72790,10 +72787,10 @@ $L__BB182_5:
 	ld.global.u32 	%r241, [%rd34+8];
 
 $L__BB183_3:
+	sub.s32 	%r4, %r241, %r88;
 	setp.lt.u32 	%p11, %r241, %r88;
 	@%p11 bra 	$L__BB183_101;
 
-	sub.s32 	%r4, %r241, %r88;
 	mul.lo.s32 	%r104, %r92, %r88;
 	setp.ge.u32 	%p12, %r1, %r104;
 	@%p12 bra 	$L__BB183_53;
@@ -98169,21 +98166,21 @@ $L__BB190_165:
 	.param .u32 termite_gqa_attention_decode_turboquant_split_stage1_f32_param_22
 )
 {
-	.reg .pred 	%p<83>;
+	.reg .pred 	%p<85>;
 	.reg .b16 	%rs<9>;
 	.reg .f32 	%f<97>;
 	.reg .b32 	%r<181>;
 	.reg .b64 	%rd<60>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E9warp_sums[64];
+	.shared .align 4 .b8 _ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE9warp_sums[64];
 	// demoted variable
-	.shared .align 4 .f32 _ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E16shared_max_score;
+	.shared .align 4 .f32 _ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE16shared_max_score;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E12shared_denom;
+	.shared .align 4 .f32 _ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_denom;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E12shared_alpha;
+	.shared .align 4 .f32 _ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_alpha;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E11shared_beta;
+	.shared .align 4 .f32 _ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE11shared_beta;
 
 	ld.param.u64 	%rd21, [termite_gqa_attention_decode_turboquant_split_stage1_f32_param_0];
 	ld.param.u64 	%rd22, [termite_gqa_attention_decode_turboquant_split_stage1_f32_param_1];
@@ -98208,8 +98205,8 @@ $L__BB190_165:
 	ld.param.u64 	%rd27, [termite_gqa_attention_decode_turboquant_split_stage1_f32_param_20];
 	ld.param.u32 	%r41, [termite_gqa_attention_decode_turboquant_split_stage1_f32_param_21];
 	ld.param.u32 	%r42, [termite_gqa_attention_decode_turboquant_split_stage1_f32_param_22];
-	setp.eq.s64 	%p7, %rd27, 0;
-	@%p7 bra 	$L__BB191_2;
+	setp.eq.s64 	%p9, %rd27, 0;
+	@%p9 bra 	$L__BB191_2;
 
 	cvta.to.global.u64 	%rd28, %rd27;
 	ld.global.u32 	%r175, [%rd28+16];
@@ -98218,67 +98215,73 @@ $L__BB190_165:
 
 $L__BB191_2:
 	mov.u32 	%r7, %tid.x;
-	or.b32  	%r43, %r38, 2;
-	setp.ne.s32 	%p9, %r43, 2;
 	mov.u32 	%r8, %ctaid.x;
-	setp.ge.u32 	%p10, %r8, %r28;
-	or.pred  	%p11, %p10, %p9;
+	mov.pred 	%p83, -1;
 	mov.u32 	%r9, %ctaid.y;
-	setp.ge.u32 	%p12, %r9, %r42;
-	or.pred  	%p13, %p11, %p12;
-	setp.gt.u32 	%p14, %r30, 512;
-	or.pred  	%p15, %p14, %p13;
-	and.b32  	%r44, %r30, 31;
-	setp.ne.s32 	%p16, %r44, 0;
-	or.pred  	%p17, %p16, %p15;
-	mov.pred 	%p82, -1;
-	mov.pred 	%p81, %p82;
-	@%p17 bra 	$L__BB191_4;
+	or.b32  	%r43, %r38, 2;
+	setp.eq.s32 	%p11, %r43, 2;
+	mov.pred 	%p82, %p83;
+	@%p11 bra 	$L__BB191_3;
+	bra.uni 	$L__BB191_4;
 
-	mov.u32 	%r45, %ntid.x;
-	setp.lt.u32 	%p81, %r45, %r30;
+$L__BB191_3:
+	setp.ge.u32 	%p82, %r8, %r28;
 
 $L__BB191_4:
-	setp.eq.s32 	%p19, %r29, 0;
-	or.pred  	%p20, %p19, %p81;
-	@%p20 bra 	$L__BB191_6;
+	setp.ge.u32 	%p13, %r9, %r42;
+	or.pred  	%p14, %p13, %p82;
+	setp.gt.u32 	%p15, %r30, 512;
+	or.pred  	%p16, %p15, %p14;
+	and.b32  	%r44, %r30, 31;
+	setp.ne.s32 	%p17, %r44, 0;
+	or.pred  	%p18, %p17, %p16;
+	@%p18 bra 	$L__BB191_6;
 
-	rem.u32 	%r46, %r28, %r29;
-	setp.ne.s32 	%p82, %r46, 0;
+	mov.u32 	%r45, %ntid.x;
+	setp.lt.u32 	%p83, %r45, %r30;
 
 $L__BB191_6:
-	setp.eq.s32 	%p21, %r34, 0;
-	or.pred  	%p22, %p21, %p82;
-	setp.eq.s32 	%p23, %r35, 0;
-	or.pred  	%p24, %p23, %p22;
-	setp.eq.s32 	%p25, %r41, 0;
-	or.pred  	%p26, %p25, %p24;
-	@%p26 bra 	$L__BB191_55;
+	setp.eq.s32 	%p20, %r29, 0;
+	or.pred  	%p21, %p20, %p83;
+	mov.pred 	%p84, -1;
+	@%p21 bra 	$L__BB191_8;
+
+	rem.u32 	%r46, %r28, %r29;
+	setp.ne.s32 	%p84, %r46, 0;
+
+$L__BB191_8:
+	setp.eq.s32 	%p22, %r34, 0;
+	or.pred  	%p23, %p22, %p84;
+	setp.eq.s32 	%p24, %r35, 0;
+	or.pred  	%p25, %p24, %p23;
+	setp.eq.s32 	%p26, %r41, 0;
+	or.pred  	%p27, %p26, %p25;
+	@%p27 bra 	$L__BB191_57;
 
 	mul.lo.s32 	%r10, %r9, %r41;
-	setp.ge.u32 	%p27, %r10, %r176;
-	@%p27 bra 	$L__BB191_55;
+	setp.ge.u32 	%p28, %r10, %r176;
+	@%p28 bra 	$L__BB191_57;
 
-	setp.lt.u32 	%p28, %r174, %r175;
+	setp.lt.u32 	%p29, %r174, %r175;
 	mov.u32 	%r177, 0;
 	mov.u32 	%r178, %r177;
-	@%p28 bra 	$L__BB191_11;
+	@%p29 bra 	$L__BB191_13;
 
 	sub.s32 	%r50, %r174, %r175;
 	add.s32 	%r51, %r50, 1;
 	min.u32 	%r178, %r51, %r176;
-	setp.eq.s32 	%p29, %r33, 0;
-	@%p29 bra 	$L__BB191_11;
+	setp.eq.s32 	%p30, %r33, 0;
+	@%p30 bra 	$L__BB191_13;
 
 	add.s32 	%r52, %r174, 1;
 	max.u32 	%r53, %r52, %r33;
 	sub.s32 	%r54, %r53, %r33;
-	setp.gt.u32 	%p30, %r54, %r175;
+	setp.gt.u32 	%p31, %r54, %r175;
 	sub.s32 	%r55, %r54, %r175;
 	min.u32 	%r56, %r55, %r178;
-	selp.b32 	%r177, %r56, 0, %p30;
+	selp.b32 	%r177, %r56, 0, %p31;
 
-$L__BB191_11:
+$L__BB191_13:
 	add.s32 	%r57, %r10, %r41;
 	max.u32 	%r179, %r10, %r177;
 	min.u32 	%r16, %r57, %r178;
@@ -98289,34 +98292,34 @@ $L__BB191_11:
 	cvta.to.global.u64 	%rd30, %rd22;
 	mul.wide.u32 	%rd31, %r60, 4;
 	add.s64 	%rd1, %rd30, %rd31;
-	setp.lt.u32 	%p31, %r179, %r16;
+	setp.lt.u32 	%p32, %r179, %r16;
 	cvt.u64.u32 	%rd32, %r7;
 	add.s64 	%rd33, %rd29, %rd32;
 	cvta.to.global.u64 	%rd34, %rd21;
 	shl.b64 	%rd35, %rd33, 2;
 	add.s64 	%rd2, %rd34, %rd35;
-	@%p31 bra 	$L__BB191_16;
-	bra.uni 	$L__BB191_12;
-
-$L__BB191_16:
-	setp.ne.s32 	%p34, %r7, 0;
-	@%p34 bra 	$L__BB191_18;
-
-	mov.u32 	%r64, -8388609;
-	st.shared.u32 	[_ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E16shared_max_score], %r64;
-	mov.u32 	%r65, 0;
-	st.shared.u32 	[_ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E12shared_denom], %r65;
+	@%p32 bra 	$L__BB191_18;
+	bra.uni 	$L__BB191_14;
 
 $L__BB191_18:
+	setp.ne.s32 	%p35, %r7, 0;
+	@%p35 bra 	$L__BB191_20;
+
+	mov.u32 	%r64, -8388609;
+	st.shared.u32 	[_ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE16shared_max_score], %r64;
+	mov.u32 	%r65, 0;
+	st.shared.u32 	[_ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_denom], %r65;
+
+$L__BB191_20:
 	cvta.to.global.u64 	%rd3, %rd24;
 	div.u32 	%r66, %r28, %r29;
 	div.u32 	%r67, %r8, %r66;
 	bar.sync 	0;
-	setp.ne.s32 	%p35, %r36, 0;
-	setp.ne.s64 	%p36, %rd26, 0;
-	and.pred  	%p37, %p36, %p35;
-	setp.ne.s32 	%p38, %r37, 0;
-	and.pred  	%p5, %p37, %p38;
+	setp.ne.s32 	%p36, %r36, 0;
+	setp.ne.s64 	%p37, %rd26, 0;
+	and.pred  	%p38, %p37, %p36;
+	setp.ne.s32 	%p39, %r37, 0;
+	and.pred  	%p7, %p38, %p39;
 	cvt.u64.u32 	%rd4, %r40;
 	cvt.u64.u32 	%rd5, %r37;
 	mul.lo.s32 	%r68, %r67, %r30;
@@ -98335,12 +98338,12 @@ $L__BB191_18:
 	cvt.u64.u32 	%rd8, %r75;
 	shr.u32 	%r18, %r7, 5;
 	shl.b32 	%r76, %r18, 2;
-	mov.u32 	%r77, _ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E9warp_sums;
+	mov.u32 	%r77, _ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE9warp_sums;
 	add.s32 	%r19, %r77, %r76;
-	setp.eq.s32 	%p39, %r18, 0;
+	setp.eq.s32 	%p40, %r18, 0;
 	and.b32  	%r20, %r7, 31;
-	setp.lt.u32 	%p40, %r20, %r72;
-	and.pred  	%p6, %p39, %p40;
+	setp.lt.u32 	%p41, %r20, %r72;
+	and.pred  	%p8, %p40, %p41;
 	shl.b32 	%r78, %r7, 2;
 	and.b32  	%r79, %r78, 124;
 	add.s32 	%r21, %r77, %r79;
@@ -98357,61 +98360,61 @@ $L__BB191_18:
 	shr.u32 	%r86, %r84, 1;
 	add.s32 	%r87, %r86, 2;
 	cvt.u64.u32 	%rd13, %r87;
-	cvta.to.global.u64 	%rd14, %rd25;
-	cvta.to.global.u64 	%rd15, %rd26;
+	cvta.to.global.u64 	%rd14, %rd26;
+	cvta.to.global.u64 	%rd15, %rd25;
 	cvt.rn.f32.u32 	%f22, %r30;
 	rsqrt.approx.f32 	%f1, %f22;
 	mov.f32 	%f96, 0f00000000;
-	not.pred 	%p41, %p5;
-	not.pred 	%p58, %p6;
+	not.pred 	%p42, %p7;
+	not.pred 	%p59, %p8;
 	shl.b64 	%rd53, %rd9, 2;
 
-$L__BB191_19:
+$L__BB191_21:
 	cvt.u64.u32 	%rd16, %r179;
 	mov.u64 	%rd59, %rd16;
-	@%p41 bra 	$L__BB191_22;
+	@%p42 bra 	$L__BB191_24;
 
 	ld.param.u32 	%r172, [termite_gqa_attention_decode_turboquant_split_stage1_f32_param_15];
 	cvt.u32.u64 	%r89, %rd16;
 	div.u32 	%r23, %r89, %r37;
-	setp.ge.u32 	%p42, %r23, %r172;
+	setp.ge.u32 	%p43, %r23, %r172;
 	mov.u32 	%r180, -1;
-	@%p42 bra 	$L__BB191_23;
+	@%p43 bra 	$L__BB191_25;
 
 	mul.lo.s32 	%r91, %r23, %r37;
 	sub.s32 	%r92, %r89, %r91;
 	mul.wide.u32 	%rd38, %r23, 4;
-	add.s64 	%rd39, %rd15, %rd38;
+	add.s64 	%rd39, %rd14, %rd38;
 	ld.global.u32 	%rd40, [%rd39];
 	mul.lo.s64 	%rd41, %rd40, %rd5;
 	cvt.u64.u32 	%rd42, %r92;
 	add.s64 	%rd59, %rd41, %rd42;
 
-$L__BB191_22:
-	setp.ge.u64 	%p43, %rd59, %rd4;
-	setp.gt.u64 	%p44, %rd59, 4294967295;
-	or.pred  	%p45, %p44, %p43;
+$L__BB191_24:
+	setp.ge.u64 	%p44, %rd59, %rd4;
+	setp.gt.u64 	%p45, %rd59, 4294967295;
+	or.pred  	%p46, %p45, %p44;
 	cvt.u32.u64 	%r93, %rd59;
-	selp.b32 	%r180, -1, %r93, %p45;
+	selp.b32 	%r180, -1, %r93, %p46;
 
-$L__BB191_23:
+$L__BB191_25:
 	mov.u32 	%r170, %tid.x;
 	ld.param.u32 	%r169, [termite_gqa_attention_decode_turboquant_split_stage1_f32_param_13];
 	ld.param.u32 	%r168, [termite_gqa_attention_decode_turboquant_split_stage1_f32_param_9];
 	mul.lo.s32 	%r94, %r180, %r169;
 	cvt.u64.u32 	%rd43, %r94;
 	add.s64 	%rd44, %rd3, %rd43;
-	setp.eq.s32 	%p46, %r180, -1;
-	setp.ne.s32 	%p47, %r180, -1;
-	selp.b64 	%rd19, %rd44, %rd3, %p47;
-	setp.ge.u32 	%p48, %r170, %r168;
+	setp.eq.s32 	%p47, %r180, -1;
+	setp.ne.s32 	%p48, %r180, -1;
+	selp.b64 	%rd19, %rd44, %rd3, %p48;
+	setp.ge.u32 	%p49, %r170, %r168;
 	mov.f32 	%f92, 0f00000000;
-	or.pred  	%p49, %p48, %p46;
-	@%p49 bra 	$L__BB191_28;
+	or.pred  	%p50, %p49, %p47;
+	@%p50 bra 	$L__BB191_30;
 
 	ld.param.u32 	%r171, [termite_gqa_attention_decode_turboquant_split_stage1_f32_param_17];
-	setp.eq.s32 	%p50, %r171, 0;
-	@%p50 bra 	$L__BB191_26;
+	setp.eq.s32 	%p51, %r171, 0;
+	@%p51 bra 	$L__BB191_28;
 
 	add.s64 	%rd45, %rd19, %rd8;
 	ld.global.u8 	%r95, [%rd45];
@@ -98422,106 +98425,106 @@ $L__BB191_23:
 	{  cvt.f32.f16 %f91, %rs1;}
 
 	// end inline asm
-	bra.uni 	$L__BB191_27;
+	bra.uni 	$L__BB191_29;
 
-$L__BB191_26:
-	setp.eq.s32 	%p51, %r17, 0;
+$L__BB191_28:
+	setp.eq.s32 	%p52, %r17, 0;
 	add.s64 	%rd46, %rd19, %rd6;
 	ld.global.u8 	%r98, [%rd46];
 	shr.u32 	%r99, %r98, 4;
-	selp.b32 	%r100, %r98, %r99, %p51;
+	selp.b32 	%r100, %r98, %r99, %p52;
 	cvt.u16.u32 	%rs2, %r100;
 	and.b16  	%rs3, %rs2, 15;
 	cvt.rn.f32.u16 	%f25, %rs3;
 	div.rn.f32 	%f26, %f25, 0f40F00000;
 	add.f32 	%f91, %f26, 0fBF800000;
 
-$L__BB191_27:
+$L__BB191_29:
 	ld.global.f32 	%f27, [%rd7];
 	mul.f32 	%f92, %f91, %f27;
 
-$L__BB191_28:
+$L__BB191_30:
 	mov.b32 	%r101, %f92;
 	mov.u32 	%r102, 2;
 	mov.u32 	%r103, 31;
 	mov.u32 	%r104, 16;
 	mov.u32 	%r105, -1;
-	shfl.sync.down.b32 	%r106|%p52, %r101, %r104, %r103, %r105;
+	shfl.sync.down.b32 	%r106|%p53, %r101, %r104, %r103, %r105;
 	mov.b32 	%f28, %r106;
 	add.f32 	%f29, %f92, %f28;
 	mov.b32 	%r107, %f29;
 	mov.u32 	%r108, 8;
-	shfl.sync.down.b32 	%r109|%p53, %r107, %r108, %r103, %r105;
+	shfl.sync.down.b32 	%r109|%p54, %r107, %r108, %r103, %r105;
 	mov.b32 	%f30, %r109;
 	add.f32 	%f31, %f29, %f30;
 	mov.b32 	%r110, %f31;
 	mov.u32 	%r111, 4;
-	shfl.sync.down.b32 	%r112|%p54, %r110, %r111, %r103, %r105;
+	shfl.sync.down.b32 	%r112|%p55, %r110, %r111, %r103, %r105;
 	mov.b32 	%f32, %r112;
 	add.f32 	%f33, %f31, %f32;
 	mov.b32 	%r113, %f33;
-	shfl.sync.down.b32 	%r114|%p55, %r113, %r102, %r103, %r105;
+	shfl.sync.down.b32 	%r114|%p56, %r113, %r102, %r103, %r105;
 	mov.b32 	%f34, %r114;
 	add.f32 	%f35, %f33, %f34;
 	mov.b32 	%r115, %f35;
 	mov.u32 	%r116, 1;
-	shfl.sync.down.b32 	%r117|%p56, %r115, %r116, %r103, %r105;
+	shfl.sync.down.b32 	%r117|%p57, %r115, %r116, %r103, %r105;
 	mov.b32 	%f36, %r117;
 	add.f32 	%f8, %f35, %f36;
-	setp.ne.s32 	%p57, %r20, 0;
-	@%p57 bra 	$L__BB191_30;
+	setp.ne.s32 	%p58, %r20, 0;
+	@%p58 bra 	$L__BB191_32;
 
 	st.shared.f32 	[%r19], %f8;
 
-$L__BB191_30:
+$L__BB191_32:
 	bar.sync 	0;
 	mov.f32 	%f94, 0f00000000;
-	@%p58 bra 	$L__BB191_32;
+	@%p59 bra 	$L__BB191_34;
 
 	ld.shared.f32 	%f94, [%r21];
 
-$L__BB191_32:
-	setp.ne.s32 	%p59, %r18, 0;
-	@%p59 bra 	$L__BB191_34;
+$L__BB191_34:
+	setp.ne.s32 	%p60, %r18, 0;
+	@%p60 bra 	$L__BB191_36;
 
 	mov.b32 	%r118, %f94;
 	mov.u32 	%r119, 2;
 	mov.u32 	%r120, 31;
 	mov.u32 	%r121, 16;
 	mov.u32 	%r122, -1;
-	shfl.sync.down.b32 	%r123|%p60, %r118, %r121, %r120, %r122;
+	shfl.sync.down.b32 	%r123|%p61, %r118, %r121, %r120, %r122;
 	mov.b32 	%f38, %r123;
 	add.f32 	%f39, %f94, %f38;
 	mov.b32 	%r124, %f39;
 	mov.u32 	%r125, 8;
-	shfl.sync.down.b32 	%r126|%p61, %r124, %r125, %r120, %r122;
+	shfl.sync.down.b32 	%r126|%p62, %r124, %r125, %r120, %r122;
 	mov.b32 	%f40, %r126;
 	add.f32 	%f41, %f39, %f40;
 	mov.b32 	%r127, %f41;
 	mov.u32 	%r128, 4;
-	shfl.sync.down.b32 	%r129|%p62, %r127, %r128, %r120, %r122;
+	shfl.sync.down.b32 	%r129|%p63, %r127, %r128, %r120, %r122;
 	mov.b32 	%f42, %r129;
 	add.f32 	%f43, %f41, %f42;
 	mov.b32 	%r130, %f43;
-	shfl.sync.down.b32 	%r131|%p63, %r130, %r119, %r120, %r122;
+	shfl.sync.down.b32 	%r131|%p64, %r130, %r119, %r120, %r122;
 	mov.b32 	%f44, %r131;
 	add.f32 	%f45, %f43, %f44;
 	mov.b32 	%r132, %f45;
 	mov.u32 	%r133, 1;
-	shfl.sync.down.b32 	%r134|%p64, %r132, %r133, %r120, %r122;
+	shfl.sync.down.b32 	%r134|%p65, %r132, %r133, %r120, %r122;
 	mov.b32 	%f46, %r134;
 	add.f32 	%f94, %f45, %f46;
 
-$L__BB191_34:
-	@%p34 bra 	$L__BB191_38;
+$L__BB191_36:
+	@%p35 bra 	$L__BB191_40;
 
-	setp.ne.s32 	%p80, %r180, -1;
-	@%p80 bra 	$L__BB191_37;
-	bra.uni 	$L__BB191_36;
+	setp.ne.s32 	%p81, %r180, -1;
+	@%p81 bra 	$L__BB191_39;
+	bra.uni 	$L__BB191_38;
 
-$L__BB191_37:
+$L__BB191_39:
 	mul.f32 	%f47, %f1, %f94;
-	ld.shared.f32 	%f48, [_ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E16shared_max_score];
+	ld.shared.f32 	%f48, [_ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE16shared_max_score];
 	max.f32 	%f49, %f48, %f47;
 	sub.f32 	%f50, %f48, %f49;
 	mov.f32 	%f51, 0f3F000000;
@@ -98542,7 +98545,7 @@ $L__BB191_37:
 	mov.b32 	%f64, %r138;
 	ex2.approx.ftz.f32 	%f65, %f63;
 	mul.f32 	%f66, %f65, %f64;
-	st.shared.f32 	[_ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E12shared_alpha], %f66;
+	st.shared.f32 	[_ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_alpha], %f66;
 	sub.f32 	%f67, %f47, %f49;
 	fma.rn.f32 	%f68, %f67, %f52, %f51;
 	cvt.sat.f32.f32 	%f69, %f68;
@@ -98556,44 +98559,44 @@ $L__BB191_37:
 	mov.b32 	%f75, %r140;
 	ex2.approx.ftz.f32 	%f76, %f74;
 	mul.f32 	%f77, %f76, %f75;
-	st.shared.f32 	[_ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E11shared_beta], %f77;
-	ld.shared.f32 	%f78, [_ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E12shared_denom];
+	st.shared.f32 	[_ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE11shared_beta], %f77;
+	ld.shared.f32 	%f78, [_ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_denom];
 	fma.rn.f32 	%f79, %f66, %f78, %f77;
-	st.shared.f32 	[_ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E12shared_denom], %f79;
-	st.shared.f32 	[_ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E16shared_max_score], %f49;
-	bra.uni 	$L__BB191_38;
-
-$L__BB191_36:
-	mov.u32 	%r135, 1065353216;
-	st.shared.u32 	[_ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E12shared_alpha], %r135;
-	mov.u32 	%r136, 0;
-	st.shared.u32 	[_ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E11shared_beta], %r136;
+	st.shared.f32 	[_ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_denom], %f79;
+	st.shared.f32 	[_ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE16shared_max_score], %f49;
+	bra.uni 	$L__BB191_40;
 
 $L__BB191_38:
-	bar.sync 	0;
-	@%p48 bra 	$L__BB191_50;
+	mov.u32 	%r135, 1065353216;
+	st.shared.u32 	[_ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_alpha], %r135;
+	mov.u32 	%r136, 0;
+	st.shared.u32 	[_ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE11shared_beta], %r136;
 
-	setp.eq.s32 	%p79, %r180, -1;
-	ld.shared.f32 	%f80, [_ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E12shared_alpha];
+$L__BB191_40:
+	bar.sync 	0;
+	@%p49 bra 	$L__BB191_52;
+
+	setp.eq.s32 	%p80, %r180, -1;
+	ld.shared.f32 	%f80, [_ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_alpha];
 	mul.f32 	%f96, %f96, %f80;
-	@%p79 bra 	$L__BB191_50;
+	@%p80 bra 	$L__BB191_52;
 
 	ld.param.u32 	%r173, [termite_gqa_attention_decode_turboquant_split_stage1_f32_param_14];
 	mul.lo.s32 	%r141, %r180, %r173;
 	cvt.u64.u32 	%rd47, %r141;
-	add.s64 	%rd20, %rd14, %rd47;
+	add.s64 	%rd20, %rd15, %rd47;
 	mov.f32 	%f95, 0f00000000;
-	setp.gt.s32 	%p69, %r39, 1;
-	@%p69 bra 	$L__BB191_44;
+	setp.gt.s32 	%p70, %r39, 1;
+	@%p70 bra 	$L__BB191_46;
 
-	setp.eq.s32 	%p72, %r39, 0;
-	@%p72 bra 	$L__BB191_48;
+	setp.eq.s32 	%p73, %r39, 0;
+	@%p73 bra 	$L__BB191_50;
 
-	setp.eq.s32 	%p73, %r39, 1;
-	@%p73 bra 	$L__BB191_43;
-	bra.uni 	$L__BB191_49;
+	setp.eq.s32 	%p74, %r39, 1;
+	@%p74 bra 	$L__BB191_45;
+	bra.uni 	$L__BB191_51;
 
-$L__BB191_43:
+$L__BB191_45:
 	add.s64 	%rd51, %rd20, %rd10;
 	ld.global.u8 	%r155, [%rd51];
 	ld.global.u8 	%r156, [%rd51+1];
@@ -98607,16 +98610,16 @@ $L__BB191_43:
 	ld.global.s8 	%rs8, [%rd52];
 	cvt.rn.f32.s16 	%f86, %rs8;
 	mul.f32 	%f95, %f86, %f85;
-	bra.uni 	$L__BB191_49;
+	bra.uni 	$L__BB191_51;
 
-$L__BB191_44:
-	setp.eq.s32 	%p70, %r39, 2;
-	@%p70 bra 	$L__BB191_47;
-
-	setp.ne.s32 	%p71, %r39, 3;
+$L__BB191_46:
+	setp.eq.s32 	%p71, %r39, 2;
 	@%p71 bra 	$L__BB191_49;
 
-	setp.eq.s32 	%p74, %r17, 0;
+	setp.ne.s32 	%p72, %r39, 3;
+	@%p72 bra 	$L__BB191_51;
+
+	setp.eq.s32 	%p75, %r17, 0;
 	add.s64 	%rd48, %rd20, %rd12;
 	ld.global.u8 	%r142, [%rd48];
 	ld.global.u8 	%r143, [%rd48+1];
@@ -98630,23 +98633,23 @@ $L__BB191_44:
 	ld.global.u8 	%r145, [%rd49];
 	and.b32  	%r146, %r145, 15;
 	shr.u32 	%r147, %r145, 4;
-	selp.b32 	%r148, %r146, %r147, %p74;
+	selp.b32 	%r148, %r146, %r147, %p75;
 	and.b32  	%r149, %r148, 8;
-	setp.eq.s32 	%p75, %r149, 0;
+	setp.eq.s32 	%p76, %r149, 0;
 	or.b32  	%r150, %r148, 240;
-	selp.b32 	%r151, %r148, %r150, %p75;
+	selp.b32 	%r151, %r148, %r150, %p76;
 	cvt.u16.u32 	%rs5, %r151;
 	cvt.s16.s8 	%rs6, %rs5;
 	cvt.rn.f32.s16 	%f83, %rs6;
 	mul.f32 	%f95, %f82, %f83;
-	bra.uni 	$L__BB191_49;
+	bra.uni 	$L__BB191_51;
 
-$L__BB191_48:
+$L__BB191_50:
 	add.s64 	%rd54, %rd20, %rd53;
 	ld.global.f32 	%f95, [%rd54];
-	bra.uni 	$L__BB191_49;
+	bra.uni 	$L__BB191_51;
 
-$L__BB191_47:
+$L__BB191_49:
 	add.s64 	%rd50, %rd20, %rd8;
 	ld.global.u8 	%r152, [%rd50];
 	ld.global.u8 	%r153, [%rd50+1];
@@ -98657,23 +98660,23 @@ $L__BB191_47:
 
 	// end inline asm
 
-$L__BB191_49:
-	ld.shared.f32 	%f87, [_ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E11shared_beta];
+$L__BB191_51:
+	ld.shared.f32 	%f87, [_ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE11shared_beta];
 	fma.rn.f32 	%f96, %f95, %f87, %f96;
 
-$L__BB191_50:
+$L__BB191_52:
 	bar.sync 	0;
 	cvt.u32.u64 	%r162, %rd16;
 	add.s32 	%r179, %r162, 1;
-	setp.lt.u32 	%p76, %r179, %r16;
-	@%p76 bra 	$L__BB191_19;
+	setp.lt.u32 	%p77, %r179, %r16;
+	@%p77 bra 	$L__BB191_21;
 
-	@%p48 bra 	$L__BB191_53;
+	@%p49 bra 	$L__BB191_55;
 
 	st.global.f32 	[%rd2], %f96;
 
-$L__BB191_53:
-	@%p34 bra 	$L__BB191_55;
+$L__BB191_55:
+	@%p35 bra 	$L__BB191_57;
 
 	ld.param.u64 	%rd58, [termite_gqa_attention_decode_turboquant_split_stage1_f32_param_1];
 	mov.u32 	%r167, %ctaid.y;
@@ -98684,29 +98687,29 @@ $L__BB191_53:
 	mul.wide.u32 	%rd57, %r163, 4;
 	cvta.to.global.u64 	%rd56, %rd58;
 	add.s64 	%rd55, %rd56, %rd57;
-	ld.shared.f32 	%f88, [_ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E16shared_max_score];
+	ld.shared.f32 	%f88, [_ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE16shared_max_score];
 	st.global.f32 	[%rd55], %f88;
-	ld.shared.f32 	%f89, [_ZZ56termite_gqa_attention_decode_turboquant_split_stage1_f32E12shared_denom];
+	ld.shared.f32 	%f89, [_ZZ28termite_tq_split_stage1_implILb0EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_denom];
 	st.global.f32 	[%rd55+4], %f89;
-	bra.uni 	$L__BB191_55;
+	bra.uni 	$L__BB191_57;
 
-$L__BB191_12:
-	setp.ge.u32 	%p32, %r7, %r30;
-	@%p32 bra 	$L__BB191_14;
+$L__BB191_14:
+	setp.ge.u32 	%p33, %r7, %r30;
+	@%p33 bra 	$L__BB191_16;
 
 	mov.u32 	%r61, 0;
 	st.global.u32 	[%rd2], %r61;
 
-$L__BB191_14:
-	setp.ne.s32 	%p33, %r7, 0;
-	@%p33 bra 	$L__BB191_55;
+$L__BB191_16:
+	setp.ne.s32 	%p34, %r7, 0;
+	@%p34 bra 	$L__BB191_57;
 
 	mov.u32 	%r62, -8388609;
 	st.global.u32 	[%rd1], %r62;
 	mov.u32 	%r63, 0;
 	st.global.u32 	[%rd1+4], %r63;
 
-$L__BB191_55:
+$L__BB191_57:
 	ret;
 
 }
@@ -98737,195 +98740,190 @@ $L__BB191_55:
 	.param .u32 termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_22
 )
 {
-	.reg .pred 	%p<61>;
+	.reg .pred 	%p<59>;
 	.reg .b16 	%rs<4>;
 	.reg .f32 	%f<84>;
-	.reg .b32 	%r<138>;
+	.reg .b32 	%r<137>;
 	.reg .b64 	%rd<33>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E9warp_sums[64];
+	.shared .align 4 .b8 _ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE9warp_sums[64];
 	// demoted variable
-	.shared .align 4 .f32 _ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E16shared_max_score;
+	.shared .align 4 .f32 _ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE16shared_max_score;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E12shared_denom;
+	.shared .align 4 .f32 _ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_denom;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E12shared_alpha;
+	.shared .align 4 .f32 _ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_alpha;
 	// demoted variable
-	.shared .align 4 .f32 _ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E11shared_beta;
+	.shared .align 4 .f32 _ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE11shared_beta;
 
 	ld.param.u64 	%rd9, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_0];
 	ld.param.u64 	%rd10, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_1];
 	ld.param.u64 	%rd11, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_2];
 	ld.param.u64 	%rd12, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_3];
 	ld.param.u64 	%rd13, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_4];
-	ld.param.u32 	%r132, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_6];
-	ld.param.u32 	%r31, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_7];
-	ld.param.u32 	%r32, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_8];
-	ld.param.u32 	%r33, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_9];
-	ld.param.u32 	%r130, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_10];
-	ld.param.u32 	%r131, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_11];
-	ld.param.u32 	%r36, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_12];
-	ld.param.u32 	%r37, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_13];
-	ld.param.u32 	%r38, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_14];
-	ld.param.u32 	%r39, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_19];
+	ld.param.u32 	%r131, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_6];
+	ld.param.u32 	%r32, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_7];
+	ld.param.u32 	%r33, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_8];
+	ld.param.u32 	%r34, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_9];
+	ld.param.u32 	%r129, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_10];
+	ld.param.u32 	%r130, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_11];
+	ld.param.u32 	%r37, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_12];
+	ld.param.u32 	%r38, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_13];
+	ld.param.u32 	%r39, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_14];
+	ld.param.u32 	%r40, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_19];
 	ld.param.u64 	%rd14, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_20];
-	ld.param.u32 	%r40, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_21];
-	ld.param.u32 	%r41, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_22];
-	setp.eq.s64 	%p7, %rd14, 0;
-	@%p7 bra 	$L__BB192_2;
+	ld.param.u32 	%r41, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_21];
+	ld.param.u32 	%r42, [termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32_param_22];
+	setp.eq.s64 	%p5, %rd14, 0;
+	@%p5 bra 	$L__BB192_2;
 
 	cvta.to.global.u64 	%rd15, %rd14;
-	ld.global.u32 	%r131, [%rd15+16];
-	ld.global.u32 	%r130, [%rd15+4];
-	ld.global.u32 	%r132, [%rd15+8];
+	ld.global.u32 	%r130, [%rd15+16];
+	ld.global.u32 	%r129, [%rd15+4];
+	ld.global.u32 	%r131, [%rd15+8];
 
 $L__BB192_2:
 	mov.u32 	%r7, %tid.x;
 	mov.u32 	%r8, %ctaid.x;
-	setp.ge.u32 	%p9, %r8, %r31;
+	setp.ge.u32 	%p7, %r8, %r32;
 	mov.u32 	%r9, %ctaid.y;
-	setp.ge.u32 	%p10, %r9, %r41;
-	or.pred  	%p11, %p9, %p10;
-	setp.gt.u32 	%p12, %r33, 512;
+	setp.ge.u32 	%p8, %r9, %r42;
+	or.pred  	%p9, %p7, %p8;
+	setp.gt.u32 	%p10, %r34, 512;
+	or.pred  	%p11, %p10, %p9;
+	and.b32  	%r43, %r34, 31;
+	setp.ne.s32 	%p12, %r43, 0;
 	or.pred  	%p13, %p12, %p11;
-	and.b32  	%r42, %r33, 31;
-	setp.ne.s32 	%p14, %r42, 0;
+	mov.u32 	%r10, %ntid.x;
+	setp.lt.u32 	%p14, %r10, %r34;
 	or.pred  	%p15, %p14, %p13;
-	mov.pred 	%p60, -1;
-	mov.pred 	%p59, %p60;
-	@%p15 bra 	$L__BB192_4;
+	setp.eq.s32 	%p16, %r33, 0;
+	or.pred  	%p17, %p16, %p15;
+	mov.pred 	%p58, -1;
+	@%p17 bra 	$L__BB192_4;
 
-	mov.u32 	%r43, %ntid.x;
-	setp.lt.u32 	%p59, %r43, %r33;
+	rem.u32 	%r44, %r32, %r33;
+	setp.ne.s32 	%p58, %r44, 0;
 
 $L__BB192_4:
-	setp.eq.s32 	%p17, %r32, 0;
-	or.pred  	%p18, %p17, %p59;
-	@%p18 bra 	$L__BB192_6;
+	setp.eq.s32 	%p18, %r38, 0;
+	or.pred  	%p19, %p18, %p58;
+	setp.eq.s32 	%p20, %r39, 0;
+	or.pred  	%p21, %p20, %p19;
+	setp.eq.s32 	%p22, %r41, 0;
+	or.pred  	%p23, %p22, %p21;
+	@%p23 bra 	$L__BB192_37;
 
-	rem.u32 	%r44, %r31, %r32;
-	setp.ne.s32 	%p60, %r44, 0;
+	mul.lo.s32 	%r11, %r9, %r41;
+	setp.ge.u32 	%p24, %r11, %r131;
+	@%p24 bra 	$L__BB192_37;
 
-$L__BB192_6:
-	setp.eq.s32 	%p19, %r37, 0;
-	or.pred  	%p20, %p19, %p60;
-	setp.eq.s32 	%p21, %r38, 0;
-	or.pred  	%p22, %p21, %p20;
-	setp.eq.s32 	%p23, %r40, 0;
-	or.pred  	%p24, %p23, %p22;
-	@%p24 bra 	$L__BB192_39;
+	setp.lt.u32 	%p25, %r129, %r130;
+	mov.u32 	%r132, 0;
+	mov.u32 	%r133, %r132;
+	@%p25 bra 	$L__BB192_9;
 
-	mul.lo.s32 	%r10, %r9, %r40;
-	setp.ge.u32 	%p25, %r10, %r132;
-	@%p25 bra 	$L__BB192_39;
-
-	setp.lt.u32 	%p26, %r130, %r131;
-	mov.u32 	%r133, 0;
-	mov.u32 	%r134, %r133;
-	@%p26 bra 	$L__BB192_11;
-
-	sub.s32 	%r48, %r130, %r131;
+	sub.s32 	%r48, %r129, %r130;
 	add.s32 	%r49, %r48, 1;
-	min.u32 	%r134, %r49, %r132;
-	setp.eq.s32 	%p27, %r36, 0;
-	@%p27 bra 	$L__BB192_11;
+	min.u32 	%r133, %r49, %r131;
+	setp.eq.s32 	%p26, %r37, 0;
+	@%p26 bra 	$L__BB192_9;
 
-	add.s32 	%r50, %r130, 1;
-	max.u32 	%r51, %r50, %r36;
-	sub.s32 	%r52, %r51, %r36;
-	setp.gt.u32 	%p28, %r52, %r131;
-	sub.s32 	%r53, %r52, %r131;
-	min.u32 	%r54, %r53, %r134;
-	selp.b32 	%r133, %r54, 0, %p28;
+	add.s32 	%r50, %r129, 1;
+	max.u32 	%r51, %r50, %r37;
+	sub.s32 	%r52, %r51, %r37;
+	setp.gt.u32 	%p27, %r52, %r130;
+	sub.s32 	%r53, %r52, %r130;
+	min.u32 	%r54, %r53, %r133;
+	selp.b32 	%r132, %r54, 0, %p27;
 
-$L__BB192_11:
-	add.s32 	%r55, %r10, %r40;
-	max.u32 	%r137, %r10, %r133;
-	min.u32 	%r16, %r55, %r134;
-	mad.lo.s32 	%r56, %r8, %r41, %r9;
-	mul.lo.s32 	%r57, %r56, %r33;
+$L__BB192_9:
+	add.s32 	%r55, %r11, %r41;
+	max.u32 	%r136, %r11, %r132;
+	min.u32 	%r17, %r55, %r133;
+	mad.lo.s32 	%r56, %r8, %r42, %r9;
+	mul.lo.s32 	%r57, %r56, %r34;
 	cvt.u64.u32 	%rd16, %r57;
 	shl.b32 	%r58, %r56, 1;
 	cvta.to.global.u64 	%rd17, %rd10;
 	mul.wide.u32 	%rd18, %r58, 4;
 	add.s64 	%rd1, %rd17, %rd18;
-	setp.lt.u32 	%p29, %r137, %r16;
+	setp.lt.u32 	%p28, %r136, %r17;
 	cvt.u64.u32 	%rd19, %r7;
 	add.s64 	%rd20, %rd16, %rd19;
 	cvta.to.global.u64 	%rd21, %rd9;
 	shl.b64 	%rd22, %rd20, 2;
 	add.s64 	%rd2, %rd21, %rd22;
-	@%p29 bra 	$L__BB192_16;
-	bra.uni 	$L__BB192_12;
+	@%p28 bra 	$L__BB192_14;
+	bra.uni 	$L__BB192_10;
 
-$L__BB192_16:
-	setp.ne.s32 	%p32, %r7, 0;
-	@%p32 bra 	$L__BB192_18;
+$L__BB192_14:
+	setp.ne.s32 	%p31, %r7, 0;
+	@%p31 bra 	$L__BB192_16;
 
 	mov.u32 	%r62, -8388609;
-	st.shared.u32 	[_ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E16shared_max_score], %r62;
+	st.shared.u32 	[_ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE16shared_max_score], %r62;
 	mov.u32 	%r63, 0;
-	st.shared.u32 	[_ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E12shared_denom], %r63;
+	st.shared.u32 	[_ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_denom], %r63;
 
-$L__BB192_18:
+$L__BB192_16:
 	cvta.to.global.u64 	%rd3, %rd12;
-	div.u32 	%r64, %r31, %r32;
+	div.u32 	%r64, %r32, %r33;
 	div.u32 	%r65, %r8, %r64;
 	bar.sync 	0;
-	mul.lo.s32 	%r66, %r65, %r33;
+	mul.lo.s32 	%r66, %r65, %r34;
 	add.s32 	%r67, %r66, %r7;
 	shr.u32 	%r68, %r67, 1;
 	cvt.u64.u32 	%rd4, %r68;
-	and.b32  	%r17, %r67, 1;
-	mad.lo.s32 	%r69, %r8, %r33, %r7;
+	and.b32  	%r18, %r67, 1;
+	mad.lo.s32 	%r69, %r8, %r34, %r7;
 	cvta.to.global.u64 	%rd23, %rd11;
 	mul.wide.u32 	%rd24, %r69, 4;
 	add.s64 	%rd5, %rd23, %rd24;
-	mov.u32 	%r70, %ntid.x;
-	add.s32 	%r71, %r70, 31;
-	shr.u32 	%r72, %r71, 5;
-	shr.u32 	%r18, %r7, 5;
-	shl.b32 	%r73, %r18, 2;
-	mov.u32 	%r74, _ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E9warp_sums;
-	add.s32 	%r19, %r74, %r73;
-	setp.eq.s32 	%p33, %r18, 0;
-	and.b32  	%r20, %r7, 31;
-	setp.lt.u32 	%p34, %r20, %r72;
-	and.pred  	%p5, %p33, %p34;
-	shl.b32 	%r75, %r7, 2;
-	and.b32  	%r76, %r75, 124;
-	add.s32 	%r21, %r74, %r76;
-	shl.b32 	%r77, %r65, 2;
-	add.s32 	%r78, %r66, %r77;
-	cvt.u64.u32 	%rd6, %r78;
-	add.s32 	%r79, %r7, 4;
-	cvt.u64.u32 	%rd7, %r79;
-	mul.lo.s32 	%r136, %r37, %r137;
-	mul.lo.s32 	%r135, %r38, %r137;
+	add.s32 	%r70, %r10, 31;
+	shr.u32 	%r71, %r70, 5;
+	shr.u32 	%r19, %r7, 5;
+	shl.b32 	%r72, %r19, 2;
+	mov.u32 	%r73, _ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE9warp_sums;
+	add.s32 	%r20, %r73, %r72;
+	setp.eq.s32 	%p32, %r19, 0;
+	and.b32  	%r21, %r7, 31;
+	setp.lt.u32 	%p33, %r21, %r71;
+	and.pred  	%p3, %p32, %p33;
+	shl.b32 	%r74, %r7, 2;
+	and.b32  	%r75, %r74, 124;
+	add.s32 	%r22, %r73, %r75;
+	shl.b32 	%r76, %r65, 2;
+	add.s32 	%r77, %r66, %r76;
+	cvt.u64.u32 	%rd6, %r77;
+	add.s32 	%r78, %r7, 4;
+	cvt.u64.u32 	%rd7, %r78;
+	mul.lo.s32 	%r135, %r38, %r136;
+	mul.lo.s32 	%r134, %r39, %r136;
 	cvta.to.global.u64 	%rd8, %rd13;
-	cvt.rn.f32.u32 	%f14, %r33;
+	cvt.rn.f32.u32 	%f14, %r34;
 	rsqrt.approx.f32 	%f1, %f14;
 	mov.f32 	%f13, 0f00000000;
-	not.pred 	%p45, %p5;
+	not.pred 	%p44, %p3;
 	mov.f32 	%f83, %f13;
 
-$L__BB192_19:
-	setp.lt.u32 	%p6, %r137, %r39;
-	setp.ge.u32 	%p35, %r137, %r39;
-	setp.ge.u32 	%p36, %r7, %r33;
-	or.pred  	%p37, %p36, %p35;
+$L__BB192_17:
+	setp.lt.u32 	%p4, %r136, %r40;
+	setp.ge.u32 	%p34, %r136, %r40;
+	setp.ge.u32 	%p35, %r7, %r34;
+	or.pred  	%p36, %p35, %p34;
 	mov.f32 	%f80, %f13;
-	@%p37 bra 	$L__BB192_21;
+	@%p36 bra 	$L__BB192_19;
 
-	setp.eq.s32 	%p38, %r17, 0;
-	cvt.u64.u32 	%rd25, %r136;
+	setp.eq.s32 	%p37, %r18, 0;
+	cvt.u64.u32 	%rd25, %r135;
 	add.s64 	%rd26, %rd3, %rd25;
-	selp.b64 	%rd27, %rd26, %rd3, %p6;
+	selp.b64 	%rd27, %rd26, %rd3, %p4;
 	add.s64 	%rd28, %rd27, %rd4;
-	ld.global.u8 	%r80, [%rd28];
-	shr.u32 	%r81, %r80, 4;
-	selp.b32 	%r82, %r80, %r81, %p38;
-	cvt.u16.u32 	%rs1, %r82;
+	ld.global.u8 	%r79, [%rd28];
+	shr.u32 	%r80, %r79, 4;
+	selp.b32 	%r81, %r79, %r80, %p37;
+	cvt.u16.u32 	%rs1, %r81;
 	and.b16  	%rs2, %rs1, 15;
 	cvt.rn.f32.u16 	%f16, %rs2;
 	div.rn.f32 	%f17, %f16, 0f40F00000;
@@ -98933,87 +98931,87 @@ $L__BB192_19:
 	ld.global.f32 	%f19, [%rd5];
 	mul.f32 	%f80, %f19, %f18;
 
-$L__BB192_21:
-	mov.b32 	%r83, %f80;
-	mov.u32 	%r84, 2;
-	mov.u32 	%r85, 31;
-	mov.u32 	%r86, 16;
-	mov.u32 	%r87, -1;
-	shfl.sync.down.b32 	%r88|%p39, %r83, %r86, %r85, %r87;
-	mov.b32 	%f20, %r88;
+$L__BB192_19:
+	mov.b32 	%r82, %f80;
+	mov.u32 	%r83, 2;
+	mov.u32 	%r84, 31;
+	mov.u32 	%r85, 16;
+	mov.u32 	%r86, -1;
+	shfl.sync.down.b32 	%r87|%p38, %r82, %r85, %r84, %r86;
+	mov.b32 	%f20, %r87;
 	add.f32 	%f21, %f80, %f20;
-	mov.b32 	%r89, %f21;
-	mov.u32 	%r90, 8;
-	shfl.sync.down.b32 	%r91|%p40, %r89, %r90, %r85, %r87;
-	mov.b32 	%f22, %r91;
+	mov.b32 	%r88, %f21;
+	mov.u32 	%r89, 8;
+	shfl.sync.down.b32 	%r90|%p39, %r88, %r89, %r84, %r86;
+	mov.b32 	%f22, %r90;
 	add.f32 	%f23, %f21, %f22;
-	mov.b32 	%r92, %f23;
-	mov.u32 	%r93, 4;
-	shfl.sync.down.b32 	%r94|%p41, %r92, %r93, %r85, %r87;
-	mov.b32 	%f24, %r94;
+	mov.b32 	%r91, %f23;
+	mov.u32 	%r92, 4;
+	shfl.sync.down.b32 	%r93|%p40, %r91, %r92, %r84, %r86;
+	mov.b32 	%f24, %r93;
 	add.f32 	%f25, %f23, %f24;
-	mov.b32 	%r95, %f25;
-	shfl.sync.down.b32 	%r96|%p42, %r95, %r84, %r85, %r87;
-	mov.b32 	%f26, %r96;
+	mov.b32 	%r94, %f25;
+	shfl.sync.down.b32 	%r95|%p41, %r94, %r83, %r84, %r86;
+	mov.b32 	%f26, %r95;
 	add.f32 	%f27, %f25, %f26;
-	mov.b32 	%r97, %f27;
-	mov.u32 	%r98, 1;
-	shfl.sync.down.b32 	%r99|%p43, %r97, %r98, %r85, %r87;
-	mov.b32 	%f28, %r99;
+	mov.b32 	%r96, %f27;
+	mov.u32 	%r97, 1;
+	shfl.sync.down.b32 	%r98|%p42, %r96, %r97, %r84, %r86;
+	mov.b32 	%f28, %r98;
 	add.f32 	%f5, %f27, %f28;
-	setp.ne.s32 	%p44, %r20, 0;
-	@%p44 bra 	$L__BB192_23;
+	setp.ne.s32 	%p43, %r21, 0;
+	@%p43 bra 	$L__BB192_21;
 
-	st.shared.f32 	[%r19], %f5;
+	st.shared.f32 	[%r20], %f5;
 
-$L__BB192_23:
+$L__BB192_21:
 	bar.sync 	0;
 	mov.f32 	%f82, 0f00000000;
+	@%p44 bra 	$L__BB192_23;
+
+	ld.shared.f32 	%f82, [%r22];
+
+$L__BB192_23:
+	setp.ne.s32 	%p45, %r19, 0;
 	@%p45 bra 	$L__BB192_25;
 
-	ld.shared.f32 	%f82, [%r21];
-
-$L__BB192_25:
-	setp.ne.s32 	%p46, %r18, 0;
-	@%p46 bra 	$L__BB192_27;
-
-	mov.b32 	%r100, %f82;
-	mov.u32 	%r101, 2;
-	mov.u32 	%r102, 31;
-	mov.u32 	%r103, 16;
-	mov.u32 	%r104, -1;
-	shfl.sync.down.b32 	%r105|%p47, %r100, %r103, %r102, %r104;
-	mov.b32 	%f30, %r105;
+	mov.b32 	%r99, %f82;
+	mov.u32 	%r100, 2;
+	mov.u32 	%r101, 31;
+	mov.u32 	%r102, 16;
+	mov.u32 	%r103, -1;
+	shfl.sync.down.b32 	%r104|%p46, %r99, %r102, %r101, %r103;
+	mov.b32 	%f30, %r104;
 	add.f32 	%f31, %f82, %f30;
-	mov.b32 	%r106, %f31;
-	mov.u32 	%r107, 8;
-	shfl.sync.down.b32 	%r108|%p48, %r106, %r107, %r102, %r104;
-	mov.b32 	%f32, %r108;
+	mov.b32 	%r105, %f31;
+	mov.u32 	%r106, 8;
+	shfl.sync.down.b32 	%r107|%p47, %r105, %r106, %r101, %r103;
+	mov.b32 	%f32, %r107;
 	add.f32 	%f33, %f31, %f32;
-	mov.b32 	%r109, %f33;
-	mov.u32 	%r110, 4;
-	shfl.sync.down.b32 	%r111|%p49, %r109, %r110, %r102, %r104;
-	mov.b32 	%f34, %r111;
+	mov.b32 	%r108, %f33;
+	mov.u32 	%r109, 4;
+	shfl.sync.down.b32 	%r110|%p48, %r108, %r109, %r101, %r103;
+	mov.b32 	%f34, %r110;
 	add.f32 	%f35, %f33, %f34;
-	mov.b32 	%r112, %f35;
-	shfl.sync.down.b32 	%r113|%p50, %r112, %r101, %r102, %r104;
-	mov.b32 	%f36, %r113;
+	mov.b32 	%r111, %f35;
+	shfl.sync.down.b32 	%r112|%p49, %r111, %r100, %r101, %r103;
+	mov.b32 	%f36, %r112;
 	add.f32 	%f37, %f35, %f36;
-	mov.b32 	%r114, %f37;
-	mov.u32 	%r115, 1;
-	shfl.sync.down.b32 	%r116|%p51, %r114, %r115, %r102, %r104;
-	mov.b32 	%f38, %r116;
+	mov.b32 	%r113, %f37;
+	mov.u32 	%r114, 1;
+	shfl.sync.down.b32 	%r115|%p50, %r113, %r114, %r101, %r103;
+	mov.b32 	%f38, %r115;
 	add.f32 	%f82, %f37, %f38;
 
-$L__BB192_27:
-	@%p32 bra 	$L__BB192_31;
+$L__BB192_25:
+	@%p31 bra 	$L__BB192_29;
 
-	@%p6 bra 	$L__BB192_30;
-	bra.uni 	$L__BB192_29;
+	@%p4 bra 	$L__BB192_28;
+	bra.uni 	$L__BB192_27;
 
-$L__BB192_30:
+$L__BB192_28:
 	mul.f32 	%f39, %f1, %f82;
-	ld.shared.f32 	%f40, [_ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E16shared_max_score];
+	ld.shared.f32 	%f40, [_ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE16shared_max_score];
 	max.f32 	%f41, %f40, %f39;
 	sub.f32 	%f42, %f40, %f41;
 	mov.f32 	%f43, 0f3F000000;
@@ -99029,12 +99027,12 @@ $L__BB192_30:
 	fma.rn.f32 	%f53, %f42, %f52, %f51;
 	mov.f32 	%f54, 0f32A57060;
 	fma.rn.f32 	%f55, %f42, %f54, %f53;
-	mov.b32 	%r119, %f49;
-	shl.b32 	%r120, %r119, 23;
-	mov.b32 	%f56, %r120;
+	mov.b32 	%r118, %f49;
+	shl.b32 	%r119, %r118, 23;
+	mov.b32 	%f56, %r119;
 	ex2.approx.ftz.f32 	%f57, %f55;
 	mul.f32 	%f58, %f57, %f56;
-	st.shared.f32 	[_ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E12shared_alpha], %f58;
+	st.shared.f32 	[_ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_alpha], %f58;
 	sub.f32 	%f59, %f39, %f41;
 	fma.rn.f32 	%f60, %f59, %f44, %f43;
 	cvt.sat.f32.f32 	%f61, %f60;
@@ -99043,88 +99041,88 @@ $L__BB192_30:
 	neg.f32 	%f64, %f63;
 	fma.rn.f32 	%f65, %f59, %f52, %f64;
 	fma.rn.f32 	%f66, %f59, %f54, %f65;
-	mov.b32 	%r121, %f62;
-	shl.b32 	%r122, %r121, 23;
-	mov.b32 	%f67, %r122;
+	mov.b32 	%r120, %f62;
+	shl.b32 	%r121, %r120, 23;
+	mov.b32 	%f67, %r121;
 	ex2.approx.ftz.f32 	%f68, %f66;
 	mul.f32 	%f69, %f68, %f67;
-	st.shared.f32 	[_ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E11shared_beta], %f69;
-	ld.shared.f32 	%f70, [_ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E12shared_denom];
+	st.shared.f32 	[_ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE11shared_beta], %f69;
+	ld.shared.f32 	%f70, [_ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_denom];
 	fma.rn.f32 	%f71, %f58, %f70, %f69;
-	st.shared.f32 	[_ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E12shared_denom], %f71;
-	st.shared.f32 	[_ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E16shared_max_score], %f41;
-	bra.uni 	$L__BB192_31;
+	st.shared.f32 	[_ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_denom], %f71;
+	st.shared.f32 	[_ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE16shared_max_score], %f41;
+	bra.uni 	$L__BB192_29;
+
+$L__BB192_27:
+	mov.u32 	%r116, 1065353216;
+	st.shared.u32 	[_ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_alpha], %r116;
+	mov.u32 	%r117, 0;
+	st.shared.u32 	[_ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE11shared_beta], %r117;
 
 $L__BB192_29:
-	mov.u32 	%r117, 1065353216;
-	st.shared.u32 	[_ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E12shared_alpha], %r117;
-	mov.u32 	%r118, 0;
-	st.shared.u32 	[_ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E11shared_beta], %r118;
-
-$L__BB192_31:
 	bar.sync 	0;
-	@%p36 bra 	$L__BB192_34;
+	@%p35 bra 	$L__BB192_32;
 
-	ld.shared.f32 	%f72, [_ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E12shared_alpha];
+	ld.shared.f32 	%f72, [_ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_alpha];
 	mul.f32 	%f83, %f83, %f72;
-	@%p35 bra 	$L__BB192_34;
+	@%p34 bra 	$L__BB192_32;
 
-	cvt.u64.u32 	%rd29, %r135;
+	cvt.u64.u32 	%rd29, %r134;
 	add.s64 	%rd30, %rd29, %rd6;
 	add.s64 	%rd31, %rd8, %rd30;
-	ld.global.u8 	%r123, [%rd31];
-	ld.global.u8 	%r124, [%rd31+1];
-	prmt.b32 	%r125, %r124, %r123, 30212;
-	ld.global.u8 	%r126, [%rd31+2];
-	prmt.b32 	%r127, %r126, %r125, 28756;
-	ld.global.u8 	%r128, [%rd31+3];
-	prmt.b32 	%r129, %r128, %r127, 1620;
-	mov.b32 	%f73, %r129;
+	ld.global.u8 	%r122, [%rd31];
+	ld.global.u8 	%r123, [%rd31+1];
+	prmt.b32 	%r124, %r123, %r122, 30212;
+	ld.global.u8 	%r125, [%rd31+2];
+	prmt.b32 	%r126, %r125, %r124, 28756;
+	ld.global.u8 	%r127, [%rd31+3];
+	prmt.b32 	%r128, %r127, %r126, 1620;
+	mov.b32 	%f73, %r128;
 	add.s64 	%rd32, %rd31, %rd7;
 	ld.global.s8 	%rs3, [%rd32];
 	cvt.rn.f32.s16 	%f74, %rs3;
 	mul.f32 	%f75, %f74, %f73;
-	ld.shared.f32 	%f76, [_ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E11shared_beta];
+	ld.shared.f32 	%f76, [_ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE11shared_beta];
 	fma.rn.f32 	%f83, %f76, %f75, %f83;
 
-$L__BB192_34:
+$L__BB192_32:
 	bar.sync 	0;
-	add.s32 	%r136, %r136, %r37;
 	add.s32 	%r135, %r135, %r38;
-	add.s32 	%r137, %r137, 1;
-	setp.lt.u32 	%p56, %r137, %r16;
-	@%p56 bra 	$L__BB192_19;
+	add.s32 	%r134, %r134, %r39;
+	add.s32 	%r136, %r136, 1;
+	setp.lt.u32 	%p55, %r136, %r17;
+	@%p55 bra 	$L__BB192_17;
 
-	@%p36 bra 	$L__BB192_37;
+	@%p35 bra 	$L__BB192_35;
 
 	st.global.f32 	[%rd2], %f83;
 
-$L__BB192_37:
-	@%p32 bra 	$L__BB192_39;
+$L__BB192_35:
+	@%p31 bra 	$L__BB192_37;
 
-	ld.shared.f32 	%f77, [_ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E16shared_max_score];
+	ld.shared.f32 	%f77, [_ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE16shared_max_score];
 	st.global.f32 	[%rd1], %f77;
-	ld.shared.f32 	%f78, [_ZZ77termite_gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32E12shared_denom];
+	ld.shared.f32 	%f78, [_ZZ28termite_tq_split_stage1_implILb1EEvPfS0_PKfPKhS4_PKjjjjjjjjjjjjjjjS6_jjE12shared_denom];
 	st.global.f32 	[%rd1+4], %f78;
-	bra.uni 	$L__BB192_39;
+	bra.uni 	$L__BB192_37;
 
-$L__BB192_12:
-	setp.ge.u32 	%p30, %r7, %r33;
-	@%p30 bra 	$L__BB192_14;
+$L__BB192_10:
+	setp.ge.u32 	%p29, %r7, %r34;
+	@%p29 bra 	$L__BB192_12;
 
 	mov.u32 	%r59, 0;
 	st.global.u32 	[%rd2], %r59;
 
-$L__BB192_14:
-	setp.ne.s32 	%p31, %r7, 0;
-	@%p31 bra 	$L__BB192_39;
+$L__BB192_12:
+	setp.ne.s32 	%p30, %r7, 0;
+	@%p30 bra 	$L__BB192_37;
 
 	mov.u32 	%r60, -8388609;
 	st.global.u32 	[%rd1], %r60;
 	mov.u32 	%r61, 0;
 	st.global.u32 	[%rd1+4], %r61;
 
-$L__BB192_39:
+$L__BB192_37:
 	ret;
 
 }
@@ -263928,8 +263926,7 @@ $L__BB332_39:
 	.reg .f32 	%f<154>;
 	.reg .b32 	%r<165>;
 	.reg .b64 	%rd<40>;
-	// demoted variable
-	.shared .align 4 .b8 _ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial[128];
+
 
 	ld.param.u64 	%rd39, [termite_linear_q4_0_qkv_nobias_f32_tile4_param_0];
 	ld.param.u64 	%rd10, [termite_linear_q4_0_qkv_nobias_f32_tile4_param_1];
@@ -264147,7 +264144,7 @@ $L__BB333_14:
 	add.f32 	%f18, %f49, %f50;
 	shr.u32 	%r104, %r10, 3;
 	and.b32  	%r105, %r104, 536870908;
-	mov.u32 	%r106, _ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial;
+	mov.u32 	%r106, _ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial;
 	add.s32 	%r26, %r106, %r105;
 	setp.ne.s32 	%p19, %r12, 0;
 	@%p19 bra 	$L__BB333_16;
@@ -264245,21 +264242,21 @@ $L__BB333_22:
 	setp.ge.u32 	%p39, %r11, %r162;
 	@%p39 bra 	$L__BB333_25;
 
-	ld.shared.f32 	%f78, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial];
+	ld.shared.f32 	%f78, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial];
 	add.f32 	%f79, %f78, 0f00000000;
-	ld.shared.f32 	%f80, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+4];
+	ld.shared.f32 	%f80, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+4];
 	add.f32 	%f81, %f79, %f80;
-	ld.shared.f32 	%f82, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+8];
+	ld.shared.f32 	%f82, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+8];
 	add.f32 	%f83, %f81, %f82;
-	ld.shared.f32 	%f84, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+12];
+	ld.shared.f32 	%f84, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+12];
 	add.f32 	%f85, %f83, %f84;
-	ld.shared.f32 	%f86, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+16];
+	ld.shared.f32 	%f86, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+16];
 	add.f32 	%f87, %f85, %f86;
-	ld.shared.f32 	%f88, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+20];
+	ld.shared.f32 	%f88, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+20];
 	add.f32 	%f89, %f87, %f88;
-	ld.shared.f32 	%f90, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+24];
+	ld.shared.f32 	%f90, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+24];
 	add.f32 	%f91, %f89, %f90;
-	ld.shared.f32 	%f92, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+28];
+	ld.shared.f32 	%f92, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+28];
 	add.f32 	%f93, %f91, %f92;
 	add.s32 	%r158, %r11, %r27;
 	mul.wide.u32 	%rd30, %r158, 4;
@@ -264271,21 +264268,21 @@ $L__BB333_25:
 	setp.ge.u32 	%p40, %r28, %r162;
 	@%p40 bra 	$L__BB333_27;
 
-	ld.shared.f32 	%f94, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+32];
+	ld.shared.f32 	%f94, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+32];
 	add.f32 	%f95, %f94, 0f00000000;
-	ld.shared.f32 	%f96, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+36];
+	ld.shared.f32 	%f96, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+36];
 	add.f32 	%f97, %f95, %f96;
-	ld.shared.f32 	%f98, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+40];
+	ld.shared.f32 	%f98, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+40];
 	add.f32 	%f99, %f97, %f98;
-	ld.shared.f32 	%f100, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+44];
+	ld.shared.f32 	%f100, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+44];
 	add.f32 	%f101, %f99, %f100;
-	ld.shared.f32 	%f102, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+48];
+	ld.shared.f32 	%f102, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+48];
 	add.f32 	%f103, %f101, %f102;
-	ld.shared.f32 	%f104, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+52];
+	ld.shared.f32 	%f104, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+52];
 	add.f32 	%f105, %f103, %f104;
-	ld.shared.f32 	%f106, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+56];
+	ld.shared.f32 	%f106, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+56];
 	add.f32 	%f107, %f105, %f106;
-	ld.shared.f32 	%f108, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+60];
+	ld.shared.f32 	%f108, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+60];
 	add.f32 	%f109, %f107, %f108;
 	add.s32 	%r159, %r28, %r27;
 	mul.wide.u32 	%rd32, %r159, 4;
@@ -264297,21 +264294,21 @@ $L__BB333_27:
 	setp.ge.u32 	%p41, %r29, %r162;
 	@%p41 bra 	$L__BB333_29;
 
-	ld.shared.f32 	%f110, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+64];
+	ld.shared.f32 	%f110, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+64];
 	add.f32 	%f111, %f110, 0f00000000;
-	ld.shared.f32 	%f112, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+68];
+	ld.shared.f32 	%f112, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+68];
 	add.f32 	%f113, %f111, %f112;
-	ld.shared.f32 	%f114, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+72];
+	ld.shared.f32 	%f114, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+72];
 	add.f32 	%f115, %f113, %f114;
-	ld.shared.f32 	%f116, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+76];
+	ld.shared.f32 	%f116, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+76];
 	add.f32 	%f117, %f115, %f116;
-	ld.shared.f32 	%f118, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+80];
+	ld.shared.f32 	%f118, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+80];
 	add.f32 	%f119, %f117, %f118;
-	ld.shared.f32 	%f120, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+84];
+	ld.shared.f32 	%f120, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+84];
 	add.f32 	%f121, %f119, %f120;
-	ld.shared.f32 	%f122, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+88];
+	ld.shared.f32 	%f122, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+88];
 	add.f32 	%f123, %f121, %f122;
-	ld.shared.f32 	%f124, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+92];
+	ld.shared.f32 	%f124, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+92];
 	add.f32 	%f125, %f123, %f124;
 	add.s32 	%r160, %r29, %r27;
 	mul.wide.u32 	%rd34, %r160, 4;
@@ -264323,21 +264320,21 @@ $L__BB333_29:
 	setp.ge.u32 	%p42, %r30, %r162;
 	@%p42 bra 	$L__BB333_31;
 
-	ld.shared.f32 	%f126, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+96];
+	ld.shared.f32 	%f126, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+96];
 	add.f32 	%f127, %f126, 0f00000000;
-	ld.shared.f32 	%f128, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+100];
+	ld.shared.f32 	%f128, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+100];
 	add.f32 	%f129, %f127, %f128;
-	ld.shared.f32 	%f130, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+104];
+	ld.shared.f32 	%f130, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+104];
 	add.f32 	%f131, %f129, %f130;
-	ld.shared.f32 	%f132, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+108];
+	ld.shared.f32 	%f132, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+108];
 	add.f32 	%f133, %f131, %f132;
-	ld.shared.f32 	%f134, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+112];
+	ld.shared.f32 	%f134, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+112];
 	add.f32 	%f135, %f133, %f134;
-	ld.shared.f32 	%f136, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+116];
+	ld.shared.f32 	%f136, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+116];
 	add.f32 	%f137, %f135, %f136;
-	ld.shared.f32 	%f138, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+120];
+	ld.shared.f32 	%f138, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+120];
 	add.f32 	%f139, %f137, %f138;
-	ld.shared.f32 	%f140, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile4E12warp_partial+124];
+	ld.shared.f32 	%f140, [_ZZ25termite_q4_0_tile_cols_atILj4ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+124];
 	add.f32 	%f141, %f139, %f140;
 	add.s32 	%r161, %r30, %r27;
 	mul.wide.u32 	%rd36, %r161, 4;
@@ -264368,8 +264365,7 @@ $L__BB333_31:
 	.reg .f32 	%f<122>;
 	.reg .b32 	%r<165>;
 	.reg .b64 	%rd<40>;
-	// demoted variable
-	.shared .align 4 .b8 _ZZ43termite_linear_q4_0_qkv_nobias_f32_tile4_w4E12warp_partial[64];
+
 
 	ld.param.u64 	%rd39, [termite_linear_q4_0_qkv_nobias_f32_tile4_w4_param_0];
 	ld.param.u64 	%rd10, [termite_linear_q4_0_qkv_nobias_f32_tile4_w4_param_1];
@@ -264588,7 +264584,7 @@ $L__BB334_14:
 	add.f32 	%f18, %f49, %f50;
 	shr.u32 	%r104, %r10, 3;
 	and.b32  	%r105, %r104, 536870908;
-	mov.u32 	%r106, _ZZ43termite_linear_q4_0_qkv_nobias_f32_tile4_w4E12warp_partial;
+	mov.u32 	%r106, _ZZ25termite_q4_0_tile_cols_atILj4ELj4ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial;
 	add.s32 	%r26, %r106, %r105;
 	@%p14 bra 	$L__BB334_16;
 
@@ -264685,13 +264681,13 @@ $L__BB334_22:
 	setp.ge.u32 	%p39, %r11, %r162;
 	@%p39 bra 	$L__BB334_25;
 
-	ld.shared.f32 	%f78, [_ZZ43termite_linear_q4_0_qkv_nobias_f32_tile4_w4E12warp_partial];
+	ld.shared.f32 	%f78, [_ZZ25termite_q4_0_tile_cols_atILj4ELj4ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial];
 	add.f32 	%f79, %f78, 0f00000000;
-	ld.shared.f32 	%f80, [_ZZ43termite_linear_q4_0_qkv_nobias_f32_tile4_w4E12warp_partial+4];
+	ld.shared.f32 	%f80, [_ZZ25termite_q4_0_tile_cols_atILj4ELj4ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+4];
 	add.f32 	%f81, %f79, %f80;
-	ld.shared.f32 	%f82, [_ZZ43termite_linear_q4_0_qkv_nobias_f32_tile4_w4E12warp_partial+8];
+	ld.shared.f32 	%f82, [_ZZ25termite_q4_0_tile_cols_atILj4ELj4ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+8];
 	add.f32 	%f83, %f81, %f82;
-	ld.shared.f32 	%f84, [_ZZ43termite_linear_q4_0_qkv_nobias_f32_tile4_w4E12warp_partial+12];
+	ld.shared.f32 	%f84, [_ZZ25termite_q4_0_tile_cols_atILj4ELj4ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+12];
 	add.f32 	%f85, %f83, %f84;
 	add.s32 	%r158, %r11, %r27;
 	mul.wide.u32 	%rd30, %r158, 4;
@@ -264703,13 +264699,13 @@ $L__BB334_25:
 	setp.ge.u32 	%p40, %r28, %r162;
 	@%p40 bra 	$L__BB334_27;
 
-	ld.shared.f32 	%f86, [_ZZ43termite_linear_q4_0_qkv_nobias_f32_tile4_w4E12warp_partial+16];
+	ld.shared.f32 	%f86, [_ZZ25termite_q4_0_tile_cols_atILj4ELj4ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+16];
 	add.f32 	%f87, %f86, 0f00000000;
-	ld.shared.f32 	%f88, [_ZZ43termite_linear_q4_0_qkv_nobias_f32_tile4_w4E12warp_partial+20];
+	ld.shared.f32 	%f88, [_ZZ25termite_q4_0_tile_cols_atILj4ELj4ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+20];
 	add.f32 	%f89, %f87, %f88;
-	ld.shared.f32 	%f90, [_ZZ43termite_linear_q4_0_qkv_nobias_f32_tile4_w4E12warp_partial+24];
+	ld.shared.f32 	%f90, [_ZZ25termite_q4_0_tile_cols_atILj4ELj4ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+24];
 	add.f32 	%f91, %f89, %f90;
-	ld.shared.f32 	%f92, [_ZZ43termite_linear_q4_0_qkv_nobias_f32_tile4_w4E12warp_partial+28];
+	ld.shared.f32 	%f92, [_ZZ25termite_q4_0_tile_cols_atILj4ELj4ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+28];
 	add.f32 	%f93, %f91, %f92;
 	add.s32 	%r159, %r28, %r27;
 	mul.wide.u32 	%rd32, %r159, 4;
@@ -264721,13 +264717,13 @@ $L__BB334_27:
 	setp.ge.u32 	%p41, %r29, %r162;
 	@%p41 bra 	$L__BB334_29;
 
-	ld.shared.f32 	%f94, [_ZZ43termite_linear_q4_0_qkv_nobias_f32_tile4_w4E12warp_partial+32];
+	ld.shared.f32 	%f94, [_ZZ25termite_q4_0_tile_cols_atILj4ELj4ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+32];
 	add.f32 	%f95, %f94, 0f00000000;
-	ld.shared.f32 	%f96, [_ZZ43termite_linear_q4_0_qkv_nobias_f32_tile4_w4E12warp_partial+36];
+	ld.shared.f32 	%f96, [_ZZ25termite_q4_0_tile_cols_atILj4ELj4ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+36];
 	add.f32 	%f97, %f95, %f96;
-	ld.shared.f32 	%f98, [_ZZ43termite_linear_q4_0_qkv_nobias_f32_tile4_w4E12warp_partial+40];
+	ld.shared.f32 	%f98, [_ZZ25termite_q4_0_tile_cols_atILj4ELj4ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+40];
 	add.f32 	%f99, %f97, %f98;
-	ld.shared.f32 	%f100, [_ZZ43termite_linear_q4_0_qkv_nobias_f32_tile4_w4E12warp_partial+44];
+	ld.shared.f32 	%f100, [_ZZ25termite_q4_0_tile_cols_atILj4ELj4ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+44];
 	add.f32 	%f101, %f99, %f100;
 	add.s32 	%r160, %r29, %r27;
 	mul.wide.u32 	%rd34, %r160, 4;
@@ -264739,13 +264735,13 @@ $L__BB334_29:
 	setp.ge.u32 	%p42, %r30, %r162;
 	@%p42 bra 	$L__BB334_31;
 
-	ld.shared.f32 	%f102, [_ZZ43termite_linear_q4_0_qkv_nobias_f32_tile4_w4E12warp_partial+48];
+	ld.shared.f32 	%f102, [_ZZ25termite_q4_0_tile_cols_atILj4ELj4ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+48];
 	add.f32 	%f103, %f102, 0f00000000;
-	ld.shared.f32 	%f104, [_ZZ43termite_linear_q4_0_qkv_nobias_f32_tile4_w4E12warp_partial+52];
+	ld.shared.f32 	%f104, [_ZZ25termite_q4_0_tile_cols_atILj4ELj4ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+52];
 	add.f32 	%f105, %f103, %f104;
-	ld.shared.f32 	%f106, [_ZZ43termite_linear_q4_0_qkv_nobias_f32_tile4_w4E12warp_partial+56];
+	ld.shared.f32 	%f106, [_ZZ25termite_q4_0_tile_cols_atILj4ELj4ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+56];
 	add.f32 	%f107, %f105, %f106;
-	ld.shared.f32 	%f108, [_ZZ43termite_linear_q4_0_qkv_nobias_f32_tile4_w4E12warp_partial+60];
+	ld.shared.f32 	%f108, [_ZZ25termite_q4_0_tile_cols_atILj4ELj4ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+60];
 	add.f32 	%f109, %f107, %f108;
 	add.s32 	%r161, %r30, %r27;
 	mul.wide.u32 	%rd36, %r161, 4;
@@ -272965,8 +272961,7 @@ $L__BB338_55:
 	.reg .f32 	%f<306>;
 	.reg .b32 	%r<289>;
 	.reg .b64 	%rd<60>;
-	// demoted variable
-	.shared .align 4 .b8 _ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial[256];
+
 
 	ld.param.u64 	%rd59, [termite_linear_q4_0_qkv_nobias_f32_tile8_param_0];
 	ld.param.u64 	%rd10, [termite_linear_q4_0_qkv_nobias_f32_tile8_param_1];
@@ -273304,7 +273299,7 @@ $L__BB339_22:
 	add.f32 	%f34, %f89, %f90;
 	shr.u32 	%r156, %r10, 3;
 	and.b32  	%r157, %r156, 536870908;
-	mov.u32 	%r158, _ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial;
+	mov.u32 	%r158, _ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial;
 	add.s32 	%r34, %r158, %r157;
 	setp.ne.s32 	%p27, %r12, 0;
 	@%p27 bra 	$L__BB339_24;
@@ -273516,21 +273511,21 @@ $L__BB339_38:
 	setp.ge.u32 	%p71, %r11, %r286;
 	@%p71 bra 	$L__BB339_41;
 
-	ld.shared.f32 	%f154, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial];
+	ld.shared.f32 	%f154, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial];
 	add.f32 	%f155, %f154, 0f00000000;
-	ld.shared.f32 	%f156, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+4];
+	ld.shared.f32 	%f156, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+4];
 	add.f32 	%f157, %f155, %f156;
-	ld.shared.f32 	%f158, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+8];
+	ld.shared.f32 	%f158, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+8];
 	add.f32 	%f159, %f157, %f158;
-	ld.shared.f32 	%f160, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+12];
+	ld.shared.f32 	%f160, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+12];
 	add.f32 	%f161, %f159, %f160;
-	ld.shared.f32 	%f162, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+16];
+	ld.shared.f32 	%f162, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+16];
 	add.f32 	%f163, %f161, %f162;
-	ld.shared.f32 	%f164, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+20];
+	ld.shared.f32 	%f164, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+20];
 	add.f32 	%f165, %f163, %f164;
-	ld.shared.f32 	%f166, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+24];
+	ld.shared.f32 	%f166, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+24];
 	add.f32 	%f167, %f165, %f166;
-	ld.shared.f32 	%f168, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+28];
+	ld.shared.f32 	%f168, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+28];
 	add.f32 	%f169, %f167, %f168;
 	add.s32 	%r278, %r11, %r35;
 	mul.wide.u32 	%rd42, %r278, 4;
@@ -273542,21 +273537,21 @@ $L__BB339_41:
 	setp.ge.u32 	%p72, %r36, %r286;
 	@%p72 bra 	$L__BB339_43;
 
-	ld.shared.f32 	%f170, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+32];
+	ld.shared.f32 	%f170, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+32];
 	add.f32 	%f171, %f170, 0f00000000;
-	ld.shared.f32 	%f172, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+36];
+	ld.shared.f32 	%f172, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+36];
 	add.f32 	%f173, %f171, %f172;
-	ld.shared.f32 	%f174, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+40];
+	ld.shared.f32 	%f174, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+40];
 	add.f32 	%f175, %f173, %f174;
-	ld.shared.f32 	%f176, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+44];
+	ld.shared.f32 	%f176, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+44];
 	add.f32 	%f177, %f175, %f176;
-	ld.shared.f32 	%f178, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+48];
+	ld.shared.f32 	%f178, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+48];
 	add.f32 	%f179, %f177, %f178;
-	ld.shared.f32 	%f180, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+52];
+	ld.shared.f32 	%f180, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+52];
 	add.f32 	%f181, %f179, %f180;
-	ld.shared.f32 	%f182, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+56];
+	ld.shared.f32 	%f182, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+56];
 	add.f32 	%f183, %f181, %f182;
-	ld.shared.f32 	%f184, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+60];
+	ld.shared.f32 	%f184, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+60];
 	add.f32 	%f185, %f183, %f184;
 	add.s32 	%r279, %r36, %r35;
 	mul.wide.u32 	%rd44, %r279, 4;
@@ -273568,21 +273563,21 @@ $L__BB339_43:
 	setp.ge.u32 	%p73, %r37, %r286;
 	@%p73 bra 	$L__BB339_45;
 
-	ld.shared.f32 	%f186, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+64];
+	ld.shared.f32 	%f186, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+64];
 	add.f32 	%f187, %f186, 0f00000000;
-	ld.shared.f32 	%f188, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+68];
+	ld.shared.f32 	%f188, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+68];
 	add.f32 	%f189, %f187, %f188;
-	ld.shared.f32 	%f190, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+72];
+	ld.shared.f32 	%f190, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+72];
 	add.f32 	%f191, %f189, %f190;
-	ld.shared.f32 	%f192, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+76];
+	ld.shared.f32 	%f192, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+76];
 	add.f32 	%f193, %f191, %f192;
-	ld.shared.f32 	%f194, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+80];
+	ld.shared.f32 	%f194, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+80];
 	add.f32 	%f195, %f193, %f194;
-	ld.shared.f32 	%f196, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+84];
+	ld.shared.f32 	%f196, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+84];
 	add.f32 	%f197, %f195, %f196;
-	ld.shared.f32 	%f198, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+88];
+	ld.shared.f32 	%f198, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+88];
 	add.f32 	%f199, %f197, %f198;
-	ld.shared.f32 	%f200, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+92];
+	ld.shared.f32 	%f200, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+92];
 	add.f32 	%f201, %f199, %f200;
 	add.s32 	%r280, %r37, %r35;
 	mul.wide.u32 	%rd46, %r280, 4;
@@ -273594,21 +273589,21 @@ $L__BB339_45:
 	setp.ge.u32 	%p74, %r38, %r286;
 	@%p74 bra 	$L__BB339_47;
 
-	ld.shared.f32 	%f202, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+96];
+	ld.shared.f32 	%f202, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+96];
 	add.f32 	%f203, %f202, 0f00000000;
-	ld.shared.f32 	%f204, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+100];
+	ld.shared.f32 	%f204, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+100];
 	add.f32 	%f205, %f203, %f204;
-	ld.shared.f32 	%f206, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+104];
+	ld.shared.f32 	%f206, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+104];
 	add.f32 	%f207, %f205, %f206;
-	ld.shared.f32 	%f208, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+108];
+	ld.shared.f32 	%f208, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+108];
 	add.f32 	%f209, %f207, %f208;
-	ld.shared.f32 	%f210, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+112];
+	ld.shared.f32 	%f210, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+112];
 	add.f32 	%f211, %f209, %f210;
-	ld.shared.f32 	%f212, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+116];
+	ld.shared.f32 	%f212, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+116];
 	add.f32 	%f213, %f211, %f212;
-	ld.shared.f32 	%f214, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+120];
+	ld.shared.f32 	%f214, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+120];
 	add.f32 	%f215, %f213, %f214;
-	ld.shared.f32 	%f216, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+124];
+	ld.shared.f32 	%f216, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+124];
 	add.f32 	%f217, %f215, %f216;
 	add.s32 	%r281, %r38, %r35;
 	mul.wide.u32 	%rd48, %r281, 4;
@@ -273620,21 +273615,21 @@ $L__BB339_47:
 	setp.ge.u32 	%p75, %r39, %r286;
 	@%p75 bra 	$L__BB339_49;
 
-	ld.shared.f32 	%f218, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+128];
+	ld.shared.f32 	%f218, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+128];
 	add.f32 	%f219, %f218, 0f00000000;
-	ld.shared.f32 	%f220, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+132];
+	ld.shared.f32 	%f220, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+132];
 	add.f32 	%f221, %f219, %f220;
-	ld.shared.f32 	%f222, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+136];
+	ld.shared.f32 	%f222, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+136];
 	add.f32 	%f223, %f221, %f222;
-	ld.shared.f32 	%f224, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+140];
+	ld.shared.f32 	%f224, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+140];
 	add.f32 	%f225, %f223, %f224;
-	ld.shared.f32 	%f226, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+144];
+	ld.shared.f32 	%f226, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+144];
 	add.f32 	%f227, %f225, %f226;
-	ld.shared.f32 	%f228, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+148];
+	ld.shared.f32 	%f228, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+148];
 	add.f32 	%f229, %f227, %f228;
-	ld.shared.f32 	%f230, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+152];
+	ld.shared.f32 	%f230, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+152];
 	add.f32 	%f231, %f229, %f230;
-	ld.shared.f32 	%f232, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+156];
+	ld.shared.f32 	%f232, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+156];
 	add.f32 	%f233, %f231, %f232;
 	add.s32 	%r282, %r39, %r35;
 	mul.wide.u32 	%rd50, %r282, 4;
@@ -273646,21 +273641,21 @@ $L__BB339_49:
 	setp.ge.u32 	%p76, %r40, %r286;
 	@%p76 bra 	$L__BB339_51;
 
-	ld.shared.f32 	%f234, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+160];
+	ld.shared.f32 	%f234, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+160];
 	add.f32 	%f235, %f234, 0f00000000;
-	ld.shared.f32 	%f236, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+164];
+	ld.shared.f32 	%f236, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+164];
 	add.f32 	%f237, %f235, %f236;
-	ld.shared.f32 	%f238, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+168];
+	ld.shared.f32 	%f238, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+168];
 	add.f32 	%f239, %f237, %f238;
-	ld.shared.f32 	%f240, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+172];
+	ld.shared.f32 	%f240, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+172];
 	add.f32 	%f241, %f239, %f240;
-	ld.shared.f32 	%f242, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+176];
+	ld.shared.f32 	%f242, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+176];
 	add.f32 	%f243, %f241, %f242;
-	ld.shared.f32 	%f244, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+180];
+	ld.shared.f32 	%f244, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+180];
 	add.f32 	%f245, %f243, %f244;
-	ld.shared.f32 	%f246, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+184];
+	ld.shared.f32 	%f246, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+184];
 	add.f32 	%f247, %f245, %f246;
-	ld.shared.f32 	%f248, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+188];
+	ld.shared.f32 	%f248, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+188];
 	add.f32 	%f249, %f247, %f248;
 	add.s32 	%r283, %r40, %r35;
 	mul.wide.u32 	%rd52, %r283, 4;
@@ -273672,21 +273667,21 @@ $L__BB339_51:
 	setp.ge.u32 	%p77, %r41, %r286;
 	@%p77 bra 	$L__BB339_53;
 
-	ld.shared.f32 	%f250, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+192];
+	ld.shared.f32 	%f250, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+192];
 	add.f32 	%f251, %f250, 0f00000000;
-	ld.shared.f32 	%f252, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+196];
+	ld.shared.f32 	%f252, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+196];
 	add.f32 	%f253, %f251, %f252;
-	ld.shared.f32 	%f254, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+200];
+	ld.shared.f32 	%f254, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+200];
 	add.f32 	%f255, %f253, %f254;
-	ld.shared.f32 	%f256, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+204];
+	ld.shared.f32 	%f256, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+204];
 	add.f32 	%f257, %f255, %f256;
-	ld.shared.f32 	%f258, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+208];
+	ld.shared.f32 	%f258, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+208];
 	add.f32 	%f259, %f257, %f258;
-	ld.shared.f32 	%f260, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+212];
+	ld.shared.f32 	%f260, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+212];
 	add.f32 	%f261, %f259, %f260;
-	ld.shared.f32 	%f262, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+216];
+	ld.shared.f32 	%f262, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+216];
 	add.f32 	%f263, %f261, %f262;
-	ld.shared.f32 	%f264, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+220];
+	ld.shared.f32 	%f264, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+220];
 	add.f32 	%f265, %f263, %f264;
 	add.s32 	%r284, %r41, %r35;
 	mul.wide.u32 	%rd54, %r284, 4;
@@ -273698,21 +273693,21 @@ $L__BB339_53:
 	setp.ge.u32 	%p78, %r42, %r286;
 	@%p78 bra 	$L__BB339_55;
 
-	ld.shared.f32 	%f266, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+224];
+	ld.shared.f32 	%f266, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+224];
 	add.f32 	%f267, %f266, 0f00000000;
-	ld.shared.f32 	%f268, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+228];
+	ld.shared.f32 	%f268, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+228];
 	add.f32 	%f269, %f267, %f268;
-	ld.shared.f32 	%f270, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+232];
+	ld.shared.f32 	%f270, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+232];
 	add.f32 	%f271, %f269, %f270;
-	ld.shared.f32 	%f272, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+236];
+	ld.shared.f32 	%f272, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+236];
 	add.f32 	%f273, %f271, %f272;
-	ld.shared.f32 	%f274, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+240];
+	ld.shared.f32 	%f274, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+240];
 	add.f32 	%f275, %f273, %f274;
-	ld.shared.f32 	%f276, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+244];
+	ld.shared.f32 	%f276, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+244];
 	add.f32 	%f277, %f275, %f276;
-	ld.shared.f32 	%f278, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+248];
+	ld.shared.f32 	%f278, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+248];
 	add.f32 	%f279, %f277, %f278;
-	ld.shared.f32 	%f280, [_ZZ40termite_linear_q4_0_qkv_nobias_f32_tile8E12warp_partial+252];
+	ld.shared.f32 	%f280, [_ZZ25termite_q4_0_tile_cols_atILj8ELj8ELb0EEvPfPKfPKhjjjjjS2_jE12warp_partial+252];
 	add.f32 	%f281, %f279, %f280;
 	add.s32 	%r285, %r42, %r35;
 	mul.wide.u32 	%rd56, %r285, 4;

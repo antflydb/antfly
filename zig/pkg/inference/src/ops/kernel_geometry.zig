@@ -123,3 +123,59 @@ pub fn planDenseDotGeneral(lhs: []const i64, rhs: []const i64, lc: []const u8, r
     if (lhs[lc[0]] != rhs[rc[0]]) return error.InvalidShape;
     return .{ .batch_count = 1, .m = @intCast(lhs[1 - lc[0]]), .n = @intCast(rhs[1 - rc[0]]), .k = @intCast(lhs[lc[0]]), .lhs_contract_last = lc[0] == 1, .rhs_contract_last = rc[0] == 1 };
 }
+
+/// Dense row geometry; empty row sets are legal, zero width is not.
+pub const DenseRows = struct {
+    rows: usize,
+    width: usize,
+    pub inline fn init(elements: usize, width: usize) error{InvalidShape}!DenseRows {
+        if (width == 0 or elements % width != 0) return error.InvalidShape;
+        return .{ .rows = elements / width, .width = width };
+    }
+};
+
+/// Validate element regions before any copy or device submission. Keep the
+/// original product-check order so callers can preserve their error mapping.
+pub const RowCopy = struct {
+    destination: usize,
+    source: usize,
+    elements: usize,
+    pub inline fn init(dst_elements: usize, src_elements: usize, dst_row: usize, src_row: usize, rows: usize, cols: usize) !RowCopy {
+        const dst = try std.math.mul(usize, dst_row, cols);
+        const src = try std.math.mul(usize, src_row, cols);
+        const count = try std.math.mul(usize, rows, cols);
+        if (cols == 0 or dst_elements % cols != 0 or src_elements % cols != 0 or
+            dst > dst_elements or count > dst_elements - dst or
+            src > src_elements or count > src_elements - src) return error.InvalidShape;
+        return .{ .destination = dst, .source = src, .elements = count };
+    }
+};
+
+/// Symmetric padding and unit dilation; native schedules retain their own
+/// indexing, grouping and workspace policy.
+pub inline fn convolutionOutput(input: usize, kernel: usize, stride: usize, padding: usize) !usize {
+    if (kernel == 0 or stride == 0) return error.InvalidShape;
+    const padded = try std.math.add(usize, input, try std.math.mul(usize, padding, 2));
+    if (kernel > padded) return error.InvalidShape;
+    return (padded - kernel) / stride + 1;
+}
+
+test "shared row and convolution geometry preserve empty bounds and overflow" {
+    const empty = try DenseRows.init(0, 4);
+    try std.testing.expectEqual(@as(usize, 0), empty.rows);
+    try std.testing.expectError(error.InvalidShape, DenseRows.init(0, 0));
+    try std.testing.expectError(error.InvalidShape, DenseRows.init(7, 4));
+    const copy = try RowCopy.init(24, 16, 3, 1, 2, 4);
+    try std.testing.expectEqual(@as(usize, 12), copy.destination);
+    try std.testing.expectEqual(@as(usize, 4), copy.source);
+    try std.testing.expectEqual(@as(usize, 8), copy.elements);
+    _ = try RowCopy.init(24, 16, 6, 4, 0, 4);
+    try std.testing.expectError(error.InvalidShape, RowCopy.init(24, 16, 6, 4, 1, 4));
+    try std.testing.expectError(error.InvalidShape, RowCopy.init(24, 15, 0, 0, 1, 4));
+    try std.testing.expectError(error.Overflow, RowCopy.init(0, 0, 0, std.math.maxInt(usize), 0, 2));
+    try std.testing.expectEqual(@as(usize, 4), try convolutionOutput(7, 3, 2, 1));
+    try std.testing.expectEqual(@as(usize, 1), try convolutionOutput(1, 1, 1, 0));
+    try std.testing.expectError(error.InvalidShape, convolutionOutput(1, 3, 1, 0));
+    try std.testing.expectError(error.InvalidShape, convolutionOutput(1, 1, 0, 0));
+    try std.testing.expectError(error.Overflow, convolutionOutput(1, 1, 1, std.math.maxInt(usize)));
+}
