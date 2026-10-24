@@ -378,7 +378,7 @@ class Upstream(BaseHTTPRequestHandler):
             pass
 
     def google_chat(self, request):
-        if request["model"] == "deadline-model":
+        if request["model"] == "google/deadline-model":
             time.sleep(0.65)
         assert self.headers.get("Authorization") == "Bearer mock-server-key"
         if "mock-vision-busy" in request["model"]:
