@@ -18,12 +18,15 @@
 const std = @import("std");
 const A = std.mem.Allocator;
 const V = std.json.Value;
+const refs = @import("entity_index.zig");
 fn field(value: V, key: []const u8) ?V {
     return if (value == .object) value.object.get(key) else null;
 }
 
 pub fn attach(a: A, item: *V, state: []const u8, metadata: ?V, required: bool, allow_derived: bool) !bool {
     var supported = true;
+    const entities = try refs.Index.init(a, item.*);
+    const entity_support = try a.alloc(bool, entities.entities.len);
     // Summarize effective source provenance once per input, not once per field.
     // Without offsets a value cannot disambiguate literal and interpreted regions.
     var source_references: std.array_list.Managed(V) = .init(a);
@@ -49,11 +52,49 @@ pub fn attach(a: A, item: *V, state: []const u8, metadata: ?V, required: bool, a
             }
         }
     }
-    if (item.object.getPtr("entities")) |entities| {
-        if (entities.* != .array) return error.InvalidDocumentModelResult;
-        for (entities.array.items) |*entity| supported = try attachField(a, entity, "text", state, metadata, required, false, unit, unlocated_interpretation) and supported;
+    // Validate each entity once; relation references reuse this result and
+    // its verified evidence rather than rescanning source regions per edge.
+    for (entities.entities, entity_support) |*entity, *valid| {
+        valid.* = try attachField(a, entity, "text", state, metadata, required, false, unit, unlocated_interpretation);
+        supported = valid.* and supported;
+    }
+    if (item.object.getPtr("relations")) |relations| {
+        if (relations.* != .array) return error.InvalidDocumentModelResult;
+        for (relations.array.items) |*relation| {
+            if (relation.* != .object) return error.InvalidDocumentModelResult;
+            _ = relation.object.swapRemove("evidence");
+            for ([_][]const u8{ "source", "target" }) |key| {
+                const endpoint = relation.object.getPtr(key) orelse {
+                    supported = false;
+                    continue;
+                };
+                supported = try attachEndpoint(a, endpoint, entities, entity_support, state, metadata, required, unit, unlocated_interpretation) and supported;
+            }
+        }
     }
     return supported;
+}
+
+fn attachEndpoint(a: A, endpoint: *V, entities: refs.Index, entity_support: []const bool, state: []const u8, metadata: ?V, required: bool, unit: []const u8, unlocated_interpretation: bool) !bool {
+    if (endpoint.* != .object) return error.InvalidDocumentModelResult;
+    _ = endpoint.object.swapRemove("evidence");
+    switch (try entities.resolve(endpoint.*)) {
+        .unresolved => return false,
+        .inline_value => return attachField(a, endpoint, "text", state, metadata, required, false, unit, unlocated_interpretation),
+        .entity => |i| {
+            if (!entity_support[i]) return false;
+            const entity = entities.entities[i];
+            // A reference cannot disagree with its entity's literal location.
+            for ([_][]const u8{ "start", "end" }) |key| if (field(endpoint.*, key)) |value| {
+                const expected = field(entity, key) orelse return false;
+                if (try offset(value) != try offset(expected)) return false;
+            };
+            _ = endpoint.object.swapRemove("origin");
+            if (field(entity, "origin")) |origin| try endpoint.object.put(a, "origin", origin);
+            if (field(entity, "evidence")) |evidence| try endpoint.object.put(a, "evidence", evidence);
+            return true;
+        },
+    }
 }
 
 fn attachField(a: A, item: *V, key: []const u8, state: []const u8, metadata: ?V, required: bool, allow_derived: bool, unit: []const u8, unlocated_interpretation: bool) !bool {
@@ -210,60 +251,8 @@ fn appendReference(a: A, out: *std.array_list.Managed(V), id: V, segment: V, ran
     try out.append(reference);
 }
 
-/// Independent extraction corroboration compares requested values/records,
-/// keeping confidence, source offsets and provider metadata out of the vote.
-pub fn sameValues(left: V, right: V) bool {
-    for ([_][]const u8{ "structures", "entities", "relations", "classifications" }) |group| {
-        const l = field(left, group);
-        const r = field(right, group);
-        if ((l == null) != (r == null)) return false;
-        if (l == null) continue;
-        if (std.mem.eql(u8, group, "structures")) {
-            if (l.? != .object or r.? != .object or l.?.object.count() != r.?.object.count()) return false;
-            for (l.?.object.keys(), l.?.object.values()) |name, records| {
-                const other = r.?.object.get(name) orelse return false;
-                if (records != .array or other != .array or records.array.items.len != other.array.items.len) return false;
-                for (records.array.items, other.array.items) |record, match| {
-                    if (record != .object or match != .object or record.object.count() != match.object.count()) return false;
-                    for (record.object.keys(), record.object.values()) |key, value| {
-                        if (!sameField(value, match.object.get(key) orelse return false)) return false;
-                    }
-                }
-            }
-        } else if (!equal(l.?, r.?, 0)) return false;
-    }
-    return true;
-}
-fn sameField(left: V, right: V) bool {
-    if (left == .object and right == .object) return equal(field(left, "value") orelse return false, field(right, "value") orelse return false, 0);
-    if (left == .array and right == .array) {
-        if (left.array.items.len != right.array.items.len) return false;
-        for (left.array.items, right.array.items) |l, r| if (!sameField(l, r)) return false;
-        return true;
-    }
-    return equal(left, right, 0);
-}
-fn equal(left: V, right: V, depth: usize) bool {
-    if (depth > 64 or std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
-    return switch (left) {
-        .null => true,
-        .bool => left.bool == right.bool,
-        .integer => left.integer == right.integer,
-        .float => left.float == right.float,
-        .string => std.mem.eql(u8, left.string, right.string),
-        .number_string => std.mem.eql(u8, left.number_string, right.number_string),
-        .array => blk: {
-            if (left.array.items.len != right.array.items.len) break :blk false;
-            for (left.array.items, right.array.items) |l, r| if (!equal(l, r, depth + 1)) break :blk false;
-            break :blk true;
-        },
-        .object => blk: {
-            if (left.object.count() != right.object.count()) break :blk false;
-            for (left.object.keys(), left.object.values()) |key, value| if (!equal(value, right.object.get(key) orelse break :blk false, depth + 1)) break :blk false;
-            break :blk true;
-        },
-    };
-}
+/// Shared semantic comparison owns bounded scratch memory for each vote.
+pub const sameValues = @import("comparison.zig").sameValues;
 
 test "document extraction evidence maps exact unicode bytes across page records" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -283,7 +272,7 @@ test "document extraction corroboration compares values without accepting confid
     const a = arena.allocator();
     const l = try std.json.parseFromSliceLeaky(V, a, "{\"structures\":{\"r\":[{\"x\":{\"value\":\"12.00\",\"score\":0.1}}]}}", .{});
     const r = try std.json.parseFromSliceLeaky(V, a, "{\"structures\":{\"r\":[{\"x\":{\"value\":\"12.00\",\"score\":0.9}}]}}", .{});
-    try std.testing.expect(sameValues(l, r));
+    try std.testing.expect(try sameValues(a, l, r));
     try std.testing.expect(!try attach(a, @constCast(&l), "12.00", null, true, false));
 }
 
@@ -345,4 +334,63 @@ test "document nonliteral and null values cannot inherit provider literal eviden
     }
     try std.testing.expectEqualStrings("estimated", record.object.get("estimate").?.object.get("origin").?.string);
     try std.testing.expectEqualStrings("derived", record.object.get("schema_value").?.object.get("origin").?.string);
+}
+
+test "document relation endpoints inherit checked entity evidence and validate inline spans" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json =
+        \\{"offset_unit":"unicode_codepoints","entities":[{"id":"p","label":"person","text":"Éva","start":0,"end":3},{"id":"o","label":"org","text":"Antfly","start":4,"end":10}],"relations":[{"type":"works_for","source":{"id":"p","evidence":[{"source_id":"fake"}]},"target":{"entity_index":1}},{"type":"works_for","source":{"text":"Éva","start":0,"end":3},"target":{"text":"Antfly","start":4,"end":10}}]}
+    ;
+    var item = try std.json.parseFromSliceLeaky(V, a, json, .{});
+    const metadata = try std.json.parseFromSliceLeaky(V, a,
+        \\{"source_id":"slide","segments":[{"number":2,"start":0,"end":11,"origin":"native"}]}
+    , .{});
+    try std.testing.expect(try attach(a, &item, "Éva Antfly", metadata, true, false));
+    for (item.object.get("relations").?.array.items) |relation| {
+        const source = field(relation, "source").?;
+        const target = field(relation, "target").?;
+        const sref = field(source, "evidence").?.array.items[0];
+        const tref = field(target, "evidence").?.array.items[0];
+        try std.testing.expectEqualStrings("slide", field(sref, "source_id").?.string);
+        try std.testing.expectEqual(@as(i64, 2), field(tref, "page_number").?.integer);
+        try std.testing.expectEqual(@as(i64, 4), field(sref, "end").?.integer);
+        try std.testing.expectEqual(@as(i64, 5), field(tref, "start").?.integer);
+    }
+    // The primary now contains Antfly evidence; the raw verifier does not.
+    const check = try std.json.parseFromSliceLeaky(V, a, json, .{});
+    try std.testing.expect(try sameValues(a, item, check));
+}
+
+test "document relation evidence rejects dangling contradictory unsupported and interpreted endpoints" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const invalid = [_][]const u8{
+        "{\"text\":\"Mallory\"}",
+        "{\"text\":\"Mallory\",\"start\":0,\"end\":5}",
+        "{\"entity_index\":3}",
+        "{\"id\":\"missing\"}",
+        "{\"entity_index\":0,\"text\":\"Mallory\"}",
+        "{\"entity_index\":0,\"start\":1,\"end\":5}",
+        "{\"entity_index\":0,\"id\":\"other\"}",
+    };
+    for (invalid) |endpoint| {
+        const json = try std.fmt.allocPrint(a, "{{\"entities\":[{{\"id\":\"p\",\"label\":\"person\",\"text\":\"Alice\",\"start\":0,\"end\":5}}],\"relations\":[{{\"type\":\"works_for\",\"source\":{s},\"target\":{{\"text\":\"Antfly\",\"start\":6,\"end\":12}}}}]}}", .{endpoint});
+        var item = try std.json.parseFromSliceLeaky(V, a, json, .{});
+        try std.testing.expect(!try attach(a, &item, "Alice Antfly", null, true, false));
+    }
+    const metadata = try std.json.parseFromSliceLeaky(V, a,
+        \\{"source_id":"photo","segments":[{"number":1,"start":0,"end":12,"origin":"interpretation"}]}
+    , .{});
+    var interpreted_item = try std.json.parseFromSliceLeaky(V, a,
+        \\{"relations":[{"type":"works_for","source":{"text":"Alice","start":0,"end":5},"target":{"text":"Antfly","start":6,"end":12}}]}
+    , .{});
+    try std.testing.expect(!try attach(a, &interpreted_item, "Alice Antfly", metadata, true, false));
+    var optional = try std.json.parseFromSliceLeaky(V, a,
+        \\{"relations":[{"type":"works_for","source":{"text":"Alice","evidence":[{"source_id":"fake"}]},"target":{"text":"Antfly"}}]}
+    , .{});
+    try std.testing.expect(try attach(a, &optional, "Alice Antfly", null, false, false));
+    try std.testing.expect(field(field(optional, "relations").?.array.items[0].object.get("source").?, "evidence") == null);
 }

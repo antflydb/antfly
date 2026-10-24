@@ -594,7 +594,7 @@ pub fn Service(comptime Node: type) type {
                 const verifier = try def.binding(name, .extract);
                 const check = try invokeExtraction(node, a, verifier, graph, input, schema, version, options, control, run);
                 try run.emit(.{ .phase = .verification, .source_id = if (cf.field(input, "id")) |id| try cf.text(id) else "", .page_number = 0, .model = verifier.model });
-                corroborated = evidence.sameValues(item, check);
+                corroborated = try evidence.sameValues(a, item, check);
             }
             if (!supported or !corroborated) {
                 const fallback = try def.binding(policy.fallback_model orelse return error.DocumentUnresolved, .extract);
@@ -605,7 +605,7 @@ pub fn Service(comptime Node: type) type {
                     const verifier = try def.binding(name, .extract);
                     if (std.mem.eql(u8, verifier.model, fallback.model)) return error.DocumentUnresolved;
                     const check = try invokeExtraction(node, a, verifier, graph, input, schema, version, options, control, run);
-                    if (!evidence.sameValues(item, check)) return error.DocumentUnresolved;
+                    if (!try evidence.sameValues(a, item, check)) return error.DocumentUnresolved;
                 }
             }
             return item;
@@ -921,7 +921,10 @@ test "document extraction keeps independent sources atomic and reuses retained r
         downloads: usize = 0,
         calls: usize = 0,
         disagree: bool = false,
-        fn documentDefinition(_: *@This(), a: A, name: []const u8, operation: c.Operation) !?[]const u8 {
+        family: enum { records, entities, relations, classifications } = .records,
+        unsupported_relation: bool = false,
+        with_fallback: bool = false,
+        fn documentDefinition(self: *@This(), a: A, name: []const u8, operation: c.Operation) !?[]const u8 {
             if (operation != .extract) return null;
             if (std.mem.eql(u8, name, "nested-parent")) return try a.dupe(u8,
                 \\{"models":[{"name":"child","model":"nested-child","operation":"extract"}],"extract":{"model":"child"}}
@@ -930,6 +933,9 @@ test "document extraction keeps independent sources atomic and reuses retained r
                 \\{"models":[{"name":"native","model":"antfly/native-document","operation":"read"},{"name":"extractor","model":"leaf","operation":"extract"}],"read":{"reader":"native"},"extract":{"model":"extractor"},"budget":{"max_pages":1,"max_model_calls":1}}
             );
             if (!std.mem.eql(u8, name, "composite")) return null;
+            if (self.with_fallback) return try a.dupe(u8,
+                \\{"models":[{"name":"extractor","model":"leaf","operation":"extract"},{"name":"verifier","model":"verifier","operation":"extract"},{"name":"fallback","model":"fallback","operation":"extract"}],"extract":{"model":"extractor","verification_model":"verifier","fallback_model":"fallback","require_source_support":true},"budget":{"max_model_calls":4}}
+            );
             return try a.dupe(u8,
                 \\{"models":[{"name":"extractor","model":"leaf","operation":"extract"},{"name":"verifier","model":"verifier","operation":"extract"}],"extract":{"model":"extractor","verification_model":"verifier","require_source_support":true},"budget":{"max_model_calls":4}}
             );
@@ -948,6 +954,26 @@ test "document extraction keeps independent sources atomic and reuses retained r
         }
         fn extractDirectWithControl(self: *@This(), a: A, name: []const u8, request: extracting.Request, _: Control) !extracting.Response {
             self.calls += 1;
+            if (self.family != .records) {
+                const row_json = switch (self.family) {
+                    .entities =>
+                    \\{"entities":[{"label":"person","text":"Alice","start":0,"end":5,"score":0.9}]}
+                    ,
+                    .relations => if (self.unsupported_relation and std.mem.eql(u8, name, "leaf"))
+                        \\{"relations":[{"type":"works_for","source":{"text":"Mallory"},"target":{"text":"Invented Corp"}}]}
+                    else
+                        \\{"relations":[{"type":"works_for","source":{"text":"Alice","start":0,"end":5},"target":{"text":"Antfly","start":6,"end":12},"score":0.9}]}
+                    ,
+                    .classifications =>
+                    \\{"classifications":[{"name":"kind","label":"work","score":0.9}]}
+                    ,
+                    .records => unreachable,
+                };
+                var row = try std.json.parseFromSliceLeaky(V, a, row_json, .{});
+                const family_name = @tagName(self.family);
+                if (std.mem.eql(u8, name, "verifier")) try row.object.getPtr(family_name).?.array.items[0].object.put(a, "score", .{ .float = 0.7 });
+                return .{ .allocator = a, .json = try std.json.Stringify.valueAlloc(a, .{ .object = "extraction", .model = name, .schema_version = request.schema_version, .data = .{row} }, .{}) };
+            }
             const content = try std.json.parseFromSliceLeaky(V, a, request.inputs[0].content_json, .{});
             const value = if (self.disagree and std.mem.eql(u8, name, "verifier")) "wrong" else content.string[0..5];
             return .{ .allocator = a, .json = try std.json.Stringify.valueAlloc(a, .{ .object = "extraction", .model = name, .schema_version = request.schema_version, .data = .{.{ .structures = .{ .record = .{.{ .value = .{ .value = value, .start = @as(u32, 0), .end = @as(u32, 5) } }} } }}, .usage = .{ .input_tokens = @as(u32, 4), .output_tokens = @as(u32, 0) } }, .{}) };
@@ -1006,6 +1032,34 @@ test "document extraction keeps independent sources atomic and reuses retained r
         \\{"model":"nested-parent","schema_version":2,"schema":{"structures":{"record":{"fields":{"value":"str"}}}},"documents":[{"id":"two-pages","url":"fixture","media_type":"application/pdf"}]}
     , .{}));
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
+
+    inline for (.{ .entities, .relations, .classifications }) |family| {
+        fake.family = family;
+        fake.calls = 0;
+        const schema = switch (family) {
+            .entities => "{\"entities\":[\"person\"]}",
+            .relations => "{\"relations\":[\"works_for\"]}",
+            .classifications => "{\"classifications\":[{\"name\":\"kind\",\"labels\":[\"work\"]}]}",
+            else => unreachable,
+        };
+        const json = try std.fmt.allocPrint(a, "{{\"model\":\"composite\",\"schema_version\":2,\"schema\":{s},\"inputs\":[{{\"content\":\"Alice Antfly\"}}]}}", .{schema});
+        defer a.free(json);
+        const response = try Service(Fake).extractJson(&fake, a, json, .{});
+        defer a.free(response);
+        try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    }
+    fake.family = .relations;
+    fake.unsupported_relation = true;
+    const relation_request =
+        \\{"model":"composite","schema_version":2,"schema":{"relations":["works_for"]},"inputs":[{"content":"Alice Antfly"}]}
+    ;
+    fake.calls = 0;
+    try std.testing.expectError(error.DocumentUnresolved, Service(Fake).extractJson(&fake, a, relation_request, .{}));
+    fake.with_fallback = true;
+    fake.calls = 0;
+    const fallback_response = try Service(Fake).extractJson(&fake, a, relation_request, .{});
+    defer a.free(fallback_response);
+    try std.testing.expectEqual(@as(usize, 4), fake.calls);
 }
 
 test "document graph keys separate same named tasks and retain real cycle detection" {

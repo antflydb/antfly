@@ -117,10 +117,19 @@ to other extraction bindings. It compares independent candidate values, tries at
 most one configured fallback, and rejects unresolved disagreement. Enable
 `require_source_support` to require exact literal spans; `allow_derived_values`
 controls explicitly marked derived/estimated values. Agreement is an advisory
-quality check, separate from source-span validation. Literal spans are checked
+quality check, separate from source-span validation. Verification compares named
+field values, entity labels/text/attributes, relation types and endpoints, and
+classification names/labels. Scores, evidence and provider metadata do not vote.
+Entity, relation, classification and record result sets may be reordered; duplicate
+counts and list-valued field order still matter. Relation references resolve
+against each result's own entity indexes or IDs before comparison. Literal spans are checked
 against the exact input and mapped to original page text; declared Unicode or
 UTF-16 offsets are converted before evidence mapping. Provider-native estimates
-never acquire fabricated visual or literal grounding.
+never acquire fabricated visual or literal grounding. Required source support
+also applies to inline relation endpoints. Referenced endpoints reuse checked
+entity evidence; dangling or conflicting references fail validation. Endpoint
+grounding establishes source support for the endpoint text, not proof of the
+relationship itself.
 
 When a read requested `retain_artifact`, inspect `document.artifact_id` and
 `artifact_ttl_ms`. Retention is best effort. Pass the opaque handle as
