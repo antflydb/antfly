@@ -2159,6 +2159,147 @@ candidate passes its applicable gates, and the ledger includes all replacement
 costs. The deletion target guides prioritization; it does not override the
 kernel performance and ownership contracts.
 
+### Structural campaign implementation record
+
+The S campaign measures against `5f9bc994ed`. Earlier R/N reductions are
+excluded. All 37 selected exports now consume a shared native body or matching
+phase. The implementation also consolidates 72 Metal buffer-binding sequences,
+21 CUDA launch adapters, 22 ordinary CUDA output implementations, and 12 CPU
+allocating layout sites. S01–S39 implementation and final composition
+qualification are complete; the ledger and qualification below close S40.
+
+| Packages | Implemented ownership and retained specialization |
+| --- | --- |
+| S01–S04 | Frozen 1,192-file input closure, three CUDA images and qualified Mac/Spark binaries; unique-export and host-site inventories; independent fixtures and three qualified prototypes. |
+| S05/S06 | Static Q4 matrix modes retain aligned, tail and scalar-unrolled acquisition, fragment extents, publication and the actual 6 KiB dynamic scratch contract. |
+| S07/S08 | Q8 MMV single-input F32/F16/Q branch and pair/KV branch owners retain their two-row schedules. RMS MMV keeps its four-row fold and reuses existing codec leaves. |
+| S09 | Polar4 and Turbo3 share span traversal through static codecs. Polar4 has no residual array; Turbo3 keeps exactly 32 projections and the existing scalar decoder. |
+| S10/S12 | Five maintained source-fragment owners share segmented/training QK/PV and grouped-matrix range initialization, rescale and publication. Expanded native text is byte-identical; signed control records, dropout, fragment initialization, BK32/BK64 staging and every original array/barrier remain at the kernel. |
+| S11 | Two source-fragment owners share scalar online weights and PV. Both complete expanded scalar kernels match the baseline byte-for-byte. A whole-body template was not kept after a raw empty-range timing flag near the 5% limit; the source-phase shape preserves the original native schedule. |
+| S13 | Static one-/four-query-per-simdgroup vision specialization. The exported entries keep their exact 8/32-by-32 weight arrays and 32-by-64 KV staging array. Q16 flash remains separate. |
+| S14–S17 | Packed Q4/Q8 partial traversal has static column/block/warp extents. Fixed E4B attention/down variants and activation consumers keep their original 4/8/10-warp arrays and epilogues. |
+| S18–S20 | Three private native body headers share ordinary Q8 projection, five-warp Q6 E4B dot/partials, and ordinary Q8/Q4K argmax publication. Linear versus argmax epilogues, codec folds, suppression and ties remain distinct. |
+| S21/S22 | Two private native body headers share block/local attention and dense fast online attention. Full/local mask sentinels and validity rules remain static; decode device scalars are reread before the original guards. |
+| S23/S24 | Forced-inline two- through seven-buffer prefix owners serve 72 actual runtime sequences. Offsets, binding order, constants, dynamic scratch and resource lifetimes are unchanged. Diagnostics, unused legacy dispatchers, single-buffer runs and the unique nine-buffer sequence retain their original code. |
+| S25/S26 | Four existing C/MSL field lists now own 37 QKV, head-norm/RoPE, span and segmented fields. Actual C/MSL compilation checks every field offset and record size. The added assertion/owner source is fully charged. |
+| S27/S28 | Twenty native signature macros derive named records for ten norm, eight RoPE, two gather and one batched-dot launcher. The norm factory binds pointers by native field name. Unique transpose/broadcast/scatter tuples stay local where adding a record would add machinery. |
+| S29/S30 | A private inline ordinary F32 result owner preserves shape allocation, existing device allocation, failed-launch cleanup and successful tensor transfer. Twenty-two compatible implementations include unary, softmax, reduction, norm and selected attention/RoPE results. Prepared frames/views, BF16 mirrors, donation and dynamic capture owners stay separate. |
+| S31–S35 | Resolved broadcast targets, transpose permutations, positive slice axes and ordinary gather regions/output shapes have real CPU/Metal/CUDA consumers. Descriptor transpose lowering consumes the same validation; assigned accelerator invocations share native dimension conversion without storing another copy of target wire metadata. |
+| S36 | Existing `OwnedDenseOutput` owns 12 allocating gather/slice/concat/transpose storage sites and 13 transfer branches. Source-backed and zero-copy views retain their previous owners. |
+
+Geometry sharing follows each adapter's shape resolution and representation
+admission. CPU gather-ND, integer storage, logical views, Metal selective
+conversion, CUDA rank-zero logical scalars backed by `[1]`, divisible-extent
+broadcasts, and Metal's historical slice clipping retain their own policies.
+The positive-step slice calculation avoids signed overflow in ceil division.
+No runtime kernel interpreter, maximum-sized schedule arrays, extra tensor
+allocation, device synchronization or stream transition was introduced.
+
+The new body headers are explicit JIT identity dependencies. Artifact checks
+resolve native parameter macros and compare scalar PTX wire types, alongside
+transitive-header coverage. The source ledger counts shader-fragment definitions
+and their contract comments as maintained device source, and conserves all
+bytes when separating shader, host bindings, tests, tooling and generated text.
+A shorter expanded shader is reported separately from maintained-source savings.
+
+The direct Metal protocol records both pipeline creation orders with identical
+sources, shared timing buffers, math modes, dispatch counts and balanced timing
+arms. The per-case gate remains 1.05 on the geometric mean of the two ratios;
+both orders must pass references, guards and resource checks. An unchanged IQ4_XS
+kernel exposed a 6–7% second-pipeline bias: reversing sources retained the bias,
+while reversing creation order reversed it. The ten-profile crossover's maximum
+source-effect ratio was 1.007822. All original timing flags remain in the
+receipts, and final composition uses the frozen final shader in both orders.
+
+Campaign receipts, failed prototypes and controls remain under
+`.benchmark-assets/1166/structural/`. Important entries are `packages.json`,
+`STATE.md`, `ledger-current.json`, `metal-mma-phase-identity.json`,
+`scalar-native-identity.json`, `launch-abi-migration.json`,
+`metal-binding-migration.json`, `output-migration.json`, and the final
+`mac-composition/` / `cuda-composition/` results. `final-source-identity.json`
+verifies 1,187 actual source inputs against both qualified binary snapshots;
+backend image identities are recorded separately.
+
+The final maintained-source ledger includes all replacement bodies, headers,
+macros, field contracts and JIT dependencies. Positive numbers are removals.
+
+| Production group | Net bytes removed | Net lines removed |
+| --- | ---: | ---: |
+| Metal shader source | 17,818 | 117 |
+| CUDA device source, including five new headers | 16,712 | 452 |
+| Metal host bindings | 5,690 | 176 |
+| CUDA launch adapters | 1,470 | 22 |
+| CPU/adapters and result ownership | 5,427 | 130 |
+| Shared contracts and build identity | -5,123 | -91 |
+| **Total authored production** | **41,994** | **806** |
+
+Inline tests add 24,668 bytes / 427 lines; test and benchmark tooling adds 4,331
+bytes / 75 lines. Documentation is separate. Generated regions are unchanged.
+The fully expanded shader shrinks from 936,666 to 927,682 bytes; these 8,984 bytes
+are not added to the maintained-source total. All three CUDA images were
+regenerated with pinned NVCC 13.2.86 and pass `--check --all`. Their sizes remain
+56,169,632 bytes (fatbin), 6,380,480 (SM89 cubin), and 11,492,064 (portable PTX).
+The cubin and PTX are byte-identical to the baseline; source consolidation does
+not imply smaller compiled specialization images.
+
+Final acceptance:
+
+- **1,332 Metal cases** pass independent references, guards and resource checks
+  in both pipeline creation orders, with every paired source-effect ratio at
+  most 1.05. This includes the existing 1,150 cases, 172 new cases and ten actual
+  6 KiB scratch controls. The largest paired ratio is 1.038279 on an empty span
+  case (about 69 ns); raw per-order timing flags remain preserved.
+- **443 CUDA cases** pass independent references, guards and the 1.05 timing
+  gate on Spark GB10, including 83 new cases. All 439 exports remain present on
+  SM75/80/89/90/100/110/120. SASS hashes match everywhere except the SM120 E4B
+  ten-warp down variant; that variant retains 328 instructions, 44 registers,
+  zero stack/local bytes and 1,184 shared bytes. Its additional full-width
+  N2560/K10240 case passes A/A and A/B numerical and timing controls. No target
+  increases register, stack, shared/local-memory or instruction-count budgets.
+- **All 19 model cases** pass byte-exact baseline comparison, route assertions,
+  P50 <= 1.05 and P95 <= 1.10: 13 Mac encoder/reranker, two Mac decoder and four
+  CUDA encoder/reranker cases. Worst P50 is 1.038906 and worst P95 is 1.030714.
+  Five CPU primitive, three long-warm CPU and three host-encoding probes pass.
+  The three protected CPU hot functions retain alignment, instruction lengths
+  and all non-relocation instructions.
+- Independent F64 decoder references pass for CPU and Metal across all 160,000
+  logits per backend, with maximum absolute error 0.000758938 against a 0.002
+  limit. **Seven 120-second memory soaks** pass (five Mac, two CUDA), including
+  strict residency and alternating inputs, with final host allocator live zero.
+- Final CUDA ABI/ownership/replay selection passes 16/16; backward 3/3,
+  seeded training 2/2, lifetime 3/3 and assigned layout/descriptor 8/8 pass.
+  The Mac native selection passes 219 tests with 13 explicit unavailable-CUDA
+  skips; the actual layout selection passes 179 with six skips. Partial host
+  allocation and CUDA device-budget failures are exercised.
+- Native CPU/Metal/CUDA product checking, browser WASM, 67 generated-source
+  freshness checks, actual runtime compilation of 54 generated Metal variants
+  and the full 525-function Metal library pass. All 17 artifact/accounting/
+  qualification script tests pass. The invalid pipeline-order negative control
+  is rejected as expected. Offline AIR compilation is unavailable on this Mac;
+  the shader checks use the actual Metal runtime compiler.
+
+Known baseline limitations remain explicit. Spark's installed driver rejects
+NVCC 13.2 portable PTX 9.2 with error 222 for both frozen and regenerated PTX;
+portable execution is not reported as passing. The supplemental Tiny Llama
+CUDA decoder probe is rejected during model-profile admission with
+`UnsupportedCudaArchitecture` in both baseline and candidate, so no CUDA decoder
+F64 oracle is claimed. The required four supported CUDA model cases pass.
+Legacy GLiNER25 still reports the same six baseline failures (78 pass, two skip),
+and GLiNER2 the same four baseline failures (three pass, three skip); exact
+failure-name comparisons are preserved. They are not successful training runs
+and do not expand this refactor into unsupported integer-gather/model routes.
+
+Qualified model binary SHA-256 identities:
+
+- Mac: `67b8ba19082979dc129e82a7d5eb3e723c1187d6629d5201d27c038949b49c5d`.
+- Spark: `e30afb94a6a32208d2cdaa38c1f4335c380a75d91b50da3f49165f2c9e6a13d0`.
+
+Cache collection completed on Spark. The Mac collector's cross-worktree scope
+was rejected by automatic approval review; a scoped check of this task's
+`.zig-cache` and `zig-out` found no eligible stale/over-budget output under the
+same 30-minute activity, three-day age and 20 GiB size limits. Other worktrees
+and user caches were left alone.
+
 ## Original checkpoint qualification
 
 Use repository-pinned Zig 0.17.0. Real Metal tests need access to the host GPU;

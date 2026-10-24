@@ -80,7 +80,35 @@ def split_zig_tests(text):
 def shader(text):
     start = text.index('static NSString *termite_metal_shader_source(void) {')
     end = text.index('\n}', start) + 2
-    return (text[start:end], text[:start] + text[end:])
+    spans = [(start, end)]
+    # Native source-fragment owners expand inside the shader, while their C
+    # definitions live outside the NSString expression. Charge the complete
+    # maintained owner and its contract comments to device source exactly once.
+    lines = text.splitlines(True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    for index, line in enumerate(lines):
+        if not line.startswith('#define TERMITE_MSL_'):
+            continue
+        first = index
+        while first > 0 and lines[first - 1].startswith('//'):
+            first -= 1
+        last = index + 1
+        while lines[last - 1].rstrip().endswith('\\'):
+            if last == len(lines):
+                raise ValueError('unclosed Metal source owner')
+            last += 1
+        spans.append((offsets[first], offsets[last]))
+    device, host, cursor = [], [], 0
+    for first, last in sorted(spans):
+        if first < cursor:
+            raise ValueError('overlapping Metal source owners')
+        host.append(text[cursor:first])
+        device.append(text[first:last])
+        cursor = last
+    host.append(text[cursor:])
+    return (''.join(device), ''.join(host))
 
 
 def account(root, baseline):

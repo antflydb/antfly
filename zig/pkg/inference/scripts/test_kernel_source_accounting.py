@@ -35,6 +35,16 @@ const multiline =
         self.assertEqual(count, 1)
         self.assertEqual(len(authored) + len(tests), len(production + block + after))
 
+    def test_metal_fragment_owners_are_device_source_and_conserve_all_bytes(self):
+        owner = '// Native phase contract.\n#define TERMITE_MSL_PHASE \\\n    "first\\n" \\\n    "second\\n"\n'
+        function = 'static NSString *termite_metal_shader_source(void) {\n    return @"prefix\\n" TERMITE_MSL_PHASE;\n}'
+        prefix, middle, suffix = 'host before\n', '\nhost middle\n', '\nhost after\n'
+        source = prefix + owner + middle + function + suffix
+        device, host = accounting.shader(source)
+        self.assertEqual(device, owner + function)
+        self.assertEqual(host, prefix + middle + suffix)
+        self.assertEqual(len(device) + len(host), len(source))
+
     def test_generated_region_keeps_both_boundary_markers(self):
         generated = '// quant-kernel-codegen:begin fixture\nbody\n// quant-kernel-codegen:end fixture\n'
         authored, emitted = accounting.managed('before\n' + generated + 'after\n')

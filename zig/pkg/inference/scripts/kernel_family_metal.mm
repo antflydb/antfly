@@ -58,7 +58,10 @@ int main(int argc, char **argv) { @autoreleasepool {
     for (NSDictionary *test in manifest[@"cases"]) { @autoreleasepool {
         NSString *name = test[@"kernel"], *mode = test[@"math_mode"] ?: @"safe";
         id<MTLComputePipelineState> pipelines[2];
-        for (int version = 0; version < 2; ++version) {
+        NSString *pipelineOrder = manifest[@"pipeline_order"] ?: @"AB";
+        require([pipelineOrder isEqual:@"AB"] || [pipelineOrder isEqual:@"BA"], @"Invalid pipeline creation order");
+        for (int slot = 0; slot < 2; ++slot) {
+            const int version = [pipelineOrder characterAtIndex:slot] == 'B';
             NSString *key = [NSString stringWithFormat:@"%d-%@", version, mode];
             id<MTLLibrary> library = libraries[key];
             if (!library) {
@@ -160,7 +163,7 @@ int main(int argc, char **argv) { @autoreleasepool {
         double ratio = medians[1] / medians[0]; bool ok = ratio <= 1.05 && resources; passed &= ok;
         [results addObject:@{@"name":test[@"name"], @"kernel":name, @"exact":@(exact), @"guards":@(guards),
             @"baseline_ns":@(medians[0]), @"candidate_ns":@(medians[1]), @"ratio":@(ratio), @"pass":@(ok),
-            @"resources_pass":@(resources), @"arms":arms,
+            @"resources_pass":@(resources), @"arms":arms, @"pipeline_order":pipelineOrder,
             @"warmup_ms":@(warmup_ms), @"warmup_dispatches":@[@(warmup_dispatches[0]), @(warmup_dispatches[1])],
             @"warmup_gpu_ns":@[@(warmup_gpu_ns[0]), @(warmup_gpu_ns[1])], @"launches_per_arm":@(repeats),
             @"reference_outputs":@(reference_outputs), @"reference_pass":reference_outputs ? @(reference) : [NSNull null],
