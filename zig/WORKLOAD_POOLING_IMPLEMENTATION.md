@@ -25526,3 +25526,107 @@ preserve the standalone module-root invocation failure, the pinned-Zig fixture
 syntax failure, and the first overlap fixture failing its own range assertion;
 the corrected overlap fixture proves overlap and passes. Formatting and
 whitespace checks pass.
+
+
+## Retained table block preparation and publication
+
+`StreamingEncoder.prepareBlock()` freezes the pending block and returns a
+retained pure-CPU owner. The caller retains the encoder and input credits,
+prepays `Block.memoryBound()`, serializes access, and keeps the encoder address
+stable. The block owner itself is movable. No admission borrow escapes a call.
+Prefix and Snappy cursors, CRC, filter initialization/hash insertion, largest
+bound copies and metadata-vector growth run in bounded stages under the
+original checkpoint. Larger entries retain compression and correctness rather
+than being rejected solely for exceeding the ordinary block target. Reusable
+compression-buffer growth installs a fresh allocation without copying or
+poisoning the old buffer. Its old allocation stays charged until bounded
+retirement. Compression admission excludes disabled probes and already-owned
+output capacity instead of reserving unused compression memory.
+
+All filter/bound allocations, metadata checks and capacity preparation finish
+before output. Metadata growth shallow-copies at most 64 existing descriptors
+per stage while the encoder keeps the original array. Commands borrow immutable
+payload ranges of at most 16 KiB. The same command survives observer rejection
+until physical completion is acknowledged. `writeNextWithAdmission()` couples
+the owning file's successful observation with an immediate infallible receipt.
+The final receipt swaps prepared capacity, adopts filters/bounds and the original
+smallest bound, records offsets/checksum/adaptive statistics and clears the input
+block before another checkpoint may reject. No speculative block metadata is
+published early. The prior descriptor array stays charged through retirement.
+
+Private staging uses raw allocation: initialization is performed by its
+bounded producer instead of Allocator.alloc's whole-buffer safety poisoning.
+Bloom's uninitialized builder likewise leaves initialization to its caller.
+Retirement poisons at most 16 KiB per original checkpoint before the raw
+allocator release, preserving its slot and byte offset through rejection.
+Allocator accounting releases the allocation once after its final chunk. Beginning retirement fences output; the
+encoder remains frozen until retirement finishes. Unwritten preparation may be
+abandoned and retried with the original input. Abandonment after attempted IO or
+a partial receipt makes the encoder terminal. The caller must settle/join
+accepted owning-file work before retiring this owner's borrowed payload. Raw
+deinit remains an explicit synchronous fallback under that same ordering.
+
+The legacy synchronous flush drives the shared block producer. The encoder now
+tracks physical output independently of its initial sink, allowing block and
+metadata commands to compose directly with an owning file. Native ABI 111 and
+storage-owner ABI 171 fence the encoder layout change. Smallest-bound allocation
+is atomic: a failed key allocation cannot leave a freed namespace attached to
+the encoder.
+
+This supplies retained block preparation and low-level owning publication.
+Retained/prepaid entry ingestion, run/output construction and backend adoption,
+cold-write cache policy, manifest/close adoption, remaining bounded teardown,
+completion/history relief and default-gate evidence remain open. Full GNU
+qualification remains waived; the full design is incomplete.
+
+Allocation-fault qualification also exposed existing `decodeAlloc()` ownership
+errors. Its copied input's error cleanup now ends when the borrowed decoder
+takes ownership, avoiding a second free after later failures or compressed
+materialization. Each partial row independently retires its namespace/key on
+value-copy rejection. Explicit raw and compressed decoder fault matrices and
+full block prepare/abandon/retry fault injection verify these paths.
+
+The block stress matrix uses 96 oversized rows for each compression policy and
+original Canceled/DeadlineExceeded/FileNotFound rejection. It rejects before
+every preparation stage, moves the owner, repeats frozen commands, checks final
+ack-only adoption, and rejects retirement after each bounded chunk or individual release. The
+96-row stream forces descriptor growth across the 64-descriptor batch boundary.
+A separate fixed-buffer allocator prepays exactly the reported additional bound
+while the original encoder owns eight existing descriptors; private compression,
+filters, bounds and replacement capacity fit before any physical output. The
+real file composition now writes the final block directly through the owning
+file, rejects an accepted block write and metadata write, proves no IO replay,
+fully decodes all 192 published rows, and reuses the same descriptor grant while
+ordinary capacity is occupied and reserved control work progresses.
+
+`retained-table-block-v1` retains the pinned Zig ArrayList constructor compile
+failure; adoption now uses `fromOwnedSlice`. `retained-table-block-v2` retains the
+decoder double-free fault found during allocation rejection. The corrected
+`retained-table-block-v3` passes 83/83 build steps, 50 physical-IO cases, 32 close
+cases, 162 table/codec cases, 74 WAL/recovery cases, 18 host/ABI cases and 45/1/8
+error-identity cases with unchanged native inputs.
+
+The first optimized fault run exposed allocation-count variability from backing
+allocator remapping. The prepare/abort/retry fixture now refuses remaps, matching
+prepaid production segments and making every injected allocation index stable.
+A subsequent source audit identified whole-buffer Debug poisoning hidden in
+Allocator.alloc/free and ArrayList clear/growth helpers. Private staging now
+uses raw allocation with bounded initialization. Growth retains the old
+compression allocation for bounded retirement; publication resets lengths only.
+Retirement preserves its byte offset through chunk rejection and calls rawFree
+once after bounded poisoning, retaining ordinary allocator accounting. The
+provider-pattern test proves prefix, Snappy workspace/output, Bloom bits, bounds
+and descriptor allocations retain supplied bytes until their explicit producer
+runs. Separate tests check that final ack does not poison retained input and
+that old compression data survives until retirement.
+
+Final qualification `retained-table-block-v5-integrated` passes 83/83 build
+steps, 52 physical-IO cases, 32 embedded close cases, 164 table/codec cases,
+74 WAL/recovery cases and 18 host/ABI checks. The final optimized
+`retained-table-block-v5-fast` table/WAL target passes 60/60 build steps and
+164/74 cases. Both runners also pass four standalone Bloom cases and the
+45/1/8 error-identity cases. Native source hashes and log digests were verified
+against the final source; compressed snapshots include all changed native files.
+Earlier receipts remain as evidence of discovered and corrected failures and
+source-audit revisions. Full GNU qualification remains waived and the full
+design remains incomplete.

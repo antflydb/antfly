@@ -180,7 +180,13 @@ pub const Builder = struct {
         const raw_bits = @max(config.min_bits, key_count * config.bits_per_key);
         const bit_count = if (key_count == 0) 0 else std.math.ceilPowerOfTwo(usize, raw_bits) catch raw_bits;
         const byte_len = if (bit_count == 0) 0 else (bit_count + 7) / 8;
-        const bytes = try allocator.alloc(u8, byte_len);
+        // This API leaves initialization to a bounded caller. Allocator.alloc
+        // would first poison the whole buffer in safety builds, defeating that
+        // boundary even though the caller later zeros it incrementally.
+        const bytes: []u8 = if (byte_len == 0) &.{} else bytes: {
+            const ptr = allocator.rawAlloc(byte_len, .of(u8), @returnAddress()) orelse return error.OutOfMemory;
+            break :bytes ptr[0..byte_len];
+        };
         return .{
             .allocator = allocator,
             .bytes = bytes,

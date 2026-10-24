@@ -114,7 +114,7 @@ const builtin = @import("builtin");
 // Close retains tentative durability grants and empty-status sync through admitted retirement.
 // Close reclaims retired memory in original CPU quanta before persistence.
 // Durability grants own private file writes, publication and discard.
-pub const abi_version: u32 = 110;
+pub const abi_version: u32 = 111;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

@@ -384,9 +384,8 @@ test "controlled physical sync table metadata publishes through owning file with
         var key: [32]u8 = undefined;
         try encoder.appendEntry(.{ .namespace_name = "docs", .key = try std.fmt.bufPrint(&key, "doc:{d:0>8}", .{i}), .value = "retained value" });
     }
-    try encoder.finishBlocks();
-    var metadata = try encoder.prepareMetadata();
-    defer metadata.deinit();
+    var block = try encoder.prepareBlock();
+    defer block.deinit();
     var pool = storage_io.NativeStoragePool.initWithCapacityForTest(a, 16);
     defer pool.deinit();
     var native = try storage_io.NativeStorage.initWithPool(a, .threaded, &pool);
@@ -412,12 +411,19 @@ test "controlled physical sync table metadata publishes through owning file with
         slots: *cpu.Scheduler,
         file: *File,
         physical_waits: usize = 0,
+        reject_block_write: bool = false,
+        block_rejected: bool = false,
         reject_metadata_write: bool = false,
         metadata_rejected: bool = false,
         fn check(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.execution.checkLifetime();
             try std.testing.expectEqual(cpu.State.running, self.slots.state(&self.execution.entry.?));
+            if (self.reject_block_write and self.file.phase == .writing) {
+                self.reject_block_write = false;
+                self.block_rejected = true;
+                return error.Canceled;
+            }
             if (self.reject_metadata_write and self.file.phase == .writing) {
                 self.reject_metadata_write = false;
                 self.metadata_rejected = true;
@@ -471,6 +477,24 @@ test "controlled physical sync table metadata publishes through owning file with
         try file.writeWithAdmission(offset, memory.out.items[offset..][0..n], original);
         offset += n;
     }
+    control.reject_block_write = true;
+    const block_writes_before = storage_io.NativeSyncTestControl.metadata.load(.acquire);
+    var block_written: usize = 0;
+    while (true) {
+        const more = block.writeNextWithAdmission(&file, original) catch |cause| {
+            try std.testing.expectEqual(error.Canceled, cause);
+            try std.testing.expect(control.block_rejected and block.pending_len != 0 and file.pending != null);
+            try std.testing.expectEqual(@as(usize, 0), encoder.blocks.items.len);
+            continue;
+        };
+        if (!more) break;
+        block_written += 1;
+    }
+    try std.testing.expect(control.block_rejected and block.published);
+    try std.testing.expectEqual(block_writes_before + block_written, storage_io.NativeSyncTestControl.metadata.load(.acquire));
+    try block.retireWithAdmission(original);
+    var metadata = try encoder.prepareMetadata();
+    defer metadata.deinit();
     control.reject_metadata_write = true;
     const writes_before = storage_io.NativeSyncTestControl.metadata.load(.acquire);
     var written: usize = 0;

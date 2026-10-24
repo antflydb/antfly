@@ -1160,6 +1160,8 @@ pub const StreamingEncoder = struct {
     block_largest_namespace_buffer: std.ArrayListUnmanaged(u8) = .empty,
     block_largest_key_buffer: std.ArrayListUnmanaged(u8) = .empty,
     finished: bool = false,
+    block_active: bool = false,
+    physical_output_len: usize,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -1190,10 +1192,12 @@ pub const StreamingEncoder = struct {
             .entry_count_offset = entry_count_offset,
             .entry_data_len_offset = entry_data_len_offset,
             .entry_data_start = entry_data_start,
+            .physical_output_len = entry_data_start,
         };
     }
 
     pub fn deinit(self: *StreamingEncoder) void {
+        std.debug.assert(!self.block_active);
         if (self.filter_builder_active) self.filter_builder.deinit();
         self.prefix_hashes.deinit(self.allocator);
         self.entry_offsets.deinit(self.allocator);
@@ -1237,6 +1241,7 @@ pub const StreamingEncoder = struct {
     /// This lets streaming compaction split before an append without buffering
     /// or rolling back an arbitrarily large entry.
     pub fn encodedSizeUpperBoundAfterEntry(self: *const StreamingEncoder, entry: Entry) !usize {
+        if (self.block_active) return error.InvalidTableFile;
         if (self.finished or self.entry_count >= max_entry_count) return error.TableFileTooLarge;
         const entry_len = try tableEntryEncodedLen(entry);
         if (self.logical_entry_data_len > max_entry_data_len or
@@ -1249,7 +1254,7 @@ pub const StreamingEncoder = struct {
             self.block_bytes.items.len +| entry_len > default_block_size;
         const projected_entry_count = try checkedAddUsize(self.entry_count, 1);
 
-        var total = self.sink.len();
+        var total = self.physical_output_len;
         total = try checkedAddUsize(total, self.block_bytes.items.len);
         total = try checkedAddUsize(total, entry_len);
 
@@ -1309,7 +1314,7 @@ pub const StreamingEncoder = struct {
     }
 
     pub fn appendEntry(self: *StreamingEncoder, entry: Entry) !void {
-        if (self.finished) return error.InvalidTableFile;
+        if (self.finished or self.block_active) return error.InvalidTableFile;
         if (self.entry_count >= max_entry_count) return error.TableFileTooLarge;
 
         const entry_start_usize = self.logical_entry_data_len;
@@ -1351,7 +1356,7 @@ pub const StreamingEncoder = struct {
     /// caller CPU; admitted writers still need a retained block producer.
     /// A partial output failure makes the encoder terminal, never replayable.
     pub fn finishBlocks(self: *StreamingEncoder) !void {
-        if (self.finished) return error.InvalidTableFile;
+        if (self.finished or self.block_active) return error.InvalidTableFile;
         self.flushBlock() catch |cause| {
             self.finished = true;
             return cause;
@@ -1362,27 +1367,27 @@ pub const StreamingEncoder = struct {
     /// Metadata owns the final filters and borrows this frozen encoder until
     /// result transfer or destruction. It issues no filesystem operations.
     pub fn prepareMetadata(self: *StreamingEncoder) !Metadata {
-        if (self.finished) return error.InvalidTableFile;
+        if (self.finished or self.block_active) return error.InvalidTableFile;
         return self.metadataAfterFinalBlock();
     }
 
     fn metadataAfterFinalBlock(self: *StreamingEncoder) !Metadata {
-        if (self.block_entry_count != 0) return error.InvalidTableFile;
-        const physical_len = self.sink.len() - self.entry_data_start;
+        if (self.block_active or self.block_entry_count != 0) return error.InvalidTableFile;
+        const physical_len = self.physical_output_len - self.entry_data_start;
         _ = try checkedU32(self.entry_count);
         _ = try checkedU32(self.logical_entry_data_len);
         _ = try checkedU32(physical_len);
         self.finished = true;
         const filter = self.filter_builder.finish();
         self.filter_builder_active = false;
-        return .{ .encoder = self, .table_filter = filter, .metadata_offset = self.sink.len(), .stats = .{
+        return .{ .encoder = self, .table_filter = filter, .metadata_offset = self.physical_output_len, .stats = .{
             .logical_entry_bytes = @intCast(self.logical_entry_data_len),
             .physical_entry_bytes = @intCast(physical_len),
         } };
     }
 
     pub fn finish(self: *StreamingEncoder) !StreamingEncoderResult {
-        if (self.finished) return error.InvalidTableFile;
+        if (self.finished or self.block_active) return error.InvalidTableFile;
         // This legacy API has no retained physical-write receipt. A failed
         // final block may have mutated the sink and must never be replayed.
         self.finished = true;
@@ -1723,10 +1728,12 @@ pub const StreamingEncoder = struct {
     };
 
     fn setBlockSmallest(self: *StreamingEncoder, entry: Entry) !void {
+        const namespace = if (entry.namespace_name) |name| try self.allocator.dupe(u8, name) else null;
+        errdefer if (namespace) |name| self.allocator.free(name);
+        const key = try self.allocator.dupe(u8, entry.key);
         self.clearBlockSmallest();
-        self.block_smallest_namespace_name = if (entry.namespace_name) |name| try self.allocator.dupe(u8, name) else null;
-        errdefer if (self.block_smallest_namespace_name) |name| self.allocator.free(name);
-        self.block_smallest_key = try self.allocator.dupe(u8, entry.key);
+        self.block_smallest_namespace_name = namespace;
+        self.block_smallest_key = key;
     }
 
     fn clearBlockSmallest(self: *StreamingEncoder) void {
@@ -1755,105 +1762,426 @@ pub const StreamingEncoder = struct {
     }
 
     fn clearBlockLargest(self: *StreamingEncoder) void {
-        self.block_largest_namespace_buffer.clearRetainingCapacity();
-        self.block_largest_key_buffer.clearRetainingCapacity();
+        // Length-only discard: safety-mode ArrayList.clear poisons all bytes.
+        self.block_largest_namespace_buffer.items.len = 0;
+        self.block_largest_key_buffer.items.len = 0;
         self.block_largest_namespace_name = null;
         self.block_largest_key = &.{};
     }
 
-    fn flushBlock(self: *StreamingEncoder) !void {
-        if (self.block_entry_count == 0) return;
+    /// Freeze the current block. The caller retains encoder/input credits and
+    /// prepays Block.memoryBound() until retirement. Retire accepted file IO
+    /// before abandoning this owner; its payload is borrowed by that IO.
+    pub fn prepareBlock(self: *StreamingEncoder) !Block {
+        if (self.finished or self.block_active) return error.InvalidTableFile;
+        return Block.init(self);
+    }
 
-        const attempt_snappy = self.compression_policy == .snappy_adaptive and self.snappy_reprobe_countdown == 0;
-        if (self.snappy_reprobe_countdown > 0) self.snappy_reprobe_countdown -= 1;
-        var encoded_payload = try encodeBlockPayloadAlloc(
-            self.allocator,
-            self.block_bytes.items,
-            self.compression_policy,
-            attempt_snappy,
-            &self.compression_bytes,
-        );
-        defer encoded_payload.deinit(self.allocator);
-        if (encoded_payload.snappy_attempted) {
-            self.snappy_attempted_blocks += 1;
-            const accepted = encoded_payload.compression == .snappy or encoded_payload.compression == .prefix_snappy;
-            if (accepted) {
-                self.snappy_rejection_streak = 0;
-                self.snappy_reprobe_countdown = 0;
-            } else {
-                self.snappy_rejection_streak +|= 1;
-                if (self.snappy_rejection_streak >= snappy_rejection_streak_limit) {
-                    self.snappy_reprobe_countdown = snappy_reprobe_interval - 1;
+    pub const Block = struct {
+        pub const Command = struct { offset: usize, bytes: []const u8 };
+        const Phase = enum { prefix_allocate, prefix_encode, snappy_allocate, snappy_encode, checksum, filter_allocate, filter_zero, filter_hashes, bounds_allocate, bounds_copy, metadata_allocate, metadata_copy, validate, ready, complete, retired };
+        encoder: *StreamingEncoder,
+        phase: Phase = .prefix_allocate,
+        prefix: ?[]u8 = null,
+        prefix_cursor: ?PrefixEncodeCursor = null,
+        prefix_len: usize = 0,
+        workspace: ?[]u32 = null,
+        snappy_cursor: ?snappy.EncodeCursor = null,
+        compression: BlockCompression = .none,
+        snappy_attempted: bool = false,
+        crc: Crc32 = .init(),
+        cpu_offset: usize = 0,
+        filters: [2]?bloom.Builder = .{ null, null },
+        filter_index: usize = 0,
+        hash_index: usize = 0,
+        largest_namespace: ?[]u8 = null,
+        largest_key: ?[]u8 = null,
+        new_blocks: ?[]OwnedEncodedBlockMeta = null,
+        old_blocks: ?[]OwnedEncodedBlockMeta = null,
+        old_compression: ?[]u8 = null,
+        copied_blocks: usize = 0,
+        meta: OwnedEncodedBlockMeta = undefined,
+        completed_metadata_bytes: usize = 0,
+        output_offset: usize = 0,
+        pending_len: usize = 0,
+        io_attempted: bool = false,
+        published: bool = false,
+        retire_slot: usize = 0,
+        retire_offset: usize = 0,
+        retiring: bool = false,
+
+        // Allocator.alloc poisons all returned bytes in safety builds. These
+        // buffers are private and initialized by bounded stages before reads.
+        // Keep ordinary allocator accounting, but avoid an implicit large fill.
+        fn allocate(comptime T: type, a: std.mem.Allocator, count: usize) ![]T {
+            if (count == 0) return &.{};
+            const size = std.math.mul(usize, count, @sizeOf(T)) catch return error.OutOfMemory;
+            const raw = a.rawAlloc(size, .of(T), @returnAddress()) orelse return error.OutOfMemory;
+            const ptr: [*]T = @ptrCast(@alignCast(raw));
+            return ptr[0..count];
+        }
+
+        fn metadataCapacity(e: *const StreamingEncoder) !usize {
+            return checkedAddUsize(try checkedAddUsize(e.blocks.items.len, e.blocks.items.len / 2), 8);
+        }
+
+        /// Additional peak bytes beyond the encoder's current working set.
+        /// Includes speculative metadata growth while its old array survives,
+        /// private compression, filters/bounds, and the reusable buffer growth.
+        pub fn memoryBound(e: *const StreamingEncoder) !usize {
+            var total: usize = @sizeOf(Block);
+            if (e.compression_policy != .none) total = try checkedAddUsize(total, try PrefixEncodeCursor.outputBound(e.block_bytes.items.len));
+            if (e.compression_policy == .snappy_adaptive and e.snappy_reprobe_countdown == 0 and e.block_bytes.items.len >= min_compress_block_bytes) {
+                total = try checkedAddUsize(total, snappy.EncodeCursor.table_entries * @sizeOf(u32));
+                const bound = try snappy.EncodeCursor.outputBound(e.block_bytes.items.len);
+                if (e.compression_bytes.capacity < bound) total = try checkedAddUsize(total, bound);
+            }
+            total = try checkedAddUsize(total, e.block_largest_key.len);
+            if (e.block_largest_namespace_name) |name| total = try checkedAddUsize(total, name.len);
+            total = try checkedAddUsize(total, try bloomEncodedLenForKeyCount(e.block_hashes.items.len, block_filter_config));
+            total = try checkedAddUsize(total, try bloomEncodedLenForKeyCount(e.block_prefix_hashes.items.len, block_filter_config));
+            if (e.blocks.items.len == e.blocks.capacity) total = try checkedAddUsize(total, try std.math.mul(usize, try metadataCapacity(e), @sizeOf(OwnedEncodedBlockMeta)));
+            return total;
+        }
+
+        fn init(e: *StreamingEncoder) !Block {
+            if (e.block_active or e.block_entry_count == 0) return error.InvalidTableFile;
+            _ = try memoryBound(e);
+            e.block_active = true;
+            return .{ .encoder = e };
+        }
+
+        fn preSnappyBytes(self: *const Block) []const u8 {
+            return if (self.prefix_len != 0) self.prefix.?[0..self.prefix_len] else self.encoder.block_bytes.items;
+        }
+
+        fn payload(self: *const Block) []const u8 {
+            return if (self.compression == .snappy or self.compression == .prefix_snappy) self.encoder.compression_bytes.items else self.preSnappyBytes();
+        }
+
+        /// One bounded CPU stage per call. The original execution checks before
+        /// every stage; rejection never loses a completed stage or frozen write.
+        pub fn step(self: *Block, original: ?read_admission.Port) !bool {
+            if (self.phase == .retired or self.retiring) return error.InvalidTableFile;
+            if (original) |control| try control.checkpoint();
+            const e = self.encoder;
+            const a = e.allocator;
+            switch (self.phase) {
+                .prefix_allocate => {
+                    if (e.compression_policy == .none) {
+                        self.phase = .checksum;
+                        return false;
+                    }
+                    self.prefix = try allocate(u8, a, try PrefixEncodeCursor.outputBound(e.block_bytes.items.len));
+                    self.prefix_cursor = try PrefixEncodeCursor.init(e.block_bytes.items.len);
+                    self.phase = .prefix_encode;
+                },
+                .prefix_encode => {
+                    if ((try self.prefix_cursor.?.step(e.block_bytes.items, self.prefix.?, 4096)).done) {
+                        if (self.prefix_cursor.?.output_offset < e.block_bytes.items.len) {
+                            self.prefix_len = self.prefix_cursor.?.output_offset;
+                            self.compression = .prefix;
+                        }
+                        self.phase = .snappy_allocate;
+                    }
+                },
+                .snappy_allocate => {
+                    const src = self.preSnappyBytes();
+                    if (e.compression_policy != .snappy_adaptive or e.snappy_reprobe_countdown != 0 or src.len < min_compress_block_bytes) {
+                        self.phase = .checksum;
+                        return false;
+                    }
+                    // Old contents are dead. Capacity growth must not copy a
+                    // previous oversized block under one execution checkpoint.
+                    const bound = try snappy.EncodeCursor.outputBound(src.len);
+                    if (e.compression_bytes.capacity < bound) {
+                        const memory = try allocate(u8, a, bound);
+                        // Keep the old allocation charged until bounded
+                        // retirement instead of copying/poisoning it here.
+                        self.old_compression = e.compression_bytes.allocatedSlice();
+                        e.compression_bytes = .fromOwnedSlice(memory);
+                    }
+                    e.compression_bytes.items.len = 0;
+                    if (self.workspace == null) self.workspace = try allocate(u32, a, snappy.EncodeCursor.table_entries);
+                    self.snappy_cursor = snappy.EncodeCursor.init(src.len);
+                    self.snappy_attempted = true;
+                    self.phase = .snappy_encode;
+                },
+                .snappy_encode => {
+                    if ((try self.snappy_cursor.?.step(self.preSnappyBytes(), e.compression_bytes.allocatedSlice(), self.workspace.?, 4096)).done) {
+                        e.compression_bytes.items.len = self.snappy_cursor.?.output_offset;
+                        if (e.compression_bytes.items.len < self.preSnappyBytes().len - self.preSnappyBytes().len / compression_savings_denominator) {
+                            self.compression = if (self.prefix_len != 0) .prefix_snappy else .snappy;
+                        }
+                        self.phase = .checksum;
+                    }
+                },
+                .checksum => {
+                    const src = self.payload();
+                    const n = @min(src.len - self.cpu_offset, 16 * 1024);
+                    self.crc.update(src[self.cpu_offset..][0..n]);
+                    self.cpu_offset += n;
+                    if (self.cpu_offset == src.len) {
+                        self.cpu_offset = 0;
+                        self.phase = .filter_allocate;
+                    }
+                },
+                .filter_allocate => {
+                    const hashes = if (self.filter_index == 0) e.block_hashes.items else e.block_prefix_hashes.items;
+                    _ = try bloomEncodedLenForKeyCount(hashes.len, block_filter_config);
+                    self.filters[self.filter_index] = try bloom.Builder.initUninitialized(a, hashes.len, block_filter_config);
+                    self.phase = .filter_zero;
+                },
+                .filter_zero => {
+                    const bytes = self.filters[self.filter_index].?.bytes;
+                    const n = @min(bytes.len - self.cpu_offset, 16 * 1024);
+                    @memset(bytes[self.cpu_offset..][0..n], 0);
+                    self.cpu_offset += n;
+                    if (self.cpu_offset == bytes.len) {
+                        self.cpu_offset = 0;
+                        self.phase = .filter_hashes;
+                    }
+                },
+                .filter_hashes => {
+                    const hashes = if (self.filter_index == 0) e.block_hashes.items else e.block_prefix_hashes.items;
+                    const end = self.hash_index + @min(hashes.len - self.hash_index, 64);
+                    for (hashes[self.hash_index..end]) |hash| self.filters[self.filter_index].?.addHashes(hash[0], hash[1]);
+                    self.hash_index = end;
+                    if (end == hashes.len) {
+                        self.hash_index = 0;
+                        if (self.filter_index == 0) {
+                            self.filter_index = 1;
+                            self.phase = .filter_allocate;
+                        } else self.phase = .bounds_allocate;
+                    }
+                },
+                .bounds_allocate => {
+                    if (self.largest_namespace == null) {
+                        if (e.block_largest_namespace_name) |name| self.largest_namespace = try allocate(u8, a, name.len);
+                    }
+                    self.largest_key = try allocate(u8, a, e.block_largest_key.len);
+                    self.phase = .bounds_copy;
+                },
+                .bounds_copy => {
+                    const ns = e.block_largest_namespace_name orelse &.{};
+                    if (self.cpu_offset < ns.len) {
+                        const n = @min(ns.len - self.cpu_offset, 16 * 1024);
+                        @memcpy(self.largest_namespace.?[self.cpu_offset..][0..n], ns[self.cpu_offset..][0..n]);
+                        self.cpu_offset += n;
+                    } else {
+                        const offset = self.cpu_offset - ns.len;
+                        const n = @min(e.block_largest_key.len - offset, 16 * 1024);
+                        @memcpy(self.largest_key.?[offset..][0..n], e.block_largest_key[offset..][0..n]);
+                        self.cpu_offset += n;
+                        if (offset + n == e.block_largest_key.len) {
+                            self.cpu_offset = 0;
+                            self.phase = .metadata_allocate;
+                        }
+                    }
+                },
+                .metadata_allocate => {
+                    if (e.blocks.items.len == e.blocks.capacity) {
+                        self.new_blocks = try allocate(OwnedEncodedBlockMeta, a, try metadataCapacity(e));
+                        self.phase = .metadata_copy;
+                    } else self.phase = .validate;
+                },
+                .metadata_copy => {
+                    const n = @min(e.blocks.items.len - self.copied_blocks, 64);
+                    @memcpy(self.new_blocks.?[self.copied_blocks..][0..n], e.blocks.items[self.copied_blocks..][0..n]);
+                    self.copied_blocks += n;
+                    if (self.copied_blocks == e.blocks.items.len) self.phase = .validate;
+                },
+                .validate => {
+                    const bytes = self.payload();
+                    const physical_end = try checkedAddUsize(e.physical_output_len, bytes.len);
+                    _ = try checkedU32(physical_end - e.entry_data_start);
+                    self.completed_metadata_bytes = try checkedAddUsize(e.completed_blocks_metadata_bytes, try encodedBlockMetadataLen(
+                        e.block_smallest_namespace_name,
+                        e.block_smallest_key,
+                        self.largest_namespace,
+                        self.largest_key.?,
+                        bloomEncodedLenForBytes(self.filters[0].?.bytes.len),
+                        bloomEncodedLenForBytes(self.filters[1].?.bytes.len),
+                    ));
+                    self.meta = .{
+                        .relative_offset = e.block_start.?,
+                        .len = try checkedU32(e.block_bytes.items.len),
+                        .physical_relative_offset = try checkedU32(e.physical_output_len - e.entry_data_start),
+                        .physical_len = try checkedU32(bytes.len),
+                        .compression = self.compression,
+                        .checksum = self.crc.final(),
+                        .first_entry_index = try checkedU32(e.block_first_entry_index),
+                        .entry_count = try checkedU32(e.block_entry_count),
+                        .smallest_namespace_name = e.block_smallest_namespace_name,
+                        .smallest_key = e.block_smallest_key,
+                        .largest_namespace_name = self.largest_namespace,
+                        .largest_key = self.largest_key.?,
+                        .filter = undefined,
+                        .hash_slots = &.{},
+                    };
+                    self.phase = .ready;
+                },
+                .ready, .complete => return true,
+                .retired => unreachable,
+            }
+            return self.phase == .ready or self.phase == .complete;
+        }
+
+        /// Commands stay byte-identical until acknowledge(). No CPU stage or
+        /// allocation follows the first output command. Physical failures and
+        /// accepted IO belong to the owning file writer, which must outlive all
+        /// borrows of these bytes even when the observer is rejected.
+        pub fn next(self: *Block, original: ?read_admission.Port) !?Command {
+            while (!(try self.step(original))) {}
+            if (self.phase == .complete) return null;
+            if (self.pending_len == 0) self.pending_len = @min(self.payload().len - self.output_offset, 16 * 1024);
+            return .{ .offset = self.encoder.physical_output_len + self.output_offset, .bytes = self.payload()[self.output_offset..][0..self.pending_len] };
+        }
+
+        pub fn writeNextWithAdmission(self: *Block, writer: anytype, original: read_admission.Port) !bool {
+            const command = (try self.next(original)) orelse return false;
+            self.io_attempted = true;
+            try writer.writeWithAdmission(command.offset, command.bytes, original);
+            self.acknowledge();
+            return true;
+        }
+
+        /// Infallible receipt after known physical completion. The final ack
+        /// adopts all prepared metadata before any subsequent checkpoint.
+        pub fn acknowledge(self: *Block) void {
+            std.debug.assert(!self.retiring and self.phase == .ready and self.pending_len != 0);
+            self.output_offset += self.pending_len;
+            self.pending_len = 0;
+            if (self.output_offset != self.payload().len) return;
+            const e = self.encoder;
+            if (self.new_blocks) |new| {
+                self.old_blocks = e.blocks.allocatedSlice();
+                const count = e.blocks.items.len;
+                e.blocks = .fromOwnedSlice(new);
+                e.blocks.items.len = count;
+                self.new_blocks = null;
+            }
+            self.meta.filter = self.filters[0].?.finish();
+            self.filters[0] = null;
+            self.meta.prefix_filter = self.filters[1].?.finish();
+            self.filters[1] = null;
+            e.blocks.appendAssumeCapacity(self.meta);
+            self.largest_namespace = null;
+            self.largest_key = null;
+            e.block_smallest_namespace_name = null;
+            e.block_smallest_key = &.{};
+            e.completed_blocks_metadata_bytes = self.completed_metadata_bytes;
+            e.blocks_owned_heap_bytes +|= ownedEncodedBlockMetaHeapBytes(self.meta);
+            e.physical_output_len += self.output_offset;
+            if (e.snappy_reprobe_countdown > 0) e.snappy_reprobe_countdown -= 1;
+            if (self.snappy_attempted) {
+                e.snappy_attempted_blocks += 1;
+                if (self.compression == .snappy or self.compression == .prefix_snappy) {
+                    e.snappy_rejection_streak = 0;
+                    e.snappy_reprobe_countdown = 0;
+                } else {
+                    e.snappy_rejection_streak +|= 1;
+                    if (e.snappy_rejection_streak >= snappy_rejection_streak_limit) e.snappy_reprobe_countdown = snappy_reprobe_interval - 1;
                 }
             }
+            // Receipt publication is scalar-only, including in Debug mode.
+            e.block_bytes.items.len = 0;
+            e.block_hashes.items.len = 0;
+            e.block_prefix_hashes.items.len = 0;
+            e.clearBlockLargest();
+            e.block_start = null;
+            e.block_entry_count = 0;
+            self.published = true;
+            self.phase = .complete;
         }
 
-        const physical_relative_offset = try checkedU32(self.sink.len() - self.entry_data_start);
-        try self.sink.appendSlice(encoded_payload.payload);
-
-        var block_filter = try buildFilterFromHashesAlloc(self.allocator, self.block_hashes.items, block_filter_config);
-        errdefer block_filter.deinit(self.allocator);
-        var block_prefix_filter = try buildFilterFromHashesAlloc(self.allocator, self.block_prefix_hashes.items, block_filter_config);
-        errdefer block_prefix_filter.deinit(self.allocator);
-        // Exact lookup already binary-searches entry_offsets within the block.
-        // The former 50%-load open-addressed table was never consulted by a
-        // reader, yet cost at least eight bytes per entry on disk and heap.
-        // Preserve the v9 metadata section with an empty slot vector so old and
-        // new runs remain wire-compatible.
-        const hash_slots = try self.allocator.alloc(u32, 0);
-        errdefer self.allocator.free(hash_slots);
-
-        const largest_namespace_name = if (self.block_largest_namespace_name) |name| try self.allocator.dupe(u8, name) else null;
-        errdefer if (largest_namespace_name) |name| self.allocator.free(name);
-        const largest_key = try self.allocator.dupe(u8, self.block_largest_key);
-        errdefer self.allocator.free(largest_key);
-        const smallest_namespace_name = self.block_smallest_namespace_name;
-        self.block_smallest_namespace_name = null;
-        const smallest_key = self.block_smallest_key;
-        self.block_smallest_key = &.{};
-        errdefer {
-            if (smallest_namespace_name) |name| self.allocator.free(name);
-            self.allocator.free(smallest_key);
+        // std.Allocator.free poisons the entire allocation in safety builds.
+        // Poison under bounded original checkpoints, then call the allocator's
+        // ordinary raw release so its accounting still runs exactly once.
+        fn retireMemory(self: *Block, comptime T: type, memory: []T, original: ?read_admission.Port) !void {
+            const bytes = std.mem.sliceAsBytes(memory);
+            if (bytes.len == 0) {
+                if (original) |control| try control.checkpoint();
+                return;
+            }
+            while (self.retire_offset < bytes.len) {
+                if (original) |control| try control.checkpoint();
+                const n = @min(bytes.len - self.retire_offset, 16 * 1024);
+                @memset(bytes[self.retire_offset..][0..n], undefined);
+                self.retire_offset += n;
+            }
+            self.encoder.allocator.rawFree(bytes, .of(T), @returnAddress());
+            self.retire_offset = 0;
         }
 
-        const next_completed_blocks_metadata_bytes = try checkedAddUsize(
-            self.completed_blocks_metadata_bytes,
-            try encodedBlockMetadataLen(
-                smallest_namespace_name,
-                smallest_key,
-                largest_namespace_name,
-                largest_key,
-                bloomEncodedLenForBytes(block_filter.bytes.len),
-                bloomEncodedLenForBytes(block_prefix_filter.bytes.len),
-            ),
-        );
+        /// Poison at most 16 KiB per original checkpoint, then release each
+        /// allocation once. Abandonment after attempted IO or any ack makes the
+        /// encoder terminal. Accepted file work must be joined before retiring.
+        pub fn retireWithAdmission(self: *Block, original: ?read_admission.Port) !void {
+            if (self.phase == .retired) return;
+            self.retiring = true;
+            if (!self.published and (self.io_attempted or self.output_offset != 0)) self.encoder.finished = true;
+            while (self.retire_slot < 9) {
+                switch (self.retire_slot) {
+                    0 => {
+                        try self.retireMemory(u8, self.prefix orelse &.{}, original);
+                        self.prefix = null;
+                    },
+                    1 => {
+                        try self.retireMemory(u32, self.workspace orelse &.{}, original);
+                        self.workspace = null;
+                    },
+                    2, 3 => {
+                        const i = self.retire_slot - 2;
+                        try self.retireMemory(u8, if (self.filters[i]) |b| b.bytes else &.{}, original);
+                        self.filters[i] = null;
+                    },
+                    4 => {
+                        try self.retireMemory(u8, self.largest_namespace orelse &.{}, original);
+                        self.largest_namespace = null;
+                    },
+                    5 => {
+                        try self.retireMemory(u8, self.largest_key orelse &.{}, original);
+                        self.largest_key = null;
+                    },
+                    6 => {
+                        try self.retireMemory(OwnedEncodedBlockMeta, self.new_blocks orelse &.{}, original);
+                        self.new_blocks = null;
+                    },
+                    7 => {
+                        try self.retireMemory(OwnedEncodedBlockMeta, self.old_blocks orelse &.{}, original);
+                        self.old_blocks = null;
+                    },
+                    8 => {
+                        try self.retireMemory(u8, self.old_compression orelse &.{}, original);
+                        self.old_compression = null;
+                    },
+                    else => unreachable,
+                }
+                self.retire_slot += 1;
+            }
+            self.encoder.block_active = false;
+            self.phase = .retired;
+        }
 
-        try self.blocks.append(self.allocator, .{
-            .relative_offset = self.block_start.?,
-            .len = try checkedU32(self.block_bytes.items.len),
-            .physical_relative_offset = physical_relative_offset,
-            .physical_len = try checkedU32(encoded_payload.payload.len),
-            .compression = encoded_payload.compression,
-            .checksum = Crc32.hash(encoded_payload.payload),
-            .first_entry_index = try checkedU32(self.block_first_entry_index),
-            .entry_count = try checkedU32(self.block_entry_count),
-            .smallest_namespace_name = smallest_namespace_name,
-            .smallest_key = smallest_key,
-            .largest_namespace_name = largest_namespace_name,
-            .largest_key = largest_key,
-            .filter = block_filter,
-            .prefix_filter = block_prefix_filter,
-            .hash_slots = hash_slots,
-        });
-        self.completed_blocks_metadata_bytes = next_completed_blocks_metadata_bytes;
-        self.blocks_owned_heap_bytes +|= ownedEncodedBlockMetaHeapBytes(self.blocks.items[self.blocks.items.len - 1]);
+        pub fn deinit(self: *Block) void {
+            self.retireWithAdmission(null) catch unreachable;
+        }
+    };
 
-        self.block_bytes.clearRetainingCapacity();
-        self.block_hashes.clearRetainingCapacity();
-        self.block_prefix_hashes.clearRetainingCapacity();
-        self.clearBlockLargest();
-        self.block_start = null;
-        self.block_entry_count = 0;
+    fn flushBlock(self: *StreamingEncoder) !void {
+        if (self.block_entry_count == 0) return;
+        var block = try Block.init(self);
+        defer block.deinit();
+        while (try block.next(null)) |command| {
+            std.debug.assert(self.sink.len() == command.offset);
+            block.io_attempted = true;
+            self.sink.appendSlice(command.bytes) catch |cause| {
+                self.finished = true;
+                return cause;
+            };
+            block.acknowledge();
+        }
     }
 };
 
@@ -2098,9 +2426,11 @@ fn compareBytesToPrefixSuccessor(bytes: []const u8, prefix: []const u8, pivot: u
 }
 
 pub fn decodeAlloc(allocator: std.mem.Allocator, raw: []const u8) !Decoded {
-    const owned_raw = try allocator.dupe(u8, raw);
-    errdefer allocator.free(owned_raw);
-    var borrowed = try decodeBorrowedOwnedAlloc(allocator, owned_raw);
+    var borrowed = transfer: {
+        const owned_raw = try allocator.dupe(u8, raw);
+        errdefer allocator.free(owned_raw);
+        break :transfer try decodeBorrowedOwnedAlloc(allocator, owned_raw);
+    };
     defer borrowed.deinit(allocator);
 
     const entries = try allocator.alloc(OwnedEntry, borrowed.entryCount());
@@ -2111,12 +2441,12 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, raw: []const u8) !Decoded {
 
     while (initialized < entries.len) : (initialized += 1) {
         const entry = try borrowed.entryAt(initialized);
-        entries[initialized] = .{
-            .namespace_name = if (entry.namespace_name) |name| try allocator.dupe(u8, name) else null,
-            .key = try allocator.dupe(u8, entry.key),
-            .value = try allocator.dupe(u8, entry.value),
-            .tombstone = entry.tombstone,
-        };
+        const namespace = if (entry.namespace_name) |name| try allocator.dupe(u8, name) else null;
+        errdefer if (namespace) |name| allocator.free(name);
+        const key = try allocator.dupe(u8, entry.key);
+        errdefer allocator.free(key);
+        const value = try allocator.dupe(u8, entry.value);
+        entries[initialized] = .{ .namespace_name = namespace, .key = key, .value = value, .tombstone = entry.tombstone };
     }
 
     return .{
@@ -6266,4 +6596,340 @@ test "table file prefix encoder relocates overlapping restart tail in one byte s
     try std.testing.expect(cursor.output_offset + cursor.restart_count * 4 > cursor.restart_base);
     while (!(try cursor.step(raw.items, output, 1)).done) {}
     try std.testing.expectEqualSlices(u8, expected, output[0..cursor.output_offset]);
+}
+
+test "controlled physical sync retained table block freezes CPU stages and adopts only final acknowledged output" {
+    const Control = struct {
+        reject: bool = false,
+        failure: anyerror,
+        calls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const call = self.calls;
+            self.calls += 1;
+            if (self.reject or call == self.fail_at) return self.failure;
+        }
+    };
+    const a = std.testing.allocator;
+    const value = try a.alloc(u8, 96 * 1024 + 7);
+    defer a.free(value);
+    @memset(value, 'v');
+    for ([_]CompressionPolicy{ .none, .snappy_adaptive }) |policy| {
+        for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.FileNotFound }) |failure| {
+            var memory = MemoryTableSink.init(a);
+            defer memory.deinit();
+            var sink = memory.sink();
+            var e = try StreamingEncoder.init(a, &sink, 96, .{ .block_compression = policy });
+            defer e.deinit();
+            var c: Control = .{ .failure = failure };
+            const payload_control: read_admission.Payload = .{ .ptr = &c, .vtable = &.{ .checkpoint = Control.check } };
+            const original = read_admission.Port.init(&payload_control);
+            for (0..96) |i| {
+                var key: [8]u8 = undefined;
+                std.mem.writeInt(u64, &key, @intCast(i), .big);
+                try e.appendEntry(.{ .namespace_name = "docs", .key = &key, .value = value });
+                _ = try StreamingEncoder.Block.memoryBound(&e);
+                var block = try e.prepareBlock();
+                defer block.deinit();
+                try std.testing.expectError(error.InvalidTableFile, e.appendEntry(.{ .key = "bad", .value = "" }));
+                try std.testing.expectError(error.InvalidTableFile, e.prepareMetadata());
+                try std.testing.expectError(error.InvalidTableFile, e.finishBlocks());
+                try std.testing.expectError(error.InvalidTableFile, e.prepareBlock());
+                const before = sink.len();
+                while (true) {
+                    const phase = block.phase;
+                    const offset = block.cpu_offset;
+                    c.reject = true;
+                    try std.testing.expectError(failure, block.step(original));
+                    try std.testing.expectEqual(phase, block.phase);
+                    try std.testing.expectEqual(offset, block.cpu_offset);
+                    try std.testing.expectEqual(before, sink.len());
+                    try std.testing.expectEqual(i, e.blocks.items.len);
+                    c.reject = false;
+                    // The owner is movable; no self pointer survives this call.
+                    var moved = block;
+                    const ready = try moved.step(original);
+                    block = moved;
+                    if (ready) break;
+                }
+                var bytes_written: usize = 0;
+                while (try block.next(original)) |command| {
+                    try std.testing.expect(command.bytes.len > 0 and command.bytes.len <= 16 * 1024);
+                    try std.testing.expectEqual(sink.len(), command.offset);
+                    const again = (try block.next(original)).?;
+                    try std.testing.expect(command.bytes.ptr == again.bytes.ptr and command.bytes.len == again.bytes.len);
+                    c.reject = true;
+                    try std.testing.expectError(failure, block.next(original));
+                    try std.testing.expectEqual(i, e.blocks.items.len);
+                    c.reject = false;
+                    try sink.appendSlice(command.bytes);
+                    bytes_written += command.bytes.len;
+                    const raw_len = e.block_bytes.items.len;
+                    const last_byte = e.block_bytes.items[raw_len - 1];
+                    block.acknowledge();
+                    if (block.published) {
+                        try std.testing.expectEqual(i + 1, e.blocks.items.len);
+                        try std.testing.expectEqual(last_byte, e.block_bytes.allocatedSlice()[raw_len - 1]);
+                    }
+                }
+                try std.testing.expect(block.published);
+                try std.testing.expectEqual(before + bytes_written, e.physical_output_len);
+                try std.testing.expectEqual(Crc32.hash(memory.out.items[before..]), e.blocks.items[i].checksum);
+                // Rejected retirement keeps the encoder frozen and fences all
+                // preparation/output methods until every allocation retires.
+                c.reject = true;
+                try std.testing.expectError(failure, block.retireWithAdmission(original));
+                try std.testing.expect(e.block_active);
+                try std.testing.expectError(error.InvalidTableFile, block.next(null));
+                c.reject = false;
+                while (block.phase != .retired) {
+                    // Advance one bounded retirement stage, then reject and
+                    // resume without releasing any allocation twice.
+                    c.fail_at = c.calls + 1;
+                    block.retireWithAdmission(original) catch |cause| {
+                        try std.testing.expectEqual(failure, cause);
+                        try std.testing.expect(e.block_active);
+                        continue;
+                    };
+                }
+                c.fail_at = std.math.maxInt(usize);
+                try block.retireWithAdmission(original);
+                try std.testing.expect(!e.block_active);
+            }
+            var result = try e.finish();
+            defer result.filter.deinit(a);
+            var decoded = try decodeAlloc(a, memory.out.items);
+            defer decoded.deinit(a);
+            try std.testing.expectEqual(@as(usize, 96), decoded.entries.len);
+            for (decoded.entries, 0..) |entry, i| {
+                var key: [8]u8 = undefined;
+                std.mem.writeInt(u64, &key, @intCast(i), .big);
+                try std.testing.expectEqualStrings("docs", entry.namespace_name.?);
+                try std.testing.expectEqualSlices(u8, &key, entry.key);
+                try std.testing.expectEqualSlices(u8, value, entry.value);
+            }
+        }
+    }
+}
+
+test "controlled physical sync retained table block abandonment and allocation failures retain input ownership" {
+    const Fixture = struct {
+        fn noResize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+            return false;
+        }
+        fn noRemap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+            return null;
+        }
+        fn run(backing: std.mem.Allocator) !void {
+            // Production prepaid segments also refuse remapping. Fix the
+            // allocation schedule so every fault index is deterministic even
+            // when an optimized backing allocator can resize in place.
+            var vtable = backing.vtable.*;
+            vtable.resize = noResize;
+            vtable.remap = noRemap;
+            const a: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
+            var memory = MemoryTableSink.init(a);
+            defer memory.deinit();
+            var sink = memory.sink();
+            var e = try StreamingEncoder.init(a, &sink, 1, .{});
+            defer e.deinit();
+            var key: [4097]u8 = @splat('k');
+            key[key.len - 1] = 'z';
+            try e.appendEntry(.{ .namespace_name = "docs", .key = &key, .value = "value" });
+            const count = e.block_entry_count;
+            const smallest = e.block_smallest_key;
+            {
+                var block = try e.prepareBlock();
+                defer block.deinit();
+                _ = try block.next(null);
+                try std.testing.expectEqual(@as(usize, header_len), sink.len());
+                try std.testing.expectEqual(count, e.block_entry_count);
+                try std.testing.expect(e.block_smallest_key.ptr == smallest.ptr);
+            }
+            try std.testing.expect(!e.finished and !e.block_active);
+            // Abandon a prepared but unwritten block; retry produces one row.
+            var result = try e.finish();
+            defer result.filter.deinit(a);
+            var decoded = try decodeAlloc(a, memory.out.items);
+            defer decoded.deinit(a);
+            try std.testing.expectEqual(@as(usize, 1), decoded.entries.len);
+            try std.testing.expectEqualSlices(u8, &key, decoded.entries[0].key);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    const a = std.testing.allocator;
+    var memory = MemoryTableSink.init(a);
+    defer memory.deinit();
+    var sink = memory.sink();
+    var e = try StreamingEncoder.init(a, &sink, 1, .{ .block_compression = .none });
+    defer e.deinit();
+    const large: [32769]u8 = @splat('v');
+    try e.appendEntry(.{ .key = "key", .value = &large });
+    var block = try e.prepareBlock();
+    defer block.deinit();
+    const first = (try block.next(null)).?;
+    try sink.appendSlice(first.bytes);
+    block.acknowledge();
+    try std.testing.expect(!block.published);
+    block.deinit();
+    try std.testing.expect(e.finished);
+    try std.testing.expectError(error.InvalidTableFile, e.finish());
+}
+
+test "controlled physical sync retained block preparation fits prepaid memory bound through metadata growth" {
+    const a = std.testing.allocator;
+    var memory = MemoryTableSink.init(a);
+    defer memory.deinit();
+    var sink = memory.sink();
+    var e = try StreamingEncoder.init(a, &sink, 16, .{ .block_compression = .none });
+    defer e.deinit();
+    for (0..8) |i| {
+        const key = [_]u8{@intCast(i)};
+        try e.appendEntry(.{ .key = &key, .value = "" });
+        try e.finishBlocks();
+    }
+    try std.testing.expectEqual(e.blocks.capacity, e.blocks.items.len);
+    const key: [8193]u8 = @splat('k');
+    try e.appendEntry(.{ .namespace_name = "docs", .key = &key, .value = &key });
+    e.compression_policy = .snappy_adaptive;
+    const bound = try StreamingEncoder.Block.memoryBound(&e);
+    const prepaid = try a.alloc(u8, bound);
+    defer a.free(prepaid);
+    var fixed = std.heap.FixedBufferAllocator.init(prepaid);
+    e.allocator = fixed.allocator();
+    defer {
+        e.compression_bytes.deinit(fixed.allocator());
+        e.compression_bytes = .empty;
+        e.allocator = a;
+    }
+    var block = try e.prepareBlock();
+    defer block.deinit();
+    _ = try block.next(null);
+    try std.testing.expect(fixed.end_index <= bound);
+    try std.testing.expect(block.new_blocks != null and block.copied_blocks == 8);
+    try std.testing.expectEqual(@as(usize, 8), e.blocks.items.len);
+    try std.testing.expectEqual(@as(usize, 1), e.block_entry_count);
+    try std.testing.expectEqualSlices(u8, &key, e.block_smallest_key);
+}
+
+test "controlled physical sync table decode allocation failures retire transferred input and partial row copies once" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator, raw: []const u8) !void {
+            var decoded = try decodeAlloc(a, raw);
+            defer decoded.deinit(a);
+            try std.testing.expectEqual(@as(usize, 2), decoded.entries.len);
+            try std.testing.expectEqualStrings("docs", decoded.entries[0].namespace_name.?);
+        }
+    };
+    const a = std.testing.allocator;
+    const value: [16385]u8 = @splat('v');
+    const entries = [_]Entry{
+        .{ .namespace_name = "docs", .key = "doc:1", .value = &value },
+        .{ .namespace_name = "docs", .key = "doc:2", .value = "short" },
+    };
+    var filter = try buildFilterAlloc(a, &entries, .{});
+    defer filter.deinit(a);
+    for ([_]CompressionPolicy{ .none, .snappy_adaptive }) |policy| {
+        const raw = try encodeWithFilterAllocOptions(a, &entries, filter, .{ .block_compression = policy });
+        defer a.free(raw);
+        try std.testing.checkAllAllocationFailures(a, Fixture.run, .{raw});
+    }
+}
+
+test "controlled physical sync retained block defers old compression buffer reclamation and skips disabled compression credit" {
+    const a = std.testing.allocator;
+    var memory = MemoryTableSink.init(a);
+    defer memory.deinit();
+    var sink = memory.sink();
+    var e = try StreamingEncoder.init(a, &sink, 1, .{ .block_compression = .none });
+    defer e.deinit();
+    const value = try a.alloc(u8, 128 * 1024 + 7);
+    defer a.free(value);
+    @memset(value, 'v');
+    try e.appendEntry(.{ .key = "key", .value = value });
+    const uncompressed_bound = try StreamingEncoder.Block.memoryBound(&e);
+    try std.testing.expect(uncompressed_bound < value.len);
+    e.compression_policy = .snappy_adaptive;
+    try e.compression_bytes.resize(a, 65537);
+    @memset(e.compression_bytes.items, 0x5a);
+    const old = e.compression_bytes.allocatedSlice();
+    var block = try e.prepareBlock();
+    defer block.deinit();
+    _ = try block.next(null);
+    try std.testing.expect(block.old_compression.?.ptr == old.ptr);
+    try std.testing.expect(e.compression_bytes.items.ptr != old.ptr);
+    for (old[0..65537]) |byte| try std.testing.expectEqual(@as(u8, 0x5a), byte);
+    block.deinit();
+    try std.testing.expect(!e.block_active and !e.finished);
+    try std.testing.expectEqual(@as(usize, 1), e.block_entry_count);
+}
+
+test "controlled physical sync retained block allocations preserve provider bytes until bounded initialization" {
+    const Painted = struct {
+        backing: std.mem.Allocator,
+        fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const ptr = self.backing.rawAlloc(len, alignment, ra) orelse return null;
+            @memset(ptr[0..len], 0x5a);
+            return ptr;
+        }
+        fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+            return false;
+        }
+        fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+            return null;
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.backing.rawFree(bytes, alignment, ra);
+        }
+    };
+    const a = std.testing.allocator;
+    var memory = MemoryTableSink.init(a);
+    defer memory.deinit();
+    var sink = memory.sink();
+    var e = try StreamingEncoder.init(a, &sink, 1, .{});
+    defer e.deinit();
+    var key: [8193]u8 = @splat('k');
+    key[3] = ':';
+    try e.appendEntry(.{ .namespace_name = "docs", .key = &key, .value = &key });
+    var painted: Painted = .{ .backing = a };
+    e.allocator = .{ .ptr = &painted, .vtable = &.{ .alloc = Painted.alloc, .resize = Painted.resize, .remap = Painted.remap, .free = Painted.free } };
+    defer e.allocator = a;
+    var block = try e.prepareBlock();
+    defer block.deinit();
+    var prefix_seen = false;
+    var workspace_seen = false;
+    var filter_seen = false;
+    var bounds_seen = false;
+    var metadata_seen = false;
+    while (!(try block.step(null))) {
+        switch (block.phase) {
+            .prefix_encode => if (!prefix_seen) {
+                try std.testing.expectEqual(@as(u8, 0x5a), block.prefix.?[0]);
+                prefix_seen = true;
+            },
+            .snappy_encode => if (!workspace_seen) {
+                try std.testing.expectEqual(@as(u32, 0x5a5a5a5a), block.workspace.?[0]);
+                try std.testing.expectEqual(@as(u8, 0x5a), e.compression_bytes.allocatedSlice()[0]);
+                workspace_seen = true;
+            },
+            .filter_zero => if (!filter_seen) {
+                try std.testing.expectEqual(@as(u8, 0x5a), block.filters[block.filter_index].?.bytes[0]);
+                filter_seen = true;
+            },
+            .bounds_copy => if (!bounds_seen) {
+                try std.testing.expectEqual(@as(u8, 0x5a), block.largest_namespace.?[0]);
+                try std.testing.expectEqual(@as(u8, 0x5a), block.largest_key.?[0]);
+                bounds_seen = true;
+            },
+            .metadata_copy => if (!metadata_seen) {
+                try std.testing.expectEqual(@as(u8, 0x5a), std.mem.sliceAsBytes(block.new_blocks.?)[0]);
+                metadata_seen = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(prefix_seen and workspace_seen and filter_seen and bounds_seen and metadata_seen);
 }
