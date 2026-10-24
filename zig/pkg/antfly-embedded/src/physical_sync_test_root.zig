@@ -27,6 +27,7 @@ test {
     _ = @import("storage/lsm_backend/run_metadata_clone.zig");
     _ = @import("storage/lsm_backend/directory_index_preparation.zig");
     _ = @import("storage/lsm_backend/run_comparison.zig");
+    _ = @import("storage/lsm_backend/run_summary.zig");
     _ = @import("storage/lsm_backend/wal.zig");
     _ = @import("storage/lsm_backend.zig");
 }

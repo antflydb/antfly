@@ -18,6 +18,7 @@
 //! and materialize their shared read/planning projection outside the writer lock.
 const std = @import("std");
 const run_comparison = @import("run_comparison.zig");
+const run_summary = @import("run_summary.zig");
 const repository = @import("repository.zig");
 const state = @import("state.zig");
 const Account = @import("memory_account.zig").Account;
@@ -121,36 +122,11 @@ const Entry = struct {
     payload: ?*Payload = null,
     domain: []const u8 = "",
 
-    pub const Summary = struct {
-        smallest: ?*const Run = null,
-        largest: ?*const Run = null,
-        non_async_runs: usize = 0,
-        tombstone_runs: usize = 0,
-        unknown_tombstone_runs: usize = 0,
-        gc_requested: bool = false,
-        oldest_tombstone: u64 = std.math.maxInt(u64),
-        newest_tombstone: u64 = 0,
-    };
+    pub const Summary = run_summary.Summary;
+    pub const Preparation = SummaryPreparation(Summary, run_summary.Full);
     pub fn summarize(entry: Entry, left: Summary, right: Summary) Summary {
-        const deletes = (entry.run.tombstone_count orelse 0) != 0;
-        var smallest = entry.run;
-        var largest = entry.run;
-        for ([_]?*const Run{ left.smallest, right.smallest }) |candidate| if (candidate) |run| {
-            if (compareBound(run.smallest_namespace_name, run.smallest_key, smallest.smallest_namespace_name, smallest.smallest_key) == .lt) smallest = run;
-        };
-        for ([_]?*const Run{ left.largest, right.largest }) |candidate| if (candidate) |run| {
-            if (compareBound(run.largest_namespace_name, run.largest_key, largest.largest_namespace_name, largest.largest_key) == .gt) largest = run;
-        };
-        return .{
-            .smallest = smallest,
-            .largest = largest,
-            .non_async_runs = left.non_async_runs + right.non_async_runs + @intFromBool(entry.run.path == null or entry.run.state != null),
-            .tombstone_runs = left.tombstone_runs + right.tombstone_runs + @intFromBool(deletes),
-            .unknown_tombstone_runs = left.unknown_tombstone_runs + right.unknown_tombstone_runs + @intFromBool(entry.run.tombstone_count == null),
-            .gc_requested = left.gc_requested or right.gc_requested or entry.run.gc_requested,
-            .oldest_tombstone = @min(left.oldest_tombstone, right.oldest_tombstone, if (deletes) entry.run.oldest_tombstone_unix_ns else std.math.maxInt(u64)),
-            .newest_tombstone = @max(left.newest_tombstone, right.newest_tombstone, if (deletes) entry.run.oldest_tombstone_unix_ns else 0),
-        };
+        var preparation = Preparation.init(entry, left, right);
+        return preparation.resumeWithAdmission(null) catch unreachable;
     }
 
     pub fn retainShared(self: Entry) Entry {
@@ -170,14 +146,29 @@ const Entry = struct {
     }
 };
 
+fn SummaryPreparation(comptime Result: type, comptime Cursor: type) type {
+    return struct {
+        cursor: Cursor,
+        entry: Entry,
+        pub fn init(entry: Entry, left: Result, right: Result) @This() {
+            return .{ .cursor = .init(entry.run, left, right), .entry = entry };
+        }
+        pub fn matches(self: *const @This(), entry: Entry, left: Result, right: Result) bool {
+            return self.entry.run == entry.run and self.entry.payload == entry.payload and
+                self.entry.domain.ptr == entry.domain.ptr and self.entry.domain.len == entry.domain.len and
+                std.meta.eql(self.cursor.left, left) and std.meta.eql(self.cursor.right, right);
+        }
+        pub fn resumeWithAdmission(self: *@This(), original: ?@import("../../common/read_admission.zig").Port) !Result {
+            return self.cursor.resumeWithAdmission(original);
+        }
+    };
+}
 const BoundsSummary = struct {
-    pub const Summary = struct { largest: ?*const Run = null };
+    pub const Summary = run_summary.UpperSummary;
+    pub const Preparation = SummaryPreparation(Summary, run_summary.Upper);
     pub fn summarize(entry: Entry, left: Summary, right: Summary) Summary {
-        var largest = entry.run;
-        for ([_]?*const Run{ left.largest, right.largest }) |candidate| if (candidate) |run| {
-            if (compareBound(largest.largest_namespace_name, largest.largest_key, run.largest_namespace_name, run.largest_key) == .lt) largest = run;
-        };
-        return .{ .largest = largest };
+        var preparation = Preparation.init(entry, left, right);
+        return preparation.resumeWithAdmission(null) catch unreachable;
     }
 };
 
@@ -1613,4 +1604,103 @@ test "controlled physical sync retained directory rank searches preserve origina
     var empty: Directory = .{};
     const probe = pinned.at(0).run;
     inline for (.{ run_comparison.Mode.read, .id, .lower, .upper }) |mode| try Fixture.check(mode, &empty, probe);
+}
+
+test "controlled physical sync private node summary refresh commits once after original computation and rejects stale shapes" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pub fn retainRunSnapshotRef(_: *@This(), _: *Run) !void {}
+        pub fn releaseRunSnapshotRef(_: *@This(), _: *Run) void {}
+    };
+    var fixture: Fixture = .{ .allocator = a };
+    const d = try Directory.create(a);
+    defer d.destroy(a);
+    const bytes = try a.alloc(u8, 2 * run_comparison.Cursor.quantum + 5);
+    defer a.free(bytes);
+    @memset(bytes, 's');
+    for (0..5) |i| {
+        bytes[bytes.len - 1] = @intCast('a' + i);
+        try d.put(&fixture, .{ .id = i + 1, .level = 1, .size_bytes = 1, .path = @constCast("/refresh.tbl"), .smallest_namespace_name = @constCast("docs"), .smallest_key = bytes, .largest_namespace_name = @constCast("docs"), .largest_key = bytes, .entry_count = 1, .tombstone_count = @intCast(i % 3), .oldest_tombstone_unix_ns = i * 11, .gc_requested = i % 2 == 1, .bloom_filter = null, .state = null, .owns_metadata = false });
+    }
+    inline for (.{ "tree", "bounds" }) |field| {
+        const tree = &@field(d, field);
+        const root = tree.root.?;
+        const expected = root.summary;
+        const shared = try d.fork(a);
+        try std.testing.expectError(error.ResourceBudgetExceeded, root.prepareRefresh());
+        shared.destroy(a);
+        const Fault = struct {
+            checks: usize = 0,
+            at: usize = std.math.maxInt(usize),
+            failure: anyerror = error.Canceled,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                const at = self.checks;
+                self.checks += 1;
+                if (at == self.at) return self.failure;
+            }
+        };
+        var checkpoints: usize = 1;
+        var target: usize = 0;
+        while (target <= checkpoints) : (target += 1) {
+            root.summary = .{}; // Private stale metadata, never visible to a reader.
+            const pending = root.summary;
+            var refresh = try root.prepareRefresh();
+            var fault: Fault = .{ .at = if (target == 0) std.math.maxInt(usize) else target - 1, .failure = switch (target % 3) {
+                0 => error.Canceled,
+                1 => error.DeadlineExceeded,
+                else => error.FileNotFound,
+            } };
+            const payload: @import("../../common/read_admission.zig").Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+            const original = @import("../../common/read_admission.zig").Port.init(&payload);
+            const result = refresh.resumeWithAdmission(original);
+            if (target == 0) {
+                try result;
+                checkpoints = fault.checks;
+            } else {
+                try std.testing.expectError(fault.failure, result);
+                try std.testing.expect(!refresh.committed);
+                try std.testing.expectEqualDeep(pending, root.summary);
+                try refresh.resumeWithAdmission(original);
+            }
+            try std.testing.expect(refresh.committed);
+            try std.testing.expectEqualDeep(expected, root.summary);
+        }
+        var stale = try root.prepareRefresh();
+        const old_left = root.left;
+        root.left = null;
+        const result = stale.resumeWithAdmission(null);
+        root.left = old_left;
+        try std.testing.expectError(error.CompactionPlanningStale, result);
+        try std.testing.expect(!stale.committed);
+        try std.testing.expectEqualDeep(expected, root.summary);
+        const Refresh = @TypeOf(stale);
+        const Control = struct {
+            refresh: *Refresh,
+            entry: bool,
+            changed: bool = false,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (!self.changed and self.refresh.preparation.cursor.comparison != null) {
+                    self.changed = true;
+                    const node = self.refresh.node;
+                    if (self.entry) node.entry.run = node.left.?.entry.run else node.left.?.summary.largest = null;
+                }
+            }
+        };
+        for ([_]bool{ false, true }) |change_entry| {
+            var refresh = try root.prepareRefresh();
+            var control: Control = .{ .refresh = &refresh, .entry = change_entry };
+            const payload: @import("../../common/read_admission.zig").Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check } };
+            const original_entry = root.entry.run;
+            const original_left_summary = root.left.?.summary;
+            const invalidated = refresh.resumeWithAdmission(@import("../../common/read_admission.zig").Port.init(&payload));
+            root.entry.run = original_entry;
+            root.left.?.summary = original_left_summary;
+            try std.testing.expect(control.changed and !refresh.committed);
+            try std.testing.expectError(error.CompactionPlanningStale, invalidated);
+            try std.testing.expectEqualDeep(expected, root.summary);
+        }
+    }
 }

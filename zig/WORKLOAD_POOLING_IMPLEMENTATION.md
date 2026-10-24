@@ -26405,3 +26405,62 @@ v2 passes the initial complete ordering/search lifecycle. Formatting, whitespace
 and the new module license pass. Full GNU qualification stays waived. Summary
 refresh/publication, payload/pin/state preparation and the broader default
 coordinator, cleanup, relief and default-gate work remain incomplete.
+
+
+### Retained directory summary computation and private-node receipts
+
+`run_summary.Full` and `Upper` now retain computation of directory subtree
+bounds and largest upper endpoints. Both preserve entry/left/right tie order,
+null-versus-empty namespace ordering, and original byte-comparison cursors.
+The full summary also preserves non-async/tombstone/unknown counts, GC requests
+and oldest/newest tombstone times. Rejection retains the exact candidate,
+phase and compared-prefix progress; completed summaries still check the next
+original's lifetime. Fixed caller-owned headers borrow pinned immutable run
+metadata and child summaries, allocate nothing and retain no original port.
+
+Directory summary policies expose these preparations. The generic ordered
+index provides `Node.prepareRefresh()` for a private, uniquely owned node. Its
+retained receipt computes a summary under original admission and installs the
+count/height/byte/summary fields only after computation and shape checks finish.
+Shared nodes refuse before construction. Entry identity, domain slice identity,
+child links, child summary values and child count/height/byte metadata must
+remain stable; stale progress callbacks refuse without committing the parent.
+The caller freezes every entry/child operand and keeps the node private for the
+entire continuation. This receipt does not make rotations, path copying, entry
+replacement/destruction or multi-index mutation admitted.
+
+Legacy AVL refresh and directory summary calls drive the same retained
+preparations with a null original. The existing directory path therefore uses
+the new summary engine, while synchronous tree mutation remains explicitly
+legacy. The future mutation coordinator can pause on a private transient shape,
+finish its summaries, and only then expose a coherent successor root.
+
+Qualification compares full bounds and every scalar aggregate with an
+independent copy of the former summary rules, covers empty child summaries and
+stable bound ties, rejects every summary/refresh checkpoint with three original
+errors, and proves no compared-prefix replay. Private-node tests verify that
+rejected work leaves the pending summary untouched, successful computation
+commits once, shared nodes refuse, and changed links/entry identity/child
+summaries (including progress-callback changes) cannot commit stale results.
+
+Still required: admitted rotations/path mutation, replacement retirement and
+atomic multi-index publication; payload/file-pin registration/release and
+unshared-state handling for complete directory rebuilding; combined/default
+coordinator wiring, admitted durable cleanup, remaining completion/history
+relief and full default-gate evidence. Full GNU qualification stays waived;
+the full design remains incomplete.
+
+Final-source receipts `retained-directory-summary-v4-integrated`, `-legacy`
+and `-fast` pass all five native commands each. Debug integration passes 83/83
+steps with 97 physical-sync, 32 owner-close, 170 table/codec, 74 WAL recovery
+and 18 runtime ABI cases. Focused legacy directory regressions pass all six
+cases and 60/60 steps. ReleaseFast passes 63/63 steps with the same 97 physical,
+170 table/codec and 74 recovery cases. Each receipt also passes four Bloom
+and 45/1/8 error-identity companions (companions use Debug). All 5,592 recorded
+native/schema input hashes and final log digests match; four immutable final
+snapshots preserve every changed native file. The v1/v3 receipts retain the
+corrected test-local naming collisions, and v2 passes the initial complete
+summary suite. Formatting, whitespace and module licensing pass. The fetched
+`origin/main` at `fd329daaf9` is already an ancestor of this branch; merging it
+reports already up to date. Full GNU qualification remains waived, and the
+broader design work listed above remains incomplete.

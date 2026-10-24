@@ -56,7 +56,61 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
                 allocator.destroy(self);
             }
 
+            /// Only a private unique node may be refreshed under admission.
+            /// Caller freezes its entry, child links and child summaries until
+            /// completion and retains every operand/payload authority.
+            pub const Refresh = if (Summary != void and @hasDecl(SummaryPolicy, "Preparation")) struct {
+                node: *Node,
+                left: ?*Node,
+                right: ?*Node,
+                count: usize,
+                height: u8,
+                bytes: u64,
+                left_count: usize,
+                right_count: usize,
+                left_height: u8,
+                right_height: u8,
+                left_bytes: u64,
+                right_bytes: u64,
+                preparation: SummaryPolicy.Preparation,
+                committed: bool = false,
+                fn stable(self: *const @This()) bool {
+                    const n = self.node;
+                    return n.refs.load(.acquire) == 1 and n.left == self.left and n.right == self.right and
+                        self.preparation.matches(n.entry, if (n.left) |child| child.summary else .{}, if (n.right) |child| child.summary else .{}) and
+                        size(n.left) == self.left_count and size(n.right) == self.right_count and
+                        depth(n.left) == self.left_height and depth(n.right) == self.right_height and
+                        (if (n.left) |child| child.bytes else @as(u64, 0)) == self.left_bytes and
+                        (if (n.right) |child| child.bytes else @as(u64, 0)) == self.right_bytes;
+                }
+                pub fn resumeWithAdmission(self: *@This(), original: ?@import("../../common/read_admission.zig").Port) !void {
+                    if (original) |port| try port.checkpoint();
+                    if (!self.stable()) return error.CompactionPlanningStale;
+                    if (self.committed) return;
+                    const summary = try self.preparation.resumeWithAdmission(original);
+                    // A progress callback may have invalidated the private shape.
+                    if (!self.stable()) return error.CompactionPlanningStale;
+                    self.node.count = self.count;
+                    self.node.height = self.height;
+                    self.node.bytes = self.bytes;
+                    self.node.summary = summary;
+                    self.committed = true;
+                }
+            } else void;
+            pub fn prepareRefresh(self: *Node) !Refresh {
+                if (comptime Refresh == void) @compileError("summary policy has no retained preparation");
+                if (self.refs.load(.acquire) != 1) return error.ResourceBudgetExceeded;
+                const left_bytes = if (self.left) |n| n.bytes else 0;
+                const right_bytes = if (self.right) |n| n.bytes else 0;
+                return .{ .node = self, .left = self.left, .right = self.right, .count = 1 + size(self.left) + size(self.right), .height = 1 + @max(depth(self.left), depth(self.right)), .bytes = @sizeOf(Node) + self.entry.retainedBytes() + left_bytes + right_bytes, .left_count = size(self.left), .right_count = size(self.right), .left_height = depth(self.left), .right_height = depth(self.right), .left_bytes = left_bytes, .right_bytes = right_bytes, .preparation = .init(self.entry, if (self.left) |n| n.summary else .{}, if (self.right) |n| n.summary else .{}) };
+            }
+
             fn refresh(self: *Node) void {
+                if (comptime Refresh != void) {
+                    var preparation = self.prepareRefresh() catch unreachable;
+                    preparation.resumeWithAdmission(null) catch unreachable;
+                    return;
+                }
                 self.count = 1 + size(self.left) + size(self.right);
                 self.height = 1 + @max(depth(self.left), depth(self.right));
                 self.bytes = @sizeOf(Node) + self.entry.retainedBytes() +
