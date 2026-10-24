@@ -1621,11 +1621,14 @@ const Execution = struct {
         const self = from(raw);
         var pin = (try acquire(raw, name)) orelse return null;
         errdefer pin.deinit();
-        if (pin.provider_metadata) |raw_identities| {
-            const identities: *const @import("lake_index_text_predicate.zig").Identities = @ptrCast(@alignCast(raw_identities));
+        // Only acquire()'s registered archive snapshots carry Identities.
+        // Recent windows carry Overlay.RecentMetadata in the same opaque
+        // provider slot. Reinterpreting that payload as an archive tie-rank
+        // callback can jump into the digest bytes during accepted-cut reads.
+        if (self.text_identities.get(@intFromPtr(pin.snapshot))) |identities| {
             if (if (self.relocated()) self.index_resolver else null) |resolver| {
                 const tie = try self.arena.create(RelocatedTie);
-                tie.* = .{ .execution = self, .identities = identities.*, .resolver = resolver };
+                tie.* = .{ .execution = self, .identities = identities, .resolver = resolver };
                 tie.identities.row_resolver = null;
                 try self.relocated_ties.append(self.arena, tie);
                 pin.logical_tie_rank = .{ .ptr = tie, .rank = RelocatedTie.fallback, .resolve = RelocatedTie.resolve, .resolve_many = RelocatedTie.resolveMany };

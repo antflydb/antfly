@@ -56,6 +56,9 @@ pub const RequestContext = struct {
     deadline_ns: ?u64,
     cancellation: ?CancellationToken = null,
     progress: ?ProgressSink = null,
+    /// Notified immediately before request bytes may reach an upstream.
+    /// A notification means the upstream outcome may be unknown on timeout.
+    submission: ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } = null,
 
     pub fn check(self: RequestContext) !void {
         if (self.cancellation) |value| if (value.isCancelled()) return error.Cancelled;

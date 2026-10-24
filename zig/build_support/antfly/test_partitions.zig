@@ -211,7 +211,17 @@ fn localNames(b: *std.Build, consumer: *std.Build.Module) []const []const u8 {
 fn partition(b: *std.Build, executable: *std.Build.Step.Compile) ?*std.Build.Step.Compile {
     const tests = testObject(executable) orelse return null;
     const max_rss = if (tests.step.max_rss != 0) tests.step.max_rss else executable.step.max_rss;
-    const partition_max_rss = if (max_rss >= 12 * 1024 * 1024 * 1024 and max_rss < 14 * 1024 * 1024 * 1024) 14 * 1024 * 1024 * 1024 else max_rss;
+    // A consumer's reservation is not evidence for its physical partition.
+    // Keep the authored floor while applying the partition's own measured
+    // profile; labels remain stable in compiler summaries and inventories.
+    const partition_name = b.fmt("{s}-local", .{tests.name});
+    const partition_max_rss = @import("../../pkg/antfly/build/runtime_memory.zig").testCompileMaxRss(
+        partition_name,
+        b.graph.host.result,
+        tests.root_module.resolved_target.?.result,
+        tests.root_module.optimize,
+        if (max_rss >= 12 * 1024 * 1024 * 1024 and max_rss < 14 * 1024 * 1024 * 1024) 14 * 1024 * 1024 * 1024 else max_rss,
+    );
     if (partitions.get(tests)) |existing| {
         if (existing.step.max_rss == 0) existing.step.max_rss = partition_max_rss;
         return existing;
@@ -236,7 +246,7 @@ fn partition(b: *std.Build, executable: *std.Build.Step.Compile) ?*std.Build.Ste
         }
     }
     const artifact = b.addTest(.{
-        .name = b.fmt("{s}-local", .{tests.name}),
+        .name = partition_name,
         .root_module = root,
         .filters = tests.filters,
         .max_rss = partition_max_rss,

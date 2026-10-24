@@ -56,6 +56,7 @@ class Upstream(BaseHTTPRequestHandler):
     session_reply_override: ClassVar[bool] = False
     session_reply: ClassVar[object] = None
     image_stream_release: ClassVar[threading.Event | None] = None
+    deadline_budgets: ClassVar[list[tuple[str, int]]] = []
     calls: ClassVar[list[str]] = []
     chat_attempts: ClassVar[list[str]] = []
     requests: ClassVar[list[tuple[str, dict]]] = []
@@ -801,6 +802,40 @@ class Upstream(BaseHTTPRequestHandler):
 
     def extra(self, request):
         path = self.path
+        model = request.get("model", "")
+        if model.startswith("deadline-fixture-"):
+            budget = int(self.headers["X-Antfly-Inference-Timeout-Ms"])
+            self.deadline_budgets.append((model, budget))
+            if model == "deadline-fixture-slow":
+                time.sleep(2)
+            if model == "deadline-fixture-stall":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(
+                    b'data: {"id":"deadline","object":"chat.completion.chunk","created":1,"model":"deadline","choices":[{"index":0,"delta":{"content":"started"},"finish_reason":null}]}\n\n'
+                )
+                self.wfile.flush()
+                time.sleep(2)
+                self.close_connection = True
+                return True
+            self.reply(
+                {
+                    "id": "deadline",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+            )
+            return True
         if path == "/ai/v1/generate" and request.get("messages", [{}])[0].get(
             "content"
         ) in (
@@ -1210,7 +1245,11 @@ def free_port() -> int:
 def verify_nested_gateway(binary: Path, root: Path, inner_url: str) -> None:
     """Native operations must survive named remote aliases and chains."""
     config = {
-        "public_inference": {"enabled": True},
+        "public_inference": {
+            "enabled": True,
+            "default_timeout_ms": 240000,
+            "max_timeout_ms": 600000,
+        },
         "inference": {
             "api_url": inner_url,
             "api_key": "mock-server-key",
@@ -2052,7 +2091,110 @@ def verify_anthropic_usage(client, messages):
         raise AssertionError("native cached usage debt was not retained")
     except openai.APIStatusError as error:
         assert error.status_code == 504, error
+        failure = error.response.json()["error"]
+        assert failure["phase"] == "admission", failure
+        assert failure["upstream_submitted"] is False, failure
+        assert failure["outcome"] == "not_submitted", failure
     assert len(Upstream.requests) == before
+
+
+def verify_invocation_deadlines(base_url):
+    url = base_url + "/ai/v1/chat/completions"
+    prompt = {"messages": [{"role": "user", "content": "hello"}]}
+
+    def invoke(alias, budget=None):
+        headers = {"Content-Type": "application/json"}
+        if budget is not None:
+            headers["X-Antfly-Inference-Timeout-Ms"] = budget
+        req = urllib.request.Request(
+            url,
+            data=json.dumps({"model": "generators/" + alias, **prompt}).encode(),
+            headers=headers,
+        )
+        return urllib.request.urlopen(req, timeout=5)
+
+    # A configured default above 120 seconds survives all public dispatch layers.
+    with invoke("deadline-fast") as response:
+        assert response.status == 200
+    assert 120000 < Upstream.deadline_budgets[-1][1] <= 240000
+    with invoke("deadline-fast", "300000") as response:
+        assert response.status == 200
+    assert 240000 < Upstream.deadline_budgets[-1][1] <= 300000
+
+    before = len(Upstream.deadline_budgets)
+    for budget in (
+        "0",
+        "-1",
+        "+1",
+        "1.2",
+        "1,2",
+        "600001",
+        "4294967296",
+        "18446744073709551616",
+    ):
+        try:
+            invoke("deadline-fast", budget)
+            raise AssertionError(("invalid budget accepted", budget))
+        except urllib.error.HTTPError as error:
+            assert error.code == 400, (budget, error.code, error.read())
+    # Use raw headers to avoid a client combining duplicates for us.
+    connection = http.client.HTTPConnection(base_url.removeprefix("http://"), timeout=5)
+    body = json.dumps({"model": "generators/deadline-fast", **prompt}).encode()
+    connection.putrequest("POST", "/ai/v1/chat/completions")
+    connection.putheader("Content-Type", "application/json")
+    connection.putheader("Content-Length", str(len(body)))
+    connection.putheader("X-Antfly-Inference-Timeout-Ms", "1")
+    connection.putheader("x-antfly-inference-timeout-ms", "2")
+    connection.endheaders(body)
+    response = connection.getresponse()
+    assert response.status == 400, (response.status, response.read())
+    response.read()
+    connection.close()
+    assert len(Upstream.deadline_budgets) == before
+
+    started = time.monotonic()
+    try:
+        invoke("deadline-slow", "1000")
+        raise AssertionError("submitted request did not expire")
+    except urllib.error.HTTPError as error:
+        assert error.code == 504, (error.code, error.read())
+        failure = json.load(error)["error"]
+        assert failure["phase"] == "upstream", failure
+        assert failure["upstream_submitted"] is True, failure
+        assert failure["outcome"] == "unknown", failure
+        assert failure["cancellation"] == "requested", failure
+        assert failure["retryable"] is False, failure
+        assert failure["request_id"] == error.headers["X-Request-ID"], failure
+    assert time.monotonic() - started < 2
+    assert len(Upstream.deadline_budgets) == before + 1
+
+    # A committed stalled stream must close under the original total deadline.
+    # There is no complete marker and no replacement JSON error response.
+    body = json.dumps(
+        {"model": "generators/deadline-stall", "stream": True, **prompt}
+    ).encode()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Antfly-Inference-Timeout-Ms": "1000",
+        },
+    )
+    started = time.monotonic()
+    with urllib.request.urlopen(req, timeout=3) as response:
+        assert response.status == 200 and response.headers["X-Request-ID"]
+        try:
+            wire = response.read()
+        except http.client.IncompleteRead as error:
+            wire = error.partial
+    assert b"started" in wire and b"[DONE]" not in wire, wire
+    assert b'"error"' not in wire, wire
+    assert time.monotonic() - started < 2
+    print(
+        "bounded invocation defaults, validation, submission outcomes and stalled streams passed",
+        flush=True,
+    )
 
 
 def verify_hosted_generation_contracts(base_url):
@@ -2225,7 +2367,11 @@ def main() -> None:
             root = Path(temporary)
             upstream_url = f"http://127.0.0.1:{upstream.server_port}"
             config = {
-                "public_inference": {"enabled": True},
+                "public_inference": {
+                    "enabled": True,
+                    "default_timeout_ms": 240000,
+                    "max_timeout_ms": 600000,
+                },
                 "inference": {
                     "api_url": upstream_url,
                     "api_key": "mock-server-key",
@@ -2601,6 +2747,20 @@ def main() -> None:
             del vertex["api_key"]
             vertex.update(model="deadline-model", credentials_path=str(credentials))
             config["generators"]["vertex-deadline"] = vertex
+            for alias, model in (
+                ("deadline-fast", "deadline-fixture-fast"),
+                ("deadline-slow", "deadline-fixture-slow"),
+                ("deadline-stall", "deadline-fixture-stall"),
+            ):
+                config["generators"][alias] = {
+                    "provider": "openai",
+                    "model": model,
+                    "url": upstream_url + "/ai/v1",
+                    "api_key": "mock-server-key",
+                }
+                config["inference_capabilities"]["generators/" + alias] = {
+                    "streaming": "supported"
+                }
             config_path = root / "config.json"
             config_path.write_text(json.dumps(config))
             port = free_port()
@@ -2650,6 +2810,7 @@ def main() -> None:
                     verify_hosted_image_inputs(base_url)
                     verify_hosted_image_streams(base_url)
                     verify_hosted_generation_contracts(base_url)
+                    verify_invocation_deadlines(base_url)
                     if args.only_images:
                         return
                     Upstream.model_delay_seconds = 0.3
@@ -3022,7 +3183,7 @@ def main() -> None:
                         (
                             "chains/fallback",
                             {"X-Antfly-Inference-Timeout-Ms": "0"},
-                            504,
+                            400,
                             [],
                         ),
                     ]:

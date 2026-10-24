@@ -267,6 +267,7 @@ def test_warmup_uses_configured_first_use_deadline(monkeypatch):
     def post(url: str, **kwargs):
         observed["url"] = url
         observed["timeout"] = kwargs["timeout"]
+        observed["headers"] = kwargs["headers"]
         return Response()
 
     monkeypatch.setattr(standalone.requests, "post", post)
@@ -280,6 +281,7 @@ def test_warmup_uses_configured_first_use_deadline(monkeypatch):
     assert observed == {
         "url": "http://127.0.0.1:8080/ai/v1/generate",
         "timeout": 1800.0,
+        "headers": {"X-Antfly-Inference-Timeout-Ms": "1800000"},
     }
 
 

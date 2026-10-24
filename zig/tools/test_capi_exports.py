@@ -165,6 +165,7 @@ else:
         (self.root / "lib").symlink_to(zig_root / "lib", target_is_directory=True)
         for relative in (
             "build_test_filters.zig",
+            "pkg/antfly/build/runtime_memory.zig",
             "pkg/inference/build/decision_modules.zig",
             "tools/build_support.zig",
             "tools/capi_exports.py",

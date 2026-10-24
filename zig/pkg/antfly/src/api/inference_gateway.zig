@@ -169,7 +169,7 @@ pub fn session(server: anytype, ctx: *httpx.Context, principal: []const u8, meth
             return context.isCancellationRequested();
         }
     }.cancelled);
-    var result = connections.invokeInferenceConnectionWithRequest(a, &client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, body, cancel, @min(connections.inferenceInvocationDeadlineNs(), ctx.application_deadline_ns orelse std.math.maxInt(u64)), if (streaming) session_sink.sink() else .{}, method, .{ .content_type = ctx.header("content-type") orelse "application/json", .query = if (raw_stream) ctx.request.uri.query else null, .body_source = if (raw_stream) transport.bodySource() else .{} }) catch |err| {
+    var result = connections.invokeInferenceConnectionWithRequest(a, &client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, body, cancel, ctx.application_deadline_ns orelse connections.inferenceInvocationDeadlineNs(), if (streaming) session_sink.sink() else .{}, method, .{ .attempt_observer = observeAttempt(ctx, null), .content_type = ctx.header("content-type") orelse "application/json", .query = if (raw_stream) ctx.request.uri.query else null, .body_source = if (raw_stream) transport.bodySource() else .{} }) catch |err| {
         observation.failure = @errorName(err);
         if (transport.started) return error.InferenceResponseCommitted;
         return err;
@@ -280,18 +280,78 @@ pub fn disabledResponse(ctx: *httpx.Context) !httpx.Response {
     return ctx.status(403).json(.{ .@"error" = .{ .code = "PublicInferenceDisabled", .type = "permission_error", .message = "Public inference is disabled for this deployment" } });
 }
 
+const InvocationState = struct {
+    allocator: std.mem.Allocator,
+    request_id: ?[]u8 = null,
+    // A transport that began sending may have submitted billable work. This is not an
+    // acknowledgement of completion, billing, or successful cancellation.
+    submitted: std.atomic.Value(bool) = .init(false),
+    uncertain: std.atomic.Value(bool) = .init(false),
+    fn mark(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.submitted.store(true, .release);
+    }
+    fn destroy(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.request_id) |id| self.allocator.free(id);
+        self.allocator.destroy(self);
+    }
+};
+const invocation_state_key = "antfly.inference.invocation";
+fn invocationState(ctx: *const httpx.Context) ?*InvocationState {
+    return @ptrCast(@alignCast(ctx.getData(invocation_state_key)));
+}
+pub fn observeAttempt(ctx: *httpx.Context, delegate: ?httpx.AttemptObserver) httpx.AttemptObserver {
+    var result = delegate orelse httpx.AttemptObserver{
+        .ptr = ctx,
+        .before = struct {
+            fn before(_: *anyopaque, _: httpx.AttemptObserver.Context) !void {}
+        }.before,
+        .after = struct {
+            fn after(_: *anyopaque, _: ?*const httpx.Response) void {}
+        }.after,
+    };
+    if (invocationState(ctx)) |state| result.delivery = .{ .context = state, .before_send = InvocationState.mark };
+    return result;
+}
+pub fn timeoutResponse(ctx: *httpx.Context) !httpx.Response {
+    const state = invocationState(ctx);
+    if (state) |value| if (value.request_id) |id| try ctx.setHeader("x-request-id", id);
+    const sent = if (state) |value| value.submitted.load(.acquire) else false;
+    const uncertain = if (state) |value| value.uncertain.load(.acquire) else false;
+    const submitted: ?bool = if (sent) true else if (uncertain) null else false;
+    return ctx.status(504).json(.{ .@"error" = .{
+        .message = "Inference invocation deadline expired",
+        .type = "inference_error",
+        .code = "Timeout",
+        .request_id = ctx.response.headers.get("x-request-id"),
+        .phase = if (sent) "upstream" else if (uncertain) "execution" else "admission",
+        .upstream_submitted = submitted,
+        .outcome = if (sent or uncertain) "unknown" else "not_submitted",
+        .cancellation = if (sent or uncertain) "requested" else "not_required",
+        .retryable = !sent and !uncertain,
+    } });
+}
+
 pub fn prepare(server: anytype, ctx: *httpx.Context) !void {
     if (!server.publicInferenceEnabled() and !isDiscoveryPath(ctx.request.uri.path)) return error.PublicInferenceDisabled;
     if (ctx.response.headers.get("x-request-id") == null) _ = try requestId(server, ctx, ctx.allocator);
     _ = try attemptBudget(ctx);
     const now = @import("antfly_platform").time.monotonicNs();
-    var timeout_ms: u64 = 120000;
-    if (ctx.header("x-antfly-inference-timeout-ms")) |raw| {
-        timeout_ms = @min(timeout_ms, std.fmt.parseInt(u64, raw, 10) catch return error.InvalidInferenceRequest);
-    }
-    const deadline = now +| timeout_ms *| std.time.ns_per_ms;
+    const policy: sources.common_config.Config.PublicInferenceConfig = if (comptime @hasField(@TypeOf(server.*), "cfg"))
+        if (server.cfg.node_config) |config| config.public_inference else .{}
+    else
+        .{};
+    const deadline = try policy.deadline(ctx.request.headers.iterator(), now, @import("../request_deadline.zig").platformDeadline(ctx));
     @import("../request_deadline.zig").tightenPlatform(ctx, deadline);
-    if (timeout_ms == 0) return error.Timeout;
+    if (invocationState(ctx) == null) {
+        const state = try ctx.allocator.create(InvocationState);
+        errdefer ctx.allocator.destroy(state);
+        state.* = .{ .allocator = ctx.allocator, .request_id = try ctx.allocator.dupe(u8, ctx.response.headers.get("x-request-id").?) };
+        errdefer ctx.allocator.free(state.request_id.?);
+        try ctx.setData(invocation_state_key, state, InvocationState.destroy);
+    }
+    if (deadline <= now) return error.Timeout;
 }
 
 fn attemptBudget(ctx: *const httpx.Context) !u8 {
@@ -421,16 +481,27 @@ fn executeGenerated(server: anytype, ctx: *httpx.Context, task: gateway.Task, a:
 fn executeResolved(server: anytype, ctx: *httpx.Context, task: gateway.Task, a: std.mem.Allocator, request: Json, named: gateway.View, target: gateway.Target, generator_override: ?generating.GeneratorConfig, fallback: bool, attempt: u8, options: ExecutionOptions) anyerror!httpx.Response {
     const requested = try string(request.object.get("model") orelse return error.ModelRequired);
     const id = try target.idAlloc(a);
-    const request_id = ctx.response.headers.get("x-request-id") orelse try requestId(server, ctx, a);
+    // Response construction transfers header ownership. Keep telemetry on the
+    // invocation-owned ID even when a completed 504 response is discarded.
+    const request_id = if (invocationState(ctx)) |state| state.request_id orelse try requestId(server, ctx, a) else ctx.response.headers.get("x-request-id") orelse try requestId(server, ctx, a);
     const descriptor = if (generator_override == null) try named.describe(a, target) else null;
     var observation = tasks.Observation{ .allocator = a, .request_id = request_id, .requested = requested, .resolved = id, .executor = if (descriptor) |value| value.executor else @tagName(generator_override.?.provider), .backend_model = if (descriptor) |value| value.backend_model else generator_override.?.model, .connection = if (descriptor) |value| value.connection else null, .task = @tagName(task), .attempt = attempt, .started_ns = @import("antfly_platform").time.monotonicNs() };
     defer observation.finish();
-    const response = executeResolvedImpl(server, ctx, task, a, request, named, target, generator_override, fallback, &observation, options) catch |err| {
+    // Legacy task adapters without delivery proof cannot assert that a timed
+    // out invocation was never submitted. Preserve an explicit unknown until
+    // their transport (or the local executor) supplies stronger evidence.
+    if (task != .generate)
+        if (invocationState(ctx)) |state| state.uncertain.store(true, .release);
+    var response = executeResolvedImpl(server, ctx, task, a, request, named, target, generator_override, fallback, &observation, options) catch |err| {
         observation.failure = @errorName(err);
         return err;
     };
     observation.status = response.status.code;
     if (response.body) |bytes| observation.usage(bytes);
+    if (response.status.code == 504 and !ctx.h1_stream_sent and !ctx.h2_stream_sent) {
+        response.deinit();
+        return error.Timeout;
+    }
     return response;
 }
 
@@ -780,12 +851,12 @@ fn executorFor(server: anytype, ctx: *httpx.Context, client: *httpx.Client, name
             return context.isCancellationRequested();
         }
     }.cancelled);
-    const deadline = @min(@import("connections.zig").inferenceInvocationDeadlineNs(), @import("../request_deadline.zig").platformDeadline(ctx) orelse std.math.maxInt(u64));
+    const deadline = @import("../request_deadline.zig").platformDeadline(ctx) orelse @import("connections.zig").inferenceInvocationDeadlineNs();
     return .{
         .view = named,
         .generator_override = generator_override,
         .http = client,
-        .context = .{ .io = server.inferenceIo(), .deadline_ns = deadline, .cancellation = if (cancellation) |v| @as(@import("antfly_cancellation").CancellationToken, .{ .ptr = v.ptr, .is_cancelled_fn = v.is_cancelled_fn }) else null },
+        .context = .{ .io = server.inferenceIo(), .deadline_ns = deadline, .submission = if (invocationState(ctx)) |state| .{ .ptr = state, .notify = InvocationState.mark } else null, .cancellation = if (cancellation) |v| @as(@import("antfly_cancellation").CancellationToken, .{ .ptr = v.ptr, .is_cancelled_fn = v.is_cancelled_fn }) else null },
         .antfly_provider = server.antfly_provider,
         .inference_api_url = server.cfg.node_config.?.inference.api_url,
         .inference_api_key = server.cfg.inference_api_key orelse server.cfg.node_config.?.inference.api_key,
@@ -1094,7 +1165,7 @@ fn executeChain(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, requ
         ctx.application_deadline_ns = previous_deadline;
         ctx.application_deadline_io = previous_clock;
     }
-    const deadline = @min(@import("connections.zig").inferenceInvocationDeadlineNs(), @import("../request_deadline.zig").platformDeadline(ctx) orelse std.math.maxInt(u64));
+    const deadline = @import("../request_deadline.zig").platformDeadline(ctx) orelse @import("connections.zig").inferenceInvocationDeadlineNs();
     ctx.application_deadline_ns = deadline;
     ctx.application_deadline_io = null;
     const budget = options.attempt_limit;
@@ -1163,7 +1234,7 @@ pub fn batch(server: anytype, ctx: *httpx.Context) !httpx.Response {
     const Result = struct { custom_id: []const u8, index: usize, response: ?Json = null, @"error": ?struct { code: []const u8, message: []const u8, retryable: bool } = null };
     const results = try a.alloc(Result, items.array.items.len);
     var succeeded: usize = 0;
-    const deadline = @min(@import("connections.zig").inferenceInvocationDeadlineNs(), @import("../request_deadline.zig").platformDeadline(ctx) orelse std.math.maxInt(u64));
+    const deadline = @import("../request_deadline.zig").platformDeadline(ctx) orelse @import("connections.zig").inferenceInvocationDeadlineNs();
     const options = ExecutionOptions{ .response_delivery = .buffered, .attempt_limit = try attemptBudget(ctx) };
     for (items.array.items, results, 0..) |item, *result, index| {
         result.* = .{ .custom_id = item.object.get("custom_id").?.string, .index = index };
@@ -1176,6 +1247,7 @@ pub fn batch(server: anytype, ctx: *httpx.Context) !httpx.Response {
         var item_context = httpx.Context.init(a, ctx.io, &item_request);
         defer item_context.deinit();
         item_context.application_deadline_ns = deadline;
+        if (invocationState(ctx)) |state| try item_context.setData(invocation_state_key, state, null);
         item_context.cancellation_probe = .{ .ptr = ctx, .is_cancelled = struct {
             fn cancelled(raw: ?*const anyopaque) bool {
                 const outer: *const httpx.Context = @ptrCast(@alignCast(raw.?));
@@ -1218,7 +1290,7 @@ fn parseBatchItemResponse(a: std.mem.Allocator, body: ?[]const u8) !Json {
 }
 
 fn discoveryContext(server: anytype, ctx: *httpx.Context) @import("antfly_inference_execution_context").RequestContext {
-    return .{ .io = server.inferenceIo(), .deadline_ns = ctx.application_deadline_ns, .cancellation = .{ .ptr = ctx, .is_cancelled_fn = struct {
+    return .{ .io = server.inferenceIo(), .deadline_ns = ctx.application_deadline_ns, .submission = if (invocationState(ctx)) |state| .{ .ptr = state, .notify = InvocationState.mark } else null, .cancellation = .{ .ptr = ctx, .is_cancelled_fn = struct {
         fn cancelled(raw: *const anyopaque) bool {
             const context: *const httpx.Context = @ptrCast(@alignCast(raw));
             return context.isCancellationRequested();
@@ -1472,7 +1544,7 @@ fn forward(server: anytype, ctx: *httpx.Context, connection: []const u8, operati
     defer if (options.attachments != null) ctx.allocator.free(encoded);
     var client = httpx.Client.initWithConfig(ctx.allocator, server.inferenceIo(), .{ .keep_alive = false });
     defer client.deinit();
-    var result = connections.invokeInferenceConnectionWithRequest(ctx.allocator, &client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, encoded, cancellation, @min(connections.inferenceInvocationDeadlineNs(), ctx.application_deadline_ns orelse std.math.maxInt(u64)), if (options.response_delivery == .buffered) .{} else if (fallback) guard.sink() else observed, .post, .{ .content_type = if (options.attachments != null) httpx.attachment_envelope.content_type else "application/json", .attempt_observer = options.attempt_observer }) catch |err| {
+    var result = connections.invokeInferenceConnectionWithRequest(ctx.allocator, &client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, encoded, cancellation, ctx.application_deadline_ns orelse connections.inferenceInvocationDeadlineNs(), if (options.response_delivery == .buffered) .{} else if (fallback) guard.sink() else observed, .post, .{ .content_type = if (options.attachments != null) httpx.attachment_envelope.content_type else "application/json", .attempt_observer = observeAttempt(ctx, options.attempt_observer) }) catch |err| {
         if (transport.started or guard.committed) return error.InferenceResponseCommitted;
         return guard.failure orelse err;
     };
@@ -1509,7 +1581,7 @@ fn forwardEndpoint(server: anytype, ctx: *httpx.Context, endpoint: []const u8, a
             return context.isCancellationRequested();
         }
     }.cancelled);
-    const timeout_ms = @max(@as(u64, 1), (@min(@import("connections.zig").inferenceInvocationDeadlineNs(), @import("../request_deadline.zig").platformDeadline(ctx) orelse std.math.maxInt(u64)) -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms);
+    const timeout_ms = try @import("connections.zig").remainingInferenceInvocationMs(@import("../request_deadline.zig").platformDeadline(ctx) orelse @import("connections.zig").inferenceInvocationDeadlineNs(), @import("antfly_platform").time.monotonicNs());
     const timeout_header = try std.fmt.allocPrint(a, "{d}", .{timeout_ms});
     defer a.free(timeout_header);
     var headers = std.ArrayList([2][]const u8).empty;
@@ -1521,8 +1593,9 @@ fn forwardEndpoint(server: anytype, ctx: *httpx.Context, endpoint: []const u8, a
     defer if (execution_options.attachments != null) a.free(encoded);
     try headers.append(a, .{ "Content-Type", if (execution_options.attachments != null) httpx.attachment_envelope.content_type else "application/json" });
     const options = httpx.RequestOptions{
+        .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
         .body = encoded,
-        .attempt_observer = execution_options.attempt_observer,
+        .attempt_observer = observeAttempt(ctx, execution_options.attempt_observer),
         .headers = headers.items,
         .timeout_ms = timeout_ms,
         .cancellation = cancellation,
@@ -1840,4 +1913,30 @@ test "httpx inference gateway admission translates the ingress executor clock" {
     try std.testing.expect(ctx.application_deadline_io == null);
     try std.testing.expect(ctx.application_deadline_ns.? >= before + 100 * std.time.ns_per_ms);
     try std.testing.expect(ctx.application_deadline_ns.? <= after + 100 * std.time.ns_per_ms);
+}
+
+test "httpx inference gateway timeout outcomes distinguish admission send proof and unknown adapters" {
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/generate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    try ctx.setHeader("x-request-id", "correlation");
+    const state = try a.create(InvocationState);
+    state.* = .{ .allocator = a, .request_id = try a.dupe(u8, "correlation") };
+    try ctx.setData(invocation_state_key, state, InvocationState.destroy);
+    for (0..3) |phase| {
+        if (phase == 1) state.uncertain.store(true, .release);
+        if (phase == 2) InvocationState.mark(state);
+        var response = try timeoutResponse(&ctx);
+        defer response.deinit();
+        const parsed = try std.json.parseFromSlice(Json, a, response.body.?, .{});
+        defer parsed.deinit();
+        const failure = parsed.value.object.get("error").?.object;
+        try std.testing.expectEqualStrings("correlation", failure.get("request_id").?.string);
+        try std.testing.expectEqualStrings(if (phase == 0) "not_submitted" else "unknown", failure.get("outcome").?.string);
+        try std.testing.expectEqual(phase == 0, failure.get("retryable").?.bool);
+        const submitted = failure.get("upstream_submitted").?;
+        if (phase == 1) try std.testing.expect(submitted == .null) else try std.testing.expectEqual(phase == 2, submitted.bool);
+    }
 }

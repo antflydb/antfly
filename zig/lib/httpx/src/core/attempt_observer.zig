@@ -23,6 +23,10 @@ pub const AttemptObserver = struct {
     before: *const fn (*anyopaque, Context) anyerror!void,
     after: *const fn (*anyopaque, ?*const Response) void,
     output_tokens: u64 = 0,
+    /// Optional delivery proof composed with admission. Invoked immediately
+    /// before bytes can reach the peer, never during quota/DNS/pool waits.
+    /// It does not acknowledge upstream acceptance, completion, or billing.
+    delivery: ?struct { context: *anyopaque, before_send: *const fn (*anyopaque) void } = null,
 
     pub const Context = struct {
         io: std.Io,

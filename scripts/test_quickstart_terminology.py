@@ -39,6 +39,22 @@ class RecordingWaitTests(unittest.TestCase):
             .replace("Wait@", "Wait+Line@")
         )
 
+    def test_continued_recording_command_and_presentation_directives(self):
+        continued = self.tape.replace(
+            "--until source-covered=10%",
+            "\\`\nEnter\nType `  --until source-covered=10%",
+        ).replace("Wait@2700s", "Sleep 2s\nHide\nWait@2700s")
+        docs.check_recording_coverage_wait(continued)
+        docs.check_recording_coverage_wait(docs.QUICKSTART_TAPE.read_text())
+        with self.assertRaises(AssertionError):
+            docs.check_recording_coverage_wait(
+                continued.replace("--timeout 45m", "--timeout 1s")
+            )
+        with self.assertRaises(AssertionError):
+            docs.check_recording_coverage_wait(
+                continued.replace("Enter\nType `  --until", "Type `  --until")
+            )
+
     def test_unrelated_timeout_or_prompt_cannot_satisfy_wait(self):
         for old, new in (
             ("--timeout 45m", "--timeout 1s"),

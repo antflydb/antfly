@@ -18,6 +18,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -53,11 +54,21 @@ beforeAll(() => {
     const selector = join(installation, "node_modules", "@antfly", "embedded");
     mkdirSync(selector, { recursive: true });
     execFileSync("tar", ["-xzf", join(root, archive), "-C", selector, "--strip-components=1"]);
-    symlinkSync(
-      realpathSync(join(packageDir, "node_modules", "koffi")),
-      join(installation, "node_modules", "koffi"),
-      "junction"
-    );
+    // Install the packed manifest's runtime dependencies using the existing
+    // locked workspace installation. Optional native packages below remain
+    // discovery fixtures; real runtime imports must resolve for both exports.
+    const manifest = JSON.parse(readFileSync(join(selector, "package.json"), "utf8")) as {
+      dependencies?: Record<string, string>;
+    };
+    for (const dependency of Object.keys(manifest.dependencies ?? {})) {
+      const destination = join(installation, "node_modules", dependency);
+      mkdirSync(dirname(destination), { recursive: true });
+      symlinkSync(
+        realpathSync(join(packageDir, "node_modules", dependency)),
+        destination,
+        "junction"
+      );
+    }
     for (const [platform, arch, library] of platforms) {
       const name = `@antfly/embedded-${platform}-${arch}`;
       const directory = join(installation, "node_modules", name);
