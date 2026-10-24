@@ -6338,7 +6338,9 @@ pub const DB = struct {
             // Status capture may borrow primary-store read epochs. Detach its
             // final cache only after capture, retaining all retired payloads
             // in backend ownership while accounting walks bounded CPU slices.
-            if (self.open_mode.allowsIndexWorkers() and @import("close_index_status.zig").Program.supportsOwnedAppend(backend)) {
+            const CloseStatus = @import("close_index_status.zig").Program;
+            const owns_wal = if (program.row_count == 0) CloseStatus.supportsOwnedSync(backend) else CloseStatus.supportsOwnedAppend(backend);
+            if (self.open_mode.allowsIndexWorkers() and owns_wal) {
                 try program.commitWithAdmission(backend, cache_io, original);
             } else try program.store_preflight.resumeWithAdmission(backend, cache_io, original);
         }
@@ -6451,7 +6453,7 @@ pub const DB = struct {
             self.persistCloseIndexStatus() catch |err| {
                 std.log.warn("index status snapshot persistence deferred during close err={s}", .{@errorName(err)});
             };
-            // The owned append already forced its WAL. Preserve deferred run
+            // The owned append or sync already forced its WAL. Preserve deferred run
             // finalization here while avoiding a second durability barrier.
             self.core.syncStore(!self.local_execution.close_index_status.owned_wal_durable) catch |err| {
                 std.log.warn("index status snapshot sync deferred during close err={s}", .{@errorName(err)});

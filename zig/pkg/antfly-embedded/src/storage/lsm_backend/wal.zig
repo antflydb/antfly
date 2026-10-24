@@ -454,6 +454,18 @@ pub fn CurrentStateSync(comptime Publication: type) type {
             self.publication = null;
         }
 
+        /// Terminal worker retirement borrows the original cleanup execution.
+        /// Rejected join/reentry retains the grant and its charge for retry.
+        pub fn retireWithAdmission(self: *Self, original: @import("../../common/read_admission.zig").Port) !void {
+            try original.checkpoint();
+            if (self.stage != .complete and self.stage != .failed) return error.ResourceBudgetExceeded;
+            std.debug.assert(self.pending == .none and self.publication == null);
+            if (self.resources) |*resources| {
+                try resources.retireWithAdmission(original);
+                self.resources = null;
+            }
+        }
+
         /// Mandatory quiesced retirement, never automatic cleanup after a
         /// rejected wait. Accepted physical work finishes before publication
         /// is released; the idle worker and descriptor are retired last.

@@ -111,7 +111,8 @@ const builtin = @import("builtin");
 // Final status owns prepaid capture, packed input and canonical WAL preparation.
 // Retirement cannot yield under its registry; SQL workspace preserves shared IO headroom.
 // Final status owns manifest admission, frozen append resources and retry-safe publication.
-pub const abi_version: u32 = 107;
+// Close retains tentative durability grants and empty-status sync through admitted retirement.
+pub const abi_version: u32 = 108;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

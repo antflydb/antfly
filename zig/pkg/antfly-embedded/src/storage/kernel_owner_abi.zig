@@ -53,7 +53,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Final status owns prepaid capture, packed input and canonical WAL preparation.
 // Retirement cannot yield under its registry; SQL workspace preserves shared IO headroom.
 // Final status owns manifest admission, frozen append resources and retry-safe publication.
-pub const abi_version: u32 = 167;
+// Close retains tentative durability grants and empty-status sync through admitted retirement.
+pub const abi_version: u32 = 168;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

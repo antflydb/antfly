@@ -2173,13 +2173,51 @@ pub const Backend = struct {
         return guard;
     }
 
+    /// Owns an idle tentative grant after a publication race or pre-dispatch
+    /// rejection. The backend, immutable record and its prepaid credit remain
+    /// alive until retry retires this owner or explicit physical destruction.
+    /// No admission borrow or payload is retained here.
+    pub const QuiescedDurabilityPreparation = struct {
+        resources: ?storage_io.DurabilityResources = null,
+        backend: ?*Backend = null,
+        record: ?[]const u8 = null,
+        failure: ?anyerror = null,
+
+        fn resumeRetirement(self: *@This(), backend: *Backend, record: ?[]const u8, original: read_admission.Port) !bool {
+            if (self.resources) |*resources| {
+                std.debug.assert(self.backend == backend);
+                std.debug.assert((self.record == null) == (record == null));
+                if (record) |bytes| std.debug.assert(self.record.?.ptr == bytes.ptr and self.record.?.len == bytes.len);
+                try resources.retireWithAdmission(original);
+                const failure = self.failure;
+                self.* = .{};
+                if (failure) |cause| return cause;
+                return true;
+            }
+            return false;
+        }
+
+        fn reject(self: *@This(), backend: *Backend, record: ?[]const u8, resources: storage_io.DurabilityResources, failure: ?anyerror, original: read_admission.Port) !void {
+            std.debug.assert(self.resources == null);
+            self.* = .{ .resources = resources, .backend = backend, .record = record, .failure = failure };
+            _ = try self.resumeRetirement(backend, record, original);
+        }
+
+        /// Explicit legacy fallback only; admitted rejection never calls this.
+        pub fn deinit(self: *@This()) void {
+            if (self.resources) |*resources| resources.deinit();
+            self.* = .{};
+        }
+    };
+
     pub const QuiescedWalSync = wal_mod.CurrentStateSync(WalOperationLock);
 
     /// The caller has fenced this backend's writers/maintenance and retains
     /// the backend through operation retirement. No backend mutex is held
     /// while publication or physical I/O is awaited. Legacy acquirers must
     /// not occupy every CPU slot needed for this cleanup execution's reentry.
-    pub fn tryBeginQuiescedWalSyncWithAdmission(self: *Backend, original: read_admission.Port) !?QuiescedWalSync {
+    pub fn tryBeginQuiescedWalSyncWithAdmission(self: *Backend, preparation: *QuiescedDurabilityPreparation, original: read_admission.Port) !?QuiescedWalSync {
+        if (try preparation.resumeRetirement(self, null, original)) return null;
         try original.checkpoint();
         if (!self.options.wal_enabled or self.root_dir == null or self.storage == null) return error.ExecutionWaitUnsupported;
         // Opening lock files or installing root state here would introduce
@@ -2187,27 +2225,29 @@ pub const Backend = struct {
         if (!self.storage.?.supportsNativePathLocks() or self.root_lock_state == null or self.wal_operation_lock_file == null)
             return error.ExecutionWaitUnsupported;
         var operation = try QuiescedWalSync.prepare(self.root_dir.?);
-        var resources = (try self.storage.?.tryPrepareDurabilityWithAdmission(original)) orelse return null;
+        // Avoid allocating a grant for an already-busy publication owner. The
+        // real acquisition below still handles a race after this probe.
+        var probe = (try self.tryAcquireWalOperationLockImpl(.exclusive, false)) orelse return null;
+        probe.release();
+        const resources = (try self.storage.?.tryPrepareDurabilityWithAdmission(original)) orelse return null;
         var publication = (self.tryAcquireWalOperationLockImpl(.exclusive, false) catch |cause| {
-            resources.deinit();
-            return cause;
+            try preparation.reject(self, null, resources, cause, original);
+            unreachable;
         }) orelse {
-            // The publication holder may need this descriptor. Never wait
-            // for publication while retaining even an idle tentative grant.
-            resources.deinit();
+            try preparation.reject(self, null, resources, null, original);
             return null;
         };
         operation.start(resources, publication, original) catch |cause| {
             publication.release();
-            resources.deinit();
-            return cause;
+            try preparation.reject(self, null, resources, cause, original);
+            unreachable;
         };
         return operation;
     }
 
-    pub fn beginQuiescedWalSyncWithAdmission(self: *Backend, io: std.Io, original: read_admission.Port) !QuiescedWalSync {
+    pub fn beginQuiescedWalSyncWithAdmission(self: *Backend, io: std.Io, preparation: *QuiescedDurabilityPreparation, original: read_admission.Port) !QuiescedWalSync {
         while (true) {
-            if (try self.tryBeginQuiescedWalSyncWithAdmission(original)) |operation| return operation;
+            if (try self.tryBeginQuiescedWalSyncWithAdmission(preparation, original)) |operation| return operation;
             // Both publication and tentative completion resources are gone
             // before relinquishing CPU and waiting under the original scope.
             try @import("../common/cleanup_wait.zig").waitForRetry(io, original);
@@ -2611,8 +2651,10 @@ pub const Backend = struct {
 
     /// A failed try/initial dispatch leaves Payload with the caller. Prepared
     /// append bytes and descriptor/worker credit precede publication acquisition;
-    /// a busy guard releases the entire tentative grant before waiting.
-    pub fn tryBeginQuiescedWalAppendWithAdmission(self: *Backend, record: []const u8, payload: anytype, original: read_admission.Port) !?QuiescedWalAppend(@TypeOf(payload)) {
+    /// a busy guard retires the tentative grant under the original execution
+    /// before waiting for publication. Rejection retains the preparation.
+    pub fn tryBeginQuiescedWalAppendWithAdmission(self: *Backend, preparation: *QuiescedDurabilityPreparation, record: []const u8, payload: anytype, original: read_admission.Port) !?QuiescedWalAppend(@TypeOf(payload)) {
+        if (try preparation.resumeRetirement(self, record, original)) return null;
         try original.checkpoint();
         if (self.options.backend.read_only) return error.ReadOnly;
         if (self.manifest_recovery_required) return error.RecoveryRequired;
@@ -2622,25 +2664,27 @@ pub const Backend = struct {
         const entries = try wal_mod.validateStateRecordWithAdmission(record, original);
         if (entries == 0) return error.ResourceBudgetExceeded;
         var operation = try QuiescedWalAppend(@TypeOf(payload)).prepare(self.root_dir.?, record.len, .{ .segment_bytes = self.options.wal_segment_bytes });
-        var resources = (try self.storage.?.tryPrepareAppendWithAdmission(record, original)) orelse return null;
+        var probe = (try self.tryAcquireWalOperationLockImpl(.exclusive, false)) orelse return null;
+        probe.release();
+        const resources = (try self.storage.?.tryPrepareAppendWithAdmission(record, original)) orelse return null;
         var guard = (self.tryAcquireWalOperationLockImpl(.exclusive, false) catch |cause| {
-            resources.deinit();
-            return cause;
+            try preparation.reject(self, record, resources, cause, original);
+            unreachable;
         }) orelse {
-            resources.deinit();
+            try preparation.reject(self, record, resources, null, original);
             return null;
         };
         operation.start(resources, .{ .backend = self, .guard = guard, .payload = payload, .entries = entries }, original) catch |cause| {
             guard.release();
-            resources.deinit();
-            return cause;
+            try preparation.reject(self, record, resources, cause, original);
+            unreachable;
         };
         return operation;
     }
 
-    pub fn beginQuiescedWalAppendWithAdmission(self: *Backend, io: std.Io, record: []const u8, payload: anytype, original: read_admission.Port) !QuiescedWalAppend(@TypeOf(payload)) {
+    pub fn beginQuiescedWalAppendWithAdmission(self: *Backend, io: std.Io, preparation: *QuiescedDurabilityPreparation, record: []const u8, payload: anytype, original: read_admission.Port) !QuiescedWalAppend(@TypeOf(payload)) {
         while (true) {
-            if (try self.tryBeginQuiescedWalAppendWithAdmission(record, payload, original)) |operation| return operation;
+            if (try self.tryBeginQuiescedWalAppendWithAdmission(preparation, record, payload, original)) |operation| return operation;
             try @import("../common/cleanup_wait.zig").waitForRetry(io, original);
         }
     }
@@ -29679,9 +29723,11 @@ test "controlled physical sync WAL compound acquisition drops tentative resource
         var control: Control = .{ .cleanup = &cleanup, .slots = &slots, .pool = &pool, .publication = &publication, .publication_live = &publication_live, .reserved = &reserved, .expected_fds = expected_fds, .mode = mode };
         const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.checkpoint, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
         const original = admission.Port.init(&payload);
-        try std.testing.expect(try backend.tryBeginQuiescedWalSyncWithAdmission(original) == null);
+        var durability_preparation: Backend.QuiescedDurabilityPreparation = .{};
+        defer durability_preparation.deinit();
+        try std.testing.expect(try backend.tryBeginQuiescedWalSyncWithAdmission(&durability_preparation, original) == null);
         try std.testing.expectEqual(expected_fds, pool.snapshotStats().fd_admitted_descriptors);
-        const first = backend.beginQuiescedWalSyncWithAdmission(std.testing.io, original);
+        const first = backend.beginQuiescedWalSyncWithAdmission(std.testing.io, &durability_preparation, original);
         var operation: Backend.QuiescedWalSync = undefined;
         if (mode == .success) operation = try first else {
             try std.testing.expectError(switch (mode) {
@@ -29692,7 +29738,7 @@ test "controlled physical sync WAL compound acquisition drops tentative resource
             }, first);
             if (mode == .end_failure) try cleanup.enter(.write);
             control.mode = .success;
-            operation = try backend.beginQuiescedWalSyncWithAdmission(std.testing.io, original);
+            operation = try backend.beginQuiescedWalSyncWithAdmission(std.testing.io, &durability_preparation, original);
         }
         defer {
             cleanup.finish();
@@ -29719,7 +29765,7 @@ test "controlled physical sync WAL compound acquisition drops tentative resource
         backend.mu.unlock();
         backend.closeWalOperationLockFile();
         const without_prepared_file = pool.snapshotStats().fd_admitted_descriptors;
-        try std.testing.expectError(error.ExecutionWaitUnsupported, backend.tryBeginQuiescedWalSyncWithAdmission(original));
+        try std.testing.expectError(error.ExecutionWaitUnsupported, backend.tryBeginQuiescedWalSyncWithAdmission(&durability_preparation, original));
         try std.testing.expect(backend.wal_operation_lock_file == null);
         try std.testing.expectEqual(without_prepared_file, pool.snapshotStats().fd_admitted_descriptors);
         try backend.prepareWalOperationLockFile();
@@ -29761,7 +29807,9 @@ test "controlled physical sync WAL retirement keeps peer publication blocked unt
         storage_io.NativeSyncTestControl.release.store(true, .release);
         storage_io.NativeSyncTestControl.pause.store(false, .release);
     }
-    var operation = try backend.beginQuiescedWalSyncWithAdmission(std.testing.io, original);
+    var durability_preparation: Backend.QuiescedDurabilityPreparation = .{};
+    defer durability_preparation.deinit();
+    var operation = try backend.beginQuiescedWalSyncWithAdmission(std.testing.io, &durability_preparation, original);
     var transferred = false;
     defer if (!transferred) {
         storage_io.NativeSyncTestControl.release.store(true, .release);
@@ -30263,17 +30311,19 @@ test "controlled physical sync backend WAL append owns actual publication and a 
         var held = try backend.acquireWalOperationLock(.exclusive);
         var held_live = true;
         defer if (held_live) held.release();
-        try std.testing.expect(try backend.tryBeginQuiescedWalAppendWithAdmission(record, publication, original) == null);
+        var durability_preparation: Backend.QuiescedDurabilityPreparation = .{};
+        defer durability_preparation.deinit();
+        try std.testing.expect(try backend.tryBeginQuiescedWalAppendWithAdmission(&durability_preparation, record, publication, original) == null);
         try std.testing.expectEqual(baseline_fds, pool.snapshotStats().fd_admitted_descriptors);
         try std.testing.expect(!published and releases == 0);
-        try std.testing.expectError(error.CorruptLsmWal, backend.tryBeginQuiescedWalAppendWithAdmission("bad", publication, original));
+        try std.testing.expectError(error.CorruptLsmWal, backend.tryBeginQuiescedWalAppendWithAdmission(&durability_preparation, "bad", publication, original));
         held.release();
         held_live = false;
         const before_records = backend.write_stats.wal_append_records;
         const before_entries = backend.write_stats.wal_append_entries;
         if (mode == .partial_failure) storage_io.NativeSyncTestControl.append_failure_after.store(3, .release);
         defer storage_io.NativeSyncTestControl.append_failure_after.store(std.math.maxInt(usize), .release);
-        var operation = try backend.beginQuiescedWalAppendWithAdmission(std.testing.io, record, publication, original);
+        var operation = try backend.beginQuiescedWalAppendWithAdmission(std.testing.io, &durability_preparation, record, publication, original);
         var live = true;
         defer if (live) operation.deinit();
         try std.testing.expect(try backend.tryAcquireWalOperationLock(.shared) == null);
@@ -30301,7 +30351,7 @@ test "controlled physical sync backend WAL append owns actual publication and a 
             }
         }
         try std.testing.expectEqual(mode != .publish, backend.manifest_recovery_required);
-        if (mode != .publish) try std.testing.expectError(error.RecoveryRequired, backend.tryBeginQuiescedWalAppendWithAdmission(record, publication, original));
+        if (mode != .publish) try std.testing.expectError(error.RecoveryRequired, backend.tryBeginQuiescedWalAppendWithAdmission(&durability_preparation, record, publication, original));
         var shared = (try backend.tryAcquireWalOperationLock(.shared)) orelse return error.TestUnexpectedResult;
         shared.release();
         try preparation.retireWithAdmission(original);
@@ -30379,4 +30429,127 @@ test "controlled physical sync sorted manifest planning resumes every rejection 
             }
         }
     }
+}
+
+test "controlled physical sync tentative WAL grants survive publication races and rejected retirement" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Hook = struct {
+        var active: *@This() = undefined;
+        backend: *Backend,
+        storage: storage_io.Storage,
+        publication: ?Backend.WalOperationLock = null,
+        race: bool,
+        reject_dispatch: bool = false,
+        reject_end: bool = true,
+        reject_begin: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn prepared(grant: ?storage_io.DurabilityResources) !?storage_io.DurabilityResources {
+            if (grant != null) {
+                if (active.race) active.publication = try active.backend.acquireWalOperationLock(.exclusive) else active.reject_dispatch = true;
+            }
+            return grant;
+        }
+        fn sync(raw: *anyopaque, original: read_admission.Port) !?storage_io.DurabilityResources {
+            return prepared(try active.storage.vtable.try_prepare_durability_with_admission.?(raw, original));
+        }
+        fn append(raw: *anyopaque, bytes: []const u8, original: read_admission.Port) !?storage_io.DurabilityResources {
+            return prepared(try active.storage.vtable.try_prepare_append_with_admission.?(raw, bytes, original));
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject_dispatch) {
+                self.reject_dispatch = false;
+                return error.FileNotFound;
+            }
+        }
+        fn lifetime(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+            if (self.reject_begin) return error.Canceled;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            if (self.reject_end) return error.Canceled;
+        }
+    };
+    const Payload = struct {
+        pub fn publish(_: *@This(), _: wal_mod.AppendResult) void {
+            unreachable;
+        }
+        pub fn requireRecovery(_: *@This()) void {
+            unreachable;
+        }
+        pub fn release(_: *@This()) void {
+            unreachable;
+        }
+    };
+    for ([_]bool{ false, true }) |append| for ([_]bool{ false, true }) |race| for ([_]bool{ false, true }) |reject_begin| {
+        const a = std.testing.allocator;
+        var pool = storage_io.NativeStoragePool.initWithCapacityForTest(a, 16);
+        defer pool.deinit();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer a.free(root);
+        var backend: Backend = undefined;
+        try backend.openInto(a, root, .{ .native_storage_pool = &pool });
+        defer backend.abandonAfterCrash();
+        var hook: Hook = .{ .backend = &backend, .storage = backend.storage.?, .race = race, .reject_begin = reject_begin };
+        Hook.active = &hook;
+        defer if (hook.publication) |*guard| guard.release();
+        const payload: read_admission.Payload = .{ .ptr = &hook, .vtable = &.{ .checkpoint = Hook.check, .check_lifetime = Hook.lifetime, .deadline_ns = Hook.deadline }, .execution_wait = .{ .ptr = &hook, .begin = Hook.begin, .end = Hook.end } };
+        const original = read_admission.Port.init(&payload);
+        var source: State = .{};
+        defer source.deinit(a);
+        try source.upsert(a, .{ .name = "docs" }, "key", "value", false);
+        const record = try wal_mod.prepareStateRecordWithAdmission(a, &source, original);
+        defer a.free(record);
+        var vtable = hook.storage.vtable.*;
+        vtable.try_prepare_durability_with_admission = Hook.sync;
+        vtable.try_prepare_append_with_admission = Hook.append;
+        backend.storage.?.vtable = &vtable;
+        defer backend.storage = hook.storage;
+        var preparation: Backend.QuiescedDurabilityPreparation = .{};
+        defer preparation.deinit();
+        const fds = pool.snapshotStats().fd_admitted_descriptors;
+        const reads = storage_io.NativeSyncTestControl.reads.load(.acquire);
+        const appends = storage_io.NativeSyncTestControl.appends.load(.acquire);
+        if (append) {
+            try std.testing.expectError(error.Canceled, backend.tryBeginQuiescedWalAppendWithAdmission(&preparation, record, Payload{}, original));
+        } else {
+            try std.testing.expectError(error.Canceled, backend.tryBeginQuiescedWalSyncWithAdmission(&preparation, original));
+        }
+        // Rejected join entry or return still owns the descriptor and frozen
+        // append bytes. Retry retires that same grant without replay.
+        try std.testing.expect(preparation.resources != null);
+        try std.testing.expectEqual(fds + 1, pool.snapshotStats().fd_admitted_descriptors);
+        try std.testing.expectEqual(@as(usize, 1), hook.begins);
+        try std.testing.expectEqual(@as(usize, if (reject_begin) 0 else 1), hook.ends);
+        hook.reject_end = false;
+        hook.reject_begin = false;
+        // Retirement precedes fresh backend policy checks, so a changed
+        // policy cannot strand a tentative grant or replace its saved error.
+        backend.manifest_recovery_required = true;
+        if (append) {
+            const result = backend.tryBeginQuiescedWalAppendWithAdmission(&preparation, record, Payload{}, original);
+            if (race) try std.testing.expect(try result == null) else try std.testing.expectError(error.FileNotFound, result);
+        } else {
+            const result = backend.tryBeginQuiescedWalSyncWithAdmission(&preparation, original);
+            if (race) try std.testing.expect(try result == null) else try std.testing.expectError(error.FileNotFound, result);
+        }
+        try std.testing.expect(preparation.resources == null);
+        try std.testing.expectEqual(fds, pool.snapshotStats().fd_admitted_descriptors);
+        try std.testing.expectEqual(@as(usize, if (reject_begin) 2 else 1), hook.begins);
+        backend.manifest_recovery_required = false;
+        try std.testing.expectEqual(reads, storage_io.NativeSyncTestControl.reads.load(.acquire));
+        try std.testing.expectEqual(appends, storage_io.NativeSyncTestControl.appends.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), backend.write_stats.wal_append_records);
+        try std.testing.expect(!backend.manifest_recovery_required);
+    };
 }

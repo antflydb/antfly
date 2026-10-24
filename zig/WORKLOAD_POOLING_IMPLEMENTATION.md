@@ -25257,3 +25257,51 @@ Incremental metadata/physical teardown, final admitted backend flush/retirement,
 completion/history relief under overload, remaining provider/legacy-generation
 adoption, compound tentative-grant retirement and default-gate evidence still
 require work. Full GNU qualification remains waived; the full goal stays active.
+
+### Tentative WAL grants and empty-status close durability
+
+Compound WAL acquisition now requires a caller-owned preparation continuation.
+A nonblocking publication probe avoids constructing a grant for a lock already
+held. If publication races after resource acquisition, or initial dispatch is
+rejected, the continuation retains the idle worker, descriptor and frozen bytes
+through retirement on the original cleanup execution. A rejected join or CPU
+return cannot trigger synchronous destruction or refund the retained charge.
+Retry retires that same grant before validating a new attempt, preserves an
+initial dispatch error across a later retirement rejection, and never waits for
+publication while retaining tentative resources. Explicit physical abandonment
+joins the retained owner before legacy persistence or backend destruction.
+
+Final close with no captured index-status rows now owns its WAL read/barriers
+instead of relying on the later legacy sync. A prepaid fixed grant covers its
+operation header; native descriptor and executor heap/stack admission remain
+shared.
+Its durable receipt precedes fallible terminal resource retirement. Retry after
+successful sync cannot dispatch another read or barrier. The DB still runs its
+existing deferred run finalization. Sync and append capabilities are selected
+independently, so empty capture needs neither mutable-successor publication nor
+append support. Nonempty captures retain their existing
+manifest/successor/frozen-record credits through the new tentative continuation.
+Native ABI 108 and storage-owner ABI 168 fence this retained close-state change.
+
+Qualification receipts `owned-close-sync-v1` and `owned-close-sync-v2` in the
+cumulative integration directory both passed with unchanged native inputs. The
+final run passed 73/73 build steps, 37 physical-IO cases, 32 embedded close cases,
+18 host/ABI cases and 45/1/8 error-identity cases. Formatting and whitespace checks
+passed; logs, input hashes and changed-source snapshots are preserved.
+
+The new physical test forces publication races and initial dispatch rejection
+for both sync and append, rejects either join entry or reentry, then verifies
+descriptor retention, original error identity and no IO across all eight
+scenarios. A changed backend recovery policy cannot strand retained resources.
+The empty-capture test rejects before observation, after durability and after
+worker join for cancellation, deadline and FileNotFound errors. It checks memory
+refusal before native acquisition, one read/two barriers with no replay, retained
+credit through rejection, and a durable reopen without legacy flush/sync. Sync
+and append capability selection is qualified independently.
+
+This is a prerequisite to final admitted backend flush and destruction. Accepted
+writes still need a funded completion path through deferred run work and bounded
+physical retirement; the existing backend's early accounting release is not
+proof of that funding. Completion/history relief under overload, remaining
+provider/legacy-generation adoption and default-gate evidence also remain open.
+Full GNU qualification remains waived and the full design is incomplete.

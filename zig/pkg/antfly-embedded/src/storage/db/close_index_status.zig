@@ -60,6 +60,8 @@ pub const Program = struct {
     manifest_preparation: Backend.QuiescedCommitPreparation = .{},
     manifest_ticket: ?Backend.CommitAdmission = null,
     append_credit: ?*Credit = null,
+    durability_preparation: Backend.QuiescedDurabilityPreparation = .{},
+    sync_operation: ?Backend.QuiescedWalSync = null,
     operation: ?Backend.QuiescedWalAppend(Publication) = null,
     status_persisted: bool = false,
     owned_wal_durable: bool = false,
@@ -304,6 +306,14 @@ pub const Program = struct {
             (backend.options.run_partition_key == null or backend.options.run_partition_key_with_admission != null);
     }
 
+    pub fn supportsOwnedSync(backend: *const Backend) bool {
+        const storage = backend.storage orelse return false;
+        return backend.root_dir != null and backend.options.wal_enabled and
+            !backend.options.backend.read_only and storage.supportsNativePathLocks() and
+            storage.vtable.append_resource_bytes != null and
+            storage.vtable.try_prepare_durability_with_admission != null;
+    }
+
     /// The caller permanently fences serving, producers and unrelated backend
     /// mutation before entry. Every continuation and accepted physical phase
     /// remains DB-owned across rejection; only the original finite execution
@@ -314,9 +324,29 @@ pub const Program = struct {
         if (self.commit_complete) return;
         try self.store_preflight.resumeWithAdmission(backend, io, original);
         if (self.row_count == 0) {
-            self.status_persisted = true;
+            if (!self.owned_wal_durable) {
+                if (self.sync_operation == null) {
+                    if (self.append_credit == null) if (backend.options.resource_manager orelse self.capture_manager) |manager| {
+                        const bytes = try backend.storage.?.appendResourceBytes(0);
+                        const bound = std.math.add(u64, bytes, @sizeOf(Credit)) catch return error.ResourceBudgetExceeded;
+                        self.append_credit = try Credit.create(manager, .lsm_wal_write_working_set, bound, original);
+                    };
+                    self.sync_operation = try backend.beginQuiescedWalSyncWithAdmission(io, &self.durability_preparation, original);
+                }
+                _ = try self.sync_operation.?.waitWithAdmission(original);
+                // Install the durability receipt before fallible retirement.
+                self.owned_wal_durable = true;
+                self.status_persisted = true;
+            }
+            if (self.sync_operation) |*operation| {
+                try operation.retireWithAdmission(original);
+                operation.deinit();
+                self.sync_operation = null;
+            }
+            if (self.append_credit) |credit| credit.retirement.publish();
+            self.append_credit = null;
             self.commit_complete = true;
-            return; // No append barrier: legacy final sync is still required.
+            return;
         }
         if (!self.status_persisted) {
             if (self.operation == null) {
@@ -329,7 +359,7 @@ pub const Program = struct {
                     const bound = std.math.add(u64, bytes, @sizeOf(Credit)) catch return error.ResourceBudgetExceeded;
                     self.append_credit = try Credit.create(manager, .lsm_wal_write_working_set, bound, original);
                 };
-                if (self.operation == null) self.operation = try backend.beginQuiescedWalAppendWithAdmission(io, self.wal_record.?, Publication{ .program = self, .backend = backend }, original);
+                if (self.operation == null) self.operation = try backend.beginQuiescedWalAppendWithAdmission(io, &self.durability_preparation, self.wal_record.?, Publication{ .program = self, .backend = backend }, original);
             }
             _ = try self.operation.?.publishWithAdmission(original);
         }
@@ -375,6 +405,9 @@ pub const Program = struct {
     /// before legacy persistence can attempt the same filesystem lock. A
     /// possibly mutated unpublished WAL poisons the backend for reopen/recovery.
     pub fn abandonWriteOwner(self: *Program) void {
+        self.durability_preparation.deinit();
+        if (self.sync_operation) |*operation| operation.deinit();
+        self.sync_operation = null;
         if (self.operation) |*operation| operation.deinit();
         self.operation = null;
         if (self.append_credit) |credit| credit.retirement.publish();
@@ -733,7 +766,7 @@ const CommitControl = struct {
     rejected: bool = false,
     fn check(raw: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        if (!self.rejected and ((self.mode == .before_append and self.program.operation != null and !self.program.status_persisted) or
+        if (!self.rejected and ((self.mode == .before_append and (self.program.operation != null or self.program.sync_operation != null) and !self.program.status_persisted) or
             (self.mode == .after_publish and self.program.status_persisted)))
         {
             self.rejected = true;
@@ -876,4 +909,108 @@ test "controlled close status owning append denies manifest and frozen capacity 
             try std.testing.expectEqual(fds, pool.snapshotStats().fd_admitted_descriptors);
         }
     }
+}
+
+test "controlled close status empty capture owns WAL sync and retains retirement receipt without replay" {
+    if (comptime @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+    const io_mod = @import("../lsm_backend/storage_io.zig");
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.FileNotFound }) |failure| {
+        for ([_]@FieldType(CommitControl, "mode"){ .before_append, .after_publish, .join_end }) |mode| {
+            const a = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+            defer a.free(root);
+            var pool = io_mod.NativeStoragePool.initWithCapacityForTest(a, 16);
+            defer pool.deinit();
+            var manager = resources.ResourceManager.init(.{ .identity_allocator = a });
+            defer manager.deinit(a);
+            var backend: Backend = undefined;
+            try backend.openInto(a, root, .{ .native_storage_pool = &pool, .resource_manager = &manager });
+            var live = true;
+            defer if (live) backend.abandonAfterCrash();
+            {
+                var store = try backend.runtimeStore(a, .{ .name = "docs" });
+                defer store.deinit();
+                var write = try store.beginWrite();
+                errdefer write.abort();
+                try write.put("key", "value");
+                try write.commit();
+            }
+            var program: Program = .{};
+            defer program.deinit(a);
+            var control: CommitControl = .{ .program = &program, .failure = failure };
+            const payload = control.payload();
+            const original = admission.Port.init(&payload);
+            try program.reserveCaptureWithAdmission(&manager, original);
+            program.complete = true;
+            const fds = pool.snapshotStats().fd_admitted_descriptors;
+            const reads_before = io_mod.NativeSyncTestControl.reads.load(.acquire);
+            const syncs_before = io_mod.NativeSyncTestControl.calls.load(.acquire);
+            const appends_before = io_mod.NativeSyncTestControl.appends.load(.acquire);
+            // Refuse memory before native grant/dispatch, even for zero rows.
+            manager.slices[@backingInt(resources.Slice.lsm_wal_write_working_set)].budget.hard_limit_bytes = 1;
+            try std.testing.expectError(error.ResourceBudgetExceeded, program.commitWithAdmission(&backend, std.testing.io, original));
+            try std.testing.expect(program.sync_operation == null and program.append_credit == null);
+            try std.testing.expectEqual(fds, pool.snapshotStats().fd_admitted_descriptors);
+            try std.testing.expectEqual(reads_before, io_mod.NativeSyncTestControl.reads.load(.acquire));
+            manager.slices[@backingInt(resources.Slice.lsm_wal_write_working_set)].budget.hard_limit_bytes = 0;
+            control.mode = mode;
+            try std.testing.expectError(failure, program.commitWithAdmission(&backend, std.testing.io, original));
+            try std.testing.expect(control.rejected and program.sync_operation != null);
+            try std.testing.expectEqual(mode != .before_append, program.owned_wal_durable);
+            try std.testing.expect(program.append_credit != null);
+            try std.testing.expect(manager.sliceStats(.lsm_wal_write_working_set).used_bytes != 0);
+            try std.testing.expectEqual(fds + 1, pool.snapshotStats().fd_admitted_descriptors);
+            try program.commitWithAdmission(&backend, std.testing.io, original);
+            try std.testing.expect(program.commit_complete and program.owned_wal_durable and program.status_persisted);
+            try std.testing.expect(program.sync_operation == null and program.append_credit == null);
+            try std.testing.expectEqual(fds, pool.snapshotStats().fd_admitted_descriptors);
+            try std.testing.expectEqual(reads_before + 1, io_mod.NativeSyncTestControl.reads.load(.acquire));
+            try std.testing.expectEqual(syncs_before + 2, io_mod.NativeSyncTestControl.calls.load(.acquire));
+            try std.testing.expectEqual(appends_before, io_mod.NativeSyncTestControl.appends.load(.acquire));
+            // A completed receipt does not dispatch another read or barrier.
+            const reads = io_mod.NativeSyncTestControl.reads.load(.acquire);
+            const syncs = io_mod.NativeSyncTestControl.calls.load(.acquire);
+            try program.commitWithAdmission(&backend, std.testing.io, original);
+            try std.testing.expectEqual(reads, io_mod.NativeSyncTestControl.reads.load(.acquire));
+            try std.testing.expectEqual(syncs, io_mod.NativeSyncTestControl.calls.load(.acquire));
+            program.deinit(a);
+            backend.abandonAfterCrash();
+            live = false;
+            while (manager.cleanupPending()) {
+                _ = try manager.drainPayloadRetirementWithAdmission(original);
+                try manager.drainConstructionCleanupWithAdmission(original);
+            }
+            try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_wal_write_working_set).used_bytes);
+            try backend.openInto(a, root, .{ .native_storage_pool = &pool, .resource_manager = &manager });
+            live = true;
+            var transaction = try backend.beginRead();
+            defer transaction.abort();
+            try std.testing.expectEqualStrings("value", try transaction.get(.{ .name = "docs" }, "key"));
+            try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+        }
+    }
+}
+
+test "controlled close status selects sync and append capabilities independently" {
+    if (comptime @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+    var backend: Backend = undefined;
+    try backend.openInto(a, root, .{});
+    defer backend.abandonAfterCrash();
+    const storage = backend.storage.?;
+    var vtable = storage.vtable.*;
+    backend.storage.?.vtable = &vtable;
+    defer backend.storage = storage;
+    try std.testing.expect(Program.supportsOwnedAppend(&backend) and Program.supportsOwnedSync(&backend));
+    vtable.try_prepare_durability_with_admission = null;
+    try std.testing.expect(Program.supportsOwnedAppend(&backend) and !Program.supportsOwnedSync(&backend));
+    vtable = storage.vtable.*;
+    vtable.try_prepare_append_with_admission = null;
+    try std.testing.expect(!Program.supportsOwnedAppend(&backend) and Program.supportsOwnedSync(&backend));
 }
