@@ -23,6 +23,7 @@
     "go/pkg/genkit",
     "go/pkg/memoryaf",
     "go/pkg/sdk",
+    "go/pkg/sources",
     "scripts",
     "tools",
     "specs",
