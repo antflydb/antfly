@@ -17,6 +17,7 @@ package sources
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -149,6 +150,7 @@ func (r *Runner) Sync(ctx context.Context) error {
 		if prior, ok := old[source.ID]; ok && prior.Table == source.Table {
 			binding.Status = prior.Status
 			binding.ValidUntil = prior.ValidUntil
+			binding.PublishedRevision = prior.PublishedRevision
 		}
 		catalog.Sources = append(catalog.Sources, binding)
 	}
@@ -171,6 +173,7 @@ func (r *Runner) Sync(ctx context.Context) error {
 	}
 	for i, source := range r.Profile.Sources {
 		catalog.Sources[i].Status = "syncing"
+		catalog.Sources[i].PublishedRevision = ""
 		catalog.Sources[i].ValidUntil = nil
 		if err := writeJSON(r.CatalogPath, catalog, 32<<20); err != nil {
 			return err
@@ -189,6 +192,9 @@ func (r *Runner) Sync(ctx context.Context) error {
 			ttl = 900
 		}
 		until := started + int64(ttl)
+		// Each successful publication gets a new fence even for an unchanged inventory.
+		revision += ":" + rand.Text()
+		catalog.Sources[i].PublishedRevision = revision
 		catalog.Sources[i].Status = "searchable"
 		catalog.Sources[i].ValidUntil = &until
 		if err := store.Publish(ctx, NewCatalogRecord(catalog.Sources[i], connection.Provider, revision, *source.Permissions)); err != nil {

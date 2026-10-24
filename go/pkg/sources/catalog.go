@@ -27,14 +27,15 @@ type Catalog struct {
 	Principals []string  `json:"principals"`
 }
 type Binding struct {
-	ID            string          `json:"id"`
-	Alias         string          `json:"alias"`
-	Table         string          `json:"table"`
-	DocumentField string          `json:"document_field"`
-	Filter        json.RawMessage `json:"filter"`
-	Status        string          `json:"status"`
-	AccessID      string          `json:"access_id,omitempty"`
-	ValidUntil    *int64          `json:"valid_until,omitempty"`
+	PublishedRevision string          `json:"published_revision,omitempty"`
+	ID                string          `json:"id"`
+	Alias             string          `json:"alias"`
+	Table             string          `json:"table"`
+	DocumentField     string          `json:"document_field"`
+	Filter            json.RawMessage `json:"filter"`
+	Status            string          `json:"status"`
+	AccessID          string          `json:"access_id,omitempty"`
+	ValidUntil        *int64          `json:"valid_until,omitempty"`
 }
 
 func SourceFilter(id string) json.RawMessage {

@@ -21,7 +21,7 @@ const Limits = @import("budget.zig").Limits;
 const A = std.mem.Allocator;
 const Seen = std.AutoHashMap([32]u8, void);
 pub const CandidateIndex = struct { version: u32, field: []const u8, version_field: []const u8 = "grep_trigrams_version" };
-pub const Table = struct { table: ?[]const u8 = null, source_id: ?[]const u8 = null, source_filter: ?std.json.Value = null, valid_until: ?i64 = null, access_id: ?[]const u8 = null, status: ?[]const u8 = null, name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", candidate_index: ?CandidateIndex = null };
+pub const Table = struct { published_revision: ?[]const u8 = null, table: ?[]const u8 = null, source_id: ?[]const u8 = null, source_filter: ?std.json.Value = null, valid_until: ?i64 = null, access_id: ?[]const u8 = null, status: ?[]const u8 = null, name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", candidate_index: ?CandidateIndex = null };
 pub const ValueVerification = struct {
     allow_scan: bool = true,
     max_documents: u64 = 100_000,
@@ -148,7 +148,7 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
     const user_filter: ?std.json.Value = if (table.source_filter) |source_filter| (if (extra_filter) |extra| try std.json.parseFromSliceLeaky(std.json.Value, filter_arena, try std.json.Stringify.valueAlloc(filter_arena, .{ .conjuncts = .{ source_filter, extra } }, .{}), .{}) else source_filter) else extra_filter;
     const text_query = try contentQuery(filter_arena, search, table);
     const filter = try candidateFilter(filter_arena, search, table, user_filter);
-    var fetcher = Fetch{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .access_id = table.access_id, .source_id = table.source_id, .valid_until = table.valid_until, .document_field = table.document_field, .filter = filter, .text_query = text_query, .http = http, .fields = try projectionFields(filter_arena, search.options, table.document_field) };
+    var fetcher = Fetch{ .table = table, .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .access_id = table.access_id, .source_id = table.source_id, .valid_until = table.valid_until, .document_field = table.document_field, .filter = filter, .text_query = text_query, .http = http, .fields = try projectionFields(filter_arena, search.options, table.document_field) };
     defer search.summary.index_requests += fetcher.summary.index_requests;
     // Finite decision budgets preserve foreground order: speculative page
     // requests must not consume the budget reserved by the user for evidence.
@@ -551,7 +551,7 @@ fn prefetchAssets(search: anytype, http: *httpx.Client, config: Config, table: T
     try fields.append(a, try std.fmt.allocPrint(a, "{s}.permissions", .{table.document_field}));
     try fields.appendSlice(a, shape.items);
     const encoded = try std.json.Stringify.valueAlloc(a, .{ .bool = .{ .filter = .{ .ids = ids.items } } }, .{});
-    var fetch: Fetch = .{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .access_id = table.access_id, .source_id = table.source_id, .valid_until = table.valid_until, .document_field = table.document_field, .filter = filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}), .http = http, .fields = fields.items, .ordered = false };
+    var fetch: Fetch = .{ .table = table, .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .access_id = table.access_id, .source_id = table.source_id, .valid_until = table.valid_until, .document_field = table.document_field, .filter = filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}), .http = http, .fields = fields.items, .ordered = false };
     defer search.summary.index_requests += fetch.summary.index_requests;
     const page = fetch.load(.{ .cursor = null, .snapshot = null, .page_size = ids.items.len }) catch |err| switch (err) {
         error.ResponseTooLarge, error.IndexPageMemoryExceeded, error.IndexProjectionTooLarge => return null,
@@ -580,6 +580,7 @@ const Page = struct {
 /// One demand-driven producer, one outstanding page, no corpus accumulation.
 /// Continuation storage outlives each outstanding request; pages own their JSON.
 const Fetch = struct {
+    table: Table,
     valid_until: ?i64 = null,
     source_id: ?[]const u8 = null,
     access_id: ?[]const u8 = null,
@@ -778,6 +779,12 @@ const Fetch = struct {
                     attempt += 1;
                     continue;
                 }
+                if (request.snapshot == null and self.options.sourced()) {
+                    const result = envelope.array.items[0];
+                    const pinned = try document.string(result, "remote_snapshot");
+                    if (result_status != 200 or pinned.len == 0) return error.InvalidIndexResponse;
+                    try @import("catalog.zig").validatePublication(a, self.io, self.options, self.config.endpoint, self.table);
+                }
                 page.response = response;
                 transferred = true;
                 break :retry decoded;
@@ -889,7 +896,7 @@ fn projectionFields(a: A, o: *const @import("options.zig").Options, field: []con
 // Unused transport fields remain undefined: pre-cancelled workers must never
 // touch transport, allocator or request storage.
 fn canceledFixture(limits: *Limits) Fetch {
-    return .{ .a = std.testing.allocator, .io = std.testing.io, .options = undefined, .limits = limits, .config = undefined, .url = undefined, .document_field = undefined, .filter = null, .fields = &.{}, .http = undefined };
+    return .{ .table = undefined, .a = std.testing.allocator, .io = std.testing.io, .options = undefined, .limits = limits, .config = undefined, .url = undefined, .document_field = undefined, .filter = null, .fields = &.{}, .http = undefined };
 }
 test "prefetch cancellation before dequeue publishes terminal completion" {
     var limits: Limits = .{};
@@ -1008,7 +1015,7 @@ fn AssetResolver(comptime SearchType: type) type {
             }
             if (fields.items.len == 2) return;
             const ids = try std.json.Stringify.valueAlloc(a, .{ .bool = .{ .filter = .{ .ids = .{self.id} } } }, .{});
-            var fetch: Fetch = .{ .a = self.search.a, .io = self.search.io, .options = self.search.options, .limits = self.search.shared_limits orelse &self.search.limits, .config = self.config, .url = self.url, .access_id = self.table.access_id, .source_id = self.table.source_id, .valid_until = self.table.valid_until, .document_field = self.table.document_field, .filter = self.filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, ids, .{}), .http = self.http, .fields = fields.items, .ordered = false };
+            var fetch: Fetch = .{ .table = self.table, .a = self.search.a, .io = self.search.io, .options = self.search.options, .limits = self.search.shared_limits orelse &self.search.limits, .config = self.config, .url = self.url, .access_id = self.table.access_id, .source_id = self.table.source_id, .valid_until = self.table.valid_until, .document_field = self.table.document_field, .filter = self.filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, ids, .{}), .http = self.http, .fields = fields.items, .ordered = false };
             defer self.search.summary.index_requests += fetch.summary.index_requests;
             // Point reads deliberately omit ordering/cursors. They reauthorize
             // current rows without creating a durable pagination snapshot.

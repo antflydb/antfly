@@ -118,6 +118,11 @@ func (f *publicationFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.selectedHeaders = append(f.selectedHeaders, r.Header.Get("X-Antfly-Source-ID"))
 	selected := []string{}
 	if q, ok := body["query"].(map[string]any); ok {
+		if conjuncts, ok := q["conjuncts"].([]any); ok && len(conjuncts) == 2 {
+			if term, ok := conjuncts[1].(map[string]any); ok && term["field"] == "source.id" {
+				selected = append(selected, term["equals"].(string))
+			}
+		}
 		if ids, ok := q["ids"].([]any); ok {
 			for _, id := range ids {
 				selected = append(selected, id.(string))
@@ -324,5 +329,24 @@ func TestDeletionReadinessWaitsForFreshSnapshot(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("expected a new snapshot after stale deletion, got %d queries", calls)
+	}
+}
+
+func TestRunnerUnchangedInventoryGetsNewPublicationFence(t *testing.T) {
+	runner, _, _ := runnerFixture(t)
+	var previous string
+	for range 2 {
+		if err := runner.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		var catalog Catalog
+		if err := loadJSON(runner.CatalogPath, &catalog, 32<<20); err != nil {
+			t.Fatal(err)
+		}
+		revision := catalog.Sources[0].PublishedRevision
+		if revision == "" || revision == previous {
+			t.Fatal("publication reused its fence")
+		}
+		previous = revision
 	}
 }

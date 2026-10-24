@@ -127,8 +127,8 @@ func TestNativeCatalogPaginationIsCompleteAndSnapshotBound(t *testing.T) {
 				if err != nil || !strings.Contains(string(output), "retry budget") {
 					t.Fatalf("complete traversal: %v: %s", err, output)
 				}
-				if catalogQueries.Load() != 2 {
-					t.Fatalf("expected 2 catalog pages, got %d", catalogQueries.Load())
+				if catalogQueries.Load() != 3 {
+					t.Fatalf("expected 2 discovery pages plus a publication check, got %d", catalogQueries.Load())
 				}
 			} else {
 				if err == nil || contentQueries.Load() != 0 {

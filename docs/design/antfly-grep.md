@@ -317,12 +317,23 @@ no credentials, provider selection/configuration, session readers or job checkpo
 
 The shared catalog writer verifies a snapshot-visible `syncing` record before
 content mutation and publishes `searchable` only after content and reconciliation
-are query-visible. There is no cross-table transaction: interruption leaves a
+are query-visible. Each standalone publication has a unique `published_revision`
+fence, also included in file-export bindings. After acquiring its first content
+snapshot, a self-hosted reader re-reads the current binding and requires the same
+searchable publication and unexpired lease before consuming any rows. A sync
+that starts before the snapshot therefore fails closed; a later sync can safely
+coexist with continuations on the already pinned snapshot. Cloud additionally
+checks current policy on each request. There is no cross-table transaction: interruption leaves a
 non-searchable record or a bounded prior lease, and retry repairs publication.
 The ingestion runtime owns catalog writes. Server authentication and row policy
 control catalog visibility as well as content; sharing metadata is descriptive,
 not a grant. In Cloud, current connection/sharing/table policy overrides retained
-catalog rows and snapshots, and non-admin catalog mutations are blocked.
+catalog rows and snapshots, and non-admin catalog mutations are blocked. The Cloud gateway rejects
+row-filtered lookups, scans, graph and artifact routes whose contracts cannot
+consume the injected security filter; those readers must use supported query
+routes. Drive Docs/Slides exports have unknown lengths: staging enforces each
+export's byte ceiling and charges actual bytes atomically with its checkpoint
+against the run budget, preserving the charge across retries.
 
 `antfly-grep --source-endpoint URL --source NAME` reads the catalog through normal
 table queries with bounded snapshot pagination. `--source-table` selects a custom

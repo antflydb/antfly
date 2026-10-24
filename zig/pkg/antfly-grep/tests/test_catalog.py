@@ -38,6 +38,7 @@ class CatalogTests(unittest.TestCase):
         self.mode = "complete"
         self.pages = []
         self.content_requests = []
+        self.file_catalog = None
         self.records = []
         for i in range(70):
             identity = str(uuid.UUID(int=i + 1))
@@ -89,9 +90,12 @@ class CatalogTests(unittest.TestCase):
                         self.reply(503, {})
                         return
                     after = body.get("search_after", [""])[0]
-                    hits = [row for row in test.records if row["_id"] > after][
-                        : body["limit"]
-                    ]
+                    rows = test.records
+                    selected = body.get("query", {}).get("conjuncts")
+                    if selected:
+                        selected_id = selected[1]["equals"]
+                        rows = [row for row in rows if row["_id"] == selected_id]
+                    hits = [row for row in rows if row["_id"] > after][: body["limit"]]
                     snapshot = (
                         "changed" if after and test.mode == "changed" else "catalog-1"
                     )
@@ -112,6 +116,15 @@ class CatalogTests(unittest.TestCase):
                     self.reply(404, {})
                     return
                 test.content_requests.append(body)
+                if not body.get("remote_snapshot"):
+                    if test.mode == "syncing_before_snapshot":
+                        test.records[0]["_source"]["source"]["status"] = "syncing"
+                    elif test.mode == "file_syncing_before_snapshot":
+                        value = json.loads(test.file_catalog.read_text())
+                        value["sources"][0]["status"] = "syncing"
+                        test.file_catalog.write_text(json.dumps(value))
+                    elif test.mode == "republished_before_snapshot":
+                        test.records[0]["_source"]["published_revision"] = "inventory-2"
                 identity = test.records[0]["_id"]
                 hits = (
                     []
@@ -174,8 +187,11 @@ class CatalogTests(unittest.TestCase):
         return subprocess.run(
             [
                 BINARY,
-                "--source-endpoint",
-                self.endpoint,
+                *(
+                    ["--source-catalog", str(self.file_catalog)]
+                    if self.file_catalog
+                    else ["--source-endpoint", self.endpoint]
+                ),
                 "--source",
                 "manuals",
                 "retry budget",
@@ -189,12 +205,45 @@ class CatalogTests(unittest.TestCase):
         result = self.search()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(b"retry budget", result.stdout)
-        self.assertEqual(len(self.pages), 2)
+        self.assertEqual(len(self.pages), 3)
         self.assertEqual(self.pages[1]["remote_snapshot"], "catalog-1")
         self.assertEqual(self.pages[1]["search_after"], [self.records[63]["_id"]])
         self.assertIn(
             self.records[0]["_id"], json.dumps(self.content_requests[0]["filter_query"])
         )
+
+    def test_publication_changes_before_snapshot_fail_without_output(self):
+        for mode, error in (
+            ("syncing_before_snapshot", b"SourceNotSearchable"),
+            ("republished_before_snapshot", b"SourcePublicationChanged"),
+        ):
+            with self.subTest(mode=mode):
+                self.mode = mode
+                self.records[0]["_source"]["source"]["status"] = "searchable"
+                self.records[0]["_source"]["published_revision"] = "inventory-1"
+                result = self.search()
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(error, result.stderr)
+                self.assertEqual(result.stdout, b"")
+
+    def test_file_catalog_is_checked_after_content_snapshot(self):
+        self.file_catalog = Path(self.temp.name) / "catalog.json"
+        source = dict(self.records[0]["_source"]["source"])
+        source["published_revision"] = "publication-1"
+        value = {
+            "version": 2,
+            "endpoint": self.endpoint,
+            "sources": [source],
+            "principals": [],
+        }
+        self.file_catalog.write_text(json.dumps(value))
+        result = self.search()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.mode = "file_syncing_before_snapshot"
+        result = self.search()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(b"SourceNotSearchable", result.stderr)
+        self.assertEqual(result.stdout, b"")
 
     def test_partial_changed_or_unauthorized_discovery_never_searches(self):
         for mode in ("changed", "failed", "unauthorized"):

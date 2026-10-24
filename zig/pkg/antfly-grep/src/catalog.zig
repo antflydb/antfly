@@ -19,6 +19,7 @@ const std = @import("std");
 const A = std.mem.Allocator;
 const indexed = @import("indexed.zig");
 pub const Source = struct {
+    published_revision: ?[]const u8 = null,
     id: []const u8,
     alias: ?[]const u8 = null,
     table: []const u8,
@@ -42,7 +43,7 @@ pub fn table(source: Source) !indexed.Table {
         for (id) |char| if (!std.ascii.isAlphanumeric(char) and char != '_' and char != '-') return error.InvalidSourceCatalog;
     }
     if (!std.mem.eql(u8, source.status, "searchable") and !std.mem.eql(u8, source.status, "pending") and !std.mem.eql(u8, source.status, "syncing") and !std.mem.eql(u8, source.status, "stale")) return error.InvalidSourceCatalog;
-    return .{ .name = source.id, .alias = source.alias, .table = source.table, .source_id = source.id, .document_field = source.document_field, .source_filter = source.filter, .access_id = source.access_id, .status = source.status, .valid_until = source.valid_until };
+    return .{ .name = source.id, .alias = source.alias, .table = source.table, .source_id = source.id, .document_field = source.document_field, .source_filter = source.filter, .access_id = source.access_id, .status = source.status, .valid_until = source.valid_until, .published_revision = source.published_revision };
 }
 pub fn load(a: A, io: std.Io, path: []const u8) ![]const u8 {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(32 * 1024 * 1024));
@@ -65,6 +66,9 @@ pub fn discover(a: A, io: std.Io, endpoint: []const u8, catalog_table: []const u
     return discoverWithSession(a, io, endpoint, catalog_table, credential, principals, timeout_ms, null);
 }
 pub fn discoverWithSession(a: A, io: std.Io, endpoint: []const u8, catalog_table: []const u8, credential: ?[]const u8, principals: []const []const u8, timeout_ms: u64, session: ?*@import("cloud.zig").Session) ![]const u8 {
+    return discoverSelected(a, io, endpoint, catalog_table, credential, principals, timeout_ms, session, null);
+}
+fn discoverSelected(a: A, io: std.Io, endpoint: []const u8, catalog_table: []const u8, credential: ?[]const u8, principals: []const []const u8, timeout_ms: u64, session: ?*@import("cloud.zig").Session, source_id: ?[]const u8) ![]const u8 {
     try @import("providers.zig").validateCustom(endpoint);
     if (catalog_table.len == 0 or std.mem.eql(u8, catalog_table, ".") or std.mem.eql(u8, catalog_table, "..")) return error.InvalidSourceCatalog;
     const httpx = @import("httpx");
@@ -81,8 +85,12 @@ pub fn discoverWithSession(a: A, io: std.Io, endpoint: []const u8, catalog_table
     var previous: ?[]const u8 = null;
     var wire_bytes: usize = 0;
     var policy: ?[]const u8 = null;
+    const query = if (source_id) |id|
+        try std.json.Stringify.valueAlloc(state, .{ .conjuncts = .{ .{ .equals = "source_catalog", .field = "doc_type" }, .{ .equals = id, .field = "source.id" } } }, .{})
+    else
+        try state.dupe(u8, "{\"equals\":\"source_catalog\",\"field\":\"doc_type\"}");
     for (0..1024) |_| {
-        const body = try std.json.Stringify.valueAlloc(state, .{ .query = .{ .equals = "source_catalog", .field = "doc_type" }, .fields = [_][]const u8{ "version", "doc_type", "source", "document_version", "published_revision" }, .limit = @as(u32, 64), .order_by = [_]struct { field: []const u8, desc: bool }{.{ .field = "_id", .desc = false }}, .remote_snapshot = snapshot, .search_after = if (previous) |id| @as(?[1][]const u8, .{id}) else null }, .{ .emit_null_optional_fields = false });
+        const body = try std.json.Stringify.valueAlloc(state, .{ .query = try std.json.parseFromSliceLeaky(std.json.Value, state, query, .{}), .fields = [_][]const u8{ "version", "doc_type", "source", "document_version", "published_revision" }, .limit = @as(u32, 64), .order_by = [_]struct { field: []const u8, desc: bool }{.{ .field = "_id", .desc = false }}, .remote_snapshot = snapshot, .search_after = if (previous) |id| @as(?[1][]const u8, .{id}) else null }, .{ .emit_null_optional_fields = false });
         var response = response: {
             for (0..2) |attempt| {
                 const token = if (session) |cloud| cloud.token() else credential;
@@ -132,7 +140,9 @@ pub fn discoverWithSession(a: A, io: std.Io, endpoint: []const u8, catalog_table
             if (std.mem.eql(u8, hit._source.source.status, "searchable") and (hit._source.source.valid_until == null or hit._source.published_revision.len == 0)) return error.InvalidSourceCatalog;
             previous = hit._id;
             _ = try table(hit._source.source);
-            try sources.append(state, hit._source.source);
+            var binding = hit._source.source;
+            binding.published_revision = hit._source.published_revision;
+            try sources.append(state, binding);
             if (sources.items.len > 1000) return error.SourceCatalogBudgetExceeded;
         }
         if (result.hits.hits.len < 64) {
@@ -143,4 +153,32 @@ pub fn discoverWithSession(a: A, io: std.Io, endpoint: []const u8, catalog_table
         }
     }
     return error.SourceCatalogBudgetExceeded;
+}
+
+/// The content snapshot must be acquired BEFORE this fresh catalog read. Writers
+/// publish syncing before touching content and a new fence after all writes are
+/// visible. This ordering closes the discovery/query race without a cross-table
+/// transaction. Continuations stay on the already validated content snapshot.
+pub fn validatePublication(a: A, io: std.Io, options: *const @import("options.zig").Options, endpoint: []const u8, expected: indexed.Table) !void {
+    if (!options.sourced() or options.cloud_session != null) return;
+    const bytes = if (options.source_catalog) |path|
+        try load(a, io, path)
+    else
+        try discoverSelected(a, io, endpoint, options.source_table, options.table_token, options.source_principals.items, options.timeout_ms, null, expected.source_id);
+    defer a.free(bytes);
+    const parsed = try std.json.parseFromSlice(indexed.Config, a, bytes, .{});
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, endpoint, parsed.value.endpoint)) return error.SourcePublicationChanged;
+    for (parsed.value.tables) |current| {
+        if (!std.mem.eql(u8, current.name, expected.name)) continue;
+        if (!std.mem.eql(u8, current.status orelse "", "searchable")) return error.SourceNotSearchable;
+        if (current.valid_until) |until| if (std.Io.Clock.real.now(io).toSeconds() >= until) return error.SourceNotSearchable;
+        const before = try std.json.Stringify.valueAlloc(a, expected, .{});
+        defer a.free(before);
+        const after = try std.json.Stringify.valueAlloc(a, current, .{});
+        defer a.free(after);
+        if (!std.mem.eql(u8, before, after)) return error.SourcePublicationChanged;
+        return;
+    }
+    return error.SourcePublicationChanged;
 }

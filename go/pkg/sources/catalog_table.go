@@ -46,6 +46,7 @@ func NewCatalogRecord(binding Binding, provider, revision string, permissions Pe
 	if binding.Alias == "" {
 		binding.Alias = binding.ID
 	}
+	binding.PublishedRevision = revision
 	binding.AccessID = "" // Cloud proofs are derived from current authenticated policy.
 	return CatalogRecord{Version: CatalogRecordVersion, DocType: "source_catalog", Source: binding, Provider: provider, DocumentVersion: 1, PublishedRevision: revision, Permissions: permissions}
 }
