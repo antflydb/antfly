@@ -160,6 +160,7 @@ test "SQL LATERAL shares captured child scans and hash builds across parents" {
     try std.testing.expectEqual(@as(usize, 1), source.captures);
     try std.testing.expectEqual(@as(usize, 1), source.closes);
     // Rebuilding the 256-row child hash for each parent exceeds this budget.
+    std.debug.print("SQL lateral work: parents=128 checkpoints={}\n", .{source.checks});
     try std.testing.expect(source.checks < 128 * 100);
     var canceled: Source = .{ .cancel_after = 100 };
     try std.testing.expectError(error.QueryCanceled, runtime.execute(std.testing.allocator, canceled.backend(), &compiled, &.{}, .{}));

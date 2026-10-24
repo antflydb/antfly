@@ -27237,3 +27237,46 @@ design documents. Formatting, whitespace and license checks pass. This supplies
 a verified host lifetime edge, while normal publication/retirement registration,
 funded assembly, coupled commit, relief and broader defaults remain open. Full
 GNU qualification remains waived; the full design is incomplete.
+
+## Shared SQL clone work quanta (2026-10-24)
+
+Controlled Datum cloning now retains one synchronous node/byte meter through
+nested JSON objects, arrays, typed arrays and stored array payloads. It checks
+the original execution owner at entry and completion, and after at most 64
+visited values or 4,096 copied/hashed bytes. Small object keys share that meter
+instead of each restarting copy and hash checkpoints. Hash-map insertion still
+uses a prepared fixed-width hash after fallible byte work; no scheduler callback
+runs inside the mutable insertion. Partial allocations remain in the caller's
+owned region until ordinary cleanup, including denial at the completion check.
+
+Controlled hashing/comparison also start their local numeric work meter at zero
+after the explicit owner entry check. This removes a duplicate check on the
+first scalar charge while preserving independent per-value work limits and
+bounded wide-value checks. No public wire format or ABI layout changes.
+
+The operator qualification covers parity for JSON, exact NUMERIC, typed/stored
+arrays and ordinary scalar values. New tests bound checkpoint overhead for a
+256-field object and inject the original cancellation at every checkpoint of a
+wide-key/payload clone and wide-value hash/comparison. These changes pass all
+117 prepared-numeric/operator tests in Debug, with no test skips. The final
+receipt repeats that root with independent runtime ABI and original-error
+checks. Receipt names and exact source/input hashes are retained under
+`qualification/workload-pooling/receipts/2026-10-10/child-outbox-capture-retirement-cumulative-integration/sql-clone-quantum-*`.
+
+This does not resolve the five correlated-query checkpoint-count failures
+observed after the main merge. Their original thresholds remain unchanged.
+Focused fixtures now print work counts before asserting, so failed bounds retain
+measurements. Diagnostic traces identify repeated polls in
+`Store.batchAppendBytesLeased`, `Store.appendBatchLeased` and nested
+`Batch.cellControlled` selection readers during hash-build admission. The clone
+changes do not change those five counts: at the first tested input they remain
+207,724/15,795/37,641/7,714 checkpoints and 13,464 for LATERAL. The next correction
+needs bounded metadata work across these batch/reader layers while preserving
+full original-owner checks in variable-width decoders, comparisons, copies and
+I/O. Removing original checks wholesale or raising these regression thresholds
+would not establish that contract.
+
+Normal storage publication/retirement registration, funded entry assembly,
+coupled backend publication, relief integration and the remaining default
+integration evidence also remain open. Full GNU qualification remains waived;
+the complete design is not yet achieved.

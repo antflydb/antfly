@@ -879,3 +879,74 @@ test "SQL grouping work oversized accelerator batches keep the serial path and o
         try std.testing.expect(source.checks > count);
     }
 }
+
+test "SQL grouping work avoids duplicate scalar entry polls and preserves every wide value cancellation" {
+    const values = [_]Datum{ .{}, Datum.json(.null), Datum.json(.{ .bool = true }), Datum.json(.{ .integer = 9007199254740993 }), Datum.json(.{ .float = 1.5 }) };
+    for (values) |value| {
+        var probe: Probe = .{};
+        try std.testing.expectEqual(try scalar.semanticHashDatum(value), try scalar.semanticHashDatumControlled(value, probe.control()));
+        try std.testing.expectEqual(try scalar.compareDatums(value, value), try scalar.compareDatumsControlled(value, value, probe.control()));
+        // Fixed-size cells need entry and completion checks, with no extra
+        // scheduler transition just to initialize a nested work meter.
+        try std.testing.expect(probe.calls <= 4);
+        probe = .{ .stop_after = 2 };
+        try std.testing.expectError(error.OwnerCanceled, scalar.semanticHashDatumControlled(value, probe.control()));
+        probe = .{ .stop_after = 2 };
+        try std.testing.expectError(error.OwnerCanceled, scalar.compareDatumsControlled(value, value, probe.control()));
+    }
+    const left: [16384]u8 = @splat('w');
+    var right: [16384]u8 = undefined;
+    @memcpy(&right, &left);
+    const value = Datum.json(.{ .string = &left });
+    const other = Datum.json(.{ .string = &right });
+    var hash_probe: Probe = .{};
+    var compare_probe: Probe = .{};
+    try std.testing.expectEqual(try scalar.semanticHashDatum(value), try scalar.semanticHashDatumControlled(value, hash_probe.control()));
+    try std.testing.expectEqual(std.math.Order.eq, try scalar.compareDatumsControlled(value, other, compare_probe.control()));
+    try std.testing.expect(hash_probe.calls > 4);
+    try std.testing.expect(compare_probe.calls > 4);
+    for (1..hash_probe.calls + 1) |stop| {
+        var probe: Probe = .{ .stop_after = stop };
+        try std.testing.expectError(error.OwnerCanceled, scalar.semanticHashDatumControlled(value, probe.control()));
+    }
+    for (1..compare_probe.calls + 1) |stop| {
+        var probe: Probe = .{ .stop_after = stop };
+        try std.testing.expectError(error.OwnerCanceled, scalar.compareDatumsControlled(value, other, probe.control()));
+    }
+}
+
+test "SQL grouping work shares clone quanta across object fields and retires every canceled partial copy" {
+    const operators = @import("operators.zig");
+    const a = std.testing.allocator;
+    var source = std.heap.ArenaAllocator.init(a);
+    defer source.deinit();
+    var fields: std.json.ObjectMap = .empty;
+    for (0..256) |index| {
+        const key = try std.fmt.allocPrint(source.allocator(), "k{d}", .{index});
+        try fields.put(source.allocator(), key, .{ .string = "small" });
+    }
+    const input = Datum.json(.{ .object = fields });
+    var copied_region = std.heap.ArenaAllocator.init(a);
+    defer copied_region.deinit();
+    var small: Probe = .{};
+    const copy = try operators.cloneDatumControlled(copied_region.allocator(), input, small.control());
+    try std.testing.expectEqual(try scalar.semanticHashDatum(input), try scalar.semanticHashDatum(copy));
+    // Work scales by bounded byte/node quanta, rather than key count times
+    // the number of nested copy/hash wrappers.
+    try std.testing.expect(small.calls <= 10);
+    const wide = try source.allocator().alloc(u8, 16385);
+    @memset(wide, 'z');
+    try fields.put(source.allocator(), wide, .{ .string = wide });
+    const large = Datum.json(.{ .object = fields });
+    var probe: Probe = .{};
+    const large_copy = try operators.cloneDatumControlled(copied_region.allocator(), large, probe.control());
+    try std.testing.expectEqual(try scalar.semanticHashDatum(large), try scalar.semanticHashDatum(large_copy));
+    try std.testing.expect(probe.calls > small.calls + 8);
+    for (1..probe.calls + 1) |stop| {
+        var region = std.heap.ArenaAllocator.init(a);
+        defer region.deinit();
+        var canceled: Probe = .{ .stop_after = stop };
+        try std.testing.expectError(error.OwnerCanceled, operators.cloneDatumControlled(region.allocator(), large, canceled.control()));
+    }
+    try std.testing.expectEqualStrings("small", fields.get("k0").?.string);
+}

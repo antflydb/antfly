@@ -3321,82 +3321,133 @@ pub fn cloneDatum(alloc: Allocator, value: Datum) anyerror!Datum {
 /// Partial copies stay in that region if an enclosing callback fails.
 pub fn cloneDatumControlled(alloc: Allocator, value: Datum, control: ?@import("operator_work.zig").Control) anyerror!Datum {
     const owner = control orelse return cloneDatum(alloc, value);
-    const Work = @import("operator_work.zig");
-    try Work.poll(control);
-    if (value.numeric) |number| {
-        if (value.sql_null or value.array != null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
-        const exact = @import("numeric_value.zig");
-        var context: exact.Context = .{ .alloc = alloc, .ptr = owner.ptr, .checkpoint = owner.checkpoint };
-        try exact.validateCanonical(&context, number.*);
-        const owned = try alloc.create(exact.Value);
-        errdefer alloc.destroy(owned);
-        owned.* = number.*;
-        owned.digits = try Work.dupe(u16, alloc, number.digits, control);
-        return Datum.typedNumeric(owned);
+    var copy: ControlledClone = .{ .alloc = alloc, .control = owner };
+    try copy.checkpoint();
+    const result = try copy.datum(value);
+    try copy.checkpoint();
+    return result;
+}
+
+// One recursive clone shares its byte/node quantum. Short object keys must not
+// each start a new scheduler quantum, while wide keys and payloads still stop
+// after at most 4096 copied/hashed bytes or 64 visited value nodes.
+const ControlledClone = struct {
+    alloc: Allocator,
+    control: @import("operator_work.zig").Control,
+    bytes_left: usize = 4096,
+    nodes_left: usize = 64,
+    fn checkpoint(self: *@This()) !void {
+        try @import("operator_work.zig").poll(self.control);
+        self.bytes_left = 4096;
+        self.nodes_left = 64;
     }
-    if (value.array) |array| {
-        if (value.sql_null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
-        const owned = try alloc.create(@import("array_value.zig").Value);
-        const dimensions = try Work.dupe(@import("array_value.zig").Dimension, alloc, array.dimensions, control);
-        if (array.stored) |stored| {
-            const copy = try alloc.create(@import("../common/sql_array_layout.zig").View);
-            copy.* = stored.*;
-            copy.bytes = try Work.dupe(u8, alloc, stored.bytes, control);
-            owned.* = .{ .element_type = array.element_type, .dimensions = dimensions, .stored = copy };
+    fn node(self: *@This()) !void {
+        if (self.nodes_left == 0) try self.checkpoint();
+        self.nodes_left -= 1;
+    }
+    fn dupe(self: *@This(), comptime T: type, input: []const T) ![]T {
+        const output = try self.alloc.alloc(T, input.len);
+        errdefer self.alloc.free(output);
+        var offset: usize = 0;
+        while (offset < input.len) {
+            if (self.bytes_left < @sizeOf(T)) try self.checkpoint();
+            const count = @min(input.len - offset, self.bytes_left / @sizeOf(T));
+            @memcpy(output[offset..][0..count], input[offset..][0..count]);
+            self.bytes_left -= count * @sizeOf(T);
+            offset += count;
+        }
+        return output;
+    }
+    fn hashBytes(self: *@This(), input: []const u8) !u64 {
+        var hash = std.hash.Wyhash.init(0);
+        var offset: usize = 0;
+        while (offset < input.len) {
+            if (self.bytes_left == 0) try self.checkpoint();
+            const count = @min(input.len - offset, self.bytes_left);
+            hash.update(input[offset..][0..count]);
+            self.bytes_left -= count;
+            offset += count;
+        }
+        return hash.final();
+    }
+    fn datum(self: *@This(), value: Datum) anyerror!Datum {
+        const alloc = self.alloc;
+        try self.node();
+        if (value.numeric) |number| {
+            if (value.sql_null or value.array != null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
+            const exact = @import("numeric_value.zig");
+            var context: exact.Context = .{ .alloc = alloc, .since_poll = 0, .ptr = self.control.ptr, .checkpoint = self.control.checkpoint };
+            try exact.validateCanonical(&context, number.*);
+            const owned = try alloc.create(exact.Value);
+            errdefer alloc.destroy(owned);
+            owned.* = number.*;
+            owned.digits = try self.dupe(u16, number.digits);
+            return Datum.typedNumeric(owned);
+        }
+        if (value.array) |array| {
+            if (value.sql_null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
+            const owned = try alloc.create(@import("array_value.zig").Value);
+            const dimensions = try self.dupe(@import("array_value.zig").Dimension, array.dimensions);
+            if (array.stored) |stored| {
+                const copy = try alloc.create(@import("../common/sql_array_layout.zig").View);
+                copy.* = stored.*;
+                copy.bytes = try self.dupe(u8, stored.bytes);
+                owned.* = .{ .element_type = array.element_type, .dimensions = dimensions, .stored = copy };
+                return Datum.typedArray(owned);
+            }
+            const elements = try alloc.alloc(Datum, array.cardinality());
+            for (elements, 0..) |*output, index| {
+                const element = array.flatCell(index);
+                if (element.array != null) return error.SqlTypeMismatch;
+                output.* = try self.datum(element);
+            }
+            owned.* = .{ .element_type = array.element_type, .dimensions = dimensions, .elements = elements };
             return Datum.typedArray(owned);
         }
-        const elements = try alloc.alloc(Datum, array.cardinality());
-        for (elements, 0..) |*output, index| {
-            const element = array.flatCell(index);
-            if (element.array != null) return error.SqlTypeMismatch;
-            output.* = try cloneDatumControlled(alloc, element, control);
-        }
-        owned.* = .{ .element_type = array.element_type, .dimensions = dimensions, .elements = elements };
-        return Datum.typedArray(owned);
+        return .{ .value = try self.json(value.value, 0, false), .sql_null = value.sql_null, .patterns = value.patterns };
     }
-    return .{ .value = try cloneJsonControlled(alloc, value.value, 0, control), .sql_null = value.sql_null, .patterns = value.patterns };
-}
-fn cloneJsonControlled(alloc: Allocator, value: Json, depth: usize, control: ?@import("operator_work.zig").Control) anyerror!Json {
-    const Work = @import("operator_work.zig");
-    try Work.poll(control);
-    if (depth > 64) return error.SqlProgramLimitExceeded;
-    return switch (value) {
-        .string => |text| .{ .string = try Work.dupe(u8, alloc, text, control) },
-        .number_string => |text| .{ .number_string = try Work.dupe(u8, alloc, text, control) },
-        .array => |array| blk: {
-            var result = try std.json.Array.initCapacity(alloc, array.items.len);
-            for (array.items) |item| result.appendAssumeCapacity(try cloneJsonControlled(alloc, item, depth + 1, control));
-            break :blk .{ .array = result };
-        },
-        .object => |object| blk: {
-            var result: std.json.ObjectMap = .empty;
-            try result.ensureTotalCapacity(alloc, @intCast(object.count()));
-            for (object.keys(), object.values()) |key, item| {
-                const bytes = try Work.dupe(u8, alloc, key, control);
-                const copied = try cloneJsonControlled(alloc, item, depth + 1, control);
-                // Source ObjectMap keys are unique. Prehash outside the mutable
-                // operation, then insert into preallocated storage with no
-                // variable-width callback or fallible work during mutation.
-                const key_hash: u32 = @truncate(try Work.hashBytes(control, 0, key));
-                const Adapted = struct {
-                    hash_value: u32,
-                    pub fn hash(self: @This(), _: []const u8) u32 {
-                        return self.hash_value;
-                    }
-                    pub fn eql(_: @This(), _: []const u8, _: []const u8, _: usize) bool {
-                        return false;
-                    }
-                };
-                const slot = result.getOrPutAssumeCapacityAdapted(bytes, Adapted{ .hash_value = key_hash });
-                std.debug.assert(!slot.found_existing);
-                slot.key_ptr.* = bytes;
-                slot.value_ptr.* = copied;
-            }
-            break :blk .{ .object = result };
-        },
-        else => value,
-    };
-}
+    fn json(self: *@This(), value: Json, depth: usize, visit: bool) anyerror!Json {
+        const alloc = self.alloc;
+        if (visit) try self.node();
+        if (depth > 64) return error.SqlProgramLimitExceeded;
+        return switch (value) {
+            .string => |text| .{ .string = try self.dupe(u8, text) },
+            .number_string => |text| .{ .number_string = try self.dupe(u8, text) },
+            .array => |array| blk: {
+                var result = try std.json.Array.initCapacity(alloc, array.items.len);
+                for (array.items) |item| result.appendAssumeCapacity(try self.json(item, depth + 1, true));
+                break :blk .{ .array = result };
+            },
+            .object => |object| blk: {
+                var result: std.json.ObjectMap = .empty;
+                try result.ensureTotalCapacity(alloc, @intCast(object.count()));
+                for (object.keys(), object.values()) |key, item| {
+                    const bytes = try self.dupe(u8, key);
+                    const copied = try self.json(item, depth + 1, true);
+                    // Source ObjectMap keys are unique. Prehash outside the mutable
+                    // operation, then insert into preallocated storage with no
+                    // variable-width callback or fallible work during mutation.
+                    const key_hash: u32 = @truncate(try self.hashBytes(key));
+                    const Adapted = struct {
+                        hash_value: u32,
+                        pub fn hash(key_context: @This(), _: []const u8) u32 {
+                            return key_context.hash_value;
+                        }
+                        pub fn eql(_: @This(), _: []const u8, _: []const u8, _: usize) bool {
+                            return false;
+                        }
+                    };
+                    const slot = result.getOrPutAssumeCapacityAdapted(bytes, Adapted{ .hash_value = key_hash });
+                    std.debug.assert(!slot.found_existing);
+                    slot.key_ptr.* = bytes;
+                    slot.value_ptr.* = copied;
+                }
+                break :blk .{ .object = result };
+            },
+            else => value,
+        };
+    }
+};
 /// Match the existing physical estimate, adding owner polls without charging
 /// work a second time or imposing a new query-wide value budget.
 pub fn datumBytesWithControl(value: Datum, control: ?@import("operator_work.zig").Control) anyerror!usize {

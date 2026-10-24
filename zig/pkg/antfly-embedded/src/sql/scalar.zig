@@ -5226,17 +5226,19 @@ pub fn semanticHashDatum(value: Datum) anyerror!u64 {
 pub fn semanticHashDatumControlled(value: Datum, control: ?@import("operator_work.zig").Control) anyerror!u64 {
     const owner = control orelse return semanticHashDatum(value);
     try @import("operator_work.zig").poll(control);
+    // The entry poll already checked this owner. Start each local work meter
+    // at zero so its first scalar charge does not repeat that same check.
     const result = blk: {
         if (value.sql_null) break :blk @as(u64, 0);
         var none = std.heap.FixedBufferAllocator.init(&.{});
         if (value.numeric) |number| {
             // Keep NUMERIC's original independent eight-MiB work allowance.
-            var context: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .checkpoint = owner.checkpoint, .ptr = owner.ptr };
+            var context: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .since_poll = 0, .checkpoint = owner.checkpoint, .ptr = owner.ptr };
             var hash = std.hash.Wyhash.init(0);
             try @import("numeric_value.zig").hash(&context, number.*, &hash);
             break :blk hash.final();
         }
-        var parent: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .remaining = std.math.maxInt(u64), .checkpoint = owner.checkpoint, .ptr = owner.ptr };
+        var parent: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .remaining = std.math.maxInt(u64), .since_poll = 0, .checkpoint = owner.checkpoint, .ptr = owner.ptr };
         var work: json_order.Budget = .{ .shared = &parent };
         if (value.array) |array| break :blk try array.semanticHash(&work);
         if (value.value == .float and !std.math.isFinite(value.value.float)) {
@@ -5253,7 +5255,7 @@ pub fn compareDatumsControlled(left: Datum, right: Datum, control: ?@import("ope
     const owner = control orelse return compareDatums(left, right);
     try @import("operator_work.zig").poll(control);
     var none = std.heap.FixedBufferAllocator.init(&.{});
-    var parent: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .remaining = std.math.maxInt(u64), .checkpoint = owner.checkpoint, .ptr = owner.ptr };
+    var parent: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .remaining = std.math.maxInt(u64), .since_poll = 0, .checkpoint = owner.checkpoint, .ptr = owner.ptr };
     var work: json_order.Budget = .{ .shared = &parent };
     const result = try compareDatumsWithBudget(left, right, &work);
     try @import("operator_work.zig").poll(control);
