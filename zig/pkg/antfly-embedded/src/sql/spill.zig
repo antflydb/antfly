@@ -137,7 +137,10 @@ pub const Manager = struct {
         return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resizeAllocation, .remap = remapAllocation, .free = freeAllocation } };
     }
     pub fn pager(self: *Manager) !*@import("execution_pager.zig").Pager {
-        self.lock();
+        return self.pagerFor(.{});
+    }
+    pub fn pagerFor(self: *Manager, access: @import("execution_pager.zig").Access) !*@import("execution_pager.zig").Pager {
+        try access.lock(self, &self.mutex);
         defer self.mutex.unlock();
         if (self.execution_pages) |owner| return owner;
         const owner = try self.allocator().create(@import("execution_pager.zig").Pager);
@@ -621,6 +624,44 @@ pub const File = struct {
         const keys = try decoder.cells();
         if (decoder.position != payload.len) return error.InvalidSqlSpill;
         return .{ .row = .{ .values = values, .keys = keys, .ordinal = ordinal }, .next = link, .matched = frame[24] & 1 != 0, .following = offset + frame_bytes + len };
+    }
+    /// Private pager IO has no codec/buffer work inside the parked interval.
+    /// Once a write reaches the provider, keep possible growth funded even when
+    /// the physical error or original CPU return rejects publication.
+    pub fn writePage(self: *File, offset: u64, bytes: []const u8, access: @import("execution_pager.zig").Access, receipt: *anyopaque, publish: *const fn (*anyopaque, u64, bool) void) !void {
+        std.debug.assert(self.run_store == null and self.pending == null and self.write_buffer.len == 0);
+        try access.check(self.manager);
+        if (offset > self.size) return error.InvalidSqlSpill;
+        const end = std.math.add(u64, offset, bytes.len) catch return error.SqlProgramLimitExceeded;
+        const growth = end -| self.size;
+        try self.manager.reserve(growth);
+        const boundary = access.boundary(self.manager);
+        if (boundary) |port| port.begin(port.ptr) catch |err| {
+            self.manager.releaseBytes(growth);
+            return err;
+        };
+        self.size = @max(self.size, end);
+        publish(receipt, offset, false);
+        const result = self.file.writePositionalAll(self.manager.io, bytes, offset);
+        if (result) |_| publish(receipt, offset, true) else |_| {}
+        self.manager.increment("write_calls", 1);
+        if (result) |_| self.manager.increment("written_bytes", bytes.len) else |_| {}
+        if (boundary) |port| try port.end(port.ptr);
+        try access.check(self.manager);
+        try result;
+    }
+    pub fn readPage(self: *File, offset: u64, bytes: []u8, access: @import("execution_pager.zig").Access) !void {
+        std.debug.assert(self.run_store == null and self.pending == null and self.write_buffer.len == 0);
+        try access.check(self.manager);
+        if (offset > self.size or bytes.len > self.size - offset) return error.InvalidSqlSpill;
+        const boundary = access.boundary(self.manager);
+        if (boundary) |port| try port.begin(port.ptr);
+        const result = self.file.readPositionalAll(self.manager.io, bytes, offset);
+        self.manager.increment("read_calls", 1);
+        if (result) |count| self.manager.increment("read_bytes", count) else |_| {}
+        if (boundary) |port| try port.end(port.ptr);
+        try access.check(self.manager);
+        if (try result != bytes.len) return error.InvalidSqlSpill;
     }
     /// Fixed-size operator state/index pages share the statement disk quota.
     pub fn writeRaw(self: *File, offset: u64, bytes: []const u8) !void {

@@ -25203,3 +25203,57 @@ finish shared SQL pager ownership, final admitted backend flush/retirement,
 completion/history relief under overload, remaining provider/legacy-generation
 adoption, compound tentative-grant retirement or default-gate evidence. The full
 design remains incomplete, with full GNU qualification still waived.
+
+### Shared SQL pager borrows the current execution
+
+The shared join/aggregate pager now accepts call-local execution authority. Its
+page directory and backing file retain no worker execution pointer. Hash bucket
+lookups, primitive aggregate updates, source snapshots, partial merges and result
+reads forward the current owner, including consumption after the producing child
+has finished. Existing unscoped APIs remain wrappers. Join aggregation forwards
+coordinator/scalar authority into its reducers and hash build; legacy parallel
+reducers cannot share a mutable coordinator/checkpoint callback frame.
+
+Pager locks and busy-page waits relinquish the caller's CPU when contended. Disk
+transfers hold no page-directory lock. Fixed metadata rollback restores directory
+ownership after rejected reentry without requesting another application grant.
+Only physical page IO executes while parked; encoding, decoding and policy checks
+execute under the caller's CPU. Shared file creation detaches its creator's
+execution before publishing the file to later operations.
+
+Accepted private writes retain their possible-growth charge. A fixed receipt
+records the reserved offset before provider IO and marks a completed page image
+before fallible CPU return. Rejected resume cannot discard a successful image or
+force an append replay; a partial write retains a dirty resident image and reuses
+the same charged offset on retry. Pre-dispatch rejection returns unused growth.
+
+Array retirement no longer waits on another worker's reentry while holding CPU.
+Busy or pinned pages remain pager-owned until their final transfer/lease ends;
+only then can their physical frame and directory slot retire. Cold read rejection
+frees its unpublished buffer exactly once, including concurrent retirement.
+
+Qualification receipts in the cumulative integration directory:
+
+- `scoped-shared-pager-v1` preserves a local receipt-parameter shadowing compile
+  error; v2 preserves an aggregate-only option passed to a hash constructor.
+- `scoped-shared-pager-v3` passes the initial scoped/typed/pager checks.
+- `scoped-shared-pager-v4` passes 75/75 build steps, 103 SQL cases, one host
+  supporting case, six pgwire ownership cases, the provisioned-pool type check,
+  and 45/1/8 error-identity cases.
+- `scoped-shared-pager-join-regressions` passes 60/60 build steps, 27 join-partial
+  query cases, one supporting case and 45/1/8 error-identity cases.
+
+The new ownership matrix covers pre-IO refusal, write/read resume refusal,
+partial writes, lock contention, retirement during eviction/restoration and
+retirement with an outstanding lease. Control work runs on the reserved control
+lane while the ordinary lane is parked. The combined operator case shares one
+16 KiB frame across paged hash buckets and both source/destination aggregate
+columns, finishes the producer, then probes/merges under a different execution.
+All final receipts have unchanged input hashes; logs and source snapshots remain
+preserved. Formatting and whitespace checks pass.
+
+This adopts scoped pager IO and prompt page abandonment, not the entire design.
+Incremental metadata/physical teardown, final admitted backend flush/retirement,
+completion/history relief under overload, remaining provider/legacy-generation
+adoption, compound tentative-grant retirement and default-gate evidence still
+require work. Full GNU qualification remains waived; the full goal stays active.

@@ -814,12 +814,12 @@ pub const HashJoin = struct {
         flat: []u64 = &.{},
         paged: ?@import("execution_pager.zig").Array(u64) = null,
         len: usize = 0,
-        fn init(a: Allocator, manager: *@import("spill.zig").Manager, count: usize) !Buckets {
+        fn init(a: Allocator, manager: *@import("spill.zig").Manager, count: usize, access: @import("execution_pager.zig").Access) !Buckets {
             var result: Buckets = .{ .len = count };
             errdefer result.deinit(a);
-            if (manager.cpu_scope == null and count >= 8192 and manager.page_residency_bytes >= @import("execution_pager.zig").page_bytes) {
-                result.paged = .{ .pager = try manager.pager() };
-                try result.paged.?.appendRepeated(@import("spill.zig").none, count);
+            if (count >= 8192 and manager.page_residency_bytes >= @import("execution_pager.zig").page_bytes) {
+                result.paged = .{ .pager = try manager.pagerFor(access) };
+                try result.paged.?.appendRepeatedFor(@import("spill.zig").none, count, access);
             } else {
                 result.flat = try a.alloc(u64, count);
                 @memset(result.flat, @import("spill.zig").none);
@@ -827,12 +827,21 @@ pub const HashJoin = struct {
             return result;
         }
         fn get(self: Buckets, index: usize) !u64 {
-            return if (self.paged) |array| try array.get(index) else self.flat[index];
+            return self.getFor(index, .{});
+        }
+        fn getFor(self: Buckets, index: usize, access: @import("execution_pager.zig").Access) !u64 {
+            return if (self.paged) |array| try array.getFor(index, access) else self.flat[index];
         }
         fn set(self: Buckets, index: usize, value: u64) !void {
-            if (self.paged) |array| try array.set(index, value) else self.flat[index] = value;
+            return self.setFor(index, value, .{});
+        }
+        fn setFor(self: Buckets, index: usize, value: u64, access: @import("execution_pager.zig").Access) !void {
+            if (self.paged) |array| try array.setFor(index, value, access) else self.flat[index] = value;
         }
         fn seedProbes(self: Buckets, hashes: []const ?u64, probes: []Probe) !void {
+            return self.seedProbesFor(hashes, probes, .{});
+        }
+        fn seedProbesFor(self: Buckets, hashes: []const ?u64, probes: []Probe, access: @import("execution_pager.zig").Access) !void {
             var begin: usize = 0;
             while (begin < hashes.len) {
                 const end = @min(hashes.len, begin + 128);
@@ -845,7 +854,7 @@ pub const HashJoin = struct {
                     positions[count] = i;
                     count += 1;
                 };
-                if (self.paged) |array| try array.getMany(indices[0..count], values[0..count]) else {
+                if (self.paged) |array| try array.getManyFor(indices[0..count], values[0..count], access) else {
                     for (indices[0..count], values[0..count]) |index, *value| value.* = self.flat[index];
                 }
                 for (values[0..count], positions[0..count]) |head, index| probes[index].cursor = if (head == @import("spill.zig").none) null else @intCast(head);
@@ -861,6 +870,9 @@ pub const HashJoin = struct {
         }
     };
 
+    fn pageAccess(self: *HashJoin) @import("execution_pager.zig").Access {
+        return .{ .execution = self.limits.execution, .control = self.leaseControl(), .wait = if (self.limits.execution == null) if (self.limits.spill) |manager| manager.wait orelse if (manager.cpu_scope) |scope| scope.wait else null else null else null };
+    }
     fn leaseControl(self: *HashJoin) ?@import("operator_work.zig").Control {
         const execution = self.limits.execution orelse return self.limits.control;
         return .{ .ptr = execution, .checkpoint = struct {
@@ -1172,7 +1184,7 @@ pub const HashJoin = struct {
     /// One bounded producer cohort. Native rows share immutable payload pages;
     /// narrow rows keep the single-file path. Only page offsets and lane IDs
     /// enter key records, so source identities retire before the next pull.
-    fn writeDiskCohort(manager: *@import("spill.zig").Manager, file: *@import("spill.zig").File, payloads: *?*@import("spill.zig").JoinPayloads, heads: Buckets, values: @import("execution_batch.zig").Batch, keys: []const []const Datum, ordinal: usize, inline_budget: usize) !void {
+    fn writeDiskCohort(manager: *@import("spill.zig").Manager, file: *@import("spill.zig").File, payloads: *?*@import("spill.zig").JoinPayloads, heads: Buckets, values: @import("execution_batch.zig").Batch, keys: []const []const Datum, ordinal: usize, inline_budget: usize, access: @import("execution_pager.zig").Access) !void {
         const Payloads = @import("spill.zig").JoinPayloads;
         if (values.len() == 0 or values.len() > Payloads.page_rows or keys.len != values.len()) return error.InvalidSqlBackendResponse;
         if (ordinal >= native_payload_bit or values.len() > native_payload_bit - ordinal) return error.SqlProgramLimitExceeded;
@@ -1226,19 +1238,19 @@ pub const HashJoin = struct {
             _ = row_scratch.reset(.{ .retain_with_limit = 8192 });
             const hashed = try keyHash(key);
             const bucket = if (hashed) |hash| hash & (heads.len - 1) else 0;
-            const link = if (hashed != null) try heads.get(bucket) else @import("spill.zig").none;
+            const link = if (hashed != null) try heads.getFor(bucket, access) else @import("spill.zig").none;
             const offset = if (native[row]) |id| blk: {
                 const ref = refs[id];
                 break :blk try file.appendWithPressure(.{ .values = &.{ Datum.json(.{ .integer = @intCast(values.width()) }), Datum.json(.{ .integer = @intCast(ref.index) }) }, .keys = key, .ordinal = ref.offset | native_payload_bit }, link, &pressure);
             } else try file.appendWithPressure(.{ .values = try values.row(row_scratch.allocator(), row), .keys = key, .ordinal = ordinal + row }, link, &pressure);
-            if (hashed != null) try heads.set(bucket, offset);
+            if (hashed != null) try heads.setFor(bucket, offset, access);
         }
     }
     fn startSpill(self: *HashJoin) !void {
         const manager = self.limits.spill orelse return error.SqlProgramLimitExceeded;
         const alloc = self.budget.allocator();
         const slots = std.math.floorPowerOfTwo(usize, @max(@as(usize, 16), self.limits.bytes / 64));
-        var heads = try Buckets.init(alloc, manager, slots);
+        var heads = try Buckets.init(alloc, manager, slots, self.pageAccess());
         errdefer heads.deinit(alloc);
         var file = try manager.createFor(self.limits.execution);
         errdefer file.close();
@@ -1256,7 +1268,7 @@ pub const HashJoin = struct {
             if (self.entries.items[ordinal].width != self.value_columns.columns.len) {
                 const values = try (Match{ .owner = self, .index = ordinal }).valuesBatch(a);
                 const keys = try self.key_columns.row(a, ordinal);
-                try writeDiskCohort(manager, &file, &payloads, heads, values, &.{keys}, ordinal, self.budget.limit -| heads.residentCharge());
+                try writeDiskCohort(manager, &file, &payloads, heads, values, &.{keys}, ordinal, self.budget.limit -| heads.residentCharge(), self.pageAccess());
                 ordinal += 1;
                 continue;
             }
@@ -1265,7 +1277,7 @@ pub const HashJoin = struct {
             const keys = try a.alloc([]const Datum, end - ordinal);
             for (keys, ordinal..) |*key, index| key.* = try self.key_columns.row(a, index);
             const values: @import("execution_batch.zig").Batch = .{ .retained = .{ .store = &self.value_columns, .begin = ordinal, .count = end - ordinal } };
-            try writeDiskCohort(manager, &file, &payloads, heads, values, keys, ordinal, self.budget.limit -| heads.residentCharge());
+            try writeDiskCohort(manager, &file, &payloads, heads, values, keys, ordinal, self.budget.limit -| heads.residentCharge(), self.pageAccess());
             ordinal = end;
         }
         self.value_columns.deinit();
@@ -1285,8 +1297,8 @@ pub const HashJoin = struct {
         if (keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
         const hashed = try keyHash(keys);
         const bucket = if (hashed) |value| value & (self.disk_heads.len - 1) else 0;
-        const offset = try writeDiskRecord(self.limits.spill.?, &self.disk.?, &self.disk_values, values, keys, self.row_count, if (hashed != null) try self.disk_heads.get(bucket) else @import("spill.zig").none, self.budget.limit -| self.disk_heads.residentCharge());
-        if (hashed != null) try self.disk_heads.set(bucket, offset);
+        const offset = try writeDiskRecord(self.limits.spill.?, &self.disk.?, &self.disk_values, values, keys, self.row_count, if (hashed != null) try self.disk_heads.getFor(bucket, self.pageAccess()) else @import("spill.zig").none, self.budget.limit -| self.disk_heads.residentCharge());
+        if (hashed != null) try self.disk_heads.setFor(bucket, offset, self.pageAccess());
         self.key_count = keys.len;
     }
     pub fn create(alloc: Allocator, limits: Limits) !*HashJoin {
@@ -1434,7 +1446,7 @@ pub const HashJoin = struct {
                 for (positions, begin..) |*position, index| position.* = index;
                 const selected = try batch.select(region.allocator(), positions);
                 if (self.key_count != null and keys[begin].len != self.key_count.?) return error.InvalidSqlBackendResponse;
-                try writeDiskCohort(self.limits.spill.?, &self.disk.?, &self.disk_values, self.disk_heads, selected, keys[begin..end], self.row_count, self.budget.limit -| self.disk_heads.residentCharge());
+                try writeDiskCohort(self.limits.spill.?, &self.disk.?, &self.disk_values, self.disk_heads, selected, keys[begin..end], self.row_count, self.budget.limit -| self.disk_heads.residentCharge(), self.pageAccess());
                 self.key_count = keys[begin].len;
                 self.row_count += end - begin;
                 begin = end;
@@ -1484,7 +1496,7 @@ pub const HashJoin = struct {
         self.sealed = true;
         if (self.key_count != null and self.key_count.? != keys.len) return error.InvalidSqlBackendResponse;
         if (self.disk != null) {
-            const bucket = if (try keyHash(keys)) |hashed| try self.disk_heads.get(hashed & (self.disk_heads.len - 1)) else @import("spill.zig").none;
+            const bucket = if (try keyHash(keys)) |hashed| try self.disk_heads.getFor(hashed & (self.disk_heads.len - 1), self.pageAccess()) else @import("spill.zig").none;
             return .{ .owner = self, .keys = keys, .cursor = if (bucket == @import("spill.zig").none) null else @intCast(bucket) };
         }
         return .{ .owner = self, .keys = keys, .cursor = if (try keyHash(keys)) |hashed| self.heads.get(hashed) else null };
@@ -1505,7 +1517,7 @@ pub const HashJoin = struct {
                 if (self.disk == null) probe_.cursor = self.heads.get(value);
             }
         }
-        if (self.disk != null) try self.disk_heads.seedProbes(hashes, probes);
+        if (self.disk != null) try self.disk_heads.seedProbesFor(hashes, probes, self.pageAccess());
         if (self.disk == null) {
             // Interleave chain traversal across lanes. Keep the first exact
             // match in the probe and leave remaining duplicates lazy.
@@ -1664,7 +1676,7 @@ pub const Grouped = struct {
             _ = scratch.reset(.retain_capacity);
             const a = scratch.allocator();
             const states = try a.alloc(Aggregate, self.specs.len);
-            for (self.state_columns, states) |column, *state| state.* = try column.snapshotControlled(a, index, self.workControl());
+            for (self.state_columns, states) |column, *state| state.* = try column.snapshotFor(a, index, self.pageAccess());
             try external.partial(try self.key_columns.row(a, index), states, self.groups.items[index].ordinal);
         }
         self.clearGroups();
@@ -1707,8 +1719,8 @@ pub const Grouped = struct {
             fn cell(raw: *anyopaque, alloc: Allocator, row: usize, column: usize) anyerror!Datum {
                 const reader: *@This() = @ptrCast(@alignCast(raw));
                 const index = reader.begin + row;
-                if (!reader.exact) return reader.group.state_columns[column].finishControlled(index, reader.group.workControl());
-                const state = try reader.group.state_columns[column].snapshotControlled(alloc, index, reader.group.workControl());
+                if (!reader.exact) return reader.group.state_columns[column].finishFor(index, reader.group.pageAccess());
+                const state = try reader.group.state_columns[column].snapshotFor(alloc, index, reader.group.pageAccess());
                 return @import("aggregate_partial.zig").cell(alloc, state);
             }
         };
@@ -1767,7 +1779,7 @@ pub const Grouped = struct {
         const index = self.result_cursor;
         self.result_cursor += 1;
         const states = try a.alloc(Aggregate, self.specs.len);
-        for (self.state_columns, states) |column, *state| state.* = try column.snapshotControlled(a, index, self.workControl());
+        for (self.state_columns, states) |column, *state| state.* = try column.snapshotFor(a, index, self.pageAccess());
         return .{ .keys = try self.key_columns.row(a, index), .aggregates = &.{}, .typed_states = states, .ordinal = self.groups.items[index].ordinal };
     }
     pub fn nextPartialResult(self: *Grouped, a: Allocator) !?GroupResult {
@@ -1782,7 +1794,7 @@ pub const Grouped = struct {
         const index = self.result_cursor;
         self.result_cursor += 1;
         const states = try a.alloc(Aggregate, self.specs.len);
-        for (self.state_columns, states) |column, *state| state.* = try column.snapshotControlled(a, index, self.workControl());
+        for (self.state_columns, states) |column, *state| state.* = try column.snapshotFor(a, index, self.pageAccess());
         return .{ .keys = try self.key_columns.row(a, index), .aggregates = try @import("aggregate_partial.zig").encode(a, states), .ordinal = self.groups.items[index].ordinal };
     }
     pub fn create(alloc: Allocator, specs: []const AggregateSpec, limits: Limits) !*Grouped {
@@ -1842,6 +1854,9 @@ pub const Grouped = struct {
         };
     }
 
+    fn pageAccess(self: *const Grouped) @import("execution_pager.zig").Access {
+        return .{ .execution = if (self.limits.coordinator_scope) |scope| scope.execution else null, .control = self.workControl(), .wait = if (self.limits.coordinator_scope == null) if (self.limits.spill) |manager| manager.wait orelse if (manager.cpu_scope) |scope| scope.wait else null else null else null };
+    }
     fn workControl(self: *const Grouped) ?@import("operator_work.zig").Control {
         if (self.limits.coordinator_scope == null and self.limits.control == null) return null;
         return .{ .ptr = @constCast(self), .checkpoint = workCheckpoint };
@@ -1931,7 +1946,7 @@ pub const Grouped = struct {
             id.* = try self.resolveGroupHashed(row_keys, hashes[index].?);
             self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
         }
-        for (self.state_columns, inputs) |*column, values| try column.updateBatchControlled(self.budget.allocator(), ids, values, self.workControl());
+        for (self.state_columns, inputs) |*column, values| try column.updateBatchFor(self.budget.allocator(), ids, values, self.pageAccess());
     }
 
     /// Keep encoded expression columns intact through group ID resolution.
@@ -2196,7 +2211,7 @@ pub const Grouped = struct {
             id.* = census.representatives[representative].group;
             self.groups.items[id.*].ordinal = @min(self.groups.items[id.*].ordinal, ordinal);
         }
-        for (self.state_columns, states) |*column, values| try column.mergeFixedBatch(self.budget.allocator(), ids[0..count], values);
+        for (self.state_columns, states) |*column, values| try column.mergeFixedBatchFor(self.budget.allocator(), ids[0..count], values, self.pageAccess());
         return true;
     }
     fn prepareColumns(a: Allocator, columns: []const @import("execution_batch.zig").Batch) ![]?@import("execution_batch.zig").PhysicalColumn {
@@ -2255,7 +2270,7 @@ pub const Grouped = struct {
             id.* = try self.resolveGroupHashed(row_keys, hashes[index].?);
             self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
         }
-        for (self.state_columns, inputs) |*column, values| try column.updateEncodedControlled(self.budget.allocator(), ids, values, self.workControl());
+        for (self.state_columns, inputs) |*column, values| try column.updateEncodedFor(self.budget.allocator(), ids, values, self.pageAccess());
     }
 
     fn addEncodedWindow(self: *Grouped, keys: []const @import("execution_batch.zig").Batch, inputs: []const @import("execution_batch.zig").Batch, count: usize, identity: ?InputIdentity) !bool {
@@ -2352,7 +2367,7 @@ pub const Grouped = struct {
                         for (selected[0..length], 0..) |*row, offset| row.* = begin + offset;
                         if (native) |physical| {
                             const view = physical.slice(begin, begin + length);
-                            if (try column.updatePhysical(self.budget.allocator(), ids[0..length], view)) {
+                            if (try column.updatePhysicalFor(self.budget.allocator(), ids[0..length], view, self.pageAccess())) {
                                 begin += length;
                                 continue;
                             }
@@ -2498,7 +2513,7 @@ pub const Grouped = struct {
             try self.ensureGlobalGroup();
             @memset(ids, 0);
             for (self.state_columns, inputs, physical_inputs) |*column, values, native| {
-                if (native) |physical| if (try column.updatePhysical(self.budget.allocator(), ids, physical)) continue;
+                if (native) |physical| if (try column.updatePhysicalFor(self.budget.allocator(), ids, physical, self.pageAccess())) continue;
                 try column.updateEncoded(self.budget.allocator(), ids, values);
             }
             self.rows_seen = std.math.add(u64, self.rows_seen, count) catch return error.SqlNumericOutOfRange;
@@ -2513,7 +2528,7 @@ pub const Grouped = struct {
         for (ids, groups_.rows) |*id, representative| id.* = groups_.representatives[representative].group;
         self.rows_seen = std.math.add(u64, self.rows_seen, count) catch return error.SqlNumericOutOfRange;
         for (self.state_columns, inputs, physical_inputs) |*column, values, native| {
-            if (native) |physical| if (try column.updatePhysical(self.budget.allocator(), ids, physical)) continue;
+            if (native) |physical| if (try column.updatePhysicalFor(self.budget.allocator(), ids, physical, self.pageAccess())) continue;
             try column.updateEncoded(self.budget.allocator(), ids, values);
         }
         return true;
@@ -2684,7 +2699,7 @@ pub const Grouped = struct {
                     const ordinal = std.math.add(u64, ordinal_base, source.groups.items[index].ordinal) catch return error.SqlNumericOutOfRange;
                     self.groups.items[id.*].ordinal = if (id.* >= previous) ordinal else @min(self.groups.items[id.*].ordinal, ordinal);
                 }
-                for (self.state_columns, source.state_columns) |*column, *from| try column.mergeSelectedBatch(self.budget.allocator(), ids[0..count], from, begin, if (selection) |selected| selected[begin..][0..count] else null);
+                for (self.state_columns, source.state_columns) |*column, *from| try column.mergeSelectedBatchFor(self.budget.allocator(), ids[0..count], from, begin, if (selection) |selected| selected[begin..][0..count] else null, self.pageAccess());
             } else for (rows, 0..) |keys, item| {
                 const index = if (selection) |selected| selected[begin + item] else begin + item;
                 const ordinal = std.math.add(u64, ordinal_base, source.groups.items[index].ordinal) catch return error.SqlNumericOutOfRange;
@@ -2703,7 +2718,7 @@ pub const Grouped = struct {
                     const previous = self.groups.items.len;
                     const slot = try self.resolveGroup(keys);
                     self.groups.items[slot].ordinal = if (slot >= previous) ordinal else @min(self.groups.items[slot].ordinal, ordinal);
-                    for (self.state_columns, source.state_columns) |*column, *from| try column.mergeBatch(self.budget.allocator(), &.{slot}, from, index);
+                    for (self.state_columns, source.state_columns) |*column, *from| try column.mergeBatchFor(self.budget.allocator(), &.{slot}, from, index, self.pageAccess());
                 }
             }
             begin += count;
@@ -2740,7 +2755,7 @@ pub const Grouped = struct {
             _ = arena.reset(.free_all);
             const keys = try source.key_columns.row(arena.allocator(), index);
             const ordinal = std.math.add(u64, ordinal_base, group.ordinal) catch return error.SqlNumericOutOfRange;
-            for (source.state_columns, states) |*column, *state| state.* = try column.snapshotControlled(arena.allocator(), index, self.workControl());
+            for (source.state_columns, states) |*column, *state| state.* = try column.snapshotFor(arena.allocator(), index, self.pageAccess());
             self.key_count = keys.len;
             if (self.external == null and self.limits.spill != null) {
                 const bytes = try self.numericStateGrowth(keys, states, null);
@@ -2752,7 +2767,7 @@ pub const Grouped = struct {
                 const previous = self.groups.items.len;
                 const slot = try self.resolveGroup(keys);
                 self.groups.items[slot].ordinal = if (slot >= previous) ordinal else @min(self.groups.items[slot].ordinal, ordinal);
-                for (self.state_columns, states) |*column, state| try column.mergeExactControlled(self.budget.allocator(), slot, state, self.workControl());
+                for (self.state_columns, states) |*column, state| try column.mergeExactFor(self.budget.allocator(), slot, state, self.pageAccess());
             }
         }
         self.rows_seen = std.math.add(u64, self.rows_seen, source.rows_seen) catch return error.SqlNumericOutOfRange;
@@ -2875,7 +2890,7 @@ pub const Grouped = struct {
         self.groups.items[index].ordinal = if (index >= previous) ordinal else @min(self.groups.items[index].ordinal, ordinal);
         for (states, 0..) |state, i| {
             const slot = if (slots) |mapping| mapping[i] else i;
-            try self.state_columns[slot].mergeExactControlled(self.budget.allocator(), index, state, self.workControl());
+            try self.state_columns[slot].mergeExactFor(self.budget.allocator(), index, state, self.pageAccess());
         }
     }
     pub fn exportPartial(self: *Grouped, external: *@import("spill_grouped.zig").Grouped) !void {
@@ -2890,7 +2905,7 @@ pub const Grouped = struct {
             _ = scratch.reset(.free_all);
             const a = scratch.allocator();
             const states = try a.alloc(Aggregate, self.specs.len);
-            for (self.state_columns, states) |column, *state| state.* = try column.snapshotControlled(a, index, self.workControl());
+            for (self.state_columns, states) |column, *state| state.* = try column.snapshotFor(a, index, self.pageAccess());
             try external.partial(try self.key_columns.row(a, index), states, try std.math.add(u64, ordinal_base, group.ordinal));
         }
     }
@@ -2921,7 +2936,7 @@ pub const Grouped = struct {
         errdefer self.failed = true;
         const remaining = inputs[1..];
         for (self.state_columns, 0..) |*states, column| {
-            var snapshot = try states.snapshotControlled(self.backing, 0, self.workControl());
+            var snapshot = try states.snapshotFor(self.backing, 0, self.pageAccess());
             const state = &snapshot;
             var index: usize = 0;
             while (index < remaining.len) {
@@ -2945,7 +2960,7 @@ pub const Grouped = struct {
                 if (state.kind == .bool_or) state.boolean = state.boolean or @reduce(.Or, @as(@Vector(4, bool), booleans));
                 index += count;
             }
-            try states.set(0, snapshot);
+            try states.setFor(0, snapshot, self.pageAccess());
         }
         self.rows_seen = std.math.add(u64, self.rows_seen, remaining.len) catch return error.SqlNumericOutOfRange;
     }
@@ -2986,7 +3001,7 @@ pub const Grouped = struct {
         errdefer self.failed = true;
         const remaining = row_count - 1;
         for (self.state_columns, 0..) |*states, column| {
-            var snapshot = try states.snapshotControlled(self.backing, 0, self.workControl());
+            var snapshot = try states.snapshotFor(self.backing, 0, self.pageAccess());
             const state = &snapshot;
             var index: usize = 0;
             while (index < remaining) {
@@ -3010,7 +3025,7 @@ pub const Grouped = struct {
                 if (state.kind == .bool_or) state.boolean = state.boolean or @reduce(.Or, @as(@Vector(4, bool), booleans));
                 index += count;
             }
-            try states.set(0, snapshot);
+            try states.setFor(0, snapshot, self.pageAccess());
         }
         self.rows_seen = std.math.add(u64, self.rows_seen, remaining) catch return error.SqlNumericOutOfRange;
     }
@@ -3047,7 +3062,7 @@ pub const Grouped = struct {
         self.finished = true;
         const values = try alloc.alloc(Datum, self.specs.len);
         errdefer alloc.free(values);
-        for (self.state_columns, values) |*column, *value| value.* = try column.finishControlled(index, self.workControl());
+        for (self.state_columns, values) |*column, *value| value.* = try column.finishFor(index, self.pageAccess());
         return .{ .keys = try self.key_columns.row(self.results.allocator(), index), .aggregates = values, .ordinal = self.groups.items[index].ordinal };
     }
 
@@ -3055,7 +3070,7 @@ pub const Grouped = struct {
         if (inputs.len != self.specs.len or keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
         self.key_count = keys.len;
         const slot = try self.resolveGroup(keys);
-        for (self.state_columns, inputs) |*column, value| try column.updateControlled(self.budget.allocator(), slot, value, self.workControl());
+        for (self.state_columns, inputs) |*column, value| try column.updateFor(self.budget.allocator(), slot, value, self.pageAccess());
         self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
     }
 
@@ -3100,7 +3115,7 @@ pub const Grouped = struct {
         try self.groups.ensureUnusedCapacity(alloc, 1);
         try self.heads.ensureUnusedCapacity(alloc, 1);
         _ = try self.key_columns.appendControlled(keys, self.workControl());
-        for (self.state_columns) |*column| try column.appendControlled(alloc, self.workControl());
+        for (self.state_columns) |*column| try column.appendFor(alloc, self.pageAccess());
         const index = self.groups.items.len;
         self.groups.appendAssumeCapacity(.{ .next = self.heads.get(hash), .ordinal = self.source_ordinal orelse self.rows_seen });
         self.heads.putAssumeCapacity(hash, index);
@@ -5895,4 +5910,66 @@ test "SQL finalized aggregate streams bypass hash retention and fence ownership 
         try std.testing.expectError(error.SqlProgramLimitExceeded, group.nextResultBatch(page.allocator(), 2, false));
     }
     try std.testing.expectEqual(@as(usize, 1), source.closes);
+}
+
+test "SQL paged scoped joins and aggregates hand state to a new execution with one shared frame" {
+    const a = std.testing.allocator;
+    const Runnable = @import("../common/runnable_scheduler.zig");
+    const Check = struct {
+        fn wrongParent(_: *anyopaque) !void {
+            return error.InvalidRunnableTransition;
+        }
+    };
+    var owner = try Runnable.Scheduler.init(.{ .slots = 2, .control_slots = 1, .max_operations = 16 });
+    defer owner.close();
+    var parent: Runnable.Execution = .{};
+    try parent.start(&owner, .{ .io = std.testing.io }, .query);
+    defer parent.finish();
+    var producer: Runnable.Execution = .{};
+    try producer.reserveChild(&parent, std.testing.io, 64 * 1024);
+    defer producer.finish();
+    try parent.park(.resource_blocked);
+    try producer.activateChild();
+    var marker: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.wrongParent, .page_residency_bytes = @import("execution_pager.zig").page_bytes, .cpu_scope = .{ .execution = &parent, .allocator = a, .io = std.testing.io, .wait = @import("spill.zig").childWait(&parent) } };
+    defer manager.deinit();
+    const join = try HashJoin.create(a, .{ .bytes = 1024 * 1024, .spill = &manager, .execution = &producer });
+    defer join.deinit();
+    try join.startSpill();
+    try std.testing.expect(join.disk_heads.paged != null);
+    for (0..128) |i| try join.add(&.{Datum.json(.{ .integer = @intCast(i + 100) })}, &.{Datum.json(.{ .integer = @intCast(i) })});
+    const specs = [_]AggregateSpec{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer } };
+    const source = try Grouped.create(a, &specs, .{ .bytes = 4 * 1024 * 1024, .spill = &manager, .coordinator_scope = .{ .execution = &producer, .allocator = a } });
+    defer source.deinit();
+    for (0..2304) |i| try source.add(&.{Datum.json(.{ .integer = @intCast(i) })}, &.{ Datum.json(.{ .integer = 1 }), Datum.json(.{ .integer = @intCast(i) }) });
+    try std.testing.expect(source.state_columns[0].paged != null and source.state_columns[1].paged != null);
+    producer.finish();
+    try parent.enter(.query);
+    var consumer: Runnable.Execution = .{};
+    try consumer.reserveChild(&parent, std.testing.io, 64 * 1024);
+    defer consumer.finish();
+    try parent.park(.resource_blocked);
+    try consumer.activateChild();
+    join.limits.execution = &consumer;
+    join.disk.?.execution = &consumer;
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    for (0..128) |i| {
+        _ = scratch.reset(.retain_capacity);
+        var probe = try join.probe(&.{Datum.json(.{ .integer = @intCast(i) })});
+        const row = (try probe.next()).?;
+        try std.testing.expectEqual(@as(i64, @intCast(i + 100)), (try row.materializeValues(scratch.allocator()))[0].value.integer);
+        try std.testing.expect((try probe.next()) == null);
+    }
+    const destination = try Grouped.create(a, &specs, .{ .bytes = 4 * 1024 * 1024, .spill = &manager, .coordinator_scope = .{ .execution = &consumer, .allocator = a } });
+    defer destination.deinit();
+    try destination.mergeExactSelected(source, 0, null);
+    try std.testing.expect(destination.state_columns[0].paged != null and destination.state_columns[1].paged != null);
+    for (0..2304) |i| {
+        try std.testing.expectEqual(@as(i64, 1), (try destination.state_columns[0].finishFor(i, destination.pageAccess())).value.integer);
+        try std.testing.expectEqual(@as(i64, @intCast(i)), (try destination.state_columns[1].finishFor(i, destination.pageAccess())).value.integer);
+    }
+    try std.testing.expect(manager.execution_pages.?.file.?.execution == null);
+    try std.testing.expect(manager.execution_pages.?.evictions != 0 and manager.execution_pages.?.restores != 0);
+    try std.testing.expect(manager.execution_pages.?.peak <= manager.page_residency_bytes);
 }
