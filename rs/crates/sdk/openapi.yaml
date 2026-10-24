@@ -49630,12 +49630,14 @@ components:
           description: Recognized text within the region
         bbox:
           type: array
+          nullable: true
           items:
             type: number
           minItems: 4
           maxItems: 4
           description: Bounding box [x1, y1, x2, y2] in the document source coordinate space, or pixels
-            for ordinary image requests
+            for ordinary image requests. Null when source geometry cannot be established, including unsupported
+            vertical PDF writing.
         confidence:
           type: number
           description: Recognition confidence score (0-1)

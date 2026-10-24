@@ -39,6 +39,7 @@ pub const Source = struct {
     fingerprint: [64]u8,
     bytes: []const u8,
     page_selection: ?[]const usize = null,
+    max_regions: usize = (c.Limits{}).max_regions,
     parsed: union(enum) { pdf: pdf.reader.Reader, image: void, slides: struct { archive: ooxml.Archive, slides: []const Slide } },
     pub fn init(a: A, input: Input, bytes: []const u8, limits: c.Limits, control: c.Control) !Source {
         try control.check();
@@ -77,7 +78,7 @@ pub const Source = struct {
             const presentation = try archive.get(a, "ppt/presentation.xml");
             const relationships = try archive.get(a, "ppt/_rels/presentation.xml.rels");
             var slides = std.ArrayList(Slide).empty;
-            var inheritance = slide_parts.Cache{};
+            var inheritance = slide_parts.Cache{ .max_regions = limits.max_regions };
             var iter = ooxml.Xml{ .bytes = presentation };
             while (try iter.next()) |token| {
                 try control.check();
@@ -114,6 +115,7 @@ pub const Source = struct {
         } else return error.UnsupportedDocumentFormat;
         errdefer result.deinit();
         result.page_selection = selection;
+        result.max_regions = limits.max_regions;
         const count = try result.pageCount();
         if (count > max_source_pages) return error.DocumentPageLimitExceeded;
         if (selection) |pages| {
@@ -136,17 +138,27 @@ pub const Source = struct {
     }
 
     pub fn analyze(self: *Source, a: A, number: usize, control: c.Control) !c.Page {
+        return self.analyzeWithRegionLimit(a, number, self.max_regions, control);
+    }
+    pub fn analyzeWithRegionLimit(self: *Source, a: A, number: usize, requested_limit: usize, control: c.Control) !c.Page {
+        const limit = @min(requested_limit, self.max_regions);
         try control.check();
         var page = c.Page{ .source_id = self.input.id, .number = number, .kind = .image };
         switch (self.parsed) {
             .pdf => |*p| {
-                var analysis = try p.extractPageTextAnalysisAlloc(number);
+                var analysis = p.extractPageTextAnalysisWithRunLimitAlloc(number, limit) catch |err| switch (err) {
+                    error.TextRunLimitExceeded => return error.DocumentRegionLimitExceeded,
+                    else => return err,
+                };
                 defer analysis.deinit(p.alloc);
                 page.kind = .page;
                 page.coordinate_space = .pdf_points;
                 page.native_text = try a.dupe(u8, analysis.text);
                 const regions = try a.alloc(c.Region, analysis.runs.len);
-                for (regions, analysis.runs, 0..) |*region, run, i| region.* = .{ .id = i, .text = try a.dupe(u8, run.text), .bbox = .{ run.x, run.y, run.x + run.advance_width, run.y + run.font_size }, .origin = .native };
+                for (regions, analysis.runs, 0..) |*region, run, i| {
+                    const box = run.bounds();
+                    region.* = .{ .id = i, .text = try a.dupe(u8, run.text), .bbox = if (box) |b| .{ b.min_x, b.min_y, b.max_x, b.max_y } else null, .origin = .native };
+                }
                 page.regions = regions;
                 if (analysis.has_unrendered_annotations) try @import("representation.zig").finding(a, &page, "pdf_annotation_rendering_unavailable", true);
                 if (analysis.outline_fallback) try @import("representation.zig").finding(a, &page, "native_font_fallback", true);
@@ -159,7 +171,7 @@ pub const Source = struct {
                 page.coordinate_space = .slide_emu;
                 const xml = try s.archive.get(a, slide.path);
                 page.native_text = try ooxml.text(a, xml);
-                page.tables = try ooxml.tables(a, xml);
+                page.tables = try ooxml.tablesWithLimit(a, xml, limit);
                 // Native extraction alone cannot assert visual completeness.
                 if (try ooxml.needsVisualInspection(xml))
                     page.findings = &.{"slide_visual_inspection_unavailable"};
@@ -191,6 +203,7 @@ pub const Source = struct {
             },
             .image => {},
         }
+        try @import("representation.zig").validatePage(page, limit);
         return page;
     }
     pub fn render(self: *Source, a: A, number: usize, run: *c.Run) !struct { bytes: []const u8, mime_type: []const u8, width: u32, height: u32, effective_dpi: u16, raster_to_source: c.Transform } {
@@ -278,4 +291,24 @@ test "document selections spend page budget only on selected PDF pages and slide
         try std.testing.expectError(error.InvalidDocumentSelection, Source.init(a, .{ .id = "source", .url = "", .media_type = fixture[1], .pages = &.{3} }, fixture[0], .{ .max_pages = 1 }, .{}));
         try std.testing.expectError(error.InvalidDocumentSelection, Source.init(a, .{ .id = "source", .url = "", .media_type = fixture[1], .pages = &.{ 1, 1 } }, fixture[0], .{}, .{}));
     }
+}
+
+test "document PDF analysis preserves transformed regions and enforces active limits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var source = try Source.init(a, .{ .id = "geometry", .url = "", .media_type = "application/pdf" }, @embedFile("testdata/transformed-text.pdf"), .{}, .{});
+    defer source.deinit();
+    const page = try source.analyze(a, 1, .{});
+    try std.testing.expectEqual(@as(usize, 4), page.regions.len);
+    for (page.regions) |region| {
+        const box = region.bbox.?;
+        if (std.mem.eql(u8, region.text, "Rotated text")) try std.testing.expect(box[3] - box[1] > 2 * (box[2] - box[0]));
+        if (std.mem.eql(u8, region.text, "Scaled text")) try std.testing.expect(box[3] - box[1] > 30);
+        if (std.mem.eql(u8, region.text, "Mirrored text")) try std.testing.expectApproxEqAbs(@as(f64, 200), box[2], 0.000001);
+    }
+    try std.testing.expectError(error.DocumentRegionLimitExceeded, source.analyzeWithRegionLimit(a, 1, 3, .{}));
+    var excess = try Source.init(a, .{ .id = "excess", .url = "", .media_type = "application/pdf" }, @embedFile("testdata/excess-text-runs.pdf"), .{}, .{});
+    defer excess.deinit();
+    try std.testing.expectError(error.DocumentRegionLimitExceeded, excess.analyze(a, 1, .{}));
 }

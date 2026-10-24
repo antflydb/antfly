@@ -14,6 +14,7 @@ from antfly.client_generated.models import (
     InferenceGenerateChatTemplateKwargs,
     InferenceGenerateRequest,
     InferenceRole,
+    InferenceTextRegion,
 )
 
 
@@ -459,6 +460,13 @@ def test_generated_request_models_preserve_nested_configuration(extraction: bool
         assert isinstance(request, GeneratedDecideRequest)
         result = client.decide(request)
     assert result.model == "registered"
+
+
+def test_native_region_with_unknown_geometry_round_trips():
+    raw = {"text": "Vertical native text", "bbox": None, "origin": "native"}
+    region = InferenceTextRegion.from_dict(raw)
+    assert region.bbox is None
+    assert region.to_dict() == raw
 
 
 def test_direct_document_read_preserves_page_identity_and_artifact():

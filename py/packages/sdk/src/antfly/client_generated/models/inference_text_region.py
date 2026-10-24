@@ -23,8 +23,9 @@ class InferenceTextRegion:
     """
     Attributes:
         text (str): Recognized text within the region
-        bbox (list[float]): Bounding box [x1, y1, x2, y2] in the document source coordinate space, or pixels for
-            ordinary image requests
+        bbox (list[float] | None): Bounding box [x1, y1, x2, y2] in the document source coordinate space, or pixels for
+            ordinary image requests. Null when source geometry cannot be established, including unsupported vertical PDF
+            writing.
         id (int | Unset): Region identity within its parent; nested regions use qualified paths.
         origin (InferenceTextRegionOrigin | Unset): Default provenance of this region; nested region origins override
             it.
@@ -40,7 +41,7 @@ class InferenceTextRegion:
     """
 
     text: str
-    bbox: list[float]
+    bbox: list[float] | None
     id: int | Unset = UNSET
     origin: InferenceTextRegionOrigin | Unset = UNSET
     text_start: int | None | Unset = UNSET
@@ -57,7 +58,12 @@ class InferenceTextRegion:
 
         text = self.text
 
-        bbox = self.bbox
+        bbox: list[float] | None
+        if isinstance(self.bbox, list):
+            bbox = self.bbox
+
+        else:
+            bbox = self.bbox
 
         id = self.id
 
@@ -141,7 +147,20 @@ class InferenceTextRegion:
         d = dict(src_dict)
         text = d.pop("text")
 
-        bbox = cast(list[float], d.pop("bbox"))
+        def _parse_bbox(data: object) -> list[float] | None:
+            if data is None:
+                return data
+            try:
+                if not isinstance(data, list):
+                    raise TypeError()
+                bbox_type_0 = cast(list[float], data)
+
+                return bbox_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(list[float] | None, data)
+
+        bbox = _parse_bbox(d.pop("bbox"))
 
         id = d.pop("id", UNSET)
 

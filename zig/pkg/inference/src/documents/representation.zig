@@ -44,13 +44,48 @@ fn cloneJson(a: A, value: std.json.Value, depth: usize) error{ OutOfMemory, Inva
         else => value,
     };
 }
+// One page-wide bound per structure family, including nested and inherited
+// content. Validate without allocation before retaining/copying model results.
+const StructureBudget = struct {
+    regions_left: usize,
+    tables_left: usize,
+    cells_left: usize,
+    fn init(limit: usize) StructureBudget {
+        return .{ .regions_left = limit, .tables_left = limit, .cells_left = limit };
+    }
+    fn tables(self: *StructureBudget, items: []const c.Table) !void {
+        if (items.len > self.tables_left) return error.DocumentRegionLimitExceeded;
+        self.tables_left -= items.len;
+        for (items) |table| {
+            if (table.cells.len > self.cells_left) return error.DocumentRegionLimitExceeded;
+            self.cells_left -= table.cells.len;
+        }
+    }
+    fn regions(self: *StructureBudget, items: []const c.Region, depth: usize) error{DocumentRegionLimitExceeded}!void {
+        if (depth > 16 or items.len > self.regions_left) return error.DocumentRegionLimitExceeded;
+        self.regions_left -= items.len;
+        for (items) |region| {
+            try self.tables(region.tables);
+            try self.regions(region.children, depth + 1);
+        }
+    }
+};
+
+pub fn validatePage(page: c.Page, limit: usize) !void {
+    var budget = StructureBudget.init(limit);
+    try budget.regions(page.regions, 0);
+    try budget.tables(page.tables);
+    for (page.inherited_parts) |part| try budget.tables(part.tables);
+}
+
 pub fn cloneTables(a: A, tables: []const c.Table, limit: usize) ![]c.Table {
-    if (tables.len > limit) return error.DocumentRegionLimitExceeded;
+    var budget = StructureBudget.init(limit);
+    try budget.tables(tables);
+    return cloneTablesUnchecked(a, tables);
+}
+fn cloneTablesUnchecked(a: A, tables: []const c.Table) ![]c.Table {
     const out = try a.dupe(c.Table, tables);
-    var cells: usize = 0;
     for (out) |*table| {
-        if (table.cells.len > limit -| cells) return error.DocumentRegionLimitExceeded;
-        cells += table.cells.len;
         const copied = try a.dupe(c.Cell, table.cells);
         for (copied) |*cell| cell.text = try a.dupe(u8, cell.text);
         table.cells = copied;
@@ -58,20 +93,21 @@ pub fn cloneTables(a: A, tables: []const c.Table, limit: usize) ![]c.Table {
     return out;
 }
 pub fn cloneRegions(a: A, regions: []const c.Region, limit: usize) ![]c.Region {
-    var remaining = limit;
-    return cloneRegionTree(a, regions, &remaining, 0);
+    var budget = StructureBudget.init(limit);
+    try budget.regions(regions, 0);
+    return cloneRegionTree(a, regions);
 }
-fn cloneRegionTree(a: A, regions: []const c.Region, remaining: *usize, depth: usize) ![]c.Region {
-    if (depth > 16 or regions.len > remaining.*) return error.DocumentRegionLimitExceeded;
-    remaining.* -= regions.len;
+// The complete tree was bounded before allocating. Each family keeps its
+// own allowance; consuming region slots must not shrink a child's cell budget.
+fn cloneRegionTree(a: A, regions: []const c.Region) error{ OutOfMemory, InvalidDocumentModelResult }![]c.Region {
     const out = try a.dupe(c.Region, regions);
     for (out) |*region| {
         region.text = try a.dupe(u8, region.text);
         if (region.label) |label| region.label = try a.dupe(u8, label);
         if (region.model) |model| region.model = try a.dupe(u8, model);
         region.fields = try cloneValue(a, region.fields);
-        region.tables = try cloneTables(a, region.tables, remaining.* + regions.len);
-        region.children = try cloneRegionTree(a, region.children, remaining, depth + 1);
+        region.tables = try cloneTablesUnchecked(a, region.tables);
+        region.children = try cloneRegionTree(a, region.children);
     }
     return out;
 }
@@ -213,4 +249,34 @@ test "document JSON copies preserve exact numeric types and own nested values" {
     };
     try Fixture.check(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{});
+}
+
+test "document structure bounds include nested sibling tables and inherited parts before copies" {
+    const cells = [_]c.Cell{.{ .row = 0, .column = 0, .text = "Cell" }};
+    const tables = [_]c.Table{.{ .id = 0, .rows = 1, .columns = 1, .cells = &cells }};
+    const children = [_]c.Region{.{ .id = 1, .text = "Child", .tables = &tables }};
+    const regions = [_]c.Region{.{ .id = 0, .text = "Parent", .tables = &tables, .children = &children }};
+    const inherited = [_]c.InheritedPart{.{ .path = "master", .role = .master, .text = "Master", .tables = &tables, .shapes_visible = true, .background_visible = false, .shape_visual = false, .background_visual = false }};
+    var page: c.Page = .{ .source_id = "source", .number = 1, .kind = .page, .regions = &regions, .inherited_parts = &inherited };
+    try std.testing.expectError(error.DocumentRegionLimitExceeded, validatePage(page, 2));
+    try validatePage(page, 3);
+    page.inherited_parts = &.{};
+    try validatePage(page, 2);
+    try std.testing.expectError(error.DocumentRegionLimitExceeded, validatePage(page, 1));
+    // No output allocator capacity is needed to reject an oversized tree.
+    const siblings = [_]c.Region{ .{ .id = 0, .text = "One", .tables = &tables }, .{ .id = 1, .text = "Two", .tables = &tables }, .{ .id = 2, .text = "Three", .tables = &tables } };
+    try std.testing.expectError(error.DocumentRegionLimitExceeded, cloneRegions(std.testing.failing_allocator, &siblings, 2));
+    const repeated = [_]c.Table{ tables[0], tables[0], tables[0] };
+    try std.testing.expectError(error.DocumentRegionLimitExceeded, cloneTables(std.testing.failing_allocator, &repeated, 2));
+}
+
+test "document nested region cells retain their independent structural allowance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cells = [_]c.Cell{ .{ .row = 0, .column = 0, .text = "One" }, .{ .row = 0, .column = 1, .text = "Two" } };
+    const tables = [_]c.Table{.{ .id = 0, .rows = 1, .columns = 2, .cells = &cells }};
+    const children = [_]c.Region{.{ .id = 1, .text = "Child", .tables = &tables }};
+    const regions = [_]c.Region{.{ .id = 0, .text = "Parent", .children = &children }};
+    const copy = try cloneRegions(arena.allocator(), &regions, 2);
+    try std.testing.expectEqualStrings("Two", copy[0].children[0].tables[0].cells[1].text);
 }

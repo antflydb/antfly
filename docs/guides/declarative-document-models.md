@@ -36,6 +36,13 @@ Encoded images use the ordinary reader MIME contract: type matching ignores
 case, validated parameters are removed before dispatch, and declared types are
 checked against the encoded bytes. Normalization borrows the existing bytes.
 
+`max_regions` bounds each page's total regions, tables and cells, including
+nested regions and inherited slide content. Native PDF runs and slide tables
+are capped during parsing, and every retained page uses the active limit,
+including native reads and interrupted model runs. PDF region bounds use the
+transformed text basis and font metrics. Unsupported vertical-writing geometry
+is left unknown while its native text remains available.
+
 `antfly/native-document` reads native PDF and slide content without loading an
 OCR model. A composite can retain trustworthy native text and render uncertain
 pages lazily for OCR. `/ai/v1/models` advertises the document executor and format

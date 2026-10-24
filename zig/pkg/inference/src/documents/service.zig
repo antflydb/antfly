@@ -183,7 +183,7 @@ pub fn Service(comptime Node: type) type {
                     var scratch = std.heap.ArenaAllocator.init(backing);
                     defer scratch.deinit();
                     const sa = scratch.allocator();
-                    var page = source.analyze(sa, number, run.control) catch |err| {
+                    var page = source.analyzeWithRegionLimit(sa, number, run.limits.max_regions, run.control) catch |err| {
                         try run.control.check();
                         if (err == error.HiddenDocumentPage) continue;
                         return err;
@@ -210,7 +210,7 @@ pub fn Service(comptime Node: type) type {
                     };
                     try run.emit(.{ .phase = if (result.status == .complete) .accepted else .unresolved, .source_id = result.source_id, .page_number = result.number, .status = result.status, .finding = if (result.findings.len > 0) result.findings[0] else null });
                     if (result.status == .complete) run.usage.completed_pages += 1;
-                    var retained = try retainPage(a, result);
+                    var retained = try retainPage(a, result, run.limits.max_regions);
                     retained.index = pages.items.len;
                     if (context.rendered) |view| retained.raster_to_source = view.raster_to_source;
                     try pages.append(a, retained);
@@ -341,7 +341,8 @@ pub fn Service(comptime Node: type) type {
             return pinned;
         }
 
-        fn retainPage(a: A, page: c.Page) !c.Page {
+        fn retainPage(a: A, page: c.Page, limit: usize) !c.Page {
+            try @import("representation.zig").validatePage(page, limit);
             var out = page;
             out.text = try a.dupe(u8, page.text);
             out.native_text = try a.dupe(u8, page.native_text);
@@ -350,13 +351,13 @@ pub fn Service(comptime Node: type) type {
             for (inherited) |*part| {
                 part.path = try a.dupe(u8, part.path);
                 part.text = try a.dupe(u8, part.text);
-                part.tables = try @import("representation.zig").cloneTables(a, part.tables, 65536);
+                part.tables = try @import("representation.zig").cloneTables(a, part.tables, limit);
             }
             out.inherited_parts = inherited;
             const ir = @import("representation.zig");
             out.fields = try ir.cloneValue(a, page.fields);
-            out.regions = try ir.cloneRegions(a, page.regions, 65536);
-            out.tables = try ir.cloneTables(a, page.tables, 65536);
+            out.regions = try ir.cloneRegions(a, page.regions, limit);
+            out.tables = try ir.cloneTables(a, page.tables, limit);
             const findings = try a.dupe([]const u8, page.findings);
             for (findings) |*finding| finding.* = try a.dupe(u8, finding.*);
             out.findings = findings;
@@ -367,7 +368,7 @@ pub fn Service(comptime Node: type) type {
             const self: *Self = @ptrCast(@alignCast(raw));
             if (std.mem.eql(u8, binding.model, "antfly/native-document")) {
                 if (bbox != null) return error.DocumentCapabilityMismatch;
-                const native = try self.source.analyze(a, self.number, run.control);
+                const native = try self.source.analyzeWithRegionLimit(a, self.number, run.limits.max_regions, run.control);
                 return .{ .model = binding.model, .origin = .native, .text = native.native_text, .regions = native.regions, .tables = native.tables, .status = if (native.findings.len == 0 and native.kind != .image) .complete else .unresolved };
             }
             if (self.rendered == null) {
@@ -1063,6 +1064,7 @@ test "document extraction keeps independent sources atomic and reuses retained r
         fn documentDownload(self: *@This(), _: A, url: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
             self.downloads += 1;
             if (std.mem.eql(u8, url, "hidden-slides")) return .{ .data = @embedFile("testdata/hidden-slides.pptx") };
+            if (std.mem.eql(u8, url, "excess-runs")) return .{ .data = @embedFile("testdata/excess-text-runs.pdf") };
             return .{ .data = if (self.slides) @embedFile("testdata/line-breaks.pptx") else @embedFile("testdata/two-pages.pdf") };
         }
         fn readDocumentArtifact(_: *@This(), a: A, _: []const u8) ![]u8 {
@@ -1143,9 +1145,16 @@ test "document extraction keeps independent sources atomic and reuses retained r
     defer a.free(retained);
     try std.testing.expectEqual(@as(usize, 0), fake.downloads);
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    fake.calls = 0;
+    try std.testing.expectError(error.DocumentRegionLimitExceeded, Service(Fake).readJson(&fake, a,
+        \\{"model":"antfly/native-document","documents":[{"id":"excess","url":"excess-runs","media_type":"application/pdf"}]}
+    , .{}));
+    try std.testing.expectError(error.DocumentRegionLimitExceeded, Service(Fake).extractJson(&fake, a,
+        \\{"model":"leaf","schema_version":2,"schema":{"structures":{"record":{"fields":{"value":"str"}}}},"documents":[{"id":"excess","url":"excess-runs","media_type":"application/pdf"}]}
+    , .{}));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
     // The visible source comes first: preflight must reject the entire batch
     // before even extracting that source. Explicit inclusion restores both rows.
-    fake.calls = 0;
     const hidden_request =
         \\{"model":"leaf","schema_version":2,"schema":{"structures":{"record":{"fields":{"value":"str"}}}},"documents":[{"id":"visible","url":"fixture","media_type":"application/pdf"},{"id":"hidden","url":"hidden-slides","media_type":"application/vnd.openxmlformats-officedocument.presentationml.presentation","pages":[1]}]}
     ;
@@ -1321,4 +1330,20 @@ test "document extraction validates retained manifests and preserves manifest so
         const malformed = try std.json.parseFromSliceLeaky(V, a, json, .{});
         try std.testing.expectError(error.InvalidDocumentArtifact, service.inputsFromRead(a, malformed));
     }
+}
+
+test "document retention applies active limits to native regions and table cells" {
+    const service = Service(struct {});
+    const regions = [_]c.Region{ .{ .id = 0, .text = "One" }, .{ .id = 1, .text = "Two" } };
+    const cells = [_]c.Cell{ .{ .row = 0, .column = 0, .text = "One" }, .{ .row = 0, .column = 1, .text = "Two" } };
+    const tables = [_]c.Table{.{ .id = 0, .rows = 1, .columns = 2, .cells = &cells }};
+    var page: c.Page = .{ .source_id = "native", .number = 1, .kind = .page, .regions = &regions };
+    try std.testing.expectError(error.DocumentRegionLimitExceeded, service.retainPage(std.testing.failing_allocator, page, 1));
+    page.regions = &.{};
+    page.tables = &tables;
+    try std.testing.expectError(error.DocumentRegionLimitExceeded, service.retainPage(std.testing.failing_allocator, page, 1));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const retained = try service.retainPage(arena.allocator(), page, 2);
+    try std.testing.expectEqual(@as(usize, 2), retained.tables[0].cells.len);
 }

@@ -33,6 +33,7 @@ const Part = struct {
 };
 pub const Cache = struct {
     parts: std.StringHashMapUnmanaged(*Part) = .{},
+    max_regions: usize = 65536,
     pub fn inherited(self: *Cache, a: A, archive: xml.Archive, slide_path: []const u8, bytes: []const u8) ![]const c.InheritedPart {
         var out = std.ArrayList(c.InheritedPart).empty;
         const visible = try showsMaster(bytes);
@@ -68,7 +69,7 @@ pub const Cache = struct {
             .path = path,
             .role = role,
             .text = try xml.text(a, content.shapes),
-            .tables = try xml.tables(a, content.shapes),
+            .tables = try xml.tablesWithLimit(a, content.shapes, self.max_regions),
             .show_master = try showsMaster(bytes),
             .shape_visual = try xml.needsVisualInspection(content.shapes),
             .has_background = content.background != null,

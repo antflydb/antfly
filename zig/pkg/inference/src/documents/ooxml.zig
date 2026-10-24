@@ -310,6 +310,9 @@ test "document XML attributes tolerate quoted greater-than and reordered attribu
 /// Native DrawingML tables retain empty cells and span declarations. Cell
 /// geometry remains unknown unless supplied by a renderer; never invent boxes.
 pub fn tables(a: A, xml: []const u8) ![]const @import("contract.zig").Table {
+    return tablesWithLimit(a, xml, 65536);
+}
+pub fn tablesWithLimit(a: A, xml: []const u8, limit: usize) ![]const @import("contract.zig").Table {
     const c = @import("contract.zig");
     var result = std.ArrayList(c.Table).empty;
     var cells = std.ArrayList(c.Cell).empty;
@@ -321,6 +324,7 @@ pub fn tables(a: A, xml: []const u8) ![]const @import("contract.zig").Table {
     var cell_start: ?usize = null;
     var row_span: usize = 1;
     var column_span: usize = 1;
+    var total_cells: usize = 0;
     while (true) {
         const before = iter.index;
         const token = (try iter.next()) orelse break;
@@ -329,7 +333,8 @@ pub fn tables(a: A, xml: []const u8) ![]const @import("contract.zig").Table {
         const local = tag.local();
         if (std.mem.eql(u8, local, "tbl")) {
             if (!tag.closing) {
-                if (active or result.items.len >= 4096) return error.InvalidDocumentTable;
+                if (active) return error.InvalidDocumentTable;
+                if (result.items.len >= @min(limit, 4096)) return error.DocumentRegionLimitExceeded;
                 active = true;
                 row = 0;
                 columns = 0;
@@ -347,7 +352,8 @@ pub fn tables(a: A, xml: []const u8) ![]const @import("contract.zig").Table {
         } else if (active and std.mem.eql(u8, local, "tc")) {
             if (tag.closing) {
                 const start = cell_start orelse return error.InvalidDocumentTable;
-                if (cells.items.len >= 65536) return error.DocumentRegionLimitExceeded;
+                if (total_cells >= limit) return error.DocumentRegionLimitExceeded;
+                total_cells += 1;
                 try cells.append(a, .{ .row = row, .column = column, .row_span = row_span, .column_span = column_span, .text = try text(a, xml[start..before]) });
                 column += 1;
                 cell_start = null;
@@ -403,4 +409,17 @@ test "document native text preserves hard breaks in runs and table cells" {
     const table = try tables(a, table_xml);
     try std.testing.expectEqualStrings("12\n34\n", table[0].cells[0].text);
     try std.testing.expectEqualStrings("12\n34\n\t\n", try text(a, table_xml));
+}
+
+test "document slide table limits are shared across cells and checked during parsing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const xml = "<a:tbl><a:tr><a:tc><a:t>One</a:t></a:tc><a:tc><a:t>Two</a:t></a:tc></a:tr></a:tbl>" ++
+        "<a:tbl><a:tr><a:tc><a:t>Three</a:t></a:tc><a:tc><a:t>Four</a:t></a:tc></a:tr></a:tbl>";
+    try std.testing.expectError(error.DocumentRegionLimitExceeded, tablesWithLimit(a, xml, 3));
+    const valid = try tablesWithLimit(a, xml, 4);
+    try std.testing.expectEqual(@as(usize, 2), valid.len);
+    try std.testing.expectEqualStrings("Four", valid[1].cells[1].text);
+    try std.testing.expectError(error.DocumentRegionLimitExceeded, tablesWithLimit(a, "<a:tbl></a:tbl><a:tbl></a:tbl>", 1));
 }

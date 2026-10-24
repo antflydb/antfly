@@ -1367,6 +1367,19 @@ pub const TextRun = struct {
     clip_points: ?[]const [2]f64 = null,
     clip_fill_rule: FillRule = .nonzero,
 
+    /// Page-space bounds of horizontal text, including its transformed basis
+    /// and font ascent/descent. Vertical writing needs per-glyph vertical
+    /// origins; leave that geometry unknown rather than inventing a rectangle.
+    pub fn bounds(self: TextRun) ?PageBox {
+        if (self.vertical) return null;
+        inline for (.{ self.x, self.y, self.a, self.b, self.c, self.d, self.advance_width, self.ascent, self.descent }) |value| if (!std.math.isFinite(value)) return null;
+        if (self.ascent < 0 or self.descent < 0) return null;
+        const box = textRunBounds(self);
+        inline for (.{ box.min_x, box.min_y, box.max_x, box.max_y }) |value| if (!std.math.isFinite(value)) return null;
+        if (box.min_x >= box.max_x or box.min_y >= box.max_y) return null;
+        return .{ .min_x = box.min_x, .min_y = box.min_y, .max_x = box.max_x, .max_y = box.max_y };
+    }
+
     pub fn deinit(self: *TextRun, alloc: Allocator) void {
         if (self.clip_points) |points| alloc.free(points);
         if (self.fill_pattern_name) |name| alloc.free(name);
@@ -3189,25 +3202,34 @@ fn markTextShowRunGroupTracking(runs: anytype) void {
 
 const PositionedTextOutput = union(enum) {
     layout: *std.ArrayList(LayoutTextRun),
-    analysis: *std.ArrayList(TextRun),
+    analysis: struct { runs: *std.ArrayList(TextRun), max_runs: usize },
     render: *std.ArrayList(TextRun),
 
     fn len(self: PositionedTextOutput) usize {
         return switch (self) {
             .layout => |out| out.items.len,
-            .analysis, .render => |out| out.items.len,
+            .analysis => |out| out.runs.items.len,
+            .render => |out| out.items.len,
         };
     }
 
     fn markTextShowTracking(self: PositionedTextOutput, start: usize) void {
         switch (self) {
             .layout => |out| markTextShowRunsTracking(out.items[start..]),
-            .analysis, .render => |out| markTextShowRunsTracking(out.items[start..]),
+            .analysis, .render => markTextShowRunsTracking(self.textRuns().items[start..]),
         }
     }
 
     fn isTextOnly(self: PositionedTextOutput) bool {
         return self != .render;
+    }
+
+    fn textRuns(self: PositionedTextOutput) *std.ArrayList(TextRun) {
+        return switch (self) {
+            .analysis => |out| out.runs,
+            .render => |out| out,
+            .layout => unreachable,
+        };
     }
 };
 
@@ -4754,6 +4776,12 @@ pub const Reader = struct {
     /// Paint-only resources are not needed for character positions. Keep mask
     /// and image decoding in the rendering APIs, as in plain-text extraction.
     pub fn extractPageTextAnalysisAlloc(self: *Reader, page_num: usize) !PageTextAnalysis {
+        return self.extractPageTextAnalysisWithRunLimitAlloc(page_num, std.math.maxInt(usize));
+    }
+
+    /// The shared run count includes nested forms and all content streams.
+    /// Reject excess runs before copying their text or reconstructing layout.
+    pub fn extractPageTextAnalysisWithRunLimitAlloc(self: *Reader, page_num: usize, max_runs: usize) !PageTextAnalysis {
         try self.beginImageCacheScope();
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
@@ -4786,7 +4814,7 @@ pub const Reader = struct {
             self.alloc.free(color_spaces);
         }
 
-        var analysis = try self.extractDecodedTextAnalysisAlloc(decoded_content, stream_ranges.?, fonts, &.{}, forms, color_spaces);
+        var analysis = try self.extractDecodedTextAnalysisAlloc(decoded_content, stream_ranges.?, fonts, &.{}, forms, color_spaces, max_runs);
         errdefer analysis.deinit(self.alloc);
         analysis.has_unrendered_annotations = annotations;
         analysis.outline_fallback = pageFontsUsedOutlineFallback(fonts);
@@ -6157,6 +6185,7 @@ pub const Reader = struct {
         gstates: []const PageExtGState,
         forms: []const PageForm,
         color_spaces: []const PageColorSpace,
+        max_runs: usize,
     ) !PageTextAnalysis {
         var text = std.ArrayList(u8).empty;
         errdefer text.deinit(self.alloc);
@@ -6165,7 +6194,7 @@ pub const Reader = struct {
             for (runs.items) |*run| run.deinit(self.alloc);
             runs.deinit(self.alloc);
         }
-        var run_parser = try PositionedTextParser.init(self.alloc, .{ .analysis = &runs }, initialTextRunStateForColorSpaces(color_spaces), &.{}, .nonzero);
+        var run_parser = try PositionedTextParser.init(self.alloc, .{ .analysis = .{ .runs = &runs, .max_runs = max_runs } }, initialTextRunStateForColorSpaces(color_spaces), &.{}, .nonzero);
         defer run_parser.deinit();
         run_parser.cancellation = self.cancellation;
 
@@ -6177,8 +6206,8 @@ pub const Reader = struct {
             // ordered reconstruction is intentionally not content order.
             var text_parser = TextContentParser.init(self.alloc, &text);
             defer text_parser.deinit();
-            try text_parser.consume(stream_content, fonts, forms, 0);
             try run_parser.consume(stream_content, fonts, gstates, forms);
+            try text_parser.consume(stream_content, fonts, forms, 0);
         }
 
         var owned_text = try text.toOwnedSlice(self.alloc);
@@ -15796,7 +15825,7 @@ fn applyTextRunOperator(
         next_group_id.* = nested_parser.next_group_id;
         switch (out) {
             .layout => {},
-            .analysis, .render => |render_out| for (render_out.items[start_len..]) |*run| {
+            .analysis, .render => for (out.textRuns().items[start_len..]) |*run| {
                 if (vectorize_form_text) {
                     // Recursively nested runs already hold the innermost
                     // resource borrow. Otherwise translate this Form-local
@@ -17329,7 +17358,9 @@ fn appendTextRunDecodedString(
                 .paint_order = paint_order,
             });
         },
-        .analysis, .render => |render_out| {
+        .analysis, .render => {
+            const render_out = out.textRuns();
+            if (out == .analysis and render_out.items.len >= out.analysis.max_runs) return error.TextRunLimitExceeded;
             const vectorizable = if (state.current_font_index) |font_idx|
                 fonts[font_idx].type3 != null or
                     fonts[font_idx].type1 != null or
@@ -31732,4 +31763,80 @@ test "document PDF annotation coverage is bounded and prevents incomplete native
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.check, .{});
+}
+
+test "document text bounds use transformed font metrics and leave unsupported geometry unknown" {
+    const run: TextRun = .{ .text = "Text", .x = 10, .y = 20, .font_size = 10, .advance_width = 40, .ascent = 8, .descent = 2, .horizontal_scale = 1 };
+    const cases = .{
+        .{ .basis = [4]f64{ 1, 0, 0, 1 }, .box = [4]f64{ 10, 18, 50, 28 } },
+        .{ .basis = [4]f64{ 0, 1, -1, 0 }, .box = [4]f64{ 2, 20, 12, 60 } },
+        .{ .basis = [4]f64{ 2, 0.5, 0.3, 3 }, .box = [4]f64{ 9.4, 14, 92.4, 64 } },
+        .{ .basis = [4]f64{ -1, 0, 0, 1 }, .box = [4]f64{ -30, 18, 10, 28 } },
+    };
+    inline for (cases) |case| {
+        var transformed = run;
+        transformed.a = case.basis[0];
+        transformed.b = case.basis[1];
+        transformed.c = case.basis[2];
+        transformed.d = case.basis[3];
+        const box = transformed.bounds().?;
+        inline for (.{ box.min_x, box.min_y, box.max_x, box.max_y }, case.box) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 0.000001);
+    }
+    var unsupported = run;
+    unsupported.vertical = true;
+    try std.testing.expect(unsupported.bounds() == null);
+    unsupported = run;
+    unsupported.a = std.math.nan(f64);
+    try std.testing.expect(unsupported.bounds() == null);
+    unsupported = run;
+    unsupported.d = 0;
+    try std.testing.expect(unsupported.bounds() == null);
+}
+
+test "document bounded PDF analysis rejects excess runs before layout and preserves the reader" {
+    const a = std.testing.allocator;
+    const bytes = try buildTextOrderingTestPdfAlloc(a, "BT /F1 12 Tf 10 20 Td (One) Tj (Two) Tj (Three) Tj ET\n");
+    defer a.free(bytes);
+    var reader = try Reader.init(a, bytes);
+    defer reader.deinit();
+    try std.testing.expectError(error.TextRunLimitExceeded, reader.extractPageTextAnalysisWithRunLimitAlloc(1, 2));
+    var complete = try reader.extractPageTextAnalysisWithRunLimitAlloc(1, 3);
+    defer complete.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), complete.runs.len);
+}
+
+test "document bounded PDF runs share one allowance across consumes and nested forms" {
+    const a = std.testing.allocator;
+    var runs: std.ArrayList(TextRun) = .empty;
+    defer {
+        for (runs.items) |*run| run.deinit(a);
+        runs.deinit(a);
+    }
+    var parser = try PositionedTextParser.init(a, .{ .analysis = .{ .runs = &runs, .max_runs = 2 } }, .{}, &.{}, .nonzero);
+    defer parser.deinit();
+    try parser.consume("BT 3 Tr (Invisible) Tj 0 Tr (First) Tj ET", &.{}, &.{}, &.{});
+    const form = PageForm{ .name = @constCast("Fm"), .content = @constCast("BT (Second) Tj (Excess) Tj ET") };
+    try std.testing.expectError(error.TextRunLimitExceeded, parser.consume("/Fm Do", &.{}, &.{}, &.{form}));
+    try std.testing.expectEqual(@as(usize, 2), runs.items.len);
+    try std.testing.expectEqualStrings("Second", runs.items[1].text);
+}
+
+test "document bounded PDF run allocation failures release partially collected text" {
+    const Runner = struct {
+        fn run(a: Allocator) !void {
+            var runs: std.ArrayList(TextRun) = .empty;
+            defer {
+                for (runs.items) |*item| item.deinit(a);
+                runs.deinit(a);
+            }
+            var parser = try PositionedTextParser.init(a, .{ .analysis = .{ .runs = &runs, .max_runs = 1 } }, .{}, &.{}, .nonzero);
+            defer parser.deinit();
+            parser.consume("BT (First) Tj (Excess) Tj ET", &.{}, &.{}, &.{}) catch |err| switch (err) {
+                error.TextRunLimitExceeded => return,
+                else => return err,
+            };
+            return error.TestUnexpectedResult;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }

@@ -30711,8 +30711,8 @@ pub const InferenceTextRegion = struct {
     fields: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
     /// Recognized text within the region
     text: []const u8,
-    /// Bounding box [x1, y1, x2, y2] in the document source coordinate space, or pixels for ordinary image requests
-    bbox: []const f64,
+    /// Bounding box [x1, y1, x2, y2] in the document source coordinate space, or pixels for ordinary image requests. Null when source geometry cannot be established, including unsupported vertical PDF writing.
+    bbox: ?[]const f64,
     /// Recognition confidence score (0-1)
     confidence: ?f64 = null,
     /// Semantic label from layout analysis (e.g., text, title, table)
