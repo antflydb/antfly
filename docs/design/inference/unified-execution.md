@@ -1074,7 +1074,7 @@ unqualified implementation as achieved savings.
   with committed source, refreshed images, retained receipts, actual net
   deletion figures and a clean worktree. There is no push/deployment step.
 
-## Proposed next bulk campaign: kernel bodies and typed launch ownership
+## Completed next bulk campaign: kernel bodies and typed launch ownership
 
 Status: implementation in progress, following the completed 24-package
 campaign. Baseline source, images and qualified executables are frozen;
@@ -1238,8 +1238,8 @@ All 88 safe/fast direct cases pass baseline bytes, independent arithmetic
 references, guards, resources and the 5% timing ceiling with 32 balanced arms
 and 2,000 dispatches. Fixtures cover partial output tiles, multiple row/block
 sizes and empty rows. Full source compilation succeeds on the actual Metal
-runtime compiler. Receipts are in `next-bulk/metal-q4-scalar/`; composition
-qualification remains pending.
+runtime compiler. Receipts are in `next-bulk/metal-q4-scalar/`; the completed
+composition qualification follows below.
 
 ### CUDA launch ABI checkpoint
 
@@ -1283,7 +1283,7 @@ indexing without merging position sources, transcendental evaluation or norm
 reductions; all 28 referenced safe/fast cases pass. N26 replaces 98 repeated
 three-buffer/constant binding blocks with one forced-inline native ABI owner.
 Encoder/resource ownership, slots, offsets and submission counts stay at their
-original callers. Host model qualification is still required for this cohort.
+original callers. The integrated model and direct-kernel qualification below passes.
 
 The N14 audit retains the existing prefill schedules. HD256 uses four simdgroups
 and page-local eight-token loads, configurable KC32/KC64 staging and a direct
@@ -1300,14 +1300,15 @@ the row loop. Their wave counts, scratch extents and output mapping differ.
 Only the identical final quantized-output writer is shared. It explicitly owns
 the zero auxiliary header used by these producers, preserving its distinction
 from raw-sum GGML Q8_1. The protected rows2 and F32 epilogue contexts remain
-separate. The new writer's all-architecture and device qualification is pending.
+separate. The writer passes all seven architecture resource checks and actual
+CUDA device qualification.
 
 N24 makes the 362 typed CUDA export fields the loading/clearing registry, with
 63 required exports and explicit native-name/JIT-only exceptions. N27 shares
 thirteen format-specific extent checks. N30 supplies dimensions to eleven named
 CUDA records through the existing `Linear` descriptor, with no new operation
 fields. Actual capture/replay and malformed/empty-input probes pass; integrated
-model gates remain pending.
+model gates pass in the integrated qualification below.
 
 N28 uses one native transfer owner for eight adapters and delegates CUDA BF16
 mirror construction to the existing typed tensor constructor. Allocation-failure
@@ -1316,8 +1317,9 @@ storage policies. N29 shares backward arithmetic and writes larger packed
 results directly. Measurements reject the single-allocation policy for tiny
 single rows; the faster original storage policy is retained below width 32.
 All five matched-harness shapes pass byte parity and timing across 32 balanced
-arms. P50 ratios are 0.891 (1×8), 0.867 (1×16), 0.632 (1×32), 0.861
-(17×768) and 0.877 (128×2048). Full model/training composition remains pending.
+arms. This checkpoint observes P50 ratios of 0.891 (1×8), 0.867 (1×16),
+0.632 (1×32), 0.861 (17×768) and 0.877 (128×2048). Final portable-candidate
+measurements and model/training composition are recorded below.
 
 N33 emits one serial attention implementation per complete head/thread/GQA
 schedule identity, retaining every exported split-count entry. Standalone
@@ -1329,8 +1331,146 @@ The transitive-include coverage check and all five artifact-script tests pass.
 
 The expanded native/compiler/renderer selection checks 133 cases: 132 pass,
 with one CUDA-device skip on the Mac. Actual CUDA ABI tests run on the Spark separately.
-Frozen composition qualification, artifact resource review, final models,
-training/lifetime/soak checks and final source accounting are still in progress.
+The completed composition, resource review, models, training/lifetime/soak
+checks and final source ledger follow.
+
+### Completed campaign and qualification (2026-10-23)
+
+N01–N36 are complete. The campaign replaces matching native kernel bodies and
+launch scaffolds with consumed owners, and qualifies the composition against
+`0f10101b97825ecd9cb0cbf682ac426dec08f6da`. The preceding completed campaign's
+1,558 lines / 74,764 bytes are excluded from these new savings.
+
+The final authored-production reduction is **3,832 lines / 197,348 bytes**,
+including every replacement helper, descriptor consumer, symbol exception,
+requiredness list and native portability adapter. Positive figures below are
+net removals; negative figures are additions.
+
+| Maintained production source | Lines removed | Bytes removed |
+| --- | ---: | ---: |
+| Metal shader bodies | 17 | 37,037 |
+| Metal native bindings | 280 | 11,588 |
+| CUDA device bodies | 772 | 29,137 |
+| CUDA launch/registration owners, including `launch_abi.zig` | 2,966 | 129,609 |
+| CPU/result ownership and packed backward outputs | −70 | −3,488 |
+| Authored generator owners | −74 | −3,741 |
+| Shared contracts and build/cache dependencies | −43 | −2,097 |
+| Native alignment and portable entry adapters | −16 | −697 |
+| **Authored production total** | **3,832** | **197,348** |
+
+Metal shader figures measure the maintained Objective-C string representation.
+Decoded MSL removes 36,782 bytes; together with CUDA device source this removes
+65,919 bytes of native shader/device language. Generated source separately
+removes 92 lines / 4,234 bytes. Inline Zig tests add 241 lines / 14,012 bytes;
+benchmark/test/build tooling adds 381 lines / 18,637 bytes. Documentation has
+its own ledger category. The three packaged images together remove 347 bytes:
+fatbin grows 3,368 bytes, SM89 cubin grows 512 bytes and PTX shrinks 4,227 bytes.
+The thin exported wrappers continue to instantiate tuned native code.
+Whole tracked-tree file content, including tests, tooling, documentation,
+generated sources and images, decreases by 129,256 bytes.
+
+`zig/pkg/inference/scripts/kernel_source_accounting.py` reproduces these
+categories from the frozen revision, including staged, unstaged and untracked
+source files. Its lexer separates Zig test blocks from implementation while
+handling quoted/multiline literals and nested comments. The per-file ledger
+retains baseline/candidate hashes. The retained receipt is
+`next-bulk/ledger-final/accounting.json` under `.benchmark-assets/1166/`.
+
+The completed ownership map includes 230 CUDA launch arrays (217 mutable-slot
+packers and 13 named native-signature records), 362 typed export fields for
+loading/clearing, 98 Metal binding blocks and eleven concrete `Linear`
+descriptor consumers. Required CUDA exports retain their original error
+priority across the profile gates. Clearing also covers the copy field and
+GLiNER attention array. Capture tests replay after launch-stack locals have
+expired; allocation-failure probes exercise partial tensor/shape construction.
+
+The CPU result adapters are forced inline. An integrated native MiniLM case
+initially regressed by about 6–7%, even with a matched benchmark harness.
+Restoring the original forward-normalization wrapper did not resolve it.
+Sampling and instruction comparisons found matching hot GEMM/attention bodies
+at different linked offsets. Explicit 64-byte native entry alignment resolves
+the regression: the final control against the original baseline has P50 ratio
+0.9993, and an alignment-only comparison against the preceding inlined
+candidate has P50 ratio 0.9437. Original failing receipts and controls remain.
+
+WebAssembly rejects explicit function alignment. It selects the existing core
+GEMM routines and an unaligned attention entry; native targets use aligned
+entries over the same arithmetic owner. The portable rebuild preserves all
+three native hot-body sizes and instructions apart from relocations, with no
+out-of-line attention-body call. Six affected model cases and all five CPU
+primitive cases pass again. Final primitive P50 ratios are 0.939 (1×8), 0.819
+(1×16), 0.632 (1×32), 0.858 (17×768) and 0.874 (128×2048). The small-row
+storage exception remains below width 32; larger packed results eliminate
+three temporary planes and their copies.
+
+| Qualification | Evidence |
+| --- | --- |
+| Full Mac model composition | 13 encoder/reranker cases, 32 balanced arms each; finite, byte-identical outputs and P50 ≤ 1.05 / P95 ≤ 1.10 |
+| Decoder model latency | CPU and Metal, prompt 8 + four decode steps, 32 balanced arms; byte parity, reset/chunked-prefill checks and the same timing limits |
+| Portable native follow-up | Four native encoder and two decoder cases pass all 32-arm gates; hot-entry instruction/alignment comparison passes |
+| Final exact-source CUDA models | Four cases on Glowworm, 32 balanced arms; all numerical and timing gates pass |
+| Metal direct composition | 656 safe/fast cases; exact outputs, guards, resources and timing pass; 262 cases check 352 independent reference outputs |
+| CUDA direct composition | 281 cases: 83 new compute, 39 edge/serial, 111 quant regressions, 12 attention regressions and 36 larger MTP dtype/ordering cases |
+| Independent decoder oracle | All 160,000 logits per backend; F64-reference maximum absolute error 0.000668 native / 0.000759 Metal, below 0.002 |
+| Native/compiler/renderer selection | 132 pass, one CUDA-device skip on the Mac; the actual CUDA capture/ABI/ownership suite passes on Spark |
+| Training, ownership and lifetime | Mac selection: 34 pass / five skips; two fixture-gated resident output/decoder tests rerun with pinned TinyLlama and both pass; final Spark subset: 14 pass / no skips |
+| Final binary soaks | Five Mac and two CUDA runs, 120 seconds each, with separate finite probes, reset/eviction/retained-input checks, allocator release and RSS budgets |
+| Product/browser | Native inference package check and browser WASM build pass |
+| Source/artifact freshness | All 67 generated files/runtime regions fresh; all three CUDA images pass pinned NVCC checks; 54 Metal sources compile through the actual GPU runtime compiler |
+| Qualification tooling | Seven artifact/source-accounting tests pass |
+
+The direct timing limit remains 5%. The 111-case CUDA regression suite first
+recorded one 6% timing failure in an unchanged-SASS kernel. Forward, reversed
+and identical-image controls did not reproduce a consistent slowdown. A
+recorded 500 ms alternating warmup and 20,000 dispatches per arm then passes
+all 111 cases with the same limit; original failures and controls are retained.
+The 36 larger MTP cases use this longer protocol across F32/BF16/F16, both
+ordering representations, non-involutive permutations and partial-cluster tails.
+Their references compute ranking independently from production helpers.
+
+All seven packaged CUDA architectures (75/80/89/90/100/110/120) retain their
+export counts with no register, shared-memory, stack or local-memory increases.
+Q4_0 tile16 argmax uses fewer registers on 75/80/89/90. Actual CUDA execution
+and performance validation use the Spark's GB10/SM121 with native SM120 code;
+the other architectures receive compile/static-resource checks. The
+CUDA TinyLlama architecture guard remains in force on both baseline and
+candidate. MTP kernel fixtures cover its changed bodies; no full Gemma4 model
+checkpoint is claimed. Optional published GLiNER/ModernBERT checkpoint tests
+remain fixture-gated; tiny resident jobs, pinned Torch AdamW, partial resume,
+clipping, allocator failures and backend-gradient coverage pass. The CUDA
+prepared-frame case skipped on the Mac passes on Spark.
+
+The Metal toolchain has no offline AIR compiler in this environment. The
+54-source check records successful `newLibraryWithSource` compilation, with
+source hashes and compiler receipts; actual device pipelines and their
+resources/timings are separately exercised by the 656-case suite.
+
+Retained specializations are explicit results of the audits: HD256/HD512
+prefill barrier/staging schedules; rows4/rows8 FFN acquisition and scratch;
+protected rows2/F32 and raw-sum/zero-aux Q8_1 contexts; NQ8 scalar and MoE
+schedules; rotary position/transcendental/norm policies; and attention
+producer/reducer emission that already has one authored renderer. These keep
+one owner for each matching leaf without combining distinct schedules.
+
+Receipts and immutable inputs are retained under
+`.benchmark-assets/1166/next-bulk/`: `baseline/`, `mac-final-v3/`,
+`mac-checks/`, `mac-portable/`, `native-candidate/`, `native-model-controls/`,
+`native-profiles/`, `cuda-composition/`, `cuda-exact/`, `cuda-portable/`,
+`cuda-mtp-shaped/`, `cuda-mtp-permutation/`, `ledger-final/` and `final-tools/`.
+The full 13-case/direct composition and portable follow-ups have separate
+receipts; their unchanged GPU sources and equal native hot-body evidence are
+retained. Final source manifests include all changed shipping inputs and image
+hashes. Baseline benchmark identities are frozen independently; the matched
+CPU harness patch is saved with the baseline. Coherent implementation commits
+include `aeed3b7587`, `08c89acdce`, `54cf359e36` and `3fa92014ce`, following
+the five earlier implementation checkpoints above.
+
+The matched-baseline worktree is removed after freezing its benchmark and
+harness patch. Task-owned compiled caches/install prefixes are collected on
+both hosts; frozen validation binaries, fixtures, source identities and raw
+receipts remain. `make gc` runs with its active-worktree protection; optional
+UV pruning reaches the existing cache lock timeout. Its lock holder is left
+alone, and task-owned compiled output is collected directly.
 
 ### Six implementation waves
 
