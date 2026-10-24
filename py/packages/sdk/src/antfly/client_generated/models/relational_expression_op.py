@@ -43,6 +43,7 @@ class RelationalExpressionOp(StrEnum):
     SIGN = "sign"
     SQRT = "sqrt"
     SUBTRACT = "subtract"
+    TRANSACTION_TIMESTAMP = "transaction_timestamp"
     TRUNC = "trunc"
     UPPER_ASCII = "upper_ascii"
     UUIDV4 = "uuidv4"

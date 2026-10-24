@@ -100,7 +100,7 @@ pub fn openAtVersion(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *
                     if (std.mem.eql(u8, field, column.path)) break true;
                 } else false;
                 try nulls.append(arena, raw == .null and !json_null);
-                const typed = if (raw == .null or column.type == .array or column.element_type == .numeric) raw else try @import("antfly_local_sources").sql_describe.coerce(raw, column.type);
+                const typed = if (raw == .null or column.type == .array or column.type == .datetime or column.element_type == .numeric) raw else try @import("antfly_local_sources").sql_describe.coerce(raw, column.type);
                 try object.put(arena, column.path, typed);
             }
             const observed = for (entry.predicates.items) |predicate| {

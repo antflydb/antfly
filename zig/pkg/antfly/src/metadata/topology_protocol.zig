@@ -127,7 +127,7 @@ const std = @import("std");
 /// proposal queues and proposal-owned source-correction fences. Main's v37
 /// resolver floor cannot be reused: this branch already assigned that profile
 /// to earlier SQL catalog support that does not decode these resolver fields.
-pub const current_version: u16 = 66;
+pub const current_version: u16 = 67;
 pub const fk_historical_references_version: u16 = 66;
 /// Version 65 retains presentation metadata on stable column identities.
 pub const sql_column_comments_version: u16 = 65;
@@ -156,6 +156,8 @@ pub const index_publication_installation_version: u16 = 56;
 pub const index_publication_decision_version: u16 = 56;
 pub const index_publication_head_version: u16 = 56;
 pub const index_delivery_version: u16 = 56;
+/// Metadata replicas must validate ASCH/reader profile 34 before admitting it.
+pub const clock_defaults_reader_version: u16 = 67;
 pub const schema_reader_publication_version: u16 = 41;
 pub const schema_reader_floor_version: u16 = 40;
 pub const schema_reader_capability_version: u16 = 39;

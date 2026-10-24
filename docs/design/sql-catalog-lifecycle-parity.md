@@ -8,19 +8,52 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 
 ## Current original-case qualification (2026-10-23)
 
-The ledger now records **764 implemented / 137 rejected / 428 superseded /
-257 unresolved**. The requested next-100 batch has closed **36 original cases**:
+The ledger now records **765 implemented / 137 rejected / 428 superseded /
+256 unresolved**. The requested next-100 batch has closed **37 original cases**:
 `sql-0011`, `sql-0014`, `sql-0570`, `sql-0580`, `sql-0586`, `sql-0591`,
 `sql-0595`, `sql-0883`, `sql-0927`, `sql-0935`, `sql-0343`–`sql-0349`,
 `sql-1456`, `sql-1459`, `sql-1464`, `sql-0005`, `sql-0008`, `sql-0009`,
-`sql-0010`, `sql-0142`–`sql-0143`, `sql-0311`–`sql-0317`, `sql-0734`, and `sql-0744`–`sql-0745`;
-**64 of that target remain unfinished**. Thirty-one are implementations; five are
+`sql-0010`, `sql-0142`–`sql-0143`, `sql-0311`–`sql-0317`, `sql-0669`, `sql-0734`, and `sql-0744`–`sql-0745`;
+**63 of that target remain unfinished**. Thirty-two are implementations; five are
 PostgreSQL-invalid originals (outer recursive MERGE, 42601, and ambiguous
 `RETURNING id`, 42702, ALTER ROLE SET with an expression, 42601, and two
-index names used as constraints, 42704), not thirty-six
+index names used as constraints, 42704), not thirty-seven
 newly supported forms. The earlier sixteen mutation witnesses are ten original
-cases, not sixteen completions. **165 unresolved DDL/catalog cases remain open**; the role
+cases, not sixteen completions. **164 unresolved DDL/catalog cases remain open**; the role
 default cohort does not complete that feature work.
+
+### Combined table declaration and transaction-owned defaults
+
+The unchanged `sql-0669` now creates its initially absent table through the
+public metadata endpoint. PostgreSQL 18 and mounted native owners agree on
+27 mutation probes, typed result descriptors, transaction-stable clock defaults,
+failed-write atomicity and cold data/catalog recovery. Coverage includes exact
+NUMERIC rounding and `22003` overflow, CHECK/NOT NULL/generated/UNIQUE/PK/FK
+enforcement, binary `COLLATE "C"`, JSON null versus SQL NULL, nullable/empty SQL
+arrays, UUIDv4 defaults and UUIDv7 default evolution. Repeating the original
+conditional CREATE preserves the populated table's newer schema and owner.
+
+Clock dependence is captured in immutable column bindings. Only omitted clock
+defaults require extra SQL normalization; ordinary defaults retain native
+commit preparation. RETURNING and staged reads share owned temporal datums,
+including existing directories carrying raw native nanoseconds. The integrity
+coordinator preserves typed-null provenance through before/after images,
+cascades, bounded owner observations and the preparation memory budget. Native
+observations explicitly negotiate provenance without changing older callers'
+response shape. NUMERIC overflow retains its SQL diagnostic; array-to-TEXT
+casts use the existing bounded typed formatter.
+
+Stable ADD COLUMN backfill clocks are captured after idempotent request lookup
+and persisted as typed inputs in the shared rewrite intent. Snapshot pages,
+retained tails and cold reconstruction reuse the timestamp while future writes
+retain the active clock default. Existing values and explicit SQL NULLs remain
+unchanged; a changed clock fails the saved program digest. Allocation-failure tests cover this boundary and temporal
+projection. Schema reader capability 34 and metadata protocol 67 use the existing
+cluster activation fence. Public expression models are generated from OpenAPI.
+The full Debug SQL suite passes 1,347 local and 236 dependent tests, with four
+existing opt-in skips; strict mounted, native cascade, rewrite and reader gates
+have no skips or leaks. The independent PostgreSQL oracle and inventory checker
+also pass. This qualification closes one original case; `sql-0736` remains open.
 
 ### NOT VALID FK: historical references and a durable coverage barrier
 
@@ -58,7 +91,7 @@ restart during pending coverage, raced destructive prepares, stale/different
 coverage decisions, early ACK replay, authenticated mounted SQL cold recovery,
 and neighboring FK and self-FK publication. Decoder version 66 uses the existing
 coordinated activation barrier. Generated public models expose the declaration.
-This closes one original case and advances the requested batch to **36/100**.
+That qualification advanced the requested batch to **36/100**.
 `sql-0736` VALIDATE remains unresolved: clearing the declaration without a
 coordinated historical proof returns `0A000`; MATCH PARTIAL NOT VALID is guarded.
 

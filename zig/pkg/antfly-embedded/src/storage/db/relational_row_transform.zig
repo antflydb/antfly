@@ -31,6 +31,8 @@ pub const Digest = [32]u8;
 
 pub const Policies = struct {
     default_columns: []const []const u8 = &.{},
+    /// Captured by admission; shared by snapshot, tail and cold recovery.
+    default_clock_micros: ?i64 = null,
     dropped_columns: enum(u8) { reject, allow } = .reject,
     expression_schema: []const u8 = "",
     column_transforms: []const @import("relational_rewrite_contract.zig").ColumnTransform = &.{},
@@ -142,6 +144,7 @@ pub const Program = struct {
     source_ordinals: []?u32,
     policies: Policies,
     default_mask: ?[]bool,
+    default_transaction_start: ?@import("../../sql/statement_clock.zig").Instant,
     requires_materialized_defaults: bool,
     source_schema_digest: Digest,
     target_schema_digest: Digest,
@@ -200,6 +203,22 @@ pub const Program = struct {
                 owned_name.* = to[ordinal].name;
             }
         }
+        var clock_required = false;
+        if (mask) |enabled| if (target.validator().?.execution.expressions) |set| {
+            for (set.bindings) |binding| {
+                if (binding.generated or !enabled[binding.ordinal]) continue;
+                for (binding.plan.nodes) |node| if (node.op == .transaction_timestamp) {
+                    clock_required = true;
+                    break;
+                };
+            }
+        };
+        if (clock_required != (policies.default_clock_micros != null)) return error.InvalidRestoreStagingCommand;
+        const default_transaction_start = if (policies.default_clock_micros) |micros| instant: {
+            const value = try @import("../../sql/statement_clock.zig").Instant.init(micros);
+            if (value.infinity() != 0) return error.InvalidRestoreStagingCommand;
+            break :instant value;
+        } else null;
         const mapping = try alloc.alloc(?u32, to.len);
         errdefer alloc.free(mapping);
         for (to, mapping, 0..) |column, *ordinal, target_ordinal| {
@@ -237,6 +256,12 @@ pub const Program = struct {
             hash.update("explicit-column-transforms-v1");
             hash.update(&transform_set.?.digest);
         }
+        if (policies.default_clock_micros) |micros| {
+            hash.update("scoped-default-clock-v1");
+            var encoded: [8]u8 = undefined;
+            std.mem.writeInt(i64, &encoded, micros, .little);
+            hash.update(&encoded);
+        }
         var materialized_defaults = false;
         if (mask) |enabled| if (target.validator().?.execution.expressions) |set| {
             for (set.bindings) |binding| {
@@ -249,7 +274,7 @@ pub const Program = struct {
         };
         var identity: Digest = undefined;
         hash.final(&identity);
-        return .{ .requires_materialized_defaults = materialized_defaults, .alloc = alloc, .source = source, .target = target, .source_ordinals = mapping, .policies = .{ .default_columns = names, .dropped_columns = policies.dropped_columns, .expression_schema = if (transform_set) |set| set.source_json else "", .column_transforms = if (transform_set) |set| set.rules else &.{} }, .default_mask = mask, .source_schema_digest = source_digest, .target_schema_digest = target_digest, .identity = identity, .transforms = transforms, .transform_set = transform_set, .expression_ordinals = expression_ordinals };
+        return .{ .requires_materialized_defaults = materialized_defaults, .alloc = alloc, .source = source, .target = target, .source_ordinals = mapping, .policies = .{ .default_columns = names, .default_clock_micros = policies.default_clock_micros, .dropped_columns = policies.dropped_columns, .expression_schema = if (transform_set) |set| set.source_json else "", .column_transforms = if (transform_set) |set| set.rules else &.{} }, .default_mask = mask, .default_transaction_start = default_transaction_start, .source_schema_digest = source_digest, .target_schema_digest = target_digest, .identity = identity, .transforms = transforms, .transform_set = transform_set, .expression_ordinals = expression_ordinals };
     }
 
     pub fn deinit(self: *Program) void {
@@ -311,6 +336,7 @@ pub const Program = struct {
         var expression_bytes: usize = expressions.max_allocated_bytes;
         var execution = expressions.Execution.init(arena, &expression_bytes);
         execution.preparation_runtime = runtime;
+        execution.bound_transaction_start = self.default_transaction_start;
         var input: expressions.PreparedInput = undefined;
         try input.initBoundRow(&execution, row);
         defer input.deinit();

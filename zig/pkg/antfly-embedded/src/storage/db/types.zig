@@ -1432,6 +1432,8 @@ pub const LookupOptions = struct {
     /// Private optimistic observation: captures version and SHA256 of the
     /// exact primary bytes from one snapshot, regardless of JSON projection.
     include_primary_digest: bool = false,
+    /// Internal typed observation only; the outer owner job carries provenance in its bounded body.
+    include_json_null_fields: bool = false,
     restore_staging_scope: ?[32]u8 = null,
     restore_staging_plan_id: ?[16]u8 = null,
     /// Authenticated group-local control read; never accepted by public lookup parsing.
@@ -1474,9 +1476,12 @@ pub const LookupResult = struct {
     json: []u8,
     version: ?u64 = null,
     expected_content_digest: ?[32]u8 = null,
+    json_null_fields: []const []const u8 = &.{},
 
     pub fn deinit(self: *LookupResult, alloc: Allocator) void {
         alloc.free(self.json);
+        for (self.json_null_fields) |name| alloc.free(name);
+        if (self.json_null_fields.len != 0) alloc.free(self.json_null_fields);
         self.* = undefined;
     }
 };
@@ -1536,6 +1541,9 @@ pub const RelationalRowQuery = struct {
     /// the same owner-side SELECT policy and mandatory filter as a read.
     /// Ordinary write normalization deliberately does not require visibility.
     require_normalized_visibility: bool = false,
+    /// Internal normalization context captured by the SQL transaction owner.
+    /// Never replaces read authority, schema fences or the authenticated policy.
+    normalization_transaction_micros: ?i64 = null,
     /// Retained typed readers bound bytes as well as rows. Transported with
     /// the query so every owner uses the same requested page envelope.
     page_bytes: usize = 16 * 1024 * 1024,

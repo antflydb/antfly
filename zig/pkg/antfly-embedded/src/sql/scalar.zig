@@ -1328,7 +1328,8 @@ pub fn assignText(alloc: Allocator, datum: Datum, source_identity: ?arrays.Eleme
     if (datum.array) |array| {
         var text: std.Io.Writer.Allocating = .init(alloc);
         defer text.deinit();
-        try @import("array_text.zig").encode(alloc, array.*, &text.writer, .{ .wire_bytes = limits.output_bytes, .context = evaluator.workOwner() });
+        @import("array_text.zig").encode(alloc, array.*, &text.writer, .{ .wire_bytes = limits.output_bytes, .context = evaluator.workOwner() }) catch |err|
+            return if (err == error.WriteFailed) error.OutOfMemory else err;
         const owned = try text.toOwnedSlice();
         errdefer alloc.free(owned);
         try evaluator.charge(owned.len);
@@ -1865,6 +1866,23 @@ test "SQL NUMERIC modifier constants reuse exact results without row allocations
             try std.testing.expectEqual(first.array, next.array);
         }
     }
+}
+
+test "SQL array text casts use the bounded typed array formatter" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var compiled = try @import("compiler.zig").compileScalar(a, "CAST(ARRAY['one',NULL,'two'] AS text)", .{});
+            defer compiled.deinit();
+            var program = try bind(a, compiled.expression, &.{}, &.{}, .{});
+            defer program.deinit();
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const value = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+            try std.testing.expectEqualStrings("{one,NULL,two}", value.value.string);
+        }
+    };
+    try Check.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "SQL bound array expressions match PostgreSQL scalar contracts" {
@@ -2974,7 +2992,9 @@ const Binder = struct {
                 // representation before narrowing to integers. An explicit
                 // real/double array cast supplies floating-point semantics.
                 if (cast.type == .array and source.kind == .array and builtin_cast.floating(source.element_type.?) and (builtin_cast.integral(cast.element_type.?) or cast.element_type == .text) and cast.operand.* != .cast and cast.operand.* != .column) return error.UnsupportedSqlShape;
-                if (cast.type != .array and source.kind == .array) return error.UnsupportedSqlShape;
+                // The shared array text encoder preserves dimensions, NULL,
+                // quoting and element identity under this execution's budgets.
+                if (cast.type != .array and cast.type != .string and source.kind == .array) return error.UnsupportedSqlShape;
                 break :blk .{ .kind = cast.type, .element_type = cast.element_type, .numeric_modifier = cast.numeric_modifier, .temporal_kind = cast.temporal_kind, .nullable = source.nullable };
             },
             .unary => |unary| blk: {
@@ -4218,7 +4238,8 @@ const Evaluator = struct {
                     if (cast.type != .string) return error.SqlTypeMismatch;
                     var text: std.Io.Writer.Allocating = .init(self.alloc);
                     defer text.deinit();
-                    try @import("array_text.zig").encode(self.alloc, array.*, &text.writer, .{ .wire_bytes = self.limits.output_bytes -| self.bytes, .context = self.workOwner() });
+                    @import("array_text.zig").encode(self.alloc, array.*, &text.writer, .{ .wire_bytes = self.limits.output_bytes -| self.bytes, .context = self.workOwner() }) catch |err|
+                        return if (err == error.WriteFailed) error.OutOfMemory else err;
                     const owned = try text.toOwnedSlice();
                     errdefer self.alloc.free(owned);
                     try self.charge(owned.len);

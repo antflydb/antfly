@@ -20457,6 +20457,7 @@ pub const DB = struct {
         if (std.mem.eql(u8, kind.value.kind, "retirement")) return self.lookupRelationalRetirement(alloc, request_json);
         var request = try std.json.parseFromSlice(struct {
             kind: enum { discover, references, claims, observations } = .discover,
+            typed_nulls: bool = false,
             addresses: []const integrity.Address = &.{},
             keys: []const []const u8 = &.{},
             schema_version: ?u32 = null,
@@ -20467,7 +20468,7 @@ pub const DB = struct {
         }, alloc, request_json, .{ .allocate = .alloc_always });
         defer request.deinit();
         if (request.value.limit == 0 or request.value.limit > 128) return error.InvalidIntegrityBudget;
-        if (request.value.kind == .observations) return self.lookupPreparationObservations(alloc, request.value.keys, options, request.value.schema_version, request.value.generation_set);
+        if (request.value.kind == .observations) return self.lookupPreparationObservations(alloc, request.value.keys, options, request.value.schema_version, request.value.generation_set, request.value.typed_nulls);
         if (request.value.kind == .claims) return self.lookupRelationalIntegrityClaims(alloc, request.value.addresses, request.value.schema_version, request.value.generation_set);
         if (request.value.kind == .references) return self.lookupRelationalIntegrityReferences(alloc, request.value.address orelse return error.InvalidIntegrityAddress, request.value.after, request.value.limit, request.value.schema_version, request.value.generation_set);
         if (request.value.address != null) return error.InvalidIntegrityAddress;
@@ -20550,7 +20551,7 @@ pub const DB = struct {
         if (bindings.schema_version != schema_version or !std.mem.eql(u8, &generation_set, &@import("relational_integrity_activation_contract.zig").generationSet(bindings))) return error.PreparedGenerationChanged;
     }
 
-    fn lookupPreparationObservations(self: *DB, alloc: Allocator, keys: []const []const u8, outer: types.LookupOptions, expected_schema: ?u32, expected_set: ?@import("relational_integrity.zig").Digest) !?types.LookupResult {
+    fn lookupPreparationObservations(self: *DB, alloc: Allocator, keys: []const []const u8, outer: types.LookupOptions, expected_schema: ?u32, expected_set: ?@import("relational_integrity.zig").Digest, typed_nulls: bool) !?types.LookupResult {
         if (expected_schema == null or expected_set == null) return error.InvalidIntegrityAddress;
         if (keys.len == 0 or keys.len > 8) return error.InvalidIntegrityBudget;
         const Item = struct { key: []const u8, row: ?types.LookupResult };
@@ -20574,6 +20575,7 @@ pub const DB = struct {
             var options = outer;
             options.relational_integrity_jobs_json = "";
             options.include_primary_digest = true;
+            options.include_json_null_fields = typed_nulls;
             const row = try self.lookupPrimarySnapshot(scratch, key, options, &probe);
             if (row) |value| {
                 retained = std.math.add(usize, retained, value.json.len) catch return error.TransactionTooLarge;
@@ -20583,6 +20585,7 @@ pub const DB = struct {
         }
         const Response = struct {
             observations: []const Item,
+            typed_nulls: bool,
             pub fn jsonStringify(value: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
                 try stream.beginObject();
                 try stream.objectField("observations");
@@ -20594,14 +20597,18 @@ pub const DB = struct {
                     try stream.objectField("row");
                     // Primary JSON remains an encoded document string. Binary
                     // digests are fixed arrays and cannot lose byte identity.
-                    try stream.write(item.row);
+                    if (value.typed_nulls) {
+                        try stream.write(item.row);
+                    } else if (item.row) |row| {
+                        try stream.write(.{ .json = row.json, .version = row.version, .expected_content_digest = row.expected_content_digest });
+                    } else try stream.write(null);
                     try stream.endObject();
                 }
                 try stream.endArray();
                 try stream.endObject();
             }
         };
-        const json = try std.json.Stringify.valueAlloc(alloc, Response{ .observations = items }, .{});
+        const json = try std.json.Stringify.valueAlloc(alloc, Response{ .observations = items, .typed_nulls = typed_nulls }, .{});
         errdefer alloc.free(json);
         if (json.len > 16 * 1024 * 1024) return error.TransactionTooLarge;
         try checkLookupOptionsActive(outer);
@@ -21103,7 +21110,11 @@ pub const DB = struct {
             }
         }
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
-        return .{ .json = stored, .version = version, .expected_content_digest = digest };
+        const json_null_fields = if (opts.include_json_null_fields)
+            if (ordinal_row) |row| try row.jsonNullFieldsAlloc(output) else &.{}
+        else
+            &.{};
+        return .{ .json = stored, .version = version, .expected_content_digest = digest, .json_null_fields = json_null_fields };
     }
 
     fn lookupSnapshotTimestamp(alloc: Allocator, key: []const u8, probe: *docstore_mod.DocStore.Txn) !u64 {
@@ -27100,7 +27111,7 @@ pub const DB = struct {
             }
         };
         const io = self.backend_runtime.io();
-        var ctx = Context{ .alloc = alloc, .intents = intents, .view = view, .validator = if (view.validator()) |compiled| (if (io) |provided| compiled.forPreparation(.{ .io = provided }) else compiled) else null, .io = io orelse std.Options.debug_io };
+        var ctx = Context{ .alloc = alloc, .intents = intents, .view = view, .validator = if (view.validator()) |compiled| (if (io) |provided| compiled.forPreparation(try (@import("../../schema/relational_expression.zig").PreparationRuntime{ .io = provided }).withClock(view.tableSchema().requires_clock_defaults)) else compiled) else null, .io = io orelse std.Options.debug_io };
         var input_bytes: usize = 0;
         for (intents) |intent| input_bytes +|= if (intent.value) |value| value.len else 0;
         const workers = @min(@as(usize, 8), @min(intents.len, @max(@as(usize, 1), input_bytes / (256 * 1024))));
@@ -42557,6 +42568,11 @@ pub const DB = struct {
         session.require_normalized_visibility = parsed.value.require_normalized_visibility;
         session.normalization_only = if (verified_principal) |proof| proof.value.purpose.normalizationOnly() else false;
         errdefer session.reader.deinit();
+        if (parsed.value.normalization_transaction_micros) |micros| {
+            const instant = try @import("../../sql/statement_clock.zig").Instant.init(micros);
+            if (instant.infinity() != 0) return error.InvalidTransactionClock;
+            if (session.preparation_runtime) |*runtime| runtime.transaction_start = instant;
+        }
         if (opts.include_range_proofs) {
             const tracking = @import("../range_protection.zig");
             if (session.reader.exact_index_tuple) |tuple| {

@@ -360,6 +360,15 @@ fn lowerProgramPolicy(alloc: std.mem.Allocator, program: *const scalar.Program, 
                 break :blk try json(alloc, .{ .op = op, .args = &[_]Json{ left, right } });
             },
             .call => |part| blk: {
+                if (part.function == .now or part.function == .transaction_timestamp or part.function == .@"$current_timestamp") {
+                    if (immutable != .column_default) return error.UnsupportedSqlShape;
+                    const precision: u8 = if (part.function == .@"$current_timestamp") p: {
+                        const argument = try defaultArgument(&plan.?, part.args[0]);
+                        if (argument.sql_null or argument.value != .integer or argument.value.integer < 0 or argument.value.integer > 6) return error.InvalidSqlProgram;
+                        break :p @intCast(argument.value.integer);
+                    } else 6;
+                    break :blk try json(alloc, .{ .op = "transaction_timestamp", .precision = precision });
+                }
                 if (part.function == .gen_random_uuid or part.function == .uuidv7) {
                     if (immutable != .column_default) return error.UnsupportedSqlShape;
                     if (part.function == .gen_random_uuid) break :blk try json(alloc, .{ .op = "uuidv4" });

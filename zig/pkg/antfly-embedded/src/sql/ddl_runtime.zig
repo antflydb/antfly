@@ -392,6 +392,111 @@ pub fn createSchemaAllocWithLimits(alloc: std.mem.Allocator, create: ast.CreateT
     return std.json.Stringify.valueAlloc(alloc, schema, .{});
 }
 
+test "SQL transaction clock defaults share owned instants fence readers and preserve restored values" {
+    const a = std.testing.allocator;
+    const Allocator = std.mem.Allocator;
+    const schema = @import("../storage/schema.zig");
+    const checks = @import("../schema/relational_checks.zig");
+    const Plan = @import("../schema/relational_expression.zig").Plan;
+    const Clock = @import("../sql/statement_clock.zig");
+    const Check = struct {
+        fn run(alloc: Allocator) !void {
+            var compiled = try @import("../sql/compiler.zig").compile(alloc, "CREATE TABLE clocked (a timestamptz DEFAULT now(), b timestamptz DEFAULT CURRENT_TIMESTAMP(3), c timestamptz DEFAULT transaction_timestamp(), n bigint DEFAULT 7)", .{});
+            defer compiled.deinit();
+            const definition = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(alloc, compiled.statement.create_table);
+            defer alloc.free(definition);
+            var validator = try @import("../schema/mod.zig").CompiledTableValidator.init(alloc, definition);
+            defer validator.deinit(alloc);
+            const table = validator.execution.expressions.?.table;
+            try std.testing.expect(table.requires_clock_defaults);
+            var declaration = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, definition);
+            defer declaration.deinit(alloc);
+            var binding_arena = std.heap.ArenaAllocator.init(alloc);
+            defer binding_arena.deinit();
+            const columns = try @import("document_row.zig").deriveRelationalColumnsLeaky(binding_arena.allocator(), alloc, declaration, table);
+            for (columns) |column| {
+                try std.testing.expect(column.defaulted);
+                try std.testing.expectEqual(!std.mem.eql(u8, column.name, "n"), column.clock_defaulted);
+            }
+
+            try std.testing.expectEqual(@as(u32, 34), schema.requiredReaderVersion(table));
+            const bytes = try schema.serializeSchema(alloc, table);
+            defer alloc.free(bytes);
+            const restored = try schema.deserializeSchema(alloc, bytes);
+            defer schema.freeSchema(alloc, restored);
+            try std.testing.expect(restored.requires_clock_defaults);
+            try std.testing.expect(!(@import("../common/schema_readers.zig").ReaderCapabilities{ .semantic_ceiling = 33, .encoding_ceiling = 33 }).supports(schema.readerRequirementsForSchema(table)));
+            var document = try std.json.parseFromSlice(std.json.Value, alloc, "{}", .{});
+            defer document.deinit();
+            if (validator.prepareValue(document.arena.allocator(), alloc, &document.value)) |_| return error.TestUnexpectedResult else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(@as(anyerror, error.SqlClockUnavailable), err);
+            }
+            const instant = try Clock.Instant.fromUnixMicroseconds(1_706_704_496_123_456);
+            const preparation = validator.forPreparation(.{ .io = std.testing.io, .transaction_start = instant });
+            try preparation.prepareValue(document.arena.allocator(), alloc, &document.value);
+            try std.testing.expectEqual(instant.unixNanoseconds().?, checks.signedDateTime(document.value.object.get("a").?).?);
+            try std.testing.expectEqual(instant.unixNanoseconds().?, checks.signedDateTime(document.value.object.get("c").?).?);
+            try std.testing.expectEqual((try instant.withPrecision(3)).unixNanoseconds().?, checks.signedDateTime(document.value.object.get("b").?).?);
+            // A cold validator needs no execution clock to verify saved rows.
+            var reopened = try @import("../schema/mod.zig").CompiledTableValidator.init(alloc, definition);
+            defer reopened.deinit(alloc);
+            try reopened.validateValue(alloc, &document.value);
+            const before = try std.json.Stringify.valueAlloc(alloc, document.value, .{});
+            defer alloc.free(before);
+            try validator.forPreparation(.{ .io = std.testing.io, .transaction_start = try Clock.Instant.fromUnixMicroseconds(0) }).prepareValue(document.arena.allocator(), alloc, &document.value);
+            const after = try std.json.Stringify.valueAlloc(alloc, document.value, .{});
+            defer alloc.free(after);
+            try std.testing.expectEqualStrings(before, after);
+            var node = try std.json.parseFromSlice(std.json.Value, alloc, "{\"op\":\"transaction_timestamp\"}", .{});
+            defer node.deinit();
+            if (Plan.init(alloc, table, node.value, .datetime)) |unexpected| {
+                var plan = unexpected;
+                plan.deinit();
+                return error.TestUnexpectedResult;
+            } else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(@as(anyerror, error.InvalidRelationalExpressionType), err);
+            }
+        }
+    };
+    try Check.run(a);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{});
+}
+
+test "SQL original combined table declaration lowers all defaults and constraints together" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    const original = try corpus.get("sql-0669");
+    var compiled = try @import("compiler.zig").compile(a, original.sql, .{});
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 7), compiled.statement.create_table.columns.len);
+    const bytes = try createSchemaAlloc(a, compiled.statement.create_table);
+    defer a.free(bytes);
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(a, bytes);
+    defer parsed.deinit(a);
+    try std.testing.expectEqual(.relational, parsed.storage_mode);
+    try std.testing.expectEqualStrings("row", parsed.default_type);
+    var validator = try @import("../schema/mod.zig").CompiledTableValidator.init(a, bytes);
+    defer validator.deinit(a);
+    var overflow = try std.json.parseFromSlice(std.json.Value, a, "{\"id\":\"00000000-0000-4000-8000-000000000001\",\"tenant_id\":\"ABC\",\"quantity\":10000000000000000}", .{ .parse_numbers = false });
+    defer overflow.deinit();
+    try std.testing.expectError(error.RelationalExpressionOverflow, validator.prepareValue(overflow.arena.allocator(), a, &overflow.value));
+    const scalar = @import("scalar.zig");
+    const columns = try a.alloc(scalar.Column, compiled.statement.create_table.columns.len);
+    defer a.free(columns);
+    for (columns, compiled.statement.create_table.columns) |*out, column| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+    var reference = try std.json.parseFromSlice(struct { cases: []const struct { read_sql: []const u8 } }, a, @import("parity_fixtures.zig").table_contract_reference, .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    var query = try @import("compiler.zig").compile(a, reference.value.cases[0].read_sql, .{});
+    defer query.deinit();
+    for (query.statement.select.columns) |projection| if (projection.expression) |expression| {
+        var program = try scalar.bind(a, expression, columns, &.{}, .{});
+        program.deinit();
+    };
+}
+
 test "SQL NUMERIC modifier declarations publish exact constrained column identity" {
     var compiled = try @import("compiler.zig").compile(std.testing.allocator, "CREATE TABLE constrained (n numeric(4,2))", .{});
     defer compiled.deinit();

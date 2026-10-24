@@ -2,6 +2,67 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-qualified-table-contract-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-table-contract-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-table-contract-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_table_contract_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_table_contract_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-qualified-table-contract-clock-defaults-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Dtest-filter=SQL transaction clock defaults share owned instants fence readers and preserve restored values",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-table-contract-clock-rewrite-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-relational-clock-rewrite-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-table-contract-reader-admission-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-store-reader-admission-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
     "sql-qualified-fk-not-valid-native-debug": {
       "command": [
         "zig",
@@ -12295,8 +12356,35 @@
     },
     {
       "id": "sql-0669",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original combined declaration executes on an initially absent table through authenticated metadata and native data owners. PostgreSQL 18 and strict Debug qualification agree on NUMERIC rounding/range errors, CHECK/NOT NULL/generated/UNIQUE/PK/FK enforcement and failed-write atomicity, binary C collation, JSON null versus SQL NULL, nullable/empty arrays, typed descriptors, UUIDv4 defaults and UUIDv7 default evolution. Transaction clock defaults are materialized once from the owned SQL transaction clock before RETURNING/staging/constraint planning. Twenty initial and seven restart mutation probes, stable transaction timestamps and exact cold primary/schema ownership pass; populated IF NOT EXISTS retains a newer schema. Reader capability 34 and metadata protocol 67 fence clock schemas. Stable backfill clocks are persisted as typed inputs in the shared rewrite intent, verified across snapshot, tail and cold reconstruction without resampling. This closes only the original combined table contract, not general constraint validation or every DDL lifecycle.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original combined table contract preserves defaults constraints arrays UUID evolution and cold ownership",
+          "gate": "sql-qualified-table-contract-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL original combined table contract preserves defaults constraints arrays UUID evolution and cold ownership",
+          "gate": "sql-qualified-table-contract-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/ddl_runtime.zig",
+          "test": "SQL transaction clock defaults share owned instants fence readers and preserve restored values",
+          "gate": "sql-qualified-table-contract-clock-defaults-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_row_transform_test.zig",
+          "test": "relational index system rewrite clock defaults freeze one admitted instant across snapshot tail and cold intent",
+          "gate": "sql-qualified-table-contract-clock-rewrite-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/service.zig",
+          "test": "system catalog schema reader publication fences clock readers across catalog reports and restore",
+          "gate": "sql-qualified-table-contract-reader-admission-debug"
+        }
+      ]
     },
     {
       "id": "sql-0670",

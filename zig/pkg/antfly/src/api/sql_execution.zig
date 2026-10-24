@@ -297,6 +297,7 @@ pub const Adapter = struct {
         var integrity_reads = @import("sql_policy_integrity_reads.zig").Cache.init(self.server, self.context);
         defer integrity_reads.deinit();
         self.context = integrity_reads.attach(self.context);
+        self.context.sql_transaction_micros = statement_instant.micros;
         defer self.lake_visibility = previous_visibility;
         defer self.context = previous_context;
         var zig017_return_error: ?anyerror = null;
@@ -627,6 +628,7 @@ pub const Adapter = struct {
                     break :zig017_failure error.InvalidTransactionClock;
                 };
                 active_backend.statement_clock = .{ .source = statement_source, .statement = statement_instant, .transaction = active_backend.transaction_start.? };
+                self.context.sql_transaction_micros = active_backend.transaction_start.?.micros;
                 active_backend.decision_provider = self.decision_provider;
                 if (compiled.uses_current_setting and active_backend.setting_capture == null) active_backend.setting_capture = self.settingCapture();
                 if (guarded_backend != null) {
@@ -2060,6 +2062,10 @@ pub const Adapter = struct {
     }
 
     fn prepareMutations(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) ![]const catalog.Mutation {
+        return prepareMutationsWithVisibility(ptr, alloc, table, input, true);
+    }
+
+    fn prepareMutationsWithVisibility(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation, require_visible: bool) ![]const catalog.Mutation {
         if (table.read_authority != null) return error.Forbidden;
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.verify(alloc, table);
@@ -2077,7 +2083,7 @@ pub const Adapter = struct {
             .limit = 1,
             .inclusive_from = true,
             .exclusive_to = true,
-            .relational_query = .{ .fields = &.{}, .schema_version = table.schema_version, .require_normalized_visibility = true },
+            .relational_query = .{ .fields = &.{}, .schema_version = table.schema_version, .require_normalized_visibility = require_visible, .normalization_transaction_micros = self.context.sql_transaction_micros },
             .row_policy_principal_proof = policy_proof orelse "",
             .row_policy_database = scope.database,
             .filter_query_json = mandatory_filter orelse "",
@@ -2089,13 +2095,13 @@ pub const Adapter = struct {
         const result = try images.merge(alloc, input, normalized);
         // RETURNING requires SELECT policy on the resulting row as well as
         // write authority. Do not publish postimages that an ordinary read hides.
-        if (try http_server.resolveEffectiveRowFilterJson(alloc, self.identity.*, table.physical_name)) |json| {
+        if (require_visible) if (try http_server.resolveEffectiveRowFilterJson(alloc, self.identity.*, table.physical_name)) |json| {
             var filter = try @import("antfly_local_sources").search_pattern_filter.PreparedPatternFilter.init(alloc, json);
             defer filter.deinit();
             for (result) |mutation| if (mutation.row) |row| {
                 if (!try filter.matchesJson(alloc, mutation.key, row)) return error.Forbidden;
             };
-        }
+        };
         try self.verify(alloc, table);
         return result;
     }
@@ -2108,10 +2114,24 @@ pub const Adapter = struct {
         return mutateInternal(ptr, alloc, scratch, table, input, true);
     }
 
-    fn mutateInternal(ptr: *anyopaque, alloc: std.mem.Allocator, scratch: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation, already_prepared: bool) !catalog.MutationOutcome {
+    fn mutateInternal(ptr: *anyopaque, alloc: std.mem.Allocator, scratch: std.mem.Allocator, table: catalog.Table, raw_input: []const catalog.Mutation, already_prepared: bool) !catalog.MutationOutcome {
         if (table.read_authority != null) return error.Forbidden;
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.verify(alloc, table);
+        // Only omitted clock defaults need SQL-owned normalization. Ordinary
+        // defaults keep their existing single native commit preparation;
+        // volatile defaults must observe this SQL transaction's captured time.
+        const omitted_default = if (already_prepared) false else missing: {
+            for (table.columns) |column| if (column.clock_defaulted) {
+                for (raw_input) |mutation| if (mutation.row) |row| {
+                    if (row != .object) return error.InvalidSqlBackendResponse;
+                    if (!row.object.contains(column.path)) break :missing true;
+                };
+            };
+            break :missing false;
+        };
+        const prepared_here = !already_prepared and omitted_default;
+        const input = if (prepared_here) try prepareMutationsWithVisibility(ptr, alloc, table, raw_input, false) else raw_input;
         const guards = try conflictGuards(alloc, input);
         if (self.active_transaction) |id| {
             const txn = @import("transactions.zig");
@@ -2142,7 +2162,7 @@ pub const Adapter = struct {
             // Document mutations always cross preparation in the executor;
             // their physical JSON already encodes SQL-NULL-as-absence. Do not
             // interpret the stripped native metadata a second time.
-            const normalized = if (!already_prepared and writes.items.len != 0 and table.storage_mode == .relational) blk: {
+            const normalized = if (!already_prepared and !prepared_here and writes.items.len != 0 and table.storage_mode == .relational) blk: {
                 const source = self.server.table_reads orelse return error.UnsupportedSqlExecution;
                 const scope = table.scope orelse return error.InvalidSqlBackendResponse;
                 const policy_proof = try self.normalizationProof(alloc, table);
@@ -2152,7 +2172,7 @@ pub const Adapter = struct {
                     .limit = 1,
                     .inclusive_from = true,
                     .exclusive_to = true,
-                    .relational_query = .{ .fields = &.{}, .schema_version = table.schema_version },
+                    .relational_query = .{ .fields = &.{}, .schema_version = table.schema_version, .normalization_transaction_micros = self.context.sql_transaction_micros },
                     .row_policy_principal_proof = policy_proof orelse "",
                     .row_policy_database = scope.database,
                     .execution_deadline_ns = (try self.context.platformDeadline()).deadline_ns,
@@ -2547,6 +2567,7 @@ test "SQL API document preparation uses native normalization and retains mutatio
             try std.testing.expectEqualStrings("a", from);
             try std.testing.expectEqualStrings("a\x00", to);
             try std.testing.expectEqual(@as(?u32, 9), options.relational_query.?.schema_version);
+            try std.testing.expectEqual(@as(?i64, 123456789), options.relational_query.?.normalization_transaction_micros);
             return .{ .ptr = ptr, .vtable = &.{ .next = undefined, .normalize = normalize, .close = close } };
         }
         fn normalize(ptr: *anyopaque, alloc: std.mem.Allocator, writes: []const db_types.BatchWrite) ![]db_types.BatchWrite {
@@ -2568,7 +2589,7 @@ test "SQL API document preparation uses native normalization and retains mutatio
     server.source = .{ .ptr = &fake, .vtable = &.{ .status = undefined, .system_catalog = Fake.resolve } };
     server.table_reads = .{ .ptr = &fake, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_read = Fake.open } };
     var identity: ?http_server.AuthenticatedIdentity = null;
-    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
+    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{ .sql_transaction_micros = 123456789 } };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();

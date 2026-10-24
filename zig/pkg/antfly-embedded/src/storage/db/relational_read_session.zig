@@ -81,7 +81,7 @@ pub const Session = struct {
         if (writes.len > 4096) return error.InvalidArgument;
         try session.checkpoint();
         const view = session.reader.active;
-        const validator = if (view.validator()) |compiled| (if (session.preparation_runtime) |runtime| compiled.forPreparation(runtime) else compiled) else null;
+        const validator = if (view.validator()) |compiled| (if (session.preparation_runtime) |runtime| compiled.forPreparation(try runtime.withClock(view.tableSchema().requires_clock_defaults)) else compiled) else null;
         const normalized = try alloc.alloc(types.BatchWrite, writes.len);
         var initialized: usize = 0;
         errdefer {

@@ -402,7 +402,7 @@ test "mounted SQL original tablespace names preserve bound owners deletion guard
     }
 }
 const RelatedImage = struct { statement: []const u8, output: Rows };
-const Probe = struct { related_after: []const RelatedImage = &.{}, statement: []const u8, sqlstate: ?[]const u8, after: Rows, repeat_on_reopen: bool = false, reopen: ?struct { sqlstate: ?[]const u8 = null } = null, absent_table: ?[]const u8 = null, declared_not_valid: ?bool = null };
+const Probe = struct { preserve_owner: bool = false, related_after: []const RelatedImage = &.{}, statement: []const u8, sqlstate: ?[]const u8, after: Rows, repeat_on_reopen: bool = false, reopen: ?struct { sqlstate: ?[]const u8 = null } = null, absent_table: ?[]const u8 = null, declared_not_valid: ?bool = null };
 const Outcome = struct { command_tag: []const u8, result: Rows };
 
 test "mounted SQL original indexed mutations publish UUID owners and preserve predicate membership across restart" {
@@ -435,6 +435,7 @@ test "mounted SQL original named arbiters distinguish constraints from indexes a
 }
 
 const Case = struct {
+    require_absent_before_ddl: bool = false,
     constraint_collection: []const u8 = "checks",
     related_after_ddl: []const RelatedImage = &.{},
     preserve_ddl_primary: bool = false,
@@ -797,7 +798,13 @@ fn expectResult(ctx: *fixture.Context, actual: wire.SQLResponse, command_tag: []
             used[index] = true;
             break true;
         } else false;
-        if (!matched) std.debug.print("schema observer mismatch original={s}\n", .{expected.id});
+        if (!matched) {
+            const observed = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .row = row, .sql_nulls = flags }, .{});
+            defer ctx.alloc.free(observed);
+            const wanted = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .rows = expected.rows, .sql_nulls = expected.sql_nulls }, .{});
+            defer ctx.alloc.free(wanted);
+            std.debug.print("schema observer mismatch original={s} observed={s} expected={s}\n", .{ expected.id, observed, wanted });
+        }
         try std.testing.expect(matched);
     }
 }
@@ -816,6 +823,7 @@ const Campaign = struct {
             try command(ctx, step.statement, null);
             if (step.table) |name| _ = try readyTable(ctx, name, 0);
         }
+        if (self.case.require_absent_before_ddl) try expectAbsent(ctx, self.case.table);
         var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
         defer corpus.deinit();
         const original = try corpus.get(self.case.id);
@@ -841,7 +849,10 @@ const Campaign = struct {
         if (self.case.retained_not_valid_check) |name|
             try expectDeclaredValidity(ctx, self.case.table, name, true, self.case.constraint_collection);
         for (self.case.probes) |probe| {
+            errdefer std.debug.print("schema lifecycle failed probe={s}\n", .{probe.statement});
+            const probe_owner = if (probe.preserve_owner) try readyTable(ctx, self.case.table, 0) else null;
             try command(ctx, probe.statement, probe.sqlstate);
+            if (probe_owner) |owner| try std.testing.expectEqualDeep(owner, try readyTable(ctx, self.case.table, owner.version));
             if (probe.absent_table) |name| try expectAbsent(ctx, name);
             try expectRows(ctx, self.case.read_sql, probe.after);
             for (probe.related_after) |related| try expectRows(ctx, related.statement, related.output);
@@ -877,6 +888,7 @@ const Campaign = struct {
         };
         for (self.case.probes) |probe| if (probe.sqlstate != null or probe.repeat_on_reopen or probe.reopen != null) {
             try command(ctx, probe.statement, if (probe.reopen) |expected| expected.sqlstate else probe.sqlstate);
+            if (probe.preserve_owner) try std.testing.expectEqualDeep(self.final_owner, try readyTable(ctx, self.case.table, self.final_owner.version));
             if (probe.absent_table) |name| try expectAbsent(ctx, name);
             try expectRows(ctx, self.case.read_sql, final);
             for (final_related) |related| try expectRows(ctx, related.statement, related.output);
@@ -1123,4 +1135,93 @@ test "mounted SQL original NOT VALID FK preserves orphan coverage future enforce
         }
     };
     try fixture.runWithState(NativeCampaign, .{ .inner = .{ .case = parsed.value.cases[0] } });
+}
+
+test "mounted SQL original combined table contract preserves defaults constraints arrays UUID evolution and cold ownership" {
+    var parsed = try std.json.parseFromSlice(struct {
+        format: u8,
+        reference: []const u8,
+        typed_oids: []const u32,
+        clock_checks: []const RelatedImage,
+        cases: []const Case,
+        restart_probes: []const Probe,
+    }, std.testing.allocator, local.sql_parity_fixtures.table_contract_reference, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u8, 1), parsed.value.format);
+    try std.testing.expectEqualStrings("PostgreSQL exact SQL", parsed.value.reference);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.cases.len);
+    try std.testing.expectEqualStrings("sql-0669", parsed.value.cases[0].id);
+    const CombinedCampaign = struct {
+        pub const native_sessions = true;
+        pub const native_auth = true;
+        pub const cold_catalog = true;
+        inner: Campaign,
+        typed_oids: []const u32,
+        clock_checks: []const RelatedImage,
+        restart_probes: []const Probe,
+
+        fn descriptors(self: *@This(), ctx: *fixture.Context) !void {
+            var response = try execute(ctx, "SELECT id,tenant_id,quantity,metadata,tags,created_at,tenant_key FROM usage_records LIMIT 0", true);
+            defer response.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+            var result = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(self.typed_oids.len, result.value.columns.len);
+            for (result.value.columns, self.typed_oids) |column, oid| try std.testing.expect(compare.postgresColumnMatches(column, oid));
+        }
+        fn transactionDefaults(self: *@This(), ctx: *fixture.Context) !void {
+            var authorized = ctx.*;
+            authorized.headers = ctx.admin_headers;
+            // Use the same native connection owner as the session campaigns.
+            authorized.base = ctx.base;
+            var opened = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, authorized.headers, authorized.base, "/db/v1/sql/connections", .POST, "{}", 15_000);
+            defer opened.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), opened.status);
+            var connection = try std.json.parseFromSlice(wire.SQLConnectionResponse, ctx.alloc, opened.body, .{});
+            defer connection.deinit();
+            const id = connection.value.connection_id;
+            const suffix = try std.fmt.allocPrint(ctx.alloc, "/db/v1/sql/connections/{s}", .{id});
+            defer ctx.alloc.free(suffix);
+            defer {
+                var closed = fixture.requestWithTimeout(ctx.alloc, ctx.transport, authorized.headers, authorized.base, suffix, .DELETE, null, 15_000) catch null;
+                if (closed) |*response| response.deinit(ctx.alloc);
+            }
+            var begun = try connected(&authorized, id, "BEGIN");
+            defer begun.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), begun.status);
+            for (self.clock_checks) |check| {
+                errdefer std.debug.print("transaction clock failed check={s}\n", .{check.statement});
+                var response = try client.executeConnected(&authorized, null, id, check.statement, .session_observation);
+                defer response.deinit(ctx.alloc);
+                if (response.status != 200) std.debug.print("clock default sql={s} status={d} body={s}\n", .{ check.statement, response.status, response.body });
+                try std.testing.expectEqual(@as(u16, 200), response.status);
+                var result = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+                defer result.deinit();
+                try expectResult(ctx, result.value, if (std.mem.startsWith(u8, check.statement, "INSERT")) "INSERT" else "SELECT", check.output);
+            }
+            var rolled_back = try connected(&authorized, id, "ROLLBACK");
+            defer rolled_back.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), rolled_back.status);
+            try std.testing.expectEqual(self.inner.primary_digest.?, try primaryFingerprint(ctx, self.inner.case.table));
+        }
+        pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+            // Parent setup establishes the catalog's authoritative naming cut
+            // before proving this conditional CREATE's target is absent.
+            self.inner.case.require_absent_before_ddl = true;
+            try self.inner.beforeRestart(ctx);
+            try self.descriptors(ctx);
+            try self.transactionDefaults(ctx);
+        }
+        pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.inner.afterRestart(ctx);
+            try self.descriptors(ctx);
+            try self.transactionDefaults(ctx);
+            for (self.restart_probes) |probe| {
+                try command(ctx, probe.statement, probe.sqlstate);
+                try expectRows(ctx, self.inner.case.read_sql, probe.after);
+                for (probe.related_after) |related| try expectRows(ctx, related.statement, related.output);
+            }
+        }
+    };
+    try fixture.runWithState(CombinedCampaign, .{ .inner = .{ .case = parsed.value.cases[0] }, .typed_oids = parsed.value.typed_oids, .clock_checks = parsed.value.clock_checks, .restart_probes = parsed.value.restart_probes });
 }

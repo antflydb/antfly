@@ -40,6 +40,14 @@ pub const max_allocated_bytes = 4 * max_output_bytes;
 pub const PreparationRuntime = struct {
     io: std.Io,
     uuid_clock: ?*@import("../common/uuid.zig").Version7Clock = null,
+    transaction_start: ?@import("../sql/statement_clock.zig").Instant = null,
+
+    pub fn withClock(self: PreparationRuntime, required: bool) !PreparationRuntime {
+        var result = self;
+        if (required and result.transaction_start == null)
+            result.transaction_start = try (@import("../sql/statement_clock.zig").Source{ .io = self.io }).sample();
+        return result;
+    }
 };
 
 pub const Execution = struct {
@@ -47,6 +55,8 @@ pub const Execution = struct {
     bytes: *usize,
     numeric: exact.Context,
     preparation_runtime: ?PreparationRuntime = null,
+    /// Immutable preparation input persisted by historical rewrite admission.
+    bound_transaction_start: ?@import("../sql/statement_clock.zig").Instant = null,
 
     pub fn init(alloc: Allocator, bytes: *usize) Execution {
         return .{ .alloc = alloc, .bytes = bytes, .numeric = .{ .alloc = alloc } };
@@ -767,7 +777,7 @@ fn numericJsonOutput(execution: *Execution, bytes: []const u8) !std.json.Value {
     return scratch.json(parsed.value) catch |err| return scratch.failure(err);
 }
 
-pub const Op = enum { literal, column, add, subtract, multiply, divide, modulo, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when, in_list, not_in_list, array, replace, md5, abs, ceil, floor, round, trunc, sign, sqrt, jsonb_typeof, jsonb_array_length, jsonb_extract_path, jsonb_extract_path_text, uuidv4, uuidv7 };
+pub const Op = enum { literal, column, add, subtract, multiply, divide, modulo, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when, in_list, not_in_list, array, replace, md5, abs, ceil, floor, round, trunc, sign, sqrt, jsonb_typeof, jsonb_array_length, jsonb_extract_path, jsonb_extract_path_text, uuidv4, uuidv7, transaction_timestamp };
 
 fn jsonFunction(op: Op) bool {
     return switch (op) {
@@ -789,6 +799,7 @@ pub fn acceptsField(op: Op, name: []const u8) bool {
     if (std.mem.eql(u8, name, "op")) return true;
     return switch (op) {
         .uuidv4 => false,
+        .transaction_timestamp => std.mem.eql(u8, name, "precision"),
         .uuidv7 => std.mem.eql(u8, name, "shift"),
         .literal => std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "value") or std.mem.eql(u8, name, "sql_type") or std.mem.eql(u8, name, "json_null"),
         .column => std.mem.eql(u8, name, "column"),
@@ -802,7 +813,7 @@ pub fn acceptsField(op: Op, name: []const u8) bool {
 pub fn acceptsArity(op: Op, count: usize) bool {
     return switch (op) {
         .literal, .column => false,
-        .uuidv4, .uuidv7 => count == 0,
+        .uuidv4, .uuidv7, .transaction_timestamp => count == 0,
         .array => count <= 32,
         .jsonb_typeof, .jsonb_array_length => count == 1,
         .jsonb_extract_path, .jsonb_extract_path_text => count >= 2 and count <= 32,
@@ -827,6 +838,7 @@ const Node = struct {
     numeric_modifier: ?exact.TypeModifier = null,
     replace_pattern: ?text_kernel.Pattern = null,
     uuid_shift: ?@import("../sql/temporal_value.zig").Interval = null,
+    clock_precision: u8 = 6,
 };
 
 test "SQL UUID defaults require owned preparation preserve explicit values and never run during restore" {
@@ -955,7 +967,7 @@ pub const Plan = struct {
         errdefer arena.deinit();
         var bytes: usize = max_allocated_bytes;
         var execution = Execution.init(arena.allocator(), &bytes);
-        var compiler: Compiler = .{ .alloc = arena.allocator(), .table = table, .execution = &execution, .allow_uuid_defaults = defaults };
+        var compiler: Compiler = .{ .alloc = arena.allocator(), .table = table, .execution = &execution, .allow_preparation_defaults = defaults };
         compiler.hash.update("antfly immutable scalar expression v1");
         const root = try compiler.compile(expression, 0);
         if (compiler.nodes.items[root].kind != expected) return error.InvalidRelationalExpressionType;
@@ -1149,6 +1161,11 @@ pub const Plan = struct {
     fn evaluateNode(self: *const Plan, execution: *Execution, source: Source, index: u16) anyerror!Value {
         try execution.numeric.charge(1);
         const node = self.nodes[index];
+        if (node.op == .transaction_timestamp) {
+            const instant = execution.bound_transaction_start orelse (if (execution.preparation_runtime) |runtime| runtime.transaction_start else null) orelse return error.SqlClockUnavailable;
+            const rounded = try instant.withPrecision(node.clock_precision);
+            return .{ .datetime = rounded.unixNanoseconds() orelse return error.TemporalOutOfRange };
+        }
         if (node.op == .uuidv4 or node.op == .uuidv7) {
             if (node.uuid_shift) |shift| if (shift.infinity() != 0) return error.TemporalOutOfRange;
             const runtime = execution.preparation_runtime orelse return error.SqlEntropyUnavailable;
@@ -2611,7 +2628,7 @@ const Compiler = struct {
     dependencies: std.ArrayList(u32) = .empty,
     hash: std.crypto.hash.Blake3 = std.crypto.hash.Blake3.init(.{}),
     visited: usize = 0,
-    allow_uuid_defaults: bool = false,
+    allow_preparation_defaults: bool = false,
     literal_bytes: usize = 0,
 
     fn frame(self: *Compiler, bytes: []const u8) void {
@@ -2636,8 +2653,21 @@ const Compiler = struct {
         self.frame(op_value.string);
         var node: Node = .{ .op = op, .kind = undefined };
         switch (op) {
+            .transaction_timestamp => {
+                if (!self.allow_preparation_defaults or !self.table.requires_clock_defaults) return error.InvalidRelationalExpressionType;
+                node.kind = .datetime;
+                if (input.object.get("precision")) |precision| {
+                    node.clock_precision = switch (precision) {
+                        .integer => |value| std.math.cast(u8, value) orelse return error.InvalidRelationalExpression,
+                        .number_string => |value| std.fmt.parseInt(u8, value, 10) catch return error.InvalidRelationalExpression,
+                        else => return error.InvalidRelationalExpression,
+                    };
+                    if (node.clock_precision > 6) return error.InvalidRelationalExpression;
+                }
+                self.hash.update(&.{node.clock_precision});
+            },
             .uuidv4, .uuidv7 => {
-                if (!self.allow_uuid_defaults or !self.table.requires_uuid_defaults) return error.InvalidRelationalExpressionType;
+                if (!self.allow_preparation_defaults or !self.table.requires_uuid_defaults) return error.InvalidRelationalExpressionType;
                 node.kind = .string;
                 node.sql_type = .uuid;
                 if (input.object.get("shift")) |shift| {
@@ -6152,7 +6182,7 @@ test "relational declarations public NUMERIC modifiers preserve PostgreSQL assig
                 if (entry.@"error" != null) {
                     if (result) |_| return error.TestExpectedError else |err| {
                         if (err == error.OutOfMemory) return err;
-                        try std.testing.expect(err == error.InvalidBatchRequest or err == error.RelationalExpressionOverflow);
+                        try std.testing.expectEqualStrings(entry.@"error".?, @import("../sql/errors.zig").describe(err).code);
                     }
                     continue;
                 }

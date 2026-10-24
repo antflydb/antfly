@@ -179,6 +179,7 @@ const Work = struct {
     key: []const u8,
     before: ?reads.LookupResponse,
     after: ?[]const u8,
+    after_json_null_fields: []const []const u8 = &.{},
     observed_version: u64 = 0,
     observed_digest: ?[32]u8 = null,
     assignments: std.StringHashMapUnmanaged(std.json.Value) = .empty,
@@ -233,6 +234,8 @@ fn observationQuery(alloc: Allocator, keys: []const []const u8, schema_version: 
             try stream.beginObject();
             try stream.objectField("kind");
             try stream.write("observations");
+            try stream.objectField("typed_nulls");
+            try stream.write(true);
             try stream.objectField("keys");
             try @import("../storage/db/relational_integrity_json.zig").write(value.keys, stream);
             try stream.objectField("schema_version");
@@ -269,6 +272,7 @@ const Builder = struct {
     prepared_bytes: usize = 0,
     control: RequestContext = .{},
     preparation_receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = null,
+    preparation_transaction: ?@import("../sql/statement_clock.zig").Instant = null,
     repair_tables: []const []const u8 = &.{},
     repair_admission: ?RepairAdmission = null,
     discovered_repairs: std.StringHashMapUnmanaged(bool) = .empty,
@@ -276,13 +280,13 @@ const Builder = struct {
     constraint_timing: []const native.ConstraintTiming = &.{},
     previous: []const contract.TableCommitRequest = &.{},
 
-    fn previousRow(self: *Builder, table: []const u8, key: []const u8) ?struct { value: ?[]const u8 } {
+    fn previousRow(self: *Builder, table: []const u8, key: []const u8) ?struct { value: ?[]const u8, json_null_fields: []const []const u8 = &.{} } {
         for (self.previous) |request| if (std.mem.eql(u8, request.table_name, table)) {
             for (request.deletes) |deleted| if (std.mem.eql(u8, deleted, key)) return .{ .value = null };
             var i = request.writes.len;
             while (i != 0) {
                 i -= 1;
-                if (std.mem.eql(u8, request.writes[i].key, key)) return .{ .value = request.writes[i].value };
+                if (std.mem.eql(u8, request.writes[i].key, key)) return .{ .value = request.writes[i].value, .json_null_fields = request.writes[i].json_null_fields };
             }
         };
         return null;
@@ -458,6 +462,12 @@ const Builder = struct {
         for (after.values) |witness| try self.appendCommand(dependency.definition.parent_table, .{ .address = witness.address, .operation = .{ .attach = dependency.reference } });
     }
 
+    fn chargeJsonNullFields(self: *Builder, fields: []const []const u8) !void {
+        var bytes = std.math.mul(usize, fields.len, @sizeOf([]const u8)) catch return error.TransactionTooLarge;
+        for (fields) |name| bytes = std.math.add(usize, bytes, name.len) catch return error.TransactionTooLarge;
+        try self.charge(bytes);
+    }
+
     fn rowIdentity(self: *Builder, table: []const u8, key: []const u8) ![]const u8 {
         return std.fmt.allocPrint(self.alloc, "{d}:{s}{s}", .{ table.len, table, key });
     }
@@ -466,6 +476,10 @@ const Builder = struct {
         const identity = try self.rowIdentity(table.name, key);
         if (self.by_row.get(identity)) |existing| return existing;
         if (self.work.items.len >= 4096) return error.TransactionTooLarge;
+        if (self.source.strict_read_index_absence) {
+            try self.observeWork(table, &.{key});
+            return self.by_row.get(identity) orelse error.InvalidIntegrityRecord;
+        }
         return self.recordWork(table, key, try self.lookup(table.name, key, .{}));
     }
 
@@ -481,14 +495,39 @@ const Builder = struct {
         if (self.previousRow(table.name, key)) |overlay| {
             const version = if (old) |row| row.version else 0;
             const digest = if (old) |row| row.expected_content_digest else null;
-            old = if (overlay.value) |json| .{ .json = try self.alloc.dupe(u8, json), .version = version, .expected_content_digest = digest } else null;
+            old = if (overlay.value) |json| .{ .json = try self.alloc.dupe(u8, json), .version = version, .expected_content_digest = digest, .json_null_fields = try types.cloneJsonNullFields(self.alloc, overlay.json_null_fields) } else null;
         }
         try self.charge(key.len + if (old) |row| row.json.len else @as(usize, 0));
+        if (old) |row| try self.chargeJsonNullFields(row.json_null_fields);
         const item = try self.alloc.create(Work);
-        item.* = .{ .table = table, .key = try self.alloc.dupe(u8, key), .before = old, .after = if (old) |row| row.json else null, .observed_version = observed_version, .observed_digest = observed_digest };
+        item.* = .{ .table = table, .key = try self.alloc.dupe(u8, key), .before = old, .after = if (old) |row| row.json else null, .after_json_null_fields = if (old) |row| row.json_null_fields else &.{}, .observed_version = observed_version, .observed_digest = observed_digest };
         try self.work.append(self.alloc, item);
         try self.by_row.put(self.alloc, identity, item);
         return item;
+    }
+
+    fn observeWork(self: *Builder, table: *Loaded, keys: []const []const u8) !void {
+        const query = try observationQuery(self.alloc, keys, table.view.version(), @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(table.catalog));
+        try self.observeWorkQuery(table, keys, query);
+    }
+
+    fn observeWorkQuery(self: *Builder, table: *Loaded, keys: []const []const u8, query: []const u8) !void {
+        var response = (try self.lookup(table.name, keys[0], .{ .relational_integrity_jobs_json = query })) orelse return error.InvalidIntegrityRecord;
+        defer response.deinit(self.alloc);
+        const Observation = struct {
+            json: []u8,
+            version: ?u64 = null,
+            expected_content_digest: ?[32]u8 = null,
+            json_null_fields: []const []const u8,
+        };
+        const Item = struct { key: []const u8, row: ?Observation };
+        const result = try std.json.parseFromSliceLeaky(struct { observations: []const Item }, self.alloc, response.json, .{ .allocate = .alloc_always });
+        if (result.observations.len != keys.len) return error.InvalidIntegrityRecord;
+        for (result.observations, keys) |item, key| {
+            if (!std.mem.eql(u8, item.key, key)) return error.InvalidIntegrityRecord;
+            const row: ?reads.LookupResponse = if (item.row) |value| .{ .json = value.json, .version = value.version orelse return error.MissingPrimaryObservation, .expected_content_digest = value.expected_content_digest, .json_null_fields = value.json_null_fields } else null;
+            _ = try self.recordWork(table, key, row);
+        }
     }
 
     fn preloadOwnerObservations(self: *Builder, table: *Loaded, keys: []const []const u8) !bool {
@@ -522,16 +561,7 @@ const Builder = struct {
                     query = try observationQuery(self.alloc, bucket.keys.items[offset..end], table.view.version(), @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(table.catalog));
                 }
                 if (query.len > 4096) return error.TransactionTooLarge;
-                var response = (try self.lookup(table.name, bucket.keys.items[offset], .{ .relational_integrity_jobs_json = query })) orelse return error.InvalidIntegrityRecord;
-                defer response.deinit(self.alloc);
-                const Item = struct { key: []const u8, row: ?types.LookupResult };
-                const result = try std.json.parseFromSliceLeaky(struct { observations: []const Item }, self.alloc, response.json, .{ .allocate = .alloc_always });
-                if (result.observations.len != end - offset) return error.InvalidIntegrityRecord;
-                for (result.observations, bucket.keys.items[offset..end]) |item, key| {
-                    if (!std.mem.eql(u8, item.key, key)) return error.InvalidIntegrityRecord;
-                    const row: ?reads.LookupResponse = if (item.row) |value| .{ .json = value.json, .version = value.version orelse return error.MissingPrimaryObservation, .expected_content_digest = value.expected_content_digest } else null;
-                    _ = try self.recordWork(table, key, row);
-                }
+                try self.observeWorkQuery(table, bucket.keys.items[offset..end], query);
                 offset = end;
             }
         }
@@ -543,6 +573,11 @@ const Builder = struct {
     /// results and publishing predicates on the caller, including on failure.
     fn preloadWork(self: *Builder, table: *Loaded, keys: []const []const u8) !void {
         if (try self.preloadOwnerObservations(table, keys)) return;
+        if (self.source.strict_read_index_absence) {
+            var offset: usize = 0;
+            while (offset < keys.len) : (offset += 1) try self.observeWork(table, keys[offset .. offset + 1]);
+            return;
+        }
         const borrow = self.control.fanout_io orelse self.control.deadline_io orelse return;
         if (keys.len < 2) return;
         const Slot = struct {
@@ -599,6 +634,7 @@ const Builder = struct {
                 if (owned) |*row| {
                     if (row.json.len > 16 * 1024 * 1024 -| self.prepared_bytes) return error.TransactionTooLarge;
                     row.json = try self.alloc.dupe(u8, row.json);
+                    row.json_null_fields = try types.cloneJsonNullFields(self.alloc, row.json_null_fields);
                 }
                 _ = try self.recordWork(table, key, owned);
             }
@@ -627,10 +663,19 @@ const Builder = struct {
                 self.preparation_receiver = try borrow.receive();
             }
         }
-        return if (self.preparation_receiver) |*receiver|
-            compiled.forPreparation(.{ .io = receiver.io() })
-        else
-            compiled;
+        if (self.preparation_receiver) |*receiver| {
+            const expressions = @import("../schema/relational_expression.zig");
+            if (self.preparation_transaction == null) if (self.control.sql_transaction_micros) |micros| {
+                const instant = try @import("../sql/statement_clock.zig").Instant.init(micros);
+                if (instant.infinity() != 0) return error.InvalidTransactionClock;
+                self.preparation_transaction = instant;
+            };
+            const required = if (compiled.execution.expressions) |set| set.table.requires_clock_defaults else false;
+            const runtime = try (expressions.PreparationRuntime{ .io = receiver.io(), .transaction_start = self.preparation_transaction }).withClock(required);
+            self.preparation_transaction = runtime.transaction_start;
+            return compiled.forPreparation(runtime);
+        }
+        return compiled;
     }
 
     fn expandWork(self: *Builder, item: *Work) !planner.Expansion {
@@ -640,9 +685,9 @@ const Builder = struct {
         var scratch = std.heap.ArenaAllocator.init(self.scratch_alloc orelse self.alloc);
         defer scratch.deinit();
         const temporary = scratch.allocator();
-        var before: ?mapper.PreparedRelationalWrite = if (item.before) |row| try mapper.PreparedRelationalWrite.init(temporary, item.key, row.json, null, view.tableSchema().*, view.physicalLayout()) else null;
+        var before: ?mapper.PreparedRelationalWrite = if (item.before) |row| try mapper.PreparedRelationalWrite.initTyped(temporary, temporary, temporary, false, item.key, row.json, null, view.tableSchema().*, view.physicalLayout(), row.json_null_fields, true) else null;
         defer if (before) |*row| row.deinit(temporary);
-        var after: ?mapper.PreparedRelationalWrite = if (item.after) |json| try mapper.PreparedRelationalWrite.init(temporary, item.key, json, if (view.validator()) |validator| try self.preparationValidator(validator) else null, view.tableSchema().*, view.physicalLayout()) else null;
+        var after: ?mapper.PreparedRelationalWrite = if (item.after) |json| try mapper.PreparedRelationalWrite.initTyped(temporary, temporary, temporary, false, item.key, json, if (view.validator()) |validator| try self.preparationValidator(validator) else null, view.tableSchema().*, view.physicalLayout(), item.after_json_null_fields, false) else null;
         defer if (after) |*row| row.deinit(temporary);
         if (after) |*row| if (view.validator()) |validator| if (validator.execution.expressions) |expressions| if (expressions.bindings.len != 0 or expressions.modifier_ordinals.len != 0) {
             // Cascading parent assignments and final participant writes must
@@ -650,6 +695,8 @@ const Builder = struct {
             const normalized = try std.json.Stringify.valueAlloc(self.alloc, row.parsedValue(), .{});
             try self.charge(normalized.len);
             item.after = normalized;
+            item.after_json_null_fields = try (try row.typedView(view.tableSchema().*, view.physicalLayout())).jsonNullFieldsAlloc(self.alloc);
+            try self.chargeJsonNullFields(item.after_json_null_fields);
         };
         item.expansion = try plan.expand(self.alloc, &.{.{ .key = item.key, .before = if (before) |*row| try row.typedView(view.tableSchema().*, view.physicalLayout()) else null, .after = if (after) |*row| try row.typedView(view.tableSchema().*, view.physicalLayout()) else null, .repair = self.repairing(item.table.name) }});
         try self.charge(item.expansion.?.arena.queryCapacity());
@@ -1139,8 +1186,8 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
             if (!std.mem.eql(u8, &expected, &current)) return error.CatalogGenerationChanged;
         }
         _ = try builder.outputIndex(table.name, table.view.version());
-        var writes = std.StringHashMapUnmanaged(?[]const u8).empty;
-        for (request.writes) |write| try writes.put(builder.alloc, write.key, write.value);
+        var writes = std.StringHashMapUnmanaged(?types.TransactionWrite).empty;
+        for (request.writes) |write| try writes.put(builder.alloc, write.key, write);
         for (request.deletes) |key| try writes.put(builder.alloc, key, null);
         if (writes.count() > 4096) return error.TransactionTooLarge;
         const keys = try builder.alloc.alloc([]const u8, writes.count());
@@ -1151,7 +1198,8 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
         while (it.next()) |entry| {
             const item = try builder.getWork(table, entry.key_ptr.*);
             item.explicit = true;
-            item.after = entry.value_ptr.*;
+            item.after = if (entry.value_ptr.*) |write| write.value else null;
+            item.after_json_null_fields = if (entry.value_ptr.*) |write| write.json_null_fields else &.{};
             try builder.enqueue(item);
             // Materialize volatile defaults before visiting any FK edge. The
             // cached expansion, explicit assignments and final writes all use
@@ -1211,7 +1259,7 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
         if (!item.dirty) continue;
         const i = try builder.outputIndex(item.table.name, item.table.view.version());
         try builder.appendPredicate(i, item.key, item.observed_version, item.observed_digest);
-        if (item.after) |json| try final_writes[i].append(builder.alloc, .{ .key = item.key, .value = json }) else try final_deletes[i].append(builder.alloc, item.key);
+        if (item.after) |json| try final_writes[i].append(builder.alloc, .{ .key = item.key, .value = json, .json_null_fields = item.after_json_null_fields }) else try final_deletes[i].append(builder.alloc, item.key);
         // This arena is owned transitively by the returned request arena.
         const expansion = try builder.expandWork(item);
         for (expansion.commands) |command| try builder.appendCommand(command.table_name, command.command);
@@ -3122,9 +3170,9 @@ fn testNativeCascade(generated: bool) !void {
     var db = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 500, .shard_id = 501 }, .primary_backend = .{ .lsm = .{} } });
     defer db.close();
     const declaration = if (generated)
-        \\{"version":1,"storage_mode":"relational","default_type":"row","generated_columns":[{"column":"id","expression":{"op":"add","args":[{"op":"column","column":"seed"},{"op":"literal","type":"integer","value":"1"}]}}],"unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"],"on_delete":"cascade","on_update":"cascade"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"seed":{"type":"integer"},"id":{"type":"integer"},"parent":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","generated_columns":[{"column":"id","expression":{"op":"add","args":[{"op":"column","column":"seed"},{"op":"literal","type":"integer","value":"1"}]}}],"unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"],"on_delete":"cascade","on_update":"cascade"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"seed":{"type":"integer"},"id":{"type":"integer"},"parent":{"type":"integer","nullable":true},"payload":{"type":"json","x-antfly-sql-type":"jsonb","nullable":true}},"additionalProperties":false}}}}
     else
-        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"],"on_delete":"cascade","on_update":"cascade"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"],"on_delete":"cascade","on_update":"cascade"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer","nullable":true},"payload":{"type":"json","x-antfly-sql-type":"jsonb","nullable":true}},"additionalProperties":false}}}}
     ;
     try db.setSchemaJson(alloc, declaration);
     const Fixture = struct {
@@ -3169,7 +3217,7 @@ fn testNativeCascade(generated: bool) !void {
     const ranges = [_]RangeRecord{.{ .group_id = 501, .table_id = 500, .start_key = "" }};
     var inserted = try prepareWithCoverage(alloc, source, &tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{
         .{ .key = "p", .value = if (generated) "{\"seed\":0,\"parent\":null}" else "{\"id\":1,\"parent\":null}" },
-        .{ .key = "c", .value = if (generated) "{\"seed\":1,\"parent\":1}" else "{\"id\":2,\"parent\":1}" },
+        .{ .key = "c", .value = if (generated) "{\"seed\":1,\"parent\":1,\"payload\":null}" else "{\"id\":2,\"parent\":1,\"payload\":null}", .json_null_fields = &.{"payload"} },
     } }});
     defer inserted.deinit();
     try std.testing.expectEqual(@as(usize, 1), fixture.observation_batches);
@@ -3178,6 +3226,12 @@ fn testNativeCascade(generated: bool) !void {
     try rejectDefiniteConflicts(alloc, source, &tables, &ranges, inserted.tables, .{});
     try std.testing.expectEqual(@as(usize, 1), fixture.claim_batches);
     try Fixture.commit(&db, inserted, 1);
+    {
+        var observed = (try db.lookup(alloc, "c", .{ .include_json_null_fields = true })).?;
+        defer observed.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), observed.json_null_fields.len);
+        try std.testing.expectEqualStrings("payload", observed.json_null_fields[0]);
+    }
     var duplicate = try prepareWithCoverage(alloc, source, &tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{.{ .key = "duplicate", .value = if (generated) "{\"seed\":0,\"parent\":null}" else "{\"id\":1,\"parent\":null}" }} }});
     defer duplicate.deinit();
     try std.testing.expectError(error.UniqueConstraintViolation, rejectDefiniteConflicts(alloc, source, &tables, &ranges, duplicate.tables, .{}));
@@ -3201,8 +3255,10 @@ fn testNativeCascade(generated: bool) !void {
         var updated = try prepareWithCoverage(alloc, source, &tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{.{ .key = "p", .value = "{\"seed\":9007199254740993,\"parent\":null}" }} }});
         defer updated.deinit();
         try Fixture.commit(&db, updated, 2);
-        const child = (try db.lookup(alloc, "c", .{})).?;
-        defer alloc.free(child.json);
+        var child = (try db.lookup(alloc, "c", .{ .include_json_null_fields = true })).?;
+        defer child.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), child.json_null_fields.len);
+        try std.testing.expectEqualStrings("payload", child.json_null_fields[0]);
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, child.json, .{ .parse_numbers = false });
         defer parsed.deinit();
         try std.testing.expectEqualStrings("9007199254740994", parsed.value.object.get("parent").?.number_string);

@@ -97,6 +97,7 @@ pub fn deriveRelationalColumnsLeaky(owned: std.mem.Allocator, temporary: std.mem
         out.path = try owned.dupe(u8, column.path);
         out.generated = generated.contains(column.name);
         out.defaulted = catalog.hasColumnDefault(parsed, column.name);
+        out.clock_defaulted = catalog.columnDefaultUsesClock(parsed, column.name);
         out.type = relationalType(parsed, column.name, out.type);
     }
     return columns;
@@ -201,6 +202,33 @@ pub fn projectValue(alloc: std.mem.Allocator, table: catalog.Table, id: []const 
 /// mutation remains pinned. Already typed cells stay borrowed; exact payloads
 /// never pass through the scalar JSON placeholder coercion path.
 pub fn declaredCell(alloc: std.mem.Allocator, column: catalog.Column, raw: catalog.Row.Cell) !catalog.Row.Cell {
+    if (column.type == .datetime and !raw.sql_null and raw.temporal() == null) {
+        // Prepared native rows carry exact epoch nanos, while public/native
+        // JSON readers may carry RFC3339. Decode once into the SQL temporal
+        // datum; formatting and reparsing loses the declared temporal domain.
+        if (raw.array != null or raw.numeric != null or raw.patterns() != null) return error.SqlTypeMismatch;
+        const temporal = @import("temporal_value.zig");
+        const kind = column.temporal_kind orelse .timestamp_tz;
+        const value: temporal.Value = if (raw.value == .string) parsed: {
+            const canonical = @import("temporal_text.zig").parseCanonical(kind, raw.value.string) catch |err| {
+                if (kind != .timestamp_tz) return err;
+                const nanos = datetime.parseDateTimeToSignedNs(raw.value.string) orelse return err;
+                break :parsed .{ .timestamp_tz = try temporal.Timestamp.fromUnixNanoseconds(nanos) };
+            };
+            break :parsed canonical;
+        } else parsed: {
+            if (kind != .timestamp_tz) return error.SqlTypeMismatch;
+            const nanos: i128 = switch (raw.value) {
+                .integer => |nanos| nanos,
+                .number_string => |bytes| std.fmt.parseInt(i128, bytes, 10) catch return error.InvalidSqlDateTime,
+                else => return error.SqlTypeMismatch,
+            };
+            break :parsed .{ .timestamp_tz = try temporal.Timestamp.fromUnixNanoseconds(nanos) };
+        };
+        const owned = try alloc.create(temporal.Value);
+        owned.* = value;
+        return .typedTemporal(owned);
+    }
     if (column.type == .array and !raw.sql_null and raw.array == null) {
         const kind = column.element_type orelse return error.InvalidSqlBackendResponse;
         const decoded = try @import("array_wire.zig").decodeBorrowed(alloc, kind, raw.value, .{});
@@ -249,7 +277,7 @@ pub const Projection = struct {
             errdefer alloc.free(out.name);
             out.path = if (std.mem.eql(u8, column.name, column.path)) out.name else try alloc.dupe(u8, column.path);
             initialized += 1;
-            has_typed_cells = has_typed_cells or column.type == .array or column.element_type == .numeric;
+            has_typed_cells = has_typed_cells or column.type == .array or column.type == .datetime or column.element_type == .numeric;
         }
         return .{ .columns = columns, .has_typed_cells = has_typed_cells, .document_root = table.storage_mode == .document };
     }
@@ -306,7 +334,8 @@ pub const Projection = struct {
                 const cell = try row.cell(name);
                 if (cell.sql_null and !column.nullable) return error.InvalidSqlBackendResponse;
                 if (!cell.sql_null and ((column.type == .array and cell.array == null) or
-                    (column.element_type == .numeric and column.type != .array and cell.numeric == null)))
+                    (column.element_type == .numeric and column.type != .array and cell.numeric == null) or
+                    (column.type == .datetime and cell.temporal() == null)))
                 {
                     direct = false;
                     break;
@@ -998,4 +1027,39 @@ test "SQL document encoded JSON projection preserves exact cells aliases depth a
     deep[66] = '0';
     @memset(deep[67..], ']');
     try std.testing.expectError(error.SqlProgramLimitExceeded, @import("json_bytes.zig").fromValidated(a, a, deep));
+}
+
+test "SQL document prepared timestamps enter the typed projection before scalar evaluation" {
+    const Check = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(backing);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const table: catalog.Table = .{ .id = 1, .physical_name = "rows", .schema_version = 1, .columns = &.{.{ .name = "created_at", .path = "created_at", .type = .datetime, .temporal_kind = .timestamp_tz }} };
+            const projection = try Projection.init(a, table, &.{"created_at"});
+            const layout = try projection.pageLayout(a);
+            try std.testing.expect(layout != null);
+            for ([_][]const u8{ "{\"created_at\":1706704496123456000}", "{\"created_at\":null}" }) |bytes| {
+                const value = try std.json.parseFromSliceLeaky(Json, a, bytes, .{ .parse_numbers = false });
+                const row = try projection.adaptBorrowed(a, layout, .{ .id = "prepared", .version = 0, .value = value });
+                const cell = try row.cell("created_at");
+                // An existing native directory can still contain legacy JSON
+                // timestamp cells. Its presence alone is not typed admission.
+                const native_cells = try a.alloc(catalog.Row.Cell, 1);
+                native_cells[0] = .{ .value = value.object.get("created_at").?, .sql_null = value.object.get("created_at").? == .null };
+                const native = try projection.adaptBorrowed(a, layout, .{ .id = "native", .version = 1, .value = .null, .typed_cells = .{ .layout = layout.?, .values = native_cells, .presence = &.{true} } });
+                const native_cell = try native.cell("created_at");
+                if (!cell.sql_null) try std.testing.expectEqual(cell.temporal().?.timestamp_tz.micros, native_cell.temporal().?.timestamp_tz.micros);
+                const typed = try @import("describe.zig").coerceDatumTyped(a, cell, .{ .kind = .datetime, .temporal_kind = .timestamp_tz });
+                if (cell.sql_null) {
+                    try std.testing.expect(typed.sql_null);
+                } else {
+                    const expected = try @import("temporal_value.zig").Timestamp.fromUnixNanoseconds(1706704496123456000);
+                    try std.testing.expectEqual(expected.micros, typed.temporal().?.timestamp_tz.micros);
+                }
+            }
+        }
+    };
+    try Check.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

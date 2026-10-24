@@ -40,6 +40,7 @@ pub const Intent = struct {
     /// Only these target columns may receive defaults on historical rows.
     /// An empty list preserves every absent historical value.
     default_columns: []const []const u8 = &.{},
+    default_clock_micros: ?i64 = null,
     allow_column_drops: bool = false,
     expression_schema: []const u8 = "",
     column_transforms: []const ColumnTransform = &.{},
@@ -47,9 +48,15 @@ pub const Intent = struct {
     program_digest: Digest,
 
     pub fn validate(self: Intent) !void {
-        if ((self.version != 2 and self.version != 3) or (self.version == 2) != (self.column_transforms.len == 0) or
+        if ((self.version != 2 and self.version != 3 and self.version != 4) or
+            (self.version == 4) != (self.default_clock_micros != null) or
+            (self.version != 4 and (self.version == 2) != (self.column_transforms.len == 0)) or
             self.source_schemas.len == 0 or self.source_schemas.len > max_source_schemas or
             self.target_schema.len == 0 or std.mem.allEqual(u8, &self.program_digest, 0)) return error.InvalidRestoreStagingCommand;
+        if (self.default_clock_micros) |micros| {
+            const instant = @import("../../sql/statement_clock.zig").Instant.init(micros) catch return error.InvalidRestoreStagingCommand;
+            if (self.preserve_document or self.default_columns.len == 0 or instant.infinity() != 0) return error.InvalidRestoreStagingCommand;
+        }
         var bytes = self.target_schema.len +| self.target_read_schema.len +| self.expression_schema.len;
         if (self.column_transforms.len > 256 or (self.column_transforms.len == 0) != (self.expression_schema.len == 0)) return error.InvalidRestoreStagingCommand;
         for (self.column_transforms, 0..) |transform, i| {
@@ -84,7 +91,7 @@ pub const Intent = struct {
     pub fn jsonStringify(self: Intent, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Intent).@"struct".field_names) |field| {
-            const include = if (comptime std.mem.eql(u8, field, "column_transforms") or std.mem.eql(u8, field, "expression_schema")) self.column_transforms.len != 0 else true;
+            const include = if (comptime std.mem.eql(u8, field, "default_clock_micros")) self.default_clock_micros != null else if (comptime std.mem.eql(u8, field, "column_transforms") or std.mem.eql(u8, field, "expression_schema")) self.column_transforms.len != 0 else true;
             if (include) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));

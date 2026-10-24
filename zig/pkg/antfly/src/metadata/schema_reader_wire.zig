@@ -63,7 +63,7 @@ fn requiresMarker(bytes: []const u8, comptime marker: []const u8) bool {
     var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), bytes);
     defer scanner.deinit();
     if ((scanner.peekNextTokenType() catch return true) != .object_begin) return true;
-    if (walk(void, false, marker, &scanner, fixed.allocator(), 0) catch return true) return true;
+    if (walk(void, .marker, marker, &scanner, fixed.allocator(), 0) catch return true) return true;
     return (scanner.next() catch return true) != .end_of_document;
 }
 
@@ -78,13 +78,42 @@ pub fn validatePublication(comptime Requirements: type, bytes: []const u8) !void
     var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), bytes);
     defer scanner.deinit();
     if ((scanner.peekNextTokenType() catch return) != .object_begin) return;
-    _ = walk(Requirements, true, "schema_reader_requirements", &scanner, fixed.allocator(), 0) catch |err| switch (err) {
+    _ = walk(Requirements, .validate, "schema_reader_requirements", &scanner, fixed.allocator(), 0) catch |err| switch (err) {
         error.InvalidSchemaReaderRequirements => return err,
         else => return,
     };
 }
 
-fn walk(comptime Requirements: type, comptime validate: bool, comptime marker_name: []const u8, scanner: *std.json.Scanner, alloc: std.mem.Allocator, depth: usize) !bool {
+const Projection = enum { marker, validate, newer_readers };
+
+/// Project only authoritative requirement objects; encoded schemas and row
+/// strings are skipped without allocation. Invalid envelopes stay conservative.
+pub fn requiresClockReaders(bytes: []const u8) bool {
+    const Requirements = struct { semantic_version: u32 = 0, encoding_version: u32 = 0 };
+    if (bytes.len > 64 * 1024 * 1024) return true;
+    var buffer: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), bytes);
+    defer scanner.deinit();
+    if ((scanner.peekNextTokenType() catch return true) != .object_begin) return true;
+    if (walk(Requirements, .newer_readers, "schema_reader_requirements", &scanner, fixed.allocator(), 0) catch return true) return true;
+    return (scanner.next() catch return true) != .end_of_document;
+}
+
+test "system catalog schema reader publication projects clock versions without reading opaque payloads" {
+    for ([_][]const u8{
+        "{}",                                                                                 "{\"schema_reader_requirements\":null}",
+        "{\"schema_reader_requirements\":{\"semantic_version\":33,\"encoding_version\":33}}", "{\"schema_json\":\"schema_reader_requirements semantic_version 34\"}",
+    }) |legacy| try std.testing.expect(!requiresClockReaders(legacy));
+    for ([_][]const u8{
+        "{\"schema_reader_requirements\":{\"semantic_version\":34,\"encoding_version\":33}}",
+        "{\"plan\":{\"targets\":[{\"table\":{\"schema_reader_requirements\":{\"semantic_version\":13,\"encoding_version\":34}}}]}}",
+        "{\"schema_reader_\\u0072equirements\":{\"semantic_version\":34,\"encoding_version\":34}}",
+        "{",
+    }) |current| try std.testing.expect(requiresClockReaders(current));
+}
+
+fn walk(comptime Requirements: type, comptime mode: Projection, comptime marker_name: []const u8, scanner: *std.json.Scanner, alloc: std.mem.Allocator, depth: usize) !bool {
     if (depth >= 128) return error.InvalidMetadataTransitionEncoding;
     var found = false;
     switch (try scanner.peekNextTokenType()) {
@@ -128,13 +157,17 @@ fn walk(comptime Requirements: type, comptime validate: bool, comptime marker_na
                     continue;
                 }
                 if (marker == .non_null and try scanner.peekNextTokenType() != .null) {
-                    if (comptime !validate) return true;
+                    if (comptime mode == .marker) return true;
                     const requirement = std.json.innerParse(Requirements, alloc, scanner, .{ .allocate = .alloc_if_needed, .max_value_len = 1024 }) catch
                         return error.InvalidSchemaReaderRequirements;
-                    if (!requirement.valid()) return error.InvalidSchemaReaderRequirements;
-                    found = true;
-                } else if (try walk(Requirements, validate, marker_name, scanner, alloc, depth + 1)) {
-                    if (comptime !validate) return true;
+                    if (comptime mode == .newer_readers) {
+                        if (requirement.semantic_version >= 34 or requirement.encoding_version >= 34) return true;
+                    } else {
+                        if (!requirement.valid()) return error.InvalidSchemaReaderRequirements;
+                        found = true;
+                    }
+                } else if (try walk(Requirements, mode, marker_name, scanner, alloc, depth + 1)) {
+                    if (comptime mode != .validate) return true;
                     found = true;
                 }
             }
@@ -143,8 +176,8 @@ fn walk(comptime Requirements: type, comptime validate: bool, comptime marker_na
         .array_begin => {
             _ = try scanner.next();
             while (try scanner.peekNextTokenType() != .array_end) {
-                if (try walk(Requirements, validate, marker_name, scanner, alloc, depth + 1)) {
-                    if (comptime !validate) return true;
+                if (try walk(Requirements, mode, marker_name, scanner, alloc, depth + 1)) {
+                    if (comptime mode != .validate) return true;
                     found = true;
                 }
             }

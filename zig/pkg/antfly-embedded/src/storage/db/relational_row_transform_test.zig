@@ -631,3 +631,72 @@ test "SQL scoped defaults reject unknown duplicate and nondefault columns" {
     try std.testing.expectError(error.InvalidRestoreStagingCommand, transform.Program.init(alloc, source_schema, target_schema, .{ .default_columns = &.{ "n", "n" } }));
     try std.testing.expectError(error.InvalidRestoreStagingCommand, transform.Program.init(alloc, source_schema, target_schema, .{ .default_columns = &.{"x"} }));
 }
+
+test "relational index system rewrite clock defaults freeze one admitted instant across snapshot tail and cold intent" {
+    const Check = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(backing);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const before =
+                \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+            ;
+            const after =
+                \\{"version":2,"storage_mode":"relational","default_type":"row","column_defaults":[{"column":"created_at","expression":{"op":"transaction_timestamp","precision":3}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"created_at":{"type":"datetime","nullable":true}},"additionalProperties":false}}}}
+            ;
+            const clock = @import("../../sql/statement_clock.zig");
+            const instant = try clock.Instant.fromUnixMicroseconds(1706704496123456);
+            const policies: transform.Policies = .{ .default_columns = &.{"created_at"}, .default_clock_micros = instant.micros };
+            try std.testing.expectEqual(@as(usize, 1), policies.default_columns.len);
+            try std.testing.expectEqual(@as(usize, 0), policies.column_transforms.len);
+            var programs = try @import("relational_rewrite_program.zig").ProgramSet.init(backing, &.{before}, after, policies);
+            defer programs.deinit();
+            const Intent = @import("relational_rewrite_contract.zig").Intent;
+            const intent: Intent = .{ .version = 4, .source_schemas = &.{before}, .target_schema = after, .default_columns = policies.default_columns, .default_clock_micros = policies.default_clock_micros, .expression_schema = policies.expression_schema, .column_transforms = policies.column_transforms, .program_digest = programs.identity };
+            const encoded = try std.json.Stringify.valueAlloc(a, intent, .{});
+            const recovered = try std.json.parseFromSliceLeaky(Intent, a, encoded, .{ .allocate = .alloc_always });
+            try recovered.validate();
+            var cold = try @import("relational_rewrite_program.zig").ProgramSet.initIntent(backing, recovered);
+            defer cold.deinit();
+            try std.testing.expectEqualSlices(u8, &programs.identity, &cold.identity);
+            const expected = (try instant.withPrecision(3)).unixNanoseconds().?;
+            for ([_]*const transform.Program{ &programs.programs[0], &cold.programs[0] }) |program| {
+                for ([_][]const u8{ "{\"id\":1}", "{\"id\":2}" }) |json| {
+                    var source = try sourceRow(program, backing, json);
+                    defer source.deinit(backing);
+                    // No execution clock is supplied after durable admission.
+                    var result = if (std.mem.indexOfScalar(u8, json, '2') != null) try program.transformPrepared(backing, source.packed_row, .{ .io = std.testing.io, .transaction_start = try clock.Instant.init(0) }, null) else try program.transform(backing, source.packed_row);
+                    defer result.deinit(backing);
+                    const row = try codec.ordinalRowView(result.packed_row, program.target.tableSchema().*, program.target.physicalLayout());
+                    const cell = (try row.findCell(row.ordinalForName("created_at").?)).?;
+                    try std.testing.expectEqual(@as(u64, @intCast(expected)), cell.value.u64_val);
+                }
+            }
+            // Scoped defaults preserve present values, including explicit SQL
+            // NULL. A captured clock never turns a replacement into a rewrite.
+            var existing = try transform.Program.init(backing, after, after, policies);
+            defer existing.deinit();
+            for ([_][]const u8{ "{\"id\":3,\"created_at\":null}", "{\"id\":4,\"created_at\":1000}" }) |json| {
+                var source = try sourceRow(&existing, backing, json);
+                defer source.deinit(backing);
+                var result = try existing.transform(backing, source.packed_row);
+                defer result.deinit(backing);
+                const row = try codec.ordinalRowView(result.packed_row, existing.target.tableSchema().*, existing.target.physicalLayout());
+                const cell = (try row.findCell(row.ordinalForName("created_at").?)).?;
+                if (std.mem.indexOf(u8, json, "null") != null) try std.testing.expect(cell.is_null) else try std.testing.expectEqual(@as(u64, 1000), cell.value.u64_val);
+            }
+            var tampered = recovered;
+            tampered.default_clock_micros = instant.micros + 1000000;
+            if (@import("relational_rewrite_program.zig").ProgramSet.initIntent(backing, tampered)) |value| {
+                var unexpected = value;
+                unexpected.deinit();
+                return error.TestUnexpectedResult;
+            } else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(@as(anyerror, error.RestoreStagingScopeChanged), err);
+            }
+        }
+    };
+    try Check.run(alloc);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{});
+}

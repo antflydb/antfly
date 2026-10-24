@@ -35,6 +35,8 @@ pub const Column = struct {
     generated: bool = false,
     /// Native row preparation fills absent DEFAULT cells after SQL evaluation.
     defaulted: bool = false,
+    /// An omitted default depends on this SQL transaction's captured clock.
+    clock_defaulted: bool = false,
 
     pub fn assignStorageValue(self: Column, alloc: std.mem.Allocator, object: *std.json.ObjectMap, value: std.json.Value, sql_null: bool) !void {
         if (sql_null and self.document_null_is_absent) {
@@ -100,6 +102,7 @@ test "SQL column identity signatures normalize defaults and retain exact builtin
     renamed.path = "physical";
     renamed.nullable = false;
     renamed.defaulted = true;
+    renamed.clock_defaulted = true;
     renamed.element_type = .int64;
     const signature = try base.identitySignature(a);
     try std.testing.expectEqual(signature, try renamed.identitySignature(a));
@@ -123,6 +126,34 @@ pub fn hasColumnDefault(schema: anytype, name: []const u8) bool {
         const column = entry.object.get("column") orelse continue;
         if (column == .string and std.mem.eql(u8, column.string, name)) return true;
     }
+    return false;
+}
+
+/// Derived once with the immutable column layout, never by parsing on writes.
+/// Native declaration admission owns validation of operators and tree bounds.
+pub fn columnDefaultUsesClock(schema: anytype, name: []const u8) bool {
+    const entries = schema.column_defaults orelse return false;
+    if (entries.value != .array) return false;
+    for (entries.value.array.items) |entry| {
+        if (entry != .object) continue;
+        const column = entry.object.get("column") orelse continue;
+        if (column != .string or !std.mem.eql(u8, column.string, name)) continue;
+        return defaultExpressionUsesClock(entry.object.get("expression") orelse return false, 0);
+    }
+    return false;
+}
+
+fn defaultExpressionUsesClock(expression: std.json.Value, depth: usize) bool {
+    // Conservatively retain preparation on a shape outside native admission.
+    if (depth >= 16) return true;
+    if (expression != .object) return false;
+    if (expression.object.get("op")) |op| if (op == .string) {
+        if (std.mem.eql(u8, op.string, "transaction_timestamp")) return true;
+        if (std.mem.eql(u8, op.string, "literal")) return false;
+    };
+    if (expression.object.get("args")) |args| if (args == .array) {
+        for (args.array.items) |arg| if (defaultExpressionUsesClock(arg, depth + 1)) return true;
+    };
     return false;
 }
 

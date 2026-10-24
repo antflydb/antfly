@@ -436,12 +436,12 @@ test "relational index system NOT VALID CHECK enforces writes without historical
     defer storage_schema.freeSchema(a, current);
     try std.testing.expectEqual(storage_schema.storage_format_version, current.decoded_format_version);
     try std.testing.expect(current.requires_deferred_constraints);
-    // Main's v33 appends the independent UUID-default reader bit. Keep the
-    // explicit v32/v31 compatibility witnesses rather than relabeling v33.
-    try std.testing.expectEqual(@as(u32, 33), current.decoded_format_version);
+    // UUID and clock defaults append independent reader bits. Keep the
+    // explicit v32/v31 witnesses without relabeling the current frame.
+    try std.testing.expectEqual(@as(u32, 34), current.decoded_format_version);
     try std.testing.expect(!current.requires_uuid_defaults);
     try std.testing.expectEqual(@as(u8, 0), current_bytes[current_bytes.len - 1]);
-    const bytes = try a.dupe(u8, current_bytes[0 .. current_bytes.len - 1]);
+    const bytes = try a.dupe(u8, current_bytes[0 .. current_bytes.len - 2]);
     defer a.free(bytes);
     std.mem.writeInt(u32, bytes[4..8], 32, .little);
     const restored = try storage_schema.deserializeSchema(a, bytes);
@@ -1952,6 +1952,7 @@ fn expressionCapabilitySchema(schema: ParsedTableSchema) storage_schema.TableSch
         .requires_jsonb_array_display = requiresJsonbArrayDisplay(schema),
         .requires_deferred_constraints = deferredConstraints(schema),
         .requires_uuid_defaults = requiresUuidDefaults(schema),
+        .requires_clock_defaults = requiresClockDefaults(schema),
     };
 }
 
@@ -1970,6 +1971,25 @@ fn uuidDefaultExpression(expression: std.json.Value, depth: usize) bool {
     if (expression.object.get("op")) |op| if (op == .string and (std.mem.eql(u8, op.string, "uuidv4") or std.mem.eql(u8, op.string, "uuidv7"))) return true;
     if (expression.object.get("args")) |args| if (args == .array) {
         for (args.array.items) |arg| if (uuidDefaultExpression(arg, depth + 1)) return true;
+    };
+    return false;
+}
+
+fn requiresClockDefaults(schema: ParsedTableSchema) bool {
+    const definitions = schema.column_defaults orelse return false;
+    if (definitions.value != .array) return false;
+    for (definitions.value.array.items) |entry| {
+        if (entry != .object) continue;
+        if (entry.object.get("expression")) |expression| if (clockDefaultExpression(expression, 0)) return true;
+    }
+    return false;
+}
+
+fn clockDefaultExpression(expression: std.json.Value, depth: usize) bool {
+    if (depth >= @import("relational_expression.zig").max_depth or expression != .object) return false;
+    if (expression.object.get("op")) |op| if (op == .string and std.mem.eql(u8, op.string, "transaction_timestamp")) return true;
+    if (expression.object.get("args")) |args| if (args == .array) {
+        for (args.array.items) |arg| if (clockDefaultExpression(arg, depth + 1)) return true;
     };
     return false;
 }

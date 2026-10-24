@@ -312,6 +312,8 @@ pub const TableSchema = struct {
     requires_deferred_constraints: bool = false,
     /// UUID generation is admitted only in owned default preparation.
     requires_uuid_defaults: bool = false,
+    /// Owned transaction-clock defaults must never execute during restoration.
+    requires_clock_defaults: bool = false,
     exact_fields: []const ExactField = &.{},
     dynamic_templates: []const DynamicTemplate = &.{},
     declared_fields: []const DeclaredField = &.{},
@@ -374,8 +376,8 @@ test "relational index system schema reader floor joins independent dimensions w
         .{ .semantic_version = 30, .encoding_version = 0 },
         .{ .semantic_version = 0, .encoding_version = 31 },
         .{ .semantic_version = 10, .encoding_version = 31 },
-        .{ .semantic_version = 33, .encoding_version = 31 },
-        .{ .semantic_version = 30, .encoding_version = 33 },
+        .{ .semantic_version = @import("../common/schema_readers.zig").current_semantic_version + 1, .encoding_version = 31 },
+        .{ .semantic_version = 30, .encoding_version = @import("../common/schema_readers.zig").current_encoding_version + 1 },
     }) |bad| {
         try std.testing.expectError(error.InvalidSchemaReaderRequirements, joined.include(bad));
         try std.testing.expect(!joined.covers(bad));
@@ -408,8 +410,8 @@ test "relational index system schema reader capabilities distinguish semantics f
         .{ .encoding_ceiling = 31 },
         .{ .semantic_ceiling = 10, .encoding_ceiling = 31 },
         .{ .semantic_ceiling = 31, .encoding_ceiling = 10 },
-        .{ .semantic_ceiling = 33, .encoding_ceiling = 31 },
-        .{ .semantic_ceiling = 31, .encoding_ceiling = 33 },
+        .{ .semantic_ceiling = @import("../common/schema_readers.zig").current_semantic_version + 1, .encoding_ceiling = 31 },
+        .{ .semantic_ceiling = 31, .encoding_ceiling = @import("../common/schema_readers.zig").current_encoding_version + 1 },
     };
     for (invalid) |profile| {
         try std.testing.expect(profile.known());
@@ -449,6 +451,7 @@ pub fn requiredReaderVersion(schema: TableSchema) u32 {
         .{ "requires_jsonb_array_display", 31 },
         .{ "requires_deferred_constraints", 32 },
         .{ "requires_uuid_defaults", 33 },
+        .{ "requires_clock_defaults", 34 },
     }) |requirement| {
         if (@field(schema, requirement[0])) version = @max(version, requirement[1]);
     }
@@ -483,6 +486,7 @@ test "relational index system schema reader requirements cover every durable exp
         .{ "requires_jsonb_array_display", 31 },
         .{ "requires_deferred_constraints", 32 },
         .{ "requires_uuid_defaults", 33 },
+        .{ "requires_clock_defaults", 34 },
     };
     comptime {
         @setEvalBranchQuota(10_000);
@@ -601,7 +605,7 @@ pub fn schemasEqualForPublicBinding(alloc: Allocator, stored: TableSchema, deriv
         derived.requires_typed_expressions or derived.requires_predicate_expressions or
         derived.requires_exact_numeric_expressions or derived.requires_exact_numeric_validation or
         derived.requires_numeric_modifiers or derived.requires_array_expressions or
-        derived.requires_array_constructors or derived.requires_constant_index_predicates or derived.requires_text_expressions or derived.requires_numeric_functions or derived.requires_jsonb_display or derived.requires_json_expressions or derived.requires_jsonb_array_display or derived.requires_deferred_constraints or derived.requires_uuid_defaults) return false;
+        derived.requires_array_constructors or derived.requires_constant_index_predicates or derived.requires_text_expressions or derived.requires_numeric_functions or derived.requires_jsonb_display or derived.requires_json_expressions or derived.requires_jsonb_array_display or derived.requires_deferred_constraints or derived.requires_uuid_defaults or derived.requires_clock_defaults) return false;
     var projection = derived;
     projection.relational_columns = &.{};
     const documents = try alloc.dupe(FullTextDocument, derived.full_text_documents);
@@ -684,6 +688,7 @@ pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u
     projection_schema.requires_jsonb_array_display = false;
     projection_schema.requires_deferred_constraints = false;
     projection_schema.requires_uuid_defaults = false;
+    projection_schema.requires_clock_defaults = false;
     const projection_documents = try alloc.dupe(FullTextDocument, schema.full_text_documents);
     defer alloc.free(projection_documents);
     for (projection_documents) |*doc| {
@@ -872,6 +877,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     if (format_version >= 31) try buf.append(alloc, @intFromBool(schema.requires_jsonb_array_display));
     if (format_version >= 32) try buf.append(alloc, @intFromBool(schema.requires_deferred_constraints));
     if (format_version >= 33) try buf.append(alloc, @intFromBool(schema.requires_uuid_defaults));
+    if (format_version >= 34) try buf.append(alloc, @intFromBool(schema.requires_clock_defaults));
     return buf.toOwnedSlice(alloc);
 }
 
@@ -1294,6 +1300,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         .requires_jsonb_array_display = if (fmt_version >= 31) data[pos + 12] == 1 else false,
         .requires_deferred_constraints = if (fmt_version >= 32) data[pos + 13] == 1 else false,
         .requires_uuid_defaults = if (fmt_version >= 33) data[pos + 14] == 1 else false,
+        .requires_clock_defaults = if (fmt_version >= 34) data[pos + 15] == 1 else false,
         .exact_fields = exact_fields,
         .dynamic_templates = templates,
         .declared_fields = declared_fields,
@@ -1554,6 +1561,7 @@ fn validateSerializedSchema(data: []const u8) !void {
     if (format_version >= 31) try cursor.readBool();
     if (format_version >= 32) try cursor.readBool();
     if (format_version >= 33) try cursor.readBool();
+    if (format_version >= 34) try cursor.readBool();
     try cursor.finish();
 }
 
@@ -1561,6 +1569,7 @@ fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
     if (schema.requires_jsonb_array_display and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_deferred_constraints and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_uuid_defaults and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
+    if (schema.requires_clock_defaults and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_json_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_jsonb_display and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_numeric_functions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;

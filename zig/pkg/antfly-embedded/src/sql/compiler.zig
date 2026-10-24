@@ -2276,6 +2276,19 @@ const Parser = struct {
         return self.fail(error.UnsupportedSqlShape, "unsupported SQL column type");
     }
 
+    fn columnCollation(self: *Parser, column: ast.Column) Error!void {
+        const collation = try self.name();
+        // Native text comparisons, key tuples and array elements have a fixed
+        // binary domain. These two PostgreSQL names normalize to that same
+        // domain; never accept a locale or case-folding name and discard it.
+        if (collation.database != null or (collation.namespace != null and
+            !std.mem.eql(u8, collation.namespace.?, "pg_catalog")) or
+            (!std.mem.eql(u8, collation.table, "C") and !std.mem.eql(u8, collation.table, "POSIX")))
+            return self.fail(error.UnsupportedSqlShape, "column collation requires the native binary C or POSIX domain");
+        if (column.type != .string and !(column.type == .array and column.element_type == .text))
+            return self.fail(error.UnsupportedSqlShape, "column type does not support a text collation");
+    }
+
     fn columnDefinition(self: *Parser, name_value: []const u8) Error!ast.Column {
         const declared = try self.castType();
         if (declared.temporal_kind != null) return self.fail(error.UnsupportedSqlShape, "persistent temporal subtype requires native storage support");
@@ -2312,10 +2325,15 @@ const Parser = struct {
                 const entry = try seen.getOrPut(self.alloc, column);
                 if (entry.found_existing) return self.fail(error.DuplicateSqlColumn, "duplicate CREATE TABLE column");
                 var definition = try self.columnDefinition(column);
+                var collation_seen = false;
                 var null_seen = false;
                 var default_seen = false;
                 while (true) {
-                    if (self.keyword(.not)) {
+                    if (self.keyword(.collate)) {
+                        if (collation_seen) return self.fail(error.InvalidSqlSyntax, "duplicate column collation");
+                        try self.columnCollation(definition);
+                        collation_seen = true;
+                    } else if (self.keyword(.not)) {
                         if (null_seen) return self.fail(error.InvalidSqlSyntax, "duplicate column nullability");
                         try self.expectKeyword(.null);
                         definition.nullable = false;
@@ -2764,9 +2782,14 @@ const Parser = struct {
                 _ = self.keyword(.column);
                 const column_name = try self.identifier();
                 var column = try self.columnDefinition(column_name);
+                var collation_seen = false;
                 var null_seen = false;
                 while (true) {
-                    if (self.keyword(.not)) {
+                    if (self.keyword(.collate)) {
+                        if (collation_seen) return self.fail(error.InvalidSqlSyntax, "duplicate column collation");
+                        try self.columnCollation(column);
+                        collation_seen = true;
+                    } else if (self.keyword(.not)) {
                         if (null_seen) return self.fail(error.InvalidSqlSyntax, "duplicate column nullability");
                         try self.expectKeyword(.null);
                         column.nullable = false;
@@ -4265,6 +4288,34 @@ test "compiler predicate modifiers preserve keyword quoting and unwind allocatio
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "compiler column collations bind only exact native binary text domains" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "CREATE TABLE t (label text COLLATE \"C\" NOT NULL)",
+        "CREATE TABLE t (label text NOT NULL COLLATE pg_catalog.\"POSIX\")",
+        "CREATE TABLE t (labels text[] COLLATE \"C\")",
+        "ALTER TABLE t ADD COLUMN label text COLLATE \"POSIX\" DEFAULT 'ABC'",
+    }) |sql| {
+        var compiled = try compile(a, sql, .{});
+        defer compiled.deinit();
+    }
+    for ([_][]const u8{
+        "CREATE TABLE t (label text COLLATE c)",
+        "CREATE TABLE t (label text COLLATE \"en_US\")",
+        "CREATE TABLE t (label text COLLATE tenant.\"C\")",
+        "CREATE TABLE t (n integer COLLATE \"C\")",
+        "ALTER TABLE t ADD COLUMN n uuid COLLATE \"C\"",
+    }) |sql| try std.testing.expectError(error.UnsupportedSqlShape, compile(a, sql, .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE TABLE t (label text COLLATE \"C\" COLLATE \"C\")", .{}));
+    const Fixture = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var compiled = try compile(alloc, "CREATE TABLE t (label text COLLATE pg_catalog.\"C\" NOT NULL UNIQUE)", .{});
+            defer compiled.deinit();
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{});
 }
 
 test "compiler durable defaults and stored generated columns own complete scalar trees" {

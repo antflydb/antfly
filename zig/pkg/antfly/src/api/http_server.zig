@@ -17391,7 +17391,21 @@ pub const ApiHttpServer = struct {
             }
         };
         var observer: Observer = .{ .server = self, .context = context };
-        const plan = try admission.buildWithPoliciesAndConstraintNameGuard(alloc, plan_id, cohort, snapshot.ranges, before.name, proposed, &observer, policies, guard);
+        var bound_policies = policies;
+        if (policies.default_columns.len != 0) {
+            var declaration = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, proposed);
+            defer declaration.deinit(alloc);
+            const needs_clock = for (policies.default_columns) |name| {
+                if (@import("antfly_local_sources").sql_catalog.columnDefaultUsesClock(declaration, name)) break true;
+            } else false;
+            if (needs_clock) {
+                const Clock = @import("antfly_local_sources").sql_catalog.Clock;
+                const instant = if (context.sql_transaction_micros) |micros| try Clock.Instant.init(micros) else try (Clock.Source{ .io = self.restore_job_store.io orelse return error.AsyncRestoreUnavailable }).sample();
+                if (instant.infinity() != 0) return error.InvalidTransactionClock;
+                bound_policies.default_clock_micros = instant.micros;
+            }
+        }
+        const plan = try admission.buildWithPoliciesAndConstraintNameGuard(alloc, plan_id, cohort, snapshot.ranges, before.name, proposed, &observer, bound_policies, guard);
         start.rewrite_plan_json = try std.json.Stringify.valueAlloc(alloc, plan, .{});
         try ensureTableOperationActive(context);
         const accepted = self.restore_job_store.startRecoverable(self.alloc, start) catch |err| return restoreJobStartErrorResponse(self.alloc, err);

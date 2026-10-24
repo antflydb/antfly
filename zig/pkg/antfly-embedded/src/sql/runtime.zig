@@ -2090,7 +2090,17 @@ pub fn encodeStorageDatum(arena: std.mem.Allocator, datum: Datum, column: catalo
 pub fn encodeStorageDatumTyped(arena: std.mem.Allocator, datum: Datum, column: catalog.Column, source_identity: ?@import("array_value.zig").ElementType, retained_bytes: usize) !Json {
     if (datum.temporal() != null and column.type != .string) {
         try datum.validateTemporal();
-        return error.UnsupportedRelationalValueType; // requires schema/layout capability activation
+        if (column.type == .datetime and column.element_type == null and
+            (column.temporal_kind orelse .timestamp_tz) == .timestamp_tz and datum.temporal().?.kind() == .timestamp_tz)
+        {
+            const nanos = datum.temporal().?.timestamp_tz.unixNanoseconds() orelse return error.UnsupportedRelationalValueType;
+            const physical = std.math.cast(u64, nanos) orelse return error.UnsupportedRelationalValueType;
+            var buffer: [20]u8 = undefined;
+            const bytes = try std.fmt.bufPrint(&buffer, "{d}", .{physical});
+            if (bytes.len > retained_bytes) return error.SqlProgramLimitExceeded;
+            return .{ .number_string = try arena.dupe(u8, bytes) };
+        }
+        return error.UnsupportedRelationalValueType; // other temporal types need schema/layout activation
     }
     const checked = try describe.assignDatum(arena, datum, source_identity, column.type, column.element_type, .{ .output_bytes = retained_bytes });
     if (checked.sql_null) {
@@ -7769,4 +7779,30 @@ test "SQL EXPLAIN roadmap estimates use native parameter frames without reading 
     defer mutation.deinit();
     try std.testing.expectError(error.SqlEstimateRequiresReadOnly, execute(a, iface, &mutation, &.{}, .{}));
     try std.testing.expectEqual(@as(usize, 0), backend.writes);
+}
+
+test "SQL storage reencodes native timestamptz datums without changing their microsecond value" {
+    const Check = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(backing);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const T = @import("temporal_value.zig");
+            const column: catalog.Column = .{ .name = "created_at", .path = "created_at", .type = .datetime, .temporal_kind = .timestamp_tz };
+            for ([_]i128{ 0, 1706704496123456000, std.math.maxInt(u64) - @mod(@as(i128, std.math.maxInt(u64)), 1000) }) |nanos| {
+                var value: T.Value = .{ .timestamp_tz = try T.Timestamp.fromUnixNanoseconds(nanos) };
+                const encoded = try encodeStorageDatum(a, .typedTemporal(&value), column, 20);
+                try std.testing.expectEqual(nanos, try std.fmt.parseInt(i128, encoded.number_string, 10));
+                try std.testing.expectError(error.SqlProgramLimitExceeded, encodeStorageDatum(a, .typedTemporal(&value), column, 0));
+            }
+            for ([_]T.Timestamp{ try T.Timestamp.fromUnixNanoseconds(-1000), try T.Timestamp.init(T.end_timestamp - 1), try T.Timestamp.init(std.math.maxInt(i64)) }) |instant| {
+                var value: T.Value = .{ .timestamp_tz = instant };
+                try std.testing.expectError(error.UnsupportedRelationalValueType, encodeStorageDatum(a, .typedTemporal(&value), column, 20));
+            }
+            var date: T.Value = .{ .date = try T.Date.init(0) };
+            try std.testing.expectError(error.UnsupportedRelationalValueType, encodeStorageDatum(a, .typedTemporal(&date), column, 20));
+        }
+    };
+    try Check.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

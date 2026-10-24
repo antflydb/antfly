@@ -642,7 +642,7 @@ pub const CompiledValidationPlan = struct {
                 if (column.kind == .numeric) {
                     // Unconstrained API values are validated, not rewritten.
                     @import("relational_expression.zig").normalizeNumericArrayJson(execution, cell, column.numeric_modifier, preserve or column.numeric_modifier == null) catch |err| switch (err) {
-                        error.OutOfMemory, error.Canceled, error.RelationalExpressionBudgetExceeded => return err,
+                        error.OutOfMemory, error.Canceled, error.RelationalExpressionBudgetExceeded, error.RelationalExpressionOverflow => return err,
                         else => return error.InvalidBatchRequest,
                     };
                 } else {
@@ -686,7 +686,7 @@ pub const CompiledValidationPlan = struct {
                 .jsonb => {},
                 .numeric => if (column.numeric_modifier) |modifier| {
                     cell.* = @import("relational_expression.zig").normalizeNumericJson(execution, cell.*, modifier, preserve) catch |err| switch (err) {
-                        error.OutOfMemory, error.Canceled, error.RelationalExpressionBudgetExceeded => return err,
+                        error.OutOfMemory, error.Canceled, error.RelationalExpressionBudgetExceeded, error.RelationalExpressionOverflow => return err,
                         else => return error.InvalidBatchRequest,
                     };
                 },

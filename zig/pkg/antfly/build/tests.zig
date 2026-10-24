@@ -852,6 +852,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-relational-index-system-test", "Run LSM index lifecycle, standby replay, and work-count benchmarks").dependOn(&addCuratedTestRunArtifact(b, relational_index_system_tests, relational_index_system_tests.filters).step);
+    const clock_rewrite_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"relational index system rewrite clock defaults freeze one admitted instant across snapshot tail and cold intent"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const clock_rewrite_run = addFilteredTestRunArtifact(b, clock_rewrite_tests);
+    clock_rewrite_run.addArg("--require-no-skips");
+    b.step("antfly-relational-clock-rewrite-test", "Verify transaction-bound stable defaults survive historical rewrite, retained tails and cold intent recovery")
+        .dependOn(&clock_rewrite_run.step);
     const constraint_cover_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
         .filters = &.{"relational index system covering constraint derives compact payloads and cold index-only reads"},
@@ -3268,7 +3277,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     reader_admission_step.dependOn(&reader_contract_run.step);
     unit_test_step.dependOn(&reader_contract_run.step);
     for ([_]struct { module: *std.Build.Module, filters: []const []const u8 }{
-        .{ .module = metadata_unit_baseline_mods[1], .filters = &.{ "system catalog schema reader readiness", "system catalog schema reader publication" } },
+        .{ .module = metadata_unit_baseline_mods[1], .filters = &.{ "system catalog schema reader readiness", "system catalog schema reader publication", "catalog projection schema reader facts" } },
         .{ .module = metadata_unit_baseline_mods[8], .filters = &.{"system catalog schema reader table"} },
         .{ .module = data_consumer_module, .filters = &.{"data runtime schema reader"} },
     }) |fixture| {

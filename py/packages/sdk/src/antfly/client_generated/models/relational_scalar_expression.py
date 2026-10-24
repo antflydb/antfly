@@ -24,15 +24,19 @@ class RelationalScalarExpression:
     UUIDv7 generation are permitted only in column defaults and require
     reader capability version 33. They run once during owned row
     preparation, never during schema publication or restore verification.
-    The uuidv4 and uuidv7 operations take no args; uuidv7 may specify shift.
+    Transaction-clock defaults require reader capability version 34 and
+    use the transaction owner's captured instant, shared across rows and
+    statements in an explicit transaction. Stored values are preserved on restore.
+    The uuidv4, uuidv7 and transaction_timestamp operations take no args;
+    uuidv7 may specify shift and transaction_timestamp may specify precision.
     A literal requires type; omitted value means typed null. A column
     requires column; other
-    operations except uuidv4 and uuidv7 require args. Unknown or irrelevant fields are rejected.
+    operations except uuidv4, uuidv7 and transaction_timestamp require args. Unknown or irrelevant fields are rejected.
     Arithmetic operands have the same integer or number type. Integer
     division truncates toward zero. Overflow and division by zero reject
     the write. Arithmetic and string operations propagate null. ASCII case
-    operations leave non-ASCII bytes unchanged. No volatile functions are
-    accepted. Allocated results are bounded to 1 MiB each.
+    operations leave non-ASCII bytes unchanged. Volatile operations are restricted to column defaults. Allocated results
+    are bounded to 1 MiB each.
     The replace operation takes three text arguments and performs literal,
     non-overlapping replacement; an empty search string leaves the input
     unchanged. md5 takes one text argument and returns 32 lowercase hex
@@ -154,6 +158,9 @@ class RelationalScalarExpression:
                 lowering resolves and binds calendar months, days, and microseconds before publication. Omission generates an
                 unshifted UUID; SQL NULL shifts lower to a NULL literal instead. Infinite intervals remain representable
                 declarations but fail when evaluated.
+            precision (int | Unset): Fractional-second precision (omission means 6), accepted only on a
+                transaction_timestamp column default. Rounding uses the shared PostgreSQL timestamp semantics. Requires reader
+                capability version 34.
             json_null (bool | Unset): For a literal of type json only. True denotes present JSON null and requires value to
                 be omitted or null. False or omission leaves an omitted/null value as SQL NULL. This explicit marker survives
                 SDKs that omit optional null values. Requires reader capability version 30.
@@ -169,6 +176,7 @@ class RelationalScalarExpression:
     numeric_modifier: SQLNumericModifier | Unset = UNSET
     value: Any | Unset = UNSET
     shift: str | Unset = UNSET
+    precision: int | Unset = UNSET
     json_null: bool | Unset = UNSET
     column: str | Unset = UNSET
     collation: str | Unset = UNSET
@@ -192,6 +200,8 @@ class RelationalScalarExpression:
         value = self.value
 
         shift = self.shift
+
+        precision = self.precision
 
         json_null = self.json_null
 
@@ -223,6 +233,8 @@ class RelationalScalarExpression:
             field_dict["value"] = value
         if shift is not UNSET:
             field_dict["shift"] = shift
+        if precision is not UNSET:
+            field_dict["precision"] = precision
         if json_null is not UNSET:
             field_dict["json_null"] = json_null
         if column is not UNSET:
@@ -266,6 +278,8 @@ class RelationalScalarExpression:
 
         shift = d.pop("shift", UNSET)
 
+        precision = d.pop("precision", UNSET)
+
         json_null = d.pop("json_null", UNSET)
 
         column = d.pop("column", UNSET)
@@ -288,6 +302,7 @@ class RelationalScalarExpression:
             numeric_modifier=numeric_modifier,
             value=value,
             shift=shift,
+            precision=precision,
             json_null=json_null,
             column=column,
             collation=collation,

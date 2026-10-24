@@ -119,6 +119,9 @@ pub const RowPolicyIntegrityRead = struct {
 };
 
 pub const RequestContext = struct {
+    /// Captured by the authenticated SQL transaction owner, never decoded
+    /// from public request JSON. Shared by normalization and FK cascades.
+    sql_transaction_micros: ?i64 = null,
     /// Private coordinator capability; never serialized or accepted publicly.
     row_policy_integrity_read: ?RowPolicyIntegrityRead = null,
     /// Granted only after administrator authentication by a trusted native

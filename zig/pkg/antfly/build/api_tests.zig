@@ -2269,6 +2269,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "SQL unknown mutation keeps native reconciliation receipt without allocation",
             "SQL default lifecycle retries only definite read admission",
             "mounted SQL original generated and casted tables own creation enforcement and restart",
+            "mounted SQL original combined table contract preserves defaults constraints arrays UUID evolution and cold ownership",
             "raft batch round trips",
             "raft protocol barrier",
             "relation publication fence",
@@ -2488,6 +2489,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_schema_ack_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "schema publication acknowledgement accepts only exact deterministic finalization", "SQL catalog ALTER submits native schema CAS without client generations", "table definition stamp distinguishes rejection from post-admission ambiguity", "SQL unknown mutation keeps native reconciliation receipt without allocation", "SQL default lifecycle retries only definite read admission" });
     sql_schema_ack_run.addArg("--require-no-skips");
     sql_default_lifecycle_step.dependOn(&sql_schema_ack_run.step);
+    const sql_table_contract_tests = b.addTest(.{
+        .root_module = sql_owner_lifecycle_test_mod,
+        .filters = &.{"mounted SQL original combined table contract preserves defaults constraints arrays UUID evolution and cold ownership"},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) (if (optimize == .debug) 16 else 12) else 7) * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_table_contract_run = addFilteredTestRunArtifact(b, sql_table_contract_tests);
+    sql_table_contract_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-table-contract-test", "Verify the original combined table declaration with typed defaults constraints cascades and cold UUID evolution")
+        .dependOn(&sql_table_contract_run.step);
     const sql_table_creation_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original generated and casted tables own creation enforcement and restart"});
     sql_table_creation_run.addArg("--require-no-skips");
     const sql_table_creation_step = b.step("antfly-api-sql-table-creation-test", "Run original generated/default table creation, primary-key enforcement and cold owner restart");

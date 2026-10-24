@@ -47,6 +47,7 @@ pub const document_root_extension_reference = @embedFile("fixtures/sql_document_
 pub const document_reference = @embedFile("fixtures/sql_document_reference.json");
 pub const document_read_reference = @embedFile("fixtures/sql_document_read_reference.json");
 pub const schema_lifecycle_reference = @embedFile("fixtures/sql_schema_lifecycle_reference.json");
+pub const table_contract_reference = @embedFile("fixtures/sql_table_contract_reference.json");
 pub const policy_lifecycle_reference = @embedFile("fixtures/sql_policy_lifecycle_reference.json");
 pub const extended_read_reference = @embedFile("fixtures/sql_extended_read_reference.json");
 pub const remaining_read_reference = @embedFile("fixtures/sql_remaining_read_reference.json");

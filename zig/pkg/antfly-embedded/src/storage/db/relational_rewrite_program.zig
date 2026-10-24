@@ -110,6 +110,7 @@ pub const ProgramSet = struct {
         try intent.validate();
         var value = if (intent.preserve_document) try initDocumentPreservationWithRead(alloc, intent.target_schema, intent.target_read_schema) else try init(alloc, intent.source_schemas, intent.target_schema, .{
             .default_columns = intent.default_columns,
+            .default_clock_micros = intent.default_clock_micros,
             .dropped_columns = if (intent.allow_column_drops) .allow else .reject,
             .expression_schema = intent.expression_schema,
             .column_transforms = intent.column_transforms,

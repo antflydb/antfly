@@ -25554,6 +25554,9 @@ pub const HostedProvisionedTableWriteSource = struct {
         }
         return .{
             .ptr = self,
+            // Preserve the local owner's declared preparation capability.
+            // Remote hosted commits use native owner preparation.
+            .prepares_rows_atomically = if (self.groupLocalWriteSource()) |local| local.prepares_rows_atomically else true,
             .vtable = &.{
                 .drop_table = dropTable,
                 .create_index = createIndex,
