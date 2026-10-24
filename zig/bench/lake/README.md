@@ -160,6 +160,23 @@ implementation of the missing encoder/compactor support. The
 now assigns sorted logical coordinates through the existing authenticated maps;
 the probe above predates that implementation.
 
+The [native implementation comparison](native-ordering-observation.json) uses
+identical verified Parquet bytes and exact answers, with three samples per cache
+mode. On 16,384 rows across eight files, ordered top-20 decorates 21 candidates
+and probes 37 ordered rows, compared with 16,384 decorated candidates before.
+These counters exclude membership construction, planning and other query I/O.
+Observed warm medians were 962 ms before and 67 ms after. Native compilation and
+lifecycle validation overlapped some samples, so this is evidence of reduced
+sort work, not a controlled throughput or timing-attribution claim.
+
+A separate 2,048-row fixture with a declared unindexed 2,048-byte payload retained
+71,135,726 new artifact bytes on refresh before the schema fix and 10,386,662
+after (about 85% less). Both runs verified all 205 changed rows and SQL revision
+results. This is retained immutable artifact growth, excluding temporary spills,
+reclaimed artifacts and provider write traces. Each report pins its actual
+executable independently of the checkout revision. The checked-in evidence keeps
+every timing/sort-work sample, memory observations and input/provenance hashes.
+
 Tests:
 
 ```sh

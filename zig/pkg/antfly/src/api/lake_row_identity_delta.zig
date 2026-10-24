@@ -148,6 +148,24 @@ pub const Builder = struct {
         self.arena.deinit();
         self.a.destroy(self);
     }
+    /// A bounded layout planner can retain a file provisionally, compare its
+    /// ordering commitment, then rebuild only a genuinely changed coordinate
+    /// layout. Unchanged layouts keep their original COW pages and ownership.
+    pub fn rescanFile(self: *Builder, index: usize) !void {
+        if (index >= self.files.len or self.prior == null or self.extension_cursor != null) return error.InvalidLogicalRowIdentity;
+        if (self.scan[index]) return;
+        const slot = self.slots[index];
+        if (!self.unchanged.contains(slot)) return error.InvalidLogicalRowIdentity;
+        // With no retained membership left, finish starts from empty maps.
+        if (self.unchanged.count() > 1) try self.eraseFile(slot, self.files[index]);
+        _ = self.unchanged.remove(slot);
+        self.scan[index] = true;
+        var key: [4]u8 = undefined;
+        std.mem.writeInt(u32, &key, slot, .big);
+        try self.edits[0].addRecord(&key, self.files[index]);
+        const digest = fileKey(self.files[index]);
+        try self.edits[1].addRecord(&digest, &key);
+    }
     fn eraseFile(self: *Builder, slot: u32, name: []const u8) !void {
         const old = self.prior.?;
         var prefix: [4]u8 = undefined;

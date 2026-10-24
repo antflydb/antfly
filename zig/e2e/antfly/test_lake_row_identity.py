@@ -367,6 +367,8 @@ def test_logical_identity_reuses_reordered_native_indexes(
         first = states()
         assert first, "Logical identity state was not published"
         original = next(root for root in first if root.get("indexes") is None)
+        if native_ordering:
+            assert original.get("native_space") is not None, original
         assert original["values_format"] == 3
         assert original["current"]["compact"]
         assert original["current"]["by_location"] == original["current"]["by_file"]

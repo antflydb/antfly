@@ -315,7 +315,8 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
     self.provider.fragment_rows = .{ .ptr = self, .open = Build.open, .replayable = Build.replayable, .open_selected = Build.openSelected };
     const layout_changed = try a.alloc(bool, self.fragments.len);
     defer a.free(layout_changed);
-    for (self.fragments, layout_changed) |fragment, *changed| changed.* = prior == null or fragment.dirty or !orderTagMatches(fragment.order_tag, order_recipe);
+    for (self.fragments, layout_changed) |fragment, *changed| changed.* = prior == null or fragment.membership_dirty or !orderTagMatches(fragment.order_tag, order_recipe) or
+        (fragment.dirty and (order_recipe == null or !self.root.current.compact));
     self.provider.replay_recommended = true;
     var old_root = self.root;
     old_root.current = prior orelse self.root.current;
@@ -327,8 +328,8 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
     defer manager.deinit();
     const builder = try @import("lake_row_identity_delta.zig").Builder.createWithScan(a, &manager, &pages, names, if (prior != null) old_root else null, null, &.{}, inventory.source_id, inventory.snapshot_id, self.root.current.compact, layout_changed);
     defer builder.deinit();
-    for (self.fragments, files, builder.slots, builder.scan) |*fragment, *file, slot, changed| {
-        if (changed) {
+    for (self.fragments, files, builder.slots, 0..) |*fragment, *file, slot, file_index| {
+        if (builder.scan[file_index] or fragment.dirty) {
             var region = std.heap.ArenaAllocator.init(a);
             defer region.deinit();
             const fa = region.allocator();
@@ -337,17 +338,20 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
                 if (sorted) |ordered| {
                     var hash = std.crypto.hash.Blake3.init(.{});
                     hash.update("native-logical-ordered-members-v1");
-                    for (ordered.indices, 0..) |index, row| {
-                        const state = ordered.states[index];
-                        try builder.add(state, .{ .file = slot, .group = 0, .row = row });
-                        hash.update(&state.id);
-                    }
+                    for (ordered.indices) |index| hash.update(&ordered.states[index].id);
                     var digest: [32]u8 = undefined;
                     hash.final(&digest);
-                    fragment.order_tag = try std.fmt.allocPrint(out, "so1-{s}-{s}", .{ std.fmt.bytesToHex(&recipe, .lower), std.fmt.bytesToHex(&digest, .lower) });
+                    const tag = try std.fmt.allocPrint(out, "so1-{s}-{s}", .{ std.fmt.bytesToHex(&recipe, .lower), std.fmt.bytesToHex(&digest, .lower) });
+                    if (!builder.scan[file_index] and (fragment.order_tag == null or !std.mem.eql(u8, fragment.order_tag.?, tag))) try builder.rescanFile(file_index);
+                    fragment.order_tag = tag;
+                    if (builder.scan[file_index]) for (ordered.indices, 0..) |index, row| {
+                        try builder.add(ordered.states[index], .{ .file = slot, .group = 0, .row = row });
+                    };
                 } else {
-                    fragment.order_tag = try std.fmt.allocPrint(out, "su1-{s}", .{std.fmt.bytesToHex(&recipe, .lower)});
-                    try addCanonicalFragment(self, a, &pages, fragment.*, builder, slot);
+                    const tag = try std.fmt.allocPrint(out, "su1-{s}", .{std.fmt.bytesToHex(&recipe, .lower)});
+                    if (!builder.scan[file_index] and (fragment.order_tag == null or !std.mem.eql(u8, fragment.order_tag.?, tag))) try builder.rescanFile(file_index);
+                    fragment.order_tag = tag;
+                    if (builder.scan[file_index]) try addCanonicalFragment(self, a, &pages, fragment.*, builder, slot);
                 }
             } else {
                 fragment.order_tag = null;
@@ -2229,5 +2233,55 @@ fn cancellingUpdatesScenario(legacy: bool) !void {
         if (last) |value| value.deinit();
         last = next;
         previous = root;
+    }
+}
+
+test "external lake logical fragments retain coordinate pages until a layout actually moves" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("logical-layout-retention");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(81), 1, std.testing.io);
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.call };
+    defer manager.deinit();
+    var reads: u64 = 0;
+    var writes: u64 = 0;
+    var pages: Pages = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    const Builder = @import("lake_row_identity_delta.zig").Builder;
+    const first = try Builder.createWithScan(a, &manager, &pages, &.{ "a", "b" }, null, null, &.{}, "source", "one", true, null);
+    defer first.deinit();
+    try first.add(.{ .id = @splat(1), .values = @splat(1) }, .{ .file = first.slots[0], .group = 0, .row = 0 });
+    try first.add(.{ .id = @splat(2), .values = @splat(2) }, .{ .file = first.slots[1], .group = 0, .row = 0 });
+    var prior = try first.finish(@splat(1), @splat(2), @splat(3));
+    for (0..3) |step| {
+        const next = try Builder.createWithScan(a, &manager, &pages, &.{ "a", "b" }, prior, null, &.{}, "source", "next", true, &.{ false, false });
+        defer next.deinit();
+        if (step != 0) {
+            try next.rescanFile(0);
+            try next.add(.{ .id = @splat(1), .values = @splat(1) }, .{ .file = next.slots[0], .group = 0, .row = step });
+            if (step == 2) {
+                try next.rescanFile(1);
+                try next.add(.{ .id = @splat(2), .values = @splat(2) }, .{ .file = next.slots[1], .group = 0, .row = step });
+            }
+        }
+        const before = writes;
+        const root = try next.finish(@splat(1), @splat(2), @splat(3));
+        if (step == 0) {
+            try std.testing.expectEqual(before, writes);
+            try std.testing.expectEqual(prior.current.by_id, root.current.by_id);
+        }
+        try std.testing.expectEqual(@as(u64, 2), root.current.rows);
+        var reader: identity.Reader = .{ .root = root, .pages = &pages };
+        const first_row = (try reader.byId(a, root.current, @splat(1))).?;
+        const second_row = (try reader.byId(a, root.current, @splat(2))).?;
+        try std.testing.expectEqual(@as(u64, step), first_row.coordinate.row);
+        try std.testing.expectEqual(@as(u64, if (step == 2) 2 else 0), second_row.coordinate.row);
+        prior = root;
     }
 }

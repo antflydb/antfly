@@ -1163,8 +1163,7 @@ coordinates. Python tooling tests run in the regular CI unittest suite.
 
 For stable-key sources, logical fragments assign native coordinates in declared
 `schema.index_sort` order. The existing publication-bound by-ID and by-location
-maps authenticate both directions; the physical source space and public stable
-identity remain independent. Sorting uses captured typed payloads and the shared
+maps authenticate both directions; the physical source space, logical identity and public IDs remain distinct. Sorting uses captured typed payloads and the shared
 native key comparator, with at most 8,192 rows per fragment and the existing
 scheduler, memory and spill admission. Only changed input fragments are sorted. Incremental verification can omit a
 complete payload capture; those fragments gather only ordering columns at their
@@ -1178,8 +1177,10 @@ an otherwise ordered tuple ascending.
 
 A normalized ordering recipe and ordered-member digest travel in authenticated
 fragment navigation. The digest also binds native coordinate reuse: a changed
-sort key that moves rows forces a full run rebuild, while unchanged layouts can
-retain row patches. Source recipes fence earlier producers that omitted ordering
+sort key that moves rows forces a full run rebuild, while unchanged layouts
+retain the original coordinate pages and can retain row patches. The identity
+builder admits a provisional file reuse and switches to a rescan only after its
+ordering commitment changes; payload-only edits do not republish coordinate maps. Source recipes fence earlier producers that omitted ordering
 or ignored disabled detailed text mappings. Native encoders attest the observed
 physical order before writing ordinary sort metadata and endpoint bounds. They
 never silently rearrange documents after source ordinals have been assigned.
