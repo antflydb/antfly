@@ -26690,3 +26690,111 @@ Formatting and whitespace checks pass. Full GNU qualification remains waived.
 Admitted payload/state/pin preparation and last-reference retirement,
 resource/retirement ownership registration and the combined backend publication
 coordinator remain required before the broader default design is complete.
+
+
+### Retained immutable-state cloning and physical byte retirement
+
+`State.Clone` now plans and copies every supported immutable representation:
+raw flat entries, arena-backed flat entries, ordered shared trees and empty
+states. It retains its input cursor, row, field, allocation and byte offset
+across original rejection or OOM. Shared rows retain their existing owners;
+raw rows preserve null versus empty namespace, keys, values and tombstones in
+independent owned allocations. Copying is bounded to 16 KiB per checkpoint,
+with no replay of completed prefixes. The vector is reserved once before rows
+are published into the private result. `State.clone` drives this same cursor
+with a null original, so ordinary run snapshot construction uses the retained
+implementation. The caller pins immutable input through compute/take; beginning
+abort stops input reads and retains all remaining private output owners.
+
+`state_clone.Owned` prepays the entire additional vector/raw-byte bound before
+any allocation. Successful take adopts exact resident allocations into a
+preprepared stable usage identity without a later fallible gap. Shared-row
+allocation accounts remain separate retained roots and must be included by the
+owning coordinator's accounting view. Partial abort keeps construction credit
+until physical reclamation completes; no original port is retained. Its fixed
+header, source authority, usage identity and retirement registration remain
+caller-prepaid obligations.
+
+`OwnedEntry.Retirement` claims the final shared reference atomically and saves
+allocator/alignment/account metadata before retiring a packed header or its
+payload bytes. Non-final shared release never touches immutable bytes. Raw
+namespace/key/value allocations retire independently; arena-backed fields stay
+with their arena. The shared allocation remains charged through its last byte
+and physical free. Ordinary entry destruction drives this same engine with a
+null original.
+
+The generic index reclaimer now retains a pending node and entry retirement
+when a policy exposes that ownership protocol. It keeps the node charged until
+its entry finishes. `State.Reclaimer` also retains flat-row, vector and arena
+progress, with one 16 KiB byte quantum per credit. Arena blocks are detached
+one at a time, sized/aligned through the pinned arena implementation, and
+retired before the arena header. Entry vectors are retired only after every
+row owner has completed. `State.deinit` uses this same reclaimer as its explicit
+joined legacy driver. Retiring state/tree headers are ownership records rather
+than readable query/accounting roots; callers keep a stable usage/debt record
+until reclamation completes.
+
+Private native ABI advances to 115 and kernel-owner ABI to 175 because native
+retirement headers now retain byte-level progress. Public C and durable formats
+are unchanged. The path pin registry still performs path hashing/comparison,
+allocation/rehash and a worker-mutex acquisition synchronously. Admitted pin
+registration/release, directory payload assembly, shared-memory Run header
+retirement, parent resource/retirement registration and the combined backend
+RunStore/view/generation/durability publication coordinator remain required,
+alongside the broader default scheduler/cleanup/relief and default qualification.
+Full GNU qualification stays waived; the full design is incomplete.
+
+
+The pinned allocator's typed `alloc/free` wrappers poison an entire buffer.
+The covered clone and packed-entry allocation paths therefore use raw allocator
+operations, initialize only fixed headers before admission checkpoints, and
+publish only fully initialized rows. Covered row/vector retirement uses raw
+free after its explicit byte quanta; arena block release already delegates to
+the standard library's raw operation with its original size/alignment. This
+avoids a second whole-buffer poison pass after stepped retirement. The generic
+index's spare pointer vector also has retained byte progress, including large
+legacy batch pools.
+
+Quiesced mutable publication now uses that same raw packed allocation helper,
+retains a partially copied pending entry as a retirement cursor, and spends one
+retirement credit per original checkpoint. Beginning abandonment cannot hide a
+last-reference destructor before its retained tree/source cleanup begins.
+These operations still rely on the supplied raw allocator's own allocation/free
+contract; the continuations bound their explicit initialization, copying and
+retirement work between allocator calls.
+
+Tests exhaust plan/copy/take/abort checkpoints across raw, arena, ordered/shared
+and empty sources, retain every actual allocation failure, verify exact copied
+bytes without prefix replay, and preserve namespace null/empty distinctions
+and tombstones. Last-reference tests keep the shared allocation charged through
+partial byte retirement and budget large flat-entry and index-spare vectors and
+arena blocks. An allocator supplying known byte patterns proves a rejected
+original can stop after raw allocation before any whole-allocation poison/copy.
+The owning clone's allocation witness proves credit precedes every allocation
+and survives original/OOM refusal, adoption moves exact resident bytes to a
+stable usage identity, physical retirement preserves charge through free, and
+quota refusal makes no allocation.
+
+
+The same typed-allocator-wrapper audit is still required for the other retained
+metadata/payload paths, including `run_metadata_clone`; the state changes above
+do not certify all existing continuations. Path-pin registration/release and
+last-reference Run/shared-memory ownership also remain separate integration
+work. The full default scheduler objective remains unachieved.
+
+Final-source `retained-state-clone-v4`, `-regressions`, `-boundaries` and `-fast`
+receipts pass all five native commands each. Debug physical-sync passes 53/53
+steps and 106 cases. Regressions pass 60/60 steps and 31 existing snapshot,
+state/OOM, merge, arena move, overlay, directory, ledger, dependency and GC
+cases. Debug boundaries pass 80/80 steps, 32 owner-close, 170 table/codec,
+74 WAL recovery and 18 ABI checks. ReleaseFast passes 63/63 steps and all
+106/170/74 physical/table/recovery cases. Each receipt also passes four Bloom
+and 45/1/8 error-identity companions (companions use Debug). All 5,593 recorded
+native/schema input hashes and final log digests match; six immutable snapshots
+cover every changed native file. Formatting, whitespace and the new module's
+license pass. The v1 receipt preserves corrected type/shadowing errors; v2
+passes the initial implementation but does not certify bounded allocator-wrapper
+work. V3 preserves the corrected ArrayList internal-field initialization error.
+V4 includes raw operations, generic spare-vector progress and the allocator
+pattern check. Full GNU qualification remains waived; the full default design
+and the remaining allocator/pin/ownership/coordinator work above are incomplete.

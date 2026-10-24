@@ -25,6 +25,7 @@ test {
     _ = @import("storage/lsm_backend/prepared_checkpoint.zig");
     _ = @import("storage/lsm_backend/output_cleanup.zig");
     _ = @import("storage/lsm_backend/run_metadata_clone.zig");
+    _ = @import("storage/lsm_backend/state_clone.zig");
     _ = @import("storage/lsm_backend/directory_index_preparation.zig");
     _ = @import("storage/lsm_backend/run_comparison.zig");
     _ = @import("storage/lsm_backend/run_summary.zig");

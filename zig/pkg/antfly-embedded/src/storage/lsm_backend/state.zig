@@ -145,18 +145,67 @@ pub const OwnedEntry = struct {
     tombstone: bool,
 
     pub fn deinit(self: *OwnedEntry, allocator: Allocator) void {
-        if (self.shared) |owner| {
-            owner.release();
-            self.* = undefined;
-            return;
-        }
-        if (self.namespace_name) |name| {
-            if (!self.namespace_from_arena) allocator.free(name);
-        }
-        if (!self.key_from_arena) allocator.free(self.key);
-        if (!self.value_from_arena) allocator.free(self.value);
+        var retirement = Retirement.init(self.*);
+        var credits: usize = std.math.maxInt(usize);
+        const complete = retirement.step(allocator, &credits);
+        std.debug.assert(complete);
         self.* = undefined;
     }
+
+    /// Consumes one entry owner. Claim the last shared reference before any
+    /// byte is touched; existing other owners retain all immutable bytes.
+    /// Saved allocation/account metadata outlive poisoning the packed header.
+    pub const Retirement = struct {
+        pub const quantum = 16 * 1024;
+        fields: [3]?[]u8 = @splat(null),
+        packed_bytes: ?[]align(@alignOf(SharedEntry)) u8 = null,
+        backing: ?Allocator = null,
+        account: ?*memory_account.Account = null,
+        field: usize = 0,
+        offset: usize = 0,
+        complete: bool = false,
+        pub fn init(value: OwnedEntry) @This() {
+            if (value.shared) |owner| {
+                if (owner.references.fetchSub(1, .acq_rel) != 1) return .{ .complete = true };
+                const bytes: [*]align(@alignOf(SharedEntry)) u8 = @ptrCast(owner);
+                return .{ .packed_bytes = bytes[0..owner.allocation_len], .backing = owner.allocator, .account = owner.account };
+            }
+            return .{ .fields = .{ if (!value.namespace_from_arena) value.namespace_name else null, if (!value.key_from_arena) value.key else null, if (!value.value_from_arena) value.value else null } };
+        }
+        pub fn step(self: *@This(), allocator: Allocator, credits: *usize) bool {
+            if (self.complete) return true;
+            if (self.packed_bytes) |bytes| {
+                while (self.offset < bytes.len) {
+                    if (credits.* == 0) return false;
+                    credits.* -= 1;
+                    const end = @min(bytes.len, self.offset + quantum);
+                    @memset(bytes[self.offset..end], undefined);
+                    self.offset = end;
+                }
+                self.backing.?.rawFree(bytes, .of(SharedEntry), @returnAddress());
+                if (self.account) |account| account.discharge(bytes.len);
+                self.packed_bytes = null;
+                self.complete = true;
+                return true;
+            }
+            while (self.field < self.fields.len) {
+                if (credits.* == 0) return false;
+                credits.* -= 1;
+                if (self.fields[self.field]) |bytes| {
+                    const end = @min(bytes.len, self.offset + quantum);
+                    @memset(bytes[self.offset..end], undefined);
+                    self.offset = end;
+                    if (self.offset != bytes.len) continue;
+                    if (bytes.len != 0) allocator.rawFree(bytes, .of(u8), @returnAddress());
+                    self.fields[self.field] = null;
+                }
+                self.field += 1;
+                self.offset = 0;
+            }
+            self.complete = true;
+            return true;
+        }
+    };
 
     pub fn entry(self: *const OwnedEntry) backend_adapter.Entry {
         std.debug.assert(!self.tombstone);
@@ -191,14 +240,6 @@ const SharedEntry = struct {
     references: std.atomic.Value(usize) = .init(1),
     allocator: Allocator,
     allocation_len: usize,
-
-    fn release(self: *@This()) void {
-        if (self.references.fetchSub(1, .acq_rel) != 1) return;
-        const allocator = self.allocator;
-        const bytes: [*]align(@alignOf(SharedEntry)) u8 = @ptrCast(self);
-        if (self.account) |account| account.discharge(self.allocation_len);
-        allocator.free(bytes[0..self.allocation_len]);
-    }
 };
 
 pub fn sharedEntryAllocationBytes(namespace_len: ?usize, key_len: usize, value_len: usize) !usize {
@@ -212,7 +253,10 @@ pub fn sharedEntryAllocationBytes(namespace_len: ?usize, key_len: usize, value_l
 /// last release remains safe when preparation is interrupted midway.
 pub fn allocateSharedEntry(allocator: Allocator, namespace_len: ?usize, key_len: usize, value_len: usize, tombstone: bool) !OwnedEntry {
     const ns_len = namespace_len orelse 0;
-    const allocation = try allocator.alignedAlloc(u8, .of(SharedEntry), try sharedEntryAllocationBytes(namespace_len, key_len, value_len));
+    const len = try sharedEntryAllocationBytes(namespace_len, key_len, value_len);
+    const raw = allocator.rawAlloc(len, .of(SharedEntry), @returnAddress()) orelse return error.OutOfMemory;
+    const ptr: [*]align(@alignOf(SharedEntry)) u8 = @alignCast(raw);
+    const allocation = ptr[0..len];
     const owner: *SharedEntry = @ptrCast(allocation.ptr);
     owner.* = .{ .allocator = allocator, .allocation_len = allocation.len };
     const bytes = allocation[@sizeOf(SharedEntry)..];
@@ -354,14 +398,10 @@ pub const State = struct {
     }
 
     pub fn deinit(self: *State, allocator: Allocator) void {
-        if (self.ordered_root) |root| root.release(allocator);
-        for (self.entries.items) |*entry| entry.deinit(allocator);
-        self.entries.deinit(allocator);
-        if (self.arena_owner) |arena| {
-            arena.deinit();
-            allocator.destroy(arena);
-        }
-        if (self.account) |account| account.release();
+        var retirement = Reclaimer.init(self.*);
+        var credits: usize = std.math.maxInt(usize);
+        const complete = retirement.step(allocator, &credits);
+        std.debug.assert(complete);
         self.* = .{};
     }
 
@@ -372,6 +412,9 @@ pub const State = struct {
         owned: State,
         tree: OrderedIndex.Reclaimer,
         index: usize = 0,
+        row: ?OwnedEntry.Retirement = null,
+        arena_pending: ?struct { part: std.heap.ArenaAllocator, bytes: []u8, offset: usize = 0 } = null,
+        vector_offset: usize = 0,
         complete: bool = false,
 
         pub fn init(owned: State) @This() {
@@ -379,35 +422,59 @@ pub const State = struct {
             out.owned.ordered_root = null;
             return out;
         }
-
         pub fn step(self: *@This(), allocator: Allocator, credits: *usize) bool {
             if (self.complete) return true;
             if (!self.tree.step(allocator, credits)) return false;
-            while (credits.* != 0 and self.index < self.owned.entries.items.len) {
-                credits.* -= 1;
-                self.owned.entries.items[self.index].deinit(allocator);
+            while (self.index < self.owned.entries.items.len) {
+                if (self.row == null) {
+                    if (credits.* == 0) return false;
+                    credits.* -= 1;
+                    self.row = .init(self.owned.entries.items[self.index]);
+                }
+                if (!self.row.?.step(allocator, credits)) return false;
+                self.row = null;
                 self.index += 1;
             }
-            if (self.index != self.owned.entries.items.len) return false;
             if (self.owned.arena_owner) |arena| {
-                // Use the arena's public state to detach one block, then let
-                // its own destructor preserve alignment/allocator semantics.
                 inline for (.{ "used_list", "free_list" }) |field| {
-                    while (credits.* != 0) {
-                        const node = @field(arena.state, field) orelse break;
-                        credits.* -= 1;
-                        @field(arena.state, field) = node.next;
-                        node.next = null;
-                        var part = std.heap.ArenaAllocator.init(arena.child_allocator);
-                        part.state.used_list = node;
-                        part.deinit();
+                    while (self.arena_pending != null or @field(arena.state, field) != null) {
+                        if (self.arena_pending == null) {
+                            if (credits.* == 0) return false;
+                            credits.* -= 1;
+                            const node = @field(arena.state, field).?;
+                            @field(arena.state, field) = node.next;
+                            node.next = null;
+                            var part = std.heap.ArenaAllocator.init(arena.child_allocator);
+                            part.state.used_list = node;
+                            const bytes: [*]u8 = @ptrCast(node);
+                            // Delegate size/alignment to the pinned arena implementation.
+                            self.arena_pending = .{ .part = part, .bytes = bytes[@sizeOf(@TypeOf(node.*))..][0..part.queryCapacity()] };
+                        }
+                        const pending = &self.arena_pending.?;
+                        while (pending.offset < pending.bytes.len) {
+                            if (credits.* == 0) return false;
+                            credits.* -= 1;
+                            const end = @min(pending.bytes.len, pending.offset + OwnedEntry.Retirement.quantum);
+                            @memset(pending.bytes[pending.offset..end], undefined);
+                            pending.offset = end;
+                        }
+                        pending.part.deinit();
+                        self.arena_pending = null;
                     }
-                    if (@field(arena.state, field) != null) return false;
                 }
+            }
+            const vector = std.mem.sliceAsBytes(self.owned.entries.allocatedSlice());
+            while (self.vector_offset < vector.len) {
+                if (credits.* == 0) return false;
+                credits.* -= 1;
+                const end = @min(vector.len, self.vector_offset + OwnedEntry.Retirement.quantum);
+                @memset(vector[self.vector_offset..end], undefined);
+                self.vector_offset = end;
             }
             if (credits.* == 0) return false;
             credits.* -= 1;
-            self.owned.entries.deinit(allocator);
+            if (vector.len != 0) allocator.rawFree(vector, .of(OwnedEntry), @returnAddress());
+            self.owned.entries = .empty;
             if (self.owned.arena_owner) |arena| allocator.destroy(arena);
             if (self.owned.account) |account| account.release();
             self.owned = .{};
@@ -416,18 +483,167 @@ pub const State = struct {
         }
     };
 
-    pub fn clone(self: *const State, allocator: Allocator) !State {
-        // Flat states may subsequently mix allocations from several accounts.
-        // Their shared entries retain those accounts individually.
-        var out: State = .{};
-        errdefer out.deinit(allocator);
-        try out.entries.ensureTotalCapacity(allocator, self.entryCount());
-        var cursor: EntryCursor = .{};
-        for (0..self.entryCount()) |i| {
-            const entry = cursor.at(self, i);
-            out.entries.appendAssumeCapacity(try cloneEntry(allocator, entry));
+    /// Borrowed immutable source; caller pins every source owner through
+    /// compute/take. Beginning abort stops source reads and retains all output
+    /// owners. Fixed header and additional heap credit are caller-prepaid.
+    pub const Clone = struct {
+        const Port = @import("../../common/read_admission.zig").Port;
+        pub const quantum = 16 * 1024;
+        source: State,
+        output: State = .{},
+        planned: usize = 0,
+        planned_bytes: u64 = 0,
+        bound: ?u64 = null,
+        planning_cursor: EntryCursor = .{},
+        cursor: EntryCursor = .{},
+        index: usize = 0,
+        field: usize = 0,
+        offset: usize = 0,
+        fields: [3]?[]u8 = @splat(null),
+        resident_bytes: u64 = 0,
+        copied_bytes: u64 = 0,
+        ready: bool = false,
+        taken: bool = false,
+        retiring: bool = false,
+        retired: bool = false,
+        retirement: ?Reclaimer = null,
+        partial_retirement: ?OwnedEntry.Retirement = null,
+        vector_ready: bool = false,
+
+        pub fn init(source: *const State) @This() {
+            return .{ .source = source.* };
         }
-        return out;
+        fn check(original: ?Port) !void {
+            if (original) |port| try port.checkpoint();
+        }
+        pub fn memoryBoundWithAdmission(self: *@This(), original: ?Port) !u64 {
+            try check(original);
+            if (self.retiring or self.retired or self.taken) return error.InvalidArgument;
+            if (self.bound) |bound| return bound;
+            while (self.planned < self.source.entryCount()) {
+                try check(original);
+                const entry = self.planning_cursor.at(&self.source, self.planned);
+                if (entry.shared == null) {
+                    var bytes = try std.math.add(u64, entry.key.len, entry.value.len);
+                    if (entry.namespace_name) |name| bytes = try std.math.add(u64, bytes, name.len);
+                    self.planned_bytes = try std.math.add(u64, self.planned_bytes, bytes);
+                }
+                self.planned += 1;
+            }
+            const capacity = if (self.source.entryCount() == 0) 0 else std.ArrayListUnmanaged(OwnedEntry).growCapacity(self.source.entryCount());
+            const vector = try std.math.mul(u64, capacity, @sizeOf(OwnedEntry));
+            self.bound = try std.math.add(u64, vector, self.planned_bytes);
+            return self.bound.?;
+        }
+        pub fn resumeWithAdmission(self: *@This(), allocator: Allocator, original: ?Port) !void {
+            try check(original);
+            if (self.retiring or self.retired or self.taken) return error.InvalidArgument;
+            if (self.bound == null) return error.ResourceBudgetExceeded;
+            if (!self.vector_ready) {
+                try check(original);
+                const count = self.source.entryCount();
+                const capacity = if (count == 0) 0 else std.ArrayListUnmanaged(OwnedEntry).growCapacity(count);
+                const bytes = std.math.mul(usize, capacity, @sizeOf(OwnedEntry)) catch return error.OutOfMemory;
+                if (bytes != 0) {
+                    const raw = allocator.rawAlloc(bytes, .of(OwnedEntry), @returnAddress()) orelse return error.OutOfMemory;
+                    const ptr: [*]OwnedEntry = @ptrCast(@alignCast(raw));
+                    self.output.entries.items = ptr[0..0];
+                    self.output.entries.capacity = capacity;
+                }
+                self.resident_bytes = bytes;
+                self.vector_ready = true;
+            }
+            while (self.index < self.source.entryCount()) {
+                try check(original);
+                const entry = self.cursor.at(&self.source, self.index);
+                if (entry.shared != null) {
+                    self.output.entries.appendAssumeCapacity(entry.retainShared());
+                    self.index += 1;
+                    continue;
+                }
+                const inputs = [_]?[]const u8{ entry.namespace_name, entry.key, entry.value };
+                while (self.field < self.fields.len) {
+                    try check(original);
+                    const input = inputs[self.field] orelse {
+                        self.field += 1;
+                        continue;
+                    };
+                    if (self.fields[self.field] == null) {
+                        self.fields[self.field] = if (input.len == 0) try allocator.alloc(u8, 0) else blk: {
+                            const raw = allocator.rawAlloc(input.len, .of(u8), @returnAddress()) orelse return error.OutOfMemory;
+                            break :blk raw[0..input.len];
+                        };
+                        self.resident_bytes += input.len;
+                        continue;
+                    }
+                    const end = @min(input.len, self.offset + quantum);
+                    @memcpy(self.fields[self.field].?[self.offset..end], input[self.offset..end]);
+                    self.copied_bytes += end - self.offset;
+                    self.offset = end;
+                    if (end == input.len) {
+                        self.field += 1;
+                        self.offset = 0;
+                    }
+                }
+                self.output.entries.appendAssumeCapacity(.{ .namespace_name = self.fields[0], .key = self.fields[1].?, .value = self.fields[2].?, .tombstone = entry.tombstone });
+                self.fields = @splat(null);
+                self.field = 0;
+                self.index += 1;
+            }
+            self.ready = true;
+        }
+        pub fn takeWithAdmission(self: *@This(), original: ?Port) !State {
+            try check(original);
+            if (!self.ready or self.taken or self.retiring or self.retired) return error.InvalidArgument;
+            const out = self.output;
+            self.output = .{};
+            self.taken = true;
+            return out;
+        }
+        pub fn retireWithAdmission(self: *@This(), allocator: Allocator, original: ?Port) !void {
+            try check(original);
+            if (self.taken or self.retired) return;
+            self.retiring = true;
+            if (self.partial_retirement == null) {
+                // Partial fields are independent allocations, including zero
+                // length fields. Never consult source bytes during retirement.
+                self.partial_retirement = .{ .fields = self.fields };
+                self.fields = @splat(null);
+            }
+            while (!self.partial_retirement.?.complete) {
+                try check(original);
+                var credits: usize = 1;
+                _ = self.partial_retirement.?.step(allocator, &credits);
+            }
+            if (self.retirement == null) {
+                self.retirement = .init(self.output);
+                self.output = .{};
+            }
+            while (true) {
+                try check(original);
+                var credits: usize = 1;
+                if (self.retirement.?.step(allocator, &credits)) break;
+            }
+            self.resident_bytes = 0;
+            self.retired = true;
+        }
+        pub fn deinit(self: *@This(), allocator: Allocator) void {
+            self.retireWithAdmission(allocator, null) catch unreachable;
+        }
+    };
+
+    pub fn clone(self: *const State, allocator: Allocator) Allocator.Error!State {
+        var cursor = Clone.init(self);
+        defer cursor.deinit(allocator);
+        _ = cursor.memoryBoundWithAdmission(null) catch |cause| switch (cause) {
+            error.Overflow => return error.OutOfMemory,
+            else => unreachable,
+        };
+        cursor.resumeWithAdmission(allocator, null) catch |cause| switch (cause) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => unreachable,
+        };
+        return cursor.takeWithAdmission(null) catch unreachable;
     }
 
     pub fn cloneArena(self: *const State, allocator: Allocator) !State {
@@ -891,7 +1107,7 @@ pub const ActiveMemTable = struct {
         compared: usize = 0,
         ready: bool = false,
         published: bool = false,
-        retirement: ?struct { tree: OrderedIndex.Reclaimer, source: State.Reclaimer } = null,
+        retirement: ?struct { tree: OrderedIndex.Reclaimer, source: State.Reclaimer, pending: ?OwnedEntry.Retirement = null } = null,
         retired: bool = false,
 
         /// Move the immutable input and retain the live root in constant time.
@@ -945,15 +1161,7 @@ pub const ActiveMemTable = struct {
                     if (input.shared != null and input.shared.?.account == account) {
                         self.pending = input.retainShared();
                     } else {
-                        const ns_len = if (input.namespace_name) |name| name.len else 0;
-                        var len = try std.math.add(usize, @sizeOf(SharedEntry), ns_len);
-                        len = try std.math.add(usize, len, input.key.len);
-                        len = try std.math.add(usize, len, input.value.len);
-                        const allocation = try allocator.alignedAlloc(u8, .of(SharedEntry), len);
-                        const owner: *SharedEntry = @ptrCast(allocation.ptr);
-                        owner.* = .{ .allocator = allocator, .allocation_len = len };
-                        const bytes = allocation[@sizeOf(SharedEntry)..];
-                        self.pending = .{ .shared = owner, .namespace_name = if (input.namespace_name != null) bytes[0..ns_len] else null, .key = bytes[ns_len..][0..input.key.len], .value = bytes[ns_len + input.key.len ..], .tombstone = input.tombstone };
+                        self.pending = try allocateSharedEntry(allocator, if (input.namespace_name) |name| name.len else null, input.key.len, input.value.len, input.tombstone);
                         self.copying = true;
                     }
                 }
@@ -1059,9 +1267,10 @@ pub const ActiveMemTable = struct {
 
         fn beginRetirement(self: *@This(), allocator: Allocator) void {
             if (self.retirement != null or self.retired) return;
-            if (self.pending) |*entry| entry.deinit(allocator);
+            _ = allocator;
+            const pending: ?OwnedEntry.Retirement = if (self.pending) |entry| .init(entry) else null;
             self.pending = null;
-            self.retirement = .{ .tree = .init(self.candidate.ordered), .source = .init(self.source) };
+            self.retirement = .{ .tree = .init(self.candidate.ordered), .source = .init(self.source), .pending = pending };
             self.candidate = .{};
             self.source = .{};
             self.node = null;
@@ -1078,8 +1287,12 @@ pub const ActiveMemTable = struct {
 
         fn retireStep(self: *@This(), allocator: Allocator) bool {
             if (self.retired) return true;
-            var credits: usize = 64;
+            var credits: usize = 1;
             const retirement = &self.retirement.?;
+            if (retirement.pending) |*pending| {
+                if (!pending.step(allocator, &credits)) return false;
+                retirement.pending = null;
+            }
             if (!retirement.tree.step(allocator, &credits)) return false;
             if (!retirement.source.step(allocator, &credits)) return false;
             self.retirement = null;
@@ -2324,4 +2537,238 @@ test "writer overlay promotion retries preserve shared payloads and accounts" {
         for (0..8) |i| try std.testing.expect(original[i] == live.entryAt(i).value.ptr);
     }
     try std.testing.expect(failures > 0);
+}
+
+test "controlled physical sync state clone retains all original rejection and preserves raw shared arena and empty inputs" {
+    const a = std.testing.allocator;
+    const admission = @import("../../common/read_admission.zig");
+    const Fault = struct {
+        checks: usize = 0,
+        at: usize = std.math.maxInt(usize),
+        failure: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const at = self.checks;
+            self.checks += 1;
+            if (at == self.at) return self.failure;
+        }
+    };
+    const Verify = struct {
+        fn same(source: *const State, output: *const State) !void {
+            try std.testing.expectEqual(source.entryCount(), output.entryCount());
+            for (0..source.entryCount()) |i| {
+                const x = source.entryAt(i);
+                const y = output.entryAt(i);
+                try std.testing.expectEqual(x.namespace_name == null, y.namespace_name == null);
+                if (x.namespace_name) |name| try std.testing.expectEqualSlices(u8, name, y.namespace_name.?);
+                try std.testing.expectEqualSlices(u8, x.key, y.key);
+                try std.testing.expectEqualSlices(u8, x.value, y.value);
+                try std.testing.expectEqual(x.tombstone, y.tombstone);
+                if (x.shared != null) try std.testing.expect(x.shared == y.shared) else try std.testing.expect(x.key.ptr != y.key.ptr);
+            }
+        }
+    };
+    const bytes = try a.alloc(u8, 2 * State.Clone.quantum + 7);
+    defer a.free(bytes);
+    @memset(bytes, 's');
+    bytes[0] = 0;
+    var flat: State = .{};
+    defer flat.deinit(a);
+    var mutable: ActiveMemTable = .{};
+    defer mutable.deinit(a);
+    for ([_]?[]const u8{ null, "", "docs" }, 0..) |name, i| {
+        try flat.appendUpsert(a, .{ .name = name }, bytes, bytes, i == 2);
+        try mutable.upsert(a, .{ .name = name }, bytes, bytes, i == 2);
+    }
+    var arena = try flat.cloneArena(a);
+    defer arena.deinit(a);
+    var shared = try mutable.snapshot(a);
+    defer shared.deinit(a);
+    const empty: State = .{};
+    for ([_]*const State{ &flat, &arena, &shared, &empty }) |source| {
+        inline for (.{ "plan", "copy", "take", "retire" }) |stage| {
+            var checks: usize = 1;
+            var target: usize = 0;
+            while (target <= checks) : (target += 1) {
+                for ([_]bool{ false, true }) |abort| {
+                    if (target == 0 and abort) continue;
+                    var clone = State.Clone.init(source);
+                    defer clone.deinit(a);
+                    if (!std.mem.eql(u8, stage, "plan")) _ = try clone.memoryBoundWithAdmission(null);
+                    if (std.mem.eql(u8, stage, "take") or std.mem.eql(u8, stage, "retire")) try clone.resumeWithAdmission(a, null);
+                    var fault: Fault = .{ .at = if (target == 0) std.math.maxInt(usize) else target - 1, .failure = switch (target % 3) {
+                        0 => error.Canceled,
+                        1 => error.DeadlineExceeded,
+                        else => error.FileNotFound,
+                    } };
+                    const payload: admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+                    const port = admission.Port.init(&payload);
+                    var output: ?State = null;
+                    defer if (output) |*value| value.deinit(a);
+                    const result: anyerror!void = if (std.mem.eql(u8, stage, "plan")) blk: {
+                        _ = clone.memoryBoundWithAdmission(port) catch |e| break :blk e;
+                        break :blk {};
+                    } else if (std.mem.eql(u8, stage, "copy")) clone.resumeWithAdmission(a, port) else if (std.mem.eql(u8, stage, "retire")) clone.retireWithAdmission(a, port) else blk: {
+                        output = clone.takeWithAdmission(port) catch |e| break :blk e;
+                        break :blk {};
+                    };
+                    if (target == 0) {
+                        try result;
+                        checks = fault.checks;
+                    } else try std.testing.expectError(fault.failure, result);
+                    if (abort or std.mem.eql(u8, stage, "retire")) {
+                        try clone.retireWithAdmission(a, port);
+                        try std.testing.expect(clone.retired and clone.resident_bytes == 0);
+                    } else {
+                        if (output == null) {
+                            _ = try clone.memoryBoundWithAdmission(port);
+                            try clone.resumeWithAdmission(a, port);
+                            try std.testing.expect(clone.resident_bytes <= clone.bound.?);
+                            if (source == &shared) try std.testing.expectEqual(@as(u64, 0), clone.copied_bytes) else try std.testing.expectEqual(clone.planned_bytes, clone.copied_bytes);
+                            output = try clone.takeWithAdmission(port);
+                        }
+                        try Verify.same(source, &output.?);
+                    }
+                    // Abort and byte retirement never mutate the borrowed input.
+                    if (source.entryCount() != 0) try std.testing.expectEqualSlices(u8, bytes, source.entryAt(0).key);
+                }
+            }
+        }
+    }
+    // Every actual allocation can refuse without discarding completed bytes.
+    var probe_allocator = std.testing.FailingAllocator.init(a, .{});
+    var probe = State.Clone.init(&flat);
+    _ = try probe.memoryBoundWithAdmission(null);
+    try probe.resumeWithAdmission(probe_allocator.allocator(), null);
+    const allocation_count = probe_allocator.alloc_index;
+    probe.deinit(probe_allocator.allocator());
+    for (0..allocation_count) |at| for ([_]bool{ false, true }) |abort| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = at });
+        var clone = State.Clone.init(&flat);
+        defer clone.deinit(failing.allocator());
+        _ = try clone.memoryBoundWithAdmission(null);
+        try std.testing.expectError(error.OutOfMemory, clone.resumeWithAdmission(failing.allocator(), null));
+        failing.fail_index = std.math.maxInt(usize);
+        if (!abort) {
+            try clone.resumeWithAdmission(failing.allocator(), null);
+            var out = try clone.takeWithAdmission(null);
+            try Verify.same(&flat, &out);
+            out.deinit(failing.allocator());
+        } else try clone.retireWithAdmission(failing.allocator(), null);
+    };
+}
+
+test "controlled physical sync state retirement charges last shared bytes and budgets tree arena and vector storage" {
+    const a = std.testing.allocator;
+    const bytes = try a.alloc(u8, 3 * OwnedEntry.Retirement.quantum + 1);
+    defer a.free(bytes);
+    @memset(bytes, 'r');
+    var mutable: ActiveMemTable = .{};
+    try mutable.upsert(a, .{}, bytes, bytes, false);
+    var source = try mutable.snapshot(a);
+    mutable.deinit(a);
+    const account = source.ordered_root.?.entry.shared.?.account.?.retain();
+    defer account.release();
+    const before = account.bytes.load(.acquire);
+    var retirement = State.Reclaimer.init(source);
+    source = .{};
+    var zero: usize = 0;
+    try std.testing.expect(!retirement.step(a, &zero));
+    for (0..2) |_| {
+        var credit: usize = 1;
+        try std.testing.expect(!retirement.step(a, &credit));
+        try std.testing.expectEqual(before, account.bytes.load(.acquire));
+    }
+    var steps: usize = 2;
+    while (true) {
+        var credit: usize = 1;
+        steps += 1;
+        if (retirement.step(a, &credit)) break;
+    }
+    try std.testing.expect(steps > 2 * bytes.len / OwnedEntry.Retirement.quantum);
+    try std.testing.expectEqual(@as(u64, @sizeOf(memory_account.Account)), account.bytes.load(.acquire));
+    var flat: State = .{};
+    try flat.appendUpsert(a, .{}, bytes, bytes, false);
+    var arena = try flat.cloneArena(a);
+    flat.deinit(a);
+    var arena_retire = State.Reclaimer.init(arena);
+    arena = .{};
+    steps = 0;
+    while (true) {
+        var credit: usize = 1;
+        steps += 1;
+        if (arena_retire.step(a, &credit)) break;
+    }
+    try std.testing.expect(steps > 2 * bytes.len / OwnedEntry.Retirement.quantum);
+    var vector: State = .{};
+    try vector.entries.ensureTotalCapacity(a, 10000);
+    var vector_retire = State.Reclaimer.init(vector);
+    vector = .{};
+    steps = 0;
+    while (true) {
+        var credit: usize = 1;
+        steps += 1;
+        if (vector_retire.step(a, &credit)) break;
+    }
+    try std.testing.expect(steps > 10);
+    var index: OrderedIndex = .{};
+    try index.spare.ensureTotalCapacity(a, 100000);
+    var index_retire = OrderedIndex.Reclaimer.init(index);
+    index = .{};
+    steps = 0;
+    while (true) {
+        var credit: usize = 1;
+        steps += 1;
+        if (index_retire.step(a, &credit)) break;
+    }
+    try std.testing.expect(steps > 10);
+}
+
+test "controlled physical sync state copying bypasses whole allocation poisoning before admitted byte work" {
+    const a = std.testing.allocator;
+    const Pattern = struct {
+        clone: *State.Clone,
+        rejected: bool = false,
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+        }
+        fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const ptr = std.testing.allocator.rawAlloc(len, alignment, ra) orelse return null;
+            @memset(ptr[0..len], 0x5a);
+            return ptr;
+        }
+        fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.rejected) if (self.clone.fields[0]) |bytes| {
+                try std.testing.expectEqual(@as(usize, 0), self.clone.offset);
+                try std.testing.expectEqual(@as(u8, 0x5a), bytes[0]);
+                try std.testing.expectEqual(@as(u8, 0x5a), bytes[bytes.len - 1]);
+                self.rejected = true;
+                return error.Canceled;
+            };
+        }
+    };
+    const name = try a.alloc(u8, 3 * State.Clone.quantum + 1);
+    defer a.free(name);
+    @memset(name, 'n');
+    var source: State = .{};
+    defer source.deinit(a);
+    try source.appendUpsert(a, .{ .name = name }, "key", "value", false);
+    var clone = State.Clone.init(&source);
+    var pattern: Pattern = .{ .clone = &clone };
+    defer clone.deinit(pattern.allocator());
+    const admission = @import("../../common/read_admission.zig");
+    const payload: admission.Payload = .{ .ptr = &pattern, .vtable = &.{ .checkpoint = Pattern.check } };
+    const port = admission.Port.init(&payload);
+    _ = try clone.memoryBoundWithAdmission(port);
+    try std.testing.expectError(error.Canceled, clone.resumeWithAdmission(pattern.allocator(), port));
+    try std.testing.expect(pattern.rejected and clone.copied_bytes == 0);
+    try clone.resumeWithAdmission(pattern.allocator(), port);
+    try std.testing.expectEqual(clone.planned_bytes, clone.copied_bytes);
+    var out = try clone.takeWithAdmission(port);
+    defer out.deinit(pattern.allocator());
+    try std.testing.expectEqualSlices(u8, name, out.entryAt(0).namespace_name.?);
 }

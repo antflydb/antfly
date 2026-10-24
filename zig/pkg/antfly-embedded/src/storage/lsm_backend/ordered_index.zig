@@ -225,6 +225,9 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
             pending: [2 * @bitSizeOf(usize)]*Node = undefined,
             len: usize = 0,
             complete: bool = false,
+            spare_offset: usize = 0,
+            retiring_node: if (@hasDecl(Entry, "Retirement")) ?*Node else void = if (@hasDecl(Entry, "Retirement")) null else {},
+            retiring_entry: if (@hasDecl(Entry, "Retirement")) ?Entry.Retirement else void = if (@hasDecl(Entry, "Retirement")) null else {},
 
             pub fn init(owned: Self) @This() {
                 var out = @This(){ .owned = owned };
@@ -237,7 +240,17 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
             }
             pub fn step(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
                 if (self.complete) return true;
-                while (credits.* != 0 and self.len != 0) {
+                while (true) {
+                    if (comptime @hasDecl(Entry, "Retirement")) {
+                        if (self.retiring_node) |node| {
+                            if (!self.retiring_entry.?.step(allocator, credits)) return false;
+                            if (node.account) |account| account.discharge(@sizeOf(Node));
+                            allocator.destroy(node);
+                            self.retiring_node = null;
+                            self.retiring_entry = null;
+                        }
+                    }
+                    if (credits.* == 0 or self.len == 0) break;
                     credits.* -= 1;
                     self.len -= 1;
                     const node = self.pending[self.len];
@@ -250,9 +263,14 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
                         self.pending[self.len] = child;
                         self.len += 1;
                     }
-                    node.entry.deinit(allocator);
-                    if (node.account) |account| account.discharge(@sizeOf(Node));
-                    allocator.destroy(node);
+                    if (comptime @hasDecl(Entry, "Retirement")) {
+                        self.retiring_node = node;
+                        self.retiring_entry = .init(node.entry);
+                    } else {
+                        node.entry.deinit(allocator);
+                        if (node.account) |account| account.discharge(@sizeOf(Node));
+                        allocator.destroy(node);
+                    }
                 }
                 if (self.len != 0) return false;
                 while (credits.* != 0) {
@@ -262,7 +280,16 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
                     allocator.destroy(node);
                 }
                 if (self.owned.spare.items.len != 0) return false;
-                self.owned.spare.deinit(allocator);
+                const vector = std.mem.sliceAsBytes(self.owned.spare.allocatedSlice());
+                while (self.spare_offset < vector.len) {
+                    if (credits.* == 0) return false;
+                    credits.* -= 1;
+                    const end = @min(vector.len, self.spare_offset + 16 * 1024);
+                    @memset(vector[self.spare_offset..end], undefined);
+                    self.spare_offset = end;
+                }
+                if (vector.len != 0) allocator.rawFree(vector, .of(*Node), @returnAddress());
+                self.owned.spare = .empty;
                 if (self.owned.account) |account| account.release();
                 self.owned = .{};
                 self.complete = true;

@@ -57,7 +57,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Close reclaims retired memory in original CPU quanta before persistence.
 // Durability grants own private file writes, publication and discard.
 // Output tickets carry registered physical/accounting retirement ownership.
-pub const abi_version: u32 = 174;
+// State retirement retains partial row, tree-node, vector and arena byte ownership.
+pub const abi_version: u32 = 175;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
