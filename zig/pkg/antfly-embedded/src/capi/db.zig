@@ -7762,11 +7762,15 @@ fn waitResolverCurationResponse(handle_ptr: ?*anyopaque, timeout_ms: u64, out: *
     defer arena.deinit();
     const a = arena.allocator();
     var result = std.json.parseFromSliceLeaky(std.json.Value, a, out.ptr.?[0..out.len], .{}) catch return .ok;
+    const rows = curationRows(&result);
+    // Capture can fail after the mutation commits. Preserve its accepted
+    // response rather than iterating incomplete wait requirements.
+    if (rows.len != targets.len) return .ok;
     // Owner refresh may replace the foreground wrapper and its lazy table
     // cache. Rebind only the captured source/destination scopes before each
     // observation; an unopened table is not evidence that replay is pending.
     var scopes: std.StringHashMapUnmanaged(void) = .empty;
-    for (curationRows(&result), targets) |row, target| {
+    for (rows, targets) |row, target| {
         if (row == .object) if (row.object.get("source_table")) |source| if (source == .string and !std.mem.eql(u8, source.string, "default"))
             scopes.put(a, source.string, {}) catch return .ok;
         if (target) |expected| if (!std.mem.eql(u8, expected.cfg.table, "default"))
@@ -7782,8 +7786,6 @@ fn waitResolverCurationResponse(handle_ptr: ?*anyopaque, timeout_ms: u64, out: *
             var iteration = std.heap.ArenaAllocator.init(std.heap.c_allocator);
             defer iteration.deinit();
             const scratch = iteration.allocator();
-            const rows = curationRows(&result);
-            if (rows.len != targets.len) return .ok;
             const root = guard.handle.parent_handle orelse guard.handle;
             var scope_names = scopes.keyIterator();
             while (scope_names.next()) |name| _ = @import("tables.zig").get(root, name.*) catch |err| switch (err) {
@@ -7835,6 +7837,24 @@ fn waitResolverCurationResponse(handle_ptr: ?*anyopaque, timeout_ms: u64, out: *
         handleLockIo().sleep(.fromMilliseconds(25), .awake) catch return .ok;
     }
     return .ok;
+}
+
+test "capi resolver curation waits preserve accepted responses when capture fails" {
+    const single = "{\"resolver\":\"concepts\",\"accepted\":true,\"applied\":false,\"revision\":7}";
+    const batch = "{\"accepted\":true,\"applied\":false,\"results\":[{\"source_table\":\"notes\",\"resolver\":\"concepts\",\"revision\":7},{\"source_table\":\"history\",\"resolver\":\"concepts\",\"revision\":7}]}";
+    for ([_]struct { json: []const u8, targets: []const ?CurationWaitTarget }{
+        .{ .json = single, .targets = &.{} },
+        .{ .json = batch, .targets = &.{} },
+        .{ .json = batch, .targets = &.{null} },
+        .{ .json = single, .targets = &.{ null, null } },
+    }) |fixture| {
+        var out = try copyJsonBuffer(fixture.json);
+        defer antfly_buffer_free(&out);
+        const accepted_ptr = out.ptr;
+        try std.testing.expectEqual(capi.ErrorCode.ok, waitResolverCurationResponse(null, 300000, &out, fixture.targets));
+        try std.testing.expectEqual(accepted_ptr, out.ptr);
+        try std.testing.expectEqualStrings(fixture.json, out.ptr.?[0..out.len]);
+    }
 }
 
 test "capi resolver curation observation batches policy-free descriptors and fences namespace moves" {
