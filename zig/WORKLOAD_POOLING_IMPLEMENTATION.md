@@ -26613,3 +26613,80 @@ corrected to an owned in-memory tombstone in v3. Formatting and whitespace
 checks pass. Full GNU qualification remains waived. Private put/replacement,
 backend ownership/publication integration and the other remaining work above
 are still required for the full design.
+
+
+### Prepared private put/replacement and entry ownership
+
+`Directory.Put` owns a prepaid private fork and a prepared `EntryLease`. It
+looks up the old ID, composes the retained removal job when present, then
+inserts the new entry into all four run indexes and updates level/generation
+aggregates and counters. Removing by ID first supports changes of lower/upper
+bounds, namespace, level and L0 visibility sequence, including moves between
+memory and file runs. It avoids relying on the old read-order key to identify
+a replacement. Two-edit `PutPools` reserve every index before mutation, with a
+retained allocation cursor and explicit memory bound.
+
+A completed removal can now transfer its private candidate to a composed job
+without publishing. Transfer and publication are mutually exclusive and
+exactly once. Put publishes the complete successor with the same original,
+source-root/counter and predecessor-pointer checks used by removal. Its caller
+still holds the publication lock and prepares the backend's other receipts.
+
+`EntryLease` owns the new payload pin and an accounting reference. Payloads
+must belong to the candidate's read-tree account, so the resulting directory's
+existing accounting roots cover them. The put job retains this owner through
+partial work, successful publication or complete private abort. Thus private
+reclamation drops only non-final references to both source and incoming
+payloads. After publication/abort, an original-checked, exactly-once handoff
+returns the remaining entry lease for separately registered retirement. The
+ordinary admitted abort does not enter the file-pin registry or run metadata
+and state destruction. The joined/quiesced deinit fallback can release that
+last owner explicitly.
+
+Legacy payload/state cloning and pin registration now live in
+`prepareEntryLegacy`, shared by ordinary `Directory.put`. This remains an
+explicit legacy preparatory step; the retained edit job never invokes it.
+The admitted payload/state/pin preparation and last-reference retirement owner
+remain required, as do parent resource accounting and wake/retirement
+registration for the job, candidate and handed-off entry.
+
+Backend integration cannot safely call the directory pointer receipt alone.
+The current `publishRunDirectory` also expects the authoritative RunStore to
+have been updated. `invalidateReadVersion` advances directory generation and
+synchronously destroys the domain index/releases the old read version. A
+complete owning coordinator must prepare the RunStore successor, view/domain
+retirement and generation/durability/inventory/accounting receipts together,
+then commit them without another fallible gap. Those paths, complete directory
+rebuilding, broader default coordinator/cleanup/relief and default overload and
+fairness evidence remain incomplete. Full GNU qualification remains waived.
+
+
+The new test exhausts every computation/publication rejection point in ten
+scenarios: insertion, unchanged-key replacement, upper-endpoint change,
+namespace/lower-key change, visibility-sequence move, moves out of and into L0,
+file-to-memory and memory-to-file replacement, and insertion into an empty
+source. Each compares the complete successor with a flat ID-replacement model:
+read order, all four index identities/counts, partition domains, level and
+generation totals, byte/memory counters, tombstones and GC summaries.
+Allocation-denying work and abort verify pool-only mutation and cleanup.
+Every rejected original keeps the predecessor live; completed publication is
+exactly once. Abort retries cover the nested removal and private-fork cleanup
+stages while source and incoming pins stay live. Entry handoff checks its
+original before transferring ownership, refuses duplicates, and preserves the
+new payload's account coverage through publication and last-owner retirement.
+
+Final-source receipts `retained-directory-put-v1`, `-regressions`, `-boundaries`
+and `-fast` pass all five native commands each. Debug physical-sync passes
+53/53 steps and all 102 cases. Regressions pass 60/60 steps and 23 existing
+mutable-state/OOM, directory, obsolete-ledger, dependency and GC cases. Debug
+close/recovery/ABI boundaries pass 80/80 steps, 32 owner-close, 170 table/codec,
+74 WAL recovery and 18 ABI checks. The already-passed identical Debug physical
+suite is not rerun in this boundary command. ReleaseFast passes 63/63 steps
+and all 102/170/74 physical/table/recovery cases. Every receipt also passes
+four Bloom and 45/1/8 error-identity companions (companions use Debug). All
+5,592 recorded native/schema input hashes and final log digests match the
+same final source; an immutable snapshot preserves the changed native file.
+Formatting and whitespace checks pass. Full GNU qualification remains waived.
+Admitted payload/state/pin preparation and last-reference retirement,
+resource/retirement ownership registration and the combined backend publication
+coordinator remain required before the broader default design is complete.

@@ -424,6 +424,47 @@ pub const Directory = struct {
             }
         }
     };
+    /// Two edits in every index cover arbitrary old-ID removal followed by
+    /// insertion, including changes of key, level and L0 visibility sequence.
+    pub const PutPools = struct {
+        directory: *Directory,
+        phase: usize = 0,
+        pub fn memoryBound(self: *const @This()) !u64 {
+            var total: u64 = 0;
+            inline for (.{ "tree", "ids", "bounds", "ends", "levels", "generations" }) |field|
+                total = try std.math.add(u64, total, try @field(self.directory, field).prepareMemoryBound(2));
+            return total;
+        }
+        pub fn resumeWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
+            if (original) |port| try port.checkpoint();
+            inline for (.{ "tree", "ids", "bounds", "ends", "levels", "generations" }, 0..) |field, i| {
+                if (self.phase == i) {
+                    if (original) |port| try @field(self.directory, field).prepareEditsWithAdmission(allocator, 2, port) else try @field(self.directory, field).prepareEdits(allocator, 2);
+                    self.phase += 1;
+                }
+            }
+        }
+    };
+
+    /// Owns one immutable payload, pin and accounting reference. Its allocator,
+    /// backend and domain authority outlive it. Last-reference release still
+    /// needs physical retirement; deinit is an explicit quiesced fallback.
+    pub const EntryLease = struct {
+        entry: Entry,
+        pub fn run(self: *const @This()) *const Run {
+            return self.entry.run;
+        }
+        pub fn accountedMemoryBytes(self: *const @This(), pass: u64) u64 {
+            return self.entry.payload.?.account.chargeOnce(pass);
+        }
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            const account = self.entry.payload.?.account;
+            self.entry.deinit(allocator);
+            account.release();
+            self.* = undefined;
+        }
+    };
+
     /// Owns an already-prepaid private fork for one removal. Caller freezes
     /// and pins source through publication or complete abort, pins the query
     /// through lookup, prepays this
@@ -459,6 +500,7 @@ pub const Directory = struct {
         },
         reclaimer: ?Reclaimer = null,
         published: bool = false,
+        taken: bool = false,
         retired: bool = false,
 
         fn roots(d: *const Directory) [6]?*const anyopaque {
@@ -492,7 +534,7 @@ pub const Directory = struct {
         }
         pub fn resumeWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
             if (original) |port| try port.checkpoint();
-            if (self.published or self.retired or std.meta.activeTag(self.pending) == .retiring) return error.InvalidArgument;
+            if (self.published or self.taken or self.retired or std.meta.activeTag(self.pending) == .retiring) return error.InvalidArgument;
             while (true) {
                 try self.check(original);
                 switch (self.pending) {
@@ -601,15 +643,25 @@ pub const Directory = struct {
         /// no destructor or other backend state change occurs here.
         pub fn publishWithAdmission(self: *@This(), live: *?*Directory, original: @import("../../common/read_admission.zig").Port) !*Directory {
             try original.checkpoint();
-            if (self.published or self.retired or std.meta.activeTag(self.pending) != .done) return error.InvalidArgument;
+            if (self.published or self.taken or self.retired or std.meta.activeTag(self.pending) != .done) return error.InvalidArgument;
             if (!self.stable() or live.* != self.source) return error.CompactionPlanningStale;
             live.* = self.candidate;
             self.published = true;
             return @constCast(self.source);
         }
+        fn takePrepared(self: *@This(), original: ?@import("../../common/read_admission.zig").Port) !*Directory {
+            if (original) |port| try port.checkpoint();
+            if (self.published or self.taken or self.retired or std.meta.activeTag(self.pending) != .done) return error.InvalidArgument;
+            if (!self.stable()) return error.CompactionPlanningStale;
+            self.taken = true;
+            return self.candidate;
+        }
+        pub fn takePreparedWithAdmission(self: *@This(), original: @import("../../common/read_admission.zig").Port) !*Directory {
+            return self.takePrepared(original);
+        }
         fn retire(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
             if (original) |port| try port.checkpoint();
-            if (self.published or self.retired) return;
+            if (self.published or self.taken or self.retired) return;
             try self.check(original);
             // A partial tree may still have summary pointers into the removed
             // entry. The independently pinned source keeps those bytes alive
@@ -663,6 +715,210 @@ pub const Directory = struct {
         }
     };
 
+    /// Owns a prepaid fork and EntryLease. Source and domain authority stay
+    /// pinned/frozen, with candidate reads/accounting/mutation excluded. Remove
+    /// by ID before inserting, so key, level and sequence changes share one
+    /// correct path. The caller separately prepares the backend's other
+    /// publication receipts and registers the old-root/entry retirement owners.
+    pub const Put = struct {
+        source: *const Directory,
+        candidate: *Directory,
+        source_roots: [6]?*const anyopaque,
+        total_bytes: u64,
+        memory_runs: usize,
+        entry: Entry,
+        lease: ?EntryLease,
+        pending: union(enum) {
+            old: IdSearch,
+            remove: Removal,
+            read_search: ReadSearch,
+            read_put: Tree.RankInsertion,
+            id_search: IdSearch,
+            id_put: IdTree.RankInsertion,
+            lower_search: LowerSearch,
+            lower_put: BoundsTree.RankInsertion,
+            upper_search: UpperSearch,
+            upper_put: EndsTree.RankInsertion,
+            level_plan,
+            level_put: LevelTree.RankInsertion,
+            generation_plan,
+            generation_put: generation_index.Tree.RankInsertion,
+            receipt,
+            done,
+        },
+        reclaimer: ?Reclaimer = null,
+        retiring: bool = false,
+        retired: bool = false,
+        published: bool = false,
+
+        pub fn init(source: *const Directory, candidate: *Directory, lease: EntryLease) !@This() {
+            if (source == candidate or candidate.retired_next != null or
+                !std.meta.eql(Removal.roots(source), Removal.roots(candidate)) or
+                source.total_run_bytes != candidate.total_run_bytes or source.memory_run_count != candidate.memory_run_count or
+                lease.entry.payload.?.account != candidate.tree.account)
+                return error.InvalidArgument;
+            return .{ .source = source, .candidate = candidate, .source_roots = Removal.roots(source), .total_bytes = source.total_run_bytes, .memory_runs = source.memory_run_count, .entry = lease.entry, .lease = lease, .pending = .{ .old = candidate.locateId(lease.entry.run) } };
+        }
+        fn stable(self: *const @This()) bool {
+            return std.meta.eql(self.source_roots, Removal.roots(self.source)) and self.total_bytes == self.source.total_run_bytes and self.memory_runs == self.source.memory_run_count;
+        }
+        fn check(self: *const @This(), original: ?@import("../../common/read_admission.zig").Port) !void {
+            if (original) |port| try port.checkpoint();
+            if (!self.stable()) return error.CompactionPlanningStale;
+        }
+        pub fn resumeWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
+            if (original) |port| try port.checkpoint();
+            if (self.published or self.retired or self.retiring) return error.InvalidArgument;
+            while (true) {
+                try self.check(original);
+                switch (self.pending) {
+                    .old => |*job| {
+                        try job.resumeWithAdmission(original);
+                        self.pending = if (job.matched) |node|
+                            .{ .remove = try Removal.init(self.source, self.candidate, node.entry.run) }
+                        else
+                            .{ .read_search = ReadSearch.init(self.candidate.tree.root, self.entry) };
+                    },
+                    .remove => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        const ready = try job.takePrepared(original);
+                        std.debug.assert(ready == self.candidate);
+                        self.pending = .{ .read_search = ReadSearch.init(self.candidate.tree.root, self.entry) };
+                    },
+                    .read_search => |*job| {
+                        try job.resumeWithAdmission(original);
+                        if (job.matched != null) return error.CompactionPlanningStale;
+                        self.pending = .{ .read_put = try Tree.RankInsertion.init(&self.candidate.tree, self.entry, job.rank, false) };
+                    },
+                    .read_put => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        const retired_entry = try job.takeRetired();
+                        std.debug.assert(retired_entry == null);
+                        self.pending = .{ .id_search = IdSearch.init(self.candidate.ids.root, self.entry) };
+                    },
+                    .id_search => |*job| {
+                        try job.resumeWithAdmission(original);
+                        if (job.matched != null) return error.CompactionPlanningStale;
+                        self.pending = .{ .id_put = try IdTree.RankInsertion.init(&self.candidate.ids, self.entry, job.rank, false) };
+                    },
+                    .id_put => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        const retired_entry = try job.takeRetired();
+                        std.debug.assert(retired_entry == null);
+                        self.pending = .{ .lower_search = LowerSearch.init(self.candidate.bounds.root, self.entry) };
+                    },
+                    .lower_search => |*job| {
+                        try job.resumeWithAdmission(original);
+                        if (job.matched != null) return error.CompactionPlanningStale;
+                        self.pending = .{ .lower_put = try BoundsTree.RankInsertion.init(&self.candidate.bounds, self.entry, job.rank, false) };
+                    },
+                    .lower_put => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        const retired_entry = try job.takeRetired();
+                        std.debug.assert(retired_entry == null);
+                        self.pending = .{ .upper_search = UpperSearch.init(self.candidate.ends.root, self.entry) };
+                    },
+                    .upper_search => |*job| {
+                        try job.resumeWithAdmission(original);
+                        if (job.matched != null) return error.CompactionPlanningStale;
+                        self.pending = .{ .upper_put = try EndsTree.RankInsertion.init(&self.candidate.ends, self.entry, job.rank, false) };
+                    },
+                    .upper_put => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        const retired_entry = try job.takeRetired();
+                        std.debug.assert(retired_entry == null);
+                        self.pending = .level_plan;
+                    },
+                    .level_plan => {
+                        var level = self.candidate.levelStats(self.entry.run.level);
+                        const replace = level.count != 0;
+                        const rank = if (self.candidate.levels.root) |root| root.lowerBound(level) else 0;
+                        level.count += 1;
+                        level.bytes += self.entry.run.size_bytes;
+                        level.tombstone_runs += @intFromBool((self.entry.run.tombstone_count orelse 0) != 0);
+                        self.pending = .{ .level_put = try LevelTree.RankInsertion.init(&self.candidate.levels, level, rank, replace) };
+                    },
+                    .level_put => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        _ = try job.takeRetired(); // Scalar aggregate, no payload owner.
+                        self.pending = .generation_plan;
+                    },
+                    .generation_plan => {
+                        if (self.entry.run.level != 0) {
+                            self.pending = .receipt;
+                            continue;
+                        }
+                        const key = generation_index.Generation{ .sequence = generation_index.sequence(self.entry.run.*) };
+                        const old = generation_index.Tree.find(self.candidate.generations.root, key);
+                        var generation = if (old) |node| node.entry else key;
+                        const rank = if (self.candidate.generations.root) |root| root.lowerBound(key) else 0;
+                        generation.files += 1;
+                        generation.bytes += self.entry.run.size_bytes;
+                        self.pending = .{ .generation_put = try generation_index.Tree.RankInsertion.init(&self.candidate.generations, generation, rank, old != null) };
+                    },
+                    .generation_put => |*job| {
+                        try job.resumeWithAdmission(allocator, original);
+                        _ = try job.takeRetired(); // Scalar aggregate, no payload owner.
+                        self.pending = .receipt;
+                    },
+                    .receipt => {
+                        self.candidate.total_run_bytes += self.entry.run.size_bytes;
+                        self.candidate.memory_run_count += @intFromBool(self.entry.run.path == null);
+                        self.pending = .done;
+                    },
+                    .done => return,
+                }
+            }
+        }
+        pub fn publishWithAdmission(self: *@This(), live: *?*Directory, original: @import("../../common/read_admission.zig").Port) !*Directory {
+            try original.checkpoint();
+            if (self.published or self.retired or self.retiring or std.meta.activeTag(self.pending) != .done) return error.InvalidArgument;
+            if (!self.stable() or live.* != self.source) return error.CompactionPlanningStale;
+            live.* = self.candidate;
+            self.published = true;
+            return @constCast(self.source);
+        }
+        /// Transfer the remaining pin/metadata owner to a prearranged retire
+        /// job. Aborting the candidate alone deliberately does not destroy it.
+        pub fn takeEntryLeaseWithAdmission(self: *@This(), original: @import("../../common/read_admission.zig").Port) !EntryLease {
+            try original.checkpoint();
+            if ((!self.published and !self.retired) or self.lease == null) return error.InvalidArgument;
+            const out = self.lease.?;
+            self.lease = null;
+            return out;
+        }
+        fn retire(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
+            if (original) |port| try port.checkpoint();
+            if (self.published or self.retired) return;
+            try self.check(original);
+            self.retiring = true;
+            if (std.meta.activeTag(self.pending) == .remove) {
+                try self.pending.remove.retire(allocator, original);
+                self.retired = true;
+                return;
+            }
+            if (self.reclaimer == null) self.reclaimer = .init(self.candidate);
+            while (true) {
+                try self.check(original);
+                var credits: usize = 1;
+                if (self.reclaimer.?.step(allocator, &credits)) break;
+            }
+            try self.check(original);
+            self.reclaimer.?.finish(allocator);
+            self.reclaimer = null;
+            self.retired = true;
+        }
+        pub fn retireWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: @import("../../common/read_admission.zig").Port) !void {
+            try self.retire(allocator, original);
+        }
+        /// Explicit joined/quiesced fallback, including last entry retirement.
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            self.retire(allocator, null) catch unreachable;
+            if (self.lease) |*lease| lease.deinit(allocator);
+            self.lease = null;
+        }
+    };
+
     pub fn indexSpareBytes(self: *const Directory) u64 {
         return (self.tree.spare.capacity + self.ids.spare.capacity + self.bounds.spare.capacity + self.ends.spare.capacity + self.levels.spare.capacity + self.generations.spare.capacity) * @sizeOf(usize);
     }
@@ -674,11 +930,12 @@ pub const Directory = struct {
         return bytes;
     }
 
-    pub fn put(self: *Directory, backend: anytype, run: Run) !void {
+    /// Legacy payload/state cloning and pin registration. The owning admitted
+    /// coordinator must replace this preparatory step with prepaid retained
+    /// payload/pin work; index editing below never invokes this legacy driver.
+    pub fn prepareEntryLegacy(self: *Directory, backend: anytype, run: Run) !EntryLease {
         const allocator = backend.allocator;
-        const previous = find(self.tree.root, .{ .run = &run });
-        var indexes = try IndexPreparation.init(self, run.level, if (previous) |node| if (compareEnds(node.entry, .{ .run = &run }) != .eq) 2 else 1 else 1);
-        try indexes.resumeWithAdmission(allocator, null);
+        const account = self.tree.account orelse return error.InvalidArgument;
         const payload = try allocator.create(Payload);
         errdefer allocator.destroy(payload);
         var owned = try repository.cloneRunCompactionSnapshot(allocator, run);
@@ -700,7 +957,6 @@ pub const Directory = struct {
         if (owned.smallest_namespace_name) |name| bytes += name.len;
         if (owned.largest_namespace_name) |name| bytes += name.len;
         if (owned.state) |*present| bytes += @intCast(present.estimatedMemoryBytes());
-        const account = self.tree.account.?;
         account.charge(bytes);
         payload.* = .{ .run = owned, .owner = @ptrCast(backend), .release_pin = release, .account = account, .bytes = bytes };
         const domain = if (comptime @hasField(@TypeOf(backend.*), "options")) blk: {
@@ -710,7 +966,18 @@ pub const Directory = struct {
             break :blk "";
         } else "";
         const entry = Entry{ .run = &payload.run, .payload = payload, .domain = domain };
-        defer entry.deinit(allocator);
+        _ = account.retain();
+        return .{ .entry = entry };
+    }
+
+    pub fn put(self: *Directory, backend: anytype, run: Run) !void {
+        const allocator = backend.allocator;
+        const previous = find(self.tree.root, .{ .run = &run });
+        var indexes = try IndexPreparation.init(self, run.level, if (previous) |node| if (compareEnds(node.entry, .{ .run = &run }) != .eq) 2 else 1 else 1);
+        try indexes.resumeWithAdmission(allocator, null);
+        var prepared_entry = try self.prepareEntryLegacy(backend, run);
+        defer prepared_entry.deinit(allocator);
+        const entry = prepared_entry.entry;
         self.memory_run_count += @intFromBool(run.path == null);
         if (previous) |node| self.memory_run_count -= @intFromBool(node.entry.run.path == null);
         const old_bytes = if (previous) |node| node.entry.run.size_bytes else 0;
@@ -2221,4 +2488,226 @@ test "controlled physical sync private directory removal publishes every index t
     try std.testing.expectEqual(source.count(), live.?.count());
     try std.testing.expectEqual(source.total_run_bytes, live.?.total_run_bytes);
     live.?.destroy(a);
+}
+
+test "controlled physical sync private put replaces every index across ordering level and sequence moves" {
+    const a = std.testing.allocator;
+    const admission = @import("../../common/read_admission.zig");
+    const Fault = struct {
+        checks: usize = 0,
+        at: usize = std.math.maxInt(usize),
+        failure: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const at = self.checks;
+            self.checks += 1;
+            if (at == self.at) return self.failure;
+        }
+    };
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pins: usize = 0,
+        options: struct { run_partition_key: ?*const fn ([]const u8) []const u8 = partition } = .{},
+        fn partition(key: []const u8) []const u8 {
+            return key[0..@min(key.len, 1)];
+        }
+        pub fn retainRunSnapshotRef(self: *@This(), _: *Run) !void {
+            self.pins += 1;
+        }
+        pub fn releaseRunSnapshotRef(self: *@This(), _: *Run) void {
+            self.pins -= 1;
+        }
+        fn prepare(self: *@This(), source: *Directory, run: Run) !Directory.Put {
+            const candidate = try source.fork(a);
+            errdefer candidate.destroy(a);
+            var pools: Directory.PutPools = .{ .directory = candidate };
+            try std.testing.expect(try pools.memoryBound() > 0);
+            try pools.resumeWithAdmission(a, null);
+            var lease = try candidate.prepareEntryLegacy(self, run);
+            errdefer lease.deinit(a);
+            return Directory.Put.init(source, candidate, lease);
+        }
+        fn perform(job: *Directory.Put, allocator: std.mem.Allocator, live: *?*Directory, original: admission.Port) !*Directory {
+            try job.resumeWithAdmission(allocator, original);
+            return job.publishWithAdmission(live, original);
+        }
+        fn verify(source: *Directory, candidate: *Directory, incoming: *const Run) !void {
+            var expected: [7]*const Run = undefined;
+            var len: usize = 0;
+            for (0..source.count()) |i| {
+                const run = source.at(i).run;
+                if (run.id != incoming.id) {
+                    expected[len] = run;
+                    len += 1;
+                }
+            }
+            expected[len] = incoming;
+            len += 1;
+            std.mem.sort(*const Run, expected[0..len], {}, struct {
+                fn less(_: void, x: *const Run, y: *const Run) bool {
+                    return Directory.runLess(x, y);
+                }
+            }.less);
+            try std.testing.expectEqual(len, candidate.count());
+            inline for (.{ "ids", "bounds", "ends" }) |field| try std.testing.expectEqual(len, @field(candidate, field).root.?.count);
+            var total: u64 = 0;
+            var memory: usize = 0;
+            var tombstones: usize = 0;
+            var gc = false;
+            var levels: [5]LevelAggregate = undefined;
+            for (&levels, 0..) |*level, i| level.* = .{ .level = @intCast(i) };
+            var gens: [7]generation_index.Generation = undefined;
+            var gen_len: usize = 0;
+            for (expected[0..len], 0..) |run, i| {
+                try std.testing.expect(candidate.at(i).run == run);
+                try std.testing.expect(candidate.byId(run.id) == run);
+                inline for (.{ Directory.locateRead, Directory.locateId, Directory.locateLower, Directory.locateUpper }) |locate| {
+                    var search = locate(candidate, run);
+                    try search.resumeWithAdmission(null);
+                    try std.testing.expect(search.matched.?.entry.run == run);
+                    try std.testing.expectEqualStrings(partition(run.smallest_key), search.matched.?.entry.domain);
+                }
+                total += run.size_bytes;
+                memory += @intFromBool(run.path == null);
+                const deletes = (run.tombstone_count orelse 0) != 0;
+                tombstones += @intFromBool(deletes);
+                gc = gc or run.gc_requested;
+                levels[run.level].count += 1;
+                levels[run.level].bytes += run.size_bytes;
+                levels[run.level].tombstone_runs += @intFromBool(deletes);
+                if (run.level == 0) {
+                    const seq = generation_index.sequence(run.*);
+                    var idx: usize = 0;
+                    while (idx < gen_len and gens[idx].sequence != seq) : (idx += 1) {}
+                    if (idx == gen_len) {
+                        gens[idx] = .{ .sequence = seq };
+                        gen_len += 1;
+                    }
+                    gens[idx].files += 1;
+                    gens[idx].bytes += run.size_bytes;
+                }
+            }
+            try std.testing.expectEqual(total, candidate.total_run_bytes);
+            try std.testing.expectEqual(memory, candidate.memory_run_count);
+            try std.testing.expectEqual(memory, candidate.tree.root.?.summary.non_async_runs);
+            try std.testing.expectEqual(tombstones, candidate.tree.root.?.summary.tombstone_runs);
+            try std.testing.expectEqual(gc, candidate.tree.root.?.summary.gc_requested);
+            var level_count: usize = 0;
+            for (levels) |expected_level| {
+                try std.testing.expectEqualDeep(expected_level, candidate.levelStats(expected_level.level));
+                level_count += @intFromBool(expected_level.count != 0);
+            }
+            try std.testing.expectEqual(level_count, candidate.levelCount());
+            try std.testing.expectEqual(gen_len, if (candidate.generations.root) |root| root.count else 0);
+            for (gens[0..gen_len]) |expected_gen| try std.testing.expectEqualDeep(expected_gen, generation_index.Tree.find(candidate.generations.root, expected_gen).?.entry);
+            try std.testing.expect(candidate.byId(incoming.id) == incoming);
+        }
+    };
+    var fixture: Fixture = .{ .allocator = a };
+    var memory: state.State = .{};
+    defer memory.deinit(a);
+    try memory.appendUpsert(a, .{}, "f", "", true);
+    var next_memory: state.State = .{};
+    defer next_memory.deinit(a);
+    try next_memory.appendUpsert(a, .{}, "m", "new", false);
+    const source = try Directory.create(a);
+    defer source.destroy(a);
+    for (0..6) |i| {
+        var key = [_]u8{@intCast('a' + i)};
+        try source.put(&fixture, .{ .id = i + 1, .visibility_id = if (i < 2) 77 else 88, .level = if (i < 3) 0 else if (i < 5) 1 else 2, .size_bytes = 10 + i, .path = if (i == 5) null else @constCast("/put-source.tbl"), .smallest_namespace_name = null, .smallest_key = &key, .largest_namespace_name = null, .largest_key = &key, .entry_count = 1, .tombstone_count = @intCast(i % 2), .oldest_tombstone_unix_ns = i * 11, .bloom_filter = null, .state = if (i == 5) memory else null, .owns_metadata = false });
+    }
+    const empty = try Directory.create(a);
+    defer empty.destroy(a);
+    for (0..10) |scenario| {
+        const base = if (scenario == 9) empty else source;
+        var incoming: Run = .{ .id = 9, .level = 1, .visibility_id = 333, .size_bytes = 37, .path = @constCast("/put-next.tbl"), .smallest_namespace_name = null, .smallest_key = @constCast("m"), .largest_namespace_name = null, .largest_key = @constCast("n"), .entry_count = 1, .tombstone_count = 0, .gc_requested = true, .bloom_filter = null, .state = null, .owns_metadata = false };
+        switch (scenario) {
+            1, 2 => {
+                incoming = base.byId(2).?.*;
+                incoming.size_bytes = 37;
+                incoming.tombstone_count = 0;
+                if (scenario == 2) incoming.largest_key = @constCast("zz");
+            },
+            3 => {
+                incoming.id = 2;
+                incoming.smallest_namespace_name = @constCast("docs");
+                incoming.largest_namespace_name = @constCast("docs");
+            },
+            4 => {
+                incoming.id = 1;
+                incoming.level = 0;
+            },
+            5 => {
+                incoming.id = 3;
+                incoming.level = 3;
+            },
+            6 => {
+                incoming.id = 4;
+                incoming.level = 0;
+                incoming.visibility_id = 444;
+            },
+            7 => {
+                incoming.id = 5;
+                incoming.path = null;
+                incoming.state = next_memory;
+                incoming.largest_key = @constCast("m");
+            },
+            8 => {
+                incoming.id = 6;
+                incoming.level = 2;
+            },
+            else => {},
+        }
+        const roots = Directory.Removal.roots(base);
+        const baseline_pins = fixture.pins;
+        var checks: usize = 1;
+        var target: usize = 0;
+        while (target <= checks) : (target += 1) {
+            for ([_]bool{ false, true }) |abort| {
+                if (target == 0 and abort) continue;
+                var job = try fixture.prepare(base, incoming);
+                defer job.deinit(a);
+                const prepared_run = job.entry.run;
+                var live: ?*Directory = base;
+                var fault: Fault = .{ .at = if (target == 0) std.math.maxInt(usize) else target - 1, .failure = switch (target % 3) {
+                    0 => error.Canceled,
+                    1 => error.DeadlineExceeded,
+                    else => error.FileNotFound,
+                } };
+                const payload: admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+                const port = admission.Port.init(&payload);
+                var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                const result = Fixture.perform(&job, failing.allocator(), &live, port);
+                if (target == 0) {
+                    try std.testing.expect(try result == base);
+                    checks = fault.checks;
+                } else {
+                    try std.testing.expectError(fault.failure, result);
+                    try std.testing.expect(live == base);
+                }
+                try std.testing.expectEqual(baseline_pins + 1, fixture.pins);
+                if (abort) {
+                    fault.at = fault.checks + target % 3;
+                    try std.testing.expectError(fault.failure, job.retireWithAdmission(failing.allocator(), port));
+                    try job.retireWithAdmission(failing.allocator(), port);
+                    try std.testing.expect(job.retired and live == base);
+                } else {
+                    if (target != 0) try std.testing.expect(try Fixture.perform(&job, failing.allocator(), &live, port) == base);
+                    try Fixture.verify(base, live.?, prepared_run);
+                    const pass = @import("memory_account.zig").nextPass();
+                    try std.testing.expect(live.?.accountedMemoryBytes(pass) > 0);
+                    try std.testing.expectEqual(@as(u64, 0), job.lease.?.accountedMemoryBytes(pass));
+                    try std.testing.expectError(error.InvalidArgument, job.publishWithAdmission(&live, port));
+                }
+                fault.at = fault.checks;
+                try std.testing.expectError(fault.failure, job.takeEntryLeaseWithAdmission(port));
+                var returned_lease = try job.takeEntryLeaseWithAdmission(port);
+                try std.testing.expectError(error.InvalidArgument, job.takeEntryLeaseWithAdmission(port));
+                returned_lease.deinit(a);
+                if (!abort) live.?.destroy(a);
+                try std.testing.expectEqual(baseline_pins, fixture.pins);
+                try std.testing.expectEqualDeep(roots, Directory.Removal.roots(base));
+            }
+        }
+    }
 }
