@@ -36,6 +36,8 @@ const values = [_]ValueSpec{
     .{ .name = "--ignore-file", .path = true },
     .{ .name = "--library", .path = true },
     .{ .name = "--dictionary", .path = true },
+    .{ .name = "--cloud-cli", .path = true },
+    .{ .name = "--source" },
     .{ .name = "--table-config", .path = true },
     .{ .name = "--table" },
     .{ .name = "--table-filter" },

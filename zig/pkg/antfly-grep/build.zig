@@ -169,6 +169,10 @@ pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     b.step("grep-fixture-build", "Build the portable local inference fixture without executing it").dependOn(&b.addInstallArtifact(fixture, .{}).step);
     integration.addArtifactArg(fixture);
     test_step.dependOn(&integration.step);
+    const cloud_integration = b.addSystemCommand(&.{"python3"});
+    cloud_integration.addFileArg(b.path("pkg/antfly-grep/tests/test_cloud.py"));
+    cloud_integration.addArtifactArg(exe);
+    test_step.dependOn(&cloud_integration.step);
     const differential_tools = b.addSystemCommand(&.{"python3"});
     differential_tools.addFileArg(b.path("pkg/antfly-grep/tests/test_differential_tools.py"));
     test_step.dependOn(&differential_tools.step);

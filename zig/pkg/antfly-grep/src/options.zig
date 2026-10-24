@@ -28,6 +28,11 @@ pub const Options = struct {
     workspace_watch_limit: usize = 65536,
     workspace_max_files: usize = 100000,
     table_config: ?[]const u8 = null,
+    table_config_json: ?[]const u8 = null,
+    cloud: bool = false,
+    cloud_cli: []const u8 = "antfly-cloud",
+    cloud_session: ?*@import("cloud.zig").Session = null,
+    sources: std.ArrayList([]const u8) = .empty,
     tables: std.ArrayList([]const u8) = .empty,
     table_token: ?[]const u8 = null,
     table_filter: ?[]const u8 = null,
@@ -271,9 +276,12 @@ pub const Options = struct {
         self.paths.deinit(a);
         self.globs.deinit(a);
         self.glob_order.deinit(a);
-        inline for (.{ "tables", "filters", "colors", "type_clear", "pre_globs", "pattern_files", "ignore_files", "types", "types_not", "type_add", "iglobs", "queries", "exclude", "only", "not" }) |field| @field(self, field).deinit(a);
+        inline for (.{ "sources", "tables", "filters", "colors", "type_clear", "pre_globs", "pattern_files", "ignore_files", "types", "types_not", "type_add", "iglobs", "queries", "exclude", "only", "not" }) |field| @field(self, field).deinit(a);
     }
 
+    pub fn indexed(self: *const Options) bool {
+        return self.cloud or self.table_config != null or self.table_config_json != null;
+    }
     pub fn parse(self: *Options, a: Allocator, args: []const []const u8) !void {
         var positional: std.ArrayList([]const u8) = .empty;
         defer positional.deinit(a);
@@ -320,6 +328,10 @@ pub const Options = struct {
                 const eq = std.mem.indexOfScalar(u8, arg, '=');
                 const name = arg[0 .. eq orelse arg.len];
                 const inline_value = if (eq) |j| arg[j + 1 ..] else null;
+                if (std.mem.eql(u8, name, "--cloud")) {
+                    self.cloud = true;
+                    continue;
+                }
                 if (std.mem.eql(u8, name, "--sort-files")) {
                     self.sort = "path";
                     continue;
@@ -670,6 +682,12 @@ pub const Options = struct {
                 } else if (std.mem.eql(u8, name, "--max-filesize")) {
                     self.max_file_bytes = try size(value);
                     self.skip_oversize = true;
+                } else if (std.mem.eql(u8, name, "--source")) {
+                    self.cloud = true;
+                    try self.sources.append(a, value);
+                } else if (std.mem.eql(u8, name, "--cloud-cli")) {
+                    self.cloud_cli = value;
+                    self.cloud = true;
                 } else if (std.mem.eql(u8, name, "--table-config")) self.table_config = value else if (std.mem.eql(u8, name, "--table")) try self.tables.append(a, value) else if (std.mem.eql(u8, name, "--table-filter")) self.table_filter = value else if (std.mem.eql(u8, name, "--max-index-documents")) self.max_index_documents = try number(value) else if (std.mem.eql(u8, name, "--max-spill-bytes")) self.max_spill_bytes = unlimited(try size(value)) else if (std.mem.eql(u8, name, "--max-pending-output")) self.max_pending_output = try number(value) else if (std.mem.eql(u8, name, "--cache-ttl")) self.cache_ttl_seconds = try number(value) else if (std.mem.eql(u8, name, "--max-columns")) self.max_columns = unlimited(try number(value)) else if (std.mem.eql(u8, name, "--max-depth")) self.max_depth = try number(value) else if (std.mem.eql(u8, name, "--max-requests")) {
                     self.max_requests_explicit = true;
                     self.max_requests = if (std.mem.eql(u8, value, "unlimited")) std.math.maxInt(usize) else try number(value);
@@ -833,11 +851,12 @@ pub const Options = struct {
             if (self.max_image_bytes == 0 or self.max_image_bytes > 768 * 1024 or self.max_image_pixels == 0) return error.InvalidImageLimit;
         }
         if (!std.math.isFinite(self.threshold) or self.threshold < 0 or self.threshold > 1 or self.chunk_lines == 0 or self.batch_size == 0 or self.batch_size > 128 or self.decision_batch_wait_ms > 1000 or self.timeout_ms == 0 or (self.max_file_bytes == 0 and !self.skip_oversize)) return error.InvalidNumber;
-        if (self.cached_only and (self.ask == null or self.no_cache or self.cache_ttl_seconds == 0 or self.table_config != null or self.pre != null or self.hostname_bin != null)) return error.ConflictingCachedOnlyFlags;
+        if (self.cached_only and (self.ask == null or self.no_cache or self.cache_ttl_seconds == 0 or self.indexed() or self.pre != null or self.hostname_bin != null)) return error.ConflictingCachedOnlyFlags;
         if (self.files and (self.patterns.items.len > 0 or self.ask != null)) return error.ConflictingFlags;
-        if (self.tables.items.len > 0 and self.table_config == null) return error.TableConfigRequired;
+        if (self.cloud and (self.table_config != null or self.table_token != null or self.tables.items.len > 0 or self.paths.items.len > 0)) return error.ConflictingCloudSourceOptions;
+        if (self.tables.items.len > 0 and !self.indexed()) return error.TableConfigRequired;
         if (self.max_index_documents == 0 or self.max_pending_output == 0) return error.InvalidNumber;
-        if (self.table_config != null and self.inventory) return error.UnsupportedIndexedInventory;
+        if (self.indexed() and self.inventory) return error.UnsupportedIndexedInventory;
         if (self.jobs > 256 or self.decision_concurrency > 256 or (self.max_requests == 0 and !self.cached_only)) return error.InvalidNumber;
 
         if (self.column and !self.line_numbers_explicit) self.line_numbers = true;

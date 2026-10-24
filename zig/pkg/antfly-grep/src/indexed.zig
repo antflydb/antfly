@@ -19,8 +19,9 @@ const httpx = @import("httpx");
 const document = @import("document.zig");
 const Limits = @import("budget.zig").Limits;
 const A = std.mem.Allocator;
+const Seen = std.AutoHashMap([32]u8, void);
 pub const CandidateIndex = struct { version: u32, field: []const u8, version_field: []const u8 = "grep_trigrams_version" };
-pub const Table = struct { name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", candidate_index: ?CandidateIndex = null };
+pub const Table = struct { access_id: ?[]const u8 = null, status: ?[]const u8 = null, name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", candidate_index: ?CandidateIndex = null };
 pub const ValueVerification = struct {
     allow_scan: bool = true,
     max_documents: u64 = 100_000,
@@ -40,8 +41,9 @@ pub const Config = struct {
     max_page_memory: usize = 64 * 1024 * 1024,
 };
 pub fn run(search: anytype) !void {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(search.io, search.options.table_config.?, search.a, .limited(1024 * 1024));
-    defer search.a.free(bytes);
+    const file_bytes = if (search.options.table_config) |path| try std.Io.Dir.cwd().readFileAlloc(search.io, path, search.a, .limited(1024 * 1024)) else null;
+    defer if (file_bytes) |bytes| search.a.free(bytes);
+    const bytes = search.options.table_config_json orelse file_bytes orelse return error.TableConfigRequired;
     const parsed = try std.json.parseFromSlice(Config, search.a, bytes, .{});
     defer parsed.deinit();
     const config = parsed.value;
@@ -53,35 +55,59 @@ pub fn run(search: anytype) !void {
         if (table.name.len == 0 or table.document_field.len == 0 or std.mem.eql(u8, table.name, ".") or std.mem.eql(u8, table.name, "..") or std.mem.indexOfScalar(u8, table.name, 0) != null) return error.InvalidTableConfig;
         if (table.candidate_index) |index| if (index.version != 1 or index.field.len == 0 or index.version_field.len == 0 or std.mem.indexOfScalar(u8, index.field, 0) != null or std.mem.indexOfScalar(u8, index.version_field, 0) != null) return error.InvalidCandidateIndex;
         if (table.alias) |alias| if (alias.len == 0) return error.InvalidTableConfig;
-        for (config.tables[0..i]) |prior| if (std.mem.eql(u8, prior.alias orelse prior.name, table.alias orelse table.name)) return error.DuplicateTableAlias;
+        for (config.tables[0..i]) |prior| {
+            if (search.options.cloud and std.mem.eql(u8, prior.name, table.name)) return error.DuplicateSourceID;
+            if (!search.options.cloud and std.mem.eql(u8, prior.alias orelse prior.name, table.alias orelse table.name)) return error.DuplicateTableAlias;
+        }
     }
-    for (search.options.tables.items) |selected| {
-        var found = false;
-        for (config.tables) |table| if (std.mem.eql(u8, selected, table.alias orelse table.name)) {
-            found = true;
-        };
-        if (!found) return error.UnknownTable;
-    }
+    const selectors = if (search.options.cloud) search.options.sources.items else search.options.tables.items;
+    const selected_tables = try resolveTableSelection(search.a, config.tables, selectors, search.options.cloud);
+    defer search.a.free(selected_tables);
     const original_source = search.provenance;
     defer search.provenance = original_source;
     search.provenance = .{ .backend = .antfly, .freshness = .indexed };
     var http = httpx.Client.initWithConfig(search.a, search.io, .{ .max_response_size = config.max_response_bytes, .pool_max_per_host = @intCast(@max(@as(usize, 5), @min(@as(usize, 8), search.options.providerJobs()) + 1)) });
     defer http.deinit();
+    var seen_memory: @import("antfly_regex").Budget = .{ .backing = search.a, .limit = config.max_page_memory };
+    var seen = Seen.init(seen_memory.allocator());
+    defer seen.deinit();
     var count: usize = 0;
-    for (config.tables) |table| {
+    for (config.tables, selected_tables) |table, selected| {
         if (search.stopped()) break;
-        if (search.options.tables.items.len > 0) {
-            var selected = false;
-            for (search.options.tables.items) |name| if (std.mem.eql(u8, name, table.alias orelse table.name)) {
-                selected = true;
-            };
-            if (!selected) continue;
-        }
-        scan(search, &http, config, table, &count) catch |err| {
+        if (!selected) continue;
+        scan(search, &http, config, table, &count, &seen) catch |err| {
             try search.reportError(table.alias orelse table.name, err);
         };
     }
 }
+// Resolve user-facing selectors once to a set of physical source identities.
+// IDs take precedence over aliases. Alias ambiguity is a selection error, not
+// authority to widen the search to every matching source. Keep discovery order
+// and deduplicate repeated selectors without affecting independent connections.
+fn resolveTableSelection(a: A, tables: []const Table, selectors: []const []const u8, cloud: bool) ![]bool {
+    const selected = try a.alloc(bool, tables.len);
+    errdefer a.free(selected);
+    @memset(selected, selectors.len == 0);
+    for (selectors) |selector| {
+        var found: ?usize = null;
+        for (tables, 0..) |table, i| {
+            if (!std.mem.eql(u8, selector, table.name)) continue;
+            if (found != null) return if (cloud) error.AmbiguousSource else error.AmbiguousTable;
+            found = i;
+        }
+        if (found == null) {
+            for (tables, 0..) |table, i| {
+                const alias = table.alias orelse continue;
+                if (!std.mem.eql(u8, selector, alias)) continue;
+                if (found != null) return if (cloud) error.AmbiguousSource else error.AmbiguousTable;
+                found = i;
+            }
+        }
+        selected[found orelse return error.UnknownTable] = true;
+    }
+    return selected;
+}
+
 fn escape(a: A, raw: []const u8) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(a);
     errdefer out.deinit();
@@ -90,7 +116,7 @@ fn escape(a: A, raw: []const u8) ![]const u8 {
     }
     return out.toOwnedSlice();
 }
-fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, count: *usize) !void {
+fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, count: *usize, seen: *Seen) !void {
     var state = std.heap.ArenaAllocator.init(search.a);
     defer state.deinit();
     var cursor: ?[]const std.json.Value = null;
@@ -109,7 +135,7 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
     const user_filter: ?std.json.Value = if (search.options.table_filter) |raw| (try std.json.parseFromSlice(std.json.Value, filter_arena, raw, .{ .allocate = .alloc_always })).value else null;
     const text_query = try contentQuery(filter_arena, search, table);
     const filter = try candidateFilter(filter_arena, search, table, user_filter);
-    var fetcher = Fetch{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .document_field = table.document_field, .filter = filter, .text_query = text_query, .http = http, .fields = try projectionFields(filter_arena, search.options, table.document_field) };
+    var fetcher = Fetch{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .access_id = table.access_id, .document_field = table.document_field, .filter = filter, .text_query = text_query, .http = http, .fields = try projectionFields(filter_arena, search.options, table.document_field) };
     defer search.summary.index_requests += fetcher.summary.index_requests;
     // Finite decision budgets preserve foreground order: speculative page
     // requests must not consume the budget reserved by the user for evidence.
@@ -356,6 +382,22 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                 search.skipped();
                 continue;
             }
+            if (search.options.cloud) {
+                // Overlapping logical source selections may contain the same
+                // canonical item. Deduplicate only after current authorization
+                // and path filters, without retaining private document text.
+                var identity = std.crypto.hash.sha2.Sha256.init(.{});
+                for ([_][]const u8{ if (document.at(value, "metadata.connection_id")) |connection| (if (connection == .string) connection.string else table.name) else table.name, doc.provenance.uri.?, doc.provenance.revision.?, doc.content }) |part| {
+                    var length: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &length, part.len, .little);
+                    identity.update(&length);
+                    identity.update(part);
+                }
+                if (document.field(value, "evidence")) |units| identity.update(try std.json.Stringify.valueAlloc(a, units, .{}));
+                var key: [32]u8 = undefined;
+                identity.final(&key);
+                if ((try seen.getOrPut(key)).found_existing) continue;
+            }
             // Scope evidence by the current authorized revision and endpoint.
             // Authorization is rechecked on every scan before any cached data
             // can be used; snapshots are deliberately not cache identities.
@@ -496,7 +538,7 @@ fn prefetchAssets(search: anytype, http: *httpx.Client, config: Config, table: T
     try fields.append(a, try std.fmt.allocPrint(a, "{s}.permissions", .{table.document_field}));
     try fields.appendSlice(a, shape.items);
     const encoded = try std.json.Stringify.valueAlloc(a, .{ .bool = .{ .filter = .{ .ids = ids.items } } }, .{});
-    var fetch: Fetch = .{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .document_field = table.document_field, .filter = filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}), .http = http, .fields = fields.items, .ordered = false };
+    var fetch: Fetch = .{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .access_id = table.access_id, .document_field = table.document_field, .filter = filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}), .http = http, .fields = fields.items, .ordered = false };
     defer search.summary.index_requests += fetch.summary.index_requests;
     const page = fetch.load(.{ .cursor = null, .snapshot = null, .page_size = ids.items.len }) catch |err| switch (err) {
         error.ResponseTooLarge, error.IndexPageMemoryExceeded, error.IndexProjectionTooLarge => return null,
@@ -525,6 +567,7 @@ const Page = struct {
 /// One demand-driven producer, one outstanding page, no corpus accumulation.
 /// Continuation storage outlives each outstanding request; pages own their JSON.
 const Fetch = struct {
+    access_id: ?[]const u8 = null,
     a: A,
     io: std.Io,
     options: *const @import("options.zig").Options,
@@ -630,14 +673,21 @@ const Fetch = struct {
             const a = page.arena.allocator();
             const memory = &page.memory;
             const body = try std.json.Stringify.valueAlloc(a, .{ .query = self.text_query orelse try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}), .execution = if (self.ordered and self.text_query != null) @as(?Execution, self.config.execution) else null, .filter_query = self.filter, .fields = self.fields, .order_by = if (self.ordered) @as(?[1]struct { field: []const u8, desc: bool }, .{.{ .field = "_id", .desc = false }}) else null, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
-            const auth = if (self.options.table_token) |token| try std.fmt.allocPrint(a, "Bearer {s}", .{token}) else null;
-            const headers: ?[]const [2][]const u8 = if (auth) |value| &.{ .{ "Authorization", value }, .{ "Content-Type", "application/json" } } else &.{.{ "Content-Type", "application/json" }};
+            var refreshed = false;
             var attempt: usize = 0;
             const parsed = retry: while (true) {
                 if (self.stopped()) return error.Canceled;
                 if (!Limits.reserve(&self.limits.requests, 1, self.options.max_requests)) return error.RequestBudgetExceeded;
                 self.summary.index_requests += 1;
-                var response = self.http.post(self.url, .{ .borrowed_body = body, .headers = headers, .timeout_ms = self.options.timeout_ms, .max_response_size = self.config.max_response_bytes, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .cancellation = httpx.CancellationToken.fromCallback(self, Fetch.cancelled) }) catch |err| {
+                const credential = if (self.options.cloud_session) |session| session.token() else self.options.table_token;
+                const auth = if (credential) |token| try std.fmt.allocPrint(a, "Bearer {s}", .{token}) else null;
+                var headers: std.ArrayList([2][]const u8) = .empty;
+                try headers.append(a, .{ "Content-Type", "application/json" });
+                if (auth) |value| try headers.append(a, .{ "Authorization", value });
+                if (self.options.cloud) {
+                    if (self.access_id) |id| try headers.append(a, .{ "X-Antfly-Source-Access", id });
+                }
+                var response = self.http.post(self.url, .{ .borrowed_body = body, .headers = headers.items, .timeout_ms = self.options.timeout_ms, .max_response_size = self.config.max_response_bytes, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .cancellation = httpx.CancellationToken.fromCallback(self, Fetch.cancelled) }) catch |err| {
                     if (self.ordered and err == error.ResponseTooLarge and page_size.* > 1) {
                         page_size.* = @max(1, page_size.* / 2);
                         continue :resize;
@@ -655,7 +705,16 @@ const Fetch = struct {
                     page_size.* = @max(1, page_size.* / 2);
                     continue :resize;
                 }
-                if (status == 409) return error.IndexSnapshotExpired;
+                if (status == 409) {
+                    if (response.header("x-antfly-source-access") != null) return error.CloudSourceAccessChanged;
+                    if (response.header("x-antfly-source-state") != null) return error.SourceNotSearchable;
+                    return error.IndexSnapshotExpired;
+                }
+                if (status == 401 and !refreshed) if (self.options.cloud_session) |session| {
+                    refreshed = true;
+                    try session.refresh(credential.?);
+                    continue :retry;
+                };
                 if (status == 401 or status == 403) return error.IndexAuthorizationFailed;
                 if (!response.ok()) {
                     if ((status != 429 and status != 408 and status < 500) or attempt >= self.options.retries) return error.IndexQueryFailed;
@@ -795,7 +854,11 @@ fn projectionFields(a: A, o: *const @import("options.zig").Options, field: []con
     for ([_][]const u8{ "version", "path", "uri", "revision", "indexed_at", "permissions", "modified_at", "created_at", "accessed_at" }) |suffix|
         try fields.append(a, try std.fmt.allocPrint(a, "{s}.{s}", .{ field, suffix }));
     if (!metadataListing(o)) try fields.append(a, try std.fmt.allocPrint(a, "{s}.content", .{field}));
-    if (o.media == .images) try fields.append(a, try std.fmt.allocPrint(a, "{s}.evidence", .{field}));
+    if (o.media == .images or o.cloud) try fields.append(a, try std.fmt.allocPrint(a, "{s}.evidence", .{field}));
+    // Identity fields are required independently of presentation: overlap
+    // deduplication must use the same connection namespace in every output mode.
+    if (o.cloud and !o.json and o.ask == null and !o.stats)
+        try fields.append(a, try std.fmt.allocPrint(a, "{s}.metadata.connection_id", .{field}));
     if (o.json or o.ask != null or o.stats) for ([_][]const u8{ "metadata", "regions" }) |suffix| {
         try fields.append(a, try std.fmt.allocPrint(a, "{s}.{s}", .{ field, suffix }));
     };
@@ -924,7 +987,7 @@ fn AssetResolver(comptime SearchType: type) type {
             }
             if (fields.items.len == 2) return;
             const ids = try std.json.Stringify.valueAlloc(a, .{ .bool = .{ .filter = .{ .ids = .{self.id} } } }, .{});
-            var fetch: Fetch = .{ .a = self.search.a, .io = self.search.io, .options = self.search.options, .limits = self.search.shared_limits orelse &self.search.limits, .config = self.config, .url = self.url, .document_field = self.table.document_field, .filter = self.filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, ids, .{}), .http = self.http, .fields = fields.items, .ordered = false };
+            var fetch: Fetch = .{ .a = self.search.a, .io = self.search.io, .options = self.search.options, .limits = self.search.shared_limits orelse &self.search.limits, .config = self.config, .url = self.url, .access_id = self.table.access_id, .document_field = self.table.document_field, .filter = self.filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, ids, .{}), .http = self.http, .fields = fields.items, .ordered = false };
             defer self.search.summary.index_requests += fetch.summary.index_requests;
             // Point reads deliberately omit ordering/cursors. They reauthorize
             // current rows without creating a durable pagination snapshot.

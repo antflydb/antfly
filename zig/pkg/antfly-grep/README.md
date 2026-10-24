@@ -6,12 +6,55 @@ running the CLI requires no Rust toolchain, ripgrep executable, shell subprocess
 database, or persistent index. Regex execution, PCRE-style extensions, decompression,
 transcoding, discovery, source analysis, and output are implemented in Zig in this
 monorepo. There is no libpcre2 or libarchive dependency. Explicit `--pre` and
-`--hostname-bin` options run the user-specified program.
+`--hostname-bin` options run the user-specified program. Cloud source selection
+invokes the public `antfly-cloud context --json` command without a shell.
 
 This implements local and table-backed search for
 [#1151](https://github.com/antflydb/antfly/issues/1151). Table profiles select
-indexed documents using the versioned schema below. Connector ingestion and
-remote-source retrieval remain separate work.
+indexed documents using the versioned schema below. Colony owns provider
+connections and background ingestion; the Cloud integration below discovers its
+authorized canonical sources.
+
+## Connected Cloud sources
+
+After `antfly-cloud login` and active instance selection, compatible Colony servers
+provide source discovery without hand-authored table JSON or copied data-plane tokens:
+
+```sh
+antfly-grep --cloud --files
+antfly-grep --source engineering -n 'retry|budget'
+antfly-grep --source engineering --source work-drive 'deadline'
+antfly-grep ask 'Why was this retry policy chosen?' --source engineering --model MODEL
+```
+
+`--cloud` selects all authorized sources; repeat `--source` to select aliases or
+stable source IDs across repositories/providers. Exact IDs take precedence over
+aliases; an ambiguous alias fails before querying. Repeated selectors select each
+resolved source once. `--cloud-cli PATH` selects the CLI
+executable. Cloud selection cannot be mixed with explicit local paths or manual table
+credentials. Identical connection/URI/revision/content from overlapping selections is
+reported once after authorization and path filters. Deduplication memory is bounded by
+`max_page_memory`; independent sources retain independent query snapshots.
+
+Discovery v2 follows bounded pages and verifies the authenticated subject and
+policy generation throughout. All sources and reader identities are collected
+before querying; incomplete discovery fails explicitly. Limits are 1 MiB per
+response, 32 MiB aggregate discovery bytes, 64 MiB parsing memory, 1,000 sources,
+262,144 reader identities and 1,024 pages. Legacy single-page v1 discovery remains
+supported. Document and indexed-table configuration versions are independent of
+discovery.
+
+The session stays in memory. A 401 refreshes through the public CLI and resumes the
+same cursor/snapshot; changing the active instance or authenticated identity fails
+explicitly. Redirects are disabled. Source revocation, stale/pending sync, expired
+snapshots and other source failures preserve earlier results and exit 2. Inference
+endpoint/model/credentials remain independently configured through existing provider
+setup; source discovery never supplies provider refresh tokens or signing keys.
+
+Colony's source-management and data-plane protocols, provider setup and current
+format limits are tracked in [Colony #813](https://github.com/antflydb/colony/issues/813)
+and its `docs/dev/connected-source-search.md`. This integration does not itself
+implement provider synchronization, OAuth consent screens or document rendering.
 
 ## Build and test
 
@@ -4592,3 +4635,10 @@ cases and Windows cross-compilation passed. The report records these final
 validation hashes separately; its performance measurements remain pinned to the
 earlier measured binaries. Failed deferred drains join and discard remaining
 borrowers before retiring any manifest page, including failures inside cleanup.
+
+Cloud discovery uses a catalogue generation for consistent pagination and a
+separate `access_id` for each source. Queries send that source's access ID in
+`X-Antfly-Source-Access`, including snapshot continuations and session refresh.
+An unrelated source's sync or rename does not invalidate a selected-source
+query. A change to the selected source's reader policy or authenticated reader
+identities ends the search explicitly as incomplete; rerun discovery to retry.

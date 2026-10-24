@@ -48,6 +48,9 @@ Use '-' for stdin; '--' ends option parsing.
       --engine ENGINE       default, pcre2, auto
   -z, --search-zip           Native streaming compressed-file search
       --dictionary PATH     Brotli/LZ4/Zstandard external dictionary
+      --cloud              Search authorized sources from antfly-cloud login
+      --source NAME        Select connected source alias/ID (repeatable)
+      --cloud-cli PATH     Cloud CLI executable (default antfly-cloud)
       --table-config PATH  Versioned Antfly table connection JSON
       --table NAME         Select a configured table (repeatable)
       --table-filter JSON  Server-side structured filter
@@ -161,6 +164,12 @@ See antfly-grep --help and the package README for semantics.
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --chunk-lines
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --cloud
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --cloud-cli
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --color
@@ -599,6 +608,9 @@ See antfly-grep --help and the package README for semantics.
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --sortr
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --source
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --stats

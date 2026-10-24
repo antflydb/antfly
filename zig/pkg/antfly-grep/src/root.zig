@@ -16,6 +16,7 @@
 const std = @import("std");
 pub const interrupt = @import("interrupt.zig");
 pub const concurrency = @import("concurrency.zig");
+pub const cloud = @import("cloud.zig");
 pub const setup = @import("setup.zig");
 pub const tooling = @import("tooling.zig");
 pub const workspace = @import("workspace.zig");
@@ -624,7 +625,7 @@ pub const Search = struct {
         var phases = @import("workspace_profile.zig").Phases.init(self.io, "run");
         defer phases.finish();
         errdefer self.flushOutput() catch {};
-        if (self.options.media == .images and (self.hasStdinPath() or (self.options.paths.items.len == 0 and self.options.table_config == null and !(try std.Io.File.stdin().isTty(self.io))))) return error.MediaStdinUnsupported;
+        if (self.options.media == .images and (self.hasStdinPath() or (self.options.paths.items.len == 0 and !self.options.indexed() and !(try std.Io.File.stdin().isTty(self.io))))) return error.MediaStdinUnsupported;
         const started = std.Io.Clock.awake.now(self.io);
         if (self.options.debug or self.options.trace) std.debug.print("antfly-grep: engine={s} threads={d} encoding={s} multiline={}\n", .{ @tagName(self.options.engine), if (self.options.files) self.options.jobs else self.fileJobs(), self.options.encoding, self.options.multiline });
         if (self.options.debug or self.options.trace) {
@@ -634,10 +635,10 @@ pub const Search = struct {
         self.shared_limits = &self.limits;
         self.decider.limits = &self.limits;
         if (self.lexical_patch) |patch| try self.protocolJson(.{ .type = "workspace_lexical_delta", .base_token = patch.base_token, .base_revision = patch.base_revision, .revision = self.workspace_generation.?.revision, .observed_at = self.workspace_generation.?.captured_at, .removed = patch.removed, .ordering = "path" }, false);
-        const implicit_directory = self.options.ask != null and self.options.paths.items.len == 0 and self.options.table_config == null and (try std.Io.File.stdin().isTty(self.io));
+        const implicit_directory = self.options.ask != null and self.options.paths.items.len == 0 and !self.options.indexed() and (try std.Io.File.stdin().isTty(self.io));
         self.query_reuse_eligible = (self.options.ask != null and self.options.ranked and self.options.sort == null and
             self.options.max_result_files != std.math.maxInt(usize) and !self.hasStdinPath() and
-            (self.options.paths.items.len > 0 or self.options.table_config != null or implicit_directory) and
+            (self.options.paths.items.len > 0 or self.options.indexed() or implicit_directory) and
             !self.options.quiet and !self.options.count and !self.options.count_matches and
             !self.options.files and !self.options.files_with_matches and !self.options.files_without_match and
             !self.options.inventory and !self.options.multiline);
@@ -690,10 +691,10 @@ pub const Search = struct {
         }
         const single_regular_file = if (self.lexical_paths) |paths| paths.len <= 1 else if (self.workspace_generation) |generation| generation.entries.items.len == 1 else self.options.paths.items.len == 1 and !self.hasStdinPath() and
             (if (std.Io.Dir.cwd().statFile(self.io, self.options.paths.items[0], .{})) |info| info.kind == .file else |_| false);
-        self.single_source = single_regular_file and self.options.table_config == null;
+        self.single_source = single_regular_file and !self.options.indexed();
         if (self.ranking == null and self.options.ask != null and self.options.ranked and self.options.sort == null and
             self.options.max_result_files == std.math.maxInt(usize) and !self.hasStdinPath() and
-            (self.options.paths.items.len > 0 or self.options.table_config != null or implicit_directory) and
+            (self.options.paths.items.len > 0 or self.options.indexed() or implicit_directory) and
             !self.options.quiet and !self.options.count and !self.options.count_matches and !self.options.files and
             !self.options.files_with_matches and !self.options.files_without_match and !self.options.inventory and !self.options.multiline)
         {
@@ -706,11 +707,11 @@ pub const Search = struct {
             (self.options.ask != null and !self.options.ranked and !self.options.jev_mode and
                 (self.options.sort == null or std.mem.eql(u8, self.options.sort.?, "none")) and
                 !self.options.quiet and !self.options.inventory and !self.hasStdinPath());
-        if (self.discovery_stream and (self.options.table_config == null or self.options.paths.items.len != 0) and (self.single_source or self.options.triage or self.options.max_files == std.math.maxInt(usize))) {
+        if (self.discovery_stream and (!self.options.indexed() or self.options.paths.items.len != 0) and (self.single_source or self.options.triage or self.options.max_files == std.math.maxInt(usize))) {
             self.file_path_triage = self.options.triage or (self.single_source and 1 > self.options.max_files);
             self.pipeline = try Pipeline.start(self);
         }
-        const streaming_files = self.options.files and self.options.ask == null and !self.options.inventory and self.options.table_config == null and (self.options.sort == null or std.mem.eql(u8, self.options.sort.?, "none"));
+        const streaming_files = self.options.files and self.options.ask == null and !self.options.inventory and !self.options.indexed() and (self.options.sort == null or std.mem.eql(u8, self.options.sort.?, "none"));
         if (streaming_files) self.collecting = false;
 
         // Lexical scans and relevance ranking can overlap bounded discovery;
@@ -719,7 +720,7 @@ pub const Search = struct {
             self.options.ask == null and !self.options.inventory and !self.options.quiet and
             (self.options.sort == null or std.mem.eql(u8, self.options.sort.?, "none")) and
             self.options.max_regions == std.math.maxInt(usize);
-        if (pipelined and self.options.table_config == null and self.pipeline == null) self.pipeline = try Pipeline.start(self);
+        if (pipelined and !self.options.indexed() and self.pipeline == null) self.pipeline = try Pipeline.start(self);
         defer if (self.pipeline) |pool| {
             pool.finish() catch {};
             self.pipeline = null;
@@ -750,10 +751,10 @@ pub const Search = struct {
             }
             self.workspace_entry = null;
         } else {
-            if (self.options.table_config != null) @import("indexed.zig").run(self) catch |err| {
+            if (self.options.indexed()) @import("indexed.zig").run(self) catch |err| {
                 try self.reportError("<antfly>", err);
             };
-            if (self.options.paths.items.len == 0 and self.options.table_config != null) {
+            if (self.options.paths.items.len == 0 and self.options.indexed()) {
                 // A table-only invocation never consumes ambient stdin.
             } else if (self.options.paths.items.len == 0) {
                 if (!self.options.files and !try std.Io.File.stdin().isTty(self.io)) self.stdin() catch |err| {
@@ -924,7 +925,7 @@ pub const Search = struct {
     }
     fn startInventory(self: *Search, triage: bool) !void {
         self.file_path_triage = self.options.triage or triage;
-        if (self.inventory_count == 1 and self.options.table_config == null) self.single_source = true;
+        if (self.inventory_count == 1 and !self.options.indexed()) self.single_source = true;
         if (self.pipeline == null) self.pipeline = try Pipeline.start(self);
         var buffer: [65536]u8 = undefined;
         var reader = self.inventory_file.?.file.reader(self.io, &buffer);
@@ -1420,7 +1421,7 @@ pub const Search = struct {
     fn searchPath(self: *Search, name: []const u8) !void {
         self.explicit_file = false;
         const stat = try std.Io.Dir.cwd().statFile(self.io, name, .{});
-        self.render_filename = self.options.filename orelse (self.options.table_config != null or self.options.ask != null or self.options.paths.items.len > 1 or stat.kind == .directory);
+        self.render_filename = self.options.filename orelse (self.options.indexed() or self.options.ask != null or self.options.paths.items.len > 1 or stat.kind == .directory);
         if (stat.kind == .directory) {
             const cwd = try std.process.currentPathAlloc(self.io, self.a);
             defer self.a.free(cwd);
@@ -3789,7 +3790,7 @@ pub const Search = struct {
         if (self.sink) |sink| {
             try sink.writeAll(bytes);
             if (self.options.line_buffered) try sink.flush();
-        } else if (self.options.block_buffered or (!self.options.line_buffered and (self.options.paths.items.len > 0 or self.options.table_config != null) and !self.hasStdinPath())) {
+        } else if (self.options.block_buffered or (!self.options.line_buffered and (self.options.paths.items.len > 0 or self.options.indexed()) and !self.hasStdinPath())) {
             if (bytes.len >= 65536) {
                 try self.flushOutput();
                 try std.Io.File.stdout().writeStreamingAll(self.io, bytes);
