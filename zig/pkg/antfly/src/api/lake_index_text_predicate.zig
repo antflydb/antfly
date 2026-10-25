@@ -273,7 +273,7 @@ pub const Identities = struct {
     };
     const FileSpan = struct { file: []const u8, span: Span };
     const CompactSpan = struct { source: u32, mapping: Span.Mapping };
-    const Deferred = struct { root: corpus.Root, snapshot: *const local.index.IndexSnapshot, key: [32]u8 };
+    const Deferred = struct { groups: []const corpus.FileGroup, domain: [32]u8, key: [32]u8 };
     deferred: ?*const Deferred = null,
     row_resolver: ?local.serverless_query_lake_serving.ServingSource.RowResolver = null,
     partial_inventory: bool = false,
@@ -287,7 +287,7 @@ pub const Identities = struct {
     pub fn spanCount(self: Identities) usize {
         if (self.deferred) |value| {
             var count: usize = 0;
-            for (value.root.file_groups) |group| count += group.sourceLen();
+            for (value.groups) |group| count += group.sourceLen();
             return count;
         }
         return if (self.compact_spans.len != 0) self.compact_spans.len else self.spans.len;
@@ -324,10 +324,22 @@ pub const Identities = struct {
             for (root.manifests) |ref| hash.update(ref.artifact_id);
             var key: [32]u8 = undefined;
             hash.final(&key);
-            deferred.* = .{ .root = root, .snapshot = snapshot, .key = key };
+            // Admission storage is transient. Retain only deeply owned lineage
+            // descriptors, never its Root slices or an acquired snapshot pointer.
+            const groups = try a.alloc(corpus.FileGroup, root.file_groups.len);
+            for (groups, root.file_groups) |*copy, group| copy.* = .{
+                .file = .{ .id = try a.dupe(u8, group.file.id), .digest = group.file.digest },
+                .segments = try corpus.source_spans.cloneRefsIntoArena(a, group.segments),
+                .sources = try corpus.source_spans.cloneIntoArena(a, group.sources),
+                .source_pages = try corpus.source_spans.cloneRefsIntoArena(a, group.source_pages),
+                .source_count = group.source_count,
+                .source_view = if (group.source_view) |view| try view.cloneIntoArena(a) else null,
+                .source_paged = if (group.source_paged) |paged| try paged.cloneIntoArena(a) else null,
+            };
+            deferred.* = .{ .groups = groups, .domain = root.domain, .key = key };
             return .{ .offsets = offsets, .partial_inventory = root.partial_inventory, .deferred = deferred };
         }
-        for (root.file_groups) |group| if (group.sourceLen() != 0) return initPacked(a, root, snapshot, offsets);
+        for (root.file_groups) |group| if (group.sourceLen() != 0) return initPacked(a, root.domain, root.file_groups, root.partial_inventory, offsets);
         var result: Identities = .{ .offsets = offsets, .partial_inventory = root.partial_inventory };
         const spans = try a.alloc(FileSpan, root.file_groups.len);
         var segment: usize = 0;
@@ -381,8 +393,8 @@ pub const Identities = struct {
             return (@as(u64, self.file_ranks[lo]) << 32) | (item.span.original(doc) catch return std.math.maxInt(u64));
         }
     };
-    fn initPacked(a: A, root: corpus.Root, snapshot: *const local.index.IndexSnapshot, offsets: []const u32) !Identities {
-        var result: Identities = .{ .offsets = offsets, .partial_inventory = root.partial_inventory };
+    fn initPacked(a: A, domain: [32]u8, groups: []const corpus.FileGroup, partial_inventory: bool, offsets: []const u32) !Identities {
+        var result: Identities = .{ .offsets = offsets, .partial_inventory = partial_inventory };
         const Mapping = Span.Mapping;
         const FileMappings = struct { index: u32, intervals: std.ArrayList(Mapping) = .empty };
         var mappings: std.StringHashMapUnmanaged(FileMappings) = .empty;
@@ -394,9 +406,9 @@ pub const Identities = struct {
         var sources: std.ArrayList(FileSpan) = .empty;
         var spans: std.ArrayList(CompactSpan) = .empty;
         var segment: usize = 0;
-        for (root.file_groups) |group| {
-            if (group.sourceLen() == 0 or group.segments.len != 1 or segment >= snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
-            if (group.source_view) |view| try view.validateMode(snapshot.segments[segment].reader.doc_count, root.domain, group.masked) else try corpus.source_spans.validateMode(group.sources, snapshot.segments[segment].reader.doc_count, root.domain, group.masked);
+        for (groups) |group| {
+            if (group.sourceLen() == 0 or group.segments.len != 1 or segment >= offsets.len - 1) return error.InvalidNativeLakeTextCorpus;
+            if (group.source_view) |view| try view.validateMode(offsets[segment + 1] - offsets[segment], domain, group.masked) else try corpus.source_spans.validateMode(group.sources, offsets[segment + 1] - offsets[segment], domain, group.masked);
             for (0..group.sourceLen()) |index| {
                 const src = group.sourceAt(index);
                 const lower = try std.math.add(u32, offsets[segment], src.pack_lower);
@@ -427,7 +439,7 @@ pub const Identities = struct {
             }
             segment += 1;
         }
-        if (segment != snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
+        if (segment != offsets.len - 1) return error.InvalidNativeLakeTextCorpus;
         var it = mappings.iterator();
         while (it.next()) |entry| {
             const intervals = entry.value_ptr.intervals.items;
@@ -469,14 +481,12 @@ pub const Identities = struct {
     /// Stable logical ranking position shares predicate/hydration translation.
     fn materialize(self: Identities, a: A, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, reads: *u64) anyerror!Identities {
         const deferred = self.deferred orelse return self;
-        var root = deferred.root;
-        const groups = try a.dupe(corpus.FileGroup, root.file_groups);
+        const groups = try a.dupe(corpus.FileGroup, deferred.groups);
         for (groups) |*group| if (group.source_paged != null) {
-            group.source_view = try corpus.source_spans.loadView(a, store, group.source_pages, group.source_count, root.domain, corpus.source_spans.Paged.queryToken(&cached.context), cached, reads, false);
+            group.source_view = try corpus.source_spans.loadView(a, store, group.source_pages, group.source_count, deferred.domain, corpus.source_spans.Paged.queryToken(&cached.context), cached, reads, false);
             group.source_paged = null;
         };
-        root.file_groups = groups;
-        var result = try init(a, root, deferred.snapshot);
+        var result = try initPacked(a, deferred.domain, groups, self.partial_inventory, try a.dupe(u32, self.offsets));
         result.row_resolver = self.row_resolver;
         result.segment_ids = try a.dupe([32]u8, self.segment_ids);
         return result;
@@ -489,11 +499,11 @@ pub const Identities = struct {
             if (cache.identity_shared) |owned| owned.release();
             cache.identity_shared = null;
             var bytes: u64 = 0;
-            for (deferred.root.file_groups) |group| for (group.source_pages) |ref| {
+            for (deferred.groups) |group| for (group.source_pages) |ref| {
                 bytes = try std.math.add(u64, bytes, ref.byte_len);
             };
             try @import("../serverless/artifacts/store.zig").chargeReadBudget(&cache.lineage_reads, bytes);
-            const anchor = for (deferred.root.file_groups) |group| {
+            const anchor = for (deferred.groups) |group| {
                 if (group.source_paged != null) break group.source_pages[0];
             } else return error.InvalidNativeLakeTextCorpus;
             const Load = struct {
@@ -512,20 +522,21 @@ pub const Identities = struct {
             cache.identity_owner = deferred.key;
         }
         var result = cache.eager_identity.?;
+        result.partial_inventory = self.partial_inventory;
         result.row_resolver = self.row_resolver;
         result.segment_ids = self.segment_ids;
         return result;
     }
     fn deferredSpan(self: Identities, a: A, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, doc: u32, reads: *u64) anyerror!struct { span: corpus.source_spans.Span, local: u32 } {
-        const root = self.deferred.?.root;
+        const groups = self.deferred.?.groups;
         var lower: usize = 0;
-        var upper = root.file_groups.len;
+        var upper = groups.len;
         while (lower < upper) {
             const middle = lower + (upper - lower) / 2;
             if (self.offsets[middle + 1] <= doc) lower = middle + 1 else upper = middle;
         }
-        if (lower == root.file_groups.len) return error.InvalidNativeLakeTextCorpus;
-        const group = root.file_groups[lower];
+        if (lower == groups.len) return error.InvalidNativeLakeTextCorpus;
+        const group = groups[lower];
         const ordinal_value = doc - self.offsets[lower];
         if (group.source_paged) |paged| return .{ .span = try paged.span(a, store, cached, ordinal_value, reads), .local = ordinal_value };
         var lo: usize = 0;

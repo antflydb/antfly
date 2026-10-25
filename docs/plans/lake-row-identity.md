@@ -1524,3 +1524,12 @@ fragment, and a fresh capture reads each missing block once per fragment rather
 than depending on random hash order fitting a small decode cache. Consumer
 coordinate generations, tuple recipes, schema epochs and public cursors retain
 their existing contracts.
+
+Admission storage can be released immediately after a native corpus is built.
+Deferred lineage therefore deeply owns its compact source descriptors, page
+references and segment counts. It retains neither expanded admission-root slices
+nor an acquired snapshot pointer. Complete inverse maps derive counts from these
+owned offsets and reattach the caller's partial-inventory semantics on every
+lease, just as they reattach the current row resolver. The interleaved-compaction
+regression explicitly frees admission storage before both point and inverse
+reads, including allocation-failure coverage of the ownership transfer.

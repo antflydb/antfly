@@ -116,6 +116,11 @@ pub fn compactIntoArena(a: std.mem.Allocator, spans: []const Span) !View {
     for (sources, intern.sources.items) |*copy, src| copy.* = try ownSource(a, src);
     return .{ .sources = sources, .ranges = ranges };
 }
+pub fn cloneRefsIntoArena(a: std.mem.Allocator, refs: []const artifacts.ChunkRef) ![]const artifacts.ChunkRef {
+    const result = try a.alloc(artifacts.ChunkRef, refs.len);
+    for (result, refs) |*copy, ref| copy.* = try ownRef(a, ref);
+    return result;
+}
 fn ownRef(a: std.mem.Allocator, ref: artifacts.ChunkRef) !artifacts.ChunkRef {
     var copy = ref;
     copy.artifact_id = try a.dupe(u8, ref.artifact_id);
@@ -626,6 +631,14 @@ pub const Paged = struct {
     first_range: usize,
     count: u32,
     domain: [32]u8,
+    pub fn cloneIntoArena(self: Paged, a: std.mem.Allocator) !Paged {
+        const sources = try a.alloc(Source, self.sources.len);
+        for (sources, self.sources) |*copy, src| copy.* = try ownSource(a, src);
+        var result = self;
+        result.sources = sources;
+        result.pages = try cloneRefsIntoArena(a, self.pages);
+        return result;
+    }
     pub fn open(a: std.mem.Allocator, store: stores.ArtifactStore, pages: []const artifacts.ChunkRef, count: u32, domain: [32]u8, token: @import("antfly_cancellation").CancellationToken, cached: artifacts.CachedRead, remaining: *u64) !?Paged {
         if (pages.len == 0 or count == 0 or count > max_spans) return null;
         var total_bytes: u64 = 0;
