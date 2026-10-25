@@ -316,6 +316,7 @@ pub const storage_db_artifact_unit_dispatch = @import("storage/db/artifact_unit_
 pub const storage_db_artifact_unit_jobs = @import("storage/db/artifact_unit_jobs.zig");
 pub const storage_db_artifact_unit_progress = @import("storage/db/artifact_unit_progress.zig");
 pub const storage_db_artifact_unit_scope_cursor = @import("storage/db/artifact_unit_scope_cursor.zig");
+pub const storage_db_artifact_vector_set = @import("storage/db/artifact_vector_set.zig");
 pub const storage_db_backfill_state = @import("storage/db/backfill_state.zig");
 pub const storage_db_backup_pin_control = @import("storage/db/backup_pin_control.zig");
 pub const storage_db_batcher = @import("storage/db/batcher.zig");

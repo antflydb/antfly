@@ -229,6 +229,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_enrichment_chunker;
     _ = @import("antfly_local_sources").storage_db_enrichment_chunker_stub;
     _ = @import("antfly_local_sources").storage_db_enrichment_config_validation;
+    _ = @import("antfly_local_sources").storage_db_enrichment_vector_label_cache;
     _ = @import("antfly_local_sources").storage_db_enrichment_document_extraction;
     _ = @import("antfly_local_sources").storage_db_enrichment_document_unit_fingerprint;
     _ = @import("antfly_local_sources").storage_db_enrichment_embedder;
@@ -474,6 +475,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_artifact_input_capture;
     _ = @import("artifact_publication_dispatch.zig");
     _ = @import("antfly_local_sources").storage_db_artifact_activation_boundary;
+    _ = @import("antfly_local_sources").storage_db_artifact_asset_publication;
     _ = @import("antfly_local_sources").storage_db_artifact_authored_acceptance;
     _ = @import("antfly_local_sources").storage_db_artifact_catalog_view;
     _ = @import("antfly_local_sources").storage_db_artifact_chunk_cursor;
@@ -482,6 +484,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_artifact_chunk_manifest;
     _ = @import("antfly_local_sources").storage_db_artifact_chunk_publication;
     _ = @import("antfly_local_sources").storage_db_artifact_chunk_scan_position;
+    _ = @import("antfly_local_sources").storage_db_artifact_chunk_staging;
     _ = @import("antfly_local_sources").storage_db_artifact_chunk_vector_publication;
     _ = @import("antfly_local_sources").storage_db_artifact_completion_plan;
     _ = @import("antfly_local_sources").storage_db_artifact_completion_progress;
@@ -527,6 +530,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_artifact_unit_jobs;
     _ = @import("antfly_local_sources").storage_db_artifact_unit_progress;
     _ = @import("antfly_local_sources").storage_db_artifact_unit_scope_cursor;
+    _ = @import("antfly_local_sources").storage_db_artifact_vector_set;
     _ = @import("antfly_local_sources").storage_db_enrichment_document_unit_payload;
     _ = @import("antfly_local_sources").storage_db_graph_mutation_scopes;
     _ = @import("antfly_local_sources").storage_db_merge_artifact_catalog;
@@ -540,7 +544,6 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_retirement_set_summary;
     _ = @import("antfly_local_sources").storage_db_root_signing_identity;
     _ = @import("antfly_local_sources").storage_db_source_artifact_batch;
-    _ = @import("antfly_local_sources").storage_source_proof_registry;
     _ = @import("antfly_local_sources").storage_db_source_proof_batch;
     _ = @import("antfly_local_sources").storage_projection_seal;
     _ = @import("antfly_local_sources").storage_retained_frame;
