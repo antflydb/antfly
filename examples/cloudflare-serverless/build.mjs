@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {limitWasmMemory} from "./wasm-memory.mjs";
 import { mkdir, readFile, writeFile, copyFile, cp } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -63,3 +64,5 @@ if (process.env.ANTFLY_WASM_OPT) {
   await writeFile(`${out}antfly-serverless.wasm`, module.emitBinary());
   module.dispose();
 }
+
+await writeFile(`${out}antfly-serverless-compact.wasm`,limitWasmMemory(await readFile(`${out}antfly-serverless.wasm`),256));

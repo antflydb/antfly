@@ -163,3 +163,78 @@ test("mutation groups do not multiply transient or fencing failures into individ
 test("metadata RPC counters expose protocol types without tenant or document identifiers",async()=>{
  const {countMetadataRpc}=await import("../performance.mjs");const counts={};countMetadataRpc(counts,{op:"get",key:"antfly/progress/private-tenant/READ_PINS/91"});countMetadataRpc(counts,{op:"put",key:"antfly/wal-v1/secret-hash/HEAD"});assert.deepEqual(counts.metadata_by_op,{"get:READ_PINS":1,"put:WAL_HEAD":1});
 });
+
+test("prepared WAL uploads expose no HEAD until the original ETag commits, including GC rotation",async()=>{
+ const {PreparedWal}=await import("../prepared-wal.mjs");const {store}=fixture(),keys=await metadataKeys("prepared");const original=record('{"write_epoch":1,"latest_lsn":0}');
+ await store.transaction(tx=>tx.put(keys.wal,original));const prepared=new PreparedWal(keys.wal,[[keys.wal,original],[keys.head,null]]),body=utf8.encode('{"write_epoch":1,"latest_lsn":8}');
+ assert.equal(prepared.objectCall({op:"put",key:keys.wal,if_match_etag:original.etag},body).status,0);body.fill(0);
+ assert.equal((await store.transaction(tx=>tx.get(keys.wal))).etag,original.etag,"preparation must not publish metadata");
+ assert.equal(prepared.objectCall({op:"put",key:keys.head,if_none_match:true},utf8.encode("1")).status,3,"preparation has no progress-write authority");
+ const cas=async(tx,request,body)=>{const previous=await tx.get(request.key);if(request.if_match_etag!==previous?.etag)return{status:2};tx.put(request.key,{etag:"committed",body});return{status:0};};
+ await store.transaction(tx=>tx.put(keys.wal,record('{"write_epoch":2,"latest_lsn":0}')));
+ assert.equal(await store.transaction(tx=>prepared.commit(tx,cas)),false,"GC epoch rotation must invalidate prepared pages");
+ const current=await store.transaction(tx=>tx.get(keys.wal)),fresh=new PreparedWal(keys.wal,[[keys.wal,current]]);
+ fresh.objectCall({op:"put",key:keys.wal,if_match_etag:current.etag},utf8.encode("durable"));
+ assert.equal(await store.transaction(tx=>fresh.commit(tx,cas)),true);assert.equal(new TextDecoder().decode((await store.transaction(tx=>tx.get(keys.wal))).body),"durable");
+});
+test("runtime routes isolate tenant identities and enforce bounded reader pools",async()=>{
+ const {runtimeName,readerSlots}=await import("../runtime-routing.mjs");assert.notEqual(runtimeName("a",0),runtimeName("a",1));assert.notEqual(runtimeName("a",0),runtimeName("b",0));assert.equal(readerSlots({}),2);assert.throws(()=>readerSlots({READERS_PER_TENANT:"5"}),/InvalidReaderPoolSize/);
+});
+
+test("maintenance tickets coalesce cron admission and reject stale continuation steps",async()=>{
+ const {MaintenanceTickets}=await import("../maintenance-tickets.mjs");const {store}=fixture();let now=1000;const tickets=new MaintenanceTickets(store,()=>now);
+ const requests=await Promise.all(Array.from({length:16},()=>tickets.request("collect_metadata","job")));assert.equal(requests.filter(r=>r.enqueue).length,1);const first=requests.find(r=>r.enqueue);
+ assert.equal(await tickets.valid("collect_metadata",first,"job"),true);
+ const next=await tickets.advance("collect_metadata",first,"job");assert.equal(next.step,1);assert.equal((await tickets.advance("collect_metadata",first,"job")).enqueue,false);
+ assert.equal(await tickets.valid("collect_metadata",first,"job"),false);await tickets.finish("collect_metadata",first);assert.equal(await tickets.valid("collect_metadata",next,"job"),true);
+ now+=120001;const replacement=await tickets.request("collect_metadata","job");assert.notEqual(replacement.id,next.id);assert.equal(await tickets.valid("collect_metadata",next,"job"),false);await tickets.abandon("collect_metadata",replacement);assert.equal((await tickets.request("collect_metadata","job")).enqueue,true);
+});
+
+test("shared kernel pools bound concurrency and leave metadata an independent slot",async()=>{
+ const {RequestPool}=await import("../request-pool.mjs");let active=0,peak=0;const metadata=new RequestPool(async()=>({request:async n=>n,usable:()=>true,memoryBytes:()=>65536}),1);
+ const readers=new RequestPool(async()=>({request:async n=>{active++;peak=Math.max(peak,active);await new Promise(r=>setTimeout(r,2));const result=await metadata.request(n);active--;return result;},usable:()=>true,memoryBytes:()=>65536}),2);
+ assert.deepEqual(await Promise.all(Array.from({length:12},(_,i)=>readers.request(i))),Array.from({length:12},(_,i)=>i));assert.equal(peak,2);assert.equal(readers.memoryBytes(),131072);
+});
+test("compact kernels enforce their declared sixteen MiB memory maximum",async()=>{
+ const {limitWasmMemory}=await import("../wasm-memory.mjs");const bytes=limitWasmMemory(await readFile(new URL("../dist/antfly-serverless.wasm",import.meta.url)),256),compiled=await WebAssembly.compile(bytes),imports={};for(const item of WebAssembly.Module.imports(compiled)){assert.equal(item.kind,"function");imports[item.module]??={};imports[item.module][item.name]=()=>0;}
+ const instance=await WebAssembly.instantiate(compiled,imports);assert.throws(()=>instance.exports.memory.grow(256),RangeError);
+});
+
+
+test("mutation admission deadline includes time waiting for an earlier WAL group",async()=>{
+ const {MutationGroups}=await import("../mutation-groups.mjs");let now=0,release,started,commits=0;
+ const began=new Promise(resolve=>started=resolve),blocked=new Promise(resolve=>release=resolve);
+ const queue=new MutationGroups(async(inputs,deadline)=>{commits++;assert.equal(deadline,30000);started();await blocked;return inputs.map(()=>({visibility:"ok"}));},{clock:()=>now});
+ const first=queue.submit({operation_id:"first",mutations:[]});await began;
+ const second=queue.submit({operation_id:"second",mutations:[]});const expired=assert.rejects(second,/DeadlineExceeded/);
+ now=30001;release();await first;await expired;assert.equal(commits,1);assert.equal(queue.pending,0);
+});
+
+
+test("expired kernel admission cannot open a publication lease behind another tenant",async()=>{
+ const {RequestPool}=await import("../request-pool.mjs");let entered,release,leases=0;
+ const began=new Promise(resolve=>entered=resolve),blocked=new Promise(resolve=>release=resolve);
+ const pool=new RequestPool(async()=>({usable:()=>true,memoryBytes:()=>65536}),1);
+ const first=pool.withHost(async()=>{entered();await blocked;return "first";});await began;
+ await assert.rejects(pool.withHost(async()=>{leases++;},{signal:AbortSignal.timeout(5)}),/DeadlineExceeded/);
+ assert.equal(leases,0);assert.equal(pool.pending.length,0);release();assert.equal(await first,"first");
+});
+
+
+test("idle checkpoints coalesce and defer behind foreground work without delaying its result",async()=>{
+ const {IdleCheckpoint}=await import("../idle-checkpoint.mjs");let revision=8,idle=true,work,calls=0;
+ const checkpoints=new IdleCheckpoint({revision:()=>revision,isIdle:()=>idle,checkpoint:async()=>{calls++;return{done:true,revision};},background:promise=>work=promise,delay:2});
+ checkpoints.schedule();checkpoints.schedule();idle=false;await work;assert.equal(calls,0);
+ idle=true;checkpoints.schedule();await work;assert.equal(calls,1);checkpoints.schedule();assert.equal(checkpoints.pending,false);
+ revision=16;checkpoints.schedule();await work;assert.equal(calls,2);assert.equal(checkpoints.last,16);
+ let retries=0;const throttled=new IdleCheckpoint({revision:()=>8,isIdle:()=>true,checkpoint:async()=>({done:++retries===2,revision:8}),background:promise=>work=promise,delay:1,retryDelay:1});throttled.schedule();await work;assert.equal(retries,2);assert.equal(throttled.last,8);
+});
+
+
+test("kernel instantiation cannot open a lease after its admission signal expires",async()=>{
+ const {RequestPool}=await import("../request-pool.mjs");let entered,release,leases=0;
+ const began=new Promise(resolve=>entered=resolve),blocked=new Promise(resolve=>release=resolve),controller=new AbortController();
+ const pool=new RequestPool(async()=>{entered();await blocked;return{usable:()=>true,memoryBytes:()=>65536};},1);
+ const expired=assert.rejects(pool.withHost(()=>{leases++;},{signal:controller.signal}),/DeadlineExceeded/);
+ await began;controller.abort();release();await expired;assert.equal(leases,0);
+});

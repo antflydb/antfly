@@ -14,6 +14,7 @@
 // limitations under the License.
 
 // Cloudflare-independent adapter for the shared native ordered metadata store.
+import {IdleCheckpoint} from "./idle-checkpoint.mjs";
 import {instrumentTransport} from "./performance.mjs";
 import {instantiateHost} from "../../zig/lib/objectstore/wasm/asyncify.mjs";
 import {createR2Transport} from "../../zig/lib/objectstore/wasm/r2.mjs";
@@ -24,17 +25,19 @@ const compare = (l, r) => {const a = utf8.encode(l), b = utf8.encode(r); for (le
 export const encode = value => JSON.stringify(value, (_, v) => v instanceof Uint8Array || v instanceof ArrayBuffer ? {__antfly_bytes: Array.from(new Uint8Array(v.buffer ?? v, v.byteOffset ?? 0, v.byteLength))} : v);
 const decode = value => JSON.parse(value, (_, v) => v && Object.keys(v).length === 1 && Array.isArray(v.__antfly_bytes) ? Uint8Array.from(v.__antfly_bytes) : v);
 export class R2CoordinatorStore {
-  constructor(module, bucket, namespace, {prefix = "antfly", clock = Date.now, onMetrics, owner, transport} = {}) {
+  constructor(module, bucket, namespace, {prefix = "antfly", clock = Date.now, onMetrics, owner, transport,kernel,cache,boundRows,background,checkpointCommits=64} = {}) {
     this.module = module; this.bucket = bucket; this.namespace = namespace; this.prefix = prefix; this.clock = clock; this.onMetrics = onMetrics;
+    this.kernel=kernel;this.boundRows=boundRows;this.checkpointCommits=checkpointCommits;
     this.owner = owner ?? Array.from(crypto.getRandomValues(new Uint8Array(16)));
-    this.cache = createImmutableReadCache({includeCommitLog:true});
+    this.cache = cache??createImmutableReadCache({includeCommitLog:true});
     const raw=transport??createR2Transport({database:bucket},{maxPutBytes:4*1024*1024});
     this.transport = this.cache.wrap(async(request,body)=>instrumentTransport(raw,this.physical??={})(request,body), `coordinator/${namespace}`);
     this.pending = []; this.running = false; this.state = null;
     this.rows=new Map();this.rowBytes=0;this.rowRevision=null;this.acquired=false;
+    if(background)this.idleCheckpoint=new IdleCheckpoint({revision:()=>this.state?.revision??0,isIdle:()=>!this.running&&!this.pending.length,background,onError:error=>{try{this.onMetrics?.({event:"antfly.checkpoint_deferred",error:String(error)});}catch{}},checkpoint:()=>this.transaction(async tx=>{if(this.pending.length)return{busy:true};const revision=tx.snapshot().revision;return{done:await tx.checkpoint(),revision};},{priority:"maintenance"})});
   }
   async native(coordinate) {
-    this.host ??= await instantiateHost(this.module, this.transport, {clock:this.clock,onMetrics:sample=>this.chargeMetrics(sample)});
+    if(!this.kernel)this.host ??= await instantiateHost(this.module, this.transport, {clock:this.clock,onMetrics:sample=>this.chargeMetrics(sample)});
     let transport=this.transport;
     if(coordinate.action==="begin"&&this.state&&this.base){
       // Prefetch only within this recovery request. Negative results are never
@@ -54,11 +57,12 @@ export class R2CoordinatorStore {
     }
     try {
       if ((this.usedOperations ?? 0) >= 1024 || (this.usedBytes ?? 0) >= 32*1024*1024) throw new Error("CoordinatorIoBudgetExceeded");
-      return await this.host.request({op: "coordinate", bucket: "database", prefix: this.prefix, namespace: this.namespace, coordinate: {owner: this.owner, state: this.state, ...coordinate}}, {transport,onMetrics:sample=>this.chargeMetrics({...sample,action:coordinate.action}),deadlineMs: this.deadline ?? this.clock() + 30000,maxOperations:1024-(this.usedOperations??0),maxTransferBytes:32*1024*1024-(this.usedBytes??0)});
-    } finally {if (!this.host.usable() || this.host.memoryBytes() >= 24 * 1024 * 1024) this.host = null;}
+      return await (this.kernel??this.host).request({op: "coordinate", bucket: "database", prefix: this.prefix, namespace: this.namespace, coordinate: {checkpoint_commits:this.checkpointCommits,owner: this.owner, state: this.state, ...coordinate}}, {transport,onMetrics:sample=>this.chargeMetrics({...sample,action:coordinate.action}),deadlineMs: this.deadline ?? this.clock() + 30000,maxOperations:1024-(this.usedOperations??0),maxTransferBytes:32*1024*1024-(this.usedBytes??0)});
+    } finally {if (this.host&&(!this.host.usable() || this.host.memoryBytes() >= 24 * 1024 * 1024)) this.host = null;}
   }
   chargeMetrics(sample){this.nativeCpuMs=(this.nativeCpuMs??0)+Math.max(0,(sample.elapsed_ms??0)-(sample.io_wait_ms??0));this.usedOperations=(this.usedOperations??0)+sample.operations;this.usedBytes=(this.usedBytes??0)+sample.transferred_bytes;try{this.onMetrics?.(sample);}catch{}}
   remember(key,value){
+    this.boundRows?.(this);
     const previous=this.rows.get(key);if(previous)this.rowBytes-=previous.bytes;this.rows.delete(key);
     const bytes=utf8.encode(key).length+(value===undefined?0:utf8.encode(encode(value)).length)+128;
     if(bytes>512*1024)return;
@@ -75,6 +79,7 @@ export class R2CoordinatorStore {
   async drain() {
     while (this.pending.length) await this.batch();
     this.running=false;
+    this.idleCheckpoint?.schedule();
   }
   async batch() {
     const started=performance.now();this.deadline = this.clock()+30000;

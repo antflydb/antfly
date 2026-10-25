@@ -45,6 +45,7 @@ pub const Log = struct {
     owner: [16]u8,
     io: std.Io,
     cancellation: ?types.CancellationToken = null,
+    checkpoint_commits: u64 = epoch_commits,
     const max_steps = 64;
     pub const epoch_commits = 64;
 
@@ -215,6 +216,7 @@ pub const Log = struct {
     }
     pub fn append(self: Log, a: A, source: State, root: []const u8) !State {
         try validate(source);
+        if (self.checkpoint_commits == 0 or epoch_commits % self.checkpoint_commits != 0) return error.InvalidImmutableLog;
         if (source.next >= epoch_commits) return error.ImmutableLogRotationRequired;
         try self.unfenced(a, source);
         const next = State{ .epoch = source.epoch, .owner = source.owner, .next = source.next + 1, .revision = try std.math.add(u64, source.revision, 1), .root = root };
@@ -227,7 +229,10 @@ pub const Log = struct {
         var result = next;
         if (next.next == epoch_commits) result = self.seal(a, next, self.owner) catch next;
         // A hint failure cannot replace a durable commit's receipt.
-        if (result.next == 0) _ = self.writeCheckpoint(a, result, false) catch false;
+        // A shorter best-effort recovery floor avoids replaying an entire
+        // 64-slot epoch after an idle restart. The one-second overwrite limit
+        // still applies, and hint failure never replaces an accepted commit.
+        if (result.next % self.checkpoint_commits == 0) _ = self.writeCheckpoint(a, result, false) catch false;
         return result;
     }
     pub fn retirable(self: Log, a: A, keys: []const []const u8, before: u64) ![]const []const u8 {
@@ -284,7 +289,7 @@ pub const Log = struct {
                 return true;
             }
             if (now < old.written_ms +| 1000) return false;
-        } else if (!force and state.revision < epoch_commits) return false;
+        } else if (!force and state.revision < self.checkpoint_commits) return false;
         const bytes = try std.json.Stringify.valueAlloc(a, Checkpoint{ .written_ms = now, .state = state }, .{});
         var client = self.client;
         client.allocator = a;
@@ -343,4 +348,33 @@ test "immutable log rejects forged cached cursors before acknowledging roots" {
     forged.epoch = @splat(7);
     forged.next = 0;
     try std.testing.expectError(error.InvalidImmutableLog, log.append(a, forged, "unreachable"));
+}
+
+test "immutable log checkpoints short recovery tails without making hint success part of commit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory = @import("memory.zig").MemoryClient.init(std.testing.allocator);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("fixture");
+    const log = Log{ .client = client, .bucket = "fixture", .prefix = "db", .owner = @splat(1), .io = std.testing.io, .checkpoint_commits = 8 };
+    var state = (try log.recover(a, null, true)).state;
+    // Open the rate window without sleeping or depending on the test clock.
+    var receipt = try client.putObject("fixture", "db/CHECKPOINT", try std.json.Stringify.valueAlloc(a, Checkpoint{ .written_ms = 0, .state = state }, .{}), .{});
+    receipt.deinit(std.testing.allocator);
+    for (0..8) |i| state = try log.append(a, state, try std.fmt.allocPrint(a, "root-{d}", .{i}));
+    try std.testing.expectEqual(state.revision, (try log.checkpoint(a)).?.state.revision);
+    state = try log.append(a, state, "root-8");
+    memory.resetOperationCount();
+    const recovered = try log.recover(a, null, false);
+    try std.testing.expectEqualStrings("root-8", recovered.state.root);
+    try std.testing.expect(memory.operationCount() <= 8);
+    // A throttled hint still returns the immutable durable commit's result.
+    const cp = (try log.checkpoint(a)).?;
+    receipt = try client.putObject("fixture", "db/CHECKPOINT", try std.json.Stringify.valueAlloc(a, Checkpoint{ .written_ms = std.math.maxInt(u64), .state = cp.state }, .{}), .{});
+    receipt.deinit(std.testing.allocator);
+    for (9..17) |i| state = try log.append(a, state, try std.fmt.allocPrint(a, "root-{d}", .{i}));
+    try std.testing.expectEqual(cp.state.revision, (try log.checkpoint(a)).?.state.revision);
+    try std.testing.expectEqualStrings("root-16", (try log.recover(a, null, false)).state.root);
 }

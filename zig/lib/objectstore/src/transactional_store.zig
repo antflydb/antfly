@@ -36,6 +36,7 @@ pub const Request = struct {
     page: ?tree.Ref = null,
     keys: []const []const u8 = &.{},
     before: []const u8 = "0",
+    checkpoint_commits: u8 = 64,
 };
 pub const Context = struct {
     alloc: A,
@@ -47,6 +48,7 @@ pub const Context = struct {
     cancellation: ?objects.CancellationToken = null,
 
     pub fn execute(self: Context, req: Request) ![]u8 {
+        if (req.checkpoint_commits < 8 or req.checkpoint_commits > 64 or (req.checkpoint_commits & (req.checkpoint_commits - 1)) != 0) return error.InvalidCoordinatorCheckpointCadence;
         var metadata = std.heap.ArenaAllocator.init(self.alloc);
         defer metadata.deinit();
         const m = metadata.allocator();
@@ -54,7 +56,7 @@ pub const Context = struct {
         std.crypto.hash.sha2.Sha256.hash(self.namespace, &digest, .{});
         const base = try std.fmt.allocPrint(m, "{s}/coord-v1/{s}", .{ self.prefix, std.fmt.bytesToHex(digest, .lower) });
         const domain = Pages.domainForNamespace(base);
-        const log = journal.Log{ .client = self.client, .bucket = self.bucket, .prefix = base, .owner = req.owner, .io = self.io, .cancellation = self.cancellation };
+        const log = journal.Log{ .client = self.client, .bucket = self.bucket, .prefix = base, .owner = req.owner, .io = self.io, .cancellation = self.cancellation, .checkpoint_commits = req.checkpoint_commits };
         if (req.action == .begin) {
             const recovered = try log.recover(m, req.state, req.state == null or !std.mem.eql(u8, &req.state.?.owner, &req.owner));
             return std.json.Stringify.valueAlloc(self.alloc, .{ .state = recovered.state, .has_more = recovered.has_more, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }) }, .{});

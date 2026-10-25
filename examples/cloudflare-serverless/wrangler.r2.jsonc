@@ -22,6 +22,14 @@
       {
         "name": "COMMITS",
         "class_name": "R2CommitCoordinator"
+      },
+      {
+        "name": "READERS",
+        "class_name": "R2ReadRuntime"
+      },
+      {
+        "name": "BUILDERS",
+        "class_name": "R2BuildRuntime"
       }
     ]
   },
@@ -31,12 +39,20 @@
       "new_sqlite_classes": [
         "R2CommitCoordinator"
       ]
+    },
+    {
+      "tag": "runtime-isolation-v1",
+      "new_sqlite_classes": [
+        "R2ReadRuntime",
+        "R2BuildRuntime"
+      ]
     }
   ],
   "vars": {
     "ANTFLY_INCARNATION": "example-r2-v1",
     "COORDINATOR_BACKEND": "r2",
-    "AUTO_GC": "true"
+    "AUTO_GC": "true",
+    "READERS_PER_TENANT": "2"
   },
   "ai": {
     "binding": "AI"
@@ -62,7 +78,7 @@
         "max_batch_size": 1,
         "max_retries": 10,
         "dead_letter_queue": "antfly-maintenance-r2-dead",
-        "max_concurrency": 1
+        "max_concurrency": 4
       }
     ]
   },

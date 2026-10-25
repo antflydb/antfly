@@ -14,13 +14,16 @@
 // limitations under the License.
 
 import {publicationKeys,publicationCall,publicationSnapshot} from "./publication-view.mjs";
+import {metadataKernel,buildKernel,sharedCache,boundRows,kernelMetrics} from "./kernels.mjs";
+import {MaintenanceTickets} from "./maintenance-tickets.mjs";
+import {PreparedWal} from "./prepared-wal.mjs";
+import {metadataKeys} from "./read-view.mjs";
 import {MutationGroups} from "./mutation-groups.mjs";
 import {metadataCollectionDue} from "./maintenance-policy.mjs";
 import {instrumentTransport} from "./performance.mjs";
 import {PublicationScheduler} from "./publication-scheduler.mjs";
 import {tenantEnvs} from "./tenants.mjs";
 import {openReadView} from "./read-view.mjs";
-import {instantiateHost} from "../../zig/lib/objectstore/wasm/asyncify.mjs";
 import {createR2Transport} from "../../zig/lib/objectstore/wasm/r2.mjs";
 import {withCommitCoordinator} from "../../zig/lib/objectstore/wasm/coordinated.mjs";
 import {openAuthority, activateR2} from "./coordinator-authority.mjs";
@@ -36,14 +39,20 @@ export class R2CommitCoordinator extends DurableObject {
     if (!env.ANTFLY_INCARNATION) throw new Error("CoordinatorNamespaceRequired");
     if(env.ANTFLY_TENANTS){const binding=env.COMMITS;env=tenantEnvs(env).find(candidate=>binding.idFromName(candidate.ANTFLY_INCARNATION).equals(ctx.id));if(!env)throw new Error("UnknownTenant");}
     this.env = env;
-    this.store = new R2CoordinatorStore(module, env.DATABASE, env.COORDINATOR_STORAGE_ID ?? env.ANTFLY_INCARNATION,{onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.coordinator",...sample}));}});
+    this.store = new R2CoordinatorStore(module, env.DATABASE, env.COORDINATOR_STORAGE_ID ?? env.ANTFLY_INCARNATION,{kernel:metadataKernel,cache:sharedCache,boundRows,background:promise=>ctx.waitUntil(promise),onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.coordinator",...sample,...kernelMetrics()}));}});
     this.serviceStore = Object.create(this.store);
     this.serviceStore.transaction = run => this.transaction(run);
     this.maintenanceStore=Object.create(this.store);this.maintenanceStore.transaction=run=>this.transaction(run,{priority:"maintenance"});
     this.publication=new PublicationScheduler(this.maintenanceStore,env.ANTFLY_INCARNATION);
+    this.maintenance=new MaintenanceTickets(this.maintenanceStore);
     this.journal = new R2CollectionJournal(this.maintenanceStore);
     ctx.blockConcurrencyWhile(async () => {this.authority = await openAuthority(env, "r2");});
   }
+  requestMaintenance(kind,jobId){return this.maintenance.request(kind,jobId);}
+  validMaintenance(kind,ticket,jobId){return this.maintenance.valid(kind,ticket,jobId);}
+  advanceMaintenance(kind,ticket,jobId){return this.maintenance.advance(kind,ticket,jobId);}
+  finishMaintenance(kind,ticket){return this.maintenance.finish(kind,ticket);}
+  abandonMaintenance(kind,ticket){return this.maintenance.abandon(kind,ticket);}
   requestPublication(force=false){return this.publication.request({force});}
   validPublication(id){return this.publication.valid(id);}
   abandonPublication(id){return this.publication.abandon(id);}
@@ -74,11 +83,11 @@ export class R2CommitCoordinator extends DurableObject {
   async collectMetadata(jobId,{scheduled=false}={}) {
     const key="__antfly_coord_gc/policy",now=Date.now();
     if(scheduled&&!jobId){const due=await this.maintenanceStore.transaction(async tx=>{
-      if(await tx.get("__antfly_coord_gc/state"))return true;
+      const active=await tx.get("__antfly_coord_gc/state");if(active)return {has_more:true,job_id:active.id};
       const prior=await tx.get(key),revision=tx.snapshot().revision;
       if(!prior){tx.put(key,{at:now,revision:revision+1});return false;}
       return metadataCollectionDue(prior,revision,now);
-    });if(!due)return{done:true,skipped:true};}
+    });if(!due)return{done:true,skipped:true};if(typeof due==="object")return due;}
     const result=await collectCoordinator(this.maintenanceStore,this.store.bucket,Date.now,jobId);
     if(result.done&&result.stats)await this.maintenanceStore.transaction(async tx=>{
       const prior=await tx.get(key);if(prior?.job_id!==result.job_id)tx.put(key,{at:Date.now(),revision:tx.snapshot().revision+1,job_id:result.job_id,stats:result.stats});
@@ -137,24 +146,31 @@ export class R2CommitCoordinator extends DurableObject {
       return {status: 3};
   }
   mutateBatch(input) {
-    this.mutationGroups??=new MutationGroups(inputs=>this.commitMutations(inputs));
+    this.mutationGroups??=new MutationGroups((inputs,deadline)=>this.commitMutations(inputs,deadline));
     return this.mutationGroups.submit(input);
   }
-  commitMutations(inputs) {
-    // Immutable uploads precede one durable metadata commit, with a distinct
-    // receipt and visibility watermark for every caller in the native group.
-    return this.transaction(async tx=>{
-      const transport=this.store.cache.wrap(withCommitCoordinator(instrumentTransport(createR2Transport({database:this.env.DATABASE},{maxPutBytes:4*1024*1024}),this.store.physical),{objectCall:(request,body)=>this.objectCallInTransaction(tx,request,body)}),this.env.ANTFLY_INCARNATION);
-      const started=performance.now();
-      this.mutationHost??=await instantiateHost(module,transport);
-      try{
-        const result=await this.mutationHost.request({op:"mutate",namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",working_set_bytes:Number(this.env.WORKING_SET_BYTES??20*1024*1024),mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))},{transport,deadlineMs:this.store.deadline,maxOperations:1024-this.store.usedOperations,maxTransferBytes:32*1024*1024-this.store.usedBytes,onMetrics:sample=>this.store.chargeMetrics(sample)});
-        let maximum=0n;for(const item of result.results)maximum=BigInt("0x"+item.visibility.slice(-16))>maximum?BigInt("0x"+item.visibility.slice(-16)):maximum;
-        const publication=await this.publication.reserve(tx,String(maximum));
-        if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_group",callers:inputs.length,records:inputs.reduce((n,input)=>n+input.mutations.length,0),native_ms:performance.now()-started}));
-        return result.results.map((item,i)=>({...item,__publication:i===0?publication:{...publication,enqueue:false}}));
-      }finally{if(!this.mutationHost.usable()||this.mutationHost.memoryBytes()>=24*1024*1024)this.mutationHost=null;}
-    });
+  async commitMutations(inputs,deadline=Date.now()+30000) {
+    const started=performance.now(),keys=await metadataKeys(this.env.ANTFLY_INCARNATION),physical={};
+    let usedOperations=0,usedBytes=0;
+    for(let attempt=0;attempt<3;attempt++){
+      // The shared durable generation pin protects the manifest read during
+      // preparation. New publication can only make admission more conservative.
+      const view=await this.openReadView({}),prepared=new PreparedWal(keys.wal,view.entries);
+      const transport=this.store.cache.wrap(withCommitCoordinator(instrumentTransport(createR2Transport({database:this.env.DATABASE},{maxPutBytes:4*1024*1024}),physical),prepared),this.env.ANTFLY_INCARNATION);
+
+      const result=await buildKernel.request({op:"mutate",namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",working_set_bytes:Number(this.env.WORKING_SET_BYTES??20*1024*1024),mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))},{transport,deadlineMs:deadline,maxOperations:1024-usedOperations,maxTransferBytes:32*1024*1024-usedBytes,onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_prepare",...sample,physical}));}});
+      let maximum=0n;for(const item of result.results)maximum=BigInt("0x"+item.visibility.slice(-16))>maximum?BigInt("0x"+item.visibility.slice(-16)):maximum;
+      const committed=await this.transaction(async tx=>{
+        if(Date.now()>=deadline)throw new Error("DeadlineExceeded");
+        if(!await prepared.commit(tx,(...args)=>this.objectCallInTransaction(...args)))return null;
+        return await this.publication.reserve(tx,String(maximum));
+      });
+      if(committed){
+        if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_group",callers:inputs.length,records:inputs.reduce((n,input)=>n+input.mutations.length,0),native_ms:performance.now()-started,prepare_attempts:attempt+1,physical_r2:physical}));
+        return result.results.map((item,i)=>({...item,__publication:i===0?committed:{...committed,enqueue:false}}));
+      }
+    }
+    throw new Error("WalCommitContended");
   }
   pruneEmbeddingCheckpointMetadata(namespace, today) {
     if (namespace !== this.env.ANTFLY_INCARNATION || !Number.isSafeInteger(today) || today < 0) throw new Error("InvalidEmbeddingCheckpointSweep");

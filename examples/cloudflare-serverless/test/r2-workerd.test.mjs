@@ -25,9 +25,10 @@ async function fixture(namespace, migration = false) {
   const output=fileURLToPath(new URL("../dist/worker/",import.meta.url));
   const wasm=(await readdir(output)).filter(name=>name.endsWith(".wasm"));
   const options={modulesRoot:output,modules:[{type:"ESModule",path:join(output,"r2-harness.mjs"),contents:`
-    import worker, {R2CommitCoordinator as R2Base,CommitCoordinator as LegacyBase} from "./worker.js";
+    import worker, {R2CommitCoordinator as R2Base,CommitCoordinator as LegacyBase,R2ReadRuntime,R2BuildRuntime} from "./worker.js";
+    export {R2ReadRuntime,R2BuildRuntime};
     export class R2CommitCoordinator extends R2Base {
-      commitMutations(inputs){this.groupSizes??=[];this.groupSizes.push(inputs.length);return super.commitMutations(inputs);}
+      commitMutations(inputs,deadline){this.groupSizes??=[];this.groupSizes.push(inputs.length);return super.commitMutations(inputs,deadline);}
       mutationDiagnostics(){return this.groupSizes??[];}
       async erasePlatformStorage(){await this.ctx.storage.deleteAll();}
       diagnostics(){return this.store.transaction(async tx=>({state:await tx.get("__antfly_collection"),tasks:(await tx.list({prefix:"__antfly_gc/tasks/"})).size,pending:(await tx.list({prefix:"__antfly_gc/pending/"})).size,marks:(await tx.list({prefix:"__antfly_gc/marks/"})).size}));}
@@ -38,6 +39,7 @@ async function fixture(namespace, migration = false) {
     }
     export default {async fetch(request,env,ctx){
       const path=new URL(request.url).pathname,stub=env.COMMITS.getByName(env.ANTFLY_INCARNATION),source=(env.LEGACY_COMMITS??env.COMMITS).getByName(env.ANTFLY_INCARNATION);
+      if(path==="/runtime-capabilities"){for(const [binding,op] of [["READERS","mutate"],["BUILDERS","lookup"]]){try{await env[binding].getByName(JSON.stringify(["runtime-v1",env.ANTFLY_INCARNATION,0])).execute({op});return Response.json({rejected:false});}catch(error){if(!String(error).includes("RuntimeCapabilityUnsupported"))throw error;}}return Response.json({rejected:true});}
       if(path==="/mutation-groups"){const tenant=request.headers.get("X-Antfly-Tenant"),name=tenant?JSON.parse(env.ANTFLY_TENANTS)[tenant].incarnation:env.ANTFLY_INCARNATION;return Response.json(await env.COMMITS.getByName(name).mutationDiagnostics());}
       if(path==="/wipe-platform"){await stub.erasePlatformStorage();return Response.json({done:true});}
       if(path==="/advance"){await source.advanceMigration();return Response.json({done:true});}
@@ -48,6 +50,7 @@ async function fixture(namespace, migration = false) {
       return worker.fetch(request,{...env,MAINTENANCE:{async send(){}}},ctx);
     }};
   `},{type:"ESModule",path:join(output,"worker.js")},...wasm.map(name=>({type:"CompiledWasm",path:join(output,name)}))],compatibilityDate:"2026-10-23",bindings:{API_TOKEN:"test-r2",ANTFLY_INCARNATION:namespace,PAGED_PROJECTIONS:"true",PUBLICATION_RECORDS:"8",COORDINATOR_BACKEND:migration?"sqlite":"r2"},r2Buckets:["DATABASE"],durableObjects:{COMMITS:{className:migration?"CommitCoordinator":"R2CommitCoordinator",useSQLite:true,unsafeUniqueKey:migration?"legacy":"native"}},resourcePersistencePath:join(persist,"resources"),isolatedResourcePersistencePath:join(persist,"isolated")};
+  options.durableObjects.READERS={className:"R2ReadRuntime",useSQLite:true,unsafeUniqueKey:"readers"};options.durableObjects.BUILDERS={className:"R2BuildRuntime",useSQLite:true,unsafeUniqueKey:"builders"};
   let mf;
   const reopen=async()=>{if(mf)await mf.dispose();mf=new Miniflare(convertV4MiniflareOptions(options));};
   const call=async(body,path="/api",allowed=200,tenant)=>{
@@ -132,6 +135,7 @@ test("SQLite migration freezes the source and preserves receipts, profiles and a
 test("tenant commit domains isolate identical IDs and admit grouped writers",{timeout:120000},async()=>{
  const f=await fixture("tenant-root");try{
   f.options.bindings.ANTFLY_TENANTS=JSON.stringify({a:{incarnation:"tenant-a",storage_id:"tenant-store-a"},b:{incarnation:"tenant-b",storage_id:"tenant-store-b"}});await f.reopen();
+  assert.equal((await f.call({},"/runtime-capabilities")).rejected,true);
   const mutation=label=>({op:"mutate",operation_id:"same-operation",mutations:[{kind:"upsert",doc_id:"same-document",body:JSON.stringify({text:label})}]});
   const a=await f.call(mutation("first"),"/api",200,"a"),b=await f.call(mutation("second"),"/api",200,"b");assert.notEqual(a.visibility,b.visibility);
   while((await f.call({op:"publish"},"/api",200,"a")).has_more){}while((await f.call({op:"publish"},"/api",200,"b")).has_more){}

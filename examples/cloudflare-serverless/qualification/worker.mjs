@@ -13,7 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import app, { CommitCoordinator as Coordinator, R2CommitCoordinator as R2Coordinator } from "../worker.mjs";
+import app, { CommitCoordinator as Coordinator, R2CommitCoordinator as R2Coordinator, R2ReadRuntime as ReadRuntime, R2BuildRuntime as BuildRuntime } from "../worker.mjs";
+export {R2ReadRuntime,R2BuildRuntime} from "../worker.mjs";
 // This wrapper is bundled only by the disposable qualification configuration.
 export class CommitCoordinator extends Coordinator {
   collection(op, args) {
@@ -36,6 +37,13 @@ export class R2CommitCoordinator extends R2Coordinator {
 }
 export class ReopenedR2CommitCoordinator extends R2CommitCoordinator {}
 export class ColdR2CommitCoordinator extends R2CommitCoordinator {}
+export class ColdReadRuntime extends ReadRuntime {}
+export class ColdBuildRuntime extends BuildRuntime {}
+export class FinalR2CommitCoordinator extends R2CommitCoordinator {}
+export class FinalReadRuntime extends ReadRuntime {}
+export class FinalBuildRuntime extends BuildRuntime {}
+export class ReopenedReadRuntime extends ReadRuntime {}
+export class ReopenedBuildRuntime extends BuildRuntime {}
 export default {
   ...app,
   async fetch(request, env, ctx) {
