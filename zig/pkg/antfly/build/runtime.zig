@@ -285,6 +285,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         .optimize = optimize,
     });
     linked_inference_abi_integration_mod.addImport("antfly_inference_bridge", production_antfly_imports.inference_bridge);
+    linked_inference_abi_integration_mod.addImport("antfly_runtime_abi", production_antfly_imports.runtime_abi);
     // This executable loads the production archive, including version consumers.
     production_antfly_imports.build_info.link(linked_inference_abi_integration_mod);
     linked_inference_abi_integration_mod.link_libc = link_libc;

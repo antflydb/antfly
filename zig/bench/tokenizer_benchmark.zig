@@ -643,6 +643,8 @@ fn runStageDiagnostics(
         tokenizer_json,
     );
     defer no_cache_hf.deinitSelf();
+    // Keep the serial reference independent of safe-boundary partitioning.
+    no_cache_hf.bpe_merge_boundaries = .full;
     try no_cache_hf.configureBpeCache(.{ .max_bytes = 0 });
     const no_cache_started = std.Io.Timestamp.now(io, .awake);
     var serial_no_cache_tokens: usize = 0;
