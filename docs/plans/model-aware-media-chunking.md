@@ -644,12 +644,13 @@ this optional accelerator, preserving ordinary reconstruction.
 
 An inference-owned disk store beneath `models_dir/.antfly-audio-plans` preserves
 checksummed snapshots across process restarts. Fixed hash slots bound storage to
-256 snapshots (16.1 MiB), 256 temporary snapshots and 256 empty lock files. Full
+256 snapshots (16.2 MiB), 256 temporary snapshots and 256 empty lock files. Full
 keys reject collisions. Per-slot cooperative mutexes and nonblocking OS file
 locks coordinate owners sharing a models directory. Writes sync and rename a
 complete snapshot; torn/missing records reconstruct rather than weakening
-source or model fences. A plan retains at most 4,096 ordered anchors; compaction
-keeps earlier sparse anchors and the advancing tail, independent of duration.
+source or model fences. A plan retains at most 4,096 ordered anchors; retention
+keeps a uniform ordinal grid, recent repair anchors and the advancing tail,
+independent of duration.
 Read-only/ephemeral model directories and cache eviction remain safe fallbacks.
 Unpinned and unknown-length forward streams do not restore seek checkpoints.
 Codec-directory cold starts retain their existing behavior.
@@ -670,7 +671,7 @@ RSS or live-model latency.
 Requests borrow immutable snapshots only while selecting a restart anchor, then
 release the view before decoding or model execution. Only the selected point and
 high-water ordinal remain. An inline buffer retains at most 4,096 newly derived
-anchors (64 KiB), using the same sparse compaction as retained plans. It needs
+anchors (64 KiB), using the same bounded grid retention as retained plans. It needs
 no heap lease during inference. Model pressure can reclaim the cached snapshot
 without invalidating the selected restart point.
 
@@ -695,3 +696,31 @@ fixture now reads zero checkpoint bytes and makes no redundant cache copies,
 versus 65,612,000 disk bytes and 65,536,000 copied bytes. This is approximately
 130x for the metadata-only planning/checkpoint component, with identical emitted
 ordinals and no model execution. It is not live-model throughput or RSS evidence.
+
+
+## Long-stream spacing and repair backfill
+
+The former every-other compaction repeatedly thinned the whole directory while
+retaining a dense new tail. After 100,000 windows, its first gap spanned 75,776
+ordinals. New directories retain exact derived boundaries on a power-of-two
+ordinal grid, with space reserved for the frontier and 64 recent inserted repair
+anchors. A continuously built directory bounds every historical gap by its
+current grid stride (32 at 100,000 windows), within the same 4,096-anchor limit.
+Recent repair anchors use insertion order; reads do not rewrite their age.
+
+The version-2 disk encoding persists spacing and repair hints and still reads
+version-1 snapshots. Legacy gaps are filled only from boundaries reconstructed
+by the real planner. A repair retains grid points traversed before its target
+and the exact target, even without advancing the frontier. Cache updates merge
+off-lock and compare content identities before replacement, retrying concurrent
+updates; disk updates merge under the existing slot locks. Neither path can
+overwrite a newer frontier with an older repair. Public cursors and identity
+fences remain unchanged.
+
+A production-planner fixture repairs ordinal 37,889 in a synthetic 100,000-window
+range-backed WAV. The legacy directory reads 151,560,044 source bytes (37,894
+reads) for the first repair. After persisting its backfill and recreating cache
+and store owners, the same repair reads 4,044 bytes (5 reads). An incrementally
+built new directory reads 8,044 bytes (6 reads), approximately 99.995% fewer
+bytes than the legacy first repair. All three emit identical source coordinates.
+These are deterministic planning/range-read measurements, not live-model latency.

@@ -2120,3 +2120,132 @@ test "model aware media checkpoint ownership preserves tight PCM budgets for rep
     try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) > 0);
     try std.testing.expectEqual(@as(usize, 0), fixture.controller.snapshot().host_scratch_bytes);
 }
+
+test "model aware media incremental spacing and legacy repair backfill bound long-stream source reads" {
+    const Plan = @import("media_audio_plan.zig");
+    const Cache = @import("media_index_cache.zig").Cache;
+    const Fixture = struct {
+        header: [44]u8,
+        bytes: usize = 0,
+        reads: usize = 0,
+        emitted: usize = 0,
+        coordinates: ?planning.Coordinates = null,
+        controller: @import("../runtime/tier/memory.zig").AdmissionController = .{},
+        fn acquire(raw: *anyopaque, amount: usize) !@import("../runtime/tier/memory.zig").AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.controller.tryAcquire(.cpu, .{ .host_limit_bytes = Cache.max_bytes }, .{ .host_scratch_bytes = amount }, false);
+        }
+        fn read(raw: *anyopaque, offset: u64, out: []u8, control: media.source.Control) !usize {
+            try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.bytes += out.len;
+            self.reads += 1;
+            const sample = std.mem.toBytes(@as(u32, @bitCast(@as(f32, 0.25))));
+            for (out, 0..) |*byte, i| {
+                const at = offset + i;
+                byte.* = if (at < 44) self.header[@intCast(at)] else sample[@intCast((at - 44) % 4)];
+            }
+            return out.len;
+        }
+        fn accept(raw: *anyopaque, item: Item) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u64, 37889), item.descriptor.ordinal);
+            self.coordinates = item.descriptor.coordinates;
+            self.emitted += 1;
+        }
+    };
+    const a = std.heap.page_allocator;
+    const windows = 100000;
+    const rate = 1000;
+    const target = 37889;
+    const tiny = try audio.wav.encodeInterleaved(a, &.{0.25}, 1, .{ .audio_format = 3, .sample_rate = rate, .bits_per_sample = 32 });
+    defer a.free(tiny);
+    var fixture = Fixture{ .header = tiny[0..44].* };
+    const data_bytes = windows * rate * 4;
+    std.mem.writeInt(u32, fixture.header[4..8], data_bytes + 36, .little);
+    std.mem.writeInt(u32, fixture.header[40..44], data_bytes, .little);
+    var source = media.source.Source{ .allocator = a, .identity = "uniform-checkpoint-review", .storage = .{ .range = .{ .context = &fixture, .read_at = Fixture.read, .length = data_bytes + 44, .immutable_binding = @splat(4) } }, .limits = .{ .max_read_bytes = 64 * 1024, .max_retained_bytes = 128 * 1024, .max_total_bytes = 512 * 1024 * 1024 } };
+    var executor = Qualification{};
+    const request = Request{ .input = .{ .binary = .{ .mime_type = "audio/wav", .data = &.{} } }, .native_source = &source, .source_version = "v1", .policy = .{ .window_ns = std.time.ns_per_s, .audio_pause_ns = 50 * std.time.ns_per_ms }, .max_chunks = 1, .execute = false, .max_working_bytes = 8 * 1024 * 1024 };
+    var runner = try Runner.init(a, request, executor.executor(), .{}, .{ .context = &fixture, .accept = Fixture.accept });
+    const identity = runner.summary.identity;
+    const key = Plan.key(&source, identity.plan, rate, windows * rate).?;
+    // Reproduce an on-disk v1 directory after the former compactor aged out
+    // early anchors. Its coordinates remain valid and must not be discarded.
+    var legacy = std.ArrayList(Plan.Point).empty;
+    defer legacy.deinit(a);
+    for (0..windows + 1) |i| {
+        if (legacy.items.len == Plan.max_points) {
+            for (0..Plan.max_points / 2) |n| legacy.items[n] = legacy.items[n * 2];
+            legacy.items.len /= 2;
+        }
+        try legacy.append(a, .{ .ordinal = i, .offset_ns = @as(i64, @intCast(i)) * std.time.ns_per_s });
+    }
+    var uniform = Plan.Builder{};
+    defer uniform.deinit(a);
+    for (0..windows + 1) |i| try uniform.append(a, .{ .ordinal = i, .offset_ns = @as(i64, @intCast(i)) * std.time.ns_per_s });
+    try uniform.snapshot().validate();
+    try std.testing.expect(uniform.points.items.len <= Plan.max_points);
+    for (uniform.points.items[1..], uniform.points.items[0 .. uniform.points.items.len - 1]) |next, previous| try std.testing.expect(next.ordinal - previous.ordinal <= uniform.snapshot().stride);
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buffer, ".zig-cache/tmp/{s}", .{temp.sub_path});
+    var directory_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const directory = try std.fmt.bufPrint(&directory_buffer, "{s}/.antfly-audio-plans", .{root});
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory);
+    var file_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const file = try std.fmt.bufPrint(&file_buffer, "{s}/{x:0>2}.plan", .{ directory, key[0] });
+    const encoded = try a.alloc(u8, 76 + legacy.items.len * 16);
+    defer a.free(encoded);
+    @memcpy(encoded[0..8], "AFAP0001");
+    @memcpy(encoded[8..40], &key);
+    std.mem.writeInt(u32, encoded[40..44], @intCast(legacy.items.len), .little);
+    for (legacy.items, 0..) |point, i| {
+        std.mem.writeInt(u64, encoded[44 + i * 16 ..][0..8], point.ordinal, .little);
+        std.mem.writeInt(i64, encoded[52 + i * 16 ..][0..8], point.offset_ns, .little);
+    }
+    std.crypto.hash.sha2.Sha256.hash(encoded[0 .. encoded.len - 32], encoded[encoded.len - 32 ..][0..32], .{});
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = file, .data = encoded });
+    var coordinates: [3]planning.Coordinates = undefined;
+    var bytes: [3]usize = undefined;
+    for (0..3) |mode| {
+        fixture.bytes = 0;
+        fixture.reads = 0;
+        fixture.emitted = 0;
+        {
+            // Mode 1 recreates both owners and relies only on the improved
+            // durable directory written while repairing the legacy gap.
+            var cache = Cache{};
+            defer cache.deinit();
+            var store = Plan.Store{};
+            const context = Plan.Store.Context{ .store = &store, .io = std.testing.io, .models_dir = root };
+            if (mode == 2) cache.remember(a, key, .{ .audio_plan = uniform.snapshot() }, .{ .context = &fixture, .acquire = Fixture.acquire });
+            var cursor: [85]u8 = undefined;
+            var repair = request;
+            repair.continuation = identity.cursor(target, &cursor);
+            repair.index_cache = &cache;
+            repair.index_cache_admission = .{ .context = &fixture, .acquire = Fixture.acquire };
+            if (mode != 2) repair.audio_plan_store = context;
+            runner = try Runner.init(a, repair, executor.executor(), .{}, .{ .context = &fixture, .accept = Fixture.accept });
+            _ = try runner.run();
+            try std.testing.expectEqual(@as(usize, 1), fixture.emitted);
+            coordinates[mode] = fixture.coordinates.?;
+            bytes[mode] = fixture.bytes;
+            if (mode != 2) {
+                const saved = try Plan.Store.load(context, a, key);
+                defer saved.deinit(a);
+                try std.testing.expectEqual(@as(u64, windows), saved.points[saved.points.len - 1].ordinal);
+                try std.testing.expectEqual(@as(u64, target), saved.nearest(target).?.ordinal);
+                try std.testing.expectEqual(@as(u64, 32), saved.stride);
+            }
+            std.debug.print("checkpoint spacing windows={d} target={d} mode={d} source_reads={d} source_bytes={d} emitted=1\n", .{ windows, target, mode, fixture.reads, fixture.bytes });
+        }
+        try std.testing.expectEqual(@as(usize, 0), fixture.controller.snapshot().host_scratch_bytes);
+    }
+    try std.testing.expectEqualDeep(coordinates[0], coordinates[1]);
+    try std.testing.expectEqualDeep(coordinates[0], coordinates[2]);
+    try std.testing.expectEqual(@as(usize, 151560044), bytes[0]);
+    try std.testing.expectEqual(@as(usize, 4044), bytes[1]);
+    try std.testing.expectEqual(@as(usize, 8044), bytes[2]);
+}

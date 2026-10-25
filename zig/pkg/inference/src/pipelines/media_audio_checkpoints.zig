@@ -32,8 +32,9 @@ pub const Owner = struct {
     ordinal: u64,
     restore: ?plan.Point = null,
     initial_tail: ?u64 = null,
-    pending: [plan.max_points]plan.Point = undefined,
-    count: usize = 0,
+    frontier: ?plan.Point = null,
+    pending: plan.Buffer = .{},
+    recording: bool = true,
     finished: bool = false,
 
     /// Initialize only at the final address: scratch borrows this allocator.
@@ -44,10 +45,10 @@ pub const Owner = struct {
         self.scratch = .{ .backing = self.allocation.allocator(), .limit = 4 * plan.max_encoded_bytes };
         self.observeMemory();
         // Another inference owner can have persisted a newer tail than RAM.
-        if (self.initial_tail) |tail| if (tail >= ordinal) return;
+        if (self.restore) |point| if (point.ordinal == ordinal) return;
         const context = store orelse return;
         const saved = plan.Store.load(context, self.allocator(), identity) catch return;
-        defer self.allocator().free(saved.points);
+        defer saved.deinit(self.allocator());
         self.observe(saved);
         // Promote disk-loaded unchanged repairs once, without rewriting disk.
         cache.remember(backing, identity, .{ .audio_plan = saved }, admission);
@@ -62,69 +63,68 @@ pub const Owner = struct {
         if (hit.data == .audio_plan) self.observe(hit.data.audio_plan);
     }
     fn observe(self: *Owner, snapshot: plan.Snapshot) void {
-        const tail = snapshot.points[snapshot.points.len - 1].ordinal;
-        if (self.initial_tail) |old| if (tail <= old) return;
-        self.initial_tail = tail;
-        self.restore = snapshot.nearest(self.ordinal);
+        const frontier = snapshot.points[snapshot.points.len - 1];
+        if (self.initial_tail == null or frontier.ordinal > self.initial_tail.?) {
+            self.initial_tail = frontier.ordinal;
+            self.frontier = frontier;
+        }
+        if (snapshot.nearest(self.ordinal)) |point| {
+            if (self.restore == null or point.ordinal > self.restore.?.ordinal) self.restore = point;
+        }
     }
     pub fn checkpoint(self: *const Owner) ?plan.Point {
         return self.restore;
     }
     pub fn append(self: *Owner, point: plan.Point) void {
-        if (self.finished) return;
-        if (self.initial_tail) |tail| if (point.ordinal <= tail) return;
-        if (self.count != 0 and point.ordinal <= self.pending[self.count - 1].ordinal) return;
-        // Fixed request-local storage cannot consume PCM admission or pin a
-        // cache lease during inference. Long pages retain sparse new anchors.
-        if (self.count == self.pending.len) self.count = plan.compact(&self.pending);
-        self.pending[self.count] = point;
-        self.count += 1;
-    }
-    fn seed(self: *Owner, merged: *plan.Builder, snapshot: plan.Snapshot) bool {
-        const a = self.allocator();
-        merged.points.clearRetainingCapacity();
-        merged.points.ensureTotalCapacityPrecise(a, @min(plan.max_points, snapshot.points.len + self.count)) catch return false;
-        for (snapshot.points) |point| merged.append(a, point) catch return false;
-        return true;
+        if (self.finished or !self.recording) return;
+        var hot = false;
+        if (self.initial_tail) |tail| if (point.ordinal <= tail) {
+            if (point.ordinal == self.ordinal) {
+                if (self.restore != null and self.restore.?.ordinal == point.ordinal) return;
+                hot = true;
+            } else {
+                // A reconstructed gap can repair missing old grid anchors,
+                // but unchanged known repairs still allocate/publish nothing.
+                if (point.ordinal > self.ordinal or (self.restore != null and point.ordinal <= self.restore.?.ordinal) or point.ordinal % plan.strideFor(tail) != 0) return;
+            }
+        };
+        if (self.pending.count == 0) if (self.frontier) |frontier| self.pending.append(frontier, false) catch {
+            self.recording = false;
+            return;
+        };
+        self.pending.append(point, hot) catch {
+            self.recording = false;
+        };
     }
     pub fn finish(self: *Owner) void {
         if (self.finished) return;
         self.finished = true;
-        if (self.count == 0) return;
+        if (!self.recording or self.pending.count == 0) return;
         const a = self.allocator();
         var merged = plan.Builder{};
         defer merged.deinit(a);
-        const through = self.pending[self.count - 1].ordinal;
         var base_tail: ?u64 = null;
+        var original_digest: ?[32]u8 = null;
         if (self.cache.get(self.identity)) |hit| {
             defer self.cache.release(hit);
             if (hit.data == .audio_plan) {
                 const base = hit.data.audio_plan;
                 base_tail = base.points[base.points.len - 1].ordinal;
-                if (base_tail.? >= through) return;
-                if (!self.seed(&merged, base)) return;
+                original_digest = base.digest();
+                merged.merge(a, base) catch return;
             }
         }
-        // Reacquire after PCM retires. If pressure removed our initial view,
-        // recover its durable prefix instead of publishing a thinner snapshot.
         if (base_tail == null or (self.initial_tail != null and base_tail.? < self.initial_tail.?)) if (self.store) |context| {
             if (plan.Store.load(context, a, self.identity)) |saved| {
-                defer a.free(saved.points);
-                const tail = saved.points[saved.points.len - 1].ordinal;
-                if (tail >= through) {
-                    self.cache.remember(self.allocation.backing, self.identity, .{ .audio_plan = saved }, self.admission);
-                    return;
-                }
-                if (base_tail == null or tail > base_tail.?) {
-                    if (!self.seed(&merged, saved)) return;
-                    base_tail = tail;
-                }
+                defer saved.deinit(a);
+                merged.merge(a, saved) catch return;
             } else |_| {}
         };
-        if (base_tail == null) merged.points.ensureTotalCapacityPrecise(a, self.count) catch return;
-        for (self.pending[0..self.count]) |point| merged.append(a, point) catch return;
-        self.cache.remember(self.allocation.backing, self.identity, .{ .audio_plan = merged.snapshot() }, self.admission);
-        if (self.store) |context| plan.Store.save(context, a, self.identity, merged.snapshot()) catch {};
+        merged.merge(a, self.pending.snapshot()) catch return;
+        const snapshot = merged.snapshot();
+        if (original_digest) |digest| if (std.mem.eql(u8, &digest, &snapshot.digest())) return;
+        self.cache.remember(self.allocation.backing, self.identity, .{ .audio_plan = snapshot }, self.admission);
+        if (self.store) |context| plan.Store.save(context, a, self.identity, snapshot) catch {};
     }
     pub fn deinit(self: *Owner) void {
         self.allocation.deinit();
@@ -201,7 +201,7 @@ test "model aware media checkpoint owner borrows unchanged plans without allocat
         var owner: Owner = undefined;
         owner.init(a, &cache, fixture.admission(), identity, context, 2000);
         defer owner.deinit();
-        try std.testing.expectEqual(@as(usize, 0), owner.count);
+        try std.testing.expectEqual(@as(usize, 0), owner.pending.count);
         try std.testing.expectEqual(@as(usize, 0), owner.allocation.reserved_bytes);
         owner.append(points[2000]);
         owner.append(points[2001]);
@@ -247,7 +247,7 @@ test "model aware media checkpoint owner isolates admission and allocation failu
         owner.init(a, &cache, denied.admission(), @splat(2), null, 0);
         defer owner.deinit();
         owner.append(.{ .ordinal = 0, .offset_ns = 0 });
-        try std.testing.expectEqual(@as(usize, 1), owner.count);
+        try std.testing.expectEqual(@as(usize, 1), owner.pending.count);
         owner.finish();
     }
     try std.testing.expectEqual(@as(usize, 0), cache.count);
