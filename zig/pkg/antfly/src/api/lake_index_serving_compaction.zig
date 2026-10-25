@@ -1206,6 +1206,14 @@ test "external lake global frontier ordered compaction composes interleaved orig
         var region = std.heap.ArenaAllocator.init(budget.allocator());
         defer region.deinit();
         const identities = try @import("lake_index_text_predicate.zig").Identities.init(region.allocator(), root, writer.snapshot());
+        const Failure = struct {
+            fn run(allocator: A, fixture: corpus.Root, snapshot: *const local.index.IndexSnapshot) !void {
+                var owner = std.heap.ArenaAllocator.init(allocator);
+                defer owner.deinit();
+                _ = try @import("lake_index_text_predicate.zig").Identities.init(owner.allocator(), fixture, snapshot);
+            }
+        };
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Failure.run, .{ root, writer.snapshot() });
         try std.testing.expectEqual(@as(usize, 0), identities.spans.len);
         try std.testing.expectEqual(@as(usize, 2), identities.compact_sources.len);
         try std.testing.expectEqual(@as(usize, 16384), identities.compact_spans.len);

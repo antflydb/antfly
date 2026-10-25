@@ -369,6 +369,9 @@ pub const Identities = struct {
                 const lower = try std.math.add(u32, offsets[segment], src.pack_lower);
                 const upper = try std.math.add(u32, lower, src.count);
                 const list = try mappings.getOrPut(std.heap.page_allocator, src.file.id);
+                // The temporary map is unwound even if owning path allocation
+                // fails below. Never leave a newly inserted list undefined.
+                if (!list.found_existing) list.value_ptr.* = .{ .index = 0 };
                 const entry = try result.files.getOrPut(a, src.file.id);
                 if (!list.found_existing) {
                     if (entry.found_existing) return error.InvalidNativeLakeTextCorpus;
