@@ -34,10 +34,11 @@ pub const term_directory = @import("lake_index_term_directory.zig");
 // Never reuse a v8 source-free segment as a covered stored-text sidecar.
 // V11 authenticates independent serving packs and original-source spans.
 // V13/protocol 83 share source dictionaries across compact range pages.
-// Historical JSON, v12 page-local dictionaries and v9-v12 roots remain readable.
-pub const metadata_version: u16 = 13;
+// V14/protocol 85 add authenticated typed routing bounds and ordering-key trees.
+// Historical JSON, v12 page-local dictionaries and v9-v13 roots remain readable.
+pub const metadata_version: u16 = 14;
 pub fn supportsBuildMetadata(version: u16) bool {
-    return version == 9 or version == 10 or version == 11 or version == 12 or version == metadata_version;
+    return version == 9 or version == 10 or version == 11 or version == 12 or version == 13 or version == metadata_version;
 }
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const max_segments = 262144;
@@ -113,6 +114,7 @@ pub const SegmentRouting = struct {
     doc_count: u32,
     fields: []const Field,
     descriptor: ?artifacts.ChunkRef = null,
+    sort_bound: ?@import("lake_index_sort_bounds.zig").Bound = null,
     /// Authenticated live native ordinal ranges; empty means unmasked.
     live: []const text_directory.Interval = &.{},
 };
@@ -135,6 +137,7 @@ pub fn validateMembers(members: []const Member, domain: [32]u8, lower: u32, coun
     if (next != try std.math.add(u32, lower, count)) return error.InvalidNativeLakeTextCorpus;
 }
 pub const FileGroup = struct {
+    sort_bounds: []const ?@import("lake_index_sort_bounds.zig").Bound = &.{},
     file: state.File,
     sources: []const source_spans.Span = &.{},
     source_pages: []const artifacts.ChunkRef = &.{},
@@ -1163,7 +1166,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v12:{s}", .{want.binding.index_config_hash});
         const recipe = try sourceRecipe(ca, table, spec.config_json, store_source);
         const prior = for (reusable) |declaration| {
-            if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == metadata_version and std.mem.eql(u8, declaration.name, want.name) and rebuild.bindingsEqual(declaration.binding, binding)) break declaration;
+            if (declaration.artifact.kind == .text_segment and (declaration.artifact.metadata_version == 13 or declaration.artifact.metadata_version == metadata_version) and std.mem.eql(u8, declaration.name, want.name) and rebuild.bindingsEqual(declaration.binding, binding)) break declaration;
         } else null;
         var exact_seed: ?Root = null;
         var seed_artifact: ?[]const u8 = null;
@@ -1184,7 +1187,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             }
         }
         var seed: ?Root = if (exact_seed) |root| root else for (candidates) |declaration| {
-            if (declaration.artifact.kind != .text_segment or declaration.artifact.metadata_version != metadata_version or !std.mem.eql(u8, declaration.name, want.name)) continue;
+            if (declaration.artifact.kind != .text_segment or (declaration.artifact.metadata_version != 13 and declaration.artifact.metadata_version != metadata_version) or !std.mem.eql(u8, declaration.name, want.name)) continue;
             var old = declaration.binding;
             old.snapshot_id = binding.snapshot_id;
             if (!rebuild.bindingsEqual(old, binding)) continue;
@@ -1348,6 +1351,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             var summaries: std.ArrayList(?statistics.Ref) = .empty;
             var forwards: std.ArrayList(?statistics.Ref) = .empty;
             var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
+            var sort_bounds: std.ArrayList(?@import("lake_index_sort_bounds.zig").Bound) = .empty;
             if (!changed) {
                 if (paged_seed or (baseline != null and reference_seed)) continue;
                 const previous_group = if (manifest_seed) try loadRecordedFile(fa, store.*, previous_refs.get(file.id) orelse return error.InvalidNativeLakeTextCorpus, seed.?.domain, cancellation) else previous_groups.get(file.id) orelse return error.InvalidNativeLakeTextCorpus;
@@ -1358,6 +1362,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 group.forwards = previous_group.forwards;
                 group.opening_packs = previous_group.opening_packs;
                 group.admissions = previous_group.admissions;
+                group.sort_bounds = previous_group.sort_bounds;
                 group.descriptors = previous_group.descriptors;
                 group.physical_manifest = previous_group.physical_manifest;
                 group.parts = previous_group.parts;
@@ -1390,7 +1395,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             defer capture_manager.deinit();
             var output_manager: local.sql_spill.Manager = .{ .alloc = a, .io = capture_manager.io, .context = &capture_check, .checkpoint = capture_manager.checkpoint, .max_bytes = 768 * 1024 * 1024, .async_writes = false };
             defer output_manager.deinit();
-            var compactor: Compactor = .{ .index_sort = effective_sort, .ordered_coordinates = effective_sort.len != 0 and provider.fragment_rows != null and std.mem.startsWith(u8, source.inventory.files[file_ordinal].etag, "so1-"), .context = provider.context, .output_manager = &output_manager, .global = &df, .directory = &directory_builder, .capture_manager = &capture_manager, .a = a, .out = fa, .store = store, .segments = &segments, .summaries = &summaries, .forwards = &forwards, .admissions = &admissions, .cancellation = cancellation, .file_ordinal = file_ordinal, .opening = &opening, .io = provider.context.io };
+            var compactor: Compactor = .{ .index_sort = effective_sort, .ordered_coordinates = effective_sort.len != 0 and provider.fragment_rows != null and std.mem.startsWith(u8, source.inventory.files[file_ordinal].etag, "so1-"), .context = provider.context, .output_manager = &output_manager, .global = &df, .directory = &directory_builder, .capture_manager = &capture_manager, .a = a, .out = fa, .store = store, .segments = &segments, .summaries = &summaries, .forwards = &forwards, .admissions = &admissions, .sort_bounds = &sort_bounds, .cancellation = cancellation, .file_ordinal = file_ordinal, .opening = &opening, .io = provider.context.io };
             defer compactor.deinit();
             if (provider.rowsForFile(file_ordinal)) |selected| if (selected.len != 0 and selected.len < source.inventory.files[file_ordinal].row_count / 2 and file.key_digest != null) {
                 const old = if (previous_refs.get(file.id)) |record| try loadRecordedFile(fa, store.*, record, seed.?.domain, cancellation) else previous_groups.get(file.id);
@@ -1538,6 +1543,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             }
             group.statistics_replaces = compactor.statistics_replaces;
             group.admissions = admissions.items;
+            group.sort_bounds = if (sort_bounds.items.len == segments.items.len) sort_bounds.items else &.{};
             _ = batch_arena.reset(.free_all);
             builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
             input_bytes = 0;
@@ -2134,6 +2140,7 @@ const Compactor = struct {
     forward_complete: bool = true,
     statistics_replaces: ?[64]u8 = null,
     admissions: *std.ArrayList(local.segment.SegmentReader.Admission),
+    sort_bounds: ?*std.ArrayList(?@import("lake_index_sort_bounds.zig").Bound) = null,
     cancellation: Cancellation,
     file_ordinal: usize,
     opening: ?*@import("lake_index_text_opening_pack.zig").Collector = null,
@@ -2540,6 +2547,7 @@ const Compactor = struct {
         var reader = try local.segment.SegmentReader.initSource(a, source);
         defer reader.deinit();
         try self.admissions.append(out, try reader.admission(out));
+        if (self.sort_bounds) |bounds| try bounds.append(out, try @import("lake_index_sort_bounds.zig").Bound.fromReader(out, &reader));
         const contributions: statistics.Contributions = .{ .global = self.global, .directory = self.directory, .segment = term_directory.identity(ref.artifact_id) };
         const summary = (if (captured != null and !captured.?.disabled) captured.?.publishConsuming(store, cancellation, self.io, contributions) else statistics.publishReaderConsuming(a, store, &reader, cancellation, self.io, contributions)) catch |err| return buildFailure(err, "segment_statistics", self.file_ordinal, segments.items.len);
         if (self.forwards) |list| {
@@ -2832,6 +2840,13 @@ test "external lake text statistics wire upgrade fences new roots and admits his
     var ref: Ref = .{ .kind = .text_segment, .metadata_version = 9, .artifact_id = upload.artifact_id, .checksum = upload.checksum, .byte_len = upload.byte_len };
     const recovered = try loadRootDirectory(ca, store, ref, .none, null);
     try std.testing.expectEqual(metadata_version, recovered.version);
+    var v13 = legacy;
+    v13.version = 13;
+    const v13_bytes = try std.json.Stringify.valueAlloc(ca, v13, .{});
+    var v13_uploaded = try store.putWithCancellation(v13_bytes, .none);
+    defer v13_uploaded.deinit(a);
+    const retained_v13 = try loadRootDirectory(ca, store, .{ .kind = .text_segment, .metadata_version = 13, .artifact_id = v13_uploaded.artifact_id, .checksum = v13_uploaded.checksum, .byte_len = v13_uploaded.byte_len }, .none, null);
+    try std.testing.expectEqual(metadata_version, retained_v13.version);
     // Metadata identity is checked against the authenticated body before any
     // normalization. Neither future formats nor a falsely advertised v10 pass.
     ref.metadata_version = metadata_version;

@@ -406,14 +406,14 @@ pub fn desiredArtifactsFromTableDefinitionAlloc(
     };
     const text_specs = try lakeTextIndexSpecsAlloc(alloc, index_root, allow_default);
     defer freeLakeTextIndexSpecs(alloc, text_specs);
-    const declared_text_revision = if (text_specs.len != 0) try declaredTextProjectionRevision(alloc, table.schema_json) else false;
+    const declared_text_revision = if (text_specs.len != 0) try declaredTextProjectionRevision(alloc, table.schema_json) else 0;
     for (text_specs) |spec| {
         const text_column = try textColumnFromIndexConfigAlloc(alloc, spec.config_json);
         defer alloc.free(text_column);
         const selected = try std.json.parseFromSlice(std.json.Value, alloc, spec.config_json, .{});
         defer selected.deinit();
         const whole_document = !textConfigSelectsField(selected.value);
-        const index_hash = try indexConfigHashAlloc(alloc, if (declared_text_revision and whole_document) "text-declared-sources-v2" else "text", spec.name, spec.config_json, &[_][]const u8{text_column});
+        const index_hash = try indexConfigHashAlloc(alloc, if (whole_document and declared_text_revision == 3) "text-document-policy-v3" else if (whole_document and declared_text_revision == 2) "text-declared-sources-v2" else "text", spec.name, spec.config_json, &[_][]const u8{text_column});
         defer alloc.free(index_hash);
         try appendDesiredArtifactAlloc(alloc, &artifacts, source, .{
             .name = spec.name,
@@ -1481,17 +1481,18 @@ fn textConfigSelectsField(config: std.json.Value) bool {
     };
     return false;
 }
-fn declaredTextProjectionRevision(a: Allocator, raw: []const u8) !bool {
-    if (raw.len == 0) return false;
+fn declaredTextProjectionRevision(a: Allocator, raw: []const u8) !u8 {
+    if (raw.len == 0) return 0;
     const value = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
     defer value.deinit();
-    if (value.value != .object or !value.value.object.contains("dynamic_templates")) return false;
+    if (value.value != .object or (!value.value.object.contains("dynamic_templates") and !value.value.object.contains("document_schemas"))) return 0;
     const schema = @import("antfly_local_sources").schema_mod;
     var parsed = try schema.parseValidatedTableSchema(a, raw);
     defer parsed.deinit(a);
     const runtime = try schema.deriveRuntimeTableSchema(a, parsed);
     defer @import("antfly_local_sources").storage_schema.freeSchema(a, runtime);
-    return @import("antfly_local_sources").storage_schema.hasHistoricalDeclaredTextExclusions(runtime);
+    const physical = @import("antfly_local_sources").storage_schema;
+    return if (physical.hasCrossDocumentTextExclusions(runtime)) 3 else if (physical.hasHistoricalDeclaredTextExclusions(runtime)) 2 else 0;
 }
 
 fn indexConfigHashAlloc(
@@ -3496,6 +3497,6 @@ test "external lake global frontier declared text policy fences only affected bi
     for ([_][]const u8{ "body_text", "vectors" }) |name| {
         try std.testing.expectEqualStrings(before.find(name).?.binding.index_config_hash, after.find(name).?.binding.index_config_hash);
     }
-    try std.testing.expect(!try declaredTextProjectionRevision(a, unaffected));
-    try std.testing.expect(try declaredTextProjectionRevision(a, affected));
+    try std.testing.expectEqual(@as(u8, 0), try declaredTextProjectionRevision(a, unaffected));
+    try std.testing.expectEqual(@as(u8, 2), try declaredTextProjectionRevision(a, affected));
 }

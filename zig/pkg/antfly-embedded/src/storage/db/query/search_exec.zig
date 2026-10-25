@@ -5644,6 +5644,38 @@ pub const SearchHitOrder = struct {
         _ = try compareSearchHitSortValues(self.effective.req, self.plan, hit, hit);
         if (!try searchHitAllowedByCursor(self.effective.req, self.plan, hit)) return error.InvalidQueryRequest;
     }
+    /// Strict primary dominance only: private IDs never bound public ties.
+    /// Unknown domains/directions or absent cutoff conservatively stay live.
+    pub fn nativeBoundsMayCompete(self: SearchHitOrder, fields: []const segment_mod.SegmentIndexSortField, bounds: segment_mod.SegmentIndexSortBounds, cutoff: []const std.json.Value) !bool {
+        const req = self.effective.req;
+        if (cutoff.len != req.order_by.len or req.order_by.len < 2 or !std.mem.eql(u8, req.order_by[req.order_by.len - 1].field, "_id")) return true;
+        const n = req.order_by.len - 1;
+        if (fields.len < n or bounds.first.len != fields.len or bounds.last.len != fields.len) return true;
+        var reversed: ?bool = null;
+        for (req.order_by[0..n], fields[0..n]) |wanted, physical| {
+            if (!std.mem.eql(u8, wanted.field, physical.field) or std.mem.eql(u8, wanted.field, "_score") or std.mem.eql(u8, wanted.field, "_id")) return true;
+            const reverse = wanted.desc != physical.desc;
+            if (reversed) |value| if (reverse != value) return true;
+            reversed = reverse;
+        }
+        const schema = self.plan.runtime_schema orelse return true;
+        for (fields, bounds.first, bounds.last) |field, first, last| {
+            const declaration: runtime_schema_mod.IndexSortField = .{ .field = field.field, .desc = field.desc };
+            if (!indexSortBoundValueMatchesField(schema, declaration, first) or !indexSortBoundValueMatchesField(schema, declaration, last)) return true;
+        }
+        if (fields.len > 32) return true;
+        var declarations: [32]runtime_schema_mod.IndexSortField = undefined;
+        for (fields, declarations[0..fields.len]) |field, *declaration| declaration.* = .{ .field = field.field, .desc = field.desc };
+        var physical_schema = schema;
+        physical_schema.index_sort = declarations[0..fields.len];
+        if (!indexSortBoundsAreOrdered(physical_schema, bounds)) return true;
+        var primary = req;
+        primary.order_by = req.order_by[0..n];
+        const before = req.search_before.len != 0;
+        const best = if (reversed.? != before) bounds.last else bounds.first;
+        const order = try compareSortedSegmentBoundToCursor(primary, self.plan, best[0..n], cutoff[0..n]);
+        return order != (if (before) std.math.Order.lt else .gt);
+    }
     pub fn compare(self: SearchHitOrder, left: types.SearchHit, right: types.SearchHit) std.math.Order {
         return compareSearchHitSortValues(self.effective.req, self.plan, left, right) catch unreachable;
     }
@@ -36614,4 +36646,34 @@ test "native public ordering seeks complete ties limit public endpoints to equal
         try std.testing.expectEqual(@as(usize, 100), count);
         try std.testing.expectEqual(@as(usize, 2), harness.calls);
     }
+}
+
+test "native public ordering seeks complete ties with conservative routing bounds" {
+    const a = std.testing.allocator;
+    var first = [_]segment_mod.SegmentIndexSortBoundValue{ .{ .i64_val = 9007199254740993 }, .{ .id = "private-z" } };
+    var last = [_]segment_mod.SegmentIndexSortBoundValue{ .{ .i64_val = 9007199254740995 }, .{ .id = "private-a" } };
+    const physical = [_]segment_mod.SegmentIndexSortField{ .{ .field = "price" }, .{ .field = "_id" } };
+    const bounds: segment_mod.SegmentIndexSortBounds = .{ .first = &first, .last = &last };
+    for ([_]bool{ false, true }) |descending| for ([_]bool{ false, true }) |backward| {
+        const cursor = [_]std.json.Value{ .{ .number_string = "9007199254740994" }, .{ .string = "public-cut" } };
+        var order = try SearchHitOrder.init(a, .{ .order_by = &.{ .{ .field = "price", .desc = descending }, .{ .field = "_id" } }, .search_before = if (backward) &cursor else &.{} }, testSortedPriceSchema());
+        defer order.deinit(a);
+        const high_wins = descending != backward;
+        const worse = [_]std.json.Value{ .{ .number_string = if (high_wins) "9007199254740996" else "9007199254740992" }, .{ .string = "public-cut" } };
+        try std.testing.expect(!try order.nativeBoundsMayCompete(&physical, bounds, &worse));
+        const equal = [_]std.json.Value{ .{ .number_string = if (high_wins) "9007199254740995" else "9007199254740993" }, .{ .string = "any-public-id" } };
+        try std.testing.expect(try order.nativeBoundsMayCompete(&physical, bounds, &equal));
+        try std.testing.expect(try order.nativeBoundsMayCompete(&physical, bounds, &cursor));
+        // Corrupt or absent evidence must never prune.
+        try std.testing.expect(try order.nativeBoundsMayCompete(&physical, .{ .first = &last, .last = &first }, &worse));
+        try std.testing.expect(try order.nativeBoundsMayCompete(&physical, bounds, &.{}));
+    };
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{ .name = "when", .path_match = "when", .mapping = .{ .field_type = .datetime, .doc_values = true, .sortable = true } }};
+    var dated = try SearchHitOrder.init(a, .{ .order_by = &.{ .{ .field = "when" }, .{ .field = "_id" } } }, .{ .dynamic_templates = &templates });
+    defer dated.deinit(a);
+    first[0] = .{ .datetime_ns = -2000000000 };
+    last[0] = .{ .datetime_ns = -1000000000 };
+    const date_fields = [_]segment_mod.SegmentIndexSortField{ .{ .field = "when" }, .{ .field = "_id" } };
+    try std.testing.expect(!try dated.nativeBoundsMayCompete(&date_fields, bounds, &.{ .{ .string = "1969-12-31T23:59:57Z" }, .{ .string = "cut" } }));
+    try std.testing.expect(try dated.nativeBoundsMayCompete(&date_fields, bounds, &.{ .{ .string = "1969-12-31T23:59:58Z" }, .{ .string = "cut" } }));
 }

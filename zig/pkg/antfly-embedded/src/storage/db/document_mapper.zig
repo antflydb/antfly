@@ -2828,6 +2828,8 @@ fn appendSchemaTextFields(
     text_analysis: introducer_mod.TextAnalysisConfig,
     observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
 ) !void {
+    var physical_schema = schema;
+    if (document_schema.physical_exact_fields) |rules| physical_schema.exact_fields = rules;
     for (document_schema.fields) |field| {
         var values = std.ArrayListUnmanaged([]const u8).empty;
         defer values.deinit(alloc);
@@ -2840,9 +2842,9 @@ fn appendSchemaTextFields(
         // Declared sources own their physical policy. A declaration-only
         // resolver also matches dynamic templates without checking the runtime
         // JSON type; those templates belong to the dynamic-value path below.
-        if (runtime_schema.declaredTextSourceDisabled(schema, field.path)) {
+        if (runtime_schema.declaredTextSourceDisabled(physical_schema, field.path)) {
             if (std.mem.eql(u8, field.path, field.emitted_name)) {
-                for (values.items) |text| try appendMappedSubfieldTextFields(alloc, fields, field.path, text, schema, text_analysis, observed_field_analyzers);
+                for (values.items) |text| try appendMappedSubfieldTextFields(alloc, fields, field.path, text, physical_schema, text_analysis, observed_field_analyzers);
             }
             continue;
         }
@@ -2865,13 +2867,13 @@ fn appendSchemaTextFields(
         }
         if (std.mem.eql(u8, field.path, field.emitted_name)) {
             for (values.items) |text| {
-                try appendMappedSubfieldTextFields(alloc, fields, field.path, text, schema, text_analysis, observed_field_analyzers);
+                try appendMappedSubfieldTextFields(alloc, fields, field.path, text, physical_schema, text_analysis, observed_field_analyzers);
             }
         }
     }
     // A disabled root can still declare separately indexed named subfields.
     // Its source remains available even though the root emits no postings.
-    for (schema.exact_fields) |field| {
+    for (physical_schema.exact_fields) |field| {
         if (field.mapping.do_index or !std.mem.eql(u8, field.field, field.source_field)) continue;
         if (!runtime_schema.containsPath(document_schema.declared_paths, field.source_field) or
             runtime_schema.pathFallsUnderAnyPrefix(document_schema.unindexed_paths, field.source_field)) continue;
@@ -2884,7 +2886,7 @@ fn appendSchemaTextFields(
         var values: std.ArrayListUnmanaged([]const u8) = .empty;
         defer values.deinit(alloc);
         try collectFieldValues(alloc, &values, root, field.source_field);
-        for (values.items) |text| try appendMappedSubfieldTextFields(alloc, fields, field.source_field, text, schema, text_analysis, observed_field_analyzers);
+        for (values.items) |text| try appendMappedSubfieldTextFields(alloc, fields, field.source_field, text, physical_schema, text_analysis, observed_field_analyzers);
     }
 }
 
@@ -3221,12 +3223,16 @@ fn collectDynamicSchemaTextFields(
                     return;
                 }
             }
-            if (resolveDynamicTextMapping(schema, path, text)) |mapping| {
+            var text_schema = schema;
+            if (document_schema) |resolved| if (resolved.physical_exact_fields) |rules| {
+                text_schema.exact_fields = rules;
+            };
+            if (resolveDynamicTextMapping(text_schema, path, text)) |mapping| {
                 try appendMappedTextField(alloc, fields, path, text, mapping, text_analysis);
                 if (observed_field_analyzers) |collector| {
                     try appendObservedFieldAnalyzer(alloc, collector, path, mapping);
                 }
-                try appendMappedSubfieldTextFields(alloc, fields, path, text, schema, text_analysis, observed_field_analyzers);
+                try appendMappedSubfieldTextFields(alloc, fields, path, text, text_schema, text_analysis, observed_field_analyzers);
                 return;
             }
             if (document_schema) |resolved| {
@@ -7197,4 +7203,38 @@ test "logical query disabled physical mappings never apply unmatched dynamic sel
     var inverted = (try reader.invertedIndexScoped(a, "body")).?;
     defer inverted.deinit();
     try std.testing.expectEqual(@as(u32, 1), (try inverted.lookup("zebrafish")).?.docFreq());
+}
+
+test "logical query physical text policies stay within their document type" {
+    const a = std.testing.allocator;
+    const json =
+        \\{"default_type":"alpha","document_schemas":{"alpha":{"schema":{"type":"object","properties":{"body":{"type":"string"},"payload":{"type":"string","x-antfly-field":{"type":"text","index":false,"fields":{"exact":{"type":"keyword"}}}}}}},"beta":{"schema":{"type":"object","properties":{"body":{"type":"string"},"payload":{"type":"string"}}}}}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(a, json);
+    defer parsed.deinit(a);
+    const schema = try schema_api.deriveRuntimeTableSchema(a, parsed);
+    defer runtime_schema.freeSchema(a, schema);
+    try std.testing.expect(runtime_schema.hasCrossDocumentTextExclusions(schema));
+    const encoded = try runtime_schema.serializeSchema(a, schema);
+    defer a.free(encoded);
+    var restored = try runtime_schema.deserializeSchema(a, encoded);
+    defer runtime_schema.freeSchema(a, restored);
+    try schema_api.bindTextProjectionPolicies(a, &restored, parsed);
+    const rebound = try runtime_schema.serializeSchema(a, restored);
+    defer a.free(rebound);
+    try std.testing.expectEqualSlices(u8, encoded, rebound);
+    for ([_]runtime_schema.TableSchema{ schema, restored }) |view| {
+        const bytes = (try buildTextSegmentFromDocuments(a, &.{
+            .{ .key = "alpha", .value = "{\"_type\":\"alpha\",\"body\":\"control\",\"payload\":\"zebrafish\"}" },
+            .{ .key = "beta", .value = "{\"_type\":\"beta\",\"body\":\"control\",\"payload\":\"zebrafish\"}" },
+        }, .{}, view)).?;
+        defer a.free(bytes);
+        var reader = try segment_mod.SegmentReader.init(a, bytes);
+        defer reader.deinit();
+        for ([_][]const u8{ "payload", "payload.exact" }) |field| {
+            var inverted = (try reader.invertedIndexScoped(a, field)).?;
+            defer inverted.deinit();
+            try std.testing.expectEqual(@as(u32, 1), (try inverted.lookup("zebrafish")).?.docFreq());
+        }
+    }
 }

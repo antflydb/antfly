@@ -164,6 +164,9 @@ pub const FullTextDynamicRule = struct {
 };
 
 pub const FullTextDocument = struct {
+    /// Projection-only rules rebound from the immutable public validator.
+    /// ASCH remains the potential-source contract and never serializes these.
+    physical_exact_fields: ?[]const ExactField = null,
     name: []const u8,
     fields: []const FullTextField = &.{},
     dynamic_rules: []const FullTextDynamicRule = &.{},
@@ -391,9 +394,21 @@ pub fn schemasEqualForPublicBinding(alloc: Allocator, stored: TableSchema, deriv
 /// Recover additive runtime metadata from an authenticated public contract
 /// without rewriting the released writer's active or historical schema bytes.
 fn deserializeStoredSchema(alloc: Allocator, data: []const u8, public_json: ?[]const u8) !TableSchema {
-    const stored = try deserializeSchema(alloc, data);
+    var stored = try deserializeSchema(alloc, data);
     errdefer freeSchema(alloc, stored);
-    if (stored.decoded_format_version != 12 or public_json == null) return stored;
+    if (public_json == null) return stored;
+    if (stored.decoded_format_version != 12) {
+        if (stored.full_text_documents.len > 1) {
+            const public_schema = @import("../schema/mod.zig");
+            var parsed = try public_schema.parseValidatedTableSchema(alloc, public_json.?);
+            defer parsed.deinit(alloc);
+            const derived = try public_schema.deriveRuntimeTableSchema(alloc, parsed);
+            defer freeSchema(alloc, derived);
+            if (!try schemasEqual(alloc, stored, derived) and !try matchesExcludedSourceEpoch(alloc, stored, derived)) return error.InvalidSchemaUpdateRequest;
+            try public_schema.bindTextProjectionPolicies(alloc, &stored, parsed);
+        }
+        return stored;
+    }
     const public_schema = @import("../schema/mod.zig");
     var parsed = try public_schema.parseValidatedTableSchema(alloc, public_json.?);
     defer parsed.deinit(alloc);
@@ -1564,6 +1579,14 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
 fn freeFullTextDocuments(alloc: Allocator, documents: []const FullTextDocument) void {
     for (documents) |doc| {
         alloc.free(doc.name);
+        if (doc.physical_exact_fields) |fields| {
+            for (fields) |field| {
+                alloc.free(field.source_field);
+                alloc.free(field.field);
+                alloc.free(field.mapping.analyzer);
+            }
+            if (fields.len != 0) alloc.free(fields);
+        }
         for (doc.fields) |field| {
             alloc.free(field.path);
             alloc.free(field.emitted_name);
@@ -1956,9 +1979,33 @@ pub fn declaredTextSourceDisabled(schema: TableSchema, path: []const u8) bool {
     const field = findExactField(schema.exact_fields, path) orelse return false;
     return std.mem.eql(u8, field.source_field, path) and !field.mapping.do_index;
 }
-/// Exact schemas affected by the former declaration-only dynamic-template
-/// exclusion. This semantic witness permits a bounded, verified rebuild while
-/// leaving unaffected projection generations unchanged.
+/// Whole-document projections whose exclusions or named subfields differed
+/// under the former table-wide policy. A semantic witness fences old postings.
+pub fn hasCrossDocumentTextExclusions(schema: TableSchema) bool {
+    for (schema.full_text_documents) |document| {
+        const rules = document.physical_exact_fields orelse continue;
+        // Undeclared values must not inherit another type's exact mapping,
+        // including its root analyzer, exclusion or generated aliases.
+        if (document.open_dynamic_paths.len != 0 or document.infer_type_dynamic_paths.len != 0 or document.dynamic_rules.len != 0 or schema.dynamic_templates.len != 0) {
+            for (schema.exact_fields) |global| {
+                if (!containsPath(document.declared_paths, global.source_field) and
+                    !pathFallsUnderAnyPrefix(document.unindexed_paths, global.source_field) and
+                    findExactField(rules, global.field) == null) return true;
+            }
+        }
+        for (document.fields) |field| {
+            var scoped = schema;
+            scoped.exact_fields = rules;
+            if (declaredTextSourceDisabled(schema, field.path) != declaredTextSourceDisabled(scoped, field.path)) return true;
+            for (schema.exact_fields) |global| {
+                if (!global.mapping.do_index or std.mem.eql(u8, global.field, global.source_field) or !std.mem.eql(u8, global.source_field, field.path)) continue;
+                const rule = findExactField(rules, global.field) orelse return true;
+                if (!rule.mapping.do_index or !std.mem.eql(u8, rule.source_field, global.source_field)) return true;
+            }
+        }
+    }
+    return false;
+}
 pub fn hasHistoricalDeclaredTextExclusions(schema: TableSchema) bool {
     for (schema.full_text_documents) |document| for (document.fields) |field| {
         if (declaredTextSourceDisabled(schema, field.path)) continue;

@@ -1413,3 +1413,52 @@ publication definition revision 11 and reader protocol 84 force revalidation;
 only affected whole-document text binding hashes change. Field-selected text and
 vector bindings retain their existing identity and artifact reuse proofs. This
 is a semantic migration, with no change to native text metadata encoding.
+
+
+## Incremental ordering-key state (reader protocol 85)
+
+Native fragment spaces optionally retain a copy-on-write page tree keyed by
+logical row ID. Each value contains primitive typed ordering keys and the exact
+ordering-input digest used to derive them. The root also binds the ordering
+cohort, including its schema and input interpretation. Keys retain signed
+nanosecond timestamps and integers beyond 2^53 without conversion to floating
+point. They contain ordering inputs, not source bodies or an independent row
+identity.
+
+When an input edit requires sorting a fragment again, the builder joins its
+current input-version cursor with the previous key cursor. Matching evidence
+supplies unchanged keys; only missing or changed rows gather ordering columns
+from the current Parquet/Iceberg locations. Deleted IDs remove their key records.
+A new cohort starts a fresh tree. Historical publications without keys remain
+readable and populate keys as fragments are processed. The bounded fragment sort,
+spill manager, shared scheduler and publication admission remain authoritative.
+
+The tree advances with the same catalog publication as the coordinate layout.
+Its pages belong to the ordinary identity dependency closure, including reader
+leases, durable cloud generation maps and GC traversal. Frozen per-index reuse
+spaces omit this builder-only cache, so they do not independently retain obsolete
+ordering state. A cache hit never substitutes for current input evidence or
+source-version validation during result hydration.
+
+## Early routing dominance and lineage read waves
+
+Native text metadata v14 attaches portable typed first/last bounds to each
+segment's authenticated routing record. A full field-order top-K can reject a
+strictly dominated primary range before descriptor, segment or lineage admission.
+The leading physical prefix must match with one uniform direction reversal;
+unknown mappings, unsupported directions, missing bounds and invalid bounds keep
+the pack eligible. Equal primary values remain eligible because private segment
+IDs cannot bound public-ID ties. Forward and backward pages use their respective
+competitive endpoint. Exact counts and full-match evaluation do not prune; a
+pruned result reports a lower-bound total. This streams compact routing metadata;
+it does not yet provide a best-first multi-field metadata tree. Prefetch owns a
+copy of the cutoff so concurrent winner movement cannot invalidate its values.
+
+Cold lineage loading admits all logical page bytes before issuing reads, then
+uses waves of at most eight shared scheduler I/O tasks. Authentication stays per
+artifact and decoding stays in publication order. Every submitted task is joined
+before failure or cancellation returns. Saturation uses caller execution;
+publication-owned execution stays serial to preserve its CPU/I/O phase ownership.
+The extra encoded residency is bounded by eight 64-KiB pages and scheduler
+workspace admission. This reduces serial provider round trips without widening
+query limits or creating another worker pool.

@@ -239,3 +239,79 @@ def test_type_filtered_dynamic_exclusions_preserve_declared_text(
         table, inserts={"d1": {"body": WORDS["body"]}}, sync_level="full_text"
     )
     assert _hits(stateful_api, table, "body") == 1
+
+
+@pytest.mark.parametrize("root_indexed", [False, True])
+@pytest.mark.parametrize("dynamic_beta", [False, True])
+def test_detailed_exclusion_and_subfields_are_scoped_to_document_type(
+    stateful_api, root_indexed, dynamic_beta
+):
+    table = f"schema_type_policy_{time.time_ns()}"
+    _create_table_with_schema(
+        stateful_api,
+        table,
+        {
+            "default_type": "alpha",
+            "document_schemas": {
+                name: {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "body": {"type": "string"},
+                            **(
+                                {}
+                                if name == "beta" and dynamic_beta
+                                else {"payload": mapping}
+                            ),
+                        },
+                        **(
+                            {"x-antfly-dynamic-indexing": {"mode": "infer_types"}}
+                            if name == "beta" and dynamic_beta
+                            else {}
+                        ),
+                    }
+                }
+                for name, mapping in (
+                    (
+                        "alpha",
+                        {
+                            "type": "string",
+                            "x-antfly-field": {
+                                "type": "text",
+                                "index": root_indexed,
+                                "fields": {"exact": {"type": "keyword"}},
+                            },
+                        },
+                    ),
+                    ("beta", {"type": "string"}),
+                )
+            },
+        },
+    )
+    stateful_api.batch_write(
+        table,
+        inserts={
+            name: {
+                "_type": name,
+                "body": "control",
+                "payload": "zebrafish",
+            }
+            for name in ("alpha", "beta")
+        },
+        sync_level="full_text",
+    )
+    for field, expected in (
+        ("payload", ["alpha", "beta"] if root_indexed else ["beta"]),
+        ("payload.exact", ["alpha"]),
+    ):
+        response = stateful_api.query_table(
+            table,
+            {
+                "full_text_search": {"match": "zebrafish", "field": field},
+                "limit": 10,
+            },
+        )
+        assert (
+            sorted(hit["_id"] for hit in response["responses"][0]["hits"]["hits"])
+            == expected
+        )

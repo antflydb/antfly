@@ -22347,6 +22347,7 @@ pub const IndexManager = struct {
                 const historical_projection = [_]TextProjectionProvenance{
                     try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 0),
                     try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 1),
+                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 2),
                 };
                 ensureTextProjectionProvenance(self.alloc, &persistent, projection_provenance, historical_projection, read_only) catch |err| {
                     std.log.warn("full_text open failed step=projection_provenance name={s} err={s}", .{
@@ -37046,7 +37047,7 @@ const TextProjectionProvenance = struct {
     // Semantic revisions belong to durable generation identity, independently
     // of public schema versions and the metadata codec's envelope version.
     fn fromRuntimeSchemaRevision(alloc: Allocator, cfg: types.IndexConfig, schema: ?schema_mod.TableSchema, named_autocomplete_revision: u32) !TextProjectionProvenance {
-        return fromRuntimeSchemaSemantics(alloc, cfg, schema, named_autocomplete_revision, 2);
+        return fromRuntimeSchemaSemantics(alloc, cfg, schema, named_autocomplete_revision, 3);
     }
     fn fromRuntimeSchemaSemantics(alloc: Allocator, cfg: types.IndexConfig, schema: ?schema_mod.TableSchema, named_autocomplete_revision: u32, exclusion_revision: u32) !TextProjectionProvenance {
         // Field-selective projection uses the second semantic witness. Give
@@ -37094,6 +37095,21 @@ const TextProjectionProvenance = struct {
                 std.mem.writeInt(u64, witness[0..8], schema_fingerprint, .little);
                 std.mem.writeInt(u32, witness[8..12], 2, .little);
                 schema_fingerprint = std.hash.Wyhash.hash(0x4146444953580001, &witness);
+            };
+        }
+        if (exclusion_revision >= 3 and !try textConfigSelectsField(alloc, cfg.config_json)) {
+            if (schema) |value| if (schema_mod.hasCrossDocumentTextExclusions(value)) {
+                var witness: [12]u8 = undefined;
+                std.mem.writeInt(u64, witness[0..8], schema_fingerprint, .little);
+                std.mem.writeInt(u32, witness[8..12], 3, .little);
+                var policy = std.hash.Wyhash.init(0x4146444953580003);
+                policy.update(&witness);
+                for (value.full_text_documents) |document| {
+                    const bytes = try std.json.Stringify.valueAlloc(alloc, .{ .name = document.name, .rules = document.physical_exact_fields }, .{});
+                    defer alloc.free(bytes);
+                    policy.update(bytes);
+                }
+                schema_fingerprint = policy.final();
             };
         }
         return .{
@@ -37195,7 +37211,7 @@ fn ensureTextProjectionProvenance(
     alloc: Allocator,
     persistent: *persistent_mod.PersistentIndex,
     expected: TextProjectionProvenance,
-    historical: [2]TextProjectionProvenance,
+    historical: [3]TextProjectionProvenance,
     read_only: bool,
 ) !void {
     const encoded = try persistent.readGenerationMetadataAlloc(

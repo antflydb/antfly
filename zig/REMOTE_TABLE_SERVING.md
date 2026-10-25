@@ -1429,3 +1429,30 @@ is active. Complete-key search cursors seek within the boundary file/row and
 stop within large equal-key groups; older or partially ordered indexes retain
 the existing native collector fallback. Public request and cursor formats stay
 the same, and normal publication/rebuild upgrades older index artifacts.
+
+
+### Optional ordering reuse and early field-sort admission
+
+Reader protocol 85 and native text metadata v14 add authenticated typed routing
+bounds and an optional per-row ordering-key tree. Bounds can reject strictly
+worse primary ranges before opening segment descriptors or lineage. Equal
+primary ranges stay live for public-ID ties, and pruned searches report a
+lower-bound total. Existing v13 text publications may still be reused; absent
+bounds choose ordinary execution rather than requiring a full archive rebuild.
+Newly processed segments capture bounds while their encoder reader is available.
+Unsorted segments incur no additional artifact reads for this metadata.
+
+Incremental fragment sorting validates retained keys against the current
+ordering cohort and each row's exact input digest, gathering source ordering
+columns only for missing or changed rows. This tree belongs to the publication's
+existing identity dependency closure. See [the row identity decision](../docs/plans/lake-row-identity.md#incremental-ordering-key-state-reader-protocol-85)
+for ownership, historical fallback and retention rules. Lineage pages load in
+joined waves of at most eight shared I/O lanes after complete logical byte
+admission, with ordered decoding and caller execution under saturation.
+
+Whole-document physical text projection also scopes detailed exclusions and
+named subfields to the selected document type. Runtime rules are rebound from
+its authenticated public validator without changing deployed ASCH epoch bytes.
+The projection witness binds these rules; exact historical witnesses authorize
+the admitted leader-owned shadow rebuild. Unknown provenance drift still fails
+closed. Explicit field-selective projections keep their existing contract.

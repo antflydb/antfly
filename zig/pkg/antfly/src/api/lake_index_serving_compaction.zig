@@ -276,6 +276,7 @@ const Builder = struct {
             else
                 try corpus.statistics.publishReaderConsuming(a, self.store, &reader, self.token, self.context.io, contributions);
             group = .{ .file = undefined, .sources = sources.items, .segments = try out.dupe(Chunk, &.{ref}), .admissions = try out.dupe(local.segment.SegmentReader.Admission, &.{admission}), .summaries = try out.dupe(?corpus.statistics.Ref, &.{summary}) };
+            group.sort_bounds = try out.dupe(?@import("lake_index_sort_bounds.zig").Bound, &.{try @import("lake_index_sort_bounds.zig").Bound.fromReader(out, &reader)});
             contributed = true;
         }
         if (level < 3 and group.sources.len >= std.math.pow(usize, 8, level + 1) and group.sources.len < corpus.source_spans.max_spans and group.admissions[0].bytes < 2 * 1024 * 1024) {

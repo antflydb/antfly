@@ -2059,6 +2059,8 @@ const Execution = struct {
             reader: ?*@import("lake_index_text_directory.zig").RoutingCursor,
             selected: ?*@import("lake_index_text_directory.zig").SelectedCursor,
             max_bytes: u64,
+            ordering: ?local.storage_db_query_search_exec.SearchHitOrder,
+            sort_boundary: []const std.json.Value = &.{},
             execution: *Execution,
             root: corpus.Root,
             declaration: local.serverless_segment_sidecar_manifest.DeclaredArtifact,
@@ -2069,6 +2071,20 @@ const Execution = struct {
                 const owner = self_.execution;
                 try owner.context.ensureActive();
                 return try owner.server.lake_text_corpora.acquireSelected(owner.server.embedding_provider_runtime.io, owner.store.artifactStore(), self_.declaration.artifact, self_.root, owner.schema_json, self_.cached, owner.context, self_.token, selected_ids);
+            }
+            fn keep(raw: *anyopaque, route: corpus.SegmentRouting) !bool {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                const order = self_.ordering orelse return true;
+                const bound = route.sort_bound orelse return true;
+                var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer scratch.deinit();
+                return bound.mayCompete(scratch.allocator(), order, self_.sort_boundary);
+            }
+            fn nextOrdered(raw: *anyopaque, output: [][32]u8, cutoff: ?f32, position: ?@import("lake_index_text_directory.zig").Position, boundary: []const std.json.Value) !?@import("lake_index_text_directory.zig").RoutingCursor.Window {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                self_.sort_boundary = boundary;
+                if (self_.reader) |value| value.filter = .{ .ptr = self_, .keep = keep };
+                return nextRanked(raw, output, cutoff, position);
             }
             fn next(raw: *anyopaque, output: [][32]u8, cutoff: ?f32) !?@import("lake_index_text_directory.zig").RoutingCursor.Window {
                 return nextRanked(raw, output, cutoff, null);
@@ -2083,8 +2099,8 @@ const Execution = struct {
                 return self_.reader.?.nextBounded(output, self_.max_bytes);
             }
         };
-        var navigation: Navigation = .{ .frontier = frontier, .reader = reader, .selected = selected_reader, .max_bytes = window_config.admission_window_bytes, .execution = self, .root = root, .declaration = selected, .cached = cached, .token = cancellation };
-        var ahead = @import("lake_text_window_ahead.zig").init(.{ .ptr = &navigation, .next = Navigation.next, .next_ranked = Navigation.nextRanked, .prepare = Navigation.prepare }, self.context.io);
+        var navigation: Navigation = .{ .frontier = frontier, .reader = reader, .selected = selected_reader, .max_bytes = window_config.admission_window_bytes, .ordering = if (!req.count_only and !req.evaluation_matches) ordering else null, .execution = self, .root = root, .declaration = selected, .cached = cached, .token = cancellation };
+        var ahead = @import("lake_text_window_ahead.zig").init(.{ .ptr = &navigation, .next = Navigation.next, .next_ranked = Navigation.nextRanked, .next_ordered = Navigation.nextOrdered, .prepare = Navigation.prepare }, self.context.io);
         defer ahead.deinit();
         // Reuse the region even when the caller is itself an arena: freeing a
         // fresh child region per window would retain every window in its parent.
@@ -2101,8 +2117,9 @@ const Execution = struct {
             // Recent rows seed the competitive cutoff, but retain their logical
             // position after all archive rows when equal scores are compared.
             const tie_cutoff = if (req.evaluation_matches) null else winners.tieCutoff();
+            const sort_boundary: []const std.json.Value = if (ordering != null and winners.limit != 0 and winners.heap.items.len == winners.limit) winners.heap.peek().?.hit.sort_values else &.{};
             const recent_window = recent != null and !recent_scored;
-            const pulled = if (recent_window) null else try ahead.nextRanked(if (frontier != null) batch_limit else window_config.admission_window_segments, competitive_cutoff, tie_cutoff);
+            const pulled = if (recent_window) null else try ahead.nextOrdered(if (frontier != null) batch_limit else window_config.admission_window_segments, competitive_cutoff, tie_cutoff, sort_boundary);
             if (pulled == null and !recent_window) break;
             var prepared = if (!recent_window) ahead.takePrepared() else null;
             defer if (prepared) |*pin| pin.deinit();
@@ -2111,10 +2128,10 @@ const Execution = struct {
                 // Copy worker-owned output before the single lookahead reuses it.
                 @memcpy(ids[0..value.identities.len], value.identities);
                 window = .{ .identities = ids[0..value.identities.len], .doc_offset = value.doc_offset };
-                ahead.prefetchRanked(if (frontier != null) batch_limit else window_config.admission_window_segments, competitive_cutoff, tie_cutoff);
+                ahead.prefetchOrdered(if (frontier != null) batch_limit else window_config.admission_window_segments, competitive_cutoff, tie_cutoff, sort_boundary);
             } else {
                 recent_scored = true;
-                ahead.prefetchRanked(if (frontier != null) batch_limit else window_config.admission_window_segments, competitive_cutoff, tie_cutoff);
+                ahead.prefetchOrdered(if (frontier != null) batch_limit else window_config.admission_window_segments, competitive_cutoff, tie_cutoff, sort_boundary);
             }
             var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = wa, .result_allocator = wa, .navigation = self.navigation, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = window.identities, .prefetched_archive = if (prepared != null) &prepared.? else null, .overlay = self.overlay, .overlay_preparation = if (self.overlay != null) frontier orelse preparation else null, .recent_text_source = if (recent != null) &recent.? else null, .recent_text_window = recent_window };
             defer child.deinit();
@@ -2193,6 +2210,9 @@ const Execution = struct {
         };
         const cursor_started = @import("antfly_platform").time.monotonicNs();
         defer self.server.lake_query_metrics.record(.text_cursor, cursor_started);
+        if (reader) |value| if (value.pruned != 0) {
+            relation = .gte;
+        };
         var result: types.SearchResult = .{ .alloc = a, .hits = try winners.finishLocated(paging.offset, if (self.use_stored_highlights) &self.highlight_locations else null, self.arena), .total_hits = total, .total_hits_relation = relation, .ordered_window_complete = ordering != null };
         if (req.profile) {
             result.sort_profile = profiled.sort_profile orelse .{};

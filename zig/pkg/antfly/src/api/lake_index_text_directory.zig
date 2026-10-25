@@ -118,11 +118,32 @@ pub fn prepare(a: A, store: *stores.ArtifactStore, group: *corpus.FileGroup, tok
             };
         }
     }
+    // Persist bounds with the same authenticated descriptor/route graph.
+    // Missing or oversized bounds decline pruning rather than ordering data.
+    const bounds = if (group.sort_bounds.len == group.segments.len) group.sort_bounds else fresh: {
+        const result = try a.alloc(?@import("lake_index_sort_bounds.zig").Bound, group.segments.len);
+        for (result, group.segments, group.admissions) |*bound, ref, admission| {
+            bound.* = null;
+            const sorted = for (admission.fields) |field| {
+                if (for (field.sections) |section| {
+                    if (section.kind == .index_sort_bounds) break true;
+                } else false) break true;
+            } else false;
+            if (!sorted) continue;
+            var data = try @import("lake_index_seekable_text.zig").loadPublication(a, .{ .store = store.*, .cache = null, .context = .{}, .cancellation = token }, ref);
+            defer data.deinit(a);
+            var reader = try local.segment.SegmentReader.initAuthenticated(a, data.source(), admission);
+            defer reader.deinit();
+            bound.* = try @import("lake_index_sort_bounds.zig").Bound.fromReader(a, &reader);
+        }
+        break :fresh result;
+    };
+    group.sort_bounds = bounds;
     const descriptors = try a.alloc(Chunk, group.segments.len);
     for (descriptors, group.segments, group.admissions, group.summaries, 0..) |*ref, segment, admission, summary, ordinal| {
         try token.check();
         const sources = if (group.parts.len != 0) group.parts[ordinal] else if (group.source_pages.len == 0) group.sources else &.{};
-        ref.* = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .sources = sources, .masked = group.masked or group.parts.len != 0, .source_pages = group.source_pages, .source_count = group.source_count, .segments = &.{segment}, .admissions = &.{admission}, .summaries = &.{summary} }, token);
+        ref.* = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .sources = sources, .masked = group.masked or group.parts.len != 0, .source_pages = group.source_pages, .source_count = group.source_count, .segments = &.{segment}, .admissions = &.{admission}, .summaries = &.{summary}, .sort_bounds = bounds[ordinal..][0..1] }, token);
     }
     group.descriptors = descriptors;
 }
@@ -799,6 +820,30 @@ test "external lake exact segment admission skips missing unrelated descriptors 
     defer windows.deinit();
     var window_ids: [2]Id = undefined;
     const subset = [_]Id{ corpus.term_directory.identity(segments[0].artifact_id), corpus.term_directory.identity(segments[8].artifact_id) };
+    // Prune seven routing leaves before descriptors, payloads or lineage are
+    // admitted. Gaps retain original full-corpus ordinals between pulls.
+    const Filter = struct {
+        ids: []const Id,
+        fn keep(raw: *anyopaque, route: corpus.SegmentRouting) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const id = corpus.term_directory.identity(route.ref.artifact_id);
+            for (self.ids) |expected| if (std.mem.eql(u8, &id, &expected)) return true;
+            return false;
+        }
+    };
+    var filter: Filter = .{ .ids = &subset };
+    const pruned = try RoutingCursor.create(a, window_root, store, cached, .none);
+    defer pruned.deinit();
+    pruned.filter = .{ .ptr = &filter, .keep = Filter.keep };
+    for (subset, [_]u64{ 0, 8 }) |id, ordinal| {
+        const window = (try pruned.next(&window_ids)).?;
+        try std.testing.expectEqual(@as(usize, 1), window.identities.len);
+        try std.testing.expectEqual(id, window.identities[0]);
+        try std.testing.expectEqual(ordinal, window.doc_offset);
+    }
+    try std.testing.expect(try pruned.next(&window_ids) == null);
+    try std.testing.expectEqual(@as(u32, 7), pruned.pruned);
+    try std.testing.expectEqual(@as(u64, 9), pruned.documents);
     const selected_windows = try SelectedCursor.create(a, window_root, store, cached, .none, &subset);
     defer selected_windows.deinit();
     try std.testing.expectError(error.InvalidNativeLakeTextCorpus, selected_windows.nextBounded(&window_ids, 0));
@@ -1024,6 +1069,9 @@ pub const RoutingCursor = struct {
     last_segment_bytes: u64 = 0,
     last_segment_docs: u32 = 0,
     pending: ?struct { identity: Id, bytes: u64, documents: u32 } = null,
+    filter: ?struct { ptr: *anyopaque, keep: *const fn (*anyopaque, corpus.SegmentRouting) anyerror!bool } = null,
+    included: bool = true,
+    pruned: u32 = 0,
     pub const Window = struct { identities: []const Id, doc_offset: u64 };
     pub fn create(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Cancellation) !*RoutingCursor {
         if (root.inventory_version != 3 or root.directories.routing == null or root.collection == null) return error.InvalidNativeLakeTextCorpus;
@@ -1067,6 +1115,8 @@ pub const RoutingCursor = struct {
         self.emitted = std.math.add(u32, self.emitted, 1) catch return error.InvalidNativeLakeTextCorpus;
         self.documents = std.math.add(u64, self.documents, record.route.doc_count) catch return error.InvalidNativeLakeTextCorpus;
         if (self.emitted > self.root.segment_count) return error.InvalidNativeLakeTextCorpus;
+        self.included = if (self.filter) |filter| try filter.keep(filter.ptr, record.route) else true;
+        if (!self.included) self.pruned += 1;
         return corpus.term_directory.identity(record.route.ref.artifact_id);
     }
     pub fn next(self: *RoutingCursor, output: []Id) !?Window {
@@ -1081,6 +1131,7 @@ pub const RoutingCursor = struct {
         var offset = self.documents;
         var count: usize = 0;
         var bytes: u64 = 0;
+        var gap = false;
         if (self.pending) |held| {
             offset -= held.documents;
             output[0] = held.identity;
@@ -1095,9 +1146,12 @@ pub const RoutingCursor = struct {
             const current: [36]u8 = entry.key[0..36].*;
             if (self.previous) |previous| if (!std.mem.eql(u8, &previous, &current)) {
                 const identity = try self.emit(previous);
-                if (count != 0 and self.last_segment_bytes > max_bytes -| bytes) {
+                if (!self.included) {
+                    gap = count != 0;
+                } else if (count != 0 and self.last_segment_bytes > max_bytes -| bytes) {
                     self.pending = .{ .identity = identity, .bytes = self.last_segment_bytes, .documents = self.last_segment_docs };
                 } else {
+                    if (count == 0) offset = self.documents - self.last_segment_docs;
                     output[count] = identity;
                     count += 1;
                     bytes +|= self.last_segment_bytes;
@@ -1107,14 +1161,15 @@ pub const RoutingCursor = struct {
             self.previous = current;
             if (std.mem.readInt(u32, entry.key[36..40], .big) != self.bytes.items.len or entry.value.len == 0 or entry.value.len > chunk_bytes or entry.value.len > corpus.max_root_bytes -| self.bytes.items.len) return error.InvalidNativeLakeTextCorpus;
             try self.bytes.appendSlice(self.a, entry.value);
-            if (self.pending != null or count == output.len or bytes >= max_bytes) return .{ .identities = output[0..count], .doc_offset = offset };
+            if (gap or self.pending != null or count == output.len or bytes >= max_bytes) return .{ .identities = output[0..count], .doc_offset = offset };
         }
         if (self.previous) |last| {
             const identity = try self.emit(last);
             self.previous = null;
-            if (count != 0 and self.last_segment_bytes > max_bytes -| bytes) {
+            if (self.included and count != 0 and self.last_segment_bytes > max_bytes -| bytes) {
                 self.pending = .{ .identity = identity, .bytes = self.last_segment_bytes, .documents = self.last_segment_docs };
-            } else {
+            } else if (self.included) {
+                if (count == 0) offset = self.documents - self.last_segment_docs;
                 output[count] = identity;
                 count += 1;
             }

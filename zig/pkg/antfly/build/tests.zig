@@ -231,7 +231,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("query-contract-test", "Run query parsing, worker transport and projection contracts").dependOn(&b.addRunArtifact(query_contract_tests).step);
 
     const logical_field_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = selectTestFilters(b, &.{ "logical value", "logical query", "projection checkpoint external storage" }) });
-    b.step("logical-field-query-test", "Verify logical query parsing, planning and original-value membership").dependOn(&b.addRunArtifact(logical_field_tests).step);
+    b.step("logical-field-query-test", "Verify logical query parsing, planning and original-value membership").dependOn(&addFilteredTestRunArtifact(b, logical_field_tests).step);
 
     const api_http_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_http_runtime_test_root.zig"),

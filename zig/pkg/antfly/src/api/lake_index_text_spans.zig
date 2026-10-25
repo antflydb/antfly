@@ -397,13 +397,40 @@ pub fn loadView(a: std.mem.Allocator, store: stores.ArtifactStore, pages: []cons
     var range_offset: usize = 0;
     var allowance: u64 = max_total_bytes;
     var modern: ?bool = null;
+    // Reserve the complete logical byte charge before concurrent reads. The
+    // wave never shares or mutates the caller's remaining-budget pointer.
     for (pages) |ref| {
-        try token.check();
         try @import("lake_index_text_directory.zig").validateRef(ref, domain);
         if (ref.byte_len > max_page_bytes) return error.InvalidNativeLakeTextCorpus;
         try stores.chargeReadBudget(&allowance, ref.byte_len);
         if (remaining) |budget| try stores.chargeReadBudget(budget, ref.byte_len);
-        const bytes = if (publication) try artifacts.readPublicationArtifact(a, store, ref, token) else try artifacts.readArtifact(a, store, ref, token, cached);
+    }
+    const waves = @import("lake_artifact_wave.zig");
+    const Read = struct {
+        refs: []const artifacts.ChunkRef,
+        store: stores.ArtifactStore,
+        token: @import("antfly_cancellation").CancellationToken,
+        cached: ?artifacts.CachedRead,
+        publication: bool,
+        fn read(raw: *anyopaque, out: std.mem.Allocator, index: usize) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.token.check();
+            return if (self.publication) artifacts.readPublicationArtifact(out, self.store, self.refs[index], self.token) else artifacts.readArtifact(out, self.store, self.refs[index], self.token, self.cached);
+        }
+    };
+    var source: Read = .{ .refs = pages, .store = store, .token = token, .cached = cached, .publication = publication };
+    var wave: waves.Wave = .{ .a = a };
+    defer wave.deinit();
+    for (pages, 0..) |_, index| {
+        try token.check();
+        if (index % waves.width == 0) {
+            wave.deinit();
+            var sizes: [waves.width]u64 = undefined;
+            const n = @min(waves.width, pages.len - index);
+            for (sizes[0..n], pages[index..][0..n]) |*size, ref| size.* = ref.byte_len;
+            wave = try waves.load(a, if (!publication and cached != null) cached.?.context.io else null, index, sizes[0..n], .{ .ptr = &source, .read = Read.read });
+        }
+        const bytes = wave.take(index % waves.width);
         defer a.free(bytes);
         const dictionary_page = std.mem.startsWith(u8, bytes, dictionary_magic);
         const records = std.mem.startsWith(u8, bytes, range_magic);
