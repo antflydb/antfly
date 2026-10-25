@@ -1965,7 +1965,17 @@ fn expressionCapabilitySchema(schema: ParsedTableSchema) storage_schema.TableSch
         .requires_clock_defaults = requiresClockDefaults(schema),
         .requires_range_expressions = requiresRangeExpressions(schema),
         .requires_temporal_keys = requiresTemporalKeys(schema),
+        .requires_sequence_defaults = requiresSequenceDefaults(schema),
     };
+}
+
+fn requiresSequenceDefaults(schema: ParsedTableSchema) bool {
+    const declarations = schema.column_defaults orelse return false;
+    if (declarations.value != .array) return false;
+    for (declarations.value.array.items) |entry| {
+        if (entry == .object and entry.object.contains("sequence")) return true;
+    }
+    return false;
 }
 
 fn requiresUuidDefaults(schema: ParsedTableSchema) bool {

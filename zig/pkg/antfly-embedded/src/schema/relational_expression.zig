@@ -40,6 +40,8 @@ pub const max_allocated_bytes = 4 * max_output_bytes;
 pub const PreparationRuntime = struct {
     io: std.Io,
     uuid_clock: ?*@import("../common/uuid.zig").Version7Clock = null,
+    sequences: ?@import("../system_catalog/column_sequences.zig").Provider = null,
+    sequence_scope: ?@import("../system_catalog/column_sequences.zig").Scope = null,
     transaction_start: ?@import("../sql/statement_clock.zig").Instant = null,
 
     pub fn withClock(self: PreparationRuntime, required: bool) !PreparationRuntime {
@@ -4154,7 +4156,48 @@ pub const Set = struct {
     read_columns: []bool,
     generated_columns: []bool,
     modifier_ordinals: []const u32,
-    pub const Binding = struct { ordinal: u32, generated: bool, plan: Plan };
+    pub const Binding = struct {
+        ordinal: u32,
+        generated: bool,
+        source: union(enum) {
+            expression: Plan,
+            sequence: @import("../system_catalog/column_sequences.zig").Owned,
+        },
+
+        fn dependencies(self: *const Binding) []const u32 {
+            return switch (self.source) {
+                .expression => |*plan| plan.dependencies,
+                .sequence => &.{},
+            };
+        }
+        fn deinit(self: *Binding) void {
+            switch (self.source) {
+                .expression => |*plan| plan.deinit(),
+                .sequence => |*owned| owned.deinit(),
+            }
+        }
+        fn evaluate(self: *const Binding, execution: *Execution, values: []const Value, column_name: []const u8) !Value {
+            return switch (self.source) {
+                .expression => |*plan| plan.evaluateWithExecution(execution, values),
+                .sequence => |*owned| blk: {
+                    try execution.charge(1);
+                    const provider = if (execution.preparation_runtime) |runtime| runtime.sequences else null;
+                    const source = provider orelse return error.SequenceProviderUnavailable;
+                    const scope = execution.preparation_runtime.?.sequence_scope orelse return error.SequenceProviderUnavailable;
+                    if (scope.table_id != owned.value.owner.table_id) return error.CatalogGenerationChanged;
+                    // This containing row-preparation boundary owns effects;
+                    // immutable scalar bytecode never performs allocator I/O.
+                    break :blk .{ .integer = try source.allocate(source.ptr, execution.alloc, scope, column_name, owned.value) };
+                },
+            };
+        }
+        fn fingerprint(self: *const Binding) [32]u8 {
+            return switch (self.source) {
+                .expression => |*plan| plan.fingerprint,
+                .sequence => |*owned| owned.value.fingerprint(),
+            };
+        }
+    };
 
     pub fn createOwned(alloc: Allocator, table: schema.TableSchema, defaults: std.json.Value, generated: std.json.Value) !*Set {
         const default_entries = try entries(defaults);
@@ -4165,7 +4208,7 @@ pub const Set = struct {
         var initialized: usize = 0;
         var total_nodes: usize = 0;
         var total_literal_bytes: usize = 0;
-        errdefer for (bindings[0..initialized]) |*binding| binding.plan.deinit();
+        errdefer for (bindings[0..initialized]) |*binding| binding.deinit();
         for ([_][]const std.json.Value{ default_entries, generated_entries }, 0..) |declarations, mode| {
             for (declarations) |entry| {
                 if (entry != .object or entry.object.count() != 2) return error.InvalidRelationalExpression;
@@ -4175,6 +4218,18 @@ pub const Set = struct {
                     if (std.mem.eql(u8, column.name, name.string)) break @intCast(i);
                 } else return error.RelationalIndexColumnNotFound;
                 for (bindings[0..initialized]) |binding| if (binding.ordinal == ordinal) return error.InvalidRelationalExpression;
+                if (entry.object.get("sequence")) |reference| {
+                    if (mode != 0 or !table.requires_sequence_defaults or table.relational_columns[ordinal].column_type != .integer)
+                        return error.InvalidRelationalExpressionType;
+                    var owned = try @import("../system_catalog/column_sequences.zig").Binding.parse(alloc, reference);
+                    errdefer owned.deinit();
+                    total_nodes += 1;
+                    total_literal_bytes += owned.value.target.database.len + owned.value.target.namespace.len + owned.value.target.table.len + @sizeOf(@TypeOf(owned.value));
+                    if (total_nodes > 4096 or total_literal_bytes > max_allocated_bytes) return error.RelationalExpressionBudgetExceeded;
+                    bindings[initialized] = .{ .ordinal = ordinal, .generated = false, .source = .{ .sequence = owned } };
+                    initialized += 1;
+                    continue;
+                }
                 var plan = if (mode == 0) try Plan.initDefault(alloc, table, entry.object.get("expression") orelse return error.InvalidRelationalExpression, table.relational_columns[ordinal].column_type) else try Plan.init(alloc, table, entry.object.get("expression") orelse return error.InvalidRelationalExpression, table.relational_columns[ordinal].column_type);
                 errdefer plan.deinit();
                 if (plan.result_kind == .sql_array and plan.result_sql_type != table.relational_columns[ordinal].sql_element_type) return error.InvalidRelationalExpressionType;
@@ -4182,7 +4237,7 @@ pub const Set = struct {
                 total_literal_bytes += plan.literal_bytes;
                 if (total_nodes > 4096 or total_literal_bytes > max_allocated_bytes) return error.RelationalExpressionBudgetExceeded;
                 if (mode == 0 and plan.dependencies.len != 0) return error.InvalidRelationalExpression;
-                bindings[initialized] = .{ .ordinal = ordinal, .generated = mode != 0, .plan = plan };
+                bindings[initialized] = .{ .ordinal = ordinal, .generated = mode != 0, .source = .{ .expression = plan } };
                 initialized += 1;
             }
         }
@@ -4195,7 +4250,7 @@ pub const Set = struct {
         errdefer alloc.free(generated_columns);
         @memset(generated_columns, false);
         for (bindings) |binding| {
-            for (binding.plan.dependencies) |ordinal| read_columns[ordinal] = true;
+            for (binding.dependencies()) |ordinal| read_columns[ordinal] = true;
             if (binding.generated) {
                 read_columns[binding.ordinal] = true;
                 generated_columns[binding.ordinal] = true;
@@ -4220,7 +4275,7 @@ pub const Set = struct {
         if (states[index] == 2) return;
         if (states[index] == 1) return error.RelationalGeneratedColumnCycle;
         states[index] = 1;
-        for (bindings[index].plan.dependencies) |dependency| for (bindings, 0..) |binding, i| {
+        for (bindings[index].dependencies()) |dependency| for (bindings, 0..) |binding, i| {
             if (binding.ordinal == dependency) try visit(bindings, order, states, written, i);
         };
         states[index] = 2;
@@ -4230,7 +4285,7 @@ pub const Set = struct {
 
     pub fn deinit(self: *Set) void {
         self.alloc.free(self.modifier_ordinals);
-        for (self.bindings) |*binding| binding.plan.deinit();
+        for (self.bindings) |*binding| binding.deinit();
         self.alloc.free(self.bindings);
         self.alloc.free(self.order);
         self.alloc.free(self.read_columns);
@@ -4269,7 +4324,7 @@ pub const Set = struct {
         for (self.order) |index| {
             const binding = &self.bindings[index];
             if (!binding.generated and (present[binding.ordinal] or defaults == .preserve_absence or (default_mask != null and !default_mask.?[binding.ordinal]))) continue;
-            values[binding.ordinal] = try self.normalizeBinding(execution, binding.ordinal, try binding.plan.evaluateWithExecution(execution, values));
+            values[binding.ordinal] = try self.normalizeBinding(execution, binding.ordinal, try binding.evaluate(execution, values, self.table.relational_columns[binding.ordinal].name));
             present[binding.ordinal] = true;
         }
     }
@@ -4472,7 +4527,7 @@ pub const Set = struct {
             const binding = &self.bindings[index];
             if (!binding.generated) continue;
             if (!present[binding.ordinal]) return error.InvalidRelationalGeneratedValue;
-            const expected = try self.normalizeBinding(execution, binding.ordinal, try binding.plan.evaluateWithExecution(execution, values));
+            const expected = try self.normalizeBinding(execution, binding.ordinal, try binding.evaluate(execution, values, self.table.relational_columns[binding.ordinal].name));
             const actual = values[binding.ordinal];
             const equal = generatedDisplayEqual(execution, expected, actual) catch |err| return executionFailure(err);
             if (!equal) return error.InvalidRelationalGeneratedValue;
@@ -5588,7 +5643,7 @@ pub fn generatedFingerprint(set: ?*const Set) [32]u8 {
     if (set) |expressions| for (expressions.bindings) |binding| {
         if (!binding.generated) continue;
         const column = expressions.table.relational_columns[binding.ordinal];
-        entries_buffer[count] = .{ .name = column.name, .fingerprint = binding.plan.fingerprint, .modifier = column.numeric_modifier };
+        entries_buffer[count] = .{ .name = column.name, .fingerprint = binding.fingerprint(), .modifier = column.numeric_modifier };
         count += 1;
     };
     const selected = entries_buffer[0..count];
@@ -6435,4 +6490,70 @@ test "relational declarations cold generated verification reads dependency cells
     try std.testing.expectError(error.InvalidRelationalGeneratedValue, validator.execution.expressions.?.verifyRow(alloc, &row));
     row.missing = true;
     try std.testing.expectError(error.InvalidRelationalGeneratedValue, validator.execution.expressions.?.verifyRow(alloc, &row));
+}
+
+test "SQL owned sequence defaults allocate outside scalar bytecode preserve NULL and restore without effects" {
+    const a = std.testing.allocator;
+    const columns = @import("../system_catalog/column_sequences.zig");
+    const input =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","column_defaults":[{"column":"id","sequence":{"generation":"serial","incarnation":"01010101010101010101010101010101","sequence_id":"18446744073709551615","namespace_id":"1","table_id":"88","column_id":"2","database":"default","namespace":"public","name":"items_id_seq"}}],"generated_columns":[{"column":"next_id","expression":{"op":"add","args":[{"op":"column","column":"id"},{"op":"literal","type":"integer","value":1}]}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer","x-antfly-sql-type":"int64"},"next_id":{"type":"integer","x-antfly-sql-type":"int64"}},"required":["id","next_id"],"additionalProperties":false}}}}
+    ;
+    var validator = try @import("mod.zig").CompiledTableValidator.init(a, input);
+    defer validator.deinit(a);
+    const table = try @import("mod.zig").deriveRuntimeTableSchema(a, validator.schema);
+    defer schema.freeSchema(a, table);
+    try std.testing.expect(table.requires_sequence_defaults);
+    try std.testing.expectEqual(@as(u32, 37), schema.requiredReaderVersion(table));
+    const encoded = try schema.serializeSchema(a, table);
+    defer a.free(encoded);
+    const decoded = try schema.deserializeSchema(a, encoded);
+    defer schema.freeSchema(a, decoded);
+    try std.testing.expect(decoded.requires_sequence_defaults);
+    try std.testing.expect(!(schema.ReaderCapabilities{ .semantic_ceiling = 36, .encoding_ceiling = 37 }).supports(schema.readerRequirementsForSchema(table)));
+
+    const Source = struct {
+        calls: usize = 0,
+        next: i64 = 100,
+        fn allocate(raw: *anyopaque, _: Allocator, scope: columns.Scope, name: []const u8, bound: columns.Binding) !i64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u64, 88), scope.table_id);
+            try std.testing.expectEqualStrings("id", name);
+            try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), bound.sequence_id);
+            try std.testing.expectEqual(@as(u64, 88), bound.owner.table_id);
+            try std.testing.expectEqual(@as(u64, 2), bound.owner.column_id);
+            self.calls += 1;
+            const value = self.next;
+            self.next += 1;
+            return value;
+        }
+    };
+    var source: Source = .{};
+    const preparation = validator.forPreparation(.{ .io = std.testing.io, .sequences = .{ .ptr = &source, .allocate = Source.allocate }, .sequence_scope = .{ .table_id = 88, .schema_version = 1, .storage_name = "items" } });
+    var absent = try std.json.parseFromSlice(std.json.Value, a, "{}", .{});
+    defer absent.deinit();
+    try std.testing.expectError(error.SequenceProviderUnavailable, validator.prepareValue(absent.arena.allocator(), a, &absent.value));
+    try std.testing.expectEqual(@as(usize, 0), absent.value.object.count());
+    try preparation.prepareValue(absent.arena.allocator(), a, &absent.value);
+    try std.testing.expectEqual(@as(i64, 100), absent.value.object.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, 101), absent.value.object.get("next_id").?.integer);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    // A second preparation sees the owned logical value, never a new lease.
+    try preparation.prepareValue(absent.arena.allocator(), a, &absent.value);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    try validator.prepareTypedValue(absent.arena.allocator(), a, &absent.value, &.{}, true);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+
+    var explicit = try std.json.parseFromSlice(std.json.Value, a, "{\"id\":7}", .{});
+    defer explicit.deinit();
+    try preparation.prepareValue(explicit.arena.allocator(), a, &explicit.value);
+    try std.testing.expectEqual(@as(i64, 7), explicit.value.object.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, 8), explicit.value.object.get("next_id").?.integer);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+
+    var null_document = try std.json.parseFromSlice(std.json.Value, a, "{\"id\":null}", .{});
+    defer null_document.deinit();
+    try std.testing.expectError(error.InvalidBatchRequest, preparation.prepareValue(null_document.arena.allocator(), a, &null_document.value));
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    explicit.value.object.getPtr("next_id").?.* = .{ .integer = 9 };
+    try std.testing.expectError(error.InvalidRelationalGeneratedValue, validator.prepareTypedValue(explicit.arena.allocator(), a, &explicit.value, &.{}, true));
 }

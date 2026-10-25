@@ -237,6 +237,7 @@ pub const Relation = union(enum) {
 };
 pub const JoinKind = enum { inner, left, right, full, cross };
 pub const Insert = struct {
+    overriding: enum { none, system, user } = .none,
     alias: ?[]const u8 = null,
     conflict: ?Conflict = null,
     returning: ?[]const Projection = null,
@@ -253,6 +254,10 @@ pub const Insert = struct {
     values_source_rows: []const []const Value = &.{},
     /// Aligned with rows/cells. Literal cells keep the direct binding path.
     expressions: []const []const ?*const Scalar = &.{},
+
+    pub fn ignoresIdentity(self: Insert, column: @import("catalog.zig").Column) bool {
+        return self.overriding == .user and if (column.sequence_default) |binding| binding.generation != .serial else false;
+    }
 
     pub fn isDefault(self: Insert, row: usize, cell: usize) bool {
         return self.defaults.len != 0 and self.defaults[row][cell];
@@ -323,6 +328,7 @@ pub const Column = struct {
     nullable: bool = true,
     default_expression: ?*const Scalar = null,
     generated_expression: ?*const Scalar = null,
+    sequence: ?@import("../system_catalog/column_sequences.zig").Creation = null,
     references: ?ForeignKey = null,
 };
 /// Native document schema declarations are deliberately separate from SQL row

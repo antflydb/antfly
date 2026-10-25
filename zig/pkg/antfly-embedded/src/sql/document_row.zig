@@ -98,6 +98,15 @@ pub fn deriveRelationalColumnsLeaky(owned: std.mem.Allocator, temporary: std.mem
         out.generated = generated.contains(column.name);
         out.defaulted = catalog.hasColumnDefault(parsed, column.name);
         out.clock_defaulted = catalog.columnDefaultUsesClock(parsed, column.name);
+        if (parsed.column_defaults) |defaults| for (defaults.value.array.items) |entry| {
+            if (!std.mem.eql(u8, entry.object.get("column").?.string, column.name)) continue;
+            if (entry.object.get("sequence")) |reference| {
+                var bound = try @import("../system_catalog/column_sequences.zig").Binding.parse(temporary, reference);
+                defer bound.deinit();
+                out.sequence_default = try bound.value.cloneLeaky(owned);
+            }
+            break;
+        };
         out.type = relationalType(parsed, column.name, out.type);
     }
     return columns;

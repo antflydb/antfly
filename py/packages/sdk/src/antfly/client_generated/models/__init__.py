@@ -2002,6 +2002,8 @@ from .reauthorize_table_destinations_response_200_status import ReauthorizeTable
 from .regexp_query import RegexpQuery
 from .relational_check_constraint import RelationalCheckConstraint
 from .relational_column_expression import RelationalColumnExpression
+from .relational_column_sequence import RelationalColumnSequence
+from .relational_column_sequence_generation import RelationalColumnSequenceGeneration
 from .relational_comparison_op import RelationalComparisonOp
 from .relational_constraint_activation_phase import RelationalConstraintActivationPhase
 from .relational_constraint_conflict_reason import RelationalConstraintConflictReason
@@ -4193,6 +4195,8 @@ __all__ = (
     "RegexpQuery",
     "RelationalCheckConstraint",
     "RelationalColumnExpression",
+    "RelationalColumnSequence",
+    "RelationalColumnSequenceGeneration",
     "RelationalComparisonOp",
     "RelationalConstraintActivationPhase",
     "RelationalConstraintConflictReason",

@@ -1025,6 +1025,7 @@ pub fn bindCandidates(alloc: Allocator, backend: catalog.Backend, target: catalo
             .update => |assignments| for (assignments, 0..) |assignment, index| {
                 const field = try target.column(assignment.field);
                 if (field.generated or std.mem.eql(u8, field.name, "_id")) return error.UnsupportedSqlShape;
+                if (field.sequence_default) |binding| if (binding.generation == .always and !assignment.use_default) return error.SqlGeneratedColumnWrite;
                 for (assignments[0..index]) |prior| if (std.mem.eql(u8, prior.field, field.name)) return error.DuplicateSqlColumn;
                 if (assignment.expression) |expression| try projections.expression(expression);
             },
@@ -1033,6 +1034,7 @@ pub fn bindCandidates(alloc: Allocator, backend: catalog.Backend, target: catalo
                 for (insert.columns, insert.values, 0..) |name, value, index| {
                     const field = try target.column(name);
                     if (field.generated) return error.UnsupportedSqlShape;
+                    if (field.sequence_default) |binding| if (binding.generation == .always and value != null) return error.SqlGeneratedColumnWrite;
                     for (insert.columns[0..index]) |prior| if (std.mem.eql(u8, prior, field.name)) return error.DuplicateSqlColumn;
                     if (value) |expression| try projections.expression(expression);
                 }

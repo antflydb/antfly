@@ -1710,5 +1710,32 @@
     },
     "last_value": 1,
     "is_called": true
+  },
+  "permission_contract": {
+    "identity_insert": "INSERT 0 1",
+    "denied": {
+      "serial_default": "42501",
+      "explicit_identity_sequence": "42501"
+    },
+    "copy_rows": {
+      "columns": [
+        "id",
+        "status"
+      ],
+      "column_oids": [
+        20,
+        25
+      ],
+      "rows": [
+        [
+          1,
+          "identity"
+        ],
+        [
+          99,
+          "explicit"
+        ]
+      ]
+    }
   }
 }

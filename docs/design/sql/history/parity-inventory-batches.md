@@ -1361,3 +1361,48 @@ now exist, but atomic table/sequence/default publication, shared typed-row
 identity enforcement and transactional owned-counter handoff remain the next
 whole-case boundary. These component and oracle results do not change those
 three dispositions.
+
+
+## Atomic serial and identity column lifecycles
+
+Closed `sql-0318`, `sql-0319` and `sql-0320` against their unchanged originals
+and an independent PostgreSQL 18 oracle. CREATE publishes the physical table,
+immutable default binding, stable attribute IDs, sequence descriptor, counter
+and ownership edge in one native metadata transaction. The mounted Debug gate
+runs all three declarations through complete write postimages, DEFAULT and
+explicit NULL handling, OVERRIDING, CHECK failure, rollback, schema rewrite,
+CONTINUE/RESTART IDENTITY, real native checkpoint installation and exact
+allocation-receipt replay, independently cold owners and owned-sequence cleanup.
+Constraint retirement must reach its existing public `ready_to_drop` barrier
+before DROP; a pending receipt or schema publication is never completion proof.
+
+SQL and public batch/typed-row preparation share the native default provider.
+An identity table writer needs namespace usage and table write authority;
+explicit NEXTVAL and serial defaults retain sequence privilege checks. Public
+bulk mutations accept explicit ALWAYS values like PostgreSQL COPY, while SQL
+INSERT, UPDATE, ON CONFLICT and MERGE enforce ALWAYS restrictions. The provider
+pins one normalization view per SQL statement and keeps cached allocation leases
+on the existing sequence owner; counter effects remain outside scalar bytecode
+and are never repeated during Raft row application or restore validation.
+
+Native checkpoint recovery preserves the sequence incarnation, ownership,
+counters and durable outcomes. An activated empty sequence outcome journal is
+encoded as head zero, distinct from an absent journal. Snapshot source proofs
+separately decode logical JSON bindings and physical binary table records;
+independently versioned sequence/view records do not alter the physical source
+cut. The catalog-store regression gate passed all 51 tests.
+
+Initial CREATE with both owned sequence intents and foreign keys remains
+unsupported by the initial-FK publication owner and is rejected before admission.
+Table archives without the metadata counter/incarnation proof also fail closed;
+this cohort qualifies full native metadata checkpoints, not counter-aware
+cross-database table imports. ALTER ADD COLUMN sequence backfill remains guarded.
+These limits do not change unrelated original-case dispositions.
+
+The focused owned-default Debug gate passed both parser and shared-preparation
+contracts. Sequence-effects (five tests), document TRUNCATE (one lifecycle),
+PostgreSQL fixture verification, public API generation, formatting, generated
+Python client consistency, license and Apache-boundary checks passed. The broad
+SQL run was stopped during unchanged spill allocation-failure coverage and is
+not claimed as a completed full-suite pass. The ledger now records 791
+implemented, 137 rejected, 433 superseded and 225 unresolved original cases.

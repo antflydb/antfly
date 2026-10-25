@@ -130,7 +130,9 @@ const std = @import("std");
 /// Version 69 includes main's native service ownership and complete resolver
 /// authority/projection decoder. Its published v38/v42 profiles overlap this
 /// branch's earlier SQL work, so require this combined decoder explicitly.
-pub const current_version: u16 = 69;
+/// Version 70 binds owned sequence defaults and table creation in one catalog transaction.
+pub const current_version: u16 = 70;
+pub const sql_column_sequences_version: u16 = 70;
 pub const native_service_tables_version: u16 = 69;
 pub const resolver_records_version: u16 = 69;
 /// Stable database/namespace annotations, without physical schema publication.

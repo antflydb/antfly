@@ -46,12 +46,14 @@ pub const max_columns = 4096;
 
 /// All historical physical layouts share one immutable expression program.
 /// A wide predecessor schema must not be cloned once per retained epoch.
+const TransformBinding = struct { ordinal: u32, generated: bool, plan: expressions.Plan };
+
 const TransformSet = struct {
     refs: std.atomic.Value(usize) = .init(1),
     alloc: Allocator,
     arena: std.heap.ArenaAllocator,
     source: registry.SchemaView,
-    bindings: []expressions.Set.Binding,
+    bindings: []TransformBinding,
     rules: []const @import("relational_rewrite_contract.zig").ColumnTransform,
     source_json: []const u8,
     digest: Digest,
@@ -76,7 +78,7 @@ const TransformSet = struct {
         const bytes = try a.dupe(u8, policies.expression_schema);
         var source = try compileView(alloc, bytes);
         errdefer source.release();
-        const bindings = try alloc.alloc(expressions.Set.Binding, policies.column_transforms.len);
+        const bindings = try alloc.alloc(TransformBinding, policies.column_transforms.len);
         errdefer alloc.free(bindings);
         var initialized: usize = 0;
         errdefer for (bindings[0..initialized]) |*binding| binding.plan.deinit();
@@ -149,7 +151,7 @@ pub const Program = struct {
     source_schema_digest: Digest,
     target_schema_digest: Digest,
     identity: Digest,
-    transforms: []const expressions.Set.Binding,
+    transforms: []const TransformBinding,
     transform_set: ?*TransformSet,
     expression_ordinals: []?u32,
 
@@ -175,7 +177,7 @@ pub const Program = struct {
         if (policies.column_transforms.len > 256 or (policies.column_transforms.len == 0) != (policies.expression_schema.len == 0)) return error.InvalidRestoreStagingCommand;
         const transform_set: ?*TransformSet = if (policies.column_transforms.len == 0) null else if (template) |existing| existing.transform_set.?.retain() else try TransformSet.init(alloc, target, policies);
         errdefer if (transform_set) |set| set.release();
-        const transforms: []const expressions.Set.Binding = if (transform_set) |set| set.bindings else &.{};
+        const transforms: []const TransformBinding = if (transform_set) |set| set.bindings else &.{};
         const logical_columns: []const schema.RelationalColumn = if (transform_set) |set| set.source.tableSchema().relational_columns else &.{};
         const expression_ordinals = try alloc.alloc(?u32, logical_columns.len);
         errdefer alloc.free(expression_ordinals);
@@ -207,7 +209,13 @@ pub const Program = struct {
         if (mask) |enabled| if (target.validator().?.execution.expressions) |set| {
             for (set.bindings) |binding| {
                 if (binding.generated or !enabled[binding.ordinal]) continue;
-                for (binding.plan.nodes) |node| if (node.op == .transaction_timestamp) {
+                const plan = switch (binding.source) {
+                    .expression => |*value| value,
+                    // Rewrites must receive already materialized sequence
+                    // defaults from their durable preparation owner.
+                    .sequence => return error.UnsupportedSqlShape,
+                };
+                for (plan.nodes) |node| if (node.op == .transaction_timestamp) {
                     clock_required = true;
                     break;
                 };
@@ -266,7 +274,11 @@ pub const Program = struct {
         if (mask) |enabled| if (target.validator().?.execution.expressions) |set| {
             for (set.bindings) |binding| {
                 if (binding.generated or !enabled[binding.ordinal]) continue;
-                for (binding.plan.nodes) |node| if (node.op == .uuidv4 or node.op == .uuidv7) {
+                const plan = switch (binding.source) {
+                    .expression => |*value| value,
+                    .sequence => return error.UnsupportedSqlShape,
+                };
+                for (plan.nodes) |node| if (node.op == .uuidv4 or node.op == .uuidv7) {
                     materialized_defaults = true;
                     break;
                 };

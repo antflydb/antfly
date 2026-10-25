@@ -407,6 +407,12 @@ pub const RaftApplyStore = struct {
     pub fn prepareSystemCatalogResult(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, command: contract.SystemCatalogCommand) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_prepare = command });
     }
+    pub fn prepareColumnSequenceHandoffs(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: @import("../metadata/column_sequence_handoff.zig").Request) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group, .{ .catalog_column_sequence_handoffs = request });
+    }
+    pub fn bindTableColumnSequences(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, command: contract.SystemCatalogCommand) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_bind_column_sequences = command });
+    }
     pub fn sqlSequenceAdmissionHead(self: *RaftApplyStore, group_id: u64) !u64 {
         return self.catalogProjection(u64, self.alloc, group_id, .{ .sql_sequence_admission_head = {} });
     }

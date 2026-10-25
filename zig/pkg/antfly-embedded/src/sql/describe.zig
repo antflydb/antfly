@@ -884,6 +884,10 @@ const Context = struct {
             if (self.table.isDocumentRoot(column.name)) {
                 for (value_rows, 0..) |_, row_index| if (statement.isDefault(row_index, i)) return error.SqlNotNullViolation;
             }
+            if (column.sequence_default) |binding| if (binding.generation == .always and statement.overriding == .none) {
+                if (value_rows.len == 0) return error.SqlGeneratedColumnWrite;
+                for (value_rows, 0..) |_, row_index| if (!statement.isDefault(row_index, i)) return error.SqlGeneratedColumnWrite;
+            };
             if (column.generated) {
                 if (value_rows.len == 0) return error.SqlGeneratedColumnWrite;
                 for (value_rows, 0..) |_, row_index| if (!statement.isDefault(row_index, i)) return error.SqlGeneratedColumnWrite;
@@ -930,6 +934,7 @@ const Context = struct {
             const column = try self.table.column(assignment.field);
             if (std.mem.eql(u8, column.name, "_id")) return error.UnsupportedSqlExecution;
             if (column.generated) return error.SqlGeneratedColumnWrite;
+            if (column.sequence_default) |binding| if (binding.generation == .always and !assignment.use_default) return error.SqlGeneratedColumnWrite;
             if ((try seen.getOrPut(self.allocator, assignment.field)).found_existing) return error.DuplicateColumn;
             if (assignment.expression == null and (index >= self.scalars.assignments.len or self.scalars.assignments[index] == null)) try self.value(assignment.value, column, true);
         }

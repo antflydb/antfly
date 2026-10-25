@@ -244,8 +244,14 @@ fn canonicalizeExpressionValue(alloc: std.mem.Allocator, expression: *std.json.V
 pub fn canonicalizeOwnedSchema(alloc: std.mem.Allocator, schema: *wire.TableSchema) !void {
     var columns: ColumnTypes = .{ .alloc = alloc, .source = .{ .public = schema } };
     defer columns.deinit();
-    if (schema.column_defaults) |items| for (@constCast(items)) |*item| try canonicalizeOwnedExpression(alloc, &item.expression);
-    if (schema.generated_columns) |items| for (@constCast(items)) |*item| try canonicalizeOwnedExpression(alloc, &item.expression);
+    if (schema.column_defaults) |items| for (@constCast(items)) |*item| {
+        if ((item.expression != null) == (item.sequence != null)) return error.InvalidRelationalExpression;
+        if (item.expression) |*expression| try canonicalizeOwnedExpression(alloc, expression);
+    };
+    if (schema.generated_columns) |items| for (@constCast(items)) |*item| {
+        if (item.sequence != null) return error.InvalidRelationalExpression;
+        try canonicalizeOwnedExpression(alloc, if (item.expression) |*expression| expression else return error.InvalidRelationalExpression);
+    };
     if (schema.checks) |items| for (@constCast(items)) |*item| {
         if (item.expression) |*expression| try canonicalizeOwnedExpression(alloc, expression);
         if (item.column) |column| {

@@ -244,7 +244,10 @@ const ExecutionCampaign = struct {
     }
     fn call(ctx: *fixture.Context, connection: ?[]const u8, sql: []const u8, code: ?[]const u8, expected: []const []const Json) !void {
         const ddl = std.mem.startsWith(u8, sql, "CREATE ") or std.mem.startsWith(u8, sql, "ALTER ") or std.mem.startsWith(u8, sql, "DROP ");
-        var response = try client.executeConnected(ctx, null, connection, sql, if (ddl) .write_admission else .never);
+        return callWithRetry(ctx, connection, sql, code, expected, if (ddl) .write_admission else .never);
+    }
+    fn callWithRetry(ctx: *fixture.Context, connection: ?[]const u8, sql: []const u8, code: ?[]const u8, expected: []const []const Json, retry: client.Retry) !void {
+        var response = try client.executeConnected(ctx, null, connection, sql, retry);
         defer response.deinit(ctx.alloc);
         if (code) |state| {
             var diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, response.body, .{});
@@ -438,4 +441,289 @@ test "mounted SQL sequence effects preserve PostgreSQL sessions cache allocation
     // sql-1103: exact document TRUNCATE original, asynchronous publication,
     // authorization, future writes and independently reopened native owners.
     try fixture.run(ExecutionCampaign);
+}
+
+const IdentityStep = struct {
+    sql: []const u8,
+    sqlstate: ?[]const u8,
+    tag: ?[]const u8,
+    output: ?struct { columns: []const Json, rows: []const []const Json },
+};
+const IdentityEntry = struct { id: []const u8, sql: []const u8, steps: []const IdentityStep };
+const IdentityCampaign = struct {
+    pub const native_sessions = true;
+    pub const native_auth = true;
+    pub const cold_catalog = true;
+    entry: IdentityEntry,
+    credentials: client.ApiKeyHeaders = .{},
+    connection: [32]u8 = undefined,
+    copy_typed_id: i64 = 2,
+
+    fn publicMutation(ctx: *fixture.Context, path: []const u8, body: []const u8) !@import("../raft/transport/http_common.zig").HttpResponse {
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 15 * std.time.ns_per_s;
+        while (true) {
+            try ctx.checkDrivers();
+            const remaining = deadline -| @import("antfly_platform").time.monotonicNs();
+            if (remaining == 0) return error.IdentityPublicWriteUnavailable;
+            var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, path, .POST, body, @intCast(@max(1, remaining / std.time.ns_per_ms)));
+            if (response.status == 503) {
+                const Diagnostic = struct { code: []const u8, retryable: bool = false };
+                var diagnostic = std.json.parseFromSlice(Diagnostic, ctx.alloc, response.body, .{ .ignore_unknown_fields = true }) catch return response;
+                defer diagnostic.deinit();
+                if (diagnostic.value.retryable and std.mem.eql(u8, diagnostic.value.code, "transaction_precommit_read_unavailable")) {
+                    // No row decision exists. Nontransactional counters may
+                    // have advanced; assert uniqueness, not gaplessness.
+                    response.deinit(ctx.alloc);
+                    try ctx.io.sleep(.fromMilliseconds(20), .awake);
+                    continue;
+                }
+            }
+            return response;
+        }
+    }
+    fn publicWrites(self: *@This(), ctx: *fixture.Context) !void {
+        try ExecutionCampaign.call(ctx, null, "CREATE TABLE copy_rows(id bigint GENERATED ALWAYS AS IDENTITY,status text)", null, &.{});
+        const serving = try fixture.waitServingSchema(ctx, "copy_rows", 0);
+        try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, serving.table_id);
+        try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, "copy_rows");
+        const manager = (ctx.metadata.server.owned_public_http_server orelse return error.MissingMetadataPublicApi).cfg.user_manager orelse return error.MissingUserManager;
+        var permission = try @import("../usermgr/mod.zig").Permission.initOwned(ctx.alloc, .table, "copy_rows", .write);
+        defer permission.deinit(ctx.alloc);
+        var namespace_permission = try @import("../usermgr/mod.zig").Permission.initOwned(ctx.alloc, .namespace, "default.public", .read);
+        defer namespace_permission.deinit(ctx.alloc);
+        try manager.addPermissionToUser("pk-rewriter", permission);
+        try manager.addPermissionToUser("pk-rewriter", namespace_permission);
+        var key = try manager.createApiKey("pk-rewriter", "identity-table-writer", &.{ permission, namespace_permission }, &.{}, null);
+        defer key.deinit(manager.alloc);
+        const authorization = try std.fmt.allocPrint(ctx.alloc, "ApiKey {s}", .{key.encoded});
+        defer ctx.alloc.free(authorization);
+        const headers = [_]@import("../raft/transport/http_common.zig").RequestHeader{.{ .name = "authorization", .value = authorization }};
+        var writer = ctx.*;
+        writer.headers = &headers;
+        var batch = try publicMutation(&writer, "/db/v1/tables/copy_rows/batch", "{\"inserts\":{\"missing\":{\"status\":\"missing\"},\"explicit\":{\"id\":99,\"status\":\"explicit\"}}}");
+        defer batch.deinit(ctx.alloc);
+        if (batch.status != 201) std.debug.print("identity public batch status={d} body={s}\n", .{ batch.status, batch.body });
+        try std.testing.expectEqual(@as(u16, 201), batch.status);
+        const request = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .schema_version = serving.version, .mutations = .{.{ .key = "typed", .expected_version = "0", .row = .{ .status = "typed" } }} }, .{});
+        defer ctx.alloc.free(request);
+        var typed = try publicMutation(&writer, "/db/v1/tables/copy_rows/rows/mutate", request);
+        defer typed.deinit(ctx.alloc);
+        if (typed.status != 201) std.debug.print("identity typed mutation status={d} body={s}\n", .{ typed.status, typed.body });
+        try std.testing.expectEqual(@as(u16, 201), typed.status);
+        var invalid = try publicMutation(ctx, "/db/v1/tables/copy_rows/batch", "{\"inserts\":{\"null\":{\"id\":null,\"status\":\"null\"}}}");
+        defer invalid.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 400), invalid.status);
+        var observed = try client.execute(ctx, "SELECT id FROM copy_rows WHERE status='typed'", .read);
+        defer observed.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), observed.status);
+        var parsed = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, observed.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.rows.len);
+        self.copy_typed_id = switch (parsed.value.rows[0][0]) {
+            .integer => |number| number,
+            .string, .number_string => |text| try std.fmt.parseInt(i64, text, 10),
+            else => return error.InvalidIdentityRow,
+        };
+        try std.testing.expect(self.copy_typed_id >= 2 and self.copy_typed_id < 98);
+        try ExecutionCampaign.call(&writer, null, "SELECT nextval('copy_rows_id_seq')", "42501", &.{});
+        try ExecutionCampaign.call(&writer, null, "INSERT INTO copy_rows(id,status) OVERRIDING SYSTEM VALUE VALUES(nextval('copy_rows_id_seq'),'forbidden')", "42501", &.{});
+        try ExecutionCampaign.call(&writer, null, "INSERT INTO copy_rows(status) VALUES('scoped')", null, &.{});
+        try self.verifyCopyRows(ctx);
+    }
+    fn verifyCopyRows(self: *@This(), ctx: *fixture.Context) !void {
+        try ExecutionCampaign.callWithRetry(ctx, null, "SELECT id,status FROM copy_rows ORDER BY id", null, &.{
+            &.{ .{ .integer = 1 }, .{ .string = "missing" } },
+            &.{ .{ .integer = self.copy_typed_id }, .{ .string = "typed" } },
+            &.{ .{ .integer = self.copy_typed_id + 1 }, .{ .string = "scoped" } },
+            &.{ .{ .integer = 99 }, .{ .string = "explicit" } },
+        }, .read);
+    }
+
+    /// Exercise the real native snapshot installer, not just reopening live
+    /// files. The restored allocator must retain its exact definition, owner,
+    /// high-water mark, generation and nonce-bound acknowledgement behavior.
+    fn restoreMetadata(_: *@This(), ctx: *fixture.Context) !void {
+        const store = ctx.metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
+        const group = ctx.metadata.server.svc.metadata_group_id;
+        var snapshot: ?[]u8 = null;
+        defer if (snapshot) |bytes| ctx.alloc.free(bytes);
+        var index: u64 = 0;
+        for (0..32) |_| {
+            const before = (try store.latestCheckpoint(group)) orelse return error.MetadataCheckpointMissing;
+            const bytes = try store.snapshotBuilder().buildSnapshot(ctx.alloc, group);
+            const after = (try store.latestCheckpoint(group)) orelse return error.MetadataCheckpointMissing;
+            if (before.commit_index == after.commit_index) {
+                snapshot = bytes;
+                index = before.commit_index;
+                break;
+            }
+            ctx.alloc.free(bytes);
+            try ctx.io.sleep(.fromMilliseconds(1), .awake);
+        } else return error.MetadataCheckpointBusy;
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        const directory = try temporary.dir.realPathFileAlloc(ctx.io, ".", ctx.alloc);
+        defer ctx.alloc.free(directory);
+        const root = try std.fmt.allocPrint(ctx.alloc, "{s}/restored", .{directory});
+        defer ctx.alloc.free(root);
+        const native = @import("../storage/metadata_raft_apply_client.zig");
+        var restored = try native.RaftApplyStore.init(ctx.alloc, .{ .root_dir = root });
+        defer restored.deinit();
+        try std.testing.expect(try restored.snapshotBuilder().installSnapshot(ctx.alloc, group, index, snapshot.?));
+        const domain = local.system_catalog_domain;
+        const target: domain.Target = .{ .database = "default", .namespace = "public", .table = "usage_records" };
+        const table = (try restored.resolveSystemCatalogTable(ctx.alloc, group, target)) orelse return error.RestoredIdentityTableMissing;
+        defer @import("../metadata/table_manager.zig").freeTable(ctx.alloc, table);
+        const query: sequence.SnapshotRequest = .{
+            .targets = &.{.{ .database = "default", .namespace = "public", .table = "usage_records_id_seq" }},
+            .include_counters = true,
+            .column_default = null,
+        };
+        const original_bytes = try store.sqlSequenceSnapshot(ctx.alloc, group, query, .{});
+        defer ctx.alloc.free(original_bytes);
+        var original = try std.json.parseFromSlice(sequence.Snapshot, ctx.alloc, original_bytes, .{});
+        defer original.deinit();
+        const restored_bytes = try restored.sqlSequenceSnapshot(ctx.alloc, group, query, .{});
+        defer ctx.alloc.free(restored_bytes);
+        var observed = try std.json.parseFromSlice(sequence.Snapshot, ctx.alloc, restored_bytes, .{});
+        defer observed.deinit();
+        const actual = observed.value.entries[0];
+        try std.testing.expectEqualDeep(original.value.incarnation, observed.value.incarnation);
+        try std.testing.expectEqualDeep(original.value.entries[0].value, actual.value);
+        try std.testing.expectEqualDeep(original.value.entries[0].counter, actual.counter);
+        const definition = try actual.value.sequence.definition();
+        try std.testing.expectEqual(table.table_id, definition.owned_by.?.table_id);
+        const expected = try actual.counter.?.reserve(definition);
+        var nonce: [16]u8 = undefined;
+        try ctx.io.randomSecure(&nonce);
+        const allocation: sequence.CounterRequest = .{
+            .target = actual.target,
+            .namespace_id = actual.namespace_id.?,
+            .sequence_id = actual.value.sequence.id,
+            .incarnation = observed.value.incarnation,
+            .request = .{ .request_id = nonce, .expected = actual.counter.?, .operation = .reserve },
+        };
+        const encoded = try std.json.Stringify.valueAlloc(ctx.alloc, allocation, .{});
+        defer ctx.alloc.free(encoded);
+        try restored.applyStandaloneCommand(group, .{ .apply_sql_sequence_counter = encoded });
+        const receipt = try ((try restored.sqlSequenceCounterOutcome(ctx.alloc, group, allocation)) orelse return error.RestoredIdentityAllocationMissing).result();
+        try std.testing.expectEqualDeep(expected.lease, receipt.lease.?);
+        try restored.applyStandaloneCommand(group, .{ .apply_sql_sequence_counter = encoded });
+        try std.testing.expectEqualDeep(receipt, try ((try restored.sqlSequenceCounterOutcome(ctx.alloc, group, allocation)) orelse return error.RestoredIdentityAllocationMissing).result());
+    }
+
+    pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+        try self.credentials.activate(ctx);
+        ctx.headers = ctx.admin_headers;
+        self.connection = try ExecutionCampaign.open(ctx);
+        for (self.entry.steps, 0..) |step, index| {
+            if (index == 0) {
+                var created = try client.executeConnected(ctx, null, &self.connection, step.sql, .write_admission);
+                defer created.deinit(ctx.alloc);
+                if (created.status != 200 and created.status != 202) std.debug.print("identity CREATE id={s} body={s}\n", .{ self.entry.id, created.body });
+                try std.testing.expect(created.status == 200 or created.status == 202);
+                const serving = try fixture.waitServingSchema(ctx, "usage_records", 0);
+                try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, serving.table_id);
+                try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, "usage_records");
+            } else if (std.mem.startsWith(u8, step.sql, "ALTER ") or std.mem.startsWith(u8, step.sql, "TRUNCATE ")) {
+                var coordinator = ctx.*;
+                coordinator.base = ctx.metadata_uri;
+                var response = try client.execute(&coordinator, step.sql, .write_admission);
+                defer response.deinit(ctx.alloc);
+                if (response.status != 200 and response.status != 202 and response.status != 409) std.debug.print("identity DDL sql={s} body={s}\n", .{ step.sql, response.body });
+                try std.testing.expect(response.status == 200 or response.status == 202 or response.status == 409);
+                var parsed = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+                defer parsed.deinit();
+                if (parsed.value.ddl_receipt) |receipt| {
+                    if (receipt.restore_job_id) |job_id| {
+                        const deadline = @import("antfly_platform").time.monotonicNs() +| 60 * std.time.ns_per_s;
+                        while (true) {
+                            try ctx.checkDrivers();
+                            var observed = try fixture.job(ctx.alloc, ctx.transport, ctx.headers, ctx.metadata_uri, job_id);
+                            defer observed.deinit(ctx.alloc);
+                            var job = try std.json.parseFromSlice(wire.RestoreJob, ctx.alloc, observed.body, .{ .ignore_unknown_fields = true });
+                            defer job.deinit();
+                            if (std.mem.eql(u8, job.value.phase, "succeeded")) break;
+                            if (std.mem.eql(u8, job.value.phase, "failed") or std.mem.eql(u8, job.value.phase, "canceled")) {
+                                std.debug.print("identity DDL failed sql={s} body={s}\n", .{ step.sql, observed.body });
+                                return error.IdentityDdlFailed;
+                            }
+                            if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.IdentityDdlTimeout;
+                            try ctx.io.sleep(.fromMilliseconds(20), .awake);
+                        }
+                    }
+                    _ = try fixture.waitServingSchema(ctx, "usage_records", @intCast(receipt.schema_version));
+                }
+            } else {
+                try ExecutionCampaign.call(ctx, &self.connection, step.sql, step.sqlstate, if (step.output) |out| out.rows else &.{});
+            }
+        }
+        if (std.mem.eql(u8, self.entry.id, "sql-0320")) {
+            try ExecutionCampaign.call(ctx, &self.connection, "INSERT INTO usage_records(id,status) OVERRIDING SYSTEM VALUE VALUES(100,'conflict') ON CONFLICT(id) DO UPDATE SET id=101", "428C9", &.{});
+            try ExecutionCampaign.call(ctx, &self.connection, "MERGE INTO usage_records t USING (VALUES (100)) s(id) ON t.id=s.id WHEN MATCHED THEN UPDATE SET id=101", "428C9", &.{});
+            try ExecutionCampaign.call(ctx, &self.connection, "MERGE INTO usage_records t USING (VALUES (999)) s(id) ON t.id=s.id WHEN NOT MATCHED THEN INSERT(id,status) VALUES(s.id,'explicit')", "428C9", &.{});
+        }
+        try self.publicWrites(ctx);
+        try self.restoreMetadata(ctx);
+    }
+    pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+        ctx.headers = ctx.admin_headers;
+        const connection = try ExecutionCampaign.open(ctx);
+        const initial: i64 = if (std.mem.eql(u8, self.entry.id, "sql-0320")) 100 else 1;
+        try ExecutionCampaign.callWithRetry(ctx, &connection, "SELECT id,status FROM usage_records ORDER BY id", null, &.{&.{ .{ .integer = initial }, .{ .string = "restarted" } }}, .read);
+        try ExecutionCampaign.call(ctx, &connection, "INSERT INTO usage_records(status) VALUES('cold') RETURNING id,status", null, &.{&.{ .{ .integer = if (initial == 100) 140 else 2 }, .{ .string = "cold" } }});
+        try self.verifyCopyRows(ctx);
+        // DROP shares the public all-owner drain for active constraints. A
+        // ready schema alone does not prove retirement reached its barrier.
+        const serving = try fixture.waitServingSchema(ctx, "usage_records", 0);
+        const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .schema_version = serving.version, .drop = true }, .{});
+        defer ctx.alloc.free(body);
+        var retirement = try fixture.request(ctx.alloc, ctx.transport, ctx.headers, ctx.metadata_uri, "/db/v1/tables/usage_records/constraints/retire", .POST, body);
+        defer retirement.deinit(ctx.alloc);
+        if (retirement.status != 202) std.debug.print("identity retirement body={s}\n", .{retirement.body});
+        try std.testing.expectEqual(@as(u16, 202), retirement.status);
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 30 * std.time.ns_per_s;
+        while (true) {
+            try ctx.checkDrivers();
+            var status = try fixture.request(ctx.alloc, ctx.transport, ctx.headers, ctx.metadata_uri, "/db/v1/tables/usage_records/constraints/status", .GET, null);
+            defer status.deinit(ctx.alloc);
+            if (status.status == 200) {
+                const Status = struct { retirement: ?struct { phase: []const u8, failure: ?[]const u8 = null } = null };
+                var observed = try std.json.parseFromSlice(Status, ctx.alloc, status.body, .{ .ignore_unknown_fields = true });
+                defer observed.deinit();
+                if (observed.value.retirement) |job| {
+                    if (job.failure != null) return error.IdentityRetirementFailed;
+                    if (std.mem.eql(u8, job.phase, "ready_to_drop")) break;
+                }
+            } else if (status.status != 409 and status.status != 503 and status.status != 504) {
+                std.debug.print("identity retirement status={d} body={s}\n", .{ status.status, status.body });
+                return error.IdentityRetirementUnavailable;
+            }
+            if (@import("antfly_platform").time.monotonicNs() >= deadline) {
+                std.debug.print("identity retirement stalled status={d} body={s}\n", .{ status.status, status.body });
+                return error.IdentityRetirementTimeout;
+            }
+            try ctx.io.sleep(.fromMilliseconds(20), .awake);
+        }
+        var coordinator = ctx.*;
+        coordinator.base = ctx.metadata_uri;
+        try ExecutionCampaign.call(&coordinator, null, "DROP TABLE usage_records", null, &.{});
+        try ExecutionCampaign.call(ctx, &connection, "SELECT nextval('usage_records_id_seq')", "42P01", &.{});
+    }
+};
+
+test "mounted SQL original serial and identity declarations preserve PostgreSQL writes and cold owners" {
+    // sql-0318, sql-0319, sql-0320: exact original declarations, PostgreSQL
+    // write postimages, real checkpoint restore, and independently cold owners.
+    const a = std.testing.allocator;
+    const Reference = struct { format: u8, reference: []const u8, entries: []const IdentityEntry };
+    var reference = try std.json.parseFromSlice(Reference, a, local.sql_parity_fixtures.identity_reference, .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    try std.testing.expectEqual(@as(usize, 3), reference.value.entries.len);
+    var corpus = try local.sql_parity_fixtures.Corpus.init(a);
+    defer corpus.deinit();
+    for (reference.value.entries) |entry| {
+        try std.testing.expectEqualStrings((try corpus.get(entry.id)).sql, entry.sql);
+        try fixture.runWithState(IdentityCampaign, .{ .entry = entry });
+    }
 }

@@ -42506,9 +42506,83 @@ pub const RelationalCheckConstraint = struct {
     }
 };
 
+/// Exactly one of expression or the backend-bound sequence reference is required. Sequence references are column defaults only and cannot define stored generated columns.
 pub const RelationalColumnExpression = struct {
     column: []const u8,
-    expression: RelationalScalarExpression,
+    expression: ?RelationalScalarExpression = null,
+    sequence: ?RelationalColumnSequence = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "column", "column", false },
+        .{ "expression", "expression", true },
+        .{ "sequence", "sequence", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("column");
+        try jw.write(self.column);
+        if (self.expression) |value| {
+            try jw.objectField("expression");
+            try jw.write(value);
+        }
+        if (self.sequence) |value| {
+            try jw.objectField("sequence");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Backend-bound owned-sequence default, assigned atomically with the table and stable attribute identity. Names are descriptive; allocation uses the exact catalog incarnation and native 64-bit identities. Requires reader capability 37. Preparation allocates only for absent inputs; explicit NULL never requests a new value. Restore preserves stored values and never consumes the sequence. Clients cannot mint ownership by copying a descriptor onto a different table or column. Bulk mutation APIs preserve explicit identity values, like PostgreSQL COPY; SQL enforces ALWAYS and OVERRIDING rules. Implicit identity allocation uses table write authority; serial defaults and explicit sequence functions require sequence privileges.
+pub const RelationalColumnSequence = struct {
+    generation: RelationalColumnSequenceGeneration,
+    incarnation: []const u8,
+    sequence_id: []const u8,
+    namespace_id: []const u8,
+    table_id: []const u8,
+    column_id: []const u8,
+    database: []const u8,
+    namespace: []const u8,
+    name: []const u8,
+};
+
+/// SQL owned-sequence default policy. Serial defaults preserve explicit values even under OVERRIDING USER VALUE; identity defaults obey PostgreSQL overriding rules.
+pub const RelationalColumnSequenceGeneration = enum {
+    serial,
+    by_default,
+    always,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .serial => "serial",
+            .by_default => "by_default",
+            .always => "always",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "serial", .serial },
+            .{ "by_default", .by_default },
+            .{ "always", .always },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const RelationalComparisonOp = enum {

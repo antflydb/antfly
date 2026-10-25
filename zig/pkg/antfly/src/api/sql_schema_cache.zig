@@ -31,7 +31,6 @@ const Layout = struct {
     indexes: []const catalog.Index = &.{},
     index_definitions: []const catalog.IndexDefinition = &.{},
     constraints: []const catalog.Constraint = &.{},
-
     fn table(self: Layout, id: u64, physical_name: []const u8) catalog.Table {
         return .{ .id = id, .physical_name = physical_name, .schema_version = self.version, .storage_mode = self.storage_mode, .version_field = self.version_field, .external_base_source = self.external_base_source, .columns = self.columns, .indexes = self.indexes, .index_definitions = self.index_definitions, .constraints = self.constraints };
     }
@@ -102,6 +101,7 @@ pub const Cache = struct {
             out.* = column;
             out.name = try alloc.dupe(u8, column.name);
             out.path = try alloc.dupe(u8, column.path);
+            if (column.sequence_default) |binding| out.sequence_default = try binding.cloneLeaky(alloc);
         }
         const indexes = try alloc.alloc(catalog.Index, entry.layout.indexes.len);
         for (entry.layout.indexes, indexes) |index, *out| {

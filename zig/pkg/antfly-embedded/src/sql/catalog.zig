@@ -37,6 +37,7 @@ pub const Column = struct {
     defaulted: bool = false,
     /// An omitted default depends on this SQL transaction's captured clock.
     clock_defaulted: bool = false,
+    sequence_default: ?*const @import("../system_catalog/column_sequences.zig").Binding = null,
 
     pub fn assignStorageValue(self: Column, alloc: std.mem.Allocator, object: *std.json.ObjectMap, value: std.json.Value, sql_null: bool) !void {
         if (sql_null and self.document_null_is_absent) {
@@ -1222,6 +1223,7 @@ pub const Ddl = union(enum) {
         schema_json: []const u8,
         if_not_exists: bool,
         tablespace: ?[]const u8 = null,
+        column_sequences: []const @import("../system_catalog/column_sequences.zig").Creation = &.{},
         /// Compiler-owned provenance for admission-time name selection.
         /// Explicit user names must never be included or silently renamed.
         generated_constraint_names: []const []const u8 = &.{},
@@ -1387,6 +1389,16 @@ pub const ReadRelation = union(enum) {
     },
 };
 
+/// Statement-owned native row normalizer. The owner pins one schema and policy
+/// cut while preparing rows, and releases it before writer admission. Stateful
+/// defaults can be evaluated row by row without repeated remote opens.
+pub const MutationPreparation = struct {
+    ptr: *anyopaque,
+    prepare: *const fn (*anyopaque, std.mem.Allocator, []const Mutation) anyerror![]const Mutation,
+    finish: *const fn (*anyopaque, std.mem.Allocator) anyerror!void,
+    close: *const fn (*anyopaque) void,
+};
+
 pub const Backend = struct {
     pub const PreparedRead = struct { name: ast.Name, relation: ReadRelation };
     /// Private resolver namespace. Distinct delegated view contexts must not
@@ -1530,6 +1542,7 @@ pub const Backend = struct {
         /// bound schema epoch. No writes occur. Mutation consumes these exact
         /// normalized values; SQL must never guess postimages or read them back
         /// after commit. Returned rows preserve key/version/order/deletion.
+        open_mutation_preparation: ?*const fn (*anyopaque, std.mem.Allocator, Table, []const u8, bool) anyerror!MutationPreparation = null,
         prepare_mutations: ?*const fn (*anyopaque, std.mem.Allocator, Table, []const Mutation) anyerror![]const Mutation = null,
         checkpoint: *const fn (*anyopaque) anyerror!void,
         /// Native authority owns atomic existence checks and durable catalog

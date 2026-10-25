@@ -316,6 +316,7 @@ pub const Adapter = struct {
         defer integrity_reads.deinit();
         self.context = integrity_reads.attach(self.context);
         self.context.sql_transaction_micros = statement_instant.micros;
+        self.context.column_sequences = .{ .ptr = self, .allocate = @import("sql_sequence_execution.zig").allocateColumn };
         defer self.lake_visibility = previous_visibility;
         defer self.context = previous_context;
         var zig017_return_error: ?anyerror = null;
@@ -723,7 +724,7 @@ pub const Adapter = struct {
 
     // Both tables have static storage. Runtime fields inside an address-of
     // literal would instead return a dangling pointer to this call's stack.
-    const view_vtable: catalog.Backend.VTable = .{ .resolve_read = resolveRead, .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .estimate_scans = estimateScans, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint };
+    const view_vtable: catalog.Backend.VTable = .{ .resolve_read = resolveRead, .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .estimate_scans = estimateScans, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .open_mutation_preparation = openMutationPreparation, .ddl = ddl, .checkpoint = checkpoint };
     const table_vtable: catalog.Backend.VTable = blk: {
         var value = view_vtable;
         value.resolve_read = null;
@@ -2084,21 +2085,86 @@ pub const Adapter = struct {
         return prepareMutationsWithVisibility(ptr, alloc, table, input, true);
     }
 
-    fn prepareMutationsWithVisibility(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation, require_visible: bool) ![]const catalog.Mutation {
+    const MutationPreparation = struct {
+        adapter: *Adapter,
+        table: catalog.Table,
+        view: @import("antfly_local_sources").api_table_read_source.RelationalReadView,
+        filter: ?@import("antfly_local_sources").search_pattern_filter.PreparedPatternFilter = null,
+        allocator: std.mem.Allocator,
+
+        fn prepare(raw: *anyopaque, alloc: std.mem.Allocator, input: []const catalog.Mutation) ![]const catalog.Mutation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var stateful = false;
+            for (self.table.columns) |column| stateful = stateful or column.sequence_default != null;
+            if (!stateful) return self.normalize(alloc, input);
+            const result = try alloc.alloc(catalog.Mutation, input.len);
+            for (input, result) |mutation, *out| {
+                var prepared = mutation;
+                if (mutation.row) |document| {
+                    if (document != .object) return error.InvalidSqlBackendResponse;
+                    // Copy the map before filling defaults; callers may retain
+                    // the original image for conflict and RETURNING guards.
+                    var object: std.json.ObjectMap = .empty;
+                    for (document.object.keys(), document.object.values()) |key, value_| try object.put(alloc, key, value_);
+                    for (self.table.columns) |column| if (column.sequence_default) |binding| {
+                        if (!object.contains(column.path)) {
+                            const next = try @import("sql_sequence_execution.zig").allocateColumn(self.adapter, alloc, .{
+                                .table_id = self.table.id,
+                                .schema_version = self.table.schema_version,
+                                .storage_name = self.table.physical_name,
+                            }, column.name, binding.*);
+                            try object.put(alloc, column.path, .{ .integer = next });
+                        }
+                    };
+                    prepared.row = .{ .object = object };
+                }
+                // Validation of this row precedes every effect of the next.
+                const normalized = try self.normalize(alloc, &.{prepared});
+                if (normalized.len != 1) return error.InvalidSqlBackendResponse;
+                out.* = normalized[0];
+            }
+            return result;
+        }
+        fn normalize(self: *@This(), alloc: std.mem.Allocator, input: []const catalog.Mutation) ![]const catalog.Mutation {
+            const images = @import("antfly_local_sources").sql_mutation_images;
+            const writes = try images.writes(db_types.BatchWrite, alloc, input);
+            if (writes.len == 0) return input;
+            const normalized = self.view.normalize(alloc, writes) catch |err| return statementReadAdmissionError(err);
+            const result = try images.merge(alloc, input, normalized);
+            if (self.filter) |*filter| for (result) |mutation| if (mutation.row) |row| {
+                if (!try filter.matchesJson(alloc, mutation.key, row)) return error.Forbidden;
+            };
+            return result;
+        }
+        fn finish(raw: *anyopaque, alloc: std.mem.Allocator) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.adapter.verify(alloc, self.table);
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.view.deinit();
+            if (self.filter) |*filter| filter.deinit();
+            self.allocator.destroy(self);
+        }
+    };
+
+    fn openMutationPreparation(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, key: []const u8, require_visible: bool) !catalog.MutationPreparation {
+        return openMutationPreparationWithVisibility(ptr, alloc, table, key, require_visible);
+    }
+    fn openMutationPreparationWithVisibility(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, key: []const u8, require_visible: bool) !catalog.MutationPreparation {
         if (table.read_authority != null) return error.Forbidden;
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.verify(alloc, table);
-        const images = @import("antfly_local_sources").sql_mutation_images;
-        const writes = try images.writes(db_types.BatchWrite, alloc, input);
-        if (writes.len == 0) return input;
         const source = self.server.table_reads orelse return error.UnsupportedSqlExecution;
-        const upper = try pointUpperBound(alloc, writes[0].key);
+        const upper = try pointUpperBound(alloc, key);
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
         const policy_proof = try self.normalizationProof(alloc, table);
         defer if (self.policy_proofs == null) if (policy_proof) |proof| alloc.free(proof);
         const mandatory_filter = try http_server.resolveEffectiveRowFilterJson(alloc, self.identity.*, table.physical_name);
         defer if (mandatory_filter) |filter| alloc.free(filter);
-        const view = (source.openRelationalRead(alloc, table.physical_name, writes[0].key, upper, .{
+        const owner = try alloc.create(MutationPreparation);
+        errdefer alloc.destroy(owner);
+        const view = (source.openRelationalRead(alloc, table.physical_name, key, upper, .{
             .limit = 1,
             .inclusive_from = true,
             .exclusive_to = true,
@@ -2109,19 +2175,21 @@ pub const Adapter = struct {
             .execution_deadline_ns = (try self.context.platformDeadline()).deadline_ns,
             .cancellation = self.context.cancellation,
         }, .read_index) catch |read_err| return physicalReadAdmissionError(read_err)) orelse return error.UnsupportedSqlExecution;
-        defer view.deinit();
-        const normalized = view.normalize(alloc, writes) catch |err| return statementReadAdmissionError(err);
-        const result = try images.merge(alloc, input, normalized);
-        // RETURNING requires SELECT policy on the resulting row as well as
-        // write authority. Do not publish postimages that an ordinary read hides.
-        if (require_visible) if (try http_server.resolveEffectiveRowFilterJson(alloc, self.identity.*, table.physical_name)) |json| {
-            var filter = try @import("antfly_local_sources").search_pattern_filter.PreparedPatternFilter.init(alloc, json);
-            defer filter.deinit();
-            for (result) |mutation| if (mutation.row) |row| {
-                if (!try filter.matchesJson(alloc, mutation.key, row)) return error.Forbidden;
-            };
+        errdefer view.deinit();
+        owner.* = .{ .adapter = self, .table = table, .view = view, .allocator = alloc };
+        if (require_visible) if (mandatory_filter) |json| {
+            owner.filter = try @import("antfly_local_sources").search_pattern_filter.PreparedPatternFilter.init(alloc, json);
         };
-        try self.verify(alloc, table);
+        return .{ .ptr = owner, .prepare = MutationPreparation.prepare, .finish = MutationPreparation.finish, .close = MutationPreparation.close };
+    }
+    fn prepareMutationsWithVisibility(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation, require_visible: bool) ![]const catalog.Mutation {
+        const key = for (input) |mutation| {
+            if (mutation.row != null) break mutation.key;
+        } else return input;
+        const preparation = try openMutationPreparationWithVisibility(ptr, alloc, table, key, require_visible);
+        defer preparation.close(preparation.ptr);
+        const result = try preparation.prepare(preparation.ptr, alloc, input);
+        try preparation.finish(preparation.ptr, alloc);
         return result;
     }
 
@@ -2141,7 +2209,7 @@ pub const Adapter = struct {
         // defaults keep their existing single native commit preparation;
         // volatile defaults must observe this SQL transaction's captured time.
         const omitted_default = if (already_prepared) false else missing: {
-            for (table.columns) |column| if (column.clock_defaulted) {
+            for (table.columns) |column| if (column.clock_defaulted or column.sequence_default != null) {
                 for (raw_input) |mutation| if (mutation.row) |row| {
                     if (row != .object) return error.InvalidSqlBackendResponse;
                     if (!row.object.contains(column.path)) break :missing true;

@@ -2957,6 +2957,45 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-qualified-identity-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-identity-lifecycle-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-identity-boundary-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Dtest-filter=SQL owned sequence defaults",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-identity-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_identity_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_identity_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -7966,18 +8005,69 @@
     },
     {
       "id": "sql-0318",
-      "status": "unresolved",
-      "reason": "Native sequence effects, bounded session caches, exact counter acknowledgement recovery and cold HTTP connection and pgwire session coverage are implemented, and the original PostgreSQL bigserial write oracle is captured. The original CREATE TABLE case remains unresolved until table creation atomically installs its owned sequence and default, with native omitted/default/explicit values, rollback, retirement and restore evidence."
+      "status": "implemented",
+      "reason": "The unchanged bigserial CREATE and complete PostgreSQL write lifecycle pass through atomic native table/owned-sequence/default publication, shared public mutation preparation, CHECK failure and rollback effects, CONTINUE/RESTART generation handoff, native checkpoint restore with exact nonce replay, independent cold owners and coordinated table/sequence retirement. Serial allocation retains sequence privilege checks. This qualifies the original declaration, not unfinished identity/FK initial publication or counter-aware table-archive import.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL original serial and identity declarations preserve PostgreSQL writes and cold owners",
+          "gate": "sql-qualified-identity-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/schema/relational_expression.zig",
+          "test": "SQL owned sequence defaults allocate outside scalar bytecode preserve NULL and restore without effects",
+          "gate": "sql-qualified-identity-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL original serial and identity declarations preserve PostgreSQL writes and cold owners",
+          "gate": "sql-qualified-identity-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0319",
-      "status": "unresolved",
-      "reason": "Sequence execution and durable session state are qualified, and the original PostgreSQL BY DEFAULT identity lifecycle is captured. Atomic table/sequence/column-identity publication, generated public identity metadata and shared typed-row default preparation remain unfinished; no native identity-table completion credit is claimed."
+      "status": "implemented",
+      "reason": "The unchanged BY DEFAULT identity CREATE and PostgreSQL write lifecycle pass with backend-bound stable attribute ownership, explicit/DEFAULT/NULL and OVERRIDING semantics, shared native/public preparation, constraint rewrite and TRUNCATE handoff, checkpoint restoration, cold allocation and owned-sequence retirement. Implicit identity allocation uses table write authority while explicit sequence functions require sequence privileges. Initial FK combinations and table archives without counter proofs fail closed.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL original serial and identity declarations preserve PostgreSQL writes and cold owners",
+          "gate": "sql-qualified-identity-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/schema/relational_expression.zig",
+          "test": "SQL owned sequence defaults allocate outside scalar bytecode preserve NULL and restore without effects",
+          "gate": "sql-qualified-identity-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL original serial and identity declarations preserve PostgreSQL writes and cold owners",
+          "gate": "sql-qualified-identity-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0320",
-      "status": "unresolved",
-      "reason": "The PostgreSQL ALWAYS identity oracle covers CACHE, generated values, explicit-value denial, OVERRIDING SYSTEM/USER VALUE, UPDATE DEFAULT, rollback and TRUNCATE identity behavior. Native sequence effects and sessions are qualified, but identity declarations, enforcement across shared mutation APIs and transactional owned-counter generation/reset publication remain unfinished."
+      "status": "implemented",
+      "reason": "The unchanged ALWAYS identity declaration and PostgreSQL lifecycle pass with START/INCREMENT/CACHE options, explicit-write rejection, OVERRIDING SYSTEM/USER VALUE, UPDATE DEFAULT, CHECK and rollback effects, atomic RESTART generation reset, burned cold cache leases, native checkpoint restore/replay and coordinated retirement. Additional native probes cover ALWAYS protection in ON CONFLICT/MERGE and COPY-like public explicit values with table-only identity authority. This does not qualify unsupported initial identity/FK creation or counter-aware table archives.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL original serial and identity declarations preserve PostgreSQL writes and cold owners",
+          "gate": "sql-qualified-identity-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/schema/relational_expression.zig",
+          "test": "SQL owned sequence defaults allocate outside scalar bytecode preserve NULL and restore without effects",
+          "gate": "sql-qualified-identity-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL original serial and identity declarations preserve PostgreSQL writes and cold owners",
+          "gate": "sql-qualified-identity-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0321",

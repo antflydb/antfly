@@ -232,6 +232,40 @@ def reference():
         ).fetchone()
         runtime_null["last_value"] = value
         runtime_null["is_called"] = called
+    with postgres() as db:
+        db.execute("CREATE ROLE scoped_writer NOLOGIN")
+        db.execute(
+            "CREATE TABLE identity_rows(id bigint GENERATED ALWAYS AS IDENTITY,status text)"
+        )
+        db.execute("CREATE TABLE serial_rows(id bigserial,status text)")
+        db.execute("GRANT INSERT ON identity_rows,serial_rows TO scoped_writer")
+        db.execute("SET ROLE scoped_writer")
+        identity_insert = db.execute(
+            "INSERT INTO identity_rows(status) VALUES('identity')"
+        ).statusmessage
+        denied = {}
+        for name, sql in {
+            "serial_default": "INSERT INTO serial_rows(status) VALUES('serial')",
+            "explicit_identity_sequence": "SELECT nextval('identity_rows_id_seq')",
+        }.items():
+            try:
+                db.execute(sql)
+            except psycopg.Error as error:
+                if error.sqlstate != "42501":
+                    raise
+                denied[name] = error.sqlstate
+            else:
+                raise AssertionError(sql)
+        with db.cursor().copy("COPY identity_rows(id,status) FROM STDIN") as copy:
+            copy.write_row((99, "explicit"))
+        db.execute("RESET ROLE")
+        permission_contract = {
+            "identity_insert": identity_insert,
+            "denied": denied,
+            "copy_rows": output(
+                db.execute("SELECT id,status FROM identity_rows ORDER BY id")
+            ),
+        }
     return {
         "format": 1,
         "reference": "PostgreSQL original serial and identity lifecycles",
@@ -239,6 +273,7 @@ def reference():
         "sessions": sessions,
         "document_truncate": document_truncate,
         "runtime_null": runtime_null,
+        "permission_contract": permission_contract,
     }
 
 

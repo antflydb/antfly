@@ -1512,6 +1512,10 @@ pub const Context = struct {
         const mutations = try self.arena.alloc(catalog.Mutation, statement.rows.len);
         var keys: std.StringHashMapUnmanaged(void) = .empty;
         var retained: usize = 0;
+        var preparation: ?catalog.MutationPreparation = null;
+        defer if (preparation) |owner| owner.close(owner.ptr);
+        var stateful_defaults = false;
+        for (table_def.columns) |column| stateful_defaults = stateful_defaults or column.sequence_default != null;
         var first: usize = 0;
         while (first < statement.rows.len) {
             var page_arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -1532,7 +1536,7 @@ pub const Context = struct {
                 var json_null_fields: std.ArrayList([]const u8) = .empty;
                 for (columns, row, 0..) |column, item, i| {
                     if (key_index != null and i == key_index.?) continue;
-                    if (statement.isDefault(row_index, i)) continue;
+                    if (statement.isDefault(row_index, i) or statement.ignoresIdentity(column)) continue;
                     const datum = try self.insertValue(item, column, row_index, i, page.values[row_index - first][i]);
                     const typed = try self.storageDatumTyped(datum, column, column.element_type);
                     if (table_def.isDocumentRoot(column.name)) {
@@ -1550,12 +1554,24 @@ pub const Context = struct {
                 if (retained > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
                 try self.validateInsertRequired(table_def, object);
                 mutation.* = .{ .key = key.string, .expected_version = 0, .unique_absence = true, .row = document, .json_null_fields = json_null_fields.items };
+                if (stateful_defaults) {
+                    if (preparation == null) preparation = try (self.backend.vtable.open_mutation_preparation orelse return error.UnsupportedSqlExecution)(self.backend.ptr, self.arena, table_def, mutation.key, statement.returning != null or statement.conflict != null or table_def.storage_mode == .document);
+                    const owner = preparation.?;
+                    const normalized = try owner.prepare(owner.ptr, self.arena, mutations[row_index .. row_index + 1]);
+                    if (normalized.len != 1) return error.InvalidSqlBackendResponse;
+                    mutation.* = normalized[0];
+                }
             }
             first = page.end;
             try self.checkpoint();
         }
+        if (preparation) |owner| {
+            try owner.finish(owner.ptr, self.arena);
+            owner.close(owner.ptr);
+            preparation = null;
+        }
         const resolved = if (statement.conflict) |clause| try @import("conflict.zig").resolve(self, table_def, clause, self.binding.conflict orelse return error.InvalidSqlBackendResponse, mutations, &.{}) else mutations;
-        return self.commitMutations(table_def, resolved, "INSERT", statement.returning);
+        return self.commitMutationsInner(table_def, resolved, "INSERT", statement.returning, stateful_defaults and statement.conflict == null);
     }
 
     fn insertSelect(self: Context, statement: ast.Insert, source: ast.Select) !Output {
@@ -1599,7 +1615,7 @@ pub const Context = struct {
             var json_null_fields: std.ArrayList([]const u8) = .empty;
             var key: ?[]const u8 = null;
             for (target_columns, bound.columns[0..statement.columns.len], row[0..statement.columns.len], 0..) |target, source_column, value_, cell_index| {
-                if (statement.isDefault(row_index, cell_index)) continue;
+                if (statement.isDefault(row_index, cell_index) or statement.ignoresIdentity(target)) continue;
                 if (!value_.sql_null and source_column.type != target.type and target.type != .string and !@import("builtin_cast.zig").numericAssignmentAllowed(source_column.type, target.type) and !(statement.values_source_rows.len != 0 and source_column.type == .string and (target.type == .datetime or target.type == .json or target.type == .uuid))) return error.SqlTypeMismatch;
                 const typed = try self.storageDatumTyped(value_, target, @import("scalar.zig").assignmentSourceIdentity(source_column.type, source_column.element_type));
                 if (std.mem.eql(u8, target.name, "_id")) {
@@ -1634,11 +1650,19 @@ pub const Context = struct {
         const decision = @import("decision_eval.zig");
         var budget: decision.PageBudget = .{ .row_limit = self.limits.page_rows, .byte_limit = self.limits.page_bytes };
         var end = first;
+        const table = self.binding.table orelse return error.InvalidSqlBackendResponse;
+        var defaults_have_effects = false;
+        for (table.columns) |column| defaults_have_effects = defaults_have_effects or column.sequence_default != null;
         while (end < statement.rows.len) {
+            var stateful = defaults_have_effects;
+            if (self.binding.scalars.insert_rows.len != 0) for (self.binding.scalars.insert_rows[end]) |optional| {
+                if (optional) |program| stateful = stateful or program.uses_sequences;
+            };
+            if (stateful and end != first) break;
             var bytes: usize = 0;
             if (self.binding.scalars.insert_rows.len != 0) {
                 for (self.binding.scalars.insert_rows[end], 0..) |optional, column| {
-                    if (statement.isDefault(end, column)) continue;
+                    if (statement.isDefault(end, column) or statement.ignoresIdentity(try table.column(statement.columns[column]))) continue;
                     if (optional) |program| for (program.instructions) |instruction| {
                         const input_value = switch (instruction.operation) {
                             .literal => |literal_value| Datum.fromJson(literal_value),
@@ -1650,7 +1674,7 @@ pub const Context = struct {
                 }
             }
             end += 1;
-            if (budget.addBytes(bytes)) break;
+            if (budget.addBytes(bytes) or stateful) break;
         }
         const values = try scratch.alloc([]?Datum, end - first);
         for (statement.rows[first..end], values) |row, *output| {
@@ -1661,7 +1685,7 @@ pub const Context = struct {
             var programs: std.ArrayList(*const @import("scalar.zig").Program) = .empty;
             var positions: std.ArrayList(usize) = .empty;
             if (self.binding.scalars.insert_rows.len != 0) for (self.binding.scalars.insert_rows[first..end], first..) |row, index| {
-                if (statement.isDefault(index, column)) continue;
+                if (statement.isDefault(index, column) or statement.ignoresIdentity(try table.column(statement.columns[column]))) continue;
                 if (row[column]) |*program| {
                     try programs.append(scratch, program);
                     try positions.append(scratch, index - first);
@@ -1961,7 +1985,7 @@ pub const Context = struct {
             const projections = self.binding.returning_projections orelse return error.InvalidSqlBackendResponse;
             if (input.len > self.limits.result_rows) return error.SqlResultTooLarge;
             const binding = self.binding.returning orelse return error.InvalidSqlBackendResponse;
-            if (input.len != 0 and table.storage_mode != .document and !std.mem.eql(u8, tag, "DELETE")) {
+            if (!did_prepare and input.len != 0 and table.storage_mode != .document and !std.mem.eql(u8, tag, "DELETE")) {
                 const prepare = self.backend.vtable.prepare_mutations orelse return error.UnsupportedSqlExecution;
                 prepared = try prepare(self.backend.ptr, self.arena, table, input);
                 did_prepare = true;

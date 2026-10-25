@@ -49,8 +49,13 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
     const preparation: @import("immutable_plan.zig").Limits = if (backend.scalar_control) |control| .{ .checkpoint = control.checkpoint, .checkpoint_context = control.ptr } else .{};
     const generated_names = if (statement == .create_table) try generatedConstraintNamesAlloc(alloc, statement.create_table) else &.{};
     defer alloc.free(generated_names);
+    var column_sequences: std.ArrayList(@import("../system_catalog/column_sequences.zig").Creation) = .empty;
+    defer column_sequences.deinit(alloc);
+    if (statement == .create_table) for (statement.create_table.columns) |column| {
+        if (column.sequence) |intent| try column_sequences.append(alloc, intent);
+    };
     const request: catalog.Ddl = switch (statement) {
-        .create_table => |create| .{ .create_table = .{ .name = create.table, .schema_json = try createSchemaAllocWithLimits(alloc, create, preparation), .if_not_exists = create.if_not_exists, .tablespace = create.tablespace, .generated_constraint_names = generated_names } },
+        .create_table => |create| .{ .create_table = .{ .name = create.table, .schema_json = try createSchemaAllocWithLimits(alloc, create, preparation), .if_not_exists = create.if_not_exists, .tablespace = create.tablespace, .generated_constraint_names = generated_names, .column_sequences = column_sequences.items } },
         .drop_table => |drop| .{ .drop_table = drop },
         .catalog_ddl => |ddl| .{ .catalog_ddl = ddl },
         .policy_ddl => |ddl| .{ .policy_ddl = ddl },

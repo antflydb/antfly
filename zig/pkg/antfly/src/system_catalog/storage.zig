@@ -575,7 +575,7 @@ pub fn readMeta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id:
     };
     var parsed = try std.json.parseFromSlice(Meta, alloc, bytes, .{});
     defer parsed.deinit();
-    if (parsed.value.version != 1 or parsed.value.next_id < 3 or parsed.value.sequence_outcome_head == 0) return error.InvalidCatalogRecord;
+    if (parsed.value.version != 1 or parsed.value.next_id < 3) return error.InvalidCatalogRecord;
     return parsed.value;
 }
 

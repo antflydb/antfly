@@ -13969,7 +13969,9 @@ pub const ApiHttpServer = struct {
         const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
         var integrity_reads = @import("sql_policy_integrity_reads.zig").Cache.init(self, request);
         defer integrity_reads.deinit();
-        var preparation_request = integrity_reads.attach(request);
+        var column_defaults: @import("sql_column_defaults.zig").Broker = .{};
+        defer column_defaults.deinit();
+        var preparation_request = column_defaults.attach(self, integrity_reads.attach(request));
         if (self.sharedApiIo()) |io| preparation_request.fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io);
         const selected = (try self.selectIntegritySnapshot(alloc, tables, request)) orelse
             return .{ .arena = std.heap.ArenaAllocator.init(alloc), .tables = tables };
@@ -14211,7 +14213,9 @@ pub const ApiHttpServer = struct {
         }
         var integrity_reads = @import("sql_policy_integrity_reads.zig").Cache.init(self, request);
         defer integrity_reads.deinit();
-        var preparation_request = integrity_reads.attach(request);
+        var column_defaults: @import("sql_column_defaults.zig").Broker = .{};
+        defer column_defaults.deinit();
+        var preparation_request = column_defaults.attach(self, integrity_reads.attach(request));
         if (self.sharedApiIo()) |io| preparation_request.fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io);
         retained_preparation.* = if (request.relational_recovery == .repair)
             integrity.prepareRepair(alloc, reader, snapshot.tables, snapshot.ranges, tables[0], preparation_request) catch |err| return if (err == error.DeadlineExceeded) error.PreDecisionDeadlineExceeded else err
@@ -17668,7 +17672,31 @@ pub const ApiHttpServer = struct {
                 bound_policies.default_clock_micros = instant.micros;
             }
         }
-        const plan = try admission.buildWithPoliciesAndConstraintNameGuard(alloc, plan_id, cohort, snapshot.ranges, before.name, proposed, &observer, bound_policies, guard);
+        var plan = try admission.buildWithPoliciesAndConstraintNameGuard(alloc, plan_id, cohort, snapshot.ranges, before.name, proposed, &observer, bound_policies, guard);
+        var sequence_context = context;
+        sequence_context.setting_admin = true;
+        const sequence_bytes = try self.source.systemCatalog(alloc, sequence_context, .{ .sql_column_sequence_handoffs = .{ .targets = plan.targets, .restart = false } });
+        const targets = try std.json.parseFromSliceLeaky([]@import("../metadata/restore_staging.zig").Target, alloc, sequence_bytes, .{});
+        for (targets) |*target| if (target.sequence_handoffs.len != 0) {
+            const rewrite = &(target.rewrite orelse return error.InvalidRestoreStaging);
+            var programs = if (rewrite.preserve_document)
+                try @import("antfly_local_sources").storage_db_relational_rewrite_program.ProgramSet.initDocumentPreservationWithRead(alloc, target.table.schema_json, target.table.read_schema_json)
+            else
+                try @import("antfly_local_sources").storage_db_relational_rewrite_program.ProgramSet.init(alloc, rewrite.source_schemas, target.table.schema_json, .{
+                    .default_columns = rewrite.default_columns,
+                    .default_clock_micros = rewrite.default_clock_micros,
+                    .dropped_columns = if (rewrite.allow_column_drops) .allow else .reject,
+                    .expression_schema = rewrite.expression_schema,
+                    .column_transforms = rewrite.column_transforms,
+                });
+            defer programs.deinit();
+            target.rewrite.?.target_schema = target.table.schema_json;
+            target.rewrite.?.program_digest = programs.identity;
+        };
+        plan.targets = targets;
+        try @import("../metadata/restore_staging.zig").prepareEmptyGenerationHandoffMappingsAlloc(alloc, targets);
+        plan.cohort_digest = try plan.rewriteIntentDigest(alloc);
+        try plan.validate(alloc);
         start.rewrite_plan_json = try std.json.Stringify.valueAlloc(alloc, plan, .{});
         try ensureTableOperationActive(context);
         const accepted = self.restore_job_store.startRecoverable(self.alloc, start) catch |err| return restoreJobStartErrorResponse(self.alloc, err);

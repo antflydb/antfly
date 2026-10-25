@@ -248,8 +248,10 @@ pub const SystemCatalogCommand = struct {
     constraint_name_admission: ?@import("antfly_local_sources").system_catalog_relation_names.constraint_naming.Admission = null,
     sql_view: ?@import("../../system_catalog/views.zig").Mutation = null,
     sql_sequence: ?@import("../../system_catalog/sequence_catalog.zig").Mutation = null,
+    column_sequences: []const @import("antfly_local_sources").system_catalog_column_sequences.Creation = &.{},
 
     pub fn jsonStringify(self: SystemCatalogCommand, writer: anytype) !void {
+        if (self.column_sequences.len != 0) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .sql_view = self.sql_view, .sql_sequence = self.sql_sequence, .column_sequences = self.column_sequences });
         if (self.sql_sequence != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .sql_view = self.sql_view, .sql_sequence = self.sql_sequence });
         if (self.sql_view != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .sql_view = self.sql_view });
         // Keep legacy frames byte-for-byte shaped as before while capability
@@ -302,6 +304,8 @@ pub const CatalogProjectionRequest = union(enum) {
     catalog_meta: void,
     catalog_admission: system_catalog.Mutation,
     catalog_prepare: SystemCatalogCommand,
+    catalog_bind_column_sequences: SystemCatalogCommand,
+    catalog_column_sequence_handoffs: @import("../column_sequence_handoff.zig").Request,
     sql_sequence_admission_head: void,
     sql_column_identities: @import("antfly_local_sources").system_catalog_domain.RelationMutationGuard,
     sql_sequence_snapshot: @import("../../system_catalog/sequence_catalog.zig").SnapshotRequest,

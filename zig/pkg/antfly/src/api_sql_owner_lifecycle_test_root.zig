@@ -26,6 +26,7 @@ pub const storage_backend_erased = @import("antfly_local_sources").storage_backe
 pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
 
 test {
+    _ = @import("metadata/column_sequence_handoff.zig");
     _ = @import("api/transactions.zig");
     _ = @import("api/sql_connections.zig");
     _ = @import("api/sql_sequence_execution.zig");

@@ -2238,6 +2238,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "SQL sequence intent cannot fall back to physical resource creation before activation",
             "SQL sequence intent producer",
             "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows",
+            "mounted SQL original serial and identity declarations preserve PostgreSQL writes and cold owners",
+            "SQL owned sequence handoff preserves CONTINUE leases and invalidates RESTART generations",
             "mounted SQL original document multi table and CASCADE truncate publish atomic cohorts and recover cold rows",
             "mounted SQL sequence effects",
             "SQL sequence cache",
@@ -2385,6 +2387,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_sequence_effects_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-sequence-effects-test", "Verify PostgreSQL sequence effects, durable session values and cold cache safety")
         .dependOn(&sql_sequence_effects_run.step);
+    const sql_identity_lifecycle_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original serial and identity declarations preserve PostgreSQL writes and cold owners", "SQL owned sequence handoff preserves CONTINUE leases and invalidates RESTART generations" });
+    sql_identity_lifecycle_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-identity-lifecycle-test", "Verify original serial and identity declarations through PostgreSQL lifecycles and native cold owners")
+        .dependOn(&sql_identity_lifecycle_run.step);
     const sql_sequence_lifecycle_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows"});
     sql_sequence_lifecycle_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-sequence-lifecycle-test", "Verify original sequence DDL with allocated native counters, PostgreSQL postimages and independent cold owners")

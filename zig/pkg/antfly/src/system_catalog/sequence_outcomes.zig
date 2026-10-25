@@ -154,7 +154,7 @@ pub fn Store(comptime Txn: type) type {
             if (bytes.len > 4096) return error.InvalidSequenceOutcome;
             var value = try std.json.parseFromSlice(Meta, a, bytes, .{});
             defer value.deinit();
-            if (value.value.version != 1 or value.value.next_id < 3 or value.value.sequence_outcome_head == 0) return error.InvalidSequenceOutcome;
+            if (value.value.version != 1 or value.value.next_id < 3) return error.InvalidSequenceOutcome;
             return value.value;
         }
         pub fn head(self: @This(), a: A) !u64 {

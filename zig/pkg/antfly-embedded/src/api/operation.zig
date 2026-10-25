@@ -119,6 +119,8 @@ pub const RowPolicyIntegrityRead = struct {
 };
 
 pub const RequestContext = struct {
+    /// Borrowed preparation broker; never serialized or invoked by Raft apply.
+    column_sequences: ?@import("../system_catalog/column_sequences.zig").Provider = null,
     /// Captured by the authenticated SQL transaction owner, never decoded
     /// from public request JSON. Shared by normalization and FK cascades.
     sql_transaction_micros: ?i64 = null,

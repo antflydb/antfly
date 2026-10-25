@@ -1810,6 +1810,11 @@ const Parser = struct {
             if (!self.take(.comma)) break;
         }
         try self.expect(.rparen);
+        var overriding: @FieldType(ast.Insert, "overriding") = .none;
+        if (self.keyword(.overriding)) {
+            overriding = if (self.keyword(.system)) .system else if (self.keyword(.user)) .user else return self.fail(error.InvalidSqlSyntax, "expected SYSTEM or USER after OVERRIDING");
+            try self.expectKeyword(.value);
+        }
         if (self.pos < self.tokens.len and (self.tokens[self.pos].isKeyword(.select) or self.tokens[self.pos].isKeyword(.with))) {
             const source = try self.alloc.create(ast.Select);
             const statement_ = try self.statement();
@@ -1828,7 +1833,7 @@ const Parser = struct {
                     source.columns = projected;
                 }
             }
-            return .{ .table = table, .alias = alias, .columns = try columns.toOwnedSlice(self.alloc), .source = source, .conflict = conflict_clause, .returning = try self.returning() };
+            return .{ .overriding = overriding, .table = table, .alias = alias, .columns = try columns.toOwnedSlice(self.alloc), .source = source, .conflict = conflict_clause, .returning = try self.returning() };
         }
         try self.expectKeyword(.values);
         var rows = std.ArrayList([]const ast.Value).empty;
@@ -1872,7 +1877,7 @@ const Parser = struct {
         for (cells) |row| for (row) |cell| if (cell) |expression| {
             contains_subquery = contains_subquery or @import("subquery_lowering.zig").has(expression);
         };
-        if (!contains_subquery and captures.len == 0) return .{ .table = table, .alias = alias, .columns = names, .rows = values, .expressions = cells, .defaults = default_cells, .conflict = conflict_clause, .returning = returning_columns };
+        if (!contains_subquery and captures.len == 0) return .{ .overriding = overriding, .table = table, .alias = alias, .columns = names, .rows = values, .expressions = cells, .defaults = default_cells, .conflict = conflict_clause, .returning = returning_columns };
 
         // VALUES with scalar subqueries is one source relation, not a collection
         // of independent expression evaluations. Keep source arms flat and in
@@ -1898,7 +1903,7 @@ const Parser = struct {
         }
         const source = try self.alloc.create(ast.Select);
         source.* = .{ .values_arms = try arms.toOwnedSlice(self.alloc), .generated_values = true };
-        return .{ .table = table, .alias = alias, .columns = names, .source = source, .values_source_rows = values, .defaults = default_cells, .conflict = conflict_clause, .returning = returning_columns };
+        return .{ .overriding = overriding, .table = table, .alias = alias, .columns = names, .source = source, .values_source_rows = values, .defaults = default_cells, .conflict = conflict_clause, .returning = returning_columns };
     }
 
     fn conflictCaptures(self: *Parser, clause: *ast.Conflict) Error![]const *const ast.Scalar {
@@ -2334,6 +2339,19 @@ const Parser = struct {
     }
 
     fn columnDefinition(self: *Parser, name_value: []const u8) Error!ast.Column {
+        if (self.pos < self.tokens.len and self.tokens[self.pos].kind == .identifier and !self.tokens[self.pos].owned) {
+            const serial_word = self.tokens[self.pos].text;
+            const integer: ?@import("../system_catalog/sequences.zig").Integer =
+                if (std.ascii.eqlIgnoreCase(serial_word, "smallserial") or std.ascii.eqlIgnoreCase(serial_word, "serial2")) .int16 else if (std.ascii.eqlIgnoreCase(serial_word, "serial") or std.ascii.eqlIgnoreCase(serial_word, "serial4")) .int32 else if (std.ascii.eqlIgnoreCase(serial_word, "bigserial") or std.ascii.eqlIgnoreCase(serial_word, "serial8")) .int64 else null;
+            if (integer) |width| {
+                self.pos += 1;
+                return .{ .name = name_value, .type = .integer, .element_type = switch (width) {
+                    .int16 => .int16,
+                    .int32 => .int32,
+                    .int64 => .int64,
+                }, .nullable = false, .sequence = .{ .column = name_value, .generation = .serial, .options = .{ .integer = width } } };
+            }
+        }
         const declared = try self.castType();
         if (declared.temporal_kind != null) return self.fail(error.UnsupportedSqlShape, "persistent temporal subtype requires native storage support");
         return .{ .name = name_value, .type = declared.type, .element_type = declared.element_type, .numeric_modifier = declared.numeric_modifier };
@@ -2384,14 +2402,15 @@ const Parser = struct {
                         null_seen = true;
                     } else if (self.keyword(.null)) {
                         if (null_seen) return self.fail(error.InvalidSqlSyntax, "duplicate column nullability");
+                        if (definition.sequence != null) return self.fail(error.InvalidSqlSyntax, "sequence-generated columns cannot declare NULL");
                         null_seen = true;
                     } else if (self.keyword(.default)) {
-                        if (default_seen or definition.generated_expression != null) return self.fail(error.InvalidSqlSyntax, "duplicate or conflicting column default");
+                        if (default_seen or definition.generated_expression != null or definition.sequence != null) return self.fail(error.InvalidSqlSyntax, "duplicate or conflicting column default");
                         definition.default_expression = try self.schemaDefault();
                         default_seen = true;
                     } else if (self.ddlWord("generated")) {
-                        if (default_seen or definition.generated_expression != null) return self.fail(error.InvalidSqlSyntax, "duplicate or conflicting generated column");
-                        definition.generated_expression = try self.generatedExpression();
+                        if (default_seen or definition.generated_expression != null or definition.sequence != null) return self.fail(error.InvalidSqlSyntax, "duplicate or conflicting generated column");
+                        try self.generatedColumn(&definition, null_seen and definition.nullable);
                     } else if (self.keyword(.primary)) {
                         try self.expectKeyword(.key);
                         definition.nullable = false;
@@ -2710,34 +2729,10 @@ const Parser = struct {
         return std.math.cast(i64, magnitude) orelse self.fail(error.SqlNumericOutOfRange, "sequence integer is out of range");
     }
 
-    fn sequenceDdl(self: *Parser, action: @FieldType(ast.CatalogDdl, "action")) Error!ast.CatalogDdl {
-        const conditional = self.keyword(.@"if");
-        if (conditional) {
-            if (action == .create) try self.expectKeyword(.not);
-            try self.expectKeyword(.exists);
-        }
-        var ddl: ast.CatalogDdl = .{ .kind = .sequence, .action = action, .name = try self.name(), .conditional = conditional };
-        if (action == .drop) {
-            var targets: std.ArrayList(ast.Name) = .empty;
-            try targets.append(self.alloc, ddl.name);
-            while (self.take(.comma)) {
-                if (targets.items.len >= 256) return self.fail(error.SqlLimitExceeded, "sequence target limit exceeded");
-                try targets.append(self.alloc, try self.name());
-            }
-            ddl.sequence_targets = try targets.toOwnedSlice(self.alloc);
-            ddl.cascade = self.keyword(.cascade);
-            if (!ddl.cascade) _ = self.keyword(.restrict);
-            return ddl;
-        }
-        if (action == .alter_sequence and self.keyword(.rename)) {
-            try self.expectKeyword(.to);
-            ddl.action = .rename;
-            ddl.new_name = try self.identifier();
-            return ddl;
-        }
+    fn sequenceOptions(self: *Parser, mode: enum { create, alter, identity }) Error!ast.SequenceOptions {
         var options: ast.SequenceOptions = .{};
         var seen: u16 = 0;
-        while (self.pos < self.tokens.len and !self.peek(.semicolon)) {
+        while (self.pos < self.tokens.len and !self.peek(.semicolon) and (mode != .identity or !self.peek(.rparen))) {
             const bit: u16 = if (self.keyword(.as)) 1 else if (self.ddlWord("INCREMENT")) 2 else if (self.ddlWord("MINVALUE")) 4 else if (self.ddlWord("MAXVALUE")) 8 else if (self.keyword(.start)) 16 else if (self.ddlWord("CACHE")) 32 else if (self.ddlWord("CYCLE")) 64 else if (self.ddlWord("OWNED")) 128 else if (self.keyword(.restart)) 256 else if (self.ddlWord("NO")) {
                 const which: u16 = if (self.ddlWord("MINVALUE")) 4 else if (self.ddlWord("MAXVALUE")) 8 else if (self.ddlWord("CYCLE")) 64 else return self.fail(error.InvalidSqlSyntax, "NO requires MINVALUE, MAXVALUE or CYCLE");
                 if (seen & which != 0) return self.fail(error.InvalidSqlSyntax, "conflicting or redundant sequence option");
@@ -2745,6 +2740,7 @@ const Parser = struct {
                 if (which == 4) options.values.minimum = .default else if (which == 8) options.values.maximum = .default else options.values.cycle = false;
                 continue;
             } else return self.fail(error.UnsupportedSqlShape, "unsupported sequence alteration or option");
+            if (mode == .identity and (bit == 1 or bit == 128 or bit == 256)) return self.fail(error.InvalidSqlSyntax, "invalid identity sequence option");
             if (seen & bit != 0) return self.fail(error.InvalidSqlSyntax, "conflicting or redundant sequence option");
             seen |= bit;
             switch (bit) {
@@ -2794,8 +2790,36 @@ const Parser = struct {
                 else => unreachable,
             }
         }
-        if (action == .alter_sequence and seen == 0) return self.fail(error.InvalidSqlSyntax, "ALTER SEQUENCE requires an alteration");
-        ddl.sequence_options = options;
+        if (mode == .alter and seen == 0) return self.fail(error.InvalidSqlSyntax, "ALTER SEQUENCE requires an alteration");
+        return options;
+    }
+
+    fn sequenceDdl(self: *Parser, action: @FieldType(ast.CatalogDdl, "action")) Error!ast.CatalogDdl {
+        const conditional = self.keyword(.@"if");
+        if (conditional) {
+            if (action == .create) try self.expectKeyword(.not);
+            try self.expectKeyword(.exists);
+        }
+        var ddl: ast.CatalogDdl = .{ .kind = .sequence, .action = action, .name = try self.name(), .conditional = conditional };
+        if (action == .drop) {
+            var targets: std.ArrayList(ast.Name) = .empty;
+            try targets.append(self.alloc, ddl.name);
+            while (self.take(.comma)) {
+                if (targets.items.len >= 256) return self.fail(error.SqlLimitExceeded, "sequence target limit exceeded");
+                try targets.append(self.alloc, try self.name());
+            }
+            ddl.sequence_targets = try targets.toOwnedSlice(self.alloc);
+            ddl.cascade = self.keyword(.cascade);
+            if (!ddl.cascade) _ = self.keyword(.restrict);
+            return ddl;
+        }
+        if (action == .alter_sequence and self.keyword(.rename)) {
+            try self.expectKeyword(.to);
+            ddl.action = .rename;
+            ddl.new_name = try self.identifier();
+            return ddl;
+        }
+        ddl.sequence_options = try self.sequenceOptions(if (action == .create) .create else .alter);
         return ddl;
     }
 
@@ -2846,11 +2870,11 @@ const Parser = struct {
                         if (null_seen) return self.fail(error.InvalidSqlSyntax, "duplicate column nullability");
                         null_seen = true;
                     } else if (self.keyword(.default)) {
-                        if (column.default_expression != null or column.generated_expression != null) return self.fail(error.InvalidSqlSyntax, "duplicate or conflicting column default");
+                        if (column.default_expression != null or column.generated_expression != null or column.sequence != null) return self.fail(error.InvalidSqlSyntax, "duplicate or conflicting column default");
                         column.default_expression = try self.schemaDefault();
                     } else if (self.ddlWord("generated")) {
-                        if (column.default_expression != null or column.generated_expression != null) return self.fail(error.InvalidSqlSyntax, "duplicate or conflicting generated column");
-                        column.generated_expression = try self.generatedExpression();
+                        if (column.default_expression != null or column.generated_expression != null or column.sequence != null) return self.fail(error.InvalidSqlSyntax, "duplicate or conflicting generated column");
+                        try self.generatedColumn(&column, null_seen and column.nullable);
                     } else if (self.keyword(.constraint)) {
                         if (column.references != null) return self.fail(error.InvalidSqlSyntax, "duplicate column REFERENCES clause");
                         column.references = (try self.foreignKeyDefinition(try self.identifier(), try self.alloc.dupe([]const u8, &.{column_name}))).add_foreign_key;
@@ -3060,6 +3084,40 @@ const Parser = struct {
         try self.checkScalarDepth(result, 0);
         try self.persistentExpression(result, false);
         return result;
+    }
+
+    fn generatedColumn(self: *Parser, column: *ast.Column, explicit_null: bool) Error!void {
+        const start = self.pos;
+        const Generation = @import("../system_catalog/column_sequences.zig").Generation;
+        const generation: Generation = if (self.ddlWord("always")) .always else by_default: {
+            try self.expectKeyword(.by);
+            try self.expectKeyword(.default);
+            break :by_default .by_default;
+        };
+        try self.expectKeyword(.as);
+        if (!self.ddlWord("identity")) {
+            if (generation != .always) return self.fail(error.InvalidSqlSyntax, "BY DEFAULT requires AS IDENTITY");
+            self.pos = start;
+            column.generated_expression = try self.generatedExpression();
+            return;
+        }
+        if (explicit_null) return self.fail(error.InvalidSqlSyntax, "identity columns cannot declare NULL");
+        if (column.type != .integer) return self.fail(error.UnsupportedSqlShape, "identity requires a SMALLINT, INTEGER or BIGINT column");
+        var options: ast.SequenceOptions = .{};
+        if (self.take(.lparen)) {
+            options = try self.sequenceOptions(.identity);
+            try self.expect(.rparen);
+        }
+        var values = options.values;
+        values.integer = switch (column.element_type orelse .int64) {
+            .int16 => .int16,
+            .int32 => .int32,
+            .int64 => .int64,
+            else => return self.fail(error.UnsupportedSqlShape, "identity requires an integer column"),
+        };
+        if (options.cache) |cache| values.cache = std.math.cast(u64, cache) orelse return self.fail(error.InvalidSqlSyntax, "CACHE must be positive");
+        column.sequence = .{ .column = column.name, .generation = generation, .options = values };
+        column.nullable = false;
     }
 
     fn generatedExpression(self: *Parser) Error!*const ast.Scalar {
@@ -5022,4 +5080,44 @@ test "compiler preserves PostgreSQL cast column labels before lowering" {
     defer statement.deinit();
     for (statement.statement.select.columns, [_][]const u8{ "id", "id", "id", "lower", "explicit_name" }) |projection, name|
         try std.testing.expectEqualStrings(name, projection.alias.?);
+}
+
+test "SQL owned sequence defaults parse serial aliases and identity options as private creation intent" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    for ([_][]const u8{ "sql-0318", "sql-0319", "sql-0320" }, 0..) |id, index| {
+        const original = try corpus.get(id);
+        var compiled = try compile(a, original.sql, .{});
+        defer compiled.deinit();
+        const table = compiled.statement.create_table;
+        try std.testing.expectEqual(@as(usize, 2), table.columns.len);
+        const column = table.columns[0];
+        try std.testing.expectEqualStrings("id", column.name);
+        try std.testing.expect(!column.nullable);
+        try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int64), column.element_type);
+        const intent = column.sequence orelse return error.MissingOwnedSequenceIntent;
+        try std.testing.expectEqual(([_]@import("../system_catalog/column_sequences.zig").Generation{ .serial, .by_default, .always })[index], intent.generation);
+        try std.testing.expectEqual(.unchanged, intent.options.owned_by);
+        if (index == 2) {
+            try std.testing.expectEqual(@as(?i64, 100), intent.options.start);
+            try std.testing.expectEqual(@as(?i64, 10), intent.options.increment);
+            try std.testing.expectEqual(@as(?u64, 4), intent.options.cache);
+            try std.testing.expectEqual(@as(?bool, false), intent.options.cycle);
+        }
+    }
+    for ([_][]const u8{ "smallserial", "serial2", "serial", "serial4", "bigserial", "serial8" }, 0..) |alias, index| {
+        const text = try std.fmt.allocPrint(a, "CREATE TABLE t (id {s})", .{alias});
+        defer a.free(text);
+        var compiled = try compile(a, text, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqual(([_]@import("../system_catalog/sequences.zig").Integer{ .int16, .int32, .int64 })[index / 2], compiled.statement.create_table.columns[0].sequence.?.options.integer.?);
+    }
+    var stored = try compile(a, "CREATE TABLE t (id bigint NULL GENERATED ALWAYS AS (7) STORED)", .{});
+    defer stored.deinit();
+    try std.testing.expect(stored.statement.create_table.columns[0].sequence == null);
+    try std.testing.expect(stored.statement.create_table.columns[0].nullable);
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE TABLE t (id bigserial DEFAULT 7)", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE TABLE t (id bigserial NULL)", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE TABLE t (id bigint NULL GENERATED ALWAYS AS IDENTITY)", .{}));
 }

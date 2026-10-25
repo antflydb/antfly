@@ -49,6 +49,12 @@ pub fn validateSelection(arena: std.mem.Allocator, sources: []const SourceTable)
         if (json.len == 0) continue;
         var schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(arena, json);
         defer schema.deinit(arena);
+        // Table archives do not carry metadata-owned sequence counters and
+        // incarnation proofs. Native metadata checkpoints do. A new table
+        // identity cannot safely adopt a copied default descriptor.
+        if (schema.column_defaults) |defaults| if (defaults.value == .array) for (defaults.value.array.items) |entry| {
+            if (entry == .object and entry.object.contains("sequence")) return error.RestoreDependencyMissing;
+        };
         if (schema.foreign_keys) |fks| for (fks.value) |fk| {
             if (!names.contains(fk.parent_table)) return error.RestoreDependencyMissing;
         };

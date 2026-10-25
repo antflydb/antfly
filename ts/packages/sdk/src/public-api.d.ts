@@ -17521,9 +17521,28 @@ export interface components {
             snapshot?: components["schemas"]["ExternalLakeSnapshotSelector"];
             catalog?: components["schemas"]["LakeCatalogConfig"];
         };
+        /**
+         * @description SQL owned-sequence default policy. Serial defaults preserve explicit values even under OVERRIDING USER VALUE; identity defaults obey PostgreSQL overriding rules.
+         * @enum {string}
+         */
+        RelationalColumnSequenceGeneration: "serial" | "by_default" | "always";
+        /** @description Backend-bound owned-sequence default, assigned atomically with the table and stable attribute identity. Names are descriptive; allocation uses the exact catalog incarnation and native 64-bit identities. Requires reader capability 37. Preparation allocates only for absent inputs; explicit NULL never requests a new value. Restore preserves stored values and never consumes the sequence. Clients cannot mint ownership by copying a descriptor onto a different table or column. Bulk mutation APIs preserve explicit identity values, like PostgreSQL COPY; SQL enforces ALWAYS and OVERRIDING rules. Implicit identity allocation uses table write authority; serial defaults and explicit sequence functions require sequence privileges. */
+        RelationalColumnSequence: {
+            generation: components["schemas"]["RelationalColumnSequenceGeneration"];
+            incarnation: string;
+            sequence_id: string;
+            namespace_id: string;
+            table_id: string;
+            column_id: string;
+            database: string;
+            namespace: string;
+            name: string;
+        };
+        /** @description Exactly one of expression or the backend-bound sequence reference is required. Sequence references are column defaults only and cannot define stored generated columns. */
         RelationalColumnExpression: {
             column: string;
-            expression: components["schemas"]["RelationalScalarExpression"];
+            expression?: components["schemas"]["RelationalScalarExpression"];
+            sequence?: components["schemas"]["RelationalColumnSequence"];
         };
         /**
          * @description A typed CHECK. Supply either expression or column and op (with optional

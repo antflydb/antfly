@@ -455,6 +455,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
     if (request.mutation.native_service != null and request.mutation.native_service != context.native_service) return error.Forbidden;
     if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
     if (request.generated_constraint_names.len != 0 and (request.mutation.kind != .table or request.mutation.action != .create)) return error.InvalidCatalogMutation;
+    if (request.column_sequences.len > 256 or (request.column_sequences.len != 0 and (request.mutation.kind != .table or request.mutation.action != .create))) return error.InvalidCatalogMutation;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -471,14 +472,14 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         });
     }
     const required_version = @max(if (request.mutation.native_service != null) protocol.native_service_tables_version else @as(u16, 0), @max(if (resolver_create) protocol.resolver_namespaces_version else @as(u16, 0), if (request.generated_constraint_names.len != 0) @max(ordinary_version, protocol.constraint_occupancy_version) else ordinary_version));
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, @max(required_version, if (request.column_sequences.len != 0) protocol.sql_column_sequences_version else 0));
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     const admission = try store.systemCatalogAdmission(a, svc.metadata_group_id, request.mutation);
-    var command: storage.SystemCatalogCommand = .{ .expected_revision = admission.meta.revision, .mutation = request.mutation };
+    var command: storage.SystemCatalogCommand = .{ .expected_revision = admission.meta.revision, .mutation = request.mutation, .column_sequences = request.column_sequences };
     if (request.mutation.action == .create and request.mutation.kind == .table) {
         var req = create_req orelse return error.InvalidCatalogMutation;
         if (request.generated_constraint_names.len != 0) {
@@ -511,6 +512,11 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         command.mutation.table_id = table.table_id;
         command.mutation.storage_name = storage_name;
         command.topology = .{ .create = .{ .expected_transition_generation = generation, .table = table, .ranges = ranges } };
+        if (command.column_sequences.len != 0) {
+            command.version = 3;
+            const bound = try store.bindTableColumnSequences(a, svc.metadata_group_id, command);
+            command = try std.json.parseFromSliceLeaky(storage.SystemCatalogCommand, a, bound, .{});
+        }
     } else if (request.create_table_json != null) return error.InvalidCatalogMutation;
     if (request.mutation.action == .drop and request.mutation.kind == .table) {
         const target: domain.Target = .{ .database = request.mutation.database, .namespace = request.mutation.namespace, .table = request.mutation.name };
@@ -2161,6 +2167,16 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             break :blk alloc.dupe(u8, "null");
         },
         .sql_sequence_mutate => |request| mutateSqlSequence(svc, alloc, context, request),
+        .sql_column_sequence_handoffs => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const bytes = try store.prepareColumnSequenceHandoffs(alloc, svc.metadata_group_id, request);
+            errdefer alloc.free(bytes);
+            try context.ensureActive();
+            break :blk bytes;
+        },
         .sql_sequence_snapshot => |request| blk: {
             if (!context.setting_admin) return error.Forbidden;
             try context.ensureActive();

@@ -1937,6 +1937,14 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.systemCatalogAdmission(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .catalog_column_sequence_handoffs => |input| {
+                    const value = handle.store.prepareColumnSequenceHandoffs(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .catalog_bind_column_sequences => |input| {
+                    const value = handle.store.bindTableColumnSequences(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .catalog_prepare => |input| {
                     const value = handle.store.prepareSystemCatalogResult(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(switch (err) {
                         error.SequenceAdmissionExpired, error.SequenceAdmissionConflict => error.MetadataMutationOutcomeUnknown,

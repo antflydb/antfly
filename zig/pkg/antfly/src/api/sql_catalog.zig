@@ -932,6 +932,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     };
     switch (input) {
         .create_table => |create| {
+            request.column_sequences = create.column_sequences;
             request.mutation.tablespace = create.tablespace;
             request.physical_name = try server.catalogStorageNameAlloc(a);
             // Explicit empty search indexes avoids building a full-text index
@@ -948,6 +949,10 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
             defer parsed.deinit(allocators.scratch);
             if (create.tablespace) |tablespace| parsed.tablespace_name = try allocators.scratch.dupe(u8, tablespace);
             if (try @import("../metadata/fk_generation_publication.zig").schemaHasForeignKeys(a, bound_schema)) {
+                // Initial FK publication has a different atomic owner. Until
+                // it accepts sequence intents, reject before reserving names
+                // rather than silently publishing a table without defaults.
+                if (create.column_sequences.len != 0) return error.UnsupportedSqlShape;
                 const generated = if (@import("../metadata/topology_protocol.zig").current_version >= @import("../metadata/topology_protocol.zig").constraint_occupancy_version) create.generated_constraint_names else &.{};
                 const plan = @import("fk_initial_create_plan_builder.zig").buildWithGeneratedNamesAndScratch(server, a, allocators.scratch, context, identity, target, parsed, generated) catch |err| switch (err) {
                     error.CatalogAlreadyExists, error.TableAlreadyExists => if (create.if_not_exists) return .{} else return err,

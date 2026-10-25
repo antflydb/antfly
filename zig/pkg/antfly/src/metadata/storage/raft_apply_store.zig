@@ -3294,6 +3294,24 @@ test "system catalog relation namespace transaction source fingerprints borrow s
     try std.testing.expectError(error.InvalidCatalogRecord, RaftApplyStore.relationSourceValueDigest(failing.allocator(), group, try tableKeyForGroup(&buf, group, 8), encoded));
     try std.testing.expectError(error.InvalidMetadataTransitionEncoding, RaftApplyStore.relationSourceValueDigest(failing.allocator(), group, key, encoded[0 .. encoded.len - 1]));
     try std.testing.expect(!std.mem.eql(u8, &expected, &RaftApplyStore.relationTableSourceDigest(7, "items", "{\"version\":2}")));
+
+    const logical_key = try system_catalog_storage.recordKeyAlloc(a, group, .table, 7);
+    defer a.free(logical_key);
+    var binding: system_catalog.Resource = .{ .kind = .table, .id = 7, .parent_id = 2, .name = "items", .storage_name = "table:items" };
+    const logical = try std.json.Stringify.valueAlloc(a, binding, .{});
+    defer a.free(logical);
+    const binding_digest = try RaftApplyStore.relationSourceValueDigest(a, group, logical_key, logical);
+    binding.description = "independent presentation metadata";
+    const described = try std.json.Stringify.valueAlloc(a, binding, .{});
+    defer a.free(described);
+    try std.testing.expectEqualSlices(u8, &binding_digest, &try RaftApplyStore.relationSourceValueDigest(a, group, logical_key, described));
+    binding.parent_id = 3;
+    const moved = try std.json.Stringify.valueAlloc(a, binding, .{});
+    defer a.free(moved);
+    try std.testing.expect(!std.mem.eql(u8, &binding_digest, &try RaftApplyStore.relationSourceValueDigest(a, group, logical_key, moved)));
+    const sequence_key = try system_catalog_storage.recordKeyAlloc(a, group, .sequence, 8);
+    defer a.free(sequence_key);
+    try std.testing.expect(!try RaftApplyStore.relationSourceKey(group, sequence_key));
 }
 
 test "system catalog relation namespace transaction FK source epochs ignore receipts but bind plans and lifecycle" {
@@ -23832,11 +23850,16 @@ pub const RaftApplyStore = struct {
     }
 
     fn validateGeneratedConstraintNamesTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, command: SystemCatalogCommand, meta: system_catalog_storage.Meta) !void {
+        const compound = command.column_sequences.len != 0;
+        if (compound) {
+            if (command.version != 3 or command.mutation.kind != .table or command.mutation.action != .create) return error.InvalidCatalogMutation;
+            _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.sql_column_sequences_version);
+        }
         const admission = command.constraint_name_admission orelse {
-            if (command.version != 1) return error.InvalidCatalogMutation;
+            if (command.version != (if (compound) @as(u16, 3) else 1)) return error.InvalidCatalogMutation;
             return;
         };
-        if (command.version != 2 or command.mutation.kind != .table or command.mutation.action != .create) return error.InvalidCatalogMutation;
+        if (command.version != (if (compound) @as(u16, 3) else 2) or command.mutation.kind != .table or command.mutation.action != .create) return error.InvalidCatalogMutation;
         const topology = command.topology orelse return error.InvalidCatalogMutation;
         if (topology != .create) return error.InvalidCatalogMutation;
         _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.constraint_occupancy_version);
@@ -23896,10 +23919,264 @@ pub const RaftApplyStore = struct {
         if (!metadata_table_manager.tableDefinitionsEqual(derived, update.replacement)) return error.InvalidCatalogMutation;
     }
 
+    /// Capture the complete indexed owned set in the same metadata cut as the
+    /// source table and native attribute identities. No sequence is changed.
+    pub fn prepareColumnSequenceHandoffs(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: @import("../column_sequence_handoff.zig").Request) ![]u8 {
+        const handoff = @import("../column_sequence_handoff.zig");
+        if (request.targets.len == 0 or request.targets.len > 128) return error.InvalidRestoreStaging;
+        var txn = try self.beginQueryCatalogReadTxn(group);
+        defer txn.abort();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const targets = try a.dupe(restore_staging.Target, request.targets);
+        var total: usize = 0;
+        for (targets) |*target| {
+            if ((!target.empty_generation and target.rewrite == null) or target.sequence_handoffs.len != 0) return error.InvalidRestoreStaging;
+            const old = target.replace orelse return error.InvalidRestoreStaging;
+            const actual = (try self.getTableTxn(a, &txn, group, old.table.table_id)) orelse return error.CatalogGenerationChanged;
+            if (!metadata_table_manager.tableDefinitionsEqual(actual, old.table)) return error.CatalogGenerationChanged;
+            var moves: std.ArrayList(handoff.Move) = .empty;
+            var prefix_buffer: [192]u8 = undefined;
+            const prefix = try sql_sequences.ownerPrefix(&prefix_buffer, group, old.table.table_id);
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(prefix);
+            if (row == null or !std.mem.startsWith(u8, row.?.key, prefix)) continue;
+            _ = try self.standbyRelationActivationTxn(&txn, group, topology_protocol.sql_column_sequences_version);
+            var before = try self.columnDescriptionStateTxn(a, &txn, group, old.table);
+            defer before.deinit();
+            var after = try column_identities.State.decode(a, try columnIdentityValue(a, target.table, null, &.{}));
+            defer after.deinit();
+            while (row) |entry| : (row = try cursor.next()) {
+                if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                if (total == handoff.max_moves or !std.mem.eql(u8, entry.value, &.{1})) return error.InvalidRestoreStaging;
+                const edge = try sql_sequences.ownershipFromKey(entry.key, group, old.table.table_id);
+                const column = before.value.columnById(edge.owner.column_id) orelse return error.InvalidSequenceState;
+                const next = for (after.value.columns) |candidate| {
+                    if (std.mem.eql(u8, column.name, candidate.name)) break candidate;
+                } else return error.InvalidSequenceState;
+                var resource = (try system_catalog_storage.getById(a, &txn, group, .sequence, edge.sequence_id)) orelse return error.InvalidSequenceState;
+                defer resource.deinit();
+                const descriptor = try sql_sequences.sequence.Descriptor.decode(a, resource.value.source_json);
+                if (!std.meta.eql((try descriptor.definition()).owned_by, @as(?sql_sequences.sequence.OwnedBy, edge.owner))) return error.InvalidSequenceState;
+                try moves.append(a, .{ .before = try system_catalog.cloneResource(a, resource.value), .owner = .{ .table_id = target.table.table_id, .column_id = next.id }, .restart = request.restart });
+                total += 1;
+            }
+            target.sequence_handoffs = try moves.toOwnedSlice(a);
+            target.table.schema_json = try handoff.rewriteSchema(a, target.table.schema_json, old.table.table_id, after.value, target.sequence_handoffs);
+            target.table.schema_reader_requirements = try @import("antfly_local_sources").schema_mod.readerRequirementsForDefinitions(a, target.table.schema_json, target.table.read_schema_json);
+        }
+        return std.json.Stringify.valueAlloc(alloc, targets, .{});
+    }
+
+    /// An immutable plan must cover every edge, including manually OWNED BY
+    /// sequences. Concurrent ownership DDL invalidates admission/publication;
+    /// advancing counters alone does not invalidate CONTINUE IDENTITY.
+    fn validateColumnSequenceHandoffsTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, target: restore_staging.Target) !void {
+        const old = target.replace orelse {
+            if (target.sequence_handoffs.len != 0) return error.InvalidRestoreStaging;
+            return;
+        };
+        if (!target.empty_generation and target.rewrite == null) {
+            if (target.sequence_handoffs.len != 0) return error.InvalidRestoreStaging;
+            return;
+        }
+        var buffer: [192]u8 = undefined;
+        const prefix = try sql_sequences.ownerPrefix(&buffer, group, old.table.table_id);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var row = try cursor.seekAtOrAfter(prefix);
+        var count: usize = 0;
+        while (row) |entry| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const edge = try sql_sequences.ownershipFromKey(entry.key, group, old.table.table_id);
+            if (!std.mem.eql(u8, entry.value, &.{1}) or count == target.sequence_handoffs.len) return error.InvalidRestoreStaging;
+            const move = for (target.sequence_handoffs) |candidate| {
+                if (candidate.before.id == edge.sequence_id) break candidate;
+            } else return error.InvalidRestoreStaging;
+            var resource = (try system_catalog_storage.getById(a, txn, group, .sequence, edge.sequence_id)) orelse return error.InvalidSequenceState;
+            defer resource.deinit();
+            if (resource.value.parent_id != move.before.parent_id or !std.mem.eql(u8, resource.value.name, move.before.name) or
+                !std.mem.eql(u8, resource.value.source_json, move.before.source_json)) return error.InvalidRestoreStaging;
+            const descriptor = try sql_sequences.sequence.Descriptor.decode(a, resource.value.source_json);
+            if (!std.meta.eql((try descriptor.definition()).owned_by, @as(?sql_sequences.sequence.OwnedBy, edge.owner))) return error.InvalidSequenceState;
+            count += 1;
+        }
+        if (count != target.sequence_handoffs.len) return error.InvalidRestoreStaging;
+        if (count == 0) return;
+        var attributes = try column_identities.State.decode(a, try columnIdentityValue(a, target.table, null, &.{}));
+        defer attributes.deinit();
+        try @import("../column_sequence_handoff.zig").validateSchemaBindings(a, target.table.schema_json, attributes.value, target.sequence_handoffs);
+    }
+
+    /// The enclosing metadata transaction has validated every table, range,
+    /// catalog preimage and complete ownership set before reaching this point.
+    fn applyColumnSequenceHandoffsTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, plan: restore_staging.Plan) !void {
+        const Change = struct { move: @import("../column_sequence_handoff.zig").Move, prior: sql_sequences.sequence.Record };
+        var changes: std.ArrayList(Change) = .empty;
+        for (plan.targets) |target| for (target.sequence_handoffs) |move| {
+            _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_column_sequences_version);
+            const definition = try (try sql_sequences.sequence.Descriptor.decode(a, move.before.source_json)).definition();
+            const counter: sql_sequences.journal.Store(docstore.DocStore.Txn) = .{ .txn = txn, .key = .{ .group = group, .sequence_id = move.before.id } };
+            const prior: sql_sequences.sequence.Record = .{ .definition = definition, .state = (try counter.load(a, definition)) orelse return error.InvalidSequenceState };
+            _ = try move.definition(a);
+            if (move.restart) _ = try prior.alter(.{ .owned_by = .{ .column = move.owner }, .restart = .{} });
+            try changes.append(a, .{ .move = move, .prior = prior });
+        };
+        for (changes.items) |change| {
+            const move = change.move;
+            if (move.restart) {
+                const counter: sql_sequences.journal.Store(docstore.DocStore.Txn) = .{ .txn = txn, .key = .{ .group = group, .sequence_id = move.before.id } };
+                _ = try counter.alter(a, change.prior, .{ .owned_by = .{ .column = move.owner }, .restart = .{} });
+            }
+            var buffer: [192]u8 = undefined;
+            try txn.delete(try sql_sequences.ownerKey(&buffer, group, change.prior.definition.owned_by.?, move.before.id));
+            try txn.put(try sql_sequences.ownerKey(&buffer, group, move.owner, move.before.id), &.{1});
+        }
+    }
+
+    /// First bind the compiler's owned-column intent in a read-only native
+    /// transaction. The containing catalog command carries these exact bytes;
+    /// preflight and Raft apply independently derive and verify them again.
+    pub fn bindTableColumnSequences(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, command: SystemCatalogCommand) ![]u8 {
+        var txn = try self.beginQueryCatalogReadTxn(group);
+        defer txn.abort();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const meta = try system_catalog_storage.readMeta(a, &txn, group);
+        if (meta.revision != command.expected_revision) return error.CatalogGenerationChanged;
+        const reader: CatalogReader = .{ .store = self, .view = .{ .alloc = a, .txn = &txn, .group_id = group, .meta = meta } };
+        try validateCatalogTopology(command);
+        var delta = try system_catalog.planWithTopology(a, reader, meta.next_id, command.mutation, false);
+        defer delta.deinit(a);
+        const prepared = try self.prepareTableColumnSequencesTxn(a, &txn, group, command, meta, delta.next_id, true);
+        var bound = command;
+        bound.topology.?.create.table.schema_json = prepared.schema_json;
+        bound.topology.?.create.table.schema_reader_requirements = try @import("antfly_local_sources").schema_mod.readerRequirementsForDefinitions(a, prepared.schema_json, bound.topology.?.create.table.read_schema_json);
+        return std.json.Stringify.valueAlloc(alloc, bound, .{});
+    }
+
+    fn prepareTableColumnSequencesTxn(
+        self: *RaftApplyStore,
+        a: std.mem.Allocator,
+        txn: *docstore.DocStore.Txn,
+        group: u64,
+        command: SystemCatalogCommand,
+        meta: system_catalog_storage.Meta,
+        first_id: u64,
+        allow_unbound: bool,
+    ) !@import("antfly_local_sources").system_catalog_column_sequence_creation.Plan {
+        const sources = @import("antfly_local_sources");
+        if (command.version != 3 or command.column_sequences.len == 0 or command.column_sequences.len > 256 or
+            command.mutation.kind != .table or command.mutation.action != .create or command.sql_sequence != null or
+            command.sql_view != null or command.placement_update != null) return error.InvalidCatalogMutation;
+        const topology = command.topology orelse return error.InvalidCatalogMutation;
+        if (topology != .create or topology.create.table.table_id != command.mutation.table_id) return error.InvalidCatalogMutation;
+        _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_column_sequences_version);
+        const epoch = try relationSourceEpochTxn(txn, group);
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = txn, .group_id = group, .meta = meta };
+        const namespace = try view.namespaceFor(command.mutation.database, command.mutation.namespace);
+        var registry = try RelationRegistry(docstore.DocStore.Txn).init(a, txn, group);
+        const live = registry.live orelse return error.CatalogPublicationProofPending;
+        if (live.root.coverage != .constraint_names or !live.root.epoch.eql(epoch) or !try relationWriterEnabledTxn(txn, group))
+            return error.CatalogOccupancyNotReady;
+        const table = topology.create.table;
+        const attribute_bytes = try columnIdentityValue(a, table, null, &.{});
+        var attributes = try column_identities.State.decode(a, attribute_bytes);
+        defer attributes.deinit();
+        var parsed = try sources.schema_mod.parseValidatedTableSchema(a, table.schema_json);
+        defer parsed.deinit(a);
+        const runtime = try sources.schema_mod.deriveRuntimeTableSchema(a, parsed);
+        defer sources.storage_schema.freeSchema(a, runtime);
+        const columns = try sources.sql_document_row.deriveRelationalColumnsLeaky(a, a, parsed, runtime);
+        const Namespace = struct {
+            view: system_catalog_storage.View,
+            registry: *RelationRegistry(docstore.DocStore.Txn),
+            namespace_id: u64,
+            columns: []const sources.sql_catalog.Column,
+
+            pub fn checkpoint(_: *@This()) !void {}
+            pub fn relationOccupied(context: *@This(), name: []const u8) !bool {
+                return try context.registry.getEntry(.{ .namespace_id = context.namespace_id, .name = name }) != null or
+                    try context.view.lookup(.table, context.namespace_id, name) != null or
+                    try context.view.lookup(.view, context.namespace_id, name) != null or
+                    try context.view.lookup(.sequence, context.namespace_id, name) != null;
+            }
+            pub fn requireColumn(context: *@This(), name: []const u8, expected: sql_sequences.sequence.Integer) !void {
+                const column = for (context.columns) |candidate| {
+                    if (std.mem.eql(u8, candidate.name, name)) break candidate;
+                } else return error.UndefinedColumn;
+                if (column.type != .integer or column.nullable) return error.InvalidSequenceDefinition;
+                const width: sql_sequences.sequence.Integer = switch (column.element_type orelse .int64) {
+                    .int16 => .int16,
+                    .int32 => .int32,
+                    .int64 => .int64,
+                    else => return error.InvalidSequenceDefinition,
+                };
+                if (width != expected) return error.InvalidSequenceDefinition;
+            }
+        };
+        var occupied: Namespace = .{ .view = view, .registry = &registry, .namespace_id = namespace.id, .columns = columns };
+        const prepared = try sources.system_catalog_column_sequence_creation.prepare(a, .{
+            .target = .{ .database = command.mutation.database, .namespace = command.mutation.namespace, .table = command.mutation.name },
+            .namespace_id = namespace.id,
+            .incarnation = epoch.incarnation,
+            .first_id = first_id,
+            .identities = attributes.value,
+            .schema_json = table.schema_json,
+            .columns = command.column_sequences,
+            .allow_unbound = allow_unbound,
+        }, &occupied);
+        for (prepared.sequences) |item| {
+            const counter: sql_sequences.journal.Store(docstore.DocStore.Txn) = .{ .txn = txn, .key = .{ .group = group, .sequence_id = item.binding.sequence_id } };
+            if (try counter.load(a, item.definition) != null) return error.InvalidSequenceState;
+        }
+        return prepared;
+    }
+
+    fn expandTableColumnSequenceDelta(a: std.mem.Allocator, delta: *system_catalog.Delta, prepared: @import("antfly_local_sources").system_catalog_column_sequence_creation.Plan) !void {
+        const resources = try a.alloc(system_catalog.Resource, delta.upserts.len + prepared.sequences.len);
+        @memcpy(resources[0..delta.upserts.len], delta.upserts);
+        for (resources[delta.upserts.len..], prepared.sequences) |*resource, item| resource.* = .{
+            .kind = .sequence,
+            .id = item.binding.sequence_id,
+            .parent_id = item.binding.namespace_id,
+            .name = item.binding.target.table,
+            .source_json = try (try sql_sequences.sequence.Descriptor.init(item.binding.sequence_id, item.definition)).encode(a),
+        };
+        a.free(delta.upserts);
+        delta.upserts = resources;
+        delta.next_id = prepared.next_id;
+    }
+
+    fn initializeTableColumnSequencesTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, table: metadata.TableRecord, prepared: @import("antfly_local_sources").system_catalog_column_sequence_creation.Plan) !void {
+        // No semantic nonadmission may occur after the first persistent write.
+        // The caller has already verified the complete table/catalog preimage.
+        try self.initializeColumnIdentitiesTxn(txn, group, table);
+        for (prepared.sequences) |item| {
+            const counter: sql_sequences.journal.Store(docstore.DocStore.Txn) = .{ .txn = txn, .key = .{ .group = group, .sequence_id = item.binding.sequence_id } };
+            try counter.initialize(a, try sql_sequences.sequence.Record.create(.{
+                .integer = item.definition.integer,
+                .increment = item.definition.increment,
+                .minimum = .{ .value = item.definition.minimum },
+                .maximum = .{ .value = item.definition.maximum },
+                .start = item.definition.start,
+                .cache = item.definition.cache,
+                .cycle = item.definition.cycle,
+                .owned_by = .{ .column = item.binding.owner },
+            }));
+            var key_buffer: [192]u8 = undefined;
+            try txn.put(try sql_sequences.ownerKey(&key_buffer, group, item.binding.owner, item.binding.sequence_id), &.{1});
+        }
+    }
+
     /// Validate and serialize the exact admitted projection before proposing.
     pub fn prepareSystemCatalogResult(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, command: SystemCatalogCommand) ![]u8 {
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
+        if (command.column_sequences.len != 0 and (command.sql_sequence != null or command.sql_view != null)) return error.InvalidCatalogMutation;
         if (command.sql_sequence != null) return std.json.Stringify.valueAlloc(alloc, try self.prepareSqlSequenceCatalogTxn(&txn, group_id, command), .{});
         if (command.sql_view != null) return std.json.Stringify.valueAlloc(alloc, try self.applySqlViewLifecycleTxn(&txn, group_id, command, false), .{});
         if (command.mutation.action == .comment) _ = try self.requireTopologyActivationTxn(&txn, group_id, topology_protocol.sql_resource_comments_version);
@@ -23913,6 +24190,11 @@ pub const RaftApplyStore = struct {
         try validateCatalogTopology(command);
         var delta = try system_catalog.planWithTopology(a, reader, meta.next_id, command.mutation, command.mutation.kind == .table and command.mutation.action == .drop);
         defer delta.deinit(a);
+        if (command.column_sequences.len != 0) {
+            const prepared = try self.prepareTableColumnSequencesTxn(a, &txn, group_id, command, meta, delta.next_id, false);
+            if (!std.mem.eql(u8, command.topology.?.create.table.schema_json, prepared.schema_json)) return error.InvalidCatalogMutation;
+            try expandTableColumnSequenceDelta(a, &delta, prepared);
+        }
         try validateCatalogPlacement(reader, command, delta);
         if (command.placement_update) |update| {
             if (command.mutation.kind != .table or command.mutation.action != .set_tablespace or update.expected.table_id != update.replacement.table_id or !std.mem.eql(u8, update.expected.name, update.replacement.name)) return error.InvalidCatalogMutation;
@@ -24304,7 +24586,8 @@ pub const RaftApplyStore = struct {
             };
             return;
         }
-        if (command.version != 1 and command.version != 2) return error.InvalidCatalogMutation;
+        if (command.version != 1 and command.version != 2 and command.version != 3) return error.InvalidCatalogMutation;
+        if (command.column_sequences.len != 0 and (command.sql_sequence != null or command.sql_view != null)) return error.InvalidCatalogMutation;
         if (command.mutation.action == .comment) {
             _ = self.requireTopologyActivationTxn(txn, group_id, topology_protocol.sql_resource_comments_version) catch |err| switch (err) {
                 error.TableTopologyProtocolUpgradeRequired => return,
@@ -24348,6 +24631,14 @@ pub const RaftApplyStore = struct {
             else => return, // A concurrent catalog/topology operation defeated admission.
         };
         defer delta.deinit(a);
+        const column_sequence_plan = if (command.column_sequences.len != 0) self.prepareTableColumnSequencesTxn(a, txn, group_id, command, meta, delta.next_id, false) catch |err| switch (err) {
+            error.InvalidCatalogMutation, error.InvalidSequenceDefinition, error.CatalogGenerationChanged, error.TableTopologyProtocolUpgradeRequired, error.CatalogPublicationProofPending, error.CatalogOccupancyNotReady, error.CatalogSourceUntracked, error.UndefinedColumn, error.ProgramLimitExceeded => return,
+            else => return err,
+        } else null;
+        if (column_sequence_plan) |prepared| {
+            if (!std.mem.eql(u8, command.topology.?.create.table.schema_json, prepared.schema_json)) return;
+            try expandTableColumnSequenceDelta(a, &delta, prepared);
+        }
         validateCatalogPlacement(reader, command, delta) catch |err| switch (err) {
             error.InvalidCatalogMutation => return,
             else => return err, // Storage/corruption failures must abort.
@@ -24377,9 +24668,16 @@ pub const RaftApplyStore = struct {
                 .drop => if (encoded != null) return,
             }
         }
+        if (column_sequence_plan) |prepared|
+            try self.initializeTableColumnSequencesTxn(a, txn, group_id, command.topology.?.create.table, prepared);
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
-        try self.applySystemCatalogDeltaTxn(self.alloc, txn, group_id, delta, meta, hash);
+        var published_meta = meta;
+        // Table-owned sequence creation is one catalog transaction, with no
+        // independent sequence-DDL receipt. Durably activate the empty journal
+        // so backup/restore can distinguish it from a missing journal header.
+        if (column_sequence_plan != null and published_meta.sequence_outcome_head == null) published_meta.sequence_outcome_head = 0;
+        try self.applySystemCatalogDeltaTxn(self.alloc, txn, group_id, delta, published_meta, hash);
         // Invalidate metadata readers through the existing catalog event path.
         self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group_id });
     }
@@ -30007,12 +30305,13 @@ pub const RaftApplyStore = struct {
     fn relationSourceKey(group_id: u64, key: []const u8) !bool {
         var buf: [160]u8 = undefined;
         const prefix = try system_catalog_storage.prefixForGroup(&buf, group_id);
-        // Stored views have their own catalog revision, immutable identities
-        // and checkpoint/dependency verification. They do not rebuild the
+        // Views and sequences have their own catalog revision, immutable
+        // identities and checkpoint/dependency verification. They do not rebuild the
         // physical table/index namespace. Including their records here would
         // change an equal-clock physical source cut and reject valid catch-up.
         if (std.mem.startsWith(u8, key, prefix) and
-            std.mem.startsWith(u8, key[prefix.len..], "record:view:")) return false;
+            (std.mem.startsWith(u8, key[prefix.len..], "record:view:") or
+                std.mem.startsWith(u8, key[prefix.len..], "record:sequence:"))) return false;
         return try capturedRelationTableId(key, group_id) != null or
             try index_publication.sourceKey(key, group_id) != null or
             try relationFkSourceTableId(key, group_id) != null or
@@ -30101,6 +30400,21 @@ pub const RaftApplyStore = struct {
                 if (bytes.len == 24 and std.mem.readInt(u64, bytes[16..24], .little) == 0) return error.InvalidCatalogRecord;
             },
         };
+        if (try system_catalog_storage.tableIdFromRecordKey(key, group)) |id| {
+            // Logical bindings are JSON resources; physical table records use
+            // the binary encoding below. Only namespace inputs belong to this
+            // cut: placement, descriptions and service progress are independent.
+            var parsed = try std.json.parseFromSlice(system_catalog.Resource, a, bytes, .{});
+            defer parsed.deinit();
+            const table = parsed.value;
+            if (table.kind != .table or table.id != id or table.parent_id == 0 or table.storage_name.len == 0) return error.InvalidCatalogRecord;
+            try system_catalog.validateResourceName(.table, table.name);
+            const projection = try std.json.Stringify.valueAlloc(a, .{ .id = id, .parent_id = table.parent_id, .name = table.name, .storage_name = table.storage_name }, .{});
+            defer a.free(projection);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(projection, &digest, .{});
+            return digest;
+        }
         if (try capturedRelationTableId(key, group)) |id| {
             const table = try borrowTableProjection(bytes, .schema);
             if (table.table_id != id) return error.InvalidCatalogRecord;
@@ -31998,6 +32312,7 @@ pub const RaftApplyStore = struct {
                 return error.InvalidRestoreStaging;
         };
         for (plan.targets) |target| {
+            try validateColumnSequenceHandoffsTxn(alloc, txn, group_id, target);
             const old = if (target.replace) |replacement| try view.byId(.table, replacement.table.table_id) else null;
             var binding = target.catalog_binding orelse old orelse continue;
             if (try view.byId(.namespace, binding.parent_id) == null or try view.byId(.table, target.table.table_id) != null) return error.InvalidRestoreStaging;
@@ -32014,6 +32329,7 @@ pub const RaftApplyStore = struct {
             binding.id = target.table.table_id;
             binding.storage_name = target.table.name;
             try upserts.append(alloc, binding);
+            for (target.sequence_handoffs) |move| try upserts.append(alloc, try move.resource(alloc));
         }
         return .{ .upserts = upserts.items, .removes = removes.items, .next_id = meta.next_id };
     }
@@ -32458,6 +32774,7 @@ pub const RaftApplyStore = struct {
                             if (err == error.InvalidRestoreStaging) return;
                             return err;
                         };
+                        try self.applyColumnSequenceHandoffsTxn(catalog_arena.allocator(), txn, group_id, job.value.plan);
                         if (delta.upserts.len != 0) {
                             const meta = try system_catalog_storage.readMeta(catalog_arena.allocator(), txn, group_id);
                             try self.applySystemCatalogDeltaTxn(catalog_arena.allocator(), txn, group_id, delta, meta, @splat(0));
@@ -32494,6 +32811,7 @@ pub const RaftApplyStore = struct {
                         var table_key_buf: [256]u8 = undefined;
                         const table = prepared.identity;
                         try self.writePreparedTableRecordTxn(txn, group_id, try tableKeyForGroup(&table_key_buf, group_id, table.table_id), prepared);
+                        if (target.sequence_handoffs.len != 0) try self.initializeColumnIdentitiesTxn(txn, group_id, target.table);
                         var added: std.ArrayList(u64) = .empty;
                         defer added.deinit(self.alloc);
                         for (target.ranges) |range| {
@@ -34645,6 +34963,8 @@ pub const RaftApplyStore = struct {
     /// complete sequence/catalog mutation is ready to commit.
     fn verifySequenceOwnerTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, namespace_id: u64, owner: sql_sequences.sequence.OwnedBy, guard: ?system_catalog.RelationMutationGuard) !?SequenceOwnerBootstrap {
         try owner.validate();
+        var reservation_buffer: [256]u8 = undefined;
+        if (try stagingGet(txn, try restore_staging.identityKey(&reservation_buffer, group, .old_table, owner.table_id)) != null) return error.CatalogGenerationChanged;
         return (try self.bindSequenceOwnerTxn(a, txn, group, namespace_id, owner.table_id, guard, .{ .id = owner.column_id }) orelse return error.CatalogGenerationChanged).bootstrap;
     }
 
@@ -34772,6 +35092,20 @@ pub const RaftApplyStore = struct {
             if (try self.bindSequenceOwnerTxn(a, &txn, group, null, wanted.guard.owner.table_id, wanted.guard, .{ .name = wanted.column })) |bound|
                 owner = .{ .namespace_id = bound.namespace_id, .column = bound.column };
         }
+        if (request.column_default) |wanted| {
+            try context.ensureActive();
+            _ = try self.standbyRelationActivationTxn(&txn, group, topology_protocol.sql_column_sequences_version);
+            var table_buffer: [160]u8 = undefined;
+            const encoded = try stagingGet(&txn, try tableKeyForGroup(&table_buffer, group, wanted.scope.table_id)) orelse return error.CatalogGenerationChanged;
+            const table = try decodeTableRecord(a, encoded);
+            if (!std.mem.eql(u8, table.name, wanted.scope.storage_name) or try @import("../../api/tables.zig").schemaVersion(table.schema_json) != wanted.scope.schema_version) return error.CatalogGenerationChanged;
+            if ((try self.loadTableTransitionFenceTxn(&txn, group, table.table_id)).active()) return error.TableTransitionActive;
+            if (try self.bindSequenceOwnerTxn(a, &txn, group, null, table.table_id, null, .{ .name = wanted.column })) |bound| {
+                if (bound.bootstrap != null) return error.InvalidSequenceState;
+                const resource = try view.byId(.table, table.table_id);
+                owner = .{ .namespace_id = bound.namespace_id, .column = bound.column, .table_name = if (resource) |value| value.name else table.name };
+            }
+        }
         const result: sql_sequences.Snapshot = .{ .metadata_group_id = group, .revision = meta.revision, .head = meta.sequence_outcome_head orelse 0, .incarnation = epoch.incarnation, .entries = entries, .owner = owner };
         try result.validate(request);
         try context.ensureActive();
@@ -34787,7 +35121,7 @@ pub const RaftApplyStore = struct {
             .rename => .rename,
             .drop => .drop,
         };
-        if (command.version != 3 or command.expected_revision != 0 or command.sql_view != null or
+        if (command.version != 3 or command.expected_revision != 0 or command.sql_view != null or command.column_sequences.len != 0 or
             command.topology != null or command.placement_update != null or command.constraint_name_admission != null or
             command.mutation.kind != .sequence or command.mutation.action != expected_action or
             command.mutation.table_id != 0 or command.mutation.storage_name.len != 0 or command.mutation.new_name != null or
@@ -35026,6 +35360,10 @@ pub const RaftApplyStore = struct {
             .drop => next = null,
         }
         const before_owner = if (prior) |value| value.definition.owned_by else null;
+        if (before_owner) |owner| {
+            var reservation_buffer: [256]u8 = undefined;
+            if (try stagingGet(txn, try restore_staging.identityKey(&reservation_buffer, group, .old_table, owner.table_id)) != null) return error.CatalogGenerationChanged;
+        }
         const after_owner = if (next) |value| value.definition.owned_by else null;
         var owner_bootstrap: ?SequenceOwnerBootstrap = null;
         if (after_owner) |owner| owner_bootstrap = try self.verifySequenceOwnerTxn(a, txn, group, namespace.id, owner, request.owner_guard);

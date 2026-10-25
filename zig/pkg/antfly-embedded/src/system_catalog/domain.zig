@@ -1030,8 +1030,10 @@ pub const Request = struct {
     physical_name: ?[]const u8 = null,
     /// Trusted SQL compiler provenance; not a public schema JSON attribute.
     generated_constraint_names: []const []const u8 = &.{},
+    column_sequences: []const @import("column_sequences.zig").Creation = &.{},
 
     pub fn jsonStringify(self: Request, writer: anytype) !void {
+        if (self.column_sequences.len != 0) return writer.write(.{ .mutation = self.mutation, .create_table_json = self.create_table_json, .physical_name = self.physical_name, .generated_constraint_names = self.generated_constraint_names, .column_sequences = self.column_sequences });
         if (self.generated_constraint_names.len == 0) return writer.write(.{ .mutation = self.mutation, .create_table_json = self.create_table_json, .physical_name = self.physical_name });
         try writer.write(.{ .mutation = self.mutation, .create_table_json = self.create_table_json, .physical_name = self.physical_name, .generated_constraint_names = self.generated_constraint_names });
     }
@@ -1736,6 +1738,8 @@ pub const Meta = struct {
     /// Durable admission high-water, independent of schema revision. Keeping
     /// it with the authority prevents a restore from erasing every outcome
     /// row and accidentally making an old CREATE executable again.
+    /// Zero is an activated, empty journal (owned sequences created with a
+    /// table); null denotes a catalog that has not activated sequences.
     sequence_outcome_head: ?u64 = null,
 };
 

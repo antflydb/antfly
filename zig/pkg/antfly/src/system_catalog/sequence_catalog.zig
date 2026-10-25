@@ -79,6 +79,9 @@ pub const SnapshotRequest = struct {
     /// Ingress has already authorized this exact table. Metadata rechecks
     /// its immutable owner/schema guard while resolving the attribute name.
     owner: ?struct { guard: domain.RelationMutationGuard, column: []const u8 } = null,
+    /// Row preparation pins its actual physical table/epoch and field name.
+    /// The returned attribute identity must independently match the reference.
+    column_default: ?struct { scope: sources.system_catalog_column_sequences.Scope, column: []const u8 } = null,
 
     pub fn validate(self: @This()) !void {
         if (self.targets.len == 0 or self.targets.len > max_lookup_targets) return error.InvalidCatalogMutation;
@@ -87,6 +90,13 @@ pub const SnapshotRequest = struct {
         if (self.sequence_ids) |ids| {
             if (ids.len != self.targets.len or self.owner != null or std.mem.allEqual(u8, &self.incarnation.?, 0)) return error.InvalidCatalogMutation;
             for (ids) |id| if (id == 0) return error.InvalidCatalogMutation;
+        }
+        if (self.column_default) |value| {
+            if (self.owner != null or self.sequence_ids == null or self.targets.len != 1 or value.scope.table_id == 0 or
+                value.scope.storage_name.len == 0 or value.scope.storage_name.len > 1024 or
+                !std.unicode.utf8ValidateSlice(value.scope.storage_name) or std.mem.indexOfScalar(u8, value.scope.storage_name, 0) != null)
+                return error.InvalidCatalogMutation;
+            try domain.validateTableName(value.column);
         }
         if (self.owner) |value| {
             try value.guard.validate();
@@ -102,7 +112,19 @@ pub const Snapshot = struct {
         value: union(enum) { missing_database, missing_namespace, absent, other, sequence: sequence.Descriptor },
         counter: ?sequence.State = null,
     };
-    pub const Owner = struct { namespace_id: u64, column: sequence.OwnedBy };
+    pub const Owner = struct {
+        namespace_id: u64,
+        column: sequence.OwnedBy,
+        /// Only capability-70 column-default requests return this native name.
+        table_name: ?[]const u8 = null,
+
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            if (self.table_name) |name|
+                try writer.write(.{ .namespace_id = self.namespace_id, .column = self.column, .table_name = name })
+            else
+                try writer.write(.{ .namespace_id = self.namespace_id, .column = self.column });
+        }
+    };
     metadata_group_id: u64 = 0,
     revision: u64,
     head: u64,
@@ -142,6 +164,11 @@ pub const Snapshot = struct {
             if (self.owner) |value| {
                 value.column.validate() catch return error.InvalidSqlBackendResponse;
                 if (value.namespace_id == 0 or value.column.table_id != wanted.guard.owner.table_id) return error.InvalidSqlBackendResponse;
+            }
+        } else if (request.column_default) |wanted| {
+            if (self.owner) |value| {
+                value.column.validate() catch return error.InvalidSqlBackendResponse;
+                if (value.namespace_id == 0 or value.column.table_id != wanted.scope.table_id) return error.InvalidSqlBackendResponse;
             }
         } else if (self.owner != null) return error.InvalidSqlBackendResponse;
     }

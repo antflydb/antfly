@@ -286,10 +286,6 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     try context.ensureActive();
     if (server.cfg.auth_enabled and identity == null) return error.Forbidden;
     if (ddl.truncate_tables.len == 0 or ddl.truncate_tables.len > 128) return error.InvalidSqlSyntax;
-    // SQL-owned sequences are not a catalog capability yet. Row identities
-    // are supplied by the secure generator, not a table-local counter. Thus
-    // RESTART IDENTITY has no sequence to reset in this catalog version; the
-    // fresh table generation still resets all owner-local identity metadata.
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -340,9 +336,9 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     const idempotency_namespace = try std.fmt.allocPrint(a, "sql-truncate:{s}", .{principal});
     const job_id = try jobs.jobIdForIdempotency(a, idempotency_namespace, &key);
     const id = try stages.idForAttempt(job_id, 1);
-    const planned = try a.alloc(stages.Target, selected.len);
+    var planned: []const stages.Target = try a.alloc(stages.Target, selected.len);
     var total_ranges: usize = 0;
-    for (selected, planned) |before, *target| {
+    for (selected, @constCast(planned)) |before, *target| {
         var old_ranges: std.ArrayList(records.RangeRecord) = .empty;
         for (snapshot.ranges) |range| if (range.table_id == before.table_id) try old_ranges.append(a, range);
         total_ranges += old_ranges.items.len;
@@ -388,7 +384,11 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         binding.id = table.table_id;
         target.* = .{ .source_table_id = before.table_id, .table = table, .catalog_binding = binding, .ranges = ranges, .empty_generation = true, .graph_retirement_digest = try stages.graphRetirementDigest(a, before.table_id, table.table_id, table.indexes_json), .generation_handoffs = handoffs, .replace = .{ .table = before, .ranges = old_ranges.items, .fences = fences } };
     }
-    try stages.prepareEmptyGenerationHandoffMappingsAlloc(a, planned);
+    var sequence_context = context;
+    sequence_context.setting_admin = true;
+    const sequence_bytes = try server.source.systemCatalog(a, sequence_context, .{ .sql_column_sequence_handoffs = .{ .targets = planned, .restart = ddl.restart_identity } });
+    planned = try std.json.parseFromSliceLeaky([]const stages.Target, a, sequence_bytes, .{});
+    try stages.prepareEmptyGenerationHandoffMappingsAlloc(a, @constCast(planned));
     const external_parents = try buildExternalParents(server, identity, context, a, snapshot, selected, planned, id);
     if (external_parents.len != 0) {
         const parent_names = try a.alloc([]const u8, external_parents.len);

@@ -615,6 +615,7 @@ pub fn applyCandidateWithLimits(alloc: std.mem.Allocator, schema: *Value, ddl: a
             if (change == .add_column) {
                 if (properties.object.contains(column_name)) return error.DuplicateSqlColumn;
                 const column = change.add_column;
+                if (column.sequence != null) return error.UnsupportedSqlShape;
                 if (column.default_expression != null and column.generated_expression != null) return error.InvalidSqlSyntax;
                 try properties.object.put(alloc, try alloc.dupe(u8, column_name), try @import("ddl_runtime.zig").columnProperty(alloc, column, column.nullable));
                 if (!change.add_column.nullable) {

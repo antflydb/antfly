@@ -73,8 +73,16 @@ pub fn requiresCoordination(alloc: Allocator, schema_json: []const u8) !bool {
     if (schema_json.len == 0) return false;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
+    if (hasSequenceDefaults(parsed)) return true;
     return (if (parsed.unique_constraints) |values| values.value.len != 0 else false) or
         (if (parsed.foreign_keys) |values| values.value.len != 0 else false);
+}
+
+fn hasSequenceDefaults(parsed: anytype) bool {
+    if (parsed.column_defaults) |defaults| if (defaults.value == .array) for (defaults.value.array.items) |entry| {
+        if (entry == .object and entry.object.contains("sequence")) return true;
+    };
+    return false;
 }
 
 /// Row-local CHECK enforcement does not add fanout to ordinary mutations.
@@ -166,6 +174,7 @@ pub const Prepared = struct {
 };
 
 const Loaded = struct {
+    table_id: u64,
     name: []const u8,
     view: registry.SchemaView,
     catalog: catalog.Catalog,
@@ -697,7 +706,7 @@ const Builder = struct {
         if (self.queue.items.len > 16_384) return error.TransactionTooLarge;
     }
 
-    fn preparationValidator(self: *Builder, compiled: schema_api.CompiledTableValidator) !schema_api.CompiledTableValidator {
+    fn preparationValidator(self: *Builder, compiled: schema_api.CompiledTableValidator, table: *const Loaded) !schema_api.CompiledTableValidator {
         // The request owns this borrowed receiver. Never attach mutable runtime
         // state to the immutable schema view or retain it in prepared rows.
         if (self.preparation_receiver == null) {
@@ -713,7 +722,7 @@ const Builder = struct {
                 self.preparation_transaction = instant;
             };
             const required = if (compiled.execution.expressions) |set| set.table.requires_clock_defaults else false;
-            const runtime = try (expressions.PreparationRuntime{ .io = receiver.io(), .transaction_start = self.preparation_transaction }).withClock(required);
+            const runtime = try (expressions.PreparationRuntime{ .io = receiver.io(), .transaction_start = self.preparation_transaction, .sequences = self.control.column_sequences, .sequence_scope = .{ .table_id = table.table_id, .schema_version = table.view.version(), .storage_name = table.name } }).withClock(required);
             self.preparation_transaction = runtime.transaction_start;
             return compiled.forPreparation(runtime);
         }
@@ -729,7 +738,7 @@ const Builder = struct {
         const temporary = scratch.allocator();
         var before: ?mapper.PreparedRelationalWrite = if (item.before) |row| try mapper.PreparedRelationalWrite.initTyped(temporary, temporary, temporary, false, item.key, row.json, null, view.tableSchema().*, view.physicalLayout(), row.json_null_fields, true) else null;
         defer if (before) |*row| row.deinit(temporary);
-        var after: ?mapper.PreparedRelationalWrite = if (item.after) |json| try mapper.PreparedRelationalWrite.initTyped(temporary, temporary, temporary, false, item.key, json, if (view.validator()) |validator| try self.preparationValidator(validator) else null, view.tableSchema().*, view.physicalLayout(), item.after_json_null_fields, false) else null;
+        var after: ?mapper.PreparedRelationalWrite = if (item.after) |json| try mapper.PreparedRelationalWrite.initTyped(temporary, temporary, temporary, false, item.key, json, if (view.validator()) |validator| try self.preparationValidator(validator, item.table) else null, view.tableSchema().*, view.physicalLayout(), item.after_json_null_fields, false) else null;
         defer if (after) |*row| row.deinit(temporary);
         if (after) |*row| if (view.validator()) |validator| if (validator.execution.expressions) |expressions| if (expressions.bindings.len != 0 or expressions.modifier_ordinals.len != 0) {
             // Cascading parent assignments and final participant writes must
@@ -1108,6 +1117,7 @@ const Builder = struct {
         table.* = .{
             .name = try self.alloc.dupe(u8, record.name),
             .view = view,
+            .table_id = record.table_id,
             .catalog = bindings,
             .catalog_digest = @import("../storage/db/relational_schema_owner_contract.zig").hash(bytes),
             .uniques = try view.validator().?.schema.relationalUniqueDefinitions(self.alloc),
@@ -1255,7 +1265,7 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
         if (record.schema_json.len == 0) continue;
         var declaration = try schema_api.parseValidatedTableSchema(builder.alloc, record.schema_json);
         defer declaration.deinit(builder.alloc);
-        if (declaration.unique_constraints == null and declaration.foreign_keys == null and ((repair_tables.len == 0 and repair_admission == null) or declaration.checks == null)) continue;
+        if (!hasSequenceDefaults(declaration) and declaration.unique_constraints == null and declaration.foreign_keys == null and ((repair_tables.len == 0 and repair_admission == null) or declaration.checks == null)) continue;
         if (request.transforms.len != 0) return error.UnsupportedOperation;
         const table = try builder.load(request.table_name);
         if (request.relational_integrity_generation_set) |expected| {

@@ -6912,6 +6912,7 @@ pub const MetadataAdminVoprSource = struct {
             .sql_view_mutate,
             .sql_sequence_admission_head,
             .sql_sequence_snapshot,
+            .sql_column_sequence_handoffs,
             .sql_sequence_mutate,
             .sql_sequence_outcome,
             .sql_sequence_counter_mutate,

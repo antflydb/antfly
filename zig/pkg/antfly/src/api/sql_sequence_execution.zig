@@ -122,6 +122,13 @@ pub const Owner = struct {
     flushed: bool = false,
     live: std.AutoHashMapUnmanaged(session.Identity, Live) = .empty,
     names: std.StringHashMapUnmanaged(session.Identity) = .empty,
+    columns: std.AutoHashMapUnmanaged(session.Identity, struct {
+        scope: local.system_catalog_column_sequences.Scope,
+        name: []const u8,
+        owner: sequences.sequence.OwnedBy,
+        table: domain.Target,
+        implicit: bool,
+    }) = .empty,
 
     pub fn create(root: *execution.Adapter) !*Owner {
         const a = root.server.alloc;
@@ -191,7 +198,16 @@ pub const Owner = struct {
         if (!try http.tablePermissionCurrentlyAllowed(identity, resource, if (mutating) .write else .read)) return error.Forbidden;
         if (mutating and self.read_only) return error.SqlReadOnlyTransaction;
     }
-    fn allocate(self: *Owner, live: *Live, operation: sequences.journal.Operation) !sequences.journal.Receipt {
+    fn authorizeColumn(self: *Owner, a: A, identity: session.Identity, live: Live) !void {
+        const proof = self.columns.get(identity) orelse return error.CatalogGenerationChanged;
+        if (!std.meta.eql(live.definition.owned_by, @as(?sequences.sequence.OwnedBy, proof.owner))) return error.CatalogGenerationChanged;
+        const principal = self.root.identity.*;
+        if (self.root.server.cfg.auth_enabled and principal == null) return error.Forbidden;
+        if (!try @import("sql_catalog_auth.zig").namespaceUsage(principal, a, proof.table) or
+            !try http.tablePermissionCurrentlyAllowed(principal, try proof.table.resourceNameAlloc(a), .write)) return error.Forbidden;
+        if (self.read_only) return error.SqlReadOnlyTransaction;
+    }
+    fn allocate(self: *Owner, live: *Live, operation: sequences.journal.Operation, implicit: bool) !sequences.journal.Receipt {
         var scratch = std.heap.ArenaAllocator.init(self.root.server.alloc);
         defer scratch.deinit();
         const a = scratch.allocator();
@@ -212,7 +228,7 @@ pub const Owner = struct {
                 receipt = outcome.result() catch |err| switch (err) {
                     error.SequenceCounterChanged, error.SequenceCatalogChanged => {
                         var fresh = try byIdentity(self.root, a, live.reference.identity);
-                        try self.authorize(a, fresh, true);
+                        if (implicit) try self.authorizeColumn(a, fresh.reference.identity, fresh) else try self.authorize(a, fresh, true);
                         const current_target = live.reference.target;
                         if (std.mem.eql(u8, fresh.reference.target.database, current_target.database) and std.mem.eql(u8, fresh.reference.target.namespace, current_target.namespace) and std.mem.eql(u8, fresh.reference.target.table, current_target.table)) fresh.reference.target = current_target else {
                             const retained = self.arena.allocator();
@@ -250,6 +266,10 @@ pub const Owner = struct {
         return reference.identity;
     }
     pub fn invoke(self: *Owner, a: A, function: effects.Function, reference: ?effects.Reference, args: []const local.sql_scalar.Datum) !i64 {
+        return self.invokeWithAuthority(a, function, reference, args, false);
+    }
+    fn invokeWithAuthority(self: *Owner, a: A, function: effects.Function, reference: ?effects.Reference, args: []const local.sql_scalar.Datum, implicit: bool) !i64 {
+        if (implicit and function != .nextval) return error.InvalidSqlProgram;
         self.flushed = false;
         try self.root.context.ensureActive();
         const identity = if (function == .lastval) (try self.state.lastValue()).identity else if (reference) |bound| bound.identity else try self.dynamic(args[0].value.string);
@@ -257,7 +277,7 @@ pub const Owner = struct {
             if (function == .lastval and err == error.SequenceNotFound) return error.SqlSequenceValueNotDefined;
             return err;
         };
-        try self.authorize(a, live.*, function == .nextval or function == .setval);
+        if (implicit) try self.authorizeColumn(a, identity, live.*) else try self.authorize(a, live.*, function == .nextval or function == .setval);
         if (function == .currval or function == .lastval) return self.state.current(identity);
         const slot = try self.state.prepare(self.state_allocator, identity);
         switch (function) {
@@ -266,7 +286,7 @@ pub const Owner = struct {
                     self.state.publishNext(identity, value);
                     return value;
                 }
-                const receipt = try self.allocate(live, .reserve);
+                const receipt = try self.allocate(live, .reserve, implicit);
                 try slot.install(receipt.lease orelse return error.SqlSequenceOutcomeUnknown);
                 const value = (try slot.take(live.definition.generation)) orelse return error.SqlSequenceOutcomeUnknown;
                 self.state.publishNext(identity, value);
@@ -275,7 +295,7 @@ pub const Owner = struct {
             .setval => {
                 const value = args[1].value.integer;
                 const called = if (args.len == 2) true else args[2].value.bool;
-                _ = try self.allocate(live, .{ .set = .{ .value = value, .called = called } });
+                _ = try self.allocate(live, .{ .set = .{ .value = value, .called = called } }, false);
                 self.state.publishSet(identity, value, called);
                 return value;
             },
@@ -319,6 +339,48 @@ pub fn invoke(raw: *anyopaque, a: A, function: effects.Function, reference: ?eff
     if (root.sequence_owner == null) root.sequence_owner = try Owner.create(root);
     return root.sequence_owner.?.invoke(a, function, reference, args);
 }
+pub fn allocateColumn(raw: *anyopaque, a: A, scope: local.system_catalog_column_sequences.Scope, column: []const u8, binding: local.system_catalog_column_sequences.Binding) !i64 {
+    const root: *execution.Adapter = @ptrCast(@alignCast(raw));
+    try binding.validate();
+    if (scope.table_id != binding.owner.table_id) return error.CatalogGenerationChanged;
+    if (root.sequence_owner == null) root.sequence_owner = try Owner.create(root);
+    const owner = root.sequence_owner.?;
+    const identity: session.Identity = .{ .incarnation = binding.incarnation, .id = binding.sequence_id };
+    if (owner.columns.get(identity)) |proof| {
+        if (proof.scope.table_id != scope.table_id or proof.scope.schema_version != scope.schema_version or
+            !std.mem.eql(u8, proof.scope.storage_name, scope.storage_name) or !std.mem.eql(u8, proof.name, column) or
+            !std.meta.eql(proof.owner, binding.owner) or proof.implicit != (binding.generation != .serial)) return error.CatalogGenerationChanged;
+    } else {
+        if (owner.columns.count() == session.max_sequences) return error.SqlProgramLimitExceeded;
+        const retained = owner.arena.allocator();
+        const cut = try snapshot(root, retained, .{
+            .targets = &.{binding.target},
+            .sequence_ids = &.{binding.sequence_id},
+            .incarnation = binding.incarnation,
+            .include_counters = true,
+            .column_default = .{ .scope = scope, .column = column },
+        });
+        const attribute = cut.owner orelse return error.CatalogGenerationChanged;
+        if (!std.meta.eql(attribute.column, binding.owner)) return error.CatalogGenerationChanged;
+        const live = try liveFrom(cut, cut.entries[0]);
+        if (!std.meta.eql(live.definition.owned_by, @as(?sequences.sequence.OwnedBy, attribute.column))) return error.CatalogGenerationChanged;
+        if (live.reference.namespace_id != binding.namespace_id or attribute.namespace_id != binding.namespace_id) return error.CatalogGenerationChanged;
+        try owner.live.put(retained, identity, live);
+        var pinned = scope;
+        pinned.storage_name = try retained.dupe(u8, scope.storage_name);
+        var table = live.reference.target;
+        table.table = attribute.table_name orelse return error.InvalidSqlBackendResponse;
+        try owner.columns.put(retained, identity, .{
+            .scope = pinned,
+            .name = try retained.dupe(u8, column),
+            .owner = binding.owner,
+            .table = table,
+            .implicit = binding.generation != .serial,
+        });
+    }
+    return owner.invokeWithAuthority(a, .nextval, .{ .identity = identity, .namespace_id = binding.namespace_id, .target = binding.target }, &.{}, binding.generation != .serial);
+}
+
 pub fn flush(raw: *anyopaque) !void {
     const root: *execution.Adapter = @ptrCast(@alignCast(raw));
     if (root.sequence_owner) |owner| owner.flush() catch return error.SqlSequenceOutcomeUnknown;
@@ -376,9 +438,9 @@ test "SQL sequence allocator observes the exact lost acknowledgement without rep
         defer owner.arena.deinit();
         var live: Live = .{ .reference = .{ .identity = .{ .incarnation = @splat(1), .id = 9 }, .namespace_id = 2, .target = .{ .table = "numbers" } }, .group = 7, .definition = definition, .counter = probe.counter };
         if (mode == .applied) {
-            const receipt = try owner.allocate(&live, .reserve);
+            const receipt = try owner.allocate(&live, .reserve, false);
             try std.testing.expectEqual(@as(i64, 1), try receipt.lease.?.value(0));
-        } else try std.testing.expectError(error.SqlSequenceOutcomeUnknown, owner.allocate(&live, .reserve));
+        } else try std.testing.expectError(error.SqlSequenceOutcomeUnknown, owner.allocate(&live, .reserve, false));
         try std.testing.expectEqual(@as(usize, 1), probe.admissions);
         try std.testing.expectEqual(@as(usize, 1), probe.observations);
         try std.testing.expectEqual(@as(i64, 4), probe.counter.last_value);

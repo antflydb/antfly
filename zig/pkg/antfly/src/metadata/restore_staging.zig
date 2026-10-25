@@ -197,7 +197,8 @@ pub const GenerationHandoffRange = struct {
 };
 pub const Target = struct {
     pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
-        return (std.mem.eql(u8, name, "empty_generation") and !self.empty_generation) or
+        return (std.mem.eql(u8, name, "sequence_handoffs") and self.sequence_handoffs.len == 0) or
+            (std.mem.eql(u8, name, "empty_generation") and !self.empty_generation) or
             (std.mem.eql(u8, name, "graph_retirement_digest") and self.graph_retirement_digest == null) or
             (std.mem.eql(u8, name, "source_table_name") and self.source_table_name.len == 0) or
             (std.mem.eql(u8, name, "target_schema_digest") and self.target_schema_digest == null) or
@@ -208,6 +209,7 @@ pub const Target = struct {
     source_table_name: []const u8 = "",
     target_schema_digest: ?Digest = null,
     empty_generation: bool = false,
+    sequence_handoffs: []const @import("column_sequence_handoff.zig").Move = &.{},
     /// Binds graph artifact retirement to the exact old/new physical table
     /// incarnations and unchanged index declarations. Old edge/metric stores
     /// remain with the fenced old groups; fresh groups must prove pristine
@@ -455,6 +457,16 @@ pub const Plan = struct {
             for (self.skipped_tables[0..index]) |previous| if (std.mem.eql(u8, previous, name)) return error.InvalidRestoreStaging;
             for (self.targets) |target| if (std.mem.eql(u8, target.table.name, name)) return error.InvalidRestoreStaging;
         }
+        var sequence_ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer sequence_ids.deinit(alloc);
+        for (self.targets) |target| for (target.sequence_handoffs) |move| {
+            if ((!target.empty_generation and target.rewrite == null) or (!target.empty_generation and move.restart) or target.replace == null or move.owner.table_id != target.table.table_id or sequence_ids.count() == @import("column_sequence_handoff.zig").max_moves)
+                return error.InvalidRestoreStaging;
+            if ((try sequence_ids.getOrPut(alloc, move.before.id)).found_existing) return error.InvalidRestoreStaging;
+            const before = try @import("antfly_local_sources").system_catalog_sequences.Descriptor.decode(alloc, move.before.source_json);
+            if (((try before.definition()).owned_by orelse return error.InvalidRestoreStaging).table_id != target.replace.?.table.table_id) return error.InvalidRestoreStaging;
+            _ = try move.definition(alloc);
+        };
         var range_count: usize = 0;
         var schema_bytes: usize = 0;
         var old_range_count: usize = 0;
@@ -538,7 +550,13 @@ pub const Plan = struct {
                 const old = target.replace orelse return error.InvalidRestoreStaging;
                 if ((target.empty_generation and (self.preparing_sources or target.rewrite != null or target.rewrite_sources.len != 0 or target.source_artifacts.len != 0)) or (!target.empty_generation and target.rewrite == null) or old.table.table_id != target.source_table_id or old.fences.len != old.ranges.len or old.ranges.len != target.ranges.len) return error.InvalidRestoreStaging;
                 if (target.generation_handoffs.len != old.ranges.len) return error.InvalidRestoreStaging;
-                if (target.empty_generation and (!std.mem.eql(u8, old.table.schema_json, table.schema_json) or !std.mem.eql(u8, old.table.read_schema_json, table.read_schema_json) or !std.mem.eql(u8, old.table.indexes_json, table.indexes_json))) return error.InvalidRestoreStaging;
+                if (target.empty_generation) {
+                    const expected_schema = if (target.sequence_handoffs.len != 0)
+                        try @import("column_sequence_handoff.zig").rewriteOwnerReferences(alloc, old.table.schema_json, old.table.table_id, target.sequence_handoffs)
+                    else
+                        old.table.schema_json;
+                    if (!std.mem.eql(u8, expected_schema, table.schema_json) or !std.mem.eql(u8, old.table.read_schema_json, table.read_schema_json) or !std.mem.eql(u8, old.table.indexes_json, table.indexes_json)) return error.InvalidRestoreStaging;
+                }
                 const graph_index = try hasGraphIndex(alloc, table.indexes_json);
                 if (target.empty_generation and graph_index != (target.graph_retirement_digest != null)) return error.InvalidRestoreStaging;
                 if (target.graph_retirement_digest) |retirement_digest| {

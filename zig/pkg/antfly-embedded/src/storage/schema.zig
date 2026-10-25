@@ -322,6 +322,8 @@ pub const TableSchema = struct {
     requires_range_expressions: bool = false,
     /// Interval claims and their transaction gap fences require native readers.
     requires_temporal_keys: bool = false,
+    /// Immutable owned-sequence references and preparation-only allocation.
+    requires_sequence_defaults: bool = false,
     exact_fields: []const ExactField = &.{},
     dynamic_templates: []const DynamicTemplate = &.{},
     declared_fields: []const DeclaredField = &.{},
@@ -462,6 +464,7 @@ pub fn requiredReaderVersion(schema: TableSchema) u32 {
         .{ "requires_clock_defaults", 34 },
         .{ "requires_range_expressions", 35 },
         .{ "requires_temporal_keys", 36 },
+        .{ "requires_sequence_defaults", 37 },
     }) |requirement| {
         if (@field(schema, requirement[0])) version = @max(version, requirement[1]);
     }
@@ -500,6 +503,7 @@ test "relational index system schema reader requirements cover every durable exp
         .{ "requires_clock_defaults", 34 },
         .{ "requires_range_expressions", 35 },
         .{ "requires_temporal_keys", 36 },
+        .{ "requires_sequence_defaults", 37 },
     };
     comptime {
         @setEvalBranchQuota(10_000);
@@ -618,7 +622,7 @@ pub fn schemasEqualForPublicBinding(alloc: Allocator, stored: TableSchema, deriv
         derived.requires_typed_expressions or derived.requires_predicate_expressions or
         derived.requires_exact_numeric_expressions or derived.requires_exact_numeric_validation or
         derived.requires_numeric_modifiers or derived.requires_array_expressions or
-        derived.requires_array_constructors or derived.requires_constant_index_predicates or derived.requires_text_expressions or derived.requires_numeric_functions or derived.requires_jsonb_display or derived.requires_json_expressions or derived.requires_jsonb_array_display or derived.requires_deferred_constraints or derived.requires_uuid_defaults or derived.requires_clock_defaults or derived.requires_range_expressions or derived.requires_temporal_keys) return false;
+        derived.requires_array_constructors or derived.requires_constant_index_predicates or derived.requires_text_expressions or derived.requires_numeric_functions or derived.requires_jsonb_display or derived.requires_json_expressions or derived.requires_jsonb_array_display or derived.requires_deferred_constraints or derived.requires_uuid_defaults or derived.requires_clock_defaults or derived.requires_range_expressions or derived.requires_temporal_keys or derived.requires_sequence_defaults) return false;
     var projection = derived;
     projection.relational_columns = &.{};
     const documents = try alloc.dupe(FullTextDocument, derived.full_text_documents);
@@ -704,6 +708,7 @@ pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u
     projection_schema.requires_clock_defaults = false;
     projection_schema.requires_range_expressions = false;
     projection_schema.requires_temporal_keys = false;
+    projection_schema.requires_sequence_defaults = false;
     const projection_documents = try alloc.dupe(FullTextDocument, schema.full_text_documents);
     defer alloc.free(projection_documents);
     for (projection_documents) |*doc| {
@@ -895,6 +900,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     if (format_version >= 34) try buf.append(alloc, @intFromBool(schema.requires_clock_defaults));
     if (format_version >= 35) try buf.append(alloc, @intFromBool(schema.requires_range_expressions));
     if (format_version >= 36) try buf.append(alloc, @intFromBool(schema.requires_temporal_keys));
+    if (format_version >= 37) try buf.append(alloc, @intFromBool(schema.requires_sequence_defaults));
     return buf.toOwnedSlice(alloc);
 }
 
@@ -1324,6 +1330,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         .requires_clock_defaults = if (fmt_version >= 34) data[pos + 15] == 1 else false,
         .requires_range_expressions = if (fmt_version >= 35) data[pos + 16] == 1 else false,
         .requires_temporal_keys = if (fmt_version >= 36) data[pos + 17] == 1 else false,
+        .requires_sequence_defaults = if (fmt_version >= 37) data[pos + 18] == 1 else false,
         .exact_fields = exact_fields,
         .dynamic_templates = templates,
         .declared_fields = declared_fields,
@@ -1588,10 +1595,12 @@ fn validateSerializedSchema(data: []const u8) !void {
     if (format_version >= 34) try cursor.readBool();
     if (format_version >= 35) try cursor.readBool();
     if (format_version >= 36) try cursor.readBool();
+    if (format_version >= 37) try cursor.readBool();
     try cursor.finish();
 }
 
 fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
+    if (schema.requires_sequence_defaults and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_jsonb_array_display and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_deferred_constraints and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_uuid_defaults and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
