@@ -2319,7 +2319,11 @@ pub fn allocRelationshipExclusionKey(
 }
 
 test "public graph metric borrowed wire partial batch resumes expired-row scan without replay" {
-    const a = std.testing.allocator;
+    // Preserve the 8,200-row cursor boundary without unwinding a stack for
+    // every successful tree allocation during fixture construction.
+    var allocator_state = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer allocator_state.deinit();
+    const a = allocator_state.allocator();
     var index = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem, .ttl_duration_ns = 10 });
     defer index.close();
     const count = 8200;

@@ -1377,12 +1377,37 @@ pub const Runtime = struct {
         return true;
     }
 
+    const ResolvedReaderConfig = struct {
+        config: readers.Config,
+        credential: ?[]u8 = null,
+        fn deinit(self: *ResolvedReaderConfig, alloc: Allocator) void {
+            if (self.credential) |value| alloc.free(value);
+        }
+    };
+
+    // Capability discovery and execution must use the same resolved credential.
+    // Keep references in catalogs; resolve only for this invocation so rotation
+    // takes effect without persisting a credential value in the producer config.
+    fn resolveReaderConfig(self: *Runtime, alloc: Allocator, raw: readers.Config) !ResolvedReaderConfig {
+        var cfg = self.routedReaderConfig(raw);
+        if (cfg.provider != .antfly or isLocalReaderProvider(cfg.provider, cfg.resolvedUrl()))
+            return .{ .config = cfg };
+        var secret = try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.bearer_token orelse cfg.api_key, "ANTFLY_INFERENCE_API_KEY");
+        defer secret.deinit(alloc);
+        const credential = try secret.resolveOwned(alloc, self.secret_store);
+        cfg.api_key = credential;
+        cfg.bearer_token = null;
+        return .{ .config = cfg, .credential = credential };
+    }
+
     fn readerCapabilities(
         self: *Runtime,
         alloc: Allocator,
         raw_cfg: readers.Config,
     ) !?inference_work.InferenceCapabilities {
-        const cfg = self.routedReaderConfig(raw_cfg);
+        var resolved_reader = try self.resolveReaderConfig(alloc, raw_cfg);
+        defer resolved_reader.deinit(alloc);
+        const cfg = resolved_reader.config;
         try cfg.validate();
         if (cfg.provider == .apple) return try readers.apple.capabilities();
         if (!isLocalReaderProvider(cfg.provider, cfg.resolvedUrl())) {
@@ -2958,7 +2983,9 @@ pub const Runtime = struct {
     }
 
     fn readImagesWithConfigReported(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.Request) !readers.BatchResult {
-        var execution_cfg = self.routedReaderConfig(cfg);
+        var resolved_reader = try self.resolveReaderConfig(alloc, cfg);
+        defer resolved_reader.deinit(alloc);
+        var execution_cfg = resolved_reader.config;
         try execution_cfg.validate();
         const local_reader = isLocalReaderProvider(execution_cfg.provider, execution_cfg.resolvedUrl());
         var capability_lease_fields = CapabilityLeaseFields{};
@@ -2967,9 +2994,9 @@ pub const Runtime = struct {
         var capability_auth_storage: [2][2][]const u8 = undefined;
         var capability_auth_count: usize = 0;
         if (!local_reader and execution_cfg.provider == .antfly and
-            (cfg.bearer_token orelse cfg.api_key) != null)
+            (execution_cfg.bearer_token orelse execution_cfg.api_key) != null)
         {
-            capability_auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{cfg.bearer_token orelse cfg.api_key.?});
+            capability_auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{execution_cfg.bearer_token orelse execution_cfg.api_key.?});
             capability_auth_storage[capability_auth_count] = .{ "Authorization", capability_auth_value.? };
             capability_auth_count += 1;
         }
@@ -3085,7 +3112,9 @@ pub const Runtime = struct {
 
     fn readEncodedImagesWithConfigReported(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.EncodedRequest) !readers.BatchResult {
         try readers.validateEncodedRequest(request);
-        var execution_cfg = self.routedReaderConfig(cfg);
+        var resolved_reader = try self.resolveReaderConfig(alloc, cfg);
+        defer resolved_reader.deinit(alloc);
+        var execution_cfg = resolved_reader.config;
         try execution_cfg.validate();
         const local_reader = isLocalReaderProvider(execution_cfg.provider, execution_cfg.resolvedUrl());
         var capability_lease_fields = CapabilityLeaseFields{};
@@ -6853,17 +6882,47 @@ test "asset producer runtime batches compatible antfly generator requests" {
     try std.testing.expectEqualStrings("second answer", results.?[1]);
 }
 
-test "asset producer runtime preserves remote reader identity and native execution" {
+fn testRemoteReaderIdentity(comptime framed: bool) !void {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const secret_dir = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(secret_dir);
+    const secret_path = try std.fs.path.join(alloc, &.{ secret_dir, "reader-secrets.json" });
+    defer alloc.free(secret_path);
+    var secrets = try common_secrets.FileStore.initWithIo(alloc, io, secret_path);
+    defer secrets.deinit();
+    var stored = try secrets.put(alloc, "reader.test", "reader-bearer");
+    stored.deinit(alloc);
+    const Auth = struct {
+        fn check(request: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer reader-bearer", request.header("Authorization") orelse return error.MissingHeader);
+            if (framed and request.method == .POST) {
+                try std.testing.expectEqualStrings(httpx.attachment_envelope.content_type, request.header("Content-Type") orelse return error.MissingHeader);
+                var envelope = try httpx.attachment_envelope.parseAlloc(std.testing.allocator, request.body, .{});
+                defer envelope.deinit();
+                try std.testing.expectEqual(@as(usize, 2), envelope.attachments.len);
+                for (envelope.attachments) |attachment| {
+                    try std.testing.expectEqualStrings("image/png", attachment.mime_type);
+                    try std.testing.expectEqual(@as(usize, 24), attachment.data.len);
+                }
+                try std.testing.expect(std.mem.indexOf(u8, envelope.metadata, "attachment:0") != null);
+                try std.testing.expect(std.mem.indexOf(u8, envelope.metadata, "attachment:1") != null);
+            }
+        }
+    };
+    const catalog = if (framed) "{\"readers\":{\"florence\":{\"inputs\":[\"image\"],\"inference_capabilities\":{\"version\":4,\"task\":\"read\",\"input_modalities\":[\"image\"],\"accepted_mime_types\":[\"image/png\"],\"input_granularity\":\"page\",\"output\":\"read_result\",\"result_cardinality\":\"one_per_item\",\"prompt_policy\":\"explicit\",\"borrowed_attachments\":false,\"framed_attachments\":true,\"task_limits\":{\"max_text_bytes_per_item\":81920,\"max_input_tokens_per_item\":null,\"max_output_tokens_per_item\":1024,\"max_candidates_per_request\":null,\"max_schema_bytes\":null},\"transport_limits\":{\"json\":{\"max_request_bytes\":8388608},\"framed_attachments\":{\"max_request_bytes\":134217728,\"max_metadata_bytes\":16777216,\"max_attachments\":1024,\"max_mime_bytes\":1024}},\"batch\":{\"mode\":\"native\",\"preferred_items\":2,\"max_items\":2,\"max_encoded_media_bytes\":104857600,\"max_decoded_pixels\":1000000,\"max_media_parts_per_item\":1,\"per_item_failures\":false}}}}}" else "{\"readers\":{\"florence\":{\"inputs\":[\"text\",\"image\"],\"inference_capabilities\":{\"task\":\"read\",\"batch\":{\"mode\":\"native\",\"preferred_items\":2,\"max_items\":2,\"max_encoded_bytes\":33554432,\"max_decoded_pixels\":0,\"max_media_parts_per_item\":1,\"per_item_failures\":false}}}}}";
+    const resolved = (try remote_capabilities.parseModelCapabilities(alloc, catalog, "florence", .read)).?;
+    try resolved.validate();
     var server = try httpx.TestServer.start(alloc, io, &.{
-        .{ .method = .GET, .path = "/ai/v1/models", .respond = .{
-            .body = "{\"readers\":{\"florence\":{\"inputs\":[\"text\",\"image\"],\"inference_capabilities\":{\"task\":\"read\",\"batch\":{\"mode\":\"native\",\"preferred_items\":2,\"max_items\":2,\"max_encoded_bytes\":33554432,\"max_decoded_pixels\":0,\"max_media_parts_per_item\":1,\"per_item_failures\":false}}}}}",
+        .{ .method = .GET, .path = "/ai/v1/models", .assert_request = Auth.check, .respond = .{
+            .body = catalog,
         } },
-        .{ .method = .POST, .path = "/read", .respond = .{
+        .{ .method = .POST, .path = "/read", .assert_request = Auth.check, .respond = .{
             .body =
             \\{"object":"list","data":[
             \\{"text":"page one","object":"read.result","index":0},
@@ -6875,12 +6934,12 @@ test "asset producer runtime preserves remote reader identity and native executi
     defer server.deinit();
     var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
     defer client.deinit();
-    var runtime = Runtime.init(alloc, &client);
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .secret_store = &secrets });
     defer runtime.deinit();
     const producer = runtime.producer();
     const cfg_json = try std.fmt.allocPrint(
         alloc,
-        "{{\"provider\":\"antfly\",\"model\":\"florence\",\"url\":\"{s}\"}}",
+        "{{\"provider\":\"antfly\",\"model\":\"florence\",\"api_key\":\"${{secret:reader.test}}\",\"url\":\"{s}\"}}",
         .{server.baseUrl()},
     );
     defer alloc.free(cfg_json);
@@ -6931,6 +6990,14 @@ test "asset producer runtime preserves remote reader identity and native executi
     try std.testing.expect(batch.items[1].identity.eql(.{ .item_id = "page-2", .source_fingerprint = "doc-b", .page_number = 2 }));
     try std.testing.expectEqualStrings("page one", batch.items[0].result.value);
     try std.testing.expectEqualStrings("page two", batch.items[1].result.value);
+}
+
+test "asset producer runtime preserves remote reader identity and native execution" {
+    try testRemoteReaderIdentity(false);
+}
+
+test "asset producer runtime preserves framed remote reader identity and server secret" {
+    try testRemoteReaderIdentity(true);
 }
 
 test "asset producer runtime preserves generator item failures" {

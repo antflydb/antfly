@@ -110,15 +110,24 @@ fn dataControl(ptr: *anyopaque) !void {
     try server.runControlRoundOnly();
 }
 
+const ordinary_request_timeout_ms: u32 = 3_000;
+// SQL may synchronously observe activation for its whole statement budget.
+// The transport guard must outlast that budget so a committed/pending receipt
+// can arrive before the client disconnects. Ordinary reads retain their guard.
+const sql_transport_timeout_ms: u32 = (@import("../pgwire/protocol.zig").Limits{}).statement_timeout_ms + ordinary_request_timeout_ms;
+
 fn request(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, suffix: []const u8, method: http.Method, body: ?[]const u8) !http.HttpResponse {
+    return requestWithTimeout(alloc, transport, headers, base, suffix, method, body, ordinary_request_timeout_ms);
+}
+fn requestWithTimeout(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, suffix: []const u8, method: http.Method, body: ?[]const u8, timeout_ms: u32) !http.HttpResponse {
     const uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base, suffix });
     defer alloc.free(uri);
-    return transport.execute(alloc, .{ .method = method, .uri = uri, .headers = headers, .content_type = if (body == null) null else "application/json", .body = body orelse "", .timeout_ms = 3_000 });
+    return transport.execute(alloc, .{ .method = method, .uri = uri, .headers = headers, .content_type = if (body == null) null else "application/json", .body = body orelse "", .timeout_ms = timeout_ms });
 }
 fn sql(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, statement: []const u8) !http.HttpResponse {
     const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = statement }, .{});
     defer alloc.free(body);
-    return request(alloc, transport, headers, base, "/db/v1/sql", .POST, body);
+    return requestWithTimeout(alloc, transport, headers, base, "/db/v1/sql", .POST, body, sql_transport_timeout_ms);
 }
 fn retryablePrecommitSqlRead(alloc: std.mem.Allocator, response: http.HttpResponse) bool {
     if (response.status != 503 or response.body.len > 4096) return false;
@@ -1327,11 +1336,19 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
         try std.testing.expect(cancellation.calls >= 3);
     }
 
+    const create_started_ns = platform.time.monotonicNs();
     var create = try sql(alloc, transport, &headers, base, if (snapshot_probe)
         "CREATE TABLE usage_records (id TEXT PRIMARY KEY, status TEXT, organization_id TEXT)"
     else
         "CREATE TABLE nodes (id BIGINT PRIMARY KEY, parent_id BIGINT)");
     defer create.deinit(alloc);
+    if (std.c.getenv("ANTFLY_TEST_WORK_PROFILE")) |value| {
+        if (platform.env.truthy(std.mem.span(value))) std.debug.print("SELF_FK_CREATE status={d} elapsed_ms={d} transport_budget_ms={d}\n", .{
+            create.status,
+            (platform.time.monotonicNs() -| create_started_ns) / std.time.ns_per_ms,
+            sql_transport_timeout_ms,
+        });
+    }
     // Placement may still be converging after the catalog commit, even for
     // one owner. awaitTable below is the public readiness barrier.
     try std.testing.expect(create.status == 200 or create.status == 202);

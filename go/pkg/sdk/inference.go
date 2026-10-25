@@ -58,17 +58,17 @@ func NewChatMessage(role oapi.InferenceRole, content string) oapi.InferenceChatM
 
 // NewUserMessage creates a user ChatMessage with string content.
 func NewUserMessage(content string) oapi.InferenceChatMessage {
-	return NewChatMessage(oapi.ChatMessageRoleUser, content)
+	return NewChatMessage(oapi.InferenceRoleUser, content)
 }
 
 // NewSystemMessage creates a system ChatMessage with string content.
 func NewSystemMessage(content string) oapi.InferenceChatMessage {
-	return NewChatMessage(oapi.ChatMessageRoleSystem, content)
+	return NewChatMessage(oapi.InferenceRoleSystem, content)
 }
 
 // NewAssistantMessage creates an assistant ChatMessage with string content.
 func NewAssistantMessage(content string) oapi.InferenceChatMessage {
-	return NewChatMessage(oapi.ChatMessageRoleAssistant, content)
+	return NewChatMessage(oapi.InferenceRoleAssistant, content)
 }
 
 // NewMultimodalUserMessage creates a user ChatMessage with text and image content.
@@ -102,7 +102,7 @@ func NewMultimodalUserMessage(text string, imageDataURIs ...string) (oapi.Infere
 		parts = append(parts, imagePart)
 	}
 
-	msg := oapi.InferenceChatMessage{Role: oapi.ChatMessageRoleUser}
+	msg := oapi.InferenceChatMessage{Role: oapi.InferenceRoleUser}
 	raw, err := json.Marshal(parts)
 	if err != nil {
 		return oapi.InferenceChatMessage{}, fmt.Errorf("setting content parts: %w", err)
@@ -317,7 +317,6 @@ func (c *InferenceClient) EmbedJSON(ctx context.Context, model string, input []s
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
 	}
-
 	return resp.JSON200, nil
 }
 
@@ -489,7 +488,6 @@ func (c *InferenceClient) ListModels(ctx context.Context) (*oapi.InferenceModels
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
 	}
-
 	return resp.JSON200, nil
 }
 
@@ -777,6 +775,8 @@ type GenerateConfig struct {
 	SpeculativeK           int
 	SpeculationPolicy      oapi.InferenceGenerateRequestSpeculationPolicy
 	SpeculationCalibration oapi.InferenceGenerateRequestSpeculationCalibration
+	ContextManagement      *oapi.InferenceContextManagement
+	KvCache                *oapi.InferenceKvCachePolicy
 	Tools                  []oapi.InferenceTool
 	ToolChoice             oapi.InferenceToolChoice
 }
@@ -860,6 +860,12 @@ func (c *InferenceClient) Generate(ctx context.Context, model string, messages [
 		if len(config.Tools) > 0 {
 			req.Tools = config.Tools
 		}
+		if config.ContextManagement != nil {
+			req.ContextManagement = *config.ContextManagement
+		}
+		if config.KvCache != nil {
+			req.KvCache = *config.KvCache
+		}
 		req.ToolChoice = config.ToolChoice
 	}
 
@@ -874,7 +880,41 @@ func (c *InferenceClient) Generate(ctx context.Context, model string, messages [
 	if resp.JSON200 == nil {
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
 	}
+	if config != nil {
+		if policy := config.ContextManagement; policy != nil {
+			if string(resp.JSON200.Context.Policy) != string(policy.Mode) ||
+				(policy.Checkpoint.Version != "" && !resp.JSON200.Context.CheckpointApplied) {
+				return nil, fmt.Errorf("generation server did not attest the requested context policy")
+			}
+		}
+		if policy := config.KvCache; policy != nil {
+			expectedVersion := policy.Version
+			if expectedVersion == "" {
+				expectedVersion = oapi.InferenceKvCachePolicyVersionV1
+			}
+			if string(resp.JSON200.Context.KvCacheMode) != string(policy.Mode) ||
+				string(resp.JSON200.Context.KvCacheVersion) != string(expectedVersion) {
+				return nil, fmt.Errorf("generation server did not attest the requested KV cache policy")
+			}
+		}
+	}
 
+	return resp.JSON200, nil
+}
+
+// PrepareChatContext inspects or prepares a bounded chat transcript using the
+// capabilities reported by the selected model and backend.
+func (c *InferenceClient) PrepareChatContext(ctx context.Context, request oapi.InferenceContextPrepareRequest) (*oapi.InferenceContextPrepareResponse, error) {
+	resp, err := c.client.PrepareChatContextWithResponse(ctx, request)
+	if err != nil {
+		return nil, fmt.Errorf("sending request: %w", err)
+	}
+	if err := inferenceResponseErrorWithCapacity(resp.StatusCode(), resp.Body, resp.JSON503); err != nil {
+		return nil, err
+	}
+	if resp.JSON200 == nil {
+		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
+	}
 	return resp.JSON200, nil
 }
 

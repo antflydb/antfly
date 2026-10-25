@@ -39,9 +39,11 @@
 //!   accepts; gather-driven paths download from the slot buffer instead.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const block = @import("../runtime/kv/block.zig");
 const storage_runtime = @import("../runtime/kv/storage_runtime.zig");
+const selection = @import("../runtime/kv/selection.zig");
 const pool_mod = @import("../runtime/kv/pool.zig");
 const turboquant = @import("../runtime/kv/turboquant.zig");
 const metal_runtime = @import("metal_runtime.zig");
@@ -97,10 +99,12 @@ const SlotBinding = struct {
     slot: usize,
     ring_page_count: usize = 0,
     sequence_owned: bool = false,
+    compactable_global: bool = false,
     logical_contiguous: bool = false,
     physical_base_tokens: usize = 0,
     written_tokens: usize = 0,
     position_offset: usize = 0,
+    selected_positions: ?[]u32 = null,
 
     fn ownsSlot(self: SlotBinding) bool {
         return self.sequence_owned;
@@ -201,6 +205,18 @@ pub const MetalKvStorage = struct {
         self.slot_buffer_capacity_tokens[slot] = 0;
     }
 
+    fn discardPrivateSlot(self: *MetalKvStorage, slot: usize) void {
+        if (slot >= self.leased_slots.len or !self.leased_slots[slot]) return;
+        if (metal_runtime.termite_metal_decode_runtime_discard_paged_kv_slot(self.runtime, slot) != 0) {
+            self.reclaimSlot(slot);
+            return;
+        }
+        self.leased_slots[slot] = false;
+        self.slot_ring_page_count[slot] = 0;
+        self.slot_ring_policy_initialized[slot] = false;
+        self.slot_buffer_capacity_tokens[slot] = 0;
+    }
+
     /// Bind a sequence/layer to either the layer-global full-history page pool
     /// or a dedicated cyclic SWA ring. `paged` must be true before global
     /// sharing is allowed; legacy contiguous writes remain sequence-owned.
@@ -208,14 +224,16 @@ pub const MetalKvStorage = struct {
         self: *MetalKvStorage,
         key: SlotKey,
         ring_page_count: usize,
-        paged: bool,
+        share_global: bool,
+        compactable_global: bool,
     ) !*SlotBinding {
         if (self.slot_map.getPtr(key)) |binding| {
             if (binding.ring_page_count != ring_page_count) return error.DeviceWriteFallback;
+            if (compactable_global and !binding.compactable_global) return error.DeviceWriteFallback;
             return binding;
         }
 
-        const owns_slot = ring_page_count > 0 or !paged;
+        const owns_slot = ring_page_count > 0 or !share_global;
         var global_created = false;
         var owned_created = false;
         var slot: usize = undefined;
@@ -243,6 +261,7 @@ pub const MetalKvStorage = struct {
             .slot = slot,
             .ring_page_count = ring_page_count,
             .sequence_owned = owns_slot,
+            .compactable_global = compactable_global,
         });
         return self.slot_map.getPtr(key).?;
     }
@@ -316,6 +335,21 @@ pub const MetalKvStorage = struct {
         return .{ .owned = offsets };
     }
 
+    fn identityPageTokenOffsets(
+        self: *MetalKvStorage,
+        needed_blocks: usize,
+        page_size_tokens: usize,
+    ) !storage_runtime.PageTokenOffsets {
+        if (needed_blocks == 0 or page_size_tokens == 0) return error.KvCapacityTooSmall;
+        const offsets = try self.allocator.alloc(u32, needed_blocks);
+        errdefer self.allocator.free(offsets);
+        for (offsets, 0..) |*offset, block_index| {
+            const token_offset = std.math.mul(usize, block_index, page_size_tokens) catch return error.KvCapacityTooSmall;
+            offset.* = std.math.cast(u32, token_offset) orelse return error.KvCapacityTooSmall;
+        }
+        return .{ .owned = offsets };
+    }
+
     fn reserveSlotCapacity(
         self: *MetalKvStorage,
         slot: usize,
@@ -369,7 +403,12 @@ pub const MetalKvStorage = struct {
             if (key_count == 0) return;
             for (keys[0..key_count]) |key| {
                 if (self.slot_map.fetchRemove(key)) |removed| {
-                    if (removed.value.ownsSlot()) self.reclaimSlot(removed.value.slot);
+                    if (removed.value.selected_positions) |positions| self.allocator.free(positions);
+                    if (removed.value.selected_positions != null) {
+                        self.discardPrivateSlot(removed.value.slot);
+                    } else if (removed.value.ownsSlot()) {
+                        self.reclaimSlot(removed.value.slot);
+                    }
                 }
             }
         }
@@ -462,8 +501,75 @@ pub const MetalKvStorage = struct {
                 .layer_index = @intCast(write.layer_index),
             },
             requested_ring_pages,
-            write.logical_blocks != null,
+            write.logical_blocks != null and !write.sequence_owned_global,
+            write.sequence_owned_global,
         );
+        if (binding.compactable_global and write.total_token_count > try selection.defaults.transientRows())
+            return error.SelectedKvCapacityExceeded;
+        if (binding.selected_positions) |old_positions| {
+            if (requested_ring_pages != 0) return error.SelectedKvRequiresPagedAttention;
+            if (write.suffix_token_count == 0) return error.SelectedKvWriteFailed;
+            if (write.total_token_count < write.suffix_token_count or
+                write.total_token_count - write.suffix_token_count != binding.written_tokens) return error.StaleKvSelection;
+            const compact_total = std.math.add(usize, old_positions.len, write.suffix_token_count) catch return error.KvCapacityTooSmall;
+            if (compact_total > try selection.defaults.transientRows()) return error.SelectedKvCapacityExceeded;
+            const positions = try self.allocator.alloc(u32, compact_total);
+            errdefer self.allocator.free(positions);
+            @memcpy(positions[0..old_positions.len], old_positions);
+            const suffix_abs_start = std.math.add(
+                usize,
+                write.position_offset,
+                write.total_token_count - write.suffix_token_count,
+            ) catch return error.KvCapacityTooSmall;
+            for (positions[old_positions.len..], 0..) |*position, index| {
+                const absolute = std.math.add(usize, suffix_abs_start, index) catch return error.KvCapacityTooSmall;
+                position.* = std.math.cast(u32, absolute) orelse return error.KvCapacityTooSmall;
+                if (position.* <= positions[old_positions.len - 1]) return error.InvalidKvPositions;
+            }
+            const compact_page_size: usize = self.page_size_tokens;
+            if (compact_page_size == 0) return error.SelectedKvWriteFailed;
+            const block_count = std.math.divCeil(usize, compact_total, compact_page_size) catch return error.KvCapacityTooSmall;
+            const block_offsets = try self.allocator.alloc(u32, block_count);
+            defer self.allocator.free(block_offsets);
+            for (block_offsets, 0..) |*offset, block_index| {
+                const token_offset = std.math.mul(usize, block_index, compact_page_size) catch return error.KvCapacityTooSmall;
+                offset.* = std.math.cast(u32, token_offset) orelse return error.KvCapacityTooSmall;
+            }
+            try self.reserveSlotCapacity(
+                binding.slot,
+                compact_total,
+                compact_page_size,
+                0,
+                key_row_bytes,
+                v_row_stride,
+            );
+            const selected_rc = metal_runtime.termite_metal_decode_runtime_update_attention_paged_from_f32_key_device_slot(
+                self.runtime,
+                binding.slot,
+                @backingInt(self.format),
+                k.handle,
+                k.byte_offset,
+                v.handle,
+                v.byte_offset,
+                compact_total,
+                write.suffix_token_count,
+                num_kv_heads,
+                head_dim,
+                key_row_bytes,
+                base_key_row_bytes,
+                v_row_stride,
+                positions[0],
+                block_offsets.ptr,
+                block_offsets.len,
+                compact_page_size,
+            );
+            if (selected_rc != 0) return error.SelectedKvWriteFailed;
+            binding.selected_positions = positions;
+            binding.written_tokens = write.total_token_count;
+            binding.position_offset = positions[0];
+            self.allocator.free(old_positions);
+            return;
+        }
         const slot = binding.slot;
         const ring_page_count = binding.ring_page_count;
         if (traceKvGather()) std.debug.print(
@@ -475,12 +581,15 @@ pub const MetalKvStorage = struct {
             if (logical_blocks.len == 0 or write.page_size_tokens == 0) break :paged -9999;
             const needed_blocks = std.math.divCeil(usize, write.total_token_count, write.page_size_tokens) catch break :paged -9999;
             if (logical_blocks.len < needed_blocks) break :paged -9999;
-            const block_offsets_result = self.pageTokenOffsets(
-                logical_blocks,
-                needed_blocks,
-                write.page_size_tokens,
-                ring_page_count,
-            ) catch break :paged -9999;
+            const block_offsets_result = if (binding.compactable_global)
+                self.identityPageTokenOffsets(needed_blocks, write.page_size_tokens) catch break :paged -9999
+            else
+                self.pageTokenOffsets(
+                    logical_blocks,
+                    needed_blocks,
+                    write.page_size_tokens,
+                    ring_page_count,
+                ) catch break :paged -9999;
             defer block_offsets_result.deinit(self.allocator);
             const block_offsets = block_offsets_result.values();
             const required_tokens = if (ring_page_count > 0)
@@ -581,8 +690,12 @@ pub const MetalKvStorage = struct {
                 .layer_index = @intCast(reserve.layer_index),
             },
             requested_ring_pages,
-            reserve.logical_blocks != null,
+            reserve.logical_blocks != null and !reserve.sequence_owned_global,
+            reserve.sequence_owned_global,
         );
+        // Selected donors grow by compact physical row count in the write
+        // path; the caller's logical token capacity is not a valid buffer size.
+        if (binding.selected_positions != null) return;
         const slot = binding.slot;
         const ring_page_count = binding.ring_page_count;
         if (traceKvGather()) std.debug.print(
@@ -591,7 +704,11 @@ pub const MetalKvStorage = struct {
         );
         if (ring_page_count > 0 and reserve.logical_blocks == null) return error.DeviceWriteFallback;
 
-        const token_capacity = if (ring_page_count > 0)
+        const token_capacity = if (binding.compactable_global) blk: {
+            binding.logical_contiguous = true;
+            binding.physical_base_tokens = 0;
+            break :blk reserve.token_capacity;
+        } else if (ring_page_count > 0)
             std.math.mul(usize, ring_page_count, reserve.page_size_tokens) catch return error.KvCapacityTooSmall
         else if (reserve.logical_blocks) |logical_blocks| blk: {
             if (logical_blocks.len == 0 or reserve.page_size_tokens == 0) break :blk reserve.token_capacity;
@@ -659,12 +776,169 @@ pub const MetalKvStorage = struct {
             .sequence_id = commit.sequence_id,
             .layer_index = @intCast(commit.layer_index),
         }) orelse return error.DeviceWriteFallback;
+        if (binding.selected_positions != null) return error.DeviceWriteFallback;
         if (!binding.commitWrite(commit.total_token_count, commit.position_offset)) return error.DeviceWriteFallback;
+    }
+
+    fn repackSelectedGlobalKv(
+        ctx: *anyopaque,
+        repack: storage_runtime.SelectedGlobalKvRepack,
+    ) anyerror!storage_runtime.DevicePagedKvLayer {
+        const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        if (repack.key_positions.len == 0 or repack.key_positions.len != repack.source_token_offsets.len)
+            return error.InvalidKvShape;
+        if (repack.num_kv_heads != self.num_kv_heads or repack.head_dim != self.head_dim)
+            return error.InvalidKvShape;
+        for (repack.key_positions[1..], repack.key_positions[0 .. repack.key_positions.len - 1]) |position, previous| {
+            if (previous >= position) return error.InvalidKvPositions;
+        }
+        const key = SlotKey{
+            .sequence_id = repack.sequence_id,
+            .layer_index = std.math.cast(u32, repack.layer_index) orelse return error.InvalidKvShape,
+        };
+        const binding = self.slot_map.getPtr(key) orelse return error.DeviceReadFallback;
+        if (binding.slot != repack.expected_source_slot or binding.written_tokens != repack.expected_written_tokens)
+            return error.StaleKvSelection;
+        if (binding.ring_page_count != 0 or !binding.compactable_global or !binding.sequence_owned)
+            return error.DeviceWriteFallback;
+        const source_physical_rows = if (binding.selected_positions) |positions| positions.len else binding.written_tokens;
+        try validateSelectedSourceRows(repack.source_token_offsets, source_physical_rows);
+
+        const layout = self.rowLayout(repack.num_kv_heads, repack.head_dim);
+        const positions = try self.allocator.dupe(u32, repack.key_positions);
+        errdefer self.allocator.free(positions);
+        const destination_slot = try self.allocateSlot();
+        errdefer self.discardPrivateSlot(destination_slot);
+        const destination_capacity = try selection.defaults.transientRows();
+        if (positions.len > destination_capacity) return error.SelectedKvCapacityExceeded;
+        const reserve_rc = metal_runtime.termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
+            self.runtime,
+            destination_slot,
+            @backingInt(self.format),
+            destination_capacity,
+            layout.key_row_bytes,
+            layout.v_row_stride,
+        );
+        if (reserve_rc != 0) return error.DeviceWriteFallback;
+        self.slot_buffer_capacity_tokens[destination_slot] = destination_capacity;
+        self.slot_ring_page_count[destination_slot] = 0;
+        self.slot_ring_policy_initialized[destination_slot] = true;
+
+        const compact_rc = metal_runtime.termite_metal_decode_runtime_compact_attention_span_slot(
+            self.runtime,
+            binding.slot,
+            destination_slot,
+            @backingInt(self.format),
+            repack.source_token_offsets.ptr,
+            repack.source_token_offsets.len,
+            layout.key_row_bytes,
+            layout.v_row_stride,
+            positions[0],
+        );
+        if (compact_rc != 0) return error.DeviceWriteFallback;
+
+        // No allocation or fallible operation follows this point. Publish the
+        // fully copied staging slot, then release only a sequence-owned source;
+        // shared global page pools remain available to other bindings/cache
+        // owners.
+        const source_slot = binding.slot;
+        const source_owned = binding.sequence_owned;
+        const old_positions = binding.selected_positions;
+        binding.* = .{
+            .slot = destination_slot,
+            .sequence_owned = true,
+            .compactable_global = true,
+            .logical_contiguous = true,
+            .physical_base_tokens = 0,
+            .written_tokens = repack.expected_written_tokens,
+            .position_offset = positions[0],
+            .selected_positions = positions,
+        };
+        if (old_positions) |old| self.allocator.free(old);
+        if (source_owned) self.discardPrivateSlot(source_slot);
+
+        return .{
+            .runtime = @ptrCast(self.runtime),
+            .slot = destination_slot,
+            .format = @backingInt(self.format),
+            .token_count = positions.len,
+            .key_row_bytes = layout.key_row_bytes,
+            .base_key_row_bytes = layout.base_key_row_bytes,
+            .v_row_stride = layout.v_row_stride,
+            .page_size_tokens = self.page_size_tokens,
+            .position_offset = positions[0],
+            .key_positions = positions,
+        };
+    }
+
+    fn scoreSelectedAttention(ctx: *anyopaque, request: storage_runtime.SelectedAttentionScore) anyerror!void {
+        const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        const binding = self.slot_map.get(.{ .sequence_id = request.sequence_id, .layer_index = @intCast(request.layer_index) }) orelse return error.DeviceReadFallback;
+        if (request.key_positions.len == 0 or request.scores_out.len != request.key_positions.len) return error.InvalidKvShape;
+        if (request.query_positions.len == 0 or request.queries.len != request.query_positions.len * request.num_heads * request.head_dim) return error.InvalidKvShape;
+        if (request.query_positions.len > selection.defaults.query_horizon or
+            request.key_positions.len > try selection.defaults.transientRows()) return error.InvalidKvShape;
+        for (request.query_positions[1..], request.query_positions[0 .. request.query_positions.len - 1]) |position, previous| {
+            if (position <= previous) return error.InvalidKvShape;
+        }
+        for (request.key_positions[1..], request.key_positions[0 .. request.key_positions.len - 1]) |position, previous| {
+            if (position <= previous) return error.InvalidKvShape;
+        }
+        if (binding.selected_positions) |positions| {
+            if (!std.mem.eql(u32, positions, request.key_positions)) return error.StaleKvSelection;
+        } else if (request.key_positions.len != binding.written_tokens) return error.StaleKvSelection;
+        const layout = self.rowLayout(@intCast(request.num_kv_heads), @intCast(request.head_dim));
+        const rc = metal_runtime.termite_metal_decode_runtime_score_selected_attention(
+            self.runtime,
+            binding.slot,
+            @backingInt(self.format),
+            request.queries.ptr,
+            request.query_positions.ptr,
+            request.query_positions.len,
+            request.key_positions.ptr,
+            request.key_positions.len,
+            request.num_heads,
+            request.num_kv_heads,
+            request.head_dim,
+            layout.key_row_bytes,
+            layout.base_key_row_bytes,
+            request.score_scale,
+            request.softcap,
+            request.scores_out.ptr,
+            request.check_ctx,
+            request.check_fn,
+        );
+        if (rc == -12) return error.Cancelled;
+        if (rc != 0) return error.DeviceReadFallback;
+        var score_sum: f64 = 0;
+        for (request.scores_out) |score| {
+            if (!std.math.isFinite(score) or score < 0) return error.InvalidSelectionScore;
+            score_sum += score;
+        }
+        // Every captured query has at least sink/recent causal keys, so a
+        // normalized consumer distribution must sum to one. A shortfall also
+        // surfaces any nonfinite encoded key rejected by pass one.
+        if (@abs(score_sum - 1.0) > 2e-3) return error.InvalidSelectionScore;
+    }
+
+    fn validateSelectedSourceRows(source_rows: []const u32, committed_physical_rows: usize) !void {
+        if (source_rows.len == 0 or committed_physical_rows == 0) return error.InvalidKvShape;
+        var previous: ?u32 = null;
+        for (source_rows) |row| {
+            if (row >= committed_physical_rows) return error.InvalidKvShape;
+            if (previous) |prior| if (row <= prior) return error.InvalidKvShape;
+            previous = row;
+        }
     }
 
     fn hookDeinit(ctx: *anyopaque, _: std.mem.Allocator) void {
         const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
         const allocator = self.allocator;
+        var binding_it = self.slot_map.valueIterator();
+        while (binding_it.next()) |binding| {
+            if (binding.selected_positions) |positions| allocator.free(positions);
+            if (binding.selected_positions != null and binding.sequence_owned) self.discardPrivateSlot(binding.slot);
+        }
         for (&self.leased_slots, 0..) |*leased, slot| {
             if (!leased.*) continue;
             _ = metal_runtime.termite_metal_decode_runtime_release_paged_kv_slot(self.runtime, slot);
@@ -679,6 +953,14 @@ pub const MetalKvStorage = struct {
     fn releaseSequenceOp(ctx: *anyopaque, sequence_id: storage_runtime.SequenceId) void {
         const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
         self.releaseSequenceSlots(sequence_id);
+    }
+
+    /// The storage/runtime ABI can stage and atomically publish compacted K/V
+    /// rows with an explicit absolute-position table. Production admission is
+    /// a separate pipeline qualification decision; this bit only describes
+    /// the implemented backend capability.
+    fn supportsSelectedGlobalKv(_: *const anyopaque) bool {
+        return true;
     }
 
     fn truncateSequenceOp(
@@ -712,6 +994,7 @@ pub const MetalKvStorage = struct {
             .sequence_id = gather.sequence_id,
             .layer_index = @intCast(gather.layer_index),
         }) orelse return error.DeviceReadFallback;
+        if (binding.selected_positions != null) return error.SelectedKvRequiresPagedAttention;
         const slot = binding.slot;
         if (binding.ring_page_count > 0) return error.RingKvRequiresPagedAttention;
         if (!binding.logical_contiguous) return error.DeviceReadFallback;
@@ -755,7 +1038,7 @@ pub const MetalKvStorage = struct {
                 .polar4 => try turboquant.decodePolar4Key(row_bytes, row_dst, num_kv_heads, head_dim),
                 .turbo3 => {
                     const base_bytes = turboquant.turbo3KeyBytes(num_kv_heads, head_dim);
-                    try turboquant.decodeTurbo3Key(row_bytes[0..base_bytes], row_dst, num_kv_heads, head_dim);
+                    try turboquant.decodeTurbo3KeyWithResidual(row_bytes[0..base_bytes], row_bytes[base_bytes..], row_dst, num_kv_heads, head_dim);
                 },
                 .raw_f32 => {
                     const src_f32: [*]const f32 = @ptrCast(@alignCast(row_bytes.ptr));
@@ -786,6 +1069,51 @@ pub const MetalKvStorage = struct {
         }
     }
 
+    fn gatherLayerKeys(
+        ctx: *anyopaque,
+        gather: storage_runtime.KvLayerGather,
+        k_out: []f32,
+    ) anyerror!void {
+        const self: *MetalKvStorage = @ptrCast(@alignCast(ctx));
+        const token_width: usize = @as(usize, gather.num_kv_heads) * @as(usize, gather.head_dim);
+        if (k_out.len < gather.token_count * token_width) return error.InvalidKvShape;
+        const binding = self.slot_map.get(.{
+            .sequence_id = gather.sequence_id,
+            .layer_index = @intCast(gather.layer_index),
+        }) orelse return error.DeviceReadFallback;
+        if (binding.ring_page_count > 0 or !binding.logical_contiguous or binding.written_tokens < gather.token_count)
+            return error.DeviceReadFallback;
+        const info = try self.slotInfo(binding.slot);
+        const handle = info.encoded_key_handle orelse return error.DeviceReadFallback;
+        const byte_count = gather.token_count * info.key_row_bytes;
+        const byte_offset = binding.physical_base_tokens * info.key_row_bytes;
+        if (byte_offset + byte_count > info.encoded_key_capacity) return error.DeviceReadFallback;
+        const encoded = try self.allocator.alloc(u8, byte_count);
+        defer self.allocator.free(encoded);
+        if (metal_runtime.termite_metal_buffer_download(self.runtime, handle, byte_offset, @ptrCast(encoded.ptr), byte_count) != 0)
+            return error.MetalDeviceReadFailed;
+        for (0..gather.token_count) |row| {
+            const src = encoded[row * info.key_row_bytes ..][0..info.key_row_bytes];
+            const dst = k_out[row * token_width ..][0..token_width];
+            switch (self.format) {
+                .polar4 => try turboquant.decodePolar4Key(src, dst, gather.num_kv_heads, gather.head_dim),
+                .turbo3 => {
+                    const base_bytes = turboquant.turbo3KeyBytes(gather.num_kv_heads, gather.head_dim);
+                    try turboquant.decodeTurbo3KeyWithResidual(src[0..base_bytes], src[base_bytes..], dst, gather.num_kv_heads, gather.head_dim);
+                },
+                .raw_f32 => {
+                    const values: [*]const f32 = @ptrCast(@alignCast(src.ptr));
+                    @memcpy(dst, values[0..token_width]);
+                },
+                .f16 => {
+                    const values: [*]const f16 = @ptrCast(@alignCast(src.ptr));
+                    for (0..token_width) |i| dst[i] = @floatCast(values[i]);
+                },
+                .int8_per_head => pool_mod.dequantizeInt8PerHeadToF32(src, dst, gather.num_kv_heads, gather.head_dim),
+            }
+        }
+    }
+
     fn gatherLayerKvDevice(
         ctx: *anyopaque,
         gather: storage_runtime.DeviceKvLayerGather,
@@ -800,6 +1128,9 @@ pub const MetalKvStorage = struct {
             .sequence_id = gather.sequence_id,
             .layer_index = @intCast(gather.layer_index),
         }) orelse return error.DeviceReadFallback;
+        // DeviceKvLayer has no absolute-position channel. Returning a compact
+        // span would silently reinterpret selected rows as contiguous history.
+        if (binding.selected_positions != null) return error.SelectedKvRequiresPagedAttention;
         const slot = binding.slot;
         if (binding.ring_page_count > 0) return error.RingKvRequiresPagedAttention;
         if (!binding.logical_contiguous) return error.DeviceReadFallback;
@@ -825,7 +1156,7 @@ pub const MetalKvStorage = struct {
                 .byte_offset = byte_offset,
                 .byte_len = byte_len,
             },
-            .token_count = gather.token_count,
+            .token_count = if (binding.selected_positions) |positions| positions.len else gather.token_count,
             .row_width = token_width,
             .position_offset = info.position_offset,
             .value_element_bytes = @sizeOf(f32),
@@ -883,13 +1214,14 @@ pub const MetalKvStorage = struct {
             .runtime = @ptrCast(self.runtime),
             .slot = slot,
             .format = @backingInt(self.format),
-            .token_count = gather.token_count,
+            .token_count = if (binding.selected_positions) |positions| positions.len else gather.token_count,
             .key_row_bytes = key_row_bytes,
             .base_key_row_bytes = base_key_row_bytes,
             .v_row_stride = token_width,
             .page_size_tokens = self.page_size_tokens,
             .ring_page_count = ring_page_count,
             .position_offset = binding.position_offset,
+            .key_positions = binding.selected_positions,
         };
     }
 
@@ -977,12 +1309,16 @@ test "Metal KV binding only covers successfully encoded tokens" {
 const hook_vtable: storage_runtime.DeviceWriteHook.VTable = .{
     .writeLayerKvSuffix = MetalKvStorage.writeLayerKvSuffix,
     .gatherLayerKv = MetalKvStorage.gatherLayerKv,
+    .gatherLayerKeys = MetalKvStorage.gatherLayerKeys,
     .gatherLayerKvDevice = MetalKvStorage.gatherLayerKvDevice,
     .pagedLayerKvDevice = MetalKvStorage.pagedLayerKvDevice,
     .reserveLayerKvDevice = MetalKvStorage.reserveLayerKvDevice,
     .commitLayerKvDeviceWrite = MetalKvStorage.commitLayerKvDeviceWrite,
+    .repackSelectedGlobalKv = MetalKvStorage.repackSelectedGlobalKv,
+    .scoreSelectedAttention = MetalKvStorage.scoreSelectedAttention,
     .truncateSequence = MetalKvStorage.truncateSequenceOp,
     .releaseSequence = MetalKvStorage.releaseSequenceOp,
+    .supportsSelectedGlobalKv = MetalKvStorage.supportsSelectedGlobalKv,
     .deinit = MetalKvStorage.hookDeinit,
 };
 
@@ -1018,6 +1354,233 @@ test "KeyFormat.fromKvDType covers supported dtypes" {
     try std.testing.expect(!KeyFormat.raw_f32.isCompressed());
     try std.testing.expect(!KeyFormat.f16.isCompressed());
     try std.testing.expect(KeyFormat.int8_per_head.isCompressed());
+}
+
+test "selected Metal repack validates committed physical source rows" {
+    try MetalKvStorage.validateSelectedSourceRows(&.{ 0, 3, 7 }, 8);
+    try std.testing.expectError(error.InvalidKvShape, MetalKvStorage.validateSelectedSourceRows(&.{}, 8));
+    try std.testing.expectError(error.InvalidKvShape, MetalKvStorage.validateSelectedSourceRows(&.{ 0, 8 }, 8));
+    try std.testing.expectError(error.InvalidKvShape, MetalKvStorage.validateSelectedSourceRows(&.{ 2, 2 }, 8));
+    try std.testing.expectError(error.InvalidKvShape, MetalKvStorage.validateSelectedSourceRows(&.{ 3, 2 }, 8));
+}
+
+fn selectionTestNotCancelled(_: ?*anyopaque) callconv(.c) c_int {
+    return 0;
+}
+
+test "selected Metal GPU scorer matches decoded-key oracle before and after repack" {
+    if (!build_options.enable_metal or builtin.os.tag != .macos) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const metal = metal_runtime.termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_decode_runtime_destroy(metal);
+    if (metal_runtime.termite_metal_decode_runtime_ready(metal) == 0) return error.SkipZigTest;
+
+    const rows: usize = 4;
+    const kv_heads: u32 = 1;
+    const query_heads: u32 = 2;
+    const head_dim: u32 = 128;
+    const width: usize = @as(usize, kv_heads) * @as(usize, head_dim);
+    var keys: [rows * width]f32 = undefined;
+    var values: [rows * width]f32 = undefined;
+    for (&keys, &values, 0..) |*key, *value, i| {
+        key.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 29)) - 14)) / 31.0;
+        value.* = @as(f32, @floatFromInt(i % 17)) / 19.0;
+    }
+    var queries: [2 * query_heads * head_dim]f32 = undefined;
+    for (&queries, 0..) |*query, i| query.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 23)) - 11)) / 27.0;
+    const query_positions = [_]u32{ 2, 3 };
+    const original_positions = [_]u32{ 0, 1, 2, 3 };
+
+    const input_bytes = keys.len * @sizeOf(f32);
+    const k_handle = metal_runtime.termite_metal_buffer_alloc(metal, input_bytes, 0) orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_buffer_release(k_handle);
+    const v_handle = metal_runtime.termite_metal_buffer_alloc(metal, input_bytes, 0) orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_buffer_release(v_handle);
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(metal, k_handle, 0, &keys, input_bytes));
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(metal, v_handle, 0, &values, input_bytes));
+
+    inline for ([_]pool_mod.KvDType{ .polar4, .turbo3, .f32, .f16, .int8 }) |dtype| {
+        const owned = try MetalKvStorage.create(allocator, metal, dtype, kv_heads, head_dim, 4);
+        defer owned.deviceWriteHook().deinit(allocator);
+        const binding = try owned.acquireBinding(.{ .sequence_id = 91, .layer_index = 0 }, 0, false, true);
+        const layout = owned.rowLayout(kv_heads, head_dim);
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_update_attention_span_from_f32_key_device_slot(
+            metal,
+            binding.slot,
+            @backingInt(owned.format),
+            k_handle,
+            0,
+            v_handle,
+            0,
+            rows,
+            kv_heads,
+            head_dim,
+            layout.key_row_bytes,
+            layout.base_key_row_bytes,
+            layout.v_row_stride,
+            0,
+        ));
+        binding.written_tokens = rows;
+
+        var decoded_keys: [rows * width]f32 = undefined;
+        var decoded_values: [rows * width]f32 = undefined;
+        try MetalKvStorage.gatherLayerKv(@ptrCast(owned), .{
+            .sequence_id = 91,
+            .layer_index = 0,
+            .token_count = rows,
+            .num_kv_heads = kv_heads,
+            .head_dim = head_dim,
+        }, &decoded_keys, &decoded_values);
+        var gpu_scores: [rows]f32 = undefined;
+        try MetalKvStorage.scoreSelectedAttention(@ptrCast(owned), .{
+            .sequence_id = 91,
+            .layer_index = 0,
+            .queries = &queries,
+            .query_positions = &query_positions,
+            .key_positions = &original_positions,
+            .num_heads = query_heads,
+            .num_kv_heads = kv_heads,
+            .head_dim = head_dim,
+            .score_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
+            .scores_out = &gpu_scores,
+            .check_fn = selectionTestNotCancelled,
+        });
+        const oracle = try selection.scoreConsumerNormalizedAttention(allocator, .{
+            .queries = &queries,
+            .query_positions = &.{ 2, 3 },
+            .keys = &decoded_keys,
+            .key_positions = &.{ 0, 1, 2, 3 },
+            .num_query_heads = query_heads,
+            .num_kv_heads = kv_heads,
+            .head_dim = head_dim,
+            .score_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
+        });
+        defer allocator.free(oracle);
+        for (gpu_scores, oracle) |actual, expected| try std.testing.expectApproxEqAbs(expected, @as(f64, actual), 3e-4);
+
+        const selected_rows = [_]u32{ 0, 2, 3 };
+        const selected_positions = [_]u32{ 0, 2, 3 };
+        const compact = try MetalKvStorage.repackSelectedGlobalKv(@ptrCast(owned), .{
+            .sequence_id = 91,
+            .layer_index = 0,
+            .expected_source_slot = binding.slot,
+            .expected_written_tokens = rows,
+            .source_token_offsets = &selected_rows,
+            .key_positions = &selected_positions,
+            .num_kv_heads = kv_heads,
+            .head_dim = head_dim,
+        });
+        try std.testing.expectEqual(@as(usize, 3), compact.token_count);
+        var compact_scores: [3]f32 = undefined;
+        try MetalKvStorage.scoreSelectedAttention(@ptrCast(owned), .{
+            .sequence_id = 91,
+            .layer_index = 0,
+            .queries = &queries,
+            .query_positions = &query_positions,
+            .key_positions = &selected_positions,
+            .num_heads = query_heads,
+            .num_kv_heads = kv_heads,
+            .head_dim = head_dim,
+            .score_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
+            .scores_out = &compact_scores,
+            .check_fn = selectionTestNotCancelled,
+        });
+        var compact_keys: [3 * width]f32 = undefined;
+        try MetalKvStorage.gatherLayerKeys(@ptrCast(owned), .{
+            .sequence_id = 91,
+            .layer_index = 0,
+            .token_count = 3,
+            .num_kv_heads = kv_heads,
+            .head_dim = head_dim,
+        }, &compact_keys);
+        const compact_oracle = try selection.scoreConsumerNormalizedAttention(allocator, .{
+            .queries = &queries,
+            .query_positions = &.{ 2, 3 },
+            .keys = &compact_keys,
+            .key_positions = &.{ 0, 2, 3 },
+            .num_query_heads = query_heads,
+            .num_kv_heads = kv_heads,
+            .head_dim = head_dim,
+            .score_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
+        });
+        defer allocator.free(compact_oracle);
+        for (compact_scores, compact_oracle) |actual, expected| try std.testing.expectApproxEqAbs(expected, @as(f64, actual), 3e-4);
+
+        // Exercise the selected-position attention ABI itself. Query position
+        // 2 may attend absolute positions 0 and 2, but must reject position 3
+        // even though it is compact physical row 2. This detects a kernel that
+        // accidentally substitutes compact row indices for absolute positions.
+        const output_values = @as(usize, query_heads) * @as(usize, head_dim);
+        const query_head_count: usize = query_heads;
+        const head_width: usize = head_dim;
+        const output_bytes = output_values * @sizeOf(f32);
+        const q_offset_values: usize = 0;
+        const q_device = metal_runtime.termite_metal_buffer_alloc(metal, output_bytes, 0) orelse return error.SkipZigTest;
+        defer metal_runtime.termite_metal_buffer_release(q_device);
+        const out_device = metal_runtime.termite_metal_buffer_alloc(metal, output_bytes, 0) orelse return error.SkipZigTest;
+        defer metal_runtime.termite_metal_buffer_release(out_device);
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(
+            metal,
+            q_device,
+            0,
+            @ptrCast(queries[q_offset_values..].ptr),
+            output_bytes,
+        ));
+        const compact_blocks = [_]u32{0};
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_attention_paged_slot_device_selected(
+            metal,
+            compact.slot,
+            compact.format,
+            q_device,
+            0,
+            &compact_blocks,
+            compact_blocks.len,
+            &selected_positions,
+            selected_positions.len,
+            compact.page_size_tokens,
+            1,
+            selected_positions.len,
+            query_heads,
+            kv_heads,
+            head_dim,
+            compact.key_row_bytes,
+            compact.base_key_row_bytes,
+            2,
+            0,
+            0,
+            null,
+            0,
+            out_device,
+            0,
+        ));
+        var gpu_attention: [output_values]f32 = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(metal, out_device, 0, &gpu_attention, output_bytes));
+        var cpu_attention: [output_values]f32 = @splat(0);
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+        for (0..query_head_count) |head| {
+            var logits: [3]f32 = undefined;
+            var best = -std.math.inf(f32);
+            for (selected_rows[0..2], 0..) |source_row, retained_row| {
+                var dot: f32 = 0;
+                for (0..head_width) |d| {
+                    dot += queries[q_offset_values + head * head_width + d] * decoded_keys[@as(usize, source_row) * width + d];
+                }
+                logits[retained_row] = dot * scale;
+                best = @max(best, logits[retained_row]);
+            }
+            var denom: f32 = 0;
+            for (logits[0..2]) |logit| denom += @exp(logit - best);
+            for (selected_rows[0..2], 0..) |source_row, retained_row| {
+                const probability = @exp(logits[retained_row] - best) / denom;
+                for (0..head_width) |d| {
+                    cpu_attention[head * head_width + d] += probability * decoded_values[@as(usize, source_row) * width + d];
+                }
+            }
+        }
+        for (gpu_attention, cpu_attention) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 8e-4);
+    }
 }
 
 test "Metal KV sequence release removes more bindings than one slot batch" {
@@ -1061,11 +1624,11 @@ test "Metal paged KV hooks sharing a runtime lease disjoint slots" {
 
     const cached = try MetalKvStorage.create(allocator, runtime, .f16, 1, 2, 2);
     defer cached.deviceWriteHook().deinit(allocator);
-    const cached_binding = try cached.acquireBinding(.{ .sequence_id = 1, .layer_index = 0 }, 0, true);
+    const cached_binding = try cached.acquireBinding(.{ .sequence_id = 1, .layer_index = 0 }, 0, true, false);
     const cached_slot = cached_binding.slot;
 
     const request_local = try MetalKvStorage.create(allocator, runtime, .f32, 1, 2, 2);
-    const local_binding = try request_local.acquireBinding(.{ .sequence_id = 1, .layer_index = 0 }, 0, true);
+    const local_binding = try request_local.acquireBinding(.{ .sequence_id = 1, .layer_index = 0 }, 0, true, false);
     const local_slot = local_binding.slot;
     try std.testing.expect(cached_slot >= metal_runtime.paged_kv_slot_base);
     try std.testing.expect(local_slot >= metal_runtime.paged_kv_slot_base);
@@ -1075,7 +1638,7 @@ test "Metal paged KV hooks sharing a runtime lease disjoint slots" {
     // still owns its original slot, while its next layer can reuse the slot
     // that the completed request returned to the shared runtime.
     request_local.deviceWriteHook().deinit(allocator);
-    const cached_layer_1 = try cached.acquireBinding(.{ .sequence_id = 1, .layer_index = 1 }, 0, true);
+    const cached_layer_1 = try cached.acquireBinding(.{ .sequence_id = 1, .layer_index = 1 }, 0, true, false);
     try std.testing.expectEqual(local_slot, cached_layer_1.slot);
     try std.testing.expect(cached_layer_1.slot != cached_slot);
 }

@@ -20,10 +20,12 @@
 // and loops until EOS or max_tokens. Matches Go inference's TextGenerationPipeline.
 
 const std = @import("std");
+const native_kv_checkpoint = @import("../runtime/kv/attention_match_checkpoint.zig");
 const Gemma4Projection = @import("gemma4_channels.zig").Projection;
 const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
+const cuda_compute = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
 const tokenizer_mod = @import("inference_tokenizer");
 const gpt_arch = @import("../architectures/gpt.zig");
 const gemma4_runtime = @import("../architectures/gemma4_runtime.zig");
@@ -49,6 +51,12 @@ const projector_format_mod = @import("../architectures/projector_format.zig");
 const hf_tokenizer = tokenizer_mod.hf;
 const graph_mod = @import("../graph/root.zig");
 const pjrt_executor_mod = if (build_options.enable_pjrt) @import("../graph/pjrt_executor.zig") else struct {};
+
+fn selectedScoreCancellationCheck(raw: ?*anyopaque) callconv(.c) c_int {
+    const control: *const InferenceExecutionControl = @ptrCast(@alignCast(raw orelse return 0));
+    control.check() catch return 1;
+    return 0;
+}
 
 fn setWorkloadProfileRegime(cb: *const ComputeBackend, regime: ops.WorkloadRegime) !void {
     cb.workloadProfileSetRegime(regime) catch |err| {
@@ -378,6 +386,14 @@ pub const GenerationConfig = struct {
     /// KV cache compaction ratio after prefill. null = no compaction.
     /// 0.02 = 50x compression, 0.1 = 10x compression.
     cache_compaction_ratio: ?f32 = null,
+    kv_cache_mode: KvCacheMode = .exact_hybrid,
+    kv_cache_version: KvCacheVersion = .v1,
+    /// Absolute token spans that lossy selection must retain (system prompt,
+    /// tool schema, and any unresolved tool-call exchange).
+    kv_protected_spans: []const runtime.kv.selection.ProtectedSpan = &.{},
+    /// Internal admission ceiling covering selected device rows, one staged
+    /// donor, bounded host key/scoring scratch, and all Q capture rings.
+    kv_selection_peak_limit_bytes: usize = 1024 * 1024 * 1024,
     prompt_cache_enabled: bool = false,
     prompt_cache_key: ?[]const u8 = null,
     /// Benchmark/compatibility mode: continue decoding when the model emits an
@@ -398,6 +414,143 @@ pub const GenerationConfig = struct {
     qwen3vl_parity_logits_path: ?[]const u8 = null,
 };
 
+pub const KvCacheMode = enum {
+    exact_hybrid,
+    select_v1,
+};
+
+pub const KvCacheVersion = enum {
+    v1,
+};
+
+/// Promotion requires Metal device qualification for the complete pipeline:
+/// post-RoPE query capture, deterministic scoring, transactional repack, and
+/// token/logit parity across prefill and decode. Source support remains
+/// callable behind tests, but production admission stays closed until then.
+/// Set only by an in-process Metal qualification harness. It is deliberately
+/// absent from request/API configuration, so untrusted callers cannot bypass
+/// production admission while parity and memory evidence is being collected.
+pub var select_v1_qualification_override: bool = false;
+pub var select_v1_gpu_oracle: bool = false;
+/// Qualification-only opt-in for sampled/grammar decode over the exact SWA
+/// ring. It is deliberately unavailable in request configuration.
+pub var exact_hybrid_sampled_ring_qualification_override: bool = false;
+
+pub fn selectV1RuntimeQualified() bool {
+    return select_v1_qualification_override;
+}
+
+/// Conservative upper bound for select_v1 residency and compaction
+/// transients, callable by serving admission before request KV allocation.
+pub fn selectedV1PeakBytes(config: gpt_mod.Config, dtype: runtime.kv.pool.KvDType) !usize {
+    const policy = runtime.kv.selection.defaults;
+    const transient = try policy.transientRows();
+    var resident_device: usize = 0;
+    var largest_row_bytes: usize = 0;
+    var largest_key_width: usize = 0;
+    var largest_query_width: usize = 0;
+    var query_capture: usize = 0;
+    for (0..@as(usize, @intCast(config.num_hidden_layers))) |layer| {
+        const geometry = try config.kvDonorGeometry(layer);
+        if (!config.layerUsesSlidingAttention(layer)) {
+            const query_width = try std.math.mul(usize, @intCast(config.num_attention_heads), @intCast(geometry.head_dim));
+            largest_query_width = @max(largest_query_width, query_width);
+            query_capture = try std.math.add(usize, query_capture, try std.math.mul(usize, policy.query_horizon, try std.math.mul(usize, query_width, @sizeOf(f32))));
+        }
+        if (!config.isKvDonorLayer(layer) or geometry.sliding) continue;
+        const row_bytes = try dtype.bytesForTokenPairChecked(geometry.num_kv_heads, geometry.head_dim);
+        resident_device = try std.math.add(usize, resident_device, try std.math.mul(usize, transient, row_bytes));
+        largest_row_bytes = @max(largest_row_bytes, row_bytes);
+        largest_key_width = @max(largest_key_width, try std.math.mul(usize, @intCast(geometry.num_kv_heads), @intCast(geometry.head_dim)));
+    }
+    const staged_device = try std.math.mul(usize, transient, largest_row_bytes);
+    // Positions, accumulator, GPU result, ranking records, keep bitmap, and
+    // retained source/position arrays, rounded upward for alignment overhead.
+    const host_selection = try std.math.mul(usize, transient, 80);
+    // Metal owns copies of Q and positions, per-query/head normalization, and
+    // scores. Consumer dispatches are serial, so only the largest is live.
+    const gpu_q = try std.math.mul(usize, policy.query_horizon, try std.math.mul(usize, largest_query_width, @sizeOf(f32)));
+    const gpu_query_positions = try std.math.mul(usize, policy.query_horizon, @sizeOf(u32));
+    const gpu_key_positions = try std.math.mul(usize, transient, @sizeOf(u32));
+    const gpu_norm = try std.math.mul(usize, policy.query_horizon, try std.math.mul(usize, @intCast(config.num_attention_heads), 2 * @sizeOf(f32)));
+    const gpu_scores = try std.math.mul(usize, transient, @sizeOf(f32));
+    var scorer = try std.math.add(usize, gpu_q, gpu_query_positions);
+    scorer = try std.math.add(usize, scorer, gpu_key_positions);
+    scorer = try std.math.add(usize, scorer, gpu_norm);
+    scorer = try std.math.add(usize, scorer, gpu_scores);
+    var oracle: usize = 0;
+    if (select_v1_gpu_oracle) {
+        oracle = try std.math.mul(usize, transient, try std.math.mul(usize, largest_key_width, @sizeOf(f32)));
+        oracle = try std.math.add(usize, oracle, try std.math.mul(usize, transient, @sizeOf(f64)));
+    }
+    var total = try std.math.add(usize, resident_device, staged_device);
+    total = try std.math.add(usize, total, query_capture);
+    total = try std.math.add(usize, total, host_selection);
+    total = try std.math.add(usize, total, scorer);
+    return std.math.add(usize, total, oracle);
+}
+
+test "select_v1 public peak estimate includes dtype-sensitive donor residency" {
+    const config = gpt_mod.Config{
+        .family = .gemma,
+        .num_hidden_layers = 10,
+        .num_kv_shared_layers = 5,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 256,
+        .num_global_key_value_heads = 2,
+        .global_head_dim = 512,
+        .sliding_window = 512,
+        .sliding_window_pattern = 5,
+    };
+    const f16_peak = try selectedV1PeakBytes(config, .f16);
+    const f32_peak = try selectedV1PeakBytes(config, .f32);
+    try std.testing.expect(f16_peak > 0);
+    try std.testing.expect(f32_peak > f16_peak);
+}
+
+test "select_v1 generation policy remains fail closed before qualification" {
+    try validateKvCachePolicy(.{});
+    try std.testing.expectError(error.UnsupportedKvCachePolicy, validateKvCachePolicy(.{ .kv_cache_mode = .select_v1 }));
+    try std.testing.expectError(error.IncompatibleKvCachePolicy, validateKvCachePolicy(.{
+        .kv_cache_mode = .select_v1,
+        .prompt_cache_enabled = true,
+    }));
+}
+
+test "select_v1 query capture replaces chunk tails and deduplicates retries" {
+    const allocator = std.testing.allocator;
+    var state = NativeDecodeState.initContiguous(allocator);
+    defer state.deinit();
+    state.selection_capture_enabled = true;
+    const chunk = try allocator.alloc(f32, runtime.kv.selection.defaults.query_horizon * 2);
+    defer allocator.free(chunk);
+    @memset(chunk, 1);
+    try NativeDecodeState.captureSelectionQueries(&state, 3, 7, 448, 1, 2, chunk);
+    try NativeDecodeState.captureSelectionQueries(&state, 3, 7, 960, 1, 2, chunk);
+    try std.testing.expectEqual(@as(usize, 1), state.selection_queries.items.len);
+    var entry = &state.selection_queries.items[0];
+    try std.testing.expectEqual(@as(u64, 960), entry.positions.items[0]);
+    try std.testing.expectEqual(@as(u64, 1023), entry.positions.items[63]);
+
+    const one = [_]f32{ 2, 3 };
+    try NativeDecodeState.captureSelectionQueries(&state, 3, 7, 1024, 1, 2, &one);
+    try std.testing.expectEqual(@as(u64, 961), entry.positions.items[0]);
+    try std.testing.expectEqual(@as(u64, 1024), entry.positions.items[63]);
+    try NativeDecodeState.captureSelectionQueries(&state, 3, 7, 1024, 1, 2, &one);
+    try std.testing.expectEqual(@as(usize, 64), entry.positions.items.len);
+    try std.testing.expectEqualSlices(f32, &one, entry.values.items[entry.values.items.len - 2 ..]);
+}
+
+fn validateKvCachePolicy(config: GenerationConfig) !void {
+    if (config.kv_cache_version != .v1) return error.UnsupportedKvCachePolicy;
+    if (config.kv_cache_mode == .select_v1) {
+        if (config.cache_compaction_ratio != null or config.prompt_cache_enabled or config.speculation_requested or config.draft_model != null)
+            return error.IncompatibleKvCachePolicy;
+        if (!selectV1RuntimeQualified()) return error.UnsupportedKvCachePolicy;
+    }
+}
+
 pub fn kvSlidingTrimForced() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_KV_SLIDING_TRIM", false);
 }
@@ -407,7 +560,9 @@ pub fn metalSplitSwaRingRequestEligible(
     generation_config: GenerationConfig,
 ) bool {
     if (comptime !build_options.enable_metal) return false;
+    const sampled_or_grammar = !isPureGreedyConfig(generation_config) or generation_config.grammar != null;
     return model_config.supportsSplitSwaGlobalKvRing() and
+        (!sampled_or_grammar or model_config.num_local_experts == 0) and
         !gemma4_runtime.wholeFramePrefillExplicitlyDisabled() and
         metalRingDecodeRequestEligible(generation_config) and
         !kvSlidingTrimForced() and
@@ -470,6 +625,26 @@ pub fn kvPoolConfig(
         .head_dim = config.maxHeadDim(),
         .sliding_window_size = config.kvPoolSlidingWindowSize(force_sliding_trim),
     };
+}
+
+/// Request-local CUDA managers track logical pages; the separately attached
+/// KvStorageRuntime owns all cache bytes. Avoid a second full host KV allocation
+/// in the manager. Shared prompt-cache pools keep their existing ownership.
+pub fn requestKvManagerPoolConfig(storage_config: runtime.kv.pool.KvPoolConfig) runtime.kv.pool.KvPoolConfig {
+    var config = storage_config;
+    if (config.backend == .cuda) config.store_cpu_bytes = false;
+    return config;
+}
+
+/// Native checkpoint preparation and restore keep numerical KV on the device.
+/// Both request pools track only the original logical positions. Preparation
+/// snapshots through the CUDA reader; host mirrors are unnecessary on this
+/// route, and trimming logical positions would violate the checkpoint contract.
+pub fn attentionMatchCheckpointPoolConfig(dtype: runtime.kv.pool.KvDType, config: gpt_mod.Config) runtime.kv.pool.KvPoolConfig {
+    var result = kvPoolConfig(.cuda, dtype, config, false);
+    result.store_cpu_bytes = false;
+    result.sliding_window_size = null;
+    return result;
 }
 
 /// Parsed chat template for rendering messages via Jinja2.
@@ -558,6 +733,191 @@ pub const ChatTemplate = struct {
 
     pub fn deinit(self: *ChatTemplate) void {
         self.template.deinit();
+    }
+};
+
+/// The native checkpoint request owns its output until the transport finishes.
+/// A savings rejection returns an exact checkpoint with an explicit outcome.
+pub const NativeCheckpointPrepare = struct {
+    // Keep HTTP admission and the engine's enforced fitting bound identical,
+    // with this ceiling above the request-specific geometry plan. Query capture
+    // and transfer buffers remain separately reserved. Process RSS is also gated.
+    pub const max_transient_host_bytes: usize = 3840 * 1024 * 1024;
+    pub const auxiliary_host_bytes: usize = 128 * 1024 * 1024;
+    pub const fit_workers: usize = 4;
+    pub const collection_options: runtime.kv.attention_match_queries.Options = .{ .samples_per_consumer = 320 };
+    pub const max_repeat_tokens: usize = 512;
+
+    pub const HostPlan = struct { fit_bytes: usize, reservation_bytes: usize, source_bytes: usize, head_workspace_bytes: usize, workers: usize };
+
+    pub fn fittingOptions() runtime.kv.attention_match_engine.Options {
+        return .{
+            .storage_precision = .f16,
+            .checkpoint_limits = native_kv_checkpoint.serving_limits,
+            .prefix_rows = 128,
+            .chunk_rows = 1024,
+            .min_retention_divisor = 2,
+            .validation = .whole_head,
+            .fit = .{ .target_rows = 1, .selection = .residual_omp, .mass_solver = .active_set },
+        };
+    }
+
+    /// Exact-prefix preparation only. Admission uses the same per-head sizing
+    /// as fitting, including the largest worker and a full-size fallback cache.
+    /// Existing compacted states must use their own coverage-aware planner.
+    pub fn hostPlan(config: gpt_mod.Config, tokens: usize, encoding: runtime.kv.attention_match_checkpoint.Encoding) !HostPlan {
+        if (comptime !build_options.enable_cuda) return error.UnsupportedCompactionQueryRoute;
+        if (config.family != .gemma or !config.usesGemma4Channels() or
+            config.num_hidden_layers == 0 or config.num_hidden_layers > 256)
+            return error.UnsupportedCompactionQueryModel;
+        if (tokens < 2 or tokens > native_kv_checkpoint.max_context_tokens) return error.CompactionQueryLimit;
+        const engine = runtime.kv.attention_match_engine;
+        const snapshot = runtime.kv.attention_match_snapshot;
+        const Fitter = @import("../ops/cuda/attention_match_fit.zig").Fitter;
+        var options = fittingOptions();
+        options.rotated4_checkpoint = encoding == .rotated4;
+        // Reserve for the largest bounded retry, even when 4:1 succeeds.
+        options.retention_divisor = options.min_retention_divisor.?;
+        var donors: [256]snapshot.Donor = undefined;
+        var mapping: [256]u32 = undefined;
+        var count: usize = 0;
+        var heads: usize = 0;
+        for (0..config.num_hidden_layers) |layer| {
+            const geometry = try config.kvDonorGeometry(layer);
+            if (config.isKvDonorLayer(layer)) {
+                donors[count] = .{ .layer = @intCast(layer), .window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0, .heads = geometry.num_kv_heads, .dim = geometry.head_dim };
+                count += 1;
+            }
+            var index: ?u32 = null;
+            for (donors[0..count], 0..) |donor, i| {
+                if (donor.layer == geometry.donor_layer) {
+                    index = @intCast(i);
+                    break;
+                }
+            }
+            mapping[layer] = index orelse return error.UnsupportedKvSnapshotLayout;
+        }
+        const source_bytes = try snapshot.geometryBytes(tokens, config.vocab_size, mapping[0..config.num_hidden_layers], donors[0..count], options.checkpoint_limits);
+        const samples = @min(@min(tokens, max_repeat_tokens), collection_options.samples_per_consumer);
+        const heldout = (samples - 1) / collection_options.heldout_stride + 1;
+        var maximum: usize = 0;
+        for (donors[0..count], 0..) |donor, di| {
+            if (donor.window != 0) continue;
+            heads = try std.math.add(usize, heads, donor.heads);
+            const old_rows = tokens - @min(tokens, options.recent_rows);
+            const prefix = @min(tokens, options.prefix_rows);
+            if (old_rows <= prefix or old_rows - prefix < 2) continue;
+            var target = tokens - old_rows + prefix;
+            var offset = prefix;
+            while (offset < old_rows) {
+                const rows = @min(options.chunk_rows, old_rows - offset);
+                target = try std.math.add(usize, target, try std.math.divCeil(usize, rows, options.retention_divisor));
+                offset += rows;
+            }
+            if (target == tokens) continue;
+            var consumers: usize = 0;
+            for (mapping[0..config.num_hidden_layers]) |mapped| if (mapped == di) {
+                consumers += 1;
+            };
+            if (config.num_attention_heads == 0 or config.num_attention_heads % donor.heads != 0) return error.InvalidCompactionQueries;
+            const width = try std.math.mul(usize, try std.math.mul(usize, consumers, config.num_attention_heads / donor.heads), donor.dim);
+            const workspace = try Fitter.headHostWorkspace(tokens, target, @min(old_rows - prefix, options.chunk_rows), try std.math.mul(usize, width, samples - heldout), try std.math.mul(usize, width, heldout), donor.dim, options);
+            if (workspace.solver_bytes > options.fit.max_workspace_bytes) return error.CompactionWorkspaceLimit;
+            maximum = @max(maximum, workspace.bytes);
+        }
+        const resident = try engine.parallelResidentBytes(source_bytes, heads);
+        if (resident > max_transient_host_bytes) return error.CompactionWorkspaceLimit;
+        const workers = if (maximum == 0) fit_workers else @min(fit_workers, (max_transient_host_bytes - resident) / maximum);
+        if (workers == 0) return error.CompactionWorkspaceLimit;
+        const fit_bytes = try engine.parallelHostBytes(source_bytes, heads, maximum, workers);
+        if (fit_bytes > max_transient_host_bytes) return error.CompactionWorkspaceLimit;
+        return .{ .fit_bytes = fit_bytes, .reservation_bytes = try std.math.add(usize, fit_bytes, auxiliary_host_bytes), .source_bytes = source_bytes, .head_workspace_bytes = maximum, .workers = workers };
+    }
+
+    planned_fit_host_bytes: ?usize = null,
+    planned_fit_workers: ?usize = null,
+
+    encoding: runtime.kv.attention_match_checkpoint.Encoding = .f16,
+    minimum_savings_ratio: f64 = 1.5,
+    validation_workers: usize = 1,
+    result: ?Result = null,
+    pub const Result = struct {
+        checkpoint: runtime.kv.attention_match_checkpoint.Owned,
+        outcome: enum { compacted, unchanged_insufficient_savings },
+        stats: runtime.kv.attention_match_engine.Stats,
+        source_host_bytes: usize,
+        query_ns: u64,
+        snapshot_ns: u64,
+        fit_ns: u64,
+    };
+    pub fn deinit(self: *@This()) void {
+        if (self.result) |*result| result.checkpoint.deinit();
+        self.result = null;
+    }
+};
+
+test "native checkpoint exact host plan sizes Gemma4 E4B and preserves the release ceiling" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const config: gpt_mod.Config = .{
+        .family = .gemma,
+        .hidden_size = 2560,
+        .num_hidden_layers = 42,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .sliding_window = 512,
+        .num_kv_shared_layers = 18,
+        .ple_hidden_size = 256,
+        .vocab_size = 262144,
+        .max_position_embeddings = 131072,
+    };
+    const small = try NativeCheckpointPrepare.hostPlan(config, 8189, .f16);
+    const large = try NativeCheckpointPrepare.hostPlan(config, 32752, .f16);
+    const boundary = try NativeCheckpointPrepare.hostPlan(config, 32768, .f16);
+    for ([_]usize{ 8189, 32752, 32768 }) |tokens| {
+        const fp16 = try NativeCheckpointPrepare.hostPlan(config, tokens, .f16);
+        const rotated = try NativeCheckpointPrepare.hostPlan(config, tokens, .rotated4);
+        try std.testing.expectEqual(fp16.source_bytes, rotated.source_bytes);
+        try std.testing.expect(rotated.head_workspace_bytes > fp16.head_workspace_bytes);
+        try std.testing.expect(rotated.fit_bytes <= NativeCheckpointPrepare.max_transient_host_bytes);
+        try std.testing.expect(rotated.workers <= fp16.workers);
+        try std.testing.expectEqual(rotated.fit_bytes + NativeCheckpointPrepare.auxiliary_host_bytes, rotated.reservation_bytes);
+    }
+    // Independently counted exact f32 host state: 24 donors, 48 heads,
+    // eight global heads and forty local heads, including all metadata.
+    const source = (32752 + 262144 + 42) * @as(usize, 4) +
+        24 * @sizeOf(runtime.kv.attention_match_checkpoint.Donor) +
+        48 * @sizeOf(runtime.kv.attention_match_checkpoint.Head) +
+        8 * 32752 * (20 + 512 * 8) + 40 * 512 * (20 + 256 * 8);
+    try std.testing.expectEqual(source, large.source_bytes);
+    try std.testing.expect(small.fit_bytes < large.fit_bytes);
+    try std.testing.expect(large.fit_bytes < boundary.fit_bytes);
+    try std.testing.expect(boundary.fit_bytes <= NativeCheckpointPrepare.max_transient_host_bytes);
+    try std.testing.expectEqual(@as(usize, 4), small.workers);
+    try std.testing.expect(large.workers > 0 and large.workers < NativeCheckpointPrepare.fit_workers);
+    // Another worst-case retry worker would exceed the unchanged ceiling.
+    try std.testing.expect(large.fit_bytes + large.head_workspace_bytes > NativeCheckpointPrepare.max_transient_host_bytes);
+    // The live-host capacity observed in the failed campaign remains unchanged.
+    try std.testing.expect(large.reservation_bytes < 4_153_092_096);
+    try std.testing.expectEqual(large.fit_bytes + NativeCheckpointPrepare.auxiliary_host_bytes, large.reservation_bytes);
+    try std.testing.expectError(error.CompactionQueryLimit, NativeCheckpointPrepare.hostPlan(config, 32769, .f16));
+    try std.testing.expectError(error.CompactionQueryLimit, NativeCheckpointPrepare.hostPlan(config, 1, .f16));
+    var wider = config;
+    wider.num_key_value_heads = 4;
+    try std.testing.expectError(error.KvCheckpointLimit, NativeCheckpointPrepare.hostPlan(wider, 32752, .f16));
+    std.debug.print("native_checkpoint_host_plan_fixture tokens=32752 source_bytes={d} head_workspace_bytes={d} fit_bytes={d} reservation_bytes={d} workers={d}\n", .{ large.source_bytes, large.head_workspace_bytes, large.fit_bytes, large.reservation_bytes, large.workers });
+}
+
+/// The pipeline retires decoded host arrays after successful GPU restoration.
+/// On failure the request scope still owns and releases them.
+pub const NativeCheckpointResume = struct {
+    checkpoint: ?runtime.kv.attention_match_checkpoint.Owned = null,
+    restored_tokens: usize = 0,
+    appended_tokens: usize = 0,
+    pub fn deinit(self: *@This()) void {
+        if (self.checkpoint) |*saved| saved.deinit();
+        self.checkpoint = null;
     }
 };
 
@@ -839,7 +1199,7 @@ fn configPromptOpensGemma4FinalChannel(config: gpt_mod.Config, prompt: []const u
 
 /// Grammar constraints apply from the first generated token. Close any thought
 /// block in the prompt so its protocol delimiters do not enter the grammar.
-fn openGemma4FinalChannelForGrammar(
+pub fn openGemma4FinalChannelForGrammar(
     allocator: std.mem.Allocator,
     prompt: []const u8,
 ) ![]u8 {
@@ -2007,13 +2367,20 @@ fn isPureGreedyConfig(config: GenerationConfig) bool {
 }
 
 fn metalRingDecodeRequestEligible(config: GenerationConfig) bool {
+    return metalRingDecodeRequestEligibleWithQualification(config, exact_hybrid_sampled_ring_qualification_override);
+}
+
+fn metalRingDecodeRequestEligibleWithQualification(config: GenerationConfig, sampled_qualified: bool) bool {
     // Sampled/grammar decode may materialize KV through the logits path,
     // even when prefill used a whole-model frame. Ring storage cannot
     // satisfy that contract after eviction. Select full-history storage
     // before prefill; never switch layouts or disable the read guard midway.
     // Both admission and execution use this policy to reserve the same layout.
-    return isPureGreedyConfig(config) and config.grammar == null and
-        !config.prompt_cache_enabled and config.cache_compaction_ratio == null;
+    const direct_decode_supported = (isPureGreedyConfig(config) and config.grammar == null) or
+        sampled_qualified;
+    return direct_decode_supported and !config.prompt_cache_enabled and
+        config.cache_compaction_ratio == null and !config.speculation_requested and
+        config.draft_model == null;
 }
 
 fn requiresCudaDecodeGraphBeforeEagerFallback(
@@ -2326,6 +2693,65 @@ pub fn getDecoderRuntimeDebugStats() DecoderRuntimeDebugStats {
     return decoder_runtime_debug_stats;
 }
 
+const SelectionQueryEntry = struct {
+    donor_layer: usize,
+    consumer_layer: usize,
+    num_heads: usize,
+    head_dim: usize,
+    positions: std.ArrayListUnmanaged(u64) = .empty,
+    values: std.ArrayListUnmanaged(f32) = .empty,
+
+    fn deinit(self: *SelectionQueryEntry, allocator: std.mem.Allocator) void {
+        self.positions.deinit(allocator);
+        self.values.deinit(allocator);
+    }
+};
+
+/// Match the measured E4B text geometry and bounded 32K serving envelope.
+/// Reserve multi-chunk prefill and a bounded decode tail. Reserving a large
+/// output limit for a short prompt wastes allocation time on early EOS.
+/// Reservation uses the same 16-token page alignment as request admission.
+fn cudaE4bPrefillKvCapacity(config: gpt_mod.Config, prompt_tokens: usize, output_tokens: i32) ?usize {
+    if (config.family != .gemma or config.hidden_size != 2560 or config.num_hidden_layers != 42 or
+        config.num_kv_shared_layers != 18 or config.num_attention_heads != 8 or
+        config.num_key_value_heads != 2 or config.attention_head_dim != 256 or config.global_head_dim != 512 or
+        config.gemma4_mtp_assistant or config.usesMoe() or config.isMultimodal() or
+        prompt_tokens <= 2048 or output_tokens <= 0) return null;
+    const tokens = std.math.add(usize, prompt_tokens, @intCast(output_tokens)) catch return null;
+    if (tokens > @min(@as(usize, 32768), config.max_position_embeddings)) return null;
+    const reserved_tokens = prompt_tokens + @min(@as(usize, @intCast(output_tokens)), 256);
+    return std.mem.alignForward(usize, reserved_tokens, 16);
+}
+
+test "CUDA prefill KV reservation respects admitted length and supported geometry" {
+    const config = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2560,
+        .num_hidden_layers = 42,
+        .num_kv_shared_layers = 18,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .max_position_embeddings = 32768,
+    };
+    try std.testing.expectEqual(@as(?usize, 8208), cudaE4bPrefillKvCapacity(config, 8189, 16));
+    try std.testing.expectEqual(@as(?usize, 32768), cudaE4bPrefillKvCapacity(config, 32752, 16));
+    try std.testing.expectEqual(@as(?usize, 8448), cudaE4bPrefillKvCapacity(config, 8192, 16384));
+    try std.testing.expectEqual(@as(?usize, 8448), cudaE4bPrefillKvCapacity(config, 8192, 257));
+    try std.testing.expect(cudaE4bPrefillKvCapacity(config, 2048, 16384) == null);
+    try std.testing.expect(cudaE4bPrefillKvCapacity(config, 20, 4096) == null);
+    try std.testing.expect(cudaE4bPrefillKvCapacity(config, 32753, 16) == null);
+    try std.testing.expect(cudaE4bPrefillKvCapacity(config, std.math.maxInt(usize), 16) == null);
+    try std.testing.expect(cudaE4bPrefillKvCapacity(config, 1, 0) == null);
+    var other = config;
+    other.num_kv_shared_layers = 0;
+    try std.testing.expect(cudaE4bPrefillKvCapacity(other, 100, 16) == null);
+    other = config;
+    other.max_position_embeddings = 4096;
+    try std.testing.expect(cudaE4bPrefillKvCapacity(other, 8189, 16) == null);
+}
+
 pub const NativeDecodeState = struct {
     allocator: std.mem.Allocator,
     kv_manager: ?*runtime.kv.manager.KvManager = null,
@@ -2352,6 +2778,9 @@ pub const NativeDecodeState = struct {
     qwen3vl_mrope_position_delta: ?i64 = null,
     qwen3vl_decode_positions: [3]u32 = .{ 0, 0, 0 },
     qwen3vl_text_only: bool = false,
+    selection_capture_enabled: bool = false,
+    selection_queries: std.ArrayListUnmanaged(SelectionQueryEntry) = .empty,
+    selection_protected_spans: []const runtime.kv.selection.ProtectedSpan = &.{},
 
     pub fn initContiguous(allocator: std.mem.Allocator) NativeDecodeState {
         return .{
@@ -2397,6 +2826,71 @@ pub const NativeDecodeState = struct {
         if (!requiresDeepSeekV4CompressedCache(config)) self.clearDeepSeekV4CompressedCache();
         self.qwen3vl_mrope_position_delta = if (config.family == .qwen3_vl) 0 else null;
         self.qwen3vl_text_only = config.family == .qwen3_vl;
+    }
+
+    fn captureSelectionQueries(
+        capture_ctx: *anyopaque,
+        donor_layer: usize,
+        consumer_layer: usize,
+        first_position: usize,
+        num_heads: usize,
+        head_dim: usize,
+        values: []const f32,
+    ) !void {
+        const self: *NativeDecodeState = @ptrCast(@alignCast(capture_ctx));
+        if (!self.selection_capture_enabled) return;
+        const width = try std.math.mul(usize, num_heads, head_dim);
+        if (width == 0 or values.len % width != 0) return error.UnexpectedOutputShape;
+        for (values) |value| if (!std.math.isFinite(value)) return error.NonFiniteAttentionInput;
+        const rows = values.len / width;
+        const horizon = runtime.kv.selection.defaults.query_horizon;
+        var entry: *SelectionQueryEntry = blk: {
+            for (self.selection_queries.items) |*candidate| {
+                if (candidate.donor_layer == donor_layer and candidate.consumer_layer == consumer_layer) {
+                    if (candidate.num_heads != num_heads or candidate.head_dim != head_dim) return error.InvalidSelectionConfig;
+                    break :blk candidate;
+                }
+            }
+            try self.selection_queries.append(self.allocator, .{
+                .donor_layer = donor_layer,
+                .consumer_layer = consumer_layer,
+                .num_heads = num_heads,
+                .head_dim = head_dim,
+            });
+            break :blk &self.selection_queries.items[self.selection_queries.items.len - 1];
+        };
+        const incoming_rows = @min(rows, horizon);
+        if (incoming_rows == horizon) {
+            entry.positions.clearRetainingCapacity();
+            entry.values.clearRetainingCapacity();
+        }
+        // A fused route may decline after Q capture and retry through the
+        // unfused attention route. Replace that overlapping suffix so every
+        // absolute query position contributes exactly once.
+        while (entry.positions.items.len > 0 and entry.positions.items[entry.positions.items.len - 1] >= first_position) {
+            _ = entry.positions.pop();
+            entry.values.shrinkRetainingCapacity(entry.values.items.len - width);
+        }
+        if (entry.positions.items.len > 0 and entry.positions.items[entry.positions.items.len - 1] + 1 != first_position)
+            return error.NonContiguousKvSelectionQueries;
+        const retained_old = @min(entry.positions.items.len, horizon -| incoming_rows);
+        if (retained_old > 0) {
+            const old_start = entry.positions.items.len - retained_old;
+            std.mem.copyForwards(u64, entry.positions.items[0..retained_old], entry.positions.items[old_start..]);
+            const value_start = old_start * width;
+            std.mem.copyForwards(f32, entry.values.items[0 .. retained_old * width], entry.values.items[value_start..]);
+        }
+        entry.positions.shrinkRetainingCapacity(retained_old);
+        entry.values.shrinkRetainingCapacity(retained_old * width);
+        const incoming_start = rows - @min(rows, horizon);
+        try entry.positions.ensureUnusedCapacity(self.allocator, rows - incoming_start);
+        try entry.values.appendSlice(self.allocator, values[incoming_start * width ..]);
+        for (incoming_start..rows) |row| entry.positions.appendAssumeCapacity(@as(u64, @intCast(first_position + row)));
+    }
+
+    fn clearSelectionQueries(self: *NativeDecodeState) void {
+        for (self.selection_queries.items) |*entry| entry.deinit(self.allocator);
+        self.selection_queries.clearRetainingCapacity();
     }
 
     fn configureKvMaxInflightTokens(self: *NativeDecodeState, token_count: usize, request_allows_ring: bool) void {
@@ -2483,6 +2977,168 @@ pub const NativeDecodeState = struct {
         const lock = self.lockPagedKv();
         defer if (lock) |mutex| mutex.unlock();
         return self.ensureAttachedUnlocked();
+    }
+
+    fn reserveFreshCudaKvCapacity(self: *NativeDecodeState, token_capacity: usize, token_limit: usize) !void {
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        if (!self.isPaged() or self.total_tokens != 0 or self.sequence_id != null)
+            return error.InvalidPagedKvState;
+        const storage = self.kv_storage orelse return error.DeviceWriteUnsupported;
+        try self.ensureAttachedUnlocked();
+        try self.kv_manager.?.reserveTokenCapacity(self.sequence_id.?, token_limit);
+        try storage.reserveDeviceTokenCapacity(self.sequence_id.?, token_capacity, token_limit);
+    }
+
+    fn prepareSelectedGlobalDonors(self: *NativeDecodeState, config: gpt_mod.Config) !void {
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        const storage = self.kv_storage orelse return error.DeviceWriteUnsupported;
+        // A host-authoritative full-history mirror would defeat the bounded
+        // memory contract and cannot represent donor-specific selected rows.
+        if (storage.storage.config.store_cpu_bytes) return error.UnsupportedKvCachePolicy;
+        try self.ensureAttachedUnlocked();
+        const sequence_id = self.sequence_id orelse return error.InvalidPagedKvState;
+        const transient_rows = try runtime.kv.selection.defaults.transientRows();
+        for (0..@as(usize, @intCast(config.num_hidden_layers))) |layer| {
+            if (!config.isKvDonorLayer(layer) or config.layerUsesSlidingAttention(layer)) continue;
+            const geometry = try config.kvDonorGeometry(layer);
+            try storage.reserveSelectedGlobalKvDeviceCapacity(
+                sequence_id,
+                geometry.donor_layer,
+                transient_rows,
+                0,
+                geometry.num_kv_heads,
+                geometry.head_dim,
+            );
+        }
+        self.selection_capture_enabled = true;
+    }
+
+    fn compactSelectedGlobalDonors(
+        self: *NativeDecodeState,
+        config: gpt_mod.Config,
+        control: ?InferenceExecutionControl,
+    ) !void {
+        if (!self.selection_capture_enabled) return;
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        const storage = self.kv_storage orelse return error.DeviceWriteUnsupported;
+        const sequence_id = self.sequence_id orelse return error.InvalidPagedKvState;
+        const policy = runtime.kv.selection.defaults;
+        var score_control = control orelse InferenceExecutionControl{};
+        for (0..@as(usize, @intCast(config.num_hidden_layers))) |layer| {
+            if (control) |request_control| try request_control.check();
+            if (!config.isKvDonorLayer(layer) or config.layerUsesSlidingAttention(layer)) continue;
+            const geometry = try config.kvDonorGeometry(layer);
+            const descriptor = try storage.pagedLayerKvDevice(
+                sequence_id,
+                geometry.donor_layer,
+                self.total_tokens,
+                geometry.num_kv_heads,
+                geometry.head_dim,
+            );
+            if (descriptor.ring_page_count != 0) return error.InvalidKvSelectionState;
+            if (descriptor.token_count < policy.hard_rows) continue;
+
+            const row_count = descriptor.token_count;
+            if (row_count > try policy.transientRows()) return error.KvCapacityTooSmall;
+            const positions = try self.allocator.alloc(u64, row_count);
+            defer self.allocator.free(positions);
+            if (descriptor.key_positions) |selected_positions| {
+                if (selected_positions.len != row_count) return error.InvalidKvSelectionState;
+                for (selected_positions, positions) |position, *out| out.* = position;
+            } else {
+                for (positions, 0..) |*position, index| position.* = @intCast(index);
+            }
+            const positions_u32 = try runtime.kv.selection.positionsU32(self.allocator, positions);
+            defer self.allocator.free(positions_u32);
+            const oracle_keys: ?[]f32 = if (select_v1_gpu_oracle)
+                try storage.gatherLayerKeys(self.allocator, sequence_id, geometry.donor_layer, row_count)
+            else
+                null;
+            defer if (oracle_keys) |keys| self.allocator.free(keys);
+
+            var accumulator = try runtime.kv.selection.ScoreAccumulator.init(self.allocator, row_count);
+            defer accumulator.deinit(self.allocator);
+            var expected_consumers: usize = 0;
+            for (0..@as(usize, @intCast(config.num_hidden_layers))) |consumer_layer| {
+                if (config.layerUsesSlidingAttention(consumer_layer)) continue;
+                if ((try config.kvStorageLayerIndex(consumer_layer)) == geometry.donor_layer) expected_consumers += 1;
+            }
+            var captured_consumers: usize = 0;
+            for (self.selection_queries.items) |*capture| {
+                if (capture.donor_layer != geometry.donor_layer) continue;
+                if (control) |request_control| try request_control.check();
+                if (capture.positions.items.len == 0) return error.MissingKvSelectionQueries;
+                const query_positions_u32 = try runtime.kv.selection.positionsU32(self.allocator, capture.positions.items);
+                defer self.allocator.free(query_positions_u32);
+                const gpu_scores = try self.allocator.alloc(f32, row_count);
+                defer self.allocator.free(gpu_scores);
+                try storage.scoreSelectedAttention(.{
+                    .sequence_id = sequence_id,
+                    .layer_index = geometry.donor_layer,
+                    .queries = capture.values.items,
+                    .query_positions = query_positions_u32,
+                    .key_positions = positions_u32,
+                    .num_heads = capture.num_heads,
+                    .num_kv_heads = geometry.num_kv_heads,
+                    .head_dim = geometry.head_dim,
+                    .score_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(geometry.head_dim))),
+                    .scores_out = gpu_scores,
+                    .check_ctx = &score_control,
+                    .check_fn = selectedScoreCancellationCheck,
+                });
+                if (oracle_keys) |keys| {
+                    const oracle = try runtime.kv.selection.scoreConsumerNormalizedAttention(self.allocator, .{
+                        .queries = capture.values.items,
+                        .query_positions = capture.positions.items,
+                        .keys = keys,
+                        .key_positions = positions,
+                        .num_query_heads = capture.num_heads,
+                        .num_kv_heads = geometry.num_kv_heads,
+                        .head_dim = geometry.head_dim,
+                        .score_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(geometry.head_dim))),
+                    });
+                    defer self.allocator.free(oracle);
+                    for (gpu_scores, oracle) |actual, expected| {
+                        if (@abs(@as(f64, actual) - expected) > 2e-4) return error.KvSelectionGpuOracleMismatch;
+                    }
+                }
+                const scores = try self.allocator.alloc(f64, row_count);
+                defer self.allocator.free(scores);
+                for (gpu_scores, scores) |score, *out| out.* = score;
+                try accumulator.addConsumer(scores);
+                captured_consumers += 1;
+            }
+            if (captured_consumers != expected_consumers) return error.MissingKvSelectionQueries;
+            const balanced_scores = try accumulator.finish();
+            var plan = try runtime.kv.selection.selectRows(
+                self.allocator,
+                policy,
+                positions,
+                balanced_scores,
+                @intCast(self.total_tokens),
+                self.selection_protected_spans,
+            );
+            defer plan.deinit();
+            const source_rows = try self.allocator.alloc(u32, plan.source_indices.len);
+            defer self.allocator.free(source_rows);
+            for (plan.source_indices, source_rows) |source, *out| out.* = std.math.cast(u32, source) orelse return error.InvalidKvSelectionState;
+            const selected_positions = try runtime.kv.selection.positionsU32(self.allocator, plan.positions);
+            defer self.allocator.free(selected_positions);
+            if (control) |request_control| try request_control.check();
+            _ = try storage.repackSelectedGlobalKv(.{
+                .sequence_id = sequence_id,
+                .layer_index = geometry.donor_layer,
+                .expected_source_slot = descriptor.slot,
+                .expected_written_tokens = self.total_tokens,
+                .source_token_offsets = source_rows,
+                .key_positions = selected_positions,
+                .num_kv_heads = geometry.num_kv_heads,
+                .head_dim = geometry.head_dim,
+            });
+        }
     }
 
     fn kvPageSizeTokens(self: *const NativeDecodeState) ?usize {
@@ -2631,6 +3287,8 @@ pub const NativeDecodeState = struct {
         if (self.qwen35_linear_cache) |*cache| cache.deinit();
         self.gemma4_layer_spec_cache.deinit(self.allocator);
         if (self.deepseek_v4_compressed_cache) |*cache| cache.deinit();
+        self.clearSelectionQueries();
+        self.selection_queries.deinit(self.allocator);
         self.kv_block_ids.deinit(self.allocator);
         self.sequence_id = null;
         self.kv_view = null;
@@ -2885,6 +3543,12 @@ pub const NativeDecodeState = struct {
             .deepseek_v4_compressed_cache = if (self.deepseek_v4_compressed_cache) |*cache| cache else null,
             .mrope_positions = decode_positions,
             .qwen3vl_text_only = self.qwen3vl_text_only,
+            .selection_query_capture = if (self.selection_capture_enabled) .{
+                .ctx = @ptrCast(self),
+                .allocator = self.allocator,
+                .horizon = runtime.kv.selection.defaults.query_horizon,
+                .captureFn = captureSelectionQueries,
+            } else null,
             .kv_cache = if (self.kvView()) |view|
                 .{
                     .sequence_id = view.sequence_id,
@@ -3335,6 +3999,10 @@ pub const NativeGenerationPipeline = struct {
     session: ?backends.Session = null,
     gpt_config: gpt_mod.Config,
     kv_dtype: ?runtime.kv.pool.KvDType = null,
+    /// Content-bound identity of this loaded model generation.
+    attention_match_identity: ?runtime.kv.attention_match_checkpoint.Identity = null,
+    checkpoint_prepare: ?*NativeCheckpointPrepare = null,
+    checkpoint_resume: ?*NativeCheckpointResume = null,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = null,
     device_memory_budget: ?runtime.kv.device_memory.Budget = null,
     tokenizer: tokenizer_mod.Tokenizer,
@@ -3412,6 +4080,1082 @@ pub const NativeGenerationPipeline = struct {
             platform.sync.lockYielding(mutex);
     }
 
+    pub const AttentionMatchQueryOptions = struct {
+        prefix_mode: enum { clone, replay } = .clone,
+        repeat_mode: enum { reference, exact, exact_split } = .reference,
+        stats: ?*AttentionMatchQueryStats = null,
+        collection: runtime.kv.attention_match_queries.Options = .{},
+        chunk_size: usize = 256,
+        /// Experimental bounded repeat: append only this many suffix tokens to
+        /// the complete cloned/replayed prefix. Queries still come from a real
+        /// forward at future positions. Null preserves full-repeat semantics.
+        max_repeat_tokens: ?usize = null,
+        /// Select prefix-wide study passages within the same repeat budget.
+        representative_repeat: bool = false,
+        max_source_tokens: usize = native_kv_checkpoint.max_context_tokens,
+        /// Additional shadow KV capacity, including growth copies. Activations
+        /// still use the backend's observed request allocation budget.
+        max_shadow_kv_bytes: usize = 4 * 1024 * 1024 * 1024,
+    };
+
+    pub const AttentionMatchQueryStats = struct {
+        ragged_repeat_calls: usize = 0,
+        prefix_ns: u64 = 0,
+        repeat_ns: u64 = 0,
+        repeat_kernel_launches: usize = 0,
+        split_kernel_launches: usize = 0,
+        scratch_bytes: usize = 0,
+        setup_ns: u64 = 0,
+        cleanup_ns: u64 = 0,
+        cloned_bytes: usize = 0,
+        shadow_allocation_bound_bytes: usize = 0,
+    };
+
+    /// Diagnostic sink deliberately cannot publish a checkpoint. The probe has
+    /// no loader-authenticated artifact identity and must never produce an
+    /// importable attachment. It exercises the bounded portable encoder only.
+    const AttentionMatchProbeSink = struct {
+        bytes: usize = 0,
+        pub fn writeAll(self: *@This(), data: []const u8) !void {
+            self.bytes = try std.math.add(usize, self.bytes, data.len);
+        }
+    };
+
+    /// Bounded numerical reproducer, not a resumable KV checkpoint. Layout is
+    /// LE f32: [version, rows, dim, train_rows, heldout_rows, scale], K,V,Qtrain,Qheldout.
+    fn dumpAttentionMatchFitFixture(self: *NativeGenerationPipeline, state: runtime.kv.attention_match_checkpoint.State, queries: *runtime.kv.attention_match_queries.Collector) !void {
+        const path = platform.env.getenv("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_FIXTURE") orelse return;
+        if (path.len == 0 or state.logical_length <= 2049) return;
+        var dumped: usize = 0;
+        for (state.donors, 0..) |donor, donor_index| {
+            if (donor.window != 0) continue;
+            for (donor.heads, 0..) |head, head_index| {
+                const rows: usize = if (platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_FIXTURE_FULL_HEAD")) head.positions.len else @intCast(@min(512, state.logical_length - 2048));
+                var train: usize = 0;
+                var heldout: usize = 0;
+                const group = self.gpt_config.num_attention_heads / donor.heads.len;
+                for (queries.batches) |batch| {
+                    if (state.layer_donors[batch.consumer_layer] != donor_index or batch.query_head / group != head_index) continue;
+                    train += batch.train.len;
+                    heldout += batch.heldout.len;
+                }
+                const count = 6 + rows * head.dim * 2 + train + heldout;
+                if (count > 40 * 1024 * 1024) return error.CompactionWorkspaceLimit;
+                const values = try self.allocator.alloc(f32, count);
+                defer self.allocator.free(values);
+                values[0..6].* = .{ 1, @floatFromInt(rows), @floatFromInt(head.dim), @floatFromInt(train / head.dim), @floatFromInt(heldout / head.dim), 1.0 / @sqrt(@as(f32, @floatFromInt(head.dim))) };
+                @memcpy(values[6..][0 .. rows * head.dim], head.keys[0 .. rows * head.dim]);
+                @memcpy(values[6 + rows * head.dim ..][0 .. rows * head.dim], head.values[0 .. rows * head.dim]);
+                var offset = 6 + rows * head.dim * 2;
+                for (queries.batches) |batch| {
+                    if (state.layer_donors[batch.consumer_layer] != donor_index or batch.query_head / group != head_index) continue;
+                    @memcpy(values[offset..][0..batch.train.len], batch.train);
+                    offset += batch.train.len;
+                }
+                for (queries.batches) |batch| {
+                    if (state.layer_donors[batch.consumer_layer] != donor_index or batch.query_head / group != head_index) continue;
+                    @memcpy(values[offset..][0..batch.heldout.len], batch.heldout);
+                    offset += batch.heldout.len;
+                }
+                const destination = if (dumped == 0) try self.allocator.dupe(u8, path) else try std.fmt.allocPrint(self.allocator, "{s}.layer{d}.head{d}.f32", .{ path, donor.layer, head_index });
+                defer self.allocator.free(destination);
+                try writeF32LeFile(self.allocator, self.io orelse return error.MissingIo, destination, values);
+                std.log.info("attention_match_fit_fixture donor_layer={d} head={d} rows={d} train_rows={d} heldout_rows={d}", .{ donor.layer, head_index, rows, train / head.dim, heldout / head.dim });
+                dumped += 1;
+                if (!platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_FIXTURE_ALL_HEADS")) return;
+            }
+        }
+        std.log.info("attention_match_fit_fixture_complete heads={d}", .{dumped});
+    }
+
+    /// Restore a bounded, decoded checkpoint into a new request owner. The
+    /// loaded model supplies identity and geometry; the uploaded header never
+    /// grants compatibility. The caller supplies the complete rendered prompt.
+    /// Returned logits belong to the caller and represent the saved boundary.
+    pub fn validateAttentionMatchResume(self: *NativeGenerationPipeline, saved: runtime.kv.attention_match_checkpoint.State, full_prompt: []const u32, max_new_tokens: usize) !void {
+        const checkpoint = runtime.kv.attention_match_checkpoint;
+        const resume_contract = runtime.kv.attention_match_resume;
+        if (self.gpt_config.num_hidden_layers == 0 or self.gpt_config.num_hidden_layers > 256) return error.UnsupportedAttentionMatchRoute;
+        if (full_prompt.len > native_kv_checkpoint.max_context_tokens or max_new_tokens == 0 or max_new_tokens > native_kv_checkpoint.max_context_tokens - full_prompt.len) return error.KvCheckpointAppendLimit;
+        const identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity;
+        const limits: checkpoint.Limits = native_kv_checkpoint.serving_limits;
+        const control: runtime.kv.attention_match.Control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork };
+        var donors: [256]resume_contract.Geometry = undefined;
+        var mapping: [256]u32 = undefined;
+        var count: usize = 0;
+        for (0..self.gpt_config.num_hidden_layers) |layer| {
+            const geometry = try self.gpt_config.kvDonorGeometry(layer);
+            if (self.gpt_config.isKvDonorLayer(layer)) {
+                donors[count] = .{ .layer = @intCast(layer), .window = if (self.gpt_config.layerUsesSlidingAttention(layer)) self.gpt_config.sliding_window else 0, .heads = geometry.num_kv_heads, .dim = geometry.head_dim };
+                count += 1;
+            }
+            var index: ?u32 = null;
+            for (donors[0..count], 0..) |donor, i| if (donor.layer == geometry.donor_layer) {
+                index = @intCast(i);
+                break;
+            };
+            mapping[layer] = index orelse return error.UnsupportedKvSnapshotLayout;
+        }
+        _ = try resume_contract.validateWithControl(saved, .{ .identity = identity, .vocab_size = self.gpt_config.vocab_size, .max_logical_tokens = native_kv_checkpoint.max_context_tokens, .max_appended_tokens = 8192, .layer_donors = mapping[0..self.gpt_config.num_hidden_layers], .donors = donors[0..count] }, full_prompt, limits, control);
+        _ = try @import("../ops/cuda/attention_match_storage.zig").allocationBytesWithControl(saved, .f16, limits, control);
+    }
+
+    pub fn restoreAttentionMatchState(self: *NativeGenerationPipeline, saved: runtime.kv.attention_match_checkpoint.State, full_prompt: []const u32, max_new_tokens: usize, diagnostic_only: bool, destination: *NativeDecodeState) ![]f32 {
+        if (comptime !build_options.enable_cuda) return error.UnsupportedAttentionMatchRoute;
+        const checkpoint = runtime.kv.attention_match_checkpoint;
+        const device_storage = @import("../ops/cuda/attention_match_storage.zig");
+        if (self.cb.kind() != .cuda or self.kv_dtype != .f16 or self.gpt_config.family != .gemma or
+            !self.gpt_config.usesGemma4Channels() or self.gpt_config.gemma4_mtp_assistant or
+            self.graph_cache != null or self.compiled_partition_backend != null or self.draft_cb != null or self.prompt_cache != null or
+            !destination.isPaged() or destination.isKvCompacted() or destination.total_tokens != 0 or destination.sequence_id != null or
+            self.gpt_config.num_hidden_layers == 0 or self.gpt_config.num_hidden_layers > 256)
+            return error.UnsupportedAttentionMatchRoute;
+        try self.validateAttentionMatchResume(saved, full_prompt, max_new_tokens);
+        const limits: checkpoint.Limits = native_kv_checkpoint.serving_limits;
+        const control: runtime.kv.attention_match.Control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork };
+        const logits = try self.allocator.dupe(f32, saved.logits);
+        errdefer self.allocator.free(logits);
+        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
+        defer if (self.execution_lock) |mutex| mutex.unlock();
+        const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const storage = destination.kv_storage orelse return error.UnsupportedAttentionMatchRoute;
+        if (storage.sequences.items.len != 0 or storage.storage.config.store_cpu_bytes) return error.UnsupportedAttentionMatchRoute;
+        const revision = try cuda_compute.attentionMatchRevision(compute, storage);
+        try control.check();
+        // This request owner is disposable on any failure. Metadata establishes
+        // the original logical positions without forwarding or replaying tokens.
+        destination.allow_swa_ring = false;
+        try destination.notePrefill(saved.tokens.len);
+        const backend: device_storage.Backend = .{ .allocator = self.allocator, .context = &compute.ctx, .precision = .f16, .limits = limits };
+        const bound = @min(compute.ctx.device_allocations.snapshot().limit, 18 * 1024 * 1024 * 1024);
+        var uploaded: ?device_storage.DeviceState = try backend.upload(saved, bound, control);
+        defer if (uploaded) |*device| device.deinit();
+        try cuda_compute.restoreAttentionMatch(compute, storage, destination.sequence_id orelse return error.InvalidCompactionProbe, &uploaded, saved.tokens.len, revision, bound, control, .{ .diagnostic_only = diagnostic_only });
+        return logits;
+    }
+
+    /// Private end-to-end portable restore check. Compare a fresh imported owner
+    /// against an independent clone of the fitted cache, without replaying its
+    /// prefix or mutating the live request. This checks restore parity, not the
+    /// lossy fit's quality against original full KV (qualified separately).
+    fn verifyRestoredAttentionMatch(self: *NativeGenerationPipeline, tokens: []const i64, logits: []const f32, source: *const NativeDecodeState) !void {
+        if (comptime !build_options.enable_cuda) return error.UnsupportedAttentionMatchRoute;
+        if (tokens.len >= native_kv_checkpoint.max_context_tokens or tokens.len != source.total_tokens) return error.InvalidCompactionProbe;
+        const answer_limit = @min(@as(usize, 16), native_kv_checkpoint.max_context_tokens - tokens.len);
+        const checkpoint = runtime.kv.attention_match_checkpoint;
+        const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const source_storage = source.kv_storage orelse return error.UnsupportedAttentionMatchRoute;
+        const source_revision = try cuda_compute.attentionMatchRevision(compute, source_storage);
+        const source_sequence = source.sequence_id orelse return error.UnsupportedAttentionMatchRoute;
+        const identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity;
+        const limits: checkpoint.Limits = native_kv_checkpoint.serving_limits;
+        const control: runtime.kv.attention_match.Control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork };
+        const ids = try self.allocator.alloc(u32, tokens.len);
+        defer self.allocator.free(ids);
+        for (ids, tokens) |*id, token| id.* = std.math.cast(u32, token) orelse return error.InvalidCompactionProbe;
+        var saved = blk: {
+            if (self.execution_lock) |mutex| try self.lockExecution(mutex);
+            defer if (self.execution_lock) |mutex| mutex.unlock();
+            if ((try cuda_compute.installedAttentionMatchActivity(compute, source_storage, source_sequence)) == null) return error.UnsupportedAttentionMatchRoute;
+            break :blk try self.snapshotAttentionMatchState(ids, logits, source, identity, limits, 2 * 1024 * 1024 * 1024);
+        };
+        defer saved.deinit();
+        // Rotated rows retain an immutable codec representation. The parity
+        // probe must exercise its real wire format rather than discard it.
+        const encoding: checkpoint.Encoding = encoding: {
+            for (saved.state.donors) |donor| for (donor.heads) |head| {
+                if (head.compressed.spans.len != 0) break :encoding .rotated4;
+            };
+            break :encoding .f32;
+        };
+        const encoded = try checkpoint.encodeWithEncoding(self.allocator, saved.state, limits, encoding, control);
+        defer self.allocator.free(encoded);
+        var restored = try checkpoint.decodeWithControl(self.allocator, encoded, identity, limits, control);
+        defer restored.deinit();
+        var clone: AttentionMatchProbeShadow = .{};
+        // init must use cloneInstalledAttentionMatch when its source is fitted.
+        try clone.init(self, source, tokens.len + answer_limit);
+        defer clone.deinit();
+        var fresh: AttentionMatchProbeShadow = .{};
+        try fresh.initEmpty(self);
+        defer fresh.deinit();
+        var clone_logits = try self.allocator.dupe(f32, logits);
+        defer self.allocator.free(clone_logits);
+        var fresh_logits = try self.restoreAttentionMatchState(restored.state, ids, answer_limit, true, &fresh.state.?);
+        defer self.allocator.free(fresh_logits);
+        var comparisons: usize = 0;
+        var appended: usize = 0;
+        for (0..answer_limit) |_| {
+            try checkAttentionMatchQueryWork(self);
+            if (!std.mem.eql(u8, std.mem.sliceAsBytes(clone_logits), std.mem.sliceAsBytes(fresh_logits))) return error.KvCheckpointResumeMismatch;
+            const chosen = activations.argmax(clone_logits);
+            comparisons += 1;
+            if (self.gpt_config.isEosToken(chosen)) break;
+            const next: [1]i64 = .{@intCast(chosen)};
+            const next_clone = try self.appendAttentionMatchProbeTokens(&clone.state.?, &next);
+            self.allocator.free(clone_logits);
+            clone_logits = next_clone;
+            const next_fresh = try self.appendAttentionMatchProbeTokens(&fresh.state.?, &next);
+            self.allocator.free(fresh_logits);
+            fresh_logits = next_fresh;
+            appended += 1;
+        }
+        if (!std.mem.eql(u8, std.mem.sliceAsBytes(clone_logits), std.mem.sliceAsBytes(fresh_logits))) return error.KvCheckpointResumeMismatch;
+        if (source.total_tokens != tokens.len or source.sequence_id != source_sequence or
+            try cuda_compute.attentionMatchRevision(compute, source_storage) != source_revision) return error.CompactionSourceChanged;
+        const activity = (try cuda_compute.installedAttentionMatchActivity(compute, &fresh.storage.?, fresh.state.?.sequence_id.?)) orelse return error.InvalidCompactionProbe;
+        if (activity.invalid or fresh.state.?.total_tokens != tokens.len + appended or clone.state.?.total_tokens != fresh.state.?.total_tokens or
+            (appended > 0 and (activity.attention_calls == 0 or activity.donor_appends == 0))) return error.KvCheckpointResumeMismatch;
+        std.log.info("attention_match_restore wire_version={d} source_tokens={d} logical_tokens={d} greedy_comparisons={d} appended_tokens={d} attention_calls={d} donor_appends={d} checkpoint_roundtrip=1 fresh_owner=1 replayed_tokens=0 bitwise_logits=1 source_unchanged=1 invalid=0", .{ encoding.wireVersion(), tokens.len, fresh.state.?.total_tokens, comparisons, appended, activity.attention_calls, activity.donor_appends });
+    }
+
+    fn resumeNativeCheckpoint(self: *NativeGenerationPipeline, request: *NativeCheckpointResume, tokens: []const i64, max_new_tokens: usize, state: *NativeDecodeState, config: GenerationConfig) !PrefillOutput {
+        const saved = if (request.checkpoint) |owned| owned.state else return error.InvalidNativeCheckpointRequest;
+        if (tokens.len < saved.tokens.len) return error.KvCheckpointPrefixMismatch;
+        const restored_tokens = saved.tokens.len;
+        const appended_tokens = tokens.len - restored_tokens;
+        const ids = try self.allocator.alloc(u32, tokens.len);
+        defer self.allocator.free(ids);
+        for (tokens, ids) |token, *id| id.* = std.math.cast(u32, token) orelse return error.InvalidKvCheckpoint;
+        var append_config = config;
+        var append_plan: ?runtime.scheduler.native_generate.PrefillChunkPlan = null;
+        defer if (append_plan) |*plan| plan.deinit(self.allocator);
+        if (appended_tokens > 0) {
+            const admitted = config.prefill_chunk_plan orelse return error.InvalidPrefillChunkPlan;
+            try admitted.validate();
+            if (admitted.prompt_tokens != tokens.len) return error.InvalidPrefillChunkPlan;
+            // Full-prompt admission already bounds logical-position workspace.
+            // Replan only the suffix, never increasing chunk or scratch bounds.
+            append_plan = try runtime.scheduler.native_generate.PrefillChunkPlan.init(
+                self.allocator,
+                appended_tokens,
+                @min(admitted.max_chunk_rows, 256),
+                admitted.max_scratch_bytes,
+                admitted.fairness,
+                .fixed_ceiling,
+            );
+            append_config.prefill_chunk_plan = append_plan.?;
+            append_config.prefill_chunk_size = append_plan.?.max_chunk_rows;
+        }
+        const logits = try self.restoreAttentionMatchState(saved, ids, max_new_tokens, false, state);
+        request.checkpoint.?.deinit();
+        request.checkpoint = null;
+        request.restored_tokens = restored_tokens;
+        request.appended_tokens = appended_tokens;
+        if (appended_tokens == 0) return .{ .last_logits = logits };
+        self.allocator.free(logits);
+        return self.executePrefill(tokens[restored_tokens..], tokens.len, restored_tokens, state, append_config, false, false);
+    }
+
+    fn prepareNativeCheckpoint(self: *NativeGenerationPipeline, request: *NativeCheckpointPrepare, tokens: []const i64, logits: []const f32, source: *const NativeDecodeState) !void {
+        if (request.result != null or !std.math.isFinite(request.minimum_savings_ratio) or request.minimum_savings_ratio <= 1 or request.minimum_savings_ratio > 4 or request.validation_workers != 1)
+            return error.InvalidNativeCheckpointRequest;
+        const plan = try NativeCheckpointPrepare.hostPlan(self.gpt_config, tokens.len, request.encoding);
+        if (request.planned_fit_host_bytes) |admitted| {
+            if (admitted != plan.fit_bytes) return error.InvalidNativeCheckpointRequest;
+        }
+        request.planned_fit_host_bytes = plan.fit_bytes;
+        if (request.planned_fit_workers) |admitted| {
+            if (admitted != plan.workers) return error.InvalidNativeCheckpointRequest;
+        }
+        request.planned_fit_workers = plan.workers;
+        const started = mtpProfileTimestamp(true, self.io);
+        var queries = try self.collectAttentionMatchQueries(tokens, source, .{
+            .prefix_mode = .clone,
+            .repeat_mode = .exact_split,
+            .collection = NativeCheckpointPrepare.collection_options,
+            .chunk_size = 256,
+            .max_repeat_tokens = NativeCheckpointPrepare.max_repeat_tokens,
+            .representative_repeat = true,
+        });
+        defer queries.deinit();
+        const query_ns = mtpProfileElapsedNs(true, self.io, started);
+        _ = try self.probeAttentionMatchFit(tokens, logits, source, &queries, query_ns, .{ .prepare_request = request });
+        if (request.result == null) return error.InvalidNativeCheckpointResult;
+    }
+
+    fn probeAttentionMatchFit(
+        self: *NativeGenerationPipeline,
+        tokens: []const i64,
+        logits: []const f32,
+        source: *const NativeDecodeState,
+        queries: *runtime.kv.attention_match_queries.Collector,
+        query_ns: u64,
+        probe_options: AttentionMatchFitProbeOptions,
+    ) !runtime.kv.attention_match_engine.Stats {
+        if (comptime !build_options.enable_cuda) return error.UnsupportedCompactionQueryRoute;
+        if (self.cb.kind() != .cuda or self.kv_dtype != .f16) return error.UnsupportedCompactionQueryDType;
+        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
+        defer if (self.execution_lock) |mutex| mutex.unlock();
+        const checkpoint = runtime.kv.attention_match_checkpoint;
+        const engine = runtime.kv.attention_match_engine;
+        const storage = @import("../ops/cuda/attention_match_storage.zig");
+        const Fitter = @import("../ops/cuda/attention_match_fit.zig").Fitter;
+        const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const control: runtime.kv.attention_match.Control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork };
+        const source_storage = source.kv_storage orelse return error.UnsupportedAttentionMatchRoute;
+        const source_revision = try cuda_compute.attentionMatchRevision(compute, source_storage);
+        const limits: checkpoint.Limits = native_kv_checkpoint.serving_limits;
+        var phase: []const u8 = "snapshot";
+        var stats: engine.Stats = .{};
+        const started = mtpProfileTimestamp(true, self.io);
+        errdefer std.log.err("attention_match_fit_rejected phase={s} elapsed_ns={d} donor_layer={d} head={d} chunk_start={d} attempted_chunks={d} completed_chunks={d} mass_error={d} output_rmse={d} nnls_sweeps={d} validating_storage={d} rounded_mass_error={d} rounded_output_rmse={d} validating_head={d} validated_heads={d}", .{
+            phase, mtpProfileElapsedNs(true, self.io, started), stats.donor_layer, stats.head, stats.chunk_start, stats.attempted_chunks, stats.completed_chunks, stats.last_fit.max_relative_mass_error, stats.last_fit.relative_output_rmse, stats.last_fit.nnls_sweeps, @intFromBool(stats.validating_storage), stats.rounded_fit.max_relative_mass_error, stats.rounded_fit.relative_output_rmse, @intFromBool(stats.validating_head), stats.validated_heads,
+        });
+        const ids = try self.allocator.alloc(u32, tokens.len);
+        defer self.allocator.free(ids);
+        for (tokens, ids) |token, *id| id.* = std.math.cast(u32, token) orelse return error.InvalidCompactionQueries;
+        const identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity;
+        var original = try self.snapshotAttentionMatchState(ids, logits, source, identity, limits, 2 * 1024 * 1024 * 1024);
+        var original_live = true;
+        defer if (original_live) {
+            original.deinit();
+        };
+        const source_host_bytes = try original.state.residentBytes();
+        if (probe_options.prepare_request == null) try self.dumpAttentionMatchFitFixture(original.state, queries);
+        const snapshot_ns = mtpProfileElapsedNs(true, self.io, started);
+        var query_heads: [256]u32 = undefined;
+        @memset(query_heads[0..original.state.layer_donors.len], self.gpt_config.num_attention_heads);
+        var scales: [256]f64 = undefined;
+        var caps: [256]f64 = undefined;
+        for (original.state.donors, 0..) |donor, i| {
+            // Captured queries already include Gemma's sqrt(head_dim)
+            // correction, exactly as consumed by CUDA attention.
+            scales[i] = 1.0 / @sqrt(@as(f64, @floatFromInt(donor.heads[0].dim)));
+            caps[i] = 0;
+        }
+        phase = "fit";
+        const fit_started = mtpProfileTimestamp(true, self.io);
+        const residual_fit = probe_options.prepare_request != null or platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_RESIDUAL");
+        const cuda_fit = probe_options.prepare_request != null or platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_CUDA");
+        const cooperative_fit = probe_options.prepare_request != null or platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_COOPERATIVE");
+        if (cooperative_fit and !cuda_fit) return error.UnsupportedCompactionQueryRoute;
+        const worker_text = platform.env.getenv("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_WORKERS") orelse "1";
+        const fit_workers = if (probe_options.prepare_request) |request| request.planned_fit_workers orelse return error.InvalidNativeCheckpointRequest else try std.fmt.parseInt(usize, worker_text, 10);
+        if (fit_workers == 0 or fit_workers > 4 or (fit_workers > 1 and !cooperative_fit)) return error.UnsupportedCompactionQueryRoute;
+        const old_device_limit = compute.ctx.device_allocations.snapshot().limit;
+        try compute.ctx.device_allocations.setLimit(@min(old_device_limit, 18 * 1024 * 1024 * 1024));
+        defer compute.ctx.device_allocations.setLimit(old_device_limit) catch {};
+        var cuda_fitters: [4]Fitter = undefined;
+        var cuda_fitter_count: usize = 0;
+        defer for (cuda_fitters[0..cuda_fitter_count]) |*fitter| fitter.deinit();
+        var fit_backends: [4]runtime.kv.attention_match.Backend = undefined;
+        if (cuda_fit) {
+            if (!residual_fit or @import("../ops/cuda/libraries.zig").Policy.current() == .off) return error.UnsupportedCompactionQueryRoute;
+            for (cuda_fitters[0..fit_workers], fit_backends[0..fit_workers]) |*fitter, *fit_backend| {
+                fitter.* = if (fit_workers > 1)
+                    try Fitter.initWorker(self.allocator, &compute.ctx, 18 * 1024 * 1024 * 1024, 512 * 1024 * 1024)
+                else
+                    try Fitter.init(self.allocator, &compute.ctx, 18 * 1024 * 1024 * 1024);
+                cuda_fitter_count += 1;
+                fitter.cooperative_enabled = cooperative_fit;
+                if (cooperative_fit and fitter.cooperative_blocks == 0) return error.UnsupportedCooperativeFit;
+                fit_backend.* = fitter.backend();
+            }
+        }
+        const diagnostic_encoding: checkpoint.Encoding = if (probe_options.prepare_request != null) .f32 else std.meta.stringToEnum(checkpoint.Encoding, platform.env.getenv("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_ENCODING") orelse "f32") orelse return error.InvalidCompactionProbe;
+        const native_policy = probe_options.prepare_request != null or platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_NATIVE_POLICY");
+        var fit_options: engine.Options = if (native_policy) NativeCheckpointPrepare.fittingOptions() else .{};
+        fit_options.fp8_checkpoint = if (probe_options.prepare_request) |request| request.encoding == .fp8 else diagnostic_encoding == .fp8;
+        fit_options.rotated4_checkpoint = if (probe_options.prepare_request) |request| request.encoding == .rotated4 else diagnostic_encoding == .rotated4;
+        fit_options.stats = &stats;
+        fit_options.storage_precision = .f16;
+        fit_options.checkpoint_limits = limits;
+        fit_options.fit.control = control;
+        fit_options.max_parallel_validations = if (probe_options.prepare_request) |request| request.validation_workers else platform.env.getenvUsize("ANTFLY_INFERENCE_ATTENTION_MATCH_VALIDATION_WORKERS") orelse 2;
+        fit_options.source_has_metadata = (try cuda_compute.installedAttentionMatchActivity(compute, source_storage, source.sequence_id orelse return error.UnsupportedAttentionMatchRoute)) != null;
+        const fit_host_bytes = if (probe_options.prepare_request) |request| request.planned_fit_host_bytes orelse return error.InvalidNativeCheckpointRequest else try std.fmt.parseInt(usize, platform.env.getenv("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_HOST_BYTES") orelse "2147483648", 10);
+        if (fit_host_bytes == 0 or fit_host_bytes > 4 * 1024 * 1024 * 1024) return error.CompactionWorkspaceLimit;
+        fit_options.max_transient_host_bytes = fit_host_bytes;
+        if (cuda_fit) fit_options.fit.backend = fit_backends[0];
+        if (residual_fit and !native_policy) {
+            fit_options.prefix_rows = 128;
+            fit_options.chunk_rows = 1024;
+            fit_options.validation = .whole_head;
+            fit_options.fit.selection = .residual_omp;
+            fit_options.fit.mass_solver = .active_set;
+        }
+        if (probe_options.prepare_request != null or platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_PRESERVE_REJECTED"))
+            fit_options.rejected_head_policy = .preserve_original;
+        const minimum_saving = platform.env.getenv("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_MIN_SAVINGS") orelse "";
+        if (probe_options.prepare_request) |request|
+            fit_options.min_global_savings_ratio = request.minimum_savings_ratio
+        else if (minimum_saving.len != 0)
+            fit_options.min_global_savings_ratio = try std.fmt.parseFloat(f64, minimum_saving);
+        if (probe_options.minimum_savings) |minimum| {
+            if (probe_options.cycle == null or !std.math.isFinite(minimum) or minimum <= 1) return error.InvalidCompactionProbe;
+            fit_options.min_global_savings_ratio = minimum;
+        }
+        const fit_layout: engine.Layout = .{
+            .query_heads_by_layer = query_heads[0..original.state.layer_donors.len],
+            .scales_by_donor = scales[0..original.state.donors.len],
+            .softcaps_by_donor = caps[0..original.state.donors.len],
+        };
+        const fit_queries = try queries.finish();
+        var candidate = (if (cuda_fitter_count > 1)
+            engine.prepareParallel(original.state, fit_queries, fit_layout, fit_options, fit_backends[0..cuda_fitter_count])
+        else
+            engine.prepare(self.allocator, original.state, fit_queries, fit_layout, fit_options)) catch |err| {
+            if (err == error.CompactionSavingsInsufficient) {
+                if (probe_options.prepare_request) |request| {
+                    try control.check();
+                    request.result = .{
+                        .checkpoint = original,
+                        .outcome = .unchanged_insufficient_savings,
+                        .stats = stats,
+                        .source_host_bytes = source_host_bytes,
+                        .query_ns = query_ns,
+                        .snapshot_ns = snapshot_ns,
+                        .fit_ns = mtpProfileElapsedNs(true, self.io, fit_started),
+                    };
+                    original_live = false;
+                    return stats;
+                }
+            }
+            std.log.err("attention_match_fit_error error={s}", .{@errorName(err)});
+            return err;
+        };
+        var candidate_live = true;
+        defer if (candidate_live) {
+            candidate.deinit();
+        };
+        var cooperative_launches: usize = 0;
+        var cooperative_restarts: usize = 0;
+        var workspace_reuses: usize = 0;
+        const executed_workers = cuda_fitter_count;
+        // Include worker retirement in the measured fit phase, and release its
+        // retained device capacity before checkpoint upload and installation.
+        for (cuda_fitters[0..cuda_fitter_count]) |*fitter| {
+            cooperative_launches += fitter.cooperative_launches;
+            cooperative_restarts += fitter.cooperative_restarts;
+            workspace_reuses += fitter.workspace_reuses;
+            fitter.deinit();
+        }
+        cuda_fitter_count = 0;
+        // Compare the immutable fitted candidate with the authoritative host
+        // snapshot before retiring it. Live publication still checks the CUDA
+        // owner revision after all uploads and fences.
+        const guard: checkpoint.Store = .{ .current = original, .generation = source_revision };
+        try guard.validateCompactionWithControl(candidate.state, source_revision, limits, control);
+        original.deinit();
+        original_live = false;
+        const fit_ns = mtpProfileElapsedNs(true, self.io, fit_started);
+        if (probe_options.prepare_request) |request| {
+            try control.check();
+            request.result = .{
+                .checkpoint = candidate,
+                .outcome = .compacted,
+                .stats = stats,
+                .source_host_bytes = source_host_bytes,
+                .query_ns = query_ns,
+                .snapshot_ns = snapshot_ns,
+                .fit_ns = fit_ns,
+            };
+            candidate_live = false;
+            return stats;
+        }
+        phase = "export";
+        const export_started = mtpProfileTimestamp(true, self.io);
+        var sink: AttentionMatchProbeSink = .{};
+        const exported = try checkpoint.exportEncoded(candidate.state, limits, diagnostic_encoding, &sink, control);
+        if (exported.bytes != sink.bytes) return error.InvalidKvCheckpoint;
+        if (probe_options.checkpoint_roundtrip) {
+            // Exercise actual bytes, decoder and independently owned imported
+            // arrays before replacing the previous cycle's live binding.
+            const encoded = try checkpoint.encodeWithEncoding(self.allocator, candidate.state, limits, diagnostic_encoding, control);
+            defer self.allocator.free(encoded);
+            var file_digest: [32]u8 = undefined;
+            var file_hash = std.crypto.hash.sha2.Sha256.init(.{});
+            var file_offset: usize = 0;
+            while (file_offset < encoded.len) {
+                try control.check();
+                const count = @min(@as(usize, 65536), encoded.len - file_offset);
+                file_hash.update(encoded[file_offset..][0..count]);
+                file_offset += count;
+            }
+            file_hash.final(&file_digest);
+            if (!std.mem.eql(u8, &file_digest, &exported.file_sha256)) return error.KvCheckpointChecksum;
+            const imported = try checkpoint.decodeWithControl(self.allocator, encoded, identity, limits, control);
+            candidate.deinit();
+            candidate = imported;
+        }
+        const export_ns = mtpProfileElapsedNs(true, self.io, export_started);
+        phase = "upload";
+        const upload_started = mtpProfileTimestamp(true, self.io);
+        const backend: storage.Backend = .{ .allocator = self.allocator, .context = &compute.ctx, .precision = .f16, .limits = limits };
+        var uploaded: ?storage.DeviceState = try backend.upload(candidate.state, 18 * 1024 * 1024 * 1024, control);
+        defer if (uploaded) |*device| device.deinit();
+        const candidate_device_bytes = uploaded.?.allocated_bytes;
+        const upload_ns = mtpProfileElapsedNs(true, self.io, upload_started);
+        const install = platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_INSTALL");
+        var install_ns: u64 = 0;
+        if (install) {
+            if (!cuda_fit or !residual_fit) return error.UnsupportedAttentionMatchRoute;
+            phase = "install";
+            const install_started = mtpProfileTimestamp(true, self.io);
+            try cuda_compute.installAttentionMatchWithOptions(compute, source_storage, source.sequence_id orelse return error.UnsupportedAttentionMatchRoute, &uploaded, source.total_tokens, source_revision, 18 * 1024 * 1024 * 1024, control, .{ .diagnostic_only = probe_options.cycle != null });
+            install_ns = mtpProfileElapsedNs(true, self.io, install_started);
+        }
+        const digest = exported.file_sha256;
+        // Keep the complete diagnostic on one line without exceeding the
+        // standard formatter's 32-argument limit.
+        var codec_log_buffer: [512]u8 = undefined;
+        const codec_log = try std.fmt.bufPrint(&codec_log_buffer, "export_version={d} fp8_heads={d} fp8_fallback_heads={d} min_retention_divisor={d} retention_retries={d} rotated4_heads={d} rotated4_fallback_heads={d} rotated4_eligible_rows={d} rotated4_compressed_rows={d} rotated4_exact_rows={d}", .{
+            diagnostic_encoding.wireVersion(),
+            stats.fp8_heads,
+            stats.fp8_fallback_heads,
+            fit_options.min_retention_divisor orelse fit_options.retention_divisor,
+            stats.retention_retries,
+            stats.rotated4_heads,
+            stats.rotated4_fallback_heads,
+            stats.rotated4_eligible_rows,
+            stats.rotated4_compressed_rows,
+            stats.rotated4_exact_rows,
+        });
+        std.log.info("{s} source_tokens={d} snapshot_ns={d} fit_ns={d} export_ns={d} upload_ns={d} total_ns={d} source_host_bytes={d} candidate_host_bytes={d} candidate_device_bytes={d} export_bytes={d} completed_chunks={d} max_nnls_sweeps={d} export_sha256={s} validated_heads={d} max_head_mass_error={d} max_head_output_rmse={d} residual_fit={d} preserved_heads={d} source_global_bytes={d} candidate_global_bytes={d} actual_global_savings_ratio={d} cuda_fit={d} diagnostic_only=1 installed={d} install_ns={d} cooperative_fit={d} cooperative_launches={d} cooperative_restarts={d} fit_workers={d} workspace_reuses={d} host_workspace_limit_bytes={d} {s}", .{
+            if (probe_options.cycle != null) @as([]const u8, "attention_match_cycle_fit") else "attention_match_fit",
+            tokens.len,
+            snapshot_ns,
+            fit_ns,
+            export_ns,
+            upload_ns,
+            query_ns + mtpProfileElapsedNs(true, self.io, started),
+            source_host_bytes,
+            try candidate.state.residentBytes(),
+            candidate_device_bytes,
+            sink.bytes,
+            stats.completed_chunks,
+            stats.max_nnls_sweeps,
+            std.fmt.bytesToHex(digest, .lower),
+            stats.validated_heads,
+            stats.max_head_mass_error,
+            stats.max_head_output_rmse,
+            @intFromBool(residual_fit),
+            stats.preserved_heads,
+            stats.source_global_bytes,
+            stats.candidate_global_bytes,
+            stats.actual_global_savings_ratio,
+            @intFromBool(cuda_fit),
+            @intFromBool(install),
+            install_ns,
+            @intFromBool(cooperative_fit),
+            cooperative_launches,
+            cooperative_restarts,
+            executed_workers,
+            workspace_reuses,
+            fit_host_bytes,
+            codec_log,
+        });
+        return stats;
+    }
+
+    const AttentionMatchFitProbeOptions = struct {
+        cycle: ?usize = null,
+        minimum_savings: ?f64 = null,
+        checkpoint_roundtrip: bool = false,
+        prepare_request: ?*NativeCheckpointPrepare = null,
+    };
+
+    /// Address-stable private cache owner. Initialize only at its final address:
+    /// state, storage and device hooks borrow pointers into this object.
+    const AttentionMatchProbeShadow = struct {
+        manager: ?runtime.kv.manager.KvManager = null,
+        storage: ?runtime.kv.storage_runtime.KvStorageRuntime = null,
+        state: ?NativeDecodeState = null,
+
+        fn deinit(self: *@This()) void {
+            if (self.state) |*state| state.deinit();
+            if (self.storage) |*storage| storage.deinit();
+            if (self.manager) |*manager| manager.deinit();
+            self.* = .{};
+        }
+
+        fn initEmpty(self: *@This(), pipeline: *NativeGenerationPipeline) !void {
+            if (self.manager != null or self.storage != null or self.state != null) return error.InvalidCompactionProbe;
+            const dtype = pipeline.kv_dtype orelse return error.UnsupportedCompactionQueryDType;
+            if (pipeline.cb.kind() != .cuda or dtype != .f16) return error.UnsupportedCompactionQueryRoute;
+            if (pipeline.execution_lock) |mutex| try pipeline.lockExecution(mutex);
+            defer if (pipeline.execution_lock) |mutex| mutex.unlock();
+            self.manager = runtime.kv.manager.KvManager.init(pipeline.allocator);
+            errdefer self.deinit();
+            const config = attentionMatchCheckpointPoolConfig(dtype, pipeline.gpt_config);
+            const pool = try self.manager.?.addPool(config);
+            self.storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(pipeline.allocator, config);
+            try pipeline.cb.provisionKvDeviceWriteHook(&self.storage.?);
+            self.state = NativeDecodeState.initPaged(pipeline.allocator, &self.manager.?, pool, null);
+            self.state.?.kv_storage = &self.storage.?;
+            self.state.?.configureForGptConfig(pipeline.gpt_config);
+            self.state.?.allow_swa_ring = false;
+        }
+
+        fn init(self: *@This(), pipeline: *NativeGenerationPipeline, source: *const NativeDecodeState, capacity: usize) !void {
+            if (self.manager != null or self.storage != null or self.state != null) return error.InvalidCompactionProbe;
+            const dtype = pipeline.kv_dtype orelse return error.UnsupportedCompactionQueryDType;
+            if (pipeline.cb.kind() != .cuda or dtype != .f16 or !source.isPaged() or source.isKvCompacted()) return error.UnsupportedCompactionQueryRoute;
+            const source_storage = source.kv_storage orelse return error.UnsupportedCompactionQueryRoute;
+            const view = source.kv_view orelse return error.UnsupportedCompactionQueryRoute;
+            if (view.position_offset != 0 or view.token_count != source.total_tokens or source.sequence_id != view.sequence_id or capacity < source.total_tokens or capacity > native_kv_checkpoint.max_context_tokens) return error.InvalidCompactionProbe;
+            var donors: [256]runtime.kv.device_clone.Donor = undefined;
+            var donor_count: usize = 0;
+            if (pipeline.gpt_config.num_hidden_layers > donors.len) return error.UnsupportedCompactionQueryRoute;
+            for (0..pipeline.gpt_config.num_hidden_layers) |layer| {
+                if (!pipeline.gpt_config.isKvDonorLayer(layer)) continue;
+                const geometry = try pipeline.gpt_config.kvDonorGeometry(layer);
+                donors[donor_count] = .{ .layer = @intCast(layer), .heads = geometry.num_kv_heads, .dim = geometry.head_dim };
+                donor_count += 1;
+            }
+            if (pipeline.execution_lock) |mutex| try pipeline.lockExecution(mutex);
+            defer if (pipeline.execution_lock) |mutex| mutex.unlock();
+            self.manager = runtime.kv.manager.KvManager.init(pipeline.allocator);
+            errdefer self.deinit();
+            var config = kvPoolConfig(.cuda, dtype, pipeline.gpt_config, false);
+            config.store_cpu_bytes = false;
+            config.sliding_window_size = null;
+            const pool = try self.manager.?.addPool(config);
+            self.storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(pipeline.allocator, config);
+            try pipeline.cb.provisionKvDeviceWriteHook(&self.storage.?);
+            const hook = self.storage.?.device_write_hook orelse return error.UnsupportedCompactionQueryRoute;
+            self.state = NativeDecodeState.initPaged(pipeline.allocator, &self.manager.?, pool, null);
+            self.state.?.kv_storage = &self.storage.?;
+            self.state.?.configureForGptConfig(pipeline.gpt_config);
+            self.state.?.allow_swa_ring = false;
+            try self.state.?.notePrefill(source.total_tokens);
+            const clone_request: runtime.kv.device_clone.Request = .{
+                .source_sequence = view.sequence_id,
+                .destination_sequence = self.state.?.sequence_id.?,
+                .tokens = source.total_tokens,
+                .capacity = std.mem.alignForward(usize, capacity, 16),
+                .page_size = config.page_size_tokens,
+                .source_blocks = view.logical_blocks orelse return error.UnsupportedDeviceKvCloneLayout,
+                .destination_blocks = self.state.?.kv_block_ids.items,
+                .donors = donors[0..donor_count],
+                .max_bytes = 4 * 1024 * 1024 * 1024,
+                .check_ctx = pipeline,
+                .check_fn = checkAttentionMatchQueryWork,
+            };
+            const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(pipeline.cb.ptr));
+            if ((try cuda_compute.installedAttentionMatchActivity(compute, source_storage, view.sequence_id)) != null) {
+                _ = (try cuda_compute.cloneInstalledAttentionMatch(compute, &self.storage.?, source_storage, clone_request)) orelse return error.UnsupportedAttentionMatchRoute;
+            } else {
+                _ = try hook.cloneExactPrefix(source_storage.device_write_hook orelse return error.UnsupportedCompactionQueryRoute, clone_request);
+            }
+        }
+    };
+
+    /// Eager append with a single last-token logit projection. Keeping the last
+    /// token separate avoids materializing [chunk, vocabulary] host logits and
+    /// avoids graph/replay state shared with the original request.
+    fn appendAttentionMatchProbeTokens(self: *NativeGenerationPipeline, state: *NativeDecodeState, tokens: []const i64) ![]f32 {
+        if (tokens.len == 0) return error.InvalidCompactionProbe;
+        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
+        defer if (self.execution_lock) |mutex| mutex.unlock();
+        var offset: usize = 0;
+        while (offset + 1 < tokens.len) {
+            try checkAttentionMatchQueryWork(self);
+            const end = offset + @min(256, tokens.len - 1 - offset);
+            try state.appendPrefillChunk(end - offset);
+            var context = state.gptDecodeContext(state.total_tokens, end - offset);
+            try gpt_arch.forwardHiddenOnly(&self.cb, self.allocator, self.gpt_config, tokens[offset..end], 1, state.total_tokens, &context);
+            offset = end;
+        }
+        try checkAttentionMatchQueryWork(self);
+        try state.appendPrefillChunk(1);
+        var context = state.gptDecodeContext(state.total_tokens, 1);
+        return gpt_arch.forward(&self.cb, self.allocator, self.gpt_config, tokens[tokens.len - 1 ..], 1, state.total_tokens, &context);
+    }
+
+    /// Diagnostic only: both branches start from the same original exact prefix.
+    /// Each candidate is exported/imported and installed into the same private
+    /// owner as the preceding cycle. The independent reference never compacts.
+    /// Identical appended and teacher-forced answer tokens keep comparisons at
+    /// the same logical positions, even when a candidate's greedy choice differs.
+    fn probeAttentionMatchCycles(self: *NativeGenerationPipeline, tokens: []const i64, logits: []const f32, source: *const NativeDecodeState, cycles: usize, append_tokens: usize, answer_tokens: usize, minimum_savings: f64) !void {
+        if (comptime !build_options.enable_cuda) return error.UnsupportedCompactionQueryRoute;
+        if (!platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_INSTALL") or
+            !platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_CUDA") or
+            !platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_RESIDUAL") or
+            !platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_COOPERATIVE") or
+            cycles == 0 or cycles > 20 or append_tokens < 512 or append_tokens > 2048 or append_tokens > tokens.len or
+            answer_tokens == 0 or answer_tokens > 32 or !std.math.isFinite(minimum_savings) or minimum_savings <= 1 or
+            logits.len != self.gpt_config.vocab_size) return error.InvalidCompactionProbe;
+        const capacity = tokens.len + cycles * (append_tokens + answer_tokens);
+        if (capacity > native_kv_checkpoint.max_context_tokens) return error.CompactionQueryLimit;
+        const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+        const source_storage = source.kv_storage orelse return error.UnsupportedCompactionQueryRoute;
+        const source_revision = try cuda_compute.attentionMatchRevision(compute, source_storage);
+        const source_length = source.total_tokens;
+        const source_sequence = source.sequence_id;
+        var exact: AttentionMatchProbeShadow = .{};
+        try exact.init(self, source, capacity);
+        defer exact.deinit();
+        var compacted: AttentionMatchProbeShadow = .{};
+        try compacted.init(self, source, capacity);
+        defer compacted.deinit();
+        const history = try self.allocator.alloc(i64, capacity);
+        defer self.allocator.free(history);
+        @memcpy(history[0..tokens.len], tokens);
+        var length = tokens.len;
+        var exact_logits = try self.allocator.dupe(f32, logits);
+        defer self.allocator.free(exact_logits);
+        var compacted_logits = try self.allocator.dupe(f32, logits);
+        defer self.allocator.free(compacted_logits);
+        var all_matches: usize = 0;
+        var all_comparisons: usize = 0;
+        for (0..cycles) |cycle| {
+            try checkAttentionMatchQueryWork(self);
+            if (cycle > 0) {
+                const suffix = tokens[tokens.len - append_tokens ..];
+                const next_exact = try self.appendAttentionMatchProbeTokens(&exact.state.?, suffix);
+                self.allocator.free(exact_logits);
+                exact_logits = next_exact;
+                const next_compacted = try self.appendAttentionMatchProbeTokens(&compacted.state.?, suffix);
+                self.allocator.free(compacted_logits);
+                compacted_logits = next_compacted;
+                @memcpy(history[length..][0..suffix.len], suffix);
+                length += suffix.len;
+            }
+            const before_revision = try cuda_compute.attentionMatchRevision(compute, &compacted.storage.?);
+            var query_stats: AttentionMatchQueryStats = .{};
+            const started = mtpProfileTimestamp(true, self.io);
+            var queries = try self.collectAttentionMatchQueries(history[0..length], &compacted.state.?, .{
+                .prefix_mode = .clone,
+                .repeat_mode = if (cycle == 0) .exact_split else .reference,
+                .stats = &query_stats,
+                .collection = .{ .samples_per_consumer = 320 },
+                .max_repeat_tokens = 512,
+                .representative_repeat = platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_NATIVE_POLICY"),
+            });
+            defer queries.deinit();
+            if (cycle > 0 and query_stats.ragged_repeat_calls == 0) return error.UnsupportedCompactionQueryRoute;
+            const stats = try self.probeAttentionMatchFit(history[0..length], compacted_logits, &compacted.state.?, &queries, mtpProfileElapsedNs(true, self.io, started), .{
+                .cycle = cycle + 1,
+                .minimum_savings = if (cycle == 0) null else minimum_savings,
+                .checkpoint_roundtrip = true,
+            });
+            const after_revision = try cuda_compute.attentionMatchRevision(compute, &compacted.storage.?);
+            if (after_revision != before_revision + 1 or stats.completed_chunks == 0 or stats.candidate_global_bytes >= stats.source_global_bytes) return error.CompactionCycleDidNotCompact;
+            const answer_start = length;
+            var matches: usize = 0;
+            var comparisons: usize = 0;
+            var max_logit_relative_l2: f64 = 0;
+            for (0..answer_tokens) |_| {
+                if (exact_logits.len != compacted_logits.len) return error.InvalidCompactionProbe;
+                var error_squared: f64 = 0;
+                var reference_squared: f64 = 0;
+                for (exact_logits, compacted_logits) |reference, candidate| {
+                    if (!std.math.isFinite(reference) or !std.math.isFinite(candidate)) return error.InvalidCompactionProbe;
+                    const difference = @as(f64, candidate) - reference;
+                    error_squared += difference * difference;
+                    reference_squared += @as(f64, reference) * reference;
+                }
+                max_logit_relative_l2 = @max(max_logit_relative_l2, @sqrt(error_squared / @max(reference_squared, 1e-30)));
+                const expected = activations.argmax(exact_logits);
+                const actual = activations.argmax(compacted_logits);
+                matches += @intFromBool(actual == expected);
+                comparisons += 1;
+                if (self.gpt_config.isEosToken(expected)) break;
+                const next_token: [1]i64 = .{@intCast(expected)};
+                const next_exact = try self.appendAttentionMatchProbeTokens(&exact.state.?, &next_token);
+                self.allocator.free(exact_logits);
+                exact_logits = next_exact;
+                const next_compacted = try self.appendAttentionMatchProbeTokens(&compacted.state.?, &next_token);
+                self.allocator.free(compacted_logits);
+                compacted_logits = next_compacted;
+                history[length] = @intCast(expected);
+                length += 1;
+            }
+            const activity = (try cuda_compute.installedAttentionMatchActivity(compute, &compacted.storage.?, compacted.state.?.sequence_id.?)) orelse return error.InvalidCompactionProbe;
+            if (activity.invalid or exact.state.?.total_tokens != length or compacted.state.?.total_tokens != length or
+                source.total_tokens != source_length or source.sequence_id != source_sequence or
+                try cuda_compute.attentionMatchRevision(compute, source_storage) != source_revision) return error.CompactionSourceChanged;
+            all_matches += matches;
+            all_comparisons += comparisons;
+            std.log.info("attention_match_cycle cycle={d} logical_tokens={d} completed_chunks={d} greedy_matches={d} greedy_comparisons={d} answer_appends={d} max_logit_relative_l2={d} ragged_repeat_calls={d} installed_revision={d} checkpoint_roundtrip=1 source_unchanged=1 invalid=0 incremental_savings_ratio={d}", .{
+                cycle + 1, length, stats.completed_chunks, matches, comparisons, length - answer_start, max_logit_relative_l2, query_stats.ragged_repeat_calls, after_revision, stats.actual_global_savings_ratio,
+            });
+        }
+        std.log.info("attention_match_cycles_complete cycles={d} initial_tokens={d} final_tokens={d} greedy_matches={d} greedy_comparisons={d} source_unchanged=1", .{ cycles, tokens.len, length, all_matches, all_comparisons });
+        // Token parity is a strict diagnostic gate, not a replacement for the
+        // task-level quality suite. Record all cycles before reporting drift.
+        if (all_matches != all_comparisons) return error.CompactionCycleGreedyMismatch;
+    }
+
+    fn checkAttentionMatchQueryWork(raw: ?*anyopaque) !void {
+        const self: *NativeGenerationPipeline = @ptrCast(@alignCast(raw orelse return error.InvalidCallbackContext));
+        if (self.execution_control) |control| try control.check();
+        if (self.continue_fn) |should_continue| {
+            if (!should_continue(self.continue_ctx orelse return error.InvalidCallbackContext)) return error.CompactionCancelled;
+        }
+    }
+
+    /// Export an exact, locked ingestion boundary from authoritative device
+    /// storage. Identity must come from loaded model artifacts, never an upload.
+    /// Logical positions, donor sharing and next-token logits are preserved.
+    /// This does not authorize compacted-cache serving or bypass its route gates.
+    pub fn snapshotAttentionMatchState(
+        self: *NativeGenerationPipeline,
+        tokens: []const u32,
+        logits: []const f32,
+        source: *const NativeDecodeState,
+        identity: runtime.kv.attention_match_checkpoint.Identity,
+        limits: runtime.kv.attention_match_checkpoint.Limits,
+        max_host_bytes: usize,
+    ) !runtime.kv.attention_match_checkpoint.Owned {
+        if (self.cb.kind() != .cuda or self.gpt_config.family != .gemma or !self.gpt_config.usesGemma4Channels() or
+            self.graph_cache != null or self.compiled_partition_backend != null or self.draft_cb != null or self.prompt_cache != null or
+            !source.isPaged() or source.isKvCompacted() or source.total_tokens != tokens.len or
+            logits.len != self.gpt_config.vocab_size or self.gpt_config.num_hidden_layers > 256)
+            return error.UnsupportedKvSnapshotLayout;
+        const storage = source.kv_storage orelse return error.DeviceReadUnsupported;
+        const hook = storage.device_write_hook orelse return error.DeviceReadUnsupported;
+        const view = source.kv_view orelse return error.UnsupportedKvSnapshotLayout;
+        if (view.position_offset != 0 or view.token_count != tokens.len or source.sequence_id != view.sequence_id)
+            return error.UnsupportedKvSnapshotLayout;
+        var donors: [256]runtime.kv.attention_match_snapshot.Donor = undefined;
+        var layer_donors: [256]u32 = undefined;
+        var count: usize = 0;
+        for (0..self.gpt_config.num_hidden_layers) |layer| {
+            const geometry = try self.gpt_config.kvDonorGeometry(layer);
+            if (self.gpt_config.isKvDonorLayer(layer)) {
+                donors[count] = .{ .layer = @intCast(layer), .window = if (self.gpt_config.layerUsesSlidingAttention(layer)) self.gpt_config.sliding_window else 0, .heads = geometry.num_kv_heads, .dim = geometry.head_dim };
+                count += 1;
+            }
+            var index: ?u32 = null;
+            for (donors[0..count], 0..) |donor, i| {
+                if (donor.layer == geometry.donor_layer) {
+                    index = @intCast(i);
+                    break;
+                }
+            }
+            layer_donors[layer] = index orelse return error.UnsupportedKvSnapshotLayout;
+        }
+        const request: runtime.kv.attention_match_snapshot.Request = .{
+            .identity = identity,
+            .sequence = source.sequence_id orelse return error.UnsupportedKvSnapshotLayout,
+            .tokens = tokens,
+            .logits = logits,
+            .layer_donors = layer_donors[0..self.gpt_config.num_hidden_layers],
+            .donors = donors[0..count],
+            .limits = limits,
+            .max_host_bytes = max_host_bytes,
+            .control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork },
+        };
+        if (comptime build_options.enable_cuda) {
+            const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+            if (try cuda_compute.snapshotInstalledAttentionMatch(compute, storage, self.allocator, request)) |snapshot| return snapshot;
+        }
+        return runtime.kv.attention_match_snapshot.capture(self.allocator, request, try hook.attentionMatchReader());
+    }
+
+    /// Qualification adapter: clone an exact prefix into owned device buffers,
+    /// then repeat its tokens at future logical positions. Replay remains an
+    /// explicit reference mode. Caller owns the returned queries. This does not
+    /// commit or serve a compacted cache; source must be locked and immutable.
+    pub fn collectAttentionMatchQueries(
+        self: *NativeGenerationPipeline,
+        source_tokens: []const i64,
+        source: *const NativeDecodeState,
+        options: AttentionMatchQueryOptions,
+    ) !runtime.kv.attention_match_queries.Collector {
+        const queries = runtime.kv.attention_match_queries;
+        const collection_started = mtpProfileTimestamp(true, self.io);
+        var cleanup_started: ?std.Io.Timestamp = null;
+        defer if (options.stats) |stats| {
+            if (cleanup_started) |started| stats.cleanup_ns = mtpProfileElapsedNs(true, self.io, started);
+        };
+        if (self.cb.kind() != .cuda or self.gpt_config.family != .gemma or
+            !self.gpt_config.usesGemma4Channels()) return error.UnsupportedCompactionQueryModel;
+        if (self.graph_cache != null or
+            self.compiled_partition_backend != null or self.draft_cb != null or self.prompt_cache != null)
+            return error.UnsupportedCompactionQueryRoute;
+        // Graph and pinned-temporary state belongs to the live request. Never
+        // reset it or accidentally capture pointers to short-lived shadow KV.
+        const replay = platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY") orelse "off";
+        if (!std.mem.eql(u8, replay, "off") or cudaReplayLastLogitsEnabled() or
+            (platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY") orelse 0) != 0 or
+            (platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD") orelse 0) != 0 or
+            platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_TEMP_ARENA_AUTOPLAN"))
+            return error.UnsupportedCompactionQueryReplay;
+        const dtype = self.kv_dtype orelse return error.UnsupportedCompactionQueryDType;
+        if (dtype != .f16 and dtype != .f32) return error.UnsupportedCompactionQueryDType;
+        if (options.repeat_mode != .reference and dtype != .f16) return error.UnsupportedCompactionQueryDType;
+        if (source_tokens.len < 2 or source_tokens.len > options.max_source_tokens or
+            source_tokens.len > self.gpt_config.max_position_embeddings / 2 or
+            options.chunk_size == 0 or options.chunk_size > 512 or
+            options.chunk_size > options.collection.max_capture_rows or self.gpt_config.num_hidden_layers > 256)
+            return error.CompactionQueryLimit;
+        const study = if (options.representative_repeat)
+            try queries.studyTokens(self.allocator, source_tokens, options.max_repeat_tokens orelse source_tokens.len)
+        else
+            null;
+        defer if (study) |tokens| self.allocator.free(tokens);
+        const repeat_tokens = study orelse source_tokens[source_tokens.len - @min(source_tokens.len, options.max_repeat_tokens orelse source_tokens.len) ..];
+        if (repeat_tokens.len < 2) return error.CompactionQueryLimit;
+        for (source_tokens) |token| if (token < 0 or token >= self.gpt_config.vocab_size) return error.InvalidCompactionQueries;
+
+        try checkAttentionMatchQueryWork(self);
+        if (options.stats) |stats| stats.* = .{};
+        var consumers: [256]queries.Consumer = undefined;
+        var donors: [256]runtime.kv.device_clone.Donor = undefined;
+        var donor_count: usize = 0;
+        var count: usize = 0;
+        var kv_row_bytes: usize = 0;
+        for (0..self.gpt_config.num_hidden_layers) |layer| {
+            const geometry = try self.gpt_config.kvDonorGeometry(layer);
+            if (self.gpt_config.isKvDonorLayer(layer)) {
+                kv_row_bytes = try std.math.add(usize, kv_row_bytes, try dtype.bytesForTokenPairChecked(geometry.num_kv_heads, geometry.head_dim));
+                donors[donor_count] = .{ .layer = @intCast(layer), .heads = geometry.num_kv_heads, .dim = geometry.head_dim };
+                donor_count += 1;
+            }
+            if (self.gpt_config.layerUsesSlidingAttention(layer)) continue;
+            consumers[count] = .{
+                .layer = @intCast(layer),
+                .donor = @intCast(geometry.donor_layer),
+                .query_heads = self.gpt_config.num_attention_heads,
+                .kv_heads = geometry.num_kv_heads,
+                .dim = geometry.head_dim,
+            };
+            count += 1;
+        }
+        const shadow_rows = std.mem.alignForward(usize, source_tokens.len + repeat_tokens.len, 16);
+        // Doubling capacities plus all prior growth copies are below 4x final
+        // required capacity. Page tables/activations are charged by the backend.
+        const shadow_kv_bytes = try std.math.mul(usize, try std.math.mul(usize, shadow_rows, 4), kv_row_bytes);
+        if (options.prefix_mode == .replay and shadow_kv_bytes > options.max_shadow_kv_bytes) return error.CompactionQueryLimit;
+        var collector = try queries.Collector.init(self.allocator, consumers[0..count], source_tokens.len, repeat_tokens.len, options.collection);
+        errdefer collector.deinit();
+        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
+        defer if (self.execution_lock) |mutex| mutex.unlock();
+        var manager = runtime.kv.manager.KvManager.init(self.allocator);
+        defer manager.deinit();
+        var pool_config = kvPoolConfig(.cuda, dtype, self.gpt_config, false);
+        pool_config.store_cpu_bytes = false;
+        pool_config.sliding_window_size = null;
+        const pool_id = try manager.addPool(pool_config);
+        var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(self.allocator, pool_config);
+        defer storage.deinit();
+        // Provisioning a separate hook does not begin/reset the model request.
+        try self.cb.provisionKvDeviceWriteHook(&storage);
+        if (storage.device_write_hook == null) return error.UnsupportedCompactionQueryRoute;
+        var shadow = NativeDecodeState.initPaged(self.allocator, &manager, pool_id, null);
+        shadow.kv_storage = &storage;
+        shadow.configureForGptConfig(self.gpt_config);
+        shadow.allow_swa_ring = false;
+        defer shadow.deinit();
+        if (options.stats) |stats| stats.setup_ns = mtpProfileElapsedNs(true, self.io, collection_started);
+        const prefix_started = mtpProfileTimestamp(true, self.io);
+        var ragged_shadow = false;
+        if (options.prefix_mode == .clone) {
+            if (!source.isPaged() or source.isKvCompacted() or source.total_tokens != source_tokens.len)
+                return error.UnsupportedDeviceKvCloneLayout;
+            const source_storage = source.kv_storage orelse return error.DeviceKvCloneUnsupported;
+            if (source_storage.storage.config.dtype != dtype) return error.InvalidDeviceKvClone;
+            const source_view = source.kv_view orelse return error.InvalidDeviceKvClone;
+            if (source_view.position_offset != 0 or source_view.token_count != source_tokens.len or
+                source.sequence_id != source_view.sequence_id) return error.UnsupportedDeviceKvCloneLayout;
+            const source_blocks = source_view.logical_blocks orelse return error.UnsupportedDeviceKvCloneLayout;
+            try shadow.notePrefill(source_tokens.len);
+            const clone_request: runtime.kv.device_clone.Request = .{ .source_sequence = source_view.sequence_id, .destination_sequence = shadow.sequence_id.?, .tokens = source_tokens.len, .capacity = shadow_rows, .page_size = pool_config.page_size_tokens, .source_blocks = source_blocks, .destination_blocks = shadow.kv_block_ids.items, .donors = donors[0..donor_count], .max_bytes = options.max_shadow_kv_bytes, .check_ctx = self, .check_fn = checkAttentionMatchQueryWork };
+            const fitted_clone = if (comptime build_options.enable_cuda) blk: {
+                const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+                break :blk try cuda_compute.cloneInstalledAttentionMatch(compute, &storage, source_storage, clone_request);
+            } else null;
+            const clone = if (fitted_clone) |value| blk: {
+                // The reference mode follows the installed bias/coverage-aware
+                // backend. Dense exact-repeat kernel options cannot describe it.
+                if (options.repeat_mode != .reference) return error.UnsupportedCompactionQueryRoute;
+                ragged_shadow = true;
+                break :blk value;
+            } else try storage.device_write_hook.?.cloneExactPrefix(source_storage.device_write_hook orelse return error.DeviceKvCloneUnsupported, clone_request);
+            if (options.stats) |stats| {
+                stats.prefix_ns = mtpProfileElapsedNs(true, self.io, prefix_started);
+                stats.cloned_bytes = clone.copied_bytes;
+                stats.shadow_allocation_bound_bytes = clone.allocation_bound_bytes;
+            }
+        } else if (options.stats) |stats| stats.shadow_allocation_bound_bytes = shadow_kv_bytes;
+        const first_pass: usize = if (options.prefix_mode == .clone) 1 else 0;
+        const profile_repeat = platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_PROFILE_PREFILL_OPS");
+        for (first_pass..2) |pass| {
+            var capture_metrics = gpt_arch.DecodeContext.SelectionQueryCapture.Metrics{};
+            const profile_before = if (comptime build_options.enable_cuda) blk: {
+                const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+                break :blk if (profile_repeat) compute.attentionMatchProfile() else cuda_compute.CudaCompute.AttentionMatchProfile{};
+            } else {};
+            var repeat_scope: if (build_options.enable_cuda) ?cuda_compute.CudaCompute.AttentionMatchRepeatScope else ?void = null;
+            if (comptime build_options.enable_cuda) {
+                if (pass == 1 and options.repeat_mode != .reference and !ragged_shadow) {
+                    const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+                    repeat_scope = try compute.beginAttentionMatchRepeat(options.repeat_mode == .exact_split, options.chunk_size);
+                    compute.kernels.attention_match_repeat_check_ctx = self;
+                    compute.kernels.attention_match_repeat_check_fn = checkAttentionMatchQueryWork;
+                }
+            }
+            defer if (comptime build_options.enable_cuda) {
+                if (repeat_scope) |*scope| scope.deinit();
+            };
+            const pass_started = mtpProfileTimestamp(true, self.io);
+            const pass_tokens = if (pass == 0) source_tokens else repeat_tokens;
+            var offset: usize = 0;
+            while (offset < pass_tokens.len) {
+                try checkAttentionMatchQueryWork(self);
+                const end = offset + @min(options.chunk_size, pass_tokens.len - offset);
+                try shadow.appendPrefillChunk(end - offset);
+                var context = shadow.gptDecodeContext(shadow.total_tokens, end - offset);
+                if (pass == 1) context.selection_query_capture = .{
+                    .ctx = &collector,
+                    .allocator = self.allocator,
+                    .horizon = options.chunk_size,
+                    .captureFn = queries.Collector.capture,
+                    .metrics = if (profile_repeat) &capture_metrics else null,
+                };
+                try gpt_arch.forwardHiddenOnly(&self.cb, self.allocator, self.gpt_config, pass_tokens[offset..end], 1, shadow.total_tokens, &context);
+                offset = end;
+            }
+            if (comptime build_options.enable_cuda) {
+                if (ragged_shadow) {
+                    const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+                    const activity = (try cuda_compute.installedAttentionMatchActivity(compute, &storage, shadow.sequence_id.?)) orelse return error.UnsupportedCompactionQueryRoute;
+                    if (activity.invalid or activity.attention_calls == 0 or activity.donor_appends == 0) return error.UnsupportedCompactionQueryRoute;
+                    if (options.stats) |stats| stats.ragged_repeat_calls = activity.attention_calls;
+                }
+                if (repeat_scope) |scope| {
+                    const launches = scope.compute.kernels.attention_match_repeat_launches;
+                    if (launches == 0) return error.UnsupportedCompactionQueryRoute;
+                    if (options.repeat_mode == .exact_split and scope.compute.kernels.attention_match_repeat_split_launches == 0)
+                        return error.UnsupportedCompactionQueryRoute;
+                    if (options.stats) |stats| {
+                        stats.repeat_kernel_launches = launches;
+                        stats.split_kernel_launches = scope.compute.kernels.attention_match_repeat_split_launches;
+                        stats.scratch_bytes = scope.compute.kernels.attention_match_repeat_scratch.len;
+                    }
+                    try scope.compute.ctx.synchronize();
+                }
+            }
+            if (comptime build_options.enable_cuda) {
+                if (profile_repeat) {
+                    const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+                    const after = compute.attentionMatchProfile();
+                    std.log.info("attention_match_phase phase={s} repeat_mode={s} attention_us={d} other_gpu_us={d} downloads={d} download_bytes={d} allocations={d} events={d} capture_calls={d} capture_bytes={d} capture_host_wait_ns={d} capture_callback_ns={d}", .{
+                        if (pass == 0) @as([]const u8, "prefix_replay") else "repeat", @tagName(options.repeat_mode),
+                        after.attention_us - profile_before.attention_us,              after.other_gpu_us - profile_before.other_gpu_us,
+                        after.downloads - profile_before.downloads,                    after.download_bytes - profile_before.download_bytes,
+                        after.allocations - profile_before.allocations,                after.events - profile_before.events,
+                        capture_metrics.calls,                                         capture_metrics.bytes,
+                        capture_metrics.host_wait_ns,                                  capture_metrics.callback_ns,
+                    });
+                }
+            }
+            if (options.stats) |stats| {
+                const elapsed = mtpProfileElapsedNs(true, self.io, pass_started);
+                if (pass == 0) stats.prefix_ns = elapsed else stats.repeat_ns = elapsed;
+            }
+        }
+        _ = try collector.finish();
+        if (self.execution_control) |control| try control.check();
+        cleanup_started = mtpProfileTimestamp(true, self.io);
+        return collector;
+    }
+
     fn shouldStopOnEos(self: *const NativeGenerationPipeline, config: GenerationConfig, token: usize) bool {
         return !config.ignore_eos and self.gpt_config.isEosToken(token);
     }
@@ -3471,6 +5215,7 @@ pub const NativeGenerationPipeline = struct {
         seq_len: usize,
         query_seq_len: usize,
         wants_last_logits: bool,
+        allow_shared_kv_prefill: bool = false,
         logits: ?[]f32 = null,
         failure: ?anyerror = null,
         ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -3497,6 +5242,33 @@ pub const NativeGenerationPipeline = struct {
         on_token_fn: ?TokenCallback,
         on_token_ctx: ?*anyopaque,
     ) !GenerationResult {
+        try validateKvCachePolicy(config);
+        const native_checkpoint = self.checkpoint_prepare != null or self.checkpoint_resume != null;
+        if (native_checkpoint and (self.checkpoint_prepare != null and self.checkpoint_resume != null or
+            self.cb.kind() != .cuda or self.kv_dtype != .f16 or self.gpt_config.family != .gemma or
+            !self.gpt_config.usesGemma4Channels() or self.gpt_config.gemma4_mtp_assistant or
+            self.attention_match_identity == null or self.scheduler != null or self.scheduler_lease != null or
+            self.graph_cache != null or self.compiled_partition_backend != null or self.draft_cb != null or self.prompt_cache != null or
+            messagesHaveImages(messages) or messagesHaveAudio(messages) or config.kv_cache_mode != .exact_hybrid or
+            config.cache_compaction_ratio != null or config.prompt_cache_enabled or config.speculation_requested))
+            return error.UnsupportedAttentionMatchRoute;
+        // select_v1 currently has a complete explicit-position storage and
+        // attention implementation only on Metal. CUDA exposes contiguous or
+        // page-table KV descriptors without selected positions, repack, or
+        // selection scoring hooks; reject before request allocation.
+        if (config.kv_cache_mode == .select_v1 and self.cb.kind() != .metal)
+            return error.UnsupportedKvCachePolicy;
+        // The scheduler's batched attention route does not yet carry
+        // per-request selected position tables or query-capture ownership.
+        if (config.kv_cache_mode == .select_v1 and self.scheduler != null)
+            return error.UnsupportedKvCachePolicy;
+        // The qualification-only sampled/grammar ring route is intentionally
+        // direct eager: scheduler microbatches and compiled whole-model paths
+        // can still request contiguous full-history KV.
+        if (exact_hybrid_sampled_ring_qualification_override and
+            (!isPureGreedyConfig(config) or config.grammar != null) and
+            (self.scheduler != null or self.graph_cache != null or self.compiled_partition_backend != null))
+            return error.UnsupportedKvCachePolicy;
         if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
         const allocator = self.allocator;
         const started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
@@ -4030,6 +5802,11 @@ pub const NativeGenerationPipeline = struct {
         const max_tokens = requested_max_tokens;
         const spec_slack: usize = if (use_speculative and config.speculative_k > 0) 1 else 0;
         const max_seq = prompt_token_count + max_tokens + spec_slack;
+        if (config.kv_cache_mode == .select_v1 and
+            try runtime.kv.selection.mandatoryRowCount(runtime.kv.selection.defaults, @intCast(max_seq), config.kv_protected_spans) > runtime.kv.selection.defaults.target_rows)
+        {
+            return error.ProtectedRowsExceedTarget;
+        }
         var token_ids = try allocator.alloc(i64, max_seq);
         defer allocator.free(token_ids);
         if (prepared_qwen3vl_prompt) |prepared| {
@@ -4040,12 +5817,26 @@ pub const NativeGenerationPipeline = struct {
             for (0..actual_prompt_tokens) |i| token_ids[i] = @intCast(encoded_ids[i]);
         }
         var seq_len = prompt_token_count;
+        if (native_checkpoint and (seq_len > native_kv_checkpoint.max_context_tokens or max_tokens > native_kv_checkpoint.max_context_tokens - seq_len)) return error.KvCheckpointAppendLimit;
         debugGenerationStage(
             "starting prefill prompt_token_count={d} seq_len={d} multimodal={}",
             .{ prompt_token_count, seq_len, prepared_multimodal_prompt != null or prepared_qwen3vl_prompt != null },
         );
 
         const runtime_prepare_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
+        if (config.kv_cache_mode == .select_v1) {
+            decode_state.selection_protected_spans = config.kv_protected_spans;
+        }
+        defer if (config.kv_cache_mode == .select_v1) {
+            decode_state.selection_capture_enabled = false;
+            decode_state.selection_protected_spans = &.{};
+            decode_state.clearSelectionQueries();
+        };
+        if (config.kv_cache_mode == .select_v1) {
+            const selected_peak = try selectedV1PeakBytes(self.gpt_config, self.kv_dtype orelse return error.UnsupportedKvCachePolicy);
+            if (selected_peak > config.kv_selection_peak_limit_bytes) return error.MemoryBudgetExceeded;
+            try decode_state.prepareSelectedGlobalDonors(self.gpt_config);
+        }
         const whole_model_kv_policy = generationKvCapacityPolicyForRoute(
             if (self.compiled_partition_backend == .metal and
                 self.compiled_attachment_target == .whole_model and
@@ -4131,12 +5922,15 @@ pub const NativeGenerationPipeline = struct {
         try setWorkloadProfileRegime(&self.cb, .prefill);
         const allow_prefill_greedy_token = !use_speculative or (use_speculative and draft_is_gemma4_mtp);
         const capture_mtp_prefill_hidden = use_speculative and draft_is_gemma4_mtp and gemma4MtpTargetHiddenSource() == .final;
-        const prefill_output = if (prepared_qwen3vl_prompt) |*prepared|
+        const prefill_output = if (self.checkpoint_resume) |request|
+            try self.resumeNativeCheckpoint(request, token_ids[0..seq_len], max_tokens, decode_state, config)
+        else if (prepared_qwen3vl_prompt) |*prepared|
             PrefillOutput{ .last_logits = try self.executePreparedQwen3VlPrefill(prepared, seq_len, decode_state) }
         else if (prepared_multimodal_prompt) |*prepared|
             try self.executePreparedMultimodalPrefill(prepared, seq_len, decode_state, capture_mtp_prefill_hidden)
         else
             try self.executePrefill(prefill_ids, seq_len, cached_prompt_tokens, decode_state, config, allow_prefill_greedy_token, capture_mtp_prefill_hidden);
+        if (self.checkpoint_resume) |request| cached_prompt_tokens = request.restored_tokens;
         var prefill_last_logits = prefill_output.last_logits;
         var prefill_greedy_token = prefill_output.greedy_token;
         const prefill_last_hidden = prefill_output.last_hidden;
@@ -4156,6 +5950,108 @@ pub const NativeGenerationPipeline = struct {
             "finished prefill seq_len={d} cached_logits={} greedy_token={}",
             .{ seq_len, prefill_last_logits != null, prefill_greedy_token != null },
         );
+
+        if (self.checkpoint_prepare) |request| {
+            try self.prepareNativeCheckpoint(request, token_ids[0..seq_len], prefill_last_logits orelse return error.MissingCompactionResumeLogits, decode_state);
+            return .{
+                .text = try allocator.dupe(u8, ""),
+                .prompt_tokens = seq_len,
+                .tokens_used = 0,
+                .finish_reason = "stop",
+                .allocator = allocator,
+            };
+        }
+
+        if (platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_REFERENCE_PROBE")) {
+            if (prepared_multimodal_prompt != null or prepared_qwen3vl_prompt != null or use_speculative or
+                config.kv_cache_mode == .select_v1 or config.cache_compaction_ratio != null or decode_state.isKvCompacted())
+                return error.UnsupportedCompactionQueryRoute;
+            const started = mtpProfileTimestamp(true, self.io);
+            const original_tokens = decode_state.total_tokens;
+            const original_sequence = decode_state.sequence_id;
+            const prefix_mode = platform.env.getenv("ANTFLY_INFERENCE_ATTENTION_MATCH_PREFIX_MODE") orelse "clone";
+            if (!std.mem.eql(u8, prefix_mode, "clone") and !std.mem.eql(u8, prefix_mode, "replay")) return error.UnsupportedCompactionQueryRoute;
+            const repeat_mode_name = platform.env.getenv("ANTFLY_INFERENCE_ATTENTION_MATCH_REPEAT_MODE") orelse "reference";
+            const repeat_mode: @FieldType(AttentionMatchQueryOptions, "repeat_mode") = if (std.mem.eql(u8, repeat_mode_name, "reference")) .reference else if (std.mem.eql(u8, repeat_mode_name, "exact")) .exact else if (std.mem.eql(u8, repeat_mode_name, "exact_split")) .exact_split else return error.UnsupportedCompactionQueryRoute;
+            const query_samples = platform.env.getenvUsize("ANTFLY_INFERENCE_ATTENTION_MATCH_QUERY_SAMPLES") orelse 80;
+            const repeat_chunk_size = platform.env.getenvUsize("ANTFLY_INFERENCE_ATTENTION_MATCH_REPEAT_CHUNK_SIZE") orelse 256;
+            const suffix_limit = platform.env.getenvUsize("ANTFLY_INFERENCE_ATTENTION_MATCH_REFERENCE_SUFFIX_TOKENS") orelse 0;
+            const max_repeat_tokens: ?usize = if (suffix_limit == 0) null else suffix_limit;
+            const representative_repeat = platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_NATIVE_POLICY");
+            if (query_samples < 2 or query_samples > 320 or (repeat_chunk_size != 256 and repeat_chunk_size != 512)) return error.CompactionQueryLimit;
+            var query_stats = AttentionMatchQueryStats{};
+            var queries = try self.collectAttentionMatchQueries(token_ids[0..seq_len], decode_state, .{
+                .prefix_mode = if (std.mem.eql(u8, prefix_mode, "clone")) .clone else .replay,
+                .stats = &query_stats,
+                .repeat_mode = repeat_mode,
+                .collection = .{ .samples_per_consumer = query_samples },
+                .chunk_size = repeat_chunk_size,
+                .max_repeat_tokens = max_repeat_tokens,
+                .representative_repeat = representative_repeat,
+            });
+            defer queries.deinit();
+            const query_elapsed_ns = mtpProfileElapsedNs(true, self.io, started);
+            const verify_clone = platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_VERIFY_CLONE");
+            var reference_ns: u64 = 0;
+            if (verify_clone) {
+                if (!std.mem.eql(u8, prefix_mode, "clone")) return error.UnsupportedCompactionQueryRoute;
+                const reference_started = mtpProfileTimestamp(true, self.io);
+                var reference = try self.collectAttentionMatchQueries(token_ids[0..seq_len], decode_state, .{ .prefix_mode = .replay, .repeat_mode = repeat_mode, .collection = .{ .samples_per_consumer = query_samples }, .chunk_size = repeat_chunk_size, .max_repeat_tokens = max_repeat_tokens, .representative_repeat = representative_repeat });
+                defer reference.deinit();
+                reference_ns = mtpProfileElapsedNs(true, self.io, reference_started);
+                if (!std.mem.eql(u64, queries.train_positions, reference.train_positions) or
+                    !std.mem.eql(u64, queries.heldout_positions, reference.heldout_positions) or
+                    !std.mem.eql(u8, std.mem.sliceAsBytes(queries.values), std.mem.sliceAsBytes(reference.values)))
+                    return error.CompactionCloneQueryMismatch;
+            }
+            const verify_repeat = platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_VERIFY_REPEAT");
+            var agreement = runtime.kv.attention_match_queries.Agreement{};
+            if (verify_repeat) {
+                if (repeat_mode == .reference) return error.UnsupportedCompactionQueryRoute;
+                const reference_started = mtpProfileTimestamp(true, self.io);
+                var reference = try self.collectAttentionMatchQueries(token_ids[0..seq_len], decode_state, .{ .collection = .{ .samples_per_consumer = query_samples }, .chunk_size = repeat_chunk_size, .max_repeat_tokens = max_repeat_tokens, .representative_repeat = representative_repeat });
+                reference_ns += mtpProfileElapsedNs(true, self.io, reference_started);
+                defer reference.deinit();
+                agreement = try queries.compare(&reference);
+                // Every sampled query must preserve the established FP32 path.
+                // This is not a fitted-cache quality gate.
+                if (!std.mem.eql(u8, std.mem.sliceAsBytes(queries.values), std.mem.sliceAsBytes(reference.values))) {
+                    std.log.err("attention_match_repeat_rejected max_absolute={d} max_relative_l2={d}", .{ agreement.max_absolute, agreement.max_relative_l2 });
+                    var value_offset: usize = 0;
+                    for (queries.consumers) |consumer| {
+                        const values = consumer.query_heads * consumer.dim * queries.samples.len;
+                        const row = try runtime.kv.attention_match_queries.compareRows(queries.values[value_offset..][0..values], reference.values[value_offset..][0..values], consumer.dim);
+                        std.log.err("attention_match_repeat_consumer layer={d} max_absolute={d} max_relative_l2={d}", .{ consumer.layer, row.max_absolute, row.max_relative_l2 });
+                        value_offset += values;
+                    }
+                    return error.CompactionRepeatQueryMismatch;
+                }
+            }
+            if (decode_state.total_tokens != original_tokens or decode_state.sequence_id != original_sequence)
+                return error.CompactionSourceChanged;
+            var query_hash: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(queries.values), &query_hash, .{});
+            std.log.info("attention_match_queries source_tokens={d} consumers={d} heads={d} train={d} heldout={d} host_query_peak_bytes={d} elapsed_ns={d} prefix_ns={d} repeat_ns={d} cloned_bytes={d} shadow_allocation_bound_bytes={d} verified_clone={d} reference_ns={d} prefix_mode={s} query_sha256={s} repeat_mode={s} verified_repeat={d} query_max_absolute={d} query_max_relative_l2={d} repeat_kernel_launches={d} split_kernel_launches={d} scratch_bytes={d} setup_ns={d} cleanup_ns={d} chunk_size={d} reference_tokens={d} ragged_repeat_calls={d}", .{
+                seq_len,                           queries.consumers.len,     queries.batches.len,                       queries.train_positions.len,
+                queries.heldout_positions.len,     queries.peak_bytes,        query_elapsed_ns,                          query_stats.prefix_ns,
+                query_stats.repeat_ns,             query_stats.cloned_bytes,  query_stats.shadow_allocation_bound_bytes, @intFromBool(verify_clone),
+                reference_ns,                      prefix_mode,               std.fmt.bytesToHex(query_hash, .lower),    repeat_mode_name,
+                @intFromBool(verify_repeat),       agreement.max_absolute,    agreement.max_relative_l2,                 query_stats.repeat_kernel_launches,
+                query_stats.split_kernel_launches, query_stats.scratch_bytes, query_stats.setup_ns,                      query_stats.cleanup_ns,
+                repeat_chunk_size,                 queries.repeat_length,     query_stats.ragged_repeat_calls,
+            });
+            const cycles = platform.env.getenvUsize("ANTFLY_INFERENCE_ATTENTION_MATCH_CYCLES") orelse 0;
+            if (cycles != 0) {
+                const append_tokens = platform.env.getenvUsize("ANTFLY_INFERENCE_ATTENTION_MATCH_CYCLE_APPEND") orelse 1024;
+                const answer_tokens = platform.env.getenvUsize("ANTFLY_INFERENCE_ATTENTION_MATCH_CYCLE_ANSWER") orelse 16;
+                const minimum_savings = try std.fmt.parseFloat(f64, platform.env.getenv("ANTFLY_INFERENCE_ATTENTION_MATCH_CYCLE_MIN_SAVINGS") orelse "1.000001");
+                try self.probeAttentionMatchCycles(token_ids[0..seq_len], prefill_last_logits orelse return error.MissingCompactionResumeLogits, decode_state, cycles, append_tokens, answer_tokens, minimum_savings);
+            }
+            if (platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_PROBE"))
+                _ = try self.probeAttentionMatchFit(token_ids[0..seq_len], prefill_last_logits orelse return error.MissingCompactionResumeLogits, decode_state, &queries, query_elapsed_ns, .{});
+            if (platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_VERIFY_RESTORE"))
+                try self.verifyRestoredAttentionMatch(token_ids[0..seq_len], prefill_last_logits orelse return error.MissingCompactionResumeLogits, decode_state);
+        }
 
         if (self.prompt_cache) |cache| {
             if (config.prompt_cache_enabled and prepared_multimodal_prompt == null and prepared_qwen3vl_prompt == null and decode_state.kv_manager == cache.managerPtr()) {
@@ -5274,6 +7170,20 @@ pub const NativeGenerationPipeline = struct {
         capture_last_hidden: bool,
     ) !PrefillOutput {
         const allocator = self.allocator;
+        // Private opt-in qualification only. Preserve admitted chunk shapes,
+        // scheduler turns and the original final-logit projection.
+        const exact_prefill_probe = platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_EXACT_PREFILL_PROBE");
+        if (exact_prefill_probe and (!build_options.enable_cuda or self.cb.kind() != .cuda or self.kv_dtype != .f16 or
+            self.gpt_config.family != .gemma or !self.gpt_config.usesGemma4Channels() or
+            !platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_PROBE") or
+            self.graph_cache != null or self.compiled_partition_backend != null or self.draft_cb != null or self.prompt_cache != null or
+            capture_last_hidden or prefilled_tokens != 0 or seq_len > 32768 or !decode_state.isPaged() or
+            config.kv_cache_mode == .select_v1 or cudaReplayLastLogitsEnabled())) return error.UnsupportedCompactionQueryRoute;
+        var exact_prefill_calls: usize = 0;
+        defer if (exact_prefill_probe) {
+            std.log.info("attention_match_exact_prefill source_tokens={d} split_launches={d} diagnostic_only=1", .{ seq_len, exact_prefill_calls });
+        };
+
         var prefill_last_logits: ?[]f32 = null;
         var prefill_greedy_token: ?usize = null;
         var prefill_last_hidden: ?ops.CT = null;
@@ -5283,7 +7193,9 @@ pub const NativeGenerationPipeline = struct {
         // A sole CUDA request keeps the device-greedy fast path. If a peer
         // arrives after this check, execution_lock still serializes the
         // direct forward against scheduler-driven work.
-        const use_cuda_prefill_greedy_token = (self.execution_lock == null or !has_scheduler_peers) and
+        const use_cuda_prefill_greedy_token = self.checkpoint_prepare == null and self.checkpoint_resume == null and
+            !platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_PROBE") and
+            (self.execution_lock == null or !has_scheduler_peers) and
             shouldUseCudaPrefillGreedyToken(
                 self.cb.kind(),
                 config,
@@ -5306,6 +7218,27 @@ pub const NativeGenerationPipeline = struct {
             capture_last_hidden,
         );
         const can_use_typed_prefill_outputs = self.graph_cache == null and self.compiled_partition_backend == null;
+        const allow_shared_kv_prefill = can_use_typed_prefill_outputs and
+            self.checkpoint_prepare == null and self.checkpoint_resume == null and
+            !capture_last_hidden and config.kv_cache_mode == .exact_hybrid;
+        // Admission already covers prompt + output KV. Reserve the prompt and
+        // a bounded decode tail instead of growing/copying every donor layer
+        // during prefill. Longer decodes keep the ordinary growth contract.
+        // Keep fitting, restore, shared prefixes, and speculation on their
+        // existing storage contracts until separately qualified.
+        if (allow_shared_kv_prefill and self.cb.kind() == .cuda and self.kv_dtype == .f16 and
+            self.prompt_cache == null and !config.prompt_cache_enabled and self.draft_cb == null and
+            !config.speculation_requested and prefilled_tokens == 0 and decode_state.total_tokens == 0 and
+            decode_state.sequence_id == null and decode_state.isPaged() and decode_state.kvSlidingWindowTokens() == null and
+            decode_state.cudaPagedKvReplayCapacityTokens() == null and
+            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_RESERVE_PREFILL_KV", true))
+        {
+            if (cudaE4bPrefillKvCapacity(self.gpt_config, seq_len, config.max_tokens)) |capacity| {
+                const limit = std.mem.alignForward(usize, seq_len + @as(usize, @intCast(config.max_tokens)), 16);
+                try decode_state.reserveFreshCudaKvCapacity(capacity, limit);
+                std.log.info("cuda_prefill_kv_reservation prompt_tokens={d} capacity_tokens={d}", .{ seq_len, capacity });
+            }
+        }
         const prefer_cuda_direct_last_logits = can_use_typed_prefill_outputs and self.cb.kind() == .cuda;
         debugGenerationStage(
             "executePrefill enter seq_len={d} prefilled={d} query_len={d} paged={} scheduler={} compiled_whole_model={} prefill_greedy={}",
@@ -5331,7 +7264,7 @@ pub const NativeGenerationPipeline = struct {
             }
         }
 
-        if (self.compiled_partition_backend != null and self.compiled_attachment_target == .whole_model and self.graph_cache != null) {
+        if (config.kv_cache_mode != .select_v1 and self.compiled_partition_backend != null and self.compiled_attachment_target == .whole_model and self.graph_cache != null) {
             if (prefilled_tokens != 0) return error.UnsupportedShape;
             const whole_model_kv_policy = generationKvCapacityPolicyForRoute(
                 if (self.compiled_partition_backend == .metal and
@@ -5436,10 +7369,10 @@ pub const NativeGenerationPipeline = struct {
             {
                 return error.InvalidPrefillChunkPlan;
             }
-            const borrowed_plan = configured_plan orelse leased_plan;
+            const borrowed_plan = if (config.kv_cache_mode == .select_v1) null else configured_plan orelse leased_plan;
             const admitted_plan: ?runtime.scheduler.native_generate.PrefillChunkPlan = if (borrowed_plan) |plan| blk: {
                 try plan.validate();
-                if (prefilled_tokens != 0) {
+                if (prefilled_tokens != 0 and self.checkpoint_resume == null) {
                     std.log.info(
                         "prefill_chunk_plan: status=bypassed reason=prompt_cache_hit fingerprint={x} cached_tokens={d}",
                         .{ plan.fingerprint, prefilled_tokens },
@@ -5447,6 +7380,7 @@ pub const NativeGenerationPipeline = struct {
                     break :blk null;
                 }
                 if (plan.prompt_tokens != query_len) {
+                    if (self.checkpoint_resume != null) return error.InvalidPrefillChunkPlan;
                     std.log.info(
                         "prefill_chunk_plan: status=bypassed reason=prompt_token_mismatch fingerprint={x} plan_prompt_tokens={d} pipeline_prompt_tokens={d}",
                         .{ plan.fingerprint, plan.prompt_tokens, query_len },
@@ -5482,8 +7416,11 @@ pub const NativeGenerationPipeline = struct {
                 break :blk query_len;
             };
             current_chunk_size = @max(@min(current_chunk_size, query_len), 1);
+            if (config.kv_cache_mode == .select_v1) {
+                current_chunk_size = @min(current_chunk_size, runtime.kv.selection.defaults.prefill_chunk_rows);
+            }
             var first_token_coalesced = false;
-            if (borrowed_plan == null) {
+            if (borrowed_plan == null and config.kv_cache_mode != .select_v1) {
                 const coalesced_chunk_size = coalescedPrefillChunkSizeForFirstToken(
                     self.cb.kind(),
                     isPureGreedyConfig(config) and config.grammar == null,
@@ -5546,20 +7483,21 @@ pub const NativeGenerationPipeline = struct {
                 if (self.scheduler) |scheduler| {
                     if (self.scheduler_lease) |lease| {
                         if (self.io) |io| {
-                            if (!prefillFinalChunkNeedsDirectExecution(
+                            if (!exact_prefill_probe and !prefillFinalChunkNeedsDirectExecution(
                                 total_chunk_end,
                                 seq_len,
                                 output_intent,
                                 prefer_cuda_direct_last_logits,
                                 use_metal_target_last_logits,
                             )) {
-                                prefill_last_logits = self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, chunk, total_chunk_end, chunk.len, total_chunk_end == seq_len) catch |err| {
+                                prefill_last_logits = self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, chunk, total_chunk_end, chunk.len, total_chunk_end == seq_len, allow_shared_kv_prefill) catch |err| {
                                     if (admitted_plan == null and err == error.MemoryBudgetExceeded and chunk_size > 1) {
                                         current_chunk_size = @max(chunk_size / 2, 1);
                                         continue;
                                     }
                                     return err;
                                 };
+                                if (config.kv_cache_mode == .select_v1) try decode_state.compactSelectedGlobalDonors(self.gpt_config, self.execution_control);
                                 processed = chunk_end;
                                 if (admitted_plan != null) plan_chunk_index += 1;
                                 scheduler.notePrefillProgress(lease, prefilled_tokens + processed, seq_len);
@@ -5578,7 +7516,7 @@ pub const NativeGenerationPipeline = struct {
                     }
                 }
                 const direct_execution_mutex = directPrefillExecutionMutex(
-                    false,
+                    exact_prefill_probe,
                     use_cuda_prefill_greedy_token or
                         (total_chunk_end == seq_len and prefer_cuda_direct_last_logits),
                     use_metal_prefill_greedy_token,
@@ -5586,13 +7524,41 @@ pub const NativeGenerationPipeline = struct {
                 );
                 if (direct_execution_mutex) |mutex| try self.lockExecution(mutex);
                 defer if (direct_execution_mutex) |mutex| mutex.unlock();
+                var exact_scope: if (build_options.enable_cuda) ?cuda_compute.CudaCompute.AttentionMatchRepeatScope else ?void = null;
+                if (comptime build_options.enable_cuda) {
+                    if (exact_prefill_probe and chunk.len > 1) {
+                        if (chunk.len > 512) return error.UnsupportedCompactionQueryRoute;
+                        const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
+                        exact_scope = try compute.beginAttentionMatchRepeat(true, chunk.len);
+                        compute.kernels.attention_match_repeat_check_ctx = self;
+                        compute.kernels.attention_match_repeat_check_fn = checkAttentionMatchQueryWork;
+                    }
+                }
+                defer if (comptime build_options.enable_cuda) {
+                    if (exact_scope) |*scope| {
+                        exact_prefill_calls += scope.compute.kernels.attention_match_repeat_split_launches;
+                        scope.deinit();
+                    }
+                };
+
                 try decode_runtime.appendPrefillChunk(chunk.len);
                 const decode_context = decode_runtime.makeDecodeContext(total_chunk_end, chunk.len);
-                const metal_prepared: ?PrefillOutput = if (processed == 0 and total_chunk_end == seq_len and use_metal_prefill_greedy_token)
+                // Shared-KV pruning is only valid for these explicit output
+                // intents. Checkpoint fitting collects queries from every
+                // consumer; hidden-row/MTP consumers also retain the full path.
+                const shared_prefill = if (allow_shared_kv_prefill and
+                    (output_intent == .kv_only or output_intent == .last_logits or output_intent == .greedy_token))
+                    try gpt_arch.tryCudaSharedKvPrefill(&self.cb, allocator, self.gpt_config, chunk, total_chunk_end, &decode_context, output_intent != .kv_only)
+                else
+                    null;
+                const metal_prepared: ?PrefillOutput = if (shared_prefill == null and processed == 0 and total_chunk_end == seq_len and use_metal_prefill_greedy_token)
                     try self.tryMetalPreparedTailPrefillGreedy(chunk, total_chunk_end, &decode_context, capture_last_hidden)
                 else
                     null;
-                if (metal_prepared) |prepared| {
+                if (shared_prefill) |prepared| {
+                    prefill_last_logits = prepared.last_logits;
+                    debugGenerationStage("executePrefill shared_kv_pruned rows={d} output={s}", .{ chunk.len, @tagName(output_intent) });
+                } else if (metal_prepared) |prepared| {
                     prefill_last_logits = prepared.last_logits;
                     prefill_greedy_token = prepared.greedy_token;
                     prefill_last_hidden = prepared.last_hidden;
@@ -5737,6 +7703,9 @@ pub const NativeGenerationPipeline = struct {
                         );
                     }
                 }
+                // The chunk's KV writes and query captures are committed at
+                // this point. Selection never runs inside an active forward.
+                if (config.kv_cache_mode == .select_v1) try decode_state.compactSelectedGlobalDonors(self.gpt_config, self.execution_control);
                 processed = chunk_end;
                 if (admitted_plan != null) plan_chunk_index += 1;
                 if (self.scheduler) |scheduler| {
@@ -5759,7 +7728,7 @@ pub const NativeGenerationPipeline = struct {
             if (self.scheduler) |scheduler| {
                 if (self.scheduler_lease) |lease| {
                     if (self.io) |io| {
-                        prefill_last_logits = try self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, prompt_ids, seq_len, seq_len, true);
+                        prefill_last_logits = try self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, prompt_ids, seq_len, seq_len, true, allow_shared_kv_prefill);
                         scheduler.notePrefillProgress(lease, seq_len, seq_len);
                     } else {
                         _ = try decode_runtime.preparePrefill(seq_len, seq_len);
@@ -6472,6 +8441,7 @@ pub const NativeGenerationPipeline = struct {
             token_ids[seq_len.*] = @intCast(next_token);
             seq_len.* += 1;
             tokens_generated += 1;
+            if (config.kv_cache_mode == .select_v1) try decode_state.compactSelectedGlobalDonors(self.gpt_config, self.execution_control);
             {
                 const kv_mutation_mutex = batchKvMutationMutex(self.execution_lock, decode_state.kv_lock);
                 if (kv_mutation_mutex) |mutex| try self.lockExecution(mutex);
@@ -6524,6 +8494,7 @@ pub const NativeGenerationPipeline = struct {
         gbnf_grammar: ?*const grammar_mod.GbnfGrammar,
         decode_state: *NativeDecodeState,
     ) bool {
+        if (config.kv_cache_mode == .select_v1) return false;
         if (!pipelinedMetalDecodeEnabled()) return false;
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         if (self.cb.kind() != .metal) return false;
@@ -7340,6 +9311,7 @@ pub const NativeGenerationPipeline = struct {
         config: GenerationConfig,
         has_grammar: bool,
     ) !?usize {
+        if (config.kv_cache_mode == .select_v1) return null;
         if (!isPureGreedyConfig(config)) return null;
         if (has_grammar or config.grammar != null) return null;
         try self.rejectUnsupportedDeepSeekV4GraphMode();
@@ -7368,6 +9340,7 @@ pub const NativeGenerationPipeline = struct {
         token_history: []const i64,
         has_grammar: bool,
     ) !?usize {
+        if (config.kv_cache_mode == .select_v1) return null;
         // Greedy requests do not need a sampling feature lookup per token.
         if (isPureGreedyConfig(config)) return null;
         if (self.cb.kind() != .metal) return null;
@@ -10102,6 +12075,7 @@ pub const NativeGenerationPipeline = struct {
             else
                 try json_grammar.*.?.allowedTokenMask(self.allocator, self.tokenizer, self.gpt_config.vocab_size);
             defer self.allocator.free(mask);
+            try self.finishGrammarMask(mask, json_grammar.*.?.isComplete());
             grammar_mod.JsonGrammar.applyMask(mask, logits);
         } else if (gbnf_grammar) |gg| {
             const mask = if (token_table) |tt|
@@ -10109,8 +12083,20 @@ pub const NativeGenerationPipeline = struct {
             else
                 try gg.allowedTokenMask(self.allocator, self.tokenizer, self.gpt_config.vocab_size);
             defer self.allocator.free(mask);
+            try self.finishGrammarMask(mask, try gg.isComplete());
             grammar_mod.GbnfGrammar.applyMask(mask, logits);
         }
+    }
+
+    // End tokens are legal only after a complete grammar match. Never sample
+    // an all-negative-infinity distribution, including an empty-language mask.
+    fn finishGrammarMask(self: *NativeGenerationPipeline, mask: []bool, complete: bool) !void {
+        const primary = self.gpt_config.eos_token_id;
+        if (primary >= 0 and primary < mask.len) mask[@intCast(primary)] = complete;
+        for (self.gpt_config.extra_eos_token_ids[0..self.gpt_config.extra_eos_token_ids_len]) |eos| {
+            if (eos >= 0 and eos < mask.len) mask[@intCast(eos)] = complete;
+        }
+        if (std.mem.indexOfScalar(bool, mask, true) == null) return error.GrammarNoValidToken;
     }
 
     fn advanceGrammarWithToken(
@@ -10120,11 +12106,16 @@ pub const NativeGenerationPipeline = struct {
         json_grammar: *?grammar_mod.JsonGrammar,
         gbnf_grammar: ?*grammar_mod.GbnfGrammar,
     ) !bool {
-        const token_bytes = if (token_table) |table| table.getTokenBytes(token_id) else try self.tokenizer.tokenBytes(self.allocator, @intCast(token_id));
-        defer if (token_table == null) self.allocator.free(token_bytes);
+        const at_start = if (json_grammar.*) |jg| jg.at_start else if (gbnf_grammar) |gg| gg.at_start else return false;
+        const decoded = if (token_table == null)
+            try self.tokenizer.decodeToken(self.allocator, @intCast(token_id), at_start)
+        else
+            null;
+        defer if (decoded) |bytes| self.allocator.free(bytes);
+        const token_bytes = if (token_table) |table| table.getTokenBytesAtPosition(token_id, at_start) else decoded.?;
 
         if (json_grammar.* != null) json_grammar.*.?.advance(token_bytes);
-        if (gbnf_grammar) |gg| gg.advance(token_bytes);
+        if (gbnf_grammar) |gg| try gg.advance(token_bytes);
 
         if (json_grammar.* != null) return json_grammar.*.?.isComplete();
         if (gbnf_grammar) |gg| return gg.isComplete();
@@ -10559,6 +12550,7 @@ pub const NativeGenerationPipeline = struct {
         seq_len: usize,
         query_seq_len: usize,
         wants_last_logits: bool,
+        allow_shared_kv_prefill: bool,
     ) !?[]f32 {
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         const decode_ctx = decode_runtime.makeDecodeContext(seq_len, query_seq_len);
@@ -10569,6 +12561,7 @@ pub const NativeGenerationPipeline = struct {
             .seq_len = seq_len,
             .query_seq_len = query_seq_len,
             .wants_last_logits = wants_last_logits,
+            .allow_shared_kv_prefill = allow_shared_kv_prefill,
         };
         defer if (work.logits) |logits| work.allocator.free(logits);
         var pending_options = pendingWorkOptionsFromState(decode_state, query_seq_len);
@@ -10739,6 +12732,21 @@ pub const NativeGenerationPipeline = struct {
             const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
             reserved[idx] = try reserveAndRefreshScheduledPrefill(&items[idx], work.seq_len);
             reserved_count = idx + 1;
+        }
+
+        // Preserve the scheduler's turn, execution lock, and reservation
+        // rollback. Only the originating request can authorize pruning, and
+        // only a singleton KV-only prefill may use the direct KV context.
+        // Mixed batches and query/hidden-state consumers retain the full path.
+        if (claimed.len == 1 and claimed[0].phase == .prefill) {
+            const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(claimed[0].work_ptr));
+            if (work.allow_shared_kv_prefill and !work.wants_last_logits) {
+                var decode_runtime = BorrowedDecodeStateRuntime.init(work.decode_state);
+                const context = decode_runtime.makeDecodeContext(work.seq_len, work.query_seq_len);
+                if (try gpt_arch.tryCudaSharedKvPrefill(&self.cb, self.allocator, self.gpt_config, work.token_ids, work.seq_len, &context, false)) |_| {
+                    return .{ .logits = null, .max_query_seq_len = max_query_seq_len };
+                }
+            }
         }
 
         var owned_ctx = try buildOwnedMixedBatchDecodeContext(self.allocator, items);
@@ -13338,6 +15346,132 @@ test "native decode state rejects KV compaction for DeepSeek V4 compressed cache
     );
 }
 
+test "CUDA prefill KV reservation keeps manager and storage counts aligned" {
+    const allocator = std.testing.allocator;
+    const config = runtime.kv.pool.KvPoolConfig{
+        .backend = .cuda,
+        .dtype = .f16,
+        .page_size_tokens = 16,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 4,
+        .store_cpu_bytes = false,
+    };
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+    const pool = try manager.addPool(config);
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, config);
+    defer storage.deinit();
+    var state = NativeDecodeState.initPaged(allocator, &manager, pool, null);
+    state.kv_storage = &storage;
+    defer state.deinit();
+    try state.reserveFreshCudaKvCapacity(48, 64);
+    const sequence = state.sequence_id.?;
+    try std.testing.expectEqual(@as(usize, 0), state.total_tokens);
+    try std.testing.expectEqual(@as(?usize, 0), manager.tokenCount(sequence));
+    try std.testing.expectEqual(@as(?usize, 0), storage.tokenCount(sequence));
+    try std.testing.expect(state.kvView() == null);
+    try state.appendPrefillChunk(17);
+    try state.appendGeneratedToken();
+    try std.testing.expectEqual(@as(?usize, 18), manager.tokenCount(sequence));
+    try std.testing.expectEqual(@as(?usize, 18), storage.tokenCount(sequence));
+    try std.testing.expectEqual(@as(usize, 18), state.kvView().?.token_count);
+    try std.testing.expectEqual(@as(usize, 4), (try storage.logicalBlocksWithReservations(sequence)).len);
+    try state.appendPrefillChunk(31);
+    try std.testing.expectEqual(@as(?usize, 49), manager.tokenCount(sequence));
+    try std.testing.expectEqual(@as(?usize, 49), storage.tokenCount(sequence));
+    try std.testing.expectEqual(@as(usize, 4), (try storage.logicalBlocksWithReservations(sequence)).len);
+    try std.testing.expectError(error.InvalidPagedKvState, state.reserveFreshCudaKvCapacity(64, 64));
+}
+
+test "attention match checkpoint owner retains logical history without host KV mirrors" {
+    const allocator = std.testing.allocator;
+    const config = attentionMatchCheckpointPoolConfig(.f16, .{
+        .family = .gemma,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 8,
+        .sliding_window = 4,
+    });
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+    const pool = try manager.addPool(config);
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, config);
+    defer storage.deinit();
+    var state = NativeDecodeState.initPaged(allocator, &manager, pool, null);
+    state.kv_storage = &storage;
+    defer state.deinit();
+    try std.testing.expectEqual(@as(usize, 0), storage.sequences.items.len);
+    try std.testing.expect(!storage.storage.config.store_cpu_bytes);
+    try state.notePrefill(32763);
+    const sequence = state.sequence_id.?;
+    try state.appendPrefillChunk(2);
+    try std.testing.expectEqual(@as(usize, 32765), state.total_tokens);
+    try std.testing.expectEqual(@as(?usize, 32765), storage.tokenCount(sequence));
+    // Exercise the actual decode append path, which applies sliding-window
+    // trimming. Zero is a window of zero tokens; only null disables trimming.
+    // Crossing the next page boundary previously erased the KV view entirely.
+    for (32766..32769) |logical_tokens| {
+        try state.appendGeneratedToken();
+        try std.testing.expectEqual(@as(?usize, logical_tokens), manager.tokenCount(sequence));
+        try std.testing.expectEqual(@as(?usize, logical_tokens), storage.tokenCount(sequence));
+        const view = state.kvView() orelse return error.MissingRestoredKvView;
+        try std.testing.expectEqual(logical_tokens, view.token_count);
+        try std.testing.expectEqual(@as(usize, 0), view.position_offset);
+        try std.testing.expectEqual((logical_tokens + 15) / 16, view.logical_block_count);
+    }
+    for ([_]*runtime.kv.pool.KvPool{ manager.getPoolMut(pool).?.hostPool().?, storage.storage.hostPool().? }) |metadata| {
+        for (metadata.blocks.items) |block| {
+            try std.testing.expectEqual(@as(usize, 0), block.k_data.len);
+            try std.testing.expectEqual(@as(usize, 0), block.v_data.len);
+        }
+        try std.testing.expectError(error.KvBytesUnavailable, metadata.readToken(0, 0, 0));
+    }
+}
+
+test "attention match request CUDA metadata pool preserves storage through append and rollback" {
+    const allocator = std.testing.allocator;
+    const config = runtime.kv.pool.KvPoolConfig{
+        .backend = .cuda,
+        .dtype = .f16,
+        .page_size_tokens = 4,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    };
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+    const pool_id = try manager.addPool(requestKvManagerPoolConfig(config));
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, config);
+    defer storage.deinit();
+    var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    state.kv_storage = &storage;
+    defer state.deinit();
+    try state.notePrefill(4);
+    const sequence = state.sequence_id.?;
+    const keys = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const values = [_]f32{ 8, 7, 6, 5, 4, 3, 2, 1 };
+    try storage.writeFullLayerKv(sequence, 0, 4, &keys, &values);
+    for (0..20) |_| {
+        try state.appendPrefillChunk(5);
+        try state.truncateTokens(5);
+        try std.testing.expectEqual(@as(usize, 4), state.total_tokens);
+        const gathered = try storage.gatherLayerKv(allocator, sequence, 0, 4);
+        defer allocator.free(gathered.k);
+        defer allocator.free(gathered.v);
+        try std.testing.expectEqualSlices(f32, &keys, gathered.k);
+        try std.testing.expectEqualSlices(f32, &values, gathered.v);
+        const metadata = manager.getPoolMut(pool_id).?.hostPool().?;
+        for (metadata.blocks.items) |block| {
+            try std.testing.expectEqual(@as(usize, 0), block.k_data.len);
+            try std.testing.expectEqual(@as(usize, 0), block.v_data.len);
+        }
+        try std.testing.expect(metadata.blocks.items.len <= 3);
+        try std.testing.expectError(error.KvBytesUnavailable, metadata.readToken(0, 0, 0));
+    }
+}
+
 test "native decode state rejects KV compaction when device storage is attached" {
     const allocator = std.testing.allocator;
     const pool_config = runtime.kv.pool.KvPoolConfig{
@@ -13886,6 +16020,13 @@ test "Metal ring admission excludes decode paths that require materialized KV" {
         try std.testing.expect(!metalRingDecodeRequestEligible(config));
         try std.testing.expectEqual(.full_history, generationKvCapacityPolicyForRoute(.metal_whole_model, model_config, config, .f16));
     }
+}
+
+test "qualification-only exact hybrid ring admits sampled and grammar eager decode" {
+    try std.testing.expect(metalRingDecodeRequestEligibleWithQualification(.{ .temperature = 0.7 }, true));
+    try std.testing.expect(metalRingDecodeRequestEligibleWithQualification(.{ .temperature = 0, .grammar = "json" }, true));
+    try std.testing.expect(!metalRingDecodeRequestEligibleWithQualification(.{ .temperature = 0.7, .prompt_cache_enabled = true }, true));
+    try std.testing.expect(!metalRingDecodeRequestEligibleWithQualification(.{ .temperature = 0.7, .speculation_requested = true }, true));
 }
 
 test "generation KV capacity policy is route and device-format aware" {
@@ -15244,6 +17385,8 @@ pub fn formatMessages(allocator: std.mem.Allocator, messages: []const Message) !
             return error.ToolHistoryRequiresChatTemplate;
         if (std.mem.eql(u8, msg.role, "system")) {
             try buf.appendSlice(allocator, "System: ");
+        } else if (std.mem.eql(u8, msg.role, "developer")) {
+            try buf.appendSlice(allocator, "Developer: ");
         } else if (std.mem.eql(u8, msg.role, "user")) {
             try buf.appendSlice(allocator, "User: ");
         } else if (std.mem.eql(u8, msg.role, "assistant")) {
@@ -15269,6 +17412,17 @@ pub fn formatMessages(allocator: std.mem.Allocator, messages: []const Message) !
     try buf.appendSlice(allocator, "Assistant: ");
 
     return try allocator.dupe(u8, buf.items);
+}
+
+test "context fallback formatting preserves developer role" {
+    const messages = [_]Message{
+        .{ .role = "system", .content = "system policy" },
+        .{ .role = "developer", .content = "developer policy" },
+        .{ .role = "user", .content = "question" },
+    };
+    const prompt = try formatMessages(std.testing.allocator, &messages);
+    defer std.testing.allocator.free(prompt);
+    try std.testing.expectEqualStrings("System: system policy\n\nDeveloper: developer policy\n\nUser: question\n\nAssistant: ", prompt);
 }
 
 test "qwen image placeholders encode from config token ids" {
@@ -15786,6 +17940,19 @@ test "Gemma4 MTP activation replacement invalidates cached target pairing" {
     try std.testing.expectEqual(@as(?u32, null), state.cached_target_choice);
     try std.testing.expect(!state.cached_choice_matches_activation);
     try std.testing.expect(!state.residentReady());
+}
+
+test "attention match collector rejects CPU before accessing source state" {
+    var model: PreparedEmbeddingsTestModel = undefined;
+    model.init(std.testing.allocator);
+    defer model.deinit(std.testing.allocator);
+    var pipeline = model.pipeline(std.testing.allocator, .{ .family = .gemma });
+    var source: NativeDecodeState = undefined;
+    try std.testing.expectError(error.UnsupportedCompactionQueryModel, pipeline.collectAttentionMatchQueries(&.{ 1, 2 }, &source, .{ .repeat_mode = .exact }));
+}
+
+test "attention match snapshot pipeline adapter compiles" {
+    std.mem.doNotOptimizeAway(&NativeGenerationPipeline.snapshotAttentionMatchState);
 }
 
 test "raw token bytes keep grammar streaming aligned with the constrained output" {

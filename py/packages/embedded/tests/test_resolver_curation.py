@@ -22,34 +22,38 @@ import antfly_embedded
 pytestmark = pytest.mark.usefixtures("require_native")
 
 
+def _add_curation_graph(db):
+    db.add_index(
+        {
+            "name": "knowledge",
+            "type": "graph",
+            "source": {"artifact": "kg", "format": "extraction_graph", "mention_edge_type": "mentions"},
+            "artifact": {
+                "name": "kg",
+                "kind": "asset",
+                "source": {"type": "field", "value": "kg"},
+                "content_type": "application/json",
+            },
+            "edge_types": [{"name": "mentions"}],
+            "resolvers": [
+                {
+                    "name": "concepts",
+                    "table": "default",
+                    "promote": False,
+                    "source_artifact": "kg",
+                    "resolution_artifact": "resolved",
+                    "key_template": "concept/{{uslug _entity.text}}",
+                }
+            ],
+        }
+    )
+
+
 def test_resolver_curation_round_trip(aflite_path):
     with antfly_embedded.create(aflite_path) as db:
-        db.add_index(
-            {
-                "name": "knowledge",
-                "type": "graph",
-                "source": {"artifact": "kg", "format": "extraction_graph", "mention_edge_type": "mentions"},
-                "artifact": {
-                    "name": "kg",
-                    "kind": "asset",
-                    "source": {"type": "field", "value": "kg"},
-                    "content_type": "application/json",
-                },
-                "edge_types": [{"name": "mentions"}],
-                "resolvers": [
-                    {
-                        "name": "concepts",
-                        "table": "default",
-                        "promote": False,
-                        "source_artifact": "kg",
-                        "resolution_artifact": "resolved",
-                        "key_template": "concept/{{uslug _entity.text}}",
-                    }
-                ],
-            }
-        )
-        accepted = db.curate_entity("default", "concept/a", {"action": "merge", "into": "concept/b"})
-        assert accepted["results"][0]["revision"] == 1
+        _add_curation_graph(db)
+        db.merge_resolver_keys("concepts", "concept/a", "concept/b")
+        assert db.resolver_curation("concepts")["curation_revision"] == 1
         assert db.render_resolver_key("concepts", {"text": "A", "label": "concept"})["key"] == "concept/b"
         db.unmerge_resolver_key("concepts", {"from": "concept/a", "pin_distinct": True})
         db.suppress_resolver_keys("concepts", {"add": {"keys": ["concept/noise"], "texts": ["private source text"]}})
@@ -66,6 +70,36 @@ def test_resolver_curation_round_trip(aflite_path):
         assert db.pending_work_stats()["resolver_curation"]["resolvers"][0]["curation_revision"] == 4
     with antfly_embedded.open(aflite_path) as db:
         assert db.resolver_curation("concepts")["curation_revision"] == 4
+        assert not db.render_resolver_key("concepts", {"text": "Noise", "label": "concept"})["suppressed"]
+
+
+def test_namespace_curation_retains_one_authority_across_reopen(aflite_path):
+    with antfly_embedded.create(aflite_path) as db:
+        _add_curation_graph(db)
+        accepted = db.curate_entity("default", "concept/a", {"action": "merge", "into": "concept/b"})
+        assert accepted["results"][0]["revision"] == 1
+        assert db.render_resolver_key("concepts", {"text": "A", "label": "concept"})["key"] == "concept/b"
+        # Namespace adoption gives every consumer one durable authority. A
+        # resolver-scoped edit must not create a second, divergent policy.
+        for edit in (
+            lambda: db.unmerge_resolver_key("concepts", {"from": "concept/a"}),
+            lambda: db.suppress_resolver_keys("concepts", {"add": {"keys": ["concept/noise"]}}),
+            lambda: db.unsuppress_resolver_key("concepts", {"key": "concept/noise"}),
+        ):
+            with pytest.raises(antfly_embedded.InvalidArgumentError, match="ResolverNamespaceCurationRequired"):
+                edit()
+        for revision, key, action in (
+            (2, "concept/a", {"action": "unmerge", "pin_distinct": True}),
+            (3, "concept/noise", {"action": "suppress"}),
+            (4, "concept/noise", {"action": "unsuppress"}),
+        ):
+            result = db.curate_entity("default", key, action)
+            assert result["results"][0]["revision"] == revision
+        db.run_until_idle()
+        assert db.resolver_curation("concepts")["curation_revision"] == 4
+    with antfly_embedded.open(aflite_path) as db:
+        assert db.resolver_curation("concepts")["curation_revision"] == 4
+        assert db.render_resolver_key("concepts", {"text": "A", "label": "concept"})["key"] == "concept/a"
         assert not db.render_resolver_key("concepts", {"text": "Noise", "label": "concept"})["suppressed"]
 
 

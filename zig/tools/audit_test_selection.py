@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -43,7 +44,10 @@ def audit(
             if not line.startswith("TEST\t"):
                 continue
             name = line.removeprefix("TEST\t")
-            if name.endswith(".test_0"):
+            # Match the aggregate ownership and inventory-comparison policy:
+            # unnamed import-discovery blocks are numbered test_0, test_1, ...
+            # Named tests can legitimately end with that spelling.
+            if ".test." not in name and re.search(r"\.test_[0-9]+$", name):
                 continue
             if name in owners:
                 errors.append(f"test has multiple owners: {name}")

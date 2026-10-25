@@ -4896,7 +4896,9 @@ test "prepared transaction effects observed identity scopes unwind every allocat
 
 test "controlled live primary scans cancel within each phase and recover without leaks" {
     const mem_backend = @import("../mem_backend.zig");
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     var backend = mem_backend.Backend.init(a, .{});
     defer backend.close();
     var store = try docstore_mod.DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));

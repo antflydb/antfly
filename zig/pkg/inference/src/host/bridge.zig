@@ -33,7 +33,7 @@ const antfly_image = @import("antfly_image");
 // Version 41 introduced CUDA cache credits surviving cache/host teardown.
 // Version 40 introduced the parented/supervised host cache allocator contract.
 // Worker Create.bridge_version also fences older executables before startup.
-pub const abi_version: u32 = 44;
+pub const abi_version: u32 = 45;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;

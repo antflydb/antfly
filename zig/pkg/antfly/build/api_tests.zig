@@ -1013,7 +1013,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     inference_http_deadline_run.addArg("--require-no-skips");
     b.step("antfly-inference-http-deadline-test", "Verify inference HTTP native clock conversion and borrowed lifetime intersection")
         .dependOn(&inference_http_deadline_run.step);
-    const inference_phase_filters = [_][]const u8{ "runnable execution local provider", "runnable execution worker budget" };
+    const inference_phase_filters = [_][]const u8{ "runnable execution local provider", "runnable execution worker budget", "native checkpoint worker upload", "inference worker checkpoint upload" };
     const inference_phase_tests = b.addTest(.{
         .name = "inference-parent-phase-tests",
         .root_module = antfly_imports.inference_host,
@@ -1022,7 +1022,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const inference_phase_step = b.step("antfly-inference-parent-phase-test", "Run provider grant transfer, worker demand and owned-result cleanup contracts");
     inference_phase_step.dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, inference_phase_tests, &inference_phase_filters).step);
-    const inference_wire_filters = [_][]const u8{"inference worker"};
+    const inference_wire_filters = [_][]const u8{ "inference worker", "native checkpoint worker streaming" };
     const inference_wire_tests = b.addTest(.{
         .name = "inference-parent-wire-tests",
         .root_module = antfly_imports.inference_worker_wire,
@@ -1829,7 +1829,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         b,
         &lib_api_auth_default_filters,
     );
-    const lib_api_auth_tests = b.addTest(.{
+    // Large native Debug auth objects need the same relocatable-object and
+    // native final-link path as the public API suite.
+    const lib_api_auth = @import("linked_tests.zig").add(b, .{
         .name = "api-auth-tests",
         .max_rss = @import("runtime_memory.zig").testCompileMaxRss("api-auth-tests", b.graph.host.result, target.result, optimize, if (target.result.os.tag == .macos) 12 * 1024 * 1024 * 1024 else 0),
         .root_module = antfly_test_mod,
@@ -1839,6 +1841,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
     });
+    const lib_api_auth_tests = lib_api_auth.executable;
     const run_lib_api_auth_tests = addFilteredTestRunArtifactWithRuntimeFilters(
         b,
         lib_api_auth_tests,
@@ -2000,6 +2003,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, api_storage_authority_test_mod, true, true);
     api_storage_authority_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lib_api_storage_authority_tests = b.addTest(.{
+        .name = @import("test_owner_names.zig").api_storage_authority,
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss(@import("test_owner_names.zig").api_storage_authority, b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024),
         .root_module = api_storage_authority_test_mod,
         .filters = selectTestFilters(b, &.{
             "portable backup manifest rejects partial per-shard accepted generation proof",
@@ -5371,7 +5376,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_api_table_reads_docid_tests = run_api_table_reads_docid_tests,
         .hosted_recovery_tests = hosted_recovery_tests,
         .hosted_recovery_step = hosted_recovery_step,
-        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ public_api_parity_tests, api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_primary_key_rewrite_tests, hosted_initial_fk_tests, hosted_initial_fk_fault_tests, hosted_initial_fk_transfer_tests, hosted_initial_fk_offline_tests, hosted_initial_fk_recovery_tests, hosted_fk_drop_tests, hosted_graph_truncate_tests, hosted_truncate_fk_recovery_tests, hosted_self_fk_retry_tests, hosted_self_fk_diagnostic_tests, hosted_self_fk_fault_tests, hosted_self_fk_metadata_restart_tests, hosted_self_fk_leader_transfer_tests, hosted_self_fk_recovery_tests }) catch @panic("OOM"),
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ public_api_parity_tests, lib_api_auth_tests, api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_primary_key_rewrite_tests, hosted_initial_fk_tests, hosted_initial_fk_fault_tests, hosted_initial_fk_transfer_tests, hosted_initial_fk_offline_tests, hosted_initial_fk_recovery_tests, hosted_fk_drop_tests, hosted_graph_truncate_tests, hosted_truncate_fk_recovery_tests, hosted_self_fk_retry_tests, hosted_self_fk_diagnostic_tests, hosted_self_fk_fault_tests, hosted_self_fk_metadata_restart_tests, hosted_self_fk_leader_transfer_tests, hosted_self_fk_recovery_tests }) catch @panic("OOM"),
         .run_api_public_table_http_docid_tests = run_api_public_table_http_docid_tests,
         .run_raft_transition_runtime_docid_tests = run_raft_transition_runtime_docid_tests,
         .run_api_table_writes_production_regression_unit_tests = run_api_table_writes_production_regression_unit_tests,

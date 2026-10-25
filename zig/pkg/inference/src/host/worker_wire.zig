@@ -17,7 +17,7 @@ const std = @import("std");
 const bridge = @import("antfly_inference_bridge");
 const http = @import("antfly_runtime_abi").http_abi;
 
-pub const version: u32 = 15;
+pub const version: u32 = 16;
 // Only options are JSON metadata. The application payload is carried raw.
 pub const Request = struct { operation: Operation, options: []const u8 = "" };
 pub const ResourceRequest = struct { operation: Operation, data: []const u8 };
@@ -341,6 +341,7 @@ pub const Http = struct {
     headers: []const Header,
     params: []const Header,
     has_body: bool,
+    stream_body: bool = false,
     deadline_ns: ?u64 = null,
     admitted_cpu_slots: u32 = 0,
     phase_handoff: bool = false,
@@ -351,6 +352,14 @@ pub const Http = struct {
             return error.InvalidRunnableDemand;
     }
 };
+
+pub const native_checkpoint_upload_limit: usize = 2 * 1024 * 1024 * 1024 + 2 * 1024 * 1024 + 128;
+
+pub fn nativeCheckpointResume(method: http.HttpMethod, path: []const u8) bool {
+    return method == .post and (std.mem.eql(u8, path, bridge.ai_api_prefix ++ "/generate/context/resume") or
+        std.mem.eql(u8, path, bridge.public_api_prefix ++ "/generate/context/resume"));
+}
+
 pub const HttpResponse = struct { status: u16, headers: []const Header };
 pub const Reservation = struct { lease: usize = 0, amounts: bridge.AdmissionAmounts };
 pub const Transfer = struct { source: usize, destination: usize, amounts: bridge.AdmissionAmounts };
@@ -499,4 +508,14 @@ test "inference worker HTTP requires valid scalar demand for acknowledged phases
     try std.testing.expectError(error.InvalidRunnableDemand, input.validate());
     input.phase_handoff = false;
     try std.testing.expectError(error.InvalidRunnableDemand, input.validate());
+}
+
+test "native checkpoint worker streaming stays limited to exact POST resume routes" {
+    inline for (.{ bridge.ai_api_prefix, bridge.public_api_prefix }) |prefix| {
+        try std.testing.expect(nativeCheckpointResume(.post, prefix ++ "/generate/context/resume"));
+        try std.testing.expect(!nativeCheckpointResume(.get, prefix ++ "/generate/context/resume"));
+        try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ "/generate/context/resume/"));
+        try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ "/generate/context/checkpoint"));
+        try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ "/chat/completions"));
+    }
 }

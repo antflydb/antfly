@@ -19,6 +19,7 @@ const block_table = @import("block_table.zig");
 const manager_mod = @import("manager.zig");
 const pool_mod = @import("pool.zig");
 const storage_mod = @import("storage.zig");
+pub const device_clone = @import("device_clone.zig");
 
 pub const SequenceId = manager_mod.SequenceId;
 
@@ -139,6 +140,10 @@ pub const SequenceState = struct {
     active: bool = true,
     block_table: block_table.SequenceBlockTable = .{},
     reserved_tail_blocks: std.ArrayListUnmanaged(block.KvBlockId) = .empty,
+    /// Allocate reserved device slots lazily on the first write. Logical
+    /// length still advances only through appendTokens.
+    initial_device_capacity_tokens: usize = 0,
+    device_capacity_limit_tokens: usize = 0,
     compacted: bool = false,
 
     pub fn deinit(self: *SequenceState, allocator: std.mem.Allocator) void {
@@ -161,6 +166,11 @@ pub const KvSuffixWrite = struct {
     sequence_id: SequenceId,
     layer_index: usize,
     total_token_count: usize,
+    /// Admitted, page-aligned capacity, separate from valid attention length.
+    /// Zero preserves incremental device allocation.
+    device_capacity_tokens: usize = 0,
+    /// Maximum admitted capacity for this request; zero keeps legacy growth.
+    device_capacity_limit_tokens: usize = 0,
     suffix_token_count: usize,
     /// Absolute position of the first suffix token in the sequence — passed
     /// through to the kernel so it can tag the span with position_offset.
@@ -170,6 +180,9 @@ pub const KvSuffixWrite = struct {
     sliding_window: usize = 0,
     max_inflight_tokens: usize = 0,
     allow_swa_ring: bool = false,
+    /// Keep global-layer storage private to this sequence so a later lossy
+    /// compaction can release the original backing allocation safely.
+    sequence_owned_global: bool = false,
     logical_blocks: ?[]const block.KvBlockId = null,
     page_size_tokens: u16 = 0,
 };
@@ -212,6 +225,7 @@ pub const DeviceKvLayerReserve = struct {
     sliding_window: usize = 0,
     max_inflight_tokens: usize = 0,
     allow_swa_ring: bool = false,
+    sequence_owned_global: bool = false,
     logical_blocks: ?[]const block.KvBlockId = null,
     page_size_tokens: u16 = 0,
 };
@@ -238,6 +252,40 @@ pub const DevicePagedKvLayer = struct {
     /// Non-zero when logical pages wrap through a fixed physical SWA ring.
     ring_page_count: usize = 0,
     position_offset: usize,
+    /// Present only for a compacted global-attention donor. The slice is
+    /// owned by the backend hook and remains valid until the next mutation of
+    /// this sequence/layer binding or sequence release.
+    key_positions: ?[]const u32 = null,
+};
+
+pub const SelectedGlobalKvRepack = struct {
+    sequence_id: SequenceId,
+    layer_index: usize,
+    /// Slot observed before selection. Prevents committing against a binding
+    /// replaced by another compaction or retry.
+    expected_source_slot: usize,
+    expected_written_tokens: usize,
+    /// Physical source row for each selected position, in the same order.
+    source_token_offsets: []const u32,
+    key_positions: []const u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+};
+
+pub const SelectedAttentionScore = struct {
+    sequence_id: SequenceId,
+    layer_index: usize,
+    queries: []const f32,
+    query_positions: []const u32,
+    key_positions: []const u32,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    score_scale: f32,
+    softcap: f32 = 0,
+    scores_out: []f32,
+    check_ctx: ?*anyopaque,
+    check_fn: *const fn (?*anyopaque) callconv(.c) c_int,
 };
 
 /// Backend-provided hook that services device-resident KV reads and writes
@@ -249,11 +297,20 @@ pub const DevicePagedKvLayer = struct {
 ///   when the backend has no device-side read path, forcing callers to use
 ///   the default storage-backed gather. Returning `error.DeviceReadFallback`
 ///   tells callers to retry via the host path for this specific read.
+pub const attention_match_snapshot = @import("attention_match_snapshot.zig");
+
 pub const DeviceWriteHook = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Authoritative, fenced exact-prefix readback. Unlike gatherLayerKv,
+        /// this path never retries through host pool storage.
+        readExactAttentionMatchKv: ?*const fn (*anyopaque, attention_match_snapshot.Range, []f32, []f32) anyerror!void = null,
+        /// Clone into an empty, separately owned hook. Both bindings must remain
+        /// locked by the caller. Success fences copies; failure leaves both
+        /// bindings unchanged. No aliasing or implicit host fallback is allowed.
+        cloneExactPrefix: ?*const fn (ctx: *anyopaque, source: DeviceWriteHook, request: device_clone.Request) anyerror!device_clone.Result = null,
         writeLayerKvSuffix: *const fn (
             ctx: *anyopaque,
             write: KvSuffixWrite,
@@ -267,6 +324,11 @@ pub const DeviceWriteHook = struct {
             gather: KvLayerGather,
             k_out: []f32,
             v_out: []f32,
+        ) anyerror!void = null,
+        gatherLayerKeys: ?*const fn (
+            ctx: *anyopaque,
+            gather: KvLayerGather,
+            k_out: []f32,
         ) anyerror!void = null,
         /// Optional device-side raw f32 gather. This exposes backend-owned
         /// device buffers for decode kernels that can consume KV without
@@ -297,6 +359,14 @@ pub const DeviceWriteHook = struct {
             ctx: *anyopaque,
             commit: DeviceKvLayerWriteCommit,
         ) anyerror!void = null,
+        /// Transactionally repack selected encoded K/V rows into a new
+        /// sequence-owned slot. Implementations must leave the old binding
+        /// untouched on failure.
+        repackSelectedGlobalKv: ?*const fn (
+            ctx: *anyopaque,
+            repack: SelectedGlobalKvRepack,
+        ) anyerror!DevicePagedKvLayer = null,
+        scoreSelectedAttention: ?*const fn (ctx: *anyopaque, request: SelectedAttentionScore) anyerror!void = null,
         /// Optional notification that a sequence tail was truncated. Device
         /// coverage metadata must shrink with the logical block table so a
         /// subsequent correction/retry can rewrite the rolled-back positions.
@@ -310,6 +380,11 @@ pub const DeviceWriteHook = struct {
         /// cache entries, etc.). Called from `releaseSequence` before the
         /// sequence state is cleared. Null = no-op.
         releaseSequence: ?*const fn (ctx: *anyopaque, sequence_id: SequenceId) void = null,
+        /// True only when the backend can consume donor-scoped selected KV
+        /// with an explicit absolute position per retained row. A backend must
+        /// leave this false until storage, attention kernels, and transactional
+        /// replacement are all wired; callers use it to fail closed.
+        supportsSelectedGlobalKv: ?*const fn (ctx: *const anyopaque) bool = null,
         deinit: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) void,
     };
 
@@ -320,6 +395,17 @@ pub const DeviceWriteHook = struct {
         v: DeviceKvRef,
     ) !void {
         return self.vtable.writeLayerKvSuffix(self.ctx, write, k, v);
+    }
+
+    pub fn attentionMatchReader(self: DeviceWriteHook) !attention_match_snapshot.Reader {
+        return .{ .context = self.ctx, .read_fn = self.vtable.readExactAttentionMatchKv orelse return error.DeviceReadUnsupported };
+    }
+
+    pub fn cloneExactPrefix(self: DeviceWriteHook, source: DeviceWriteHook, request: device_clone.Request) !device_clone.Result {
+        if (self.ctx == source.ctx or self.vtable != source.vtable) return error.InvalidDeviceKvClone;
+        const clone_fn = self.vtable.cloneExactPrefix orelse return error.DeviceKvCloneUnsupported;
+        try request.check();
+        return clone_fn(self.ctx, source, request);
     }
 
     pub fn gatherLayerKv(
@@ -352,6 +438,16 @@ pub const DeviceWriteHook = struct {
         return commit_fn(self.ctx, commit);
     }
 
+    pub fn repackSelectedGlobalKv(self: DeviceWriteHook, repack: SelectedGlobalKvRepack) !DevicePagedKvLayer {
+        const repack_fn = self.vtable.repackSelectedGlobalKv orelse return error.DeviceWriteUnsupported;
+        return repack_fn(self.ctx, repack);
+    }
+
+    pub fn scoreSelectedAttention(self: DeviceWriteHook, request: SelectedAttentionScore) !void {
+        const score_fn = self.vtable.scoreSelectedAttention orelse return error.DeviceReadUnsupported;
+        return score_fn(self.ctx, request);
+    }
+
     pub fn truncateSequence(self: DeviceWriteHook, sequence_id: SequenceId, retained_token_count: usize) void {
         const truncate_fn = self.vtable.truncateSequence orelse return;
         truncate_fn(self.ctx, sequence_id, retained_token_count);
@@ -360,6 +456,11 @@ pub const DeviceWriteHook = struct {
     pub fn releaseSequence(self: DeviceWriteHook, sequence_id: SequenceId) void {
         const release_fn = self.vtable.releaseSequence orelse return;
         release_fn(self.ctx, sequence_id);
+    }
+
+    pub fn supportsSelectedGlobalKv(self: DeviceWriteHook) bool {
+        const supports_fn = self.vtable.supportsSelectedGlobalKv orelse return false;
+        return supports_fn(self.ctx);
     }
 
     pub fn deinit(self: DeviceWriteHook, allocator: std.mem.Allocator) void {
@@ -420,6 +521,65 @@ pub const KvStorageRuntime = struct {
         self.device_write_hook = hook;
     }
 
+    pub fn supportsSelectedGlobalKv(self: *const KvStorageRuntime) bool {
+        const hook = self.device_write_hook orelse return false;
+        return hook.supportsSelectedGlobalKv();
+    }
+
+    pub fn repackSelectedGlobalKv(
+        self: *KvStorageRuntime,
+        repack: SelectedGlobalKvRepack,
+    ) !DevicePagedKvLayer {
+        const hook = self.device_write_hook orelse return error.DeviceWriteUnsupported;
+        _ = try self.sequenceMut(repack.sequence_id);
+        return hook.repackSelectedGlobalKv(repack);
+    }
+
+    pub fn pagedLayerKvDevice(
+        self: *KvStorageRuntime,
+        sequence_id: SequenceId,
+        layer_index: usize,
+        token_count: usize,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) !DevicePagedKvLayer {
+        const hook = self.device_write_hook orelse return error.DeviceReadUnsupported;
+        return hook.pagedLayerKvDevice(.{
+            .sequence_id = sequence_id,
+            .layer_index = layer_index,
+            .token_count = token_count,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+        });
+    }
+
+    pub fn gatherLayerKeys(
+        self: *KvStorageRuntime,
+        allocator: std.mem.Allocator,
+        sequence_id: SequenceId,
+        layer_index: usize,
+        token_count: usize,
+    ) ![]f32 {
+        const hook = self.device_write_hook orelse return error.DeviceReadUnsupported;
+        const width = self.storage.keyValuesPerToken();
+        const keys = try allocator.alloc(f32, try std.math.mul(usize, token_count, width));
+        errdefer allocator.free(keys);
+        const gather_fn = hook.vtable.gatherLayerKeys orelse return error.DeviceReadUnsupported;
+        try gather_fn(hook.ctx, .{
+            .sequence_id = sequence_id,
+            .layer_index = layer_index,
+            .token_count = token_count,
+            .num_kv_heads = self.storage.config.num_kv_heads,
+            .head_dim = self.storage.config.head_dim,
+        }, keys);
+        return keys;
+    }
+
+    pub fn scoreSelectedAttention(self: *KvStorageRuntime, request: SelectedAttentionScore) !void {
+        const hook = self.device_write_hook orelse return error.DeviceReadUnsupported;
+        return hook.scoreSelectedAttention(request);
+    }
+
     /// Device-resident suffix write. Requires a device-write hook installed.
     /// Returns `error.DeviceWriteUnsupported` when no hook is present so
     /// callers can fall back to the host-slice path.
@@ -436,6 +596,10 @@ pub const KvStorageRuntime = struct {
         const reserved_capacity = (sequence_state.block_table.blocks.items.len + sequence_state.reserved_tail_blocks.items.len) * page_size;
         if (write.total_token_count > reserved_capacity) return error.KvCapacityTooSmall;
         var enriched = write;
+        enriched.device_capacity_tokens = sequence_state.initial_device_capacity_tokens;
+        enriched.device_capacity_limit_tokens = sequence_state.device_capacity_limit_tokens;
+        if (enriched.device_capacity_limit_tokens != 0 and write.total_token_count > enriched.device_capacity_limit_tokens)
+            return error.KvCapacityTooSmall;
         enriched.allow_swa_ring = enriched.allow_swa_ring and sequence_state.block_table.shared_prefix_blocks == 0;
         enriched.logical_blocks = try self.logicalBlocksWithReservations(write.sequence_id);
         enriched.page_size_tokens = page_size;
@@ -468,6 +632,31 @@ pub const KvStorageRuntime = struct {
             .sliding_window = sliding_window,
             .max_inflight_tokens = max_inflight_tokens,
             .allow_swa_ring = allow_swa_ring and sequence_state.block_table.shared_prefix_blocks == 0,
+            .logical_blocks = try self.logicalBlocksWithReservations(sequence_id),
+            .page_size_tokens = self.storage.config.page_size_tokens,
+        });
+    }
+
+    pub fn reserveSelectedGlobalKvDeviceCapacity(
+        self: *KvStorageRuntime,
+        sequence_id: SequenceId,
+        layer_index: usize,
+        token_capacity: usize,
+        position_offset: usize,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) !void {
+        const hook = self.device_write_hook orelse return error.DeviceWriteUnsupported;
+        if (token_capacity == 0) return;
+        try self.reserveTokenCapacity(sequence_id, token_capacity);
+        try hook.reserveLayerKvDevice(.{
+            .sequence_id = sequence_id,
+            .layer_index = layer_index,
+            .token_capacity = token_capacity,
+            .position_offset = position_offset,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .sequence_owned_global = true,
             .logical_blocks = try self.logicalBlocksWithReservations(sequence_id),
             .page_size_tokens = self.storage.config.page_size_tokens,
         });
@@ -513,6 +702,8 @@ pub const KvStorageRuntime = struct {
             seq_state.id = id;
             seq_state.active = true;
             seq_state.compacted = false;
+            seq_state.initial_device_capacity_tokens = 0;
+            seq_state.device_capacity_limit_tokens = 0;
             seq_state.block_table.reset();
             seq_state.reserved_tail_blocks.clearRetainingCapacity();
             return id;
@@ -630,6 +821,23 @@ pub const KvStorageRuntime = struct {
                 try sequence_state.reserved_tail_blocks.append(self.allocator, id);
             }
         }
+    }
+
+    /// Request-local CUDA FP16 reservation. No token is made visible and no
+    /// device allocation occurs until its layer receives a real suffix write.
+    pub fn reserveDeviceTokenCapacity(self: *KvStorageRuntime, sequence_id: SequenceId, token_capacity: usize, token_limit: usize) !void {
+        if (self.storage.config.backend != .cuda or self.storage.config.dtype != .f16 or
+            self.storage.config.sliding_window_size != null) return error.DeviceWriteUnsupported;
+        const page_size: usize = self.storage.config.page_size_tokens;
+        if (page_size == 0 or token_capacity == 0 or token_capacity > token_limit) return error.KvCapacityTooSmall;
+        const initial_pages = try std.math.divCeil(usize, token_capacity, page_size);
+        const limit_pages = try std.math.divCeil(usize, token_limit, page_size);
+        const initial = try std.math.mul(usize, initial_pages, page_size);
+        const limit = try std.math.mul(usize, limit_pages, page_size);
+        try self.reserveTokenCapacity(sequence_id, limit);
+        const sequence = try self.sequenceMut(sequence_id);
+        sequence.initial_device_capacity_tokens = initial;
+        sequence.device_capacity_limit_tokens = limit;
     }
 
     pub fn logicalBlocksWithReservations(self: *KvStorageRuntime, sequence_id: SequenceId) ![]const block.KvBlockId {
@@ -855,6 +1063,8 @@ pub const KvStorageRuntime = struct {
         seq_state.block_table.reset();
         seq_state.reserved_tail_blocks.clearRetainingCapacity();
         seq_state.compacted = false;
+        seq_state.initial_device_capacity_tokens = 0;
+        seq_state.device_capacity_limit_tokens = 0;
         seq_state.active = false;
         self.free_sequence_indices.append(self.allocator, idx) catch {};
     }
@@ -1054,6 +1264,8 @@ test "storage runtime reuses released sequence slots" {
 const TestDeviceWriteHookContext = struct {
     calls: usize = 0,
     last_total_token_count: usize = 0,
+    last_device_capacity_tokens: usize = 0,
+    last_device_capacity_limit_tokens: usize = 0,
     last_logical_block_count: usize = 0,
     last_page_size_tokens: u16 = 0,
     last_allow_swa_ring: bool = false,
@@ -1066,6 +1278,8 @@ fn testDeviceWriteLayerKvSuffix(ctx: *anyopaque, write: KvSuffixWrite, _: Device
     const typed: *TestDeviceWriteHookContext = @ptrCast(@alignCast(ctx));
     typed.calls += 1;
     typed.last_total_token_count = write.total_token_count;
+    typed.last_device_capacity_tokens = write.device_capacity_tokens;
+    typed.last_device_capacity_limit_tokens = write.device_capacity_limit_tokens;
     typed.last_logical_block_count = if (write.logical_blocks) |blocks| blocks.len else 0;
     typed.last_page_size_tokens = write.page_size_tokens;
     typed.last_allow_swa_ring = write.allow_swa_ring;
@@ -1086,6 +1300,52 @@ const test_device_write_hook_vtable = DeviceWriteHook.VTable{
     .deinit = testDeviceWriteHookDeinit,
 };
 
+test "storage runtime rejects aliased cross-backend and cancelled device clones" {
+    const Mock = struct {
+        calls: usize = 0,
+
+        fn clone(ctx: *anyopaque, _: DeviceWriteHook, _: device_clone.Request) !device_clone.Result {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return error.UnexpectedDeviceCopy;
+        }
+
+        fn cancelled(_: ?*anyopaque) !void {
+            return error.CompactionCancelled;
+        }
+
+        const vtable = DeviceWriteHook.VTable{
+            .cloneExactPrefix = clone,
+            .writeLayerKvSuffix = testDeviceWriteLayerKvSuffix,
+            .deinit = testDeviceWriteHookDeinit,
+        };
+    };
+    var source_context = Mock{};
+    var destination_context = Mock{};
+    const source = DeviceWriteHook{ .ctx = &source_context, .vtable = &Mock.vtable };
+    const destination = DeviceWriteHook{ .ctx = &destination_context, .vtable = &Mock.vtable };
+    const unsupported_source = DeviceWriteHook{ .ctx = &source_context, .vtable = &test_device_write_hook_vtable };
+    const unsupported_destination = DeviceWriteHook{ .ctx = &destination_context, .vtable = &test_device_write_hook_vtable };
+    const request = device_clone.Request{
+        .source_sequence = 0,
+        .destination_sequence = 0,
+        .tokens = 1,
+        .capacity = 16,
+        .page_size = 16,
+        .source_blocks = &.{0},
+        .destination_blocks = &.{0},
+        .donors = &.{.{ .layer = 0, .heads = 1, .dim = 4 }},
+        .max_bytes = 1024,
+        .check_fn = Mock.cancelled,
+    };
+    try std.testing.expectError(error.InvalidDeviceKvClone, source.cloneExactPrefix(source, request));
+    try std.testing.expectError(error.InvalidDeviceKvClone, destination.cloneExactPrefix(unsupported_source, request));
+    try std.testing.expectError(error.DeviceKvCloneUnsupported, unsupported_destination.cloneExactPrefix(unsupported_source, request));
+    try std.testing.expectError(error.CompactionCancelled, destination.cloneExactPrefix(source, request));
+    try std.testing.expectEqual(@as(usize, 0), source_context.calls);
+    try std.testing.expectEqual(@as(usize, 0), destination_context.calls);
+}
+
 test "storage runtime notifies device hooks after tail truncation" {
     const allocator = std.testing.allocator;
     var runtime = try KvStorageRuntime.init(allocator, .{
@@ -1103,6 +1363,7 @@ test "storage runtime notifies device hooks after tail truncation" {
         .ctx = &hook_context,
         .vtable = &test_device_write_hook_vtable,
     });
+    try std.testing.expect(!runtime.supportsSelectedGlobalKv());
 
     const sequence_id = try runtime.attachSequence(runtime.poolId());
     try runtime.appendTokens(sequence_id, 7);
@@ -1110,6 +1371,58 @@ test "storage runtime notifies device hooks after tail truncation" {
     try std.testing.expectEqual(@as(usize, 1), hook_context.truncate_calls);
     try std.testing.expectEqual(sequence_id, hook_context.last_truncated_sequence_id);
     try std.testing.expectEqual(@as(usize, 4), hook_context.last_retained_token_count);
+}
+
+test "CUDA prefill KV reservation separates valid rows from device capacity and resets on release" {
+    var runtime = try KvStorageRuntime.init(std.testing.allocator, .{
+        .backend = .cuda,
+        .dtype = .f16,
+        .page_size_tokens = 4,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 4,
+        .store_cpu_bytes = false,
+    });
+    defer runtime.deinit();
+    var context = TestDeviceWriteHookContext{};
+    runtime.setDeviceWriteHook(.{ .ctx = &context, .vtable = &test_device_write_hook_vtable });
+    const sequence = try runtime.attachSequence(runtime.poolId());
+    try runtime.reserveDeviceTokenCapacity(sequence, 10, 16);
+    try std.testing.expectEqual(@as(?usize, 0), runtime.tokenCount(sequence));
+    try runtime.appendTokens(sequence, 2);
+    var marker: f32 = 1;
+    const ref = DeviceKvRef{ .handle = @ptrCast(&marker), .byte_offset = 0, .byte_len = @sizeOf(f32) };
+    var write = KvSuffixWrite{
+        .sequence_id = sequence,
+        .layer_index = 0,
+        .total_token_count = 2,
+        .suffix_token_count = 1,
+        .position_offset = 0,
+        .num_kv_heads = 1,
+        .head_dim = 1,
+    };
+    try runtime.writeLayerKvSuffixDevice(write, ref, ref);
+    try std.testing.expectEqual(@as(usize, 2), context.last_total_token_count);
+    try std.testing.expectEqual(@as(usize, 12), context.last_device_capacity_tokens);
+    try std.testing.expectEqual(@as(usize, 16), context.last_device_capacity_limit_tokens);
+    try std.testing.expectEqual(@as(?usize, 2), runtime.tokenCount(sequence));
+    try runtime.appendTokens(sequence, 11);
+    write.total_token_count = 13;
+    try runtime.writeLayerKvSuffixDevice(write, ref, ref);
+    try std.testing.expectEqual(@as(usize, 12), context.last_device_capacity_tokens);
+    try std.testing.expectEqual(@as(usize, 16), context.last_device_capacity_limit_tokens);
+    try std.testing.expectEqual(@as(?usize, 13), runtime.tokenCount(sequence));
+    try runtime.releaseSequence(sequence);
+    const reused = try runtime.attachSequence(runtime.poolId());
+    try std.testing.expectEqual(sequence, reused);
+    try runtime.appendTokens(reused, 1);
+    write.total_token_count = 1;
+    // Caller-supplied hints cannot bypass the runtime's reservation authority.
+    write.device_capacity_tokens = 1000;
+    write.device_capacity_limit_tokens = 1000;
+    try runtime.writeLayerKvSuffixDevice(write, ref, ref);
+    try std.testing.expectEqual(@as(usize, 0), context.last_device_capacity_tokens);
+    try std.testing.expectEqual(@as(usize, 0), context.last_device_capacity_limit_tokens);
 }
 
 test "storage runtime device writes count reserved blocks as capacity" {

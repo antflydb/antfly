@@ -598,7 +598,14 @@ pub const KvPool = struct {
                 const scratch_k = self.read_scratch_k orelse return error.ScratchNotAllocated;
                 const scratch_v = self.read_scratch_v orelse return error.ScratchNotAllocated;
                 const base_bytes = turboquant.turbo3KeyBytes(self.config.num_kv_heads, self.config.head_dim);
-                try turboquant.decodeTurbo3Key(entry.k_data[key_byte_start..][0..base_bytes], scratch_k, self.config.num_kv_heads, self.config.head_dim);
+                const residual_bytes = turboquant.turbo3ResidualBytes(self.config.num_kv_heads, self.config.head_dim);
+                try turboquant.decodeTurbo3KeyWithResidual(
+                    entry.k_data[key_byte_start..][0..base_bytes],
+                    entry.k_data[key_byte_start + base_bytes ..][0..residual_bytes],
+                    scratch_k,
+                    self.config.num_kv_heads,
+                    self.config.head_dim,
+                );
                 dequantizeInt8PerHeadToF32(entry.v_data[value_byte_start..][0..value_row_bytes], scratch_v, self.config.num_kv_heads, self.config.head_dim);
                 return .{ .k = scratch_k, .v = scratch_v };
             },
@@ -1287,6 +1294,15 @@ test "pool turbo3 round-trip uses packed 3-bit keys and int8 values" {
     const residual_bytes = turboquant.turbo3ResidualBytes(1, 64);
     try std.testing.expectEqual(base_bytes + residual_bytes, encoded.k_bytes.len);
     try std.testing.expectEqual(@as(usize, 4), residual_bytes);
+
+    var query: [64]f32 = undefined;
+    for (0..64) |i| query[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5)) / 7.0;
+    var materialized_score: f32 = 0;
+    for (query, row.k) |q, key| materialized_score += q * key;
+    const direct_score = try turboquant.dotTurbo3Key(&query, encoded.k_bytes[0..base_bytes], 1, 64, 0) +
+        turboquant.turbo3_residual_default_scale *
+            try turboquant.dotTurbo3ResidualSketch(&query, encoded.k_bytes[base_bytes..], 1, 64, 0);
+    try std.testing.expectApproxEqAbs(direct_score, materialized_score, 1e-5);
 
     for (k_row, row.k) |expected, actual| {
         try std.testing.expectApproxEqAbs(expected, actual, 0.15);

@@ -18,6 +18,9 @@ import type {
   ChunkEmbeddingStreamEvent,
   ChunkResponse,
   ClassificationResult,
+  ContextPrepareRequest,
+  ContextPrepareResponse,
+  ContextDiagnostics,
   DecideRequest,
   DecideResponse,
   EmbedInput,
@@ -44,6 +47,28 @@ import type {
 import type { components, paths } from "./public-api.js";
 import { RequestAdmission } from "./request-admission.js";
 import { parseSSEFrames } from "./sse.js";
+
+function validateContextAttestation(
+  request: Omit<GenerateRequest, "stream">,
+  diagnostics: ContextDiagnostics
+): void {
+  if (request.context_management !== undefined) {
+    if (diagnostics.policy !== request.context_management.mode) {
+      throw new Error("Generation server attested a different context policy");
+    }
+    if (request.context_management.checkpoint !== undefined && !diagnostics.checkpoint_applied) {
+      throw new Error("Generation server did not attest the requested checkpoint");
+    }
+  }
+  if (request.kv_cache !== undefined) {
+    if (diagnostics.kv_cache_mode !== request.kv_cache.mode) {
+      throw new Error("Generation server attested a different KV cache policy");
+    }
+    if (diagnostics.kv_cache_version !== (request.kv_cache.version ?? "v1")) {
+      throw new Error("Generation server attested a different KV cache version");
+    }
+  }
+}
 
 const MAX_INFERENCE_JSON_RESPONSE_BYTES = 16 << 20;
 const MAX_GENERATION_RESPONSE_BYTES = MAX_INFERENCE_JSON_RESPONSE_BYTES;
@@ -166,11 +191,52 @@ export class InferenceClient {
     if (truncated) {
       throw new Error(`Generation response exceeded ${MAX_GENERATION_RESPONSE_BYTES} bytes`);
     }
+    let result: GenerateResponse;
     try {
-      return JSON.parse(text) as GenerateResponse;
+      result = JSON.parse(text) as GenerateResponse;
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       throw new Error(`Generation returned invalid JSON: ${detail}`);
+    }
+    if (
+      (request.context_management !== undefined || request.kv_cache !== undefined) &&
+      result.context === undefined
+    ) {
+      throw new Error("Generation server did not attest the requested context policy");
+    }
+    if (result.context !== undefined) validateContextAttestation(request, result.context);
+    return result;
+  }
+
+  /** Inspect or prepare bounded chat context before generation. */
+  async prepareChatContext(
+    request: ContextPrepareRequest,
+    options?: RequestOptions
+  ): Promise<ContextPrepareResponse> {
+    const response = await fetch(`${this.baseUrl}/ai/v1/generate/context/prepare`, {
+      method: "POST",
+      headers: {
+        ...this.headers,
+        Accept: "application/json",
+      },
+      body: JSON.stringify(request),
+      signal: options?.signal,
+    });
+    if (!response.ok) throw await inferenceAPIErrorResponse(response);
+    const { text, truncated } = await readLimitedResponseText(
+      response,
+      MAX_GENERATION_RESPONSE_BYTES
+    );
+    if (truncated) {
+      throw new Error(
+        `Context preparation response exceeded ${MAX_GENERATION_RESPONSE_BYTES} bytes`
+      );
+    }
+    try {
+      return JSON.parse(text) as ContextPrepareResponse;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`Context preparation returned invalid JSON: ${detail}`);
     }
   }
 
@@ -203,11 +269,32 @@ export class InferenceClient {
     }
     if (!response.body) throw new Error("Generation stream returned an empty body");
 
+    const requiresContextAttestation =
+      request.context_management !== undefined || request.kv_cache !== undefined;
+    let sawContextAttestation = false;
     for await (const frame of parseSSEFrames(response.body)) {
       if (frame.event === "error") throw new Error(`Generation stream failed: ${frame.data}`);
-      if (frame.data.trim() === "[DONE]") return;
+      if (frame.data.trim() === "[DONE]") {
+        if (requiresContextAttestation && !sawContextAttestation) {
+          throw new Error("Generation server did not attest the requested context policy");
+        }
+        return;
+      }
       try {
-        yield JSON.parse(frame.data) as GenerateChunk;
+        const chunk = JSON.parse(frame.data) as GenerateChunk;
+        if (chunk.context !== undefined) {
+          validateContextAttestation(request, chunk.context);
+          sawContextAttestation = true;
+        } else if (
+          requiresContextAttestation &&
+          !sawContextAttestation &&
+          chunk.choices.length > 0
+        ) {
+          throw new Error(
+            "Generation server emitted content before attesting the requested context policy"
+          );
+        }
+        yield chunk;
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         throw new Error(`Generation stream returned invalid JSON: ${detail}`);

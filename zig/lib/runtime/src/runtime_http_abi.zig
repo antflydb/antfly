@@ -115,7 +115,9 @@ pub const RequestBodySource = extern struct {
     context: ?*anyopaque = null,
     read_all: ?*const fn (?*anyopaque, *OptionalBytes) callconv(.c) CallbackStatus = null,
     streaming: u8 = 0,
-    /// Reads at most capacity bytes; zero bytes with .ok is EOF.
+    /// Incremental read into caller-owned storage. A successful zero-byte
+    /// result means EOF; implementations must never return more than capacity.
+    /// Neither the destination nor the count pointer may be retained.
     read: ?*const fn (?*anyopaque, [*]u8, usize, *usize) callconv(.c) CallbackStatus = null,
     read_controlled: ?*const fn (?*anyopaque, [*]u8, usize, *usize, *const RequestControl) callconv(.c) CallbackStatus = null,
     read_all_controlled: ?*const fn (?*anyopaque, *OptionalBytes, *const RequestControl) callconv(.c) CallbackStatus = null,

@@ -15444,7 +15444,9 @@ test "lite value reads bound allocations and coalesce physical IO across pinned 
 }
 
 test "lite namespace index bounds hot and cold single namespace mutations" {
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "namespace-index-bounds.aflite");
@@ -15851,7 +15853,9 @@ test "lite inline namespace cache prepares ownership before publication under OO
 }
 
 test "lite namespace batch reads share tree paths and physically regroup packed records" {
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "namespace-batch-reads.aflite");
@@ -15893,7 +15897,9 @@ test "lite namespace batch reads share tree paths and physically regroup packed 
 }
 
 test "lite namespace batch tracking memory depends on namespaces not documents" {
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "namespace-batch-memory.aflite");
@@ -16221,7 +16227,9 @@ test "lite index views reject malformed slot layouts before exposing borrowed ke
 }
 
 test "lite scan integrity scales with packed pages for documents and namespaces" {
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     for ([_]bool{ false, true }) |many_namespaces| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -16295,7 +16303,9 @@ test "lite scan integrity resolves collisions and rejects stale missing and extr
 }
 
 test "lite sorted editor bounds update and deletion heap across tree heights" {
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     for ([_]usize{ 16384, 65536 }) |count| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -16569,7 +16579,9 @@ test "lite addressed writes coalesce sorted document and catalog updates" {
 }
 
 test "lite sorted initial ingest bounds heap independently of input length" {
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     for ([_]usize{ 16384, 131072 }) |count| {
         for ([_]bool{ false, true }) |grouped| {
             var tmp = std.testing.tmpDir(.{});
@@ -16773,7 +16785,9 @@ test "lite index snapshots preserve pinned external values through allocation fa
 }
 
 test "lite ingest scratch and bulk key storage bound allocation churn" {
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     for ([_]usize{ 16384, 65536 }) |count| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();

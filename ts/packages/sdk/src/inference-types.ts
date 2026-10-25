@@ -76,6 +76,11 @@ export type InferenceChatMessage = components["schemas"]["InferenceChatMessage"]
 export type GenerateRequest = components["schemas"]["InferenceGenerateRequest"];
 export type GenerateResponse = components["schemas"]["InferenceGenerateResponse"];
 export type GenerateChunk = components["schemas"]["InferenceGenerateChunk"];
+export type ContextCheckpoint = components["schemas"]["InferenceContextCheckpoint"];
+export type ContextDiagnostics = components["schemas"]["InferenceContextDiagnostics"];
+export type ContextToolResultOutcome = components["schemas"]["InferenceContextToolResultOutcome"];
+export type ContextPrepareRequest = components["schemas"]["InferenceContextPrepareRequest"];
+export type ContextPrepareResponse = components["schemas"]["InferenceContextPrepareResponse"];
 
 // Content part types for multimodal embeddings
 export type ContentPart = components["schemas"]["InferenceContentPart"];

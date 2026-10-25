@@ -31316,7 +31316,11 @@ fn implementationTests() type {
         }
 
         test "aggregation full-result rerun counts text matches and each vector window without changing ranked page" {
-            const alloc = std.testing.allocator;
+            // Keep the >2,000-document window regression and memory checks,
+            // without unwinding every successful allocation during ingestion.
+            var allocator_state = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+            defer allocator_state.deinit();
+            const alloc = allocator_state.allocator();
             var path_tmp = try TestDirectory.init("antfly-api-aggregation-hybrid");
             defer path_tmp.cleanup();
             var db = try db_mod.DB.open(alloc, path_tmp.path(), .{});

@@ -6312,13 +6312,18 @@ fn registerLinkedInferenceManifest(
         };
         try owned_routes.append(alloc, route);
         errdefer _ = owned_routes.pop();
-        try server.routeWithData(switch (entry.method) {
+        const method: httpx.Method = switch (entry.method) {
             .get => .GET,
             .post => .POST,
             .put => .PUT,
             .delete => .DELETE,
             .patch => .PATCH,
-        }, entry.path.slice(), linkedInferenceHttpHandler, route);
+        };
+        if (nativeCheckpointUploadLimit(method, entry.path.slice())) |limit| {
+            try server.routeStreamingRawWithDataAndBodyLimit(method, entry.path.slice(), linkedInferenceHttpHandler, route, limit);
+        } else {
+            try server.routeWithData(method, entry.path.slice(), linkedInferenceHttpHandler, route);
+        }
     }
 }
 
@@ -6482,6 +6487,18 @@ fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
     return response;
 }
 
+// AFATT001: at most 2 GiB checkpoint, 2 MiB metadata, and bounded framing.
+// This ceiling is separate from the public buffered-body budget and applies
+// only to the native checkpoint resume endpoint.
+const native_checkpoint_upload_limit: usize = 2 * 1024 * 1024 * 1024 + 2 * 1024 * 1024 + 128;
+
+fn nativeCheckpointUploadLimit(method: httpx.Method, path: []const u8) ?usize {
+    if (method != .POST) return null;
+    if (!std.mem.eql(u8, path, inference_bridge.ai_api_prefix ++ "/generate/context/resume") and
+        !std.mem.eql(u8, path, inference_bridge.public_api_prefix ++ "/generate/context/resume")) return null;
+    return native_checkpoint_upload_limit;
+}
+
 const public_http_connection_ceiling: u32 = 256;
 const public_http_max_h1_inflight_bodies: u32 = 32;
 
@@ -6505,6 +6522,7 @@ fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerCon
         .host = bind_host,
         .port = bind_port,
         .max_body_size = antfly.public_api.http_server.public_api_max_request_body_bytes,
+        .max_streamed_body_size = native_checkpoint_upload_limit,
         // Bound aggregate request-body buffering across HTTP/1 and HTTP/2.
         // Four maximum-sized public requests may complete while excess uploads
         // are shed before allocator pressure becomes systemic.
@@ -9285,6 +9303,7 @@ test "standalone runtime module compiles" {
     _ = runFromIterator;
     try std.testing.expect(isInteractiveGeneratePath("/ai/v1/generate"));
     try std.testing.expect(isInteractiveGeneratePath("/ai/v1/chat/completions"));
+    try std.testing.expect(isInteractiveGeneratePath("/ai/v1/generate/context/prepare"));
     try std.testing.expect(isInteractiveGeneratePath("/ml/v1/generate/batch"));
     try std.testing.expect(!isInteractiveGeneratePath("/ai/v1/embed"));
     try std.testing.expect(!isInteractiveGeneratePath("/ai/v10/generate"));
@@ -11477,12 +11496,22 @@ test "standalone runtime defaults public listener to antfarm port" {
     try std.testing.expectEqual(@as(u16, default_public_port), listener.bind_port);
 }
 
+test "only native checkpoint resume admits large streamed uploads" {
+    try std.testing.expectEqual(@as(?usize, native_checkpoint_upload_limit), nativeCheckpointUploadLimit(.POST, "/ai/v1/generate/context/resume"));
+    try std.testing.expectEqual(@as(?usize, native_checkpoint_upload_limit), nativeCheckpointUploadLimit(.POST, "/ml/v1/generate/context/resume"));
+    for ([_][]const u8{ "/ai/v1/chat/completions", "/ai/v1/generate/context/checkpoint", "/ai/v1/generate/context/resume/extra", "/api/v1/query" }) |path| {
+        try std.testing.expectEqual(@as(?usize, null), nativeCheckpointUploadLimit(.POST, path));
+    }
+    try std.testing.expectEqual(@as(?usize, null), nativeCheckpointUploadLimit(.GET, "/ai/v1/generate/context/resume"));
+}
+
 test "standalone public HTTP server is restart-safe and uses public API request body limit" {
     const cfg = publicHttpServerConfig("127.0.0.1", 8080);
     try std.testing.expect(cfg.reuse_address);
     try std.testing.expect(!cfg.reuse_port);
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_body_size);
     try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), cfg.request_body_buffer_budget_bytes);
+    try std.testing.expectEqual(@as(?usize, native_checkpoint_upload_limit), cfg.max_streamed_body_size);
     try std.testing.expect(cfg.max_connections >= 1);
     try std.testing.expect(cfg.max_connections <= public_http_connection_ceiling);
     try std.testing.expectEqual(cfg.max_connections, cfg.max_request_tasks);
