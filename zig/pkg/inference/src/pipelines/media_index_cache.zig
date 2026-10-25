@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Immutable container indexes shared by paged requests. Entries own every
+//! Immutable container and planning indexes shared by paged requests. Entries own every
 //! metadata slice; sources, provider contexts, decoder state and controls are
 //! always rebound to the current request. Unpinned ranges bypass the cache.
 const std = @import("std");
@@ -37,8 +37,9 @@ pub const Cache = struct {
         context: *anyopaque,
         acquire: *const fn (*anyopaque, usize) anyerror!@import("../runtime/tier/memory.zig").AdmissionLease,
     };
-    pub const Input = union(enum) { mp4: media.mp4.Reader, webm: media.webm.Reader, audio: audio_seek.Index, aac: @import("media_chunking_audio_source.zig").Mp4 };
+    pub const Input = union(enum) { audio_plan: @import("media_audio_plan.zig").Snapshot, mp4: media.mp4.Reader, webm: media.webm.Reader, audio: audio_seek.Index, aac: @import("media_chunking_audio_source.zig").Mp4 };
     pub const Data = union(enum) {
+        audio_plan: @import("media_audio_plan.zig").Snapshot,
         aac: @import("media_chunking_audio_source.zig").Mp4.Snapshot,
         audio: audio_seek.Index,
         mp4: struct {
@@ -89,6 +90,7 @@ pub const Cache = struct {
         mp4_plan: ?video_owner.Snapshot = null,
         webm_plan: ?WebmSnapshot = null,
         refs: usize = 1,
+        audio_plan_digest: ?[32]u8 = null,
         hash_next: ?*Entry = null,
         older: ?*Entry = null,
         newer: ?*Entry = null,
@@ -195,48 +197,60 @@ pub const Cache = struct {
         self.rememberPlanned(a, identity, data, admission, null);
     }
     pub fn rememberPlanned(self: *Cache, a: std.mem.Allocator, identity: [32]u8, data: Input, admission: Admission, planning: ?Planning) void {
-        const estimate = switch (data) {
-            .aac => |owner| @import("media_chunking_audio_source.zig").Mp4.Snapshot.estimatedBytes(owner),
-            .audio => |index| index.estimatedBytes(),
-            .mp4 => |r| std.math.mul(usize, r.packets.len, @sizeOf(media.mp4.Packet)) catch return,
-            .webm => |r| (std.math.mul(usize, r.packets.len, @sizeOf(media.webm.Packet)) catch return) +| (std.math.mul(usize, r.cues.len, @sizeOf(media.webm.Cue)) catch return),
-        };
-        if (estimate > max_bytes) return;
-        var header_lease = admission.acquire(admission.context, @sizeOf(Entry)) catch return;
-        const entry = a.create(Entry) catch {
-            header_lease.release();
-            return;
-        };
-        entry.* = .{ .header_lease = header_lease, .allocation = .{ .backing = a, .admission_context = admission.context, .admit = admission.acquire }, .arena = undefined, .key = identity, .data = undefined, .refs = 0 };
-        entry.arena = .init(entry.allocation.allocator());
-        self.copy(entry, data) catch {
-            entry.destroy();
-            return;
-        };
-        if (planning) |value| switch (value) {
-            .mp4 => |owner| {
-                // In-band parameter registries own mutable request context.
-                if (owner.registry == null) entry.mp4_plan = video_owner.Snapshot.copy(entry.arena.allocator(), owner) catch {
-                    entry.destroy();
-                    return;
-                };
-            },
-            .webm => |snapshot| entry.webm_plan = WebmSnapshot.copy(entry.arena.allocator(), snapshot) catch {
-                entry.destroy();
-                return;
-            },
-        };
-        entry.bytes = entry.allocation.reserved_bytes + @sizeOf(Entry);
-        if (entry.bytes > max_bytes) {
-            entry.destroy();
+        if (data == .audio_plan) {
+            self.rememberAudioPlan(a, identity, data.audio_plan, admission);
             return;
         }
+        const entry = self.prepareEntry(a, identity, data, admission, planning) orelse return;
         self.lock();
         defer self.mutex.unlock();
         if (self.find(identity) != null) {
             entry.destroy();
             return;
         }
+        self.insert(entry);
+    }
+    fn prepareEntry(self: *Cache, a: std.mem.Allocator, identity: [32]u8, data: Input, admission: Admission, planning: ?Planning) ?*Entry {
+        const estimate = switch (data) {
+            .audio_plan => |plan| plan.points.len * @sizeOf(@import("media_audio_plan.zig").Point) + plan.hot_ordinals.len * @sizeOf(u64),
+            .aac => |owner| @import("media_chunking_audio_source.zig").Mp4.Snapshot.estimatedBytes(owner),
+            .audio => |index| index.estimatedBytes(),
+            .mp4 => |r| std.math.mul(usize, r.packets.len, @sizeOf(media.mp4.Packet)) catch return null,
+            .webm => |r| (std.math.mul(usize, r.packets.len, @sizeOf(media.webm.Packet)) catch return null) +| (std.math.mul(usize, r.cues.len, @sizeOf(media.webm.Cue)) catch return null),
+        };
+        if (estimate > max_bytes) return null;
+        var header_lease = admission.acquire(admission.context, @sizeOf(Entry)) catch return null;
+        const entry = a.create(Entry) catch {
+            header_lease.release();
+            return null;
+        };
+        entry.* = .{ .header_lease = header_lease, .allocation = .{ .backing = a, .admission_context = admission.context, .admit = admission.acquire }, .arena = undefined, .key = identity, .data = undefined, .refs = 0 };
+        entry.arena = .init(entry.allocation.allocator());
+        self.copy(entry, data) catch {
+            entry.destroy();
+            return null;
+        };
+        if (planning) |value| switch (value) {
+            .mp4 => |owner| {
+                // In-band parameter registries own mutable request context.
+                if (owner.registry == null) entry.mp4_plan = video_owner.Snapshot.copy(entry.arena.allocator(), owner) catch {
+                    entry.destroy();
+                    return null;
+                };
+            },
+            .webm => |snapshot| entry.webm_plan = WebmSnapshot.copy(entry.arena.allocator(), snapshot) catch {
+                entry.destroy();
+                return null;
+            },
+        };
+        entry.bytes = entry.allocation.reserved_bytes + @sizeOf(Entry);
+        if (entry.bytes > max_bytes) {
+            entry.destroy();
+            return null;
+        }
+        return entry;
+    }
+    fn insert(self: *Cache, entry: *Entry) void {
         while (self.count >= max_entries or entry.bytes > max_bytes - self.bytes) {
             const victim = self.evictable() orelse {
                 entry.destroy();
@@ -244,16 +258,63 @@ pub const Cache = struct {
             };
             self.remove(victim);
         }
-        const index = bucket(identity);
+        const index = bucket(entry.key);
         entry.hash_next = self.buckets[index];
         self.buckets[index] = entry;
         self.touch(entry);
         self.count += 1;
         self.bytes += entry.bytes;
     }
+    /// Same-tail repair anchors are improvements too. Merge off-lock, then
+    /// compare content identities before replacing; concurrent writers retry
+    /// rather than overwriting a newer frontier or another repair's anchors.
+    fn rememberAudioPlan(self: *Cache, a: std.mem.Allocator, identity: [32]u8, snapshot: @import("media_audio_plan.zig").Snapshot, admission: Admission) void {
+        self.rememberAudioPlanUpdate(a, identity, snapshot, admission, null);
+    }
+    pub fn rememberAudioPlanUpdate(self: *Cache, a: std.mem.Allocator, identity: [32]u8, snapshot: @import("media_audio_plan.zig").Snapshot, admission: Admission, base_digest: ?[32]u8) void {
+        snapshot.validate() catch return;
+        for (0..3) |_| {
+            var merged = @import("media_audio_plan.zig").Buffer{};
+            var observed: ?[32]u8 = null;
+            var reuse = false;
+            if (self.get(identity)) |old| {
+                defer self.release(old);
+                if (old.data != .audio_plan) return;
+                observed = old.audio_plan_digest;
+                reuse = base_digest != null and std.mem.eql(u8, &base_digest.?, &observed.?);
+                if (!reuse) merged.merge(old.data.audio_plan) catch return;
+            }
+            if (!reuse) merged.merge(snapshot) catch return;
+            const candidate = if (reuse) snapshot else merged.snapshot();
+            const digest = candidate.digest();
+            if (observed) |old| if (std.mem.eql(u8, &old, &digest)) return;
+            const entry = self.prepareEntry(a, identity, .{ .audio_plan = candidate }, admission, null) orelse return;
+            entry.audio_plan_digest = digest;
+            self.lock();
+            const current = self.find(identity);
+            const matches = if (current) |old| old.data == .audio_plan and observed != null and std.mem.eql(u8, &old.audio_plan_digest.?, &observed.?) else observed == null;
+            if (!matches) {
+                self.mutex.unlock();
+                entry.destroy();
+                continue;
+            }
+            if (current) |old| {
+                if (old.refs != 0) {
+                    self.mutex.unlock();
+                    entry.destroy();
+                    return;
+                }
+                self.remove(old);
+            }
+            self.insert(entry);
+            self.mutex.unlock();
+            return;
+        }
+    }
     fn copy(_: *Cache, entry: *Entry, data: Input) !void {
         const a = entry.arena.allocator();
         switch (data) {
+            .audio_plan => |plan| entry.data = .{ .audio_plan = .{ .points = try a.dupe(@import("media_audio_plan.zig").Point, plan.points), .stride = plan.stride, .hot_ordinals = try a.dupe(u64, plan.hot_ordinals) } },
             .aac => |owner| entry.data = .{ .aac = try @import("media_chunking_audio_source.zig").Mp4.Snapshot.copy(a, owner) },
             .audio => |index| entry.data = .{ .audio = try index.copy(a) },
             .mp4 => |original| {
@@ -463,4 +524,79 @@ test "model aware media hashed LRU resolves collisions and preserves pinned entr
     _ = Cache.reclaim(&cache, Cache.max_bytes);
     try std.testing.expectEqual(@as(usize, 0), cache.count);
     try std.testing.expectEqual(@as(usize, 0), provider.controller.snapshot().hostTotalBytes());
+}
+
+test "model aware media pause plan cache advances without regressing or destroying borrowed snapshots" {
+    const memory = @import("../runtime/tier/memory.zig");
+    const Admission = struct {
+        fn acquire(raw: *anyopaque, amount: usize) !memory.AdmissionLease {
+            const controller: *memory.AdmissionController = @ptrCast(@alignCast(raw));
+            return controller.tryAcquire(.cpu, .{ .host_limit_bytes = Cache.max_bytes }, .{ .host_scratch_bytes = amount }, false);
+        }
+    };
+    const a = std.testing.allocator;
+    var controller = memory.AdmissionController{};
+    var cache = Cache{};
+    defer cache.deinit();
+    const admission = Cache.Admission{ .context = &controller, .acquire = Admission.acquire };
+    const identity: [32]u8 = @splat(9);
+    const points = [_]@import("media_audio_plan.zig").Point{ .{ .ordinal = 0, .offset_ns = 0 }, .{ .ordinal = 1, .offset_ns = 1000 }, .{ .ordinal = 2, .offset_ns = 2000 } };
+    cache.remember(a, identity, .{ .audio_plan = .{ .points = points[0..2] } }, admission);
+    const borrowed = cache.get(identity).?;
+    cache.remember(a, identity, .{ .audio_plan = .{ .points = &points } }, admission);
+    try std.testing.expectEqual(@as(usize, 2), borrowed.data.audio_plan.points.len);
+    try std.testing.expectEqual(@as(usize, 0), Cache.reclaim(&cache, Cache.max_bytes));
+    cache.release(borrowed);
+    cache.remember(a, identity, .{ .audio_plan = .{ .points = &points } }, admission);
+    cache.remember(a, identity, .{ .audio_plan = .{ .points = points[0..2] } }, admission);
+    const latest = cache.get(identity).?;
+    try std.testing.expectEqual(@as(u64, 2), latest.data.audio_plan.nearest(2).?.ordinal);
+    cache.release(latest);
+    try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) > 0);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+}
+
+test "model aware media concurrent checkpoint updates preserve same-tail repair anchors" {
+    const Plan = @import("media_audio_plan.zig");
+    const Fixture = struct {
+        controller: @import("../runtime/tier/memory.zig").AdmissionController = .{},
+        cache: *Cache,
+        race: bool = false,
+        identity: [32]u8 = @splat(8),
+        fn acquire(raw: *anyopaque, amount: usize) !@import("../runtime/tier/memory.zig").AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.race) {
+                self.race = false;
+                self.cache.remember(std.testing.allocator, self.identity, .{ .audio_plan = .{ .points = &.{.{ .ordinal = 1000, .offset_ns = 1000000 }}, .hot_ordinals = &.{1000} } }, .{ .context = self, .acquire = acquire });
+            }
+            return self.controller.tryAcquire(.cpu, .{ .host_limit_bytes = Cache.max_bytes }, .{ .host_scratch_bytes = amount }, false);
+        }
+    };
+    var cache = Cache{};
+    defer cache.deinit();
+    var fixture = Fixture{ .cache = &cache };
+    const admission = Cache.Admission{ .context = &fixture, .acquire = Fixture.acquire };
+    cache.remember(std.testing.allocator, fixture.identity, .{ .audio_plan = .{ .points = &.{ .{ .ordinal = 0, .offset_ns = 0 }, .{ .ordinal = 100000, .offset_ns = 100000000 } } } }, admission);
+    const base = cache.get(fixture.identity).?;
+    const base_digest = base.audio_plan_digest.?;
+    var candidate = Plan.Buffer{};
+    try candidate.merge(base.data.audio_plan);
+    cache.release(base);
+    try candidate.append(.{ .ordinal = 500, .offset_ns = 500000 }, true);
+    fixture.race = true;
+    // Race while preparing a caller-merged candidate. Its base digest matches
+    // initially, then must take the retry/merge path after the competing write.
+    cache.rememberAudioPlanUpdate(std.testing.allocator, fixture.identity, candidate.snapshot(), admission, base_digest);
+    {
+        const hit = cache.get(fixture.identity).?;
+        defer cache.release(hit);
+        const snapshot: Plan.Snapshot = hit.data.audio_plan;
+        try snapshot.validate();
+        try std.testing.expectEqual(snapshot.digest(), hit.audio_plan_digest.?);
+        try std.testing.expectEqual(@as(u64, 100000), snapshot.points[snapshot.points.len - 1].ordinal);
+        try std.testing.expectEqual(@as(u64, 500), snapshot.nearest(500).?.ordinal);
+        try std.testing.expectEqual(@as(u64, 1000), snapshot.nearest(1000).?.ordinal);
+    }
+    try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) != 0);
+    try std.testing.expectEqual(@as(usize, 0), fixture.controller.snapshot().host_scratch_bytes);
 }

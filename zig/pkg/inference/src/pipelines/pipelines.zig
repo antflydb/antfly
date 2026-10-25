@@ -15,6 +15,8 @@
 
 const std = @import("std");
 
+pub const media_audio_checkpoints = @import("media_audio_checkpoints.zig");
+pub const media_audio_plan = @import("media_audio_plan.zig");
 pub const media_chunking_audio_source = @import("media_chunking_audio_source.zig");
 pub const media_classification = @import("media_classification.zig");
 pub const laya = @import("laya.zig");
@@ -92,6 +94,8 @@ pub const JsonGrammar = grammar.JsonGrammar;
 
 test {
     _ = media_classification;
+    _ = media_audio_checkpoints;
+    _ = media_audio_plan;
     _ = media_chunking_audio_source;
     _ = extraction_constraints;
     _ = extraction_schema;
