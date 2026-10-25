@@ -6677,7 +6677,12 @@ test "capi lite inference service survives foreground and maintenance snapshots"
         }
         owner.collectRetired();
         owner.maintenance_pending = true;
-        _ = try owner.maintenanceTurnForTest();
+        // A turn may run bounded group-source work before replay captures
+        // the maintenance snapshot; the schedule alternates the two.
+        for (0..4) |_| {
+            _ = try owner.maintenanceTurnForTest();
+            if (owner.maintenance_snapshot != null) break;
+        }
         try std.testing.expectEqual(service, owner.maintenance_snapshot.?.lite_inference.?);
         try std.testing.expectEqual(service, owner.current.?.lite_inference.?);
         try std.testing.expectEqual(@as(usize, 2), service.references.load(.acquire));
