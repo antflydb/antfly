@@ -1,0 +1,546 @@
+{
+  "status": "prototype_pass",
+  "primary_throughput_eligible": false,
+  "created_at": "2026-10-25T07:04:48.540894+00:00",
+  "preparation": {
+    "scope": "Private original register GEMM using public MPP cooperative tensor coordinates. BF16 operands and F32 accumulators, same real layers/guards, no production change.",
+    "mlx_headers_sha256": {},
+    "input_sha256": {
+      ".venv-lighton-vllm-metal/engine86_MLX_LICENSE": "ccfab7ccb2ea306f71531c8ca77bb55507606cd90768b1e32b8b52ab5b48cf01",
+      ".venv-lighton-vllm-metal/engine86_real_ffn_probe.m": "7ae41dc85ad73f99236e0fc13e7864e5b25054b7268ebc0ceef829636ff5e9cc",
+      ".venv-lighton-vllm-metal/engine82_real_ffn_prefix.inc": "f4823f7590c13df6431e4730615acd830bee0897ab13b5afe793b0ffe0cb8169",
+      ".venv-lighton-vllm-metal/engine82_probe_checks.m": "a75033e195e5a0a783deeadbb6452cc7c0800ed757621136938184df6da1ba77",
+      ".venv-lighton-vllm-metal/engine82_probe_kernels.m": "8747e4225dcf45be2cecf6ee2973dd310adb781ca7e93db128df12f4177bd0d9",
+      ".venv-lighton-vllm-metal/engine82_weight_offsets.inc": "d1a0ccbeafbe8c2886b45958e34f939cf7a7830e67793764d9fd40a84824b26a",
+      "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine88_register_gemm.metal": "88c7d2932a561a11456fd2dd09c7f1bb66ab7594519508cda2f88d3f542e087e"
+    },
+    "production_c_sha256": "fc6d71ea0364f91d02b3902e47ffbec50baf5c08f62716aaa202ed1005d43584"
+  },
+  "driver_sha256": "9d0e716e631c72892fe5d3963134b1a17d76991f343b2252742f148086b646ea",
+  "scope": "Isolated four-real-layer ordinary FFN, full-K MPP vs original register-coordinate MPP BF16 operands/F32 accumulation, ABBA. No packed FFN fusion and no dtype reduction. All output elements bounded 2e-4+2e-5*abs(baseline); record packed/output differences caused by reduction order. CPU corners and all canaries. Not full model speed or OCR quality evidence.",
+  "reused_exact_c_binary_from_initial_shader_failure": true,
+  "binary_sha256": "968dc38255b085e774ec44c99f3b1dc51c2cf9c150e9e9263686ee4983a2ac3e",
+  "real_weight_payloads": [
+    {
+      "layer": 0,
+      "kind": 0,
+      "offset": 1402958584,
+      "bytes": 47185920,
+      "sha256": "a2a8ec444fd8ff936b23f54d97e06c14759a164ff92e82417831366c7f13611f"
+    },
+    {
+      "layer": 0,
+      "kind": 1,
+      "offset": 1450144504,
+      "bytes": 47185920,
+      "sha256": "4c1e126bfef13e699371f09bdd92fb55fda908bd44fb6450c45d7fd8c8e06e9c"
+    },
+    {
+      "layer": 0,
+      "kind": 2,
+      "offset": 1355772664,
+      "bytes": 47185920,
+      "sha256": "cfe2844c75c00bf917c3433158d0cec5a8a5aa1f969a856db804046655dc029b"
+    },
+    {
+      "layer": 8,
+      "kind": 0,
+      "offset": 8091362296,
+      "bytes": 47185920,
+      "sha256": "06ba7e17867e0554065d95a3a6a80bcf6a2ff6f75c97f298208d52ec9133a410"
+    },
+    {
+      "layer": 8,
+      "kind": 1,
+      "offset": 8138548216,
+      "bytes": 47185920,
+      "sha256": "8b5faab28be43f24b7405321e0c911fcc7c50a0e75f20889c108c28c0a31af1a"
+    },
+    {
+      "layer": 8,
+      "kind": 2,
+      "offset": 8044176376,
+      "bytes": 47185920,
+      "sha256": "91b85fe7d151644d8b7bd2922e167e5611e89be2075d7836fd8f941436269716"
+    },
+    {
+      "layer": 16,
+      "kind": 0,
+      "offset": 3187983352,
+      "bytes": 47185920,
+      "sha256": "c83ef117686dbeb6592972193d40ec9da6d11446d69a1ae9eb3bf7b45e9004b4"
+    },
+    {
+      "layer": 16,
+      "kind": 1,
+      "offset": 3235169272,
+      "bytes": 47185920,
+      "sha256": "9879999885dfa40918d3d0ad1196c66d9a215a268c4ddcf8fdc7981ec15e3140"
+    },
+    {
+      "layer": 16,
+      "kind": 2,
+      "offset": 3140797432,
+      "bytes": 47185920,
+      "sha256": "be99784ff18ea8fabefddd75d0451899a93f5016d333459e35ea992103721398"
+    },
+    {
+      "layer": 24,
+      "kind": 0,
+      "offset": 5198855800,
+      "bytes": 47185920,
+      "sha256": "fa9f686b21f81b5ba944ac22b3625689e38d37d5625be94e713acdfb7ede93fc"
+    },
+    {
+      "layer": 24,
+      "kind": 1,
+      "offset": 5246041720,
+      "bytes": 47185920,
+      "sha256": "18398603224be064ec8b4ad539bd319f210a2db52f56f1f90bed4839d3a2cac5"
+    },
+    {
+      "layer": 24,
+      "kind": 2,
+      "offset": 5151669880,
+      "bytes": 47185920,
+      "sha256": "ec06219d462c9a00748cfeed0f1a132c4a93821e3c8fe42c5749b71e5eb6d25d"
+    }
+  ],
+  "exit_code": 0,
+  "records": [
+    {
+      "rows": 432,
+      "leg": 0,
+      "fused": 0,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        7322.875,
+        7322.374,
+        6747.666,
+        6541.499,
+        6552.75,
+        6526.916,
+        6623.5,
+        6652.5
+      ],
+      "host_encode_us": [
+        131.958,
+        102.167,
+        113.834,
+        121.167,
+        96.0,
+        110.875,
+        115.041,
+        113.917
+      ]
+    },
+    {
+      "rows": 432,
+      "leg": 1,
+      "fused": 1,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        11710.458,
+        11698.083,
+        11671.874,
+        11680.75,
+        11703.416,
+        11672.749,
+        11678.875,
+        11790.75
+      ],
+      "host_encode_us": [
+        114.375,
+        121.666,
+        118.583,
+        96.083,
+        110.417,
+        119.334,
+        106.375,
+        125.917
+      ]
+    },
+    {
+      "rows": 432,
+      "leg": 2,
+      "fused": 1,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        11719.541,
+        11673.374,
+        11671.083,
+        11715.75,
+        11672.583,
+        11696.416,
+        11712.25,
+        11679.666
+      ],
+      "host_encode_us": [
+        105.25,
+        103.291,
+        101.083,
+        101.666,
+        127.167,
+        98.792,
+        120.917,
+        93.041
+      ]
+    },
+    {
+      "rows": 432,
+      "leg": 3,
+      "fused": 0,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        5770.833,
+        5745.249,
+        5770.874,
+        5767.624,
+        5758.124,
+        5764.583,
+        5744.0,
+        5755.958
+      ],
+      "host_encode_us": [
+        107.125,
+        123.875,
+        119.708,
+        117.667,
+        94.208,
+        107.167,
+        117.0,
+        79.917
+      ]
+    },
+    {
+      "rows": 554,
+      "leg": 0,
+      "fused": 0,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        7318.833,
+        7451.833,
+        7337.624,
+        7360.874,
+        7344.041,
+        7375.999,
+        7337.999,
+        7339.124
+      ],
+      "host_encode_us": [
+        136.459,
+        120.25,
+        119.708,
+        114.208,
+        101.709,
+        102.292,
+        111.958,
+        101.167
+      ]
+    },
+    {
+      "rows": 554,
+      "leg": 1,
+      "fused": 1,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        14922.5,
+        14937.75,
+        14925.291,
+        14957.416,
+        14924.583,
+        14878.0,
+        15104.499,
+        14892.583
+      ],
+      "host_encode_us": [
+        105.375,
+        117.5,
+        130.417,
+        101.584,
+        121.75,
+        129.125,
+        118.917,
+        124.834
+      ]
+    },
+    {
+      "rows": 554,
+      "leg": 2,
+      "fused": 1,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        14877.5,
+        14907.666,
+        14872.791,
+        14974.999,
+        14967.541,
+        14921.875,
+        14932.124,
+        14970.0
+      ],
+      "host_encode_us": [
+        83.166,
+        91.666,
+        108.208,
+        124.041,
+        120.667,
+        114.5,
+        113.917,
+        110.458
+      ]
+    },
+    {
+      "rows": 554,
+      "leg": 3,
+      "fused": 0,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        7319.708,
+        7335.125,
+        7394.916,
+        7315.166,
+        7351.291,
+        7338.249,
+        7318.166,
+        7391.416
+      ],
+      "host_encode_us": [
+        98.75,
+        110.791,
+        98.583,
+        118.709,
+        112.542,
+        78.541,
+        112.208,
+        80.709
+      ]
+    },
+    {
+      "rows": 662,
+      "leg": 0,
+      "fused": 0,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        8539.624,
+        8520.958,
+        8520.833,
+        8532.749,
+        8550.25,
+        8540.166,
+        8535.416,
+        8532.874
+      ],
+      "host_encode_us": [
+        111.25,
+        101.458,
+        91.667,
+        103.375,
+        118.416,
+        134.625,
+        106.333,
+        99.833
+      ]
+    },
+    {
+      "rows": 662,
+      "leg": 1,
+      "fused": 1,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        17449.958,
+        17443.249,
+        17446.374,
+        17456.875,
+        17424.999,
+        17442.083,
+        17453.208,
+        17437.374
+      ],
+      "host_encode_us": [
+        105.0,
+        136.833,
+        91.584,
+        109.208,
+        105.084,
+        101.417,
+        122.166,
+        111.417
+      ]
+    },
+    {
+      "rows": 662,
+      "leg": 2,
+      "fused": 1,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        17433.916,
+        17435.041,
+        17433.958,
+        17480.749,
+        17437.833,
+        17444.291,
+        17431.416,
+        17435.166
+      ],
+      "host_encode_us": [
+        99.416,
+        115.875,
+        101.792,
+        115.125,
+        111.417,
+        91.0,
+        110.542,
+        115.75
+      ]
+    },
+    {
+      "rows": 662,
+      "leg": 3,
+      "fused": 0,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        8588.499,
+        8541.291,
+        8543.375,
+        8633.874,
+        8523.833,
+        8524.624,
+        8523.5,
+        8562.374
+      ],
+      "host_encode_us": [
+        118.333,
+        118.0,
+        114.208,
+        107.417,
+        120.542,
+        116.959,
+        91.875,
+        113.625
+      ]
+    }
+  ],
+  "stdout_sha256": "ba154bb3d018c19f423b3ec8b61dfd310b890d6e33fef71326989d77e89e09de",
+  "stderr_sha256": "df090985f88e5423a4465c9575e7a69d1d5a0ffb1c2d7c580e98d6568fefa1b1"
+}

@@ -1,0 +1,28 @@
+{
+  "decision": "hold_no_production_promotion",
+  "scope": "Same real-weight complete FFN, no model-level speed claim.",
+  "audit_sha256": "7cb5ed3fb37dede8ad89e5cc1da488132b677df9de2e895fffcf6393784ccb99",
+  "cases": [
+    {
+      "rows": 432,
+      "baseline_gpu_us": 7128.5515000000005,
+      "steel_gpu_us": 7242.09325,
+      "steel_to_baseline_ratio": 1.0159277449282649,
+      "all_bitwise_exact": true
+    },
+    {
+      "rows": 554,
+      "baseline_gpu_us": 7346.01,
+      "steel_gpu_us": 7602.96825,
+      "steel_to_baseline_ratio": 1.034979294882528,
+      "all_bitwise_exact": true
+    },
+    {
+      "rows": 662,
+      "baseline_gpu_us": 8532.499500000002,
+      "steel_gpu_us": 8847.85375,
+      "steel_to_baseline_ratio": 1.0369591876331195,
+      "all_bitwise_exact": true
+    }
+  ]
+}

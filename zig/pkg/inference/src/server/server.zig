@@ -7669,6 +7669,15 @@ pub const Node = struct {
         }
     };
 
+    // Lifetime gauges, not physical residency. Capture outside timed work.
+    fn benchmarkOcrMemorySnapshot(round: usize, phase: []const u8) void {
+        if (comptime build_options.enable_metal) {
+            const tensors = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
+            const observed = @import("../backends/metal_telemetry.zig").memorySnapshot(true);
+            std.debug.print("OCR_MEMORY round={d} phase={s} tensor_live_bytes={d} owned_buffer_live_bytes={d} alias_buffer_live_bytes={d}\n", .{ round, phase, tensors.device_owned_live_bytes, observed[0], observed[6] });
+        }
+    }
+
     fn benchmarkOcrProcessCpuNs() ?u64 {
         if (comptime @import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return null;
         const usage = std.posix.getrusage(std.posix.rusage.SELF);
@@ -7754,6 +7763,8 @@ pub const Node = struct {
             "ANTFLY_LIGHTONOCR3_EXECUTOR_TAIL",
             "ANTFLY_LIGHTONOCR3_PHASE_FAIR",
             "ANTFLY_LIGHTONOCR3_EPOCH_AUX",
+            "TERMITE_METAL_ENABLE_LIGHTONOCR3_PREFILL_FFN",
+            "TERMITE_METAL_LIGHTONOCR3_BF16_ACTIVATIONS",
         };
         const Env = struct {
             extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
@@ -7778,6 +7789,18 @@ pub const Node = struct {
         }
         const policy_names: []const []const u8 = if (parsed_rounds) |value| value.value else &.{"current"};
         if (policy_names.len == 0 or policy_names.len > 16) return error.InvalidBenchmarkPolicy;
+        var parsed_prefill_ffn_rounds: ?std.json.Parsed([]const bool) = null;
+        defer if (parsed_prefill_ffn_rounds) |*value| value.deinit();
+        if (platform.env.getenv("ANTFLY_TEST_OCR_PREFILL_FFN_ROUNDS")) |raw| {
+            parsed_prefill_ffn_rounds = try std.json.parseFromSlice([]const bool, allocator, raw, .{});
+            if (parsed_prefill_ffn_rounds.?.value.len != policy_names.len) return error.InvalidBenchmarkPolicy;
+        }
+        var parsed_bf16_rounds: ?std.json.Parsed([]const bool) = null;
+        defer if (parsed_bf16_rounds) |*value| value.deinit();
+        if (platform.env.getenv("ANTFLY_TEST_OCR_BF16_PROJECTION_ROUNDS")) |raw| {
+            parsed_bf16_rounds = try std.json.parseFromSlice([]const bool, allocator, raw, .{});
+            if (parsed_bf16_rounds.?.value.len != policy_names.len) return error.InvalidBenchmarkPolicy;
+        }
         for (policy_names, 0..) |policy, round| {
             for (policy_flags, old_flags) |flag, old| {
                 const rc = if (old) |value| Env.setenv(flag, value, 1) else Env.unsetenv(flag);
@@ -7831,6 +7854,16 @@ pub const Node = struct {
                 if (Env.setenv("ANTFLY_LIGHTONOCR3_EPOCH_AUX", if (std.mem.eql(u8, policy, "engineepoch") or std.mem.eql(u8, policy, "enginetailepoch")) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
             }
             std.debug.print("OCR_POLICY round={d} name={s}\n", .{ round, policy });
+            if (parsed_prefill_ffn_rounds) |rounds| {
+                const enabled = rounds.value[round];
+                if (Env.setenv("TERMITE_METAL_ENABLE_LIGHTONOCR3_PREFILL_FFN", if (enabled) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
+                std.debug.print("OCR_PREFILL_FFN_POLICY round={d} enabled={d}\n", .{ round, @intFromBool(enabled) });
+            }
+            if (parsed_bf16_rounds) |rounds| {
+                const enabled = rounds.value[round];
+                if (Env.setenv("TERMITE_METAL_LIGHTONOCR3_BF16_ACTIVATIONS", if (enabled) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
+                std.debug.print("OCR_BF16_POLICY round={d} enabled={d}\n", .{ round, @intFromBool(enabled) });
+            }
             const latencies = try allocator.alloc(u64, requests);
             defer allocator.free(latencies);
             @memset(latencies, 0);
@@ -7840,6 +7873,7 @@ pub const Node = struct {
             var threads: [reader_execution_pool.Pool.max_capacity]std.Thread = undefined;
             var spawned: usize = 0;
             var spawn_error: ?anyerror = null;
+            benchmarkOcrMemorySnapshot(round, "before");
             const cpu_begin = benchmarkOcrProcessCpuNs();
             const begin = embedTimingNowNs();
             for (0..concurrency) |worker| {
@@ -7855,6 +7889,7 @@ pub const Node = struct {
             if (spawn_error) |err| return err;
             const elapsed = embedTimingNowNs() - begin;
             const cpu_elapsed: ?u64 = if (cpu_begin) |before| if (benchmarkOcrProcessCpuNs()) |after| after -| before else null else null;
+            benchmarkOcrMemorySnapshot(round, "after");
             var completed: usize = 0;
             var native_items: usize = 0;
             for (tasks[0..spawned]) |task| {

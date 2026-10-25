@@ -7,9 +7,9 @@ These measurements do not yet establish sustained parity with vLLM.
 
 | Model | Last repeated matched comparison (native / reference pages/s) | Scope |
 | --- | --- | --- |
-| LightOn 0.8B | 3.9004 / 3.4294; reverse 3.5178 / 2.8488 | Engine80 paired67: actual vLLM API, 13.7% and 23.5% leads. |
-| LightOn 4B | 0.8830 / 0.87627; reverse 0.8154 / 0.91327 | Engine71 paired59: forward +0.8%, reverse −10.7%. No repeated win. |
-| Florence-2 | 4.2800 / 3.5102; reverse 4.4597 / 4.0622 | Engine80 paired67: MLX-VLM proxy leads of 21.9% and 9.8%, different weights/decoding, normalized content comparison. |
+| LightOn 0.8B | 3.9485 / 3.2603; reverse 3.5592 / 3.4840 | Engine85 paired72: actual vLLM API, 21.1% and 2.2% leads. |
+| LightOn 4B | 1.0802 / 1.0196; reverse 0.7282 / 1.1192 | Engine85 paired73: forward +5.9%, reverse −34.9%. No repeated win. |
+| Florence-2 | 4.5697 / 4.1840; reverse 4.7283 / 4.3067 | Engine85 paired72: MLX-VLM proxy leads of 9.2% and 9.8%, different weights/decoding, normalized content comparison. |
 
 Engine71 integrates `origin/main` through `730999bf2d`, including Florence's
 persistent cross-cache ownership fix. Validation caught and corrected a stale
@@ -58,7 +58,7 @@ with two symbolized samples; its 0.9829 pages/s is excluded from comparisons.
 Private engine75's value-major recurrent layout initially only compiles: large
 working sets are skipped under the original memory guard twice. A third retry
 admits 33/48/64-page, 24-layer working sets and passes all full state/output
-checks exactly. Candidate GPU times differ by about 0.5–1.2%; the layout remains
+checks exactly. Candidate GPU times improve by about 0.6–1.3%; the layout remains
 unpromoted without runtime interoperability qualification or model speed data. Engine76's explicit-FMA
 prefill preserves all state/output values across two 1,200-record probes, but
 common-prompt timings show no consistent gain. Engine77's larger projection
@@ -82,11 +82,119 @@ checks. Those checks also cover all four existing projection/reuse rollback
 flags and rejection while a submitted producer command buffer remains pending.
 The nineteen C suites are reused from engine79 only after exact C/header/checker
 and binary hashes. The new FFN remains disabled by default. Fresh model-level
-4B comparisons are pending; this qualification alone establishes no 4B speed win.
-The source80 0.8B actual-vLLM comparison completes in both run orders at the rates
-above: all 128 outputs in each leg equal the serial references and all three full
+4B comparisons are described below; this qualification alone establishes no 4B speed win.
+The source80 0.8B actual-vLLM comparison completes at 3.9004/3.4294 and
+3.5178/2.8488 pages/s: all 128 outputs in each leg equal the serial references and all three full
 fixture strings match across runtimes. No admission pressure is observed. The
 current 4B and Florence comparison status remains separate.
+
+Engine81 adds same-resident FFN policy rounds, qualified with 258 Metal and
+202 CPU passes. Paired70 completes a four-round OFF/ON/ON/OFF 4B comparison:
+0.9336 / 0.8272 / 0.7974 / 0.8428 pages/s. Every round preserves all 128 texts;
+the full fixture strings match actual vLLM, and there is no admission pressure.
+Observed FFN calls are 0 / 4096 / 4096 / 0, so every layer uses the intended
+policy. Mean ON throughput is 8.5% below OFF. Fresh opening vLLM C16/C32/C64
+controls reach 0.8682 / 0.9015 / 0.8654 pages/s with automatic cache sizing.
+The experiment stops after this loss, before closing reference servers launch.
+It is not a repeated native win. The optional FFN stays disabled by default.
+
+Private engine82/83 probes rotate four actual 4B FFN layer triplets, preserving
+BF16 operands and F32 accumulation. The ordinary and fused paths produce exact
+packed intermediates and full outputs, and pass CPU corners and canaries.
+The current fused kernel gains only 3.4–4.2% in engine83's isolated working sets;
+that does not override the negative complete-model result. Engine82's wider
+tile helps one prompt length but gives mixed results on the other two, so it
+is not promoted.
+
+Engine84's CPU horizontal bicubic resize processes RGB/RGBA channels together
+with exact integer SIMD and a bounded wide-accumulator fallback. All 140
+packed/padded/tiny-image comparisons preserve every output byte. The image
+processing tests pass in Debug and ReleaseFast, including pinned Pillow and
+Torchvision pixels and allocation failures. A same-binary scalar/SIMD ABBA
+probe measures 1.6–2.3x gains across six image/format cases. These are horizontal
+resize stage gains, not complete OCR throughput. The first GPU build exposes
+a scratch storage enum error; engine85 corrects it to the existing two-byte
+carrier while retaining BF16 kernel operands. Failed attempts remain recorded.
+
+Engine85 passes 258 Metal tests (one skip), 202 CPU tests (24 skips), and the
+complete image suite. An initial sandbox run could not access Metal; the same
+binary passes with GPU access. Its fresh paired72 smaller-model comparisons
+are listed above. Every native leg preserves all 128 same-model serial texts;
+0.8B also preserves all full cross-runtime fixture strings. Florence retains
+whitespace-normalized cross-runtime content and exact native fixture strings.
+The smaller reverse 0.8B margin is reported without selecting the earlier,
+larger lead. Shared-machine variation remains visible.
+
+Engine85 paired73 completes all opening and closing actual-vLLM API controls.
+Opening C16/C32/C64 reach 0.8511/0.8865/1.0196 pages/s; closing C64/C32/C16
+reach 1.1192/0.9655/0.8884. Both native rounds use one resident model, the
+original F32 decode/BF16 prefill profile, and the ordinary FFN. All native
+and reference outputs pass their serial checks and full cross-runtime fixture
+strings match. There is no native admission pressure. Native GPU time rises
+from 106.7 to 156.6 seconds between identical rounds, while CPU preprocessing
+stays at 1.2/1.5 seconds. These data establish a reverse loss and motivate
+untimed buffer-lifetime diagnostics; they do not establish its cause.
+The optional closing 320-block reference is rejected by its fresh automatic
+admission before any timed result and is excluded, rather than forced.
+
+Private engine86 adapts MLX Steel GEMM with the same BF16 operands and F32
+accumulation. Four real layer triplets produce bit-identical full FFN outputs
+and packed intermediates, with passing CPU corners and canaries, but run
+1.6–3.7% slower. The adapted engine87 NAX wrapper fails numerical verification
+before any primary model timing; no speed result follows. Original engine88
+register kernels using public MPP coordinates produce exact full outputs but
+are about 1.8–2.0x slower. Cooperative-input K64 is rejected by the shader
+compiler, which supports K16/K32. None of these experiments changes production
+dispatch. Their original failures and corrected private checks remain separate.
+
+Private engine89 tests larger 256/512-thread packed-FFN tiles on the same four
+real layer triplets. All full outputs, packed intermediates, CPU corners and
+canaries pass. The 64x64/eight-simdgroup tile varies from a 1.3% gain to a 2.9%
+loss; the 128-row tiles are 11.8–25.1% slower. None is promoted. The first
+attempt correctly declines before building when the primary controller has an
+active child; the probes run only after the complete paired73 comparison.
+
+Engine90 adds same-resident decode-projection precision rounds and untimed
+before/after buffer-lifetime gauges. Invalid round lengths, changing prefill
+precision during the decode ablation, and missing policy rounds are rejected
+before model access. It passes 258 Metal and 202 CPU tests. Its queued model
+diagnostic is retired before model admission when the ownership audit below
+finds a concrete cleanup defect.
+
+Engine91 fixes ARC ownership in the calloc/free Metal runtime: two frame-host
+staging slots, nine pipeline fields, and two MPS plan arrays were not cleared
+before freeing the struct. An immutable pre-fix C snapshot reproduces two
+retained 8-MiB staging buffers and a retained bias pipeline after destruction.
+The new standalone `--check-frame-staging-lifetime` regression verifies that
+staging buffers, the bias pipeline and both MPS plan objects disappear after
+canceled, active-producer and submitted-producer destruction. Producer output
+also remains correct. These are logical lifetime checks, not physical residency
+or a claim that this defect caused the complete paired73 slowdown.
+
+The fixed source passes all 20 fresh C suites, the fresh 24-record/six-length
+packed-FFN checks, 258 Metal tests (one skip), 202 CPU tests (24 skips), and the
+image suite. All five Metal shader-source functions remain byte-identical to
+the pre-cleanup snapshot. The post-fix model diagnostic completes five R128
+rounds with every output matching F32 serial references and the saved full
+cross-runtime fixture strings. The first 1.0639 pages/s round is a saturation
+warm and is excluded. F32 controls reach 0.9370/1.0329 pages/s; BF16 decode
+reaches 0.9126/0.9470 and is not selected. Vision/prefill packing counts remain
+constant; only ON rounds show the required decode-pack dispatches. The old
+vLLM report is a content oracle only, never a timing comparator for this run.
+
+Tensor live bytes are zero at every round boundary. After the saturation warm,
+owned-buffer gauges range from 1.610 to 1.720 GB and logical aliases from 1.481
+to 2.048 GB. These are independent lifetime gauges, not physical residency or
+a measurement of the pre-fix leak size. New matched vLLM comparisons remain
+required before a 4B win can be claimed.
+
+Private engine92 changes only prefill threadgroup geometry. All 14,400
+full-output/state bit comparisons and canaries pass across recurrence-only,
+normalization-only and combined 64/128/256/512-thread variants. Combined256
+helps the three 4B fixture lengths by 3.2%/6.8%/16.9% in the core-only probe;
+other shapes are mixed. This establishes neither a complete-model gain nor a
+new default. The full timing audit is losslessly compressed with raw and
+compressed hashes in `large_audits_manifest.json`.
 
 
 Engine70 extends the existing per-frame settings cache for recurrent,
@@ -107,8 +215,7 @@ shared cache blocks and capacity for 77.80 full 1,024-token contexts. Capacity
 must be read separately for each leg. A stronger default-memory concurrency
 search remains required.
 
-The smaller-model rates above bind their historical engine64 source; they are
-not measurements of the current candidate. Engine68's primary comparison was
+The smaller-model rates above bind engine85 source. Engine68's primary comparison was
 held before any leg ran because of the trace-mask defect.
 All primary pages use exact same-model serial text; the three synthetic fixtures
 provide consistency coverage rather than a broad OCR accuracy evaluation.

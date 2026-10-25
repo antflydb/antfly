@@ -1,0 +1,91 @@
+{
+  "status": "review_pending_model_qualification",
+  "primary_throughput_eligible": false,
+  "audit_sha256": "d3618528b7684e653c34d1f43be10228c93220c43256656e9d00c7e72cfe116f",
+  "candidates": [
+    {
+      "m": 64,
+      "n": 64,
+      "simdgroups": 8,
+      "cases": [
+        {
+          "rows": 432,
+          "baseline_gpu_us": 5638.687,
+          "candidate_gpu_us": 5568.0827500000005,
+          "candidate_to_baseline_ratio": 0.9874786009579891,
+          "all_outputs_and_packed_bits_exact": true
+        },
+        {
+          "rows": 554,
+          "baseline_gpu_us": 7082.71825,
+          "candidate_gpu_us": 7063.57225,
+          "candidate_to_baseline_ratio": 0.9972968005609993,
+          "all_outputs_and_packed_bits_exact": true
+        },
+        {
+          "rows": 662,
+          "baseline_gpu_us": 8201.56175,
+          "candidate_gpu_us": 8441.759750000001,
+          "candidate_to_baseline_ratio": 1.0292868611273944,
+          "all_outputs_and_packed_bits_exact": true
+        }
+      ]
+    },
+    {
+      "m": 128,
+      "n": 32,
+      "simdgroups": 8,
+      "cases": [
+        {
+          "rows": 432,
+          "baseline_gpu_us": 5936.23925,
+          "candidate_gpu_us": 6638.114,
+          "candidate_to_baseline_ratio": 1.1182355899823275,
+          "all_outputs_and_packed_bits_exact": true
+        },
+        {
+          "rows": 554,
+          "baseline_gpu_us": 7082.6245,
+          "candidate_gpu_us": 8457.541,
+          "candidate_to_baseline_ratio": 1.1941252850549962,
+          "all_outputs_and_packed_bits_exact": true
+        },
+        {
+          "rows": 662,
+          "baseline_gpu_us": 8213.447,
+          "candidate_gpu_us": 10079.4055,
+          "candidate_to_baseline_ratio": 1.2271833616263672,
+          "all_outputs_and_packed_bits_exact": true
+        }
+      ]
+    },
+    {
+      "m": 128,
+      "n": 64,
+      "simdgroups": 16,
+      "cases": [
+        {
+          "rows": 432,
+          "baseline_gpu_us": 5753.0725,
+          "candidate_gpu_us": 6838.68725,
+          "candidate_to_baseline_ratio": 1.1887017328566605,
+          "all_outputs_and_packed_bits_exact": true
+        },
+        {
+          "rows": 554,
+          "baseline_gpu_us": 7091.687,
+          "candidate_gpu_us": 8653.384999999998,
+          "candidate_to_baseline_ratio": 1.2202153027904359,
+          "all_outputs_and_packed_bits_exact": true
+        },
+        {
+          "rows": 662,
+          "baseline_gpu_us": 8199.63525,
+          "candidate_gpu_us": 10260.3745,
+          "candidate_to_baseline_ratio": 1.2513208438143637,
+          "all_outputs_and_packed_bits_exact": true
+        }
+      ]
+    }
+  ]
+}

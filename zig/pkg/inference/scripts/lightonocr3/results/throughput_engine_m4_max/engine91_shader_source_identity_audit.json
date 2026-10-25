@@ -1,0 +1,13 @@
+{
+  "status": "pass",
+  "scope": "All static NSString Metal source-producing functions remain byte-identical to the exact pre-cleanup C snapshot. Lifetime cleanup changes no shader arithmetic; fresh C/GPU qualification still required and completed separately.",
+  "before_c_sha256": "fc6d71ea0364f91d02b3902e47ffbec50baf5c08f62716aaa202ed1005d43584",
+  "after_c_sha256": "ab7db0fab1cab774c127bf2a32560a4879980a29b4405f19ac75f4d70012ef83",
+  "source_function_sha256": {
+    "termite_metal_lightonocr3_recurrent_source": "1ad391095431539f3dd94aeb61e9535b4771f11ffcc0fb61d4222788c6f007cd",
+    "termite_metal_lighton_prefill_ffn_source": "3145a1c57d14ac858653df435632bc3b708eb87ce1d878ba9455dbbe43139684",
+    "termite_metal_lightonocr3_tensor_source": "9de03f7973d812d3fb324b655597f7279b0eeab174f3e40842ad1eec573cec9f",
+    "termite_metal_shader_source": "e2ec4942813793ab15e207e1b576aaf20e4e2030ac00ce1d3a530ecaf2db5cf2",
+    "termite_metal_deberta_training_attention_v1_source": "fd8fa28493f7146e9e7e75de057823d1f4ea3f5b23c24a9255ad93c37941f37c"
+  }
+}

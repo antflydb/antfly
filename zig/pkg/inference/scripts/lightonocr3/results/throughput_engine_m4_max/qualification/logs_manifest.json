@@ -7986,5 +7986,709 @@
   "ocr-run_engine80_florence_paired67-parent.txt.gz": {
     "raw_sha256": "a0bb693218cfed6926b461b815b0d27d5e3790a5ee59a3094bb3d2a08945bd48",
     "raw_bytes": 1723
+  },
+  "ocr-engine81-08-resident_ffn_qualification69_r0_physical64_c4_vf4_prefix16_wide640_p1_r4.txt.gz": {
+    "raw_sha256": "5083f77f3be9198435461af14a5953069a1bf0f27f4a51c23f92bea810d30aeb",
+    "raw_bytes": 8555
+  },
+  "ocr-engine81-4b-paired70_resident_wide_r0_c64_p1_v1_vf3_r128.txt.gz": {
+    "raw_sha256": "6ce7b5aa05c0e75ca0d9cc1b1abc050ea7aaa13a5023f9b49c7d3322e3564488",
+    "raw_bytes": 9030
+  },
+  "ocr-engine81-cpu-parent.txt.gz": {
+    "raw_sha256": "31f83008503494e553273d11edcde91f57574fe94fb466785f654b3e47ea054c",
+    "raw_bytes": 22
+  },
+  "ocr-engine81-finalize-parent.txt.gz": {
+    "raw_sha256": "b4fced42d8d2a4d3137becb068ff9beebd3b0cead744d769bf54212c47022490",
+    "raw_bytes": 133
+  },
+  "ocr-engine81-finalqualification-parent.txt.gz": {
+    "raw_sha256": "5eee3a4e24ec908f5447e5f278089e74191dadcd475cc082d633c18878ceb27d",
+    "raw_bytes": 649
+  },
+  "ocr-engine81-finalqualification-verify2-parent.txt.gz": {
+    "raw_sha256": "584c64b2bd6cfb6c375624ceddb4bf82b74aeff58e8efe5181a5356a1638efb9",
+    "raw_bytes": 108
+  },
+  "ocr-engine81-gpu-parent.txt.gz": {
+    "raw_sha256": "1fef9f31b6766a8bc5ecad11ae3f8c6bb6e34c8ab208d1ea6e888122649f191d",
+    "raw_bytes": 1295
+  },
+  "ocr-engine81-metal-disabled.txt.gz": {
+    "raw_sha256": "20f2a98bbfc43fa94189442fa37101a2e823139de3aae813ee92fae6fa2e829f",
+    "raw_bytes": 26817
+  },
+  "ocr-engine81-native-paired70_resident-wide-r0-driver.txt.gz": {
+    "raw_sha256": "91cab1de2df73e8d41919db8b89ed80eb635ac24d486737e1a2eeac11ec3c081",
+    "raw_bytes": 4861
+  },
+  "ocr-engine81-primary70-parent.txt.gz": {
+    "raw_sha256": "dd8b5caedd7a8fd109339aad0ad40ab91c53c5af718e3b1018ccd37d26370d3f",
+    "raw_bytes": 973
+  },
+  "ocr-engine81-primary70-verify2-parent.txt.gz": {
+    "raw_sha256": "b0fc28de64d9bc7c7bf9ce46beb5ebbfe8074445ed11fe0089ea81dd9af7dbed",
+    "raw_bytes": 1734
+  },
+  "ocr-engine81-qualification-parent.txt.gz": {
+    "raw_sha256": "d428f2052c8eb7fe03f5b8a064c53af7d3b306b7b415b22cb49d7d48f4a0092c",
+    "raw_bytes": 151
+  },
+  "ocr-engine81-resident-rounds-parent.txt.gz": {
+    "raw_sha256": "4b9fef8bfcb0e8f70d70b53021f06f398e526cc7fe5684d0813feeb18a4d4664",
+    "raw_bytes": 3874
+  },
+  "ocr-engine81-verify2-gpu-build.txt.gz": {
+    "raw_sha256": "e69327a8914b0b76b1b5b2bbe75a2c85694ab53daddcce5c26007639abb483de",
+    "raw_bytes": 40332
+  },
+  "ocr-engine81-vllm-paired70-r0-c16-bNone.txt.gz": {
+    "raw_sha256": "6a58a03f134cf6e8c48d95b3064cfbcfc480e2c73419a57fc31cc5dd31a5d297",
+    "raw_bytes": 209
+  },
+  "ocr-engine81-vllm-paired70-r0-c32-bNone.txt.gz": {
+    "raw_sha256": "82dacc45ef94d67d8f4aa6691f0991f98f8c6b05f09dbd15492bcd7ddf7c14dc",
+    "raw_bytes": 208
+  },
+  "ocr-engine81-vllm-paired70-r0-c64-bNone.txt.gz": {
+    "raw_sha256": "754bea92b156b86cb0df88158641b2a85be5ffd973d441c6b9fc58052e571795",
+    "raw_bytes": 208
+  },
+  "ocr-engine82-real-ffn-build.txt.gz": {
+    "raw_sha256": "3ecb13b49df6d89c8555e8dd9bbd4022e153e472670cf3d18e02bc012c0b33a4",
+    "raw_bytes": 5363
+  },
+  "ocr-engine82-real-ffn-parent.txt.gz": {
+    "raw_sha256": "012476384b21182a2b1c996e06808c63ffb0a518ef0516a8f06b9bbc46c5e353",
+    "raw_bytes": 86
+  },
+  "ocr-engine82-real-ffn-stderr.txt.gz": {
+    "raw_sha256": "4fa81357613f11f8144c4b8f36003dff906174d83a7ca71bd9dd18daa0054182",
+    "raw_bytes": 61
+  },
+  "ocr-engine82-real-ffn-stdout.txt.gz": {
+    "raw_sha256": "357d6702dcb434d5833e8e401de14b2cff833b276664c711a48b695793e4c4b8",
+    "raw_bytes": 4599
+  },
+  "ocr-engine83-real-ffn-parent.txt.gz": {
+    "raw_sha256": "bbac368c2a47e861cd2de6da76a78975c533748785df8695a282c9cf4faf3d19",
+    "raw_bytes": 32
+  },
+  "ocr-engine83-real-ffn-retry-build.txt.gz": {
+    "raw_sha256": "95b0d49764138ce55597d28606cd7f002018ba22826f1e985a1bb6b452e32f52",
+    "raw_bytes": 5363
+  },
+  "ocr-engine83-real-ffn-retry-parent.txt.gz": {
+    "raw_sha256": "310b449bf7c41df71081e1202e19abb89864ebcc8560f51ba3146a80364ae51f",
+    "raw_bytes": 63
+  },
+  "ocr-engine83-real-ffn-retry-stderr.txt.gz": {
+    "raw_sha256": "67a728569d060ceb37c4fe64fe45b39285753047768621248af137854e23b1a3",
+    "raw_bytes": 61
+  },
+  "ocr-engine83-real-ffn-retry-stdout.txt.gz": {
+    "raw_sha256": "8b42fea3b9bf28114b3e4d1a99536c20f3dee89c7a11cfdd47e068f86f4f6761",
+    "raw_bytes": 4599
+  },
+  "ocr-engine84-gpu-parent.txt.gz": {
+    "raw_sha256": "0c6868c2c44f053619cef1cc383e1d530743b574ca192ace9168a9ccf46a86e3",
+    "raw_bytes": 7
+  },
+  "ocr-engine84-horizontal-bench.txt.gz": {
+    "raw_sha256": "6925310a107ab3d100d60023fe269fbeb0e29611094a663c9fd1c636cc373d8b",
+    "raw_bytes": 2707
+  },
+  "ocr-engine84-image-parent.txt.gz": {
+    "raw_sha256": "f11f8211e637da9c266a9febed054e076efba069e633da833e2cebf6d8eb4571",
+    "raw_bytes": 523
+  },
+  "ocr-engine84-image-tests.txt.gz": {
+    "raw_sha256": "e97fb694f95eefbdbd959e79587295ffecb345406d1dbe3981df9f63307c6966",
+    "raw_bytes": 523
+  },
+  "ocr-engine84-processing-debug-tests.txt.gz": {
+    "raw_sha256": "686f5192f00142b3bd744b21f308cb4adc91e7cdb59ae842f7293c42d585c7c4",
+    "raw_bytes": 1137
+  },
+  "ocr-engine84-processing-release-tests.txt.gz": {
+    "raw_sha256": "686f5192f00142b3bd744b21f308cb4adc91e7cdb59ae842f7293c42d585c7c4",
+    "raw_bytes": 1137
+  },
+  "ocr-engine84-qualification-parent.txt.gz": {
+    "raw_sha256": "95bd9e11a3bc53576841ceea04304d10ddd2fcb322c8fd530f20428da3173c30",
+    "raw_bytes": 82
+  },
+  "ocr-engine84-verify2-gpu-build.txt.gz": {
+    "raw_sha256": "2fa0709e46fe69b2f197045d3b4c2efe5c2fb53595f4f709ec764138e9bfacfe",
+    "raw_bytes": 13036
+  },
+  "ocr-engine85-08-paired72_r0_physical64_c64_vf4_prefix16_wide640_p1_r128.txt.gz": {
+    "raw_sha256": "9d5edb35e2e0bc14e22415f8898d12ccf8c0f0f8d6e018d7aa03e7bdd183b885",
+    "raw_bytes": 4086
+  },
+  "ocr-engine85-08-paired72_r1_physical64_c64_vf4_prefix16_wide640_p1_r128.txt.gz": {
+    "raw_sha256": "4cbc94a4e72d3fd2fdaba7dff459927a5e47289556d12dcad8dcf680b6edd546",
+    "raw_bytes": 4079
+  },
+  "ocr-engine85-4b-paired73_resident_wide_r0_c64_p1_v1_vf3_r128.txt.gz": {
+    "raw_sha256": "f7fa8e1d5a6057758419d33d929bdc314458935c5a028985e4733cfbed7c6136",
+    "raw_bytes": 5513
+  },
+  "ocr-engine85-cpu-verify3-parent.txt.gz": {
+    "raw_sha256": "31f83008503494e553273d11edcde91f57574fe94fb466785f654b3e47ea054c",
+    "raw_bytes": 22
+  },
+  "ocr-engine85-finalize-verify3-parent.txt.gz": {
+    "raw_sha256": "e278d41a2eb9e94780c857df0a5ccd18a2075ee1c063dc5e9d6e90974c324d2d",
+    "raw_bytes": 133
+  },
+  "ocr-engine85-florence-paired72-native0.txt.gz": {
+    "raw_sha256": "cd431180bd2407722afbbdbb94cc84be4d3509dc36be0ba89473af1abd17d7a3",
+    "raw_bytes": 2235
+  },
+  "ocr-engine85-florence-paired72-native1.txt.gz": {
+    "raw_sha256": "c42ef35fbebb72b92e3530ffc1f00d2217146897ed497aa0cecc0f67b878b91c",
+    "raw_bytes": 2235
+  },
+  "ocr-engine85-florence-paired72-reference0.txt.gz": {
+    "raw_sha256": "82a6f4d70fdecfcaa137d2419d3611979e27e17f6009c2d66b25103d36e571d7",
+    "raw_bytes": 147
+  },
+  "ocr-engine85-florence-paired72-reference1.txt.gz": {
+    "raw_sha256": "1afe0ece6e03dc719311a85a6614e8b2e6b65bb1a5a3a8f761f37d0e3bbca2f7",
+    "raw_bytes": 147
+  },
+  "ocr-engine85-gpu-parent.txt.gz": {
+    "raw_sha256": "0c6868c2c44f053619cef1cc383e1d530743b574ca192ace9168a9ccf46a86e3",
+    "raw_bytes": 7
+  },
+  "ocr-engine85-gpu-verify3-parent.txt.gz": {
+    "raw_sha256": "1fef9f31b6766a8bc5ecad11ae3f8c6bb6e34c8ab208d1ea6e888122649f191d",
+    "raw_bytes": 1295
+  },
+  "ocr-engine85-image-parent.txt.gz": {
+    "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "raw_bytes": 0
+  },
+  "ocr-engine85-image-verify3-parent.txt.gz": {
+    "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "raw_bytes": 0
+  },
+  "ocr-engine85-metal-disabled.txt.gz": {
+    "raw_sha256": "1e20a37310bd69b4581e1d2e94ccd8ec508a06315a9b712483b003f5d6bb31e5",
+    "raw_bytes": 26817
+  },
+  "ocr-engine85-native-paired73_resident-wide-r0-driver.txt.gz": {
+    "raw_sha256": "339062ee6c619d1f599a9b9913c4a4a76f606f3255a9833a08af4e6408de96a0",
+    "raw_bytes": 2500
+  },
+  "ocr-engine85-primary-queue-parent.txt.gz": {
+    "raw_sha256": "e9bb8596350efccffa8db0fed17dcab22a9f1e5737ef82ab7b18b809ac45c76f",
+    "raw_bytes": 557
+  },
+  "ocr-engine85-primary-queue-verify3-parent.txt.gz": {
+    "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "raw_bytes": 0
+  },
+  "ocr-engine85-primary-queue-verify4-parent.txt.gz": {
+    "raw_sha256": "49e888ea6ea5afe7c53ce29439b000884b365e856c6607999cac9dd6f04c2c05",
+    "raw_bytes": 69
+  },
+  "ocr-engine85-primary-queue-verify5-parent.txt.gz": {
+    "raw_sha256": "49547a1cfefd50164c1c8481d06a65ae7af8de21f40770b1982a8b768e46a907",
+    "raw_bytes": 300
+  },
+  "ocr-engine85-primary73-parent.txt.gz": {
+    "raw_sha256": "4649a51b73faf4fc2e0606adf1c1d1b97425ea0d90100acb6f02b57f33228eb4",
+    "raw_bytes": 844
+  },
+  "ocr-engine85-qualification-parent.txt.gz": {
+    "raw_sha256": "b009867c676eb206c63a99ae70d218109029b4e882740067392e100ab3035499",
+    "raw_bytes": 82
+  },
+  "ocr-engine85-qualification-verify3-parent.txt.gz": {
+    "raw_sha256": "d27fd49fc9dc6ee472d2bfa6cc6080470456fdc4b1e194eb08751f71f6fb8d5b",
+    "raw_bytes": 198
+  },
+  "ocr-engine85-verify2-gpu-build.txt.gz": {
+    "raw_sha256": "8c552b0e3fc236ca6c854e677e58d0080193cfadf3b76ed05b838134ae1780f4",
+    "raw_bytes": 32762
+  },
+  "ocr-engine85-verify3-gpu-build.txt.gz": {
+    "raw_sha256": "53a3fce0b45accfaa634a17b85ee6d1e34118cede990e69cc0667a853fb8f40c",
+    "raw_bytes": 40332
+  },
+  "ocr-engine85-vllm-08-paired72-r0.txt.gz": {
+    "raw_sha256": "58a9c0ce4671b65aa7f2891ce6ec76e93515e39056bdb7a90031c35dafd4de83",
+    "raw_bytes": 208
+  },
+  "ocr-engine85-vllm-08-paired72-r1.txt.gz": {
+    "raw_sha256": "136e0f6cbcc37332c4541c6e900fd94376eb1f50a95321f5215a2e1f835e7df7",
+    "raw_bytes": 209
+  },
+  "ocr-engine85-vllm-paired73-r0-c16-bNone.txt.gz": {
+    "raw_sha256": "fd62bf66e87e9459e24babb14cae6fb819979167f05c84281a46aedcded46946",
+    "raw_bytes": 209
+  },
+  "ocr-engine85-vllm-paired73-r0-c32-bNone.txt.gz": {
+    "raw_sha256": "00582642e6713d7665244559202e3f94061ae74b9e04160785bbfb5ab9862578",
+    "raw_bytes": 209
+  },
+  "ocr-engine85-vllm-paired73-r0-c64-bNone.txt.gz": {
+    "raw_sha256": "471f366ae4e4d1e3ff3b53cd9c8b3806c12b4266413c4e3d9a3d1a33a45dfb10",
+    "raw_bytes": 209
+  },
+  "ocr-engine85-vllm-paired73-r1-c16-bNone.txt.gz": {
+    "raw_sha256": "0492d6744c4e65dd935a2b24a7e6a2d4d22351d8180f4e687b5d3d0d7a1d43fa",
+    "raw_bytes": 210
+  },
+  "ocr-engine85-vllm-paired73-r1-c32-bNone.txt.gz": {
+    "raw_sha256": "8d554140f0f21a795368a2134294c1bfdb8746aeb02751cfa9768313c40b3d10",
+    "raw_bytes": 209
+  },
+  "ocr-engine85-vllm-paired73-r1-c64-b320.txt.gz": {
+    "raw_sha256": "c14258ddc0a8440b4a7bd98de730b14da11d41c5d52b575b3a8a20e556e5ab83",
+    "raw_bytes": 528
+  },
+  "ocr-engine85-vllm-paired73-r1-c64-bNone.txt.gz": {
+    "raw_sha256": "126b1f04187dfbaa720ed8d80bbaaff3bedd2ade4696173943f5a99d314f943d",
+    "raw_bytes": 209
+  },
+  "ocr-engine86-steel-build.txt.gz": {
+    "raw_sha256": "0c12e73218f1792a4b563a0a0d3ac86c207b4a6d2752371dac0fc0690e300f26",
+    "raw_bytes": 5363
+  },
+  "ocr-engine86-steel-stderr.txt.gz": {
+    "raw_sha256": "1d68e32753fc98774cffab252e642f045f21eb0be48910defa364fe7b6798eb9",
+    "raw_bytes": 1704
+  },
+  "ocr-engine86-steel-stdout.txt.gz": {
+    "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "raw_bytes": 0
+  },
+  "ocr-engine86-steel-verify2-stderr.txt.gz": {
+    "raw_sha256": "df090985f88e5423a4465c9575e7a69d1d5a0ffb1c2d7c580e98d6568fefa1b1",
+    "raw_bytes": 94
+  },
+  "ocr-engine86-steel-verify2-stdout.txt.gz": {
+    "raw_sha256": "6fcf8f1a5446c83921af1c337ff1a7b7085878dd39e3cb7a963c3f3f42e50ff0",
+    "raw_bytes": 4645
+  },
+  "ocr-engine87-diagnostic-build.txt.gz": {
+    "raw_sha256": "88a3e689ffa88c3e54d1d8c7f0a53e9f594668d748468cc6eb98b52c165c613e",
+    "raw_bytes": 4017
+  },
+  "ocr-engine87-diagnostic-stderr.txt.gz": {
+    "raw_sha256": "dc2f26297480c60621ddca4c2747cfc4d9d6f4734a109e772b8cfe31393e2af1",
+    "raw_bytes": 175
+  },
+  "ocr-engine87-diagnostic-stdout.txt.gz": {
+    "raw_sha256": "e7dd9942ee15740991ccb971a4780850c64e2e9492fabfc493ee83d7f991c345",
+    "raw_bytes": 387
+  },
+  "ocr-engine87-nax-parent.txt.gz": {
+    "raw_sha256": "74b6bba923b0c767faccb5ff825ff2a824e43160186aa59a2185eeef5bfdb94a",
+    "raw_bytes": 700
+  },
+  "ocr-engine87-nax-stderr.txt.gz": {
+    "raw_sha256": "d2da751a7ed76834f5899aaf3d71e1a6d25ea147fd6570f1e20f14ad05a42eb2",
+    "raw_bytes": 27
+  },
+  "ocr-engine87-nax-stdout.txt.gz": {
+    "raw_sha256": "d8fa511c578badcb0c6f7a8889464ba682fc0ca38d8c790d485df179f3118dd7",
+    "raw_bytes": 387
+  },
+  "ocr-engine88-register-k32-stderr.txt.gz": {
+    "raw_sha256": "df090985f88e5423a4465c9575e7a69d1d5a0ffb1c2d7c580e98d6568fefa1b1",
+    "raw_bytes": 94
+  },
+  "ocr-engine88-register-k32-stdout.txt.gz": {
+    "raw_sha256": "631adeed6fce6dd5385073aa4d9f2d21bd35c78c894a43cf6646ec9f3e78ba40",
+    "raw_bytes": 4708
+  },
+  "ocr-engine88-register-k64-stderr.txt.gz": {
+    "raw_sha256": "6370182a516f7b9f37fd0f6b305ecbb9b0e21b6251234fc1425565959fa2e660",
+    "raw_bytes": 7006
+  },
+  "ocr-engine88-register-k64-stdout.txt.gz": {
+    "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "raw_bytes": 0
+  },
+  "ocr-engine88-register-parent.txt.gz": {
+    "raw_sha256": "8376f457ab8f08614a51e288b98a6711151d2c0893623395637c1dbd17ba9017",
+    "raw_bytes": 26
+  },
+  "ocr-engine88-register-stderr.txt.gz": {
+    "raw_sha256": "df090985f88e5423a4465c9575e7a69d1d5a0ffb1c2d7c580e98d6568fefa1b1",
+    "raw_bytes": 94
+  },
+  "ocr-engine88-register-stdout.txt.gz": {
+    "raw_sha256": "ba154bb3d018c19f423b3ec8b61dfd310b890d6e33fef71326989d77e89e09de",
+    "raw_bytes": 4710
+  },
+  "ocr-engine88-then85-primary73-parent.txt.gz": {
+    "raw_sha256": "a7b3a876c0d53d0e7e4ad3778a215e27630004b9f3d9356bdc525f628038f3e2",
+    "raw_bytes": 1579
+  },
+  "ocr-engine89-after-primary-parent.txt.gz": {
+    "raw_sha256": "7b5f1b9f7d0ba27e2f66706768577e385e7904a6424c2fbd4595a852362433a4",
+    "raw_bytes": 189
+  },
+  "ocr-engine89-archive-closed.txt.gz": {
+    "raw_sha256": "37ffde6303c1827c26752b92cc7b1d05b9b7c3381d2f7b60ae1609489e56b65d",
+    "raw_bytes": 1306
+  },
+  "ocr-engine89-m128n32s8-stderr.txt.gz": {
+    "raw_sha256": "4fa81357613f11f8144c4b8f36003dff906174d83a7ca71bd9dd18daa0054182",
+    "raw_bytes": 61
+  },
+  "ocr-engine89-m128n32s8-stdout.txt.gz": {
+    "raw_sha256": "301ff911d8793b3e93b10936d8eaf8fb985425bad6257f4340d14ca278783741",
+    "raw_bytes": 4586
+  },
+  "ocr-engine89-m128n64s16-stderr.txt.gz": {
+    "raw_sha256": "4fa81357613f11f8144c4b8f36003dff906174d83a7ca71bd9dd18daa0054182",
+    "raw_bytes": 61
+  },
+  "ocr-engine89-m128n64s16-stdout.txt.gz": {
+    "raw_sha256": "b4bdcbf9c89d7c3f76254fb2a741d92706977fbd7569b1811b5c199db459e24b",
+    "raw_bytes": 4588
+  },
+  "ocr-engine89-m64n64s8-stderr.txt.gz": {
+    "raw_sha256": "4fa81357613f11f8144c4b8f36003dff906174d83a7ca71bd9dd18daa0054182",
+    "raw_bytes": 61
+  },
+  "ocr-engine89-m64n64s8-stdout.txt.gz": {
+    "raw_sha256": "754ba742beb4319ae2d58cc603efb1e9da2e8359fef3a999134276430dd1ad69",
+    "raw_bytes": 4572
+  },
+  "ocr-engine89-tiles-build.txt.gz": {
+    "raw_sha256": "ab6d30a092883a091b02030d6eaec886d141fb318481486a2cf590614632f57f",
+    "raw_bytes": 5363
+  },
+  "ocr-engine89-tiles-parent.txt.gz": {
+    "raw_sha256": "9beb33204276bed2fd05c8f951c9d14a58ce1a84cdd7984858334008c21ce1df",
+    "raw_bytes": 357
+  },
+  "ocr-run_engine85_08_paired72-parent.txt.gz": {
+    "raw_sha256": "b2c0fbe8c97cb8b640bd47ad594f0fc3da2fd3bf1bc14dc5a0c9bf6b151cd081",
+    "raw_bytes": 4230
+  },
+  "ocr-run_engine85_florence_paired72-parent.txt.gz": {
+    "raw_sha256": "b50f1ac7a591b22384a69e96ea0c279103d5013b3dc3ffcb0a22726174f4be7d",
+    "raw_bytes": 1727
+  },
+  "ocr-run_engine85_primary71-parent.txt.gz": {
+    "raw_sha256": "0b1fc8bccda2191fb105322d1546253e6fedb84de13b3ce23c9a197a06ac86de",
+    "raw_bytes": 1144
+  },
+  "ocr-run_engine86_steel_probe-parent.txt.gz": {
+    "raw_sha256": "f41521291dbb37be0f3d7ff15749da837fda9ea113580136c30c12d83588b1e1",
+    "raw_bytes": 702
+  },
+  "ocr-run_engine86_steel_probe_verify2-parent.txt.gz": {
+    "raw_sha256": "4c465c1bd7bf4c926286a371e7e846aaf01d005897415b6ace97849714ebc23f",
+    "raw_bytes": 23
+  },
+  "ocr-engine90-cpu-verify3-parent.txt.gz": {
+    "raw_sha256": "31f83008503494e553273d11edcde91f57574fe94fb466785f654b3e47ea054c",
+    "raw_bytes": 22
+  },
+  "ocr-engine90-finalize-verify3-parent.txt.gz": {
+    "raw_sha256": "c6f871d29b4ea40b83815c26a3ff7c807010b0d91007cc13cc719d772da85ad1",
+    "raw_bytes": 133
+  },
+  "ocr-engine90-gpu-verify3-parent.txt.gz": {
+    "raw_sha256": "1fef9f31b6766a8bc5ecad11ae3f8c6bb6e34c8ab208d1ea6e888122649f191d",
+    "raw_bytes": 1295
+  },
+  "ocr-engine90-image-verify3-parent.txt.gz": {
+    "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "raw_bytes": 0
+  },
+  "ocr-engine90-metal-disabled.txt.gz": {
+    "raw_sha256": "000563909d2a05c5eede4d33c12fd381e1e28b468cfc6c48b9cee019fad52603",
+    "raw_bytes": 26817
+  },
+  "ocr-engine90-precision74-parent.txt.gz": {
+    "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "raw_bytes": 0
+  },
+  "ocr-engine90-qualification-parent.txt.gz": {
+    "raw_sha256": "96dcd521f4c78fc2d6f9cf73f8ded7776e347e9ef326f2e89f3782b771090651",
+    "raw_bytes": 198
+  },
+  "ocr-engine90-verify3-gpu-build.txt.gz": {
+    "raw_sha256": "a25443cc732adeefa3d8085fdd59501eaba8eeab836307d2566f7f4b0a33568b",
+    "raw_bytes": 40331
+  },
+  "ocr-engine91-4b-precision_memory_screen74_offwarm_off_on_on_off_c64_r128.txt.gz": {
+    "raw_sha256": "6417e0649a5b854ef91255bc14cb76439818ac1776f7eeffbe680c87d4265cca",
+    "raw_bytes": 12071
+  },
+  "ocr-engine91-c-batch-argmax.txt.gz": {
+    "raw_sha256": "81b078ec69276253afee4a718ab65d2c5c6821c1a9caf6ca5cdcfc84036c280c",
+    "raw_bytes": 826
+  },
+  "ocr-engine91-c-batch-attention.txt.gz": {
+    "raw_sha256": "24459ecfe00569877bba18f375271937c1c044c63c4ac7308e4132280bb4585b",
+    "raw_bytes": 885
+  },
+  "ocr-engine91-c-build-parent.txt.gz": {
+    "raw_sha256": "4e6eb4e5ec25682bbbeb1056acb1a1615da718e8f3f2987abba6ab657ab61edd",
+    "raw_bytes": 55
+  },
+  "ocr-engine91-c-build.txt.gz": {
+    "raw_sha256": "d765c4ea28ef51e0d3eea0dd98a9febadb8ecf319eb407a7cd279260d77c5d4e",
+    "raw_bytes": 2744
+  },
+  "ocr-engine91-c-decode-pack-reuse.txt.gz": {
+    "raw_sha256": "4c8482b956abe2835ec5262e300aff7bef6b1484a8a6a90b421e743963a7795b",
+    "raw_bytes": 4964
+  },
+  "ocr-engine91-c-frame-metadata.txt.gz": {
+    "raw_sha256": "c034de06f39ef80e7d68f6cb5c784a6256c0df938e62efe7d1ef431a1151cd53",
+    "raw_bytes": 325
+  },
+  "ocr-engine91-c-frame-staging-lifetime.txt.gz": {
+    "raw_sha256": "645bccc4f1301379005505b69420240f28608954eabb3eeba27766938722334b",
+    "raw_bytes": 285
+  },
+  "ocr-engine91-c-full.txt.gz": {
+    "raw_sha256": "4789492a5246304cd25b8e0aa24243d309b9470a5e97987cc1480406de3d7c8f",
+    "raw_bytes": 73068
+  },
+  "ocr-engine91-c-gpu-token-burst-long.txt.gz": {
+    "raw_sha256": "3e3faea81d5978224d546a8c88889940e583f66fd0be87d8ff3625102302e9f3",
+    "raw_bytes": 1893
+  },
+  "ocr-engine91-c-gpu-token-burst.txt.gz": {
+    "raw_sha256": "165c8b91514a4f9dadac80beb319dc6d72f0e8fdece0804a0a90d66fead1e945",
+    "raw_bytes": 1001
+  },
+  "ocr-engine91-c-large-vision-pack-reuse.txt.gz": {
+    "raw_sha256": "4e43d279f684d25b4c8869f6e6491d78e0d076231a4384280b6f8a0bf2c56eff",
+    "raw_bytes": 594
+  },
+  "ocr-engine91-c-planned-mpp.txt.gz": {
+    "raw_sha256": "cd1716a973aa2a3c33667f570c7fe0c4c1d9744be05599f244e0dfd0552e5d7b",
+    "raw_bytes": 4096
+  },
+  "ocr-engine91-c-prefill-pack-reuse-large.txt.gz": {
+    "raw_sha256": "d6b857bda67d590e0adaea01a78abc0343f9d3ba743fcb310e5c55d7fbc94b16",
+    "raw_bytes": 1499
+  },
+  "ocr-engine91-c-prefill-pack-reuse.txt.gz": {
+    "raw_sha256": "577ae254b0d8db8a2d8aa9d24146017c1b2f0146c84395a126f71024cbc2fc63",
+    "raw_bytes": 1019
+  },
+  "ocr-engine91-c-qualification-parent.txt.gz": {
+    "raw_sha256": "eb5e80704af005973e94948fae4587e0b0798139ee4e2d7dade87d260ae5664a",
+    "raw_bytes": 946
+  },
+  "ocr-engine91-c-resident-vision-dispatch.txt.gz": {
+    "raw_sha256": "8f490dc7d6bfcccd0cba5716892c597d40ec396672dbbebbdd9793e0e8ee442b",
+    "raw_bytes": 171
+  },
+  "ocr-engine91-c-vision-pack-reuse.txt.gz": {
+    "raw_sha256": "1d818f4c53eca777c2d0d8def22ec948e7a0781b3f92ccae7b0d6122aeeb6b33",
+    "raw_bytes": 1388
+  },
+  "ocr-engine91-c-vision-workspace-cache.txt.gz": {
+    "raw_sha256": "9ab550ab3a038d28832af5d10d682678648c17d1b624f5bdf0bde7cb20abbfa0",
+    "raw_bytes": 261
+  },
+  "ocr-engine91-c-wide-gate-up-full64.txt.gz": {
+    "raw_sha256": "e498ce584c8b0bb68da88c0ed32fe92227c119023795cbc650079ec60d66c7e7",
+    "raw_bytes": 2073
+  },
+  "ocr-engine91-c-wide-gate-up-large64.txt.gz": {
+    "raw_sha256": "485a4cb4a45c1f754dce5e5503e186edac998f3ac860a44d270cc294301c8250",
+    "raw_bytes": 2063
+  },
+  "ocr-engine91-c-wide-gate-up.txt.gz": {
+    "raw_sha256": "ebac300bc4dafb769bde066c1b530091dd3b988e6dd22e5294a04320053da045",
+    "raw_bytes": 1973
+  },
+  "ocr-engine91-c-wide-mpp.txt.gz": {
+    "raw_sha256": "8ed4ccfc55d872b3ca3f7913280f2d24b8bb444c919d58f441980322ef91da4a",
+    "raw_bytes": 14823
+  },
+  "ocr-engine91-c-wide64.txt.gz": {
+    "raw_sha256": "604cdaac2e36c631ca5aa5f6bc072b3b1e41b8a515f4560493e803be6ce369db",
+    "raw_bytes": 17860
+  },
+  "ocr-engine91-cpu-parent.txt.gz": {
+    "raw_sha256": "31f83008503494e553273d11edcde91f57574fe94fb466785f654b3e47ea054c",
+    "raw_bytes": 22
+  },
+  "ocr-engine91-finalize-parent.txt.gz": {
+    "raw_sha256": "3aa301669b8ef82e91d9e624961d23c145e944e1e62a3ece6a8e539d997664f6",
+    "raw_bytes": 133
+  },
+  "ocr-engine91-focused-ffn-build.txt.gz": {
+    "raw_sha256": "767b0fd1f4e1ac1ef9bdaa43caf4705f9bed80d22656d63140f644fd7459eeef",
+    "raw_bytes": 4228
+  },
+  "ocr-engine91-focused-ffn-parent.txt.gz": {
+    "raw_sha256": "8391ac4facbf3a89ccd4dd77c3097a731afed451ce7abbe427ac0b0d9fbfdcfd",
+    "raw_bytes": 32
+  },
+  "ocr-engine91-focused-ffn-stderr.txt.gz": {
+    "raw_sha256": "8080289350a1230afdd2e89bb2da2224296c766167af3113e6ee0f8382e7229a",
+    "raw_bytes": 143
+  },
+  "ocr-engine91-focused-ffn-stdout.txt.gz": {
+    "raw_sha256": "435741a3c0260ff2e34c2018ed080ca3e2d1dda7777591ed28440f9c3e670c2e",
+    "raw_bytes": 7504
+  },
+  "ocr-engine91-gpu-parent.txt.gz": {
+    "raw_sha256": "1fef9f31b6766a8bc5ecad11ae3f8c6bb6e34c8ab208d1ea6e888122649f191d",
+    "raw_bytes": 1295
+  },
+  "ocr-engine91-image-parent.txt.gz": {
+    "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "raw_bytes": 0
+  },
+  "ocr-engine91-lifetime-before-build.txt.gz": {
+    "raw_sha256": "32f8fd2f32d5afd78cbba435f3335aa2fcc19418aa3738a0af756df61b5f5acc",
+    "raw_bytes": 3248
+  },
+  "ocr-engine91-lifetime-before-parent.txt.gz": {
+    "raw_sha256": "69532480aedb81a98c0850f88654afbe00b079fc6f0bbbf99a1d60a606beb972",
+    "raw_bytes": 1784
+  },
+  "ocr-engine91-lifetime-before-verify2-parent.txt.gz": {
+    "raw_sha256": "3a883df02f3af55d5f54d3e11ae48d86e932b0ba3606c6abc72ffe2578f239d7",
+    "raw_bytes": 140
+  },
+  "ocr-engine91-lifetime-before.txt.gz": {
+    "raw_sha256": "79518ac60f5da5b7e38d1fab890c4830b2e17c4f78c46d666e9a67018624f9c3",
+    "raw_bytes": 96
+  },
+  "ocr-engine91-metal-disabled.txt.gz": {
+    "raw_sha256": "000563909d2a05c5eede4d33c12fd381e1e28b468cfc6c48b9cee019fad52603",
+    "raw_bytes": 26817
+  },
+  "ocr-engine91-precision74-driver.txt.gz": {
+    "raw_sha256": "ba58eab373a24a0bb28a78b5e3752a6378d87315f868401ea238325afa13572b",
+    "raw_bytes": 6038
+  },
+  "ocr-engine91-precision74-parent.txt.gz": {
+    "raw_sha256": "756beaeaa5ff9f4e7322f8f2bafa2cac18c6acee492f3dd26c2058ccc62f8da9",
+    "raw_bytes": 471
+  },
+  "ocr-engine91-qualification-parent.txt.gz": {
+    "raw_sha256": "3bfe652879f34c4c3b7faeb1c5a41da2812bf264f2ab3c5dfb61ffaa95a29355",
+    "raw_bytes": 363
+  },
+  "ocr-engine91-verify3-gpu-build.txt.gz": {
+    "raw_sha256": "3e49c8ade51ace3a7767650626f78a737fcce30c0a37f2c0341673dce6211457",
+    "raw_bytes": 40331
+  },
+  "ocr-engine92-geometry-build.txt.gz": {
+    "raw_sha256": "a804e34214b621baa430b3f898ce14ab68ea203abb70f0acfe30aacf8871aa3c",
+    "raw_bytes": 3856
+  },
+  "ocr-engine92-geometry-k1-w128-stderr.txt.gz": {
+    "raw_sha256": "be7457a6c57ba08553e202760c53eb1623011ad02c840ae2d3e5866e5b3acdb9",
+    "raw_bytes": 1268
+  },
+  "ocr-engine92-geometry-k1-w128-stdout.txt.gz": {
+    "raw_sha256": "42a32ad7797a444a38ad15c8fe58c30539f226ed5e85769f10b692389e26d708",
+    "raw_bytes": 142241
+  },
+  "ocr-engine92-geometry-k1-w256-stderr.txt.gz": {
+    "raw_sha256": "097e7721b2d3b3c60ffe6d79991e1f9d80f8b22208f32a27950320562ff2f47b",
+    "raw_bytes": 1268
+  },
+  "ocr-engine92-geometry-k1-w256-stdout.txt.gz": {
+    "raw_sha256": "3a3125fb0d2c706577e6859b227c79cc2456d441a144056b96675c747b071ffa",
+    "raw_bytes": 142179
+  },
+  "ocr-engine92-geometry-k1-w512-stderr.txt.gz": {
+    "raw_sha256": "6fc73eecde5bb27047eaf123a90174d80311f68522886a162ba15725fba10d8a",
+    "raw_bytes": 1268
+  },
+  "ocr-engine92-geometry-k1-w512-stdout.txt.gz": {
+    "raw_sha256": "fec415fa44c3b77c2f2c32247c8f02cac8e0c80df85ac2cb347e7b2bcec592d4",
+    "raw_bytes": 142224
+  },
+  "ocr-engine92-geometry-k1-w64-stderr.txt.gz": {
+    "raw_sha256": "e34b952de29e5bfcf280227a7265ba8b883e138799b06336492da4a80037c8a5",
+    "raw_bytes": 1267
+  },
+  "ocr-engine92-geometry-k1-w64-stdout.txt.gz": {
+    "raw_sha256": "a5574e6427297fd63b1bb64cd7fcdb05a5d8c6a41ceef1a5e27341041f8b6d1b",
+    "raw_bytes": 141079
+  },
+  "ocr-engine92-geometry-k2-w128-stderr.txt.gz": {
+    "raw_sha256": "a8162878a3af07e4c8cef4b110097900524ead72667fc4eb4fc581d408ceba75",
+    "raw_bytes": 1268
+  },
+  "ocr-engine92-geometry-k2-w128-stdout.txt.gz": {
+    "raw_sha256": "b6fda1745fff4aae098a893c032ddb1f48217b102cb8b89ff4ea1b72d7192cec",
+    "raw_bytes": 142202
+  },
+  "ocr-engine92-geometry-k2-w256-stderr.txt.gz": {
+    "raw_sha256": "7c2bf6d51f81757b6d4e36cc03bef2b14b145abfee81611d1b432856decc5194",
+    "raw_bytes": 1268
+  },
+  "ocr-engine92-geometry-k2-w256-stdout.txt.gz": {
+    "raw_sha256": "11da167f7a06b898cd534ea9d3b69662a584df9a14756486a9e4cf761f0fbd1d",
+    "raw_bytes": 142222
+  },
+  "ocr-engine92-geometry-k2-w512-stderr.txt.gz": {
+    "raw_sha256": "f6d17f3cef341ed44afce1e60ad3bb4d17629571ec39d6e784c93d43b6976ba8",
+    "raw_bytes": 1268
+  },
+  "ocr-engine92-geometry-k2-w512-stdout.txt.gz": {
+    "raw_sha256": "934d2a3e7d5099bb66ba19d7811a67a89cd1365d4d26c466be828b2c10cece15",
+    "raw_bytes": 142236
+  },
+  "ocr-engine92-geometry-k2-w64-stderr.txt.gz": {
+    "raw_sha256": "bb253fda99e3afae12202cdb6e775d3259e8ff9764e123b979b04643704faaf3",
+    "raw_bytes": 1267
+  },
+  "ocr-engine92-geometry-k2-w64-stdout.txt.gz": {
+    "raw_sha256": "2d40cb64a5b60674bcc8c9a96cd720ed513c628ff2f0d02f89cab4d424dc34a7",
+    "raw_bytes": 141023
+  },
+  "ocr-engine92-geometry-k3-w128-stderr.txt.gz": {
+    "raw_sha256": "f58be4b8c0b6261c467181ec00c87025763e699819fb107b67c26fc7e16451ef",
+    "raw_bytes": 1268
+  },
+  "ocr-engine92-geometry-k3-w128-stdout.txt.gz": {
+    "raw_sha256": "4100ceaa20fe67c8371f363912ac49d7b65aefa841ee9bed2cb8e595f943ba18",
+    "raw_bytes": 142215
+  },
+  "ocr-engine92-geometry-k3-w256-stderr.txt.gz": {
+    "raw_sha256": "22c7517614e5f5b99fe1fee039fbdd073cf1fa6aa493ea7f63d367f3ced03557",
+    "raw_bytes": 1268
+  },
+  "ocr-engine92-geometry-k3-w256-stdout.txt.gz": {
+    "raw_sha256": "2932bbf67f99e11662bbb30e60b2b28b7d05def027c5a44f3d9057bbe85b0fa4",
+    "raw_bytes": 142189
+  },
+  "ocr-engine92-geometry-k3-w512-stderr.txt.gz": {
+    "raw_sha256": "beabd86d5164e73fea65cb263c02bd46e72b8d8d9286b7260a87b9d05fab22c0",
+    "raw_bytes": 1268
+  },
+  "ocr-engine92-geometry-k3-w512-stdout.txt.gz": {
+    "raw_sha256": "73047c1986eeaa7c7f659cc5473fc20e82f0041ac3a9d605273d8bfc3dfd7fd0",
+    "raw_bytes": 142236
+  },
+  "ocr-engine92-geometry-k3-w64-stderr.txt.gz": {
+    "raw_sha256": "4b7e4e9ca7bf898047f6ea0bdbc8c66d9dbbf58bfeacfdc23020069f7672f53a",
+    "raw_bytes": 1267
+  },
+  "ocr-engine92-geometry-k3-w64-stdout.txt.gz": {
+    "raw_sha256": "b9e0a79e9858bdcb08e8f995265d727af907b3f7518239a887a057260622c28e",
+    "raw_bytes": 141011
+  },
+  "ocr-engine92-geometry-parent.txt.gz": {
+    "raw_sha256": "6708a5e6efa88c9145af0a1f6729d7792f3f8c809baaa65f509a1e71db1d7738",
+    "raw_bytes": 556
   }
 }

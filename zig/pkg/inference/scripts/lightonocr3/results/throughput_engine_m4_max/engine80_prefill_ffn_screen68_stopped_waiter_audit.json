@@ -1,0 +1,16 @@
+{
+  "status": "running",
+  "scope": "Fixed source80 C64 single-page prefill/VF3/width4 original-cap 4B ABBA: ordinary/packed/packed/ordinary FFN. Every R128 page and three full cross-runtime fixture strings must match. No new vLLM timing claim.",
+  "created_at": "2026-10-25T05:14:42.375980+00:00",
+  "driver_sha256": "94e9b483d64b2053f05fee156b6add0eff51a821e2bbcbdba638509a90403d12",
+  "cases": [
+    {
+      "leg": 0,
+      "enabled": false,
+      "pages_per_second": 0.8871,
+      "observed_calls": 0,
+      "report": "engine80_4b_ffn_screen68_enable0_wide_r0_c64_p1_v1_vf3_r128/report.json",
+      "report_sha256": "cb038d3dd00f28c41e5f50e56879138c74541681e2496b6211139d4e080626d5"
+    }
+  ]
+}

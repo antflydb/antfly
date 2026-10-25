@@ -1,0 +1,43 @@
+{
+  "decision": "hold_wider_tile_pending_shape_repeats",
+  "scope": "The qualified current FFN and wider prototype both match ordinary projections bitwise on four actual checkpoint FFN layer triplets. This strengthens numerical/working-set qualification; it is not a model throughput comparison. Wider tile helps 432 rows but controls drift; 554/662 show no consistent material gain. No production promotion.",
+  "audit_sha256": "c12bed1861547aaad45d4d32fd1cca4520ee0a66a56829f1fcab0224a1c8a1fd",
+  "cases": [
+    {
+      "rows": 432,
+      "wide_to_current_fused_gpu_ratio": 0.8514717898344437,
+      "per_leg_median_us": [
+        6069.3955,
+        5609.7495,
+        5749.2705000000005,
+        6985.103999999999
+      ],
+      "output_bit_differences": 0,
+      "packed_bit_differences": 0
+    },
+    {
+      "rows": 554,
+      "wide_to_current_fused_gpu_ratio": 1.0024414756679345,
+      "per_leg_median_us": [
+        7101.8125,
+        7113.916499999999,
+        7137.874,
+        7126.708
+      ],
+      "output_bit_differences": 0,
+      "packed_bit_differences": 0
+    },
+    {
+      "rows": 662,
+      "wide_to_current_fused_gpu_ratio": 0.9926738273020161,
+      "per_leg_median_us": [
+        8608.895499999999,
+        8275.354,
+        8371.937,
+        8355.937
+      ],
+      "output_bit_differences": 0,
+      "packed_bit_differences": 0
+    }
+  ]
+}

@@ -3890,8 +3890,57 @@ static int gpu_token_burst_check(termite_metal_decode_runtime *r, size_t width) 
     return 0;
 }
 
+static int frame_staging_lifetime_check(void) {
+    for (int mode = 0; mode < 3; mode++) {
+        __weak id<MTLBuffer> slots[2] = {nil, nil};
+        __weak id<MTLComputePipelineState> bias_pipeline = nil;
+        __weak MPSMatrixMultiplication *dot_plan = nil;
+        __weak MPSMatrixMultiplication *gemm_plan = nil;
+        size_t retained_after_destroy = 0;
+        @autoreleasepool {
+            termite_metal_decode_runtime *runtime = termite_metal_decode_runtime_create();
+            if (!runtime) return 1;
+            bias_pipeline = runtime->linear_bias_pipeline;
+            dot_plan = termite_metal_decode_runtime_cached_dot_general_mps_mm(runtime, 4, 4, 4, 1);
+            gemm_plan = termite_metal_decode_runtime_cached_gemm_mps_mm(runtime, 4, 4, 4, 0, 1, 1.0f, 0.0f);
+            if (!dot_plan || !gemm_plan) return 13;
+            float zeros[4] = {0};
+            id<MTLBuffer> zero = [runtime->device newBufferWithBytes:zeros length:sizeof(zeros) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> output = [runtime->device newBufferWithLength:sizeof(zeros) options:MTLResourceStorageModeShared];
+            if (!zero || !output || !bias_pipeline) return 2;
+            for (int frame = 0; frame < 2; frame++) {
+                if (termite_metal_decode_runtime_begin_frame(runtime)) return 3;
+                if (termite_metal_decode_runtime_ensure_host_staging_buffer(runtime, false, 8u * 1024u * 1024u)) return 4;
+                size_t index = runtime->frame_host_staging_index & 1u;
+                slots[index] = runtime->active_frame_host_staging_buffer;
+                if (!slots[index]) return 5;
+                memset(runtime->active_frame_host_staging_buffer.contents, 0, sizeof(zeros));
+                if (mode == 0) {
+                    if (termite_metal_decode_runtime_cancel_frame(runtime)) return 6;
+                } else {
+                    if (termite_metal_decode_runtime_apply_add_device(runtime, (__bridge void *)runtime->active_frame_host_staging_buffer, 0,
+                        (__bridge void *)zero, 0, 4, (__bridge void *)output, 0)) return 7;
+                    // Mode1 leaves the final producer active; mode2 submits it.
+                    if (frame == 0 || mode == 2) {
+                        if (termite_metal_decode_runtime_submit_frame(runtime)) return 8;
+                        if (frame == 0 && termite_metal_decode_runtime_wait_frame(runtime)) return 9;
+                    }
+                }
+            }
+            if (!slots[0] || !slots[1]) return 10;
+            termite_metal_decode_runtime_destroy(runtime);
+            if (mode != 0) for (size_t i = 0; i < 4; i++) if (((float *)output.contents)[i] != 0) return 11;
+        }
+        for (size_t i = 0; i < 2; i++) retained_after_destroy += slots[i] != nil;
+        fprintf(stderr, "FRAME_STAGING_LIFETIME mode=%d retained_buffers=%zu bias_pipeline_retained=%d mps_plans_retained=%d\n", mode, retained_after_destroy, bias_pipeline != nil, (dot_plan != nil) + (gemm_plan != nil));
+        if (retained_after_destroy || bias_pipeline != nil || dot_plan != nil || gemm_plan != nil) return 12;
+    }
+    return 0;
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
+        if (argc == 2 && strcmp(argv[1], "--check-frame-staging-lifetime") == 0) return frame_staging_lifetime_check();
         termite_metal_decode_runtime *r = termite_metal_decode_runtime_create();
         if (!r)
             return 1;

@@ -1,0 +1,51 @@
+{
+  "created_at": "2026-10-25T06:55:58.962670+00:00",
+  "scope": "Fresh vLLM C64 automatic-cache controls in both orders against the fixed prior-qualified 0.8B C64/VF4/prefix16 profile, now using engine85 with batch argmax and retained vision workspace. C64 was the winning concurrency in prior C16/C32/C48/C64 searches (paired16/18). Shared machine uncontrolled; no own compilation or sampling during timings.",
+  "comparisons": [
+    {
+      "model": "08",
+      "round": 0,
+      "order": "fresh vLLM C64 then native",
+      "native_report": "engine85_08_paired72_r0_physical64_c64_vf4_prefix16_wide640_p1_r128/report.json",
+      "native_report_sha256": "1415ef51ec4c1bd436af694a462f0ef627c227a690fa17755a5623b61aad5c6a",
+      "reference_report": "vllm_08_primary_reference72_r0_auto_c64_r128/report.json",
+      "reference_report_sha256": "0d450c8935bc9954c38038fd380d468d663715ba58de88c025cb4da915f56b8c",
+      "native_pages_per_second": 3.9485,
+      "reference_pages_per_second": 3.260323690795393,
+      "native_to_vllm_ratio": 1.2110760692711215,
+      "full_fixture_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "primary_throughput_eligible": true
+    },
+    {
+      "model": "08",
+      "round": 1,
+      "order": "native then fresh vLLM C64",
+      "native_report": "engine85_08_paired72_r1_physical64_c64_vf4_prefix16_wide640_p1_r128/report.json",
+      "native_report_sha256": "42da86d4fee8ab738350c977928fe91c4db8e6146c21332a75c24351c2e2ac0a",
+      "reference_report": "vllm_08_primary_reference72_r1_auto_c64_r128/report.json",
+      "reference_report_sha256": "2f8ce41f57a0f635895434d4c27518a5edfb299bc8f9af3edf4e51245a906634",
+      "native_pages_per_second": 3.5592,
+      "reference_pages_per_second": 3.483951939803204,
+      "native_to_vllm_ratio": 1.0215984782502616,
+      "full_fixture_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "primary_throughput_eligible": true
+    }
+  ],
+  "selected_profiles": {
+    "08": {
+      "settings": [
+        64,
+        4,
+        16,
+        false,
+        1
+      ],
+      "report": "engine45_08_gpu_greedy_stream_prefix16_physical64_c64_vf4_r128_primary/report.json",
+      "report_sha256": "719433d20f2940d1eb47423d2baa70418d0a40b436f77466f0d04c8ba8d6028d",
+      "candidate_pages_per_second": 3.9062
+    }
+  },
+  "status": "small_repeated_lead"
+}

@@ -1,0 +1,14 @@
+{
+  "binary": ".venv-lighton-vllm-metal/engine91_conformance",
+  "binary_sha256": "205268d2d0f139c93af55b0bb2a621f29a4c143ad91cd16a011c995195ba02cd",
+  "input_sha256": {
+    "zig/pkg/inference/src/backends/metal_kernels.m": "ab7db0fab1cab774c127bf2a32560a4879980a29b4405f19ac75f4d70012ef83",
+    "zig/pkg/inference/src/backends/metal_buffer_observation.h": "6873d32642e0b9bd3f8acfdbf33306798b11e6a3a1a0b8c6571026f1c36b8ef7",
+    "zig/pkg/inference/src/backends/metal_mtp_head.h": "890772ce81b6b8bab2d61aaf28a7f1b4bca125c3e4bc12565284e3e577b5b233",
+    "zig/pkg/inference/src/backends/metal_mtp_head_impl.h": "1e032aa77b9b47f0567763be7230995c5f2646034e7a133de73149a7b5979649",
+    "zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m": "bac7f1a44c37ce4b6e8808168bd86c9d181dce638aabb45153e212e51a537563"
+  },
+  "compiler_driver_sha256": "216fa1f5deea713e060f334c9a891a705c207571f7e86c7a951e7133397a7b0d",
+  "qualification_driver_sha256": "a86403620efbe05feba63f1df1f6636421f05f09c69577881c79a0f20467262d",
+  "scope": "Fresh20C suites including canceled/active/submitted producer teardown and weak staging-buffer/pipeline/MPS-plan lifetimes; fresh6-length packed FFN checks. No prior-C qualification reuse."
+}

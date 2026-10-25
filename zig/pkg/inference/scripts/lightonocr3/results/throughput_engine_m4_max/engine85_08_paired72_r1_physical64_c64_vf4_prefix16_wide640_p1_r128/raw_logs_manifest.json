@@ -1,0 +1,8 @@
+{
+  "lighton08-batch-c64.txt": {
+    "compressed_path": "lighton08-batch-c64.txt.gz",
+    "raw_sha256": "df004944d9d4d719ccf04966adf5b6731f8753f144ea5c27dca30163904390f8",
+    "raw_bytes": 32086,
+    "compressed_sha256": "87d82ee161fe13e04069aad1ea8fa8789640680e27df04a75225dfe40f68a8a4"
+  }
+}

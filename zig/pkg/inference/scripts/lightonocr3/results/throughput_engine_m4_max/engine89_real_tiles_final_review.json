@@ -1,0 +1,6 @@
+{
+  "decision": "hold_no_consistent_kernel_gain_no_production_change",
+  "original_review_sha256": "75bbeb1c25622618bec04237bb16786e493ca592d8ceae0ed3194f482174759d",
+  "reason": "The64x64/eight-SG candidate gives only1.3%/0.3% gains then2.9%loss; both128-row candidates regress every tested prompt length. Exact full outputs/packed/CPU/canaries do not establish a speedup.",
+  "primary_throughput_eligible": false
+}

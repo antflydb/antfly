@@ -1,0 +1,11 @@
+{
+  "status": "pass",
+  "created_at": "2026-10-25T06:52:25.124252+00:00",
+  "retired_pid": 31883,
+  "exact_command": [
+    "/opt/homebrew/Cellar/python@3.12/3.12.14/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python",
+    ".venv-lighton-vllm-metal/run_engine85_primary_queue_verify3.py"
+  ],
+  "children_before_and_after_suspend": 0,
+  "reason": "Insert isolated same-precision real-weight Steel GEMM probe before any primary model timing. Qualification remains active separately. No model child or timed result existed. All future primary controls fresh after the probe."
+}

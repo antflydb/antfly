@@ -214,6 +214,16 @@ def run(args, model, label, mode, concurrency, output):
     env["TERMITE_METAL_ENABLE_LIGHTONOCR3_PREFILL_FFN"] = (
         "1" if args.prefill_fused_ffn else "0"
     )
+    env.pop("ANTFLY_TEST_OCR_PREFILL_FFN_ROUNDS", None)
+    if args.prefill_ffn_rounds:
+        env["ANTFLY_TEST_OCR_PREFILL_FFN_ROUNDS"] = json.dumps(
+            [value == "on" for value in args.prefill_ffn_rounds]
+        )
+    env.pop("ANTFLY_TEST_OCR_BF16_PROJECTION_ROUNDS", None)
+    if args.bf16_projection_rounds:
+        env["ANTFLY_TEST_OCR_BF16_PROJECTION_ROUNDS"] = json.dumps(
+            [value == "on" for value in args.bf16_projection_rounds]
+        )
     if args.bf16_prefill_inputs:
         env["TERMITE_METAL_LIGHTONOCR3_BF16_PREFILL_INPUTS"] = "1"
     if args.prefill_sg_attention:
@@ -450,6 +460,12 @@ def run(args, model, label, mode, concurrency, output):
                 prior_snapshots = re.findall(snapshot_pattern, pieces[0])
                 previous_snapshots = int(prior_snapshots[-1]) if prior_snapshots else 0
                 for sample, section in zip(result["policy_rounds"], sections):
+                    sample["decode_pack_calls"] = sum(
+                        int(value)
+                        for value in re.findall(
+                            r"LIGHTONOCR3 decode_pack_calls=(\d+)", section
+                        )
+                    )
                     sample["retained_weight_handles_observed"] = (
                         "lightonocr3_weight_handles: provider_owned=1 temporary_host_mirrors=1"
                         in section
@@ -561,10 +577,63 @@ def run(args, model, label, mode, concurrency, output):
                     r"LIGHTONOCR3 prefill_fused_ffn_calls=(\d+)", section
                 )
             )
+        if args.prefill_ffn_rounds:
+            observed = [
+                bool(int(enabled))
+                for _, enabled in re.findall(
+                    r"OCR_PREFILL_FFN_POLICY round=(\d+) enabled=([01])", text
+                )
+            ]
+            expected = [value == "on" for value in args.prefill_ffn_rounds]
+            if observed != expected:
+                result["status"] = "missing_prefill_ffn_rounds"
+            for sample, enabled in zip(result.get("policy_rounds", []), expected):
+                sample["prefill_fused_ffn_enabled"] = enabled
+        if args.bf16_projection_rounds:
+            observed = [
+                (int(index), bool(int(enabled)))
+                for index, enabled in re.findall(
+                    r"OCR_BF16_POLICY round=(\d+) enabled=([01])", text
+                )
+            ]
+            expected = [
+                (index, value == "on")
+                for index, value in enumerate(args.bf16_projection_rounds)
+            ]
+            samples = result.get("policy_rounds", [])
+            if observed != expected or len(samples) != len(expected):
+                result["status"] = "missing_bf16_projection_rounds"
+            for sample, (index, enabled) in zip(samples, expected):
+                sample["bf16_projection_enabled"] = enabled
+                if sample.get("round") != index or (
+                    (sample.get("decode_pack_calls", 0) > 0) != enabled
+                ):
+                    result["status"] = "missing_timed_bf16_projection_policy"
+        memory_samples = {}
+        for index, phase, tensor_live, owned_live, alias_live in re.findall(
+            r"OCR_MEMORY round=(\d+) phase=(before|after) tensor_live_bytes=(\d+) owned_buffer_live_bytes=(\d+) alias_buffer_live_bytes=(\d+)",
+            text,
+        ):
+            memory_samples.setdefault(int(index), {})[phase] = dict(
+                tensor_live_bytes=int(tensor_live),
+                owned_buffer_live_bytes=int(owned_live),
+                alias_buffer_live_bytes=int(alias_live),
+            )
+        for sample in result.get("policy_rounds", []):
+            sample["buffer_lifetime_gauges"] = memory_samples.get(sample["round"], {})
+        if args.require_memory_rounds and (
+            not result.get("policy_rounds")
+            or any(
+                set(sample.get("buffer_lifetime_gauges", {})) != {"before", "after"}
+                for sample in result["policy_rounds"]
+            )
+        ):
+            result["status"] = "missing_round_buffer_lifetime_gauges"
         if args.require_prefill_fused_ffn:
             timed_samples = result.get("policy_rounds", [result])
             if not timed_samples or any(
-                sample.get("prefill_fused_ffn_calls", 0) <= 0
+                (sample.get("prefill_fused_ffn_calls", 0) > 0)
+                != sample.get("prefill_fused_ffn_enabled", args.prefill_fused_ffn)
                 for sample in timed_samples
             ):
                 result["status"] = "missing_timed_prefill_fused_ffn"
@@ -840,6 +909,12 @@ def main():
     parser.add_argument("--bf16-prefill-inputs", action="store_true")
     parser.add_argument("--prefill-fused-ffn", action="store_true")
     parser.add_argument("--require-prefill-fused-ffn", action="store_true")
+    parser.add_argument(
+        "--prefill-ffn-rounds",
+        nargs="+",
+        choices=("off", "on"),
+        help="Override the FFN flag per policy round within one resident model",
+    )
     parser.add_argument("--prefill-direct-kv", action="store_true")
     parser.add_argument("--decode-wait-us", type=int, default=1000)
     parser.add_argument(
@@ -969,6 +1044,17 @@ def main():
     parser.add_argument("--florence-encoder-mirrors", action="store_true")
     parser.add_argument("--disable-florence-encoder-mirrors", action="store_true")
     parser.add_argument("--bf16-projection-inputs", action="store_true")
+    parser.add_argument(
+        "--bf16-projection-rounds",
+        nargs="+",
+        choices=("off", "on"),
+        help="Override decode projection input precision per resident policy round; requires BF16 prefill",
+    )
+    parser.add_argument(
+        "--require-memory-rounds",
+        action="store_true",
+        help="Require before/after buffer lifetime gauges outside timed policy rounds",
+    )
     parser.add_argument("--disable-wide-mpp", action="store_true")
     parser.add_argument("--disable-florence-single-frame", action="store_true")
     parser.add_argument("--require-florence-single-frame", action="store_true")
@@ -1075,10 +1161,33 @@ def main():
         help="Overlap admitted single-page prefill layer groups after one complete warm prompt",
     )
     args = parser.parse_args()
-    if args.prefill_fused_ffn and not args.bf16_prefill_inputs:
-        parser.error("--prefill-fused-ffn requires --bf16-prefill-inputs")
-    if args.require_prefill_fused_ffn and not args.prefill_fused_ffn:
-        parser.error("--require-prefill-fused-ffn requires --prefill-fused-ffn")
+    if args.bf16_projection_rounds and (
+        not args.policy_rounds
+        or len(args.bf16_projection_rounds) != len(args.policy_rounds)
+    ):
+        parser.error("--bf16-projection-rounds must match --policy-rounds length")
+    if (
+        args.bf16_projection_rounds
+        and "on" in args.bf16_projection_rounds
+        and not args.bf16_prefill_inputs
+    ):
+        parser.error(
+            "decode precision rounds require --bf16-prefill-inputs to hold prefill precision fixed"
+        )
+    if args.require_memory_rounds and not args.policy_rounds:
+        parser.error("--require-memory-rounds requires --policy-rounds")
+    prefill_ffn_enabled = args.prefill_fused_ffn or "on" in (
+        args.prefill_ffn_rounds or []
+    )
+    if prefill_ffn_enabled and not args.bf16_prefill_inputs:
+        parser.error("packed prefill FFN requires --bf16-prefill-inputs")
+    if args.prefill_ffn_rounds and (
+        not args.policy_rounds
+        or len(args.prefill_ffn_rounds) != len(args.policy_rounds)
+    ):
+        parser.error("--prefill-ffn-rounds must match --policy-rounds length")
+    if args.require_prefill_fused_ffn and not prefill_ffn_enabled:
+        parser.error("--require-prefill-fused-ffn requires an enabled FFN round")
     if args.prefill_stream_layers and (
         not args.continuous
         or not args.device_recurrent_state

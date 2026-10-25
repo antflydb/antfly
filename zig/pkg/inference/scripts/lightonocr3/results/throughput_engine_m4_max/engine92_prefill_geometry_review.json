@@ -1,0 +1,2000 @@
+{
+  "decision": "hold_no_consistent_large_prefill_gain",
+  "scope": "Existing shader arithmetic unchanged; all1200records per12candidates check full output/state bits and canaries. Discard first4 alternating pairs for timing. No production change or model throughput claim.",
+  "audit_sha256": "080c97afa2123ac18331c0620598f8213ac2ee04ac555285abe1e6172ab7cfd6",
+  "candidates": [
+    {
+      "kind": 1,
+      "threads": 64,
+      "cases": [
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 468.72850000000005,
+          "candidate_gpu_us": 445.7495,
+          "candidate_to_baseline_ratio": 0.9509758847605809
+        },
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 474.72850000000005,
+          "candidate_gpu_us": 453.04100000000005,
+          "candidate_to_baseline_ratio": 0.9543159932466663
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 1384.979,
+          "candidate_gpu_us": 1337.7495,
+          "candidate_to_baseline_ratio": 0.9658987609198405
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 1388.437,
+          "candidate_gpu_us": 1341.187,
+          "candidate_to_baseline_ratio": 0.9659689276503003
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1758.708,
+          "candidate_gpu_us": 1703.416,
+          "candidate_to_baseline_ratio": 0.9685610118336869
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1762.2495,
+          "candidate_gpu_us": 1708.02,
+          "candidate_to_baseline_ratio": 0.9692271156836759
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 2084.2705,
+          "candidate_gpu_us": 2019.812,
+          "candidate_to_baseline_ratio": 0.9690738318274906
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 2084.9790000000003,
+          "candidate_gpu_us": 2028.9365,
+          "candidate_to_baseline_ratio": 0.9731208323920767
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3217.416,
+          "candidate_gpu_us": 2963.666,
+          "candidate_to_baseline_ratio": 0.9211323621191665
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 2941.0415000000003,
+          "candidate_gpu_us": 2697.7290000000003,
+          "candidate_to_baseline_ratio": 0.917269953518167
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 839.25,
+          "candidate_gpu_us": 836.7915,
+          "candidate_to_baseline_ratio": 0.9970705987488829
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 850.4784999999999,
+          "candidate_gpu_us": 850.7284999999999,
+          "candidate_to_baseline_ratio": 1.0002939521692789
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 2597.52,
+          "candidate_gpu_us": 2589.5415000000003,
+          "candidate_to_baseline_ratio": 0.9969284163355817
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 2613.6245,
+          "candidate_gpu_us": 2607.833,
+          "candidate_to_baseline_ratio": 0.9977841116809244
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1425.374,
+          "candidate_gpu_us": 1425.624,
+          "candidate_to_baseline_ratio": 1.0001753925636359
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1906.937,
+          "candidate_gpu_us": 1827.479,
+          "candidate_to_baseline_ratio": 0.9583321315806449
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 1720.1455,
+          "candidate_gpu_us": 1562.812,
+          "candidate_to_baseline_ratio": 0.9085347722038629
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 1733.875,
+          "candidate_gpu_us": 1715.25,
+          "candidate_to_baseline_ratio": 0.9892581645158964
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3465.0825,
+          "candidate_gpu_us": 3476.8955,
+          "candidate_to_baseline_ratio": 1.003409154038901
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3470.562,
+          "candidate_gpu_us": 3457.9995,
+          "candidate_to_baseline_ratio": 0.996380269247459
+        }
+      ]
+    },
+    {
+      "kind": 1,
+      "threads": 128,
+      "cases": [
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 469.77049999999997,
+          "candidate_gpu_us": 441.66650000000004,
+          "candidate_to_baseline_ratio": 0.9401750429198941
+        },
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 473.91650000000004,
+          "candidate_gpu_us": 443.41600000000005,
+          "candidate_to_baseline_ratio": 0.9356416161918819
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 1383.8745,
+          "candidate_gpu_us": 1336.8325,
+          "candidate_to_baseline_ratio": 0.9660070331522115
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 1388.062,
+          "candidate_gpu_us": 1348.1245,
+          "candidate_to_baseline_ratio": 0.971227870224817
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1754.7285,
+          "candidate_gpu_us": 1709.75,
+          "candidate_to_baseline_ratio": 0.9743672596643869
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1763.3955,
+          "candidate_gpu_us": 1718.5205,
+          "candidate_to_baseline_ratio": 0.9745519368740592
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 2078.187,
+          "candidate_gpu_us": 2027.687,
+          "candidate_to_baseline_ratio": 0.9756999731015544
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 2086.437,
+          "candidate_gpu_us": 2034.75,
+          "candidate_to_baseline_ratio": 0.9752271456075597
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3242.541,
+          "candidate_gpu_us": 3075.708,
+          "candidate_to_baseline_ratio": 0.9485486845039122
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3450.6665000000003,
+          "candidate_gpu_us": 3330.8535,
+          "candidate_to_baseline_ratio": 0.9652783020323754
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 832.2495,
+          "candidate_gpu_us": 815.562,
+          "candidate_to_baseline_ratio": 0.9799489215673906
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 851.3325,
+          "candidate_gpu_us": 831.9159999999999,
+          "candidate_to_baseline_ratio": 0.9771928124440216
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 2590.7075,
+          "candidate_gpu_us": 2561.7495,
+          "candidate_to_baseline_ratio": 0.9888223583712171
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 2607.833,
+          "candidate_gpu_us": 2577.1035,
+          "candidate_to_baseline_ratio": 0.9882164617136143
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1430.895,
+          "candidate_gpu_us": 1405.3535000000002,
+          "candidate_to_baseline_ratio": 0.9821499830525652
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1442.875,
+          "candidate_gpu_us": 1414.437,
+          "candidate_to_baseline_ratio": 0.9802907389760027
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 2258.2495,
+          "candidate_gpu_us": 2291.6035,
+          "candidate_to_baseline_ratio": 1.0147698471758768
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 1747.1245,
+          "candidate_gpu_us": 1682.3955,
+          "candidate_to_baseline_ratio": 0.9629511234030547
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3712.437,
+          "candidate_gpu_us": 3788.3955,
+          "candidate_to_baseline_ratio": 1.0204605492295222
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3538.666,
+          "candidate_gpu_us": 3492.8125,
+          "candidate_to_baseline_ratio": 0.9870421509122363
+        }
+      ]
+    },
+    {
+      "kind": 1,
+      "threads": 256,
+      "cases": [
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 468.625,
+          "candidate_gpu_us": 439.16650000000004,
+          "candidate_to_baseline_ratio": 0.9371384369165111
+        },
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 474.8955,
+          "candidate_gpu_us": 442.749,
+          "candidate_to_baseline_ratio": 0.9323082657131937
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 1383.2910000000002,
+          "candidate_gpu_us": 1343.7915,
+          "candidate_to_baseline_ratio": 0.971445270734791
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 1390.2285,
+          "candidate_gpu_us": 1352.9995,
+          "candidate_to_baseline_ratio": 0.9732209489303377
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1753.5410000000002,
+          "candidate_gpu_us": 1713.708,
+          "candidate_to_baseline_ratio": 0.9772842494130448
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1762.7495,
+          "candidate_gpu_us": 1716.4365,
+          "candidate_to_baseline_ratio": 0.9737268398033868
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 1015.3744999999999,
+          "candidate_gpu_us": 1020.187,
+          "candidate_to_baseline_ratio": 1.0047396305501075
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 2084.3325,
+          "candidate_gpu_us": 2042.7285000000002,
+          "candidate_to_baseline_ratio": 0.9800396529824297
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3457.1455,
+          "candidate_gpu_us": 3406.875,
+          "candidate_to_baseline_ratio": 0.985458957397078
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3396.8745,
+          "candidate_gpu_us": 3416.52,
+          "candidate_to_baseline_ratio": 1.0057834047151286
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 835.2495,
+          "candidate_gpu_us": 798.9365,
+          "candidate_to_baseline_ratio": 0.9565243678685231
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 850.3955000000001,
+          "candidate_gpu_us": 812.687,
+          "candidate_to_baseline_ratio": 0.9556576910390517
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 1314.437,
+          "candidate_gpu_us": 1397.7075,
+          "candidate_to_baseline_ratio": 1.0633506969143445
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 1310.7285,
+          "candidate_gpu_us": 1399.77,
+          "candidate_to_baseline_ratio": 1.0679328327720043
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1437.8325,
+          "candidate_gpu_us": 1420.1660000000002,
+          "candidate_to_baseline_ratio": 0.98771310288229
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 2827.833,
+          "candidate_gpu_us": 2772.1035,
+          "candidate_to_baseline_ratio": 0.9802925066649976
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 1708.2910000000002,
+          "candidate_gpu_us": 1526.6875,
+          "candidate_to_baseline_ratio": 0.893692877852778
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 2197.541,
+          "candidate_gpu_us": 2613.52,
+          "candidate_to_baseline_ratio": 1.1892929415196347
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3726.5825,
+          "candidate_gpu_us": 3502.958,
+          "candidate_to_baseline_ratio": 0.9399920704828083
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3470.666,
+          "candidate_gpu_us": 3344.749,
+          "candidate_to_baseline_ratio": 0.9637196434344301
+        }
+      ]
+    },
+    {
+      "kind": 1,
+      "threads": 512,
+      "cases": [
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 467.312,
+          "candidate_gpu_us": 435.875,
+          "candidate_to_baseline_ratio": 0.9327280275276475
+        },
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 473.97850000000005,
+          "candidate_gpu_us": 441.41600000000005,
+          "candidate_to_baseline_ratio": 0.93129962645985
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 1382.0410000000002,
+          "candidate_gpu_us": 1348.02,
+          "candidate_to_baseline_ratio": 0.9753835088828767
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 1385.4575,
+          "candidate_gpu_us": 1355.1875,
+          "candidate_to_baseline_ratio": 0.9781516213958206
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1755.041,
+          "candidate_gpu_us": 1719.1665,
+          "candidate_to_baseline_ratio": 0.9795591669938196
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1763.187,
+          "candidate_gpu_us": 1725.2495,
+          "candidate_to_baseline_ratio": 0.978483564136986
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 2083.9375,
+          "candidate_gpu_us": 2045.9375,
+          "candidate_to_baseline_ratio": 0.9817652880664607
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 2085.062,
+          "candidate_gpu_us": 2057.9785,
+          "candidate_to_baseline_ratio": 0.9870106980032249
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3485.0415000000003,
+          "candidate_gpu_us": 3481.2285,
+          "candidate_to_baseline_ratio": 0.9989058953817336
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3447.8540000000003,
+          "candidate_gpu_us": 3480.791,
+          "candidate_to_baseline_ratio": 1.0095528987016271
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 838.5,
+          "candidate_gpu_us": 798.6245,
+          "candidate_to_baseline_ratio": 0.9524442456768039
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 849.854,
+          "candidate_gpu_us": 811.25,
+          "candidate_to_baseline_ratio": 0.9545757271248944
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 1237.125,
+          "candidate_gpu_us": 1182.1245,
+          "candidate_to_baseline_ratio": 0.9555416792967565
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 1299.3745,
+          "candidate_gpu_us": 1344.0,
+          "candidate_to_baseline_ratio": 1.034343832359339
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1433.1245,
+          "candidate_gpu_us": 1401.8745,
+          "candidate_to_baseline_ratio": 0.9781944974075875
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1878.1455,
+          "candidate_gpu_us": 1808.8955,
+          "candidate_to_baseline_ratio": 0.9631285222577272
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 1719.1035,
+          "candidate_gpu_us": 1684.062,
+          "candidate_to_baseline_ratio": 0.979616410530256
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 2221.1875,
+          "candidate_gpu_us": 2352.395,
+          "candidate_to_baseline_ratio": 1.0590708798784434
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3515.9785,
+          "candidate_gpu_us": 3430.2495,
+          "candidate_to_baseline_ratio": 0.9756173139283986
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3625.4790000000003,
+          "candidate_gpu_us": 3473.8540000000003,
+          "candidate_to_baseline_ratio": 0.9581779400735737
+        }
+      ]
+    },
+    {
+      "kind": 2,
+      "threads": 64,
+      "cases": [
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 467.6455,
+          "candidate_gpu_us": 464.458,
+          "candidate_to_baseline_ratio": 0.9931839395439495
+        },
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 473.10350000000005,
+          "candidate_gpu_us": 470.58299999999997,
+          "candidate_to_baseline_ratio": 0.9946724131189051
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 1384.979,
+          "candidate_gpu_us": 1385.791,
+          "candidate_to_baseline_ratio": 1.0005862904780505
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 1390.5410000000002,
+          "candidate_gpu_us": 1394.7495,
+          "candidate_to_baseline_ratio": 1.0030265198940553
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1757.937,
+          "candidate_gpu_us": 1763.8745,
+          "candidate_to_baseline_ratio": 1.0033775385579802
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1763.812,
+          "candidate_gpu_us": 1769.6245,
+          "candidate_to_baseline_ratio": 1.0032954192396921
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 2081.541,
+          "candidate_gpu_us": 2079.9995,
+          "candidate_to_baseline_ratio": 0.9992594428839018
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 2088.562,
+          "candidate_gpu_us": 2092.6040000000003,
+          "candidate_to_baseline_ratio": 1.0019353028543085
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 2975.4785,
+          "candidate_gpu_us": 2810.2915000000003,
+          "candidate_to_baseline_ratio": 0.9444838872134348
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3180.7495,
+          "candidate_gpu_us": 3193.27,
+          "candidate_to_baseline_ratio": 1.0039363363886404
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 812.2705,
+          "candidate_gpu_us": 673.062,
+          "candidate_to_baseline_ratio": 0.8286180527299711
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 850.1034999999999,
+          "candidate_gpu_us": 839.5205,
+          "candidate_to_baseline_ratio": 0.9875509276223425
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 1367.5625,
+          "candidate_gpu_us": 1413.6875,
+          "candidate_to_baseline_ratio": 1.033727891778255
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 1294.52,
+          "candidate_gpu_us": 1420.187,
+          "candidate_to_baseline_ratio": 1.0970761363285233
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1435.312,
+          "candidate_gpu_us": 1398.7910000000002,
+          "candidate_to_baseline_ratio": 0.9745553579988185
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1992.3955,
+          "candidate_gpu_us": 2407.5205,
+          "candidate_to_baseline_ratio": 1.2083547167216548
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 1730.145,
+          "candidate_gpu_us": 1616.9575,
+          "candidate_to_baseline_ratio": 0.9345791826696607
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 1720.187,
+          "candidate_gpu_us": 1492.562,
+          "candidate_to_baseline_ratio": 0.8676742702973572
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3850.124,
+          "candidate_gpu_us": 3820.645,
+          "candidate_to_baseline_ratio": 0.9923433634864748
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3571.0205,
+          "candidate_gpu_us": 3537.3955,
+          "candidate_to_baseline_ratio": 0.9905839241191698
+        }
+      ]
+    },
+    {
+      "kind": 2,
+      "threads": 128,
+      "cases": [
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 467.7075,
+          "candidate_gpu_us": 463.41600000000005,
+          "candidate_to_baseline_ratio": 0.9908243934510352
+        },
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 472.85350000000005,
+          "candidate_gpu_us": 468.72850000000005,
+          "candidate_to_baseline_ratio": 0.9912763678390876
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 1382.9785000000002,
+          "candidate_gpu_us": 1383.833,
+          "candidate_to_baseline_ratio": 1.0006178693305787
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 1389.583,
+          "candidate_gpu_us": 1391.229,
+          "candidate_to_baseline_ratio": 1.0011845280202765
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1758.5615,
+          "candidate_gpu_us": 1760.437,
+          "candidate_to_baseline_ratio": 1.001066496679246
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1764.687,
+          "candidate_gpu_us": 1769.7495,
+          "candidate_to_baseline_ratio": 1.0028687806959535
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 2077.2075,
+          "candidate_gpu_us": 2081.562,
+          "candidate_to_baseline_ratio": 1.0020963240311813
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 2083.624,
+          "candidate_gpu_us": 2089.562,
+          "candidate_to_baseline_ratio": 1.0028498423899899
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3446.4365,
+          "candidate_gpu_us": 3435.8955,
+          "candidate_to_baseline_ratio": 0.9969414785387748
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3447.812,
+          "candidate_gpu_us": 3450.52,
+          "candidate_to_baseline_ratio": 1.0007854256554591
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 463.4375,
+          "candidate_gpu_us": 459.6865,
+          "candidate_to_baseline_ratio": 0.9919061362103844
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 849.687,
+          "candidate_gpu_us": 844.9165,
+          "candidate_to_baseline_ratio": 0.9943855796310878
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 1331.25,
+          "candidate_gpu_us": 1413.124,
+          "candidate_to_baseline_ratio": 1.0615015962441314
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 1341.5615,
+          "candidate_gpu_us": 1418.895,
+          "candidate_to_baseline_ratio": 1.0576443942376104
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1831.6455,
+          "candidate_gpu_us": 1798.2495,
+          "candidate_to_baseline_ratio": 0.9817672142344137
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1777.6865,
+          "candidate_gpu_us": 1812.645,
+          "candidate_to_baseline_ratio": 1.0196651659333633
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 2179.999,
+          "candidate_gpu_us": 2132.6865,
+          "candidate_to_baseline_ratio": 0.9782970083931232
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 1732.4575,
+          "candidate_gpu_us": 1517.395,
+          "candidate_to_baseline_ratio": 0.8758627556520145
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3461.4575,
+          "candidate_gpu_us": 3447.812,
+          "candidate_to_baseline_ratio": 0.9960578744647305
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3392.6245,
+          "candidate_gpu_us": 3390.4375,
+          "candidate_to_baseline_ratio": 0.9993553663248026
+        }
+      ]
+    },
+    {
+      "kind": 2,
+      "threads": 256,
+      "cases": [
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 469.0825,
+          "candidate_gpu_us": 462.645,
+          "candidate_to_baseline_ratio": 0.9862764012726972
+        },
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 472.77,
+          "candidate_gpu_us": 469.312,
+          "candidate_to_baseline_ratio": 0.992685661103708
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 1383.7495,
+          "candidate_gpu_us": 1386.624,
+          "candidate_to_baseline_ratio": 1.0020773268572094
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 1387.812,
+          "candidate_gpu_us": 1392.9995,
+          "candidate_to_baseline_ratio": 1.0037378982167613
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1753.8745,
+          "candidate_gpu_us": 1761.52,
+          "candidate_to_baseline_ratio": 1.0043592058610809
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1760.3115,
+          "candidate_gpu_us": 1764.6035000000002,
+          "candidate_to_baseline_ratio": 1.0024382048290885
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 2079.0205,
+          "candidate_gpu_us": 2083.333,
+          "candidate_to_baseline_ratio": 1.002074294120717
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 2086.2285,
+          "candidate_gpu_us": 2092.875,
+          "candidate_to_baseline_ratio": 1.0031858926287316
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3458.958,
+          "candidate_gpu_us": 3447.916,
+          "candidate_to_baseline_ratio": 0.9968077091424643
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3391.333,
+          "candidate_gpu_us": 3441.3115,
+          "candidate_to_baseline_ratio": 1.0147371254901834
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 466.83299999999997,
+          "candidate_gpu_us": 466.7285,
+          "candidate_to_baseline_ratio": 0.9997761512146742
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 850.895,
+          "candidate_gpu_us": 847.6875,
+          "candidate_to_baseline_ratio": 0.9962304397134781
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 1323.749,
+          "candidate_gpu_us": 1389.375,
+          "candidate_to_baseline_ratio": 1.0495758637022576
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 1302.6865,
+          "candidate_gpu_us": 1414.1455,
+          "candidate_to_baseline_ratio": 1.0855608774636107
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1425.604,
+          "candidate_gpu_us": 1404.833,
+          "candidate_to_baseline_ratio": 0.9854300352692613
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1834.6455,
+          "candidate_gpu_us": 1486.4785000000002,
+          "candidate_to_baseline_ratio": 0.810226553304167
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 2327.2915000000003,
+          "candidate_gpu_us": 2646.3745,
+          "candidate_to_baseline_ratio": 1.1371048706189146
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 2259.4785,
+          "candidate_gpu_us": 2564.2705,
+          "candidate_to_baseline_ratio": 1.1348948440978748
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3553.8535,
+          "candidate_gpu_us": 3554.687,
+          "candidate_to_baseline_ratio": 1.0002345341472292
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3414.6665000000003,
+          "candidate_gpu_us": 3427.2075,
+          "candidate_to_baseline_ratio": 1.0036726866298655
+        }
+      ]
+    },
+    {
+      "kind": 2,
+      "threads": 512,
+      "cases": [
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 467.3745,
+          "candidate_gpu_us": 462.1245,
+          "candidate_to_baseline_ratio": 0.9887670379962963
+        },
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 474.437,
+          "candidate_gpu_us": 469.624,
+          "candidate_to_baseline_ratio": 0.9898553443344428
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 1383.145,
+          "candidate_gpu_us": 1387.895,
+          "candidate_to_baseline_ratio": 1.0034342024878087
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 1389.375,
+          "candidate_gpu_us": 1393.687,
+          "candidate_to_baseline_ratio": 1.0031035537561852
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1751.7495,
+          "candidate_gpu_us": 1762.7705,
+          "candidate_to_baseline_ratio": 1.0062914246586057
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1761.9995,
+          "candidate_gpu_us": 1766.4165,
+          "candidate_to_baseline_ratio": 1.0025068111540327
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 2081.145,
+          "candidate_gpu_us": 2088.999,
+          "candidate_to_baseline_ratio": 1.0037738840878458
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 2089.145,
+          "candidate_gpu_us": 2092.062,
+          "candidate_to_baseline_ratio": 1.0013962649792139
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 2882.8745,
+          "candidate_gpu_us": 2803.062,
+          "candidate_to_baseline_ratio": 0.9723149585595904
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3190.166,
+          "candidate_gpu_us": 3166.875,
+          "candidate_to_baseline_ratio": 0.9926991260015936
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 834.7909999999999,
+          "candidate_gpu_us": 832.9784999999999,
+          "candidate_to_baseline_ratio": 0.9978287978667715
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 849.812,
+          "candidate_gpu_us": 851.5615,
+          "candidate_to_baseline_ratio": 1.0020586906280449
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 1369.5205,
+          "candidate_gpu_us": 1412.4160000000002,
+          "candidate_to_baseline_ratio": 1.0313215464828749
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 2605.9785,
+          "candidate_gpu_us": 2571.3325,
+          "candidate_to_baseline_ratio": 0.9867051857872196
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1424.833,
+          "candidate_gpu_us": 1392.9995,
+          "candidate_to_baseline_ratio": 0.9776580834385502
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1867.4575,
+          "candidate_gpu_us": 1832.458,
+          "candidate_to_baseline_ratio": 0.9812582080181209
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 2183.2285,
+          "candidate_gpu_us": 2257.9995,
+          "candidate_to_baseline_ratio": 1.0342479039642436
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 1729.979,
+          "candidate_gpu_us": 1589.7495,
+          "candidate_to_baseline_ratio": 0.9189415016020425
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3525.77,
+          "candidate_gpu_us": 3489.7285,
+          "candidate_to_baseline_ratio": 0.9897776939505414
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3630.499,
+          "candidate_gpu_us": 3610.2495,
+          "candidate_to_baseline_ratio": 0.9944223920733761
+        }
+      ]
+    },
+    {
+      "kind": 3,
+      "threads": 64,
+      "cases": [
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 469.7495,
+          "candidate_gpu_us": 441.437,
+          "candidate_to_baseline_ratio": 0.9397285148786747
+        },
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 473.9575,
+          "candidate_gpu_us": 447.187,
+          "candidate_to_baseline_ratio": 0.9435170875025715
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 1384.1455,
+          "candidate_gpu_us": 1339.354,
+          "candidate_to_baseline_ratio": 0.967639601472533
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 1391.2910000000002,
+          "candidate_gpu_us": 1343.437,
+          "candidate_to_baseline_ratio": 0.9656046075192032
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1752.5410000000002,
+          "candidate_gpu_us": 1703.687,
+          "candidate_to_baseline_ratio": 0.9721239046618594
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1765.8745,
+          "candidate_gpu_us": 1716.937,
+          "candidate_to_baseline_ratio": 0.972287101942975
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 2080.8745,
+          "candidate_gpu_us": 2020.854,
+          "candidate_to_baseline_ratio": 0.9711561172958774
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 2088.0415000000003,
+          "candidate_gpu_us": 2031.374,
+          "candidate_to_baseline_ratio": 0.9728609321222781
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3040.7495,
+          "candidate_gpu_us": 2787.4165000000003,
+          "candidate_to_baseline_ratio": 0.9166873167289842
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 2787.562,
+          "candidate_gpu_us": 2688.9995,
+          "candidate_to_baseline_ratio": 0.964642042042473
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 487.7495,
+          "candidate_gpu_us": 462.437,
+          "candidate_to_baseline_ratio": 0.9481034834479585
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 852.562,
+          "candidate_gpu_us": 834.187,
+          "candidate_to_baseline_ratio": 0.978447315268567
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 1748.333,
+          "candidate_gpu_us": 1980.2705,
+          "candidate_to_baseline_ratio": 1.1326620843969655
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 1335.395,
+          "candidate_gpu_us": 1413.437,
+          "candidate_to_baseline_ratio": 1.0584411353943963
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1683.2910000000002,
+          "candidate_gpu_us": 1785.812,
+          "candidate_to_baseline_ratio": 1.0609050960291475
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1440.8325,
+          "candidate_gpu_us": 1402.2705,
+          "candidate_to_baseline_ratio": 0.9732363060938729
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 1720.583,
+          "candidate_gpu_us": 1683.3745,
+          "candidate_to_baseline_ratio": 0.9783744812078231
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 2194.6455,
+          "candidate_gpu_us": 2148.0825,
+          "candidate_to_baseline_ratio": 0.9787833615953009
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3450.0205,
+          "candidate_gpu_us": 3470.999,
+          "candidate_to_baseline_ratio": 1.0060806885060538
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3602.7495,
+          "candidate_gpu_us": 3622.374,
+          "candidate_to_baseline_ratio": 1.0054470897851766
+        }
+      ]
+    },
+    {
+      "kind": 3,
+      "threads": 128,
+      "cases": [
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 468.625,
+          "candidate_gpu_us": 434.97900000000004,
+          "candidate_to_baseline_ratio": 0.9282027207255269
+        },
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 473.6455,
+          "candidate_gpu_us": 440.75,
+          "candidate_to_baseline_ratio": 0.9305482686946249
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 1380.062,
+          "candidate_gpu_us": 1341.7285000000002,
+          "candidate_to_baseline_ratio": 0.9722233493857524
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 1387.3745,
+          "candidate_gpu_us": 1350.3325,
+          "candidate_to_baseline_ratio": 0.9733006480946566
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1758.77,
+          "candidate_gpu_us": 1706.7910000000002,
+          "candidate_to_baseline_ratio": 0.9704458229330727
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1760.2705,
+          "candidate_gpu_us": 1716.145,
+          "candidate_to_baseline_ratio": 0.9749325458786021
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 2083.291,
+          "candidate_gpu_us": 2027.6455,
+          "candidate_to_baseline_ratio": 0.9732896172450224
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 2085.145,
+          "candidate_gpu_us": 2035.2075,
+          "candidate_to_baseline_ratio": 0.9760508262015352
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3282.625,
+          "candidate_gpu_us": 3074.7075,
+          "candidate_to_baseline_ratio": 0.9366612086363809
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3220.291,
+          "candidate_gpu_us": 3218.9785,
+          "candidate_to_baseline_ratio": 0.9995924281377055
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 462.91600000000005,
+          "candidate_gpu_us": 447.8535,
+          "candidate_to_baseline_ratio": 0.9674616993147783
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 851.208,
+          "candidate_gpu_us": 820.104,
+          "candidate_to_baseline_ratio": 0.9634589900470861
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 1420.6455,
+          "candidate_gpu_us": 1387.2915,
+          "candidate_to_baseline_ratio": 0.9765219402025347
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 2611.937,
+          "candidate_gpu_us": 2545.9165000000003,
+          "candidate_to_baseline_ratio": 0.9747235480794523
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1439.083,
+          "candidate_gpu_us": 1384.1035,
+          "candidate_to_baseline_ratio": 0.9617954628051334
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1464.8745,
+          "candidate_gpu_us": 1398.2495,
+          "candidate_to_baseline_ratio": 0.9545182880854298
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 1715.1660000000002,
+          "candidate_gpu_us": 1577.7075,
+          "candidate_to_baseline_ratio": 0.9198570284159083
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 1747.1245,
+          "candidate_gpu_us": 1594.77,
+          "candidate_to_baseline_ratio": 0.9127969987256204
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3547.9790000000003,
+          "candidate_gpu_us": 3501.916,
+          "candidate_to_baseline_ratio": 0.9870171159412161
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3422.687,
+          "candidate_gpu_us": 3396.958,
+          "candidate_to_baseline_ratio": 0.9924828066370077
+        }
+      ]
+    },
+    {
+      "kind": 3,
+      "threads": 256,
+      "cases": [
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 467.562,
+          "candidate_gpu_us": 431.7705,
+          "candidate_to_baseline_ratio": 0.9234507936915318
+        },
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 473.0615,
+          "candidate_gpu_us": 435.20799999999997,
+          "candidate_to_baseline_ratio": 0.9199818628233326
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 1383.812,
+          "candidate_gpu_us": 1342.583,
+          "candidate_to_baseline_ratio": 0.9702062129826885
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 1389.9785000000002,
+          "candidate_gpu_us": 1353.7705,
+          "candidate_to_baseline_ratio": 0.9739506762154954
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1755.9165,
+          "candidate_gpu_us": 1711.916,
+          "candidate_to_baseline_ratio": 0.9749415760943074
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1767.9375,
+          "candidate_gpu_us": 1717.0410000000002,
+          "candidate_to_baseline_ratio": 0.9712113691801889
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 2080.1455,
+          "candidate_gpu_us": 2038.479,
+          "candidate_to_baseline_ratio": 0.979969430023044
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 2090.2075,
+          "candidate_gpu_us": 2041.062,
+          "candidate_to_baseline_ratio": 0.9764877410496325
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3238.8540000000003,
+          "candidate_gpu_us": 3218.0205,
+          "candidate_to_baseline_ratio": 0.9935676322551124
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3431.3535,
+          "candidate_gpu_us": 3420.7285,
+          "candidate_to_baseline_ratio": 0.996903554238874
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 460.22850000000005,
+          "candidate_gpu_us": 439.458,
+          "candidate_to_baseline_ratio": 0.9548691573859506
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 852.9995,
+          "candidate_gpu_us": 808.4375,
+          "candidate_to_baseline_ratio": 0.9477584687915995
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 2010.708,
+          "candidate_gpu_us": 1947.02,
+          "candidate_to_baseline_ratio": 0.9683255848188796
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 1461.395,
+          "candidate_gpu_us": 1386.187,
+          "candidate_to_baseline_ratio": 0.9485368432217162
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1890.208,
+          "candidate_gpu_us": 1762.437,
+          "candidate_to_baseline_ratio": 0.9324037354619173
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1924.27,
+          "candidate_gpu_us": 1773.854,
+          "candidate_to_baseline_ratio": 0.9218321753184324
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 1728.5415,
+          "candidate_gpu_us": 1435.7285000000002,
+          "candidate_to_baseline_ratio": 0.8306011166061099
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 1729.9375,
+          "candidate_gpu_us": 1578.9995,
+          "candidate_to_baseline_ratio": 0.912749449040789
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3654.125,
+          "candidate_gpu_us": 3462.291,
+          "candidate_to_baseline_ratio": 0.9475020695789006
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3655.041,
+          "candidate_gpu_us": 3481.8125,
+          "candidate_to_baseline_ratio": 0.952605593206752
+        }
+      ]
+    },
+    {
+      "kind": 3,
+      "threads": 512,
+      "cases": [
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 469.333,
+          "candidate_gpu_us": 428.79150000000004,
+          "candidate_to_baseline_ratio": 0.91361890171797
+        },
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 475.02,
+          "candidate_gpu_us": 431.687,
+          "candidate_to_baseline_ratio": 0.908776472569576
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 1384.479,
+          "candidate_gpu_us": 1354.1665,
+          "candidate_to_baseline_ratio": 0.9781054822788934
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 1391.0410000000002,
+          "candidate_gpu_us": 1360.7910000000002,
+          "candidate_to_baseline_ratio": 0.978253696332459
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1755.7915,
+          "candidate_gpu_us": 1724.729,
+          "candidate_to_baseline_ratio": 0.9823085485947506
+        },
+        {
+          "heads": 16,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1762.375,
+          "candidate_gpu_us": 1734.5205,
+          "candidate_to_baseline_ratio": 0.9841949074402441
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 2077.458,
+          "candidate_gpu_us": 2053.583,
+          "candidate_to_baseline_ratio": 0.9885075895637842
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 2086.77,
+          "candidate_gpu_us": 2064.5,
+          "candidate_to_baseline_ratio": 0.9893280045237377
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3276.9165000000003,
+          "candidate_gpu_us": 3369.291,
+          "candidate_to_baseline_ratio": 1.028189457985884
+        },
+        {
+          "heads": 16,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3465.645,
+          "candidate_gpu_us": 3417.6665000000003,
+          "candidate_to_baseline_ratio": 0.9861559680809778
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": false,
+          "baseline_gpu_us": 841.0825,
+          "candidate_gpu_us": 788.437,
+          "candidate_to_baseline_ratio": 0.9374074481397485
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": true,
+          "baseline_gpu_us": 853.7915,
+          "candidate_gpu_us": 807.312,
+          "candidate_to_baseline_ratio": 0.9455610649672666
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": false,
+          "baseline_gpu_us": 2606.416,
+          "candidate_gpu_us": 2528.27,
+          "candidate_to_baseline_ratio": 0.9700178329169249
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": true,
+          "baseline_gpu_us": 1456.6035,
+          "candidate_gpu_us": 1345.8325,
+          "candidate_to_baseline_ratio": 0.9239525375299456
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": false,
+          "baseline_gpu_us": 1434.625,
+          "candidate_gpu_us": 1326.729,
+          "candidate_to_baseline_ratio": 0.9247914960355494
+        },
+        {
+          "heads": 32,
+          "seq": 554,
+          "initialized": true,
+          "baseline_gpu_us": 1848.7705,
+          "candidate_gpu_us": 1798.9785,
+          "candidate_to_baseline_ratio": 0.9730675062156173
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": false,
+          "baseline_gpu_us": 2203.812,
+          "candidate_gpu_us": 2368.4790000000003,
+          "candidate_to_baseline_ratio": 1.074719168422715
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": true,
+          "baseline_gpu_us": 1785.083,
+          "candidate_gpu_us": 1672.1665,
+          "candidate_to_baseline_ratio": 0.9367443978795383
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": false,
+          "baseline_gpu_us": 3729.062,
+          "candidate_gpu_us": 3599.3745,
+          "candidate_to_baseline_ratio": 0.9652224875853499
+        },
+        {
+          "heads": 32,
+          "seq": 2048,
+          "initialized": true,
+          "baseline_gpu_us": 3666.7285,
+          "candidate_gpu_us": 3550.5415000000003,
+          "candidate_to_baseline_ratio": 0.968313170718803
+        }
+      ]
+    }
+  ],
+  "audit_compressed_path": "engine92_prefill_geometry_audit.json.gz"
+}

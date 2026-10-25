@@ -1,0 +1,18 @@
+{
+  "status": "skipped_live_memory",
+  "primary_throughput_eligible": false,
+  "scope": "Four actual FFN layer triplets, ordinary qualified projections versus current fused FFN in ABBA order. Full packed/output parity and CPU corners; private C only, no model speed claim.",
+  "driver_sha256": "cf293b3cd3687abf89782a7405e19917228f4107da98fab1c9a6e99493a5268e",
+  "preparation_sha256": "884860f8bfbde0d44e4e6567716f041d13ea35404a3bc7b44ffea6552e27b622",
+  "inputs": {
+    ".venv-lighton-vllm-metal/engine82_real_ffn_probe.m": "c3a6aeb6383c295eb7a5b4104b635b3215be447cbf505e3353057e673d0c4453",
+    ".venv-lighton-vllm-metal/engine82_real_ffn_prefix.inc": "f4823f7590c13df6431e4730615acd830bee0897ab13b5afe793b0ffe0cb8169",
+    ".venv-lighton-vllm-metal/engine82_weight_offsets.inc": "d1a0ccbeafbe8c2886b45958e34f939cf7a7830e67793764d9fd40a84824b26a",
+    ".venv-lighton-vllm-metal/engine82_probe_checks.m": "a75033e195e5a0a783deeadbb6452cc7c0800ed757621136938184df6da1ba77",
+    ".venv-lighton-vllm-metal/engine82_probe_kernels.m": "8747e4225dcf45be2cecf6ee2973dd310adb781ca7e93db128df12f4177bd0d9",
+    ".venv-lighton-vllm-metal/engine82_real_gate.metal": "e6fc1c54777dd2e109e04d99dfb5e4dea33ed5a52572c7891d1b625a1d10a259",
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine83_real_ffn_probe.m": "8b072e4ccdd775892e40605f582395ada6707c0806fe18343069d192ae41b70a"
+  },
+  "checks": [],
+  "available_bytes": 7558266880
+}

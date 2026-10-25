@@ -1,0 +1,32 @@
+{
+  "status": "pass",
+  "script_sha256": "ec029254b2081360c3fc8fe38491a8a26d5cd7f3cc9e482debabc682d2359763",
+  "checks": [
+    {
+      "args": [
+        "--bf16-projection-rounds",
+        "on"
+      ],
+      "exit_code": 2,
+      "expected_error": "must match --policy-rounds length"
+    },
+    {
+      "args": [
+        "--policy-rounds",
+        "engineepoch",
+        "--bf16-projection-rounds",
+        "on"
+      ],
+      "exit_code": 2,
+      "expected_error": "require --bf16-prefill-inputs"
+    },
+    {
+      "args": [
+        "--require-memory-rounds"
+      ],
+      "exit_code": 2,
+      "expected_error": "requires --policy-rounds"
+    }
+  ],
+  "scope": "Reject invalid precision/memory policy inputs before any model work; all required CLI arguments supplied."
+}

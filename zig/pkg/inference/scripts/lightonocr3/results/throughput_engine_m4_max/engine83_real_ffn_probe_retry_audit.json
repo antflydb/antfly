@@ -1,0 +1,543 @@
+{
+  "status": "prototype_pass",
+  "primary_throughput_eligible": false,
+  "scope": "Four actual FFN layer triplets, ordinary qualified projections versus current fused FFN in ABBA order. Full packed/output parity and CPU corners; private C only, no model speed claim.",
+  "driver_sha256": "c4b429bb65bac6ae556d12604c9dd40cf9f8e0f70ac8b57d8d50822797a0c4fe",
+  "preparation_sha256": "884860f8bfbde0d44e4e6567716f041d13ea35404a3bc7b44ffea6552e27b622",
+  "inputs": {
+    ".venv-lighton-vllm-metal/engine82_real_ffn_probe.m": "c3a6aeb6383c295eb7a5b4104b635b3215be447cbf505e3353057e673d0c4453",
+    ".venv-lighton-vllm-metal/engine82_real_ffn_prefix.inc": "f4823f7590c13df6431e4730615acd830bee0897ab13b5afe793b0ffe0cb8169",
+    ".venv-lighton-vllm-metal/engine82_weight_offsets.inc": "d1a0ccbeafbe8c2886b45958e34f939cf7a7830e67793764d9fd40a84824b26a",
+    ".venv-lighton-vllm-metal/engine82_probe_checks.m": "a75033e195e5a0a783deeadbb6452cc7c0800ed757621136938184df6da1ba77",
+    ".venv-lighton-vllm-metal/engine82_probe_kernels.m": "8747e4225dcf45be2cecf6ee2973dd310adb781ca7e93db128df12f4177bd0d9",
+    ".venv-lighton-vllm-metal/engine82_real_gate.metal": "e6fc1c54777dd2e109e04d99dfb5e4dea33ed5a52572c7891d1b625a1d10a259",
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine83_real_ffn_probe.m": "8b072e4ccdd775892e40605f582395ada6707c0806fe18343069d192ae41b70a"
+  },
+  "checks": [],
+  "real_weight_payloads": [
+    {
+      "layer": 0,
+      "kind": 0,
+      "offset": 1402958584,
+      "bytes": 47185920,
+      "sha256": "a2a8ec444fd8ff936b23f54d97e06c14759a164ff92e82417831366c7f13611f"
+    },
+    {
+      "layer": 0,
+      "kind": 1,
+      "offset": 1450144504,
+      "bytes": 47185920,
+      "sha256": "4c1e126bfef13e699371f09bdd92fb55fda908bd44fb6450c45d7fd8c8e06e9c"
+    },
+    {
+      "layer": 0,
+      "kind": 2,
+      "offset": 1355772664,
+      "bytes": 47185920,
+      "sha256": "cfe2844c75c00bf917c3433158d0cec5a8a5aa1f969a856db804046655dc029b"
+    },
+    {
+      "layer": 8,
+      "kind": 0,
+      "offset": 8091362296,
+      "bytes": 47185920,
+      "sha256": "06ba7e17867e0554065d95a3a6a80bcf6a2ff6f75c97f298208d52ec9133a410"
+    },
+    {
+      "layer": 8,
+      "kind": 1,
+      "offset": 8138548216,
+      "bytes": 47185920,
+      "sha256": "8b5faab28be43f24b7405321e0c911fcc7c50a0e75f20889c108c28c0a31af1a"
+    },
+    {
+      "layer": 8,
+      "kind": 2,
+      "offset": 8044176376,
+      "bytes": 47185920,
+      "sha256": "91b85fe7d151644d8b7bd2922e167e5611e89be2075d7836fd8f941436269716"
+    },
+    {
+      "layer": 16,
+      "kind": 0,
+      "offset": 3187983352,
+      "bytes": 47185920,
+      "sha256": "c83ef117686dbeb6592972193d40ec9da6d11446d69a1ae9eb3bf7b45e9004b4"
+    },
+    {
+      "layer": 16,
+      "kind": 1,
+      "offset": 3235169272,
+      "bytes": 47185920,
+      "sha256": "9879999885dfa40918d3d0ad1196c66d9a215a268c4ddcf8fdc7981ec15e3140"
+    },
+    {
+      "layer": 16,
+      "kind": 2,
+      "offset": 3140797432,
+      "bytes": 47185920,
+      "sha256": "be99784ff18ea8fabefddd75d0451899a93f5016d333459e35ea992103721398"
+    },
+    {
+      "layer": 24,
+      "kind": 0,
+      "offset": 5198855800,
+      "bytes": 47185920,
+      "sha256": "fa9f686b21f81b5ba944ac22b3625689e38d37d5625be94e713acdfb7ede93fc"
+    },
+    {
+      "layer": 24,
+      "kind": 1,
+      "offset": 5246041720,
+      "bytes": 47185920,
+      "sha256": "18398603224be064ec8b4ad539bd319f210a2db52f56f1f90bed4839d3a2cac5"
+    },
+    {
+      "layer": 24,
+      "kind": 2,
+      "offset": 5151669880,
+      "bytes": 47185920,
+      "sha256": "ec06219d462c9a00748cfeed0f1a132c4a93821e3c8fe42c5749b71e5eb6d25d"
+    }
+  ],
+  "build_exit_code": 0,
+  "build_log_sha256": "95b0d49764138ce55597d28606cd7f002018ba22826f1e985a1bb6b452e32f52",
+  "binary_sha256": "067942d23caa78c6a2e82ee95fb5ae93db6a790b6fa19f7046f807975d3eaf37",
+  "exit_code": 0,
+  "records": [
+    {
+      "rows": 432,
+      "leg": 0,
+      "fused": 0,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        7062.125,
+        6905.333,
+        6654.374,
+        6324.833,
+        6212.041,
+        6110.375,
+        6030.458,
+        5942.749
+      ],
+      "host_encode_us": [
+        74.042,
+        64.042,
+        82.708,
+        89.875,
+        202.917,
+        91.459,
+        95.375,
+        79.417
+      ]
+    },
+    {
+      "rows": 432,
+      "leg": 1,
+      "fused": 1,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        5569.125,
+        5648.874,
+        5693.375,
+        5811.166,
+        5772.666,
+        5843.5,
+        5670.249,
+        5785.5
+      ],
+      "host_encode_us": [
+        43.75,
+        41.459,
+        54.375,
+        46.5,
+        49.041,
+        47.0,
+        46.208,
+        57.833
+      ]
+    },
+    {
+      "rows": 432,
+      "leg": 2,
+      "fused": 1,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        5569.083,
+        5842.833,
+        5722.375,
+        5812.25,
+        5728.5,
+        5768.958,
+        5590.583,
+        5579.999
+      ],
+      "host_encode_us": [
+        44.5,
+        42.542,
+        38.375,
+        34.917,
+        42.625,
+        45.333,
+        38.083,
+        49.667
+      ]
+    },
+    {
+      "rows": 432,
+      "leg": 3,
+      "fused": 0,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        5860.0,
+        5789.791,
+        5899.416,
+        5867.125,
+        5905.0,
+        5868.875,
+        5846.874,
+        5871.0
+      ],
+      "host_encode_us": [
+        93.875,
+        74.084,
+        98.625,
+        58.666,
+        64.75,
+        60.708,
+        60.084,
+        73.667
+      ]
+    },
+    {
+      "rows": 554,
+      "leg": 0,
+      "fused": 0,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        7424.333,
+        7407.083,
+        7397.999,
+        7346.291,
+        7391.583,
+        7419.0,
+        7369.916,
+        7374.249
+      ],
+      "host_encode_us": [
+        96.334,
+        83.208,
+        95.542,
+        78.75,
+        71.917,
+        111.083,
+        87.375,
+        92.333
+      ]
+    },
+    {
+      "rows": 554,
+      "leg": 1,
+      "fused": 1,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        7108.249,
+        7118.374,
+        7061.708,
+        7065.958,
+        7106.083,
+        7056.791,
+        7086.833,
+        7089.333
+      ],
+      "host_encode_us": [
+        68.042,
+        55.708,
+        60.584,
+        59.208,
+        50.625,
+        62.917,
+        50.292,
+        57.417
+      ]
+    },
+    {
+      "rows": 554,
+      "leg": 2,
+      "fused": 1,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        7147.458,
+        7076.249,
+        7109.25,
+        7093.499,
+        7098.458,
+        7084.041,
+        7070.833,
+        7093.749
+      ],
+      "host_encode_us": [
+        56.334,
+        52.458,
+        39.041,
+        45.833,
+        58.042,
+        57.916,
+        51.167,
+        58.667
+      ]
+    },
+    {
+      "rows": 554,
+      "leg": 3,
+      "fused": 0,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        7362.874,
+        7437.499,
+        7339.999,
+        7348.0,
+        7377.874,
+        7382.874,
+        7372.124,
+        7375.375
+      ],
+      "host_encode_us": [
+        98.791,
+        91.667,
+        106.209,
+        99.042,
+        102.291,
+        112.209,
+        83.291,
+        95.625
+      ]
+    },
+    {
+      "rows": 662,
+      "leg": 0,
+      "fused": 0,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        8560.249,
+        8572.666,
+        8565.291,
+        8574.749,
+        8866.374,
+        8594.374,
+        8545.291,
+        8567.375
+      ],
+      "host_encode_us": [
+        76.208,
+        115.875,
+        109.916,
+        181.584,
+        95.709,
+        96.416,
+        189.209,
+        116.0
+      ]
+    },
+    {
+      "rows": 662,
+      "leg": 1,
+      "fused": 1,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        8192.833,
+        8206.749,
+        8203.624,
+        8195.916,
+        8205.124,
+        8202.124,
+        8209.999,
+        8207.541
+      ],
+      "host_encode_us": [
+        49.0,
+        56.084,
+        57.709,
+        59.208,
+        68.0,
+        52.583,
+        58.0,
+        56.833
+      ]
+    },
+    {
+      "rows": 662,
+      "leg": 2,
+      "fused": 1,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        8220.958,
+        8178.833,
+        8233.125,
+        8198.374,
+        8209.249,
+        8182.624,
+        8199.375,
+        8205.249
+      ],
+      "host_encode_us": [
+        52.959,
+        54.167,
+        59.916,
+        54.833,
+        50.375,
+        54.75,
+        54.625,
+        56.75
+      ]
+    },
+    {
+      "rows": 662,
+      "leg": 3,
+      "fused": 0,
+      "real_layers": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "output_bit_differences": 0,
+      "packed_differences": 0,
+      "norm_packed_differences": 0,
+      "max_abs": 0,
+      "cpu_max_abs": 3.63797881e-07,
+      "gpu_us": [
+        8563.124,
+        8559.25,
+        8553.874,
+        8596.75,
+        8587.916,
+        8578.249,
+        8562.541,
+        8566.875
+      ],
+      "host_encode_us": [
+        144.875,
+        96.625,
+        84.75,
+        116.875,
+        111.875,
+        86.208,
+        107.083,
+        106.417
+      ]
+    }
+  ],
+  "stdout_sha256": "8b42fea3b9bf28114b3e4d1a99536c20f3dee89c7a11cfdd47e068f86f4f6761",
+  "stderr_sha256": "67a728569d060ceb37c4fe64fe45b39285753047768621248af137854e23b1a3"
+}

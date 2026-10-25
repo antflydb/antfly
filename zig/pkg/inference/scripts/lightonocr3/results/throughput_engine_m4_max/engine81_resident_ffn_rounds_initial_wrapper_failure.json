@@ -1,0 +1,8 @@
+{
+  "scope": "Private C64-oriented post-verifier incorrectly required a wide MPP vocabulary head for a C4 harness validation. Native execution and canonical verification passed all four rounds. No runtime change; primary C64 verifier remains unchanged.",
+  "original_driver_sha256": "fec258755a7e37ae4419b8471c846adfead23443e6cb3f334279a5c09db9c57d",
+  "original_qualification_driver_sha256": "9701d07134da4d7f49fdb9c184cb165a49dac4b38cf67ba71259fb63174ae233",
+  "original_failure_log_sha256": "4b9fef8bfcb0e8f70d70b53021f06f398e526cc7fe5684d0813feeb18a4d4664",
+  "report_sha256": "c5fc53b62e2626806f6037a3e8d83f9578d68edbc08a3fda493ec9189aae2438",
+  "native_log_sha256": "b1b64ac7c46358e6513e28d557887c94171f31b521c639184c0b8c401c82e4f6"
+}

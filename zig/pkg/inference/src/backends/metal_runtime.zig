@@ -10861,9 +10861,8 @@ pub fn lightOnPrefillFfnEnabled(self: anytype) bool {
     return antfly_metal_lighton_prefill_ffn_enabled(runtime) != 0;
 }
 
-/// The two private scratch tensors are byte carriers for BF16 intermediates.
-/// Retaining their conservative F32 capacities uses less storage than the
-/// ordinary gate/up/activation F32 intermediates. Only the final F32 is exposed.
+/// Private BF16 scratch preserves the prefill operands without allocating
+/// unused F32 capacity. Only the final F32 tensor is exposed to the model.
 pub fn decoderRuntimeTryApplyLightOnPrefillFfn(self: anytype, request: anytype) !?MetalTensor {
     if (request.activation != .silu or !request.input.isDevice() or request.input.ndim() != 2 or
         request.input.dim(0) <= 0 or request.input.dim(1) <= 0 or request.input.deviceByteOffset() % 16 != 0 or
@@ -10872,10 +10871,10 @@ pub fn decoderRuntimeTryApplyLightOnPrefillFfn(self: anytype, request: anytype) 
     const rows: usize = @intCast(request.input.dim(0));
     if (antfly_metal_lighton_prefill_ffn_can_apply(runtime, request.gate_slot, request.up_slot, request.down_slot, rows, request.hidden_size, request.intermediate_size) == 0) return null;
     const hidden_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, request.hidden_size), @sizeOf(f32));
-    const gated_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, request.intermediate_size), @sizeOf(f32));
-    var norm_scratch = try MetalTensor.deviceAllocate(runtime, hidden_bytes, .private, &.{ @intCast(rows), @intCast(request.hidden_size) });
+    // i16 is a two-byte storage carrier; the Metal kernels read BF16 bits.
+    var norm_scratch = try MetalTensor.deviceAllocateTyped(std.heap.c_allocator, runtime, .i16, .private, &.{ @intCast(rows), @intCast(request.hidden_size) });
     defer norm_scratch.deinit();
-    var gated_scratch = try MetalTensor.deviceAllocate(runtime, gated_bytes, .private, &.{ @intCast(rows), @intCast(request.intermediate_size) });
+    var gated_scratch = try MetalTensor.deviceAllocateTyped(std.heap.c_allocator, runtime, .i16, .private, &.{ @intCast(rows), @intCast(request.intermediate_size) });
     defer gated_scratch.deinit();
     var output = try MetalTensor.deviceAllocate(runtime, hidden_bytes, .private, &.{ @intCast(rows), @intCast(request.hidden_size) });
     errdefer output.deinit();

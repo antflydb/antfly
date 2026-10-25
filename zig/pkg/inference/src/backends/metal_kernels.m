@@ -32977,6 +32977,10 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->mapped_model_allocated_bytes = 0;
     runtime->deberta_cc_mps_mm = nil;
     runtime->deberta_relative_mps_mm = nil;
+    for (size_t i = 0; i < TERMITE_METAL_DOT_GENERAL_MPS_CACHE_CAPACITY; ++i)
+        runtime->dot_general_mps_mm[i] = nil;
+    for (size_t i = 0; i < TERMITE_METAL_GEMM_MPS_CACHE_CAPACITY; ++i)
+        runtime->gemm_mps_mm[i] = nil;
     runtime->deberta_mps_seq_len = 0;
     runtime->deberta_mps_relative_count = 0;
     runtime->deberta_mps_head_dim = 0;
@@ -32984,6 +32988,11 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->host_staging_buffer = nil;
     runtime->active_frame_host_staging_buffer = nil;
     runtime->active_frame_host_staging_retained_buffer = nil;
+    for (size_t i = 0; i < 2; ++i) {
+        runtime->frame_host_staging_buffers[i] = nil;
+        runtime->frame_host_staging_capacities[i] = 0;
+    }
+    runtime->frame_host_staging_index = 0;
     runtime->token_buffer = nil;
     runtime->sample_logits_buffer = nil;
     runtime->sample_topk_values_buffer = nil;
@@ -33125,6 +33134,17 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     memset(runtime->active_frame_blit_source_counts, 0, sizeof(runtime->active_frame_blit_source_counts));
     memset(runtime->submitted_frame_blit_source_counts, 0, sizeof(runtime->submitted_frame_blit_source_counts));
     memset(runtime->last_frame_blit_source_counts, 0, sizeof(runtime->last_frame_blit_source_counts));
+    // The runtime is calloc/free storage: ARC does not destroy its strong
+    // fields automatically. Retire these optional and shared-library PSOs too.
+    runtime->compressed_attention_store_local_pipeline = nil;
+    runtime->compressed_attention_store_component_pipeline = nil;
+    runtime->compressed_attention_update_component_pipeline = nil;
+    runtime->compressed_attention_select_compressed_pipeline = nil;
+    runtime->compressed_attention_hybrid_attention_pipeline = nil;
+    runtime->linear_bias_pipeline = nil;
+    runtime->ffn_gelu_backward_rank1_branches_pipeline = nil;
+    runtime->ffn_gelu_backward_rank1_first_branch_pipeline = nil;
+    runtime->audio_pad_pipeline = nil;
     runtime->precise_library = nil;
     runtime->library = nil;
     runtime->queue = nil;

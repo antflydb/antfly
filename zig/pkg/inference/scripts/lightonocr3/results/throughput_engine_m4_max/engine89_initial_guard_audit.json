@@ -1,0 +1,7 @@
+{
+  "status": "declined_before_any_build_or_gpu_work",
+  "primary_throughput_eligible": false,
+  "reason": "Own 4B primary waiter already had a child. Initial guard rejected pausing or running the private tile probe; no process suspended, no compilation, no GPU work.",
+  "driver_sha256": "afb4b62988e8c8afde13f25304674da7567aaa3cd7417d5d688856ed3bf71745",
+  "log_sha256": "9beb33204276bed2fd05c8f951c9d14a58ce1a84cdd7984858334008c21ce1df"
+}
