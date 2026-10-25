@@ -14754,17 +14754,30 @@ export interface components {
          *
          *     API key via `api_key` field or `GEMINI_API_KEY` environment variable.
          *
-         *     **Example Models:** gemini-embedding-001 (default, 3072 dims)
+         *     **Example Models:** gemini-embedding-2 (default, 3072 dims)
          *
          *     **Docs:** https://ai.google.dev/gemini-api/docs/embeddings
          * @example {
          *       "provider": "gemini",
-         *       "model": "gemini-embedding-001",
+         *       "model": "gemini-embedding-2",
          *       "dimension": 3072,
          *       "api_key": "your-api-key"
          *     }
          */
         GoogleEmbedderConfig: {
+            /**
+             * @description Wire protocol. New configurations default to embed_content; existing catalogs retain their pinned protocol. No automatic fallback.
+             * @default embed_content
+             * @enum {string}
+             */
+            request_format?: "embed_content" | "batch_embed_contents";
+            /**
+             * @description Retrieval task representation, independent of model name. Defaults to prompt with embed_content and task_type with legacy protocols. Changing it requires re-embedding.
+             * @enum {string}
+             */
+            task_encoding?: "prompt" | "task_type" | "none";
+            /** @description Maximum inputs per upstream request. embed_content requires 1 so independent records never become one aggregated embedding. */
+            batch_size?: number;
             /**
              * @description discriminator enum property added by openapi-typescript
              * @enum {string}
@@ -14776,10 +14789,10 @@ export interface components {
             location?: string;
             /**
              * @description The name of the embedding model to use.
-             * @default gemini-embedding-001
-             * @example gemini-embedding-001
+             * @default gemini-embedding-2
+             * @example gemini-embedding-2
              */
-            model: string;
+            model?: string;
             /**
              * @description The dimension of the embedding vector (768, 1536, or 3072 recommended).
              * @default 3072
@@ -14799,7 +14812,7 @@ export interface components {
          *
          *     Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`.
          *
-         *     **Example Model:** gemini-embedding-001 (default, 3072 dims)
+         *     **Example Model:** gemini-embedding-2 (default, 3072 dims)
          *
          *     Antfly's Vertex embedder currently supports text inputs. Binary media is rejected
          *     instead of being flattened or silently discarded.
@@ -14807,13 +14820,26 @@ export interface components {
          *     **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
          * @example {
          *       "provider": "vertex",
-         *       "model": "gemini-embedding-001",
+         *       "model": "gemini-embedding-2",
          *       "project_id": "my-gcp-project",
-         *       "location": "us-central1",
+         *       "location": "global",
          *       "dimension": 3072
          *     }
          */
         VertexEmbedderConfig: {
+            /**
+             * @description Wire protocol. New configurations default to embed_content; existing catalogs retain their pinned protocol. No automatic fallback.
+             * @default embed_content
+             * @enum {string}
+             */
+            request_format?: "embed_content" | "predict";
+            /**
+             * @description Retrieval task representation, independent of model name. Defaults to prompt with embed_content and task_type with legacy protocols. Changing it requires re-embedding.
+             * @enum {string}
+             */
+            task_encoding?: "prompt" | "task_type" | "none";
+            /** @description Maximum inputs per upstream request. embed_content requires 1 so independent records never become one aggregated embedding. */
+            batch_size?: number;
             /**
              * @description discriminator enum property added by openapi-typescript
              * @enum {string}
@@ -14821,21 +14847,21 @@ export interface components {
             provider: "vertex";
             /**
              * @description The name of the Vertex AI embedding model to use.
-             * @default gemini-embedding-001
-             * @example gemini-embedding-001
+             * @default gemini-embedding-2
+             * @example gemini-embedding-2
              */
-            model: string;
+            model?: string;
             /** @description Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment variable. */
             project_id?: string;
             /**
-             * @description Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'.
-             * @default us-central1
+             * @description Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'global' for new configurations.
+             * @default global
              */
             location?: string;
             /** @description Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Alternative to the default ADC chain. */
             credentials_path?: string;
             /**
-             * @description The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001).
+             * @description The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-2).
              * @default 3072
              */
             dimension?: number;
@@ -17888,6 +17914,8 @@ export interface components {
             provider: string;
             /** @description Configured provider model when applicable. */
             model?: string;
+            request_format?: string;
+            task_encoding?: string;
             /** @description Pinned immutable embedding asset and recipe identity. */
             model_identity?: string;
             models?: string[];

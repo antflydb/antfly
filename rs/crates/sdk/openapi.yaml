@@ -34833,11 +34833,32 @@ components:
         API key via `api_key` field or `GEMINI_API_KEY` environment variable.
 
 
-        **Example Models:** gemini-embedding-001 (default, 3072 dims)
+        **Example Models:** gemini-embedding-2 (default, 3072 dims)
 
 
         **Docs:** https://ai.google.dev/gemini-api/docs/embeddings
       properties:
+        request_format:
+          type: string
+          enum:
+            - embed_content
+            - batch_embed_contents
+          description: Wire protocol. New configurations default to embed_content; existing catalogs retain
+            their pinned protocol. No automatic fallback.
+          default: embed_content
+        task_encoding:
+          type: string
+          enum:
+            - prompt
+            - task_type
+            - none
+          description: Retrieval task representation, independent of model name. Defaults to prompt with
+            embed_content and task_type with legacy protocols. Changing it requires re-embedding.
+        batch_size:
+          type: integer
+          minimum: 1
+          description: Maximum inputs per upstream request. embed_content requires 1 so independent records
+            never become one aggregated embedding.
         provider:
           type: string
           enum:
@@ -34852,8 +34873,8 @@ components:
         model:
           type: string
           description: The name of the embedding model to use.
-          default: gemini-embedding-001
-          example: gemini-embedding-001
+          default: gemini-embedding-2
+          example: gemini-embedding-2
         dimension:
           type: integer
           description: The dimension of the embedding vector (768, 1536, or 3072 recommended).
@@ -34870,10 +34891,9 @@ components:
           $ref: '#/components/schemas/EmbeddingRetrievalConfig'
       required:
         - provider
-        - model
       example:
         provider: gemini
-        model: gemini-embedding-001
+        model: gemini-embedding-2
         dimension: 3072
         api_key: your-api-key
     VertexEmbedderConfig:
@@ -34885,7 +34905,7 @@ components:
         Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`.
 
 
-        **Example Model:** gemini-embedding-001 (default, 3072 dims)
+        **Example Model:** gemini-embedding-2 (default, 3072 dims)
 
 
         Antfly's Vertex embedder currently supports text inputs. Binary media is rejected
@@ -34895,6 +34915,27 @@ components:
 
         **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
       properties:
+        request_format:
+          type: string
+          enum:
+            - embed_content
+            - predict
+          description: Wire protocol. New configurations default to embed_content; existing catalogs retain
+            their pinned protocol. No automatic fallback.
+          default: embed_content
+        task_encoding:
+          type: string
+          enum:
+            - prompt
+            - task_type
+            - none
+          description: Retrieval task representation, independent of model name. Defaults to prompt with
+            embed_content and task_type with legacy protocols. Changing it requires re-embedding.
+        batch_size:
+          type: integer
+          minimum: 1
+          description: Maximum inputs per upstream request. embed_content requires 1 so independent records
+            never become one aggregated embedding.
         provider:
           type: string
           enum:
@@ -34902,16 +34943,16 @@ components:
         model:
           type: string
           description: The name of the Vertex AI embedding model to use.
-          default: gemini-embedding-001
-          example: gemini-embedding-001
+          default: gemini-embedding-2
+          example: gemini-embedding-2
         project_id:
           type: string
           description: Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment variable.
         location:
           type: string
           description: Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can
-            also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'.
-          default: us-central1
+            also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'global' for new configurations.
+          default: global
         credentials_path:
           type: string
           writeOnly: true
@@ -34919,18 +34960,17 @@ components:
             Alternative to the default ADC chain.
         dimension:
           type: integer
-          description: The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001).
+          description: The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-2).
           default: 3072
         retrieval:
           $ref: '#/components/schemas/EmbeddingRetrievalConfig'
       required:
         - provider
-        - model
       example:
         provider: vertex
-        model: gemini-embedding-001
+        model: gemini-embedding-2
         project_id: my-gcp-project
-        location: us-central1
+        location: global
         dimension: 3072
     OllamaEmbedderConfig:
       type: object
@@ -40727,6 +40767,10 @@ components:
         model:
           type: string
           description: Configured provider model when applicable.
+        request_format:
+          type: string
+        task_encoding:
+          type: string
         model_identity:
           type: string
           pattern: ^[0-9a-f]{64}$
