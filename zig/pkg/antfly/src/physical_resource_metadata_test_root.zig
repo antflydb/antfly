@@ -1056,6 +1056,20 @@ const RegisteredSourceFixture = struct {
         return runMode(shared, phase, target, oom, 0);
     }
     fn runMode(shared: bool, phase: Phase, target: ?usize, oom: bool, writer_count: usize) !Stats {
+        return runExtended(shared, phase, target, oom, writer_count, false);
+    }
+    fn finishLedger(root: *?Scope.ObsoleteLedger, cursor: *?Scope.ObsoleteLedger.Reclaimer, a: std.mem.Allocator) void {
+        if (root.*) |ledger| {
+            if (cursor.* == null) cursor.* = .init(ledger);
+            while (true) {
+                var steps: usize = 1;
+                if (cursor.*.?.step(a, &steps)) break;
+            }
+            cursor.* = null;
+            root.* = null;
+        }
+    }
+    fn runExtended(shared: bool, phase: Phase, target: ?usize, oom: bool, writer_count: usize, exercise_obsolete: bool) !Stats {
         const a = std.testing.allocator;
         var allocator1 = std.testing.FailingAllocator.init(a, .{});
         var header_witness: HeaderWitness = .{};
@@ -1097,7 +1111,15 @@ const RegisteredSourceFixture = struct {
         var root_cursor: ?Store.Reclaimer = null;
         var snapshot: ?*Store = null;
         var snapshot_cursor: ?Store.Reclaimer = null;
+        var obsolete_live: ?Scope.ObsoleteLedger = null;
+        var obsolete_snapshot: ?Scope.ObsoleteLedger = null;
+        var obsolete_cursor: ?Scope.ObsoleteLedger.Reclaimer = null;
+        var obsolete_old_cursor: ?Scope.ObsoleteLedger.Reclaimer = null;
+        var obsolete_candidate: ?*Scope.RegisteredObsolete = null;
         defer {
+            finishLedger(&obsolete_live, &obsolete_cursor, a2);
+            finishLedger(&obsolete_snapshot, &obsolete_old_cursor, a2);
+            if (obsolete_candidate) |owner| owner.requestRetirement();
             finishRoot(&root, &root_cursor, a2);
             finishRoot(&snapshot, &snapshot_cursor, a2);
             if (writer_view) |*view| view.deinit(a2);
@@ -1139,6 +1161,13 @@ const RegisteredSourceFixture = struct {
         const key = try a1.alloc(u8, 32775);
         @memset(key, 'k');
         source.run = .{ .id = 911, .level = if (writer_count == 0) 1 else 0, .size_bytes = 1, .path = if (shared) null else try a1.dupe(u8, "registered-source-ancestor.sst"), .smallest_namespace_name = null, .smallest_key = key, .largest_namespace_name = null, .largest_key = try a1.dupe(u8, "z"), .entry_count = 1, .bloom_filter = null, .state = if (shared) .{} else null };
+        if (exercise_obsolete) {
+            a1.free(source.run.path.?);
+            const path = try a1.alloc(u8, 32779);
+            @memset(path, 'p');
+            path[path.len - 1] = '0';
+            source.run.path = path;
+        }
         if (shared) {
             try source.run.state.?.appendUpsert(a1, .{ .name = "docs" }, key, key, false);
             try source.run.shareMemory(a1);
@@ -1153,6 +1182,12 @@ const RegisteredSourceFixture = struct {
             for (1..route_count) |ordinal| {
                 var seed = source.run;
                 seed.id += ordinal;
+                const seed_path = if (exercise_obsolete) try a1.dupe(u8, source.run.path.?) else null;
+                defer if (seed_path) |path| a1.free(path);
+                if (seed_path) |path| {
+                    path[path.len - 1] += @intCast(ordinal);
+                    seed.path = path;
+                }
                 var held: ?lsm.Backend.DirectoryEntryLifetime = .{ .context = &source, .release = Source.release };
                 source.lifetimes += 1;
                 errdefer if (held != null) {
@@ -1216,6 +1251,16 @@ const RegisteredSourceFixture = struct {
                         try std.testing.expectError(error.ExecutionWaitUnsupported, writer_view.?.ensureState(a2));
                         try std.testing.expectError(error.ExecutionWaitUnsupported, writer_view.?.ensureBloomFilter(a2));
                     }
+                    if (exercise_obsolete) {
+                        const empty_ledger: Scope.ObsoleteLedger = .{};
+                        obsolete_candidate = scope2.?.beginObsoletePutWithAdmission(if (obsolete_live) |*live| live else &empty_ledger, &writer_view.?, 100 + level, original) catch |cause| break :blk cause;
+                        obsolete_candidate.?.resumeWithAdmission(original) catch |cause| break :blk cause;
+                        const next_ledger = obsolete_candidate.?.takeWithAdmission(original) catch |cause| break :blk cause;
+                        obsolete_candidate.?.requestRetirement();
+                        obsolete_candidate = null;
+                        finishLedger(&obsolete_live, &obsolete_cursor, a2);
+                        obsolete_live = next_ledger;
+                    }
                     candidate = scope2.?.beginRegisteredWriterRootWithAdmission(if (root) |live| live else &empty, &writer_view.?, false, original) catch |cause| break :blk cause;
                     candidate.?.resumeWithAdmission(original) catch |cause| break :blk cause;
                     const next = candidate.?.takeWithAdmission(original) catch |cause| break :blk cause;
@@ -1249,10 +1294,42 @@ const RegisteredSourceFixture = struct {
                 const replacement = candidate.?.takeWithAdmission(original) catch |cause| break :blk cause;
                 candidate.?.requestRetirement();
                 candidate = null;
-                writer_view.?.deinit(a2);
-                writer_view = null;
                 finishRoot(&root, &root_cursor, a2);
                 root = replacement;
+                if (exercise_obsolete) {
+                    obsolete_snapshot = obsolete_live.?.fork();
+                    obsolete_candidate = scope2.?.beginObsoletePutWithAdmission(&obsolete_live.?, &writer_view.?, 1, original) catch |cause| break :blk cause;
+                    obsolete_candidate.?.resumeWithAdmission(original) catch |cause| break :blk cause;
+                    const kept_deadline = obsolete_candidate.?.takeWithAdmission(original) catch |cause| break :blk cause;
+                    obsolete_candidate.?.requestRetirement();
+                    obsolete_candidate = null;
+                    try std.testing.expectEqual(100 + latest, kept_deadline.get(writer_view.?.path.?).?.delete_after_ns);
+                    finishLedger(&obsolete_live, &obsolete_cursor, a2);
+                    obsolete_live = kept_deadline;
+                    obsolete_candidate = scope2.?.beginObsoletePutWithAdmission(&obsolete_live.?, &writer_view.?, 1000, original) catch |cause| break :blk cause;
+                    obsolete_candidate.?.resumeWithAdmission(original) catch |cause| break :blk cause;
+                    const revised_deadline = obsolete_candidate.?.takeWithAdmission(original) catch |cause| break :blk cause;
+                    obsolete_candidate.?.requestRetirement();
+                    obsolete_candidate = null;
+                    try std.testing.expectEqual(100 + latest, obsolete_snapshot.?.get(writer_view.?.path.?).?.delete_after_ns);
+                    try std.testing.expectEqual(@as(u64, 1000), revised_deadline.get(writer_view.?.path.?).?.delete_after_ns);
+                    finishLedger(&obsolete_live, &obsolete_cursor, a2);
+                    obsolete_live = revised_deadline;
+                    const rank = writer_count / 2;
+                    obsolete_candidate = scope2.?.beginObsoleteRemoveWithAdmission(&obsolete_live.?, rank, original) catch |cause| break :blk cause;
+                    obsolete_candidate.?.resumeWithAdmission(original) catch |cause| break :blk cause;
+                    const removed = obsolete_candidate.?.takeWithAdmission(original) catch |cause| break :blk cause;
+                    obsolete_candidate.?.requestRetirement();
+                    obsolete_candidate = null;
+                    try std.testing.expectEqual(writer_count - 1, removed.count());
+                    try std.testing.expectEqual(writer_count, obsolete_live.?.count());
+                    try std.testing.expectEqual(@as(u64, 0), removed.memoryBytes(391));
+                    try std.testing.expectError(error.ExecutionWaitUnsupported, obsolete_live.?.ensureUnusedCapacity(a2, 1));
+                    finishLedger(&obsolete_live, &obsolete_cursor, a2);
+                    obsolete_live = removed;
+                }
+                writer_view.?.deinit(a2);
+                writer_view = null;
                 try std.testing.expectEqual(writer_count, root.?.count());
                 try std.testing.expect(root.?.tree.account.?.independently_funded);
                 try std.testing.expectEqual(@as(u64, 0), root.?.tree.account.?.chargeOnce(913));
@@ -1310,6 +1387,24 @@ const RegisteredSourceFixture = struct {
                     lease2.?.deinit(a2);
                     lease2 = null;
                 }
+                if (exercise_obsolete) {
+                    obsolete_cursor = .init(obsolete_live.?);
+                    while (true) {
+                        original.checkpoint() catch |cause| break :blk cause;
+                        var steps: usize = 1;
+                        if (obsolete_cursor.?.step(a2, &steps)) break;
+                    }
+                    obsolete_cursor = null;
+                    obsolete_live = null;
+                    obsolete_old_cursor = .init(obsolete_snapshot.?);
+                    while (true) {
+                        original.checkpoint() catch |cause| break :blk cause;
+                        var steps: usize = 1;
+                        if (obsolete_old_cursor.?.step(a2, &steps)) break;
+                    }
+                    obsolete_old_cursor = null;
+                    obsolete_snapshot = null;
+                }
                 while (first.resource_manager.payload_retirement_ready.load(.acquire) != 0 or second.resource_manager.payload_retirement_ready.load(.acquire) != 0) {
                     _ = second.resource_manager.drainPayloadRetirementWithAdmission(original) catch |cause| break :blk cause;
                     _ = first.resource_manager.drainPayloadRetirementWithAdmission(original) catch |cause| break :blk cause;
@@ -1330,6 +1425,7 @@ const RegisteredSourceFixture = struct {
             var observer = lsm.Backend.init(a2, .{ .resource_manager = &second.resource_manager, .wal_enabled = false });
             defer observer.close();
             observer.runs = root.?.fork();
+            if (obsolete_live) |*ledger| observer.obsolete_paths = ledger.fork();
             const retired = try a2.create(Store);
             retired.* = root.?.fork();
             observer.retired_run_stores = retired;
@@ -1344,6 +1440,10 @@ const RegisteredSourceFixture = struct {
             try std.testing.expectEqual(@as(u64, 0), root.?.memoryBytes(915));
             try std.testing.expectEqual(@as(u64, 0), root.?.observedHeaderBytes());
         }
+        finishLedger(&obsolete_live, &obsolete_cursor, a2);
+        finishLedger(&obsolete_snapshot, &obsolete_old_cursor, a2);
+        if (obsolete_candidate) |owner| owner.requestRetirement();
+        obsolete_candidate = null;
         finishRoot(&root, &root_cursor, a2);
         finishRoot(&snapshot, &snapshot_cursor, a2);
         if (writer_view) |*view| view.deinit(a2);
@@ -1733,4 +1833,22 @@ test "physical cache metadata registered builder output aborts every allocation 
         const count = (try RegisteredOutputFixture.run(stage, null, false, false)).allocations;
         for (0..count) |at| _ = try RegisteredOutputFixture.run(stage, at, true, false);
     }
+}
+
+test "physical cache metadata registered obsolete roots preserve exact paths deadlines and snapshots after producer exit" {
+    for ([_]usize{ 1, 3, 8 }) |count| for ([_]RegisteredSourceFixture.Phase{ .construct, .retire }) |phase| {
+        _ = try RegisteredSourceFixture.runExtended(false, phase, null, false, count, true);
+    };
+}
+
+test "physical cache metadata registered obsolete roots retain every original edit and retirement refusal" {
+    for ([_]RegisteredSourceFixture.Phase{ .construct, .retire }) |phase| {
+        const count = (try RegisteredSourceFixture.runExtended(false, phase, null, false, 3, true)).checks;
+        for (0..count) |at| _ = try RegisteredSourceFixture.runExtended(false, phase, at, false, 3, true);
+    }
+}
+
+test "physical cache metadata registered obsolete roots retire every allocation failure while allocation stays exhausted" {
+    const count = (try RegisteredSourceFixture.runExtended(false, .construct, null, false, 3, true)).allocations;
+    for (0..count) |at| _ = try RegisteredSourceFixture.runExtended(false, .construct, at, true, 3, true);
 }

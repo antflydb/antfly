@@ -71,7 +71,7 @@ const failure_abi = @import("runtime_failure_abi");
 // Yieldable physical run and cached table-index retirement cursors.
 // Registered writer anchors and independently funded writer-root descendants.
 // Owned builder bounds, registered output handoff and domain lifetime policy.
-pub const abi_version: u32 = 187;
+pub const abi_version: u32 = 188;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

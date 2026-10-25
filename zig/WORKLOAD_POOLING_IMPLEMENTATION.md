@@ -28016,3 +28016,75 @@ cases, plus four Bloom and 45/1/8 original-error companions. Its unchanged
 executed case fails, skips or leaks. Formatting, license-header, generated-error
 and whitespace checks pass. All failed and final receipts and changed-source
 snapshots, including the new output-owner module, remain preserved.
+
+
+## Registered immutable obsolete-file ledger edits (2026-10-25)
+
+The legacy compaction publication job still prepares obsolete paths through
+allocating ledger edits and generic final path destruction. Switching its driver
+to registered directory and writer roots first requires an equally owned obsolete
+root. Publication resources now expose prepaid obsolete put/remove candidates.
+Put accepts an actual registered writer record, retains its fixed anchor, copies
+its actual path in bounded quanta and releases the writer only after that copy
+is complete. No arbitrary path or caller-supplied memory estimate is accepted.
+Bounded path comparisons choose an insertion/replacement rank; replacements keep
+the later retention deadline. Remove uses a rank in the pinned source generation.
+
+Each candidate owns an independent account and exact allocator-host lease. Its
+prepaid bound covers the frame, account, path and copied-node/spare capacity.
+Existing nodes retain their original independent funders. New node and path
+references cannot trigger final variable path destruction during a generic drop:
+the registered final anchor waits for all node accounts and payload references
+to leave, then retires its path in physical quanta before releasing its host.
+Partial retained insertion/removal and detached retirement-only nodes remain
+owned through refusal. A completed edit is remembered separately from detached
+cleanup so a rejected cleanup checkpoint cannot apply the edit twice.
+
+Value roots carry their account and registration; their receiving controller
+owns the root header. Backend accounting excludes already funded ledger nodes
+and spare capacity. Legacy allocating edits reject registered ledgers. Native
+ABI 128 and kernel-owner ABI 188 fence the changed private contracts; no durable
+format or reader epoch changes. Rank removal is metadata preparation only: the
+controller still must validate the source generation and complete durable file
+deletion before committing removal of the cleanup obligation.
+
+This supplies an owned obsolete-root candidate alongside owned directory/writer
+roots and completed outputs. The default driver, coupled root and WAL/manifest
+publication, bounded generation rebase/diffs, admitted durable deletion, relief
+and whole-path default overload/fairness qualification remain incomplete.
+Unfinished builder I/O and input borrows still need their producer lifetime.
+Full GNU qualification remains waived; the full design is not complete.
+
+
+Focused Debug qualification passes all five native commands on unchanged
+5,660-file input hashes: 37 ownership cases, four Bloom tests and 45/1/8 original
+error companions. New fixtures exercise one, three and eight distinct long-path
+source generations across allocator hosts and memory parents. They retain old
+roots through deadline extension and rank removal, preserve a later deadline
+when an earlier one is requested, and observe registered ledger roots through
+legacy and admitted backend accounting without double billing. Every constructor
+and retirement checkpoint rotates Canceled, DeadlineExceeded, FileNotFound and
+ParentMemoryBusy; allocation failure is exhausted one site at a time while
+cleanup's allocator remains exhausted. Generic tree drops leave registered path
+anchors for separately admitted retirement. The union-capture compile correction
+and fixture replacement-root cleanup correction have preserved failed receipts
+and exact source snapshots. No focused test fails, skips or leaks.
+
+
+Broader Debug passes all five native commands: 160 physical-sync, five output/
+publication, 124 accounting, 19 local and 25 ABI/context cases, reusing the
+identical-input focused 37-case ownership result. Four Bloom and 45/1/8 original
+error companions also pass. Focused and broader Debug input maps remain
+unchanged and identical across 5,660 native files. No executed case fails, skips
+or leaks.
+
+
+Final-source ReleaseFast passes all five native commands: five output/
+publication, six read-metadata retirement, nine entry-preparation, fifteen
+payload-retirement, 124 accounting, 19 local and 62 ABI/host/context cases, plus
+four Bloom and 45/1/8 original-error companions. All three final/focused native
+input maps remain unchanged and identical across 5,660 files. No executed case
+fails, skips or leaks. Formatting, license-header, generated-error and whitespace
+checks pass. Exact changed-source snapshots, failed compile receipts and final
+qualification evidence are retained under the registered-obsolete prefix. The
+full design remains incomplete.

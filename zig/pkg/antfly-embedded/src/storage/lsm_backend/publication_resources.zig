@@ -155,6 +155,19 @@ pub const Owner = struct {
         return RegisteredWriterRoot.start(self.allocator, self.manager, source, run, replace, original);
     }
 
+    pub const RegisteredObsolete = @import("registered_obsolete.zig").Candidate;
+    pub const ObsoleteLedger = @import("obsolete_ledger.zig").Ledger;
+    pub fn beginObsoletePutWithAdmission(self: *Owner, source: *const ObsoleteLedger, run: *const Run, deadline: u64, original: admission.Port) !*RegisteredObsolete {
+        try original.checkpoint();
+        if (self.closing) return error.InvalidArgument;
+        return RegisteredObsolete.startPut(self.allocator, self.manager, source, run, deadline, original);
+    }
+    pub fn beginObsoleteRemoveWithAdmission(self: *Owner, source: *const ObsoleteLedger, rank: usize, original: admission.Port) !*RegisteredObsolete {
+        try original.checkpoint();
+        if (self.closing) return error.InvalidArgument;
+        return RegisteredObsolete.startRemove(self.allocator, self.manager, source, rank, original);
+    }
+
     /// Transfer a reader/candidate lease only after construction and final
     /// registration finish. Independent retirement immediately owns the anchor.
     pub fn takeEntryWithAdmission(self: *Owner, scope: admission.Port) !Directory.EntryLease {

@@ -129,7 +129,7 @@ const builtin = @import("builtin");
 // Yieldable physical run and cached table-index retirement cursors.
 // Registered writer anchors and independently funded writer-root descendants.
 // Owned builder bounds, registered output handoff and domain lifetime policy.
-pub const abi_version: u32 = 127;
+pub const abi_version: u32 = 128;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
