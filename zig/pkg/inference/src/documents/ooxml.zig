@@ -17,6 +17,7 @@
 //! archive subprocess, or trust in ZIP entry size declarations.
 const std = @import("std");
 const A = std.mem.Allocator;
+pub const max_presentation_slides = 10000;
 pub const Entry = struct { name: []const u8, method: u16, offset: usize, compressed: usize, size: usize, crc: u32 };
 pub const Archive = struct {
     bytes: []const u8,
@@ -246,6 +247,9 @@ pub const View = struct {
     bytes: []const u8,
     part: Part = .fragment,
     unsupported_content: bool = false,
+    unsupported_offsets: []const usize = &.{},
+    offset_base: usize = 0,
+    slide_ids: []const []const u8 = &.{},
     pub const Part = enum { fragment, slide, notes, layout, master };
     pub fn init(a: A, bytes: []const u8) !View {
         return initWithControl(a, bytes, .{});
@@ -260,10 +264,50 @@ pub const View = struct {
     pub fn requirePart(self: View, part: Part) !void {
         if (self.part != part) return error.InvalidDocumentXml;
     }
-    /// Only for content assembled from this already-checked part. Preserve its
-    /// unsupported-content finding without reparsing fragments out of scope.
-    pub fn fragment(self: View, bytes: []const u8) View {
-        return .{ .bytes = bytes, .unsupported_content = self.unsupported_content };
+    pub const Range = struct { start: usize, end: usize };
+    fn lowerBound(offsets: []const usize, target: usize) usize {
+        var low: usize = 0;
+        var high = offsets.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (offsets[middle] < target) low = middle + 1 else high = middle;
+        }
+        return low;
+    }
+    /// Borrow a contiguous checked subtree, retaining only its owners' findings.
+    pub fn slice(self: View, bytes: []const u8) View {
+        const start = @intFromPtr(bytes.ptr) - @intFromPtr(self.bytes.ptr);
+        std.debug.assert(start <= self.bytes.len and bytes.len <= self.bytes.len - start);
+        const base = self.offset_base + start;
+        const offsets = self.unsupported_offsets[lowerBound(self.unsupported_offsets, base)..lowerBound(self.unsupported_offsets, base + bytes.len)];
+        return .{ .bytes = bytes, .unsupported_content = offsets.len > 0, .unsupported_offsets = offsets, .offset_base = base };
+    }
+    /// Ordered disjoint exclusions remap findings with the same retained spans.
+    /// Each byte and finding is visited once; unchanged views keep borrowing.
+    pub fn excluding(self: View, a: A, ranges: []const Range) !View {
+        if (ranges.len == 0) return self;
+        var output = @import("output.zig").Writer.init(a, self.bytes.len);
+        defer output.deinit();
+        var offsets = std.ArrayList(usize).empty;
+        defer offsets.deinit(a);
+        var position: usize = 0;
+        var issue: usize = 0;
+        for (0..ranges.len + 1) |index| {
+            const end = if (index < ranges.len) ranges[index].start else self.bytes.len;
+            if (end < position or end > self.bytes.len) return error.InvalidDocumentXml;
+            while (issue < self.unsupported_offsets.len and self.unsupported_offsets[issue] - self.offset_base < end) : (issue += 1) {
+                const local = self.unsupported_offsets[issue] - self.offset_base;
+                if (local >= position) try offsets.append(a, output.len() + local - position);
+            }
+            try output.raw(self.bytes[position..end]);
+            if (index < ranges.len) {
+                if (ranges[index].end < end or ranges[index].end > self.bytes.len) return error.InvalidDocumentXml;
+                position = ranges[index].end;
+            }
+        }
+        const bytes = try output.toOwnedSlice();
+        errdefer a.free(bytes);
+        return .{ .bytes = bytes, .unsupported_content = offsets.items.len > 0, .unsupported_offsets = try offsets.toOwnedSlice(a) };
     }
     pub fn text(self: View, a: A) ![]const u8 {
         return extractText(a, self.bytes);
@@ -318,12 +362,14 @@ const table_namespace = "http://schemas.openxmlformats.org/drawingml/2006/table"
 fn isTableUri(raw: []const u8) !bool {
     return try decodedEqual(raw, table_namespace) or try decodedEqual(raw, "http://purl.oclc.org/ooxml/drawingml/table");
 }
-const Namespace = enum { presentation, drawing, compatibility, other, fragment };
-const ProjectionMode = enum { part, fragment };
+const Namespace = enum { presentation, drawing, compatibility, office_relationships, package_relationships, other, fragment };
+const ProjectionMode = enum { part, fragment, manifest };
 fn namespaceKind(uri: []const u8) !Namespace {
     if (try decodedEqual(uri, pml_namespace) or try decodedEqual(uri, "http://purl.oclc.org/ooxml/presentationml/main")) return .presentation;
     if (try decodedEqual(uri, dml_namespace) or try decodedEqual(uri, "http://purl.oclc.org/ooxml/drawingml/main")) return .drawing;
     if (try decodedEqual(uri, mc_namespace)) return .compatibility;
+    if (try decodedEqual(uri, "http://schemas.openxmlformats.org/officeDocument/2006/relationships") or try decodedEqual(uri, "http://purl.oclc.org/ooxml/officeDocument/relationships")) return .office_relationships;
+    if (try decodedEqual(uri, "http://schemas.openxmlformats.org/package/2006/relationships")) return .package_relationships;
     return .other;
 }
 const Namespaces = struct {
@@ -343,11 +389,12 @@ const Namespaces = struct {
             const previous = self.index.get(prefix);
             if (previous) |prior| if (prior >= self.starts[depth]) return error.InvalidDocumentXml;
             const binding_kind = try namespaceKind(attribute.value);
-            var understood = binding_kind == .presentation or binding_kind == .drawing;
+            var understood = binding_kind == .presentation or binding_kind == .drawing or binding_kind == .office_relationships;
             for ([_][]const u8{
                 "http://schemas.openxmlformats.org/presentationml/2006/main",
                 "http://schemas.openxmlformats.org/drawingml/2006/main",
                 "http://schemas.openxmlformats.org/drawingml/2006/table",
+                "http://purl.oclc.org/ooxml/drawingml/table",
                 "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
             }) |namespace| understood = understood or try decodedEqual(attribute.value, namespace);
             const binding = Binding{ .prefix = prefix, .previous = previous, .kind = binding_kind, .understood = understood };
@@ -375,8 +422,19 @@ const Namespaces = struct {
         const prefix = if (colon) |i| tag.name[0..i] else "";
         return if (self.lookup(prefix)) |binding| binding.kind else if (mode == .fragment) .fragment else .other;
     }
-    fn isMc(self: *const @This(), tag: Tag) bool {
-        return self.kind(tag, .part) == .compatibility;
+    fn expandedAttribute(self: *const @This(), tag: Tag, vocabulary: Namespace, local: []const u8) !?[]const u8 {
+        var result: ?[]const u8 = null;
+        var attrs = Attributes{ .raw = tag.raw, .index = tag.name.len };
+        while (try attrs.next()) |attr_value| {
+            // Default namespaces do not apply to attributes.
+            const colon = std.mem.indexOfScalar(u8, attr_value.name, ':') orelse continue;
+            if (!std.mem.eql(u8, attr_value.name[colon + 1 ..], local)) continue;
+            const binding = self.lookup(attr_value.name[0..colon]) orelse continue;
+            if (binding.kind != vocabulary) continue;
+            if (result != null) return error.InvalidDocumentXml;
+            result = attr_value.value;
+        }
+        return result;
     }
     fn supported(self: *const @This(), requires: []const u8) !bool {
         var prefixes = std.mem.tokenizeAny(u8, requires, " \t\r\n");
@@ -435,7 +493,7 @@ fn projectBytes(a: A, bytes: []const u8, control: @import("contract.zig").Contro
     var ns = Namespaces{};
     defer ns.deinit(scratch);
     const Kind = enum { ordinary, alternate, choice, fallback };
-    const Role = enum { other, shape, body, paragraph, run, table_data, table, row, cell };
+    const Role = enum { other, presentation, slide_list, shape, body, paragraph, run, table_data, table, row, cell };
     const Frame = struct {
         kind: Kind = .ordinary,
         role: Role = .other,
@@ -446,10 +504,18 @@ fn projectBytes(a: A, bytes: []const u8, control: @import("contract.zig").Contro
         output_start: usize = 0,
         hidden: bool = false,
         visibility_seen: bool = false,
-        unsupported_before: bool = false,
+        issues_start: usize = 0,
+        unsupported_seen: bool = false,
         selected: bool = false,
         fallback_seen: bool = false,
     };
+    var issues = std.ArrayList(usize).empty;
+    defer issues.deinit(a);
+    var slide_ids = std.ArrayList([]const u8).empty;
+    defer slide_ids.deinit(a);
+    var seen_ids = std.StringHashMapUnmanaged(void){};
+    defer seen_ids.deinit(scratch);
+    var list_seen = false;
     var frames: [258]Frame = @splat(.{});
     var iter = Xml{ .bytes = bytes };
     var output = @import("output.zig").Writer.init(a, bytes.len);
@@ -470,9 +536,11 @@ fn projectBytes(a: A, bytes: []const u8, control: @import("contract.zig").Contro
                 const raw_offset = @intFromPtr(tag.raw.ptr) - @intFromPtr(bytes.ptr);
                 const end = if (excluded.whole) iter.index else std.mem.lastIndexOfScalar(u8, bytes[0..raw_offset], '<') orelse return error.InvalidDocumentXml;
                 if (end > excluded.start) {
-                    try output.raw(bytes[cursor..excluded.start]);
-                    cursor = end;
-                    changed = true;
+                    if (mode != .manifest) {
+                        try output.raw(bytes[cursor..excluded.start]);
+                        cursor = end;
+                        changed = true;
+                    }
                 }
                 skip = null;
                 ns.close(depth);
@@ -487,7 +555,7 @@ fn projectBytes(a: A, bytes: []const u8, control: @import("contract.zig").Contro
                 output.writer.end = frame.output_start;
                 cursor = iter.index;
                 changed = true;
-                result.unsupported_content = frame.unsupported_before;
+                issues.items.len = frame.issues_start;
             }
             ns.close(depth);
             continue;
@@ -497,16 +565,23 @@ fn projectBytes(a: A, bytes: []const u8, control: @import("contract.zig").Contro
         const local = tag.local();
         const vocabulary = ns.kind(tag, mode);
         const parent = &frames[depth - 1];
+        const tag_start = std.mem.lastIndexOfScalar(u8, bytes[0 .. @intFromPtr(tag.raw.ptr) - @intFromPtr(bytes.ptr)], '<') orelse return error.InvalidDocumentXml;
         frames[depth] = .{
             .owner = parent.owner,
             .drawing_owner = parent.drawing_owner,
             .logical_depth = parent.logical_depth + 1,
-            .unsupported_before = result.unsupported_content,
+            .issues_start = issues.items.len,
+            .output_start = output.len() + tag_start - cursor,
         };
         const frame = &frames[depth];
-        if (depth == 1 and mode == .part) {
+        if (depth == 1 and mode != .fragment) {
             if (root_seen or vocabulary != .presentation) return error.InvalidDocumentXml;
             root_seen = true;
+            if (mode == .manifest) {
+                if (!std.mem.eql(u8, local, "presentation")) return error.InvalidDocumentXml;
+                frame.role = .presentation;
+                continue;
+            }
             result.part = if (std.mem.eql(u8, local, "sld")) .slide else if (std.mem.eql(u8, local, "notes")) .notes else if (std.mem.eql(u8, local, "sldLayout")) .layout else if (std.mem.eql(u8, local, "sldMaster")) .master else return error.InvalidDocumentXml;
         }
         const mc = vocabulary == .compatibility;
@@ -544,9 +619,24 @@ fn projectBytes(a: A, bytes: []const u8, control: @import("contract.zig").Contro
         }
         if (parent.kind == .alternate) return error.InvalidDocumentXml;
 
+        if (mode == .manifest) {
+            if (vocabulary == .presentation and std.mem.eql(u8, local, "sldIdLst") and parent.role == .presentation) {
+                if (list_seen) return error.InvalidDocumentXml;
+                list_seen = true;
+                frame.role = .slide_list;
+            } else if (vocabulary == .presentation and std.mem.eql(u8, local, "sldId") and parent.role == .slide_list) {
+                if (slide_ids.items.len >= max_presentation_slides) return error.DocumentPageLimitExceeded;
+                const id = try decodedText(a, (try ns.expandedAttribute(tag, .office_relationships, "id")) orelse return error.InvalidDocumentXml);
+                if (id.len == 0) return error.InvalidDocumentXml;
+                const entry = try seen_ids.getOrPut(scratch, id);
+                if (entry.found_existing) return error.InvalidDocumentXml;
+                try slide_ids.append(a, id);
+            } else if (!tag.empty) skip = .{ .depth = depth, .start = iter.index, .whole = true };
+            continue;
+        }
         const core = vocabulary == .presentation or vocabulary == .drawing;
         const is_metadata = core and (std.mem.eql(u8, local, "extLst") or std.mem.eql(u8, local, "ext") or std.mem.eql(u8, local, "custDataLst"));
-        var excluded = is_metadata or vocabulary == .other or vocabulary == .compatibility;
+        var excluded = is_metadata or (!core and vocabulary != .fragment);
         if (mode == .part and !excluded) {
             if (presentation_signals.has(local) and vocabulary != .presentation) excluded = true;
             if (drawing_signals.has(local) and vocabulary != .drawing) excluded = true;
@@ -582,9 +672,11 @@ fn projectBytes(a: A, bytes: []const u8, control: @import("contract.zig").Contro
             }
         }
         if (excluded) {
-            if (!is_metadata) result.unsupported_content = true;
-            const raw_offset = @intFromPtr(tag.raw.ptr) - @intFromPtr(bytes.ptr);
-            const start = std.mem.lastIndexOfScalar(u8, bytes[0..raw_offset], '<') orelse return error.InvalidDocumentXml;
+            if (!is_metadata and !parent.unsupported_seen) {
+                try issues.append(a, parent.output_start);
+                parent.unsupported_seen = true;
+            }
+            const start = tag_start;
             if (tag.empty) {
                 try output.raw(bytes[cursor..start]);
                 cursor = iter.index;
@@ -593,8 +685,7 @@ fn projectBytes(a: A, bytes: []const u8, control: @import("contract.zig").Contro
             continue;
         }
         if (!tag.empty and isDrawing(local)) {
-            const raw_offset = @intFromPtr(tag.raw.ptr) - @intFromPtr(bytes.ptr);
-            const start = std.mem.lastIndexOfScalar(u8, bytes[0..raw_offset], '<') orelse return error.InvalidDocumentXml;
+            const start = tag_start;
             frame.drawing_owner = depth;
             frame.start = start;
             frame.output_start = output.len() + start - cursor;
@@ -608,13 +699,121 @@ fn projectBytes(a: A, bytes: []const u8, control: @import("contract.zig").Contro
             }
         }
     }
-    if (mode == .part and !root_seen) return error.InvalidDocumentXml;
+    if (mode != .fragment and !root_seen) return error.InvalidDocumentXml;
+    try control.check();
+    std.mem.sort(usize, issues.items, {}, std.sort.asc(usize));
+    try control.check();
+    var issue_count: usize = 0;
+    for (issues.items) |position| {
+        if (issue_count > 0 and issues.items[issue_count - 1] == position) continue;
+        issues.items[issue_count] = position;
+        issue_count += 1;
+    }
+    issues.items.len = issue_count;
+    result.unsupported_content = issues.items.len > 0;
     if (changed) {
         try output.raw(bytes[cursor..]);
         result.bytes = try output.toOwnedSlice();
     }
+    errdefer if (changed) a.free(result.bytes);
+    result.unsupported_offsets = try issues.toOwnedSlice(a);
+    errdefer a.free(result.unsupported_offsets);
+    result.slide_ids = try slide_ids.toOwnedSlice(a);
     return result;
 }
+
+/// Manifest traversal shares namespace scopes and MC branch selection with the
+/// visible-part projection, but only direct slide-list entries have meaning.
+pub fn presentationSlideIds(a: A, bytes: []const u8, control: @import("contract.zig").Control) ![]const []const u8 {
+    return (try projectBytes(a, bytes, control, .manifest)).slide_ids;
+}
+fn decodedText(a: A, raw: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, raw, '&') == null) {
+        if (!std.unicode.utf8ValidateSlice(raw)) return error.InvalidDocumentXml;
+        return raw;
+    }
+    var output = @import("output.zig").Writer.init(a, raw.len);
+    defer output.deinit();
+    unescape(&output.writer, raw) catch |err| return output.failure orelse err;
+    const result = try output.toOwnedSlice();
+    errdefer a.free(result);
+    if (!std.unicode.utf8ValidateSlice(result)) return error.InvalidDocumentXml;
+    return result;
+}
+pub const RelationshipKind = enum { slide, layout, master, notes, other };
+pub const Relationship = struct { target: []const u8, kind: RelationshipKind, external: bool };
+fn relationshipKind(raw: []const u8) !RelationshipKind {
+    inline for (.{ .{ "slide", RelationshipKind.slide }, .{ "slideLayout", RelationshipKind.layout }, .{ "slideMaster", RelationshipKind.master }, .{ "notesSlide", RelationshipKind.notes } }) |entry| {
+        if (try decodedEqual(raw, "http://schemas.openxmlformats.org/officeDocument/2006/relationships/" ++ entry[0]) or
+            try decodedEqual(raw, "http://purl.oclc.org/ooxml/officeDocument/relationships/" ++ entry[0])) return entry[1];
+    }
+    return .other;
+}
+/// Source-arena-owned index. A .rels part is parsed once, with O(1) ID lookup.
+/// Extension payloads and wrong-vocabulary lookalikes cannot declare links.
+pub const Relationships = struct {
+    items: std.StringHashMapUnmanaged(Relationship) = .{},
+    by_kind: [5]?Relationship = @splat(null),
+    duplicate_kind: [5]bool = @splat(false),
+    pub fn init(a: A, bytes: []const u8, control: @import("contract.zig").Control) !Relationships {
+        var result = Relationships{};
+        errdefer result.items.deinit(a);
+        var buffer: [4096]u8 = undefined;
+        var first = std.heap.BufferFirstAllocator.init(&buffer, a);
+        const scratch = first.allocator();
+        var namespaces = Namespaces{};
+        defer namespaces.deinit(scratch);
+        var iter = Xml{ .bytes = bytes };
+        var root_seen = false;
+        while (try iter.next()) |token| {
+            try control.check();
+            if (token != .tag) continue;
+            const tag = token.tag;
+            const depth = iter.depth + @intFromBool(tag.closing or tag.empty);
+            if (tag.closing) {
+                namespaces.close(depth);
+                continue;
+            }
+            try namespaces.open(scratch, tag, depth);
+            defer if (tag.empty) namespaces.close(depth);
+            const vocabulary = namespaces.kind(tag, .part);
+            if (depth == 1) {
+                if (root_seen or vocabulary != .package_relationships or !std.mem.eql(u8, tag.local(), "Relationships")) return error.InvalidDocumentXml;
+                root_seen = true;
+            } else if (depth == 2 and vocabulary == .package_relationships and std.mem.eql(u8, tag.local(), "Relationship")) {
+                if (result.items.count() >= 65536) return error.DocumentArchiveLimitExceeded;
+                const id = try decodedText(a, (try tag.uniqueAttr("Id")) orelse return error.InvalidDocumentXml);
+                const target = try decodedText(a, (try tag.uniqueAttr("Target")) orelse return error.InvalidDocumentXml);
+                if (id.len == 0 or target.len == 0) return error.InvalidDocumentXml;
+                const kind = try relationshipKind((try tag.uniqueAttr("Type")) orelse return error.InvalidDocumentXml);
+                const mode = (try tag.uniqueAttr("TargetMode")) orelse "Internal";
+                const external = try decodedEqual(mode, "External");
+                if (!external and !try decodedEqual(mode, "Internal")) return error.InvalidDocumentXml;
+                const entry = try result.items.getOrPut(a, id);
+                if (entry.found_existing) return error.InvalidDocumentXml;
+                entry.value_ptr.* = .{ .target = target, .kind = kind, .external = external };
+                const slot = @backingInt(kind);
+                result.duplicate_kind[slot] = result.by_kind[slot] != null;
+                result.by_kind[slot] = entry.value_ptr.*;
+            }
+        }
+        if (!root_seen) return error.InvalidDocumentXml;
+        return result;
+    }
+    pub fn get(self: Relationships, id: []const u8, expected: RelationshipKind) !Relationship {
+        const item = self.items.get(id) orelse return error.MissingDocumentPart;
+        if (item.kind != expected) return error.InvalidDocumentXml;
+        if (item.external) return error.ExternalDocumentPartDenied;
+        return item;
+    }
+    pub fn unique(self: Relationships, expected: RelationshipKind) !?Relationship {
+        const slot = @backingInt(expected);
+        if (self.duplicate_kind[slot]) return error.InvalidDocumentXml;
+        const result = self.by_kind[slot] orelse return null;
+        if (result.external) return error.ExternalDocumentPartDenied;
+        return result;
+    }
+};
 
 // Small isolated XML snippets exercise visibility and compatibility machinery
 // without claiming to be valid source parts or namespace-qualified evidence.
@@ -1104,4 +1303,120 @@ test "document checked projection releases allocations and ignores opaque payloa
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+const test_manifest_root = "<p:presentation xmlns:p='http://schemas.openxmlformats.org/presentationml/2006/main' xmlns:rel='http://schemas.openxmlformats.org/officeDocument/2006/relationships' xmlns:m='http://schemas.openxmlformats.org/markup-compatibility/2006' xmlns:x='urn:metadata'>";
+const test_relationship_root = "<pkg:Relationships xmlns:pkg='http://schemas.openxmlformats.org/package/2006/relationships' xmlns:x='urn:metadata'>";
+test "document manifest admits only scoped slide entries and namespace qualified relationship IDs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ids = try presentationSlideIds(a, test_manifest_root ++
+        "<p:extLst><p:ext><x:sldId rel:id='metadata'/><p:sldIdLst><p:sldId rel:id='wrong'/></p:sldIdLst></p:ext></p:extLst>" ++
+        "<x:sldIdLst><p:sldId rel:id='foreign-parent'/></x:sldIdLst><p:sldId rel:id='outside-list'/>" ++
+        "<p:sldIdLst><x:sldId rel:id='lookalike'/><m:AlternateContent><m:Choice Requires='x'><p:sldId rel:id='unselected'/></m:Choice><m:Fallback><p:sldId rel:id='s&#49;'/></m:Fallback></m:AlternateContent>" ++
+        "<p:sldId xmlns:q='http://schemas.openxmlformats.org/officeDocument/2006/relationships' q:id='second'/></p:sldIdLst></p:presentation>", .{});
+    try std.testing.expectEqual(@as(usize, 2), ids.len);
+    try std.testing.expectEqualStrings("s1", ids[0]);
+    try std.testing.expectEqualStrings("second", ids[1]);
+    const strict = try presentationSlideIds(a, "<presentation xmlns='http://purl.oclc.org/ooxml/presentationml/main' xmlns:r='http://purl.oclc.org/ooxml/officeDocument/relationships'><sldIdLst><sldId r:id='strict'/></sldIdLst></presentation>", .{});
+    try std.testing.expectEqualStrings("strict", strict[0]);
+    for ([_][]const u8{
+        "<p:sldIdLst><p:sldId rel:id='one'/><p:sldId rel:id='one'/></p:sldIdLst>",
+        "<p:sldIdLst/><p:sldIdLst/>",
+        "<p:sldIdLst><p:sldId id='unqualified'/></p:sldIdLst>",
+        "<p:sldIdLst><p:sldId rel:id='wrong' xmlns:rel='urn:rebound'/></p:sldIdLst>",
+        "<p:sldIdLst><p:sldId xmlns:q='http://schemas.openxmlformats.org/officeDocument/2006/relationships' rel:id='one' q:id='two'/></p:sldIdLst>",
+    }) |body| try std.testing.expectError(error.InvalidDocumentXml, presentationSlideIds(a, try std.mem.concat(a, u8, &.{ test_manifest_root, body, "</p:presentation>" }), .{}));
+    try std.testing.expectError(error.InvalidDocumentXml, presentationSlideIds(a, "<presentation/>", .{}));
+}
+
+test "document relationships index ignores lookalikes and validates roles identities and decoded targets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const index = try Relationships.init(a, test_relationship_root ++
+        "<x:Relationship Id='spoof' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide' Target='wrong.xml'/>" ++
+        "<x:metadata><pkg:Relationship Id='nested' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide' Target='wrong.xml'/></x:metadata>" ++
+        "<pkg:Relationship Id='s&#49;' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide' Target='slides/s&#49;.xml'/>" ++
+        "<pkg:Relationship Id='notes' Type='http://purl.oclc.org/ooxml/officeDocument/relationships/notesSlide' Target='../notes/one.xml'/>" ++
+        "<pkg:Relationship Id='metadata' Type='urn:metadata/slide' Target='private.xml'/>" ++
+        "<pkg:Relationship Id='external' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout' Target='https://example.invalid/layout.xml' TargetMode='Exter&#110;al'/></pkg:Relationships>", .{});
+    try std.testing.expectEqual(@as(usize, 4), index.items.count());
+    try std.testing.expectEqualStrings("slides/s1.xml", (try index.get("s1", .slide)).target);
+    try std.testing.expectEqualStrings("../notes/one.xml", (try index.unique(.notes)).?.target);
+    try std.testing.expectError(error.InvalidDocumentXml, index.get("metadata", .slide));
+    try std.testing.expectError(error.ExternalDocumentPartDenied, index.unique(.layout));
+    try std.testing.expectError(error.MissingDocumentPart, index.get("spoof", .slide));
+    const duplicate = test_relationship_root ++ "<pkg:Relationship Id='same' Type='urn:metadata' Target='a'/><pkg:Relationship Id='same' Type='urn:metadata' Target='b'/></pkg:Relationships>";
+    try std.testing.expectError(error.InvalidDocumentXml, Relationships.init(a, duplicate, .{}));
+    try std.testing.expectError(error.InvalidDocumentXml, Relationships.init(a, "<Relationships/>", .{}));
+    const multiple = try Relationships.init(a, test_relationship_root ++ "<pkg:Relationship Id='a' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide' Target='a'/><pkg:Relationship Id='b' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide' Target='b'/></pkg:Relationships>", .{});
+    try std.testing.expectError(error.InvalidDocumentXml, multiple.unique(.notes));
+}
+
+test "document scoped projection remaps owner findings through subtree slices and ordered exclusions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const view = try View.init(a, test_part_root ++ "<p:cSld><p:bg><x:paint/></p:bg><p:spTree>" ++ test_text_shape ++ "</p:spTree></p:cSld></p:sld>");
+    const start = std.mem.indexOf(u8, view.bytes, "<p:bg>").?;
+    const end = std.mem.indexOf(u8, view.bytes, "</p:bg>").? + "</p:bg>".len;
+    try std.testing.expect(try view.slice(view.bytes[start..end]).needsVisualInspection());
+    const shapes = try view.excluding(a, &.{.{ .start = start, .end = end }});
+    try std.testing.expect(!try shapes.needsVisualInspection());
+    try std.testing.expectEqualStrings("Visible 12.50\n", try shapes.text(a));
+    const both = try View.init(a, test_part_root ++ "<p:bg><x:paint/></p:bg>" ++ test_text_shape ++ "<p:sp><p:txBody><x:unknown/></p:txBody></p:sp></p:sld>");
+    const bg_start = std.mem.indexOf(u8, both.bytes, "<p:bg>").?;
+    const bg_end = std.mem.indexOf(u8, both.bytes, "</p:bg>").? + "</p:bg>".len;
+    const still_unknown = try both.excluding(a, &.{.{ .start = bg_start, .end = bg_end }});
+    try std.testing.expect(try still_unknown.needsVisualInspection());
+    const tree_start = std.mem.indexOf(u8, view.bytes, "<p:spTree>").?;
+    const tree_end = std.mem.indexOf(u8, view.bytes, "</p:spTree>").? + "</p:spTree>".len;
+    const subtree = view.slice(view.bytes[tree_start..tree_end]);
+    try std.testing.expect(!subtree.unsupported_content);
+    try std.testing.expectEqual(view.bytes.ptr + tree_start, subtree.bytes.ptr);
+    try std.testing.expectEqual(subtree.bytes.ptr, (try subtree.excluding(std.testing.failing_allocator, &.{})).bytes.ptr);
+}
+
+test "document manifest relationship and scoped projection allocation failures release scratch" {
+    const Case = struct {
+        fn run(backing: A) !void {
+            var arena = std.heap.ArenaAllocator.init(backing);
+            defer arena.deinit();
+            const a = arena.allocator();
+            _ = try presentationSlideIds(a, test_manifest_root ++ "<p:sldIdLst><p:sldId rel:id='s&#49;'/></p:sldIdLst></p:presentation>", .{});
+            _ = try Relationships.init(a, test_relationship_root ++ "<pkg:Relationship Id='s&#49;' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide' Target='s&#49;.xml'/></pkg:Relationships>", .{});
+            const view = try View.init(a, test_part_root ++ "<p:bg><x:paint/></p:bg><p:sp><x:shape/></p:sp></p:sld>");
+            const start = std.mem.indexOf(u8, view.bytes, "<p:bg>").?;
+            const end = std.mem.indexOf(u8, view.bytes, "</p:bg>").? + "</p:bg>".len;
+            const shapes = try view.excluding(a, &.{.{ .start = start, .end = end }});
+            try std.testing.expect(shapes.unsupported_content);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "document manifest and indexed relationships handle the absolute slide ceiling" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var manifest = @import("output.zig").Writer.init(a, 2 << 20);
+    var relationships = @import("output.zig").Writer.init(a, 4 << 20);
+    defer manifest.deinit();
+    defer relationships.deinit();
+    try manifest.raw(test_manifest_root ++ "<p:sldIdLst>");
+    try relationships.raw(test_relationship_root);
+    for (0..10000) |i| {
+        try manifest.raw(try std.fmt.allocPrint(a, "<p:sldId rel:id='s{d}'/>", .{i}));
+        try relationships.raw(try std.fmt.allocPrint(a, "<pkg:Relationship Id='s{d}' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide' Target='slides/s{d}.xml'/>", .{ i, i }));
+    }
+    try manifest.raw("</p:sldIdLst></p:presentation>");
+    try relationships.raw("</pkg:Relationships>");
+    const ids = try presentationSlideIds(a, manifest.writer.buffer[0..manifest.len()], .{});
+    const index = try Relationships.init(a, relationships.writer.buffer[0..relationships.len()], .{});
+    try std.testing.expectEqual(@as(usize, 10000), ids.len);
+    for (ids, 0..) |id, i| {
+        try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "slides/s{d}.xml", .{i}), (try index.get(id, .slide)).target);
+    }
 }

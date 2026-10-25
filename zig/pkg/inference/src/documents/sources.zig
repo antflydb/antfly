@@ -24,7 +24,7 @@ const slide_parts = @import("slides.zig");
 const A = std.mem.Allocator;
 pub const Input = @import("antfly_readers").DocumentSource;
 // Structural parsing is bounded independently of the selected-page work budget.
-pub const max_source_pages = 10000;
+pub const max_source_pages = ooxml.max_presentation_slides;
 fn selectedPage(selection: ?[]const usize, number: usize) bool {
     const pages = selection orelse return true;
     return std.sort.binarySearch(usize, pages, number, struct {
@@ -33,7 +33,7 @@ fn selectedPage(selection: ?[]const usize, number: usize) bool {
         }
     }.order) != null;
 }
-pub const Slide = struct { path: []const u8, view: ?ooxml.View = null, hidden: bool = false, notes: ?[]const u8 = null, inherited: []const c.InheritedPart = &.{} };
+pub const Slide = struct { path: []const u8, view: ?ooxml.View = null, hidden: bool = false, notes: ?ooxml.View = null, inherited: []const c.InheritedPart = &.{} };
 pub const Source = struct {
     input: Input,
     fingerprint: [64]u8,
@@ -78,15 +78,13 @@ pub const Source = struct {
         } else if (std.mem.eql(u8, normalized.media_type, "application/vnd.openxmlformats-officedocument.presentationml.presentation")) {
             const archive = try ooxml.Archive.initWithControl(a, bytes, limits.max_source_bytes, control);
             const presentation = try archive.get(a, "ppt/presentation.xml");
-            const relationships = try archive.get(a, "ppt/_rels/presentation.xml.rels");
             var slides = std.ArrayList(Slide).empty;
             var inheritance = slide_parts.Cache{ .max_regions = limits.max_regions };
-            var iter = ooxml.Xml{ .bytes = presentation };
-            while (try iter.next()) |token| {
+            const relationships = (try inheritance.relationshipsFor(a, archive, "ppt/presentation.xml")) orelse return error.MissingDocumentPart;
+            const ids = try ooxml.presentationSlideIds(a, presentation, control);
+            for (ids) |id| {
                 try control.check();
-                if (token != .tag or token.tag.closing or !std.mem.eql(u8, token.tag.local(), "sldId")) continue;
-                const id = token.tag.attr("r:id") orelse return error.InvalidDocumentXml;
-                const path = try relationship(a, relationships, id, "ppt/");
+                const path = try normalizedPart(a, "ppt/", (try relationships.get(id, .slide)).target);
                 if (slides.items.len >= max_source_pages) return error.DocumentPageLimitExceeded;
                 const number = slides.items.len + 1;
                 if (selection == null and number > limits.max_pages) return error.DocumentPageLimitExceeded;
@@ -105,6 +103,10 @@ pub const Source = struct {
                         }
                     }
                     slide.inherited = try inheritance.inherited(a, archive, path, xml);
+                    if (input.include_notes and (!slide.hidden or input.include_hidden)) if (try inheritance.relatedPath(a, archive, path, .notes)) |notes_path| {
+                        slide.notes = try ooxml.View.initWithControl(a, try archive.get(a, notes_path), control);
+                        try slide.notes.?.requirePart(.notes);
+                    };
                 }
                 try slides.append(a, slide);
             }
@@ -188,26 +190,8 @@ pub const Source = struct {
                     if (part.conditional_content or (part.shapes_visible and (std.mem.trim(u8, part.text, " \t\r\n").len > 0 or part.tables.len > 0))) try ir.finding(a, &page, "slide_inherited_native_content_requires_composition", true);
                 }
                 if (slide.hidden and !self.input.include_hidden) return error.HiddenDocumentPage;
-                if (self.input.include_notes) {
-                    const slash = std.mem.lastIndexOfScalar(u8, slide.path, '/') orelse return error.InvalidDocumentSource;
-                    const rel_path = try std.fmt.allocPrint(a, "{s}/_rels/{s}.rels", .{ slide.path[0..slash], slide.path[slash + 1 ..] });
-                    if (s.archive.get(a, rel_path)) |rels| {
-                        var iter = ooxml.Xml{ .bytes = rels };
-                        while (try iter.next()) |token| {
-                            if (token != .tag or token.tag.closing) continue;
-                            const kind = token.tag.attr("Type") orelse continue;
-                            if (!std.mem.endsWith(u8, kind, "/notesSlide")) continue;
-                            if (token.tag.attr("TargetMode")) |mode| if (std.mem.eql(u8, mode, "External")) return error.ExternalDocumentPartDenied;
-                            const target = token.tag.attr("Target") orelse return error.InvalidDocumentXml;
-                            const path = try normalizedPart(a, slide.path[0 .. slash + 1], target);
-                            const notes_view = try ooxml.View.initWithControl(a, try s.archive.get(a, path), control);
-                            try notes_view.requirePart(.notes);
-                            const notes = try notes_view.text(a);
-                            // Notes are separate findings/evidence, not visible OCR.
-                            page.notes = notes;
-                        }
-                    } else |err| if (err != error.MissingDocumentPart) return err;
-                }
+                // Notes retain their own checked view, separately from visible OCR.
+                if (slide.notes) |notes| page.notes = try notes.text(a);
             },
             .image => {},
         }
@@ -281,16 +265,6 @@ pub const Source = struct {
     }
 };
 
-fn relationship(a: A, xml: []const u8, id: []const u8, base: []const u8) ![]const u8 {
-    var iter = ooxml.Xml{ .bytes = xml };
-    while (try iter.next()) |token| {
-        if (token != .tag or token.tag.closing or !std.mem.eql(u8, token.tag.local(), "Relationship")) continue;
-        if (!std.mem.eql(u8, token.tag.attr("Id") orelse continue, id)) continue;
-        if (token.tag.attr("TargetMode")) |mode| if (std.mem.eql(u8, mode, "External")) return error.ExternalDocumentPartDenied;
-        return normalizedPart(a, base, token.tag.attr("Target") orelse return error.InvalidDocumentXml);
-    }
-    return error.MissingDocumentPart;
-}
 const normalizedPart = slide_parts.normalizedPart;
 
 test "document sources normalize validated image MIME while enforcing byte identity" {

@@ -2114,7 +2114,7 @@ test "document regional encoding bounds every provider and nested view before di
 test "document checked projection and table validation agree across fresh and retained extraction" {
     const extracting = @import("antfly_extracting");
     const Fake = struct {
-        metadata: bool = false,
+        fixture: []const u8 = @embedFile("testdata/one-pixel.png"),
         downloads: usize = 0,
         raw_report: []const u8 =
             \\{"text":"Total 12.50","status":"complete","tables":[{"id":0,"rows":1,"columns":1,"cells":[{"row":0,"column":0,"text":"12.50"}]}]}
@@ -2138,7 +2138,7 @@ test "document checked projection and table validation agree across fresh and re
         }
         pub fn documentDownload(self: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
             self.downloads += 1;
-            return .{ .data = if (self.metadata) @embedFile("testdata/extension-metadata.pptx") else @embedFile("testdata/one-pixel.png") };
+            return .{ .data = self.fixture };
         }
         pub fn readDocumentArtifact(self: *@This(), a: A, _: []const u8) ![]u8 {
             return a.dupe(u8, self.retained);
@@ -2164,33 +2164,41 @@ test "document checked projection and table validation agree across fresh and re
         }
     };
     const a = std.testing.allocator;
-    var metadata = Fake{ .metadata = true };
-    const reading = try Service(Fake).readJson(&metadata, a,
-        \\{"model":"reader","documents":[{"id":"slide","url":"fixture","media_type":"application/vnd.openxmlformats-officedocument.presentationml.presentation"}]}
-    , .{});
-    defer a.free(reading);
-    metadata.retained = reading;
-    var parsed = try std.json.parseFromSlice(V, a, reading, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("complete", parsed.value.object.get("document").?.object.get("status").?.string);
-    try std.testing.expectEqualStrings("Visible total 12.50\n", parsed.value.object.get("data").?.array.items[0].object.get("text").?.string);
     for ([_][]const u8{
-        \\{"model":"extractor","schema_version":2,"schema":{"structures":{"receipt":{"fields":{"total":"str"}}}},"documents":[{"id":"slide","url":"fixture","media_type":"application/vnd.openxmlformats-officedocument.presentationml.presentation"}]}
-        ,
-        \\{"model":"extractor","schema_version":2,"schema":{"structures":{"receipt":{"fields":{"total":"str"}}}},"read_artifact":"fixture"}
-        ,
-    }) |request| {
-        const response = try Service(Fake).extractJson(&metadata, a, request, .{});
-        defer a.free(response);
-        var result = try std.json.parseFromSlice(V, a, response, .{});
-        defer result.deinit();
-        const total = result.value.object.get("data").?.array.items[0].object.get("structures").?.object.get("receipt").?.array.items[0].object.get("total").?;
-        try std.testing.expectEqualStrings("12.50", total.object.get("value").?.string);
-        try std.testing.expectEqualStrings("native", total.object.get("evidence").?.array.items[0].object.get("origin").?.string);
+        @embedFile("testdata/extension-metadata.pptx"),
+        @embedFile("testdata/manifest-metadata.pptx"),
+        @embedFile("testdata/aliased-relationships.pptx"),
+        @embedFile("testdata/overridden-background.pptx"),
+    }) |fixture| {
+        var metadata = Fake{ .fixture = fixture };
+        const reading = try Service(Fake).readJson(&metadata, a,
+            \\{"model":"reader","documents":[{"id":"slide","url":"fixture","media_type":"application/vnd.openxmlformats-officedocument.presentationml.presentation"}]}
+        , .{});
+        defer a.free(reading);
+        metadata.retained = reading;
+        var parsed = try std.json.parseFromSlice(V, a, reading, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("complete", parsed.value.object.get("document").?.object.get("status").?.string);
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("data").?.array.items.len);
+        try std.testing.expectEqualStrings("Visible total 12.50\n", parsed.value.object.get("data").?.array.items[0].object.get("text").?.string);
+        for ([_][]const u8{
+            \\{"model":"extractor","schema_version":2,"schema":{"structures":{"receipt":{"fields":{"total":"str"}}}},"documents":[{"id":"slide","url":"fixture","media_type":"application/vnd.openxmlformats-officedocument.presentationml.presentation"}]}
+            ,
+            \\{"model":"extractor","schema_version":2,"schema":{"structures":{"receipt":{"fields":{"total":"str"}}}},"read_artifact":"fixture"}
+            ,
+        }) |request| {
+            const response = try Service(Fake).extractJson(&metadata, a, request, .{});
+            defer a.free(response);
+            var result = try std.json.parseFromSlice(V, a, response, .{});
+            defer result.deinit();
+            const total = result.value.object.get("data").?.array.items[0].object.get("structures").?.object.get("receipt").?.array.items[0].object.get("total").?;
+            try std.testing.expectEqualStrings("12.50", total.object.get("value").?.string);
+            try std.testing.expectEqualStrings("native", total.object.get("evidence").?.array.items[0].object.get("origin").?.string);
+        }
+        try std.testing.expectEqual(@as(usize, 0), metadata.calls);
+        try std.testing.expectEqual(@as(usize, 2), metadata.extract_calls);
+        try std.testing.expectEqual(@as(usize, 2), metadata.downloads);
     }
-    try std.testing.expectEqual(@as(usize, 0), metadata.calls);
-    try std.testing.expectEqual(@as(usize, 2), metadata.extract_calls);
-    try std.testing.expectEqual(@as(usize, 2), metadata.downloads);
 
     const read_request =
         \\{"model":"reader","documents":[{"id":"image","url":"fixture","media_type":"image/png"}]}

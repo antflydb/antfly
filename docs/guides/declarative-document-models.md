@@ -323,6 +323,20 @@ outside their namespace scope. Selected slides and shared layout/master parts
 reuse their checked views; unselected slides retain their original indexes
 without decompressing XML.
 
+Slide discovery admits only namespace-qualified entries in the presentation's
+slide list, including the selected compatibility branch. Extension metadata and
+foreign lookalikes cannot add slides. Relationship attributes resolve by namespace
+URI, so prefix aliases, scoped declarations and character references preserve
+their meaning. Each relationship part is indexed once; slide, layout, master and
+notes lookups check the relationship's declared role and reject duplicate IDs,
+ambiguous parent links and external targets.
+
+Unsupported-markup findings stay attached to their retained XML owners. Removing
+a template placeholder or overriding an inherited background removes its findings
+without clearing findings from visible shapes. Checked subtree views borrow both
+their bytes and their scoped findings; filtered views remap findings while copying
+retained spans, without another namespace parse.
+
 Sources parse once. Remote routing/extraction/verification share one bounded,
 resource-accounted HTTP pool per run. Source buffers release between documents and page scratch
 buffers release between pages. Local child invocations borrow encoded image

@@ -34,11 +34,31 @@ const Part = struct {
 pub const Cache = struct {
     parts: std.StringHashMapUnmanaged(*Part) = .{},
     max_regions: usize = 65536,
+    relationships: std.StringHashMapUnmanaged(*xml.Relationships) = .{},
+    pub fn relationshipsFor(self: *Cache, a: A, archive: xml.Archive, path: []const u8) !?*xml.Relationships {
+        if (self.relationships.get(path)) |known| return known;
+        const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return error.InvalidDocumentSource;
+        const rel_path = try std.fmt.allocPrint(a, "{s}/_rels/{s}.rels", .{ path[0..slash], path[slash + 1 ..] });
+        const bytes = archive.get(a, rel_path) catch |err| switch (err) {
+            error.MissingDocumentPart => return null,
+            else => return err,
+        };
+        const result = try a.create(xml.Relationships);
+        result.* = try xml.Relationships.init(a, bytes, archive.control);
+        try self.relationships.put(a, path, result);
+        return result;
+    }
+    pub fn relatedPath(self: *Cache, a: A, archive: xml.Archive, path: []const u8, kind: xml.RelationshipKind) !?[]const u8 {
+        const index = (try self.relationshipsFor(a, archive, path)) orelse return null;
+        const related = (try index.unique(kind)) orelse return null;
+        const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return error.InvalidDocumentSource;
+        return try normalizedPart(a, path[0 .. slash + 1], related.target);
+    }
     pub fn inherited(self: *Cache, a: A, archive: xml.Archive, slide_path: []const u8, bytes: []const u8) ![]const c.InheritedPart {
         var out = std.ArrayList(c.InheritedPart).empty;
         const visible = try showsMaster(bytes);
         var background_visible = !try hasBackground(bytes);
-        const layout_path = (try parentPath(a, archive, slide_path, .layout)) orelse return &.{};
+        const layout_path = (try self.relatedPath(a, archive, slide_path, .layout)) orelse return &.{};
         const layout = try self.load(a, archive, layout_path, .layout);
         try out.append(a, view(layout, visible, background_visible));
         background_visible = background_visible and !layout.has_background;
@@ -58,8 +78,8 @@ pub const Cache = struct {
         const visible = try xml.View.initWithControl(a, try archive.get(a, path), archive.control);
         const bytes = visible.bytes;
         try visible.requirePart(if (role == .layout) .layout else .master);
-        const content = try inheritedContent(a, bytes);
-        const shapes = visible.fragment(content.shapes);
+        const content = try inheritedContent(a, visible);
+        const shapes = content.shapes;
         const part = try a.create(Part);
         part.* = .{
             .path = path,
@@ -70,8 +90,8 @@ pub const Cache = struct {
             .shape_visual = try shapes.needsVisualInspection(),
             .has_background = content.background != null,
             .conditional_content = content.conditional_content,
-            .background_visual = if (content.background) |bg| try visible.fragment(bg).needsVisualInspection() else false,
-            .parent = if (role == .layout) (try parentPath(a, archive, path, .master)) orelse return error.MissingDocumentPart else null,
+            .background_visual = if (content.background) |bg| try bg.needsVisualInspection() else false,
+            .parent = if (role == .layout) (try self.relatedPath(a, archive, path, .master)) orelse return error.MissingDocumentPart else null,
         };
         try self.parts.put(a, path, part);
         return part;
@@ -95,15 +115,16 @@ fn hasBackground(bytes: []const u8) !bool {
 
 /// Placeholder prompts are template data, not displayed slide text. Keep
 /// non-placeholder decorations and inspect backgrounds independently of shapes.
-fn inheritedContent(a: A, bytes: []const u8) !struct { shapes: []const u8, background: ?[]const u8, conditional_content: bool } {
+fn inheritedContent(a: A, visible: xml.View) !struct { shapes: xml.View, background: ?xml.View, conditional_content: bool } {
+    const bytes = visible.bytes;
     var iter = xml.Xml{ .bytes = bytes };
-    var output = std.Io.Writer.Allocating.init(a);
-    var cursor: usize = 0;
+    var exclusions = std.ArrayList(xml.View.Range).empty;
+    defer exclusions.deinit(a);
     var start: ?usize = null;
     var depth: usize = 0;
     var placeholder = false;
     var background = false;
-    var background_xml: ?[]const u8 = null;
+    var background_xml: ?xml.View = null;
     var conditional_content = false;
     while (try iter.next()) |token| {
         if (token != .tag) continue;
@@ -129,34 +150,13 @@ fn inheritedContent(a: A, bytes: []const u8) !struct { shapes: []const u8, backg
         }
         if (start) |begin| if ((tag.closing and iter.depth < depth) or (tag.empty and started)) {
             if (placeholder or background) {
-                try output.writer.writeAll(bytes[cursor..begin]);
-                if (background) background_xml = bytes[begin..iter.index];
-                cursor = iter.index;
+                try exclusions.append(a, .{ .start = begin, .end = iter.index });
+                if (background) background_xml = visible.slice(bytes[begin..iter.index]);
             }
             start = null;
         };
     }
-    try output.writer.writeAll(bytes[cursor..]);
-    return .{ .shapes = try output.toOwnedSlice(), .background = background_xml, .conditional_content = conditional_content };
-}
-fn parentPath(a: A, archive: xml.Archive, path: []const u8, role: Role) !?[]const u8 {
-    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return error.InvalidDocumentSource;
-    const rel_path = try std.fmt.allocPrint(a, "{s}/_rels/{s}.rels", .{ path[0..slash], path[slash + 1 ..] });
-    const bytes = archive.get(a, rel_path) catch |err| switch (err) {
-        error.MissingDocumentPart => return null,
-        else => return err,
-    };
-    var iter = xml.Xml{ .bytes = bytes };
-    var result: ?[]const u8 = null;
-    while (try iter.next()) |token| {
-        if (token != .tag or token.tag.closing or !std.mem.eql(u8, token.tag.local(), "Relationship")) continue;
-        const kind = token.tag.attr("Type") orelse continue;
-        if (!std.mem.endsWith(u8, kind, if (role == .layout) "/slideLayout" else "/slideMaster")) continue;
-        if (result != null) return error.InvalidDocumentXml;
-        if (token.tag.attr("TargetMode")) |mode| if (std.mem.eql(u8, mode, "External")) return error.ExternalDocumentPartDenied;
-        result = try normalizedPart(a, path[0 .. slash + 1], token.tag.attr("Target") orelse return error.InvalidDocumentXml);
-    }
-    return result;
+    return .{ .shapes = try visible.excluding(a, exclusions.items), .background = background_xml, .conditional_content = conditional_content };
 }
 pub fn normalizedPart(a: A, base: []const u8, target: []const u8) ![]const u8 {
     if (target.len == 0 or target[0] == '/' or std.mem.indexOfAny(u8, target, "\\:%?#") != null) return error.ExternalDocumentPartDenied;
@@ -179,17 +179,17 @@ test "document inherited slide text excludes placeholders and separates backgrou
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const content = try inheritedContent(a, "<p:sldMaster><p:bg><a:blipFill/></p:bg><p:sp><p:ph/><a:t>Template prompt</a:t></p:sp><p:sp><a:t>Confidential</a:t></p:sp></p:sldMaster>");
-    try std.testing.expectEqualStrings("Confidential", try (xml.View{ .bytes = content.shapes }).text(a));
+    const content = try inheritedContent(a, .{ .bytes = "<p:sldMaster><p:bg><a:blipFill/></p:bg><p:sp><p:ph/><a:t>Template prompt</a:t></p:sp><p:sp><a:t>Confidential</a:t></p:sp></p:sldMaster>" });
+    try std.testing.expectEqualStrings("Confidential", try content.shapes.text(a));
     try std.testing.expect(content.background != null);
-    try std.testing.expect(try (xml.View{ .bytes = content.background.? }).needsVisualInspection());
+    try std.testing.expect(try content.background.?.needsVisualInspection());
     try std.testing.expect(!try showsMaster("<p:sld showMasterSp='false'/>"));
     try std.testing.expect(!try showsMaster("<p:sld showMasterSp='&#48;'/>"));
     try std.testing.expect(try showsMaster("<p:sld showMasterSp=' tr&#117;e '/>"));
     try std.testing.expectError(error.InvalidDocumentXml, showsMaster("<p:sld showMasterSp='0' showMasterSp='1'/>"));
-    const footer = try inheritedContent(a, "<p:sldMaster><p:sp><p:ph type='ftr'/><a:t>Footer</a:t></p:sp></p:sldMaster>");
+    const footer = try inheritedContent(a, .{ .bytes = "<p:sldMaster><p:sp><p:ph type='ftr'/><a:t>Footer</a:t></p:sp></p:sldMaster>" });
     try std.testing.expect(footer.conditional_content);
-    try std.testing.expectEqualStrings("Footer", try (xml.View{ .bytes = footer.shapes }).text(a));
+    try std.testing.expectEqualStrings("Footer", try footer.shapes.text(a));
 }
 
 test "document inheritance shares parsed masters and honors visibility with bounded references" {
@@ -201,6 +201,7 @@ test "document inheritance shares parsed masters and honors visibility with boun
     const visible = try cache.inherited(a, archive, "ppt/slides/slide2.xml", try archive.get(a, "ppt/slides/slide2.xml"));
     const hidden = try cache.inherited(a, archive, "ppt/slides/slide1.xml", try archive.get(a, "ppt/slides/slide1.xml"));
     try std.testing.expectEqual(@as(usize, 2), cache.parts.count());
+    try std.testing.expectEqual(@as(usize, 3), cache.relationships.count());
     try std.testing.expectEqual(@as(usize, 2), visible.len);
     try std.testing.expectEqualStrings("Confidential\n", visible[1].text);
     try std.testing.expect(visible[1].text.ptr == hidden[1].text.ptr);
@@ -210,4 +211,18 @@ test "document inheritance shares parsed masters and honors visibility with boun
     layout.parent = layout.path;
     try std.testing.expectError(error.DocumentDependencyCycle, cache.inherited(a, archive, "ppt/slides/slide2.xml", try archive.get(a, "ppt/slides/slide2.xml")));
     try std.testing.expectError(error.ExternalDocumentPartDenied, normalizedPart(a, "ppt/", "https://example.com/master.xml"));
+}
+
+test "document inherited fragments discard placeholder findings and preserve visible unknown shapes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = "<p:sldMaster xmlns:p='http://schemas.openxmlformats.org/presentationml/2006/main' xmlns:x='urn:future'>";
+    const placeholder = "<p:sp><p:nvSpPr><p:nvPr><p:ph/></p:nvPr></p:nvSpPr><p:txBody><x:text/></p:txBody></p:sp>";
+    const checked = try xml.View.init(a, root ++ "<p:cSld><p:bg><x:paint/></p:bg><p:spTree>" ++ placeholder ++ "</p:spTree></p:cSld></p:sldMaster>");
+    const content = try inheritedContent(a, checked);
+    try std.testing.expect(!try content.shapes.needsVisualInspection());
+    try std.testing.expect(try content.background.?.needsVisualInspection());
+    const visible = try xml.View.init(a, root ++ "<p:cSld><p:spTree>" ++ placeholder ++ "<p:sp><p:txBody><x:visible/></p:txBody></p:sp></p:spTree></p:cSld></p:sldMaster>");
+    try std.testing.expect(try (try inheritedContent(a, visible)).shapes.needsVisualInspection());
 }
