@@ -41,6 +41,14 @@ pub const Writer = struct {
     pub fn raw(self: *Writer, bytes: []const u8) !void {
         self.writer.writeAll(bytes) catch |err| return self.failure orelse err;
     }
+    /// Some streaming codecs write directly into a minimum-size output window
+    /// before their first drain. Reserve that window within the same byte cap.
+    pub fn reserve(self: *Writer, additional: usize) !void {
+        if (additional > self.limit -| self.len()) return error.DocumentOutputTooLarge;
+        self.storage.writer.end = self.writer.end;
+        try self.storage.ensureTotalCapacityPrecise(self.len() + additional);
+        self.writer.buffer = self.storage.writer.buffer[0..@min(self.limit, self.storage.writer.buffer.len)];
+    }
     pub fn value(self: *Writer, item: anytype) !void {
         if (@TypeOf(item) == std.json.Value) try validateValue(item, self.limit -| self.len());
         std.json.Stringify.value(item, .{}, &self.writer) catch |err| return self.failure orelse err;

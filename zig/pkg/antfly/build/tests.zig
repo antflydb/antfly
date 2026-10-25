@@ -725,6 +725,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
     });
+    const api_document_runs_tests = b.addTest(.{
+        .root_module = api_restore_jobs_test_mod,
+        .filters = selectTestFilters(b, &.{ "document artifact run", "research job" }),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_api_document_runs_tests = addFilteredTestRunArtifact(b, api_document_runs_tests);
+    const document_runs_protocol_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/readers/src/document_runs.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = selectTestFilters(b, &.{"document durable"}),
+    });
+    const run_document_runs_protocol_tests = b.addRunArtifact(document_runs_protocol_tests);
+    const api_document_runs_test_step = b.step("antfly-api-document-runs-test", "Run durable document artifact checkpoints and lease recovery");
+    api_document_runs_test_step.dependOn(&run_api_document_runs_tests.step);
+    api_document_runs_test_step.dependOn(&run_document_runs_protocol_tests.step);
     const run_api_restore_jobs_tests = addFilteredTestRunArtifact(b, api_restore_jobs_tests);
     const lib_api_restore_jobs_test_step = b.step("antfly-api-restore-jobs-test", "Run durable restore job store tests");
     lib_api_restore_jobs_test_step.dependOn(&run_api_restore_jobs_tests.step);
@@ -5393,6 +5411,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_algebraic_dynamic_template_tests.step);
     unit_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
     unit_test_step.dependOn(&run_api_restore_jobs_tests.step);
+    unit_test_step.dependOn(&run_api_document_runs_tests.step);
+    unit_test_step.dependOn(&run_document_runs_protocol_tests.step);
     // The storage support artifact owns portable backup; keep its focused target.
     unit_test_step.dependOn(&run_public_api_parity_aggregate_tests.step);
     unit_test_step.dependOn(&run_lib_template_tests.step);

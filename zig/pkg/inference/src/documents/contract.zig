@@ -44,6 +44,8 @@ pub const Limits = struct {
     max_output_bytes: usize = 16 * 1024 * 1024,
     max_model_calls: usize = 256,
     max_total_tokens: u64 = 1_000_000,
+    max_parallel_pages: usize = 4,
+    max_parallel_calls: usize = 4,
     max_region_attempts: usize = 2,
     max_regions: usize = 4096,
     max_pixels: u64 = 40_000_000,
@@ -56,6 +58,7 @@ pub const Limits = struct {
             if (@field(self, name) == 0) return error.InvalidDocumentLimits;
         }
         if (self.max_sources > 128 or self.max_pages > 10000 or self.max_regions > 65536 or
+            self.max_parallel_pages > 64 or self.max_parallel_calls > 64 or
             self.max_region_attempts > 8 or self.max_model_calls > 10000 or
             self.deadline_ms > 1_800_000 or self.max_output_bytes > 256 * 1024 * 1024 or
             self.max_source_bytes > 256 * 1024 * 1024 or self.max_pixels > 100_000_000 or self.max_dimension > 32768)
@@ -369,8 +372,22 @@ pub const Control = struct {
         if (self.event_fn) |f| try f(self.ptr, event);
     }
 };
+/// A wave's short critical sections coordinate cumulative admission. Workers
+/// retain separate Runs for nested absolute ceilings and their own event arenas.
+pub const SharedAccounting = struct {
+    limits: Limits,
+    usage: Usage,
+    event_count: usize,
+    provider_state: ?*anyopaque = null,
+    provider_deinit_fn: ?*const fn (?*anyopaque) void = null,
+    mutex: std.atomic.Mutex = .unlocked,
+    pub fn lock(self: *SharedAccounting) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+};
 pub const Run = struct {
     limits: Limits,
+    shared: ?*SharedAccounting = null,
     usage: Usage = .{},
     source_count: usize = 0,
     source_bytes: usize = 0,
@@ -387,8 +404,18 @@ pub const Run = struct {
     }
     pub fn emit(self: *Run, event: Event) !void {
         try self.control.check();
+        if (self.shared) |shared| {
+            shared.lock();
+            defer shared.mutex.unlock();
+            if (shared.event_count >= 16384) return error.DocumentEventLimitExceeded;
+            shared.event_count += 1;
+        }
         if (self.event_allocator != null) _ = try self.outputJson(event);
         try self.control.emit(event);
+        try self.retainEvent(event);
+    }
+    /// Events merged in source order were already charged by the worker.
+    pub fn retainEvent(self: *Run, event: Event) !void {
         if (self.event_allocator) |a| {
             if (self.events.items.len >= 16384) return error.DocumentEventLimitExceeded;
             var retained = event;
@@ -427,12 +454,35 @@ pub const Run = struct {
     pub fn call(self: *Run) !void {
         try self.requireOutput();
         if (self.usage.model_calls >= self.limits.max_model_calls) return error.DocumentBudgetExhausted;
+        if (self.shared) |shared| {
+            shared.lock();
+            defer shared.mutex.unlock();
+            if (shared.usage.output_bytes >= shared.limits.max_output_bytes) return error.DocumentOutputTooLarge;
+            if (shared.usage.model_calls >= shared.limits.max_model_calls) return error.DocumentBudgetExhausted;
+            shared.usage.model_calls += 1;
+        }
         self.usage.model_calls += 1;
+    }
+    pub fn physicalCall(self: *Run) void {
+        if (self.shared) |shared| {
+            shared.lock();
+            defer shared.mutex.unlock();
+            shared.usage.physical_model_calls += 1;
+        }
+        self.usage.physical_model_calls += 1;
     }
     pub fn tokens(self: *Run, input: u64, output_tokens: u64) !void {
         try self.control.check();
         const count = std.math.add(u64, input, output_tokens) catch return error.DocumentTokenLimitExceeded;
         if (count > self.limits.max_total_tokens -| self.usage.total_tokens) return error.DocumentTokenLimitExceeded;
+        if (self.shared) |shared| {
+            shared.lock();
+            defer shared.mutex.unlock();
+            if (count > shared.limits.max_total_tokens -| shared.usage.total_tokens) return error.DocumentTokenLimitExceeded;
+            shared.usage.prompt_tokens += input;
+            shared.usage.completion_tokens += output_tokens;
+            shared.usage.total_tokens += count;
+        }
         self.usage.prompt_tokens += input;
         self.usage.completion_tokens += output_tokens;
         self.usage.total_tokens += count;
@@ -441,14 +491,32 @@ pub const Run = struct {
         try self.control.check();
         if (count > self.limits.max_pixels or count > self.limits.max_total_pixels -| self.usage.rendered_pixels)
             return error.DocumentPixelLimitExceeded;
+        if (self.shared) |shared| {
+            shared.lock();
+            defer shared.mutex.unlock();
+            if (count > shared.limits.max_total_pixels -| shared.usage.rendered_pixels) return error.DocumentPixelLimitExceeded;
+            shared.usage.rendered_pixels += count;
+        }
         self.usage.rendered_pixels += count;
     }
     pub fn output(self: *Run, count: usize) !void {
         if (count > self.limits.max_output_bytes -| self.usage.output_bytes) return error.DocumentOutputTooLarge;
+        if (self.shared) |shared| {
+            shared.lock();
+            defer shared.mutex.unlock();
+            if (count > shared.limits.max_output_bytes -| shared.usage.output_bytes) return error.DocumentOutputTooLarge;
+            shared.usage.output_bytes += count;
+        }
         self.usage.output_bytes += count;
     }
     pub fn remainingOutput(self: *const Run) usize {
-        return self.limits.max_output_bytes -| self.usage.output_bytes;
+        const local = self.limits.max_output_bytes -| self.usage.output_bytes;
+        if (self.shared) |shared| {
+            shared.lock();
+            defer shared.mutex.unlock();
+            return @min(local, shared.limits.max_output_bytes -| shared.usage.output_bytes);
+        }
+        return local;
     }
     pub fn requireOutput(self: *const Run) !void {
         try self.control.check();
@@ -575,4 +643,32 @@ test "document table validation rejects invalid extents without allocation or ov
         try std.testing.expectError(error.InvalidDocumentModelResult, table.validate());
     }
     try (Table{ .id = 0, .rows = std.math.maxInt(usize), .columns = std.math.maxInt(usize), .cells = &.{.{ .row = std.math.maxInt(usize) - 1, .column = std.math.maxInt(usize) - 1, .text = "edge" }} }).validate();
+}
+
+test "document parallel accounting shares admission while child ceilings remain independent" {
+    var accounting = SharedAccounting{ .limits = .{ .max_model_calls = 2, .max_total_tokens = 10, .max_output_bytes = 10, .max_total_pixels = 10 }, .usage = .{}, .event_count = 0 };
+    var first = Run{ .limits = accounting.limits, .shared = &accounting };
+    var second = Run{ .limits = accounting.limits, .shared = &accounting };
+    try first.call();
+    try second.call();
+    try std.testing.expectError(error.DocumentBudgetExhausted, first.call());
+    first.physicalCall();
+    second.physicalCall();
+    try first.tokens(3, 1);
+    try second.tokens(4, 2);
+    try std.testing.expectError(error.DocumentTokenLimitExceeded, second.tokens(1, 0));
+    try first.pixels(6);
+    try second.pixels(4);
+    try std.testing.expectError(error.DocumentPixelLimitExceeded, first.pixels(1));
+    try first.output(7);
+    try std.testing.expectEqual(@as(usize, 3), second.remainingOutput());
+    try std.testing.expectError(error.DocumentOutputTooLarge, second.output(4));
+    try second.output(3);
+    try std.testing.expectError(error.DocumentOutputTooLarge, first.requireOutput());
+    try std.testing.expectEqual(@as(usize, 2), accounting.usage.physical_model_calls);
+    try std.testing.expectEqual(@as(u64, 10), accounting.usage.total_tokens);
+    accounting.usage.output_bytes = 0;
+    var scoped = Run{ .limits = .{ .max_model_calls = 1 }, .shared = &accounting };
+    scoped.usage.model_calls = 1;
+    try std.testing.expectError(error.DocumentBudgetExhausted, scoped.call());
 }

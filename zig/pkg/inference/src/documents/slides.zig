@@ -29,12 +29,16 @@ const Part = struct {
     has_background: bool,
     background_visual: bool,
     conditional_content: bool,
+    render_view: xml.View,
     parent: ?[]const u8,
 };
 pub const Cache = struct {
     parts: std.StringHashMapUnmanaged(*Part) = .{},
     max_regions: usize = 65536,
     relationships: std.StringHashMapUnmanaged(*xml.Relationships) = .{},
+    pub fn renderView(self: *const Cache, path: []const u8) !xml.View {
+        return (self.parts.get(path) orelse return error.MissingDocumentPart).render_view;
+    }
     pub fn relationshipsFor(self: *Cache, a: A, archive: xml.Archive, path: []const u8) !?*xml.Relationships {
         if (self.relationships.get(path)) |known| return known;
         const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return error.InvalidDocumentSource;
@@ -90,6 +94,7 @@ pub const Cache = struct {
             .shape_visual = try shapes.needsVisualInspection(),
             .has_background = content.background != null,
             .conditional_content = content.conditional_content,
+            .render_view = content.render_view,
             .background_visual = if (content.background) |bg| try bg.needsVisualInspection() else false,
             .parent = if (role == .layout) (try self.relatedPath(a, archive, path, .master)) orelse return error.MissingDocumentPart else null,
         };
@@ -115,11 +120,13 @@ fn hasBackground(bytes: []const u8) !bool {
 
 /// Placeholder prompts are template data, not displayed slide text. Keep
 /// non-placeholder decorations and inspect backgrounds independently of shapes.
-fn inheritedContent(a: A, visible: xml.View) !struct { shapes: xml.View, background: ?xml.View, conditional_content: bool } {
+fn inheritedContent(a: A, visible: xml.View) !struct { shapes: xml.View, background: ?xml.View, conditional_content: bool, render_view: xml.View } {
     const bytes = visible.bytes;
     var iter = xml.Xml{ .bytes = bytes };
     var exclusions = std.ArrayList(xml.View.Range).empty;
     defer exclusions.deinit(a);
+    var placeholders = std.ArrayList(xml.View.Range).empty;
+    defer placeholders.deinit(a);
     var start: ?usize = null;
     var depth: usize = 0;
     var placeholder = false;
@@ -151,12 +158,13 @@ fn inheritedContent(a: A, visible: xml.View) !struct { shapes: xml.View, backgro
         if (start) |begin| if ((tag.closing and iter.depth < depth) or (tag.empty and started)) {
             if (placeholder or background) {
                 try exclusions.append(a, .{ .start = begin, .end = iter.index });
+                if (placeholder) try placeholders.append(a, .{ .start = begin, .end = iter.index });
                 if (background) background_xml = visible.slice(bytes[begin..iter.index]);
             }
             start = null;
         };
     }
-    return .{ .shapes = try visible.excluding(a, exclusions.items), .background = background_xml, .conditional_content = conditional_content };
+    return .{ .shapes = try visible.excluding(a, exclusions.items), .background = background_xml, .conditional_content = conditional_content, .render_view = try visible.excluding(a, placeholders.items) };
 }
 pub fn normalizedPart(a: A, base: []const u8, target: []const u8) ![]const u8 {
     if (target.len == 0 or target[0] == '/' or std.mem.indexOfAny(u8, target, "\\:%?#") != null) return error.ExternalDocumentPartDenied;

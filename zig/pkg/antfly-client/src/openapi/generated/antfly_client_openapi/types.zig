@@ -11521,6 +11521,8 @@ pub const DocumentSchema = struct {
 };
 
 pub const DocumentSource = struct {
+    /// Image-only perspective correction. Four clockwise corners in original image-edge pixels, ordered top-left, top-right, bottom-right, bottom-left. OCR evidence remains in original source coordinates.
+    quadrilateral: ?[]const []const f64 = null,
     /// Unique source identity within the request. Separate sources are never implicitly merged.
     id: []const u8,
     /// Inline data URI or location allowed by the deployment content security policy.
@@ -11535,6 +11537,7 @@ pub const DocumentSource = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "quadrilateral", "quadrilateral", true },
         .{ "id", "id", false },
         .{ "url", "url", false },
         .{ "media_type", "media_type", false },
@@ -11553,6 +11556,10 @@ pub const DocumentSource = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.quadrilateral) |value| {
+            try jw.objectField("quadrilateral");
+            try jw.write(value);
+        }
         try jw.objectField("id");
         try jw.write(self.id);
         try jw.objectField("url");

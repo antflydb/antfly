@@ -26,6 +26,7 @@ const image = @import("antfly_image");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const A = std.mem.Allocator;
 const V = std.json.Value;
+const adapter_version = "antfly-documents-v2";
 
 pub const ReadRequest = struct {
     model: []const u8,
@@ -178,6 +179,7 @@ pub fn Service(comptime Node: type) type {
         node: *Node,
         definition: c.Definition,
         work_allocator: A,
+        reader_batcher: ?*@import("reader_batcher.zig").Batcher(Node) = null,
         graph: *const Graph,
         control: Control,
         source: *sources.Source,
@@ -288,47 +290,92 @@ pub fn Service(comptime Node: type) type {
                 inputs.items[source_index].media_type = source.input.media_type;
                 try fingerprints.append(a, .{ .id = input.id, .sha256 = try a.dupe(u8, &source.fingerprint), .page_number = if (attached) |attachments| attachments.images[source_index].page_number else null });
                 const count = try source.pageCount();
-                for (0..count) |index| {
-                    const number = index + 1;
-                    if (!source.selected(number)) continue;
-                    if (run.usage.visited_pages >= run.limits.max_pages) return error.DocumentPageLimitExceeded;
-                    run.usage.visited_pages += 1;
-                    var scratch = std.heap.ArenaAllocator.init(backing);
-                    defer scratch.deinit();
-                    const sa = scratch.allocator();
-                    var page = source.analyzeWithRegionLimit(sa, number, run.limits.max_regions, run.control) catch |err| {
-                        try run.control.check();
-                        if (err == error.HiddenDocumentPage) continue;
-                        return err;
+                // Sources freeze their shared PDF index before workers borrow
+                // it; every page owns mutable decode/render state and scratch.
+                const io: ?std.Io = if (control.io) |owned_io| owned_io else if (@hasDecl(Node, "documentIo")) node.documentIo() else null;
+                const width = if (io != null and run.shared == null) @min(run.limits.max_parallel_pages, run.limits.max_parallel_calls) else 1;
+                if (width > 1 and source.parsed == .pdf and source.render_template == null)
+                    source.render_template = try source.parsed.pdf.prepareRenderForkTemplate(source_alloc, source.parsed.pdf.cancellationProbe());
+                var next: usize = 0;
+                while (next < count) {
+                    const tasks = try backing.alloc(PageTask, @min(width, count - next));
+                    defer backing.free(tasks);
+                    var filled: usize = 0;
+                    defer for (tasks[0..filled]) |*task| task.deinit();
+                    while (next < count and filled < tasks.len) : (next += 1) {
+                        const number = next + 1;
+                        if (!source.selected(number)) continue;
+                        if (run.usage.visited_pages >= run.limits.max_pages) return error.DocumentPageLimitExceeded;
+                        run.usage.visited_pages += 1;
+                        tasks[filled] = .{
+                            .arena = .init(backing),
+                            .node = node,
+                            .definition = def,
+                            .graph = graph,
+                            .source = &source,
+                            .number = number,
+                            .request = request,
+                            .control = control,
+                            .original_number = if (attached) |attachments| attachments.images[source_index].page_number else null,
+                            .fork = width > 1,
+                        };
+                        filled += 1;
+                    }
+                    var accounting = c.SharedAccounting{ .limits = run.limits, .usage = run.usage, .event_count = run.events.items.len, .provider_state = run.provider_state, .provider_deinit_fn = run.provider_deinit_fn };
+                    defer {
+                        run.provider_state = accounting.provider_state;
+                        run.provider_deinit_fn = accounting.provider_deinit_fn;
+                    }
+                    const Batch = @import("reader_batcher.zig").Batcher(Node);
+                    var batcher = if (io) |executor_io| Batch{ .io = executor_io, .node = node, .backing = backing, .max_parallel = @min(width, run.limits.max_parallel_calls) } else undefined;
+                    var batch_group: std.Io.Group = .init;
+                    var batch_enabled = false;
+                    if (@hasDecl(Node, "documentBatching")) {
+                        if (io != null and filled > 1 and node.documentBatching()) {
+                            batch_enabled = if (batch_group.concurrent(io.?, Batch.execute, .{&batcher})) |_| true else |_| false;
+                        }
+                    }
+                    defer if (batch_enabled) {
+                        batcher.stop();
+                        batch_group.await(io.?) catch {};
                     };
-                    if (attached) |attachments| if (attachments.images[source_index].page_number) |original| {
-                        page.number = original;
-                    };
-                    var context = Self{ .node = node, .definition = def, .work_allocator = sa, .graph = graph, .control = control, .source = &source, .number = number, .native_regions = page.regions, .prompt = request.prompt, .max_tokens = request.max_tokens };
-                    const reading: executor.Result = if (std.mem.eql(u8, request.model, "antfly/native-document")) native: {
-                        var native_page = page;
-                        native_page.text = page.native_text;
-                        native_page.status = if (page.findings.len == 0 and page.kind != .image) .complete else .unresolved;
-                        const output_bytes = try run.outputJson(native_page);
-                        break :native .{ .page = native_page, .output_bytes = output_bytes };
-                    } else executor.readPageReported(sa, def, .{ .ptr = &context, .read_fn = read, .decide_fn = decide, .validate_fn = validate }, index, page, run) catch |err| switch (err) {
-                        error.DocumentRendererUnavailable, error.DocumentBudgetExhausted => blk: {
-                            var unresolved = page;
-                            unresolved.text = page.native_text;
-                            unresolved = try executor.interrupted(sa, unresolved, err);
-                            const output_bytes = try run.outputJson(unresolved);
-                            break :blk .{ .page = unresolved, .output_bytes = output_bytes };
-                        },
-                        else => return err,
-                    };
-                    var result = reading.page;
-                    result.index = page_count;
-                    if (context.rendered) |view| result.raster_to_source = view.raster_to_source;
-                    try appendPage(&response, result, run, reading.output_bytes, page_count > 0);
-                    page_count += 1;
-                    try run.emit(.{ .phase = if (result.status == .complete) .accepted else .unresolved, .source_id = result.source_id, .page_number = result.number, .status = result.status, .finding = if (result.findings.len > 0) result.findings[0] else null });
-                    if (result.status == .complete) run.usage.completed_pages += 1;
-                    try control.update(.executing, run.usage.visited_pages, 0);
+                    for (tasks[0..filled]) |*task| {
+                        task.reader_batcher = if (batch_enabled) &batcher else null;
+                        task.run = .{
+                            .limits = run.limits,
+                            .usage = run.usage,
+                            .source_count = run.source_count,
+                            .source_bytes = run.source_bytes,
+                            .shared = &accounting,
+                            .event_allocator = task.arena.allocator(),
+                            .work_allocator = backing,
+                            .control = .{ .ptr = run.control.ptr, .check_fn = run.control.check_fn },
+                        };
+                    }
+                    if (io != null and filled > 1) {
+                        var group: std.Io.Group = .init;
+                        defer group.cancel(io.?);
+                        for (tasks[0..filled]) |*task| group.concurrent(io.?, PageTask.execute, .{task}) catch task.execute() catch unreachable;
+                        group.await(io.?) catch return error.Cancelled;
+                    } else for (tasks[0..filled]) |*task| try task.execute();
+                    run.usage = accounting.usage;
+                    // Only the bounded wave is buffered. Publication and events
+                    // follow source order even when models finish out of order.
+                    for (tasks[0..filled]) |*task| {
+                        if (task.failure) |err| return err;
+                        for (task.run.events.items) |event| {
+                            try run.control.emit(event);
+                            try run.retainEvent(event);
+                        }
+                        const reading = task.result orelse continue; // Hidden slide.
+                        var result = reading.page;
+                        result.index = page_count;
+                        try appendPage(&response, result, run, reading.output_bytes, page_count > 0);
+                        page_count += 1;
+                        try run.emit(.{ .phase = if (result.status == .complete) .accepted else .unresolved, .source_id = result.source_id, .page_number = result.number, .status = result.status, .finding = if (result.findings.len > 0) result.findings[0] else null });
+                        if (result.status == .complete) run.usage.completed_pages += 1;
+                        try control.update(.executing, run.usage.visited_pages, 0);
+                    }
                 }
             }
             const status: c.Status = if (run.usage.completed_pages - completed_before == page_count) .complete else .unresolved;
@@ -345,15 +392,15 @@ pub fn Service(comptime Node: type) type {
                 };
                 if (!found) try models.append(a, .{ .model = binding.model, .operation = binding.operation, .provider = .cloudflare, .identity = null });
             };
-            const SourceOptions = struct { id: []const u8, media_type: []const u8, pages: ?[]const usize, include_notes: bool, include_hidden: bool };
+            const SourceOptions = struct { id: []const u8, media_type: []const u8, pages: ?[]const usize, include_notes: bool, include_hidden: bool, quadrilateral: ?[4][2]f64 };
             const source_options = try a.alloc(SourceOptions, inputs.items.len);
-            for (source_options, inputs.items) |*options, input| options.* = .{ .id = input.id, .media_type = input.media_type, .pages = input.pages, .include_notes = input.include_notes, .include_hidden = input.include_hidden };
+            for (source_options, inputs.items) |*options, input| options.* = .{ .id = input.id, .media_type = input.media_type, .pages = input.pages, .include_notes = input.include_notes, .include_hidden = input.include_hidden, .quadrilateral = input.quadrilateral };
             const runtime_version = @import("build_info").version();
             var run_digest: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ .definition = std.fmt.bytesToHex(definition_digest, .lower), .sources = fingerprints.items, .models = models.items, .options = source_options, .prompt = request.prompt, .max_tokens = request.max_tokens, .limits = run.limits, .adapter_version = "antfly-documents-v1", .runtime_version = runtime_version }, .{}), &run_digest, .{});
+            std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ .definition = std.fmt.bytesToHex(definition_digest, .lower), .sources = fingerprints.items, .models = models.items, .options = source_options, .prompt = request.prompt, .max_tokens = request.max_tokens, .limits = run.limits, .adapter_version = adapter_version, .runtime_version = runtime_version }, .{}), &run_digest, .{});
             try run.emit(.{ .phase = .complete, .source_id = "", .page_number = 0, .status = status });
             try response.raw("],\"document\":");
-            try response.value(.{ .version = @as(u32, 1), .status = status, .sources = fingerprints.items, .definition_sha256 = @as([]const u8, &std.fmt.bytesToHex(definition_digest, .lower)), .run_sha256 = @as([]const u8, &std.fmt.bytesToHex(run_digest, .lower)), .runtime_version = runtime_version, .models = models.items, .adapter_version = "antfly-documents-v1" });
+            try response.value(.{ .version = @as(u32, 1), .status = status, .sources = fingerprints.items, .definition_sha256 = @as([]const u8, &std.fmt.bytesToHex(definition_digest, .lower)), .run_sha256 = @as([]const u8, &std.fmt.bytesToHex(run_digest, .lower)), .runtime_version = runtime_version, .models = models.items, .adapter_version = adapter_version });
             try response.raw(",\"usage\":");
             try response.value(run.usage);
             try response.raw(",\"events\":");
@@ -430,6 +477,70 @@ pub fn Service(comptime Node: type) type {
             }
             return error.DocumentDependencyCycle;
         }
+
+        const PageTask = struct {
+            arena: std.heap.ArenaAllocator,
+            node: *Node,
+            definition: c.Definition,
+            graph: *const Graph,
+            source: *sources.Source,
+            number: usize,
+            request: ReadRequest,
+            original_number: ?u32,
+            control: Control,
+            fork: bool,
+            reader_batcher: ?*@import("reader_batcher.zig").Batcher(Node) = null,
+            run: c.Run = .{ .limits = .{} },
+            result: ?executor.Result = null,
+            failure: ?anyerror = null,
+
+            fn deinit(self: *PageTask) void {
+                self.run.deinit();
+                self.arena.deinit();
+            }
+            fn execute(self: *PageTask) std.Io.Cancelable!void {
+                self.process() catch |err| {
+                    self.failure = err;
+                };
+            }
+            fn process(self: *PageTask) !void {
+                const sa = self.arena.allocator();
+                var local = self.source.*;
+                local.render_template = null;
+                if (self.fork and local.parsed == .pdf) {
+                    local.parsed = .{ .pdf = try self.source.render_template.?.instantiate(sa, self.source.parsed.pdf.cancellationProbe()) };
+                }
+                // Serial execution borrows the original parser/cache; parallel
+                // execution owns only independently instantiated fork state.
+                const source = if (self.fork) &local else self.source;
+                defer if (self.fork) local.deinit();
+                var page = source.analyzeWithRegionLimit(sa, self.number, self.run.limits.max_regions, self.run.control) catch |err| {
+                    try self.run.control.check();
+                    if (err == error.HiddenDocumentPage) return;
+                    return err;
+                };
+                if (self.original_number) |number| page.number = number;
+                var context = Self{ .node = self.node, .definition = self.definition, .work_allocator = sa, .reader_batcher = self.reader_batcher, .graph = self.graph, .control = self.control, .source = source, .number = self.number, .native_regions = page.regions, .prompt = self.request.prompt, .max_tokens = self.request.max_tokens };
+                var reading: executor.Result = if (std.mem.eql(u8, self.request.model, "antfly/native-document")) native: {
+                    var native_page = page;
+                    native_page.text = page.native_text;
+                    native_page.status = if (page.findings.len == 0 and page.kind != .image) .complete else .unresolved;
+                    const output_bytes = try self.run.outputJson(native_page);
+                    break :native .{ .page = native_page, .output_bytes = output_bytes };
+                } else executor.readPageReported(sa, self.definition, .{ .ptr = &context, .read_fn = read, .decide_fn = decide, .validate_fn = validate }, self.number - 1, page, &self.run) catch |err| switch (err) {
+                    error.DocumentRendererUnavailable, error.DocumentBudgetExhausted => blk: {
+                        var unresolved = page;
+                        unresolved.text = page.native_text;
+                        unresolved = try executor.interrupted(sa, unresolved, err);
+                        const output_bytes = try self.run.outputJson(unresolved);
+                        break :blk .{ .page = unresolved, .output_bytes = output_bytes };
+                    },
+                    else => return err,
+                };
+                if (context.rendered) |view| reading.page.raster_to_source = view.raster_to_source;
+                self.result = reading;
+            }
+        };
 
         fn extractionBinding(def: c.Definition, graph: *const Graph) !c.Binding {
             var current = def;
@@ -534,7 +645,7 @@ pub fn Service(comptime Node: type) type {
                         .{ .type = "image_url", .image_url = .{ .url = try dataUri(a, mime, data) } },
                     } }},
                 }, .{}), .{ .parse_numbers = false });
-                run.usage.physical_model_calls += 1;
+                run.physicalCall();
                 const result = try self.node.invokeCloudflare(a, binding, payload, self.control, run);
                 try recordUsage(run, result);
                 const reading = try cf.chatReading(result);
@@ -580,13 +691,16 @@ pub fn Service(comptime Node: type) type {
                 }
             };
             const pinned = try self.verifyBinding(a, binding);
-            run.usage.physical_model_calls += 1;
-            const batch = try self.node.readEncodedImagesReportedDirectWithContext(a, pinned.path, .{
+            const request = readers.EncodedRequest{
                 .allow_incomplete = true,
                 .images = &.{.{ .bytes = data, .mime_type = mime, .item_id = self.source.input.id, .page_number = @intCast(self.number) }},
                 .prompt = self.prompt,
                 .max_tokens = self.max_tokens,
-            }, self.control.deadline_ns, .{ .ptr = &self.control, .is_cancelled_fn = Cancel.cancelled });
+            };
+            const batch = if (self.reader_batcher) |batcher| try batcher.read(a, pinned.path, request, self.control, run) else direct: {
+                run.physicalCall();
+                break :direct try self.node.readEncodedImagesReportedDirectWithContext(a, pinned.path, request, self.control.deadline_ns, .{ .ptr = &self.control, .is_cancelled_fn = Cancel.cancelled });
+            };
             _ = try self.verifyBinding(a, binding);
             if (batch.usage) |usage| {
                 try run.tokens(@intCast(@max(0, usage.prompt_tokens)), @intCast(@max(0, usage.completion_tokens)));
@@ -630,7 +744,7 @@ pub fn Service(comptime Node: type) type {
             var questions = cf.object();
             try cf.put(a, &questions, "action", q);
             if (binding.provider == .cloudflare) {
-                run.usage.physical_model_calls += 1;
+                run.physicalCall();
                 const response = try self.node.invokeCloudflare(a, binding, try cf.request(a, binding.model, state, "questions", questions), self.control, run);
                 const result = try cf.unwrap(response);
                 try recordUsage(run, result);
@@ -640,7 +754,7 @@ pub fn Service(comptime Node: type) type {
             }
             const request = try @import("antfly_decisions").requestJson(a, binding.model, state, questions, null, null);
             _ = try self.verifyBinding(a, binding);
-            run.usage.physical_model_calls += 1;
+            run.physicalCall();
             const bytes = try self.node.decideDirectJsonWithControl(a, request, self.control);
             _ = try self.verifyBinding(a, binding);
             const response = try std.json.parseFromSliceLeaky(V, a, bytes, .{ .parse_numbers = false });
@@ -853,7 +967,7 @@ pub fn Service(comptime Node: type) type {
             var scratch = std.heap.ArenaAllocator.init(run.work_allocator orelse a);
             defer scratch.deinit();
             const work = scratch.allocator();
-            run.usage.physical_model_calls += 1;
+            run.physicalCall();
             const native_plan = if (binding.provider == .cloudflare) try cf.extractionSchema(work, schema) else null;
             var item: V = undefined;
             if (binding.provider == .cloudflare) {
@@ -2481,4 +2595,80 @@ test "document extraction forwards schema and options within the depth boundary"
         try expectExtractionParameterDepth("schema", depth, error.UnexpectedCall);
         try expectExtractionParameterDepth("options", depth, error.UnexpectedCall);
     }
+}
+
+test "document parallel pages finish out of order with canonical output and shared accounting" {
+    const Fake = struct {
+        io: std.Io,
+        batching: bool = false,
+        second_finished: std.Io.Event = .unset,
+        calls: std.atomic.Value(usize) = .init(0),
+        pub fn documentBatching(self: *@This()) bool {
+            return self.batching;
+        }
+        pub fn documentIo(self: *@This()) ?std.Io {
+            return self.io;
+        }
+        pub fn documentDefinition(_: *@This(), a: A, name: []const u8, _: c.Operation) !?[]const u8 {
+            if (!std.mem.eql(u8, name, "agent")) return null;
+            return try a.dupe(u8,
+                \\{"models":[{"name":"leaf","model":"leaf","operation":"read"}],"read":{"reader":"leaf","native_text":"always_ocr"},"budget":{"max_parallel_pages":2,"max_parallel_calls":2}}
+            );
+        }
+        pub fn documentResolveBinding(_: *@This(), _: A, b: c.Binding) !c.Snapshot {
+            var hash: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(b.model, &hash, .{});
+            return .{ .binding = b, .path = b.model, .identity = hash };
+        }
+        pub fn documentDownload(_: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
+            return .{ .data = @embedFile("testdata/two-pages.pdf") };
+        }
+        pub fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, _: []const u8, req: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+            _ = self.calls.fetchAdd(1, .monotonic);
+            const number = req.images[0].page_number.?;
+            if (!self.batching and number == 1) try self.second_finished.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(5000), .clock = .awake } });
+            const results = try a.alloc(readers.Result, req.images.len);
+            for (results, req.images) |*result, input| result.* = .{ .text = if (input.page_number.? == 1) "First page total 12.50" else "Second page notes", .completion = .complete };
+            if (!self.batching and number == 2) self.second_finished.set(self.io);
+            return .{ .items = results, .execution = if (self.batching) .{ .requested_items = results.len, .native_items = results.len, .native_batches = 1 } else .{ .requested_items = results.len, .serial_items = results.len }, .usage = .{ .prompt_tokens = @intCast(7 * results.len), .completion_tokens = @intCast(3 * results.len), .total_tokens = @intCast(10 * results.len) } };
+        }
+        pub fn invokeCloudflare(_: *@This(), _: A, _: c.Binding, _: V, _: Control, _: *c.Run) anyerror!V {
+            return error.UnexpectedCall;
+        }
+        pub fn decideDirectJsonWithControl(_: *@This(), _: A, _: []const u8, _: ?Control) anyerror![]u8 {
+            return error.UnexpectedCall;
+        }
+    };
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    for ([_]bool{ false, true }) |batching| {
+        var fake = Fake{ .io = io_impl.io(), .batching = batching };
+        const response = try Service(Fake).readJson(&fake, a,
+            \\{"model":"agent","documents":[{"id":"pdf","url":"fixture","media_type":"application/pdf"}]}
+        , .{});
+        defer a.free(response);
+        var parsed = try std.json.parseFromSlice(V, a, response, .{});
+        defer parsed.deinit();
+        const pages = parsed.value.object.get("data").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), pages.len);
+        try std.testing.expectEqualStrings("First page total 12.50", pages[0].object.get("text").?.string);
+        try std.testing.expectEqualStrings("Second page notes", pages[1].object.get("text").?.string);
+        const usage = parsed.value.object.get("usage").?;
+        try std.testing.expectEqual(@as(i64, 2), usage.object.get("model_calls").?.integer);
+        try std.testing.expectEqual(@as(i64, @intCast(fake.calls.load(.monotonic))), usage.object.get("physical_model_calls").?.integer);
+        try std.testing.expectEqual(@as(i64, 20), usage.object.get("total_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 2), usage.object.get("completed_pages").?.integer);
+        var previous_page: i64 = 0;
+        for (parsed.value.object.get("events").?.array.items) |event| {
+            const page = event.object.get("page_number").?.integer;
+            if (page == 0) continue;
+            try std.testing.expect(page >= previous_page);
+            previous_page = page;
+        }
+    }
+}
+
+test "document reader batch queue contracts" {
+    _ = @import("reader_batcher.zig");
 }

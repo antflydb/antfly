@@ -77,6 +77,8 @@ Child names below are examples and must resolve to installed models.
     "max_model_calls": 24,
     "max_total_tokens": 100000,
     "max_region_attempts": 2,
+    "max_parallel_pages": 4,
+    "max_parallel_calls": 4,
     "max_total_pixels": 40000000
   },
   "read": {
@@ -265,23 +267,32 @@ independent of protocol fixture tests.
 PDFs support native text and lazy visual rendering. PNG/JPEG/WebP photos support
 OCR with original pixel coordinates and targeted crops. PPTX support includes
 declared slide order, native text, native table cells/merge spans, explicit hidden
-slide policy, and separately attributed speaker notes. Visual slide rendering,
-chart interpretation and perspective correction are unavailable and are reported
-as such. XML inspection recognizes drawings independently of namespace prefixes,
+slide policy, and separately attributed speaker notes. Native Zig slide rendering
+supports embedded pictures with alpha, rectangular crops, rotation and flips;
+rectangles, ellipses and lines with explicit RGB fills/strokes; and solid RGB
+backgrounds. Nested groups compose child coordinates, scaling, rotation and flips.
+Visible master/layout decorations compose behind slide drawings,
+with the nearest selected background beneath all shapes and template placeholders
+excluded. Text rendering, charts, theme-dependent styles and
+effects remain unsupported. Unsupported content is reported
+explicitly. XML inspection recognizes drawings independently of namespace prefixes,
 including vector shapes, pictures, charts and embedded content. A slide with
 unsupported visual content remains unresolved. Slide layouts and masters are
 parsed once per source and shared across slides. Inherited parts retain their
 source identity and visibility metadata; template prompts are excluded. Visible
-inherited decorations, conditional footer content, and backgrounds that require
-composition or rendering keep the slide unresolved until those capabilities are
-available. PDF native inspection checks
+inherited text, conditional footer content, and unsupported drawing styles keep
+the slide unresolved. Incomplete slide images are never sent to OCR. PDF native inspection checks
 painting operators without decoding images or materializing vector paths;
 text-bearing pages with drawings still require visual inspection. PDF annotation
 coverage is inspected separately from page content streams, using bounded metadata
-and reference resolution. Potentially visible stamps, widgets/form fields and
-other annotations remain unresolved because appearance compositing is unavailable.
-Both native painting and document OCR reject that unsupported rendering path;
-page-content-only rasters cannot certify coverage. Hidden annotations and
+and reference resolution. Static normal appearance streams for stamps and
+widgets/form fields are composited as clipped Form XObjects, honoring the selected
+appearance state, appearance matrix and page geometry. They trigger visual
+inspection even on an otherwise text-only page. Viewer-generated appearances,
+NoZoom/NoRotate, optional-content visibility, and annotation opacity/blend modes
+that require separate compositing remain explicit unsupported findings. Native
+painting and document OCR reject those unsupported paths; page-content-only
+rasters cannot certify annotation coverage. Hidden annotations and
 borderless links without appearances do not require visual work. See the
 [PDF reference, annotation flags](https://printtechnologies.org/wp-content/uploads/2020/03/pdfreference_v1-4-1.pdf)
 for the screen/print visibility rules.
@@ -302,6 +313,25 @@ and partially transparent pixels. The page caches one RGBA decode, and the PNG
 encoder streams borrowed rows with the original stride. Specialists and
 verifiers inspect the same pixels without allocating and copying another raster
 for each crop.
+
+Image document sources can supply `quadrilateral` for perspective correction:
+
+```json
+{
+  "id": "receipt",
+  "url": "data:image/jpeg;base64,...",
+  "media_type": "image/jpeg",
+  "quadrilateral": [[100, 80], [900, 120], [950, 1400], [50, 1380]]
+}
+```
+
+Corners use original image-edge coordinates in clockwise order: top-left,
+top-right, bottom-right, bottom-left. The polygon must be finite, strictly convex,
+and contained in the image. Rectification limits source/destination pixels,
+checks cancellation between rows, and interpolates premultiplied alpha. The
+projective `raster_to_source` mapping keeps OCR regions, cells, crops and evidence
+in the original photo's coordinates. The quadrilateral participates in run
+identity. Automatic corner detection is not implied by this input contract.
 
 Slide text, tables and visual inspection share one namespace- and
 visibility-checked XML view. Native text comes from supported PresentationML and
@@ -360,8 +390,18 @@ child's encoded-byte, dimension and pixel ceilings; borrowing avoids a second
 physical source charge. Reading metadata includes a run fingerprint of
 source hashes, source-selection options, prompts, effective limits, model
 identities and adapter/runtime versions. Remote providers expose model names
-without an immutable weight revision. Per-run execution is currently serial; existing
-reader executors own physical batching. Model discovery reports this limit.
+without an immutable weight revision. Independent pages run in bounded waves on
+the host-owned executor. `max_parallel_pages` and `max_parallel_calls` both default
+to four, with a maximum of 64; the smaller ceiling bounds page concurrency. Hosts
+without a shared executor run serially. Each PDF page has an independent reader
+fork and scratch arena. All workers share cumulative call/token/pixel/output
+admission and one hosted HTTP pool. Results and retained events merge in source
+order, so completion order cannot reorder document output. At most one wave of
+completed pages is buffered. Compatible ready crops from independent pages
+coalesce into shared reader invocations; incompatible groups dispatch concurrently
+within the call ceiling. Token usage is charged once for each physical batch.
+Region refinement within each page remains ordered. Model discovery reports
+the effective parallel-call ceiling.
 
 Initial OCR output and accepted revisions must retain trustworthy native text
 coverage. Missing coverage triggers whole-page escalation and prevents a router
@@ -487,6 +527,17 @@ Responses include bounded events and measured aggregate usage separately from
 physical batch reports. Artifact reuse is implemented; durable checkpoint/resume,
 job endpoints and task event streaming remain separate lifecycle work. No public
 job or resume capability is advertised by this implementation.
+
+The durable storage foundation reuses Antfly's existing artifact backend for
+immutable payloads and a separate task metadata namespace for owner checks,
+CAS revisions, lease attempts and random fencing nonces. Stage reservations are
+durable before dispatch; interrupted work retains conservative charges across
+attempts. The executor facade replays accepted stages from a bounded index, and
+event chunks commit atomically with their stage results and receive stable
+sequence cursors. Actual artifact/metadata close-and-reopen tests cover recovery.
+This foundation is not yet connected to document requests or public job routes;
+source snapshot admission, task lifecycle/GC and streamed HTTP events remain
+integration work. Process-local reading handles retain their existing lifetime.
 
 `max_output_bytes` admits full structured pages, extraction payloads and retained
 events across the run, including child work and verification attempts. Extraction

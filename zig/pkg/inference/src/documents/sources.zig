@@ -21,6 +21,7 @@ const image = @import("antfly_image");
 const c = @import("contract.zig");
 const ooxml = @import("ooxml.zig");
 const slide_parts = @import("slides.zig");
+const drawingml = @import("drawingml.zig");
 const A = std.mem.Allocator;
 pub const Input = @import("antfly_readers").DocumentSource;
 // Structural parsing is bounded independently of the selected-page work budget.
@@ -42,13 +43,14 @@ pub const Source = struct {
     // Source-owned immutable fork metadata is reused across bounded page calls.
     render_template: ?pdf.reader.RenderForkTemplate = null,
     max_regions: usize = (c.Limits{}).max_regions,
-    parsed: union(enum) { pdf: pdf.reader.Reader, image: void, slides: struct { archive: ooxml.Archive, slides: []const Slide } },
+    parsed: union(enum) { pdf: pdf.reader.Reader, image: void, slides: struct { archive: ooxml.Archive, slides: []const Slide, size: ?drawingml.Size, inheritance: slide_parts.Cache } },
     pub fn init(a: A, input: Input, bytes: []const u8, limits: c.Limits, control: c.Control) !Source {
         try control.check();
         if (input.id.len == 0 or input.id.len > 256 or bytes.len > limits.max_source_bytes) return error.InvalidDocumentSource;
         const essence = @import("antfly_readers").mediaTypeEssence(input.media_type) catch return error.InvalidDocumentSource;
         var normalized = input;
         normalized.media_type = if (std.ascii.eqlIgnoreCase(essence, "application/pdf")) "application/pdf" else if (std.ascii.eqlIgnoreCase(essence, "application/vnd.openxmlformats-officedocument.presentationml.presentation")) "application/vnd.openxmlformats-officedocument.presentationml.presentation" else if (image.inferenceFormatForMimeEssence(essence)) |format| image.inferenceMimeEssenceForFormat(format).? else return error.UnsupportedDocumentFormat;
+        if (input.quadrilateral != null and !std.mem.startsWith(u8, normalized.media_type, "image/")) return error.InvalidDocumentQuadrilateral;
         const selection: ?[]const usize = if (input.pages) |pages| blk: {
             if (pages.len == 0) return error.InvalidDocumentSelection;
             if (pages.len > limits.max_pages) return error.DocumentPageLimitExceeded;
@@ -78,6 +80,10 @@ pub const Source = struct {
         } else if (std.mem.eql(u8, normalized.media_type, "application/vnd.openxmlformats-officedocument.presentationml.presentation")) {
             const archive = try ooxml.Archive.initWithControl(a, bytes, limits.max_source_bytes, control);
             const presentation = try archive.get(a, "ppt/presentation.xml");
+            const slide_size = drawingml.presentationSize(a, presentation, control) catch |err| switch (err) {
+                error.DocumentRendererUnavailable => null,
+                else => return err,
+            };
             var slides = std.ArrayList(Slide).empty;
             var inheritance = slide_parts.Cache{ .max_regions = limits.max_regions };
             const relationships = (try inheritance.relationshipsFor(a, archive, "ppt/presentation.xml")) orelse return error.MissingDocumentPart;
@@ -111,12 +117,13 @@ pub const Source = struct {
                 try slides.append(a, slide);
             }
             if (slides.items.len == 0) return error.InvalidDocumentSource;
-            result = .{ .input = normalized, .bytes = bytes, .fingerprint = fingerprint, .parsed = .{ .slides = .{ .archive = archive, .slides = try slides.toOwnedSlice(a) } } };
+            result = .{ .input = normalized, .bytes = bytes, .fingerprint = fingerprint, .parsed = .{ .slides = .{ .archive = archive, .slides = try slides.toOwnedSlice(a), .size = slide_size, .inheritance = inheritance } } };
         } else if (std.mem.startsWith(u8, normalized.media_type, "image/")) {
             const expected = image.inferenceFormatForMimeEssence(normalized.media_type) orelse return error.UnsupportedDocumentFormat;
             if (image.detectFormat(bytes) != expected) return error.DocumentMediaTypeMismatch;
             const info = try image.inspectEncoded(bytes);
             if (info.width > limits.max_dimension or info.height > limits.max_dimension or try info.pixels() > limits.max_pixels) return error.DocumentPixelLimitExceeded;
+            if (input.quadrilateral) |quad| _ = try @import("rectification.zig").plan(quad, info.width, info.height, limits);
             result = .{ .input = normalized, .bytes = bytes, .fingerprint = fingerprint, .parsed = .image };
         } else return error.UnsupportedDocumentFormat;
         errdefer result.deinit();
@@ -258,9 +265,65 @@ pub const Source = struct {
             .image => {
                 const info = try image.inspectEncoded(self.bytes);
                 try run.pixels(try info.pixels());
+                if (self.input.quadrilateral) |quad| {
+                    const rectification = @import("rectification.zig");
+                    const target = try rectification.plan(quad, info.width, info.height, run.limits);
+                    try run.pixels(@as(u64, target.width) * target.height);
+                    const decoded = try @import("../pipelines/image.zig").decodeRgba(a, self.bytes);
+                    defer decoded.deinit(a);
+                    const rgba = try rectification.warp(a, .{ .data = decoded.data, .width = decoded.width, .height = decoded.height, .format = .rgba8 }, target, run.control);
+                    defer a.free(rgba);
+                    const Probe = struct {
+                        fn cancelled(raw: ?*const anyopaque) bool {
+                            const ctl: *const c.Control = @ptrCast(@alignCast(raw.?));
+                            ctl.check() catch return true;
+                            return false;
+                        }
+                    };
+                    const png = image.png.encodeRgbaWithOptions(a, a, target.width, target.height, rgba, .{
+                        .max_output_bytes = run.limits.max_source_bytes,
+                        .cancellation = .{ .context = &run.control, .is_cancelled_fn = Probe.cancelled },
+                    }) catch |err| {
+                        try run.control.check();
+                        return if (err == error.ImageTooLarge) error.DocumentSourceLimitExceeded else err;
+                    };
+                    return .{ .raster_to_source = target.raster_to_source, .bytes = png, .mime_type = "image/png", .width = target.width, .height = target.height, .effective_dpi = 0 };
+                }
                 return .{ .raster_to_source = .{}, .bytes = self.bytes, .mime_type = self.input.media_type, .width = info.width, .height = info.height, .effective_dpi = 0 };
             },
-            .slides => return error.DocumentRendererUnavailable,
+            .slides => |slides| {
+                if (number == 0 or number > slides.slides.len) return error.InvalidDocumentSelection;
+                const slide = slides.slides[number - 1];
+                if (slide.hidden and !self.input.include_hidden) return error.HiddenDocumentPage;
+                // Composition is only admitted when every visible layer has
+                // native display support. Never OCR an incomplete slide image.
+                const size = slides.size orelse return error.DocumentRendererUnavailable;
+                var scratch = std.heap.ArenaAllocator.init(a);
+                defer scratch.deinit();
+                const work = scratch.allocator();
+                var layers = std.ArrayList(drawingml.Layer).empty;
+                // Back-to-front master/layout/slide order, retaining the same
+                // placeholder and nearest-background decisions as extraction.
+                for (0..slide.inherited.len) |index| {
+                    const part = slide.inherited[slide.inherited.len - index - 1];
+                    if (part.conditional_content) return error.DocumentRendererUnavailable;
+                    if (!part.shapes_visible and !part.background_visible) continue;
+                    try layers.append(work, .{ .path = part.path, .view = try slides.inheritance.renderView(part.path), .shapes = part.shapes_visible, .background = part.background_visible });
+                }
+                try layers.append(work, .{ .path = slide.path, .view = slide.view orelse return error.InvalidDocumentSelection, .background = true });
+                const bytes = try drawingml.compile(work, slides.archive, size, layers.items, run);
+                var native = try Source.init(scratch.allocator(), .{ .id = self.input.id, .url = "", .media_type = "application/pdf" }, bytes, run.limits, run.control);
+                defer native.deinit();
+                var rendered = try native.render(a, 1, run);
+                // The internal display list uses PDF points with Y up; public
+                // slide evidence remains in top-left DrawingML EMU coordinates.
+                for (0..3) |column| {
+                    rendered.raster_to_source.matrix[column] *= 12700;
+                    rendered.raster_to_source.matrix[3 + column] *= -12700;
+                }
+                rendered.raster_to_source.matrix[5] += size.height;
+                return rendered;
+            },
         }
     }
 };
@@ -285,6 +348,90 @@ test "document sources normalize validated image MIME while enforcing byte ident
     }
     try std.testing.expectError(error.DocumentMediaTypeMismatch, Source.init(a, .{ .id = "image", .url = "", .media_type = "IMAGE/JPEG; charset=binary" }, bytes, .{}, .{}));
     try std.testing.expectError(error.InvalidDocumentSource, Source.init(a, .{ .id = "image", .url = "", .media_type = "image/png;" }, bytes, .{}, .{}));
+}
+
+fn expectNativeRgb(expected: [3]u8, actual: []const u8) !void {
+    // Bilinear sampling at rounded output pixels can differ from an exact
+    // source-sample center by one or two channel levels.
+    for (expected, actual) |left, right| try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(left)), @as(f32, @floatFromInt(right)), 2);
+}
+
+test "document native slide pictures preserve quadrants alpha and slide coordinates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var source = try Source.init(a, .{ .id = "slide", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, @embedFile("testdata/native-pictures.pptx"), .{}, .{});
+    defer source.deinit();
+    var run = c.Run{ .limits = .{} };
+    defer run.deinit();
+    const raster = try source.render(a, 1, &run);
+    const decoded = try @import("../pipelines/image.zig").decodeRgba(a, raster.bytes);
+    defer decoded.deinit(a);
+    const samples = [_]struct { x: f64, y: f64, color: [3]u8 }{
+        .{ .x = 0.25, .y = 0.25, .color = .{ 255, 0, 0 } },
+        .{ .x = 0.625, .y = 0.25, .color = .{ 0, 0, 255 } },
+        .{ .x = 0.875, .y = 0.25, .color = .{ 0, 255, 0 } },
+        .{ .x = 0.625, .y = 0.75, .color = .{ 255, 255, 255 } },
+        .{ .x = 0.875, .y = 0.75, .color = .{ 255, 255, 0 } },
+    };
+    for (samples) |sample| {
+        const x: usize = @intFromFloat(sample.x * @as(f64, @floatFromInt(decoded.width)));
+        const y: usize = @intFromFloat(sample.y * @as(f64, @floatFromInt(decoded.height)));
+        const pixel = decoded.data[(y * decoded.width + x) * 4 ..][0..3];
+        try expectNativeRgb(sample.color, pixel);
+    }
+    const corner = try raster.raster_to_source.point(.{ @floatFromInt(raster.width), @floatFromInt(raster.height) });
+    // Native PDF raster dimensions ceil fractional DPI extents. The last
+    // column can extend beyond the slide by less than one physical pixel.
+    const pixel_emu = 72.0 * 12700 / @as(f64, @floatFromInt(raster.effective_dpi));
+    try std.testing.expect(corner[0] >= 2540000 and corner[0] - 2540000 < pixel_emu);
+    try std.testing.expectApproxEqAbs(@as(f64, 1270000), corner[1], 0.0001);
+    try std.testing.expectEqual(@as(usize, 0), run.usage.physical_model_calls);
+    try std.testing.expect(run.usage.rendered_pixels > 4);
+}
+
+test "document native slide nearest background remains beneath inherited master shapes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var source = try Source.init(a, .{ .id = "slide", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, @embedFile("testdata/native-layers.pptx"), .{}, .{});
+    defer source.deinit();
+    var run = c.Run{ .limits = .{} };
+    defer run.deinit();
+    const raster = try source.render(a, 1, &run);
+    const decoded = try @import("../pipelines/image.zig").decodeRgba(a, raster.bytes);
+    defer decoded.deinit(a);
+    const y: usize = decoded.height * 3 / 4;
+    const decoration = decoded.data[(y * decoded.width + decoded.width / 4) * 4 ..][0..3];
+    const background = decoded.data[(y * decoded.width + decoded.width * 5 / 8) * 4 ..][0..3];
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0 }, decoration);
+    try expectNativeRgb(.{ 0, 255, 0 }, background);
+}
+
+test "document native nested slide groups compose child extents without shifting source coordinates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var source = try Source.init(a, .{ .id = "group", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, @embedFile("testdata/native-groups.pptx"), .{}, .{});
+    defer source.deinit();
+    var run = c.Run{ .limits = .{} };
+    defer run.deinit();
+    const raster = try source.render(a, 1, &run);
+    const decoded = try @import("../pipelines/image.zig").decodeRgba(a, raster.bytes);
+    defer decoded.deinit(a);
+    const samples = [_]struct { x: f64, y: f64, color: [3]u8 }{
+        .{ .x = 0.125, .y = 0.5, .color = .{ 255, 255, 255 } },
+        .{ .x = 0.375, .y = 0.5, .color = .{ 255, 0, 0 } },
+        .{ .x = 0.5625, .y = 0.375, .color = .{ 0, 0, 255 } },
+        .{ .x = 0.6875, .y = 0.375, .color = .{ 0, 255, 0 } },
+        .{ .x = 0.5625, .y = 0.625, .color = .{ 255, 255, 255 } },
+        .{ .x = 0.6875, .y = 0.625, .color = .{ 255, 255, 0 } },
+    };
+    for (samples) |sample| {
+        const x: usize = @intFromFloat(sample.x * @as(f64, @floatFromInt(decoded.width)));
+        const y: usize = @intFromFloat(sample.y * @as(f64, @floatFromInt(decoded.height)));
+        try expectNativeRgb(sample.color, decoded.data[(y * decoded.width + x) * 4 ..][0..3]);
+    }
 }
 
 test "document selections spend page budget only on selected PDF pages and slides" {

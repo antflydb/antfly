@@ -118,7 +118,7 @@ pub const Tag = struct {
     }
     /// Visibility metadata must not silently use the first of contradictory
     /// attributes or treat malformed attributes as an absent/default flag.
-    fn uniqueAttr(self: Tag, wanted: []const u8) !?[]const u8 {
+    pub fn uniqueAttr(self: Tag, wanted: []const u8) !?[]const u8 {
         var result: ?[]const u8 = null;
         var attrs = Attributes{ .raw = self.raw, .index = self.name.len };
         while (try attrs.next()) |attr_value| if (std.mem.eql(u8, attr_value.name, wanted)) {
@@ -362,11 +362,12 @@ const table_namespace = "http://schemas.openxmlformats.org/drawingml/2006/table"
 fn isTableUri(raw: []const u8) !bool {
     return try decodedEqual(raw, table_namespace) or try decodedEqual(raw, "http://purl.oclc.org/ooxml/drawingml/table");
 }
-const Namespace = enum { presentation, drawing, compatibility, office_relationships, package_relationships, other, fragment };
+pub const Namespace = enum { presentation, drawing, chart, compatibility, office_relationships, package_relationships, other, fragment };
 const ProjectionMode = enum { part, fragment, manifest };
 fn namespaceKind(uri: []const u8) !Namespace {
     if (try decodedEqual(uri, pml_namespace) or try decodedEqual(uri, "http://purl.oclc.org/ooxml/presentationml/main")) return .presentation;
     if (try decodedEqual(uri, dml_namespace) or try decodedEqual(uri, "http://purl.oclc.org/ooxml/drawingml/main")) return .drawing;
+    if (try decodedEqual(uri, "http://schemas.openxmlformats.org/drawingml/2006/chart") or try decodedEqual(uri, "http://purl.oclc.org/ooxml/drawingml/chart")) return .chart;
     if (try decodedEqual(uri, mc_namespace)) return .compatibility;
     if (try decodedEqual(uri, "http://schemas.openxmlformats.org/officeDocument/2006/relationships") or try decodedEqual(uri, "http://purl.oclc.org/ooxml/officeDocument/relationships")) return .office_relationships;
     if (try decodedEqual(uri, "http://schemas.openxmlformats.org/package/2006/relationships")) return .package_relationships;
@@ -635,7 +636,10 @@ fn projectBytes(a: A, bytes: []const u8, control: @import("contract.zig").Contro
             continue;
         }
         const core = vocabulary == .presentation or vocabulary == .drawing;
-        const is_metadata = core and (std.mem.eql(u8, local, "extLst") or std.mem.eql(u8, local, "ext") or std.mem.eql(u8, local, "custDataLst"));
+        // DrawingML `ext` is the extent of a transform. Only PresentationML
+        // `ext` is an extension container; local-name filtering erased shape
+        // dimensions before native rendering could inspect the checked view.
+        const is_metadata = core and (std.mem.eql(u8, local, "extLst") or (vocabulary == .presentation and std.mem.eql(u8, local, "ext")) or std.mem.eql(u8, local, "custDataLst"));
         var excluded = is_metadata or (!core and vocabulary != .fragment);
         if (mode == .part and !excluded) {
             if (presentation_signals.has(local) and vocabulary != .presentation) excluded = true;
@@ -727,7 +731,7 @@ fn projectBytes(a: A, bytes: []const u8, control: @import("contract.zig").Contro
 pub fn presentationSlideIds(a: A, bytes: []const u8, control: @import("contract.zig").Control) ![]const []const u8 {
     return (try projectBytes(a, bytes, control, .manifest)).slide_ids;
 }
-fn decodedText(a: A, raw: []const u8) ![]const u8 {
+pub fn decodedText(a: A, raw: []const u8) ![]const u8 {
     if (std.mem.indexOfScalar(u8, raw, '&') == null) {
         if (!std.unicode.utf8ValidateSlice(raw)) return error.InvalidDocumentXml;
         return raw;
@@ -740,10 +744,72 @@ fn decodedText(a: A, raw: []const u8) ![]const u8 {
     if (!std.unicode.utf8ValidateSlice(result)) return error.InvalidDocumentXml;
     return result;
 }
-pub const RelationshipKind = enum { slide, layout, master, notes, other };
+/// Namespace-aware token traversal for native visual compilation. Consume full
+/// checked parts, so inherited bindings remain available for nested drawings.
+pub const QualifiedXml = struct {
+    allocator: A,
+    xml: Xml,
+    namespaces: Namespaces = .{},
+    close_depth: ?usize = null,
+    pub const Token = union(enum) {
+        tag: struct { value: Tag, namespace: Namespace, depth: usize },
+        text: []const u8,
+    };
+    pub fn init(a: A, bytes: []const u8) QualifiedXml {
+        return .{ .allocator = a, .xml = .{ .bytes = bytes } };
+    }
+    pub fn deinit(self: *QualifiedXml) void {
+        self.namespaces.deinit(self.allocator);
+    }
+    pub fn next(self: *QualifiedXml) !?QualifiedXml.Token {
+        if (self.close_depth) |depth| {
+            self.namespaces.close(depth);
+            self.close_depth = null;
+        }
+        const token = (try self.xml.next()) orelse return null;
+        if (token == .text) return .{ .text = token.text };
+        const tag = token.tag;
+        const depth = self.xml.depth + @intFromBool(tag.closing or tag.empty);
+        if (!tag.closing) try self.namespaces.open(self.allocator, tag, depth);
+        const vocabulary = self.namespaces.kind(tag, .part);
+        if (tag.closing or tag.empty) self.close_depth = depth;
+        return .{ .tag = .{ .value = tag, .namespace = vocabulary, .depth = depth } };
+    }
+    pub fn attribute(self: *const QualifiedXml, tag: Tag, vocabulary: Namespace, local: []const u8) !?[]const u8 {
+        return self.namespaces.expandedAttribute(tag, vocabulary, local);
+    }
+};
+
+test "document native drawing tokens preserve scoped namespaces and qualified relationships" {
+    const bytes =
+        \\<s:sld xmlns:s="http://purl.oclc.org/ooxml/presentationml/main" xmlns:d="http://purl.oclc.org/ooxml/drawingml/main" xmlns:r="http://purl.oclc.org/ooxml/officeDocument/relationships">
+        \\<d:blip r:embed="image-1"/><s:sp xmlns:d="urn:foreign"><d:blip r:embed="fake"/></s:sp><d:blip r:embed="image-2"/>
+        \\</s:sld>
+    ;
+    var iter = QualifiedXml.init(std.testing.allocator, bytes);
+    defer iter.deinit();
+    var drawings: usize = 0;
+    var foreign: usize = 0;
+    while (try iter.next()) |token| {
+        if (token != .tag or token.tag.value.closing or !std.mem.eql(u8, token.tag.value.local(), "blip")) continue;
+        if (token.tag.namespace == .drawing) {
+            drawings += 1;
+            const id = (try iter.attribute(token.tag.value, .office_relationships, "embed")).?;
+            try std.testing.expectEqualStrings(if (drawings == 1) "image-1" else "image-2", id);
+        } else foreign += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), drawings);
+    try std.testing.expectEqual(@as(usize, 1), foreign);
+    var duplicate = QualifiedXml.init(std.testing.allocator, "<p xmlns:r='http://purl.oclc.org/ooxml/officeDocument/relationships' xmlns:s='http://purl.oclc.org/ooxml/officeDocument/relationships' r:embed='a' s:embed='b'/>");
+    defer duplicate.deinit();
+    const tag = (try duplicate.next()).?.tag.value;
+    try std.testing.expectError(error.InvalidDocumentXml, duplicate.attribute(tag, .office_relationships, "embed"));
+}
+
+pub const RelationshipKind = enum { slide, layout, master, notes, image, chart, theme, other };
 pub const Relationship = struct { target: []const u8, kind: RelationshipKind, external: bool };
 fn relationshipKind(raw: []const u8) !RelationshipKind {
-    inline for (.{ .{ "slide", RelationshipKind.slide }, .{ "slideLayout", RelationshipKind.layout }, .{ "slideMaster", RelationshipKind.master }, .{ "notesSlide", RelationshipKind.notes } }) |entry| {
+    inline for (.{ .{ "slide", RelationshipKind.slide }, .{ "slideLayout", RelationshipKind.layout }, .{ "slideMaster", RelationshipKind.master }, .{ "notesSlide", RelationshipKind.notes }, .{ "image", RelationshipKind.image }, .{ "chart", RelationshipKind.chart }, .{ "theme", RelationshipKind.theme } }) |entry| {
         if (try decodedEqual(raw, "http://schemas.openxmlformats.org/officeDocument/2006/relationships/" ++ entry[0]) or
             try decodedEqual(raw, "http://purl.oclc.org/ooxml/officeDocument/relationships/" ++ entry[0])) return entry[1];
     }
@@ -753,8 +819,8 @@ fn relationshipKind(raw: []const u8) !RelationshipKind {
 /// Extension payloads and wrong-vocabulary lookalikes cannot declare links.
 pub const Relationships = struct {
     items: std.StringHashMapUnmanaged(Relationship) = .{},
-    by_kind: [5]?Relationship = @splat(null),
-    duplicate_kind: [5]bool = @splat(false),
+    by_kind: [@typeInfo(RelationshipKind).@"enum".field_names.len]?Relationship = @splat(null),
+    duplicate_kind: [@typeInfo(RelationshipKind).@"enum".field_names.len]bool = @splat(false),
     pub fn init(a: A, bytes: []const u8, control: @import("contract.zig").Control) !Relationships {
         var result = Relationships{};
         errdefer result.items.deinit(a);

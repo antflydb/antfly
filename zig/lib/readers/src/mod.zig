@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const document_runs = @import("document_runs.zig");
 const httpx = @import("httpx");
 const google_auth = @import("antfly_google").auth;
 const inference_api = @import("inference_api");
@@ -64,6 +65,8 @@ pub const InlineContentTrust = enum {
 };
 
 pub const DocumentSource = struct {
+    /// Clockwise image-edge corners: top-left, top-right, bottom-right, bottom-left.
+    quadrilateral: ?[4][2]f64 = null,
     id: []const u8,
     url: []const u8,
     media_type: []const u8,

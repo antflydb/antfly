@@ -28855,6 +28855,8 @@ export interface components {
          */
         ExtractionSchemaVersion: 1 | 2;
         DocumentSource: {
+            /** @description Image-only perspective correction. Four clockwise corners in original image-edge pixels, ordered top-left, top-right, bottom-right, bottom-left. OCR evidence remains in original source coordinates. */
+            quadrilateral?: number[][];
             /** @description Unique source identity within the request. Separate sources are never implicitly merged. */
             id: string;
             /** @description Inline data URI or location allowed by the deployment content security policy. */

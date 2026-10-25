@@ -18167,6 +18167,16 @@ pub const Node = struct {
         return limits;
     }
 
+    /// Borrow the node-owned executor; document requests never create their
+    /// own thread pool merely to enable page concurrency.
+    pub fn documentBatching(_: *Node) bool {
+        return true;
+    }
+
+    pub fn documentIo(self: *Node) ?std.Io {
+        return self.session_manager.io;
+    }
+
     pub fn documentDownload(self: *Node, a: std.mem.Allocator, url: []const u8, max_bytes: usize, control: InferenceExecutionControl) !scraping.DownloadedContent {
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*owned| owned.deinit();
@@ -18192,15 +18202,23 @@ pub const Node = struct {
                 session.allocator.destroy(session);
             }
         };
-        const session: *Session = if (run.provider_state) |state| @ptrCast(@alignCast(state)) else init: {
-            const backing = run.work_allocator orelse a;
-            const state = try backing.create(Session);
-            state.* = .{ .allocator = backing, .client = undefined };
-            const io = self.inferenceIo(backing, control.io, &state.owned_io);
-            state.client = httpx.Client.init(backing, io);
-            run.provider_state = state;
-            run.provider_deinit_fn = Session.release;
-            break :init state;
+        // The shared pool outlives all page scratch arenas. Serialize only
+        // lazy initialization; HTTP requests run concurrently on the pool.
+        if (run.shared) |shared| shared.lock();
+        const session: *Session = session: {
+            defer if (run.shared) |shared| shared.mutex.unlock();
+            const owner = if (run.shared) |shared| &shared.provider_state else &run.provider_state;
+            const release = if (run.shared) |shared| &shared.provider_deinit_fn else &run.provider_deinit_fn;
+            break :session if (owner.*) |state| @ptrCast(@alignCast(state)) else init: {
+                const backing = run.work_allocator orelse a;
+                const state = try backing.create(Session);
+                state.* = .{ .allocator = backing, .client = undefined };
+                const io = self.inferenceIo(backing, control.io, &state.owned_io);
+                state.client = httpx.Client.init(backing, io);
+                owner.* = state;
+                release.* = Session.release;
+                break :init state;
+            };
         };
         const Cancel = struct {
             fn cancelled(raw: *const anyopaque) bool {
@@ -22209,11 +22227,11 @@ pub const Node = struct {
                 },
                 .executor = if (definition != null) "declarative_composite" else "native_document",
                 .remote_execution = if (definition) |def| def.allow_remote else false,
-                .max_parallel_calls = @as(u32, 1),
+                .max_parallel_calls = @as(u32, if (self.session_manager.io != null) @intCast(@min(limits.max_parallel_pages, limits.max_parallel_calls)) else 1),
                 .document_formats = .{
-                    .pdf = .{ .native_text = true, .visual_rendering = true, .annotation_rendering = false },
-                    .pptx = .{ .native_text = true, .visual_rendering = false, .speaker_notes = true, .hidden_slide_policy = true },
-                    .images = .{ .formats = .{ "image/png", "image/jpeg", "image/webp" }, .perspective_correction = false },
+                    .pdf = .{ .native_text = true, .visual_rendering = true, .annotation_rendering = true },
+                    .pptx = .{ .native_text = true, .visual_rendering = true, .native_pictures = true, .basic_vector_shapes = true, .solid_backgrounds = true, .group_transforms = true, .chart_rendering = false, .text_rendering = false, .speaker_notes = true, .hidden_slide_policy = true },
+                    .images = .{ .formats = .{ "image/png", "image/jpeg", "image/webp" }, .perspective_correction = true },
                 },
                 .artifact_reuse = .{ .retention = "process_local", .max_ttl_ms = @as(u32, 300000), .durable_resume = false },
             },
@@ -40812,7 +40830,8 @@ test "document direct read accepts whole PDF and ordered PPTX without model admi
     var catalog = try std.json.parseFromSlice(std.json.Value, a, catalog_bytes, .{});
     defer catalog.deinit();
     const native = catalog.value.object.get("readers").?.object.get("antfly/native-document").?;
-    try std.testing.expect(!native.object.get("inference_capabilities").?.object.get("document_formats").?.object.get("pptx").?.object.get("visual_rendering").?.bool);
+    try std.testing.expect(native.object.get("inference_capabilities").?.object.get("document_formats").?.object.get("pptx").?.object.get("visual_rendering").?.bool);
+    try std.testing.expect(!native.object.get("inference_capabilities").?.object.get("document_formats").?.object.get("pptx").?.object.get("chart_rendering").?.bool);
 }
 
 test "document model dispatch preserves client errors for invalid ordinary model names" {
@@ -40858,7 +40877,7 @@ test "document artifact admission reclaims retained memory without evicting on i
     try std.testing.expectError(error.DocumentArtifactNotFound, node.readDocumentArtifact(a, &@as([64]u8, @splat('a'))));
 }
 
-test "document native annotation coverage remains unresolved through HTTP and typed decoding" {
+test "document native static annotation coverage requires visual reading through HTTP and typed decoding" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -40885,7 +40904,8 @@ test "document native annotation coverage remains unresolved through HTTP and ty
     var batch = try readers_api.documentBatchResult(a, response.body.?);
     defer batch.deinit(a);
     try std.testing.expectEqual(readers_api.Completion.unresolved, batch.items[0].completion);
-    try std.testing.expect(std.mem.indexOf(u8, batch.items[0].document_json.?, "pdf_annotation_rendering_unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, batch.items[0].document_json.?, "visual_content_requires_inspection") != null);
+    try std.testing.expect(std.mem.indexOf(u8, batch.items[0].document_json.?, "pdf_annotation_rendering_unavailable") == null);
 }
 
 test "document task namespaces stay distinct in dispatch limits and discovery" {

@@ -63867,6 +63867,20 @@ components:
         - url
         - media_type
       properties:
+        quadrilateral:
+          type: array
+          minItems: 4
+          maxItems: 4
+          description: Image-only perspective correction. Four clockwise corners in original image-edge
+            pixels, ordered top-left, top-right, bottom-right, bottom-left. OCR evidence remains in original
+            source coordinates.
+          items:
+            type: array
+            minItems: 2
+            maxItems: 2
+            items:
+              type: number
+              format: double
         id:
           type: string
           minLength: 1

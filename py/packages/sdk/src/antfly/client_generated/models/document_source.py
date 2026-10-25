@@ -18,6 +18,9 @@ class DocumentSource:
         id (str): Unique source identity within the request. Separate sources are never implicitly merged.
         url (str): Inline data URI or location allowed by the deployment content security policy.
         media_type (DocumentSourceMediaType):
+        quadrilateral (list[list[float]] | Unset): Image-only perspective correction. Four clockwise corners in original
+            image-edge pixels, ordered top-left, top-right, bottom-right, bottom-left. OCR evidence remains in original
+            source coordinates.
         pages (list[int] | Unset): Optional one-based page/slide selection, returned in original source order. Omission
             selects every visible page/slide.
         include_notes (bool | Unset): Include slide speaker notes as separate evidence, never silently as visible slide
@@ -28,6 +31,7 @@ class DocumentSource:
     id: str
     url: str
     media_type: DocumentSourceMediaType
+    quadrilateral: list[list[float]] | Unset = UNSET
     pages: list[int] | Unset = UNSET
     include_notes: bool | Unset = False
     include_hidden: bool | Unset = False
@@ -38,6 +42,14 @@ class DocumentSource:
         url = self.url
 
         media_type = self.media_type.value
+
+        quadrilateral: list[list[float]] | Unset = UNSET
+        if not isinstance(self.quadrilateral, Unset):
+            quadrilateral = []
+            for quadrilateral_item_data in self.quadrilateral:
+                quadrilateral_item = quadrilateral_item_data
+
+                quadrilateral.append(quadrilateral_item)
 
         pages: list[int] | Unset = UNSET
         if not isinstance(self.pages, Unset):
@@ -56,6 +68,8 @@ class DocumentSource:
                 "media_type": media_type,
             }
         )
+        if quadrilateral is not UNSET:
+            field_dict["quadrilateral"] = quadrilateral
         if pages is not UNSET:
             field_dict["pages"] = pages
         if include_notes is not UNSET:
@@ -74,6 +88,15 @@ class DocumentSource:
 
         media_type = DocumentSourceMediaType(d.pop("media_type"))
 
+        _quadrilateral = d.pop("quadrilateral", UNSET)
+        quadrilateral: list[list[float]] | Unset = UNSET
+        if _quadrilateral is not UNSET:
+            quadrilateral = []
+            for quadrilateral_item_data in _quadrilateral:
+                quadrilateral_item = cast(list[float], quadrilateral_item_data)
+
+                quadrilateral.append(quadrilateral_item)
+
         pages = cast(list[int], d.pop("pages", UNSET))
 
         include_notes = d.pop("include_notes", UNSET)
@@ -84,6 +107,7 @@ class DocumentSource:
             id=id,
             url=url,
             media_type=media_type,
+            quadrilateral=quadrilateral,
             pages=pages,
             include_notes=include_notes,
             include_hidden=include_hidden,

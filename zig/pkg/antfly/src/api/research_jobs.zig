@@ -35,6 +35,7 @@ const agent_tools = @import("agent_tools.zig");
 const platform_sync = @import("antfly_platform").sync;
 
 pub const StoreConfig = struct {
+    namespace: enum { research, documents } = .research,
     path: ?[]const u8 = null,
     retention_ms: ?u64 = null,
     /// Jobs per owner that may be queued or running at once.
@@ -119,6 +120,9 @@ pub const Store = struct {
     /// Engine-owned store (standalone LSM root). Borrowed; outlives `Store`.
     runtime: ?*backend_erased.Store = null,
     mutex: std.atomic.Mutex = .unlocked,
+    /// An ambiguous durable document-state write requires a store reload before
+    /// another reservation can be authorized from the in-memory mirror.
+    document_write_failed: bool = false,
     /// job_id -> encoded Record, owned by `alloc`.
     jobs: std.StringHashMapUnmanaged([]u8) = .empty,
     /// job_id -> owner and activity, kept beside `jobs` so quota checks do
@@ -126,6 +130,60 @@ pub const Store = struct {
     meta: std.StringHashMapUnmanaged(Meta) = .empty,
 
     const Meta = struct { owner: []u8, active: bool };
+
+    fn keyPrefix(self: *const Store) []const u8 {
+        return if (self.cfg.namespace == .documents) "__api_document_runs__:" else key_prefix;
+    }
+    pub fn durable(self: *const Store) bool {
+        return self.opened_store != null or self.runtime != null;
+    }
+
+    /// Versioned task metadata reuses durable job storage and owner quotas.
+    /// Compare the entire revision/attempt/nonce fence atomically; a restored
+    /// record cannot authorize a superseded worker with the same counter.
+    pub fn compareDocumentRun(self: *Store, expected: anytype, next: anytype, now_fn: *const fn () u64) !bool {
+        if (self.cfg.namespace != .documents) return error.DocumentStorageNotConfigured;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.document_write_failed) return error.DocumentRunStoreNeedsRecovery;
+        var outer: Record = undefined;
+        if (self.jobs.get(next.run_id)) |bytes| {
+            if (expected == null) return false;
+            outer = try std.json.parseFromSliceLeaky(Record, a, bytes, .{ .allocate = .alloc_always });
+            if (!std.mem.eql(u8, outer.owner, next.owner)) return false;
+            const previous = try std.json.parseFromSliceLeaky(@TypeOf(next), a, outer.request, .{});
+            if (!std.meta.eql(previous.version(), expected.?) or next.revision != expected.?.revision + 1) return false;
+            // Recheck at the metadata linearization point. Artifact IO may
+            // have outlived the timestamp used to prepare this transition.
+            const now = now_fn();
+            if (previous.state == .running) {
+                if (next.attempt == previous.attempt and next.state != .cancelled and now >= previous.lease_until_ms) return error.DocumentRunLeaseLost;
+                if (next.attempt > previous.attempt and now < previous.lease_until_ms) return error.DocumentRunBusy;
+            }
+        } else {
+            if (expected != null) return false;
+            var active: usize = 0;
+            var owners = self.meta.valueIterator();
+            while (owners.next()) |meta| if (meta.active and std.mem.eql(u8, meta.owner, next.owner)) {
+                active += 1;
+            };
+            if (active >= self.cfg.max_active_per_owner) return error.TooManyActiveJobs;
+            outer = .{ .job_id = next.run_id, .owner = next.owner, .request = "", .state = .queued, .created_at_ms = nowMillis(), .updated_at_ms = nowMillis(), .expires_at_ms = 0 };
+        }
+        outer.request = try std.json.Stringify.valueAlloc(a, next, .{});
+        outer.state = std.meta.stringToEnum(JobState, @tagName(next.state)) orelse return error.InvalidDocumentCheckpoint;
+        outer.phase = "document";
+        outer.attempt = next.attempt;
+        outer.advances = next.revision;
+        outer.lease_until_ms = next.lease_until_ms;
+        outer.updated_at_ms = nowMillis();
+        outer.expires_at_ms = outer.updated_at_ms +| self.retentionMillis();
+        try self.putLocked(outer);
+        return true;
+    }
 
     pub fn init(alloc: std.mem.Allocator, cfg: StoreConfig) Store {
         return .{ .alloc = alloc, .cfg = cfg };
@@ -159,7 +217,7 @@ pub const Store = struct {
         defer self.mutex.unlock();
         self.opened_store = opened;
         errdefer self.opened_store = null;
-        const results = try opened.docstore.scanPrefix(self.alloc, key_prefix);
+        const results = try opened.docstore.scanPrefix(self.alloc, self.keyPrefix());
         defer docstore_mod.DocStore.freeResults(self.alloc, results);
         for (results) |kv| {
             var parsed = std.json.parseFromSlice(Record, self.alloc, kv.value, .{ .ignore_unknown_fields = true }) catch continue;
@@ -192,9 +250,9 @@ pub const Store = struct {
             defer txn.abort();
             var cursor = try txn.openCursor();
             defer cursor.close();
-            var entry = try cursor.seekAtOrAfter(key_prefix);
+            var entry = try cursor.seekAtOrAfter(self.keyPrefix());
             while (entry) |row| : (entry = try cursor.next()) {
-                if (!std.mem.startsWith(u8, row.key, key_prefix)) break;
+                if (!std.mem.startsWith(u8, row.key, self.keyPrefix())) break;
                 try rows.append(self.alloc, try self.alloc.dupe(u8, row.value));
             }
         }
@@ -243,6 +301,7 @@ pub const Store = struct {
     pub fn load(self: *Store, arena: std.mem.Allocator, job_id: []const u8, owner: []const u8) !?Record {
         lock(&self.mutex);
         defer self.mutex.unlock();
+        if (self.cfg.namespace == .documents and self.document_write_failed) return error.DocumentRunStoreNeedsRecovery;
         const encoded = self.jobs.get(job_id) orelse return null;
         const record = try std.json.parseFromSliceLeaky(Record, arena, try arena.dupe(u8, encoded), .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
         if (!std.mem.eql(u8, record.owner, owner)) return null;
@@ -362,7 +421,7 @@ pub const Store = struct {
             expired.append(self.alloc, entry.key_ptr.*) catch continue;
         }
         for (expired.items) |job_id| {
-            const key = std.fmt.allocPrint(self.alloc, "{s}{s}", .{ key_prefix, job_id }) catch continue;
+            const key = std.fmt.allocPrint(self.alloc, "{s}{s}", .{ self.keyPrefix(), job_id }) catch continue;
             defer self.alloc.free(key);
             if (self.opened_store) |opened| opened.docstore.putBatch(&.{}, &.{key}) catch {};
             if (self.runtime) |runtime| deleteRuntime(runtime, key) catch {};
@@ -377,9 +436,26 @@ pub const Store = struct {
     fn putLocked(self: *Store, record: Record) !void {
         const encoded = try std.json.Stringify.valueAlloc(self.alloc, record, .{});
         errdefer self.alloc.free(encoded);
+        const owner = try self.alloc.dupe(u8, record.owner);
+        errdefer self.alloc.free(owner);
+        try self.meta.ensureUnusedCapacity(self.alloc, 1);
+        const existing = self.jobs.getKey(record.job_id);
+        var new_key: ?[]u8 = null;
+        defer if (new_key) |key| self.alloc.free(key);
+        const stable_key = existing orelse key: {
+            try self.jobs.ensureUnusedCapacity(self.alloc, 1);
+            new_key = try self.alloc.dupe(u8, record.job_id);
+            break :key new_key.?;
+        };
+        // Finish every fallible cache allocation before durable publication.
+        // An IO error can be ambiguous; document runs then refuse admission
+        // until reopening reconstructs the authoritative committed record.
         if (self.opened_store != null or self.runtime != null) {
-            const key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ key_prefix, record.job_id });
+            const key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ self.keyPrefix(), stable_key });
             defer self.alloc.free(key);
+            errdefer if (self.cfg.namespace == .documents) {
+                self.document_write_failed = true;
+            };
             if (self.opened_store) |opened| try opened.docstore.put(key, encoded);
             if (self.runtime) |runtime| {
                 var txn = try runtime.beginWrite();
@@ -388,19 +464,14 @@ pub const Store = struct {
                 try txn.commit();
             }
         }
-        const owner = try self.alloc.dupe(u8, record.owner);
-        errdefer self.alloc.free(owner);
-        try self.meta.ensureUnusedCapacity(self.alloc, 1);
-        if (self.jobs.getEntry(record.job_id)) |entry| {
+        if (self.jobs.getEntry(stable_key)) |entry| {
             self.alloc.free(entry.value_ptr.*);
             entry.value_ptr.* = encoded;
         } else {
-            const key = try self.alloc.dupe(u8, record.job_id);
-            errdefer self.alloc.free(key);
-            try self.jobs.put(self.alloc, key, encoded);
+            self.jobs.putAssumeCapacity(stable_key, encoded);
+            new_key = null;
         }
-        const key = self.jobs.getKey(record.job_id).?;
-        const slot = self.meta.getOrPutAssumeCapacity(key);
+        const slot = self.meta.getOrPutAssumeCapacity(stable_key);
         if (slot.found_existing) self.alloc.free(slot.value_ptr.owner);
         slot.value_ptr.* = .{ .owner = owner, .active = !record.terminal() };
     }
