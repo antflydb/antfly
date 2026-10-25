@@ -6759,5 +6759,6 @@ test "embeddinggemma2 streamed FFN restores controls and releases post-cancel ou
 }
 
 test {
+    _ = kernel_descriptor;
     _ = @import("embedding_vision_plan.zig");
 }

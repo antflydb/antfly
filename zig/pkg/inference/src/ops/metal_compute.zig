@@ -46,7 +46,7 @@ pub fn supportsAssignedDescriptor(descriptor: *const ops.kernel_descriptor.Descr
             // a separate result buffer to an operation that can remain a view.
             if (plan.contiguous()) return false;
         },
-        .gather => |gather| if (gather.axis != 0 or descriptor.input_shapes[0].rank() != 2) return false,
+        .gather => |gather| if (gather.axis != 0 or descriptor.input_shapes[0].rank() != 2 or descriptor.input_shapes[1].dtype != .f32) return false,
         .broadcast => |layout| {
             if (layout.input_rank == 0 or layout.input_rank != layout.output_rank) return false;
             for (0..layout.input_rank) |axis| {

@@ -108,6 +108,8 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         "src/ops/cuda/kernels/q6_e4b_tile8_partials.cuh",
         "src/ops/cuda/kernels/quant_argmax_tile4_publish.cuh",
         "src/ops/cuda/kernels/block_local_attention.cuh",
+        "src/ops/cuda/kernels/primitive_gather.cuh",
+        "src/ops/cuda/kernels/primitive_scatter.cuh",
         "src/ops/cuda/kernels/dense_fast_attention_online.cuh",
         "src/ops/cuda/kernels/training_validation.cuh",
         "src/ops/cuda/kernels/gliner25_layer_norm.cuh",

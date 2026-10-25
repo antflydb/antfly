@@ -922,3 +922,63 @@ unsigned int log_softmax
     unsigned int in_dim, \
     unsigned int q_out_dim, \
     unsigned int kv_out_dim
+
+#define ANTFLY_CUDA_PRIMITIVE_GATHER_I32_PARAMS \
+    float* output, \
+    const float* input, \
+    const int* indices, \
+    unsigned int output_count, \
+    unsigned int index_count, \
+    unsigned int axis_extent, \
+    unsigned int suffix_size
+
+#define ANTFLY_CUDA_PRIMITIVE_GATHER_I64_PARAMS \
+    float* output, \
+    const float* input, \
+    const long long* indices, \
+    unsigned int output_count, \
+    unsigned int index_count, \
+    unsigned int axis_extent, \
+    unsigned int suffix_size
+
+#define ANTFLY_CUDA_PRIMITIVE_GATHER_BF16_I32_PARAMS \
+    float* output, \
+    const unsigned short* input, \
+    const int* indices, \
+    unsigned int output_count, \
+    unsigned int index_count, \
+    unsigned int axis_extent, \
+    unsigned int suffix_size
+
+#define ANTFLY_CUDA_PRIMITIVE_GATHER_BF16_I64_PARAMS \
+    float* output, \
+    const unsigned short* input, \
+    const long long* indices, \
+    unsigned int output_count, \
+    unsigned int index_count, \
+    unsigned int axis_extent, \
+    unsigned int suffix_size
+
+#define ANTFLY_CUDA_PRIMITIVE_SCATTER_PARAMS \
+    float* output, \
+    const float* input, \
+    const float* indices, \
+    unsigned int rows, \
+    unsigned int cols, \
+    unsigned int output_rows
+
+#define ANTFLY_CUDA_PRIMITIVE_SCATTER_I32_PARAMS \
+    float* output, \
+    const float* input, \
+    const int* indices, \
+    unsigned int rows, \
+    unsigned int cols, \
+    unsigned int output_rows
+
+#define ANTFLY_CUDA_PRIMITIVE_SCATTER_I64_PARAMS \
+    float* output, \
+    const float* input, \
+    const long long* indices, \
+    unsigned int rows, \
+    unsigned int cols, \
+    unsigned int output_rows

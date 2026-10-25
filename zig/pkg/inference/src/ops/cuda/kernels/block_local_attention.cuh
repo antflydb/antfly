@@ -1,7 +1,8 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 // Included directly in the two native 128-thread kernels; no include guard.
-// Local is static. Full/local ranges, sentinels, bias and finite checks retain their original contracts.
+// Local is static. Full/local ranges and bias retain native schedules.
+// Invalid scores are -infinity so an empty softmax publishes zero in both modes.
 
     unsigned int row_id = blockIdx.x;
     unsigned int total_rows = batch * seq_len * num_heads;
@@ -19,7 +20,7 @@
 
     const unsigned int begin = Local && qi > radius ? qi - radius : 0u;
     const unsigned int end = Local && radius < seq_len - 1u - qi ? qi + radius + 1u : seq_len;
-    float max_score = Local ? -INFINITY : -3.402823466e+38f;
+    float max_score = -INFINITY;
     for (unsigned int ki = begin; ki < end; ++ki) {
         bool valid = Local ? mask[b * seq_len + ki] != 0ll : !(causal && ki > qi) && !(has_mask && mask[b * seq_len + ki] == 0ll);
         float part = 0.0f;
@@ -34,7 +35,7 @@
             __syncthreads();
         }
         if (tid == 0u) {
-            float score = valid ? scratch[0] * scale : (Local ? -INFINITY : -3.402823466e+38f);
+            float score = valid ? scratch[0] * scale : (-INFINITY);
             if (valid && bias_mode == 1u) score += bias[(head * seq_len + qi) * seq_len + ki];
             if (valid && bias_mode == 2u) score += bias[((b * num_heads + head) * seq_len + qi) * seq_len + ki];
             scores[ki] = score;
@@ -50,7 +51,7 @@
 
     float denom_part = 0.0f;
     for (unsigned int ki = begin + tid; ki < end; ki += blockDim.x) {
-        float e = Local && !isfinite(shared_max) ? 0.0f : expf(scores[ki] - shared_max);
+        float e = !isfinite(shared_max) ? 0.0f : expf(scores[ki] - shared_max);
         scores[ki] = e;
         denom_part += e;
     }

@@ -14726,20 +14726,14 @@ __device__ __forceinline__ void termite_primitive_gather_impl(
     unsigned int axis_extent,
     unsigned int suffix_size
 ) {
-    unsigned int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (out_idx >= output_count) return;
-    unsigned int suffix_coord = out_idx % suffix_size;
-    unsigned int outer = out_idx / suffix_size;
-    unsigned int index_pos = outer % index_count;
-    unsigned int prefix = outer / index_count;
-    int gather_index = (int)indices[index_pos];
-    if (gather_index < 0) gather_index += (int)axis_extent;
-    if (gather_index < 0 || (unsigned int)gather_index >= axis_extent) {
-        output[out_idx] = NAN;
-        return;
-    }
-    unsigned int input_idx = (prefix * axis_extent + (unsigned int)gather_index) * suffix_size + suffix_coord;
-    output[out_idx] = termite_dense_storage_f32<Format>(input, input_idx);
+#include "../kernels/primitive_gather.cuh"
+}
+
+template<unsigned int Format, typename Storage, typename Index>
+__device__ __forceinline__ void termite_primitive_gather_integer_impl(float* output, const Storage* input, const Index* indices, unsigned int output_count, unsigned int index_count, unsigned int axis_extent, unsigned int suffix_size) {
+#define TERMITE_PRIMITIVE_INTEGER_INDICES
+#include "../kernels/primitive_gather.cuh"
+#undef TERMITE_PRIMITIVE_INTEGER_INDICES
 }
 
 extern "C" __global__ void termite_primitive_gather_f32(ANTFLY_CUDA_PRIMITIVE_GATHER_PARAMS) {
@@ -14750,23 +14744,39 @@ extern "C" __global__ void termite_primitive_gather_bf16_f32(ANTFLY_CUDA_PRIMITI
     termite_primitive_gather_impl<1u>(output, input, indices, output_count, index_count, axis_extent, suffix_size);
 }
 
-extern "C" __global__ void termite_primitive_scatter_add_axis0_f32(
-    float* output,
-    const float* input,
-    const float* indices,
-    unsigned int rows,
-    unsigned int cols,
-    unsigned int output_rows
-) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = rows * cols;
-    if (idx >= count) return;
-    unsigned int row = idx / cols;
-    unsigned int col = idx - row * cols;
-    int output_row = (int)indices[row];
-    if (output_row < 0) output_row += (int)output_rows;
-    if (output_row < 0 || (unsigned int)output_row >= output_rows) return;
-    atomicAdd(output + (unsigned int)output_row * cols + col, input[idx]);
+extern "C" __global__ void termite_primitive_gather_f32_i32(ANTFLY_CUDA_PRIMITIVE_GATHER_I32_PARAMS) {
+    termite_primitive_gather_integer_impl<0u, float, int>(output, input, indices, output_count, index_count, axis_extent, suffix_size);
+}
+
+extern "C" __global__ void termite_primitive_gather_f32_i64(ANTFLY_CUDA_PRIMITIVE_GATHER_I64_PARAMS) {
+    termite_primitive_gather_integer_impl<0u, float, long long>(output, input, indices, output_count, index_count, axis_extent, suffix_size);
+}
+
+extern "C" __global__ void termite_primitive_gather_bf16_f32_i32(ANTFLY_CUDA_PRIMITIVE_GATHER_BF16_I32_PARAMS) {
+    termite_primitive_gather_integer_impl<1u, unsigned short, int>(output, input, indices, output_count, index_count, axis_extent, suffix_size);
+}
+
+extern "C" __global__ void termite_primitive_gather_bf16_f32_i64(ANTFLY_CUDA_PRIMITIVE_GATHER_BF16_I64_PARAMS) {
+    termite_primitive_gather_integer_impl<1u, unsigned short, long long>(output, input, indices, output_count, index_count, axis_extent, suffix_size);
+}
+
+template<typename Index>
+__device__ __forceinline__ void termite_primitive_scatter_add_axis0_integer_impl(float* output, const float* input, const Index* indices, unsigned int rows, unsigned int cols, unsigned int output_rows) {
+#define TERMITE_PRIMITIVE_INTEGER_INDICES
+#include "../kernels/primitive_scatter.cuh"
+#undef TERMITE_PRIMITIVE_INTEGER_INDICES
+}
+
+extern "C" __global__ void termite_primitive_scatter_add_axis0_f32(ANTFLY_CUDA_PRIMITIVE_SCATTER_PARAMS) {
+#include "../kernels/primitive_scatter.cuh"
+}
+
+extern "C" __global__ void termite_primitive_scatter_add_axis0_f32_i32(ANTFLY_CUDA_PRIMITIVE_SCATTER_I32_PARAMS) {
+    termite_primitive_scatter_add_axis0_integer_impl<int>(output, input, indices, rows, cols, output_rows);
+}
+
+extern "C" __global__ void termite_primitive_scatter_add_axis0_f32_i64(ANTFLY_CUDA_PRIMITIVE_SCATTER_I64_PARAMS) {
+    termite_primitive_scatter_add_axis0_integer_impl<long long>(output, input, indices, rows, cols, output_rows);
 }
 
 extern "C" __global__ void termite_primitive_transpose_f32(

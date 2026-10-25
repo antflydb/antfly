@@ -34,6 +34,7 @@ const cuda_kernel_renderer = @import("../../graph/quant_kernel_cuda_renderer.zig
 const quant_codec = @import("../../gguf/quant_codec.zig");
 const a4b_qualification = @import("../../runtime/moe/a4b_qualification.zig");
 const platform = @import("antfly_platform");
+const TensorDType = @import("../../backends/tensor.zig").DType;
 
 const turboquant = @import("../../runtime/kv/turboquant.zig");
 const kv_pool_mod = @import("../../runtime/kv/pool.zig");
@@ -2422,6 +2423,12 @@ pub const KernelModule = struct {
     primitive_gather_f32: driver_mod.CUfunction = null,
     primitive_gather_bf16_f32: driver_mod.CUfunction = null,
     primitive_scatter_add_axis0_f32: driver_mod.CUfunction = null,
+    primitive_scatter_add_axis0_f32_i64: driver_mod.CUfunction = null,
+    primitive_scatter_add_axis0_f32_i32: driver_mod.CUfunction = null,
+    primitive_gather_bf16_f32_i64: driver_mod.CUfunction = null,
+    primitive_gather_bf16_f32_i32: driver_mod.CUfunction = null,
+    primitive_gather_f32_i64: driver_mod.CUfunction = null,
+    primitive_gather_f32_i32: driver_mod.CUfunction = null,
     primitive_transpose_f32: driver_mod.CUfunction = null,
     primitive_transpose_2d_f32: driver_mod.CUfunction = null,
     primitive_concat_f32: driver_mod.CUfunction = null,
@@ -10353,23 +10360,7 @@ pub const KernelModule = struct {
         axis_extent: usize,
         suffix_size: usize,
     ) driver_mod.Error!void {
-        const function = self.primitive_gather_f32 orelse return error.CudaKernelUnavailable;
-        try checkBytes(output, output_count);
-        try checkBytes(input, input_count);
-        try checkBytes(indices, index_count);
-        if (output_count == 0) return;
-        if (index_count == 0 or axis_extent == 0 or suffix_size == 0) return error.InvalidCudaState;
-        var arguments: launch_abi.ArgumentsFor("PRIMITIVE_GATHER") = .{
-            .output = output.ptr,
-            .input = input.ptr,
-            .indices = indices.ptr,
-            .output_count = try toU32(output_count),
-            .index_count = try toU32(index_count),
-            .axis_extent = try toU32(axis_extent),
-            .suffix_size = try toU32(suffix_size),
-        };
-        var params = launch_abi.fieldsFor("PRIMITIVE_GATHER", &arguments);
-        try launch1d(function, ctx, output_count, &params);
+        return self.launchPrimitiveGatherTyped(.f32, .f32, ctx, output, input, indices, output_count, input_count, index_count, axis_extent, suffix_size);
     }
 
     pub fn launchPrimitiveGatherBf16F32(
@@ -10384,13 +10375,41 @@ pub const KernelModule = struct {
         axis_extent: usize,
         suffix_size: usize,
     ) driver_mod.Error!void {
-        const function = self.primitive_gather_bf16_f32 orelse return error.CudaKernelUnavailable;
+        return self.launchPrimitiveGatherTyped(.bf16, .f32, ctx, output, input, indices, output_count, input_count, index_count, axis_extent, suffix_size);
+    }
+
+    pub fn launchPrimitiveGather(self: *KernelModule, value_dtype: TensorDType, index_dtype: TensorDType, ctx: *context_mod.CudaContext, output: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, indices: buffer_mod.DeviceBuffer, output_count: usize, input_count: usize, index_count: usize, axis_extent: usize, suffix_size: usize) driver_mod.Error!void {
+        switch (value_dtype) {
+            inline .f32, .bf16 => |value| switch (index_dtype) {
+                inline .f32, .i32, .i64 => |index| return self.launchPrimitiveGatherTyped(value, index, ctx, output, input, indices, output_count, input_count, index_count, axis_extent, suffix_size),
+                else => return error.InvalidCudaState,
+            },
+            else => return error.InvalidCudaState,
+        }
+    }
+
+    fn launchPrimitiveGatherTyped(self: *KernelModule, comptime value_dtype: TensorDType, comptime index_dtype: TensorDType, ctx: *context_mod.CudaContext, output: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, indices: buffer_mod.DeviceBuffer, output_count: usize, input_count: usize, index_count: usize, axis_extent: usize, suffix_size: usize) driver_mod.Error!void {
+        const suffix = comptime switch (index_dtype) {
+            .f32 => "",
+            .i32 => "_i32",
+            .i64 => "_i64",
+            else => @compileError("unsupported primitive index dtype"),
+        };
+        const slot = comptime std.fmt.comptimePrint("primitive_gather_{s}{s}", .{ if (value_dtype == .bf16) "bf16_f32" else "f32", suffix });
+        const family = comptime std.fmt.comptimePrint("PRIMITIVE_GATHER{s}{s}", .{ if (value_dtype == .bf16) "_BF16" else "", switch (index_dtype) {
+            .f32 => "",
+            .i32 => "_I32",
+            .i64 => "_I64",
+            else => unreachable,
+        } });
+        const function = @field(self, slot) orelse return error.CudaKernelUnavailable;
         try checkBytes(output, output_count);
-        try checkRawBytes(input, try checkedTensorElements(input_count, @sizeOf(u16)));
-        try checkBytes(indices, index_count);
+        try checkRawBytes(input, try checkedTensorElements(input_count, value_dtype.byteSize()));
+        try checkPrimitiveIndexBytes(index_dtype, indices, index_count);
         if (output_count == 0) return;
+        if (index_dtype == .f32) _ = try toU32(input_count);
         if (index_count == 0 or axis_extent == 0 or suffix_size == 0) return error.InvalidCudaState;
-        var arguments: launch_abi.ArgumentsFor("PRIMITIVE_GATHER_BF16") = .{
+        var arguments: launch_abi.ArgumentsFor(family) = .{
             .output = output.ptr,
             .input = input.ptr,
             .indices = indices.ptr,
@@ -10399,34 +10418,53 @@ pub const KernelModule = struct {
             .axis_extent = try toU32(axis_extent),
             .suffix_size = try toU32(suffix_size),
         };
-        var params = launch_abi.fieldsFor("PRIMITIVE_GATHER_BF16", &arguments);
+        var params = launch_abi.fieldsFor(family, &arguments);
         try launch1d(function, ctx, output_count, &params);
     }
 
-    pub fn launchPrimitiveScatterAddAxis0F32(
-        self: *KernelModule,
-        ctx: *context_mod.CudaContext,
-        output: buffer_mod.DeviceBuffer,
-        input: buffer_mod.DeviceBuffer,
-        indices: buffer_mod.DeviceBuffer,
-        rows: usize,
-        cols: usize,
-        output_rows: usize,
-    ) driver_mod.Error!void {
-        const function = self.primitive_scatter_add_axis0_f32 orelse return error.CudaKernelUnavailable;
+    pub fn launchPrimitiveScatterAddAxis0F32(self: *KernelModule, ctx: *context_mod.CudaContext, output: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, indices: buffer_mod.DeviceBuffer, rows: usize, cols: usize, output_rows: usize) driver_mod.Error!void {
+        return self.launchPrimitiveScatterAddAxis0(.f32, ctx, output, input, indices, rows, cols, output_rows);
+    }
+
+    pub fn launchPrimitiveScatterAddAxis0(self: *KernelModule, index_dtype: TensorDType, ctx: *context_mod.CudaContext, output: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, indices: buffer_mod.DeviceBuffer, rows: usize, cols: usize, output_rows: usize) driver_mod.Error!void {
+        switch (index_dtype) {
+            inline .f32, .i32, .i64 => |dtype| return self.launchPrimitiveScatterAddAxis0Typed(dtype, ctx, output, input, indices, rows, cols, output_rows),
+            else => return error.InvalidCudaState,
+        }
+    }
+
+    fn launchPrimitiveScatterAddAxis0Typed(self: *KernelModule, comptime index_dtype: TensorDType, ctx: *context_mod.CudaContext, output: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, indices: buffer_mod.DeviceBuffer, rows: usize, cols: usize, output_rows: usize) driver_mod.Error!void {
+        const suffix = comptime switch (index_dtype) {
+            .f32 => "",
+            .i32 => "_i32",
+            .i64 => "_i64",
+            else => @compileError("unsupported primitive index dtype"),
+        };
+        const slot = comptime std.fmt.comptimePrint("primitive_scatter_add_axis0_f32{s}", .{suffix});
+        const family = comptime std.fmt.comptimePrint("PRIMITIVE_SCATTER{s}", .{switch (index_dtype) {
+            .f32 => "",
+            .i32 => "_I32",
+            .i64 => "_I64",
+            else => unreachable,
+        }});
+        const function = @field(self, slot) orelse return error.CudaKernelUnavailable;
         const input_count = try checkedTensorElements(rows, cols);
         const output_count = try checkedTensorElements(output_rows, cols);
         try checkBytes(output, output_count);
         try checkBytes(input, input_count);
-        try checkBytes(indices, rows);
+        try checkPrimitiveIndexBytes(index_dtype, indices, rows);
         if (input_count == 0) return;
-        var output_ptr = output.ptr;
-        var input_ptr = input.ptr;
-        var indices_ptr = indices.ptr;
-        var rows_u32 = try toU32(rows);
-        var cols_u32 = try toU32(cols);
-        var output_rows_u32 = try toU32(output_rows);
-        var params = launch_abi.addresses(.{ &output_ptr, &input_ptr, &indices_ptr, &rows_u32, &cols_u32, &output_rows_u32 });
+        _ = try toU32(input_count);
+        if (index_dtype == .f32) _ = try toU32(output_count);
+        var arguments: launch_abi.ArgumentsFor(family) = .{
+            .output = output.ptr,
+            .input = input.ptr,
+            .indices = indices.ptr,
+            .rows = try toU32(rows),
+            .cols = try toU32(cols),
+            .output_rows = try toU32(output_rows),
+        };
+        var params = launch_abi.fieldsFor(family, &arguments);
         try launch1d(function, ctx, input_count, &params);
     }
 
@@ -14601,6 +14639,12 @@ fn checkedTensorElements(a: usize, b: usize) driver_mod.Error!usize {
 fn toU32(value: usize) driver_mod.Error!u32 {
     if (value > std.math.maxInt(u32)) return error.InvalidCudaState;
     return @intCast(value);
+}
+
+fn checkPrimitiveIndexBytes(comptime dtype: TensorDType, buffer: buffer_mod.DeviceBuffer, count: usize) driver_mod.Error!void {
+    const width = dtype.byteSize();
+    try checkRawBytes(buffer, try checkedTensorElements(count, width));
+    if (count != 0 and buffer.ptr % width != 0) return error.InvalidCudaState;
 }
 
 fn checkBytes(buffer: buffer_mod.DeviceBuffer, f32_count: usize) driver_mod.Error!void {
@@ -21992,4 +22036,130 @@ test "CUDA named projection adapters preserve every codec epilogue and output pl
     try Verify.reset(&ctx, dst_a, dst_b);
     try module.launchLinearQ4KPairNoBiasTile4F32(&ctx, dst_a, dst_b, input, q4k_a, q4k_b, rows, k, n);
     try Verify.check(&ctx, dst_a, dst_b, .pair, &bias_values, &residual_values);
+}
+
+test "CUDA typed gather and scatter preserve exact index widths strides and guards" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    var ctx = context_mod.CudaContext.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+    var values: [24]f32 = undefined;
+    var bf16: [24]u16 = undefined;
+    for (&values, &bf16, 0..) |*value, *bits, i| {
+        value.* = @floatFromInt(i);
+        bits.* = @intCast(@as(u32, @bitCast(value.*)) >> 16);
+    }
+    var input = try buffer_mod.DeviceBuffer.alloc(&ctx, 24 * 4);
+    defer input.free(&ctx);
+    var bf16_input = try buffer_mod.DeviceBuffer.alloc(&ctx, 24 * 2);
+    defer bf16_input.free(&ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(&ctx, 32 * 4);
+    defer output.free(&ctx);
+    try input.copyFromHost(&ctx, std.mem.sliceAsBytes(&values));
+    try bf16_input.copyFromHost(&ctx, std.mem.sliceAsBytes(&bf16));
+    inline for (.{ TensorDType.i32, TensorDType.i64 }) |dtype| {
+        const T = if (dtype == .i32) i32 else i64;
+        const selected = [_]T{ -1, 0, -1 };
+        var indices = try buffer_mod.DeviceBuffer.alloc(&ctx, @sizeOf(@TypeOf(selected)));
+        defer indices.free(&ctx);
+        try indices.copyFromHost(&ctx, std.mem.sliceAsBytes(&selected));
+        inline for (.{ TensorDType.f32, TensorDType.bf16 }) |value_dtype| {
+            try module.launchFillF32(&ctx, output, 32, -777);
+            try module.launchPrimitiveGather(value_dtype, dtype, &ctx, output, if (value_dtype == .bf16) bf16_input else input, indices, 24, 24, 3, 3, 4);
+            var actual: [32]f32 = undefined;
+            try output.copyToHost(&ctx, std.mem.sliceAsBytes(&actual));
+            try ctx.synchronize();
+            try std.testing.expectEqualSlices(f32, &.{ 8, 9, 10, 11, 0, 1, 2, 3, 8, 9, 10, 11, 20, 21, 22, 23, 12, 13, 14, 15, 20, 21, 22, 23 }, actual[0..24]);
+            for (actual[24..]) |guard| try std.testing.expectEqual(@as(f32, -777), guard);
+        }
+        try module.launchFillF32(&ctx, output, 32, -777);
+        try module.launchFillF32(&ctx, output, 6, 0);
+        try module.launchPrimitiveScatterAddAxis0(dtype, &ctx, output, input, indices, 3, 2, 3);
+        var scattered: [32]f32 = undefined;
+        try output.copyToHost(&ctx, std.mem.sliceAsBytes(&scattered));
+        try ctx.synchronize();
+        try std.testing.expectEqualSlices(f32, &.{ 2, 3, 0, 0, 4, 6 }, scattered[0..6]);
+        for (scattered[6..]) |guard| try std.testing.expectEqual(@as(f32, -777), guard);
+    }
+    const wide = [_]i64{ 0x100000000, std.math.minInt(i64), std.math.maxInt(i64), -1 };
+    var indices = try buffer_mod.DeviceBuffer.alloc(&ctx, @sizeOf(@TypeOf(wide)));
+    defer indices.free(&ctx);
+    try indices.copyFromHost(&ctx, std.mem.sliceAsBytes(&wide));
+    try module.launchFillF32(&ctx, output, 32, -777);
+    try module.launchPrimitiveGather(.f32, .i64, &ctx, output, input, indices, 16, 12, 4, 3, 4);
+    var actual: [32]f32 = undefined;
+    try output.copyToHost(&ctx, std.mem.sliceAsBytes(&actual));
+    try ctx.synchronize();
+    for (actual[0..12]) |value| try std.testing.expect(std.math.isNan(value));
+    try std.testing.expectEqualSlices(f32, &.{ 8, 9, 10, 11 }, actual[12..16]);
+    for (actual[16..]) |guard| try std.testing.expectEqual(@as(f32, -777), guard);
+    try module.launchFillF32(&ctx, output, 32, -777);
+    try module.launchFillF32(&ctx, output, 6, 0);
+    try module.launchPrimitiveScatterAddAxis0(.i64, &ctx, output, input, indices, 4, 2, 3);
+    var invalid_scatter: [32]f32 = undefined;
+    try output.copyToHost(&ctx, std.mem.sliceAsBytes(&invalid_scatter));
+    try ctx.synchronize();
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0, 6, 7 }, invalid_scatter[0..6]);
+    for (invalid_scatter[6..]) |guard| try std.testing.expectEqual(@as(f32, -777), guard);
+    var misaligned = indices;
+    misaligned.ptr += 4;
+    misaligned.len -= 4;
+    try std.testing.expectError(error.InvalidCudaState, module.launchPrimitiveGather(.f32, .i64, &ctx, output, input, misaligned, 4, 12, 1, 3, 4));
+    var short = indices;
+    short.len = 4;
+    try std.testing.expectError(error.InvalidCudaState, module.launchPrimitiveGather(.f32, .i64, &ctx, output, input, short, 1, 12, 1, 3, 4));
+}
+
+test "CUDA typed gather selects valid integers beyond F32 exact precision" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    var ctx = context_mod.CudaContext.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+    const selected = 16_777_217;
+    const count = selected + 2;
+    var table = try buffer_mod.DeviceBuffer.alloc(&ctx, count * 4);
+    defer table.free(&ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(&ctx, 8);
+    defer output.free(&ctx);
+    try module.launchFillF32(&ctx, table, count, 0);
+    const row = buffer_mod.DeviceBuffer{ .ptr = table.ptr + selected * 4, .len = 4, .borrowed = true };
+    try row.copyFromHost(&ctx, std.mem.sliceAsBytes(&[_]f32{17}));
+    inline for (.{ TensorDType.i32, TensorDType.i64 }) |dtype| {
+        const T = if (dtype == .i32) i32 else i64;
+        const index = [_]T{selected};
+        var indices = try buffer_mod.DeviceBuffer.alloc(&ctx, @sizeOf(@TypeOf(index)));
+        defer indices.free(&ctx);
+        try indices.copyFromHost(&ctx, std.mem.sliceAsBytes(&index));
+        try module.launchFillF32(&ctx, output, 2, -777);
+        try module.launchPrimitiveGather(.f32, dtype, &ctx, output, table, indices, 1, count, 1, count, 1);
+        var actual: [2]f32 = undefined;
+        try output.copyToHost(&ctx, std.mem.sliceAsBytes(&actual));
+        try ctx.synchronize();
+        try std.testing.expectEqualSlices(f32, &.{ 17, -777 }, &actual);
+    }
+}
+
+test "CUDA primitive index traversal rejects overflowing legacy coordinates before submission" {
+    const function: driver_mod.CUfunction = @ptrFromInt(1);
+    var module = KernelModule{
+        .primitive_gather_f32 = function,
+        .primitive_scatter_add_axis0_f32 = function,
+        .primitive_scatter_add_axis0_f32_i32 = function,
+        .primitive_scatter_add_axis0_f32_i64 = function,
+    };
+    var ctx: context_mod.CudaContext = undefined;
+    const large = buffer_mod.DeviceBuffer{ .ptr = 8, .len = @as(usize, 1) << 35 };
+    inline for (.{ TensorDType.f32, TensorDType.i32, TensorDType.i64 }) |dtype| {
+        try std.testing.expectError(error.InvalidCudaState, module.launchPrimitiveScatterAddAxis0(dtype, &ctx, large, large, large, 65536, 65536, 65536));
+    }
+    try std.testing.expectError(error.InvalidCudaState, module.launchPrimitiveScatterAddAxis0(.f32, &ctx, large, large, large, 1, 65536, 65536));
+    try std.testing.expectError(error.InvalidCudaState, module.launchPrimitiveGather(.f32, .f32, &ctx, large, large, large, 2, @as(usize, 1) << 32, 1, @as(usize, 1) << 31, 2));
 }

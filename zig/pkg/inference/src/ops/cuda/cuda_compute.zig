@@ -2387,8 +2387,9 @@ pub const CudaCompute = struct {
     }
 
     pub fn enableResidentBoundaryAttention(self: *CudaCompute) !void {
-        if (self.ctx.info.compute_major != 8) return;
-        if (self.boundary_attention == null) self.boundary_attention = try @import("boundary_attention.zig").Module.init(&self.ctx);
+        const attention = @import("boundary_attention.zig");
+        if (!attention.supportsDevice(self.ctx.info.compute_major)) return;
+        if (self.boundary_attention == null) self.boundary_attention = try attention.Module.init(&self.ctx);
     }
 
     pub fn embeddingGemma2Module(self: *CudaCompute) !*embedding_gemma2_cuda.Module {
@@ -13333,6 +13334,15 @@ fn primBroadcastInDimOp(ctx: *anyopaque, input_ct: CT, target_shape: []const i64
 
 const planBatchedDotGeneral = @import("../kernel_geometry.zig").planBatchedDotGeneral;
 
+// Allocating and assigned batched dots must preserve the selected strict F32
+// training implementation and express transposes through its original flags.
+fn launchBatchedDotInto(self: *CudaCompute, output: buffer_mod.DeviceBuffer, lhs: buffer_mod.DeviceBuffer, rhs: buffer_mod.DeviceBuffer, plan: kernel_geometry.BatchedDotGeneralPlan) !void {
+    if (self.training_blas) |*blas| {
+        try self.ctx.makeCurrent();
+        try blas.batched(self.ctx.stream, @ptrFromInt(output.ptr), @ptrFromInt(lhs.ptr), @ptrFromInt(rhs.ptr), plan.batch_count, plan.m, plan.k, plan.n, !plan.lhs_contract_last, plan.rhs_contract_last);
+    } else try self.kernels.launchPrimitiveBatchedDotF32(&self.ctx, output, lhs, rhs, plan.batch_count, plan.m, plan.n, plan.k, plan.lhs_contract_last, plan.rhs_contract_last);
+}
+
 fn primDotGeneralOp(
     ctx: *anyopaque,
     lhs_ct: CT,
@@ -13374,18 +13384,7 @@ fn primDotGeneralOp(
         output_shape[output_shape.len - 1] = @intCast(plan.n);
         var output_device = try allocDeviceBuffer(self, output_count * @sizeOf(f32));
         errdefer output_device.free(&self.ctx);
-        try self.kernels.launchPrimitiveBatchedDotF32(
-            &self.ctx,
-            output_device,
-            lhs.buffer,
-            rhs.buffer,
-            plan.batch_count,
-            plan.m,
-            plan.n,
-            plan.k,
-            plan.lhs_contract_last,
-            plan.rhs_contract_last,
-        );
+        try launchBatchedDotInto(self, output_device, lhs.buffer, rhs.buffer, plan);
         self.stats.launch_linear += 1;
         return createTensor(self, output_device, output_shape, output_count);
     }
@@ -14061,12 +14060,20 @@ fn transposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []cons
     return createTensor(self, device, output_shape, numel);
 }
 
+fn ensurePrimitiveIndices(indices: *const CudaTensor) !void {
+    if (indices.quant_type != null) return error.UnsupportedTensorType;
+    switch (indices.dtype) {
+        .f32, .i32, .i64 => {},
+        else => return error.UnsupportedTensorType,
+    }
+}
+
 fn primGatherOp(ctx: *anyopaque, input_ct: CT, indices_ct: CT, axis: u8, input_shape: []const i64) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input = tensorFromCt(input_ct);
     const indices = tensorFromCt(indices_ct);
     const input_route = try primitiveGatherInputRoute(input);
-    try ensureF32(indices);
+    try ensurePrimitiveIndices(indices);
     const rank = input.shape.len;
     const axis_index: usize = axis;
     if (rank == 0 or rank > 8 or input_shape.len != rank or axis_index >= rank or indices.shape.len > 8) return error.InvalidShape;
@@ -14098,30 +14105,7 @@ fn primGatherOp(ctx: *anyopaque, input_ct: CT, indices_ct: CT, axis: u8, input_s
     const output_count = try geometry.count(indices.elem_count);
     var device = try allocDeviceBuffer(self, output_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    switch (input_route) {
-        .f32 => try self.kernels.launchPrimitiveGatherF32(
-            &self.ctx,
-            device,
-            input.buffer,
-            indices.buffer,
-            output_count,
-            input.elem_count,
-            indices.elem_count,
-            axis_extent,
-            suffix_size,
-        ),
-        .bf16_to_f32 => try self.kernels.launchPrimitiveGatherBf16F32(
-            &self.ctx,
-            device,
-            input.buffer,
-            indices.buffer,
-            output_count,
-            input.elem_count,
-            indices.elem_count,
-            axis_extent,
-            suffix_size,
-        ),
-    }
+    try self.kernels.launchPrimitiveGather(input.dtype, indices.dtype, &self.ctx, device, input.buffer, indices.buffer, output_count, input.elem_count, indices.elem_count, axis_extent, suffix_size);
     // Primitive graph activations and all gather/scatter VJPs are F32 even
     // when a frozen resident table is stored as BF16. The BF16 kernel widens
     // each selected value exactly while gathering; do not tag this output as
@@ -14134,7 +14118,7 @@ fn primScatterAddOp(ctx: *anyopaque, input_ct: CT, indices_ct: CT, input_shape: 
     const input = tensorFromCt(input_ct);
     const indices = tensorFromCt(indices_ct);
     try ensureF32(input);
-    try ensureF32(indices);
+    try ensurePrimitiveIndices(indices);
     if (axis != 0 or input_shape.len != 2 or input.shape.len != 2 or output_shape_declared.len != 2) return error.UnsupportedShape;
     const rows_i64 = input.shape[0];
     const cols_i64 = input.shape[1];
@@ -14151,7 +14135,7 @@ fn primScatterAddOp(ctx: *anyopaque, input_ct: CT, indices_ct: CT, input_shape: 
     var device = try allocDeviceBuffer(self, output_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
     try self.kernels.launchFillF32(&self.ctx, device, output_count, 0.0);
-    try self.kernels.launchPrimitiveScatterAddAxis0F32(&self.ctx, device, input.buffer, indices.buffer, rows, cols, output_rows);
+    try self.kernels.launchPrimitiveScatterAddAxis0(indices.dtype, &self.ctx, device, input.buffer, indices.buffer, rows, cols, output_rows);
     return createTensor(self, device, output_shape, output_count);
 }
 
@@ -20117,7 +20101,7 @@ fn silu(ctx: *anyopaque, input: CT) anyerror!CT {
     self.stats.launch_elementwise += 1;
     return output.intoTensor();
 }
-fn layaWarpEligible(self: *const CudaCompute, batch: usize, seq: usize, dim: usize) bool {
+pub fn layaWarpEligible(self: *const CudaCompute, batch: usize, seq: usize, dim: usize) bool {
     return self.laya_optimizations and self.ctx.info.compute_major == 8 and
         self.ctx.info.compute_minor == 9 and batch >= 2 and seq > 0 and seq <= 512 and
         (dim == 64 or dim == 128) and self.kernels.laya_attention_warp_f32 != null;
@@ -27334,6 +27318,12 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
                 descriptor.operation.dot.lhs_contract_last and descriptor.operation.dot.rhs_contract_last and self.training_blas == null));
         if (projected_weight) {
             if (!assignedProjectionWeightSupported(tensor, descriptor.operation == .linear and descriptor.operation.linear.bias)) return false;
+        } else if (i == 1 and descriptor.operation == .gather) {
+            ensurePrimitiveIndices(tensor) catch return false;
+            const expected: tensor_mod.DType = switch (descriptor.input_shapes[i].dtype) {
+                inline else => |tag| @field(tensor_mod.DType, @tagName(tag)),
+            };
+            if (tensor.dtype != expected) return false;
         } else if (tensor.dtype != .f32 or tensor.quant_type != null) return false;
     }
     if (descriptor.operation == .dot) {
@@ -27385,7 +27375,7 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
         },
         .gather => |gather| {
             const indices = tensorFromCt(request.inputs[1]);
-            try self.kernels.launchPrimitiveGatherF32(&self.ctx, output.buffer, a.buffer, indices.buffer, output.elem_count, a.elem_count, indices.elem_count, gather.geometry.extent, gather.geometry.suffix);
+            try self.kernels.launchPrimitiveGather(a.dtype, indices.dtype, &self.ctx, output.buffer, a.buffer, indices.buffer, output.elem_count, a.elem_count, indices.elem_count, gather.geometry.extent, gather.geometry.suffix);
             return true;
         },
         .dot => |dot| {
@@ -27407,7 +27397,7 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
                     transposed.buffer = workspace.buffer;
                     try linearF32NoBiasInto(self, output.buffer, a, &transposed, dot.m, dot.k, dot.n, true);
                 }
-            } else try self.kernels.launchPrimitiveBatchedDotF32(&self.ctx, output.buffer, a.buffer, rhs.buffer, dot.batch_count, dot.m, dot.n, dot.k, dot.lhs_contract_last, dot.rhs_contract_last);
+            } else try launchBatchedDotInto(self, output.buffer, a.buffer, rhs.buffer, dot);
             if (!(unbatched and dot.lhs_contract_last and dot.rhs_contract_last and self.training_blas == null)) self.stats.launch_linear += 1;
             return true;
         },
@@ -28183,4 +28173,66 @@ test "CUDA resident weight uploads release partial host allocations and device b
         try std.testing.expectEqual(@as(usize, 0), compute.resident_weights.count());
     }
     try std.testing.expectEqualSlices(f32, &.{ 1, -2, 3, -4 }, source.asFloat32());
+}
+
+test "CUDA typed gather descriptors execute into assigned storage without host access" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    const ml = @import("ml").graph;
+    const K = ops.kernel_descriptor;
+    const input = try @import("../testing/assigned_kernel_conformance.zig").physicalTensor(&cb, &.{ 1, 2, 3, 4, 5, 6 }, &.{ 3, 2 });
+    defer cb.free(input);
+    inline for (.{ tensor_mod.DType.i32, tensor_mod.DType.i64 }) |dtype| {
+        const T = if (dtype == .i32) i32 else i64;
+        const selected = [_]T{ -1, 0, 0 };
+        const indices = blk: {
+            var buffer = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, @sizeOf(@TypeOf(selected)));
+            errdefer buffer.free(&compute.ctx);
+            try buffer.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&selected));
+            const shape = try a.dupe(i64, &.{3});
+            errdefer a.free(shape);
+            break :blk try createTensorWithDType(&compute, buffer, shape, selected.len, dtype);
+        };
+        defer cb.free(indices);
+        var graph = ml.Graph.init(a);
+        defer graph.deinit();
+        var b = ml.Builder.init(&graph);
+        const x = try b.parameter("x", ml.Shape.init(.f32, &.{ 3, 2 }));
+        const ix = try b.parameter("indices", ml.Shape.init(@field(ml.DType, @tagName(dtype)), &.{3}));
+        const y = try b.gather(x, ix, ml.Shape.init(.f32, &.{ 3, 2 }));
+        var descriptor = K.lower(&graph, y).?;
+        const output = try @import("../testing/assigned_kernel_conformance.zig").physicalTensor(&cb, &.{ -99, -99, -99, -99, -99, -99 }, &.{ 3, 2 });
+        defer cb.free(output);
+        var request = K.Invocation{ .descriptor = &descriptor, .inputs = &.{ input, indices } };
+        const audit_mod = @import("../../execution/transfer_audit.zig");
+        var audit = audit_mod.Audit{ .forbid_device_host_access = true };
+        try audit_mod.begin(&audit);
+        const queried = runAssignedKernelOp(&compute, request);
+        audit_mod.end();
+        try std.testing.expect(try queried);
+        const untouched = try cb.toFloat32(output, a);
+        defer a.free(untouched);
+        try std.testing.expectEqualSlices(f32, &.{ -99, -99, -99, -99, -99, -99 }, untouched);
+        request.output = output;
+        for (0..3) |_| {
+            try audit_mod.begin(&audit);
+            const executed = runAssignedKernelOp(&compute, request);
+            audit_mod.end();
+            try std.testing.expect(try executed);
+            const actual = try cb.toFloat32(output, a);
+            defer a.free(actual);
+            try std.testing.expectEqualSlices(f32, &.{ 5, 6, 1, 2, 1, 2 }, actual);
+        }
+        var aliased = request;
+        aliased.output = input;
+        try std.testing.expectError(error.InvalidAssignedAlias, runAssignedKernelOp(&compute, aliased));
+        descriptor.input_shapes[1].dtype = if (dtype == .i32) .i64 else .i32;
+        try std.testing.expect(!try runAssignedKernelOp(&compute, request));
+        const retained = try cb.toFloat32(input, a);
+        defer a.free(retained);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6 }, retained);
+    }
 }

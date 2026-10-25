@@ -329,6 +329,12 @@ required_symbols=(
   termite_gliner25_layer_norm_f32
   termite_gliner25_softmax_f32
   termite_primitive_gather_f32
+  termite_primitive_gather_f32_i32
+  termite_primitive_gather_f32_i64
+  termite_primitive_gather_bf16_f32_i32
+  termite_primitive_gather_bf16_f32_i64
+  termite_primitive_scatter_add_axis0_f32_i32
+  termite_primitive_scatter_add_axis0_f32_i64
   termite_primitive_scatter_add_axis0_f32
   termite_primitive_transpose_f32
   termite_primitive_concat_f32

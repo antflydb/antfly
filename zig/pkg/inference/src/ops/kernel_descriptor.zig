@@ -283,7 +283,9 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
         const input_count = input_shape.numElements() orelse return null;
         const reduced_weight = index == 1 and (operation == .linear or operation == .dot) and
             (input_shape.dtype == .f16 or input_shape.dtype == .bf16);
-        if ((input_shape.dtype != .f32 and !reduced_weight) or input_count <= 0 or input_count > std.math.maxInt(i32)) return null;
+        const integer_indices = index == 1 and operation == .gather and
+            (input_shape.dtype == .i32 or input_shape.dtype == .i64);
+        if ((input_shape.dtype != .f32 and !reduced_weight and !integer_indices) or input_count <= 0 or input_count > std.math.maxInt(i32)) return null;
         if ((operation == .unary or operation == .binary or operation == .softmax) and input_count != 1 and !std.mem.eql(i64, input_shape.dims[0..input_shape.rank()], shape.dims[0..shape.rank()])) return null;
         if ((operation == .unary or operation == .softmax) and input_count != count) return null;
         result.input_shapes[index] = input_shape;
@@ -318,4 +320,21 @@ test "shared layout descriptors lower concrete concat slice and gather without w
     try std.testing.expect(lower(&graph, gathered) == null);
     // New logical records fit beneath the existing reduction payload.
     try std.testing.expect(@sizeOf(Slice) <= @sizeOf(Reduction));
+}
+
+test "shared gather descriptors preserve exact index storage admission" {
+    var graph = ml.graph.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const values = try builder.parameter("values", ml.graph.Shape.init(.f32, &.{ 3, 4 }));
+    inline for (.{ ml.graph.DType.f32, ml.graph.DType.i32, ml.graph.DType.i64 }) |dtype| {
+        const indices = try builder.parameter(@tagName(dtype), ml.graph.Shape.init(dtype, &.{2}));
+        const gathered = try builder.gather(values, indices, ml.graph.Shape.init(.f32, &.{ 2, 4 }));
+        const descriptor = lower(&graph, gathered).?;
+        try std.testing.expectEqual(dtype, descriptor.input_shapes[1].dtype);
+        try std.testing.expectEqual(@as(usize, 8), descriptor.elements());
+    }
+    const indices = try builder.parameter("unsupported", ml.graph.Shape.init(.f16, &.{2}));
+    const gathered = try builder.gather(values, indices, ml.graph.Shape.init(.f32, &.{ 2, 4 }));
+    try std.testing.expect(lower(&graph, gathered) == null);
 }
