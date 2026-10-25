@@ -54,6 +54,17 @@ pub fn indices(a: std.mem.Allocator, payload: []const u8) ![]u32 {
     };
     return indicesFromResults(a, &.{});
 }
+/// Ordered scalar replacement retires child vectors atomically. A present
+/// scalar therefore selects the scalar topology; parent receipts describe
+/// boundary work and cannot veto independently accepted text computation.
+/// Callers still authenticate every selected vector's current causal proof.
+pub fn storedIndices(a: std.mem.Allocator, txn: anytype, member: []const u8, embedding: []const u8, payload: []const u8) ![]u32 {
+    const scalar = try keys.derivedEmbeddingArtifactKeyAlloc(a, member, embedding);
+    defer a.free(scalar);
+    const exists = txn.get(scalar) catch |err| if (err == error.NotFound) null else return err;
+    if (exists != null) return a.dupe(u32, &.{0});
+    return indices(a, payload);
+}
 pub fn indicesFromResults(a: std.mem.Allocator, results: []const @import("inference_chunker").outputs.Result) ![]u32 {
     var result = std.ArrayList(u32).empty;
     errdefer result.deinit(a);
@@ -111,4 +122,59 @@ test "model aware media vector set guard advances atomically with any child vect
     var read = try erased.beginProbe();
     defer read.abort();
     try std.testing.expectError(error.EnrichmentSourceChanged, publication.validateArtifactSources(a, &read, command.namespace, &.{.{ .document_key = "doc", .timestamp = 1, .content_digest = @splat(1), .input_position = null }}, &.{guard}));
+}
+
+test "model aware media stored vector selection ignores obsolete parent topology but requires a complete fused set otherwise" {
+    const a = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer store.deinit();
+    var erased = try @import("../backend_erased.zig").storeFrom(a, store);
+    defer erased.deinit();
+    const member = try keys.chunkArtifactKeyAlloc(a, "doc", "clips", 0);
+    defer a.free(member);
+    const scalar = try keys.derivedEmbeddingArtifactKeyAlloc(a, member, "vectors");
+    defer a.free(scalar);
+    const O = @import("inference_chunker").outputs;
+    const failed = O.Result{ .name = "embedding", .kind = .embedding, .required = true, .model = "model", .model_identity = "", .model_revision = "", .recipe_id = "", .status = .failed, .terminal = true, .code = "OldFailure" };
+    const encoded = try std.json.Stringify.valueAlloc(a, [_]O.Result{failed}, .{});
+    defer a.free(encoded);
+    var metadata = @import("inference_chunker").types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .coordinates = .{ .kind = .text }, .input_tokens = 1 }, .inference_id = "plan:0", .plan_id = "plan", .source_fingerprint = "source", .source_version = "v1", .model = "model", .model_identity = "", .model_revision = "", .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .outputs_json = encoded };
+    const payload = try std.json.Stringify.valueAlloc(a, .{ .body = "retained text", ._chunk = metadata }, .{});
+    defer a.free(payload);
+    {
+        var txn = try erased.beginWrite();
+        errdefer txn.abort();
+        try txn.put(scalar, "accepted vector");
+        try txn.commit();
+    }
+    {
+        var read = try erased.beginProbe();
+        defer read.abort();
+        const selected = try storedIndices(a, &read, member, "vectors", payload);
+        defer a.free(selected);
+        try std.testing.expectEqualSlices(u32, &.{0}, selected);
+        try std.testing.expectError(error.RequiredMediaOutputFailed, storedIndices(a, &read, member, "other", payload));
+    }
+    var windows = [_]O.Result{ failed, failed };
+    for (&windows, 0..) |*value, i| {
+        value.status = .complete;
+        value.terminal = false;
+        value.code = null;
+        value.sub_index = @intCast(i);
+    }
+    const raw = try std.json.Stringify.valueAlloc(a, windows, .{});
+    defer a.free(raw);
+    metadata.outputs_json = raw;
+    const split = try std.json.Stringify.valueAlloc(a, .{ .body = "retained text", ._chunk = metadata }, .{});
+    defer a.free(split);
+    var read = try erased.beginProbe();
+    defer read.abort();
+    const independent = try storedIndices(a, &read, member, "vectors", split);
+    defer a.free(independent);
+    try std.testing.expectEqualSlices(u32, &.{0}, independent);
+    const fused = try storedIndices(a, &read, member, "other", split);
+    defer a.free(fused);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, fused);
 }

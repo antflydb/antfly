@@ -558,7 +558,7 @@ pub const SparseEnricher = struct {
             var descriptor = try document_facts.parseCheckpointBody(self.alloc, stored);
             defer descriptor.deinit();
             base = descriptor.value.base;
-            break :resolved try document_facts.resolveCheckpointBodyAlloc(self.alloc, pages, stored);
+            break :resolved try document_facts.resolveCheckpointStateAlloc(self.alloc, pages, stored);
         } else try self.alloc.dupe(u8, stored);
         defer self.alloc.free(source);
         source_input_bytes.* = source.len;
@@ -568,7 +568,7 @@ pub const SparseEnricher = struct {
         if (cfg.stage == .chunk_embeddings and self.model_chunker != null) {
             var key_digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(key, &key_digest, .{});
-            self.checkpoint_context = .{ .allocator = self.alloc, .pages = pages, .previous = fact.body, .key_digest = key_digest };
+            self.checkpoint_context = .{ .allocator = self.alloc, .pages = pages, .previous = fact.body, .previous_is_compact = document_facts.isCheckpointBody(stored), .key_digest = key_digest };
             // Output ancestry is durable replay, not another logical source
             // input. Its independent finite allowance also admits legacy full
             // body checkpoints during migration; working/output caps still
@@ -953,6 +953,7 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
     // across consumer edits and pipeline-version changes.
     var legacy_current = false;
     var checkpoint = try media_checkpoint.get(scratch, document);
+    const had_checkpoint = checkpoint != null;
     var fast_checkpoint: ?media_checkpoint.Group = null;
     var probe_identities: []const media_outputs.Result = &.{};
     var same_checkpoint_plan = false;
@@ -982,6 +983,9 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
             checkpoint = null;
         }
     }
+    var repair_base: ?document_facts.BodyRef = if (fast_checkpoint) |saved| saved.repair_base else null;
+    const baseline_vectors = document.object.get("chunk_embeddings");
+    const baseline_previews = document.object.get("chunk_preview");
     current_identities = probe_identities;
     const cached_document_outputs = document.object.get("media_outputs");
     const has_output_rows = if (cached_document_outputs) |value| value == .object and value.object.contains("chunks") else false;
@@ -1030,6 +1034,10 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
             };
         }
     }
+    if (repair_base == null and cached_rows.len != 0) if (self.checkpoint_context) |context| if (!context.previous_is_compact and !had_checkpoint) {
+        repair_base = context.previous;
+    };
+    if (fast_checkpoint != null and repair_base != null and cached_rows.len == 0) return error.InvalidMediaCheckpoint;
     // A configuration fingerprint cannot certify mutable deployed aliases.
     // Probe every configured recipe before the completed-document fast path.
     const current_outputs = input == null or legacy_current or (cached_rows.len != 0 and for (consumers.targets) |target| {
@@ -1111,6 +1119,7 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
         }
     };
     const group_start = if (position) |cursor| cursor.ordinal else 0;
+    var covered: u64 = group_start;
     var group_generation: ?[32]u8 = if (fast_checkpoint) |saved| saved.generation else null;
     const page_limit = @min(self.media_page_limit, @max(completed_pages, 1));
     const checkpoint_deadline = @import("antfly_platform").time.monotonicNs() +| (std.math.mul(u64, self.media_checkpoint_interval_ms, std.time.ns_per_ms) catch std.math.maxInt(u64));
@@ -1170,6 +1179,7 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
             try appendServerlessEmbeddingRows(scratch, wanted, metadata, independent, chunk.text orelse "", &embeddings, &previews);
         }
         pages += 1;
+        covered = page.covered_through_ordinal;
         preparation_complete = page.complete;
         if (page.complete) break;
         if (position) |cursor| {
@@ -1185,20 +1195,17 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
         position = .{ .plan_id = plan, .source_fingerprint = fingerprint, .source_version = try a.dupe(u8, page.source_version), .ordinal = page.covered_through_ordinal };
         if (self.media_page_limit != 0 and (pages >= page_limit or (self.media_checkpoint_interval_ms != 0 and @import("antfly_platform").time.monotonicNs() >= checkpoint_deadline))) {
             pending_outputs = true;
-            // Preserve unvisited receipts during a secondary-only repair; the
-            // next bounded page can skip those already accepted computations.
-            if (page.covered_through_ordinal < cached_rows.len) try output_rows.appendSlice(scratch, cached_rows[@intCast(page.covered_through_ordinal)..]);
             break;
         }
     }
     // The labeled version below also distinguishes a retryable failed output
     // from a healthy preparation cap. Terminal receipts are reusable.
-    const can_compact = self.checkpoint_context != null and !preparation_complete and position != null and group_generation != null and healthy: {
+    const can_compact = self.checkpoint_context != null and (cached_rows.len == 0 or repair_base != null or fast_checkpoint != null) and !preparation_complete and position != null and group_generation != null and healthy: {
         for (output_rows.items) |row| for (consumers.targets) |target| if (needsServerlessOutput(target, row.outputs, current_identities)) break :healthy false;
         break :healthy true;
     };
     if (!can_compact) if (fast_checkpoint != null) {
-        try media_checkpoint.expand(scratch, self.checkpoint_context.?, &document);
+        try media_checkpoint.expandPrefix(scratch, self.checkpoint_context.?, &document);
         const old_vectors = document.object.get("chunk_embeddings").?.array.items;
         const old_previews = document.object.get("chunk_preview").?.array.items;
         const old_rows = try std.json.parseFromValueLeaky(struct { chunks: []const media_outputs.Row }, scratch, document.object.get("media_outputs").?, .{ .ignore_unknown_fields = true });
@@ -1206,6 +1213,21 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
         try previews.insertSlice(scratch, 0, old_previews);
         try output_rows.insertSlice(scratch, 0, old_rows.chunks);
     };
+    if (!can_compact and !preparation_complete and covered < cached_rows.len) {
+        try output_rows.appendSlice(scratch, cached_rows[@intCast(covered)..]);
+        const index_recipe = for (current_identities) |identity| {
+            if (std.mem.eql(u8, identity.name, "embedding")) break identity.recipe_id;
+        } else "";
+        if (baseline_vectors) |old| {
+            if (old != .array or baseline_previews == null or baseline_previews.? != .array or old.array.items.len != baseline_previews.?.array.items.len) return error.InvalidChunkerResponse;
+            for (old.array.items, baseline_previews.?.array.items) |row, preview| {
+                const ordinal = try media_checkpoint.vectorOrdinal(row);
+                if (ordinal < covered or !media_checkpoint.healthyIndex(cached_rows, ordinal, index_recipe)) continue;
+                try embeddings.append(scratch, row);
+                try previews.append(scratch, preview);
+            }
+        }
+    }
     // Mark a mixed-generation traversal pending even if its source tail was
     // reached. The next pass repairs only receipts outside the latest space.
     for (output_rows.items) |row| for (consumers.targets) |target| {
@@ -1247,7 +1269,10 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
     try document.object.put(scratch, "_enrichment", state);
     if (can_compact) {
         const context = self.checkpoint_context.?;
-        try media_checkpoint.compact(scratch, context, &document, .{ .key_digest = context.key_digest, .recipe = &recipe_fingerprint, .generation = group_generation.?, .plan_id = plan_id, .start = if (fast_checkpoint != null) group_start else 0, .end = position.?.ordinal, .parent = if (fast_checkpoint != null) context.previous else null, .vectors = embeddings.items, .previews = previews.items, .rows = output_rows.items });
+        const index_recipe = for (current_identities) |identity| {
+            if (std.mem.eql(u8, identity.name, "embedding")) break identity.recipe_id;
+        } else return error.InvalidChunkOutput;
+        try media_checkpoint.compact(scratch, context, &document, .{ .format = if (repair_base != null) 2 else 1, .repair_base = repair_base, .index_recipe = if (repair_base != null) index_recipe else null, .key_digest = context.key_digest, .recipe = &recipe_fingerprint, .generation = group_generation.?, .plan_id = plan_id, .start = if (fast_checkpoint != null) group_start else 0, .end = position.?.ordinal, .parent = if (fast_checkpoint != null) context.previous else null, .vectors = embeddings.items, .previews = previews.items, .rows = output_rows.items });
     }
     return .{ .body = try std.json.Stringify.valueAlloc(a, document, .{}), .used_model = true };
 }
@@ -3413,6 +3438,7 @@ const ServerlessMediaTestProvider = struct {
     fail_ordinal: ?u64 = null,
     pages: usize = 0,
     boundary_revision_changed: bool = false,
+    index_revision_changed: bool = false,
     calls: [3]usize = @splat(0),
     fail: bool = true,
     fn page(raw: *anyopaque, a: Allocator, _: []const u8, _: chunking.inference.RemoteInput, cfg: chunking.types.Config, _: @import("antfly_inference_execution_context").RequestContext) anyerror!chunking.inference.ChunkPage {
@@ -3432,7 +3458,7 @@ const ServerlessMediaTestProvider = struct {
         for (config.value.targets, 0..) |target, index| {
             if (target.execute) self.calls[index] += 1;
             const identity = "3333333333333333333333333333333333333333333333333333333333333333";
-            const revision = if ((index == 2 and self.speech_revision_changed) or (index == 0 and self.boundary_revision_changed)) "5555555555555555555555555555555555555555555555555555555555555555" else "4444444444444444444444444444444444444444444444444444444444444444";
+            const revision = if ((index == 2 and self.speech_revision_changed) or (index == 0 and self.boundary_revision_changed) or (index == 1 and self.index_revision_changed)) "5555555555555555555555555555555555555555555555555555555555555555" else "4444444444444444444444444444444444444444444444444444444444444444";
             const recipe = try target.recipeIdentity(scratch, identity, revision);
             const copies: usize = if (index == 1 and target.execute) 2 else 1;
             for (0..copies) |sub_index| {
@@ -3935,4 +3961,167 @@ test "model aware media serverless compact WAL checkpoints publish resume and fi
         // with no in-memory output prefix surviving the publication boundary.
     }
     try std.testing.expectEqual([3]usize{ 4, 4, 4 }, fake.calls);
+}
+
+test "model aware media serverless secondary repair keeps healthy vectors and checkpoints only new output groups" {
+    const Fake = ServerlessMediaTestProvider;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/repair-checkpoints", .{tmp.sub_path});
+    var fs = try @import("../artifacts/fs_store.zig").FsStore.init(a, path);
+    defer fs.deinit();
+    var objects = fs.artifactStore();
+    var reads: u64 = 256 * 1024 * 1024;
+    var writes: u64 = 256 * 1024 * 1024;
+    var pages = PageStore{ .domain = PageStore.namespaceDomain("docs"), .attempt = @splat(1), .artifacts = &objects, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var totals: [2]usize = @splat(0);
+    const Compare = struct {
+        fn values(left: std.json.Value, right: std.json.Value) !void {
+            try std.testing.expectEqual(std.meta.activeTag(left), std.meta.activeTag(right));
+            switch (left) {
+                .object => |object| {
+                    try std.testing.expectEqual(object.count(), right.object.count());
+                    var fields = object.iterator();
+                    while (fields.next()) |entry| try values(entry.value_ptr.*, right.object.get(entry.key_ptr.*) orelse return error.TestExpectedEqual);
+                },
+                .array => |array| {
+                    try std.testing.expectEqual(array.items.len, right.array.items.len);
+                    for (array.items, right.array.items) |first, second| try values(first, second);
+                },
+                else => try std.testing.expectEqualDeep(left, right),
+            }
+        }
+    };
+    var final_body: ?[]u8 = null;
+    defer if (final_body) |bytes| a.free(bytes);
+    for (0..2) |mode| {
+        var fake = Fake{ .fail = false, .parent_count = 64 };
+        var worker = SparseEnricher{ .alloc = a, .artifacts = undefined, .manifests = undefined, .progress = undefined, .wal = undefined };
+        defer worker.deinit();
+        const Boundary = @import("antfly_runtime_abi").callback_abi.Boundary(struct { chunk_page_with_context: ?*const @TypeOf(Fake.page) = null });
+        try worker.setModelChunker(.{ .provider = .antfly, .embedding = .{ .model = "indexA", .dimensions = 2 }, .outputs_json = "{\"boundary_model\":\"boundary\",\"targets\":[{\"name\":\"boundary\",\"kind\":\"embedding\",\"model\":\"boundaryB\",\"dimensions\":2},{\"name\":\"embedding\",\"kind\":\"embedding\",\"model\":\"indexA\",\"dimensions\":2},{\"name\":\"speech\",\"kind\":\"transcribe\",\"model\":\"speech\"}]}" }, "clip", .{ .ptr = &fake, .boundary_dispatch = Boundary.local_dispatch, .chunk_page_with_context_callback = @ptrCast(&Fake.page) });
+
+        const padding = try a.alloc(u8, 256 * 1024);
+        defer a.free(padding);
+        @memset(padding, 'x');
+        const source = try std.json.Stringify.valueAlloc(a, .{ .clip = "audio source", .padding = padding }, .{});
+        defer a.free(source);
+
+        const first = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, source, 1, .require_model);
+        defer a.free(first.body.?);
+        var stored = try a.dupe(u8, first.body.?);
+        defer a.free(stored);
+        const base = try document_facts.putBody(a, &pages, stored);
+        var previous = base;
+        fake.speech_revision_changed = true;
+        worker.media_page_limit = 8;
+        worker.model_chunker.?.max_chunks = 1;
+        var commits: usize = 0;
+        while (commits < 32) {
+            if (mode == 1) worker.checkpoint_context = .{ .allocator = a, .pages = &pages, .previous = previous, .previous_is_compact = document_facts.isCheckpointBody(stored), .key_digest = @splat(5) };
+            const input = if (document_facts.isCheckpointBody(stored)) try document_facts.resolveCheckpointStateAlloc(a, &pages, stored) else try a.dupe(u8, stored);
+            defer a.free(input);
+            const next = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, input, 1, .require_model);
+            if (next.body == null) break;
+            defer a.free(next.body.?);
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, next.body.?, .{});
+            defer parsed.deinit();
+            const compact = (try media_checkpoint.get(parsed.arena.allocator(), parsed.value)) != null;
+            const payload = if (compact) try document_facts.encodeCheckpointBodyAlloc(a, base, next.body.?) else try a.dupe(u8, next.body.?);
+            a.free(stored);
+            stored = payload;
+            totals[mode] += payload.len;
+            commits += 1;
+            previous = try document_facts.putBody(a, &pages, stored);
+            const public = try document_facts.readBodyAlloc(a, &pages, previous);
+            defer a.free(public);
+            var projection = try document_projection.parseAlloc(a, public);
+            defer projection.deinit(a);
+            // Every pending publication retains all independently healthy vectors.
+            try std.testing.expectEqual(@as(usize, 128), projection.chunk_embeddings.?.len);
+            try std.testing.expectEqual(@as(usize, 64), fake.calls[0]);
+            try std.testing.expectEqual(@as(usize, 64), fake.calls[1]);
+            if (compact) {
+                const group = (try media_checkpoint.get(parsed.arena.allocator(), parsed.value)).?;
+                try std.testing.expectEqual(@as(u8, 2), group.format);
+                try std.testing.expectEqual(base, group.repair_base.?);
+                try std.testing.expect(group.rows.len <= 8);
+                var descriptor = try document_facts.parseCheckpointBody(a, payload);
+                defer descriptor.deinit();
+                try std.testing.expectEqual(base, descriptor.value.base);
+                // The source and full receipt inventory stay in the leased baseline.
+                try std.testing.expect(payload.len < first.body.?.len / 2);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 11), commits);
+        try std.testing.expectEqualDeep([3]usize{ 64, 64, 128 }, fake.calls);
+        var final = try std.json.parseFromSlice(std.json.Value, a, stored, .{});
+        defer final.deinit();
+        if (mode == 0) {
+            final_body = try a.dupe(u8, stored);
+        } else {
+            var expected = try std.json.parseFromSlice(std.json.Value, a, final_body.?, .{});
+            defer expected.deinit();
+            try Compare.values(expected.value, final.value);
+        }
+        try std.testing.expectEqual(@as(i64, 1), final.value.object.get("_enrichment").?.object.get("chunk_embeddings_version").?.integer);
+        std.debug.print("secondary repair compact={any} source={d} commits={d} serialized_bytes={d} final={d} calls={any}\n", .{ mode == 1, source.len, commits, totals[mode], stored.len, fake.calls });
+    }
+    try std.testing.expect(totals[1] < totals[0] / 3);
+}
+
+test "model aware media serverless repair overlays hide stale index generations and reject mismatched baselines" {
+    const Fake = ServerlessMediaTestProvider;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/repair-generation", .{tmp.sub_path});
+    var fs = try @import("../artifacts/fs_store.zig").FsStore.init(a, path);
+    defer fs.deinit();
+    var objects = fs.artifactStore();
+    var reads: u64 = 64 * 1024 * 1024;
+    var writes: u64 = 64 * 1024 * 1024;
+    var pages = PageStore{ .domain = PageStore.namespaceDomain("docs"), .attempt = @splat(1), .artifacts = &objects, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var fake = Fake{ .fail = false, .parent_count = 8 };
+    var worker = SparseEnricher{ .alloc = a, .artifacts = undefined, .manifests = undefined, .progress = undefined, .wal = undefined };
+    defer worker.deinit();
+    const Boundary = @import("antfly_runtime_abi").callback_abi.Boundary(struct { chunk_page_with_context: ?*const @TypeOf(Fake.page) = null });
+    try worker.setModelChunker(.{ .provider = .antfly, .embedding = .{ .model = "indexA", .dimensions = 2 }, .outputs_json = "{\"boundary_model\":\"boundary\",\"targets\":[{\"name\":\"boundary\",\"kind\":\"embedding\",\"model\":\"boundaryB\",\"dimensions\":2},{\"name\":\"embedding\",\"kind\":\"embedding\",\"model\":\"indexA\",\"dimensions\":2},{\"name\":\"speech\",\"kind\":\"transcribe\",\"model\":\"speech\"}]}" }, "clip", .{ .ptr = &fake, .boundary_dispatch = Boundary.local_dispatch, .chunk_page_with_context_callback = @ptrCast(&Fake.page) });
+
+    const padding = try a.alloc(u8, 256 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'x');
+    const source = try std.json.Stringify.valueAlloc(a, .{ .clip = "audio source", .padding = padding }, .{});
+    defer a.free(source);
+
+    const initial = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, source, 1, .require_model);
+    defer a.free(initial.body.?);
+    const base = try document_facts.putBody(a, &pages, initial.body.?);
+    worker.checkpoint_context = .{ .allocator = a, .pages = &pages, .previous = base, .key_digest = @splat(5) };
+    worker.media_page_limit = 1;
+    worker.model_chunker.?.max_chunks = 1;
+    fake.index_revision_changed = true;
+    const repaired = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, initial.body.?, 1, .require_model);
+    defer a.free(repaired.body.?);
+    const payload = try document_facts.encodeCheckpointBodyAlloc(a, base, repaired.body.?);
+    defer a.free(payload);
+    const public = try document_facts.resolveCheckpointBodyAlloc(a, &pages, payload);
+    defer a.free(public);
+    var projection = try document_projection.parseAlloc(a, public);
+    defer projection.deinit(a);
+    // Only the newly repaired index rows belong to the new vector space.
+    try std.testing.expectEqual(@as(usize, 2), projection.chunk_embeddings.?.len);
+    try std.testing.expectEqualDeep([3]usize{ 8, 9, 8 }, fake.calls);
+    const wrong_base = try document_facts.putBody(a, &pages, "{}");
+    const wrong = try document_facts.encodeCheckpointBodyAlloc(a, wrong_base, repaired.body.?);
+    defer a.free(wrong);
+    try std.testing.expectError(error.InvalidMediaCheckpoint, document_facts.resolveCheckpointBodyAlloc(a, &pages, wrong));
+    try std.testing.expectError(error.InvalidMediaCheckpoint, document_facts.resolveCheckpointStateAlloc(a, &pages, wrong));
+    worker.checkpoint_context.?.key_digest = @splat(6);
+    const state = try document_facts.resolveCheckpointStateAlloc(a, &pages, payload);
+    defer a.free(state);
+    try std.testing.expectError(error.InvalidMediaCheckpoint, buildDerivedBodyAlloc(&worker, .chunk_embeddings, state, 1, .require_model));
 }

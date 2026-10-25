@@ -98,13 +98,13 @@ pub const Root = struct {
     counts: [7]u64 = @splat(0),
 
     pub const encoded_bytes = 576;
-    pub const metadata_version = 6;
+    pub const metadata_version = 7;
     pub fn eql(a: Root, b: Root) bool {
         return std.mem.eql(u8, &a.encode(), &b.encode());
     }
     pub fn encode(self: Root) [encoded_bytes]u8 {
         var out = @as([encoded_bytes]u8, @splat(0));
-        @memcpy(out[0..8], "AFDFACT6");
+        @memcpy(out[0..8], "AFDFACT7");
         @memcpy(out[16..48], &self.domain);
         @memcpy(out[48..80], &self.policy_fingerprint);
         std.mem.writeInt(u64, out[80..88], self.wal_end_lsn, .little);
@@ -124,7 +124,7 @@ pub const Root = struct {
     }
     pub fn decode(bytes: []const u8) !Root {
         const legacy = bytes.len == 512 and std.mem.eql(u8, bytes[0..8], "AFDFACT3");
-        if (!legacy and (bytes.len != encoded_bytes or (!std.mem.eql(u8, bytes[0..8], "AFDFACT4") and !std.mem.eql(u8, bytes[0..8], "AFDFACT5") and !std.mem.eql(u8, bytes[0..8], "AFDFACT6")))) return error.InvalidDocumentFactsRoot;
+        if (!legacy and (bytes.len != encoded_bytes or (!std.mem.eql(u8, bytes[0..8], "AFDFACT4") and !std.mem.eql(u8, bytes[0..8], "AFDFACT5") and !std.mem.eql(u8, bytes[0..8], "AFDFACT6") and !std.mem.eql(u8, bytes[0..8], "AFDFACT7")))) return error.InvalidDocumentFactsRoot;
         if (bytes[8] > (if (legacy) @as(u8, 31) else 63) or !std.mem.allEqual(u8, bytes[9..16], 0) or
             !std.mem.allEqual(u8, bytes[if (legacy) @as(usize, 472) else 536..], 0)) return error.InvalidDocumentFactsRoot;
         var root = Root{
@@ -390,7 +390,7 @@ pub fn mediaCheckpointParent(a: Allocator, body: []const u8) !?BodyRef {
     const group = state.object.get("chunk_embeddings_checkpoint") orelse return null;
     if (group != .object) return error.InvalidDocumentBody;
     const version = group.object.get("format") orelse return error.InvalidDocumentBody;
-    if (version != .integer or version.integer != 1) return error.InvalidDocumentBody;
+    if (version != .integer or (version.integer != 1 and version.integer != 2)) return error.InvalidDocumentBody;
     const parent = group.object.get("parent") orelse return null;
     if (parent == .null) return null;
     return try std.json.parseFromValueLeaky(BodyRef, parsed.arena.allocator(), parent, .{});
@@ -447,6 +447,14 @@ pub fn encodeCheckpointBodyAlloc(a: Allocator, base: BodyRef, document: []const 
     return std.mem.concat(a, u8, &.{ checkpoint_magic, encoded });
 }
 pub fn resolveCheckpointBodyAlloc(a: Allocator, pages: *page_store.PageStore, bytes: []const u8) ![]u8 {
+    return resolveCheckpointSelectedAlloc(a, pages, bytes, true);
+}
+/// Enrichment resumes the compact cursor directly; ordinary readers and
+/// builders materialize repair overlays without losing healthy vector rows.
+pub fn resolveCheckpointStateAlloc(a: Allocator, pages: *page_store.PageStore, bytes: []const u8) ![]u8 {
+    return resolveCheckpointSelectedAlloc(a, pages, bytes, false);
+}
+fn resolveCheckpointSelectedAlloc(a: Allocator, pages: *page_store.PageStore, bytes: []const u8, materialize: bool) ![]u8 {
     var descriptor = try parseCheckpointBody(a, bytes);
     defer descriptor.deinit();
     // Nested bases are forbidden: unrelated stages/upserts collapse to a new
@@ -457,6 +465,8 @@ pub fn resolveCheckpointBodyAlloc(a: Allocator, pages: *page_store.PageStore, by
     var parsed = try std.json.parseFromSlice(std.json.Value, a, source, .{});
     defer parsed.deinit();
     if (parsed.value != .object or descriptor.value.patch != .object) return error.InvalidDocumentBody;
+    var baseline = std.json.Value{ .object = .empty };
+    for (media_fields[1..]) |name| if (parsed.value.object.get(name)) |value| try baseline.object.put(parsed.arena.allocator(), name, value);
     for (media_fields) |name| _ = parsed.value.object.swapRemove(name);
     var it = descriptor.value.patch.object.iterator();
     while (it.next()) |entry| {
@@ -468,8 +478,34 @@ pub fn resolveCheckpointBodyAlloc(a: Allocator, pages: *page_store.PageStore, by
         if (!allowed) return error.InvalidDocumentBody;
         try parsed.value.object.put(parsed.arena.allocator(), entry.key_ptr.*, entry.value_ptr.*);
     }
+    const repair = repairCheckpoint(parsed.value);
+    if (repair) {
+        const checkpoint = @import("../enrichment/media_checkpoint.zig");
+        if (try checkpoint.get(parsed.arena.allocator(), parsed.value)) |group| if (group.repair_base) |base| {
+            if (!std.meta.eql(base, descriptor.value.base)) return error.InvalidMediaCheckpoint;
+            if (materialize) {
+                try checkpoint.expandRepairView(parsed.arena.allocator(), .{ .allocator = a, .pages = pages, .previous = base, .key_digest = group.key_digest }, &parsed.value, baseline);
+            } else {
+                // A resuming worker borrows the original accepted receipts for
+                // selective masks. The group cursor owns the repaired prefix.
+                var fields = baseline.object.iterator();
+                while (fields.next()) |entry| try parsed.value.object.put(parsed.arena.allocator(), entry.key_ptr.*, entry.value_ptr.*);
+            }
+        };
+    }
     return std.json.Stringify.valueAlloc(a, parsed.value, .{});
 }
+fn repairCheckpoint(document: std.json.Value) bool {
+    if (document != .object) return false;
+    const state = document.object.get("_enrichment") orelse return false;
+    if (state != .object) return false;
+    const group = state.object.get("chunk_embeddings_checkpoint") orelse return false;
+    if (group != .object) return false;
+    if (group.object.get("repair_base")) |base| if (base != .null) return true;
+    if (group.object.get("format")) |format| return format == .integer and format.integer == 2;
+    return false;
+}
+
 pub fn readBodyAlloc(a: Allocator, pages: *page_store.PageStore, ref: BodyRef) ![]u8 {
     const bytes = try readStoredBodyAlloc(a, pages, ref);
     if (!isCheckpointBody(bytes)) return bytes;
@@ -508,7 +544,7 @@ pub fn readStoredBodyAlloc(alloc: Allocator, pages: *page_store.PageStore, ref: 
 }
 
 pub fn loadRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.ArtifactRef) !Root {
-    if (source.kind != .document_facts or !((source.metadata_version == 3 and source.byte_len == 512) or ((source.metadata_version == 4 or source.metadata_version == 5 or source.metadata_version == Root.metadata_version) and source.byte_len == Root.encoded_bytes)))
+    if (source.kind != .document_facts or !((source.metadata_version == 3 and source.byte_len == 512) or ((source.metadata_version == 4 or source.metadata_version == 5 or source.metadata_version == 6 or source.metadata_version == Root.metadata_version) and source.byte_len == Root.encoded_bytes)))
         return error.InvalidDocumentFactsRoot;
     try artifacts.validateSha256ArtifactIdentity(source.artifact_id, source.checksum);
     const scope = (try artifacts.uploadScopeFromArtifactId(source.artifact_id)) orelse return error.InvalidDocumentFactsRoot;
@@ -525,6 +561,7 @@ pub fn loadRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.Art
         4 => "AFDFACT4",
         5 => "AFDFACT5",
         6 => "AFDFACT6",
+        7 => "AFDFACT7",
         else => return error.InvalidDocumentFactsRoot,
     };
     if (!std.mem.eql(u8, bytes[0..8], magic)) return error.InvalidDocumentFactsRoot;

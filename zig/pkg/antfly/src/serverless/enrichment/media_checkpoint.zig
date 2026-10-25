@@ -22,7 +22,7 @@ const facts = @import("../build/document_facts.zig");
 const PageStore = @import("../graph_segment/page_store.zig").PageStore;
 const outputs = @import("inference_chunker").outputs;
 
-pub const Context = struct { allocator: std.mem.Allocator, pages: *PageStore, previous: facts.BodyRef, key_digest: [32]u8 };
+pub const Context = struct { allocator: std.mem.Allocator, pages: *PageStore, previous: facts.BodyRef, previous_is_compact: bool = false, key_digest: [32]u8 };
 pub const Group = struct {
     format: u8 = 1,
     key_digest: [32]u8,
@@ -32,6 +32,10 @@ pub const Group = struct {
     start: u64,
     end: u64,
     parent: ?facts.BodyRef = null,
+    /// A repair overlays this leased, plain fact body. It is also the compact
+    /// envelope's base, so ordinary dependency retention owns its lifetime.
+    repair_base: ?facts.BodyRef = null,
+    index_recipe: ?[]const u8 = null,
     vectors: []const std.json.Value,
     previews: []const std.json.Value,
     rows: []const outputs.Row,
@@ -43,7 +47,7 @@ pub fn get(a: std.mem.Allocator, document: std.json.Value) !?Group {
     if (state != .object) return null;
     const raw = state.object.get("chunk_embeddings_checkpoint") orelse return null;
     const group = try std.json.parseFromValueLeaky(Group, a, raw, .{});
-    if (group.format != 1 or group.start >= group.end or group.recipe.len != 64 or group.plan_id.len != 64 or (group.start == 0) != (group.parent == null)) return error.InvalidMediaCheckpoint;
+    if ((group.format != 1 and group.format != 2) or (group.format == 2) != (group.repair_base != null) or (group.repair_base != null and (group.index_recipe == null or group.index_recipe.?.len != 64)) or group.start >= group.end or group.recipe.len != 64 or group.plan_id.len != 64 or (group.start == 0) != (group.parent == null)) return error.InvalidMediaCheckpoint;
     return group;
 }
 
@@ -67,6 +71,20 @@ pub fn generations(targets: []const outputs.Target, current: []const outputs.Res
 // any prior receipt. Hash-verified BodyRefs and document working limits bound
 // both corrupted ancestry and oversized final materialization.
 pub fn expand(a: std.mem.Allocator, context: Context, document: *std.json.Value) !void {
+    return expandSelected(a, context, document, true, null);
+}
+/// Worker closure already owns the newly processed tail. It needs only the
+/// acknowledged prefix, whereas query/invalidation materialization needs the
+/// baseline's unvisited outputs too.
+pub fn expandPrefix(a: std.mem.Allocator, context: Context, document: *std.json.Value) !void {
+    return expandSelected(a, context, document, false, null);
+}
+/// The compact envelope reader already parsed its plain base. Borrow those
+/// arrays rather than fetching and parsing the entire source a second time.
+pub fn expandRepairView(a: std.mem.Allocator, context: Context, document: *std.json.Value, baseline: std.json.Value) !void {
+    return expandSelected(a, context, document, true, baseline);
+}
+fn expandSelected(a: std.mem.Allocator, context: Context, document: *std.json.Value, include_tail: bool, supplied_baseline: ?std.json.Value) !void {
     const last = (try get(a, document.*)) orelse return;
     if (!std.mem.eql(u8, &last.key_digest, &context.key_digest)) return error.InvalidMediaCheckpoint;
     var groups = std.ArrayList(Group).empty;
@@ -84,7 +102,7 @@ pub fn expand(a: std.mem.Allocator, context: Context, document: *std.json.Value)
         var previous = try std.json.parseFromSlice(std.json.Value, context.allocator, bytes, .{});
         defer previous.deinit();
         const next = (try get(previous.arena.allocator(), previous.value)) orelse return error.InvalidMediaCheckpoint;
-        if (next.end != current.start or next.start >= current.start or !std.mem.eql(u8, &next.key_digest, &last.key_digest) or !std.mem.eql(u8, next.recipe, last.recipe) or !std.mem.eql(u8, next.plan_id, last.plan_id) or !std.mem.eql(u8, &next.generation, &last.generation)) return error.InvalidMediaCheckpoint;
+        if (next.end != current.start or next.start >= current.start or !std.mem.eql(u8, &next.key_digest, &last.key_digest) or !std.mem.eql(u8, next.recipe, last.recipe) or !std.mem.eql(u8, next.plan_id, last.plan_id) or !std.mem.eql(u8, &next.generation, &last.generation) or !std.meta.eql(next.repair_base, last.repair_base) or !optionalEqual(next.index_recipe, last.index_recipe)) return error.InvalidMediaCheckpoint;
         const encoded = try std.json.Stringify.valueAlloc(context.allocator, next, .{ .emit_null_optional_fields = false });
         defer context.allocator.free(encoded);
         current = try std.json.parseFromSliceLeaky(Group, a, encoded, .{ .allocate = .alloc_always });
@@ -100,14 +118,83 @@ pub fn expand(a: std.mem.Allocator, context: Context, document: *std.json.Value)
         try previews.appendSlice(a, group.previews);
         try rows.appendSlice(a, group.rows);
     }
+    if (include_tail) if (last.repair_base) |base| {
+        var bytes: ?[]u8 = null;
+        defer if (bytes) |raw| context.allocator.free(raw);
+        var parsed_baseline: ?std.json.Parsed(std.json.Value) = null;
+        defer if (parsed_baseline) |*value| value.deinit();
+        const baseline = supplied_baseline orelse read: {
+            bytes = try facts.readStoredBodyAlloc(context.allocator, context.pages, base);
+            if (facts.isCheckpointBody(bytes.?)) return error.InvalidMediaCheckpoint;
+            parsed_baseline = try std.json.parseFromSlice(std.json.Value, context.allocator, bytes.?, .{});
+            break :read parsed_baseline.?.value;
+        };
+        if (baseline != .object) return error.InvalidMediaCheckpoint;
+        const media = baseline.object.get("media_outputs") orelse return error.InvalidMediaCheckpoint;
+        if (media != .object) return error.InvalidMediaCheckpoint;
+        const plan = media.object.get("plan_id") orelse return error.InvalidMediaCheckpoint;
+        if (plan != .string or !std.mem.eql(u8, plan.string, last.plan_id)) return error.InvalidMediaCheckpoint;
+        const raw_rows = media.object.get("chunks") orelse return error.InvalidMediaCheckpoint;
+        var cached = try std.json.parseFromValue([]outputs.Row, context.allocator, raw_rows, .{});
+        defer cached.deinit();
+        if (baseline.object.get("chunk_embeddings")) |old| {
+            const old_previews = baseline.object.get("chunk_preview");
+            if (old != .array or old_previews == null or old_previews.? != .array or old_previews.?.array.items.len != old.array.items.len) return error.InvalidMediaCheckpoint;
+            for (old.array.items, old_previews.?.array.items) |value, preview| {
+                const ordinal = try vectorOrdinal(value);
+                if (ordinal < last.end or !healthyIndex(cached.value, ordinal, last.index_recipe.?)) continue;
+                try vectors.append(a, try cloneValue(a, value));
+                try previews.append(a, try cloneValue(a, preview));
+            }
+        }
+        for (cached.value, 0..) |row, ordinal| {
+            if (row.chunk_id != ordinal) return error.InvalidMediaCheckpoint;
+            if (ordinal < last.end) continue;
+            const encoded = try std.json.Stringify.valueAlloc(context.allocator, row, .{});
+            defer context.allocator.free(encoded);
+            try rows.append(a, try std.json.parseFromSliceLeaky(outputs.Row, a, encoded, .{ .allocate = .alloc_always }));
+        }
+    };
     try document.object.put(a, "chunk_embeddings", .{ .array = vectors.toManaged(a) });
     try document.object.put(a, "chunk_preview", .{ .array = previews.toManaged(a) });
-    const encoded = try std.json.Stringify.valueAlloc(a, .{ .plan_id = last.plan_id, .chunks = rows.items }, .{ .emit_null_optional_fields = false });
+    const projection = try outputs.project(a, rows.items);
+    try document.object.put(a, "transcript", .{ .string = projection.text });
+    try document.object.put(a, "transcript_spans", try cloneValue(a, projection.transcript_spans));
+    const encoded = try std.json.Stringify.valueAlloc(a, .{ .plan_id = last.plan_id, .chunks = rows.items, .complete_chunks = projection.complete_chunks, .failed_chunks = projection.failed_chunks, .terminal_chunks = projection.terminal_chunks, .status = projection.status }, .{ .emit_null_optional_fields = false });
     defer a.free(encoded);
     try document.object.put(a, "media_outputs", try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{ .allocate = .alloc_always }));
     var state = document.object.get("_enrichment").?;
     _ = state.object.swapRemove("chunk_embeddings_checkpoint");
     try document.object.put(a, "_enrichment", state);
+}
+
+fn optionalEqual(first: ?[]const u8, second: ?[]const u8) bool {
+    if (first) |value| return second != null and std.mem.eql(u8, value, second.?);
+    return second == null;
+}
+fn cloneValue(a: std.mem.Allocator, value: anytype) !std.json.Value {
+    const encoded = try std.json.Stringify.valueAlloc(a, value, .{});
+    defer a.free(encoded);
+    return std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{ .allocate = .alloc_always });
+}
+pub fn vectorOrdinal(value: std.json.Value) !u64 {
+    if (value != .object) return error.InvalidMediaCheckpoint;
+    const metadata = value.object.get("_chunk") orelse return error.InvalidMediaCheckpoint;
+    if (metadata != .object) return error.InvalidMediaCheckpoint;
+    const descriptor = metadata.object.get("descriptor") orelse return error.InvalidMediaCheckpoint;
+    if (descriptor != .object) return error.InvalidMediaCheckpoint;
+    const ordinal = descriptor.object.get("ordinal") orelse return error.InvalidMediaCheckpoint;
+    if (ordinal != .integer or ordinal.integer < 0) return error.InvalidMediaCheckpoint;
+    return @intCast(ordinal.integer);
+}
+pub fn healthyIndex(rows: []const outputs.Row, ordinal: u64, recipe: []const u8) bool {
+    if (ordinal >= rows.len or rows[@intCast(ordinal)].chunk_id != ordinal) return false;
+    var found = false;
+    for (rows[@intCast(ordinal)].outputs) |result| if (result.kind == .embedding and std.mem.eql(u8, result.name, "embedding")) {
+        if (!std.mem.eql(u8, result.recipe_id, recipe) or !result.reusable() or result.status != .complete) return false;
+        found = true;
+    };
+    return found;
 }
 
 pub fn compact(a: std.mem.Allocator, context: Context, document: *std.json.Value, group: Group) !void {

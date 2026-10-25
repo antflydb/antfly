@@ -56,8 +56,27 @@ test "model aware media transcript assets retain UTF8 offsets source clocks and 
 /// Text cuts keep whole phrase clocks. A partial phrase has the original
 /// timing envelope; we never invent word timing by interpolating bytes.
 pub fn stampTranscriptChunks(a: std.mem.Allocator, chunks: []@import("../../../chunking/chunk.zig").Chunk, raw: []const u8, source_name: []const u8) !void {
+    return stampTranscriptChunksImpl(a, chunks, raw, source_name, true);
+}
+// The full-scan mode provides an output-equivalent benchmark baseline. Both
+// paths retain the same validation, phrase clocks and output serialization.
+fn stampTranscriptChunksImpl(a: std.mem.Allocator, chunks: []@import("../../../chunking/chunk.zig").Chunk, raw: []const u8, source_name: []const u8, comptime use_sweep: bool) !void {
     var asset = try std.json.parseFromSlice(struct { text: []const u8, source_artifact_name: []const u8 = "", transcript_spans: []const TranscriptSpan }, a, raw, .{ .ignore_unknown_fields = true });
     defer asset.deinit();
+    // Generated offsets are ordered. Imported/unordered spans or cuts retain
+    // the general path; do not assume an ordering that was never validated.
+    var ordered = use_sweep;
+    for (asset.value.transcript_spans, 0..) |phrase, i| {
+        if (phrase.char_start > phrase.char_end or phrase.char_end > asset.value.text.len or phrase.start_ns < 0 or phrase.end_ns < phrase.start_ns) return error.InvalidTranscriptCoordinates;
+        if (i > 0) {
+            const previous = asset.value.transcript_spans[i - 1];
+            ordered = ordered and previous.char_start <= phrase.char_start and previous.char_end <= phrase.char_end;
+        }
+    }
+    for (chunks, 0..) |chunk, i| if (i > 0) {
+        ordered = ordered and (chunks[i - 1].start_offset orelse return error.InvalidTranscriptCoordinates) <= (chunk.start_offset orelse return error.InvalidTranscriptCoordinates);
+    };
+    var cursor: usize = 0;
     for (chunks) |*chunk| {
         const first = chunk.start_offset orelse return error.InvalidTranscriptCoordinates;
         const last = chunk.end_offset orelse return error.InvalidTranscriptCoordinates;
@@ -66,7 +85,11 @@ pub fn stampTranscriptChunks(a: std.mem.Allocator, chunks: []@import("../../../c
         defer spans.deinit(a);
         var start: ?i64 = null;
         var end: i64 = 0;
-        for (asset.value.transcript_spans) |phrase| {
+        if (ordered) while (cursor < asset.value.transcript_spans.len and asset.value.transcript_spans[cursor].char_end <= first) {
+            cursor += 1;
+        };
+        for (asset.value.transcript_spans[if (ordered) cursor else 0..]) |phrase| {
+            if (ordered and phrase.char_start >= last) break;
             if (phrase.char_end <= first or phrase.char_start >= last) continue;
             if (phrase.char_start > phrase.char_end or phrase.char_end > asset.value.text.len or phrase.start_ns < 0 or phrase.end_ns < phrase.start_ns) return error.InvalidTranscriptCoordinates;
             var local = phrase;
@@ -177,4 +200,74 @@ test "model aware media page collector matches whole projection and preserves UT
     var parsed = try std.json.parseFromSlice(struct { chunks: []const Row }, a, encoded, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 2), parsed.value.chunks.len);
+}
+
+test "model aware media transcript stamping preserves overlaps and unordered UTF8 cuts" {
+    const a = std.testing.allocator;
+    const Chunk = @import("../../../chunking/chunk.zig").Chunk;
+    for (0..4) |mode| {
+        var spans = [_]TranscriptSpan{
+            .{ .char_start = 0, .char_end = 5, .start_ns = 10, .end_ns = 20, .parent_ordinal = 0, .sub_index = 0, .speaker_index = 1 },
+            .{ .char_start = 6, .char_end = 12, .start_ns = 30, .end_ns = 40, .parent_ordinal = 1, .sub_index = 1, .speaker_index = 0 },
+        };
+        if (mode & 1 != 0) std.mem.swap(TranscriptSpan, &spans[0], &spans[1]);
+        const raw = try std.json.Stringify.valueAlloc(a, .{ .text = "hello 世界", .transcript_spans = spans }, .{});
+        defer a.free(raw);
+        var chunks = [_]Chunk{ .{ .chunk_id = 0, .start_offset = 0, .end_offset = 6 }, .{ .chunk_id = 1, .start_offset = 3, .end_offset = 12 } };
+        defer for (&chunks) |*chunk| chunk.deinit(a);
+        if (mode & 2 != 0) std.mem.swap(Chunk, &chunks[0], &chunks[1]);
+        try stampTranscriptChunks(a, &chunks, raw, "speech");
+        for (chunks) |chunk| {
+            var media = try std.json.parseFromSlice(struct { start_ns: i64, end_ns: i64, transcript_spans: []const TranscriptSpan }, a, chunk.media_spans_json.?, .{ .ignore_unknown_fields = true });
+            defer media.deinit();
+            try std.testing.expectEqual(@as(i64, 10), media.value.start_ns);
+            try std.testing.expectEqual(@as(i64, if (chunk.chunk_id == 0) 20 else 40), media.value.end_ns);
+            try std.testing.expectEqual(@as(usize, if (chunk.chunk_id == 0) 1 else 2), media.value.transcript_spans.len);
+            for (media.value.transcript_spans) |span| {
+                if (span.parent_ordinal == 1) {
+                    try std.testing.expectEqual(@as(u32, 3), span.char_start);
+                    try std.testing.expectEqual(@as(u32, 9), span.char_end);
+                    try std.testing.expectEqual(@as(i64, 30), span.start_ns);
+                    try std.testing.expectEqual(@as(u32, 1), span.sub_index);
+                } else {
+                    try std.testing.expectEqual(@as(u32, 0), span.char_start);
+                    try std.testing.expectEqual(@as(u32, if (chunk.chunk_id == 0) 5 else 2), span.char_end);
+                    try std.testing.expectEqual(@as(?u32, 1), span.speaker_index);
+                }
+            }
+        }
+    }
+}
+
+test "benchmark transcript span stamping full scan and ordered sweep" {
+    const a = std.heap.smp_allocator;
+    const Chunk = @import("../../../chunking/chunk.zig").Chunk;
+    const n = 30000;
+    const text = try a.alloc(u8, n * 2);
+    defer a.free(text);
+    @memset(text, 'a');
+    const spans = try a.alloc(TranscriptSpan, n);
+    defer a.free(spans);
+    for (spans, 0..) |*span, i| span.* = .{ .char_start = @intCast(i * 2), .char_end = @intCast(i * 2 + 1), .start_ns = @intCast(i * 100), .end_ns = @intCast(i * 100 + 50), .parent_ordinal = @intCast(i), .sub_index = 0, .speaker_index = null };
+    const raw = try std.json.Stringify.valueAlloc(a, .{ .text = text, .transcript_spans = spans }, .{});
+    defer a.free(raw);
+    var times: [2]i128 = undefined;
+    var previous: ?[]Chunk = null;
+    defer if (previous) |chunks| {
+        for (chunks) |*chunk| chunk.deinit(a);
+        a.free(chunks);
+    };
+    for (0..2) |mode| {
+        const chunks = try a.alloc(Chunk, n);
+        defer if (mode == 1) {
+            for (chunks) |*chunk| chunk.deinit(a);
+            a.free(chunks);
+        };
+        for (chunks, 0..) |*chunk, i| chunk.* = .{ .chunk_id = @intCast(i), .start_offset = @intCast(i * 2), .end_offset = @intCast(i * 2 + 2) };
+        const start = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
+        if (mode == 0) try stampTranscriptChunksImpl(a, chunks, raw, "speech", false) else try stampTranscriptChunks(a, chunks, raw, "speech");
+        times[mode] = std.Io.Clock.awake.now(std.testing.io).toNanoseconds() - start;
+        if (mode == 0) previous = chunks else for (previous.?, chunks) |old, new| try std.testing.expectEqualStrings(old.media_spans_json.?, new.media_spans_json.?);
+    }
+    std.debug.print("transcript chunks={d} spans={d} full_scan_ns={d} sweep_ns={d} equal_outputs=true\n", .{ n, n, times[0], times[1] });
 }

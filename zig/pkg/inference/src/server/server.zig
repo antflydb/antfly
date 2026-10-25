@@ -40937,6 +40937,7 @@ const MediaOutputExecution = struct {
             }
             const boundary_target = self.config.targets[boundary_index];
             const shared_embedding = target.kind == .embedding and boundary_target.kind == .embedding and (primary != null or primary_error != null) and std.mem.eql(u8, target.model, boundary_target.model) and std.mem.eql(u8, target.task_type, boundary_target.task_type) and target.dimensions == boundary_target.dimensions;
+            if (shared_embedding) try validateMediaOutputGeneration(resolved.identity, resolved.revision, self.resolved[boundary_index].identity, self.resolved[boundary_index].revision);
             if (target.kind == .embedding and (index == boundary_index or shared_embedding)) {
                 var value = base;
                 if (!target.wants(descriptor.ordinal, 0)) {
@@ -41312,4 +41313,25 @@ test "model aware media sparse frame repairs prepare only needed classifier tens
         }
     }
     try std.testing.expectEqual([2]usize{ 32, 1 }, counts);
+}
+
+test "model aware media shared embeddings require the same resolved producing generation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const O = lib_chunker.outputs;
+    const targets = [_]O.Target{ .{ .name = "boundary", .kind = .embedding, .model = "alias", .dimensions = 2 }, .{ .name = "embedding", .kind = .embedding, .model = "alias", .dimensions = 2 } };
+    var execution = MediaOutputExecution{ .node = undefined, .io = std.testing.io, .control = .{}, .config = .{ .boundary_model = "boundary", .targets = &targets }, .initialized = 2 };
+    const identity: [64]u8 = @splat('a');
+    const revision_a: [64]u8 = @splat('1');
+    const revision_b: [64]u8 = @splat('2');
+    execution.resolved[0] = .{ .path = "alias", .identity = identity, .revision = revision_a, .recipe_id = try targets[0].recipeIdentity(a, &identity, &revision_a) };
+    execution.resolved[1] = .{ .path = "alias", .identity = identity, .revision = revision_b, .recipe_id = try targets[1].recipeIdentity(a, &identity, &revision_b) };
+    const vector = try a.dupe(f32, &.{ 1, 0 });
+    try std.testing.expectError(error.ModelConfigurationChanged, MediaOutputExecution.execute(&execution, a, .{ .text = "hello" }, .{ .ordinal = 0, .input_tokens = 1, .coordinates = .{ .kind = .text, .start_byte = 0, .end_byte = 5 } }, .{ .model = "alias", .model_identity = identity, .model_revision = revision_a, .task_type = "RETRIEVAL_DOCUMENT" }, .{ .vector = vector, .input_tokens = 1 }, null, true));
+    execution.resolved[1].revision = revision_a;
+    execution.resolved[1].recipe_id = try targets[1].recipeIdentity(a, &identity, &revision_a);
+    const results = try MediaOutputExecution.execute(&execution, a, .{ .text = "hello" }, .{ .ordinal = 0, .input_tokens = 1, .coordinates = .{ .kind = .text, .start_byte = 0, .end_byte = 5 } }, .{ .model = "alias", .model_identity = identity, .model_revision = revision_a, .task_type = "RETRIEVAL_DOCUMENT" }, .{ .vector = vector, .input_tokens = 1 }, null, true);
+    try std.testing.expectEqualSlices(f32, vector, results[1].embedding.?);
+    try results[1].validate(targets[1]);
 }

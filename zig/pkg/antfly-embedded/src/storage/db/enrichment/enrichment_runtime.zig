@@ -15099,14 +15099,14 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
                 const header = try @import("../../artifact_payload.zig").Metadata.decode(scalar.?);
                 break :independent header.dense_dimensions == upstream.expected_dims and header.sourceHash() == retainedTextEmbeddingHashAtRevision(source_request, text.?, generation.revision);
             } else false;
-            const indices = if (independent) try a.dupe(u32, &.{0}) else try vector_set.indicesFromResults(a, results);
+            const indices = if (scalar != null) try a.dupe(u32, &.{0}) else try vector_set.indicesFromResults(a, results);
             defer a.free(indices);
             const selected = try a.alloc(?@import("inference_chunker").outputs.Result, indices.len);
             defer a.free(selected);
             @memset(selected, null);
             var window_count: usize = 0;
             if (!independent) for (results) |result| if (result.kind == .embedding and std.mem.eql(u8, result.name, "embedding")) {
-                selected[result.sub_index] = result;
+                if (result.sub_index < selected.len) selected[result.sub_index] = result;
                 window_count += 1;
             };
             for (indices) |index| {
@@ -40441,7 +40441,7 @@ test "model aware media labels authenticate independently refreshed retained tex
     const vector_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, member, "vectors");
     defer alloc.free(vector_key);
     const dense_request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "vectors", .artifact_name = "clips", .embedding_name = "vectors", .doc_key = "doc", .source_field = "body", .producer_json = "{\"provider\":\"antfly\",\"model\":\"vectors\"}", .expected_dims = 2 };
-    const metadata = @import("inference_chunker").types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .coordinates = .{ .kind = .video }, .input_tokens = 2 }, .inference_id = "plan:0", .source_fingerprint = "source", .source_version = "v1", .plan_id = "plan", .model = "vectors", .model_identity = "3333333333333333333333333333333333333333333333333333333333333333", .model_revision = "0101010101010101010101010101010101010101010101010101010101010101", .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{} };
+    const metadata = @import("inference_chunker").types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .coordinates = .{ .kind = .video }, .input_tokens = 2 }, .inference_id = "plan:0", .source_fingerprint = "source", .source_version = "v1", .plan_id = "plan", .model = "vectors", .model_identity = "3333333333333333333333333333333333333333333333333333333333333333", .model_revision = "0101010101010101010101010101010101010101010101010101010101010101", .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .outputs_json = "[{\"name\":\"embedding\",\"kind\":\"embedding\",\"required\":true,\"model\":\"vectors\",\"model_identity\":\"\",\"model_revision\":\"\",\"recipe_id\":\"\",\"status\":\"failed\",\"code\":\"OldModelFailure\",\"terminal\":true}]" };
     const text = "exact text";
     const payload = try std.json.Stringify.valueAlloc(alloc, .{ .body = text, ._chunk = metadata }, .{});
     defer alloc.free(payload);

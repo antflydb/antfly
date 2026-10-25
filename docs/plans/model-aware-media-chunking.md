@@ -507,3 +507,36 @@ verification peaks at 215,232 admitted bytes and passes under a 256 KiB hard
 limit. Persisted recipes already omit vector and output payloads; this saving
 concerns identity metadata. These deterministic counters do not measure live
 model latency or process RSS.
+
+
+## Secondary repair and transcript preparation qualification
+
+`antfly-serverless-test` covers durable secondary-only repair overlays. A
+64-parent fixture with a 262,180-byte source retains all 128 healthy index
+vectors after every pending publication, including reads through stored fact
+bodies. Eleven repair commits serialize 770,774 bytes, compared with 5,794,416
+for complete snapshots preserving the same healthy vectors. Both modes produce
+the same 526,644-byte final document and make 64 boundary, 64 index, and 128
+speech calls across initial preparation plus speech repair. The earlier
+4,872,630-byte repair measurement dropped healthy tail vectors; it is not an
+equivalent-output baseline. These are serialized payload counts, not latency
+or network-throughput measurements.
+
+Repair groups use the plain leased baseline as the compact envelope base.
+Queries and builders materialize the repaired prefix plus healthy unvisited
+outputs; workers resume the compact cursor against the baseline's accepted
+receipts. Materialization checks the baseline and index recipe and never mixes
+unvisited vectors from a replaced index generation. Version 7 fact roots retain
+formats 3–6 as readable inputs while fencing readers unaware of repair overlays.
+
+The `benchmark transcript span stamping full scan and ordered sweep` test
+compares the production sweep with an output-equivalent full-scan mode. Run it
+with the pinned Zig through `zig build antfly-storage-test -Doptimize=ReleaseFast
+'-Dtest-filter=benchmark transcript span stamping'` from `zig/`. The fixture
+contains 30,000 spans and 30,000 text chunks, includes JSON
+parsing and serialization, and compares every output metadata string. Clock
+results describe this component on the measured host; they do not qualify live
+model latency. Three ReleaseFast runs measured 304.0–304.7 ms for the full scan
+and 14.9–15.6 ms for the sweep, with identical metadata outputs. Normal media
+tests additionally cover unordered spans/cuts,
+UTF-8 byte offsets, phrase clocks, and local speaker scopes.
