@@ -262,7 +262,7 @@ reproduced before this barrier and pass with the same compiler backend after it.
 The C API unit gate runs model-free contracts regardless of which models are
 installed. Actual embedding, reranking, generation/streaming, and Lite embedding
 drain tests belong to `capi-local-model-test`. Both targets share one compiled
-artifact and its existing memory admission; they have disjoint runtime filters.
+artifact and its existing compilation memory reservation; they have disjoint runtime filters.
 The model target requires all selected tests to run without skips, so an absent
 model fails qualification rather than silently passing it. It never pulls models.
 
@@ -344,3 +344,31 @@ by one live row, an initial scan allowance of 8,199, and the exact total of
 construction. A local checked allocator with opt-in traces reduced it to
 1.39 seconds with the same dataset, cursor boundaries, output, and memory
 checks. No production graph scan limit or scheduler policy changed.
+
+### SQL fault campaigns and large operator fixtures
+
+SQL's shared test allocator retains leak, mismatch, double-free and
+write-after-free checks. Fault campaigns still use the platform's stable
+no-resize/no-remap enumeration. `ANTFLY_TEST_ALLOCATOR_TRACES=1` restores
+successful-allocation traces. Four large operator fixtures use the same checked
+allocator without changing row counts, spill quotas, compression/parallel modes,
+reference outputs, capture counts or early-close checks.
+
+Samples of sorted-cursor fault injection and high-cardinality set execution
+attributed about 80–82% of active stacks to SafeAllocator trace capture.
+Native Debug measurements, excluding compilation, were:
+
+| Regression | Before | Checked allocation |
+| --- | ---: | ---: |
+| Shared spill fault campaign | 56.2–80.1 s | 2.8–3.1 s |
+| Sorted delivery fault campaign | 41.7–69.6 s | 5.8–10.6 s |
+| Compact delivery fault campaign | 51.1 s | 3.6–3.8 s |
+| High-cardinality set promotion | 57.3–67.7 s | 6.5 s |
+| Parallel partition reducers | 50.2 s | 2.1 s |
+| Partial join spill | 49.7 s | 3.1 s |
+| Shared-file sort cohorts | 44.8 s | 1.2 s |
+
+Concurrent local work accounts for substantial run-to-run variation; these are
+not production throughput claims or pass/fail latency thresholds. The complete
+SQL target passes 1,272 distinct tests with three skips and no failures or leaks
+across its two ownership partitions (22/22 build steps). Trace opt-in also passes.

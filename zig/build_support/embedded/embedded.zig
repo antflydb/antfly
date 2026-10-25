@@ -623,7 +623,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
             .mode = .simple,
         },
     });
-    // Share compilation and memory admission between hermetic API contracts
+    // Share compilation and its memory admission between hermetic API contracts
     // and explicit model qualification. Installed models must not silently
     // change the cost or selection of the ordinary unit gate.
     const run_capi_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, capi_tests, selectTestFilters(b, &capi_default_filters));
