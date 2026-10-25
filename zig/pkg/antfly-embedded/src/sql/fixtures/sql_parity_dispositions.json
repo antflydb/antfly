@@ -3095,6 +3095,51 @@
       ],
       "cwd": ".",
       "timeout_seconds": 1800
+    },
+    "sql-qualified-temporal-bin-boundary-debug": {
+      "command": [
+        "zig",
+        "build",
+        "--build-file",
+        "zig/build.zig",
+        "sql-test",
+        "-Dtest-filter=SQL temporal",
+        "-Dtest-filter=SQL transaction timestamp",
+        "-Dtest-filter=SQL assignment",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-temporal-bin-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "--build-file",
+        "zig/build.zig",
+        "antfly-api-sql-temporal-bin-lifecycle-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-temporal-bin-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_temporal_bin_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_temporal_bin_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -5308,8 +5353,30 @@
     },
     {
       "id": "sql-0179",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL and parameters execute through public native SQL with PostgreSQL temporal identities: CURRENT_DATE is DATE (OID 1082) borrowed from the pinned transaction clock, typed date_bin retains timestamp overload identity and exact signed microseconds, and DATE conflict assignments coerce to target TIMESTAMPTZ. PostgreSQL qualifies complete output/table postimages; mounted native sessions, durable commits, independent owner restart, resumed bin/conflict writes and residual/sorted reads qualify activation. The current temporal timezone capability is UTC; no integer epoch overload is invented.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_temporal_bin_integration_test.zig",
+          "test": "mounted SQL original temporal bins and transaction dates preserve typed writes and cold postimages",
+          "gate": "sql-qualified-temporal-bin-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL temporal bins match PostgreSQL overloads signed arithmetic infinities and errors",
+          "gate": "sql-qualified-temporal-bin-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL temporal bins preserve logical ingress lazy branches and allocation failure ownership",
+          "gate": "sql-qualified-temporal-bin-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_temporal_bin_integration_test.zig",
+          "test": "mounted SQL original temporal bins and transaction dates preserve typed writes and cold postimages",
+          "gate": "sql-qualified-temporal-bin-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0180",
@@ -7149,18 +7216,84 @@
     },
     {
       "id": "sql-0264",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The historical source classified these statements as successful native equivalents. That non-PostgreSQL contract is explicitly superseded by strict PostgreSQL signature/name resolution, qualified against unchanged original SQL and parameters. Unchanged original SQL and parameters receive independently qualified PostgreSQL diagnostics: numeric epoch date_bin overloads do not exist (42883), and an unqualified ON CONFLICT timestamp source is ambiguous (42702). Native owners reject before durable mutation and preserve complete postimages after reopening. This is standard signature/name resolution, not a generic unsupported-shape fallback; positive typed bins and qualified calendar assignments also execute through the same native campaign.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_temporal_bin_integration_test.zig",
+          "test": "mounted SQL original temporal bins and transaction dates preserve typed writes and cold postimages",
+          "gate": "sql-qualified-temporal-bin-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL temporal bins match PostgreSQL overloads signed arithmetic infinities and errors",
+          "gate": "sql-qualified-temporal-bin-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL temporal bins preserve logical ingress lazy branches and allocation failure ownership",
+          "gate": "sql-qualified-temporal-bin-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_temporal_bin_integration_test.zig",
+          "test": "mounted SQL original temporal bins and transaction dates preserve typed writes and cold postimages",
+          "gate": "sql-qualified-temporal-bin-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0265",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The historical source classified these statements as successful native equivalents. That non-PostgreSQL contract is explicitly superseded by strict PostgreSQL signature/name resolution, qualified against unchanged original SQL and parameters. Unchanged original SQL and parameters receive independently qualified PostgreSQL diagnostics: numeric epoch date_bin overloads do not exist (42883), and an unqualified ON CONFLICT timestamp source is ambiguous (42702). Native owners reject before durable mutation and preserve complete postimages after reopening. This is standard signature/name resolution, not a generic unsupported-shape fallback; positive typed bins and qualified calendar assignments also execute through the same native campaign.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_temporal_bin_integration_test.zig",
+          "test": "mounted SQL original temporal bins and transaction dates preserve typed writes and cold postimages",
+          "gate": "sql-qualified-temporal-bin-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL temporal bins match PostgreSQL overloads signed arithmetic infinities and errors",
+          "gate": "sql-qualified-temporal-bin-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL temporal bins preserve logical ingress lazy branches and allocation failure ownership",
+          "gate": "sql-qualified-temporal-bin-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_temporal_bin_integration_test.zig",
+          "test": "mounted SQL original temporal bins and transaction dates preserve typed writes and cold postimages",
+          "gate": "sql-qualified-temporal-bin-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0266",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL and parameters execute through public native SQL with PostgreSQL temporal identities: CURRENT_DATE is DATE (OID 1082) borrowed from the pinned transaction clock, typed date_bin retains timestamp overload identity and exact signed microseconds, and DATE conflict assignments coerce to target TIMESTAMPTZ. PostgreSQL qualifies complete output/table postimages; mounted native sessions, durable commits, independent owner restart, resumed bin/conflict writes and residual/sorted reads qualify activation. The current temporal timezone capability is UTC; no integer epoch overload is invented.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_temporal_bin_integration_test.zig",
+          "test": "mounted SQL original temporal bins and transaction dates preserve typed writes and cold postimages",
+          "gate": "sql-qualified-temporal-bin-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL temporal bins match PostgreSQL overloads signed arithmetic infinities and errors",
+          "gate": "sql-qualified-temporal-bin-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL temporal bins preserve logical ingress lazy branches and allocation failure ownership",
+          "gate": "sql-qualified-temporal-bin-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_temporal_bin_integration_test.zig",
+          "test": "mounted SQL original temporal bins and transaction dates preserve typed writes and cold postimages",
+          "gate": "sql-qualified-temporal-bin-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0267",
@@ -26717,8 +26850,30 @@
     },
     {
       "id": "sql-1467",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL and parameters execute through public native SQL with PostgreSQL temporal identities: CURRENT_DATE is DATE (OID 1082) borrowed from the pinned transaction clock, typed date_bin retains timestamp overload identity and exact signed microseconds, and DATE conflict assignments coerce to target TIMESTAMPTZ. PostgreSQL qualifies complete output/table postimages; mounted native sessions, durable commits, independent owner restart, resumed bin/conflict writes and residual/sorted reads qualify activation. The current temporal timezone capability is UTC; no integer epoch overload is invented.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_temporal_bin_integration_test.zig",
+          "test": "mounted SQL original temporal bins and transaction dates preserve typed writes and cold postimages",
+          "gate": "sql-qualified-temporal-bin-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL temporal bins match PostgreSQL overloads signed arithmetic infinities and errors",
+          "gate": "sql-qualified-temporal-bin-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL temporal bins preserve logical ingress lazy branches and allocation failure ownership",
+          "gate": "sql-qualified-temporal-bin-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_temporal_bin_integration_test.zig",
+          "test": "mounted SQL original temporal bins and transaction dates preserve typed writes and cold postimages",
+          "gate": "sql-qualified-temporal-bin-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1468",
@@ -26839,8 +26994,30 @@
     },
     {
       "id": "sql-1477",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The historical source classified these statements as successful native equivalents. That non-PostgreSQL contract is explicitly superseded by strict PostgreSQL signature/name resolution, qualified against unchanged original SQL and parameters. Unchanged original SQL and parameters receive independently qualified PostgreSQL diagnostics: numeric epoch date_bin overloads do not exist (42883), and an unqualified ON CONFLICT timestamp source is ambiguous (42702). Native owners reject before durable mutation and preserve complete postimages after reopening. This is standard signature/name resolution, not a generic unsupported-shape fallback; positive typed bins and qualified calendar assignments also execute through the same native campaign.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_temporal_bin_integration_test.zig",
+          "test": "mounted SQL original temporal bins and transaction dates preserve typed writes and cold postimages",
+          "gate": "sql-qualified-temporal-bin-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL temporal bins match PostgreSQL overloads signed arithmetic infinities and errors",
+          "gate": "sql-qualified-temporal-bin-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL temporal bins preserve logical ingress lazy branches and allocation failure ownership",
+          "gate": "sql-qualified-temporal-bin-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_temporal_bin_integration_test.zig",
+          "test": "mounted SQL original temporal bins and transaction dates preserve typed writes and cold postimages",
+          "gate": "sql-qualified-temporal-bin-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1478",

@@ -162,6 +162,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlUndefinedFunction => .{ .code = "42883", .message = "No function matches the argument types.", .hint = "Use explicit casts to compatible argument types." },
         error.SqlDistinctOrderMismatch => .{ .code = "42P10", .message = "For SELECT DISTINCT, ORDER BY expressions must appear in the select list." },
         error.SqlDistinctOnOrderMismatch => .{ .code = "42P10", .message = "SELECT DISTINCT ON expressions must match initial ORDER BY expressions." },
+        error.SqlDateBinCalendarStride => .{ .code = "0A000", .message = "Timestamp bins cannot contain months or years." },
         error.TemporalOutOfRange => .{ .code = "22008", .message = "The temporal value is outside the supported range." },
         error.InvalidTemporalBinary => .{ .code = "22P03", .message = "The temporal binary representation is invalid." },
         error.InvalidTemporalText => .{ .code = "22007", .message = "The temporal input is invalid." },

@@ -818,10 +818,10 @@ const Parser = struct {
         } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "array") and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lbracket) {
             self.pos += 1;
             left = try self.arrayConstructor(depth + 1);
-        } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timestamptz") or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "interval") or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "date") or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timestamp")) and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .string) {
+        } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timestamptz") or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "interval") or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "date") or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timestamp") or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "time") or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timetz")) and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .string) {
             // Typed literals use the same validating/canonicalizing cast as
             // CAST(text AS timestamptz), including offset normalization.
-            const temporal_kind: ?@import("temporal_value.zig").Kind = if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "interval")) .interval else if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "date")) .date else if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timestamp")) .timestamp else null;
+            const temporal_kind: ?@import("temporal_value.zig").Kind = if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "interval")) .interval else if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "date")) .date else if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timestamp")) .timestamp else if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "time")) .time else if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timetz")) .time_tz else null;
             self.pos += 1;
             const literal = try self.scalarNode(.{ .literal = try self.value() });
             left = try self.scalarNode(.{ .cast = .{ .operand = literal, .type = .datetime, .temporal_kind = temporal_kind } });
@@ -830,6 +830,9 @@ const Parser = struct {
             if (self.peek(.lparen)) return self.fail(error.InvalidSqlSyntax, "CURRENT_USER does not take parentheses");
             self.uses_current_setting = true;
             left = try self.scalarNode(.{ .call = .{ .name = "$current_user", .args = &.{} } });
+        } else if (self.keyword(.current_date)) {
+            if (self.peek(.lparen)) return self.fail(error.InvalidSqlSyntax, "CURRENT_DATE does not take parentheses");
+            left = try self.scalarNode(.{ .call = .{ .name = "$current_date", .args = &.{} } });
         } else if (self.keyword(.current_timestamp)) {
             var precision: i64 = 6;
             if (self.take(.lparen)) {
@@ -2188,7 +2191,7 @@ const Parser = struct {
     // it before relational lowering substitutes internal expression columns.
     fn projectionLabel(expression: *const ast.Scalar) ?[]const u8 {
         return switch (expression.*) {
-            .call => |call| if (std.mem.eql(u8, call.name, "$current_timestamp")) "current_timestamp" else if (std.mem.eql(u8, call.name, "$current_user")) "current_user" else if (std.mem.eql(u8, call.name, "$regex_operator")) "?column?" else if (std.mem.startsWith(u8, call.name, "$")) null else if (std.mem.lastIndexOfScalar(u8, call.name, 0)) |at| call.name[at + 1 ..] else call.name,
+            .call => |call| if (std.mem.eql(u8, call.name, "$current_timestamp")) "current_timestamp" else if (std.mem.eql(u8, call.name, "$current_date")) "current_date" else if (std.mem.eql(u8, call.name, "$current_user")) "current_user" else if (std.mem.eql(u8, call.name, "$regex_operator")) "?column?" else if (std.mem.startsWith(u8, call.name, "$")) null else if (std.mem.lastIndexOfScalar(u8, call.name, 0)) |at| call.name[at + 1 ..] else call.name,
             .case_when => "case",
             .column => |column| if (std.mem.lastIndexOfScalar(u8, column, 0)) |at| column[at + 1 ..] else column,
             .cast => |cast| switch (cast.operand.*) {
@@ -2238,6 +2241,8 @@ const Parser = struct {
         if (!self.peek(.identifier) or self.tokens[self.pos].owned) return .{ .type = try self.columnType() };
         const name_value = self.tokens[self.pos].text;
         self.pos += 1;
+        if (std.ascii.eqlIgnoreCase(name_value, "time")) return .{ .type = .datetime, .temporal_kind = .time };
+        if (std.ascii.eqlIgnoreCase(name_value, "timetz")) return .{ .type = .datetime, .temporal_kind = .time_tz };
         if (std.ascii.eqlIgnoreCase(name_value, "interval")) return .{ .type = .datetime, .temporal_kind = .interval };
         if (std.ascii.eqlIgnoreCase(name_value, "date")) return .{ .type = .datetime, .temporal_kind = .date };
         if (std.ascii.eqlIgnoreCase(name_value, "timestamp")) return .{ .type = .datetime, .temporal_kind = .timestamp };

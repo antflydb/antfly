@@ -41,11 +41,12 @@ pub const StableFunction = enum { transaction, statement };
 pub const Frame = struct {
     view: View,
     values: [2][7]temporal.Value,
+    transaction_date: temporal.Value,
     valid: [2]u7,
 
     pub fn init(view: View) !Frame {
         try view.validate();
-        var frame: Frame = .{ .view = view, .values = undefined, .valid = .{ 0, 0 } };
+        var frame: Frame = .{ .view = view, .values = undefined, .valid = .{ 0, 0 }, .transaction_date = .{ .date = try temporal.Date.init(@intCast(@divFloor(view.transaction.micros, temporal.micros_per_day))) } };
         for ([_]Instant{ view.transaction, view.statement }, 0..) |instant, index| {
             for (0..7) |precision| {
                 // A valid finite instant can overflow when rounded at a

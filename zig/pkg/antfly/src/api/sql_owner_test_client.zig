@@ -184,6 +184,12 @@ pub fn executeParameters(ctx: *fixture.Context, statement: []const u8, parameter
     return executeBody(ctx, null, body, retry);
 }
 
+pub fn executeConnectedParameters(ctx: *fixture.Context, connection: []const u8, statement: []const u8, parameters: []const std.json.Value, retry: Retry) !http.HttpResponse {
+    const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .statement = statement, .parameters = parameters, .connection_id = connection }, .{});
+    defer ctx.alloc.free(body);
+    return executeBody(ctx, connection, body, retry);
+}
+
 pub fn executeConnected(
     ctx: *fixture.Context,
     namespace: ?[]const u8,

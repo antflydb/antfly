@@ -504,10 +504,12 @@ pub const Function = enum {
     currval,
     lastval,
     setval,
+    date_bin,
+    @"$current_date",
     pub fn volatility(self: Function) Volatility {
         return switch (self) {
             .ai_decide, .ai_choice, .ai_score, .ai_probability, .gen_random_uuid, .uuidv7, .nextval, .currval, .lastval, .setval => .@"volatile",
-            .now, .transaction_timestamp, .@"$current_timestamp", .@"$current_user", .current_setting, .date_part, .extract, .date_trunc, .to_jsonb, .jsonb_build_object, .concat, .concat_ws => .stable,
+            .now, .transaction_timestamp, .@"$current_timestamp", .@"$current_date", .@"$current_user", .current_setting, .date_part, .extract, .date_trunc, .to_jsonb, .jsonb_build_object, .concat, .concat_ws => .stable,
             else => .immutable,
         };
     }
@@ -549,7 +551,7 @@ fn rangeEndpointType(kind: @import("range_value.zig").Kind) Type {
 
 fn clockFunction(function: Function) ?@import("statement_clock.zig").StableFunction {
     return switch (function) {
-        .now, .transaction_timestamp, .@"$current_timestamp" => .transaction,
+        .now, .transaction_timestamp, .@"$current_timestamp", .@"$current_date" => .transaction,
         else => null,
     };
 }
@@ -1317,10 +1319,10 @@ pub fn parameterElementType(descriptor: Type) !arrays.ElementType {
 /// Explicit text expressions retain their identity and require an SQL cast.
 pub fn assignmentExpression(alloc: Allocator, expression: *const ast.Scalar, expected: Type) !*const ast.Scalar {
     const kind = expected.kind orelse return expression;
-    if (kind == .string or expression.* != .literal or expression.literal != .string) return expression;
+    if (kind == .string or (kind != .datetime and (expression.* != .literal or expression.literal != .string))) return expression;
     if (kind == .array and expected.element_type == null) return error.SqlAssignmentTypeMismatch;
     const cast = try alloc.create(ast.Scalar);
-    cast.* = .{ .cast = .{ .operand = expression, .type = kind, .element_type = expected.element_type, .numeric_modifier = expected.numeric_modifier } };
+    cast.* = .{ .cast = .{ .operand = expression, .type = kind, .element_type = expected.element_type, .numeric_modifier = expected.numeric_modifier, .temporal_kind = expected.temporal_kind } };
     return cast;
 }
 
@@ -2934,7 +2936,7 @@ fn arity(function: Function, count: usize) !void {
         .lastval => count == 0,
         .nextval, .currval => count == 1,
         .setval => count == 2 or count == 3,
-        .now, .transaction_timestamp, .@"$current_user", .gen_random_uuid => count == 0,
+        .now, .transaction_timestamp, .@"$current_date", .@"$current_user", .gen_random_uuid => count == 0,
         .uuidv7 => count <= 1,
         .uuid_extract_version, .uuid_extract_timestamp => count == 1,
         .@"$record_validate" => count == 1,
@@ -2964,13 +2966,13 @@ fn arity(function: Function, count: usize) !void {
         .nullif, .power, .mod, .starts_with, .strpos, .repeat, .left, .right, .date_part, .extract, .date_trunc, .@"$single" => count == 2,
         .@"$pattern_quantified", .@"$array_pattern_quantified" => count == 5,
         .substring, .lpad, .rpad => count == 2 or count == 3,
-        .replace, .translate, .split_part => count == 3,
+        .replace, .translate, .split_part, .date_bin => count == 3,
         .overlay => count == 3 or count == 4,
         .trim, .ltrim, .rtrim => count == 1 or count == 2,
         .coalesce, .greatest, .least => count > 0,
         .concat => count > 0,
     };
-    if (!valid) return if (clockFunction(function) != null or arrayCompatibleFunction(function) or function == .uuid_extract_version or function == .uuid_extract_timestamp or function == .gen_random_uuid or function == .uuidv7 or function == .starts_with or function == .md5 or function == .jsonb_exists_any or function == .jsonb_exists_all or function == .jsonb_array_length or function == .initcap or function == .jsonb_extract_path or function == .jsonb_extract_path_text) error.SqlUndefinedFunction else error.InvalidSqlParameters;
+    if (!valid) return if (function == .date_bin or clockFunction(function) != null or arrayCompatibleFunction(function) or function == .uuid_extract_version or function == .uuid_extract_timestamp or function == .gen_random_uuid or function == .uuidv7 or function == .starts_with or function == .md5 or function == .jsonb_exists_any or function == .jsonb_exists_all or function == .jsonb_array_length or function == .initcap or function == .jsonb_extract_path or function == .jsonb_extract_path_text) error.SqlUndefinedFunction else error.InvalidSqlParameters;
 }
 
 const Binder = struct {
@@ -3090,7 +3092,8 @@ const Binder = struct {
                 // timestamp with time zone is not an epoch-number domain in
                 // PostgreSQL. Resolve this at binding, even for SQL NULL or
                 // dead branches; an evaluator must not invent unit conversion.
-                if (cast.type == .datetime and source.kind == .datetime and (cast.temporal_kind orelse .timestamp_tz) != (source.temporal_kind orelse .timestamp_tz)) return error.SqlCannotCoerce;
+                if (cast.type == .datetime and source.kind == .datetime and !@import("temporal_cast.zig").allowed(source.temporal_kind orelse .timestamp_tz, cast.temporal_kind orelse .timestamp_tz, cast.coercion == .function))
+                    return if (cast.coercion == .function) error.SqlUndefinedFunction else error.SqlCannotCoerce;
                 if (cast.type == .datetime and source.kind != null and source.kind != .datetime and source.kind != .string)
                     return if (cast.coercion == .function) error.SqlUndefinedFunction else error.SqlCannotCoerce;
                 if (source.kind == .datetime and cast.type != .datetime and cast.type != .string)
@@ -3212,6 +3215,31 @@ const Binder = struct {
                     };
                     if (rangeInformation(function)) return error.SqlUndefinedFunction;
                 }
+                if (function == .date_bin) {
+                    const width = try self.infer(call.args[0], depth + 1);
+                    const unknown_width = call.args[0].* == .literal and call.args[0].literal == .string;
+                    if (width.kind != null and !(width.kind == .datetime and width.temporal_kind == .interval) and !unknown_width) return error.SqlUndefinedFunction;
+                    var stamp: ?@import("temporal_value.zig").Kind = null;
+                    var nullable = width.nullable;
+                    for (call.args[1..]) |arg| {
+                        const input = try self.infer(arg, depth + 1);
+                        nullable = nullable or input.nullable;
+                        if (input.kind == null or (arg.* == .literal and arg.literal == .string)) continue;
+                        if (input.kind != .datetime) return error.SqlUndefinedFunction;
+                        const identity = input.temporal_kind orelse .timestamp_tz;
+                        switch (identity) {
+                            .date => {},
+                            .timestamp => if (stamp == null) {
+                                stamp = .timestamp;
+                            },
+                            .timestamp_tz => stamp = .timestamp_tz,
+                            else => return error.SqlUndefinedFunction,
+                        }
+                    }
+                    // timestamptz is the preferred datetime overload when
+                    // dates/unknowns alone cannot choose an exact timestamp.
+                    break :blk .{ .kind = .datetime, .temporal_kind = stamp orelse .timestamp_tz, .nullable = nullable };
+                }
                 if (function == .gen_random_uuid) break :blk .{ .kind = .uuid, .element_type = .uuid, .nullable = false };
                 if (function == .uuidv7) {
                     if (call.args.len == 1) {
@@ -3245,7 +3273,7 @@ const Binder = struct {
                         const arg = call.args[0];
                         if (arg.* != .literal or arg.literal != .integer or arg.literal.integer < 0 or arg.literal.integer > 6) return error.InvalidSqlProgram;
                     }
-                    break :blk .{ .kind = .datetime, .nullable = false };
+                    break :blk .{ .kind = .datetime, .temporal_kind = if (function == .@"$current_date") .date else null, .nullable = false };
                 }
                 if (function == .@"$json_path" or function == .@"$json_path_text") {
                     const input = try self.infer(call.args[0], depth + 1);
@@ -3982,6 +4010,15 @@ const Binder = struct {
                         else => kind.kind,
                     };
                     const actual = try self.infer(arg, depth + 1);
+                    if (function == .date_bin) {
+                        const identity = if (i == 0) @import("temporal_value.zig").Kind.interval else kind.temporal_kind.?;
+                        if (actual.kind == null or (arg.* == .literal and arg.literal == .string)) {
+                            const coercion = try self.alloc.create(ast.Scalar);
+                            coercion.* = .{ .cast = .{ .operand = arg, .type = .datetime, .temporal_kind = identity, .coercion = .function } };
+                            out.* = try self.compileTypedContext(coercion, .datetime, null, identity, depth + 1);
+                        } else out.* = try self.compileTypedContext(arg, .datetime, null, actual.temporal_kind, depth + 1);
+                        continue;
+                    }
                     if (function == .uuidv7) {
                         const coercion = try self.alloc.create(ast.Scalar);
                         coercion.* = .{ .cast = .{ .operand = arg, .type = .datetime, .temporal_kind = .interval, .coercion = .function } };
@@ -4491,12 +4528,21 @@ const Evaluator = struct {
                 }
                 if (datum.temporal() != null) {
                     try datum.validateTemporal();
-                    if (cast.type == .datetime and datum.temporal().?.kind() == (cast.temporal_kind orelse .timestamp_tz) and cast.element_type == null) break :blk datum;
+                    if (cast.type == .datetime and cast.element_type == null) {
+                        const target = cast.temporal_kind orelse .timestamp_tz;
+                        if (datum.temporal().?.kind() == target) break :blk datum;
+                        const converted = try @import("temporal_cast.zig").castUtc(datum.temporal().?.*, target);
+                        try self.charge(@sizeOf(@import("temporal_value.zig").Value));
+                        const owned = try self.alloc.create(@import("temporal_value.zig").Value);
+                        owned.* = converted;
+                        break :blk Datum.typedTemporal(owned);
+                    }
                     if (cast.type != .string) return error.UnsupportedSqlShape;
                     break :blk Datum.json(.{ .string = try self.temporalText(datum) });
                 }
-                if (cast.temporal_kind) |temporal_kind| {
-                    if (cast.type != .datetime or datum.value != .string) return error.SqlCannotCoerce;
+                if (cast.type == .datetime) {
+                    const temporal_kind = cast.temporal_kind orelse .timestamp_tz;
+                    if (datum.value != .string) return error.SqlCannotCoerce;
                     const value = try @import("temporal_text.zig").parseInput(temporal_kind, datum.value.string);
                     try self.charge(@sizeOf(@import("temporal_value.zig").Value));
                     const owned = try self.alloc.create(@import("temporal_value.zig").Value);
@@ -4804,6 +4850,22 @@ const Evaluator = struct {
                     try self.charge(text.len);
                     break :blk Datum.json(.{ .string = try self.alloc.dupe(u8, &text) });
                 }
+                if (call.function == .date_bin) {
+                    var input: [3]@import("temporal_value.zig").Value = undefined;
+                    for (call.args, &input) |arg, *output| {
+                        const datum = try self.runDatum(arg, depth + 1);
+                        if (datum.sql_null) break :blk .{};
+                        try datum.validateTemporal();
+                        output.* = try temporalArithmeticValue(datum, self.program.instructions[arg].type);
+                    }
+                    if (input[0] != .interval) return error.InvalidSqlProgram;
+                    const bins = @import("temporal_bin.zig");
+                    const stamp = try bins.bin(input[0].interval, try @import("temporal_cast.zig").asTimestamp(input[1]), try @import("temporal_cast.zig").asTimestamp(input[2]));
+                    try self.charge(@sizeOf(@import("temporal_value.zig").Value));
+                    const output = try self.alloc.create(@import("temporal_value.zig").Value);
+                    output.* = if (instruction.type.temporal_kind == .timestamp) .{ .timestamp = stamp } else .{ .timestamp_tz = stamp };
+                    break :blk Datum.typedTemporal(output);
+                }
                 if (clockFunction(call.function)) |function| {
                     const frame = self.limits.clock_values orelse return error.SqlClockUnavailable;
                     const precision: u8 = if (call.function == .@"$current_timestamp") p: {
@@ -4811,7 +4873,7 @@ const Evaluator = struct {
                         if (value.sql_null or value.value != .integer or value.value.integer < 0 or value.value.integer > 6) return error.InvalidSqlProgram;
                         break :p @intCast(value.value.integer);
                     } else 6;
-                    break :blk Datum.typedTemporal(try frame.value(function, precision));
+                    break :blk Datum.typedTemporal(if (call.function == .@"$current_date") &frame.transaction_date else try frame.value(function, precision));
                 }
                 if (decisions.descriptor(@tagName(call.function))) |desc| {
                     if (self.limits.decision_values) |values| if (index < values.len) if (values[index]) |value| break :blk value;
@@ -8994,5 +9056,116 @@ test "SQL range containment overloads match PostgreSQL polymorphic endpoint iden
             try std.testing.expect(!actual.sql_null);
             try std.testing.expectEqualStrings(expected.string, actual.value.string);
         }
+    }
+}
+
+test "SQL temporal bins match PostgreSQL overloads signed arithmetic infinities and errors" {
+    const a = std.testing.allocator;
+    const Case = struct { expression: []const u8, oid: ?u32, result: ?[]const u8, sqlstate: ?[]const u8 };
+    const reference = try std.json.parseFromSlice(struct { vectors: []const Case }, a, @import("parity_fixtures.zig").temporal_bin_reference, .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    for (reference.value.vectors) |case| {
+        var compiled = @import("compiler.zig").compileScalar(a, case.expression, .{}) catch |err| {
+            std.debug.print("temporal bin compile expression={s} error={s}\n", .{ case.expression, @errorName(err) });
+            return err;
+        };
+        defer compiled.deinit();
+        var program = bind(a, compiled.expression, &.{}, &.{}, .{}) catch |err| {
+            if (case.sqlstate) |expected| {
+                try std.testing.expectEqualStrings(expected, @import("errors.zig").describe(err).code);
+                continue;
+            }
+            std.debug.print("temporal bin binding expression={s} error={s}\n", .{ case.expression, @errorName(err) });
+            return err;
+        };
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const datum = program.evaluate(arena.allocator(), &.{}, &.{}, .{}) catch |err| {
+            if (case.sqlstate) |expected| {
+                try std.testing.expectEqualStrings(expected, @import("errors.zig").describe(err).code);
+                continue;
+            }
+            std.debug.print("temporal bin evaluation expression={s} error={s}\n", .{ case.expression, @errorName(err) });
+            return err;
+        };
+        if (case.sqlstate) |expected| {
+            std.debug.print("temporal bin expected error={s} expression={s}\n", .{ expected, case.expression });
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expectEqual(ast.ColumnType.datetime, program.output_type.kind.?);
+        const temporal_kind: @import("temporal_value.zig").Kind = program.output_type.temporal_kind orelse .timestamp_tz;
+        try std.testing.expectEqual(case.oid.?, temporal_kind.oid());
+        if (case.result) |expected| {
+            var output: [@import("temporal_text.zig").output_capacity]u8 = undefined;
+            const text = try @import("temporal_text.zig").format(datum.temporal().?.*, &output);
+            try std.testing.expectEqualStrings(expected, text);
+        } else try std.testing.expect(datum.sql_null);
+    }
+}
+
+test "SQL temporal bins and transaction dates retain prepared types and borrow pinned clocks" {
+    const a = std.testing.allocator;
+    const clock = @import("statement_clock.zig");
+    const temporal = @import("temporal_value.zig");
+    const Case = struct { timestamp: []const u8, result: []const u8 };
+    const reference = try std.json.parseFromSlice(struct { transaction_dates: []const Case }, a, @import("parity_fixtures.zig").temporal_bin_reference, .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    var compiled = try @import("compiler.zig").compileScalar(a, "CURRENT_DATE", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expectEqual(@as(?temporal.Kind, .date), program.output_type.temporal_kind);
+    try std.testing.expect(program.constant_pool == null);
+    var none = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    for (reference.value.transaction_dates) |case| {
+        const value = try @import("temporal_text.zig").parseInput(.timestamp_tz, case.timestamp);
+        var frame = try clock.Frame.init(.{ .source = .{ .io = std.testing.io }, .transaction = value.timestamp_tz, .statement = .{ .micros = 0 } });
+        for (0..1024) |_| {
+            const datum = try program.evaluate(none.allocator(), &.{}, &.{}, .{ .clock_values = &frame });
+            try std.testing.expect(datum.temporal() == &frame.transaction_date);
+            var output: [@import("temporal_text.zig").output_capacity]u8 = undefined;
+            try std.testing.expectEqualStrings(case.result, try @import("temporal_text.zig").format(datum.temporal().?.*, &output));
+        }
+    }
+    var prepared = try @import("compiler.zig").compileScalar(a, "date_bin($1,$2,$3)", .{});
+    defer prepared.deinit();
+    var signature = try bind(a, prepared.expression, &.{}, &.{ null, null, null }, .{});
+    defer signature.deinit();
+    for (signature.parameter_descriptors, [_]temporal.Kind{ .interval, .timestamp_tz, .timestamp_tz }) |descriptor, kind| {
+        try std.testing.expectEqual(@as(?temporal.Kind, kind), descriptor.temporal_kind);
+    }
+    try std.testing.expectEqual(@as(?temporal.Kind, .timestamp_tz), signature.output_type.temporal_kind);
+}
+
+test "SQL temporal bins preserve logical ingress lazy branches and allocation failure ownership" {
+    const a = std.testing.allocator;
+    const Run = struct {
+        fn run(fault: std.mem.Allocator) !void {
+            var compiled = try @import("compiler.zig").compileScalar(fault, "date_bin('15 minutes',v,'2000-01-01')", .{});
+            defer compiled.deinit();
+            var program = try bind(fault, compiled.expression, &.{.{ .name = "v", .type = .datetime }}, &.{}, .{});
+            defer program.deinit();
+            var arena = std.heap.ArenaAllocator.init(fault);
+            defer arena.deinit();
+            const datum = try program.evaluate(arena.allocator(), &.{Datum.fromJson(.{ .string = "1999-12-31T23:59:59.999999Z" })}, &.{}, .{});
+            var output: [@import("temporal_text.zig").output_capacity]u8 = undefined;
+            try std.testing.expectEqualStrings("1999-12-31 23:45:00+00", try @import("temporal_text.zig").format(datum.temporal().?.*, &output));
+        }
+    };
+    try Run.run(a);
+    try std.testing.checkAllAllocationFailures(a, Run.run, .{});
+    for ([_][]const u8{
+        "CASE WHEN false THEN date_bin(INTERVAL '1 month',TIMESTAMP '2000-01-01',TIMESTAMP '2000-01-01') ELSE TIMESTAMP '2000-01-01' END",
+        "COALESCE(TIMESTAMP '2000-01-01',date_bin(INTERVAL '0',TIMESTAMP '2000-01-01',TIMESTAMP '2000-01-01'))",
+        "CASE WHEN false THEN CURRENT_DATE ELSE DATE '2000-01-01' END",
+    }) |text| {
+        var compiled = try @import("compiler.zig").compileScalar(a, text, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        _ = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
     }
 }

@@ -1511,3 +1511,50 @@ The totals exclude schema compilation and verify both values and complete
 allocation reclamation. These measure preparation and extraction allocation
 work, not end-to-end query latency. The ledger now records 794 implemented,
 137 rejected, 438 superseded and 217 unresolved original cases.
+
+
+## Typed timestamp bins and transaction dates
+
+Closed the native temporal cohort `sql-0179`, `sql-0264`, `sql-0265`,
+`sql-0266`, `sql-1467` and `sql-1477` against PostgreSQL's actual type contracts.
+`CURRENT_DATE` is a transaction-stable DATE (OID 1082), including its ordinary
+DATE-to-TIMESTAMPTZ conflict assignment. Its value borrows the invocation frame;
+prepared plans never capture a wall date. `date_bin` selects the timestamp or
+timestamptz overload once, binds exact interval/timestamp parameter identities,
+and uses checked signed microsecond arithmetic with floor boundaries, explicit
+infinities, strict NULLs and PostgreSQL error ordering. Native typed rows stay on
+the direct value path; bound logical JSON timestamp ingress shares the existing
+normalization boundary. UTC date/timestamp casts retain typed values and infinities.
+Timestamp input accepts validated numeric offsets and bare interval seconds;
+fractional input rounds to PostgreSQL microseconds with even half ties and day
+carry, while bin arithmetic remains integral.
+canonical persisted temporal spelling remains strict.
+
+The independent PostgreSQL matrix covers 650 bin, overload, input and cast
+contracts, including BC dates, extreme dates, signed origins, invalid strides,
+NULLs and infinities. Debug gates cover ownership under allocation failures,
+lazy branches, stable prepared parameter/output descriptors, and repeated
+transaction-date evaluation with an allocator that rejects every allocation.
+A mounted native campaign executes all six unchanged originals and compares
+complete rows, SQL NULLs, output type identities and table postimages. It then
+reopens metadata/data/session owners, resumes typed-bin and conflict writes,
+and verifies filtered/sorted timestamp-bin reads.
+
+Three originals are successful implementations. Three historical success
+contracts are explicitly superseded by verified PostgreSQL diagnostics. The two numeric-epoch bin
+statements receive PostgreSQL 42883, and the unqualified conflict timestamp
+reference receives PostgreSQL 42702. These are precise invalid SQL contracts,
+not unsupported-feature waivers; the campaign separately exercises positive typed
+bins and qualified calendar assignments. No legacy epoch-number overload or
+alternate statement replaces an original. The current timezone capability is
+UTC; arbitrary session timezones and full native storage of every temporal type
+remain separate work. Counts are 797 implemented, 137 rejected, 441 superseded,
+and 211 unresolved originals.
+
+A separate catalog gap remains: durable view outputs in
+`sql/view_definition.zig` retain the coarse datetime family without its temporal
+kind, and the view output/dependency signatures need that exact domain carried
+through publication, replacement, restoration and rebinding. These statement
+and conflict gates do not qualify stored views over non-timestamptz temporal
+outputs. That requires a complete descriptor/capability migration rather than
+relabeling DATE, TIME or TIMESTAMP as TIMESTAMPTZ.

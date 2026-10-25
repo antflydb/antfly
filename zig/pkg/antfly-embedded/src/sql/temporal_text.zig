@@ -247,7 +247,7 @@ fn parseTime(text: []const u8) ParseError!u64 {
     var parts = std.mem.splitScalar(u8, text, ':');
     const hour = try unsigned(parts.next() orelse return error.InvalidTemporalText);
     const minute = try unsigned(parts.next() orelse return error.InvalidTemporalText);
-    const last = parts.next() orelse return error.InvalidTemporalText;
+    const last = parts.next() orelse "0";
     if (parts.next() != null or minute > 59) return error.InvalidTemporalText;
     const point = std.mem.indexOfScalar(u8, last, '.');
     const second = try unsigned(if (point) |pos| last[0..pos] else last);
@@ -255,9 +255,21 @@ fn parseTime(text: []const u8) ParseError!u64 {
     var fraction: u64 = 0;
     if (point) |pos| {
         const digits = last[pos + 1 ..];
-        if (digits.len == 0 or digits.len > 6) return error.InvalidTemporalText;
-        fraction = try unsigned(digits);
-        for (digits.len..6) |_| fraction *= 10;
+        if (digits.len == 0 or digits.len > output_capacity) return error.InvalidTemporalText;
+        if (digits.len <= 6) {
+            fraction = try unsigned(digits);
+            for (digits.len..6) |_| fraction *= 10;
+        } else {
+            // PostgreSQL input rounds the parsed binary fraction to nearest
+            // microseconds with even half ties. Keep this at text ingress;
+            // typed temporal arithmetic and binning remain exact integers.
+            for (digits) |byte| if (byte < '0' or byte > '9') return error.InvalidTemporalText;
+            const parsed = std.fmt.parseFloat(f64, last[pos..]) catch return error.InvalidTemporalText;
+            const scaled = parsed * 1_000_000;
+            fraction = @intFromFloat(@floor(scaled));
+            const remainder = scaled - @as(f64, @floatFromInt(fraction));
+            if (remainder > 0.5 or (remainder == 0.5 and fraction % 2 == 1)) fraction += 1;
+        }
     }
     const total: u128 = (@as(u128, hour) * 3600 + minute * 60 + second) * 1_000_000 + fraction;
     return std.math.cast(u64, total) orelse return error.TemporalOutOfRange;
@@ -265,9 +277,48 @@ fn parseTime(text: []const u8) ParseError!u64 {
 
 /// SQL input is separate from the canonical persisted/wire representation.
 /// Quantities retain decimal precision, without floating-point month/day math.
+// ISO timestamp coercion is distinct from canonical persisted spelling.
+// Numeric offsets are validated for both overloads, then ignored for timestamp
+// without time zone or applied exactly for timestamp with time zone (UTC).
+fn timestampInput(kind: temporal.Kind, input: []const u8) ParseError!temporal.Value {
+    const text = std.mem.trim(u8, input, " \t\r\n");
+    const bc = std.mem.endsWith(u8, text, " BC");
+    const body = if (bc) text[0 .. text.len - 3] else text;
+    const split = std.mem.indexOfAny(u8, body, " Tt") orelse return error.InvalidTemporalText;
+    const date = try parseDate(body[0..split], bc);
+    const clock = std.mem.trim(u8, body[split + 1 ..], " ");
+    const zone = std.mem.indexOfAny(u8, clock, "+-Zz") orelse clock.len;
+    var normalized: [output_capacity]u8 = undefined;
+    const raw_time = clock[0..zone];
+    var time_len = raw_time.len;
+    if (time_len > normalized.len - 3) return error.InvalidTemporalText;
+    @memcpy(normalized[0..time_len], raw_time);
+    if (std.mem.count(u8, raw_time, ":") == 1) {
+        @memcpy(normalized[time_len..][0..3], ":00");
+        time_len += 3;
+    }
+    var west: i32 = 0;
+    var time: temporal.Time = undefined;
+    if (zone != clock.len and clock[zone] != 'Z' and clock[zone] != 'z') {
+        const offset = clock[zone..];
+        if (time_len + offset.len > normalized.len) return error.InvalidTemporalText;
+        @memcpy(normalized[time_len..][0..offset.len], offset);
+        const zoned = try parseFinite(.time_tz, normalized[0 .. time_len + offset.len]);
+        time = zoned.time_tz.time;
+        west = zoned.time_tz.seconds_west;
+    } else {
+        if (zone != clock.len and zone + 1 != clock.len) return error.InvalidTemporalText;
+        time = try temporal.Time.init(std.math.cast(i64, try parseTime(normalized[0..time_len])) orelse return error.TemporalOutOfRange);
+    }
+    var stamp = try (Fields{ .date = date, .time = time }).toTimestamp();
+    if (kind == .timestamp_tz) stamp = try temporal.Timestamp.init(std.math.add(i64, stamp.micros, @as(i64, west) * 1_000_000) catch return error.TemporalOutOfRange);
+    return if (kind == .timestamp_tz) .{ .timestamp_tz = stamp } else .{ .timestamp = stamp };
+}
+
 pub fn parseInput(kind: temporal.Kind, input: []const u8) ParseError!temporal.Value {
     if (kind != .interval) {
         return parseCanonical(kind, input) catch |err| {
+            if (kind == .time or kind == .time_tz) return parseFinite(kind, std.mem.trim(u8, input, " \t\r\n"));
             if (kind == .timestamp or kind == .timestamp_tz) {
                 // SQL timestamp input admits a date at midnight. Keep this
                 // input coercion separate from strict persisted-byte spelling.
@@ -276,6 +327,11 @@ pub fn parseInput(kind: temporal.Kind, input: []const u8) ParseError!temporal.Va
                     const value = try (Fields{ .date = date.date, .time = .{ .micros = 0 } }).toTimestamp();
                     return if (kind == .timestamp) .{ .timestamp = value } else .{ .timestamp_tz = value };
                 } else |_| {}
+            }
+            if (kind == .timestamp or kind == .timestamp_tz) {
+                if (timestampInput(kind, input)) |value| return value else |failure| {
+                    if (failure == error.TemporalOutOfRange) return failure;
+                }
             }
             if (kind != .timestamp_tz or input.len > output_capacity) return err;
             var normalized: [output_capacity + 3]u8 = undefined;
@@ -315,7 +371,11 @@ pub fn parseInput(kind: temporal.Kind, input: []const u8) ParseError!temporal.Va
             micros += if (number[0] == '-') -@as(i128, magnitude) else magnitude;
             continue;
         }
-        const unit = parts.next() orelse return error.InvalidTemporalText;
+        const unit = parts.next() orelse {
+            const seconds = try intervalDecimal(number);
+            micros += intervalRound(seconds.value * 1_000_000, seconds.scale);
+            break;
+        };
         const decimal = try intervalDecimal(number);
         const factor: i128 = if (intervalUnit(unit, "millennium", "millennia")) 12000 else if (intervalUnit(unit, "century", "centuries")) 1200 else if (intervalUnit(unit, "decade", "decades")) 120 else if (intervalUnit(unit, "year", "years")) 12 else if (intervalUnit(unit, "month", "months") or intervalUnit(unit, "mon", "mons")) 1 else 0;
         if (factor != 0) {

@@ -38,7 +38,7 @@ pub const AddTestsResult = struct {
     run_lib_api_standalone_backup_restore_tests: *std.Build.Step.Run,
     distributed_query_availability_step: *std.Build.Step,
     run_public_api_parity_aggregate_tests: *std.Build.Step.Run,
-    run_sql_owner_lifecycle_tests: [13]*std.Build.Step.Run,
+    run_sql_owner_lifecycle_tests: [14]*std.Build.Step.Run,
     run_lib_api_auth_tests: *std.Build.Step.Run,
     run_algebraic_dynamic_template_tests: *std.Build.Step.Run,
     run_lib_api_connections_tests: *std.Build.Step.Run,
@@ -2261,6 +2261,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL original table comment preserves schema rows privileges and all cold owners",
             "mounted SQL original resource comments preserve identities authorization and cold owners",
             "mounted SQL original calendar intervals preserve typed results and cold rows",
+            "mounted SQL original temporal bins and transaction dates preserve typed writes and cold postimages",
             "mounted SQL range values preserve native bytes typed results and cold owners",
             "mounted SQL original temporal keys enforce intervals and retain all cold owners",
             "api http client temporal probes use bounded bodies and preserve constraint rejection",
@@ -2389,6 +2390,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_sequence_effects_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-sequence-effects-test", "Verify PostgreSQL sequence effects, durable session values and cold cache safety")
         .dependOn(&sql_sequence_effects_run.step);
+    const temporal_bin_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original temporal bins and transaction dates preserve typed writes and cold postimages"});
+    temporal_bin_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-temporal-bin-lifecycle-test", "Verify typed bins and transaction dates across native mutation commits and cold owners")
+        .dependOn(&temporal_bin_run.step);
     const document_generated_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original document producers preserve generated domains row filters and cold postimages"});
     document_generated_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-document-generated-lifecycle-test", "Verify document producers and cold generated-column admission through native owners")
@@ -2860,7 +2865,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_lib_api_standalone_backup_restore_tests = run_lib_api_standalone_backup_restore_tests,
         .distributed_query_availability_step = lib_api_distributed_query_availability_test_step,
         .run_public_api_parity_aggregate_tests = run_public_api_parity_aggregate_tests,
-        .run_sql_owner_lifecycle_tests = .{ sql_primary_key_rewrite_run, sql_index_lifecycle_run, sql_nullability_run, sql_covering_constraint_run, sql_role_defaults_run, fk_validation_run, sql_resource_comment_run, sql_temporal_arithmetic_run, sql_range_run, sql_temporal_key_run, sql_fk_validation_run, document_alias_run, document_generated_run },
+        .run_sql_owner_lifecycle_tests = .{ sql_primary_key_rewrite_run, sql_index_lifecycle_run, sql_nullability_run, sql_covering_constraint_run, sql_role_defaults_run, fk_validation_run, sql_resource_comment_run, sql_temporal_arithmetic_run, sql_range_run, sql_temporal_key_run, sql_fk_validation_run, document_alias_run, document_generated_run, temporal_bin_run },
         .run_lib_api_auth_tests = run_lib_api_auth_tests,
         .run_algebraic_dynamic_template_tests = run_algebraic_dynamic_template_tests,
         .run_lib_api_connections_tests = run_lib_api_connections_tests,
