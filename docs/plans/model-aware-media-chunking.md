@@ -597,3 +597,30 @@ selection, approximately 16x for this component. Smaller 527/1,000-class vocabul
 improved approximately 1.7–2.1x. This measures ranking with equal results and the
 same label-string ownership, not end-to-end model latency. Selection scratch is
 bounded by top-k, and no full-vocabulary result array is allocated.
+
+
+## Bounded classifier admission and adaptive batches
+
+Prepared single-frame and batched classifiers share checked scratch accounting:
+one owned float32 input, tensor metadata, one bounded selector, and selected
+result rows with copied label strings. Raw PCM/raster preparation retains its
+separate temporary allowance and shrinks it before execution. Session model
+workspace and logits admission remain active. Batch tensors adopt their prepared
+storage instead of allocating and copying another full input tensor.
+
+Dynamic exports reduce a rejected batch to smaller supported sizes, including
+when the original shape exceeds a permanent resource limit. Accepted frames are
+not recomputed. Cancellation, deadlines and invalid outputs propagate without
+retry. Fixed larger exports keep their required batch size and padded-tail path;
+a denial at the smallest supported size still fails.
+
+A deterministic 32-frame, 224x224, 65,536-class, top-1 fixture using real session
+admission reduces peak admitted scratch from 312,606,720 to 221,255,640 bytes
+(about 29%). At a 240 MiB cap, it needs one model call instead of 32 serial calls.
+At a 64 MiB cap, it succeeds with four eight-frame calls, peaking at 55,317,264
+bytes; previously the whole request failed before inference. Results match and
+admission drains after success and failure. Top-128 also fits the 240 MiB cap in
+one call. Allocation-failure probes cover ownership transfer and ranking cleanup.
+For 480,000 waveform samples, current raw/prepared peaks are 17,284,616 and
+15,364,616 bytes. These are admission and call-count measurements with a model
+stub, not RSS or live-model latency measurements.

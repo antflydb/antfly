@@ -25,6 +25,31 @@ const ranking = @import("inference_chunker").ranking;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 pub const Input = union(enum) { pcm: @import("audio.zig").PcmAudio, raster: image.BorrowedRasterAttachment };
 
+const Selector = ranking.TopK(outputs.Label, struct {
+    fn less(x: outputs.Label, y: outputs.Label) bool {
+        return x.score > y.score or (x.score == y.score and std.mem.order(u8, x.label, y.label) == .lt);
+    }
+}.less);
+
+/// Input storage is copied once (or adopted for a batch). Session execution
+/// separately admits model workspace and logits. Ranking keeps one bounded
+/// selector and owns only the selected labels, including their string bytes.
+fn executionScratchBytes(elements: usize, rows: usize, labels: []const []const u8, top_k: usize) !usize {
+    var longest: usize = 0;
+    for (labels) |label| longest = @max(longest, label.len);
+    const label_bytes = try std.math.add(usize, @sizeOf(outputs.Label), longest);
+    const row_bytes = try std.math.add(usize, @sizeOf([]outputs.Label), try std.math.mul(usize, @min(top_k, labels.len), label_bytes));
+    const metadata = @sizeOf(backends.Tensor) + 4 * @sizeOf(i64) + @sizeOf(Control) + @sizeOf(Selector) + ranking.max_top_k * @sizeOf(Selector.Entry);
+    return std.math.add(usize, try std.math.mul(usize, elements, @sizeOf(f32)), try std.math.add(usize, metadata, try std.math.mul(usize, rows, row_bytes)));
+}
+
+fn canReduceBatch(err: anyerror) bool {
+    return switch (err) {
+        error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.QueueFull, error.OutOfMemory, error.SharedAdmissionExceeded, error.MemoryBudgetExceeded, error.InferenceAdmissionQueueFull, error.ConcurrencyUnavailable => true,
+        else => false,
+    };
+}
+
 pub fn classify(a: std.mem.Allocator, session: backends.Session, profile: Profile, labels: []const []const u8, input: Input, top_k: usize, control: Control) ![]outputs.Label {
     try profile.validate();
     try control.check();
@@ -42,7 +67,7 @@ pub fn classify(a: std.mem.Allocator, session: backends.Session, profile: Profil
             break :blk try std.math.mul(usize, try std.math.mul(usize, profile.width, profile.height), 3);
         },
     };
-    var permit = try session.admitHostPreprocess(try std.math.mul(usize, max_elements + labels.len, 16));
+    var permit = try session.admitHostPreprocess(try std.math.mul(usize, max_elements, 16));
     defer permit.deinit();
     const prepared = switch (input) {
         .pcm => |pcm| blk: {
@@ -92,7 +117,7 @@ pub fn classifyPrepared(a: std.mem.Allocator, session: backends.Session, profile
     if (inputs.len != 1 or !std.mem.eql(u8, inputs[0].name, expected_name) or inputs[0].dtype != .f32) return error.UnsupportedMediaClassifier;
     const output_info = session.outputInfo();
     if (output_info.len != 1 or !std.mem.eql(u8, output_info[0].name, "logits") or output_info[0].dtype != .f32) return error.UnsupportedMediaClassifier;
-    var permit = try session.admitHostPreprocess(try std.math.mul(usize, prepared.len + labels.len, 16));
+    var permit = try session.admitHostPreprocess(try executionScratchBytes(prepared.len, 1, labels, top_k));
     defer permit.deinit();
     var shape: [4]i64 = .{ 1, 3, profile.height, profile.width };
     const selected_shape: []const i64 = if (profile.input == .waveform) blk: {
@@ -158,13 +183,6 @@ pub fn classifyPreparedFrames(a: std.mem.Allocator, session: backends.Session, p
         }
         return results;
     }
-    if (supportsPreparedBatch(session, profile, frames.len)) {
-        const batched: ?[][]outputs.Label = classifyPreparedBatch(a, session, profile, labels, frames, top_k, control) catch |err| switch (err) {
-            error.ResourceTemporarilyUnavailable, error.QueueFull, error.OutOfMemory, error.SharedAdmissionExceeded, error.MemoryBudgetExceeded, error.InferenceAdmissionQueueFull, error.ConcurrencyUnavailable => null,
-            else => return err,
-        };
-        if (batched) |rows| return rows;
-    }
     const results = try a.alloc([]outputs.Label, frames.len);
     var initialized: usize = 0;
     errdefer {
@@ -174,9 +192,26 @@ pub fn classifyPreparedFrames(a: std.mem.Allocator, session: backends.Session, p
         }
         a.free(results);
     }
-    for (frames, results) |frame, *row| {
-        row.* = try classifyPrepared(a, session, profile, labels, frame, top_k, control);
-        initialized += 1;
+    var width = frames.len;
+    while (initialized < frames.len) {
+        try control.check();
+        const count = @min(width, frames.len - initialized);
+        if (supportsPreparedBatch(session, profile, count)) {
+            const rows = classifyPreparedBatch(a, session, profile, labels, frames[initialized..][0..count], top_k, control) catch |err| {
+                if (count == 1 or !canReduceBatch(err)) return err;
+                const smaller = @max(@as(usize, 1), count / 2);
+                // A fixed output batch axis cannot accept a smaller tensor.
+                if (!supportsPreparedBatch(session, profile, smaller)) return err;
+                width = smaller;
+                continue;
+            };
+            @memcpy(results[initialized..][0..count], rows);
+            a.free(rows);
+            initialized += count;
+        } else {
+            results[initialized] = try classifyPrepared(a, session, profile, labels, frames[initialized], top_k, control);
+            initialized += 1;
+        }
     }
     return results;
 }
@@ -214,19 +249,21 @@ pub fn classifyPreparedBatch(a: std.mem.Allocator, session: backends.Session, pr
     if (!std.mem.eql(u8, inputs[0].name, "pixel_values") or inputs[0].dtype != .f32 or !std.mem.eql(u8, out[0].name, "logits") or out[0].dtype != .f32) return error.UnsupportedMediaClassifier;
     const elements = try std.math.mul(usize, @as(usize, profile.width) * profile.height, 3);
     const total = try std.math.mul(usize, elements, frames.len);
-    var permit = try session.admitHostPreprocess(try std.math.mul(usize, try std.math.add(usize, total, try std.math.mul(usize, labels.len, frames.len)), 16));
+    var permit = try session.admitHostPreprocess(try executionScratchBytes(total, frames.len, labels, top_k));
     defer permit.deinit();
-    const prepared = try a.alloc(f32, total);
-    defer a.free(prepared);
-    for (frames, 0..) |frame, i| {
-        try control.check();
-        if (frame.len != elements) return error.InvalidInputShape;
-        for (frame) |value| if (!std.math.isFinite(value)) return error.InvalidInputShape;
-        @memcpy(prepared[i * elements ..][0..elements], frame);
-    }
-    const shape = [_]i64{ @intCast(frames.len), 3, profile.height, profile.width };
-    for (inputs[0].shape, shape) |expected, actual| if (expected > 0 and expected != actual) return error.InvalidInputShape;
-    var tensor = try backends.Tensor.initFloat32(a, "pixel_values", &shape, prepared);
+    var tensor = tensor: {
+        const prepared = try a.alloc(f32, total);
+        errdefer a.free(prepared);
+        for (frames, 0..) |frame, i| {
+            try control.check();
+            if (frame.len != elements) return error.InvalidInputShape;
+            for (frame) |value| if (!std.math.isFinite(value)) return error.InvalidInputShape;
+            @memcpy(prepared[i * elements ..][0..elements], frame);
+        }
+        const shape = [_]i64{ @intCast(frames.len), 3, profile.height, profile.width };
+        for (inputs[0].shape, shape) |expected, actual| if (expected > 0 and expected != actual) return error.InvalidInputShape;
+        break :tensor try backends.Tensor.initFloat32Owned(a, "pixel_values", &shape, prepared);
+    };
     defer tensor.deinit();
     var values = try session.runWithControl(&.{tensor}, a, control);
     defer {
@@ -263,11 +300,6 @@ fn rankLogits(a: std.mem.Allocator, logits: []const f32, labels: []const []const
         denominator += @exp(@as(f64, value) - maximum);
     };
     if (top_k == 0 or top_k > ranking.max_top_k) return error.InvalidMediaClassifierProfile;
-    const Selector = ranking.TopK(outputs.Label, struct {
-        fn less(x: outputs.Label, y: outputs.Label) bool {
-            return x.score > y.score or (x.score == y.score and std.mem.order(u8, x.label, y.label) == .lt);
-        }
-    }.less);
     var buffer: [ranking.max_top_k]Selector.Entry = undefined;
     var selector = Selector{ .storage = buffer[0..@min(top_k, logits.len)] };
     for (logits, labels) |logit, label| selector.offer(.{ .label = label, .score = @floatCast(if (transform == .softmax) @exp(@as(f64, logit) - maximum) / denominator else if (logit >= 0) 1 / (1 + @exp(-@as(f64, logit))) else @exp(@as(f64, logit)) / (1 + @exp(@as(f64, logit)))) });
@@ -375,6 +407,7 @@ test "model aware media frame classifiers batch compatible tensors with one mode
         fixed: bool = false,
         fixed_two: bool = false,
         deny_batch: bool = false,
+        batch_error: anyerror = error.ResourceTemporarilyUnavailable,
         fn inputs(raw: *anyopaque) []const backends.TensorInfo {
             const self: *@This() = @ptrCast(@alignCast(raw));
             return if (self.fixed_two) &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ 2, 3, 1, 1 } }} else if (self.fixed) &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ 1, 3, 1, 1 } }} else &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ -1, 3, 1, 1 } }};
@@ -390,7 +423,7 @@ test "model aware media frame classifiers batch compatible tensors with one mode
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             const serial = tensors[0].shape[0] == 1;
-            if (self.deny_batch and !serial) return error.ResourceTemporarilyUnavailable;
+            if (self.deny_batch and !serial) return self.batch_error;
             try std.testing.expectEqualSlices(i64, if (serial) &.{ 1, 3, 1, 1 } else &.{ 2, 3, 1, 1 }, tensors[0].shape);
             if (!serial and !self.fixed_two) try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0, 0, 1, 0 }, tensors[0].asFloat32());
             const result = try a.alloc(backends.Tensor, 1);
@@ -446,7 +479,42 @@ test "model aware media frame classifiers batch compatible tensors with one mode
         a.free(fallback);
     }
     try std.testing.expectEqual(@as(usize, 6), fake.calls);
+    fake.batch_error = error.ResourceLimitExceeded;
+    const permanent = try classifyPreparedFrames(a, fake.session(), profile, &.{ "negative", "positive" }, &.{ &.{ 1, 0, 0 }, &.{ 0, 1, 0 } }, 1, .{});
+    defer {
+        for (permanent) |row| {
+            for (row) |label| a.free(label.label);
+            a.free(row);
+        }
+        a.free(permanent);
+    }
+    try std.testing.expectEqual(@as(usize, 9), fake.calls);
+    for ([_]anyerror{ error.InvalidClassifierOutput, error.Cancelled, error.Timeout }) |err| {
+        fake.batch_error = err;
+        const calls = fake.calls;
+        try std.testing.expectError(err, classifyPreparedFrames(a, fake.session(), profile, &.{ "negative", "positive" }, &.{ &.{ 1, 0, 0 }, &.{ 0, 1, 0 } }, 1, .{}));
+        try std.testing.expectEqual(calls + 1, fake.calls);
+    }
+    fake.fixed_two = true;
+    fake.batch_error = error.ResourceLimitExceeded;
+    const denied_calls = fake.calls;
+    try std.testing.expectError(error.ResourceLimitExceeded, classifyPreparedFrames(a, fake.session(), profile, &.{ "negative", "positive" }, &.{ &.{ 1, 0, 0 }, &.{ 0, 1, 0 } }, 1, .{}));
+    try std.testing.expectEqual(denied_calls + 1, fake.calls);
     fake.deny_batch = false;
+    const AllocationProbe = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var model = Fake{};
+            const rows = try classifyPreparedBatch(allocator, model.session(), .{ .input = .pixels, .score_transform = .softmax, .width = 1, .height = 1 }, &.{ "negative", "positive" }, &.{ &.{ 1, 0, 0 }, &.{ 0, 1, 0 } }, 1, .{});
+            defer {
+                for (rows) |row| {
+                    for (row) |label| allocator.free(label.label);
+                    allocator.free(row);
+                }
+                allocator.free(rows);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, AllocationProbe.run, .{});
     fake.fixed_two = true;
     const before = fake.calls;
     const tiled = try classifyPreparedFrames(a, fake.session(), profile, &.{ "negative", "positive" }, &.{ &.{ 1, 0, 0 }, &.{ 0, 1, 0 }, &.{ 1, 0, 0 }, &.{ 0, 1, 0 }, &.{ 1, 0, 0 } }, 1, .{});
@@ -660,4 +728,109 @@ test "benchmark model aware media production bounded ranking against full vocabu
         }
         std.debug.print("classifier ranking labels={d} top_k=3 repeats=64 sort_ns={d} bounded_ns={d} equal=true\n", .{ n, times[0], times[1] });
     }
+}
+
+test "model aware media wide classifiers retain batches under tight admission and reduce permanent denials" {
+    const memory = @import("../runtime/tier/memory.zig");
+    const Fake = struct {
+        controller: *memory.AdmissionController,
+        calls: usize = 0,
+        peak: usize = 0,
+        limit: usize = std.math.maxInt(usize),
+        fn inputs(_: *anyopaque) []const backends.TensorInfo {
+            return &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ -1, 3, 224, 224 } }};
+        }
+        fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ -1, 65536 } }};
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        fn run(raw: *anyopaque, tensors: []const backends.Tensor, a: std.mem.Allocator) anyerror![]backends.Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.peak = @max(self.peak, self.controller.snapshot().host_scratch_bytes);
+            self.calls += 1;
+            const batch: usize = @intCast(tensors[0].shape[0]);
+            const logits = try a.alloc(f32, batch * 65536);
+            defer a.free(logits);
+            @memset(logits, 0);
+            for (0..batch) |i| logits[i * 65536] = 1;
+            const result = try a.alloc(backends.Tensor, 1);
+            errdefer a.free(result);
+            result[0] = try backends.Tensor.initFloat32(a, "logits", &.{ @intCast(batch), 65536 }, logits);
+            return result;
+        }
+        fn controlled(raw: *anyopaque, tensors: []const backends.Tensor, a: std.mem.Allocator, control: Control) anyerror![]backends.Tensor {
+            try control.check();
+            return run(raw, tensors, a);
+        }
+        fn session(self: *@This()) backends.Session {
+            return .{ .ptr = self, .vtable = &.{ .run = run, .runWithControl = controlled, .inputInfo = inputs, .outputInfo = outputInfo, .backend = backend, .close = close }, .run_admission = .{ .controller = self.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = self.limit, .scratch_limit_bytes = self.limit }, .static_workspace_bytes = 0, .check_live_memory = false } };
+        }
+    };
+    const a = std.testing.allocator;
+    var controller = memory.AdmissionController{};
+    var fake = Fake{ .controller = &controller };
+    const names = try a.alloc([16]u8, 65536);
+    defer a.free(names);
+    const labels = try a.alloc([]const u8, 65536);
+    defer a.free(labels);
+    for (labels, names, 0..) |*label, *name, i| label.* = try std.fmt.bufPrint(name, "label-{d:0>5}", .{i});
+    const pixels = try a.alloc(f32, 224 * 224 * 3);
+    defer a.free(pixels);
+    @memset(pixels, 0);
+    const frames: [32][]const f32 = @splat(pixels);
+    const profile = Profile{ .input = .pixels, .score_transform = .sigmoid, .width = 224, .height = 224 };
+    for ([_]usize{ std.math.maxInt(usize), 240 * 1024 * 1024, 64 * 1024 * 1024 }) |limit| {
+        fake.limit = limit;
+        fake.calls = 0;
+        fake.peak = 0;
+        const rows = try classifyPreparedFrames(a, fake.session(), profile, labels, &frames, 1, .{});
+        defer {
+            for (rows) |row| {
+                for (row) |value| a.free(value.label);
+                a.free(row);
+            }
+            a.free(rows);
+        }
+        for (rows) |row| {
+            try std.testing.expectEqualStrings("label-00000", row[0].label);
+            try std.testing.expectEqual(@as(f32, @floatCast(1.0 / (1.0 + @exp(@as(f64, -1))))), row[0].score);
+        }
+        try std.testing.expectEqual(@as(usize, if (limit == 64 * 1024 * 1024) 4 else 1), fake.calls);
+        try std.testing.expect(fake.peak <= limit);
+        try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+        try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_kv_bytes);
+        std.debug.print("classifier admission frames=32 pixels=224x224 classes=65536 top_k=1 limit={d} calls={d} admitted_peak={d} equal=true drained=true\n", .{ fake.limit, fake.calls, fake.peak });
+    }
+    fake.limit = 1024;
+    fake.calls = 0;
+    try std.testing.expectError(error.ResourceLimitExceeded, classifyPreparedFrames(a, fake.session(), profile, labels, &frames, 1, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    fake.limit = 240 * 1024 * 1024;
+    fake.calls = 0;
+    const many = try classifyPreparedFrames(a, fake.session(), profile, labels, &frames, ranking.max_top_k, .{});
+    defer {
+        for (many) |row| {
+            for (row) |label| a.free(label.label);
+            a.free(row);
+        }
+        a.free(many);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    for (many) |row| {
+        try std.testing.expectEqual(@as(usize, ranking.max_top_k), row.len);
+        for (row, 0..) |label, i| try std.testing.expectEqualStrings(labels[i], label.label);
+    }
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+}
+
+test "model aware media classifier reservations bound selected label ownership with checked sizes" {
+    const short = try executionScratchBytes(3, 32, &.{ "a", "b" }, 128);
+    const long = try executionScratchBytes(3, 32, &.{ "aaaaaaaaa", "bbbbbbbbb" }, 128);
+    try std.testing.expectEqual(@as(usize, 32 * 2 * 8), long - short);
+    try std.testing.expectError(error.Overflow, executionScratchBytes(std.math.maxInt(usize), 1, &.{"a"}, 1));
+    try std.testing.expectError(error.Overflow, executionScratchBytes(1, std.math.maxInt(usize), &.{"a"}, 1));
 }
