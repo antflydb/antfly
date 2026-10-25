@@ -265,7 +265,10 @@ def test_detailed_exclusion_and_subfields_are_scoped_to_document_type(
                             ),
                         },
                         **(
-                            {"x-antfly-dynamic-indexing": {"mode": "infer_types"}}
+                            {
+                                "additionalProperties": True,
+                                "x-antfly-dynamic-indexing": {"mode": "infer_types"},
+                            }
                             if name == "beta" and dynamic_beta
                             else {}
                         ),
