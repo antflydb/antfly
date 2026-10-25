@@ -141,7 +141,7 @@ def account(root, baseline):
         b = after.decode()
         if name.startswith('docs/'):
             row['groups'].append(add('documentation', a, b))
-        elif '/scripts/' in name or '/bench/' in name or '/tools/' in name or (name == 'zig/pkg/inference/build.zig'):
+        elif '/scripts/' in name or '/bench/' in name or '/tools/' in name or '/testing/' in name or (name == 'zig/pkg/inference/build.zig'):
             row['groups'].append(add('tests_and_benchmark_tooling', a, b))
         elif '/generated/' in name:
             row['groups'].append(add('generated', a, b))
