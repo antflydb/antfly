@@ -518,16 +518,21 @@ pub fn list(db: anytype, a: std.mem.Allocator, name: []const u8) ![]u8 {
     var out = std.json.Array.init(scratch);
     for (identities) |cfg| {
         if (name.len > 0 and !std.mem.eql(u8, cfg.name, name)) continue;
-        const state = try resolver.curation.parseState(scratch, cfg.curation_json);
-        var item = try cfg.publicValue(scratch);
-        try item.object.put(scratch, "redirects", try json(scratch, try resolver.curation.redirectsWithOrigins(scratch, try cfg.effectiveAliasesAlloc(scratch), state, cfg.merges)));
-        try item.object.put(scratch, "curation", try json(scratch, state));
-        try item.object.put(scratch, "progress", try json(scratch, db.pendingWorkStats()));
+        const item = try inspectionValue(db, scratch, cfg);
         if (name.len > 0) return std.json.Stringify.valueAlloc(a, item, .{});
         try out.append(item);
     }
     if (name.len > 0) return error.ResolverNotFound;
     return std.json.Stringify.valueAlloc(a, std.json.Value{ .array = out }, .{});
+}
+
+pub fn inspectionValue(db: anytype, a: std.mem.Allocator, cfg: catalog.ResolverConfig) !std.json.Value {
+    const state = try resolver.curation.parseState(a, cfg.curation_json);
+    var item = try cfg.publicValue(a);
+    try item.object.put(a, "redirects", try json(a, try resolver.curation.redirectsWithOrigins(a, try cfg.effectiveAliasesAlloc(a), state, cfg.merges)));
+    try item.object.put(a, "curation", try json(a, state));
+    try item.object.put(a, "progress", try json(a, db.pendingWorkStats()));
+    return item;
 }
 
 fn json(a: std.mem.Allocator, value: anytype) !std.json.Value {

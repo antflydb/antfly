@@ -13359,6 +13359,27 @@ pub const IndexManager = struct {
         return result.toOwnedSlice(alloc);
     }
 
+    /// Match listResolvers' active/staged routing selection without copying
+    /// destination-owned projected policy for unrelated resolver siblings.
+    pub fn listResolverRoutingDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const result = try alloc.alloc(ResolverConfig, self.resolvers.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |*cfg| cfg.deinit(alloc);
+            alloc.free(result);
+        }
+        for (self.resolvers.items, result) |definition, *output| {
+            var cfg = definition;
+            cfg.merges = &.{};
+            cfg.curation_json = "{}";
+            output.* = try ResolverConfig.clone(alloc, cfg);
+            initialized += 1;
+        }
+        return result;
+    }
+
     /// Caller-owned snapshot of one identity. Lookup is shared with namespace
     /// routing and rebuilt only after structural catalog publication.
     pub fn resolverDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8, static_only: bool) !?ResolverConfig {
@@ -13372,6 +13393,12 @@ pub const IndexManager = struct {
             cfg.curation_json = "{}";
         }
         return try ResolverConfig.clone(alloc, cfg);
+    }
+    pub fn resolverIdentityAlloc(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+        return self.resolverDescriptor(alloc, name, false);
+    }
+    pub fn resolverStaticDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+        return self.resolverDescriptor(alloc, name, true);
     }
     pub fn resolverAdmissionDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8, namespace_owned: bool) !?ResolverConfig {
         self.catalog_mutex.lockExclusive();
@@ -23818,7 +23845,16 @@ pub const IndexManager = struct {
         const graph_version: u32 = for (self.graph_indexes.items) |entry| {
             if (entry.ttl_duration_ns != 0) break resolver_catalog.graph_expiration_namespace_reader_version;
         } else 1;
-        const authoritative = @max(graph_version, @max(producer_version, @max(baseline, try resolver_catalog.catalogReaderVersion(self.alloc, catalog))));
+        const prior_catalog = txn.get(resolver_catalog_key) catch |err| switch (err) {
+            error.NotFound => "[]",
+            else => return err,
+        };
+        const prior_format = try resolver_catalog.catalogReaderVersion(self.alloc, prior_catalog);
+        // Native record publication can raise its epoch independently of this
+        // manager's catalog mutation. Such a durable increase is permanent;
+        // the old envelope already accounts for the reservation's own fence.
+        const independently_raised = if (current > prior_format) current else 1;
+        const authoritative = @max(independently_raised, @max(graph_version, @max(producer_version, @max(baseline, try resolver_catalog.catalogReaderVersion(self.alloc, catalog)))));
         var pending_version: u32 = 1;
         {
             var cursor = try txn.openCursor();
@@ -23853,7 +23889,10 @@ pub const IndexManager = struct {
         // Native binding maintenance can introduce durable projection jobs in
         // this same transaction. Preserve its reader fence and envelope.
         const derived_version = try resolver_catalog.readMinimumReaderVersion(txn, resolver_catalog.supported_reader_version);
-        const upgraded = derived_version > version;
+        // Only a requirement introduced by this catalog write is new. The
+        // old effective epoch may still include the reservation being removed;
+        // treating it as a derived upgrade makes that temporary fence permanent.
+        const upgraded = derived_version > @max(current, version);
         if (upgraded) {
             version = derived_version;
             const envelope = try resolver_catalog.versionedCatalog(self.alloc, catalog, version);
@@ -24742,11 +24781,11 @@ pub const IndexManager = struct {
         result.peak_task_alloc_bytes = @max(result.peak_task_alloc_bytes, @as(u64, @intCast(task.deletion_state.budget.peakTaskLiveBytes())));
     }
 
-    /// Native Io cancellation and runtime-boundary cancellation have the same
-    /// retry/shutdown semantics. Neither indicates a damaged merge source.
+    /// Cancellation and invalidated source fences retire the current task and
+    /// retry from a fresh view. Neither indicates a damaged merge source.
     pub fn isTextMergeCancellation(err: anyerror) bool {
         return switch (err) {
-            error.Canceled, error.Cancelled, error.EnrichmentWaitCanceled => true,
+            error.Canceled, error.Cancelled, error.EnrichmentWaitCanceled, error.EnrichmentSourceChanged => true,
             else => false,
         };
     }
@@ -49901,4 +49940,36 @@ test "index_manager bounded native prepared text publication spills before admis
     }
     try std.testing.expectEqual(@as(u32, 2), documents);
     std.debug.print("PREPARED_TEXT_SPILL documents={d} peak_bytes={d}\n", .{ documents, stats.peak_bytes });
+}
+
+test "capi resolver reservation removal preserves independently raised native epochs" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var store = try docstore_mod.DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(a, path);
+    defer manager.deinit();
+    const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
+    try manager.add(&store, .{ .name = "old", .kind = .graph, .config_json = config });
+    var prepared = try manager.prepareGraphReplacementConfig(&store, "old", .{ .name = "new", .kind = .graph, .config_json = config }, 0);
+    defer prepared.deinit(a);
+    try std.testing.expectEqual(@as(u32, 2), manager.minimum_reader_version.load(.acquire));
+    // Native binding/record publication may run independently of the loaded
+    // resolver manager. Its format requirement must survive cancellation.
+    const required = resolver_catalog.resolver_projection_delta_reader_version;
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        try write.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(required));
+        try write.commit();
+    }
+    try std.testing.expect(try manager.cancelGraphReplacement(&store, "new"));
+    try std.testing.expectEqual(required, manager.minimum_reader_version.load(.acquire));
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(required, try resolver_catalog.readMinimumReaderVersion(&read, required));
+    try std.testing.expectEqual(required, try resolver_catalog.catalogReaderVersion(a, try read.get(resolver_catalog_key)));
 }

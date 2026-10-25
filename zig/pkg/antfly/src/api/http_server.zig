@@ -5388,6 +5388,21 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    fn memoryIndexCatalog(self: *ApiHttpServer) ?@import("memory.zig").engine.IndexCatalog {
+        if (self.source.vtable.create_index == null and self.source.vtable.drop_index == null) return null;
+        return .{ .ptr = self, .create = memoryCreateIndex, .drop = memoryDropIndex };
+    }
+
+    fn memoryCreateIndex(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, name: []const u8, json: []const u8) !void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try self.source.createIndex(a, table, name, json);
+    }
+
+    fn memoryDropIndex(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, name: []const u8) !void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try self.source.dropIndex(a, table, name);
+    }
+
     const MemoryMaintenanceWork = struct {
         server: *ApiHttpServer,
         fn run(ptr: *anyopaque) anyerror!void {
@@ -5438,7 +5453,7 @@ pub const ApiHttpServer = struct {
         if (state.space.len == 0) return;
         var deadline: MemoryWorkDeadline = .{ .server = self, .group_id = owner_range.group_id, .end = platform_time.monotonicNs() +| MemoryWorkDeadline.finalization_ns };
         const context: module.memory.Context = .{ .check_ptr = &deadline, .check_fn = MemoryWorkDeadline.check, .principal = state.owner, .admin = false, .now_ms = @intCast(platform_time.realtimeNs() / std.time.ns_per_ms) };
-        var adapter: module.engine.Routed = .{ .table = table, .reads = reader, .writes = writer, .context = context };
+        var adapter: module.engine.Routed = .{ .table = table, .reads = reader, .writes = writer, .index_catalog = self.memoryIndexCatalog(), .context = context };
         adapter.request = .{ .deadline_ns = deadline.end };
         const entry = try self.memory_work_cursors.getOrPut(self.alloc, owner_range.table_id);
         if (!entry.found_existing) entry.value_ptr.* = .{};
@@ -5500,7 +5515,7 @@ pub const ApiHttpServer = struct {
             context.now_ms = @intCast(platform_time.realtimeNs() / std.time.ns_per_ms);
             context.clock_ms_fn = memoryClockMs;
             try context.check();
-            var adapter: module.engine.Routed = .{ .table = table, .reads = server.table_reads.?, .writes = server.table_writes.?, .context = context };
+            var adapter: module.engine.Routed = .{ .table = table, .reads = server.table_reads.?, .writes = server.table_writes.?, .index_catalog = server.memoryIndexCatalog(), .context = context };
             adapter.request = .{ .deadline_ns = work.deadline.end };
             const inference_deadline = try work.deadline.beginExecution(adapter.backend(), a, platform_time.monotonicNs(), context.now_ms, state, pending);
             const executor = if (pending) |item| item.execution_principal else state.execution_principal;
@@ -21754,7 +21769,7 @@ pub const ApiHttpServer = struct {
             .check_fn = Check.call,
         };
         var resources: MemoryResourceReader = .{ .server = self, .identity = &identity, .database = input.database, .request = request };
-        var adapter: module.engine.Routed = .{ .table = table, .reads = self.table_reads orelse return error.MemoryCapabilityUnavailable, .writes = self.table_writes orelse return error.MemoryCapabilityUnavailable, .context = context, .request = request, .resource_ptr = &resources, .resource_fn = MemoryResourceReader.read };
+        var adapter: module.engine.Routed = .{ .table = table, .reads = self.table_reads orelse return error.MemoryCapabilityUnavailable, .writes = self.table_writes orelse return error.MemoryCapabilityUnavailable, .index_catalog = self.memoryIndexCatalog(), .context = context, .request = request, .resource_ptr = &resources, .resource_fn = MemoryResourceReader.read };
         const models = @import("antfly_local_sources").memory_models;
         const Runtime = @import("antfly_local_sources").asset_producer_runtime.Runtime;
         const runtime = try Runtime.createOwned(a, self.inferenceIo(), .{ .antfly_provider = self.antfly_provider, .inference_api_url = self.configuredInferenceAPIURL(), .secret_store = self.cfg.secret_store, .source_table = table });
