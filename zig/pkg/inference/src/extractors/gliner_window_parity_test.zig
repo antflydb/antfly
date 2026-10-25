@@ -36,7 +36,8 @@ const Capture = struct {
     },
 };
 
-fn parity(metal: bool) !void {
+fn parity(comptime backend: enum { native, metal, cuda }) !void {
+    const accelerated = backend != .native;
     const directory = platform.env.getenv("ANTFLY_GLINER_WINDOW_MODEL_DIR") orelse return error.SkipZigTest;
     const capture_path = platform.env.getenv("ANTFLY_GLINER_WINDOW_CAPTURE");
     const variant = platform.env.getenv("ANTFLY_GLINER_WINDOW_VARIANT") orelse "base";
@@ -48,7 +49,11 @@ fn parity(metal: bool) !void {
     const capture = try std.json.parseFromSlice(Capture, a, bytes, .{ .ignore_unknown_fields = true });
     defer capture.deinit();
     const modern = std.mem.eql(u8, capture.value.variant, "decide_1b");
-    const session = if (metal) try factory.createMetalSession(a, directory) else try factory.createNativeSession(a, directory);
+    const session = switch (backend) {
+        .native => try factory.createNativeSession(a, directory),
+        .metal => try factory.createMetalSession(a, directory),
+        .cuda => try factory.createCudaSession(a, directory),
+    };
     defer session.close();
     const tokenizer_path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
     defer a.free(tokenizer_path);
@@ -62,14 +67,14 @@ fn parity(metal: bool) !void {
         _ = try qualification.require(try factory.getGlinerDecisionIdentity(session));
     }
 
-    const watchdog = if (metal) try @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a) else null;
+    const watchdog: ?*@import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog = if (accelerated) try @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a) else null;
     defer if (watchdog) |owner| owner.destroy();
     if (watchdog) |owner| try owner.start(std.testing.io);
     const control = @import("../execution_control.zig").InferenceExecutionControl{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = platform.time.monotonicNs() + 600 * std.time.ns_per_s };
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
     for (capture.value.cases) |case| {
-        errdefer std.debug.print("window parity {s} {s}/{s}\n", .{ if (metal) "Metal" else "native", capture.value.variant, case.id });
+        errdefer std.debug.print("window parity {s} {s}/{s}\n", .{ @tagName(backend), capture.value.variant, case.id });
         const schema = try std.json.parseFromSlice(std.json.Value, a, case.native_schema_json, .{});
         defer schema.deinit();
         const body = try std.json.Stringify.valueAlloc(a, .{ .schema_version = @as(u32, 2), .model = "window", .schema = schema.value, .options = .{ .offset_unit = "unicode_codepoints", .long_document = .{ .mode = "window", .window_words = case.window_words, .overlap_words = @as(usize, 16) } }, .inputs = .{.{ .content = case.text }} }, .{});
@@ -97,7 +102,11 @@ fn parity(metal: bool) !void {
         } else {
             const config = try factory.getGlinerBoundaryConfig(session);
             const options = long.Options{ .identity = try factory.getGlinerBoundaryIdentity(session), .control = control, .pipeline = item.options.native(.{ .control = control }), .limits = .{ .window_batch_size = 1 } };
-            var gate = try @import("gliner_boundary_qualification.zig").Gate.init(options.identity, if (metal) .metal else .native, &request, control);
+            var gate = try @import("gliner_boundary_qualification.zig").Gate.init(options.identity, switch (backend) {
+                .native => .native,
+                .metal => .metal,
+                .cuda => .cuda,
+            }, &request, control);
             var result = try long.executeQualified(&managed.backend, a, &config, tokenizer.tokenizer(), item, options, &gate);
             defer result.deinit();
             try std.testing.expectEqual(case.windows.len, result.window_count);
@@ -107,9 +116,14 @@ fn parity(metal: bool) !void {
 }
 
 test "GLiNER bounded window composition pinned native" {
-    try parity(false);
+    try parity(.native);
 }
 test "GLiNER bounded window composition pinned Metal" {
     if (!@import("build_options").enable_metal) return error.SkipZigTest;
-    try parity(true);
+    try parity(.metal);
+}
+
+test "GLiNER bounded window composition pinned CUDA" {
+    if (!@import("build_options").enable_cuda) return error.SkipZigTest;
+    try parity(.cuda);
 }

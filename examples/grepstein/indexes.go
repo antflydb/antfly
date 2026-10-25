@@ -30,8 +30,8 @@ const (
 	DefaultEmbeddingPull    = "antflydb/clipclap:gguf:Q4_K"
 	DefaultEmbeddingDims    = 512
 	DefaultChunkerModel     = "fixed-bert-tokenizer"
-	DefaultOCRModel         = "microsoft/Florence-2-base-ft"
-	DefaultRecognizerModel  = "antflydb/gliner2-base-v1"
+	DefaultOCRModel         = "antflydb/florence-2-base:gguf:Q4_K@1c12eae118a4bdad5af436e2aa0212baf2214fee"
+	DefaultRecognizerModel  = "fastino/gliner2.5-base-v1:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d"
 	DefaultAutographIndex   = "autograph_relations"
 	DefaultAutographAsset   = "relations_v1"
 	DefaultAutographModel   = DefaultRecognizerModel
@@ -68,7 +68,7 @@ func inferenceMLBaseURL(raw string) (string, error) {
 	return root + "/ai/v1", nil
 }
 
-func createArtifactGraphIndex(indexName, artifactName, producerType, model, inferenceURL string, labels, relationLabels []string) (*antfly.IndexConfig, error) {
+func createArtifactGraphIndex(indexName, artifactName, producerType, model, inferenceURL string, labels, relationLabels []string, keyRef ...string) (*antfly.IndexConfig, error) {
 	if strings.TrimSpace(indexName) == "" {
 		return nil, fmt.Errorf("artifact graph index name is required")
 	}
@@ -108,6 +108,9 @@ func createArtifactGraphIndex(indexName, artifactName, producerType, model, infe
 	}
 
 	producerJSON := artifactProducerConfig(producerType, model, inferenceAPIURL, labelEnum, relationEnum, relationSchemas)
+	if len(keyRef) > 0 && keyRef[0] != "" {
+		producerJSON["config"].(map[string]any)["api_key"] = keyRef[0]
+	}
 	if inferenceAPIURL == "" {
 		delete(producerJSON["config"].(map[string]any), "api_url")
 	}

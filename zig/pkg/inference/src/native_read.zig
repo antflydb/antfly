@@ -661,3 +661,36 @@ test "benchmark telemetry equality detects drift" {
     drifted.generated_tokens = 7;
     try std.testing.expect(!readTelemetryEql(baseline, drifted));
 }
+
+test "Florence CUDA pinned OCR reads invoice fixture" {
+    if (!build_options.enable_cuda) return error.SkipZigTest;
+    const directory = platform.env.getenv("ANTFLY_FLORENCE2_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const image_data = try c_file.readFile(a, "../../lib/readers/src/testdata/apple-ocr.png");
+    defer a.free(image_data);
+    var sessions = backends.SessionManager.initWithIo(a, std.testing.io);
+    sessions.preferred_backends = &.{.cuda};
+    sessions.required_backend = .cuda;
+    sessions.process_termination_available = true;
+    var manager = model_manager_mod.ModelManager.init(a, sessions);
+    defer manager.deinit();
+    const watchdog = try @import("hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a);
+    defer watchdog.destroy();
+    try watchdog.start(std.testing.io);
+    const control = @import("execution_control.zig").InferenceExecutionControl{
+        .hard_cancellation = watchdog.boundary(),
+        .deadline_ns = platform.time.monotonicNs() + 180 * std.time.ns_per_s,
+    };
+    var reader = try readers_mod.LoadedReader.loadFromDirWithControl(a, directory, &manager.session_manager, &manager, control);
+    defer reader.deinit();
+    var fence = (try readers_mod.LoadedReader.acquireExecutionFence(directory, &manager)) orelse return error.MissingFlorenceExecutionFence;
+    defer fence.deinit();
+    try std.testing.expectEqual(backends.BackendType.cuda, fence.backend());
+    var result = try reader.read(image_data, .{ .prompt = "<OCR>", .max_tokens = 128, .execution_control = control });
+    defer result.deinit();
+    const lower = try std.ascii.allocLowerString(a, result.text);
+    defer a.free(lower);
+    errdefer std.debug.print("Florence CUDA invoice output: {s}\n", .{result.text});
+    for ([_][]const u8{ "antfly", "12345", "42.00" }) |text|
+        try std.testing.expect(std.mem.indexOf(u8, lower, text) != null);
+}

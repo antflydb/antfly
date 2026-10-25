@@ -27,7 +27,7 @@ func TestVertexCorpusEmbeddingSharesDimensionsAndProject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	indexes, err := corpusIndexes("unused", DefaultAutographModel, "", "", false, true, config)
+	indexes, err := corpusIndexes("unused", DefaultAutographModel, "", "", false, true, corpusIndexOptions{Embedder: config})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestVertexCorpusEmbeddingSharesDimensionsAndProject(t *testing.T) {
 	if enrichment["expected_dims"] != index["dimension"] {
 		t.Fatal("producer/index dimension mismatch")
 	}
-	plain, err := corpusIndexes("unused", DefaultAutographModel, "", "", false, false, config)
+	plain, err := corpusIndexes("unused", DefaultAutographModel, "", "", false, false, corpusIndexOptions{Embedder: config})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,5 +78,76 @@ func TestCorpusEmbedderRejectsWrongTagsSecretsAndDimensions(t *testing.T) {
 	}
 	if corpusEmbeddingDimensions(config) != 768 {
 		t.Fatal(config)
+	}
+}
+
+func TestHostedCorpusProfilesKeepModelsDimensionsAndRoutingAligned(t *testing.T) {
+	config, err := corpusEmbedderConfig("unused", "antfly-embedder.example.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexes, err := corpusIndexes("unused", DefaultAutographModel, "https://inference.example", "florence-reader.example.json", true, true, corpusIndexOptions{Embedder: config, InferenceSecret: "hosted.inference.key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	semantic := indexes[DefaultEmbeddingIndex].(map[string]any)
+	if semantic["dimension"] != 768 || semantic["enrichments"].([]any)[0].(map[string]any)["expected_dims"] != 768 {
+		t.Fatal(semantic)
+	}
+	if semantic["embedder"].(map[string]any)["api_url"] != "https://inference.example/ai/v1" {
+		t.Fatal(semantic)
+	}
+	if config["provider"] != "antfly" || config["model"] != "google/embeddinggemma-2:safetensors@914f7f89142e33e77833254d9c9b90c3cef7303b" {
+		t.Fatal(config)
+	}
+	text := indexes[corpusTextIndex].(map[string]any)
+	asset := text["enrichments"].([]any)[0].(map[string]any)
+	var producer map[string]any
+	if err := json.Unmarshal([]byte(asset["producer_json"].(string)), &producer); err != nil {
+		t.Fatal(err)
+	}
+	ocr := producer["config"].(map[string]any)["ocr"].(map[string]any)
+	reader := ocr["config"].(map[string]any)
+	if ocr["enabled"] != true || ocr["executor"] != "reader" || reader["model"] != DefaultOCRModel || reader["api_url"] != "https://inference.example/ai/v1" {
+		t.Fatal(ocr)
+	}
+	graphBytes, err := json.Marshal(indexes[DefaultAutographIndex])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var graph map[string]any
+	if err := json.Unmarshal(graphBytes, &graph); err != nil {
+		t.Fatal(err)
+	}
+	extractor := graph["artifact"].(map[string]any)["producer_json"].(map[string]any)["config"].(map[string]any)
+	if reader["api_key"] != "${secret:hosted.inference.key}" || semantic["embedder"].(map[string]any)["api_key"] != reader["api_key"] || extractor["api_key"] != reader["api_key"] {
+		t.Fatal("inference credentials must remain the same server-side secret reference")
+	}
+	if extractor["model"] != DefaultAutographModel || extractor["api_url"] != reader["api_url"] {
+		t.Fatal(extractor)
+	}
+	if len(extractor["schema"].(map[string]any)["relations"].([]any)) == 0 {
+		t.Fatal("missing relationship schema")
+	}
+}
+
+func TestHostedInferenceSecretRejectsAmbiguousCredentialRouting(t *testing.T) {
+	for _, option := range []corpusIndexOptions{
+		{InferenceSecret: "${secret:nested}"},
+		{InferenceSecret: "key with spaces"},
+		{InferenceSecret: "hosted.key", Embedder: map[string]any{"provider": "antfly", "model": DefaultEmbeddingModel, "dimension": 512, "api_url": "https://other.example/ai/v1"}},
+	} {
+		if _, err := corpusIndexes(DefaultEmbeddingModel, DefaultAutographModel, "https://inference.example", "", true, true, option); err == nil {
+			t.Fatalf("accepted ambiguous credential routing: %+v", option)
+		}
+	}
+	if _, err := corpusIndexes(DefaultEmbeddingModel, DefaultAutographModel, "", "", false, true, corpusIndexOptions{InferenceSecret: "hosted.key"}); err == nil {
+		t.Fatal("secret requires an explicit endpoint")
+	}
+	for _, value := range []string{"private-token", "${secret:}", "${secret:key}literal}"} {
+		config := map[string]any{"provider": "antfly", "model": DefaultEmbeddingModel, "dimension": 512, "api_key": value}
+		if err := validateCorpusEmbedder(config); err == nil {
+			t.Fatal("accepted inline or malformed credential")
+		}
 	}
 }

@@ -731,7 +731,21 @@ fn transformersWrapperEntries() [6]Entry {
     }
     return entries;
 }
-const production_entries: []const Entry = &(base_production_entries ++ multilingualEntries() ++ composed_window_entries ++ transformersWrapperEntries());
+// CUDA FP32 evidence, 2026-10-25, NVIDIA GB10 / driver 580.178.04:
+// - boundary_scorer_device_test: all ten frozen Python task fixtures on the
+//   original base and Transformers-wrapper artifacts, unchanged 5e-4 tolerance.
+// - gliner_window_parity_test: tiny/short/three-window cases and a complete
+//   1024-token mixed prompt, including classifications and relationships.
+// The composed document sizes are existing planner/merge resource ceilings;
+// encoder context remains 1024 tokens. Do not inherit the older 5708-token
+// native/Metal long-document row, reduced precisions, or multilingual profiles.
+const cuda_base_entries = [_]Entry{
+    .{ .identity = fastino_gliner25_base_v1, .backend = .cuda, .features = fastino_gliner25_base_v1_features, .lengths = fastino_gliner25_base_v1_lengths },
+    .{ .identity = fastino_gliner25_base_v1_transformers, .backend = .cuda, .features = fastino_gliner25_base_v1_features, .lengths = fastino_gliner25_base_v1_lengths },
+    .{ .identity = fastino_gliner25_base_v1, .backend = .cuda, .features = composed_window_features, .lengths = composed_window_lengths },
+    .{ .identity = fastino_gliner25_base_v1_transformers, .backend = .cuda, .features = composed_window_features, .lengths = composed_window_lengths },
+};
+const production_entries: []const Entry = &(base_production_entries ++ multilingualEntries() ++ composed_window_entries ++ transformersWrapperEntries() ++ cuda_base_entries);
 
 comptime {
     // Each entry's five digests are hex-validated one character at a time
@@ -1241,7 +1255,7 @@ test "boundary qualification Transformers wrapper has exactly the original fp32 
         try require(identity, entry.backend, entry.features, entry.lengths);
         count += 1;
     }
-    try std.testing.expectEqual(@as(usize, 6), count);
+    try std.testing.expectEqual(@as(usize, 8), count);
     for (0..4) |index| {
         var changed = identity;
         changed.sidecars[index].sha256[0] = 'f';
@@ -1253,5 +1267,21 @@ test "boundary qualification Transformers wrapper has exactly the original fp32 
     var changed = identity;
     changed.weight.sha256[0] = 'f';
     try std.testing.expect(!hasQualifiedIdentity(changed));
-    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, .cuda, fastino_gliner25_base_v1_features, fastino_gliner25_base_v1_lengths));
+    try require(identity, .cuda, fastino_gliner25_base_v1_features, fastino_gliner25_base_v1_lengths);
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, .cuda, fastino_gliner25_base_v1_long_document_features, fastino_gliner25_base_v1_long_document_lengths));
+}
+
+test "CUDA boundary base profiles keep exact identity context and precision gates" {
+    for (cuda_base_entries) |entry| {
+        try require(entry.identity, entry.backend, entry.features, entry.lengths);
+        var mismatch = entry.identity;
+        mismatch.weight.sha256[0] = 'f';
+        try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(mismatch, .cuda, entry.features, entry.lengths));
+        var oversized = entry.lengths;
+        oversized.padded_sequence_tokens = Range.exact(entry.lengths.padded_sequence_tokens.max + 1);
+        try std.testing.expectError(error.GlinerBoundaryPaddedSequenceLimitExceeded, require(entry.identity, .cuda, entry.features, oversized));
+        mismatch = entry.identity;
+        mismatch.precision = .fp16_encoder;
+        try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(mismatch, .cuda, entry.features, entry.lengths));
+    }
 }

@@ -161,16 +161,37 @@ separate; it needs read access to the originals bucket.
 ./grepstein publish --state ./grepstein-corpus --bucket antfly-showcases-originals
 # Set ANTFLY_API_KEY securely to a write key for this instance/table.
 ./grepstein load --state ./grepstein-corpus --url "$ANTFLY_URL" \
-  --create-table --num-shards 4 --reader-config vertex-reader.example.json
+  --create-table --num-shards 4 --reader-config florence-reader.example.json \
+  --inference-url "$ANTFLY_INFERENCE_URL" \
+  --inference-secret antfly.antfly_inference.api_key
 ./grepstein wait --url "$ANTFLY_URL"
 ./grepstein stats --state ./grepstein-corpus --url "$ANTFLY_URL"
 ```
 
-Edit the reader example's project/location/model for the approved deployment.
-The **Antfly runtime** needs ADC/Workload Identity permission to invoke Vertex in
-that project. Logging in with the local Antfly CLI does not configure remote
-workers. Reader configuration rejects inline API keys/tokens. For a purely
-digital-text pilot, omit `--reader-config`; scanned pages will still need OCR.
+The showcase OCR profile uses digest-pinned Florence-2 on shared Antfly inference.
+Set `ANTFLY_INFERENCE_URL` to a server-reachable inference root or `/ai/v1` URL;
+`--inference-url` binds the Florence profile and relation extractor to that endpoint.
+The Cloud connection uses the existing `antfly.antfly_inference.api_key` server
+keystore key. `--inference-secret` stores only a secret reference in the OCR,
+embedding and relation configs; self-hosted users select their own key name.
+Reader configuration rejects inline credential values. Repeat the endpoint and
+secret flags for `enrich --stage semantic` and `enrich --stage graph`.
+Without an endpoint override, Antfly's runtime inference configuration owns routing.
+For a purely digital-text pilot, omit `--reader-config`; scanned pages will still
+need OCR. The Vertex reader example remains available as an alternative.
+
+The relation stage defaults to pinned `fastino/gliner2.5-base-v1`, with entity and
+relation schemas and bounded long-document windowing. Colony must deploy its
+GLiNER2.5 and Florence GPU routes before the hosted pipeline is qualified. CUDA
+kernels alone do not qualify the GLiNER2.5 serving policy: use a runtime with
+measured CUDA production profiles, then verify the deployed L4 path. RC.2 rejects
+GLiNER2.5 CUDA. Preserve the existing GLiNER2 route for other callers.
+
+For semantic backfill, use `--embedder-config antfly-embedder.example.json` to select
+EmbeddingGemma 2 with 768 dimensions consistently across enrichment and the index.
+This stage reuses extracted chunks. A model change requires re-embedding; never
+mix the existing CLIP or Gemini vectors with EmbeddingGemma vectors. Pin query and
+document vectors to the same runtime model identity (CUDA BF16 differs from CPU F32).
 
 GCS publication uses SHA-256 object keys and `ifGenerationMatch=0`. Existing
 objects are checked by size/MD5 before reuse. Originals and prepared parts have
