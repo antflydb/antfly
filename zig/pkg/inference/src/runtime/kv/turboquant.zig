@@ -107,6 +107,32 @@ pub fn decodeTurbo3Key(src: []const u8, dst: []f32, num_kv_heads: u32, head_dim:
     }
 }
 
+/// Decode the effective Turbo3 key consumed by attention, including the
+/// residual-sign sketch. The sketch's dot-product correction is linear in Q,
+/// so it can be represented exactly as this additive key vector.
+pub fn decodeTurbo3KeyWithResidual(
+    base_key: []const u8,
+    residual_sketch: []const u8,
+    dst: []f32,
+    num_kv_heads: u32,
+    head_dim: u32,
+) !void {
+    try decodeTurbo3Key(base_key, dst, num_kv_heads, head_dim);
+    if (residual_sketch.len != turbo3ResidualBytes(num_kv_heads, head_dim)) return error.InvalidKvRowWidth;
+    const hd: usize = head_dim;
+    const correction_scale: f32 = 0.125 / @as(f32, @floatFromInt(turbo3_residual_bits_per_head));
+    for (0..@as(usize, num_kv_heads)) |head| {
+        for (0..hd) |d| {
+            var correction: f32 = 0;
+            for (0..turbo3_residual_bits_per_head) |projection| {
+                const sign: f32 = if (getBit(residual_sketch, head * turbo3_residual_bits_per_head + projection)) 1 else -1;
+                correction += sign * randomSign(head, projection, d);
+            }
+            dst[head * hd + d] += correction * correction_scale;
+        }
+    }
+}
+
 pub fn encodeTurbo3ResidualSketch(src: []const f32, base_key: []const u8, dst: []u8, num_kv_heads: u32, head_dim: u32) !void {
     if (!isSupportedHeadDim(head_dim)) return error.UnsupportedKvHeadDim;
     const hd: usize = head_dim;
@@ -383,6 +409,26 @@ test "turbo3 key round trip" {
     for (src, decoded) |expected, actual| {
         try std.testing.expectApproxEqAbs(expected, actual, 0.15);
     }
+}
+
+test "turbo3 effective decode includes the exact residual dot correction" {
+    var key: [64]f32 = undefined;
+    var query: [64]f32 = undefined;
+    for (0..64) |i| {
+        key[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 19)) - 9)) / 9.0;
+        query[i] = @as(f32, @floatFromInt(@as(i32, @intCast((i * 5) % 17)) - 8)) / 8.0;
+    }
+    var base: [turbo3KeyBytes(1, 64)]u8 = undefined;
+    var residual: [turbo3ResidualBytes(1, 64)]u8 = undefined;
+    try encodeTurbo3Key(&key, &base, 1, 64);
+    try encodeTurbo3ResidualSketch(&key, &base, &residual, 1, 64);
+    var effective: [64]f32 = undefined;
+    try decodeTurbo3KeyWithResidual(&base, &residual, &effective, 1, 64);
+    var decoded_dot: f32 = 0;
+    for (query, effective) |q, k| decoded_dot += q * k;
+    const direct = try dotTurbo3Key(&query, &base, 1, 64, 0) +
+        0.125 * try dotTurbo3ResidualSketch(&query, &residual, 1, 64, 0);
+    try std.testing.expectApproxEqAbs(direct, decoded_dot, 2e-5);
 }
 
 test "polar4 direct dot matches decoded dot" {

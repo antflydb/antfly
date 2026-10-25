@@ -234,6 +234,53 @@ describe("InferenceClient with mock fetch", () => {
       messages: [{ role: "user" as const, content: "hello" }],
     };
 
+    it("forwards developer instructions during context preparation and returns diagnostics", async () => {
+      const messages = [
+        { role: "developer" as const, content: "Preserve these instructions." },
+        ...request.messages,
+      ];
+      const prepared = {
+        messages,
+        context: {
+          policy: "inspect" as const,
+          applied: false,
+          original_input_tokens: 4,
+          effective_input_tokens: 4,
+          target_input_tokens: 128,
+          reserved_output_tokens: 16,
+          dropped_messages: 0,
+          retained_messages: messages.length,
+          retained_from_message: 0,
+          checkpoint_applied: false,
+          windowed: false,
+          compacted: false,
+        },
+        usage: { prompt_tokens: 4, completion_tokens: 0, total_tokens: 4 },
+      };
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(JSON.stringify(prepared), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      );
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      const prepareRequest = {
+        ...request,
+        messages,
+        max_tokens: 16,
+        mode: "inspect" as const,
+        tool_choice: "none" as const,
+        chat_template_kwargs: { enable_thinking: false },
+      };
+      await expect(client.prepareChatContext(prepareRequest)).resolves.toEqual(prepared);
+      expect(await lastFetchJSONBody()).toEqual(prepareRequest);
+      const [input] = vi.mocked(fetch).mock.calls.at(-1) ?? [];
+      expect(input instanceof Request ? input.url : input).toBe(
+        "http://localhost:8080/ai/v1/generate/context/prepare"
+      );
+    });
+
     it("supports JSON and framed SSE generation without exposing the generated parser gap", async () => {
       const completion = {
         id: "chatcmpl-json",
@@ -289,6 +336,57 @@ describe("InferenceClient with mock fetch", () => {
       const [, init] = vi.mocked(fetch).mock.calls.at(-1) ?? [];
       expect(init?.signal).toBe(controller.signal);
       expect((init?.headers as Record<string, string>).Accept).toBe("text/event-stream");
+    });
+
+    it("fails closed when a server does not attest a managed generation policy", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: "legacy",
+            object: "chat.completion",
+            created: 1,
+            model: "gemma",
+            choices: [],
+            usage: { prompt_tokens: 1, completion_tokens: 0, total_tokens: 1 },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        )
+      );
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(
+        client.generate({ ...request, context_management: { mode: "reject" } })
+      ).rejects.toThrow("did not attest the requested context policy");
+
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: "wrong-policy",
+            object: "chat.completion",
+            created: 1,
+            model: "gemma",
+            choices: [],
+            context: {
+              policy: "window",
+              applied: false,
+              original_input_tokens: 1,
+              effective_input_tokens: 1,
+              target_input_tokens: 8,
+              reserved_output_tokens: 1,
+              dropped_messages: 0,
+              retained_messages: 1,
+              retained_from_message: 0,
+              checkpoint_applied: false,
+              windowed: false,
+              compacted: false,
+            },
+            usage: { prompt_tokens: 1, completion_tokens: 0, total_tokens: 1 },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        )
+      );
+      await expect(
+        client.generate({ ...request, context_management: { mode: "reject" } })
+      ).rejects.toThrow("attested a different context policy");
     });
 
     it("normalizes repeated trailing slashes and an explicit inference prefix", async () => {

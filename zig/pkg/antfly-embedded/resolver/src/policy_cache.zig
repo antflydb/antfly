@@ -17,9 +17,9 @@
 //! only the cache reference; active readers retain their own lease. No grants,
 //! documents, model outputs, or mutable decision state live here.
 const std = @import("std");
+const builtin = @import("builtin");
 const curation = @import("curation.zig");
 const A = std.mem.Allocator;
-const builtin = @import("builtin");
 // Cached policies and active leases outlive individual operations. Keep their
 // allocator in the process/instance domain, including threadless WASM.
 const heap = if (builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64)

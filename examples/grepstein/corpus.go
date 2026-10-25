@@ -425,7 +425,28 @@ func printCorpusJSON(value any) error {
 	return enc.Encode(value)
 }
 
-func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string, graph, semantic bool, embedderOverride ...map[string]any) (map[string]any, error) {
+type corpusIndexOptions struct {
+	Embedder        map[string]any
+	InferenceSecret string
+}
+
+func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string, graph, semantic bool, overrides ...corpusIndexOptions) (map[string]any, error) {
+	var options corpusIndexOptions
+	if len(overrides) > 0 {
+		options = overrides[0]
+	}
+	secretRef := ""
+	if options.InferenceSecret != "" {
+		if inferenceURL == "" {
+			return nil, fmt.Errorf("inference-secret requires an explicit inference-url")
+		}
+		for _, c := range options.InferenceSecret {
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("._-/", c)) {
+				return nil, fmt.Errorf("inference-secret must be a keystore key name")
+			}
+		}
+		secretRef = "${secret:" + options.InferenceSecret + "}"
+	}
 	ocr := map[string]any{"enabled": false}
 	if language != "" {
 		data, err := os.ReadFile(language)
@@ -443,6 +464,19 @@ func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string
 			if reader[key] != nil {
 				return nil, fmt.Errorf("reader-config must reference server credentials, not contain %s", key)
 			}
+		}
+		if reader["provider"] == "antfly" && inferenceURL != "" && reader["api_url"] == nil && reader["url"] == nil {
+			endpoint, err := inferenceMLBaseURL(inferenceURL)
+			if err != nil {
+				return nil, err
+			}
+			reader["api_url"] = endpoint
+		}
+		if reader["provider"] == "antfly" && secretRef != "" {
+			if err := validateCorpusInferenceEndpoint(reader, inferenceURL); err != nil {
+				return nil, err
+			}
+			reader["api_key"] = secretRef
 		}
 		ocr = map[string]any{"enabled": true, "executor": "reader", "mode": "auto", "render_dpi": 150, "prompt_policy": "plain", "config": reader}
 	}
@@ -462,8 +496,31 @@ func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string
 	// name in a public create request is rejected, even with default settings.
 	if semantic {
 		embedder, _ := corpusEmbedderConfig(embeddingModel, "")
-		if len(embedderOverride) > 0 {
-			embedder = embedderOverride[0]
+		if options.Embedder != nil {
+			embedder = options.Embedder
+		}
+		if embedder["provider"] == "antfly" && inferenceURL != "" && embedder["api_url"] == nil && embedder["url"] == nil {
+			endpoint, err := inferenceMLBaseURL(inferenceURL)
+			if err != nil {
+				return nil, err
+			}
+			routed := make(map[string]any, len(embedder)+1)
+			for key, value := range embedder {
+				routed[key] = value
+			}
+			routed["api_url"] = endpoint
+			embedder = routed
+		}
+		if embedder["provider"] == "antfly" && secretRef != "" {
+			if err := validateCorpusInferenceEndpoint(embedder, inferenceURL); err != nil {
+				return nil, err
+			}
+			routed := make(map[string]any, len(embedder)+1)
+			for key, value := range embedder {
+				routed[key] = value
+			}
+			routed["api_key"] = secretRef
+			embedder = routed
 		}
 		if err := validateCorpusEmbedder(embedder); err != nil {
 			return nil, err
@@ -476,7 +533,7 @@ func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string
 		indexes[DefaultEmbeddingIndex].(map[string]any)["coverage_policy"] = "partial"
 	}
 	if graph {
-		index, e := createArtifactGraphIndex(DefaultAutographIndex, DefaultAutographAsset, "extractor", extractorModel, inferenceURL, strings.Split(DefaultEntityLabels, ","), strings.Split(DefaultRelationLabels, ","))
+		index, e := createArtifactGraphIndex(DefaultAutographIndex, DefaultAutographAsset, "extractor", extractorModel, inferenceURL, strings.Split(DefaultEntityLabels, ","), strings.Split(DefaultRelationLabels, ","), secretRef)
 		if e != nil {
 			return nil, e
 		}
@@ -574,11 +631,12 @@ func corpusLoadCmd(args []string) error {
 	batchSize := flags.Int("batch-size", 100, "Records per durable upsert (native workers manage OCR/transcription admission)")
 	semantic := flags.Bool("semantic", false, "Create semantic index (requires embedding inference)")
 	graph := flags.Bool("graph", false, "Create relation graph; run corpus graph after extraction (requires extractor inference)")
-	inference := flags.String("inference-url", "", "Antfly inference URL for the optional relation graph")
-	model := flags.String("embedding-model", DefaultEmbeddingModel, "Embedding model, with 512 dimensions")
+	inference := flags.String("inference-url", "", "Server-reachable Antfly inference URL for OCR, embeddings and relation extraction")
+	inferenceSecret := flags.String("inference-secret", "", "Server keystore key name for the selected inference endpoint (never a credential value)")
+	model := flags.String("embedding-model", DefaultEmbeddingModel, fmt.Sprintf("Embedding model (%d dimensions; use embedder-config for another dimension)", DefaultEmbeddingDims))
 	embedderPath := flags.String("embedder-config", "", "Native embedder JSON including provider, model, project/location and dimension")
 	extractorModel := flags.String("artifact-extractor-model", DefaultAutographModel, "Registered inference model for relation extraction")
-	language := flags.String("reader-config", "", "Native OCR reader JSON file (Vertex ADC recommended); empty disables OCR")
+	language := flags.String("reader-config", "", "Native OCR reader JSON file (florence-reader.example.json for hosted inference); empty disables OCR")
 	numShards := flags.Int("num-shards", 1, "Number of shards when creating the table")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -614,7 +672,7 @@ func corpusLoadCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	indexes, err := corpusIndexes(*model, *extractorModel, *inference, *language, *graph, *semantic, embedder)
+	indexes, err := corpusIndexes(*model, *extractorModel, *inference, *language, *graph, *semantic, corpusIndexOptions{Embedder: embedder, InferenceSecret: *inferenceSecret})
 	if err != nil {
 		return err
 	}

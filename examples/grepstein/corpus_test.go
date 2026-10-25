@@ -383,7 +383,7 @@ func TestCorpusExtractorModelUsesRegisteredIdentifier(t *testing.T) {
 			t.Fatalf("model=%v want=%s", got, model)
 		}
 	}
-	if DefaultAutographModel != "antflydb/gliner2-base-v1" {
+	if DefaultAutographModel != "fastino/gliner2.5-base-v1:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d" {
 		t.Fatalf("unregistered default %s", DefaultAutographModel)
 	}
 }
