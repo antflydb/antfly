@@ -18,6 +18,9 @@
 //! store does not execute models, retain source credentials, or resume jobs.
 const std = @import("std");
 const A = std.mem.Allocator;
+/// Reserved by the reader before processing sources. A 64-byte opaque handle
+/// and a u64 TTL fit within this JSON decoration allowance.
+pub const response_overhead: usize = 128;
 /// Retention adds only the handle to the response. Keep structured numeric
 /// tokens exact and leave the immutable stored reading untouched.
 pub fn responseWithHandle(work: A, output: A, result: []const u8, handle: []const u8, ttl_ms: u64) ![]u8 {
@@ -27,7 +30,7 @@ pub fn responseWithHandle(work: A, output: A, result: []const u8, handle: []cons
     if (document.* != .object) return error.InvalidDocumentArtifact;
     try document.object.put(work, "artifact_id", .{ .string = handle });
     try document.object.put(work, "artifact_ttl_ms", .{ .integer = @intCast(ttl_ms) });
-    return std.json.Stringify.valueAlloc(output, envelope, .{});
+    return @import("output.zig").valueAlloc(output, envelope, std.math.add(usize, result.len, response_overhead) catch return error.DocumentOutputTooLarge);
 }
 
 pub const Charge = struct {
@@ -338,4 +341,15 @@ test "document retained responses preserve exact structured numeric tokens" {
     try std.testing.expect(std.mem.indexOf(u8, response, "9007199254740993.01") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "\"artifact_id\":\"handle\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, original, "artifact_id") == null);
+}
+
+test "document artifact response fits its reserved bounded decoration allowance" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const original = "{\"data\":[],\"document\":{\"status\":\"complete\"}}";
+    const handle: [64]u8 = @splat('a');
+    const decorated = try responseWithHandle(arena.allocator(), a, original, &handle, std.math.maxInt(i64));
+    defer a.free(decorated);
+    try std.testing.expect(decorated.len <= original.len + response_overhead);
 }

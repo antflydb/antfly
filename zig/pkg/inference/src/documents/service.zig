@@ -19,6 +19,7 @@ const std = @import("std");
 const c = @import("contract.zig");
 const executor = @import("executor.zig");
 const sources = @import("sources.zig");
+const json_output = @import("output.zig");
 const cf = @import("antfly_cloudflare");
 const readers = @import("antfly_readers");
 const image = @import("antfly_image");
@@ -152,7 +153,12 @@ pub fn Service(comptime Node: type) type {
             }
             if (inputs.items.len == 0 or inputs.items.len > run.limits.max_sources -| run.source_count) return error.InvalidDocumentSource;
             if (attached == null) for (inputs.items, 0..) |input, i| for (inputs.items[0..i]) |prior| if (std.mem.eql(u8, input.id, prior.id)) return error.DuplicateDocumentSource;
-            var pages = std.ArrayList(c.Page).empty;
+            const response_limit = @min(def.budget.max_output_bytes, run.limits.max_output_bytes);
+            const decoration = if (request.retain_artifact) @import("artifacts.zig").response_overhead else 0;
+            var response = json_output.Writer.init(backing, response_limit -| decoration);
+            defer response.deinit();
+            try response.begin("list", request.model);
+            var page_count: usize = 0;
             var fingerprints = std.ArrayList(struct { id: []const u8, sha256: []const u8, page_number: ?u32 = null }).empty;
             for (inputs.items, 0..) |input_value, source_index| {
                 var input = input_value;
@@ -192,32 +198,33 @@ pub fn Service(comptime Node: type) type {
                         page.number = original;
                     };
                     var context = Self{ .node = node, .definition = def, .work_allocator = sa, .graph = graph, .control = control, .source = &source, .number = number, .native_regions = page.regions, .prompt = request.prompt, .max_tokens = request.max_tokens };
-                    const result = if (std.mem.eql(u8, request.model, "antfly/native-document")) native: {
+                    const reading: executor.Result = if (std.mem.eql(u8, request.model, "antfly/native-document")) native: {
                         var native_page = page;
                         native_page.text = page.native_text;
                         native_page.status = if (page.findings.len == 0 and page.kind != .image) .complete else .unresolved;
-                        try run.output(native_page.text.len);
-                        break :native native_page;
-                    } else executor.readPage(sa, def, .{ .ptr = &context, .read_fn = read, .decide_fn = decide, .validate_fn = validate }, index, page, run) catch |err| switch (err) {
+                        const output_bytes = try run.outputJson(native_page);
+                        break :native .{ .page = native_page, .output_bytes = output_bytes };
+                    } else executor.readPageReported(sa, def, .{ .ptr = &context, .read_fn = read, .decide_fn = decide, .validate_fn = validate }, index, page, run) catch |err| switch (err) {
                         error.DocumentRendererUnavailable, error.DocumentBudgetExhausted => blk: {
                             var unresolved = page;
                             unresolved.text = page.native_text;
                             unresolved = try executor.interrupted(sa, unresolved, err);
-                            try run.output(unresolved.text.len);
-                            break :blk unresolved;
+                            const output_bytes = try run.outputJson(unresolved);
+                            break :blk .{ .page = unresolved, .output_bytes = output_bytes };
                         },
                         else => return err,
                     };
+                    var result = reading.page;
+                    result.index = page_count;
+                    if (context.rendered) |view| result.raster_to_source = view.raster_to_source;
+                    try appendPage(&response, result, run, reading.output_bytes, page_count > 0);
+                    page_count += 1;
                     try run.emit(.{ .phase = if (result.status == .complete) .accepted else .unresolved, .source_id = result.source_id, .page_number = result.number, .status = result.status, .finding = if (result.findings.len > 0) result.findings[0] else null });
                     if (result.status == .complete) run.usage.completed_pages += 1;
-                    var retained = try retainPage(a, result, run.limits.max_regions);
-                    retained.index = pages.items.len;
-                    if (context.rendered) |view| retained.raster_to_source = view.raster_to_source;
-                    try pages.append(a, retained);
                     try control.update(.executing, run.usage.visited_pages, 0);
                 }
             }
-            const status: c.Status = if (run.usage.completed_pages - completed_before == pages.items.len) .complete else .unresolved;
+            const status: c.Status = if (run.usage.completed_pages - completed_before == page_count) .complete else .unresolved;
             var definition_digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ .root = def, .children = graph.plans.items }, .{}), &definition_digest, .{});
             const ModelIdentity = struct { model: []const u8, operation: c.Operation, provider: c.Provider, identity: ?[]const u8 };
@@ -238,17 +245,14 @@ pub fn Service(comptime Node: type) type {
             var run_digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ .definition = std.fmt.bytesToHex(definition_digest, .lower), .sources = fingerprints.items, .models = models.items, .options = source_options, .prompt = request.prompt, .max_tokens = request.max_tokens, .limits = run.limits, .adapter_version = "antfly-documents-v1", .runtime_version = runtime_version }, .{}), &run_digest, .{});
             try run.emit(.{ .phase = .complete, .source_id = "", .page_number = 0, .status = status });
-            const result = try std.json.Stringify.valueAlloc(backing, .{
-                .object = "list",
-                .model = request.model,
-                .data = pages.items,
-                .document = .{ .version = @as(u32, 1), .status = status, .sources = fingerprints.items, .definition_sha256 = @as([]const u8, &std.fmt.bytesToHex(definition_digest, .lower)), .run_sha256 = @as([]const u8, &std.fmt.bytesToHex(run_digest, .lower)), .runtime_version = runtime_version, .models = models.items, .adapter_version = "antfly-documents-v1" },
-                .usage = run.usage,
-                .events = run.events.items,
-            }, .{});
-            errdefer backing.free(result);
-            if (result.len > @min(def.budget.max_output_bytes, run.limits.max_output_bytes)) return error.DocumentOutputTooLarge;
-            return result;
+            try response.raw("],\"document\":");
+            try response.value(.{ .version = @as(u32, 1), .status = status, .sources = fingerprints.items, .definition_sha256 = @as([]const u8, &std.fmt.bytesToHex(definition_digest, .lower)), .run_sha256 = @as([]const u8, &std.fmt.bytesToHex(run_digest, .lower)), .runtime_version = runtime_version, .models = models.items, .adapter_version = "antfly-documents-v1" });
+            try response.raw(",\"usage\":");
+            try response.value(run.usage);
+            try response.raw(",\"events\":");
+            try response.value(run.events.items);
+            try response.raw("}");
+            return response.toOwnedSlice();
         }
 
         fn preflight(node: *Node, a: A, parent: Key, def: c.Definition, graph: *Graph, stack: []const Key, remote_allowed: bool) !void {
@@ -341,30 +345,14 @@ pub fn Service(comptime Node: type) type {
             return pinned;
         }
 
-        fn retainPage(a: A, page: c.Page, limit: usize) !c.Page {
-            try @import("representation.zig").validatePage(page, limit);
-            var out = page;
-            out.text = try a.dupe(u8, page.text);
-            out.native_text = try a.dupe(u8, page.native_text);
-            out.notes = try a.dupe(u8, page.notes);
-            const inherited = try a.dupe(c.InheritedPart, page.inherited_parts);
-            for (inherited) |*part| {
-                part.path = try a.dupe(u8, part.path);
-                part.text = try a.dupe(u8, part.text);
-                part.tables = try @import("representation.zig").cloneTables(a, part.tables, limit);
-            }
-            out.inherited_parts = inherited;
-            const ir = @import("representation.zig");
-            out.fields = try ir.cloneValue(a, page.fields);
-            out.regions = try ir.cloneRegions(a, page.regions, limit);
-            out.tables = try ir.cloneTables(a, page.tables, limit);
-            const findings = try a.dupe([]const u8, page.findings);
-            for (findings) |*finding| finding.* = try a.dupe(u8, finding.*);
-            out.findings = findings;
-            return out;
+        fn appendPage(response: *json_output.Writer, page: c.Page, run: *c.Run, credit: usize, comma: bool) !void {
+            try @import("representation.zig").validatePage(page, run.limits.max_regions);
+            const bytes = try response.append(page, run.remainingOutput(), credit, comma);
+            try run.output(bytes -| credit);
         }
 
         fn read(raw: *anyopaque, a: A, binding: c.Binding, _: usize, bbox: ?[4]f64, run: *c.Run) !executor.Candidate {
+            try run.requireOutput();
             const self: *Self = @ptrCast(@alignCast(raw));
             if (std.mem.eql(u8, binding.model, "antfly/native-document")) {
                 if (bbox != null) return error.DocumentCapabilityMismatch;
@@ -497,6 +485,7 @@ pub fn Service(comptime Node: type) type {
         }
 
         fn decide(raw: *anyopaque, a: A, binding: c.Binding, observation: executor.Observation, run: *c.Run) !executor.Action {
+            try run.requireOutput();
             const self: *Self = @ptrCast(@alignCast(raw));
             // Routers receive bounded observations rather than repeatedly
             // serializing every region/table and the complete native page.
@@ -640,40 +629,44 @@ pub fn Service(comptime Node: type) type {
         }
 
         const ExtractionPhase = enum { fresh, after_read };
+        const Produced = struct { value: V, output_bytes: usize };
 
-        fn applyExtractionPolicy(node: *Node, a: A, def: c.Definition, graph: *const Graph, input: V, schema: V, version: u32, options: V, control: Control, run: *c.Run, phase: ExtractionPhase) anyerror!V {
+        fn applyExtractionPolicy(node: *Node, a: A, def: c.Definition, graph: *const Graph, input: V, schema: V, version: u32, options: V, control: Control, run: *c.Run, phase: ExtractionPhase) anyerror!Produced {
             const binding = try def.binding((def.extract orelse return error.DocumentCapabilityMismatch).model, .extract);
             const content = try cf.text(cf.field(input, "content") orelse return error.UnsupportedDocumentFormat);
             const policy = def.extract orelse return error.DocumentCapabilityMismatch;
-            var item = try invokeExtraction(node, a, binding, graph, input, schema, version, options, control, run, phase);
+            var produced = try invokeExtraction(node, a, binding, graph, input, schema, version, options, control, run, phase);
+            var item = produced.value;
             const evidence = @import("evidence.zig");
             var supported = try evidence.attach(a, &item, content, cf.field(input, "metadata"), policy.require_source_support, policy.allow_derived_values);
             var corroborated = true;
             if (policy.verification_model) |name| {
                 const verifier = try def.binding(name, .extract);
-                const check = try invokeExtraction(node, a, verifier, graph, input, schema, version, options, control, run, .fresh);
+                const check = (try invokeExtraction(node, a, verifier, graph, input, schema, version, options, control, run, .fresh)).value;
                 try run.emit(.{ .phase = .verification, .source_id = if (cf.field(input, "id")) |id| try cf.text(id) else "", .page_number = 0, .model = verifier.model });
                 corroborated = try evidence.sameValues(a, item, check);
             }
             if (!supported or !corroborated) {
                 const fallback = try def.binding(policy.fallback_model orelse return error.DocumentUnresolved, .extract);
-                item = try invokeExtraction(node, a, fallback, graph, input, schema, version, options, control, run, .fresh);
+                produced = try invokeExtraction(node, a, fallback, graph, input, schema, version, options, control, run, .fresh);
+                item = produced.value;
                 supported = try evidence.attach(a, &item, content, cf.field(input, "metadata"), policy.require_source_support, policy.allow_derived_values);
                 if (!supported) return error.DocumentUnresolved;
                 if (policy.verification_model) |name| {
                     const verifier = try def.binding(name, .extract);
                     if (std.mem.eql(u8, verifier.model, fallback.model)) return error.DocumentUnresolved;
-                    const check = try invokeExtraction(node, a, verifier, graph, input, schema, version, options, control, run, .fresh);
+                    const check = (try invokeExtraction(node, a, verifier, graph, input, schema, version, options, control, run, .fresh)).value;
                     if (!try evidence.sameValues(a, item, check)) return error.DocumentUnresolved;
                 }
             }
-            return item;
+            return .{ .value = item, .output_bytes = produced.output_bytes };
         }
 
-        fn invokeExtraction(node: *Node, a: A, binding: c.Binding, graph: *const Graph, input: V, schema: V, version: u32, options: V, control: Control, run: *c.Run, phase: ExtractionPhase) anyerror!V {
+        fn invokeExtraction(node: *Node, a: A, binding: c.Binding, graph: *const Graph, input: V, schema: V, version: u32, options: V, control: Control, run: *c.Run, phase: ExtractionPhase) anyerror!Produced {
             const content = try cf.text(cf.field(input, "content") orelse return error.UnsupportedDocumentFormat);
             try run.call();
             try run.emit(.{ .phase = .extracting, .source_id = if (cf.field(input, "id")) |id| try cf.text(id) else "", .page_number = 0, .model = binding.model });
+            try run.requireOutput();
             if (binding.provider == .antfly) if (graph.get(.{ .name = binding.model, .operation = binding.operation })) |child| {
                 const parent_limits = run.limits;
                 defer run.limits = parent_limits;
@@ -731,9 +724,8 @@ pub fn Service(comptime Node: type) type {
                 if (rows != .array or rows.array.items.len != 1) return error.InvalidDocumentModelResult;
                 item = rows.array.items[0];
             }
-            const item_json = try std.json.Stringify.valueAlloc(work, item, .{});
-            try run.output(item_json.len);
-            return std.json.parseFromSliceLeaky(V, a, item_json, .{ .allocate = .alloc_always, .parse_numbers = false });
+            const output_bytes = try run.outputJson(item);
+            return .{ .value = (try @import("representation.zig").cloneValue(a, item)).?, .output_bytes = output_bytes };
         }
 
         pub fn extractJson(node: *Node, backing: A, bytes: []const u8, control: Control) ![]u8 {
@@ -785,6 +777,9 @@ pub fn Service(comptime Node: type) type {
             if (binding.provider == .cloudflare) if (cf.field(root, "options")) |options| {
                 if (options != .object or options.object.count() != 0) return error.UnsupportedCloudflareSchema;
             };
+            var response = json_output.Writer.init(backing, run.limits.max_output_bytes);
+            defer response.deinit();
+            try response.begin("extraction", model);
             var inputs: std.array_list.Managed(V) = .init(a);
             var artifact_snapshot: ?@import("artifacts.zig").Snapshot = null;
             defer if (artifact_snapshot) |*snapshot_value| snapshot_value.release();
@@ -824,36 +819,54 @@ pub fn Service(comptime Node: type) type {
                 try inputs.appendSlice(supplied.array.items);
             }
             if (inputs.items.len == 0 or inputs.items.len > def.budget.max_sources) return error.InvalidDocumentSource;
+            const decorations = try a.alloc(usize, inputs.items.len);
+            // Validate and reserve all output metadata before the first model
+            // call. IDs, source segments and retained-artifact metadata are not
+            // returned by the leaf extractor and must not escape accounting.
             // Validate the entire batch before the first extraction call.
             // Unknown per-input replacements must never be silently discarded.
-            for (inputs.items, 0..) |input, index| {
-                if (input != .object) return error.InvalidDocumentSource;
-                const normalized = try normalizeTextContent(a, cf.field(input, "content") orelse return error.UnsupportedDocumentFormat);
-                try inputs.items[index].object.put(a, "content", cf.string(normalized));
-                for ([_][]const u8{ "schema", "options", "tokens" }) |key| if (cf.field(input, key)) |value| {
+            for (inputs.items, 0..) |*input, index| {
+                if (input.* != .object) return error.InvalidDocumentSource;
+                const normalized = try normalizeTextContent(a, cf.field(input.*, "content") orelse return error.UnsupportedDocumentFormat);
+                try input.object.put(a, "content", cf.string(normalized));
+                for ([_][]const u8{ "schema", "options", "tokens" }) |key| if (cf.field(input.*, key)) |value| {
                     if (value != .null) return error.UnsupportedDocumentInputOverride;
                 };
-                if (cf.field(input, "id")) |id| {
+                if (cf.field(input.*, "id")) |id| {
                     const name = try cf.text(id);
                     for (inputs.items[0..index]) |prior| if (cf.field(prior, "id")) |prior_id| {
                         if (std.mem.eql(u8, name, try cf.text(prior_id))) return error.DuplicateDocumentSource;
                     };
                 }
                 if (plan) |p| _ = try cf.evidenceRequest(a, binding.model, .{ .state = try cf.text(cf.field(inputs.items[index], "content").?), .images = .{ .array = .init(a) } }, p.fields);
+                var decoration = cf.object();
+                if (cf.field(input.*, "id")) |id| try cf.put(a, &decoration, "id", id);
+                if (cf.field(input.*, "metadata")) |metadata| try cf.put(a, &decoration, if (cf.field(root, "documents") != null or cf.field(root, "read_artifact") != null) "document" else "metadata", metadata);
+                decorations[index] = if (decoration.object.count() == 0) 0 else (try json_output.measure(decoration, run.remainingOutput())) - 1;
+                try run.output(decorations[index]);
             }
-            var output: std.array_list.Managed(V) = .init(a);
-            for (inputs.items) |input| {
-                var item = try applyExtractionPolicy(node, a, def, &graph, input, schema, version, cf.field(root, "options") orelse cf.object(), extraction_control, &run, .after_read);
-                if (cf.field(input, "id")) |id| try cf.put(a, &item, "id", id);
-                if (cf.field(input, "metadata")) |metadata| try cf.put(a, &item, if (cf.field(root, "documents") != null or cf.field(root, "read_artifact") != null) "document" else "metadata", metadata);
-                try output.append(item);
+            for (inputs.items, 0..) |input, index| {
+                var row_arena = std.heap.ArenaAllocator.init(backing);
+                defer row_arena.deinit();
+                const row_allocator = row_arena.allocator();
+                const produced = try applyExtractionPolicy(node, row_allocator, def, &graph, input, schema, version, cf.field(root, "options") orelse cf.object(), extraction_control, &run, .after_read);
+                var item = produced.value;
+                if (cf.field(input, "id")) |id| try cf.put(row_allocator, &item, "id", id);
+                if (cf.field(input, "metadata")) |metadata| try cf.put(row_allocator, &item, if (cf.field(root, "documents") != null or cf.field(root, "read_artifact") != null) "document" else "metadata", metadata);
+                const credit = produced.output_bytes +| decorations[index];
+                const bytes_written = try response.append(item, run.remainingOutput(), credit, index > 0);
+                try run.output(bytes_written -| credit);
                 try run.emit(.{ .phase = .accepted, .source_id = if (cf.field(input, "id")) |id| try cf.text(id) else "", .page_number = 0, .status = .complete });
             }
             try run.emit(.{ .phase = .complete, .source_id = "", .page_number = 0, .status = .complete });
-            const response = try std.json.Stringify.valueAlloc(backing, .{ .object = "extraction", .model = model, .data = output.items, .schema_version = version, .usage = run.usage, .events = run.events.items }, .{});
-            errdefer backing.free(response);
-            if (response.len > run.limits.max_output_bytes) return error.DocumentOutputTooLarge;
-            return response;
+            try response.raw("],\"schema_version\":");
+            try response.value(version);
+            try response.raw(",\"usage\":");
+            try response.value(run.usage);
+            try response.raw(",\"events\":");
+            try response.value(run.events.items);
+            try response.raw("}");
+            return response.toOwnedSlice();
         }
     };
 }
@@ -1037,6 +1050,12 @@ test "document extraction keeps independent sources atomic and reuses retained r
         attributed_relations: bool = false,
         slides: bool = false,
         fn documentDefinition(self: *@This(), a: A, name: []const u8, operation: c.Operation) !?[]const u8 {
+            if (std.mem.eql(u8, name, "limited-output-reader")) return try a.dupe(u8,
+                \\{"models":[{"name":"native","model":"antfly/native-document","operation":"read"}],"read":{"reader":"native"},"budget":{"max_output_bytes":8192}}
+            );
+            if (std.mem.eql(u8, name, "limited-output-extractor")) return try a.dupe(u8,
+                \\{"models":[{"name":"leaf","model":"leaf","operation":"extract"}],"extract":{"model":"leaf"},"budget":{"max_output_bytes":8192}}
+            );
             if (operation != .extract) return null;
             if (std.mem.eql(u8, name, "nested-parent")) return try a.dupe(u8,
                 \\{"models":[{"name":"child","model":"nested-middle","operation":"extract"}],"extract":{"model":"child"}}
@@ -1065,6 +1084,7 @@ test "document extraction keeps independent sources atomic and reuses retained r
             self.downloads += 1;
             if (std.mem.eql(u8, url, "hidden-slides")) return .{ .data = @embedFile("testdata/hidden-slides.pptx") };
             if (std.mem.eql(u8, url, "excess-runs")) return .{ .data = @embedFile("testdata/excess-text-runs.pdf") };
+            if (std.mem.eql(u8, url, "output-regions")) return .{ .data = @embedFile("testdata/output-regions.pdf") };
             return .{ .data = if (self.slides) @embedFile("testdata/line-breaks.pptx") else @embedFile("testdata/two-pages.pdf") };
         }
         fn readDocumentArtifact(_: *@This(), a: A, _: []const u8) ![]u8 {
@@ -1152,6 +1172,22 @@ test "document extraction keeps independent sources atomic and reuses retained r
     try std.testing.expectError(error.DocumentRegionLimitExceeded, Service(Fake).extractJson(&fake, a,
         \\{"model":"leaf","schema_version":2,"schema":{"structures":{"record":{"fields":{"value":"str"}}}},"documents":[{"id":"excess","url":"excess-runs","media_type":"application/pdf"}]}
     , .{}));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    fake.downloads = 0;
+    try std.testing.expectError(error.DocumentOutputTooLarge, Service(Fake).readJson(&fake, a,
+        \\{"model":"limited-output-reader","documents":[{"id":"one","url":"output-regions","media_type":"application/pdf"},{"id":"two","url":"output-regions","media_type":"application/pdf"}]}
+    , .{}));
+    try std.testing.expectEqual(@as(usize, 1), fake.downloads);
+    fake.downloads = 0;
+    try std.testing.expectError(error.DocumentOutputTooLarge, Service(Fake).extractJson(&fake, a,
+        \\{"model":"limited-output-extractor","schema_version":2,"schema":{"structures":{"record":{"fields":{"value":"str"}}}},"documents":[{"id":"one","url":"output-regions","media_type":"application/pdf"},{"id":"two","url":"output-regions","media_type":"application/pdf"}]}
+    , .{}));
+    try std.testing.expectEqual(@as(usize, 1), fake.downloads);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    const oversized_metadata: [9000]u8 = @splat('x');
+    const metadata_request = try std.json.Stringify.valueAlloc(a, .{ .model = "limited-output-extractor", .schema_version = 2, .schema = .{ .structures = .{ .record = .{ .fields = .{ .value = "str" } } } }, .inputs = .{ .{ .id = "first", .content = "Total 12.50" }, .{ .id = "last", .content = "Total 12.50", .metadata = .{ .blob = &oversized_metadata } } } }, .{});
+    defer a.free(metadata_request);
+    try std.testing.expectError(error.DocumentOutputTooLarge, Service(Fake).extractJson(&fake, a, metadata_request, .{}));
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
     // The visible source comes first: preflight must reject the entire batch
     // before even extracting that source. Explicit inclusion restores both rows.
@@ -1332,18 +1368,42 @@ test "document extraction validates retained manifests and preserves manifest so
     }
 }
 
-test "document retention applies active limits to native regions and table cells" {
+test "document page output applies active structure limits before allocation" {
     const service = Service(struct {});
     const regions = [_]c.Region{ .{ .id = 0, .text = "One" }, .{ .id = 1, .text = "Two" } };
     const cells = [_]c.Cell{ .{ .row = 0, .column = 0, .text = "One" }, .{ .row = 0, .column = 1, .text = "Two" } };
     const tables = [_]c.Table{.{ .id = 0, .rows = 1, .columns = 2, .cells = &cells }};
     var page: c.Page = .{ .source_id = "native", .number = 1, .kind = .page, .regions = &regions };
-    try std.testing.expectError(error.DocumentRegionLimitExceeded, service.retainPage(std.testing.failing_allocator, page, 1));
+    var run = c.Run{ .limits = .{ .max_regions = 1 } };
+    var denied = json_output.Writer.init(std.testing.failing_allocator, 8192);
+    defer denied.deinit();
+    try std.testing.expectError(error.DocumentRegionLimitExceeded, service.appendPage(&denied, page, &run, 0, false));
     page.regions = &.{};
     page.tables = &tables;
-    try std.testing.expectError(error.DocumentRegionLimitExceeded, service.retainPage(std.testing.failing_allocator, page, 1));
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const retained = try service.retainPage(arena.allocator(), page, 2);
-    try std.testing.expectEqual(@as(usize, 2), retained.tables[0].cells.len);
+    try std.testing.expectError(error.DocumentRegionLimitExceeded, service.appendPage(&denied, page, &run, 0, false));
+    run.limits.max_regions = 2;
+    var response = json_output.Writer.init(std.testing.allocator, 8192);
+    defer response.deinit();
+    try service.appendPage(&response, page, &run, 0, false);
+    const bytes = try response.toOwnedSlice();
+    defer std.testing.allocator.free(bytes);
+    const parsed = try std.json.parseFromSlice(V, std.testing.allocator, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("tables").?.array.items[0].object.get("cells").?.array.items.len);
+    try std.testing.expectEqual(bytes.len, run.usage.output_bytes);
+}
+
+test "document page output credits already admitted structures without losing aggregate limits" {
+    const a = std.testing.allocator;
+    var response = json_output.Writer.init(a, 8192);
+    defer response.deinit();
+    const regions = [_]c.Region{.{ .id = 0, .text = "Text", .bbox = .{ 0, 0, 10, 10 } }};
+    const page: c.Page = .{ .source_id = "source", .number = 1, .kind = .page, .text = "Text", .regions = &regions };
+    var run = c.Run{ .limits = .{} };
+    const first = try run.outputJson(page);
+    try Service(struct {}).appendPage(&response, page, &run, first, false);
+    try std.testing.expectEqual(first, run.usage.output_bytes);
+    const second = try run.outputJson(page);
+    try Service(struct {}).appendPage(&response, page, &run, second, true);
+    try std.testing.expectEqual(first + second + 1, run.usage.output_bytes);
 }

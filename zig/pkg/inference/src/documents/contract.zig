@@ -366,6 +366,8 @@ pub const Run = struct {
         self.provider_deinit_fn = null;
     }
     pub fn emit(self: *Run, event: Event) !void {
+        try self.control.check();
+        if (self.event_allocator != null) _ = try self.outputJson(event);
         try self.control.emit(event);
         if (self.event_allocator) |a| {
             if (self.events.items.len >= 16384) return error.DocumentEventLimitExceeded;
@@ -403,7 +405,7 @@ pub const Run = struct {
         return result;
     }
     pub fn call(self: *Run) !void {
-        try self.control.check();
+        try self.requireOutput();
         if (self.usage.model_calls >= self.limits.max_model_calls) return error.DocumentBudgetExhausted;
         self.usage.model_calls += 1;
     }
@@ -424,6 +426,18 @@ pub const Run = struct {
     pub fn output(self: *Run, count: usize) !void {
         if (count > self.limits.max_output_bytes -| self.usage.output_bytes) return error.DocumentOutputTooLarge;
         self.usage.output_bytes += count;
+    }
+    pub fn remainingOutput(self: *const Run) usize {
+        return self.limits.max_output_bytes -| self.usage.output_bytes;
+    }
+    pub fn requireOutput(self: *const Run) !void {
+        try self.control.check();
+        if (self.remainingOutput() == 0) return error.DocumentOutputTooLarge;
+    }
+    pub fn outputJson(self: *Run, value: anytype) !usize {
+        const count = try @import("output.zig").measure(value, self.remainingOutput());
+        try self.output(count);
+        return count;
     }
 };
 
@@ -493,4 +507,27 @@ test "document borrowed views enforce child bytes and reserve pixels without dou
     try std.testing.expectEqual(@as(usize, 2), run.source_count);
     try std.testing.expectError(error.DocumentSourceLimitExceeded, run.nestedViewLimits(child, 69, 10, 10));
     try std.testing.expectError(error.DocumentPixelLimitExceeded, run.nestedViewLimits(child, 68, 11, 10));
+}
+
+test "document event output is admitted before copying or publishing progress" {
+    const Sink = struct {
+        called: bool = false,
+        fn emit(raw: ?*anyopaque, _: Event) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.called = true;
+        }
+    };
+    var sink = Sink{};
+    var run = Run{ .limits = .{ .max_output_bytes = 16 }, .event_allocator = std.testing.failing_allocator, .control = .{ .ptr = &sink, .event_fn = Sink.emit } };
+    defer run.deinit();
+    try std.testing.expectError(error.DocumentOutputTooLarge, run.emit(.{ .phase = .source, .source_id = "source", .page_number = 1 }));
+    try std.testing.expect(!sink.called);
+    try std.testing.expectEqual(@as(usize, 0), run.events.items.len);
+    try std.testing.expectEqual(@as(usize, 0), run.usage.output_bytes);
+}
+
+test "document exhausted output admission prevents another model call" {
+    var run = Run{ .limits = .{ .max_output_bytes = 1 }, .usage = .{ .output_bytes = 1 } };
+    try std.testing.expectError(error.DocumentOutputTooLarge, run.call());
+    try std.testing.expectEqual(@as(usize, 0), run.usage.model_calls);
 }

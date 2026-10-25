@@ -310,6 +310,16 @@ physical batch reports. Artifact reuse is implemented; durable checkpoint/resume
 job endpoints and task event streaming remain separate lifecycle work. No public
 job or resume capability is advertised by this implementation.
 
+`max_output_bytes` admits full structured pages, extraction payloads and retained
+events across the run, including child work and verification attempts. Extraction
+reserves IDs and source metadata before calling any extractor. `usage.output_bytes`
+reports this cumulative payload admission, rather than just visible text or the
+size of the final envelope. Each response also has a hard encoded JSON byte cap:
+pages and rows are written directly into one capped buffer, with temporary data
+released after each item. An oversized page or row stops further source/model
+processing. Artifact retention reserves room for its handle and TTL within
+the same response cap.
+
 ## Comparing readers
 
 Run `scripts/eval_document_models.py --corpus CORPUS --model BASELINE --model

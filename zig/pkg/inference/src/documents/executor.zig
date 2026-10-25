@@ -81,7 +81,11 @@ fn defaultAction(r: c.Read, page: c.Page, region: ?c.Region) Action {
     return .accept;
 }
 
+pub const Result = struct { page: c.Page, output_bytes: usize };
 pub fn readPage(a: A, def: c.Definition, driver: Driver, page_index: usize, supplied: c.Page, run: *c.Run) !c.Page {
+    return (try readPageReported(a, def, driver, page_index, supplied, run)).page;
+}
+pub fn readPageReported(a: A, def: c.Definition, driver: Driver, page_index: usize, supplied: c.Page, run: *c.Run) !Result {
     try def.validate();
     const r = def.read orelse return error.DocumentCapabilityMismatch;
     var page = supplied;
@@ -93,9 +97,9 @@ pub fn readPage(a: A, def: c.Definition, driver: Driver, page_index: usize, supp
         page.regions = try ir.cloneRegions(a, page.regions, run.limits.max_regions);
         ir.annotate(page.text, @constCast(page.regions));
         page.status = .complete;
-        try run.output(page.text.len);
+        const output_bytes = try run.outputJson(page);
         try run.emit(.{ .phase = .native_text, .source_id = page.source_id, .page_number = page.number });
-        return page;
+        return .{ .page = page, .output_bytes = output_bytes };
     }
     const initial = try def.binding(r.reader, .read);
     try run.call();
@@ -162,9 +166,9 @@ pub fn readPage(a: A, def: c.Definition, driver: Driver, page_index: usize, supp
         page.status = .unresolved;
         try ir.finding(a, &page, "native_text_coverage_incomplete", true);
     } else try ir.finding(a, &page, "native_text_coverage_incomplete", false);
-    try run.output(page.text.len);
+    const output_bytes = try run.outputJson(page);
     try run.emit(.{ .phase = if (page.status == .complete) .accepted else .unresolved, .source_id = page.source_id, .page_number = page.number });
-    return page;
+    return .{ .page = page, .output_bytes = output_bytes };
 }
 
 fn applyPage(a: A, supplied: c.Page, candidate: Candidate, model: []const u8, limit: usize) !c.Page {
@@ -563,4 +567,24 @@ test "document interruptions retain accepted regional work and propagate cancell
         try std.testing.expect(ir.hasFinding(page, if (failure == error.DocumentBudgetExhausted) "model_call_budget_exhausted" else "renderer_unavailable_for_visual_content"));
         try std.testing.expectEqual(@as(usize, if (failure == error.DocumentBudgetExhausted) 2 else 3), fake.calls);
     }
+}
+
+test "document child output budgets include structured page data before returning to a parent" {
+    const Fake = struct {
+        fn read(_: *anyopaque, a: A, _: c.Binding, _: usize, _: ?[4]f64, _: *c.Run) !Candidate {
+            const value: [2000]u8 = @splat('x');
+            var fields: std.json.Value = .{ .object = .{} };
+            try fields.object.put(a, "blob", .{ .string = try a.dupe(u8, &value) });
+            return .{ .text = "Small", .fields = fields };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var dummy: u8 = 0;
+    var run = c.Run{ .limits = .{} };
+    const outer = run.limits;
+    run.limits = run.nestedLimits(.{ .max_output_bytes = 1024 });
+    defer run.limits = outer;
+    const def = c.Definition{ .models = &.{.{ .name = "leaf", .model = "leaf", .operation = .read }}, .read = .{ .reader = "leaf" } };
+    try std.testing.expectError(error.DocumentOutputTooLarge, readPage(arena.allocator(), def, .{ .ptr = &dummy, .read_fn = Fake.read }, 0, .{ .source_id = "image", .number = 1, .kind = .image }, &run));
 }
