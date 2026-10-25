@@ -23095,6 +23095,13 @@ export interface components {
             } & {
                 [key: string]: unknown;
             };
+            /** @description Proven native dense output width and inclusive supported truncation range, read from resolved metadata without loading weights. Omitted when unknown or for non-embedding tasks. */
+            dense_output?: {
+                /** Format: int64 */
+                native_dimensions: number;
+                /** Format: int64 */
+                minimum_dimensions: number;
+            };
             /** @description Immutable resolved embedding or generator generation, returned for scoped model/task discovery without loading weights. */
             model_revision?: string;
             /**

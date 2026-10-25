@@ -130,6 +130,18 @@ has a one-byte ingestion budget. Durable managed
 operations expose evidence acceptance independently of assertion readiness,
 bounded attempts, errors, retry times and configuration generation. Publication
 uses the same revision predicate after inference; a stale result cannot commit.
+Managed embedder admission pins `revision: "current"` and an omitted
+`dimensions` from the same metadata-only capability lookup. It does not load
+weights or generate a probe embedding. The stored configuration contains the
+resolved revision and dimension; retrying the original operation keeps those
+values. To adopt a different model or width, submit a revision-fenced
+configuration change. Explicit supported widths (including EmbeddingGemma's
+Matryoshka truncation) are preserved. Unknown geometry and external embedders
+require an explicit dimension (`MemoryEmbeddingDimensionsRequired`); proved
+unsupported widths fail admission with `MemoryEmbeddingDimensionsUnsupported`.
+Providers whose catalogs do not report geometry still accept an explicit width,
+with result shape checked during execution.
+
 Model calls use existing qualified Antfly producers and embedders, without
 persisting consumer session credentials. Each enabled role is qualified
 independently even when one model serves several roles.
