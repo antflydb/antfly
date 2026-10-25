@@ -9773,7 +9773,14 @@ pub const DB = struct {
         defer if (schema_view) |*view| view.release();
         const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
         defer alloc.free(store_key);
-        const raw = try self.core.getStoreValue(alloc, store_key) orelse {
+        const raw = blk: {
+            if (!internal_keys.isChunkArtifactRecordKey(store_key)) break :blk try self.core.getStoreValue(alloc, store_key);
+            var read = try self.core.store.beginProbeTxn();
+            defer read.abort();
+            const value = (try @import("artifact_chunk_generation.zig").readMember(alloc, &read, store_key)) orelse break :blk null;
+            if (internal_keys.mediaWindowIndex(store_key)) |index| break :blk try @import("../../chunking/chunk.zig").mediaWindowPayloadAlloc(alloc, value, index);
+            break :blk try alloc.dupe(u8, value);
+        } orelse {
             try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
             return null;
         };
@@ -26269,6 +26276,8 @@ pub const DB = struct {
         var prepared: ?publication.PreparedBaseVectors = null;
         defer if (prepared) |*value| value.deinit();
         var preparation_error: ?anyerror = null;
+        var chunk_control: ?@import("artifact_chunk_staging.zig").Control = null;
+        defer if (chunk_control) |*value| value.deinit();
         var input_preparation_error = false;
         var prepared_replay: ?[]u8 = null;
         defer if (prepared_replay) |value| self.alloc.free(value);
@@ -26278,6 +26287,8 @@ pub const DB = struct {
         defer if (prepared_document_refs) |*value| value.deinit();
         var coverage_layout: ?@import("artifact_coverage_layout.zig").Layout = null;
         defer if (coverage_layout) |*value| value.deinit();
+        var projection_reservation: ?resource_manager_mod.Reservation = null;
+        defer if (projection_reservation) |*value| value.release();
         var reservation: ?resource_manager_mod.Reservation = null;
         defer if (reservation) |*value| value.release();
         var census_budget = if ((command.mode == .census or command.mode == .complete_streams or command.mode == .reconcile_units) and self.core.index_manager.resource_manager != null)
@@ -26332,6 +26343,24 @@ pub const DB = struct {
                 preparation_error = err;
                 break :blk null;
             };
+        }
+        if (command.mode == .append_chunks or command.mode == .prune_chunks) {
+            if (self.core.index_manager.resource_manager) |manager| {
+                const bytes = try @import("artifact_publication_transport_codec.zig").encodedLength(command);
+                reservation = try manager.reserveWithoutReclaim(.shard_transition_working_set, try std.math.add(u64, 64 * 1024, try std.math.mul(u64, bytes, 8)));
+            }
+            var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+            defer read.abort();
+            var anticipated = try inventory.load(self.alloc, &read);
+            defer if (anticipated) |*value| value.deinit();
+            if (anticipated) |value| {
+                if (value.value.command.binding.epoch == command.authority_epoch and std.mem.eql(u8, &value.value.command.binding.digest, &command.catalog_digest)) {
+                    chunk_control = @import("artifact_chunk_staging.zig").prepareControl(self.alloc, &read, command, value.value.command.catalogs) catch |err| blk: {
+                        preparation_error = err;
+                        break :blk null;
+                    };
+                } else preparation_error = error.ArtifactCatalogDrift;
+            } else preparation_error = error.ArtifactCatalogDrift;
         }
         if (command.mode == .publish) {
             var anticipated = blk: {
@@ -26410,6 +26439,20 @@ pub const DB = struct {
                             };
                         }
                     }
+                    if (command.chunk_generation != null and preparation_error == null) {
+                        var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+                        defer read.abort();
+                        if (self.core.index_manager.resource_manager) |manager| {
+                            const bytes = @import("artifact_chunk_staging.zig").projectionWorkingSetBytes(self.alloc, &read, command, anticipated.?.value.command.catalogs) catch |err| blk: {
+                                preparation_error = err;
+                                break :blk 0;
+                            };
+                            if (bytes != 0) projection_reservation = try manager.reserveWithoutReclaim(.shard_transition_working_set, bytes);
+                        }
+                        if (preparation_error == null) @import("artifact_chunk_staging.zig").bindSelection(self.alloc, &read, command, anticipated.?.value.command.catalogs, value) catch |err| {
+                            preparation_error = err;
+                        };
+                    }
                     if (preparation_error == null) {
                         var preparation_ctx = self.batchContext();
                         prepared_replay = try encodeChangeRecordPayloadWithTargetHints(&preparation_ctx, value.batch, 0, value.target_hints);
@@ -26459,7 +26502,26 @@ pub const DB = struct {
             var txn = try self.core.store.beginWriteTxn();
             var txn_open = true;
             defer if (txn_open) txn.abort();
-            if (command.mode == .census or command.mode == .complete_streams or command.mode == .reconcile_units) {
+            if (command.mode == .append_chunks or command.mode == .prune_chunks) {
+                const failure: ?anyerror = if (preparation_error) |err| err else blk: {
+                    if (chunk_control) |*control| control.stage(self.alloc, &txn) catch |err| break :blk err else break :blk error.InvalidBatchRequest;
+                    break :blk null;
+                };
+                if (failure) |err| {
+                    const reason: publication.Rejection = switch (err) {
+                        error.EnrichmentSourceChanged => .stale_source,
+                        error.ArtifactCatalogDrift => .stale_catalog,
+                        error.ArtifactPublicationPending, error.ArtifactCoverageBaselinePending => .baseline_pending,
+                        error.RetainedEffectsFenceMismatch => .sealed_source,
+                        error.InvalidBatchRequest, error.OnlineMergeArtifactTailsUnsupported => .invalid_output,
+                        else => return err,
+                    };
+                    txn.abort();
+                    txn_open = false;
+                    return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, reason, &apply_held);
+                }
+                try completeArtifactUpload(&txn, opts.artifact_upload_finalize, entry);
+            } else if (command.mode == .census or command.mode == .complete_streams or command.mode == .reconcile_units) {
                 const failure: ?anyerror = if (preparation_error) |err| err else blk: {
                     if (prepared_completion) |*value| {
                         _ = value.stageCurrent(&txn, self.root_incarnation) catch |err| break :blk err;
@@ -26595,7 +26657,7 @@ pub const DB = struct {
         }
         if (preparation_error) |err| switch (err) {
             error.EnrichmentSourceChanged => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, if (input_preparation_error) .stale_source else .stale_catalog, &apply_held),
-            error.ArtifactCoverageBaselinePending => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .baseline_pending, &apply_held),
+            error.ArtifactCoverageBaselinePending, error.ArtifactPublicationPending => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .baseline_pending, &apply_held),
             error.ArtifactCatalogDrift => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_catalog, &apply_held),
             error.InvalidBatchRequest, error.OnlineMergeArtifactTailsUnsupported => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .invalid_output, &apply_held),
             else => return err,
@@ -26672,7 +26734,7 @@ pub const DB = struct {
         var guard: Guard = .{ .db = self, .replication_payload = replication_payload, .command = command, .sequence = sequence, .coverage = prepared_value.coverage, .chunk_fence = prepared_value.chunk_fence, .chunk_vector_fence = prepared_value.chunk_vector_fence, .asset_upstream_fences = prepared_value.asset_upstream_fences, .position = .{ .raft = .{ .term = entry.term, .index = entry.index } }, .proof = prepared_proof orelse return error.ArtifactCatalogCorrupt, .document_references = if (prepared_document_refs) |*value| value else return error.ArtifactCatalogCorrupt, .upload = opts.artifact_upload_finalize };
         _ = self.core.store.putBatchWithPromotionsReplayAndBuiltWrite(batch_ctx.io, writes.items, deletes.items, &.{}, .{ .sequence = sequence, .payload = replay }, null, .{ .ptr = &guard, .validate = Guard.validate }) catch |err| switch (err) {
             error.EnrichmentSourceChanged => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_source, &apply_held),
-            error.ArtifactCoverageBaselinePending => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .baseline_pending, &apply_held),
+            error.ArtifactCoverageBaselinePending, error.ArtifactPublicationPending => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .baseline_pending, &apply_held),
             else => return err,
         };
         self.executor.commitBacklogAdmission(sequence, &backlog);
@@ -31359,6 +31421,7 @@ pub const DB = struct {
             .error_count = status.error_count,
             .retryable_error_count = status.retryable_error_count,
             .fatal_error_count = status.fatal_error_count,
+            .output_counts = status.output_counts,
             .consecutive_retry_count = status.consecutive_retry_count,
             .next_retry_at_ms = status.next_retry_at_ms,
             .retrying = status.retrying,
@@ -35290,6 +35353,7 @@ pub const DB = struct {
                         .name = try state.alloc.dupe(u8, source.name),
                         .kind = source.kind,
                         .chunk_id = source.chunk_id,
+                        .window_index = source.window_index,
                         .unit_id = if (source.unit_id) |unit_id| try state.alloc.dupe(u8, unit_id) else null,
                     };
                     defer source_ref.deinit(state.alloc);
@@ -46561,10 +46625,8 @@ pub const DB = struct {
         defer alloc.free(store_key);
         var txn = try self.core.store.beginProbeTxn();
         defer txn.abort();
-        const raw = txn.get(store_key) catch |err| switch (err) {
-            error.NotFound => return null,
-            else => return err,
-        };
+        const raw = (try @import("artifact_chunk_generation.zig").readMember(alloc, &txn, store_key)) orelse return null;
+        if (internal_keys.mediaWindowIndex(store_key)) |index| return try @import("../../chunking/chunk.zig").mediaWindowPayloadAlloc(alloc, raw, index);
         return try self.core.index_manager.materializeStoredValueAlloc(alloc, store_key, raw);
     }
 
@@ -47150,6 +47212,9 @@ fn loadStoredSearchDocumentsMany(
     if (bench_profile) txn_ns = platform_time.monotonicNs() - txn_start_ns;
     const get_many_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     try txn.getManySorted(read_keys, read_values);
+    var members = @import("artifact_chunk_generation.zig").MemberReader.init(alloc);
+    defer members.deinit();
+    for (read_keys, read_values) |key, *value| value.* = try members.override(&txn, key, value.*);
     if (bench_profile) get_many_ns = platform_time.monotonicNs() - get_many_start_ns;
 
     const materialize_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
@@ -49980,6 +50045,9 @@ fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.
     defer txn.abort();
     // Presence only needs the primary reference, not its decoded vector.
     try txn.getManySortedPhysical(keys, values);
+    var members = @import("artifact_chunk_generation.zig").MemberReader.init(alloc);
+    defer members.deinit();
+    for (keys, values) |key, *value| value.* = try members.override(&txn, key, value.*);
     for (pending.items, values) |item, value| if (value == null) {
         keep[item.hit_index] = false;
     };
@@ -50592,10 +50660,7 @@ fn isNonvisibleStoredSearchKeyCallback(
     {
         var txn = try self.core.store.beginProbeTxn();
         defer txn.abort();
-        _ = txn.get(store_key) catch |err| switch (err) {
-            error.NotFound => return true,
-            else => return err,
-        };
+        _ = (try @import("artifact_chunk_generation.zig").readMember(alloc, &txn, store_key)) orelse return true;
     }
     return try isExpiredDocumentKey(self, alloc, key);
 }

@@ -15013,7 +15013,7 @@ pub const IndexManager = struct {
             }
             if (entry.chunk_name) |chunk_name| {
                 const chunk_cfg = self.getEnrichmentExcluding(.chunk, chunk_name, excluded_enrichment) orelse continue;
-                if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0) return true;
+                if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0 or self.assetSourceIsMediaOutput(chunk_cfg.source_artifact_name)) return true;
             }
             for (entry.source_artifact_names) |artifact_name| {
                 if (self.getEnrichmentExcluding(.chunk, artifact_name, excluded_enrichment) != null or
@@ -15475,6 +15475,10 @@ pub const IndexManager = struct {
                 }
                 asset_emitted[entry_index] = true;
                 emit_progress = true;
+                if (self.getEnrichment(.chunk, entry.source_artifact_name)) |chunk| {
+                    try appendGeneratedChunkRequest(alloc, &requests, entry.name, doc_key, chunk, false, true, true);
+                }
+
                 try appendOwnedGeneratedRequest(alloc, &requests, .{
                     .kind = .asset,
                     .index_name = entry.name,
@@ -15499,14 +15503,14 @@ pub const IndexManager = struct {
         for (self.text_indexes.items) |entry| {
             if (entry.chunk_name) |chunk_name| {
                 if (self.getEnrichment(.chunk, chunk_name)) |chunk_cfg| {
-                    if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0) {
+                    if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0 or self.assetSourceIsMediaOutput(chunk_cfg.source_artifact_name)) {
                         try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false, true);
                     }
                 }
             }
             for (entry.source_artifact_names) |artifact_name| {
                 const chunk_cfg = self.getEnrichment(.chunk, artifact_name) orelse continue;
-                if (chunk_cfg.source_artifact_name.len > 0 and self.assetGroupRoot(chunk_cfg.source_artifact_name).len == 0) continue;
+                if (chunk_cfg.source_artifact_name.len > 0 and self.assetGroupRoot(chunk_cfg.source_artifact_name).len == 0 and !self.assetSourceIsMediaOutput(chunk_cfg.source_artifact_name)) continue;
                 try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false, true);
             }
         }
@@ -15514,7 +15518,7 @@ pub const IndexManager = struct {
         for (self.graph_indexes.items) |entry| {
             for (entry.artifact_sources) |source| {
                 const chunk_cfg = self.getEnrichment(.chunk, source.artifact_name) orelse continue;
-                if (chunk_cfg.source_artifact_name.len > 0 and self.assetGroupRoot(chunk_cfg.source_artifact_name).len == 0) continue;
+                if (chunk_cfg.source_artifact_name.len > 0 and self.assetGroupRoot(chunk_cfg.source_artifact_name).len == 0 and !self.assetSourceIsMediaOutput(chunk_cfg.source_artifact_name)) continue;
                 try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, true);
             }
         }
@@ -15580,7 +15584,7 @@ pub const IndexManager = struct {
                     if (embedding_cfg.expected_dims > 0 and embedding_cfg.expected_dims != entry.dims) continue;
                     if (embedding_cfg.source_artifact_name.len > 0) {
                         const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                        if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0)
+                        if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0 or self.assetSourceIsMediaOutput(chunk_cfg.source_artifact_name))
                             try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, false);
                         if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
                             try appendOwnedGeneratedRequest(alloc, &requests, .{
@@ -15685,7 +15689,7 @@ pub const IndexManager = struct {
                     if (embedding_cfg.expected_dims != 0) continue;
                     if (embedding_cfg.source_artifact_name.len > 0) {
                         const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                        if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0)
+                        if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0 or self.assetSourceIsMediaOutput(chunk_cfg.source_artifact_name))
                             try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, false);
                         if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
                             try appendOwnedGeneratedRequest(alloc, &requests, .{
@@ -15811,6 +15815,7 @@ pub const IndexManager = struct {
             }
             requests.shrinkRetainingCapacity(retained);
         }
+        try orderGeneratedArtifactDependencies(self.alloc, requests.items);
         return try requests.toOwnedSlice(alloc);
     }
 
@@ -17194,6 +17199,13 @@ pub const IndexManager = struct {
         var producer = asset_producer_mod.parseProducerConfig(self.alloc, asset_cfg.producer_json) catch return false;
         defer producer.deinit(self.alloc);
         return producer.type == .document_extraction;
+    }
+
+    fn assetSourceIsMediaOutput(self: *const IndexManager, name: []const u8) bool {
+        const config = self.getEnrichment(.asset, name) orelse return false;
+        var producer = asset_producer_mod.parseProducerConfig(self.alloc, config.producer_json) catch return false;
+        defer producer.deinit(self.alloc);
+        return producer.type == .media_output;
     }
 
     fn artifactSourceSupportsUnitGrouping(self: *const IndexManager, artifact_name: []const u8) bool {
@@ -24382,6 +24394,29 @@ pub const IndexManager = struct {
                     // their own members are validated.
                     if (cfg.source_field.len > 0 or cfg.source_template.len > 0) return error.InvalidEnrichmentConfig;
                     try enrichment_config_validation.validateUpstreamAssetProducer(self.alloc, cfg.producer_json);
+                    var producer = try @import("../enrichment/asset_producer.zig").parseProducerConfig(self.alloc, cfg.producer_json);
+                    defer producer.deinit(self.alloc);
+                    if (producer.type == .media_output) {
+                        const upstream = self.getEnrichment(.chunk, cfg.source_artifact_name) orelse return error.InvalidEnrichmentConfig;
+                        var chunk_config = try @import("../../../chunking/types.zig").parseConfigFromSlice(self.alloc, upstream.chunker_json);
+                        defer chunk_config.deinit(self.alloc);
+                        if (chunk_config.outputs_json.len == 0) return error.InvalidEnrichmentConfig;
+                        var output_config = try std.json.parseFromSlice(@import("inference_chunker").outputs.Config, self.alloc, chunk_config.outputs_json, .{});
+                        defer output_config.deinit();
+                        var consumer = try @import("../enrichment/media_output.zig").parse(self.alloc, producer.config_json);
+                        defer consumer.deinit();
+                        const found = for (output_config.value.targets) |target| {
+                            if (std.mem.eql(u8, target.name, consumer.value.output_name)) break true;
+                        } else false;
+                        if (!found or upstream.source_artifact_name.len != 0) return error.InvalidEnrichmentConfig;
+                        return;
+                    }
+                    if (producer.type == .vector_labels) {
+                        const upstream = self.getEnrichment(.embedding, cfg.source_artifact_name) orelse return error.InvalidEnrichmentConfig;
+                        const chunks = self.getEnrichment(.chunk, upstream.source_artifact_name) orelse return error.InvalidEnrichmentConfig;
+                        if (upstream.expected_dims == 0 or chunks.source_artifact_name.len != 0) return error.InvalidEnrichmentConfig;
+                        return;
+                    }
                     var hops: usize = 0;
                     var current: []const u8 = cfg.source_artifact_name;
                     while (current.len > 0) {
@@ -34737,6 +34772,63 @@ fn containsOwnedString(items: []const []const u8, value: []const u8) bool {
     return false;
 }
 
+fn generatedOutputName(request: enrichment_types.GeneratedEnrichmentRequest) []const u8 {
+    return switch (request.kind) {
+        .asset, .chunk_text => if (request.artifact_name.len != 0) request.artifact_name else request.index_name,
+        .dense_embedding, .sparse_embedding => if (request.embedding_name.len != 0) request.embedding_name else request.index_name,
+    };
+}
+
+fn orderGeneratedArtifactDependencies(alloc: Allocator, items: []enrichment_types.GeneratedEnrichmentRequest) !void {
+    const Kind = @FieldType(enrichment_types.GeneratedEnrichmentRequest, "kind");
+    // Names are scoped by producer family. Resolve each typed edge once before
+    // sorting, then move its kind alongside the request.
+    const dependencies = try alloc.alloc(Kind, items.len);
+    defer alloc.free(dependencies);
+    for (items, dependencies) |request, *kind| {
+        kind.* = switch (request.kind) {
+            .dense_embedding, .sparse_embedding => .chunk_text,
+            .chunk_text, .asset => .asset,
+        };
+        if (request.kind == .asset and request.upstream_artifact_name.len != 0 and request.producer_json.len != 0) {
+            var producer = try @import("../enrichment/asset_producer.zig").parseProducerConfig(alloc, request.producer_json);
+            defer producer.deinit(alloc);
+            kind.* = switch (producer.type) {
+                .vector_labels => .dense_embedding,
+                .media_output => .chunk_text,
+                else => .asset,
+            };
+        }
+    }
+    for (0..items.len) |position| {
+        var selected: ?usize = null;
+        for (items[position..], position..) |request, index| {
+            const upstream = switch (request.kind) {
+                .dense_embedding, .sparse_embedding => if (request.input_kind != .document) request.artifact_name else request.upstream_artifact_name,
+                .asset, .chunk_text => request.upstream_artifact_name,
+            };
+            const pending = if (upstream.len != 0) blk: {
+                for (items[position..]) |candidate| {
+                    const compatible_kind = candidate.kind == dependencies[index];
+                    if (compatible_kind and std.mem.eql(u8, generatedOutputName(candidate), upstream)) break :blk true;
+                }
+                break :blk false;
+            } else false;
+            if (!pending) {
+                selected = index;
+                break;
+            }
+        }
+        const index = selected orelse return error.InvalidEnrichmentConfig;
+        const request = items[index];
+        const dependency = dependencies[index];
+        std.mem.copyBackwards(enrichment_types.GeneratedEnrichmentRequest, items[position + 1 .. index + 1], items[position..index]);
+        std.mem.copyBackwards(Kind, dependencies[position + 1 .. index + 1], dependencies[position..index]);
+        items[position] = request;
+        dependencies[position] = dependency;
+    }
+}
+
 fn appendGeneratedChunkRequest(
     alloc: Allocator,
     requests: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
@@ -34769,6 +34861,7 @@ fn appendGeneratedChunkRequest(
         .artifact_name = chunk_cfg.name,
         .doc_key = doc_key,
         .source_field = chunk_cfg.source_field,
+        .upstream_artifact_name = chunk_cfg.source_artifact_name,
         .source_template = chunk_cfg.source_template,
         .chunk_size = chunk_cfg.chunk_size,
         .chunk_overlap = chunk_cfg.chunk_overlap,
@@ -49937,6 +50030,68 @@ test "index_manager bounded native prepared text publication spills before admis
     }
     try std.testing.expectEqual(@as(u32, 2), documents);
     std.debug.print("PREPARED_TEXT_SPILL documents={d} peak_bytes={d}\n", .{ documents, stats.peak_bytes });
+}
+
+test "model aware media generated dependencies order chunks vectors labels and transcript text" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/media-plan", .{tmp.sub_path});
+    const path_z = try a.dupeSentinel(u8, path, 0);
+    defer a.free(path_z);
+    var store = try docstore_mod.DocStore.open(a, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(a, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addEnrichment(&store, .{ .name = "clips", .kind = .chunk, .field = "media", .chunker_json = "{\"provider\":\"antfly\",\"embedding\":{\"model\":\"model\",\"dimensions\":2},\"outputs\":{\"boundary_model\":\"embedding\",\"targets\":[{\"name\":\"embedding\",\"kind\":\"embedding\",\"model\":\"model\",\"dimensions\":2},{\"name\":\"speech\",\"kind\":\"transcribe\",\"model\":\"whisper\"}]}}" });
+    try manager.addEnrichment(&store, .{ .name = "vectors", .kind = .embedding, .field = "text", .source_artifact_name = "clips", .expected_dims = 2, .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\"}" });
+    try manager.addEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"}]}}" });
+    try manager.addEnrichment(&store, .{ .name = "transcript", .kind = .asset, .source_artifact_name = "clips", .producer_json = "{\"type\":\"media_output\",\"config\":{\"output_name\":\"speech\"}}" });
+    try manager.addEnrichment(&store, .{ .name = "text_chunks", .kind = .chunk, .field = "text", .source_artifact_name = "transcript", .chunk_size = 16 });
+    try manager.addAllNoBackfill(&store, &.{
+        .{ .name = "semantic", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\",\"sources\":[{\"artifact\":\"vectors\"}]}" },
+        .{ .name = "spoken", .kind = .full_text, .config_json = "{\"field\":\"text\",\"sources\":[{\"artifact\":\"text_chunks\"}]}" },
+    });
+    const planned = try manager.planGeneratedEnrichments(a, "doc", "{\"media\":\"hello\"}", &.{}, &.{});
+    defer enrichment_types.deinitGeneratedRequests(a, planned);
+    var positions = std.StringHashMap(usize).init(a);
+    defer positions.deinit();
+    for (planned, 0..) |request, index| try positions.put(generatedOutputName(request), index);
+    try std.testing.expect(positions.get("clips").? < positions.get("vectors").?);
+    try std.testing.expect(positions.get("vectors").? < positions.get("labels").?);
+    try std.testing.expect(positions.get("clips").? < positions.get("transcript").?);
+    try std.testing.expect(positions.get("transcript").? < positions.get("text_chunks").?);
+    const text = planned[positions.get("text_chunks").?];
+    try std.testing.expectEqualStrings("transcript", text.upstream_artifact_name);
+    var pin = try manager.acquireWritePlanSnapshot();
+    defer pin.release();
+    try std.testing.expectEqual(@import("../artifact_completion_plan.zig").Scope.document, (try pin.plan().completion_plan.?.providerFor(text)).scope);
+}
+
+test "model aware media dependency ordering permits a legacy shared chunk and embedding name" {
+    var requests = [_]enrichment_types.GeneratedEnrichmentRequest{
+        .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "semantic", .producer_json = "{\"type\":\"vector_labels\",\"config\":{}}" },
+        .{ .kind = .dense_embedding, .index_name = "semantic", .artifact_name = "semantic", .embedding_name = "semantic", .doc_key = "doc", .source_field = "body", .input_kind = .inline_chunks },
+        .{ .kind = .chunk_text, .index_name = "semantic", .artifact_name = "semantic", .doc_key = "doc", .source_field = "body" },
+    };
+    try orderGeneratedArtifactDependencies(std.testing.allocator, &requests);
+    try std.testing.expect(requests[0].kind == .chunk_text);
+    try std.testing.expect(requests[1].kind == .dense_embedding);
+    try std.testing.expect(requests[2].kind == .asset);
+}
+
+test "model aware media dependency ordering distinguishes identical names across families" {
+    var requests = [_]enrichment_types.GeneratedEnrichmentRequest{
+        .{ .kind = .asset, .index_name = "semantic", .artifact_name = "semantic", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "semantic", .producer_json = "{\"type\":\"vector_labels\",\"config\":{}}" },
+        .{ .kind = .dense_embedding, .index_name = "semantic", .artifact_name = "clips", .embedding_name = "semantic", .doc_key = "doc", .source_field = "body", .input_kind = .inline_chunks },
+        .{ .kind = .chunk_text, .index_name = "clips", .artifact_name = "clips", .doc_key = "doc", .source_field = "body" },
+    };
+    try orderGeneratedArtifactDependencies(std.testing.allocator, &requests);
+    try std.testing.expectEqual(.chunk_text, requests[0].kind);
+    try std.testing.expectEqual(.dense_embedding, requests[1].kind);
+    try std.testing.expectEqual(.asset, requests[2].kind);
 }
 
 test "capi resolver reservation removal preserves independently raised native epochs" {

@@ -50,16 +50,17 @@ pub const ChunkerConfig = struct {
     /// The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
     model: ?[]const u8 = null,
     provider: ChunkerProvider,
-    /// Controls whether chunk data is persisted to storage. When false (default), chunks are generated in memory and only embeddings are stored. When true, both chunks and embeddings are stored.
+    /// Controls whether chunk data is persisted to storage. When false (default), fixed chunks are generated in memory and only embeddings are stored. Model-aware streams always retain descriptor recipes; false omits their payloads. When true, chunk payloads are also stored. Vectors remain in the embedding artifact family.
     store_chunks: ?bool = null,
     /// Configuration for full-text indexing of chunks. When present (even if empty), chunk artifacts are persisted and indexed in Antfly's native full-text index, queryable and projectable via the document's `_chunks` field. When absent, chunks are generated only to drive vector embeddings and are not indexed for full-text search (unless `store_chunks` is also set).
     full_text_index: ?std.json.ArrayHashMap(std.json.Value) = null,
-    /// Maximum number of chunks to generate per document. Zero (or omitted, the default) means unlimited — the document is chunked in full with no cap. Set an explicit value up to 4096 to bound chunk count for very large inputs.
+    /// Maximum chunks per invocation. Model-aware enrichment treats this as a page size and resumes until source completion; zero selects the worker page size. Fixed chunking retains its per-document cap, with zero meaning unlimited.
     max_chunks: ?i64 = null,
     threshold: ?f32 = null,
     text: ?antfly_chunking_api_openapi.TextChunkOptions = null,
     audio: ?antfly_chunking_api_openapi.AudioChunkOptions = null,
     embedding: ?antfly_chunking_api_openapi.ChunkEmbeddingTarget = null,
+    outputs: ?antfly_chunking_api_openapi.ChunkOutputs = null,
     policy: ?antfly_chunking_api_openapi.MediaChunkPolicy = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -74,6 +75,7 @@ pub const ChunkerConfig = struct {
         .{ "text", "text", false },
         .{ "audio", "audio", false },
         .{ "embedding", "embedding", false },
+        .{ "outputs", "outputs", false },
         .{ "policy", "policy", false },
     };
 
@@ -132,6 +134,13 @@ pub const ChunkerConfig = struct {
             try jw.write(value);
         } else if (jw.options.emit_null_optional_fields) {
             try jw.objectField("embedding");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.outputs) |value| {
+            try jw.objectField("outputs");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("outputs");
             try jw.write(@as(?u8, null));
         }
         if (self.policy) |value| {
