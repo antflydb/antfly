@@ -321,3 +321,29 @@ measured sort work; they do not isolate timing attribution or qualify empty-cach
 cloud-transport or full-archive throughput. Full Parquet and real Iceberg lifecycle
 tests additionally exercise 64-row ties, both primary directions, forward/backward
 pagination, external rewrites, retained vector generations, deletion and restart.
+
+The [independent public-ID comparison](native-public-id-v3-observation.json)
+adds plain `_id ASC` to the same frozen source and physical-order controls.
+All 48 samples agree with independently derived application IDs. Plain ID sorting
+falls from 16,384 decorated candidates to 21, with 21 ordered probes. Complete
+forward/reverse tuples and the wide forward tie remain at 21 decorations. The
+observed warm ID median falls from 1,293 ms to 24 ms; restarted median falls from
+1,491 ms to 211 ms. These local Debug timings remain observational, with the same
+cache and transport limits described above.
+
+Independent native regressions show that an inclusive winning-ID cutoff scans
+one row from a 64-row range, and that batching 64 exact ID lookups charges 196,760
+page-read bytes versus 12,592,640 for scalar seeks. Both traversal directions,
+exclusive starting cursors, duplicate/missing IDs, optional quota exhaustion,
+required-read reserves and allocation-failure cleanup are covered. The complete
+public-ID endpoint applies only to an equal primary group; better groups retain
+all identities.
+
+The comparison also pins an executable upgrade check. A declared string hidden
+by the prior numeric-only dynamic-template projection returns zero matches with
+the old executable, then one after automatic local repair and another restart.
+Relational external schemas disallow dynamic templates, so their existing Parquet
+publication is an unchanged control. A separate native planner regression verifies
+that affected whole-document text bindings change while selected-field text and
+vector bindings remain stable. Reader protocol 84 fences this semantic revision;
+native text metadata encoding remains v13.

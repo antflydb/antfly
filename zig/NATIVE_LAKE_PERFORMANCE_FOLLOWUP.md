@@ -5899,3 +5899,42 @@ formatting, whitespace, license headers, and the Apache boundary passed.
 The final installed CLI build and version smoke check passed after reclaiming
 completed task-local compiler intermediates. Required repository cache cleanup
 completed; its uv prune was stopped after waiting on the existing cache lock.
+
+### Independent public-ID ordering, complete cutoffs and batched translation
+
+Declared string sources now consult their exact physical mapping for exclusion.
+A numeric-only dynamic template can no longer unconditionally suppress a declared
+string. Exact historical projection witnesses authorize the existing admitted
+leader-owned rebuild; unknown drift remains manual repair debt. Native definition
+revision 11 revalidates bindings and changes only affected whole-document text
+hashes. Selected-field text and vector bindings remain stable; native reader
+protocol 84 fences the semantic transition without changing text metadata v13.
+
+Plain `_id` sorting reuses public-file/current-row/index-by-ID navigation through
+the exact membership collector, including forward/backward cursors. Competitive
+bounds carry the complete winning public ID. Better primary groups retain all
+identities; only equal groups receive the inclusive public endpoint. Optional
+fallback withdraws the complete-order proof and retains completed top-K work.
+Stable-ID and filename translation use bounded authenticated multi-get. Coalesced
+and parallel reads share the optional quota under the owner lock, preserve the
+required-read reserve and retain existing scheduler/memory admission.
+
+The [public-ID evidence](bench/lake/native-public-id-v3-observation.json) retains
+all 48 exact-answer samples, independent oracle derivation, actual binary/source
+identities, workload/environment provenance and full-report hashes. On the same
+16,384 rows/eight files, plain `_id` drops from 16,384 decorations to 21, with 21
+ordered probes. Existing complete forward/reverse and wide-tie controls stay at
+21 decorations. Local Debug warm medians fall from 1,293 ms to 24 ms; timings do
+not isolate attribution or qualify cloud/full-archive throughput.
+
+Separate deterministic regressions reduce a 64-row range to one scanned row with
+a complete public-ID cutoff, and charge 196,760 bytes for 64 batched lookups versus
+12,592,640 for scalar seeks. Tests cover both directions, equal-primary endpoint
+proofs, duplicates/misses, optional row/read exhaustion, required reserve and
+allocation failures. The final CLI passes 209 lake native tests and 93 logical
+projection/query tests, with two benchmark skips and no leaks. Eighteen archive/
+schema E2Es and both full native Parquet/real Iceberg lifecycles pass. An actual
+old-to-new executable upgrade repairs the missing local posting and retains it
+through a second restart; an existing remote Parquet publication remains queryable.
+Relational external schemas reject dynamic templates, so the affected native
+binding migration is independently covered at the planner boundary.
