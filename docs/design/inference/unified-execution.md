@@ -3130,15 +3130,22 @@ match. Runtime cache-capacity snapshots are recorded separately from actual
 device payload ownership because those snapshots also vary between identical
 baseline arms.
 
-The composed CPU primitive gate still rejects the 1-by-8 normalization
-backward case. Its tiny-row latency exceeds the original 1.05 threshold;
-unchanged numerical output and passing larger rows do not override that
-failure. Failed alignment, getter, scratch, vector, static-width and ownership
-prototypes retain their sources, executable identities and raw arms. An
-identical isolated benchmark entry was built for both corrected reference and
-candidate to separate the benchmark's stack layout from unrelated CLI modes;
-that change alone does not close the gate. These executables remain
-qualification candidates until the complete final gate passes.
+The first composed CPU primitive gate rejected the 1-by-8 normalization
+backward case. Failed alignment, getter, scratch, vector, static-width and
+ownership prototypes retain their sources, executable identities and raw arms;
+none is admitted. Making the benchmark entry non-inlined alone did not close
+the gate: it still inherited stack alignment from the expanded CLI. Both the
+corrected reference and candidate were then rebuilt with the identical
+non-inlined entry and 64-byte-aligned benchmark state. The generated entry
+explicitly aligns the stack. With the original production kernel restored, all
+five primitive cases and all three extended-warmup controls pass the unchanged
+1.05 p50 / 1.10 p95 limits. The 1-by-8 p50 ratios are 1.025 and 0.975807.
+
+The aligned benchmark changes the absolute timing conditions for both arms;
+it does not establish an absolute kernel speedup over the earlier harness.
+The original failed arms remain alongside the matched reference/candidate
+sources and executable identities under `u-campaign/norm-aligned-harness/`.
+Complete final executable and model qualification remains required.
 
 All 558 direct CUDA cases pass on Spark. The 24-case attention cohort first
 exposed a stale independent reference: its full-block oracle used finite

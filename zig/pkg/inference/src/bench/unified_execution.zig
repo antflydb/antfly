@@ -442,12 +442,14 @@ fn runDecoder(init: std.process.Init, model: *inference.server.model_manager.Loa
     std.debug.print("decoder_kernels prefill_calls={d} decode_greedy_calls={d} prepared_hits={d} runtime_prepared_hits={d}\n", .{ stats.prefill_calls, stats.decode_greedy_calls, stats.ensure_prepared_fast_hits, stats.runtime_prepare_fast_hits });
 }
 
-fn runNormBackward(init: std.process.Init, options: Options) !void {
+// Isolate tiny primitive timings from the CLI's other mode frames. Aligning
+// the state also fixes the stack alignment inherited from that caller.
+noinline fn runNormBackward(init: std.process.Init, options: Options) !void {
     const a = std.heap.smp_allocator;
     const native = inference.native_compute.native;
     var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
     defer store.deinitOwned();
-    var compute = native.NativeCompute.initWithIo(a, &store, null, init.io);
+    var compute: native.NativeCompute align(64) = native.NativeCompute.initWithIo(a, &store, null, init.io);
     defer compute.deinit();
     const backend = compute.computeBackend();
     const count = try std.math.mul(usize, options.rows, options.dim);
