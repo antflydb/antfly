@@ -29,16 +29,13 @@ pub const default_aws_region = "us-east-1";
 pub const cohere_max_embedding_batch_size: usize = 96;
 pub const vertex_default_max_embedding_batch_size: usize = 250;
 
-/// Vertex generally accepts 250 embedding instances per prediction request,
-/// but gemini-embedding-001 is restricted to one input. Keep this model-aware
-/// wire limit shared by provider and managed batching so one managed chunk is
-/// always exactly one upstream request.
+/// Legacy prediction limits. Unknown models conservatively use one instance;
+/// modern embedContent limits are determined by its transport, not model names.
 pub fn vertexMaxEmbeddingBatchSize(model: []const u8) usize {
     const basename = std.fs.path.basename(model);
-    return if (std.mem.eql(u8, basename, "gemini-embedding-001"))
-        1
-    else
-        vertex_default_max_embedding_batch_size;
+    const batched = [_][]const u8{ "text-embedding-004", "text-embedding-005", "text-multilingual-embedding-002", "textembedding-gecko@001", "textembedding-gecko@003", "textembedding-gecko-multilingual@001" };
+    for (batched) |name| if (std.mem.eql(u8, basename, name)) return vertex_default_max_embedding_batch_size;
+    return 1;
 }
 
 pub fn normalizedBase(configured: []const u8, default_value: []const u8) []const u8 {
@@ -62,6 +59,9 @@ pub fn vertexRegionalV1BaseAlloc(
     location: []const u8,
 ) ![]u8 {
     if (configured.len > 0) return try alloc.dupe(u8, normalizedBase(configured, configured));
+    if (std.mem.eql(u8, location, "global")) return alloc.dupe(u8, vertex_v1_base);
+    if (std.mem.eql(u8, location, "us") or std.mem.eql(u8, location, "eu"))
+        return std.fmt.allocPrint(alloc, "https://aiplatform.{s}.rep.googleapis.com/v1", .{location});
     return try std.fmt.allocPrint(alloc, "https://{s}-aiplatform.googleapis.com/v1", .{
         if (location.len > 0) location else default_google_location,
     });
@@ -80,6 +80,12 @@ pub fn bedrockRuntimeEndpointAlloc(
 
 test "provider endpoint defaults preserve explicit deployment endpoints" {
     const alloc = std.testing.allocator;
+    const global = try vertexRegionalV1BaseAlloc(alloc, "", "global");
+    defer alloc.free(global);
+    try std.testing.expectEqualStrings("https://aiplatform.googleapis.com/v1", global);
+    const multi = try vertexRegionalV1BaseAlloc(alloc, "", "us");
+    defer alloc.free(multi);
+    try std.testing.expectEqualStrings("https://aiplatform.us.rep.googleapis.com/v1", multi);
     const explicit = try vertexRegionalV1BaseAlloc(alloc, "https://private.example/v1/", "ignored");
     defer alloc.free(explicit);
     try std.testing.expectEqualStrings("https://private.example/v1", explicit);
