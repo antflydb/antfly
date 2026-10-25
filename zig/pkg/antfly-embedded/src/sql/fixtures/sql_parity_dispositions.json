@@ -2930,6 +2930,33 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-document-truncate-lifecycle-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-document-truncate-lifecycle-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-document-truncate-lifecycle-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_document_truncate_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_document_truncate_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -20026,8 +20053,20 @@
     },
     {
       "id": "sql-1102",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "superseded",
+      "reason": "The original document-table rejection is superseded by PostgreSQL-compatible multi-table TRUNCATE through the existing atomic empty-generation publication. The exact original SQL runs through authenticated native APIs; read-only denial and a missing second target preserve every generation, row, version and digest. One-cut catalog observations reject partial cohort publication. Only a succeeded durable job confirms completion, both tables receive fresh generations and accept reused document keys, and independently reopened metadata/session/data owners retain complete PostgreSQL-backed postimages and physical fingerprints. Unrelated tables remain unchanged. This does not claim owned-sequence reset or serial/identity declarations.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_truncate_lifecycle_integration_test.zig",
+          "test": "mounted SQL original document multi table and CASCADE truncate publish atomic cohorts and recover cold rows",
+          "gate": "sql-document-truncate-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_truncate_lifecycle_integration_test.zig",
+          "test": "mounted SQL original document multi table and CASCADE truncate publish atomic cohorts and recover cold rows",
+          "gate": "sql-document-truncate-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1103",
@@ -20048,8 +20087,20 @@
     },
     {
       "id": "sql-1104",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "superseded",
+      "reason": "The original document-table rejection is superseded by PostgreSQL-compatible TRUNCATE CASCADE through the shared fenced empty-generation publication. The exact original SQL runs through authenticated native APIs and a durable job must succeed before completion is inferred. PostgreSQL verifies the complete empty and future-write postimages. Native evidence checks read-only denial and missing-target nonadmission without any changed generation or physical row, a fresh document generation, reused document keys, unchanged unrelated archive and control tables, and complete values/versions/digests after independent cold metadata/session/data recovery. This document-only original does not claim owned-counter restart or new FK dependency machinery.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_truncate_lifecycle_integration_test.zig",
+          "test": "mounted SQL original document multi table and CASCADE truncate publish atomic cohorts and recover cold rows",
+          "gate": "sql-document-truncate-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_truncate_lifecycle_integration_test.zig",
+          "test": "mounted SQL original document multi table and CASCADE truncate publish atomic cohorts and recover cold rows",
+          "gate": "sql-document-truncate-lifecycle-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1105",

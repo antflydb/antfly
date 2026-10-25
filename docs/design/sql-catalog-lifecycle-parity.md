@@ -8,8 +8,8 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 
 ## Current original-case qualification (2026-10-24)
 
-The ledger now records **788 implemented / 137 rejected / 430 superseded /
-231 unresolved**. The requested next-100 batch has closed **62 original cases**:
+The ledger now records **788 implemented / 137 rejected / 433 superseded /
+228 unresolved**. The requested next-100 batch has closed **62 original cases**:
 `sql-0011`, `sql-0014`, `sql-0570`, `sql-0580`, `sql-0586`, `sql-0591`,
 `sql-0593`–`sql-0595`, `sql-0883`, `sql-0927`, `sql-0935`, `sql-0343`–`sql-0349`,
 `sql-1456`, `sql-1459`, `sql-1464`, `sql-0005`, `sql-0008`, `sql-0009`,
@@ -24,6 +24,34 @@ index names used as constraints, 42704, and SQL-standard ADD PERIOD FOR,
 supported forms. The earlier sixteen mutation witnesses are ten original
 cases, not sixteen completions. **159 unresolved DDL/catalog cases remain open**;
 the role default cohort does not complete that feature work.
+
+### Document TRUNCATE: complete multi-table and CASCADE lifecycles
+
+`sql-1102` and `sql-1104` now have complete mounted native qualification.
+Their unchanged original statements use the existing fenced empty-generation
+restore publication; no new coordinator or row-deletion path is introduced.
+PostgreSQL 18 independently executes both originals and records complete before,
+empty and future-write postimages. These valid PostgreSQL forms supersede the
+old document-table rejection contracts. Alongside the previously qualified
+`sql-1103`, all three document TRUNCATE originals are now covered.
+
+The authenticated native campaign creates and seeds three document tables through
+public APIs. Read-only denial and a missing second target leave all generations,
+rows, physical versions and content digests unchanged. A multi-name catalog
+lookup observes each publication cut in one metadata transaction and rejects any
+partially replaced cohort. The pending/unknown response is explicitly `DDL PENDING`;
+only a succeeded durable job establishes completion. Every selected table gets
+a fresh generation, while CASCADE leaves unrelated tables and their physical
+rows unchanged. Both replacement tables accept their original document keys.
+Independent cold metadata, session and data owners retain final generations,
+complete postimages, versions and digests. The strict Debug gate passes its
+single campaign covering both originals with zero skips, failures or leaks.
+
+This closes two original cases and reduces the global unresolved count from
+230 to 228. It does not close serial/identity declarations or SQL-owned counter
+handoff/reset: `sql-0318`–`sql-0320` remain unresolved. The immutable inventory's
+DDL family still has 159 unresolved cases; these originals belong to its
+historical unsupported-write family.
 
 ### FK VALIDATE: SQL publication through transaction coverage
 

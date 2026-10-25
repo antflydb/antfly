@@ -43,6 +43,7 @@ test {
     _ = @import("api/sql_view_document_integration_test.zig");
     _ = @import("api/sql_document_mutation_lifecycle_integration_test.zig");
     _ = @import("api/sql_sequence_lifecycle_integration_test.zig");
+    _ = @import("api/sql_document_truncate_lifecycle_integration_test.zig");
     _ = @import("api/sql_expression_index_lifecycle_integration_test.zig");
     _ = @import("api/sql_default_lifecycle_integration_test.zig");
     _ = @import("api/sql_table_creation_integration_test.zig");

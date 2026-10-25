@@ -36,6 +36,7 @@ pub const conditional_subquery_reference = @embedFile("fixtures/sql_conditional_
 pub const document_campaign = @embedFile("fixtures/sql_document_campaign.json");
 pub const document_patch_reference = @embedFile("fixtures/sql_document_patch_reference.json");
 pub const document_envelope_reference = @embedFile("fixtures/sql_document_envelope_reference.json");
+pub const document_truncate_reference = @embedFile("fixtures/sql_document_truncate_reference.json");
 pub const document_identity_reference = @embedFile("fixtures/sql_document_identity_reference.json");
 pub const source_mutation_reference = @embedFile("fixtures/sql_source_mutation_reference.json");
 pub const prepared_source_reference = @embedFile("fixtures/sql_prepared_source_reference.json");
