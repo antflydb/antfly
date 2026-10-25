@@ -91,6 +91,7 @@ pub fn readPage(a: A, def: c.Definition, driver: Driver, page_index: usize, supp
 pub fn readPageReported(a: A, def: c.Definition, driver: Driver, page_index: usize, supplied: c.Page, run: *c.Run) !Result {
     try def.validate();
     const r = def.read orelse return error.DocumentCapabilityMismatch;
+    try ir.validatePage(supplied, run.limits.max_regions);
     var page = supplied;
     try run.emit(.{ .phase = .source, .source_id = page.source_id, .page_number = page.number });
     // Native content is retained and never replaced just because OCR is enabled.

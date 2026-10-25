@@ -95,6 +95,7 @@ pub const Source = struct {
                 // decompress XML, walk inheritance, or populate part caches.
                 if (selectedPage(selection, number)) {
                     slide.view = try ooxml.View.initWithControl(a, try archive.get(a, path), control);
+                    try slide.view.?.requirePart(.slide);
                     const xml = slide.view.?.bytes;
                     var slide_iter = ooxml.Xml{ .bytes = xml };
                     while (try slide_iter.next()) |part| {
@@ -174,6 +175,7 @@ pub const Source = struct {
                 page.kind = .slide;
                 page.coordinate_space = .slide_emu;
                 const view = slide.view orelse try ooxml.View.initWithControl(a, try s.archive.get(a, slide.path), control);
+                try view.requirePart(.slide);
                 page.native_text = try view.text(a);
                 page.tables = try view.tables(a, limit);
                 // Native extraction alone cannot assert visual completeness.
@@ -199,6 +201,7 @@ pub const Source = struct {
                             const target = token.tag.attr("Target") orelse return error.InvalidDocumentXml;
                             const path = try normalizedPart(a, slide.path[0 .. slash + 1], target);
                             const notes_view = try ooxml.View.initWithControl(a, try s.archive.get(a, path), control);
+                            try notes_view.requirePart(.notes);
                             const notes = try notes_view.text(a);
                             // Notes are separate findings/evidence, not visible OCR.
                             page.notes = notes;

@@ -2110,3 +2110,131 @@ test "document regional encoding bounds every provider and nested view before di
         try std.testing.expectEqualStrings("complete", parsed.value.object.get("document").?.object.get("status").?.string);
     }
 }
+
+test "document checked projection and table validation agree across fresh and retained extraction" {
+    const extracting = @import("antfly_extracting");
+    const Fake = struct {
+        metadata: bool = false,
+        downloads: usize = 0,
+        raw_report: []const u8 =
+            \\{"text":"Total 12.50","status":"complete","tables":[{"id":0,"rows":1,"columns":1,"cells":[{"row":0,"column":0,"text":"12.50"}]}]}
+        ,
+        retained: []const u8 = "",
+        calls: usize = 0,
+        extract_calls: usize = 0,
+        pub fn documentDefinition(_: *@This(), a: A, name: []const u8, _: c.Operation) !?[]const u8 {
+            if (std.mem.eql(u8, name, "extractor")) return try a.dupe(u8,
+                \\{"models":[{"name":"reader","model":"leaf","operation":"read"},{"name":"leaf","model":"extract-leaf","operation":"extract"}],"read":{"reader":"reader"},"extract":{"model":"leaf","require_source_support":true,"allow_derived_values":false}}
+            );
+            if (!std.mem.eql(u8, name, "reader")) return null;
+            return try a.dupe(u8,
+                \\{"models":[{"name":"leaf","model":"leaf","operation":"read"}],"read":{"reader":"leaf"}}
+            );
+        }
+        pub fn documentResolveBinding(_: *@This(), _: A, b: c.Binding) !c.Snapshot {
+            var hash: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(b.model, &hash, .{});
+            return .{ .binding = b, .path = b.model, .identity = hash };
+        }
+        pub fn documentDownload(self: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
+            self.downloads += 1;
+            return .{ .data = if (self.metadata) @embedFile("testdata/extension-metadata.pptx") else @embedFile("testdata/one-pixel.png") };
+        }
+        pub fn readDocumentArtifact(self: *@This(), a: A, _: []const u8) ![]u8 {
+            return a.dupe(u8, self.retained);
+        }
+        pub fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, _: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+            self.calls += 1;
+            const items = try a.alloc(readers.Result, 1);
+            items[0] = .{ .text = "Total 12.50", .completion = .complete, .document_json = self.raw_report };
+            return .{ .items = items, .execution = .{ .requested_items = 1, .serial_items = 1 } };
+        }
+        pub fn extractDirectWithControl(self: *@This(), a: A, _: []const u8, req: extracting.Request, _: Control) !extracting.Response {
+            self.extract_calls += 1;
+            const value = try std.json.parseFromSliceLeaky(V, a, req.inputs[0].content_json, .{});
+            const total = if (std.mem.indexOf(u8, value.string, "999.99") != null) "999.99" else "12.50";
+            const start = std.mem.indexOf(u8, value.string, total) orelse return error.UnexpectedCall;
+            return .{ .allocator = a, .json = try std.json.Stringify.valueAlloc(a, .{ .object = "extraction", .model = "extractor", .schema_version = 2, .data = .{.{ .structures = .{ .receipt = .{.{ .total = .{ .value = total, .start = start, .end = start + total.len } }} } }} }, .{}) };
+        }
+        pub fn invokeCloudflare(_: *@This(), _: A, _: c.Binding, _: V, _: Control, _: *c.Run) anyerror!V {
+            return error.UnexpectedCall;
+        }
+        pub fn decideDirectJsonWithControl(_: *@This(), _: A, _: []const u8, _: ?Control) anyerror![]u8 {
+            return error.UnexpectedCall;
+        }
+    };
+    const a = std.testing.allocator;
+    var metadata = Fake{ .metadata = true };
+    const reading = try Service(Fake).readJson(&metadata, a,
+        \\{"model":"reader","documents":[{"id":"slide","url":"fixture","media_type":"application/vnd.openxmlformats-officedocument.presentationml.presentation"}]}
+    , .{});
+    defer a.free(reading);
+    metadata.retained = reading;
+    var parsed = try std.json.parseFromSlice(V, a, reading, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("complete", parsed.value.object.get("document").?.object.get("status").?.string);
+    try std.testing.expectEqualStrings("Visible total 12.50\n", parsed.value.object.get("data").?.array.items[0].object.get("text").?.string);
+    for ([_][]const u8{
+        \\{"model":"extractor","schema_version":2,"schema":{"structures":{"receipt":{"fields":{"total":"str"}}}},"documents":[{"id":"slide","url":"fixture","media_type":"application/vnd.openxmlformats-officedocument.presentationml.presentation"}]}
+        ,
+        \\{"model":"extractor","schema_version":2,"schema":{"structures":{"receipt":{"fields":{"total":"str"}}}},"read_artifact":"fixture"}
+        ,
+    }) |request| {
+        const response = try Service(Fake).extractJson(&metadata, a, request, .{});
+        defer a.free(response);
+        var result = try std.json.parseFromSlice(V, a, response, .{});
+        defer result.deinit();
+        const total = result.value.object.get("data").?.array.items[0].object.get("structures").?.object.get("receipt").?.array.items[0].object.get("total").?;
+        try std.testing.expectEqualStrings("12.50", total.object.get("value").?.string);
+        try std.testing.expectEqualStrings("native", total.object.get("evidence").?.array.items[0].object.get("origin").?.string);
+    }
+    try std.testing.expectEqual(@as(usize, 0), metadata.calls);
+    try std.testing.expectEqual(@as(usize, 2), metadata.extract_calls);
+    try std.testing.expectEqual(@as(usize, 2), metadata.downloads);
+
+    const read_request =
+        \\{"model":"reader","documents":[{"id":"image","url":"fixture","media_type":"image/png"}]}
+    ;
+    const fresh_request =
+        \\{"model":"extractor","schema_version":2,"schema":{"structures":{"receipt":{"fields":{"total":"str"}}}},"documents":[{"id":"image","url":"fixture","media_type":"image/png"}]}
+    ;
+    const retained_request =
+        \\{"model":"extractor","schema_version":2,"schema":{"structures":{"receipt":{"fields":{"total":"str"}}}},"read_artifact":"fixture"}
+    ;
+    var valid = Fake{};
+    const valid_reading = try Service(Fake).readJson(&valid, a, read_request, .{});
+    defer a.free(valid_reading);
+    valid.retained = valid_reading;
+    const valid_extraction = try Service(Fake).extractJson(&valid, a, retained_request, .{});
+    defer a.free(valid_extraction);
+    try std.testing.expectEqual(@as(usize, 1), valid.extract_calls);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    for ([_][]const u8{
+        \\{"text":"Total 12.50","status":"complete","tables":[{"id":0,"rows":1,"columns":1,"cells":[{"row":99,"column":0,"text":"12.50"}]}]}
+        ,
+        \\{"text":"Total 12.50","status":"complete","tables":[{"id":0,"rows":1,"columns":1,"cells":[{"row":0,"column":99,"text":"12.50"}]}]}
+        ,
+        \\{"text":"Total 12.50","status":"complete","tables":[{"id":0,"rows":1,"columns":1,"cells":[{"row":0,"column":0,"row_span":0,"text":"12.50"}]}]}
+        ,
+        \\{"text":"Total 12.50","status":"complete","tables":[{"id":0,"rows":1,"columns":1,"cells":[{"row":0,"column":0,"column_span":2,"text":"12.50"}]}]}
+        ,
+        \\{"text":"Total 12.50","status":"complete","tables":[{"id":0,"rows":0,"columns":1,"cells":[]}]}
+        ,
+        \\{"text":"Total 12.50","status":"complete","regions":[{"id":0,"text":"Total 12.50","children":[{"id":1,"text":"Total 12.50","tables":[{"id":0,"rows":1,"columns":1,"cells":[{"row":0,"column":0,"row_span":2,"text":"12.50"}]}]}]}]}
+        ,
+    }) |raw| {
+        var invalid = Fake{ .raw_report = raw };
+        try std.testing.expectError(error.InvalidDocumentModelResult, Service(Fake).readJson(&invalid, a, read_request, .{}));
+        try std.testing.expectError(error.InvalidDocumentModelResult, Service(Fake).extractJson(&invalid, a, fresh_request, .{}));
+        var page = try std.json.parseFromSliceLeaky(V, work, raw, .{});
+        try cf.put(work, &page, "source_id", cf.string("image"));
+        try cf.put(work, &page, "number", .{ .integer = 1 });
+        const wrapper = try std.json.Stringify.valueAlloc(work, .{ .document = .{ .status = "complete", .sources = .{.{ .id = "image" }} }, .data = .{page} }, .{});
+        invalid.retained = wrapper;
+        try std.testing.expectError(error.InvalidDocumentModelResult, Service(Fake).extractJson(&invalid, a, retained_request, .{}));
+        try std.testing.expectEqual(@as(usize, 0), invalid.extract_calls);
+    }
+}

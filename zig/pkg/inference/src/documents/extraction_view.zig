@@ -44,6 +44,7 @@ fn tables(a: A, value: ?V, inherited: c.Origin) ![]c.Table {
     for (items, result) |item, *table| {
         table.* = try typed(c.Table, a, item);
         table.origin = try origin(a, item, inherited);
+        try table.validate();
     }
     return result;
 }
@@ -144,7 +145,6 @@ pub fn appendTables(a: A, backing: A, page: V, writer: *output.Writer, segments:
         for (cells) |view| {
             const cell = view.cell;
             try control.check();
-            if (cell.row >= table.rows or cell.column >= table.columns or cell.row_span == 0 or cell.column_span == 0 or cell.row_span > table.rows - cell.row or cell.column_span > table.columns - cell.column) return error.InvalidDocumentModelResult;
             start = writer.len();
             try writer.raw("\n[row ");
             try writer.value(cell.row);

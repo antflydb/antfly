@@ -67,9 +67,10 @@ const StructureBudget = struct {
         for (items) |table| {
             if (table.cells.len > self.cells_left) return error.DocumentRegionLimitExceeded;
             self.cells_left -= table.cells.len;
+            try table.validate();
         }
     }
-    fn regions(self: *StructureBudget, items: []const c.Region, depth: usize) error{DocumentRegionLimitExceeded}!void {
+    fn regions(self: *StructureBudget, items: []const c.Region, depth: usize) error{ DocumentRegionLimitExceeded, InvalidDocumentModelResult }!void {
         if (depth > 16 or items.len > self.regions_left) return error.DocumentRegionLimitExceeded;
         self.regions_left -= items.len;
         for (items) |region| {

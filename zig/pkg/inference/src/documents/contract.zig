@@ -293,6 +293,16 @@ pub const Table = struct {
     columns: usize,
     cells: []const Cell,
     origin: Origin = .native,
+
+    /// Shared semantic boundary for native, model and retained table views.
+    /// Subtraction after bounds checks keeps spans safe at the usize ceiling.
+    pub fn validate(self: Table) error{InvalidDocumentModelResult}!void {
+        if (self.rows == 0 or self.columns == 0) return error.InvalidDocumentModelResult;
+        for (self.cells) |cell| {
+            if (cell.row >= self.rows or cell.column >= self.columns or cell.row_span == 0 or cell.column_span == 0 or
+                cell.row_span > self.rows - cell.row or cell.column_span > self.columns - cell.column) return error.InvalidDocumentModelResult;
+        }
+    }
 };
 pub const InheritedPart = struct {
     path: []const u8,
@@ -540,4 +550,29 @@ test "document exhausted output admission prevents another model call" {
     var run = Run{ .limits = .{ .max_output_bytes = 1 }, .usage = .{ .output_bytes = 1 } };
     try std.testing.expectError(error.DocumentOutputTooLarge, run.call());
     try std.testing.expectEqual(@as(usize, 0), run.usage.model_calls);
+}
+
+test "document table validation rejects invalid extents without allocation or overflow" {
+    const valid = Table{ .id = 0, .rows = 2, .columns = 3, .cells = &.{.{ .row = 0, .column = 0, .row_span = 2, .column_span = 3, .text = "Merged" }} };
+    try valid.validate();
+    for ([_]Cell{
+        .{ .row = 2, .column = 0, .text = "outside" },
+        .{ .row = 0, .column = 3, .text = "outside" },
+        .{ .row = 0, .column = 0, .row_span = 0, .text = "zero" },
+        .{ .row = 0, .column = 0, .column_span = 0, .text = "zero" },
+        .{ .row = 1, .column = 0, .row_span = 2, .text = "crossing" },
+        .{ .row = 0, .column = 2, .column_span = 2, .text = "crossing" },
+        .{ .row = std.math.maxInt(usize), .column = 0, .text = "overflow" },
+        .{ .row = 1, .column = 0, .row_span = std.math.maxInt(usize), .text = "overflow" },
+        .{ .row = 0, .column = 1, .column_span = std.math.maxInt(usize), .text = "overflow" },
+    }) |cell| {
+        var table = valid;
+        table.cells = &.{cell};
+        try std.testing.expectError(error.InvalidDocumentModelResult, table.validate());
+    }
+    for ([_][2]usize{ .{ 0, 1 }, .{ 1, 0 }, .{ 0, 0 } }) |dimensions| {
+        const table = Table{ .id = 0, .rows = dimensions[0], .columns = dimensions[1], .cells = &.{} };
+        try std.testing.expectError(error.InvalidDocumentModelResult, table.validate());
+    }
+    try (Table{ .id = 0, .rows = std.math.maxInt(usize), .columns = std.math.maxInt(usize), .cells = &.{.{ .row = std.math.maxInt(usize) - 1, .column = std.math.maxInt(usize) - 1, .text = "edge" }} }).validate();
 }

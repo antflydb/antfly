@@ -154,6 +154,10 @@ Interpreted/derived/estimated cells and generated labels still obey extraction's
 derived-value policy; their presence does not prevent located literal cells from
 being verified. Canonical text and segment metadata are bounded before model
 calls, with no intermediate serialization of the reading tree.
+Table dimensions must be positive; cell coordinates and nonzero spans must fit
+inside those dimensions. Native tables and model reports are checked before a
+reading can be accepted, including nested and inherited tables. Retained reading
+reuse enforces the same rules before dispatching extraction.
 
 An optional extraction policy can set `verification_model` and `fallback_model`
 to other extraction bindings. It compares independent candidate values, tries at
@@ -290,7 +294,13 @@ the active byte ceiling, including the destination child model's limit, while
 compressing. A crop that cannot fit fails before model dispatch; cancellation
 and allocation failures release its transient buffers.
 
-Slide text, tables and visual inspection share a visibility-checked XML view.
+Slide text, tables and visual inspection share one namespace- and
+visibility-checked XML view. Native text comes from supported PresentationML and
+DrawingML shape/cell text bodies, and native tables from table graphic-data
+containers. Namespace aliases and scoped rebindings resolve before projection.
+Extension lists and custom-data payloads remain opaque: their text, tables and
+drawing properties cannot enter visible readings or literal evidence. Unsupported
+markup outside those metadata containers produces an unresolved visual finding.
 Individual `cNvPr.hidden` flags apply to the owning shape, picture, table frame
 or group, including hidden ancestors in slides, layouts, masters and notes.
 Hidden content cannot become visible reading text or literal extraction evidence,
@@ -298,8 +308,9 @@ and hidden drawings do not trigger unnecessary visual inspection. `include_hidde
 continues to select hidden slides; it does not reveal hidden objects within them.
 Slide visibility (`show`), inherited master visibility (`showMasterSp`), hidden
 objects and text boxes share XML boolean parsing. It accepts character references
-and surrounding whitespace, and rejects malformed or duplicate flags. The pass uses a bounded stack, borrows the
-original bytes for visible parts, and copies visible spans once when filtering.
+and surrounding whitespace, and rejects malformed or duplicate flags. One pass
+checks namespaces, content context and visibility using a bounded stack. It
+borrows unchanged part bytes and copies retained spans once when filtering.
 OOXML `AlternateContent` selects the first choice whose required namespace URIs
 are supported, otherwise its fallback. Namespace aliases, scoped rebindings and
 encoded requirements resolve before selection. Unselected branch payloads are
@@ -307,8 +318,10 @@ excluded from text, tables, visual inspection and evidence. Control tags retain
 namespace scopes so filtering and rechecking inherited parts gives the same
 selection. Unchanged parts borrow their bytes; filtered output is bounded by the
 original part size.
-Selected slides and shared layout/master parts reuse their checked views;
-unselected slides retain their original indexes without decompressing XML.
+Checked layout/master fragments reuse their parent projection without reparsing
+outside their namespace scope. Selected slides and shared layout/master parts
+reuse their checked views; unselected slides retain their original indexes
+without decompressing XML.
 
 Sources parse once. Remote routing/extraction/verification share one bounded,
 resource-accounted HTTP pool per run. Source buffers release between documents and page scratch

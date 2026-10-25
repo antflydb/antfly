@@ -173,6 +173,7 @@ fn decodeTables(a: A, value: ?V, parent_origin: c.Origin) error{ OutOfMemory, In
             cell.* = .{ .row = decoded.row, .column = decoded.column, .row_span = decoded.row_span, .column_span = decoded.column_span, .bbox = decoded.bbox, .text = try text(field(raw, "text") orelse return error.InvalidDocumentModelResult) };
         }
         table.* = .{ .id = shape.id, .region_id = shape.region_id, .projection = shape.projection, .rows = shape.rows, .columns = shape.columns, .cells = cells, .origin = try origin(a, item, parent_origin) };
+        try table.validate();
     }
     return tables;
 }
