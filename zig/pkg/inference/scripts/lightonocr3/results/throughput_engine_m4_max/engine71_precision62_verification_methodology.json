@@ -1,0 +1,13 @@
+{
+  "scope": "Private verification correction only; original runtime/native stdout unchanged.",
+  "initial_failure": "BF16 execution succeeded, but private wrapper expected a full64 F32 fused-FFN counter. Corrected expectation explicitly requires zero for BF16 mode.",
+  "preserved": [
+    "engine71_precision_screen62_attempt1_audit.json",
+    "engine71_4b_precision_screen62_bf16_wide_r1_c64_p1_v1_vf3_r128/report_before_verification_fix.json",
+    "original native benchmark stdout (compressed with raw hash)",
+    "original precision62 parent exception log"
+  ],
+  "limitation": "The offline recheck reused and overwrote the private per-leg wrapper stderr log. The native benchmark raw stdout, pre-verification report, initial failure audit and original parent exception are preserved; no claim of retaining that original wrapper stderr.",
+  "runtime_changed": false,
+  "output_and_memory_checks_relaxed": false
+}

@@ -1,0 +1,8 @@
+{
+  "pid": 28696,
+  "command": [
+    "/opt/homebrew/Cellar/python@3.12/3.12.14/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python",
+    ".venv-lighton-vllm-metal/run_engine80_finalqualification.py"
+  ],
+  "reason": "Replace child-free queued private final verifier before launch: actual C harness pass marker and explicit original-reserve memory admission. No GPU/build launched."
+}

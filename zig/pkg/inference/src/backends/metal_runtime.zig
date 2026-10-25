@@ -10852,6 +10852,38 @@ pub fn tryRawLinearHost(
     }
 }
 
+pub extern fn antfly_metal_lighton_prefill_ffn_enabled(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn antfly_metal_lighton_prefill_ffn_can_apply(runtime: ?*RawMetalDecodeRuntime, gate: usize, up: usize, down: usize, rows: usize, hidden: usize, intermediate: usize) c_int;
+pub extern fn antfly_metal_lighton_prefill_ffn_apply(runtime: ?*RawMetalDecodeRuntime, gate: usize, up: usize, down: usize, rows: usize, hidden: usize, intermediate: usize, input: ?*anyopaque, input_offset: usize, norm: ?*anyopaque, norm_offset: usize, gated: ?*anyopaque, gated_offset: usize, output: ?*anyopaque, output_offset: usize) c_int;
+
+pub fn lightOnPrefillFfnEnabled(self: anytype) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    return antfly_metal_lighton_prefill_ffn_enabled(runtime) != 0;
+}
+
+/// The two private scratch tensors are byte carriers for BF16 intermediates.
+/// Retaining their conservative F32 capacities uses less storage than the
+/// ordinary gate/up/activation F32 intermediates. Only the final F32 is exposed.
+pub fn decoderRuntimeTryApplyLightOnPrefillFfn(self: anytype, request: anytype) !?MetalTensor {
+    if (request.activation != .silu or !request.input.isDevice() or request.input.ndim() != 2 or
+        request.input.dim(0) <= 0 or request.input.dim(1) <= 0 or request.input.deviceByteOffset() % 16 != 0 or
+        @as(usize, @intCast(request.input.dim(1))) != request.hidden_size) return null;
+    const runtime = self.raw_decode_runtime orelse return null;
+    const rows: usize = @intCast(request.input.dim(0));
+    if (antfly_metal_lighton_prefill_ffn_can_apply(runtime, request.gate_slot, request.up_slot, request.down_slot, rows, request.hidden_size, request.intermediate_size) == 0) return null;
+    const hidden_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, request.hidden_size), @sizeOf(f32));
+    const gated_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, request.intermediate_size), @sizeOf(f32));
+    var norm_scratch = try MetalTensor.deviceAllocate(runtime, hidden_bytes, .private, &.{ @intCast(rows), @intCast(request.hidden_size) });
+    defer norm_scratch.deinit();
+    var gated_scratch = try MetalTensor.deviceAllocate(runtime, gated_bytes, .private, &.{ @intCast(rows), @intCast(request.intermediate_size) });
+    defer gated_scratch.deinit();
+    var output = try MetalTensor.deviceAllocate(runtime, hidden_bytes, .private, &.{ @intCast(rows), @intCast(request.hidden_size) });
+    errdefer output.deinit();
+    const rc = antfly_metal_lighton_prefill_ffn_apply(runtime, request.gate_slot, request.up_slot, request.down_slot, rows, request.hidden_size, request.intermediate_size, request.input.deviceHandle(), request.input.deviceByteOffset(), norm_scratch.deviceHandle(), norm_scratch.deviceByteOffset(), gated_scratch.deviceHandle(), gated_scratch.deviceByteOffset(), output.deviceHandle(), output.deviceByteOffset());
+    if (rc != 0) return error.MetalLightOnPrefillFfnFailed;
+    return output;
+}
+
 /// BF16 gate/up projection plus SiLU/multiply. The raw selector admits measured
 /// device/shapes by default and explicit experiments elsewhere. Capability or
 /// rollout misses retain the FFN fallback; admitted failures propagate to cleanup.
@@ -46993,6 +47025,90 @@ test "metal native decoder runtime bf16 multi-row linear matches identity projec
         for (0..out_dim) |col| {
             try std.testing.expectApproxEqAbs(input_data[row * hidden_size + col], actual[row * out_dim + col], 1e-3);
         }
+    }
+}
+
+test "LightOnOCR3 prefill fused FFN wrapper retains private scratch through submit and cancellation" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const flags = [_][:0]const u8{
+        "TERMITE_METAL_ENABLE_LIGHTONOCR3_PREFILL_FFN",
+        "TERMITE_METAL_LIGHTONOCR3_BF16_PREFILL_INPUTS",
+        "TERMITE_METAL_ENABLE_LIGHTONOCR3_FRAME_POLICY",
+        "TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_FFN",
+        "TERMITE_METAL_DISABLE_LIGHTONOCR3_MPP",
+        "TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_PROJECTIONS",
+        "TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_PACK_REUSE",
+        "TERMITE_METAL_DISABLE_LIGHTONOCR3_PLANNED_MPP",
+    };
+    var original: [flags.len]?[:0]u8 = @splat(null);
+    defer for (flags, original) |name, value| {
+        if (value) |saved| {
+            _ = setenv(name, saved.ptr, 1);
+            allocator.free(saved);
+        } else _ = unsetenv(name);
+    };
+    for (flags, 0..) |name, i| {
+        if (std.c.getenv(name)) |value| original[i] = try allocator.dupeSentinel(u8, std.mem.span(value), 0);
+    }
+    for (flags, 0..) |name, i| {
+        if (i < 3) {
+            try std.testing.expectEqual(@as(c_int, 0), setenv(name, "1", 1));
+        } else try std.testing.expectEqual(@as(c_int, 0), unsetenv(name));
+    }
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    termite_metal_decode_runtime_set_lightonocr3_projections(runtime, 1);
+    termite_metal_decode_runtime_set_qwen35_ocr_vector_loads(runtime, 1);
+    const rows = 128;
+    const hidden = 2560;
+    const intermediate = 9216;
+    const weights = try allocator.alloc(u16, hidden * intermediate);
+    defer allocator.free(weights);
+    const bias = try allocator.alloc(f32, intermediate);
+    defer allocator.free(bias);
+    @memset(weights, 0);
+    @memset(bias, 1);
+    for (0..2) |slot| try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_linear_bf16(runtime, slot, std.mem.sliceAsBytes(weights).ptr, weights.len * 2, bias.ptr, hidden, intermediate));
+    @memset(bias, 0);
+    for (0..hidden) |col| weights[col * intermediate + col] = 0x3f80;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_linear_bf16(runtime, 2, std.mem.sliceAsBytes(weights).ptr, weights.len * 2, bias.ptr, intermediate, hidden));
+    const data = try allocator.alloc(f32, rows * hidden);
+    defer allocator.free(data);
+    @memset(data, 0);
+    var input = try testDeviceTensorFromSlice(runtime, data, &.{ rows, hidden });
+    defer input.deinit();
+    const request = .{
+        .input = input,
+        .gate_slot = @as(usize, 0),
+        .up_slot = @as(usize, 1),
+        .down_slot = @as(usize, 2),
+        .hidden_size = @as(usize, hidden),
+        .intermediate_size = @as(usize, intermediate),
+        .activation = ops.DecoderRuntimeActivationKind.silu,
+    };
+    try std.testing.expect((try decoderRuntimeTryApplyLightOnPrefillFfn(&provider, request)) == null);
+    for (0..3) |iteration| {
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_begin_frame(runtime));
+        var frame = true;
+        defer if (frame) {
+            _ = termite_metal_decode_runtime_cancel_frame(runtime);
+        };
+        try setActiveFrameRegime(runtime, .prefill);
+        var output = (try decoderRuntimeTryApplyLightOnPrefillFfn(&provider, request)) orelse return error.UnexpectedNull;
+        defer output.deinit();
+        // Scratch owners have already been released by the helper at this point.
+        if (iteration == 1) {
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_cancel_frame(runtime));
+        } else {
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_submit_frame(runtime));
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_wait_frame(runtime));
+            const actual = try tensorHostSlice(&output);
+            for (actual) |value| try std.testing.expectEqual(@as(f32, 0.73046875), value);
+        }
+        frame = false;
     }
 }
 

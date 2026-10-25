@@ -1,0 +1,9 @@
+{
+  "decision": "failed_harness_no_promotion",
+  "reason": "Probe adaptation added a duplicate free(w)/free(b) at shape exit; the original harness already freed them after copying weights to Metal. First shape passed full output/corner/canary checks before malloc aborted. Failure is confined to the private harness.",
+  "original_harness_sha256": "763aabc52c102b0a9fcc2e1e1715cf13e37daabfe816b7eae774bbd33d8c37be",
+  "corrected_harness_sha256": "3211deb7756322101ebed319b941388b0e43dde88406d89cfc0f30f1b1bcea28",
+  "failed_audit_sha256": "773adcd3e56a400a9e7a326d9533d1afe5a90971fbae58d10bc0ff4a65621509",
+  "production_runtime_changed": false,
+  "own_paused_controller_resumed": true
+}

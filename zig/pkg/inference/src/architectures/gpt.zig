@@ -9873,7 +9873,11 @@ fn feedForward(
             defer cb.free(down_w);
             // Both integrated OCR decoders have qualified gate/up + SiLU
             // kernels. Keep the paired projection fallback on other profiles.
-            if (total >= 1 and (total <= 8 or
+            // Long-prompt FFNs also reach the backend's optional packed-prefill
+            // selector. The backend owns feature flags and frame/capability guards.
+            const packed_prefill_candidate = !isDecodeStep(decode_context) and
+                total >= 128 and total <= 1024 and hidden_size == 2560;
+            if (total >= 1 and (packed_prefill_candidate or total <= 8 or
                 (isDecodeStep(decode_context) and total <= 64 and
                     (hidden_size != 2560 or total < 64 or platform.env.getenvBool("TERMITE_METAL_ENABLE_LIGHTONOCR3_FULL64_GATE_UP")))) and
                 config.hasQwen35VisionArchitectureContract() and

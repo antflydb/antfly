@@ -1,0 +1,29 @@
+{
+  "status": "running",
+  "primary_throughput_eligible": false,
+  "scope": "Isolated explicit F32 FMA recurrent-prefill prototype. Same canonical state/dtype, Safe compilation, changes F32 rounding. No runtime promotion inferred. Full output/state and all canaries, nonzero offsets, GPU conv/norm producers, initialized/uninitialized, actual columns4 selection, alternating 30 trials.",
+  "preparation_sha256": "5a0218301004a4c880f75596db9fee9f5abd84d54fefc7580daf632fb0c80e6b",
+  "driver_sha256": "6741311afbca7ccc71fbe81d8a5e56063ef15637551df0165f8900f397fb70c2",
+  "checks": [],
+  "build_exit_code": 0,
+  "build_command": [
+    "clang",
+    "-O3",
+    "-fobjc-arc",
+    "-I",
+    "zig/pkg/inference/src/backends",
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine76_fma_probe.m",
+    "-framework",
+    "Foundation",
+    "-framework",
+    "Metal",
+    "-framework",
+    "MetalPerformanceShaders",
+    "-framework",
+    "Accelerate",
+    "-o",
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine76_fma_probe"
+  ],
+  "build_log_sha256": "804b5849fbf47dd040c3e3a5dc7b9f5c43b4513e5b9f5ffd7651bb3d58ffef01",
+  "binary_sha256": "7eb75e243dccd5b922c09ca4a176d34ee902999c05922735d83b02a620a39dbc"
+}

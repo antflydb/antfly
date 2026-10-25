@@ -1284,6 +1284,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     lighton_prepared_blocks: usize = 0,
     lighton_wide_projection_tiles_start: u64 = 0,
     lighton_single_frame_stats: [2]u64 = @splat(0),
+    lighton_prefill_ffn_calls: u64 = 0,
     lighton_gpu_token_bursts: u64 = 0,
     lighton_gpu_token_burst_extra_steps: u64 = 0,
     lighton_gpu_token_burst_extra_rows: u64 = 0,
@@ -1390,6 +1391,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         metal_runtime_mod.termite_metal_decode_runtime_lighton_vision_pack_stats(raw, &self.lighton_vision_pack_baseline);
         metal_runtime_mod.termite_metal_decode_runtime_lighton_mpp_encoder_stats(raw, &self.lighton_mpp_encoder_baseline);
         self.lighton_single_frame_stats = @splat(0);
+        self.lighton_prefill_ffn_calls = 0;
         self.lighton_gpu_token_bursts = 0;
         self.lighton_gpu_token_burst_extra_steps = 0;
         self.lighton_gpu_token_burst_extra_rows = 0;
@@ -1494,10 +1496,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     pub fn noteLightOnBurst(cb: *const ops.ComputeBackend, frames: u64, argmaxes: u64, width: usize, rows: usize) void {
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         self.lighton_gpu_token_bursts += 1;
-        self.lighton_gpu_token_burst_mismatches += @intFromBool(width < 2 or width > 4 or frames != width or argmaxes != width);
+        self.lighton_gpu_token_burst_mismatches += @intFromBool(width < 2 or width > 8 or frames != width or argmaxes != width);
         self.lighton_gpu_token_burst_extra_steps += width - 1;
         self.lighton_gpu_token_burst_extra_rows += (width - 1) * rows;
         self.lighton_gpu_token_burst_max_width = @max(self.lighton_gpu_token_burst_max_width, width);
+    }
+
+    pub fn lightOnPrefillFfnCalls(cb: *const ops.ComputeBackend) u64 {
+        if (cb.kind() != .metal) return 0;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.lighton_prefill_ffn_calls;
     }
 
     pub fn lightOnBurstStats(cb: *const ops.ComputeBackend) [5]u64 {
@@ -27674,7 +27682,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const lighton = self.lightonocr3_projections and request.rows >= 1 and request.rows <= 64 and
             ((request.hidden_size == 2560 and request.intermediate_size == 9216) or
                 (request.hidden_size == 1024 and request.intermediate_size == 3584)) and request.activation == .silu;
-        if (!lighton and (self.data.a4b_inference == null or
+        const lighton_prefill = self.lightonocr3_projections and request.rows >= 128 and request.rows <= 1024 and
+            request.hidden_size == 2560 and request.intermediate_size == 9216 and request.activation == .silu and
+            metal_runtime.lightOnPrefillFfnEnabled(self.provider_impl);
+        if (!lighton and !lighton_prefill and (self.data.a4b_inference == null or
             request.rows != 1 or
             !a4bHighMemoryFeatureEnabled(
                 "TERMITE_METAL_ENABLE_A4B_SHARED_FFN_FUSION",
@@ -27711,6 +27722,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var input = try self.ownedMetalTensorFromCt(request.input);
         defer input.deinit();
         if (!input.isDevice()) return null;
+        if (lighton_prefill) {
+            const output = (try metal_runtime.decoderRuntimeTryApplyLightOnPrefillFfn(self.provider_impl, .{
+                .gate_slot = gate_slot,
+                .up_slot = up_slot,
+                .down_slot = down_slot,
+                .input = input,
+                .hidden_size = request.hidden_size,
+                .intermediate_size = request.intermediate_size,
+                .activation = request.activation,
+            })) orelse return null;
+            self.lighton_prefill_ffn_calls += 1;
+            return self.ctFromOwnedMetalTensor(output);
+        }
         if (lighton) {
             var gated = (try metal_runtime.decoderRuntimeTryApplyBf16GateUp(self.provider_impl, .{
                 .gate_slot = gate_slot,

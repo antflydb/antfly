@@ -8026,7 +8026,7 @@ pub const Node = struct {
                     features.prepared and features.worker and features.activation_pool and features.batch_attention and
                     features.single_frame and features.stream_first_layers == 0 and
                     !platform.env.getenvBool("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME");
-                features.gpu_token_burst_width = @intCast(std.math.clamp(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH") orelse 2, 2, 4));
+                features.gpu_token_burst_width = @intCast(std.math.clamp(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH") orelse 2, 2, generation.NativeGenerationPipeline.max_gpu_token_burst_width));
                 features.pipeline_vision = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PIPELINE_VISION") and
                     metal_runtime.qualifiedM4DeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
                     features.resident_vision_budget and features.cpu_preprocess and features.epoch_auxiliary and
@@ -8168,6 +8168,8 @@ pub const Node = struct {
                     std.debug.print("LIGHTONOCR3 stream_forward_splits={d} stream_first_layers={d}\n", .{ stream_splits, ctx.features.stream_first_layers });
                     const prefill_splits = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnPrefillStreamSplits(&cb) else 0;
                     std.debug.print("LIGHTONOCR3 prefill_stream_layers={d} prefill_stream_splits={d}\n", .{ ctx.features.prefill_stream_layers, prefill_splits });
+                    const prefill_ffn_calls = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnPrefillFfnCalls(&cb) else 0;
+                    std.debug.print("LIGHTONOCR3 prefill_fused_ffn_calls={d}\n", .{prefill_ffn_calls});
                     const core_weights = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnSharedCoreWeightStats(&cb) else @as([3]usize, @splat(0));
                     std.debug.print("LIGHTONOCR3 shared_core_weight_hits={d} shared_core_weight_misses={d} shared_core_weight_bytes={d}\n", .{ core_weights[0], core_weights[1], core_weights[2] });
                     const wide_mpp = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnWideMppStats(&cb) else @as([2]u64, @splat(0));

@@ -1,0 +1,18 @@
+[
+  {
+    "pid": 27800,
+    "command": [
+      "/opt/homebrew/Cellar/python@3.12/3.12.14/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python",
+      ".venv-lighton-vllm-metal/run_engine79_finalqualification.py"
+    ],
+    "reason": "Retire child-free waiting controller before model-level dispatch guard qualification. No benchmark launched."
+  },
+  {
+    "pid": 28014,
+    "command": [
+      "/opt/homebrew/Cellar/python@3.12/3.12.14/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python",
+      ".venv-lighton-vllm-metal/run_engine79_primary_queue.py"
+    ],
+    "reason": "Retire child-free waiting controller before model-level dispatch guard qualification. No benchmark launched."
+  }
+]

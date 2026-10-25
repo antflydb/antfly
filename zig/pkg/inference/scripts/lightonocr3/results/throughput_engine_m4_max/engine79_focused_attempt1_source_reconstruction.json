@@ -1,0 +1,7 @@
+{
+  "scope": "Recover the exact initial focused-C source after four independently qualified rollback guards were added. Original result is unchanged.",
+  "method": "Remove exactly the four new frame rollback predicates inside antfly_metal_lighton_prefill_ffn_enabled from current production C; recovered bytes must match the original recorded SHA256.",
+  "recovered_source_sha256": "d66675dacb456b578e40e66587a6c088b6e3cb6b1ad215a6dc39d689004fe70e",
+  "source_artifact": ".venv-lighton-vllm-metal/engine79_focused_attempt1_metal_kernels.m",
+  "source_audit_sha256": "ec10392298eee32286e3c0c204af606f013a2281d304d6b566f8500211c26064"
+}

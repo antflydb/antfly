@@ -1,0 +1,13 @@
+{
+  "decode_sample_start": 320,
+  "decode_sample_reason": "The unchanged four serial/warm prompts consume 338 frames: 32 vision, four prefill, 302 decode. Start after warmup to sample the timed parallel decoder.",
+  "status": "pass",
+  "primary_throughput_eligible": false,
+  "created_at": "2026-10-25T03:15:45.231655+00:00",
+  "driver_sha256": "93a7c400426cc4f8063970472d84a5c22811ada9b7d4188ddf514fe7cb7b5078",
+  "scope": "Separate R64 Metal timestamp/encoder diagnostic after primary59 loss. Original caps and full output checks. Instrumented timing is not eligible for a throughput claim.",
+  "report": "engine71_4b_gpu_diagnostic61_wide_r0_c64_p1_v1_vf3_r64/report.json",
+  "report_sha256": "c8f2d177b37ce2076aadb8e3dc912cb0c6126d336727a748bbac0afce4de0a71",
+  "metal_timestamp_supported": true,
+  "encoder_timing_present": true
+}

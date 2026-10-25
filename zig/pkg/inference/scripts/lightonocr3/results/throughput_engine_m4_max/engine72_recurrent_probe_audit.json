@@ -1,0 +1,388 @@
+{
+  "status": "pass",
+  "created_at": "2026-10-25T03:17:30.363475+00:00",
+  "scope": "Isolated F32 recurrent lane-layout diagnostic only, never primary throughput evidence. Full staged checks precede separate 24-layer ABBA working sets with full output/state comparisons and canaries. Same state layout/dtype; altered reduction tree. No promotion inferred from microbenchmarks.",
+  "primary_throughput_eligible": false,
+  "binary_sha256": "a0c121e9ea027b691db97ba640d95844246fc0599cad760d3369244c676a4c89",
+  "checks": [
+    {
+      "pages": 0,
+      "available_bytes": 11524571136,
+      "working_plus_gold_estimate_bytes": 268435456,
+      "os_reserve_bytes": 6442450944,
+      "status": "pass",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine72-probe-pages0.txt",
+      "log_sha256": "02ce781bad38cb834316be2154fb398c5975e3bebfffb6d50ac8c92f9f02bea6",
+      "records": []
+    },
+    {
+      "pages": 33,
+      "available_bytes": 11270635520,
+      "working_plus_gold_estimate_bytes": 4149894400,
+      "os_reserve_bytes": 6442450944,
+      "status": "pass",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine72-probe-pages33.txt",
+      "log_sha256": "f805bd6008a8c5334cf77b41d57a6c4b7ba261a66dbffe39a9a6f531d4b46ff4",
+      "records": [
+        {
+          "pages": 33,
+          "layers": 24,
+          "heads": 32,
+          "candidate": 1,
+          "leg": 0,
+          "mode": 0,
+          "threads": 512,
+          "checked_elements": 454215168,
+          "full_output_state_max_abs": 0,
+          "gpu_us": [
+            11683.374,
+            11498.833,
+            12046.333,
+            11529.374,
+            11386.25,
+            11253.75,
+            11304.499,
+            11354.75
+          ]
+        },
+        {
+          "pages": 33,
+          "layers": 24,
+          "heads": 32,
+          "candidate": 1,
+          "leg": 1,
+          "mode": 1,
+          "threads": 256,
+          "checked_elements": 454215168,
+          "full_output_state_max_abs": 1.86264515e-08,
+          "gpu_us": [
+            11609.999,
+            11633.666,
+            11640.374,
+            11717.499,
+            11698.874,
+            11657.875,
+            11906.25,
+            11803.041
+          ]
+        },
+        {
+          "pages": 33,
+          "layers": 24,
+          "heads": 32,
+          "candidate": 1,
+          "leg": 2,
+          "mode": 1,
+          "threads": 256,
+          "checked_elements": 454215168,
+          "full_output_state_max_abs": 1.86264515e-08,
+          "gpu_us": [
+            11848.666,
+            11748.666,
+            11887.833,
+            11877.749,
+            11913.041,
+            11978.499,
+            11909.624,
+            11959.208
+          ]
+        },
+        {
+          "pages": 33,
+          "layers": 24,
+          "heads": 32,
+          "candidate": 1,
+          "leg": 3,
+          "mode": 0,
+          "threads": 512,
+          "checked_elements": 454215168,
+          "full_output_state_max_abs": 0,
+          "gpu_us": [
+            11399.124,
+            11269.958,
+            11304.874,
+            11263.833,
+            11421.0,
+            11278.208,
+            11510.874,
+            11387.874
+          ]
+        },
+        {
+          "pages": 33,
+          "layers": 24,
+          "heads": 32,
+          "candidate": 2,
+          "leg": 0,
+          "mode": 0,
+          "threads": 512,
+          "checked_elements": 454215168,
+          "full_output_state_max_abs": 0,
+          "gpu_us": [
+            11450.624,
+            11536.125,
+            11598.375,
+            11299.375,
+            11756.374,
+            11472.208,
+            11314.749,
+            11350.166
+          ]
+        },
+        {
+          "pages": 33,
+          "layers": 24,
+          "heads": 32,
+          "candidate": 2,
+          "leg": 1,
+          "mode": 2,
+          "threads": 512,
+          "checked_elements": 454215168,
+          "full_output_state_max_abs": 1.86264515e-08,
+          "gpu_us": [
+            11583.041,
+            11822.375,
+            11755.958,
+            11811.291,
+            11661.333,
+            11614.999,
+            11678.375,
+            11559.75
+          ]
+        },
+        {
+          "pages": 33,
+          "layers": 24,
+          "heads": 32,
+          "candidate": 2,
+          "leg": 2,
+          "mode": 2,
+          "threads": 512,
+          "checked_elements": 454215168,
+          "full_output_state_max_abs": 1.86264515e-08,
+          "gpu_us": [
+            11351.374,
+            11623.25,
+            11479.083,
+            11412.083,
+            11378.083,
+            11520.375,
+            11480.458,
+            11613.249
+          ]
+        },
+        {
+          "pages": 33,
+          "layers": 24,
+          "heads": 32,
+          "candidate": 2,
+          "leg": 3,
+          "mode": 0,
+          "threads": 512,
+          "checked_elements": 454215168,
+          "full_output_state_max_abs": 0,
+          "gpu_us": [
+            11333.875,
+            11263.083,
+            11347.624,
+            11336.124,
+            11364.0,
+            11133.666,
+            11691.624,
+            11249.124
+          ]
+        }
+      ]
+    },
+    {
+      "pages": 48,
+      "available_bytes": 12902760448,
+      "working_plus_gold_estimate_bytes": 5914193920,
+      "os_reserve_bytes": 6442450944,
+      "status": "pass",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine72-probe-pages48.txt",
+      "log_sha256": "888e557556b19c11f8cd39b6aa7a7192fc0f9344de262ed0d974da5f6348a13c",
+      "records": [
+        {
+          "pages": 48,
+          "layers": 24,
+          "heads": 32,
+          "candidate": 1,
+          "leg": 0,
+          "mode": 0,
+          "threads": 512,
+          "checked_elements": 660676608,
+          "full_output_state_max_abs": 0,
+          "gpu_us": [
+            16396.874,
+            16373.999,
+            16442.041,
+            16580.083,
+            16665.375,
+            16735.583,
+            16391.958,
+            16558.958
+          ]
+        },
+        {
+          "pages": 48,
+          "layers": 24,
+          "heads": 32,
+          "candidate": 1,
+          "leg": 1,
+          "mode": 1,
+          "threads": 256,
+          "checked_elements": 660676608,
+          "full_output_state_max_abs": 1.86264515e-08,
+          "gpu_us": [
+            16937.874,
+            16899.25,
+            17162.041,
+            17233.416,
+            17100.083,
+            16860.875,
+            16835.874,
+            17114.708
+          ]
+        },
+        {
+          "pages": 48,
+          "layers": 24,
+          "heads": 32,
+          "candidate": 1,
+          "leg": 2,
+          "mode": 1,
+          "threads": 256,
+          "checked_elements": 660676608,
+          "full_output_state_max_abs": 1.86264515e-08,
+          "gpu_us": [
+            17059.124,
+            17174.208,
+            16989.374,
+            16912.291,
+            16843.624,
+            16987.166,
+            16922.875,
+            16926.833
+          ]
+        },
+        {
+          "pages": 48,
+          "layers": 24,
+          "heads": 32,
+          "candidate": 1,
+          "leg": 3,
+          "mode": 0,
+          "threads": 512,
+          "checked_elements": 660676608,
+          "full_output_state_max_abs": 0,
+          "gpu_us": [
+            16562.499,
+            16626.541,
+            16409.749,
+            16558.25,
+            16510.124,
+            16415.999,
+            16261.249,
+            16204.999
+          ]
+        },
+        {
+          "pages": 48,
+          "layers": 24,
+          "heads": 32,
+          "candidate": 2,
+          "leg": 0,
+          "mode": 0,
+          "threads": 512,
+          "checked_elements": 660676608,
+          "full_output_state_max_abs": 0,
+          "gpu_us": [
+            16197.291,
+            16162.333,
+            16105.749,
+            16337.0,
+            16290.375,
+            16277.333,
+            16449.499,
+            16221.75
+          ]
+        },
+        {
+          "pages": 48,
+          "layers": 24,
+          "heads": 32,
+          "candidate": 2,
+          "leg": 1,
+          "mode": 2,
+          "threads": 512,
+          "checked_elements": 660676608,
+          "full_output_state_max_abs": 1.86264515e-08,
+          "gpu_us": [
+            16440.374,
+            16529.916,
+            16506.833,
+            16294.375,
+            16474.625,
+            16306.749,
+            16549.375,
+            16485.166
+          ]
+        },
+        {
+          "pages": 48,
+          "layers": 24,
+          "heads": 32,
+          "candidate": 2,
+          "leg": 2,
+          "mode": 2,
+          "threads": 512,
+          "checked_elements": 660676608,
+          "full_output_state_max_abs": 1.86264515e-08,
+          "gpu_us": [
+            16746.791,
+            16746.999,
+            16724.875,
+            16630.124,
+            16791.375,
+            16817.166,
+            16867.624,
+            17105.5
+          ]
+        },
+        {
+          "pages": 48,
+          "layers": 24,
+          "heads": 32,
+          "candidate": 2,
+          "leg": 3,
+          "mode": 0,
+          "threads": 512,
+          "checked_elements": 660676608,
+          "full_output_state_max_abs": 0,
+          "gpu_us": [
+            16309.625,
+            16169.666,
+            16354.374,
+            16093.625,
+            16051.583,
+            16533.708,
+            16735.125,
+            16281.499
+          ]
+        }
+      ]
+    },
+    {
+      "pages": 64,
+      "available_bytes": 14079098880,
+      "working_plus_gold_estimate_bytes": 7796113408,
+      "os_reserve_bytes": 6442450944,
+      "status": "skipped_before_allocation",
+      "reason": "Keep original six-GiB reserve; insufficient actual available bytes."
+    }
+  ]
+}

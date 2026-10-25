@@ -451,7 +451,7 @@ The wider and pipelined paths remain separate opt-ins:
 | `ANTFLY_LIGHTONOCR3_SHARED_CORE_WEIGHTS` | M4 4B throughput preset: `1`; otherwise `0` | Share immutable recurrent side weights within the admitted epoch; required for prompt streaming. |
 | `ANTFLY_LIGHTONOCR3_SINGLE_FRAME` | `0` | Keep decoder, output head and argmax in one owned frame; required for complete-step token bursts. |
 | `ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST` | `0` | Pipeline complete greedy decode steps with GPU token handoff; requires prepared decode, the executor, GPU recurrent state, shared scratch and single-frame mode. Set `ANTFLY_LIGHTONOCR3_STREAM_FIRST_LAYERS=0` when selecting it. |
-| `ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH` | `2` | Bound each burst to 2–4 steps and to every page's remaining token capacity. EOS and cancellation discard unused results after producers drain. |
+| `ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH` | `2` | Bound each burst to 2–8 steps and to every page's remaining token capacity. Larger bursts reduce scheduler handoffs and can delay token publication. EOS and cancellation discard unused results after producers drain. |
 | `ANTFLY_LIGHTONOCR3_PIPELINE_VISION` | `0` | With resident vision and CPU preparation, overlap two fully admitted single-image frame groups. Group size must be one or two blocks. |
 | `ANTFLY_LIGHTONOCR3_PREFILL_STREAM_LAYERS` | `0` | Experiment with prompt layer groups of 1–16 after one complete synchronous prompt; currently limited to single-page prompts up to 1024 tokens, shared core weights and shared decoder scratch. |
 
@@ -571,3 +571,5 @@ Earlier rounds remain archived under `kernel_saturation_m4_max`,
 folder. Installed vLLM Metal lacks a Florence adapter, so the Florence reference
 uses MLX-VLM's supported serial path; its batch-eight attempt failed in that
 adapter and is recorded separately.
+
+The experimental `--prefill-fused-ffn --bf16-prefill-inputs` benchmark flags enable a packed BF16 FFN for 4B prefill rows 128–1024 on qualified Metal devices. The path preserves the existing BF16 prefill operands and F32 output. `--require-prefill-fused-ffn` checks that every timed round used it. It is disabled by default; `TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_FFN=1` restores the ordinary FFN. Full model throughput qualification is still pending.

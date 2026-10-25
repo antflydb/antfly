@@ -3426,6 +3426,8 @@ pub const QwenVisionBatchHook = struct {
 };
 
 pub const NativeGenerationPipeline = struct {
+    /// Token publication is bounded; GPU steps reuse two frame/logit banks.
+    pub const max_gpu_token_burst_width: usize = 8;
     allocator: std.mem.Allocator,
     io: ?std.Io = null,
     cb: ComputeBackend,
@@ -10801,7 +10803,7 @@ pub const NativeGenerationPipeline = struct {
         }
 
         fn acceptTokens(self: *@This(), tokens: []const u32, reserved: usize) !void {
-            if (tokens.len == 0 or tokens.len > 4 or (reserved != 0 and reserved != tokens.len - 1)) return error.InvalidBatchDecodeState;
+            if (tokens.len == 0 or tokens.len > max_gpu_token_burst_width or (reserved != 0 and reserved != tokens.len - 1)) return error.InvalidBatchDecodeState;
             // Publish every accepted output while the work is still borrowed;
             // enqueue exactly once, after the last accepted output. Enqueue
             // may transfer this stack continuation to an idle canceller.
@@ -11086,7 +11088,7 @@ pub const NativeGenerationPipeline = struct {
         before_argmax: u64,
     ) !StepForwardResult {
         if (comptime !build_options.enable_metal) return error.UnsupportedOperation;
-        if (steps < 2 or steps > 4) return error.InvalidBatchDecodeState;
+        if (steps < 2 or steps > max_gpu_token_burst_width) return error.InvalidBatchDecodeState;
         const M = @import("../ops/metal_compute.zig").MetalCompute;
         const first = try self.allocator.alloc(u32, claimed.len);
         errdefer self.allocator.free(first);
@@ -11268,7 +11270,7 @@ pub const NativeGenerationPipeline = struct {
                     const head = try self.graphWeight("lm_head.weight");
                     defer self.cb.free(head);
                     var burst_slot: ?usize = null;
-                    var burst_steps: usize = std.math.clamp(@as(usize, self.gpu_token_burst_width), 2, 4);
+                    var burst_steps: usize = std.math.clamp(@as(usize, self.gpu_token_burst_width), 2, max_gpu_token_burst_width);
                     if (self.gpu_token_burst_lighton_decode and self.single_frame_lighton_decode and
                         !self.gpu_greedy_stream_lighton_decode and self.execution_lock != null and
                         M.lightOnPreparedStreamReady(&self.cb, self.gpt_config, claimed.len) and eligible: {
@@ -11405,12 +11407,12 @@ pub const NativeGenerationPipeline = struct {
                             continue;
                         };
                         const count = 1 + second.len / claimed.len;
-                        if (second.len % claimed.len != 0 or count < 2 or count > 4) {
+                        if (second.len % claimed.len != 0 or count < 2 or count > max_gpu_token_burst_width) {
                             work.failure = error.InvalidBatchDecodeState;
                             work.ready.store(true, .release);
                             continue;
                         }
-                        var choices: [4]u32 = undefined;
+                        var choices: [max_gpu_token_burst_width]u32 = undefined;
                         choices[0] = token;
                         for (1..count) |step| choices[step] = second[(step - 1) * claimed.len + row];
                         sequence.acceptTokens(choices[0..count], count - 1) catch |err| {
@@ -17002,7 +17004,7 @@ test "LightOnOCR3 prefill group size respects the complete packed input row budg
     }
 }
 
-test "LightOnOCR3 GPU token burst publishes widths two through four with EOS length cancellation and KV accounting" {
+test "LightOnOCR3 GPU token burst publishes widths two through eight with EOS length cancellation and KV accounting" {
     const Coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator;
     const StepItem = runtime.scheduler.native_generate.StepItem;
     const Cancel = struct {
@@ -17016,7 +17018,7 @@ test "LightOnOCR3 GPU token burst publishes widths two through four with EOS len
     };
     // First EOS, second EOS, exact length, continuing pair, cancellation before
     // either output, and cancellation between outputs all retain one borrow.
-    for (2..5) |width| {
+    for (2..NativeGenerationPipeline.max_gpu_token_burst_width + 1) |width| {
         for (0..8) |scenario| {
             var scheduler = Coordinator.init(std.testing.allocator);
             defer scheduler.deinit();
@@ -17027,7 +17029,7 @@ test "LightOnOCR3 GPU token burst publishes widths two through four with EOS len
             defer state.deinit();
             try state.notePrefill(5);
             try state.appendGeneratedToken();
-            var lease = try scheduler.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .prompt_tokens = 5, .max_tokens = 8 });
+            var lease = try scheduler.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .prompt_tokens = 5, .max_tokens = 16 });
             defer scheduler.release(lease);
             scheduler.beginDecode(&lease, 5);
             var tokens: [16]i64 = @splat(-1);
@@ -17043,7 +17045,7 @@ test "LightOnOCR3 GPU token burst publishes widths two through four with EOS len
                 .token_ids = &tokens,
                 .seq_len = &len,
                 .generated = 1,
-                .max_tokens = if (scenario == 2) 1 + width else 8,
+                .max_tokens = if (scenario == 2) 1 + width else 16,
             };
             sequence.work.sequence = &sequence;
             try scheduler.enqueueDecodeWork(lease, &sequence.work, 6, 6, 0, .{});
@@ -17054,7 +17056,8 @@ test "LightOnOCR3 GPU token burst publishes widths two through four with EOS len
             // Reserve every sampled output consumed by a subsequent GPU step.
             for (1..width) |_| try state.appendGeneratedToken();
             const first: u32 = if (scenario == 0) 99 else 11;
-            var second: [3]u32 = .{ 12, 13, 14 };
+            var second: [NativeGenerationPipeline.max_gpu_token_burst_width - 1]u32 = undefined;
+            for (&second, 0..) |*token, i| token.* = @intCast(12 + i);
             if (scenario == 1) second[width - 2] = 99;
             if (scenario == 6) second[width / 2 - 1] = 99;
             NativeGenerationPipeline.completeClaimedStepBeforePublish(&scheduler, &turn, step.items, NativeGenerationPipeline.SuccessfulStepPublisher{

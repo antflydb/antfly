@@ -211,6 +211,9 @@ def run(args, model, label, mode, concurrency, output):
         env["TERMITE_METAL_DISABLE_LIGHTONOCR3_64_ROW_TILE"] = "1"
     if args.disable_planned_mpp:
         env["TERMITE_METAL_DISABLE_LIGHTONOCR3_PLANNED_MPP"] = "1"
+    env["TERMITE_METAL_ENABLE_LIGHTONOCR3_PREFILL_FFN"] = (
+        "1" if args.prefill_fused_ffn else "0"
+    )
     if args.bf16_prefill_inputs:
         env["TERMITE_METAL_LIGHTONOCR3_BF16_PREFILL_INPUTS"] = "1"
     if args.prefill_sg_attention:
@@ -491,6 +494,7 @@ def run(args, model, label, mode, concurrency, output):
                         "wide_mpp_heads",
                         "wide_gate_up_calls",
                         "full64_gate_up_calls",
+                        "prefill_fused_ffn_calls",
                         "vision_workspace_allocations",
                         "vision_workspace_reuses",
                         "vision_workspace_bytes",
@@ -546,6 +550,24 @@ def run(args, model, label, mode, concurrency, output):
                 for key in fields:
                     if key != "concurrency":
                         result.pop(key, None)
+        if not args.policy_rounds:
+            timed_sections = re.split(r"OCR_POLICY round=\d+ name=[a-z0-9]+\n", text)[
+                1:
+            ]
+            result["prefill_fused_ffn_calls"] = sum(
+                int(value)
+                for section in timed_sections
+                for value in re.findall(
+                    r"LIGHTONOCR3 prefill_fused_ffn_calls=(\d+)", section
+                )
+            )
+        if args.require_prefill_fused_ffn:
+            timed_samples = result.get("policy_rounds", [result])
+            if not timed_samples or any(
+                sample.get("prefill_fused_ffn_calls", 0) <= 0
+                for sample in timed_samples
+            ):
+                result["status"] = "missing_timed_prefill_fused_ffn"
         cpu_samples = [
             int(value)
             for _, value in re.findall(
@@ -816,6 +838,8 @@ def main():
     )
     parser.add_argument("--prefill-sg-attention", action="store_true")
     parser.add_argument("--bf16-prefill-inputs", action="store_true")
+    parser.add_argument("--prefill-fused-ffn", action="store_true")
+    parser.add_argument("--require-prefill-fused-ffn", action="store_true")
     parser.add_argument("--prefill-direct-kv", action="store_true")
     parser.add_argument("--decode-wait-us", type=int, default=1000)
     parser.add_argument(
@@ -1034,7 +1058,7 @@ def main():
     parser.add_argument(
         "--gpu-token-burst-width",
         type=int,
-        choices=(2, 3, 4),
+        choices=tuple(range(2, 9)),
         default=2,
         help="Maximum GPU token burst width; two logits buffers are reused",
     )
@@ -1051,6 +1075,10 @@ def main():
         help="Overlap admitted single-page prefill layer groups after one complete warm prompt",
     )
     args = parser.parse_args()
+    if args.prefill_fused_ffn and not args.bf16_prefill_inputs:
+        parser.error("--prefill-fused-ffn requires --bf16-prefill-inputs")
+    if args.require_prefill_fused_ffn and not args.prefill_fused_ffn:
+        parser.error("--require-prefill-fused-ffn requires --prefill-fused-ffn")
     if args.prefill_stream_layers and (
         not args.continuous
         or not args.device_recurrent_state

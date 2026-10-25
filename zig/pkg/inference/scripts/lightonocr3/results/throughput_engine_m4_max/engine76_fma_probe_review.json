@@ -1,0 +1,409 @@
+{
+  "decision": "hold_not_promoted",
+  "reason": "Both candidates preserve all checked outputs/state exactly, but adjacent same-shape comparisons are mostly neutral at the 432/554/662-token prompt lengths used in the current throughput corpus. Longer shapes show variation and some preliminary gains; no full-model benefit is established.",
+  "methodology": "Keep heads, sequence length and initialized state separate. Report adjacent paired ratios rather than a ratio of pooled medians across initialized/uninitialized cases. Both all30 and descriptive post-two-trial statistics retained; no primary throughput claim.",
+  "primary_throughput_eligible": false,
+  "audit_sha256": "bd85bc64e4a3df85125ef4c958527285b06729e4d00544b4900ade1b8e4def24",
+  "comparisons": [
+    {
+      "candidate": 1,
+      "heads": 16,
+      "seq": 128,
+      "initialized": 0,
+      "baseline_median_us": 474.45799999999997,
+      "candidate_median_us": 471.79150000000004,
+      "median_adjacent_duration_ratio_all_trials": 0.9920131239898444,
+      "median_adjacent_duration_ratio_after_two_trials": 0.992323627644905
+    },
+    {
+      "candidate": 1,
+      "heads": 16,
+      "seq": 128,
+      "initialized": 1,
+      "baseline_median_us": 480.1865,
+      "candidate_median_us": 478.4995,
+      "median_adjacent_duration_ratio_all_trials": 0.9937705411977982,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9937705411977982
+    },
+    {
+      "candidate": 1,
+      "heads": 16,
+      "seq": 432,
+      "initialized": 0,
+      "baseline_median_us": 1386.6035000000002,
+      "candidate_median_us": 1383.8535,
+      "median_adjacent_duration_ratio_all_trials": 0.9983715659722949,
+      "median_adjacent_duration_ratio_after_two_trials": 0.999173410372696
+    },
+    {
+      "candidate": 1,
+      "heads": 16,
+      "seq": 432,
+      "initialized": 1,
+      "baseline_median_us": 1391.604,
+      "candidate_median_us": 1394.687,
+      "median_adjacent_duration_ratio_all_trials": 1.0010499011501106,
+      "median_adjacent_duration_ratio_after_two_trials": 1.0010499011501106
+    },
+    {
+      "candidate": 1,
+      "heads": 16,
+      "seq": 554,
+      "initialized": 0,
+      "baseline_median_us": 1767.0,
+      "candidate_median_us": 1759.875,
+      "median_adjacent_duration_ratio_all_trials": 0.9971403708793241,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9972713699887363
+    },
+    {
+      "candidate": 1,
+      "heads": 16,
+      "seq": 554,
+      "initialized": 1,
+      "baseline_median_us": 1768.2075,
+      "candidate_median_us": 1771.812,
+      "median_adjacent_duration_ratio_all_trials": 1.0006586105502255,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9998939131789528
+    },
+    {
+      "candidate": 1,
+      "heads": 16,
+      "seq": 662,
+      "initialized": 0,
+      "baseline_median_us": 2095.166,
+      "candidate_median_us": 2092.937,
+      "median_adjacent_duration_ratio_all_trials": 0.998834727802433,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9991348869701309
+    },
+    {
+      "candidate": 1,
+      "heads": 16,
+      "seq": 662,
+      "initialized": 1,
+      "baseline_median_us": 2094.6035,
+      "candidate_median_us": 2096.562,
+      "median_adjacent_duration_ratio_all_trials": 1.001348069307118,
+      "median_adjacent_duration_ratio_after_two_trials": 1.001348069307118
+    },
+    {
+      "candidate": 1,
+      "heads": 16,
+      "seq": 2048,
+      "initialized": 0,
+      "baseline_median_us": 3653.7285,
+      "candidate_median_us": 2950.645,
+      "median_adjacent_duration_ratio_all_trials": 0.9555872354421949,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9326601850641963
+    },
+    {
+      "candidate": 1,
+      "heads": 16,
+      "seq": 2048,
+      "initialized": 1,
+      "baseline_median_us": 4955.228999999999,
+      "candidate_median_us": 3934.062,
+      "median_adjacent_duration_ratio_all_trials": 0.9648444985490698,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9543133581881911
+    },
+    {
+      "candidate": 1,
+      "heads": 32,
+      "seq": 128,
+      "initialized": 0,
+      "baseline_median_us": 843.3534999999999,
+      "candidate_median_us": 843.062,
+      "median_adjacent_duration_ratio_all_trials": 0.9981417374123698,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9981417374123698
+    },
+    {
+      "candidate": 1,
+      "heads": 32,
+      "seq": 128,
+      "initialized": 1,
+      "baseline_median_us": 854.0415,
+      "candidate_median_us": 856.3125,
+      "median_adjacent_duration_ratio_all_trials": 1.002412140571105,
+      "median_adjacent_duration_ratio_after_two_trials": 1.0028645912813654
+    },
+    {
+      "candidate": 1,
+      "heads": 32,
+      "seq": 432,
+      "initialized": 0,
+      "baseline_median_us": 2615.895,
+      "candidate_median_us": 2456.6455,
+      "median_adjacent_duration_ratio_all_trials": 0.9952299362166372,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9952299362166372
+    },
+    {
+      "candidate": 1,
+      "heads": 32,
+      "seq": 432,
+      "initialized": 1,
+      "baseline_median_us": 2635.374,
+      "candidate_median_us": 2634.6040000000003,
+      "median_adjacent_duration_ratio_all_trials": 1.000253092418844,
+      "median_adjacent_duration_ratio_after_two_trials": 1.000253092418844
+    },
+    {
+      "candidate": 1,
+      "heads": 32,
+      "seq": 554,
+      "initialized": 0,
+      "baseline_median_us": 3320.9995,
+      "candidate_median_us": 2989.687,
+      "median_adjacent_duration_ratio_all_trials": 0.9967555615498349,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9967555615498349
+    },
+    {
+      "candidate": 1,
+      "heads": 32,
+      "seq": 554,
+      "initialized": 1,
+      "baseline_median_us": 3340.916,
+      "candidate_median_us": 3348.2705,
+      "median_adjacent_duration_ratio_all_trials": 0.9995239040621088,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9995239040621088
+    },
+    {
+      "candidate": 1,
+      "heads": 32,
+      "seq": 662,
+      "initialized": 0,
+      "baseline_median_us": 3564.2495,
+      "candidate_median_us": 3572.1245,
+      "median_adjacent_duration_ratio_all_trials": 1.0026140373043892,
+      "median_adjacent_duration_ratio_after_two_trials": 1.0048057944736082
+    },
+    {
+      "candidate": 1,
+      "heads": 32,
+      "seq": 662,
+      "initialized": 1,
+      "baseline_median_us": 3796.416,
+      "candidate_median_us": 3745.3745,
+      "median_adjacent_duration_ratio_all_trials": 0.9947590477723824,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9947590477723824
+    },
+    {
+      "candidate": 1,
+      "heads": 32,
+      "seq": 2048,
+      "initialized": 0,
+      "baseline_median_us": 4675.5615,
+      "candidate_median_us": 4381.353499999999,
+      "median_adjacent_duration_ratio_all_trials": 0.9652442187123491,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9676464851844242
+    },
+    {
+      "candidate": 1,
+      "heads": 32,
+      "seq": 2048,
+      "initialized": 1,
+      "baseline_median_us": 5260.9995,
+      "candidate_median_us": 5352.395,
+      "median_adjacent_duration_ratio_all_trials": 0.9826834716286528,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9826834716286528
+    },
+    {
+      "candidate": 2,
+      "heads": 16,
+      "seq": 128,
+      "initialized": 0,
+      "baseline_median_us": 471.3325,
+      "candidate_median_us": 472.8745,
+      "median_adjacent_duration_ratio_all_trials": 1.0030645792765895,
+      "median_adjacent_duration_ratio_after_two_trials": 1.004385034648769
+    },
+    {
+      "candidate": 2,
+      "heads": 16,
+      "seq": 128,
+      "initialized": 1,
+      "baseline_median_us": 478.3125,
+      "candidate_median_us": 475.75,
+      "median_adjacent_duration_ratio_all_trials": 0.9929152129184777,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9929152129184777
+    },
+    {
+      "candidate": 2,
+      "heads": 16,
+      "seq": 432,
+      "initialized": 0,
+      "baseline_median_us": 1386.4785000000002,
+      "candidate_median_us": 1382.9785000000002,
+      "median_adjacent_duration_ratio_all_trials": 0.9962961497621727,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9962961497621727
+    },
+    {
+      "candidate": 2,
+      "heads": 16,
+      "seq": 432,
+      "initialized": 1,
+      "baseline_median_us": 1394.312,
+      "candidate_median_us": 1392.104,
+      "median_adjacent_duration_ratio_all_trials": 0.9986850862126384,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9990010741541908
+    },
+    {
+      "candidate": 2,
+      "heads": 16,
+      "seq": 554,
+      "initialized": 0,
+      "baseline_median_us": 1758.6665,
+      "candidate_median_us": 1758.6665,
+      "median_adjacent_duration_ratio_all_trials": 0.9982564198009832,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9982564198009832
+    },
+    {
+      "candidate": 2,
+      "heads": 16,
+      "seq": 554,
+      "initialized": 1,
+      "baseline_median_us": 1774.041,
+      "candidate_median_us": 1773.479,
+      "median_adjacent_duration_ratio_all_trials": 0.9975058816868909,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9974927568174283
+    },
+    {
+      "candidate": 2,
+      "heads": 16,
+      "seq": 662,
+      "initialized": 0,
+      "baseline_median_us": 2089.416,
+      "candidate_median_us": 2092.812,
+      "median_adjacent_duration_ratio_all_trials": 1.001019234150027,
+      "median_adjacent_duration_ratio_after_two_trials": 1.001019234150027
+    },
+    {
+      "candidate": 2,
+      "heads": 16,
+      "seq": 662,
+      "initialized": 1,
+      "baseline_median_us": 2095.125,
+      "candidate_median_us": 2095.6040000000003,
+      "median_adjacent_duration_ratio_all_trials": 1.0012593600687132,
+      "median_adjacent_duration_ratio_after_two_trials": 1.0012593600687132
+    },
+    {
+      "candidate": 2,
+      "heads": 16,
+      "seq": 2048,
+      "initialized": 0,
+      "baseline_median_us": 4499.728999999999,
+      "candidate_median_us": 4156.02,
+      "median_adjacent_duration_ratio_all_trials": 0.9723850842823956,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9723850842823956
+    },
+    {
+      "candidate": 2,
+      "heads": 16,
+      "seq": 2048,
+      "initialized": 1,
+      "baseline_median_us": 3548.8325,
+      "candidate_median_us": 3490.874,
+      "median_adjacent_duration_ratio_all_trials": 0.9465588983101576,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9363179066867438
+    },
+    {
+      "candidate": 2,
+      "heads": 32,
+      "seq": 128,
+      "initialized": 0,
+      "baseline_median_us": 837.6034999999999,
+      "candidate_median_us": 840.6034999999999,
+      "median_adjacent_duration_ratio_all_trials": 1.0087625682966144,
+      "median_adjacent_duration_ratio_after_two_trials": 1.0115293422894527
+    },
+    {
+      "candidate": 2,
+      "heads": 32,
+      "seq": 128,
+      "initialized": 1,
+      "baseline_median_us": 854.3330000000001,
+      "candidate_median_us": 854.5615,
+      "median_adjacent_duration_ratio_all_trials": 1.0048667123059696,
+      "median_adjacent_duration_ratio_after_two_trials": 1.0072973817856332
+    },
+    {
+      "candidate": 2,
+      "heads": 32,
+      "seq": 432,
+      "initialized": 0,
+      "baseline_median_us": 2626.1245,
+      "candidate_median_us": 2623.8540000000003,
+      "median_adjacent_duration_ratio_all_trials": 0.9982278949422853,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9982278949422853
+    },
+    {
+      "candidate": 2,
+      "heads": 32,
+      "seq": 432,
+      "initialized": 1,
+      "baseline_median_us": 2635.1865,
+      "candidate_median_us": 2638.7075,
+      "median_adjacent_duration_ratio_all_trials": 1.0025289046359718,
+      "median_adjacent_duration_ratio_after_two_trials": 1.0025289046359718
+    },
+    {
+      "candidate": 2,
+      "heads": 32,
+      "seq": 554,
+      "initialized": 0,
+      "baseline_median_us": 3331.2705,
+      "candidate_median_us": 3322.562,
+      "median_adjacent_duration_ratio_all_trials": 0.9982306503898996,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9982306503898996
+    },
+    {
+      "candidate": 2,
+      "heads": 32,
+      "seq": 554,
+      "initialized": 1,
+      "baseline_median_us": 3338.8115,
+      "candidate_median_us": 3338.9995,
+      "median_adjacent_duration_ratio_all_trials": 0.9988220051793029,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9996328259216232
+    },
+    {
+      "candidate": 2,
+      "heads": 32,
+      "seq": 662,
+      "initialized": 0,
+      "baseline_median_us": 3947.4785,
+      "candidate_median_us": 3757.4785,
+      "median_adjacent_duration_ratio_all_trials": 0.9969946717267214,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9964727770343456
+    },
+    {
+      "candidate": 2,
+      "heads": 32,
+      "seq": 662,
+      "initialized": 1,
+      "baseline_median_us": 2218.312,
+      "candidate_median_us": 2098.4165000000003,
+      "median_adjacent_duration_ratio_all_trials": 0.9981075709482167,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9961756485022725
+    },
+    {
+      "candidate": 2,
+      "heads": 32,
+      "seq": 2048,
+      "initialized": 0,
+      "baseline_median_us": 5484.603999999999,
+      "candidate_median_us": 4806.083,
+      "median_adjacent_duration_ratio_all_trials": 0.9440761387323635,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9536934699663357
+    },
+    {
+      "candidate": 2,
+      "heads": 32,
+      "seq": 2048,
+      "initialized": 1,
+      "baseline_median_us": 5439.541499999999,
+      "candidate_median_us": 5080.645,
+      "median_adjacent_duration_ratio_all_trials": 0.9536628959631478,
+      "median_adjacent_duration_ratio_after_two_trials": 0.9600131322821741
+    }
+  ]
+}

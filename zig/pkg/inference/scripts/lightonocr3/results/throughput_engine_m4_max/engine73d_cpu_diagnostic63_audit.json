@@ -1,0 +1,31 @@
+{
+  "status": "skipped_live_memory_admission",
+  "created_at": "2026-10-25T03:42:31.986979+00:00",
+  "scope": "Separate sampled R64 CPU diagnostic only after the fresh 4B primary loses. Exact outputs and unchanged caps; no primary eligibility. Samples target only the native binary descended from this private worker.",
+  "primary_throughput_eligible": false,
+  "diagnostic_driver_sha256": "8dba6bd7401ee7113f92b7c6df566e8b9565e38a901eddc7817b16fa38a7491a",
+  "selected_profile": {
+    "settings": [
+      64,
+      1,
+      1,
+      3,
+      0,
+      0,
+      0
+    ],
+    "prefill_stream_layers": 0,
+    "pipeline_vision": false,
+    "eligible": true,
+    "pages_per_second": 0.8962,
+    "gpu_token_burst_steps": 73,
+    "process_cpu_ms": 29796,
+    "report": "engine71_4b_prefill_batch_screen58_p1_c64_vf3_r0_c64_p1_v1_vf3_r128/report.json",
+    "report_sha256": "08d7a3b6bc7dcaf88b89a923f2e6c5db228d25956549c2aba6fd2b390f10ac3d"
+  },
+  "samples": [],
+  "reason": "Existing dynamic live-memory admission refused the 4B load before timings. Required model host/backend estimate 11348275670 bytes plus original six-GiB reserve; actual available 13915694039 bytes. No forced allocation, cap relaxation, native performance sample, or speed claim.",
+  "native_report": "engine73d_4b_cpu_diagnostic63_wide_r0_c64_p1_v1_vf3_r64/report.json",
+  "native_report_sha256": "39be1a77119889c6dc16c88a8b315b6e132872ee32994134b083c4ee985b6824",
+  "failed_attempt_audit_sha256": "2774cc6a86dbb11d73c72e52e2a9407f48bb61e62e3ed8f253c265f2b3912861"
+}

@@ -1,0 +1,44 @@
+{
+  "status": "pass",
+  "created_at": "2026-10-25T03:43:24.635440+00:00",
+  "scope": "Value-major F32 persistent-state layout prototype only; no runtime interop qualification. Full logical state/output comparisons after ten continued steps and all canaries. ABBA 24-layer working sets; not primary throughput evidence and not promotable without full layout interoperability qualification.",
+  "primary_throughput_eligible": false,
+  "binary_sha256": "7ef601f6d0bab023ddec4cb15b2e1d2254d03647d882e0e83c8da28d757dd78d",
+  "checks": [
+    {
+      "pages": 0,
+      "available_bytes": 6783795200,
+      "working_plus_gold_estimate_bytes": 268435456,
+      "os_reserve_bytes": 6442450944,
+      "status": "pass",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine75-probe-pages0.txt",
+      "log_sha256": "6eadb97b3588451196099399a284882cedce1b4b7e81c5b7f3bc50a7c3e38ecf",
+      "records": []
+    },
+    {
+      "pages": 33,
+      "available_bytes": 8019345408,
+      "working_plus_gold_estimate_bytes": 4149894400,
+      "os_reserve_bytes": 6442450944,
+      "status": "skipped_before_allocation",
+      "reason": "Keep original six-GiB reserve; insufficient actual available bytes."
+    },
+    {
+      "pages": 48,
+      "available_bytes": 8016445440,
+      "working_plus_gold_estimate_bytes": 5914193920,
+      "os_reserve_bytes": 6442450944,
+      "status": "skipped_before_allocation",
+      "reason": "Keep original six-GiB reserve; insufficient actual available bytes."
+    },
+    {
+      "pages": 64,
+      "available_bytes": 8012873728,
+      "working_plus_gold_estimate_bytes": 7796113408,
+      "os_reserve_bytes": 6442450944,
+      "status": "skipped_before_allocation",
+      "reason": "Keep original six-GiB reserve; insufficient actual available bytes."
+    }
+  ]
+}

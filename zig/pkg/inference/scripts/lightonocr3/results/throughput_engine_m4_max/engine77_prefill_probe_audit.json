@@ -1,0 +1,132 @@
+{
+  "status": "failed",
+  "primary_throughput_eligible": false,
+  "created_at": "2026-10-25T04:02:20.607739+00:00",
+  "driver_sha256": "776f7efeae306cad91edad50fa9b47291544aeb182bc9a1f21d733005bd3f8a6",
+  "paused_own_child_free_waiter_pid": 84637,
+  "scope": "Stage-one isolated new prefill matrix tiles only, one weight per shape exceeding cache for larger matrices. Same BF16 GPU packing/weights/F32 accumulation/output. GPU-produced private input, full outputs and independent CPU corners, offsets/canaries, actual selection counters, ABBA two warm/eight measured per leg. Screen only; large distinct-weight confirmation and full runtime qualification/model/paired-vLLM tests required before promotion.",
+  "preparation_sha256": "63275449b4aca34b03ba90d23d2d168884f9f504130e89c96123bcfa9bf0c22f",
+  "inputs": {
+    ".venv-lighton-vllm-metal/engine77_probe_kernels.m": "2f17914da98c2317a24c0a12bb503766111a7a754c7fbab060e53c87f796daac",
+    ".venv-lighton-vllm-metal/engine77_probe_checks.m": "9fe2d29f0f2ff765713a382692c5936678d75ce6454faae9df4df5ece0aacdeb",
+    ".venv-lighton-vllm-metal/engine77_sources.inc": "52b8f3cbea09baf42d1878bc3813efbaa4ae86241641c69743ddba6dce20d59b",
+    ".venv-lighton-vllm-metal/engine77_prefill_probe.m": "763aabc52c102b0a9fcc2e1e1715cf13e37daabfe816b7eae774bbd33d8c37be",
+    ".venv-lighton-vllm-metal/engine77_prefill_1.metal": "feab425313536abbb0f5300d5864de3ac5f965fdb660389e443c39ce07fa9a36",
+    ".venv-lighton-vllm-metal/engine77_prefill_2.metal": "a12fbda17402327f8b1aaaabe479a6035f807df1ce787a234bfeee83d0fa0839",
+    ".venv-lighton-vllm-metal/engine77_prefill_3.metal": "39f9b196a2878e88978a5a26bf7b73e9394371f43391af5e85c982d4b31d1531"
+  },
+  "build_command": [
+    "clang",
+    "-O3",
+    "-fobjc-arc",
+    "-I",
+    "zig/pkg/inference/src/backends",
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine77_prefill_probe.m",
+    "-framework",
+    "Foundation",
+    "-framework",
+    "Metal",
+    "-framework",
+    "MetalPerformanceShaders",
+    "-framework",
+    "Accelerate",
+    "-o",
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine77_prefill_probe"
+  ],
+  "build_exit_code": 0,
+  "build_log_sha256": "fb71fda5a688262a4e7768596641f3327b9031842bd5290749c3e086e7993d9e",
+  "binary_sha256": "addc3dbc864ec53418c50c3da68e0df865c53d1ad67001db24e4a8c0c6cdcd40",
+  "available_bytes_before_probe": 7224967168,
+  "working_estimate_bytes": 536870912,
+  "os_reserve_bytes": 6442450944,
+  "exit_code": -6,
+  "stdout_sha256": "9866d7e1768632eb9b24c0f60b7cd96a183a81904e2a952ffbdd9dc0c51ee089",
+  "stderr_sha256": "be749f2a6a10a3ad879d1ce0f021417f89ba400c8af49916770dafe07239ee05",
+  "ready_candidates": [
+    1
+  ],
+  "records": [
+    {
+      "candidate": 1,
+      "rows": 432,
+      "in": 2560,
+      "out": 8192,
+      "mode": 0,
+      "leg": 0,
+      "max_abs": 0,
+      "cpu_error": 2.56695785e-07,
+      "gpu_us": [
+        2462.208,
+        2857.625,
+        2581.0,
+        2663.749,
+        2801.624,
+        2519.0,
+        2826.583,
+        2641.75
+      ]
+    },
+    {
+      "candidate": 1,
+      "rows": 432,
+      "in": 2560,
+      "out": 8192,
+      "mode": 1,
+      "leg": 1,
+      "max_abs": 0,
+      "cpu_error": 2.56695785e-07,
+      "gpu_us": [
+        3315.0,
+        3272.708,
+        3272.083,
+        3616.958,
+        3277.833,
+        3462.041,
+        3804.249,
+        3411.624
+      ]
+    },
+    {
+      "candidate": 1,
+      "rows": 432,
+      "in": 2560,
+      "out": 8192,
+      "mode": 1,
+      "leg": 2,
+      "max_abs": 0,
+      "cpu_error": 2.56695785e-07,
+      "gpu_us": [
+        3781.624,
+        4064.916,
+        3791.374,
+        4060.166,
+        4699.291,
+        4382.499,
+        3942.708,
+        4494.124
+      ]
+    },
+    {
+      "candidate": 1,
+      "rows": 432,
+      "in": 2560,
+      "out": 8192,
+      "mode": 0,
+      "leg": 3,
+      "max_abs": 0,
+      "cpu_error": 2.56695785e-07,
+      "gpu_us": [
+        4547.999,
+        5011.416,
+        4130.125,
+        4297.25,
+        5566.708,
+        6057.458,
+        6354.125,
+        6473.875
+      ]
+    }
+  ],
+  "error": "AssertionError()",
+  "own_waiter_resumed": true
+}
