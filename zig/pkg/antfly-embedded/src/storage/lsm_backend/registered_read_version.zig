@@ -13,20 +13,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Funded directory-only reader epochs. The immutable directory and reader
-//! header keep their actual allocator host until registered physical cleanup.
-//! Projection construction is a separate funded operation, not implied here.
+//! Funded reader epochs. Directory/header and optional projection ownership
+//! retain their actual allocator hosts through registered physical cleanup.
 const std = @import("std");
 const resources = @import("../resource_manager.zig");
 const admission = @import("../../common/read_admission.zig");
 const Directory = @import("run_directory.zig").Directory;
 const ReadVersion = @import("runtime.zig").ReadVersion;
 const Root = @import("registered_directory_root.zig").Candidate;
+const Projection = @import("registered_read_projection.zig").Owner;
 
 pub const Owner = struct {
     const State = struct {
         directory: Directory = .{},
         cleanup: ?Directory.Reclaimer = null,
+        projection: ?*Projection = null,
     };
     allocator: std.mem.Allocator,
     manager: *resources.ResourceManager,
@@ -75,6 +76,39 @@ pub const Owner = struct {
         self.taken = true;
         return &self.version;
     }
+    fn fromVersion(version: *ReadVersion) !*Owner {
+        const capability = version.owned_retirement orelse return error.ExecutionWaitUnsupported;
+        if (capability.retire != returnVersion) return error.InvalidArgument;
+        const self: *Owner = @ptrCast(@alignCast(capability.context));
+        if (&self.version != version or self.complete or self.state == null or self.returned.load(.acquire) or version.references.load(.acquire) == 0 or (!self.taken and self.closing.load(.acquire)) or self.registration.credit == null or self.registration.context != @as(*anyopaque, @ptrCast(self)) or self.registration.step == null or self.registration.step.?.advance != advance or self.registration.credit.?.manager != self.manager or version.directory != &self.state.?.directory) return error.InvalidArgument;
+        return self;
+    }
+    /// Caller owns an epoch reference and serializes preparation. All variable
+    /// work occurs off service locks; refusal keeps this same registered builder.
+    pub fn resumeProjectionForVersionWithAdmission(version: *ReadVersion, original: admission.Port) !void {
+        try original.checkpoint();
+        const self = try fromVersion(version);
+        if (version.prepared) return;
+        const s = self.state.?;
+        if (s.projection == null) s.projection = try Projection.start(self.allocator, self.manager, &s.directory, original);
+        try s.projection.?.resumeWithAdmission(original);
+    }
+    /// Fixed, serialized publication tail. Lifetime checks cannot cooperatively
+    /// park while the caller holds its Backend publication mutex.
+    pub fn publishProjectionForVersionWithAdmission(version: *ReadVersion, original: admission.Port) !bool {
+        try original.checkLifetime();
+        const self = try fromVersion(version);
+        if (version.prepared) return false;
+        const projection = self.state.?.projection orelse return error.InvalidArgument;
+        const views = try projection.takePrepared();
+        version.runs = views.runs;
+        version.l0_groups = views.groups;
+        version.levels = views.levels;
+        version.projection_bytes = views.bytes;
+        version.prepared = true;
+        return true;
+    }
+
     pub fn requestRetirement(self: *Owner) void {
         if (self.closing.swap(true, .acq_rel)) return;
         self.registration.publish();
@@ -101,10 +135,20 @@ pub const Owner = struct {
             self.creation_released = true;
         }
         std.debug.assert(self.version.references.load(.acquire) == 0);
-        // This fixed grant owns headers only. No unreserved projection can be
-        // attached through the ordinary Backend preparation path.
-        std.debug.assert(!self.version.prepared and self.version.runs.len == 0 and self.version.l0_groups.len == 0 and self.version.levels.len == 0 and self.version.projection_bytes == 0);
         if (self.state) |s| {
+            if (s.projection) |projection| {
+                s.projection = null;
+                self.version.runs = &.{};
+                self.version.l0_groups = &.{};
+                self.version.levels = &.{};
+                self.version.projection_bytes = 0;
+                self.version.prepared = false;
+                // The child owns its complete buffers and a separate directory
+                // snapshot/host. No epoch or Backend pointer survives this drop.
+                projection.requestRetirement();
+                return false;
+            }
+            std.debug.assert(!self.version.prepared and self.version.runs.len == 0 and self.version.l0_groups.len == 0 and self.version.levels.len == 0 and self.version.projection_bytes == 0);
             if (!self.state_retiring) {
                 if (s.cleanup == null) s.cleanup = .init(&s.directory);
                 var steps: usize = 1;

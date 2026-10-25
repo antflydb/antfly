@@ -28385,3 +28385,57 @@ its retained/partial ownership, normal Backend generation capture/rebase and
 batch installation, default flush/compaction adoption, durable completion and
 remaining whole-design requirements are still open. Full GNU qualification
 remains waived; this is not a claim of complete default or whole-path delivery.
+
+
+## Registered reader projection construction (2026-10-25)
+
+Registered reader epochs now have an independently registered projection owner.
+It reserves a conservative bound before any array allocation, acquires the actual
+allocator host and captures its own immutable directory snapshot. Partial run,
+group, level, member-index and scratch buffers remain reachable after every
+refusal. Cleanup poisons at most 16 KiB per buffer step, frees each complete
+allocation once, then reclaims source guards and its construction cursor. Group
+member views alias disjoint spans of a single owned indices allocation; no legacy
+group destructor owns those spans. Full capacity and unused planning headroom
+remain reserved through final physical retirement.
+
+Projection follows the canonical directory read order. Lower-bound index traversal
+forms L0 overlap components, bounded comparison cursors preserve partial long-key
+work, and retained read-order searches map each component member back to its run
+rank. A numeric pass fills each group's members in ascending read order. Lower
+level spans are built alongside the run descriptors. No variable string sort or
+borrowed Backend receiver is stored in the builder.
+
+The ordinary admitted Backend preparation entry claims one epoch producer, drops
+the mutex, resumes the registered builder, performs mandatory reentry and checks
+original lifetime before publishing completed views in a fixed tail. Peers may
+coalesce only when they can lend execution; unscoped construction is refused.
+An already prepared owned epoch needs no new construction. Original refusals keep
+the same partial builder for a fresh admitted attempt. Epoch retirement transfers
+projection cleanup to its independent owner before releasing the header's own
+snapshot/host. Native ABI 133 and kernel-owner ABI 193 fence the private changes.
+
+Debug and ReleaseFast qualification passed on identical immutable inputs.
+Extended ownership fixtures cover populated and
+empty projections, metadata equivalence against legacy grouping/level builders,
+transitive/disjoint L0 ranges, null/empty namespaces, mixed lower levels, original
+refusals, retry of the same partial builder and allocation exhaustion. Oracle
+allocations run outside measured failure/allocator sweeps. A fixture loop-name
+compile correction and its exact failed source receipt are preserved. These are
+projection metadata and lifetime checks, not full query/engine qualification.
+Normal Backend generation capture/rebase and multi-edit installation, default
+flush/compaction adoption, durable completion/deletion, relief and the broader
+original default requirements remain open. Full GNU qualification remains waived;
+the complete goal remains active.
+
+Final projection receipts: `registered-reader-projection-v5-debug` and
+`registered-reader-projection-v5-fast`; all five commands in each exited zero
+and both input maps remained unchanged. Debug completed 72/72 build steps and
+65/65 tests (49 ownership and 16 ABI), plus six legacy read metadata tests and
+the Bloom/error-identity companions. ReleaseFast completed 80/80 steps and
+49/49 ownership tests plus its ABI, local metadata and companion checks.
+The fixture now attributes the live Backend metadata charge before closing it;
+coalescing exercises explicit execution lending. The physical metadata compiler
+reservation is 3 GiB after observing a 2.21 GiB compile. Formatting, license and
+whitespace checks passed. Latest `origin/main` was fetched again and was already
+included at `27011cf1c3`; no merge commit was necessary.

@@ -3594,6 +3594,34 @@ pub const ReadVersion = struct {
         allocator.destroy(self);
     }
 
+    /// Compare registered projection semantics against the existing builders.
+    /// This allocator is diagnostic-only and outside measured fault/OOM sweeps.
+    pub fn qualifyProjectionForTest(self: *const ReadVersion, allocator: Allocator) !void {
+        if (!@import("builtin").is_test) @compileError("projection oracle is test-only");
+        const expected_runs = try self.directory.?.projectWithAdmission(allocator, null);
+        defer allocator.free(expected_runs);
+        try std.testing.expectEqual(expected_runs.len, self.runs.len);
+        for (expected_runs, self.runs) |expected, actual| try std.testing.expect(std.meta.eql(expected, actual));
+        const expected_groups = try buildL0RunGroupsControlled(allocator, expected_runs, null);
+        defer deinitRunGroups(allocator, expected_groups);
+        try std.testing.expectEqual(expected_groups.len, self.l0_groups.len);
+        for (expected_groups, self.l0_groups) |expected, actual| {
+            inline for (.{ "smallest_namespace_name", "largest_namespace_name" }) |field| {
+                const e = @field(expected, field);
+                const a = @field(actual, field);
+                try std.testing.expectEqual(e == null, a == null);
+                if (e) |bytes| try std.testing.expectEqualStrings(bytes, a.?);
+            }
+            try std.testing.expectEqualStrings(expected.smallest_key, actual.smallest_key);
+            try std.testing.expectEqualStrings(expected.largest_key, actual.largest_key);
+            try std.testing.expectEqualSlices(usize, expected.run_indices, actual.run_indices);
+        }
+        const expected_levels = try buildLowerLevelsControlled(allocator, expected_runs, null);
+        defer allocator.free(expected_levels);
+        try std.testing.expectEqual(expected_levels.len, self.levels.len);
+        for (expected_levels, self.levels) |expected, actual| try std.testing.expectEqualDeep(expected, actual);
+    }
+
     pub fn buildMemoryBound(run_count: usize) u64 {
         // Flat descriptors, sort scratch, per-component groups/indices and
         // geometric ArrayList slack. All temporary metadata is admitted before

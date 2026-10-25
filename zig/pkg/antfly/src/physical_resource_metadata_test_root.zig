@@ -1068,6 +1068,69 @@ const RegisteredSourceFixture = struct {
             @panic("returned reader header did not physically retire");
         }
     };
+    const ProjectionCoalescingProbe = struct {
+        backend: *lsm.Backend,
+        version: *@FieldType(Scope.RegisteredReadVersion, "version"),
+        reject_after_progress: bool,
+        waits: usize = 0,
+        lent: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject_after_progress and self.waits != 0) return error.DeadlineExceeded;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.lent) return error.TestUnexpectedLending;
+            self.lent = true;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.lent) return error.TestUnexpectedLending;
+            self.lent = false;
+        }
+        fn wait(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // The progress provider owns execution lending; Port.waitForProgress
+            // only brackets this callback with original admission checks.
+            try begin(raw);
+            defer end(raw) catch unreachable;
+            if (!self.backend.mu.tryLock()) return error.TestProducerBlockedByWaiter;
+            // Deterministically hand the producer claim to an independently
+            // admitted preparation while the coalescing peer is suspended.
+            self.version.preparing = false;
+            const prepared = self.backend.prepareReadVersionWithAdmission(self.version, quotaControl());
+            self.backend.mu.unlock();
+            try prepared;
+            self.waits += 1;
+        }
+    };
+    fn qualifyProjectionCoalescing(a: std.mem.Allocator, manager: *ResourceManager, directory: *const Directory) !void {
+        for ([_]bool{ false, true }) |reject_after_progress| {
+            var observer = lsm.Backend.init(a, .{ .resource_manager = manager, .wal_enabled = false });
+            defer observer.close();
+            var creator: ?*Scope.RegisteredReadVersion = try Scope.RegisteredReadVersion.start(a, manager, directory, quotaControl());
+            defer if (creator) |owner| owner.requestRetirement();
+            const epoch = try creator.?.takeWithAdmission(quotaControl());
+            creator = null;
+            defer epoch.releaseOwned();
+            epoch.preparing = true;
+            try std.testing.expect(observer.mu.tryLock());
+            const refused = observer.prepareReadVersionWithAdmission(epoch, quotaControl());
+            observer.mu.unlock();
+            try std.testing.expectError(error.ExecutionWaitUnsupported, refused);
+            try std.testing.expect(epoch.preparing and !epoch.prepared);
+            var probe: ProjectionCoalescingProbe = .{ .backend = &observer, .version = epoch, .reject_after_progress = reject_after_progress };
+            const payload: read_admission.Payload = .{ .ptr = &probe, .vtable = &.{ .checkpoint = ProjectionCoalescingProbe.check, .check_lifetime = ProjectionCoalescingProbe.check, .wait_for_progress = ProjectionCoalescingProbe.wait }, .execution_wait = .{ .ptr = &probe, .begin = ProjectionCoalescingProbe.begin, .end = ProjectionCoalescingProbe.end } };
+            try std.testing.expect(observer.mu.tryLock());
+            const coalesced = observer.prepareReadVersionWithAdmission(epoch, read_admission.Port.init(&payload));
+            observer.mu.unlock();
+            if (reject_after_progress) try std.testing.expectError(error.DeadlineExceeded, coalesced) else try coalesced;
+            try std.testing.expect(epoch.prepared and !epoch.preparing and !probe.lent);
+            try std.testing.expectEqual(@as(usize, 1), probe.waits);
+            try std.testing.expectEqual(@as(u64, 1), observer.read_version_builds);
+            try epoch.qualifyProjectionForTest(a);
+        }
+    }
     const Store = Scope.WriterStore;
     fn finishRoot(root: *?*Store, cursor: *?Store.Reclaimer, a: std.mem.Allocator) void {
         if (root.*) |store| {
@@ -1124,6 +1187,9 @@ const RegisteredSourceFixture = struct {
         return runAll(shared, phase, target, oom, writer_count, exercise_obsolete, exercise_directory, exercise_remove, retry_edit, false);
     }
     fn runAll(shared: bool, phase: Phase, target: ?usize, oom: bool, writer_count: usize, exercise_obsolete: bool, exercise_directory: bool, exercise_remove: bool, retry_edit: bool, publication: bool) !Stats {
+        return runProjectionScenario(shared, phase, target, oom, writer_count, exercise_obsolete, exercise_directory, exercise_remove, retry_edit, publication, false);
+    }
+    fn runProjectionScenario(shared: bool, phase: Phase, target: ?usize, oom: bool, writer_count: usize, exercise_obsolete: bool, exercise_directory: bool, exercise_remove: bool, retry_edit: bool, publication: bool, projection_shape: bool) !Stats {
         // Exhaustive replay keeps all allocator safety and leak checks. Trace
         // collection adds no coverage and dominates Debug allocation replay.
         var checked = std.heap.SafeAllocator.init(std.heap.page_allocator, .{ .stack_trace_frames = 0, .check_write_after_free = true });
@@ -1276,6 +1342,25 @@ const RegisteredSourceFixture = struct {
             for (1..route_count) |ordinal| {
                 var seed = source.run;
                 seed.id += ordinal;
+                // Metadata oracle shapes: transitive and disjoint L0 ranges,
+                // distinct null/empty namespaces, and two lower levels.
+                const shape_small = if (projection_shape) try a1.dupe(u8, ([_][]const u8{ "k", "a", "b", "f", "a", "a", "a", "d" })[ordinal % 8]) else null;
+                defer if (shape_small) |bytes| a1.free(bytes);
+                const shape_large = if (projection_shape) try a1.dupe(u8, ([_][]const u8{ "z", "c", "e", "g", "c", "b", "e", "f" })[ordinal % 8]) else null;
+                defer if (shape_large) |bytes| a1.free(bytes);
+                const shape_namespace = if (projection_shape and ordinal % 8 == 4) try a1.dupe(u8, "") else if (projection_shape and ordinal % 8 == 6) try a1.dupe(u8, "docs") else null;
+                defer if (shape_namespace) |bytes| a1.free(bytes);
+                if (projection_shape) {
+                    seed.smallest_key = shape_small.?;
+                    seed.largest_key = shape_large.?;
+                    seed.smallest_namespace_name = shape_namespace;
+                    seed.largest_namespace_name = shape_namespace;
+                    seed.level = switch (ordinal % 8) {
+                        5 => 1,
+                        6 => 2,
+                        else => 0,
+                    };
+                }
                 const seed_path = if (exercise_obsolete) try a1.dupe(u8, source.run.path.?) else null;
                 defer if (seed_path) |path| a1.free(path);
                 if (seed_path) |path| {
@@ -1362,9 +1447,25 @@ const RegisteredSourceFixture = struct {
                     try std.testing.expectEqual(ordinal + 1, epoch.directory.?.count());
                     try std.testing.expectEqual(@as(u64, 0), epoch.accountedMemoryBytes(230));
                     try std.testing.expect(backend2.mu.tryLock());
-                    const refused_projection = backend2.prepareReadVersionWithAdmission(epoch, quotaControl());
+                    const refused_projection = backend2.prepareReadVersion(epoch);
                     backend2.mu.unlock();
                     try std.testing.expectError(error.ExecutionWaitUnsupported, refused_projection);
+                    try std.testing.expect(backend2.mu.tryLock());
+                    const prepared_projection = backend2.prepareReadVersionWithAdmission(epoch, original);
+                    backend2.mu.unlock();
+                    prepared_projection catch |cause| {
+                        if (!retry_edit or cause != fault.failure) break :blk cause;
+                        recovered_edit = true;
+                        fault.live = false;
+                        try std.testing.expect(backend2.mu.tryLock());
+                        const retried_projection = backend2.prepareReadVersionWithAdmission(epoch, quotaControl());
+                        backend2.mu.unlock();
+                        retried_projection catch |retry_cause| break :blk retry_cause;
+                    };
+                    try std.testing.expect(epoch.prepared);
+                    try std.testing.expectEqual(ordinal + 1, epoch.runs.len);
+                    try std.testing.expectEqual(@as(u64, 0), epoch.accountedMemoryBytes(231));
+                    for (epoch.runs, 0..) |projected_run, rank| try std.testing.expectEqual(epoch.directory.?.at(rank).run.id, projected_run.id);
                     if (ordinal == 0) {
                         // Ordinary Backend release unlinks its epoch before
                         // the registered receipt can authorize cleanup.
@@ -1425,6 +1526,16 @@ const RegisteredSourceFixture = struct {
                     writer_view.?.deinit(a2);
                     writer_view = null;
                 }
+                reader_owner = scope2.?.beginReadVersionWithAdmission(working.directory.?, original) catch |cause| break :blk cause;
+                backend_reader = reader_owner.?.takeWithAdmission(original) catch |cause| break :blk cause;
+                reader_owner = null;
+                try std.testing.expect(backend2.mu.tryLock());
+                const empty_projection = backend2.prepareReadVersionWithAdmission(backend_reader.?, original);
+                backend2.mu.unlock();
+                empty_projection catch |cause| break :blk cause;
+                try std.testing.expect(backend_reader.?.prepared and backend_reader.?.runs.len == 0 and backend_reader.?.l0_groups.len == 0 and backend_reader.?.levels.len == 0);
+                backend_reader.?.releaseOwned();
+                backend_reader = null;
                 lease2.?.deinit(a2);
                 lease2 = null;
                 for (&extra_sources) |*slot| if (slot.*) |lease| {
@@ -1779,6 +1890,14 @@ const RegisteredSourceFixture = struct {
             try std.testing.expect(allocator2.has_induced_failure);
             try std.testing.expectError(error.OutOfMemory, result);
         } else if (target != null and !recovered_edit) try std.testing.expectError(fault.failure, result) else try result;
+        if (publication and phase == .construct and (target == null or recovered_edit) and !oom) {
+            for (readers[0..writer_count]) |slot| try slot.?.qualifyProjectionForTest(a2);
+            try qualifyProjectionCoalescing(a2, &second.resource_manager, readers[0].?.directory.?);
+            if (projection_shape and writer_count == 8) {
+                try std.testing.expectEqual(@as(usize, 3), readers[7].?.l0_groups.len);
+                try std.testing.expectEqual(@as(usize, 2), readers[7].?.levels.len);
+            }
+        }
         if (writer_count != 0 and !publication and phase == .construct and target == null and !oom) {
             // These diagnostic roots are outside the measured constructor and
             // retain their own prepaid header through the observer's close.
@@ -1854,6 +1973,14 @@ const RegisteredSourceFixture = struct {
         if (scope2) |owner| owner.requestRetirement();
         scope2 = null;
         drainPair(&first.resource_manager, &second.resource_manager);
+        if (backend2_live) {
+            // Off-lock preparation initializes the live Backend's observer.
+            // After external owners retire, only that tracked charge may remain.
+            try std.testing.expectEqual(backend2.tracked_in_memory_state_bytes, second.resource_manager.sliceStats(.lsm_in_memory_state).used_bytes);
+            backend2.close();
+            backend2_live = false;
+            drainPair(&first.resource_manager, &second.resource_manager);
+        }
         try std.testing.expect(source.released);
         try std.testing.expectEqual(@as(u64, 0), first.quota_lifetimes.load(.acquire));
         try std.testing.expectEqual(@as(u64, 0), second.quota_lifetimes.load(.acquire));
@@ -2314,5 +2441,24 @@ test "physical cache metadata sealed publication and reader epochs retire partia
     for ([_]bool{ false, true }) |shared| {
         const count = (try RegisteredSourceFixture.runAll(shared, .construct, null, false, 3, false, false, false, false, true)).allocations;
         for (0..count) |at| _ = try RegisteredSourceFixture.runAll(shared, .construct, at, true, 3, false, false, false, false, true);
+    }
+}
+
+test "physical cache metadata funded reader projections match legacy mixed range namespace and level semantics" {
+    for ([_]bool{ false, true }) |shared| for ([_]usize{ 1, 3, 8 }) |count| {
+        _ = try RegisteredSourceFixture.runProjectionScenario(shared, .construct, null, false, count, false, false, false, false, true, true);
+        _ = try RegisteredSourceFixture.runProjectionScenario(shared, .retire, null, false, count, false, false, false, false, true, true);
+    };
+}
+
+test "physical cache metadata funded reader projection resumes the same partial builder after original refusal" {
+    for ([_]bool{ false, true }) |shared| {
+        const count = (try RegisteredSourceFixture.runAll(shared, .construct, null, false, 3, false, false, false, true, true)).checks;
+        var resumed: usize = 0;
+        for (0..count) |at| {
+            const result = try RegisteredSourceFixture.runAll(shared, .construct, at, false, 3, false, false, false, true, true);
+            resumed += @intFromBool(result.recovered);
+        }
+        try std.testing.expect(resumed != 0);
     }
 }

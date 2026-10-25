@@ -1585,6 +1585,23 @@ pub const Directory = struct {
         }
     };
 
+    /// Allocation-free lower-bound order over this pinned immutable root.
+    pub const BoundsCursor = struct {
+        directory: *const Directory,
+        rank: usize = 0,
+        path: BoundsTree.Cursor = .{},
+        pub fn nextWithAdmission(self: *@This(), original: @import("../../common/read_admission.zig").Port) !?Handle {
+            try original.checkpoint();
+            if (self.rank == self.directory.count()) return null;
+            const entry = self.path.at(self.directory.bounds.root.?, self.rank);
+            self.rank += 1;
+            return .{ .run = entry.run, .revision = entry.payload.? };
+        }
+    };
+    pub fn boundsCursor(self: *const Directory) BoundsCursor {
+        return .{ .directory = self };
+    }
+
     pub fn readCursor(self: *const Directory) Cursor {
         return .{ .directory = self };
     }

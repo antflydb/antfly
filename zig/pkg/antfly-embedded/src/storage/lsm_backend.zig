@@ -7213,11 +7213,42 @@ pub const Backend = struct {
         } else _ = runtime_mod.lockBackend(Backend, self);
     }
 
+    fn prepareOwnedReadVersionControlled(self: *Backend, version: *runtime_mod.ReadVersion, control: ?read_admission.Port) !void {
+        if (control) |original| try original.checkLifetime();
+        if (version.prepared) return;
+        var trace: read_admission.RejectionTrace = .{};
+        const original = trace.bind(control orelse return error.ExecutionWaitUnsupported).?;
+        self.retainReaderKind(.other);
+        defer self.releaseReaderKind(.other);
+        while (version.preparing) {
+            if (!try original.hasExecutionWait()) return error.ExecutionWaitUnsupported;
+            runtime_mod.unlockBackend(Backend, self, true);
+            const waited = original.waitForProgress();
+            const reentry = self.reacquireReadPreparationBackend(original);
+            if (trace.failure) |first| return first;
+            try reentry;
+            try waited;
+            if (version.prepared) return;
+        }
+        version.preparing = true;
+        defer version.preparing = false;
+        const started = self.readStatsNowNs();
+        runtime_mod.unlockBackend(Backend, self, true);
+        const Reader = @import("lsm_backend/registered_read_version.zig").Owner;
+        const prepared = Reader.resumeProjectionForVersionWithAdmission(version, original);
+        const reentry = self.reacquireReadPreparationBackend(original);
+        if (trace.failure) |first| return first;
+        try reentry;
+        try prepared;
+        if (try Reader.publishProjectionForVersionWithAdmission(version, original)) {
+            self.read_version_builds +|= 1;
+            self.recordRunGroupBuild(version.runs.len, if (version.levels.len != 0) version.levels[0].start_index else version.runs.len, self.readStatsElapsedNs(started));
+        }
+    }
+
     fn prepareReadVersionControlled(self: *Backend, version: *runtime_mod.ReadVersion, control: ?read_admission.Port) !void {
         if (control) |owner| try owner.checkLifetime();
-        // A registered reader's fixed grant owns its epoch/directory headers.
-        // Projection arrays require a separate retained construction grant.
-        if (version.owned_retirement != null) return error.ExecutionWaitUnsupported;
+        if (version.owned_retirement != null) return self.prepareOwnedReadVersionControlled(version, control);
         if (version.prepared) return;
         self.retainReaderKind(.other);
         defer self.releaseReaderKind(.other);

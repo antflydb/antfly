@@ -165,7 +165,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "physical-resource-metadata-tests",
         .root_module = physical_metadata_root,
         .filters = &.{"physical cache metadata"},
-        .max_rss = 2 * 1024 * 1024 * 1024,
+        .max_rss = 3 * 1024 * 1024 * 1024,
     });
     b.step("antfly-physical-resource-metadata-test", "Verify fixed cache metadata admission and movable teardown ownership")
         .dependOn(&b.addRunArtifact(physical_metadata_tests).step);
