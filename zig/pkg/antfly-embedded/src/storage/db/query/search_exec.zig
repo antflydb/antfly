@@ -4813,6 +4813,31 @@ test "distributed merge cursor-only request uses implicit id order" {
     try std.testing.expectEqual(@as(u64, 0), profile.cursor_rejected_count);
 }
 
+test "native sort nullable distributed tuples preserve scalar domains and cursors" {
+    const a = std.testing.allocator;
+    var schema = testNumericRankRuntimeSchema();
+    var templates = [_]runtime_schema_mod.DynamicTemplate{schema.dynamic_templates[0]};
+    templates[0].mapping.missing_null_policy = .nulls_ordered;
+    schema.dynamic_templates = &templates;
+    var left = [_]types.SearchHit{ try testSortedHitAlloc(a, "doc:a", 0), try testSortedHitAlloc(a, "doc:c", 3) };
+    defer testDeinitFixedHits(a, &left);
+    left[0].sort_values[0] = .null;
+    var right = [_]types.SearchHit{ try testSortedHitAlloc(a, "doc:b", 0), try testSortedHitAlloc(a, "doc:d", 4) };
+    defer testDeinitFixedHits(a, &right);
+    right[0].sort_values[0] = .null;
+    const shards = [_]DistributedSortedShard{ .{ .hits = &left, .total_hits = left.len }, .{ .hits = &right, .total_hits = right.len } };
+    const req: types.SearchRequest = .{ .order_by = &.{.{ .field = "rank" }}, .limit = 4 };
+    const plan: SortExecutionPlan = .{ .kind = .distributed_k_way_merge, .runtime_schema = schema };
+    const hits = try mergeDistributedSortedHitsAlloc(a, req, plan, &shards);
+    defer testFreeOwnedHits(a, hits);
+    for (hits, [_][]const u8{ "doc:a", "doc:b", "doc:c", "doc:d" }) |hit, expected| try std.testing.expectEqualStrings(expected, hit.id);
+    var order = try SearchHitOrder.init(a, req, schema);
+    defer order.deinit(a);
+    try std.testing.expectEqual(std.math.Order.lt, order.compare(hits[0], hits[1]));
+    try std.testing.expectEqual(std.math.Order.lt, order.compare(hits[1], hits[2]));
+    try std.testing.expectError(error.InvalidQueryRequest, validateDistributedSortedShards(a, req, .{ .kind = .distributed_k_way_merge, .runtime_schema = testNumericRankRuntimeSchema() }, &shards));
+}
+
 test "distributed shard validation rejects mixed scalar sort domains" {
     const alloc = std.testing.allocator;
     const order_by = [_]types.SortField{.{ .field = "opaque_rank" }};
@@ -5957,6 +5982,13 @@ fn validateDistributedSortedHitTuple(
                 return error.InvalidQueryRequest;
             }
         }
+        // NULL does not establish or conflict with the non-null scalar
+        // domain. Admission still requires the mapped opt-in policy above.
+        if (sort_value == .null_value and sortFieldNeedsNativeValue(field)) {
+            const schema = plan.runtime_schema orelse return error.InvalidQueryRequest;
+            const mapping = sortFieldMapping(schema, field.field) orelse return error.InvalidQueryRequest;
+            if (mapping.missing_null_policy == .nulls_ordered) continue;
+        }
         const value_class = distributedSortTupleScalarClass(sort_value) orelse {
             recordDistributedSortTupleRejection(field.field, "invalid_doc_value_type");
             return error.InvalidQueryRequest;
@@ -6631,7 +6663,7 @@ fn sortCursorValueIsReplayable(value: std.json.Value) bool {
         .float => |v| std.math.isFinite(v),
         .number_string => |v| jsonNumberStringIsNumeric(v),
         .bool, .integer, .string => true,
-        .null => false,
+        .null => true,
         .array, .object => false,
     };
 }

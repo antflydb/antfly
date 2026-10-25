@@ -417,6 +417,49 @@ def test_nullable_native_ordering_and_compound_membership(tmp_path, kind):
                     },
                 }
             )
+    # Fixed NULL boundaries verify both public cursor gates and native replay.
+    # The empty ID is below every public ID at the unique hn_id boundary.
+    for descending in [False, True]:
+        ordered = sorted(
+            range(count),
+            key=lambda i: (
+                (ranks[i] is None, -ranks[i] if ranks[i] is not None else 0, -i)
+                if descending
+                else (ranks[i] is not None, ranks[i] if ranks[i] is not None else 0, i)
+            ),
+        )
+        null_ids = [i for i in ordered if ranks[i] is None]
+        boundary = null_ids[len(null_ids) // 2]
+        position = ordered.index(boundary)
+        for before in [False, True]:
+            expected = (
+                ordered[max(0, position - 20) : position]
+                if before
+                else ordered[position : position + 20]
+            )
+            plan["cases"].append(
+                {
+                    "name": f"null_cursor_{descending}_{before}",
+                    "identity_field": "hn_id",
+                    "expected_ids": expected,
+                    "request": {
+                        "full_text_search": {"disjuncts": terms},
+                        "full_text_index": "text",
+                        "fields": ["hn_id", "rank"],
+                        "profile": True,
+                        "limit": 20,
+                        "order_by": [
+                            {"field": "rank", "desc": descending},
+                            {"field": "hn_id", "desc": descending},
+                        ],
+                        "search_before" if before else "search_after": [
+                            None,
+                            boundary,
+                            "",
+                        ],
+                    },
+                }
+            )
     plan["cases"].append(
         {
             "name": "exact_count",
@@ -468,7 +511,7 @@ def test_nullable_native_ordering_and_compound_membership(tmp_path, kind):
         )
     assert result.returncode == 0, log.read_text()
     report = json.loads((output / "report.json").read_text())
-    assert report["complete"] and len(report["samples"]) == 10
+    assert report["complete"] and len(report["samples"]) == 18
     for sample in report["samples"]:
         if sample["case"] == "exact_count":
             continue
@@ -476,4 +519,4 @@ def test_nullable_native_ordering_and_compound_membership(tmp_path, kind):
         assert profile["index_sort_coverage"] == "covered_with_bounds", profile
         assert profile["candidate_count"] < 128, profile
     answer = json.loads((output / "exact_count-answer.json").read_text())
-    assert answer["hits"]["total"] == {"value": count, "relation": "eq"}, answer
+    assert answer["hits"]["total"] == {"value": count, "relation": "exact"}, answer
