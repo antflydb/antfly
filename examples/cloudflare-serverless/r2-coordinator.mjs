@@ -178,7 +178,13 @@ export class R2CommitCoordinator extends DurableObject {
     const keys=await publicationKeys(this.env.ANTFLY_INCARNATION);
     return this.transaction(tx=>publicationCall(tx,keys,(...args)=>this.objectCallInTransaction(...args),request,body,expected),{priority:"maintenance"});
   }
-  objectCallInTransaction(tx,request,body){return metadataObjectCall(tx,request,body,(tx,collection)=>this.journal.valid(tx,collection));}
+  async objectCallInTransaction(tx,request,body){
+    const result=await metadataObjectCall(tx,request,body,(tx,collection)=>this.journal.valid(tx,collection));
+    // Compaction, reindex and legacy publication use individual HEAD CAS calls.
+    // Give them the same atomic read protection as prepared publication.
+    if(result.status===0&&request.op==="put"&&request.key===`antfly/progress/${this.env.ANTFLY_INCARNATION}/HEAD`)await captureReadView(tx,await metadataKeys(this.env.ANTFLY_INCARNATION));
+    return result;
+  }
   mutateBatch(input) {
     this.mutationGroups??=new MutationGroups((inputs,deadline)=>this.commitMutations(inputs,deadline));
     return this.mutationGroups.submit(input);

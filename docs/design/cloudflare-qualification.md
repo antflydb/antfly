@@ -859,7 +859,7 @@ This clears the local ANN condition; it does not establish the live latency,
 queue stability or recovery conditions.
 
 Verification passed 550 native serverless tests and 61 supporting tests (six
-skipped, no failures or leaks), 148 Node tests and five persisted Worker tests.
+skipped, no failures or leaks), 148 Node tests and six persisted Worker tests.
 Regressions cover exact source-bit reconstruction and conservative bounds for all
 three metrics, multiple projections, continuation eviction, source-revision
 mismatch, namespace isolation, allocation failures, malformed dictionary pages,
@@ -914,7 +914,10 @@ maintenance. This uses the existing native metadata store and does not cache a
 mutable frontier or weaken fencing. The regression verifies that the first
 read-only view performs no metadata writes. Snapshot pools also use the injected
 clock consistently, which makes this test exercise the intended admission path.
-The updated 148-test Node suite and five persisted Worker checks passed.
+The same protection applies to individual HEAD CAS calls used by compaction,
+reindex and legacy publication. The persisted fixture runs both prepared and
+legacy publication and rejects any successful HEAD update lacking read
+protection. The updated 148-test Node suite and six persisted Worker checks passed.
 
 An interrupted setup can explicitly replay its acknowledged seed operation IDs.
 Resume validation requires all 32 seed acknowledgements across four tenants on
