@@ -334,3 +334,13 @@ zero error logs or leaks, including all six checked allocation campaigns. The
 protocol-measured sum is 233.9 seconds. A coordinator campaign also passes with
 `ANTFLY_TEST_ALLOCATOR_TRACES=1`; these comparisons exclude compilation and
 include concurrent local workloads.
+
+### Expired graph rows and exact cursor work
+
+The public borrowed-wire cursor regression retains 8,200 expired rows followed
+by one live row, an initial scan allowance of 8,199, and the exact total of
+8,201 rows without replay. Its native Debug execution measured 126.6 seconds;
+97% of sampled setup stacks were SafeAllocator trace capture during graph batch
+construction. A local checked allocator with opt-in traces reduced it to
+1.39 seconds with the same dataset, cursor boundaries, output, and memory
+checks. No production graph scan limit or scheduler policy changed.
