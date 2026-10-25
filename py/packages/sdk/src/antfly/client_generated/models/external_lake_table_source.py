@@ -15,6 +15,7 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.external_lake_credential_ref import ExternalLakeCredentialRef
     from ..models.external_lake_snapshot_selector import ExternalLakeSnapshotSelector
+    from ..models.external_lake_table_source_row_identity import ExternalLakeTableSourceRowIdentity
     from ..models.lake_catalog_config import LakeCatalogConfig
 
 
@@ -36,6 +37,9 @@ class ExternalLakeTableSource:
                 data prefix.
             row_identity_version (ExternalLakeTableSourceRowIdentityVersion | Unset): Server-assigned public row identity
                 version, fixed when the source is attached and preserved across index creation and schema updates.
+            row_identity (ExternalLakeTableSourceRowIdentity | Unset): Optional verified stable identity for external
+                rewrites. Keys must be non-null and unique in each published snapshot. Uses native typed equality; an unchanged
+                key alone never authorizes index reuse.
             schema_fingerprint (str | Unset):  Default: 'auto'.
             write_policy (ExternalLakeTableSourceWritePolicy | Unset): iceberg_writer authorizes explicit Iceberg catalog
                 commits and requires catalog plus a current snapshot selector. It does not enable ordinary row batch writes.
@@ -56,6 +60,7 @@ class ExternalLakeTableSource:
     format_: ExternalLakeTableSourceFormat
     uri: str
     row_identity_version: ExternalLakeTableSourceRowIdentityVersion | Unset = UNSET
+    row_identity: ExternalLakeTableSourceRowIdentity | Unset = UNSET
     schema_fingerprint: str | Unset = "auto"
     write_policy: ExternalLakeTableSourceWritePolicy | Unset = ExternalLakeTableSourceWritePolicy.READ_ONLY
     object_mutability: ExternalLakeTableSourceObjectMutability | Unset = ExternalLakeTableSourceObjectMutability.MUTABLE
@@ -75,6 +80,10 @@ class ExternalLakeTableSource:
         row_identity_version: int | Unset = UNSET
         if not isinstance(self.row_identity_version, Unset):
             row_identity_version = self.row_identity_version.value
+
+        row_identity: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.row_identity, Unset):
+            row_identity = self.row_identity.to_dict()
 
         schema_fingerprint = self.schema_fingerprint
 
@@ -110,6 +119,8 @@ class ExternalLakeTableSource:
         )
         if row_identity_version is not UNSET:
             field_dict["row_identity_version"] = row_identity_version
+        if row_identity is not UNSET:
+            field_dict["row_identity"] = row_identity
         if schema_fingerprint is not UNSET:
             field_dict["schema_fingerprint"] = schema_fingerprint
         if write_policy is not UNSET:
@@ -129,6 +140,7 @@ class ExternalLakeTableSource:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.external_lake_credential_ref import ExternalLakeCredentialRef
         from ..models.external_lake_snapshot_selector import ExternalLakeSnapshotSelector
+        from ..models.external_lake_table_source_row_identity import ExternalLakeTableSourceRowIdentity
         from ..models.lake_catalog_config import LakeCatalogConfig
 
         d = dict(src_dict)
@@ -146,6 +158,13 @@ class ExternalLakeTableSource:
             row_identity_version = UNSET
         else:
             row_identity_version = ExternalLakeTableSourceRowIdentityVersion(_row_identity_version)
+
+        _row_identity = d.pop("row_identity", UNSET)
+        row_identity: ExternalLakeTableSourceRowIdentity | Unset
+        if isinstance(_row_identity, Unset):
+            row_identity = UNSET
+        else:
+            row_identity = ExternalLakeTableSourceRowIdentity.from_dict(_row_identity)
 
         schema_fingerprint = d.pop("schema_fingerprint", UNSET)
 
@@ -190,6 +209,7 @@ class ExternalLakeTableSource:
             format_=format_,
             uri=uri,
             row_identity_version=row_identity_version,
+            row_identity=row_identity,
             schema_fingerprint=schema_fingerprint,
             write_policy=write_policy,
             object_mutability=object_mutability,

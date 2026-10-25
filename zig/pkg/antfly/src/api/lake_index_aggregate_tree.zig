@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Exact normalized-key indexes over immutable aggregate blocks. Hash/radix
 //! reduction ownership remains independent of the ordered serving forest.
@@ -165,7 +165,7 @@ fn differencesRange(a: A, backing: tree.Store, left: ?tree.Ref, right: ?tree.Ref
                 const fence = page.entries[ri + 1].key;
                 if (end == null or std.mem.order(u8, fence, end.?) == .lt) end = fence;
             };
-            try differencesRange(a, backing, if (lp) |page| page.entries[li].child else left, if (rp) |page| page.entries[ri].child else right, begin, end, visitor);
+            try differencesRange(a, backing, if (lp) |page| page.entries[li].valueEntry().child else left, if (rp) |page| page.entries[ri].valueEntry().child else right, begin, end, visitor);
             if (end == null or (upper != null and std.mem.eql(u8, end.?, upper.?))) break;
             begin = end.?;
         }
@@ -202,7 +202,7 @@ pub fn merge(a: A, store: *stores.ArtifactStore, recipe: Recipe, left: Index, ri
     if (left.page == null) return right;
     if (right.page == null) return left;
     var access: directory.Access = undefined;
-    access.init(store.*, scope.domain, token, null);
+    access.initPublication(store.*, scope.domain, token);
     var cache: tree.Cache = .{ .alloc = a, .underlying = access.backing() };
     defer cache.deinit();
     const backing = cache.store();
@@ -356,7 +356,7 @@ test "external lake aggregate interval differences skip retained pages across fe
     // The same retained leaf can acquire a taller root after a boundary split.
     var root_page = try tree.readPage(a, backing, root);
     defer root_page.deinit(a);
-    const first_leaf = root_page.entries[0].child.?;
+    const first_leaf = root_page.entries[0].child.?.*;
     var visitor: Visitor = .{ .expected = 0 };
     var cache: tree.Cache = .{ .alloc = a, .underlying = backing };
     defer cache.deinit();

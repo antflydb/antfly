@@ -287,7 +287,7 @@ nvcc -fatbin \
   src/ops/cuda/generated/quant_kernel_q4_k_small_batch_bias_gelu.cu \
   -o /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin
 
-zig-out/bin/antfly-inference bench-cuda \
+zig-out/bin/antfly-inference-dev bench-cuda \
   --warmup-iters 5 \
   --measure-iters 50 \
   --quant-compiler-lazy-target \
@@ -295,7 +295,7 @@ zig-out/bin/antfly-inference bench-cuda \
   --quant-compiler-repeat-runs 3 \
   --quant-compiler-evidence-out src/ops/cuda/generated/evidence/q4_k_small_batch_bias_gelu_benchmark.json
 
-zig-out/bin/antfly-inference bench-cuda \
+zig-out/bin/antfly-inference-dev bench-cuda \
   --quant-compiler-check-evidence src/ops/cuda/generated/evidence/q4_k_small_batch_bias_gelu_benchmark.json \
   --quant-compiler-require-promotion-ready
 ```
@@ -629,7 +629,7 @@ behavior rather than on raw tok/s.
 User-facing E2B CUDA smoke from the repository root:
 
 ```sh
-zig/pkg/inference/zig-out/bin/antfly-inference generate \
+zig/pkg/inference/zig-out/bin/antfly-inference-dev generate \
   .models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf \
   "Give a one sentence summary of Korean history." \
   --backend cuda \
@@ -640,11 +640,11 @@ zig/pkg/inference/zig-out/bin/antfly-inference generate \
 
 If running from `zig/pkg/inference/zig-out/bin`, pass an absolute model path.
 The model loader treats the first argument as a model path relative to the
-current working directory, so `./antfly-inference generate .models/...` from the
+current working directory, so `./antfly-inference-dev generate .models/...` from the
 binary directory will fail with `NoTokenizerFound`.
 
 ```sh
-./antfly-inference generate \
+./antfly-inference-dev generate \
   /abs/path/to/antfly/.models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf \
   "Give a one sentence summary of Korean history." \
   --backend cuda \
@@ -656,7 +656,7 @@ binary directory will fail with `NoTokenizerFound`.
 Optional `polar4` E2B smoke:
 
 ```sh
-zig/pkg/inference/zig-out/bin/antfly-inference generate \
+zig/pkg/inference/zig-out/bin/antfly-inference-dev generate \
   .models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf \
   "Give a one sentence summary of Korean history." \
   --backend cuda \
@@ -673,11 +673,11 @@ zig build -Dcuda=true
 
 zig/pkg/inference/scripts/regen-cuda-artifacts.sh --check --all
 
-zig/pkg/inference/zig-out/bin/antfly-inference cuda-info --smoke
+zig/pkg/inference/zig-out/bin/antfly-inference-dev cuda-info --smoke
 
 zig/pkg/inference/scripts/gemma4/validate_cuda_turboquant_gemma4.sh --quick
 
-zig/pkg/inference/zig-out/bin/antfly-inference generate \
+zig/pkg/inference/zig-out/bin/antfly-inference-dev generate \
   /path/to/gemma4-12b-target \
   "Write one sentence about ants." \
   --backend cuda \
@@ -687,7 +687,7 @@ zig/pkg/inference/zig-out/bin/antfly-inference generate \
   --print-token-ids \
   --print-timing
 
-zig/pkg/inference/zig-out/bin/antfly-inference generate \
+zig/pkg/inference/zig-out/bin/antfly-inference-dev generate \
   /path/to/gemma4-12b-target \
   "Write one sentence about ants." \
   --backend cuda \
@@ -715,7 +715,7 @@ prior loader. `pipeline` fails closed on pinned-staging/worker/host-allocation
 problems, while `auto` falls back to `legacy` only in those same cases.
 
 `--a4b-prepared-pack` controls whether an offline-built balanced expert pack
-(`antfly-inference a4b-pack`) is used instead of the canonical GGUF. The
+(`antfly-inference-dev a4b-pack`) is used instead of the canonical GGUF. The
 default `auto` policy uses `$MODEL/a4b-cuda-pack-v2` when present; an absent
 pack uses the canonical GGUF normally, and a stale, malformed, or
 geometry-mismatched optional pack emits a warning before falling back to the
@@ -914,7 +914,7 @@ order does not include CUDA.
 ### Capability probe
 
 `CudaDriver` is a dynamic loader (`dlopen("libcuda.so.1")`, driver-API symbol
-resolution). `antfly-inference cuda-info --smoke` reports driver version,
+resolution). `antfly-inference-dev cuda-info --smoke` reports driver version,
 selected device, compute capability, memory, and artifact mode. On machines
 without CUDA the probe reports unavailable without crashing; on CUDA machines
 it succeeds without a CUDA toolkit in the container.
@@ -1089,7 +1089,7 @@ Fallback defaults are intentionally strict:
 
 CUDA meets its minimal-usefulness bar:
 
-- `antfly-inference` starts on machines without CUDA and behaves as before.
+- `antfly-inference-dev` starts on machines without CUDA and behaves as before.
 - The same binary starts on a GKE L4 node and reports CUDA availability when
   requested.
 - The container image contains no CUDA runtime, cuBLAS, cuDNN, TensorRT, ONNX

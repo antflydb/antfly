@@ -30,6 +30,22 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ReleaseLicenseTests(unittest.TestCase):
+    def test_removed_cli_products_are_rejected_before_building(self):
+        for product in ("lite", "inference"):
+            with self.subTest(product=product):
+                result = subprocess.run(
+                    [
+                        "bash",
+                        str(ROOT / "scripts/packaging/build_zig_release_archive.sh"),
+                        "--product",
+                        product,
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("invalid --product", result.stderr)
+
     def test_missing_macho_linker_fails_before_compilation(self):
         with tempfile.TemporaryDirectory() as directory:
             tools = Path(directory)
@@ -70,9 +86,7 @@ class ReleaseLicenseTests(unittest.TestCase):
                 "scripts/packaging/render_libantfly_pkgconfig.py",
                 "scripts/packaging/package_grep_release.py",
                 "zig/pkg/antfly-embedded/libantfly.pc.in",
-                "scripts/packaging/lite-release-README.md",
                 "scripts/packaging/embedded-release-README.md",
-                "scripts/packaging/inference-release-README.md",
                 "scripts/apache_engine_files.txt",
                 "scripts/source_license_roots.json",
                 "scripts/embedded_asset_licenses.json",
@@ -102,14 +116,14 @@ class ReleaseLicenseTests(unittest.TestCase):
                 "prefix = Path(args[args.index('--prefix') + 1])\n"
                 "if os.environ.get('RELEASE_CACHE_PROBE_ZIG'):\n"
                 "    root = Path(__file__).resolve().parents[1]\n"
-                "    entry = 'cache-embedded.build.zig' if 'lite' in args else 'cache-server.build.zig'\n"
+                "    entry = 'cache-embedded.build.zig' if '--build-file' in args else 'cache-server.build.zig'\n"
                 "    options = [arg for arg in args if arg.startswith(('-Dtarget=', '-Doptimize='))]\n"
-                "    built = run_fixture([os.environ['RELEASE_CACHE_PROBE_ZIG'], 'build', '--build-file', entry, '--summary', 'all', '--cache-dir', args[args.index('--cache-dir') + 1], *options], cwd=root, timeout=180)\n"
+                "    built = run_fixture([os.environ['RELEASE_CACHE_PROBE_ZIG'], 'build', '--build-file', entry, '--summary', 'all', '--cache-dir', args[args.index('--cache-dir') + 1], *options], cwd=root, timeout=600)\n"
                 "    Path('cache-summary.txt').write_text(built.stdout + built.stderr)\n"
                 "    if built.returncode: raise RuntimeError(built.stdout + built.stderr)\n"
                 "inference = Path.cwd().name == 'inference'\n"
                 "library = 'lib/libantfly.dylib' if any(arg.startswith('-Dtarget=aarch64-macos') for arg in args) else 'lib/libantfly.so'\n"
-                "names = ('bin/antfly-inference',) if inference else (('bin/antfly-lite',) if 'lite' in args else ('bin/antfly',)) + (library, 'include/antfly.h')\n"
+                "names = (() if '--build-file' in args else ('bin/antfly',)) + (library, 'include/antfly.h')\n"
                 "if 'grep' in args: names += ('bin/antfly-grep',)\n"
                 "for name in names:\n"
                 "    path = prefix / name\n"
@@ -121,6 +135,8 @@ class ReleaseLicenseTests(unittest.TestCase):
             if probe_zig:
                 # Both product entrypoints compile the same provider, as in
                 # the real graph. Give it a real compiler/cache, not a marker.
+                # The first cold Zig build also compiles its build runner; give
+                # that tool bootstrap a bounded ten minutes on shared CI CPUs.
                 for entry in ("cache-server.build.zig", "cache-embedded.build.zig"):
                     (root / "zig" / entry).write_text(
                         'pub const build = @import("cache-support.zig").build;\n'
@@ -169,12 +185,15 @@ pub fn build(b: *std.Build) void {
             )
             compile_failed = False
             for product, target, steps, license_name in (
-                ("embedded", darwin_target, ["lite"], "LICENSES/Apache-2.0.txt"),
-                ("lite", darwin_target, ["lite"], "LICENSES/Apache-2.0.txt"),
-                ("inference", darwin_target, [], "LICENSES/Apache-2.0.txt"),
-                ("server", darwin_target, ["antfly", "capi", "grep"], "LICENSE"),
-                ("server", darwin_target, ["antfly", "capi", "grep"], "LICENSE"),
-                ("server", "aarch64-linux-musl", ["antfly", "capi", "grep"], "LICENSE"),
+                ("embedded", darwin_target, ["libantfly"], "LICENSES/Apache-2.0.txt"),
+                ("server", darwin_target, ["antfly", "libantfly", "grep"], "LICENSE"),
+                ("server", darwin_target, ["antfly", "libantfly", "grep"], "LICENSE"),
+                (
+                    "server",
+                    "aarch64-linux-musl",
+                    ["antfly", "libantfly", "grep"],
+                    "LICENSE",
+                ),
             ):
                 if compile_failed:
                     break  # Later cases require this first provider/cache to exist.
@@ -215,11 +234,7 @@ pub fn build(b: *std.Build) void {
                     args = json.loads((build_dir / "build-args.json").read_text())
                     self.assertEqual(
                         steps,
-                        [
-                            arg
-                            for arg in args
-                            if arg in ("lite", "antfly", "capi", "grep")
-                        ],
+                        [arg for arg in args if arg in ("libantfly", "antfly", "grep")],
                     )
                     self.assertEqual(
                         product == "server", "-Dapple-providers=false" in args
@@ -255,36 +270,6 @@ pub fn build(b: *std.Build) void {
                             summary,
                             rf"compile lib release-cache-probe fast \S+ {expected}",
                         )
-                        if product == "embedded":
-                            inference_summary = (
-                                root / "zig/pkg/inference/cache-summary.txt"
-                            ).read_text()
-                            self.assertRegex(
-                                inference_summary,
-                                r"compile lib release-cache-probe fast \S+ cached",
-                            )
-                    if product == "embedded":
-                        inference_args = json.loads(
-                            (root / "zig/pkg/inference/build-args.json").read_text()
-                        )
-                        self.assertNotIn("--max-rss-cap", inference_args)
-                        self.assertEqual(
-                            args[args.index("--cache-dir") + 1],
-                            inference_args[inference_args.index("--cache-dir") + 1],
-                        )
-                        self.assertNotIn("--build-file", inference_args)
-                        self.assertNotIn("-Dapple-providers=false", inference_args)
-                        for option in (
-                            f"-Dtarget={darwin_target}",
-                            "-Dantfly-version=test",
-                            "-Doptimize=fast",
-                        ):
-                            self.assertIn(option, args)
-                            self.assertIn(option, inference_args)
-                        self.assertEqual(
-                            args[args.index("--prefix") + 1],
-                            inference_args[inference_args.index("--prefix") + 1],
-                        )
                     with tarfile.open(root / "out" / (product + ".tar.gz")) as archive:
                         self.assertFalse(
                             any("stale-product" in name for name in archive.getnames())
@@ -319,11 +304,11 @@ pub fn build(b: *std.Build) void {
                             self.assertIn("Version: test", pc)
                             self.assertIn("prefix=${pcfiledir}/../..", pc)
                         self.assertEqual(
-                            product == "server",
+                            False,
                             "./LICENSES/Elastic-2.0.txt" in archive.getnames(),
                         )
                         self.assertEqual(
-                            product == "server",
+                            True,
                             "./LICENSING.md" in archive.getnames(),
                         )
                         bundled_notices = (
@@ -340,26 +325,11 @@ pub fn build(b: *std.Build) void {
                                 " ".join(notice.read_text().split()),
                                 " ".join(bundled_notices.split()),
                             )
-                        if product == "server":
-                            license_map = (
-                                archive.extractfile("./LICENSING.md").read().decode()
-                            )
-                            for linked_file in re.findall(
-                                r"\]\(([^)]+)\)", license_map
-                            ):
-                                self.assertIn("./" + linked_file, archive.getnames())
                         if product != "inference":
                             self.assertEqual(
                                 (ROOT / "scripts/apache_engine_files.txt").read_bytes(),
                                 archive.extractfile(
                                     "./scripts/apache_engine_files.txt"
-                                ).read(),
-                            )
-                        if product == "server":
-                            self.assertEqual(
-                                (ROOT / "LICENSE").read_bytes(),
-                                archive.extractfile(
-                                    "./LICENSES/Elastic-2.0.txt"
                                 ).read(),
                             )
                         self.assertEqual(
@@ -382,21 +352,7 @@ pub fn build(b: *std.Build) void {
                             "./completions/antfly.bash" in archive.getnames(),
                         )
                         expected_binaries = (
-                            {"./antfly"}
-                            if product == "server"
-                            else (
-                                {"./antfly-inference"}
-                                if product == "inference"
-                                else (
-                                    {
-                                        "./antfly-lite",
-                                        "./antfly-inference-worker",
-                                        "./antfly-inference",
-                                    }
-                                    if product == "embedded"
-                                    else {"./antfly-lite", "./antfly-inference-worker"}
-                                )
-                            )
+                            {"./antfly"} if product == "server" else set()
                         )
                         self.assertEqual(
                             expected_binaries,

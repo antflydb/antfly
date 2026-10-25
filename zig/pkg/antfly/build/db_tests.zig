@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const addRuntimeTestFilters = @import("../../../build_support/antfly/test_support.zig").addRuntimeTestFilters;
@@ -171,6 +171,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db public extraction budget rejection publishes a failure manifest",
         "db document extraction manifest inspection and reprocess API",
         "db generic artifact repair queue",
+        "db successful asset publication clears terminal debt",
+        "db artifact repair kind",
+        "source vector sealed backup",
         "db shared repair completion",
         "db repair completion cannot clear debt behind terminal coverage",
         "db resolver workers recover pending journal targets after reopen without new writes",
@@ -241,6 +244,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "PDF window output allocator enforces one ceiling across concurrent workers",
         "PDF image embedding has a media-sized batch byte default",
         "PDF composite lease releases admission between invocation windows",
+        "PDF composite admission retries contention",
+        "PDF prefetch admission falls back",
+        "PDF scratch growth distinguishes",
+        "PDF partial scratch grants yield contention",
         "PDF composite lease admits two future overlap windows atomically",
         "prepared document source cache isolates credentials and reuses bytes",
         "prepared document cache single-flights concurrent PDF variants and drains leases",
@@ -739,6 +746,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{
             "text late visibility",
             "text query drops hits",
+            "text live visibility",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),

@@ -503,7 +503,7 @@ class HarnessTests(unittest.TestCase):
         self.tmp = Path(self.tempdir.name)
         self.model = self.tmp / "model.gguf"
         self.model.write_bytes(b"fake gguf")
-        self.binary = self.tmp / "antfly-inference"
+        self.binary = self.tmp / "antfly-inference-dev"
         executable(self.binary, FAKE_ANTFLY)
         self.order_log = self.tmp / "order.log"
 

@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const antfly_client = @import("antfly-client");
@@ -32,7 +32,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     if (std.mem.eql(u8, subcommand, "subjects")) return subjects(allocator, io, client, args);
     if (std.mem.eql(u8, subcommand, "api-keys")) return apiKeys(allocator, io, client, args);
 
-    cli.fatal("unknown auth subcommand: {s}", .{subcommand});
+    cli.argumentError("unknown auth subcommand: {s}", .{subcommand});
 }
 
 fn me(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient) !void {
@@ -48,7 +48,7 @@ fn users(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antfly
         return listUsers(allocator, io, client);
     }
     if (std.mem.eql(u8, sub, "get")) {
-        const username = args.next() orelse cli.fatal("username is required", .{});
+        const username = args.next() orelse cli.argumentError("username is required", .{});
         cli.rejectRemainingArgs(args, "auth users get");
         var resp = try client.inner.getUserByName(username);
         defer resp.deinit();
@@ -56,28 +56,28 @@ fn users(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antfly
     }
     if (std.mem.eql(u8, sub, "create")) return createUser(allocator, io, client, args);
     if (std.mem.eql(u8, sub, "delete")) {
-        const username = args.next() orelse cli.fatal("username is required", .{});
+        const username = args.next() orelse cli.argumentError("username is required", .{});
         cli.rejectRemainingArgs(args, "auth users delete");
         var resp = try client.inner.deleteUser(username);
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
     }
     if (std.mem.eql(u8, sub, "password")) {
-        const username = args.next() orelse cli.fatal("username is required", .{});
+        const username = args.next() orelse cli.argumentError("username is required", .{});
         var password_value: ?[]const u8 = null;
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "--password")) {
                 cli.takeUniqueValue(args, &password_value, arg);
             } else {
-                cli.fatal("unknown auth users password option: {s}", .{arg});
+                cli.argumentError("unknown auth users password option: {s}", .{arg});
             }
         }
-        const password = password_value orelse cli.fatal("--password is required", .{});
+        const password = password_value orelse cli.argumentError("--password is required", .{});
         var resp = try client.inner.updateUserPassword(username, .{ .new_password = password });
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
     }
-    cli.fatal("unknown auth users subcommand: {s}", .{sub});
+    cli.argumentError("unknown auth users subcommand: {s}", .{sub});
 }
 
 pub fn listUsers(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient) !void {
@@ -87,7 +87,7 @@ pub fn listUsers(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
 }
 
 pub fn createUser(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
-    const username = args.next() orelse cli.fatal("username is required", .{});
+    const username = args.next() orelse cli.argumentError("username is required", .{});
     var password: ?[]const u8 = null;
     var file: ?[]const u8 = null;
     while (args.next()) |arg| {
@@ -96,26 +96,26 @@ pub fn createUser(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
         } else if (std.mem.eql(u8, arg, "--file")) {
             cli.takeUniqueValue(args, &file, arg);
         } else {
-            cli.fatal("unknown auth users create option: {s}", .{arg});
+            cli.argumentError("unknown auth users create option: {s}", .{arg});
         }
     }
     if (file) |path| {
-        if (password != null) cli.fatal("use only one of --password or --file", .{});
+        if (password != null) cli.argumentError("use only one of --password or --file", .{});
         var parsed = try parseFile(antfly_client.types.CreateUserRequest, allocator, io, path);
         defer parsed.deinit();
         var resp = try client.inner.createUser(username, parsed.value);
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
     }
-    const pass = password orelse cli.fatal("--password is required unless --file is provided", .{});
+    const pass = password orelse cli.argumentError("--password is required unless --file is provided", .{});
     var resp = try client.inner.createUser(username, .{ .username = username, .password = pass });
     defer resp.deinit();
     try printResponse(allocator, io, &resp);
 }
 
 fn permissions(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
-    const sub = args.next() orelse cli.fatal("permissions subcommand is required", .{});
-    const username = args.next() orelse cli.fatal("username is required", .{});
+    const sub = args.next() orelse cli.argumentError("permissions subcommand is required", .{});
+    const username = args.next() orelse cli.argumentError("username is required", .{});
     if (std.mem.eql(u8, sub, "list")) {
         cli.rejectRemainingArgs(args, "auth permissions list");
         var resp = try client.inner.getUserPermissions(username);
@@ -137,29 +137,29 @@ fn permissions(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.
             } else if (std.mem.eql(u8, arg, "--resource-type")) {
                 cli.takeUniqueValue(args, &resource_type, arg);
             } else {
-                cli.fatal("unknown auth permissions remove option: {s}", .{arg});
+                cli.argumentError("unknown auth permissions remove option: {s}", .{arg});
             }
         }
         var resp = try client.inner.removePermissionFromUser(username, .{
-            .resource = resource orelse cli.fatal("--resource is required", .{}),
-            .resource_type = resource_type orelse cli.fatal("--resource-type is required", .{}),
+            .resource = resource orelse cli.argumentError("--resource is required", .{}),
+            .resource_type = resource_type orelse cli.argumentError("--resource-type is required", .{}),
         });
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
     }
-    cli.fatal("unknown auth permissions subcommand: {s}", .{sub});
+    cli.argumentError("unknown auth permissions subcommand: {s}", .{sub});
 }
 
 fn roles(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
-    const sub = args.next() orelse cli.fatal("roles subcommand is required", .{});
-    const username = args.next() orelse cli.fatal("username is required", .{});
+    const sub = args.next() orelse cli.argumentError("roles subcommand is required", .{});
+    const username = args.next() orelse cli.argumentError("username is required", .{});
     if (std.mem.eql(u8, sub, "list")) {
         cli.rejectRemainingArgs(args, "auth roles list");
         var resp = try client.inner.listUserRoles(username);
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
     }
-    const role = args.next() orelse cli.fatal("role is required", .{});
+    const role = args.next() orelse cli.argumentError("role is required", .{});
     if (std.mem.eql(u8, sub, "add")) {
         cli.rejectRemainingArgs(args, "auth roles add");
         var resp = try client.inner.addRoleToUser(username, .{ .role = role });
@@ -172,19 +172,19 @@ fn roles(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antfly
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
     }
-    cli.fatal("unknown auth roles subcommand: {s}", .{sub});
+    cli.argumentError("unknown auth roles subcommand: {s}", .{sub});
 }
 
 fn rowFilters(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
-    const sub = args.next() orelse cli.fatal("row-filters subcommand is required", .{});
-    const username = args.next() orelse cli.fatal("username is required", .{});
+    const sub = args.next() orelse cli.argumentError("row-filters subcommand is required", .{});
+    const username = args.next() orelse cli.argumentError("username is required", .{});
     if (std.mem.eql(u8, sub, "list")) {
         cli.rejectRemainingArgs(args, "auth row-filters list");
         var resp = try client.inner.listRowFilters(username);
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
     }
-    const table = args.next() orelse cli.fatal("table is required", .{});
+    const table = args.next() orelse cli.argumentError("table is required", .{});
     if (std.mem.eql(u8, sub, "get")) {
         cli.rejectRemainingArgs(args, "auth row-filters get");
         var resp = try client.inner.getRowFilter(username, table, .{});
@@ -197,10 +197,10 @@ fn rowFilters(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.A
             if (std.mem.eql(u8, arg, "--file")) {
                 cli.takeUniqueValue(args, &file_value, arg);
             } else {
-                cli.fatal("unknown auth row-filters set option: {s}", .{arg});
+                cli.argumentError("unknown auth row-filters set option: {s}", .{arg});
             }
         }
-        const file = file_value orelse cli.fatal("--file is required", .{});
+        const file = file_value orelse cli.argumentError("--file is required", .{});
         var parsed = try parseFile(std.json.ArrayHashMap(std.json.Value), allocator, io, file);
         defer parsed.deinit();
         var resp = try client.inner.setRowFilter(username, table, parsed.value, .{});
@@ -213,7 +213,7 @@ fn rowFilters(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.A
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
     }
-    cli.fatal("unknown auth row-filters subcommand: {s}", .{sub});
+    cli.argumentError("unknown auth row-filters subcommand: {s}", .{sub});
 }
 
 fn subjects(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
@@ -223,7 +223,7 @@ fn subjects(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
         return listSubjects(allocator, io, client);
     }
     if (std.mem.eql(u8, sub, "row-filters")) {
-        const subject = args.next() orelse cli.fatal("subject is required", .{});
+        const subject = args.next() orelse cli.argumentError("subject is required", .{});
         const action = args.next() orelse "list";
         if (std.mem.eql(u8, action, "list")) {
             cli.rejectRemainingArgs(args, "auth subjects row-filters list");
@@ -231,7 +231,7 @@ fn subjects(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
             defer resp.deinit();
             return printResponse(allocator, io, &resp);
         }
-        const table = args.next() orelse cli.fatal("table is required", .{});
+        const table = args.next() orelse cli.argumentError("table is required", .{});
         if (std.mem.eql(u8, action, "get")) {
             cli.rejectRemainingArgs(args, "auth subjects row-filters get");
             var resp = try client.inner.getSubjectRowFilter(subject, table, .{});
@@ -244,10 +244,10 @@ fn subjects(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
                 if (std.mem.eql(u8, arg, "--file")) {
                     cli.takeUniqueValue(args, &file_value, arg);
                 } else {
-                    cli.fatal("unknown auth subjects row-filters set option: {s}", .{arg});
+                    cli.argumentError("unknown auth subjects row-filters set option: {s}", .{arg});
                 }
             }
-            const file = file_value orelse cli.fatal("--file is required", .{});
+            const file = file_value orelse cli.argumentError("--file is required", .{});
             var parsed = try parseFile(std.json.ArrayHashMap(std.json.Value), allocator, io, file);
             defer parsed.deinit();
             var resp = try client.inner.setSubjectRowFilter(subject, table, parsed.value, .{});
@@ -260,9 +260,9 @@ fn subjects(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
             defer resp.deinit();
             return printResponse(allocator, io, &resp);
         }
-        cli.fatal("unknown subject row-filters action: {s}", .{action});
+        cli.argumentError("unknown subject row-filters action: {s}", .{action});
     }
-    cli.fatal("unknown auth subjects subcommand: {s}", .{sub});
+    cli.argumentError("unknown auth subjects subcommand: {s}", .{sub});
 }
 
 fn listSubjects(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient) !void {
@@ -272,8 +272,8 @@ fn listSubjects(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client
 }
 
 fn apiKeys(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
-    const sub = args.next() orelse cli.fatal("api-keys subcommand is required", .{});
-    const username = args.next() orelse cli.fatal("username is required", .{});
+    const sub = args.next() orelse cli.argumentError("api-keys subcommand is required", .{});
+    const username = args.next() orelse cli.argumentError("username is required", .{});
     if (std.mem.eql(u8, sub, "list")) {
         cli.rejectRemainingArgs(args, "auth api-keys list");
         var resp = try client.inner.listApiKeys(username);
@@ -292,29 +292,29 @@ fn apiKeys(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
             } else if (std.mem.eql(u8, arg, "--file")) {
                 cli.takeUniqueValue(args, &file, arg);
             } else {
-                cli.fatal("unknown auth api-keys create option: {s}", .{arg});
+                cli.argumentError("unknown auth api-keys create option: {s}", .{arg});
             }
         }
         if (file) |path| {
-            if (name != null or expires_in != null) cli.fatal("--file cannot be combined with --name or --expires-in", .{});
+            if (name != null or expires_in != null) cli.argumentError("--file cannot be combined with --name or --expires-in", .{});
             var parsed = try parseFile(antfly_client.types.CreateApiKeyRequest, allocator, io, path);
             defer parsed.deinit();
             var resp = try client.inner.createApiKey(username, parsed.value);
             defer resp.deinit();
             return printResponse(allocator, io, &resp);
         }
-        var resp = try client.inner.createApiKey(username, .{ .name = name orelse cli.fatal("--name is required unless --file is provided", .{}), .expires_in = expires_in });
+        var resp = try client.inner.createApiKey(username, .{ .name = name orelse cli.argumentError("--name is required unless --file is provided", .{}), .expires_in = expires_in });
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
     }
     if (std.mem.eql(u8, sub, "delete")) {
-        const key_id = args.next() orelse cli.fatal("key id is required", .{});
+        const key_id = args.next() orelse cli.argumentError("key id is required", .{});
         cli.rejectRemainingArgs(args, "auth api-keys delete");
         var resp = try client.inner.deleteApiKey(username, key_id);
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
     }
-    cli.fatal("unknown auth api-keys subcommand: {s}", .{sub});
+    cli.argumentError("unknown auth api-keys subcommand: {s}", .{sub});
 }
 
 fn parsePermission(args: *std.process.Args.Iterator) antfly_client.types.Permission {
@@ -329,13 +329,13 @@ fn parsePermission(args: *std.process.Args.Iterator) antfly_client.types.Permiss
         } else if (std.mem.eql(u8, arg, "--type")) {
             cli.takeUniqueValue(args, &permission_type, arg);
         } else {
-            cli.fatal("unknown auth permission option: {s}", .{arg});
+            cli.argumentError("unknown auth permission option: {s}", .{arg});
         }
     }
     return .{
-        .resource = resource orelse cli.fatal("--resource is required", .{}),
-        .resource_type = parseResourceType(resource_type orelse cli.fatal("--resource-type is required", .{})),
-        .type = parsePermissionType(permission_type orelse cli.fatal("--type is required", .{})),
+        .resource = resource orelse cli.argumentError("--resource is required", .{}),
+        .resource_type = parseResourceType(resource_type orelse cli.argumentError("--resource-type is required", .{})),
+        .type = parsePermissionType(permission_type orelse cli.argumentError("--type is required", .{})),
     };
 }
 
@@ -347,14 +347,14 @@ fn parseResourceType(raw: []const u8) antfly_client.types.ResourceType {
     if (std.mem.eql(u8, raw, "user")) return .user;
     if (std.mem.eql(u8, raw, "inference")) return .inference;
     if (std.mem.eql(u8, raw, "*")) return .@"*";
-    cli.fatal("invalid resource type: {s}", .{raw});
+    cli.argumentError("invalid resource type: {s}", .{raw});
 }
 
 fn parsePermissionType(raw: []const u8) antfly_client.types.PermissionType {
     if (std.mem.eql(u8, raw, "read")) return .read;
     if (std.mem.eql(u8, raw, "write")) return .write;
     if (std.mem.eql(u8, raw, "admin")) return .admin;
-    cli.fatal("invalid permission type: {s}", .{raw});
+    cli.argumentError("invalid permission type: {s}", .{raw});
 }
 
 fn parseFile(comptime T: type, allocator: std.mem.Allocator, io: std.Io, path: []const u8) !std.json.Parsed(T) {

@@ -8,7 +8,6 @@ on:
       - 'CHANGELOG.md'
       - 'examples/**'
       - 'docs/**'
-      - 'go/pkg/operator/docs/**'
       - 'specs/openapi/**'
   release:
     types: [published]

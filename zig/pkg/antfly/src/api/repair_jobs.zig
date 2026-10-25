@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -465,8 +465,15 @@ pub const Store = struct {
         total.missing_source_docs +|= pass.missing_source_docs;
         total.failed +|= pass.failed;
         total.unsupported +|= pass.unsupported;
-        total.unresolved +|= pass.unresolved;
-        total.in_progress +|= pass.in_progress;
+        if (std.mem.eql(u8, previous.target, "index") and previous.index != null) {
+            // Polling one rebuild observes the same debt until publication.
+            // These are current-state gauges, not repeated units of work.
+            total.unresolved = pass.unresolved;
+            total.in_progress = pass.in_progress;
+        } else {
+            total.unresolved +|= pass.unresolved;
+            total.in_progress +|= pass.in_progress;
+        }
         total.indexes_rebuilt +|= pass.indexes_rebuilt;
         // These are job-level state gauges for the one named index, not work
         // counters. A bounded retry may observe the same index repeatedly;
@@ -1447,6 +1454,8 @@ test "index repair job keeps degradation gauges as snapshots across retries" {
     try std.testing.expectEqualStrings("succeeded", terminal.value.phase);
     try std.testing.expectEqual(@as(u64, 1), terminal.value.result.indexes_degraded_before);
     try std.testing.expectEqual(@as(u64, 0), terminal.value.result.indexes_degraded_after);
+    try std.testing.expectEqual(@as(u64, 0), terminal.value.result.in_progress);
+    try std.testing.expectEqual(@as(u64, 0), terminal.value.result.unresolved);
 }
 
 test "durable cancellation retries transient failures with backoff" {

@@ -749,6 +749,22 @@ def test_query_decoder_enforces_observable_path_and_traversal_semantics() -> Non
         )
 
 
+@pytest.mark.parametrize("reason", ["qualified_start_identity_required", "k_must_be_positive"])
+def test_graph_capability_error_decodes_runtime_reason(reason: str) -> None:
+    payload = {
+        "status": 422,
+        "error": "graph_query_unsupported",
+        "message": "graph capability not supported",
+        "retryable": False,
+        "operation": "incoming",
+        "feature": "traverse",
+        "reason": reason,
+    }
+    error = GraphQueryUnsupportedError.from_dict(payload)
+    assert error.reason.value == reason
+    assert error.to_dict() == payload
+
+
 def test_antfly_client_query_uses_fail_closed_graph_result_decoder(monkeypatch: pytest.MonkeyPatch) -> None:
     client = AntflyClient("http://test")
     malformed = _query_response(

@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const server_group_metadata = @import("../storage/server_group_metadata.zig");
 const builtin = @import("builtin");
@@ -3440,13 +3440,17 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
         },
         else => "",
     };
+    if (metadata_topology_protocol.usesResolverRecords(namespace_indexes)) return metadata_topology_protocol.resolver_records_version;
     if (metadata_topology_protocol.usesResolverNamespaces(namespace_indexes)) return metadata_topology_protocol.resolver_namespaces_version;
     switch (command) {
-        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| for (delta.upsert_tables) |table| {
-            if (transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }) >= metadata_topology_protocol.resolver_namespaces_version) return metadata_topology_protocol.resolver_namespaces_version;
+        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| {
+            var required: u16 = 0;
+            for (delta.upsert_tables) |table| required = @max(required, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
+            if (required >= metadata_topology_protocol.resolver_namespaces_version) return required;
         },
         else => {},
     }
+    if (command == .apply_resolver_authority) return metadata_topology_protocol.resolver_records_version;
     if (command == .compare_and_replace_table and command.compare_and_replace_table.relation_guard != null)
         return metadata_topology_protocol.relation_mutation_version;
     if (command == .apply_relation_reconciliation) {
@@ -3466,6 +3470,12 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
         },
         else => false,
     };
+    const has_native_resolver_records = switch (command) {
+        .upsert_table => |table| std.mem.indexOf(u8, table.indexes_json, "_resolver_record_store") != null,
+        .compare_and_replace_table => |cas| std.mem.indexOf(u8, cas.replacement.indexes_json, "_resolver_record_store") != null,
+        else => false,
+    };
+    if (has_native_resolver_records) return metadata_topology_protocol.resolver_records_version;
     if (object_engine) return metadata_topology_protocol.object_table_engine_version;
     switch (command) {
         .mutate_lake_index_lifecycle, .remove_table => return metadata_topology_protocol.lake_index_catalog_version,

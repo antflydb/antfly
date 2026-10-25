@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const structlog = @import("structlog");
@@ -48,7 +48,12 @@ fn mainImpl(init: std.process.Init) !void {
     defer args.deinit();
 
     const argv0 = args.next() orelse "antfly";
-    const subcommand = args.next() orelse {
+    const invocation_mod = @import("cli_invocation.zig");
+    var invocation = try invocation_mod.parse(init.gpa, &args);
+    defer invocation.deinit(init.gpa);
+    args = std.process.Args.Iterator.init(.{ .vector = invocation.arguments.items });
+    const subcommand = invocation.command orelse {
+        if (invocation.has_global_prefix) return runRuntimeUnit(.cli, "", init, &args);
         printUsage(argv0);
         return;
     };
@@ -62,11 +67,10 @@ fn mainImpl(init: std.process.Init) !void {
         return;
     }
 
-    const command = completion.findCommand(subcommand) orelse {
-        std.debug.print("unknown subcommand: {s}\n", .{subcommand});
-        printUsage(argv0);
-        return error.InvalidArguments;
-    };
+    const command = completion.findCommand(subcommand) orelse
+        return runRuntimeUnit(.cli, subcommand, init, &args);
+    if (invocation.has_global_prefix and command.route != .cli)
+        return runRuntimeUnit(.cli, subcommand, init, &args);
 
     // Server-side subcommands dispatch into independently generated runtime
     // units through the narrow internal ABI. Lite uses standalone because its
@@ -260,6 +264,8 @@ fn printUsage(argv0: []const u8) void {
         \\  index          Manage indexes (create, drop, list, get)
         \\  artifact       Manage generated artifact enrichments and reprocessing
         \\  query          Query data from a table
+        \\  schema         Discover qualified tables, columns, indexes and field capabilities
+        \\  capabilities   Discover the CLI contract without connecting to a server
         \\  sql            Execute a typed SQL statement
         \\  lookup         Look up a document by key
         \\  load           Bulk load data from NDJSON file
@@ -274,6 +280,20 @@ fn printUsage(argv0: []const u8) void {
         \\  internal       Internal cluster management
         \\  cloud          Delegate to the separate Antfly Cloud CLI
         \\  completion     Generate shell completions (bash, zsh, fish)
+        \\
+        \\client global options (before command or before its local options):
+        \\  --agent / --no-agent          Compact bounded JSON with completeness metadata
+        \\  --fingerprint ordered|multiset     Compare complete received results (response-local)
+        \\  --output auto|json|compact|table   Default: human tables; agent: compact envelope
+        \\  --display-rows N              Display units (default 20; SQL --limit is admission)
+        \\  --display-bytes N             Encoded output bytes (default 16384; minimum 1024)
+        \\  --display-cell-bytes N        Maximum cell bytes (default 2048; whole row omitted)
+        \\  --deadline-ms N               Cooperative server request deadline (maximum 1800000)
+        \\  --max-scan-rows N              SQL execution work bound (independent of --limit)
+        \\  --memory-bytes N / --spill-bytes N   Tighten SQL engine budgets
+        \\  --progress                    Measured lifecycle events on stderr
+        \\  ANTFLY_AGENT_MODE=1|0         Overrides piped agent-environment detection
+        \\  Retrieve omitted read data with --output json; reconcile mutation receipts first.
         \\
     , .{argv0});
 }

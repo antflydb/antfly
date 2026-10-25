@@ -1,17 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from __future__ import annotations
 
@@ -42,13 +42,13 @@ from port_reservations import LoopbackPortReservations
 
 pytestmark = pytest.mark.slow
 
-MEMORYAF_VERSION = "0.0.1"
-MEMORYAF_PACKAGE_STORE = REPO_ROOT.parent / "extensions"
-MEMORYAF_GRANTS = [
-    {"name": "db:read", "scope": "memoryaf"},
-    {"name": "db:write", "scope": "memoryaf"},
-    {"name": "ai:embed", "scope": "memoryaf"},
-    {"name": "mcp:tool", "scope": "memoryaf"},
+RECORDS_VERSION = "0.0.1"
+RECORDS_PACKAGE_STORE = REPO_ROOT / "e2e" / "fixtures" / "extensions"
+RECORDS_GRANTS = [
+    {"name": "db:read", "scope": "records"},
+    {"name": "db:write", "scope": "records"},
+    {"name": "ai:embed", "scope": "records"},
+    {"name": "mcp:tool", "scope": "records"},
 ]
 
 
@@ -57,10 +57,10 @@ class _ExtensionProcess:
         self.binary = binary
         self.mode = mode
         self.host = "127.0.0.1"
-        self.package_store = MEMORYAF_PACKAGE_STORE
-        if not (self.package_store / "memoryaf" / "extension.json").exists():
+        self.package_store = RECORDS_PACKAGE_STORE
+        if not (self.package_store / "records" / "extension.json").exists():
             raise RuntimeError(
-                f"memoryaf extension package not found under {self.package_store}"
+                f"records extension package not found under {self.package_store}"
             )
         if mode not in {"standalone", "distributed"}:
             raise ValueError(mode)
@@ -281,7 +281,7 @@ def test_extension_package_routes_match_standalone_and_distributed(
 
 
 @pytest.mark.e2e_resource("antfly_process")
-def test_extension_memoryaf_wasm_runtime_required() -> None:
+def test_extension_records_wasm_runtime_required() -> None:
     if not os.environ.get("ANTFLY_WASMTIME_LIB"):
         pytest.skip(
             "set ANTFLY_WASMTIME_LIB to run the required Wasmtime extension runtime e2e"
@@ -318,7 +318,7 @@ def test_extension_table_binding_rejects_rename_and_name_reuse(
 
     wait_until(
         lambda: any(
-            package["name"] == "memoryaf"
+            package["name"] == "records"
             for package in request("GET", "/extensions/v1/packages")
         ),
         timeout_s=10.0,
@@ -330,15 +330,15 @@ def test_extension_table_binding_rejects_rename_and_name_reuse(
     request("POST", f"{api}/tables/{table}", {"num_shards": 1})
     request(
         "POST",
-        "/extensions/v1/installed/memoryaf",
+        "/extensions/v1/installed/records",
         {
-            "version": MEMORYAF_VERSION,
+            "version": RECORDS_VERSION,
             "scope": {"kind": "table", "table_name": table},
-            "grants": MEMORYAF_GRANTS,
+            "grants": RECORDS_GRANTS,
         },
     )
-    members = request("GET", "/extensions/v1/installed/memoryaf/objects")
-    endpoint = "/mcp/v1/extensions/memoryaf"
+    members = request("GET", "/extensions/v1/installed/records/objects")
+    endpoint = "/mcp/v1/extensions/records"
     initialized = session.post(
         server.url + endpoint,
         json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
@@ -366,7 +366,7 @@ def test_extension_table_binding_rejects_rename_and_name_reuse(
             "extension table binding is no longer current"
         )
 
-    assert not invoke("store_memory", {"content": "original memory"})["isError"]
+    assert not invoke("store_record", {"content": "original record"})["isError"]
     request(
         "POST",
         f"{api}/databases/default/namespaces/public/tables/{table}/rename",
@@ -374,8 +374,8 @@ def test_extension_table_binding_rejects_rename_and_name_reuse(
     )
     # Renaming must fail closed under the old public authorization scope, even
     # when the guest itself claims that a failed host write succeeded.
-    assert_binding_error("store_memory", {"content": "after rename"})
-    assert_binding_error("list_memories", {"limit": 5})
+    assert_binding_error("store_record", {"content": "after rename"})
+    assert_binding_error("list_records", {"limit": 5})
     request("POST", f"{api}/tables/{table}", {"num_shards": 1})
     request(
         "POST",
@@ -387,19 +387,19 @@ def test_extension_table_binding_rejects_rename_and_name_reuse(
     )
     request(
         "POST",
-        "/extensions/v1/installed/memoryaf/update",
-        {"target_version": MEMORYAF_VERSION},
+        "/extensions/v1/installed/records/update",
+        {"target_version": RECORDS_VERSION},
     )
-    assert_binding_error("store_memory", {"content": "wrong table"})
-    assert_binding_error("list_memories", {"limit": 5})
-    assert members == request("GET", "/extensions/v1/installed/memoryaf/objects")
+    assert_binding_error("store_record", {"content": "wrong table"})
+    assert_binding_error("list_records", {"limit": 5})
+    assert members == request("GET", "/extensions/v1/installed/records/objects")
     replacement = request("POST", f"{api}/tables/{table}/query", {"limit": 10})
     original = request("POST", f"{api}/tables/{renamed}/query", {"limit": 10})
     replacement_hits = replacement["responses"][0]["hits"]["hits"]
     original_hits = original["responses"][0]["hits"]["hits"]
     assert [hit["_id"] for hit in replacement_hits] == ["replacement"]
     assert len(original_hits) == 1
-    assert original_hits[0]["_source"]["content"] == "original memory"
+    assert original_hits[0]["_source"]["content"] == "original record"
 
 
 def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> None:
@@ -416,43 +416,43 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
         packages = _check_response(
             session.get(f"{base_url}/extensions/v1/packages", timeout=10)
         )
-        if any(package.get("name") == "memoryaf" for package in packages):
+        if any(package.get("name") == "records" for package in packages):
             return packages
         return None
 
     packages = wait_until(projected_packages, timeout_s=10.0, interval_s=0.25)
     assert packages is not None, (
-        f"memoryaf package was not projected\n{extension_server.debug_logs()}"
+        f"records package was not projected\n{extension_server.debug_logs()}"
     )
-    memoryaf_package = next(
-        package for package in packages if package["name"] == "memoryaf"
+    records_package = next(
+        package for package in packages if package["name"] == "records"
     )
-    assert memoryaf_package["version"] == MEMORYAF_VERSION
-    assert memoryaf_package["artifacts"][0]["kind"] == "wasm"
+    assert records_package["version"] == RECORDS_VERSION
+    assert records_package["artifacts"][0]["kind"] == "wasm"
 
     dry_run = _check_response(
         session.post(
-            f"{base_url}/extensions/v1/installed/memoryaf",
+            f"{base_url}/extensions/v1/installed/records",
             json={
-                "version": MEMORYAF_VERSION,
+                "version": RECORDS_VERSION,
                 "scope": {"kind": "cluster"},
                 "dry_run": True,
             },
             timeout=10,
         )
     )
-    assert dry_run["name"] == "memoryaf"
-    assert dry_run["package_version"] == MEMORYAF_VERSION
+    assert dry_run["name"] == "records"
+    assert dry_run["package_version"] == RECORDS_VERSION
     assert dry_run["scope"]["kind"] == "cluster"
 
     installed_after_dry_run = _check_response(
         session.get(f"{base_url}/extensions/v1/installed", timeout=10)
     )
     assert all(
-        extension.get("name") != "memoryaf" for extension in installed_after_dry_run
+        extension.get("name") != "records" for extension in installed_after_dry_run
     )
 
-    table_name = f"memoryaf_memories_{extension_server.mode}"
+    table_name = f"records_records_{extension_server.mode}"
     created_table = _check_response(
         session.post(
             f"{extension_server.api_url}/tables/{table_name}",
@@ -464,36 +464,36 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
 
     installed = _check_response(
         session.post(
-            f"{base_url}/extensions/v1/installed/memoryaf",
+            f"{base_url}/extensions/v1/installed/records",
             json={
-                "version": MEMORYAF_VERSION,
+                "version": RECORDS_VERSION,
                 "scope": {"kind": "table", "table_name": table_name},
-                "grants": MEMORYAF_GRANTS,
+                "grants": RECORDS_GRANTS,
             },
             timeout=10,
         )
     )
-    assert installed["name"] == "memoryaf"
-    assert installed["package_version"] == MEMORYAF_VERSION
+    assert installed["name"] == "records"
+    assert installed["package_version"] == RECORDS_VERSION
     assert installed["scope"] == {"kind": "table", "table_name": table_name}
     assert isinstance(installed["installed_at_epoch_ms"], int)
     assert installed["installed_at_epoch_ms"] > 1_700_000_000_000
 
     objects = _check_response(
-        session.get(f"{base_url}/extensions/v1/installed/memoryaf/objects", timeout=10)
+        session.get(f"{base_url}/extensions/v1/installed/records/objects", timeout=10)
     )
     object_kinds = {(obj["object_kind"], obj["object_name"]) for obj in objects}
-    assert ("data_shape", "memory_record") in object_kinds
-    assert ("generated_artifact", "memory_embedding") in object_kinds
-    assert ("skill", "memory") in object_kinds
-    assert ("mcp_tool", "store_memory") in object_kinds
-    assert ("mcp_tool", "search_memories") in object_kinds
-    assert ("mcp_tool", "list_memories") in object_kinds
+    assert ("data_shape", "record_record") in object_kinds
+    assert ("generated_artifact", "record_embedding") in object_kinds
+    assert ("skill", "record") in object_kinds
+    assert ("mcp_tool", "store_record") in object_kinds
+    assert ("mcp_tool", "search_records") in object_kinds
+    assert ("mcp_tool", "list_records") in object_kinds
 
-    old_mcp_route = session.get(f"{base_url}/mcp/extensions/memoryaf", timeout=10)
+    old_mcp_route = session.get(f"{base_url}/mcp/extensions/records", timeout=10)
     assert old_mcp_route.status_code == 404
 
-    mcp_endpoint = f"{base_url}/mcp/v1/extensions/memoryaf"
+    mcp_endpoint = f"{base_url}/mcp/v1/extensions/records"
     initialize = session.post(
         mcp_endpoint,
         json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
@@ -512,7 +512,7 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
         )
     )
     tool_names = {tool["name"] for tool in tools["result"]["tools"]}
-    assert {"store_memory", "search_memories", "list_memories"}.issubset(tool_names)
+    assert {"store_record", "search_records", "list_records"}.issubset(tool_names)
     assert "create_table" not in tool_names
 
     if not os.environ.get("ANTFLY_WASMTIME_LIB"):
@@ -527,7 +527,7 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
                 "id": 3,
                 "method": "tools/call",
                 "params": {
-                    "name": "store_memory",
+                    "name": "store_record",
                     "arguments": {
                         "content": "Extension runtimes should be executable",
                         "project": "antfly",
@@ -540,10 +540,10 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
     )
     assert store["result"]["isError"] is False, store
     assert store["result"]["structuredContent"]["ok"] is True
-    assert store["result"]["structuredContent"]["tool"] == "store_memory"
+    assert store["result"]["structuredContent"]["tool"] == "store_record"
     assert store["result"]["structuredContent"]["status"] == "stored"
     assert (
-        "db.write(memory_record)" in store["result"]["structuredContent"]["host_calls"]
+        "db.write(record_record)" in store["result"]["structuredContent"]["host_calls"]
     )
     assert "ai.embed(content)" in store["result"]["structuredContent"]["host_calls"]
     assert (
@@ -563,7 +563,7 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
                 "id": 4,
                 "method": "tools/call",
                 "params": {
-                    "name": "search_memories",
+                    "name": "search_records",
                     "arguments": {"query": "extension runtime", "limit": 5},
                 },
             },
@@ -571,7 +571,7 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
         )
     )
     assert search["result"]["isError"] is False
-    assert search["result"]["structuredContent"]["tool"] == "search_memories"
+    assert search["result"]["structuredContent"]["tool"] == "search_records"
     assert search["result"]["structuredContent"]["query"] == "extension runtime"
     assert search["result"]["structuredContent"]["limit"] == 5
     assert "Extension runtimes should be executable" in json.dumps(
@@ -586,7 +586,7 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
                 "jsonrpc": "2.0",
                 "id": 6,
                 "method": "tools/call",
-                "params": {"name": "list_memories", "arguments": {"limit": 5}},
+                "params": {"name": "list_records", "arguments": {"limit": 5}},
             },
             timeout=10,
         )
@@ -604,7 +604,7 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
                 "jsonrpc": "2.0",
                 "id": 7,
                 "method": "tools/call",
-                "params": {"name": "search_memories", "arguments": {}},
+                "params": {"name": "search_records", "arguments": {}},
             },
             timeout=10,
         )

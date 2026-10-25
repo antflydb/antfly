@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const ant_json = @import("antfly-json");
@@ -326,6 +326,7 @@ pub const TableApi = struct {
         UnsupportedArtifactIndexSources,
         ArtifactIndexSourcesTemporarilyUnavailable,
         ProbeUnavailable,
+        InferenceEndpointAccessDenied,
         ModelNotFound,
         Backpressured,
         InternalFailure,
@@ -2443,6 +2444,8 @@ pub fn handleTableGetIndex(
     return .{ .status = 200, .body = response_body, .json = true };
 }
 
+pub const inference_endpoint_access_denied_message = "embedder.api_url denied inference access; check endpoint credentials and permissions. For local Antfly inference omit embedder.api_url. An HTTP /ai/v1 endpoint requires public_inference.enabled and inference permissions.";
+
 pub fn handleTableCreateIndex(
     alloc: std.mem.Allocator,
     table_name: []const u8,
@@ -2457,6 +2460,7 @@ pub fn handleTableCreateIndex(
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"not_found\",\"message\":\"not found\",\"retryable\":false}"), .json = true },
         error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "{\"error\":\"table_mutation_conflict\",\"message\":\"table mutation conflict; retry request\",\"retryable\":true}"), .json = true },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "{\"error\":\"method_not_allowed\",\"message\":\"method not allowed\",\"retryable\":false}"), .json = true },
+        error.InferenceEndpointAccessDenied => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"invalid_index_request\",\"message\":\"embedder.api_url denied inference access; check endpoint credentials and permissions. For local Antfly inference omit embedder.api_url. An HTTP /ai/v1 endpoint requires public_inference.enabled and inference permissions.\",\"retryable\":false}"), .json = true },
         error.InvalidIndexRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"invalid_index_request\",\"message\":\"unsupported index configuration\",\"retryable\":false}"), .json = true },
         error.GraphMetricConfigurationLimitExceeded => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"graph_metric_configuration_limit_exceeded\",\"message\":\"graph metric configuration exceeds serverless limits (maximum 16 graph metric indexes, 16 metrics per graph, 64 metrics total, 64 edge types per filter, 256-byte index names, 128-byte metric names, and 256-byte edge type names)\",\"retryable\":false}"), .json = true },
         error.MissingEmbeddingArtifactEnrichment => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"missing_embedding_artifact_enrichment\",\"message\":\"embedding index source has no matching embedding enrichment\",\"retryable\":false}"), .json = true },
@@ -5287,6 +5291,44 @@ test "unsupported graph diagnostics identify the rejected operation feature" {
     }
 }
 
+test "unsupported graph diagnostics identify the rejected operation feature across named operations" {
+    const distributed_graph = @import("distributed_graph.zig");
+    var diagnostic_context: query_request_diagnostics.Context = .{};
+    const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
+    defer diagnostic_scope.deinit();
+    const queries = [_]db_mod.types.NamedGraphQuery{
+        .{ .name = "supported_incoming", .query = .{
+            .query_type = .traverse,
+            .index_name = "knowledge",
+            .start_nodes = .{ .identities = &.{.{ .table = "concepts", .key = "antfly" }} },
+            .params = .{ .direction = .in },
+        } },
+        .{ .name = "seed_paths", .query = .{
+            .query_type = .traverse,
+            .index_name = "knowledge",
+            .start_nodes = .{ .identities = &.{.{ .table = "concepts", .key = "antfly" }} },
+            .params = .{ .direction = .in, .deduplicate = false },
+        } },
+    };
+    const req: db_mod.types.SearchRequest = .{
+        .graph_queries = &queries,
+        .graph_query_diagnostic_sink = graph_query_diagnostic.sink(),
+    };
+    try std.testing.expect(!distributed_graph.supportsCrossRange(req));
+    // Planning probes must not publish a rejection into another execution.
+    try std.testing.expect(graph_query_diagnostic.take() == null);
+    try std.testing.expectError(error.GraphQueryModeUnsupported, distributed_graph.rejectUnsupportedCrossRange(req));
+    const body = try graphQueryUnsupportedBody(std.testing.allocator,
+        \\{"graph_queries":{"supported_incoming":{"index":"knowledge","traverse":{"start":{"identities":[{"table":"concepts","key":"antfly"}]},"direction":"in"}},"seed_paths":{"index":"knowledge","traverse":{"start":{"identities":[{"table":"concepts","key":"antfly"}]},"direction":"in","deduplicate_nodes":false}}}}
+    );
+    defer std.testing.allocator.free(body);
+    var parsed = try ant_json.parseFromSlice(metadata_openapi.GraphQueryUnsupportedError, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("seed_paths", parsed.value.operation);
+    try std.testing.expectEqualStrings("traverse", parsed.value.feature);
+    try std.testing.expectEqualStrings("deduplicate_nodes_must_be_true", parsed.value.reason);
+}
+
 test "runtime graph capability diagnostics preserve the failing named operation" {
     var diagnostic_context: query_request_diagnostics.Context = .{};
     const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
@@ -6669,4 +6711,28 @@ test "public table graph metric action handler returns status response" {
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expect(backend.called);
     try std.testing.expectEqualStrings("{\"status\":{\"state\":\"fresh\",\"maintenance_paused\":true}}", resp.body);
+}
+
+test "public table create index explains embedding endpoint access rejection" {
+    const Denied = struct {
+        fn create(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: @FieldType(TableApi, "request")) TableApi.ExecuteCreateIndexError![]u8 {
+            return error.InferenceEndpointAccessDenied;
+        }
+    };
+    const api: TableApi = .{ .ptr = undefined, .request = .{}, .vtable = &.{
+        .execute_table_batch = unsupportedBatch,
+        .execute_table_query_request = unsupportedQueryRequest,
+        .execute_table_query_view = unsupportedQueryView,
+        .execute_table_backup = unsupportedBackup,
+        .execute_table_restore = unsupportedRestore,
+        .execute_table_list_indexes = unsupportedListIndexes,
+        .execute_table_get_index = unsupportedGetIndex,
+        .execute_table_create_index = Denied.create,
+        .execute_table_delete_index = unsupportedDeleteIndex,
+    } };
+    var response = try handleTableCreateIndex(std.testing.allocator, "docs", "semantic", "{}", api);
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "embedder.api_url") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "public_inference.enabled") != null);
 }

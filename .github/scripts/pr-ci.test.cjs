@@ -370,19 +370,19 @@ test('large diffs select all standard suites; renamed paths are considered', asy
   assert.deepEqual(JSON.parse(f.checks[0].output.text).suites,config.suites.filter(s=>!s.label).map(s=>s.id));
   const g=fixture();
   const target=config.suites.find(s=>s.paths);
-  const filename=target.id==='proxy'?'go/pkg/proxy/old.go':'go/pkg/old.go';
-  g.files([{filename:'docs/moved.txt',previous_filename:filename}]); await g.call();
-  assert.ok(JSON.parse(g.checks[0].output.text).suites.includes(target.id));
+  if (target) {
+    const filename=target.paths.some(p=>new RegExp(p).test('go/pkg/old.go'))?'go/pkg/old.go':'docs/moved.txt';
+    g.files([{filename:'docs/moved.txt',previous_filename:filename}]); await g.call();
+    assert.ok(JSON.parse(g.checks[0].output.text).suites.includes(target.id));
+  }
+
 });
 
 test('path selection matches repository CI owners and does not enable optional tests', () => {
   const f=fixture();
   if (config.suites.some(s=>s.id==='zig')) {
-    assert.deepEqual(selectSuites(['go/pkg/proxy/test.go'],f.pr,config),['policy','zig','sdks','proxy']);
-    assert.ok(selectSuites(['specs/openapi/new.yaml'],f.pr,config).includes('operator'));
-    assert.ok(selectSuites(['go/pkg/operator/api/types.go'],f.pr,config).includes('operator'));
-    assert.ok(!selectSuites(['go/pkg/operator/work-log/README.md'],f.pr,config).includes('operator'));
-    assert.ok(!selectSuites(['go/pkg/proxy/docs/notes.mdx'],f.pr,config).includes('proxy'));
+    assert.deepEqual(selectSuites(['go/pkg/sdk/client.go'],f.pr,config),['policy','zig','sdks']);
+    assert.ok(!config.suites.some(s=>s.id==='operator'||s.id==='proxy'));
   } else {
     assert.deepEqual(selectSuites(['infra/src/test.go'],f.pr,config),['policy','infra']);
     assert.deepEqual(selectSuites(['ts/apps/dashboard/test.ts'],f.pr,config),['policy','vitest','playwright']);

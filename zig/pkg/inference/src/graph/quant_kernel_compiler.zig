@@ -21,6 +21,7 @@
 //! pre-publication qualification against the bundled production kernel.
 
 const std = @import("std");
+const benchmark_commands = @import("../benchmark_commands.zig");
 const platform = @import("antfly_platform");
 const backend_contracts = @import("backend_contracts.zig");
 const quant_matmul = @import("quant_matmul.zig");
@@ -1053,6 +1054,7 @@ const BenchmarkEvidence = struct {
     generated_ptx_path: []const u8,
     generated_ptx_command: []const u8,
     benchmark_command: []const u8,
+    command_version: benchmark_commands.Version = .current,
     correctness_evidence_path: []const u8,
     benchmark_evidence_path: []const u8,
     benchmark_mode: []const u8,
@@ -2472,7 +2474,7 @@ pub const first_lazy_benchmark = BenchmarkCase{
     .generated_source_fingerprint = first_lazy_cuda_source_fingerprint,
     .generated_ptx_path = "/tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin",
     .generated_ptx_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " src/ops/cuda/generated/quant_kernel_q4_k_small_batch_bias_gelu.cu -o /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin",
-    .benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_lazy_benchmark_evidence_path,
+    .benchmark_command = benchmark_commands.current_prefix ++ " --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_lazy_benchmark_evidence_path,
     .generated_ptx_arg = "--quant-compiler-generated-ptx",
     .handwritten_baseline = "termite_linear_q4_k_bias_gelu_f32_tile4_r2",
     .correctness_tolerance_abs = 0.01,
@@ -2618,7 +2620,8 @@ const first_benchmark_evidence = [_]BenchmarkEvidence{
         .generated_source_fingerprint = first_general_cuda_q4_0_mmv_source_fingerprint,
         .generated_ptx_path = first_general_cuda_q4_0_mmv_ptx_path,
         .generated_ptx_command = first_general_cuda_q4_0_mmv_check_command,
-        .benchmark_command = first_general_cuda_q4_0_mmv_benchmark_command,
+        .benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-mmv-ptx /tmp/antfly_q4_0_mmv_f32_v1.fatbin --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out src/ops/cuda/generated/evidence/q4_0_mmv_benchmark.json",
+        .command_version = .legacy,
         .correctness_evidence_path = first_general_cuda_q4_0_mmv_evidence_path,
         .benchmark_evidence_path = first_general_cuda_q4_0_mmv_evidence_path,
         .benchmark_mode = "sequential",
@@ -2634,7 +2637,8 @@ const first_benchmark_evidence = [_]BenchmarkEvidence{
         .generated_source_fingerprint = first_general_cuda_q4_0_mm_source_fingerprint,
         .generated_ptx_path = first_general_cuda_q4_0_mm_ptx_path,
         .generated_ptx_command = first_general_cuda_q4_0_mm_check_command,
-        .benchmark_command = first_general_cuda_q4_0_mm_benchmark_command,
+        .benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-mm-ptx /tmp/antfly_q4_0_mm_f32_v1.fatbin --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out src/ops/cuda/generated/evidence/q4_0_mm_benchmark.json",
+        .command_version = .legacy,
         .correctness_evidence_path = first_general_cuda_q4_0_mm_evidence_path,
         .benchmark_evidence_path = first_general_cuda_q4_0_mm_evidence_path,
         .benchmark_mode = "sequential",
@@ -2650,7 +2654,8 @@ const first_benchmark_evidence = [_]BenchmarkEvidence{
         .generated_source_fingerprint = first_general_cuda_q4_0_pair_source_fingerprint,
         .generated_ptx_path = first_general_cuda_q4_0_pair_ptx_path,
         .generated_ptx_command = first_general_cuda_q4_0_pair_check_command,
-        .benchmark_command = first_general_cuda_q4_0_pair_benchmark_command,
+        .benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-pair-ptx /tmp/antfly_q4_0_pair_mmv_f32_v1.fatbin --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out src/ops/cuda/generated/evidence/q4_0_pair_benchmark.json",
+        .command_version = .legacy,
         .correctness_evidence_path = first_general_cuda_q4_0_pair_evidence_path,
         .benchmark_evidence_path = first_general_cuda_q4_0_pair_evidence_path,
         .benchmark_mode = "sequential",
@@ -2666,7 +2671,8 @@ const first_benchmark_evidence = [_]BenchmarkEvidence{
         .generated_source_fingerprint = first_general_cuda_q4_0_pair_q8_source_fingerprint,
         .generated_ptx_path = first_general_cuda_q4_0_pair_q8_ptx_path,
         .generated_ptx_command = first_general_cuda_q4_0_pair_q8_check_command,
-        .benchmark_command = first_general_cuda_q4_0_pair_q8_benchmark_command,
+        .benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-pair-q8-ptx /tmp/antfly_q4_0_pair_activation_q8_1_mmv_v1.fatbin --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out src/ops/cuda/generated/evidence/q4_0_pair_q8_benchmark.json",
+        .command_version = .legacy,
         .correctness_evidence_path = first_general_cuda_q4_0_pair_q8_evidence_path,
         .benchmark_evidence_path = first_general_cuda_q4_0_pair_q8_evidence_path,
         .benchmark_mode = "sequential",
@@ -2682,7 +2688,8 @@ const first_benchmark_evidence = [_]BenchmarkEvidence{
         .generated_source_fingerprint = first_general_cuda_q4_0_down_q8_source_fingerprint,
         .generated_ptx_path = first_general_cuda_q4_0_down_q8_ptx_path,
         .generated_ptx_command = first_general_cuda_q4_0_down_q8_check_command,
-        .benchmark_command = first_general_cuda_q4_0_down_q8_benchmark_command,
+        .benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-down-q8-ptx /tmp/antfly_q4_0_down_q8_1_mmv_v1.fatbin --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out src/ops/cuda/generated/evidence/q4_0_down_q8_benchmark.json",
+        .command_version = .legacy,
         .correctness_evidence_path = first_general_cuda_q4_0_down_q8_evidence_path,
         .benchmark_evidence_path = first_general_cuda_q4_0_down_q8_evidence_path,
         .benchmark_mode = "sequential",
@@ -2867,9 +2874,9 @@ pub const first_metal_promotion_blocker_evidence_expected_case_count = metalProm
 pub const first_metal_promotion_blocker_evidence_expected_route_ready_count = first_metal_promotion_blocker_evidence_expected_case_count;
 pub const first_metal_production_benchmark_cases = buildMetalProductionBenchmarkCases();
 pub const first_metal_production_benchmark_case_count = first_metal_production_benchmark_cases.len;
-pub const first_artifact_manifest_schema = "antfly.quant_kernel_artifacts.v6";
-pub const first_benchmark_manifest_schema = "antfly.quant_kernel_benchmarks.v6";
-pub const first_lazy_benchmark_check_command = "zig-out/bin/antfly-inference bench-cuda --quant-compiler-check-evidence " ++ first_lazy_benchmark_evidence_path ++ " --quant-compiler-require-promotion-ready";
+pub const first_artifact_manifest_schema = "antfly.quant_kernel_artifacts.v7";
+pub const first_benchmark_manifest_schema = "antfly.quant_kernel_benchmarks.v7";
+pub const first_lazy_benchmark_check_command = benchmark_commands.current_prefix ++ " --quant-compiler-check-evidence " ++ first_lazy_benchmark_evidence_path ++ " --quant-compiler-require-promotion-ready";
 pub const first_spec_manifest_path = "src/ops/cuda/generated/quant_kernel_specs.json";
 pub const first_artifact_manifest_path = "src/ops/cuda/generated/quant_kernel_artifacts.json";
 pub const first_benchmark_manifest_path = "src/ops/cuda/generated/quant_kernel_benchmarks.json";
@@ -2881,31 +2888,31 @@ pub const first_general_cuda_q4_0_mmv_source_path = "src/ops/cuda/generated/quan
 pub const first_general_cuda_q4_0_mmv_ptx_path = "/tmp/antfly_q4_0_mmv_f32_v1.fatbin";
 pub const first_general_cuda_q4_0_mmv_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_general_cuda_q4_0_mmv_source_path ++ " -o " ++ first_general_cuda_q4_0_mmv_ptx_path;
 pub const first_general_cuda_q4_0_mmv_evidence_path = "src/ops/cuda/generated/evidence/q4_0_mmv_benchmark.json";
-pub const first_general_cuda_q4_0_mmv_benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-mmv-ptx " ++ first_general_cuda_q4_0_mmv_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_mmv_evidence_path;
+pub const first_general_cuda_q4_0_mmv_benchmark_command = benchmark_commands.current_prefix ++ " --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-mmv-ptx " ++ first_general_cuda_q4_0_mmv_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_mmv_evidence_path;
 pub const first_general_cuda_q4_0_mm_kernel_id = "antfly_q4_0_mm_f32_v1";
 pub const first_general_cuda_q4_0_mm_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_mm.cu";
 pub const first_general_cuda_q4_0_mm_ptx_path = "/tmp/antfly_q4_0_mm_f32_v1.fatbin";
 pub const first_general_cuda_q4_0_mm_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_general_cuda_q4_0_mm_source_path ++ " -o " ++ first_general_cuda_q4_0_mm_ptx_path;
 pub const first_general_cuda_q4_0_mm_evidence_path = "src/ops/cuda/generated/evidence/q4_0_mm_benchmark.json";
-pub const first_general_cuda_q4_0_mm_benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-mm-ptx " ++ first_general_cuda_q4_0_mm_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_mm_evidence_path;
+pub const first_general_cuda_q4_0_mm_benchmark_command = benchmark_commands.current_prefix ++ " --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-mm-ptx " ++ first_general_cuda_q4_0_mm_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_mm_evidence_path;
 pub const first_general_cuda_q4_0_pair_kernel_id = "antfly_q4_0_pair_mmv_f32_v1";
 pub const first_general_cuda_q4_0_pair_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_pair_mmv.cu";
 pub const first_general_cuda_q4_0_pair_ptx_path = "/tmp/antfly_q4_0_pair_mmv_f32_v1.fatbin";
 pub const first_general_cuda_q4_0_pair_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_general_cuda_q4_0_pair_source_path ++ " -o " ++ first_general_cuda_q4_0_pair_ptx_path;
 pub const first_general_cuda_q4_0_pair_evidence_path = "src/ops/cuda/generated/evidence/q4_0_pair_benchmark.json";
-pub const first_general_cuda_q4_0_pair_benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-pair-ptx " ++ first_general_cuda_q4_0_pair_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_pair_evidence_path;
+pub const first_general_cuda_q4_0_pair_benchmark_command = benchmark_commands.current_prefix ++ " --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-pair-ptx " ++ first_general_cuda_q4_0_pair_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_pair_evidence_path;
 pub const first_general_cuda_q4_0_pair_q8_kernel_id = "antfly_q4_0_pair_activation_q8_1_mmv_v1";
 pub const first_general_cuda_q4_0_pair_q8_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_pair_activation_q8_1.cu";
 pub const first_general_cuda_q4_0_pair_q8_ptx_path = "/tmp/antfly_q4_0_pair_activation_q8_1_mmv_v1.fatbin";
 pub const first_general_cuda_q4_0_pair_q8_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_general_cuda_q4_0_pair_q8_source_path ++ " -o " ++ first_general_cuda_q4_0_pair_q8_ptx_path;
 pub const first_general_cuda_q4_0_pair_q8_evidence_path = "src/ops/cuda/generated/evidence/q4_0_pair_q8_benchmark.json";
-pub const first_general_cuda_q4_0_pair_q8_benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-pair-q8-ptx " ++ first_general_cuda_q4_0_pair_q8_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_pair_q8_evidence_path;
+pub const first_general_cuda_q4_0_pair_q8_benchmark_command = benchmark_commands.current_prefix ++ " --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-pair-q8-ptx " ++ first_general_cuda_q4_0_pair_q8_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_pair_q8_evidence_path;
 pub const first_general_cuda_q4_0_down_q8_kernel_id = "antfly_q4_0_down_q8_1_mmv_v1";
 pub const first_general_cuda_q4_0_down_q8_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_down_q8_1.cu";
 pub const first_general_cuda_q4_0_down_q8_ptx_path = "/tmp/antfly_q4_0_down_q8_1_mmv_v1.fatbin";
 pub const first_general_cuda_q4_0_down_q8_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_general_cuda_q4_0_down_q8_source_path ++ " -o " ++ first_general_cuda_q4_0_down_q8_ptx_path;
 pub const first_general_cuda_q4_0_down_q8_evidence_path = "src/ops/cuda/generated/evidence/q4_0_down_q8_benchmark.json";
-pub const first_general_cuda_q4_0_down_q8_benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-down-q8-ptx " ++ first_general_cuda_q4_0_down_q8_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_down_q8_evidence_path;
+pub const first_general_cuda_q4_0_down_q8_benchmark_command = benchmark_commands.current_prefix ++ " --warmup-iters 5 --measure-iters 50 --quant-compiler-q4-0-down-q8-ptx " ++ first_general_cuda_q4_0_down_q8_ptx_path ++ " --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out " ++ first_general_cuda_q4_0_down_q8_evidence_path;
 pub const first_e2b_cuda_q4_0_pair_q8_6144_kernel_id = "antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1";
 pub const first_e2b_cuda_q4_0_pair_q8_6144_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_pair_activation_q8_1_e2b_6144.cu";
 pub const first_e2b_cuda_q4_0_pair_q8_6144_ptx_path = "/tmp/antfly_q4_0_pair_activation_q8_1_e2b_6144_mmv_v1.fatbin";
@@ -7918,7 +7925,7 @@ fn benchmarkPromotionBlockerWithEvidence(bench: BenchmarkCase, evidence_records:
     if (builds_fatbin and !commandHasToken(bench.generated_ptx_command, "-gencode=arch=compute_89,code=sm_89")) return "missing_native_fatbin_arch";
     if (!commandHasToken(bench.generated_ptx_command, bench.generated_source_path)) return "ptx_command_missing_source";
     if (!commandHasArgValue(bench.generated_ptx_command, "-o", bench.generated_ptx_path)) return "ptx_command_missing_output";
-    if (!commandFirstTokenEquals(bench.benchmark_command, "zig-out/bin/antfly-inference") or !commandHasToken(bench.benchmark_command, "bench-cuda")) return "missing_bench_cuda_command";
+    if (benchmark_commands.arguments(bench.benchmark_command, .current) == null) return "missing_bench_cuda_command";
     if (!commandHasArgValue(bench.benchmark_command, "--warmup-iters", "5")) return "missing_warmup_iters";
     if (!commandHasArgValue(bench.benchmark_command, "--measure-iters", "50")) return "missing_measure_iters";
     if (std.mem.eql(u8, bench.generated_ptx_arg, "--quant-compiler-generated-ptx") and
@@ -8199,7 +8206,7 @@ fn benchmarkEvidenceFor(bench: BenchmarkCase, evidence_records: []const Benchmar
             evidence.generated_source_fingerprint == bench.generated_source_fingerprint and
             std.mem.eql(u8, evidence.generated_ptx_path, bench.generated_ptx_path) and
             std.mem.eql(u8, evidence.generated_ptx_command, bench.generated_ptx_command) and
-            std.mem.eql(u8, evidence.benchmark_command, bench.benchmark_command) and
+            benchmark_commands.matches(evidence.benchmark_command, evidence.command_version, bench.benchmark_command) and
             std.mem.eql(u8, evidence.correctness_evidence_path, bench.correctness_evidence_path) and
             std.mem.eql(u8, evidence.benchmark_evidence_path, bench.benchmark_evidence_path) and
             std.mem.eql(u8, evidence.benchmark_mode, bench.benchmark_mode) and
@@ -10653,7 +10660,7 @@ test "quant kernel compiler benchmark manifest maps to conformance rows" {
                 try std.testing.expect(std.mem.containsAtLeast(u8, bench.generated_ptx_command, 1, "nvcc -fatbin"));
                 try std.testing.expect(std.mem.containsAtLeast(u8, bench.generated_ptx_command, 1, bench.generated_source_path));
                 try std.testing.expect(std.mem.containsAtLeast(u8, bench.generated_ptx_command, 1, bench.generated_ptx_path));
-                try std.testing.expect(std.mem.containsAtLeast(u8, bench.benchmark_command, 1, "zig-out/bin/antfly-inference bench-cuda"));
+                try std.testing.expect(std.mem.containsAtLeast(u8, bench.benchmark_command, 1, benchmark_commands.current_prefix ++ ""));
                 try std.testing.expect(std.mem.containsAtLeast(u8, bench.benchmark_command, 1, "--warmup-iters 5"));
                 try std.testing.expect(std.mem.containsAtLeast(u8, bench.benchmark_command, 1, "--measure-iters 50"));
                 try std.testing.expect(std.mem.containsAtLeast(u8, bench.benchmark_command, 1, bench.generated_ptx_arg));
@@ -10863,7 +10870,7 @@ test "quant kernel compiler benchmark promotion evidence is complete" {
     try std.testing.expectEqualStrings("missing_matching_evidence_record", benchmarkPromotionBlockerWithEvidence(bench, &wrong_evidence_ptx_command));
 
     var wrong_evidence_benchmark_command = passing_evidence;
-    wrong_evidence_benchmark_command[0].benchmark_command = "zig-out/bin/antfly-inference bench-cuda --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.ptx";
+    wrong_evidence_benchmark_command[0].benchmark_command = benchmark_commands.current_prefix ++ " --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.ptx";
     try std.testing.expectEqualStrings("missing_matching_evidence_record", benchmarkPromotionBlockerWithEvidence(bench, &wrong_evidence_benchmark_command));
 
     var single_repeat_evidence = passing_evidence;
@@ -10892,7 +10899,7 @@ test "quant kernel compiler benchmark promotion evidence is complete" {
 
     var wrong_ptx_arg = bench;
     wrong_ptx_arg.generated_ptx_arg = "--ptx";
-    wrong_ptx_arg.benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.ptx";
+    wrong_ptx_arg.benchmark_command = benchmark_commands.current_prefix ++ " --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.ptx";
     try std.testing.expect(!benchmarkHasPromotionEvidence(wrong_ptx_arg));
     try std.testing.expectEqualStrings("wrong_generated_ptx_arg", benchmarkPromotionBlocker(wrong_ptx_arg));
 
@@ -10907,32 +10914,32 @@ test "quant kernel compiler benchmark promotion evidence is complete" {
     try std.testing.expectEqualStrings("missing_generated_ptx_path", benchmarkPromotionBlocker(wrong_ptx_extension));
 
     var missing_ptx_arg = bench;
-    missing_ptx_arg.benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target";
+    missing_ptx_arg.benchmark_command = benchmark_commands.current_prefix ++ " --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target";
     try std.testing.expect(!benchmarkHasPromotionEvidence(missing_ptx_arg));
     try std.testing.expectEqualStrings("benchmark_missing_generated_ptx_arg", benchmarkPromotionBlocker(missing_ptx_arg));
 
     var missing_repeat = bench;
-    missing_repeat.benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin --quant-compiler-evidence-out src/ops/cuda/generated/evidence/q4_k_small_batch_bias_gelu_benchmark.json";
+    missing_repeat.benchmark_command = benchmark_commands.current_prefix ++ " --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin --quant-compiler-evidence-out src/ops/cuda/generated/evidence/q4_k_small_batch_bias_gelu_benchmark.json";
     try std.testing.expect(!benchmarkHasPromotionEvidence(missing_repeat));
     try std.testing.expectEqualStrings("missing_benchmark_repeat_runs", benchmarkPromotionBlocker(missing_repeat));
 
     var wrong_ptx_path_value = bench;
-    wrong_ptx_path_value.benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/wrong.fatbin /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out src/ops/cuda/generated/evidence/q4_k_small_batch_bias_gelu_benchmark.json";
+    wrong_ptx_path_value.benchmark_command = benchmark_commands.current_prefix ++ " --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/wrong.fatbin /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out src/ops/cuda/generated/evidence/q4_k_small_batch_bias_gelu_benchmark.json";
     try std.testing.expect(!benchmarkHasPromotionEvidence(wrong_ptx_path_value));
     try std.testing.expectEqualStrings("benchmark_missing_generated_ptx_path", benchmarkPromotionBlocker(wrong_ptx_path_value));
 
     var missing_evidence_out = bench;
-    missing_evidence_out.benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin --quant-compiler-repeat-runs 3";
+    missing_evidence_out.benchmark_command = benchmark_commands.current_prefix ++ " --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin --quant-compiler-repeat-runs 3";
     try std.testing.expect(!benchmarkHasPromotionEvidence(missing_evidence_out));
     try std.testing.expectEqualStrings("benchmark_missing_evidence_out_arg", benchmarkPromotionBlocker(missing_evidence_out));
 
     var wrong_evidence_path = bench;
-    wrong_evidence_path.benchmark_command = "zig-out/bin/antfly-inference bench-cuda --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out /tmp/wrong-evidence.json";
+    wrong_evidence_path.benchmark_command = benchmark_commands.current_prefix ++ " --warmup-iters 5 --measure-iters 50 --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin --quant-compiler-repeat-runs 3 --quant-compiler-evidence-out /tmp/wrong-evidence.json";
     try std.testing.expect(!benchmarkHasPromotionEvidence(wrong_evidence_path));
     try std.testing.expectEqualStrings("benchmark_missing_evidence_out_path", benchmarkPromotionBlocker(wrong_evidence_path));
 
     var missing_iters = bench;
-    missing_iters.benchmark_command = "zig-out/bin/antfly-inference bench-cuda --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin";
+    missing_iters.benchmark_command = benchmark_commands.current_prefix ++ " --quant-compiler-lazy-target --quant-compiler-generated-ptx /tmp/antfly_q4_k_small_batch_bias_gelu_f32_v1.fatbin";
     try std.testing.expect(!benchmarkHasPromotionEvidence(missing_iters));
     try std.testing.expectEqualStrings("missing_warmup_iters", benchmarkPromotionBlocker(missing_iters));
 
@@ -11015,7 +11022,7 @@ test "quant kernel compiler checked-in CUDA promotion evidence is fresh and rout
         try std.testing.expectEqual(bench.generated_source_fingerprint, evidence.generated_source_fingerprint);
         try std.testing.expectEqualStrings(bench.generated_ptx_path, evidence.generated_ptx_path);
         try std.testing.expectEqualStrings(bench.generated_ptx_command, evidence.generated_ptx_command);
-        try std.testing.expectEqualStrings(bench.benchmark_command, evidence.benchmark_command);
+        try std.testing.expect(benchmark_commands.matches(evidence.benchmark_command, benchmark_commands.schemaVersion(evidence.schema) orelse return error.InvalidEvidenceSchema, bench.benchmark_command));
         try std.testing.expectEqualStrings(bench.correctness_evidence_path, evidence.correctness_evidence_path);
         try std.testing.expectEqualStrings(bench.benchmark_evidence_path, evidence.benchmark_evidence_path);
         try std.testing.expectEqualStrings(bench.benchmark_mode, evidence.benchmark_mode);
@@ -12794,7 +12801,7 @@ test "quant kernel compiler docs describe compile API guardrail" {
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "Unsupported-handwritten-baseline candidates are route-evidence-only"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "cannot be promoted"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "by the sequential speedup gate"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "benchmark_manifest=antfly.quant_kernel_benchmarks.v6:22:<fingerprint>"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "benchmark_manifest=antfly.quant_kernel_benchmarks.v7:22:<fingerprint>"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "Runtime Observability"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "`fast_path_misses`: the sum of explicit, mutually exclusive fallback reasons"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "Actual generated Metal dispatch counters are not treated as handwritten\nfallbacks"));

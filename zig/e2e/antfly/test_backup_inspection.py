@@ -1,17 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Offline inspection must cover the whole standalone Lite catalog (#1212)."""
 
@@ -25,7 +25,6 @@ import subprocess
 import pytest
 import requests
 from conftest import DEFAULT_ANTFLY_BIN, StandaloneAntflyServer, resolve_binary_path
-
 
 # Server ownership is dynamic/direct, outside static fixture inference.
 pytestmark = pytest.mark.e2e_resource("antfly_process")
@@ -62,31 +61,52 @@ def test_inspect_standalone_lite_tables_and_dependencies(tmp_path):
         capabilities.write_text(
             json.dumps({"version": 1, "configuration_id": "test", "requirements": []})
         )
-        result = subprocess.run(
-            [
-                binary,
-                "backup",
-                "inspect",
-                "--input",
-                str(source),
-                "--destination-capabilities",
-                str(capabilities),
-            ],
-            text=True,
-            capture_output=True,
-            timeout=60,
-            check=True,
-        )
-        report = json.loads(result.stdout)
-        assert report["completeness"]["scan_complete"], report
-        assert report["inventory"]["documents"] == 2, report
-        assert report["inventory"]["shards"] == 2, report
-        assert any(r["kind"] == "model" for r in report["inventory"]["requirements"]), (
-            report
-        )
-        assert report["compatibility"]["verdict"] != "compatible", report
-        assert report["source"]["sha256"] == before
-        assert hashlib.sha256(source.read_bytes()).hexdigest() == before
+        original = None
+        for flags in (
+            [],
+            ["--no-agent"],
+            ["--agent"],
+            ["--agent", "--output", "table"],
+            ["--agent", "--output", "compact"],
+            ["--agent", "--fingerprint", "ordered"],
+            ["--agent", "--display-cell-bytes", "1", "--display-bytes", "1024"],
+        ):
+            result = subprocess.run(
+                [
+                    binary,
+                    *flags,
+                    "backup",
+                    "inspect",
+                    "--input",
+                    str(source),
+                    "--destination-capabilities",
+                    str(capabilities),
+                ],
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=True,
+                env={
+                    **os.environ,
+                    "ANTFLY_URL": "://invalid-server-url",
+                    "ANTFLY_AGENT_MODE": "0",
+                },
+            )
+            if original is None:
+                original = result.stdout
+            assert result.stdout == original, (
+                "presentation policy changed the inspection artifact"
+            )
+            report = json.loads(result.stdout)
+            assert report["completeness"]["scan_complete"], report
+            assert report["inventory"]["documents"] == 2, report
+            assert report["inventory"]["shards"] == 2, report
+            assert any(
+                r["kind"] == "model" for r in report["inventory"]["requirements"]
+            ), report
+            assert report["compatibility"]["verdict"] != "compatible", report
+            assert report["source"]["sha256"] == before
+            assert hashlib.sha256(source.read_bytes()).hexdigest() == before
         failed = False
     finally:
         server.stop(test_failed=failed)

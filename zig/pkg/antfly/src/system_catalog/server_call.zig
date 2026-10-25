@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Server catalog command envelope and admission policy.
 const std = @import("std");
@@ -54,6 +54,7 @@ pub const RelationSchemaMutation = struct {
 };
 
 pub const Call = union(enum) {
+    resolver_authority_mutate: @import("../metadata/resolver_authority.zig").Write,
     lake_index_lifecycle_read: u64,
     lake_index_lifecycle_work: ?u64,
     lake_index_lifecycle_mutate: @import("../metadata/lake_index_lifecycle.zig").Write,
@@ -103,6 +104,9 @@ pub const Call = union(enum) {
     relation_replace: RelationReplacement,
     relation_schema_mutate: RelationSchemaMutation,
     query_definition: []const u8,
+    /// Private body-bound native service provisioning. Old metadata peers
+    /// reject this tag before any table or private source is published.
+    native_memory_create: Request,
     mutate: Request,
     // A distinct operation makes older peers reject unsupported point reads.
     table_status: TableStatusTarget,
@@ -112,7 +116,7 @@ pub const Call = union(enum) {
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
-            .relation_replace, .relation_schema_mutate => true,
+            .relation_replace, .relation_schema_mutate, .native_memory_create => true,
             .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };

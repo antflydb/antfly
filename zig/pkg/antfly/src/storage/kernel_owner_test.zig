@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const hot_standby_write_gate_adapter = @import("hot_standby/write_gate.zig");
 const hot_standby_publisher_adapter = @import("hot_standby/db_commit.zig");
@@ -3286,6 +3286,28 @@ test "opaque data raft apply owner preserves batch snapshot and placement lifecy
     try std.testing.expectEqual(latest.last_entry_index, restored_latest.last_entry_index);
 
     try std.testing.expectEqual(abi.Status.busy, abi.antfly_storage_context_destroy(context.handle));
+}
+
+test "opaque metadata standalone portable export crosses the compiled owner boundary" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
+    try store.replaceStandaloneCatalog(group, 0, &.{.{ .table_id = 1, .name = "portable", .schema_json = "{}", .indexes_json = "{}" }}, &.{}, "{}");
+    const bytes = try store.exportStandalonePortableCatalog(a);
+    defer a.free(bytes);
+    var decoded = try std.json.parseFromSlice(@import("../system_catalog/projection.zig").Export, a, bytes, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), decoded.value.tables.len);
+    try std.testing.expectEqualStrings("portable", decoded.value.tables[0].name);
+    // The auxiliary catalog is not itself a portable table export.
+    const auxiliary = (try store.loadStandaloneCatalog(a)).?;
+    defer a.free(auxiliary);
+    try std.testing.expectEqualStrings("{}", auxiliary);
 }
 
 test "opaque metadata HA callback preserves lost ack replay and full checkpoint authority" {

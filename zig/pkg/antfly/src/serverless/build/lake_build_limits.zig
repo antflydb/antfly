@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Total-work admission for lake sidecar builds and their replay buffers.
 
@@ -75,6 +75,7 @@ pub const WorkingSetAllocator = struct {
         }
         if (@import("antfly_local_sources").sql_parallel_scheduler.LockedAllocator.parentAllocator(a)) |parent| return headroom(parent);
         if (comptime @import("builtin").is_test) if (a.vtable == std.testing.allocator.vtable) return std.math.maxInt(usize);
+        if (@import("antfly_local_sources").sql_memory_budget.optionalLocalHeadroom(a)) |layer| return @min(layer.available, headroom(layer.backing) orelse return null);
         return @import("antfly_local_sources").sql_memory_budget.optionalHeadroom(a);
     }
     fn permitsGrowth(self: *WorkingSetAllocator, additional_bytes: usize) bool {
@@ -266,4 +267,20 @@ test "lake build working-set allocator shares exact accounting across upload wor
     started = 0;
     try std.testing.expectEqual(@as(usize, 0), bounded.live_bytes);
     try std.testing.expect(!bounded.limit_exceeded);
+}
+
+test "lake build working-set headroom composes SQL budgets without bypassing opaque quotas" {
+    const Memory = @import("antfly_local_sources").sql_memory_budget;
+    var build = try WorkingSetAllocator.init(std.testing.allocator, .{ .max_working_set_bytes = 8192 });
+    var sql: Memory = .{ .backing = build.allocator(), .limit = 4096 };
+    const bytes = try sql.allocator().alloc(u8, 1024);
+    defer sql.allocator().free(bytes);
+    try std.testing.expectEqual(@as(?usize, 3072), WorkingSetAllocator.headroom(sql.allocator()));
+    const outer = try build.allocator().alloc(u8, 5000);
+    defer build.allocator().free(outer);
+    try std.testing.expectEqual(@as(?usize, 2168), WorkingSetAllocator.headroom(sql.allocator()));
+    var buffer: [8192]u8 = undefined;
+    var unknown_backing = std.heap.FixedBufferAllocator.init(&buffer);
+    var unknown: Memory = .{ .backing = unknown_backing.allocator(), .limit = 4096 };
+    try std.testing.expectEqual(@as(?usize, null), WorkingSetAllocator.headroom(unknown.allocator()));
 }

@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const AntflyRootImports = @import("../../../build_support/antfly/imports.zig").AntflyRootImports;
@@ -339,6 +339,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
 
     const lib_api_auth_default_filters = [_][]const u8{
+        "trusted principal table operations",
         "storage migration job observation preserves admitted and unpublished catalog state",
         "storage migration command admission fences delayed starts across handlers",
         "api http server requires auth on public routes when enabled",
@@ -425,7 +426,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     // The real MCP transport/database security regression does not need the
     // monolithic library discovery root or its full-suite memory reservation.
-    const mcp_auth_filters = &.{"api http server serves document lookup through mcp tool"};
+    const mcp_auth_filters = &.{ "api http server serves document lookup through mcp tool", "trusted principal table operations" };
     const mcp_auth_tests = b.addTest(.{
         .name = "api-mcp-auth-tests",
         .root_module = options.api_http_runtime_test_mod,
@@ -437,6 +438,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-mcp-auth-test", "Run real MCP trusted-principal authorization regressions")
         .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, mcp_auth_tests, mcp_auth_filters).step);
+
+    const source_merge_filters = &.{"linear merge"};
+    const source_merge_tests = b.addTest(.{
+        .name = "api-source-merge-tests",
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = source_merge_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    b.step("antfly-api-source-merge-test", "Run bounded source LinearMerge regressions")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, source_merge_tests, source_merge_filters).step);
 
     const authorization_sink_filters = [_][]const u8{
         "api http server document scan requires table read permission",

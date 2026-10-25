@@ -17,6 +17,16 @@
 //! The owner must have a stable address and outlive every allocated object.
 const std = @import("std");
 const Budget = @This();
+/// Transport-neutral classification of shared host admission. This callback
+/// never raises local limits and runs outside the budget's accounting lock.
+pub const Pressure = struct {
+    ptr: *anyopaque,
+    exhausted: *const fn (*anyopaque) bool,
+    /// Expose a known shared admission layer without hiding the original
+    /// allocator's quotas or refund semantics from optional work planning.
+    capacity: ?struct { backing: std.mem.Allocator, available: *const fn (*anyopaque) usize } = null,
+};
+pressure: ?Pressure = null,
 backing: std.mem.Allocator,
 limit: usize,
 live: usize = 0,
@@ -50,8 +60,10 @@ pub fn allocator(self: *Budget) std.mem.Allocator {
 /// historical failure; restoring parent headroom can admit healthy new work.
 pub fn isLocallyExhausted(self: *Budget) bool {
     self.lock();
-    defer self.mutex.unlock();
-    return self.exhausted or self.admission_exhausted;
+    const exhausted = self.exhausted or self.admission_exhausted;
+    const pressure = self.pressure;
+    self.mutex.unlock();
+    return exhausted or if (pressure) |owner| owner.exhausted(owner.ptr) else false;
 }
 /// Temporary owners may bypass standard arenas without bypassing this budget
 /// or any enclosing budget/failure allocator. Returned objects must be freed
@@ -85,10 +97,11 @@ pub fn isExhausted(self: *Budget) bool {
     self.lock();
     const exhausted = self.exhausted or self.admission_exhausted;
     const backing = self.backing;
+    const pressure = self.pressure;
     self.mutex.unlock();
     // A child can be below its own limit when shared parent admission fails.
     // Preserve genuine allocator OOMs: only known Budget owners carry policy.
-    return exhausted or allocatorExhausted(backing);
+    return exhausted or (if (pressure) |owner| owner.exhausted(owner.ptr) else false) or allocatorExhausted(backing);
 }
 fn allocatorExhausted(a: std.mem.Allocator) bool {
     if (@import("parallel_scheduler.zig").LockedAllocator.parentAllocator(a)) |parent| return allocatorExhausted(parent);
@@ -113,29 +126,45 @@ pub fn headroom(a: std.mem.Allocator) ?usize {
     if (a.vtable.alloc != alloc and a.vtable.alloc != scratchAlloc) return null;
     const self: *Budget = @ptrCast(@alignCast(a.ptr));
     self.lock();
-    const available = self.limit -| if (self.monotonic) self.spent else self.live;
-    const backing = self.backing;
+    var available = self.limit -| if (self.monotonic) self.spent else self.live;
+    var backing = self.backing;
+    const pressure = self.pressure;
     self.mutex.unlock();
+    if (pressure) |shared| if (shared.capacity) |capacity| {
+        available = @min(available, capacity.available(shared.ptr));
+        backing = capacity.backing;
+    };
     // Scratch forwards through reclaimed arena backings; admission introspection
     // must follow that same allocator path rather than stopping at the region.
     const actual = if (a.vtable.alloc == scratchAlloc) reclaimingAllocator(backing) else backing;
     return if (headroom(actual)) |parent| @min(available, parent) else available;
 }
+/// Inspect only this known budget layer so other allocation owners can compose
+/// complete headroom chains without treating opaque backings as unbounded.
+/// External reservation owners have no locally provable spare capacity.
+pub fn optionalLocalHeadroom(a: std.mem.Allocator) ?struct { available: usize, backing: std.mem.Allocator } {
+    if (a.vtable.alloc != alloc and a.vtable.alloc != scratchAlloc) return null;
+    const self: *Budget = @ptrCast(@alignCast(a.ptr));
+    self.lock();
+    const admitted = self.admission != null;
+    var available = self.limit -| if (self.monotonic) self.spent else self.live;
+    var backing = self.backing;
+    const pressure = self.pressure;
+    self.mutex.unlock();
+    if (admitted) return null;
+    if (pressure) |shared| if (shared.capacity) |capacity| {
+        available = @min(available, capacity.available(shared.ptr));
+        backing = capacity.backing;
+    };
+    return .{ .available = available, .backing = backing };
+}
 /// Optional acceleration must not speculate through an opaque quota wrapper.
 /// Recognize only our complete budget chain and standard unbounded backings;
 /// mandatory allocations continue to use the normal allocator error contract.
 pub fn optionalHeadroom(a: std.mem.Allocator) ?usize {
-    if (a.vtable.alloc == alloc or a.vtable.alloc == scratchAlloc) {
-        const self: *Budget = @ptrCast(@alignCast(a.ptr));
-        self.lock();
-        const available = self.limit -| if (self.monotonic) self.spent else self.live;
-        const backing = self.backing;
-        const shared_admission = self.admission != null;
-        self.mutex.unlock();
-        // An external reservation owner can impose another, opaque cap.
-        if (shared_admission) return null;
-        const parent = optionalHeadroom(backing) orelse return null;
-        return @min(available, parent);
+    if (optionalLocalHeadroom(a)) |layer| {
+        const parent = optionalHeadroom(layer.backing) orelse return null;
+        return @min(layer.available, parent);
     }
     if (a.vtable == std.heap.page_allocator.vtable) return std.math.maxInt(usize);
     if (comptime !@import("builtin").single_threaded) {
@@ -163,10 +192,20 @@ pub fn reusableHeadroom(a: std.mem.Allocator) ?usize {
         const self: *Budget = @ptrCast(@alignCast(actual.ptr));
         self.lock();
         const reusable = !self.monotonic and self.admission == null;
-        const available = self.limit -| self.live;
-        const backing = self.backing;
+        var available = self.limit -| self.live;
+        var backing = self.backing;
+        const pressure = self.pressure;
         self.mutex.unlock();
         if (!reusable) return null;
+        if (pressure) |shared| if (shared.capacity) |capacity| {
+            available = @min(available, capacity.available(shared.ptr));
+            backing = capacity.backing;
+            const reclaimed = reclaimingAllocator(backing);
+            // Allocation still goes through the shared owner's actual backing.
+            // An arena hidden there cannot promise refunds merely because
+            // introspection could unwrap it.
+            if (reclaimed.ptr != backing.ptr or reclaimed.vtable != backing.vtable) return null;
+        };
         return @min(available, reusableHeadroom(backing) orelse return null);
     }
     if (comptime @import("builtin").is_test) {
@@ -439,4 +478,26 @@ test "SQL reclaimable scratch headroom follows quota owners behind regions" {
     try std.testing.expectError(error.OutOfMemory, nested.allocator().alloc(u8, 65));
     try std.testing.expect(nested.isExhausted());
     try std.testing.expectEqual(@as(usize, 512), parent.live);
+}
+
+test "SQL shared backing pressure propagates through nested execution budgets without classifying backing OOM" {
+    const Shared = struct {
+        denied: bool = false,
+        fn exhausted(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.denied;
+        }
+    };
+    var shared: Shared = .{};
+    var parent: Budget = .{ .backing = std.testing.allocator, .limit = 4096, .pressure = .{ .ptr = &shared, .exhausted = Shared.exhausted } };
+    var child: Budget = .{ .backing = parent.allocator(), .limit = 1024 };
+    try std.testing.expect(!child.isExhausted());
+    shared.denied = true;
+    try std.testing.expect(child.isExhausted());
+    shared.denied = false;
+    try std.testing.expect(!child.isExhausted());
+    var failures = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var backing: Budget = .{ .backing = failures.allocator(), .limit = 1024 };
+    try std.testing.expectError(error.OutOfMemory, backing.allocator().alloc(u8, 16));
+    try std.testing.expect(!backing.isExhausted());
 }

@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 
@@ -145,10 +145,12 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // reached 8.10 GB in a clean aarch64-linux-musl ReleaseFast
         // build. The v0.3 RC ARM64 GNU API peaked at 10,983,571,456 bytes;
         // reserve 12 GiB on Linux, retaining about 17% headroom. October's
-        // native lake codegen reached
-        // 19.81 GB on macOS with paged native maintenance. Reserve 24 GiB
-        // to retain at least 25% headroom over that measured peak.
-        .api_kernel => @as(usize, if (target.os.tag == .macos) 24 else 12) * 1024 * 1024 * 1024,
+        // native lake codegen reached 27,085,701,120 bytes on macOS with
+        // logical input commitments. Reserve 28 GiB, over 10% above that
+        // measured peak, while fitting a 36 GiB host's 28.8 GiB compiler
+        // budget. Further headroom requires partitioning the API owner;
+        // overlapping this unit with another large compile is unsafe.
+        .api_kernel => @as(usize, if (target.os.tag == .macos) 28 else 12) * 1024 * 1024 * 1024,
         // September's macOS 20 GiB claim is below the reported 22–23 GB
         // compiler peak. 28 GiB includes >=25% headroom at 23 decimal GB.
         // Keep the measured Linux profiles separate. The other macOS bumps
@@ -218,7 +220,22 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
         return authored;
     // Run 38693574492: 16,964,825,088 and 11,133,898,752 bytes.
     // Each floor includes >=25% headroom and fits CI's 22 GiB budget alone.
-    const gib: usize = if (std.mem.eql(u8, name, "public-api-parity")) 20 else if (std.mem.eql(u8, name, "data-runtime-tests")) 14 else return authored;
+    // Native Nix glibc-linked Zig 0.17.0, baseline x86_64 GNU Debug:
+    // run 40093707715 independently measured each compiler process. These
+    // are distinct test closures, not the runtime archive reservations above.
+    // Round each peak + 10% to whole GiB rather than applying a blanket bump
+    // that would suppress unrelated compilation parallelism. See COMPILATION.md.
+    const floors = [_]struct { name: []const u8, gib: usize }{
+        .{ .name = "public-api-parity", .gib = 20 },
+        .{ .name = "data-runtime-tests", .gib = 14 },
+        .{ .name = "standalone-runtime-owner-tests", .gib = 16 },
+        .{ .name = "data-runtime-implementation-tests", .gib = 18 },
+        .{ .name = "antfly-hosted-initial-fk-recovery", .gib = 14 },
+        .{ .name = "sql-tests-local", .gib = 9 },
+    };
+    const gib: usize = for (floors) |floor| {
+        if (std.mem.eql(u8, name, floor.name)) break floor.gib;
+    } else return authored;
     return @max(authored, gib * 1024 * 1024 * 1024);
 }
 
@@ -233,6 +250,18 @@ test "macOS reservations cover reported storage peak and prevent unsafe overlap"
     // A 48 GiB developer host with 8 GiB reserved for other work cannot
     // admit storage and inference simultaneously under the revised claims.
     try std.testing.expect(storage + runtimeCompileMaxRss(.inference, profile) > 40 * 1024 * 1024 * 1024);
+}
+
+test "macOS default API admission covers the native lake peak within the local compiler budget" {
+    const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
+    const profile: CompileMemoryProfile = .{ .host = macos, .target = macos, .optimize = .fast, .strip = false, .cpu_inference = true };
+    const peak: usize = 27_085_701_120;
+    const gib = 1024 * 1024 * 1024;
+    const budget = 36 * gib * 4 / 5;
+    const claim = runtimeCompileMaxRss(.api_kernel, profile);
+    try std.testing.expect(claim >= peak + peak / 10);
+    try std.testing.expect(claim <= budget);
+    try std.testing.expect(claim + runtimeCompileMaxRss(.distributed, profile) > budget);
 }
 
 test "measured release reservations admit storage with inference and preserve unmeasured profiles" {
@@ -443,7 +472,9 @@ test "native Darwin Debug test reservations cover measured peaks without unsafe 
         try std.testing.expectEqual(12 * gib, testCompileMaxRss(name, macos, macos, .safe, 12 * gib));
         try std.testing.expectEqual(12 * gib, testCompileMaxRss(name, macos, linux, .debug, 12 * gib));
         try std.testing.expectEqual(12 * gib, testCompileMaxRss(name, linux, macos, .debug, 12 * gib));
-        try std.testing.expectEqual(7 * gib, testCompileMaxRss(name, linux, linux, .debug, 7 * gib));
+        // Some implementation closures now have independent Linux evidence.
+        const linux_floor: usize = if (std.mem.eql(u8, name, "data-runtime-implementation-tests")) 18 else if (std.mem.eql(u8, name, "antfly-hosted-initial-fk-recovery")) 14 else 7;
+        try std.testing.expectEqual(linux_floor * gib, testCompileMaxRss(name, linux, linux, .debug, 7 * gib));
     }
 }
 
@@ -459,4 +490,27 @@ test "Linux release API reservations cover ARM64 GNU and musl peaks within the r
         try std.testing.expect(claim >= peak + peak / 6);
         try std.testing.expect(claim + runtimeCompileMaxRss(.enrichment_compute, profile) <= 20 * gib);
     }
+}
+
+test "native Linux implementation reservations retain useful overlap within CI admission" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
+    const gib: usize = 1024 * 1024 * 1024;
+    const measurements = [_]struct { name: []const u8, peak: usize }{
+        .{ .name = "standalone-runtime-owner-tests", .peak = 15_286_923_264 },
+        .{ .name = "data-runtime-implementation-tests", .peak = 17_153_777_664 },
+        .{ .name = "antfly-hosted-initial-fk-recovery", .peak = 13_219_102_720 },
+        .{ .name = "sql-tests-local", .peak = 8_168_538_112 },
+    };
+    for (measurements) |sample| {
+        const claim = testCompileMaxRss(sample.name, linux, linux, .debug, 0);
+        try std.testing.expect(claim >= sample.peak + sample.peak / 10);
+        // Every measured root can overlap a 2 GiB compiler within the actual
+        // main unit runner's 20 GiB aggregate budget. Smaller roots can also
+        // overlap ordinary 7 GiB tests instead of serializing the whole gate.
+        try std.testing.expect(claim + 2 * gib <= 20 * gib);
+        try std.testing.expectEqual(24 * gib, testCompileMaxRss(sample.name, linux, linux, .debug, 24 * gib));
+        try std.testing.expectEqual(7 * gib, testCompileMaxRss(sample.name, linux, linux, .fast, 7 * gib));
+    }
+    try std.testing.expect(testCompileMaxRss("sql-tests-local", linux, linux, .debug, 0) + 7 * gib <= 20 * gib);
+    try std.testing.expect(testCompileMaxRss("antfly-hosted-initial-fk-recovery", linux, linux, .debug, 0) + 6 * gib <= 20 * gib);
 }

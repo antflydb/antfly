@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Public-ID ordered seeks over native tuple/file counts and physical rows.
 //! A tie group visits only participating files and the requested row window.
@@ -377,27 +377,30 @@ pub const Cursor = struct {
         try reader.pages.cancellation.check();
         if (reader.cached) |cached| try cached.context.ensureActive();
     }
-    fn addParticipant(self: *Cursor, slot: u32) !void {
+    fn addParticipants(self: *Cursor, slots: []const u32) !void {
         const owner = self.participants.?;
         try participantCheck(self.reader);
         _ = owner.scratch.reset(.retain_capacity);
         const scratch = owner.scratch.allocator();
-        const digest = try self.reader.publicDigest(scratch, slot);
-        if (self.boundary) |boundary| if (std.mem.eql(u8, self.group, boundary)) {
-            if (std.mem.order(u8, &digest, &self.boundary_digest.?) == (if (self.reverse_ids) std.math.Order.gt else .lt)) return;
-        };
-        if (self.participant_after) |after| {
-            if (std.mem.order(u8, &digest, &after) != (if (self.reverse_ids) std.math.Order.lt else .gt)) return;
+        var digests: [128][32]u8 = undefined;
+        try self.reader.publicDigestsMany(scratch, slots, digests[0..slots.len]);
+        for (slots, digests[0..slots.len]) |slot, digest| {
+            if (self.boundary) |boundary| if (std.mem.eql(u8, self.group, boundary)) {
+                if (std.mem.order(u8, &digest, &self.boundary_digest.?) == (if (self.reverse_ids) std.math.Order.gt else .lt)) continue;
+            };
+            if (self.participant_after) |after| {
+                if (std.mem.order(u8, &digest, &after) != (if (self.reverse_ids) std.math.Order.lt else .gt)) continue;
+            }
+            var key: [36]u8 = undefined;
+            key[0..32].* = digest;
+            key[32..36].* = ordered.file_dictionary.slotKey(slot);
+            // Native memcomparable spill runs keep arbitrary digest bytes intact.
+            // Complementing the key supplies descending order without JSON encoding.
+            if (self.reverse_ids) for (&key) |*byte| {
+                byte.* = ~byte.*;
+            };
+            try owner.sort.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = &key })}, .values = &.{}, .ordinal = slot });
         }
-        var key: [36]u8 = undefined;
-        key[0..32].* = digest;
-        key[32..36].* = ordered.file_dictionary.slotKey(slot);
-        // Native memcomparable spill runs keep arbitrary digest bytes intact.
-        // Complementing the key supplies descending order without JSON encoding.
-        if (self.reverse_ids) for (&key) |*byte| {
-            byte.* = ~byte.*;
-        };
-        try owner.sort.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = &key })}, .values = &.{}, .ordinal = slot });
     }
     fn sortParticipants(self: *Cursor, following: ?tree.Cursor.Record, seed: std.ArrayList(u32), io: std.Io) !bool {
         const owner = try self.a.create(Participants);
@@ -407,7 +410,16 @@ pub const Cursor = struct {
         owner.sort.encoded_bytes = true;
         self.participants = owner;
         errdefer self.clearParticipants();
-        for (seed.items) |slot| try self.addParticipant(slot);
+        var slots: [128]u32 = undefined;
+        var count: usize = 0;
+        for (seed.items) |slot| {
+            slots[count] = slot;
+            count += 1;
+            if (count == slots.len) {
+                try self.addParticipants(&slots);
+                count = 0;
+            }
+        }
         var next_record = following;
         while (next_record) |record| {
             if (record.key.len != self.group.len + 4 or !std.mem.eql(u8, record.key[0..self.group.len], self.group)) {
@@ -415,9 +427,15 @@ pub const Cursor = struct {
                 break;
             }
             if (record.value.len != 8 or std.mem.readInt(u64, record.value[0..8], .big) == 0) return error.InvalidNativeLakeRowIndex;
-            try self.addParticipant(std.mem.readInt(u32, record.key[record.key.len - 4 ..][0..4], .big));
+            slots[count] = std.mem.readInt(u32, record.key[record.key.len - 4 ..][0..4], .big);
+            count += 1;
+            if (count == slots.len) {
+                try self.addParticipants(&slots);
+                count = 0;
+            }
             next_record = try self.directory.?.next();
         }
+        try self.addParticipants(slots[0..count]);
         self.participant_sorts += 1;
         self.participant_spill_files_peak = @max(self.participant_spill_files_peak, owner.manager.admissionStats().peak_files);
         self.files = &.{};

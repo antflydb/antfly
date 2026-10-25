@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -146,9 +146,9 @@ fn login(allocator: std.mem.Allocator, io: std.Io, client: *AntflyClient, option
     try requireData(begin);
     const attempt = begin.data.?.value;
     try validateAuthorizationUrl(attempt.authorization_url);
-    std.debug.print("Continue with ChatGPT in your local browser:\n{s}\n", .{attempt.authorization_url});
+    cli.output.notice("Continue with ChatGPT in your local browser:\n{s}\n", .{attempt.authorization_url});
     if (!options.no_browser) openBrowser(io, attempt.authorization_url) catch {
-        std.debug.print("Open the URL above manually; waiting for authorization.\n", .{});
+        cli.output.notice("Open the URL above manually; waiting for authorization.\n", .{});
     };
     const deadline = std.Io.Clock.awake.now(io).nanoseconds + @as(i128, options.timeout_seconds) * std.time.ns_per_s;
     const id = try waitForConnection(allocator, io, client, attempt.attempt_id, deadline, 60_000);

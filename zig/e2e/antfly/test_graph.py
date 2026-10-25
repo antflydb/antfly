@@ -1,17 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Portable graph E2E tests adapted from the Go antfly suite."""
 
@@ -116,6 +116,40 @@ def _create_stateful_table(api, table_name: str, **kwargs) -> dict:
     )
     assert created is not None
     return created
+
+
+def test_stateful_graph_diagnostic_identifies_later_incoming_operation(stateful_api):
+    api = stateful_api
+    table = f"graph_capability_{time.time_ns()}"
+    _create_stateful_table(
+        api, table, num_shards=2, indexes={"knowledge": {"type": "graph"}}
+    )
+    start = {"identities": [{"table": table, "key": "seed"}]}
+    response = api._request(
+        "POST",
+        f"/tables/{table}/query",
+        {
+            "graph_queries": {
+                "supported_incoming": {
+                    "index": "knowledge",
+                    "traverse": {"start": start, "direction": "in", "max_depth": 1},
+                },
+                "seed_paths": {
+                    "index": "knowledge",
+                    "traverse": {
+                        "start": start,
+                        "direction": "in",
+                        "max_depth": 1,
+                        "deduplicate_nodes": False,
+                    },
+                },
+            }
+        },
+    )
+    assert response.status_code == 422, response.text
+    error = response.json()
+    assert error["operation"] == "seed_paths", error
+    assert error["reason"] == "deduplicate_nodes_must_be_true", error
 
 
 def _batch_write_stateful(api, table_name: str, **kwargs) -> dict:

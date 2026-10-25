@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Bounded native enrichment units shared by archive and accepted-WAL builds.
 const std = @import("std");
@@ -28,6 +28,9 @@ pub const Unit = struct {
     source_fingerprint: ?[]const u8 = null,
     parts: []const Part = &.{},
     materialized: ?V = null,
+    /// Borrowed physical vector; valid for the input batch lease. Publication
+    /// consumes it before advancing the source, without JSON boxing.
+    dense_vector: ?[]const f32 = null,
     start_offset: ?u32 = null,
     end_offset: ?u32 = null,
     start_time_ms: ?f32 = null,
@@ -68,6 +71,13 @@ pub fn rebind(a: A, key: []const u8, public_parent: []const u8) ![]u8 {
 pub fn prepare(a: A, config: V, column: []const u8, row: V, options: ?managed.InitOptions) ![]const Unit {
     if (row != .object or config != .object) return error.InvalidEmbeddingInput;
     const value = row.object.get(column) orelse .null;
+    return prepareSelected(a, config, value, row, options);
+}
+
+/// Field-only inputs retain the same chunking, remote-media and cancellation
+/// semantics as document enrichment. Only templates need the complete row.
+pub fn prepareSelected(a: A, config: V, value: V, row: ?V, options: ?managed.InitOptions) ![]const Unit {
+    if (config != .object) return error.InvalidEmbeddingInput;
     if (configured(config, "embedder") == null) {
         if (value == .null) return &.{};
         const result = try a.alloc(Unit, 1);
@@ -79,7 +89,7 @@ pub fn prepare(a: A, config: V, column: []const u8, row: V, options: ?managed.In
     if (opts.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
     var parts: []const Part = if (configured(config, "template")) |source| templated: {
         if (source != .string) return error.InvalidEmbeddingInput;
-        const bytes = try std.json.Stringify.valueAlloc(a, row, .{});
+        const bytes = try std.json.Stringify.valueAlloc(a, row orelse return error.InvalidEmbeddingInput, .{});
         defer a.free(bytes);
         break :templated try local.template_remote.renderJsonToPartsWithConfig(a, source.string, bytes, .{
             .io = opts.io,

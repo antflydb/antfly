@@ -26,6 +26,16 @@ const db_mod = @import("../storage/db/control_root.zig");
 
 pub const algebraic_ir = db_mod.algebraic.ir;
 
+/// Bind private document controls after selecting a physical route, before
+/// encoding either a compiled-owner call or a remote shard request.
+pub fn bindDocumentAuthorityToGroup(req: db_mod.types.SearchRequest, group_id: u64) !db_mod.types.SearchRequest {
+    if (req.document_authority_mode == .none) return req;
+    if (group_id == 0 or (req.document_authority_group != 0 and req.document_authority_group != group_id)) return error.InvalidQueryRequest;
+    var scoped = req;
+    scoped.document_authority_group = group_id;
+    return scoped;
+}
+
 pub fn checkQueryDeadline(req: db_mod.types.SearchRequest) !void {
     if (req.cancellation) |value| {
         if (value.isCancelled()) return error.Cancelled;
@@ -3473,6 +3483,10 @@ pub fn encodeQueryRequestWithGraphWireMode(
         );
     } else if (req.full_text) |full_text| {
         try appendTextQueryField(alloc, &out, &first, "full_text_search", full_text);
+    } else if (req.document_authority_mode == .lookup and req.query == .match_all) {
+        // Exact-ID primary hydration has no scoring relation. Encoding its
+        // implicit match-all as full_text_search would normalize into an
+        // explicit text query, which the primary-only lookup gate rejects.
     } else if ((dense_queries.len > 0 or sparse_queries.len > 0) and req.query == .match_all) {
         // The storage request defaults to match-all, but a vector-only query
         // has no text retrieval component. Serializing that default would make
@@ -5127,7 +5141,7 @@ pub fn parseStorageKernelSearchResult(alloc: std.mem.Allocator, body: []const u8
 /// Decode private sources only for an admitted internal request. Both HTTP
 /// workers and compiled storage owners serialize the same authority envelope.
 pub fn restoreDocumentAuthority(alloc: std.mem.Allocator, scratch: std.mem.Allocator, group_id: u64, mode: db_mod.types.document_authority.Mode, result: *db_mod.types.SearchResult) !void {
-    if (mode == .none) return;
+    if (mode == .none or mode == .lookup) return;
     if (result.document_authority_version != 1) return error.StorageReadTemporarilyUnavailable;
     for (result.hits) |*hit| {
         if (hit.document_authority != null) return error.InvalidRemoteResponse;

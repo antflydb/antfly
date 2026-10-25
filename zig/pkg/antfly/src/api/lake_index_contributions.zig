@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Lazy authenticated contribution lookup and copy-on-write live-set updates.
 const std = @import("std");
@@ -22,6 +22,7 @@ const pages = @import("../serverless/graph_segment/page_store.zig");
 const stores = @import("../serverless/artifacts/store.zig");
 const A = std.mem.Allocator;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
+pub const Predecessor = struct { source: []const u8, schema: []const u8, snapshot: []const u8, count: u32, cut: ?catalog.Digest = null };
 pub const Index = struct {
     io: ?std.Io = null,
     metadata_mutex: std.Io.Mutex = .init,
@@ -44,7 +45,9 @@ pub const Index = struct {
     has_file_coverage: bool = false,
     migrating: bool = false,
     prior_roots: []const catalog.Digest = &.{},
-    predecessor: ?struct { source: []const u8, schema: []const u8, snapshot: []const u8, count: u32 } = null,
+    predecessor: ?Predecessor = null,
+    /// Immutable per-declaration proofs, populated before parallel workers start.
+    predecessors: std.StringHashMapUnmanaged(Predecessor) = .empty,
     roots: std.AutoHashMapUnmanaged(catalog.Digest, void) = .empty,
     pub fn init(self: *Index, a: A, store: stores.ArtifactStore, root: ?tree.Ref, cancellation: Cancellation) !void {
         const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
@@ -54,6 +57,7 @@ pub const Index = struct {
         @memset(self.cache.slots, null);
     }
     pub fn deinit(self: *Index) void {
+        self.predecessors.deinit(self.a);
         self.retained.deinit(self.a);
         self.roots.deinit(self.a);
         self.covered_files.deinit(self.a);
@@ -79,7 +83,14 @@ pub const Index = struct {
         self.delta_reductions += 1;
     }
     pub fn acceptsDelta(self: *const Index, delta: @import("lake_source_navigation.zig").Delta) bool {
-        const prior = self.predecessor orelse return false;
+        return self.accepts(self.predecessor, delta);
+    }
+    pub fn acceptsDeltaFor(self: *const Index, name: []const u8, delta: @import("lake_source_navigation.zig").Delta) bool {
+        return self.accepts(self.predecessors.get(name) orelse self.predecessor, delta);
+    }
+    fn accepts(self: *const Index, predecessor: ?Predecessor, delta: @import("lake_source_navigation.zig").Delta) bool {
+        const prior = predecessor orelse return false;
+        if (prior.cut) |cut| if (delta.prior_cut == null or !std.mem.eql(u8, &cut, &delta.prior_cut.?)) return false;
         return self.counted and !self.migrating and delta.prior_snapshot != null and
             delta.prior_count == prior.count and std.mem.eql(u8, delta.prior_snapshot.?, prior.snapshot) and
             std.mem.eql(u8, delta.source, prior.source) and std.mem.eql(u8, delta.schema, prior.schema);
@@ -532,4 +543,30 @@ test "external lake counted ownership preserves shared aliases retires dead bran
     values[1].owned = &y_children;
     try cycle.includeRoot(identity(values[0]));
     try std.testing.expectError(error.InvalidLakeIndexCatalog, cycle.update(values[0..2]));
+}
+
+test "external lake aggregate delta admission binds each declaration to its original census" {
+    const a = std.testing.allocator;
+    var index: Index = .{ .a = a, .root = null, .store = undefined, .counted = true };
+    defer index.predecessors.deinit(a);
+    try index.predecessors.put(a, "sum", .{ .source = "s", .schema = "schema", .snapshot = "one", .count = 16, .cut = @splat(1) });
+    try index.predecessors.put(a, "count", .{ .source = "s", .schema = "schema", .snapshot = "two", .count = 16, .cut = @splat(2) });
+    var delta: @import("lake_source_navigation.zig").Delta = undefined;
+    delta.source = "s";
+    delta.schema = "schema";
+    delta.prior_snapshot = "one";
+    delta.prior_count = 16;
+    delta.prior_cut = @splat(1);
+    try std.testing.expect(index.acceptsDeltaFor("sum", delta));
+    try std.testing.expect(!index.acceptsDeltaFor("count", delta));
+    try std.testing.expect(!index.acceptsDeltaFor("missing", delta));
+    delta.prior_cut = @splat(2);
+    try std.testing.expect(!index.acceptsDeltaFor("sum", delta));
+    delta.prior_snapshot = "two";
+    try std.testing.expect(index.acceptsDeltaFor("count", delta));
+    delta.prior_count = 15;
+    try std.testing.expect(!index.acceptsDeltaFor("count", delta));
+    delta.prior_count = 16;
+    delta.schema = "different";
+    try std.testing.expect(!index.acceptsDeltaFor("count", delta));
 }

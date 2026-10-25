@@ -24,7 +24,7 @@ Alternates Antfly and llama.cpp on the Gemma 4 E2B QAT CUDA benchmark
 and writes raw outputs plus paired summary artifacts.
 
 Environment overrides:
-  ANTFLY_BIN              antfly-inference binary
+  ANTFLY_BIN              antfly-inference-dev binary
   LLAMA_CPP_BIN           llama.cpp llama-completion binary
   MODEL                   Gemma 4 E2B QAT q4_0 GGUF file or model directory
   OUT_DIR                 output directory
@@ -126,7 +126,7 @@ fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)"
 inference_dir="$repo_root/zig/pkg/inference"
-antfly_bin="${ANTFLY_BIN:-${ANTFY_BIN:-$inference_dir/zig-out/bin/antfly-inference}}"
+antfly_bin="${ANTFLY_BIN:-${ANTFY_BIN:-$inference_dir/zig-out/bin/antfly-inference-dev}}"
 llama_cpp_bin="${LLAMA_CPP_BIN:-/tmp/llama.cpp/build/bin/llama-completion}"
 model="${MODEL:-$repo_root/.models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf}"
 out_dir="${OUT_DIR:-/tmp/antfly-gemma4-qat-llamacpp-paired-$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -272,7 +272,7 @@ run_maybe_timeout() {
   fi
 }
 
-require_path "antfly-inference binary" "$antfly_bin"
+require_path "antfly-inference-dev binary" "$antfly_bin"
 require_path "llama.cpp binary" "$llama_cpp_bin"
 require_path "Gemma 4 E2B QAT model" "$model"
 mkdir -p "$out_dir"

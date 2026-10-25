@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Bounded merge of an immutable statement read view and staged primary rows.
 //! Owns at most one native page; staged state is borrowed from the serialized
@@ -31,7 +31,7 @@ pub fn needsMerge(staged: *const transactions.OwnedTransactionCommitRequest, tab
         if (!std.mem.eql(u8, staged.physicalName(entry.table_name), table.physical_name)) continue;
         if (entry.schema_version != null and entry.schema_version != table.schema_version) return error.CatalogGenerationChanged;
         if (entry.relational_schema_version != null and entry.relational_schema_version != table.schema_version) return error.CatalogGenerationChanged;
-        writes = writes or entry.batch.writes.len != 0 or entry.batch.deletes.len != 0 or entry.txn_writes.len != 0;
+        writes = writes or entry.batch.writes.len != 0 or entry.batch.deletes.len != 0;
     }
     return writes;
 }

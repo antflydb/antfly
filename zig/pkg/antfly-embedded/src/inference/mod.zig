@@ -74,6 +74,9 @@ test "remote capability invalidation fences active discovery" {
 
 test "bedrock provider request helpers" {
     try managed_embedder.testBedrockCredentialTrafficBypassesModelQuota();
+    try bedrock.testConverseWire();
+    try bedrock.testConverseSignedRequest();
+    try bedrock.testConverseStream();
     try bedrock.testBedrockSigningClockUsesUnixWallTime();
     try bedrock.testBedrockSigningDatesUseCalendarMonthNumbers();
     try bedrock.testTitanMultimodalBodyOmitsEmptyInputText();

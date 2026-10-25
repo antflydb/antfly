@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Exact indexed metadata predicates in a pinned native text snapshot.
 const std = @import("std");
@@ -24,6 +24,58 @@ const Result = local.storage_db_query_search_exec.IndexedTextPredicate;
 const Condition = local.sql_catalog.Condition;
 const Graph = local.storage_db_query_graph_exec;
 const Compiled = Graph.CompiledPatternFilter;
+
+/// Translate a complete physical selection in bounded tiles before deriving
+/// index-space pack/ordinal supersets. Residual predicates still use current rows.
+pub fn indexSelection(a: A, source: *local.serverless_query_lake_serving.ServingSource, binding: ?local.serverless_query_lake_serving.ServingSource.RowResolver, selected: *const @import("lake_index_physical_set.zig").Set, allowance: *local.serverless_query_lake_serving.ServingSource.TranslationAllowance) !@import("lake_index_physical_set.zig").Set {
+    if (selected.boundedCardinality(@intCast(allowance.remaining_rows)) == null) return error.QueryCandidateBudgetExceeded;
+    return indexSelectionCutLimited(a, source.inventory.source_id, source.inventory.snapshot_id, binding, selected, allowance);
+}
+fn indexSelectionCut(a: A, source_id: []const u8, snapshot_id: []const u8, binding: ?local.serverless_query_lake_serving.ServingSource.RowResolver, selected: *const @import("lake_index_physical_set.zig").Set) !@import("lake_index_physical_set.zig").Set {
+    return indexSelectionCutLimited(a, source_id, snapshot_id, binding, selected, null);
+}
+fn indexSelectionCutLimited(a: A, source_id: []const u8, snapshot_id: []const u8, binding: ?local.serverless_query_lake_serving.ServingSource.RowResolver, selected: *const @import("lake_index_physical_set.zig").Set, allowance: ?*local.serverless_query_lake_serving.ServingSource.TranslationAllowance) !@import("lake_index_physical_set.zig").Set {
+    const Set = @import("lake_index_physical_set.zig").Set;
+    const RowRef = local.storage_rowsource_types.RowRef;
+    var result = Set.init(a);
+    errdefer result.deinit();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var refs: [256]RowRef = undefined;
+    var count: usize = 0;
+    var files = selected.files.iterator();
+    while (files.next()) |file| {
+        var blocks = file.value_ptr.iterator();
+        while (blocks.next()) |block| {
+            var selected_rows = block.value_ptr.iterator();
+            while (selected_rows.next()) |low| {
+                refs[count] = .{ .external = .{ .source_id = source_id, .snapshot_id = snapshot_id, .file_id = file.key_ptr.*, .row_group_ordinal = block.key_ptr.group, .row_ordinal = (@as(u64, block.key_ptr.high) << 32) | low } };
+                count += 1;
+                if (count == refs.len) {
+                    const mapped = try indexBatch(scratch.allocator(), binding, refs[0..count], allowance);
+                    for (mapped) |ref| try result.addRow(ref.external.file_id, ref.external.row_group_ordinal, ref.external.row_ordinal);
+                    _ = scratch.reset(.retain_capacity);
+                    count = 0;
+                }
+            }
+        }
+    }
+    const mapped = try indexBatch(scratch.allocator(), binding, refs[0..count], allowance);
+    for (mapped) |ref| try result.addRow(ref.external.file_id, ref.external.row_group_ordinal, ref.external.row_ordinal);
+    return result;
+}
+
+fn indexBatch(a: A, binding: ?local.serverless_query_lake_serving.ServingSource.RowResolver, refs: []const local.storage_rowsource_types.RowRef, allowance: ?*local.serverless_query_lake_serving.ServingSource.TranslationAllowance) ![]const local.storage_rowsource_types.RowRef {
+    const resolver = binding orelse return refs;
+    if (allowance) |limited| {
+        const translate = resolver.translate_many_bounded orelse return error.QueryCandidateBudgetExceeded;
+        return translate(resolver.ptr, a, refs, false, limited);
+    }
+    if (resolver.translate_many) |translate| return translate(resolver.ptr, a, refs, false);
+    const result = try a.alloc(local.storage_rowsource_types.RowRef, refs.len);
+    for (refs, result) |ref, *target| target.* = try resolver.to_index(resolver.ptr, a, ref);
+    return result;
+}
 
 /// Four independently reusable slots bound decode/rank storage even when the
 /// request allocator is an arena. Each slot uses a fixed buffer, not an arena
@@ -215,6 +267,7 @@ pub const Identities = struct {
         }
     };
     const FileSpan = struct { file: []const u8, span: Span };
+    row_resolver: ?local.serverless_query_lake_serving.ServingSource.RowResolver = null,
     partial_inventory: bool = false,
     files: std.StringHashMapUnmanaged(Span) = .empty,
     spans: []const FileSpan = &.{},
@@ -293,7 +346,7 @@ pub const Identities = struct {
         var segment: usize = 0;
         for (root.file_groups) |group| {
             if (group.sources.len == 0 or group.segments.len != 1 or segment >= snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
-            try corpus.source_spans.validate(group.sources, snapshot.segments[segment].reader.doc_count, root.domain);
+            try corpus.source_spans.validateMode(group.sources, snapshot.segments[segment].reader.doc_count, root.domain, group.masked);
             for (group.sources) |source| {
                 const owned = try std.json.Stringify.valueAlloc(a, source, .{});
                 defer a.free(owned);
@@ -369,7 +422,20 @@ pub const Identities = struct {
     }
     /// Translate a query-wide compressed physical tombstone set into just the
     /// admitted native window. Keep each temporary bitmap within one 2^20 block.
-    pub fn bitmapForPhysical(self: Identities, a: A, selected: *const @import("lake_index_physical_set.zig").Set, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead) !Bitmap {
+    pub fn bitmapForPhysical(self: Identities, a: A, selected: *const @import("lake_index_physical_set.zig").Set, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead) anyerror!Bitmap {
+        if (self.row_resolver) |resolver| {
+            var window_rows: usize = 0;
+            for (self.spans) |item| window_rows +|= item.span.upper - item.span.lower;
+            if (window_rows != 0 and selected.boundedCardinality(window_rows) == null)
+                return self.bitmapForCurrentCandidates(a, selected, store, cached, resolver);
+            var mapped = try indexSelectionCut(a, resolver.current_source, resolver.current_snapshot, resolver, selected);
+            defer mapped.deinit();
+            var direct = self;
+            direct.row_resolver = null;
+            // Run the native compressed block/rank kernel in the selected
+            // index's coordinate space after bounded batch translation.
+            return direct.bitmapForPhysical(a, &mapped, store, cached);
+        }
         var result = Bitmap.init(a);
         errdefer result.deinit();
         var cache: LiveRowsCache = .{ .backing = a };
@@ -390,10 +456,56 @@ pub const Identities = struct {
         }
         return result;
     }
+    /// A broad mask is probed from this window's candidates. Each archive row
+    /// is translated at most once across disjoint windows; the compressed
+    /// query-wide mask never expands into a second archive-sized selection.
+    fn bitmapForCurrentCandidates(self: Identities, a: A, selected: *const @import("lake_index_physical_set.zig").Set, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, resolver: local.serverless_query_lake_serving.ServingSource.RowResolver) !Bitmap {
+        var result = Bitmap.init(a);
+        errdefer result.deinit();
+        var direct = self;
+        direct.row_resolver = null;
+        var live: LiveRowsCache = .{ .backing = a };
+        defer live.deinit(a);
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        var refs: [256]local.storage_rowsource_types.RowRef = undefined;
+        var docs: [256]u32 = undefined;
+        for (self.spans) |item| {
+            var begin = item.span.lower;
+            while (begin < item.span.upper) {
+                try cached.context.ensureActive();
+                _ = scratch.reset(.retain_capacity);
+                const count = @min(refs.len, item.span.upper - begin);
+                for (refs[0..count], docs[0..count], begin..) |*ref, *doc, ordinal_| {
+                    doc.* = @intCast(ordinal_);
+                    ref.* = try direct.physicalRow(scratch.allocator(), &live, store, cached, doc.*, resolver.source, resolver.snapshot);
+                }
+                const mapped = if (resolver.translate_many) |translate| try translate(resolver.ptr, scratch.allocator(), refs[0..count], true) else blk: {
+                    const translated = try scratch.allocator().alloc(local.storage_rowsource_types.RowRef, count);
+                    for (translated, refs[0..count]) |*row, ref| row.* = try resolver.from_index(resolver.ptr, scratch.allocator(), ref);
+                    break :blk translated;
+                };
+                for (mapped, docs[0..count]) |ref, doc| if (selected.contains(ref.external.file_id, ref.external.row_group_ordinal, ref.external.row_ordinal)) try result.add(doc);
+                begin += @intCast(count);
+            }
+        }
+        return result;
+    }
     fn liveRows(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, block: corpus.physical.Block) !*const Bitmap {
         return cache.load(a, store, cached, block);
     }
     fn addBlock(self: Identities, a: A, temporary: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, selected: @import("lake_index_predicate_blocks.zig").Block, result: *Bitmap) !void {
+        if (self.row_resolver != null) {
+            // An ordered index may be freshly rebuilt while this text index
+            // is retained. Its compressed blocks still describe current rows.
+            var physical = @import("lake_index_physical_set.zig").Set.init(temporary);
+            defer physical.deinit();
+            try physical.addBlock(selected);
+            var translated = try self.bitmapForPhysical(temporary, &physical, store, cached);
+            defer translated.deinit();
+            try result.orWith(&translated);
+            return;
+        }
         const file = self.files.get(selected.file) orelse {
             if (self.partial_inventory) return;
             return error.ExternalLakeSnapshotMismatch;
@@ -437,12 +549,15 @@ pub const Identities = struct {
     }
     pub fn ordinal(self: Identities, a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, row: local.storage_rowsource_types.RowRef) !?u32 {
         if (row != .external) return error.InvalidNativeLakeRowIndex;
-        const ref = row.external;
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const mapped = if (self.row_resolver) |resolver| try resolver.to_index(resolver.ptr, scratch.allocator(), row) else row;
+        const ref = mapped.external;
         const span = self.files.get(ref.file_id) orelse {
             if (self.partial_inventory) return null;
             return error.ExternalLakeSnapshotMismatch;
         };
-        return span.localOrdinal((try sourceRank(a, cache, store, cached, span, row)) orelse return null);
+        return span.localOrdinal((try sourceRank(a, cache, store, cached, span, mapped)) orelse return null);
     }
     pub fn sourceOrdinal(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, physical: @import("lake_index_aggregate_artifact.zig").ChunkRef, count: u32, row: local.storage_rowsource_types.RowRef) !?u32 {
         const span: Span = .{ .lower = 0, .upper = count, .rows = &.{}, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = physical.artifact_id, .checksum = physical.checksum, .byte_len = physical.byte_len }, .expected_rows = count };
@@ -590,7 +705,21 @@ pub const Identities = struct {
             const live = try liveRows(a, cache, store, cached, block);
             break :blk live.read_rank.?.select(rank) orelse return error.InvalidNativeLakeTextCorpus;
         } else try std.math.add(u32, block.lower, rank);
-        return .{ .external = .{ .source_id = source, .snapshot_id = snapshot, .file_id = file.file, .row_group_ordinal = block.group, .row_ordinal = (block.high << corpus.physical.shift) | low } };
+        const ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = if (self.row_resolver) |resolver| resolver.source else source, .snapshot_id = if (self.row_resolver) |resolver| resolver.snapshot else snapshot, .file_id = file.file, .row_group_ordinal = block.group, .row_ordinal = (block.high << corpus.physical.shift) | low } };
+        return if (self.row_resolver) |resolver| try resolver.from_index(resolver.ptr, a, ref) else ref;
+    }
+    /// Resolve one native candidate tile through a single relocation operation.
+    pub fn physicalRows(self: Identities, a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, ordinals: []const u32, source: []const u8, snapshot: []const u8) ![]const local.storage_rowsource_types.RowRef {
+        if (ordinals.len > 128) return error.InvalidNativeLakeTextCorpus;
+        var original = self;
+        original.row_resolver = null;
+        const refs = try a.alloc(local.storage_rowsource_types.RowRef, ordinals.len);
+        for (ordinals, refs) |doc_ordinal, *ref| ref.* = try original.physicalRow(a, cache, store, cached, doc_ordinal, if (self.row_resolver) |resolver| resolver.source else source, if (self.row_resolver) |resolver| resolver.snapshot else snapshot);
+        if (self.row_resolver) |resolver| {
+            if (resolver.translate_many) |translate| return translate(resolver.ptr, a, refs, true);
+            for (refs) |*ref| ref.* = try resolver.from_index(resolver.ptr, a, ref.*);
+        }
+        return refs;
     }
     pub fn sourcePhysicalRow(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, span: corpus.source_spans.Span, ordinal_value: u32, source: []const u8, snapshot: []const u8) !local.storage_rowsource_types.RowRef {
         const item: FileSpan = .{ .file = span.file.id, .span = .{ .lower = 0, .upper = span.file_rows, .rows = &.{}, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = span.physical.artifact_id, .checksum = span.physical.checksum, .byte_len = span.physical.byte_len }, .expected_rows = span.file_rows } };
@@ -679,6 +808,33 @@ fn PredicateResolver(comptime Set: type) type {
                 for (self.predicates.items) |*predicate| predicate.deinit();
                 self.predicates.clearRetainingCapacity();
             }
+            /// Reopen an exact compound predicate rather than consuming the
+            /// adaptive membership cursor. Shared original coordinates keep
+            /// broad native selections compressed through vector admission.
+            pub fn indexSpaceSelection(self: *@This(), a: A, target: ?local.serverless_query_lake_serving.ServingSource.RowResolver) !?PhysicalSet {
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const ca = arena.allocator();
+                const parsed = try std.json.parseFromSliceLeaky(std.json.Value, ca, self.json, .{});
+                const compiled = try Graph.compilePatternFilter(ca, parsed);
+                var conditions: std.ArrayList(Condition) = .empty;
+                if (!try collectConditions(ca, compiled, &conditions, 0)) return null;
+                var predicate = (try rows.tryOpenPredicateWithContext(a, self.resolver.server, self.resolver.table, conditions.items, self.resolver.context, self.resolver.source, self.resolver.pinned)) orelse return null;
+                defer predicate.deinit();
+                if (!predicate.blocksMatch(target)) return null;
+                var result = PhysicalSet.init(a);
+                errdefer result.deinit();
+                var window = std.heap.ArenaAllocator.init(a);
+                defer window.deinit();
+                while (true) {
+                    try self.resolver.read_context.ensureActive();
+                    _ = window.reset(.free_all);
+                    const blocks = try predicate.nextBlocks(window.allocator());
+                    if (blocks.len == 0) break;
+                    for (blocks) |block| try result.addBlock(block);
+                }
+                return result;
+            }
             fn materialize(self: *@This()) !void {
                 if (self.complete != null) return;
                 // A selective exact driver is cheaper than walking a broad
@@ -699,7 +855,7 @@ fn PredicateResolver(comptime Set: type) type {
                 for (self.predicates.items[1..]) |*predicate| {
                     const count = candidates.boundedCardinality(4096) orelse return error.InvalidNativeLakeRowIndex;
                     if (count == 0) break;
-                    if (64 *| count >= predicate.work or !predicate.canProbeMembership()) {
+                    if (predicate.membershipWork(count) >= predicate.work or !predicate.canProbeMembership()) {
                         var next = try self.resolver.consume(self.a, predicate);
                         defer next.deinit();
                         candidates.andWith(&next);
@@ -743,7 +899,8 @@ fn PredicateResolver(comptime Set: type) type {
                 try self.resolver.context.ensureActive();
                 try self.resolver.read_context.ensureActive();
                 if (self.complete == null) {
-                    const cost = std.math.mul(u64, 64, self.predicates.items.len) catch std.math.maxInt(u64);
+                    var cost: u64 = 0;
+                    for (self.predicates.items) |predicate| cost +|= predicate.membershipWork(1);
                     var probe = self.predicates.items.len != 0 and cost <= self.budget -| self.spent;
                     for (self.predicates.items) |predicate| probe = probe and predicate.canProbeMembership();
                     if (probe) {
@@ -758,6 +915,51 @@ fn PredicateResolver(comptime Set: type) type {
                 if (ref != .external) return error.InvalidNativeLakeRowIndex;
                 const row = ref.external;
                 return self.complete.?.contains(row.file_id, row.row_group_ordinal, row.row_ordinal);
+            }
+            /// Probe a complete conjunction over one native candidate tile.
+            /// Admission is reserved for the whole tile before any predicate
+            /// advances, so a declined tile safely materializes the exact set.
+            pub fn allowsMany(self: *@This(), refs: []const local.storage_rowsource_types.RowRef, output: []bool) !void {
+                if (refs.len != output.len or refs.len > 128) return error.InvalidNativeLakeRowIndex;
+                try self.resolver.context.ensureActive();
+                try self.resolver.read_context.ensureActive();
+                if (self.complete == null) {
+                    var cost: u64 = 0;
+                    var probe = self.predicates.items.len != 0;
+                    for (self.predicates.items) |predicate| {
+                        cost +|= predicate.membershipWork(refs.len);
+                        probe = probe and predicate.canProbeMembership();
+                    }
+                    if (probe and cost <= self.budget -| self.spent) {
+                        self.spent +|= cost;
+                        @memset(output, true);
+                        var selected: [128]local.storage_rowsource_types.RowRef = undefined;
+                        var positions: [128]usize = undefined;
+                        var allowed: [128]bool = undefined;
+                        for (self.predicates.items) |*predicate| {
+                            var count: usize = 0;
+                            for (refs, output, 0..) |ref, keep, i| if (keep) {
+                                selected[count] = ref;
+                                positions[count] = i;
+                                count += 1;
+                            };
+                            if (count == 0) break;
+                            predicate.containsMany(selected[0..count], allowed[0..count]) catch |err| {
+                                if (err != error.ArtifactReadBudgetExceeded and err != error.QueryCandidateBudgetExceeded) return err;
+                                try self.materialize();
+                                return self.allowsMany(refs, output);
+                            };
+                            for (positions[0..count], allowed[0..count]) |i, keep| output[i] = keep;
+                        }
+                        return;
+                    }
+                    try self.materialize();
+                }
+                for (refs, output) |ref, *keep| {
+                    if (ref != .external) return error.InvalidNativeLakeRowIndex;
+                    const row = ref.external;
+                    keep.* = self.complete.?.contains(row.file_id, row.row_group_ordinal, row.row_ordinal);
+                }
             }
         };
         pub fn openMembership(self: Self, a: A, json: []const u8) !Membership {
@@ -810,7 +1012,9 @@ fn PredicateResolver(comptime Set: type) type {
                 }
                 result.budget = @min(work, rows.predicateScanWork(self.source, conditions.items) orelse std.math.maxInt(u64));
                 const selective = result.predicates.items.len != 0 and result.predicates.items[0].estimatedRows() <= 4096;
-                if (probe and !selective and result.budget > 64 *| result.predicates.items.len) return result;
+                var point_work: u64 = 0;
+                for (result.predicates.items) |predicate| point_work +|= predicate.membershipWork(1);
+                if (probe and !selective and result.budget > point_work) return result;
             }
             // Selective, unsupported or exhausted plans use the authoritative
             // exact planner. Small selections are ready before sparse navigation.
@@ -859,14 +1063,31 @@ fn PredicateResolver(comptime Set: type) type {
             }
             return best;
         }
-        pub fn selectiveCandidates(self: Self, a: A, json: []const u8, limit: usize) !?PhysicalSet {
+        pub fn selectiveCandidates(self: Self, a: A, json: []const u8, limit: usize, allowance: *local.serverless_query_lake_serving.ServingSource.TranslationAllowance) !?PhysicalSet {
             var best = (try self.selectivePredicate(a, json, limit)) orelse return null;
             defer best.deinit();
-            var result = try self.consume(a, &best);
-            if (result.boundedCardinality(limit) == null) {
-                result.deinit();
-                return null;
+            if (best.hasBlocks()) {
+                var result = try self.consume(a, &best);
+                if (result.boundedCardinality(limit) == null) {
+                    result.deinit();
+                    return null;
+                }
+                return result;
             }
+            var result = PhysicalSet.init(a);
+            var keep = false;
+            defer if (!keep) result.deinit();
+            var window = std.heap.ArenaAllocator.init(a);
+            defer window.deinit();
+            while (true) {
+                try self.read_context.ensureActive();
+                _ = window.reset(.free_all);
+                const refs = try best.nextPhysicalBounded(window.allocator(), 256, allowance);
+                if (refs.len == 0) break;
+                for (refs) |ref| try result.addRow(ref.external.file_id, ref.external.row_group_ordinal, ref.external.row_ordinal);
+                if (result.boundedCardinality(limit) == null) return null;
+            }
+            keep = true;
             return result;
         }
 
@@ -908,7 +1129,6 @@ fn PredicateResolver(comptime Set: type) type {
             cache: LiveRowsCache = .{},
             materialized: ?Bitmap = null,
             spent_work: u64 = 0,
-            const point_work: u64 = 64;
             fn close(raw: *anyopaque) void {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 if (self.materialized) |*bitmap| bitmap.deinit();
@@ -940,26 +1160,52 @@ fn PredicateResolver(comptime Set: type) type {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 try self.resolver.context.ensureActive();
                 if (self.materialized == null) {
-                    const work = if (candidates) |selected| std.math.mul(u64, selected.cardinality(), point_work) catch std.math.maxInt(u64) else std.math.maxInt(u64);
+                    const work = if (candidates) |selected| self.predicate.membershipWork(selected.cardinality()) else std.math.maxInt(u64);
                     if (candidates != null and work <= self.work_budget -| self.spent_work) {
                         self.spent_work +|= work;
                         var result = Bitmap.init(a);
                         errdefer result.deinit();
                         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.resolver.server.lake_read_cache, .scope = self.resolver.store_identity, .context = self.resolver.read_context };
                         var iterator = candidates.?.iterator();
-                        var checked: usize = 0;
-                        while (iterator.next()) |local_ordinal| : (checked += 1) {
-                            if (checked % 64 == 0) try self.resolver.context.ensureActive();
-                            if (local_ordinal >= count) return error.InvalidNativeLakeTextCorpus;
-                            if (!self.predicate.canProbeMembership()) {
+                        var tile_budget: local.sql_memory_budget = .{ .backing = local.sql_memory_budget.reclaimingAllocator(a), .limit = 4 * 1024 * 1024 };
+                        var scratch = std.heap.ArenaAllocator.init(tile_budget.allocator());
+                        defer scratch.deinit();
+                        while (true) {
+                            try self.resolver.context.ensureActive();
+                            var ordinals: [128]u32 = undefined;
+                            var local_ordinals: [128]u32 = undefined;
+                            var size: usize = 0;
+                            while (size < ordinals.len) {
+                                const local_ordinal = iterator.next() orelse break;
+                                if (local_ordinal >= count) return error.InvalidNativeLakeTextCorpus;
+                                local_ordinals[size] = local_ordinal;
+                                ordinals[size] = try std.math.add(u32, offset, local_ordinal);
+                                size += 1;
+                            }
+                            if (size == 0) break;
+                            const admitted = tile: {
+                                if (!self.predicate.canProbeMembership()) break :tile false;
+                                _ = scratch.reset(.free_all);
+                                const refs = self.resolver.identities.physicalRows(scratch.allocator(), &self.cache, self.resolver.store, cached, ordinals[0..size], self.resolver.source.inventory.source_id, self.resolver.source.inventory.snapshot_id) catch |err| {
+                                    if (err == error.OutOfMemory and tile_budget.isExhausted()) break :tile false;
+                                    return err;
+                                };
+                                var allowed: [128]bool = undefined;
+                                self.predicate.containsMany(refs, allowed[0..size]) catch |err| {
+                                    if (err == error.ArtifactReadBudgetExceeded or err == error.QueryCandidateBudgetExceeded or (err == error.OutOfMemory and tile_budget.isExhausted())) break :tile false;
+                                    return err;
+                                };
+                                for (local_ordinals[0..size], allowed[0..size]) |ordinal, keep| if (keep) try result.add(ordinal);
+                                break :tile true;
+                            };
+                            if (!admitted) {
+                                // Discard all partial probe output before exposing exact fallback.
+                                _ = scratch.reset(.free_all);
                                 try self.materialize();
                                 const slice = try self.materialized.?.sliceRebased(a, offset, @as(u64, offset) + count);
                                 result.deinit();
                                 return slice;
                             }
-                            const ordinal_value = try std.math.add(u32, offset, local_ordinal);
-                            const row = try self.resolver.identities.physicalRow(self.a, &self.cache, self.resolver.store, cached, ordinal_value, self.resolver.source.inventory.source_id, self.resolver.source.inventory.snapshot_id);
-                            if (try self.predicate.contains(row)) try result.add(local_ordinal);
                         }
                         return result;
                     }
@@ -986,7 +1232,7 @@ fn PredicateResolver(comptime Set: type) type {
             }
             // A point-sized metadata predicate is cheaper to materialize than
             // even one reverse-tree probe. Preserve native scorer pushdown.
-            if (predicate.estimatedRows() == 0 or predicate.work <= ProducerOwner.point_work) {
+            if (predicate.estimatedRows() == 0 or predicate.work <= predicate.membershipWork(1)) {
                 const bitmap = try self.consume(a, &predicate);
                 predicate.deinit();
                 return .{ .bitmap = bitmap };
@@ -1171,7 +1417,14 @@ fn PredicateResolver(comptime Set: type) type {
             defer bitmap_cache.deinit(a);
             var window = std.heap.ArenaAllocator.init(a);
             defer window.deinit();
-            if (predicate.hasBlocks()) {
+            const direct_blocks = if (Set == Bitmap) predicate.blocksMatch(self.identities.row_resolver) else false;
+            if (predicate.hasBlocks() or direct_blocks) {
+                // Choose translation once for the complete compressed mask.
+                // Per-block candidate probes would rescan the same window
+                // once for every block in the archive.
+                const mixed_blocks = Set == Bitmap and !direct_blocks and self.identities.row_resolver != null;
+                var physical = PhysicalSet.init(a);
+                defer physical.deinit();
                 while (true) {
                     try self.context.ensureActive();
                     _ = window.reset(.free_all);
@@ -1181,11 +1434,21 @@ fn PredicateResolver(comptime Set: type) type {
                         if (Set == PhysicalSet) {
                             try result.addBlock(block);
                         } else {
+                            if (mixed_blocks) {
+                                try physical.addBlock(block);
+                                continue;
+                            }
                             const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store_identity, .context = self.read_context };
-                            try self.identities.addBlock(a, window.allocator(), &bitmap_cache, self.store, cached, block, &result);
+                            var identities = self.identities;
+                            if (direct_blocks) identities.row_resolver = null;
+                            try identities.addBlock(a, window.allocator(), &bitmap_cache, self.store, cached, block, &result);
                         }
                     }
                 }
+                if (comptime Set == Bitmap) if (mixed_blocks) {
+                    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store_identity, .context = self.read_context };
+                    return self.identities.bitmapForPhysical(a, &physical, self.store, cached);
+                };
                 return result;
             }
             while (true) {
@@ -1839,4 +2102,120 @@ test "external lake bounded WAL physical masks preserve selected gaps and high r
     defer result.deinit();
     try std.testing.expectEqual(@as(u64, 3), result.cardinality());
     try std.testing.expect(result.contains(0) and result.contains(1) and result.contains(3));
+}
+
+test "external lake rebuilt predicate blocks translate into retained text coordinates" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("mixed-predicate-blocks");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    const store = fs.artifactStore();
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &cache, .scope = @splat(8), .context = .{ .io = std.testing.io } };
+    const Ref = local.storage_rowsource_types.RowRef;
+    const Mapping = struct {
+        fn reverse(_: *anyopaque, allocator: A, row: Ref) !Ref {
+            if (!std.mem.eql(u8, row.external.file_id, "new") or row.external.row_ordinal >= 4) return error.TestUnexpectedResult;
+            var result = row;
+            result.external.file_id = try allocator.dupe(u8, "old");
+            result.external.row_ordinal = 3 - row.external.row_ordinal;
+            return result;
+        }
+        fn forward(raw: *anyopaque, _: A, row: Ref) !Ref {
+            const calls: *u8 = @ptrCast(@alignCast(raw));
+            calls.* += 1;
+            if (!std.mem.eql(u8, row.external.file_id, "old") or row.external.row_ordinal >= 4) return error.TestUnexpectedResult;
+            var result = row;
+            result.external.file_id = "new";
+            result.external.row_ordinal = 3 - row.external.row_ordinal;
+            return result;
+        }
+        fn file(_: *anyopaque, _: A, _: []const u8) !?[]const u8 {
+            return error.TestUnexpectedResult;
+        }
+        fn digest(_: *anyopaque, _: A, _: []const u8) ![]const u8 {
+            return error.TestUnexpectedResult;
+        }
+        fn rank(_: *anyopaque, _: A, _: Ref) !u64 {
+            return error.TestUnexpectedResult;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var marker: u8 = 0;
+    var identities: Identities = .{ .offsets = &.{}, .row_resolver = .{ .ptr = &marker, .source = "source", .snapshot = "old-cut", .current_source = "source", .current_snapshot = "new-cut", .rows = 4, .to_index = Mapping.reverse, .from_index = Mapping.forward, .file = Mapping.file, .digest = Mapping.digest, .tie_rank = Mapping.rank, .close = Mapping.close } };
+    defer identities.files.deinit(a);
+    const blocks = [_]corpus.physical.Block{.{ .group = 0, .high = 0, .base = 0, .count = 4, .lower = 0 }};
+    try identities.files.put(a, "old", .{ .lower = 0, .upper = 4, .rows = &blocks });
+    var live: LiveRowsCache = .{ .backing = a };
+    defer live.deinit(a);
+    var result = Bitmap.init(a);
+    defer result.deinit();
+    try identities.addBlock(a, a, &live, store, cached, .{ .file = "new", .group = 0, .base = 0, .selection = .{ .interval = .{ .lower = 0, .count = 2 } } }, &result);
+    try std.testing.expectEqual(@as(u64, 2), result.cardinality());
+    try std.testing.expect(result.contains(2) and result.contains(3));
+    var selection = @import("lake_index_physical_set.zig").Set.init(a);
+    defer selection.deinit();
+    try selection.addRow("new", 0, 1);
+    var single = try identities.bitmapForPhysical(a, &selection, store, cached);
+    defer single.deinit();
+    try std.testing.expectEqual(@as(u64, 1), single.cardinality());
+    try std.testing.expect(single.contains(2));
+    // A four-row mask over a two-row window must use just two forward probes.
+    identities.spans = &.{.{ .file = "old", .span = .{ .lower = 0, .upper = 2, .rows = &blocks } }};
+    try selection.addBlock(.{ .file = "new", .group = 0, .base = 0, .selection = .{ .interval = .{ .lower = 0, .count = 4 } } });
+    var broad = try identities.bitmapForPhysical(a, &selection, store, cached);
+    defer broad.deinit();
+    try std.testing.expectEqual(@as(u64, 2), broad.cardinality());
+    try std.testing.expect(broad.contains(0) and broad.contains(1));
+    try std.testing.expectEqual(@as(u8, 2), marker);
+}
+
+test "external lake text candidate tiles batch shuffled duplicate relocation without scalar map probes" {
+    const a = std.testing.allocator;
+    const Ref = local.storage_rowsource_types.RowRef;
+    const Mapping = struct {
+        batches: usize = 0,
+        fn one(_: *anyopaque, _: A, _: Ref) !Ref {
+            return error.TestUnexpectedResult;
+        }
+        fn many(raw: *anyopaque, out: A, refs: []const Ref, forward: bool) ![]const Ref {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.batches += 1;
+            try std.testing.expect(forward);
+            const result = try out.dupe(Ref, refs);
+            for (result) |*ref| {
+                try std.testing.expectEqualStrings("old", ref.external.snapshot_id);
+                ref.external.snapshot_id = "new";
+                ref.external.file_id = "current";
+                ref.external.row_ordinal = 7 - ref.external.row_ordinal;
+            }
+            return result;
+        }
+        fn file(_: *anyopaque, _: A, _: []const u8) !?[]const u8 {
+            return error.TestUnexpectedResult;
+        }
+        fn digest(_: *anyopaque, _: A, _: []const u8) ![]const u8 {
+            return error.TestUnexpectedResult;
+        }
+        fn rank(_: *anyopaque, _: A, _: Ref) !u64 {
+            return error.TestUnexpectedResult;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var mapping: Mapping = .{};
+    const blocks = [_]corpus.physical.Block{.{ .group = 0, .high = 0, .base = 0, .count = 8, .lower = 0 }};
+    const identities: Identities = .{ .offsets = &.{}, .spans = &.{.{ .file = "original", .span = .{ .lower = 0, .upper = 8, .rows = &blocks } }}, .row_resolver = .{ .ptr = &mapping, .source = "source", .snapshot = "old", .current_source = "source", .current_snapshot = "new", .rows = 8, .from_index = Mapping.one, .to_index = Mapping.one, .translate_many = Mapping.many, .file = Mapping.file, .digest = Mapping.digest, .tie_rank = Mapping.rank, .close = Mapping.close } };
+    var live: LiveRowsCache = .{};
+    defer live.deinit(a);
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = undefined, .scope = @splat(1), .context = .{} };
+    const refs = try identities.physicalRows(region.allocator(), &live, undefined, cached, &.{ 7, 1, 1, 3 }, "source", "new");
+    try std.testing.expectEqual(@as(usize, 1), mapping.batches);
+    for (refs, [_]u64{ 0, 6, 6, 4 }) |ref, row| {
+        try std.testing.expectEqual(row, ref.external.row_ordinal);
+        try std.testing.expectEqualStrings("new", ref.external.snapshot_id);
+    }
 }

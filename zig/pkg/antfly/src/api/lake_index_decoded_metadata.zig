@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Verified immutable metadata, sharing the bounded decoded-cache lease owner.
 const std = @import("std");
@@ -84,6 +84,9 @@ pub fn acquireInterpreted(comptime T: type, cached: artifacts.CachedRead, store:
 /// Optional interpretations remember only their own deterministic size decline.
 /// Shared loading pressure and backing allocator failures remain retryable.
 pub fn acquireInterpretedBounded(comptime T: type, cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, interpretation: []const u8, arguments: anytype, comptime load: anytype, limit: usize, fallback: ?T) !Owned(T) {
+    return acquireInterpretedBoundedInner(T, cached, store, ref, cancellation, interpretation, arguments, load, limit, fallback, null);
+}
+fn acquireInterpretedBoundedInner(comptime T: type, cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, interpretation: []const u8, arguments: anytype, comptime load: anytype, limit: usize, fallback: ?T, decline_error: ?anyerror) !Owned(T) {
     try cached.context.ensureActive();
     try cancellation.check();
     var key = try cacheKey(T, cached, ref);
@@ -93,7 +96,7 @@ pub fn acquireInterpretedBounded(comptime T: type, cached: artifacts.CachedRead,
         hash.update(interpretation);
         hash.final(&key);
     }
-    if (fallback != null) {
+    if (fallback != null or decline_error != null) {
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update(&key);
         var encoded_limit: [8]u8 = undefined;
@@ -108,21 +111,25 @@ pub fn acquireInterpretedBounded(comptime T: type, cached: artifacts.CachedRead,
         cached: artifacts.CachedRead,
         arguments: @TypeOf(arguments),
         fallback: ?T,
+        decline_error: ?anyerror,
         fn decode(raw: *anyopaque, item: *local.serverless_query_lake_decoded_cache.Item) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const a = item.arena.allocator();
             const decoded = load(a, self.store, self.ref, self.cancellation, self.cached, self.arguments) catch |err| declined: {
                 if (err != error.OutOfMemory or !item.budget.exhausted or item.budget.admission_exhausted) return err;
-                const result = self.fallback orelse return err;
+                const result = self.fallback orelse return self.decline_error orelse err;
                 _ = item.arena.reset(.free_all);
                 item.budget.exhausted = false;
                 break :declined result;
             };
-            const value = try a.create(T);
+            const value = a.create(T) catch |err| {
+                if (err == error.OutOfMemory and item.budget.exhausted and !item.budget.admission_exhausted) return self.decline_error orelse err;
+                return err;
+            };
             value.* = decoded;
             item.payload = .{ .extension = value };
         }
-    }{ .store = store, .ref = ref, .cancellation = cancellation, .cached = cached, .arguments = arguments, .fallback = fallback };
+    }{ .store = store, .ref = ref, .cancellation = cancellation, .cached = cached, .arguments = arguments, .fallback = fallback, .decline_error = decline_error };
     // Both API cancellation and the serving deadline remain active while
     // waiting for another decoder or global decode memory admission.
     const Check = struct {
@@ -195,6 +202,25 @@ pub fn acquireColumnBlock(cached: artifacts.CachedRead, store: stores.ArtifactSt
     return acquire(local.sql_spill.ColumnarBlock, cached, store, .{ .kind = .ordered_row_index, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, Loader.load);
 }
 
+/// Independent covering waves own a retained reservation for this exact
+/// decoded limit. A narrower flight cannot impose its limit on ordinary reads.
+pub fn acquireColumnBlockBounded(cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: artifacts.ChunkRef, cancellation: @import("antfly_cancellation").CancellationToken, limit: usize) !Owned(local.sql_spill.ColumnarBlock) {
+    const reference: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .ordered_row_index, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
+    if (try lookup(local.sql_spill.ColumnarBlock, cached, reference)) |owned| {
+        if (owned.lease.item.budget.live <= limit) return owned;
+        owned.release();
+        return error.SqlMemoryLimitExceeded;
+    }
+    const Loader = struct {
+        fn load(a: std.mem.Allocator, source: stores.ArtifactStore, artifact: local.serverless_manifest_artifact_ref.ArtifactRef, token: @import("antfly_cancellation").CancellationToken, cache: ?artifacts.CachedRead, _: void) !local.sql_spill.ColumnarBlock {
+            if (artifact.byte_len > artifacts.max_block_bytes) return error.InvalidNativeLakeRowIndex;
+            const bytes = try artifacts.readArtifact(a, source, .{ .artifact_id = artifact.artifact_id, .checksum = artifact.checksum, .byte_len = artifact.byte_len }, token, cache);
+            return local.sql_spill.decodeColumnarBlockInArena(a, bytes, artifacts.max_block_bytes);
+        }
+    };
+    return acquireInterpretedBoundedInner(local.sql_spill.ColumnarBlock, cached, store, reference, cancellation, "covering-wave-v1", {}, Loader.load, limit, null, error.SqlMemoryLimitExceeded);
+}
+
 /// A verified pack already owns the immutable block bytes. Cache admission
 /// still binds the exact content identity and copies into the cache lease.
 pub fn acquireColumnBlockBytes(cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: artifacts.ChunkRef, cancellation: @import("antfly_cancellation").CancellationToken, bytes: []const u8) !Owned(local.sql_spill.ColumnarBlock) {
@@ -241,9 +267,19 @@ test "external lake decoded covering blocks share exact dictionaries and fence c
     try std.testing.expectError(error.DeadlineExceeded, acquireColumnBlock(cached, store, ref, .none));
     cached.context.deadline_ns = null;
     cached.scope = @splat(2);
+    // A narrow interpretation may decline without poisoning the ordinary
+    // decoder's flight or hiding genuine allocator failures.
+    try std.testing.expectError(error.SqlMemoryLimitExceeded, acquireColumnBlockBounded(cached, store, ref, .none, 256));
     const isolated = try acquireColumnBlock(cached, store, ref, .none);
     defer isolated.release();
     try std.testing.expect(isolated.value != first.value);
+    try std.testing.expectError(error.SqlMemoryLimitExceeded, acquireColumnBlockBounded(cached, store, ref, .none, 256));
+    var failures = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var unavailable = local.serverless_query_lake_serving_cache.Cache.init(failures.allocator());
+    defer unavailable.deinit();
+    var uncached = cached;
+    uncached.cache = &unavailable;
+    try std.testing.expectError(error.OutOfMemory, acquireColumnBlockBounded(uncached, store, ref, .none, 16 * 1024 * 1024));
 }
 
 test "external lake decoded metadata remembers local interpretation size declines" {

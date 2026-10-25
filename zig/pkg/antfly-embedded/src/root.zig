@@ -22,6 +22,8 @@ pub const object_storage = embedded.object_storage;
 pub const lsm_backend = embedded.lsm_backend;
 pub const storage_backend = embedded.storage_backend;
 pub const db_types = embedded.db_types;
+pub const memory = @import("memory/service.zig");
+pub const memory_engine = @import("memory/engine.zig");
 
 test "pkg antfly embedded root compiles" {
     _ = db;

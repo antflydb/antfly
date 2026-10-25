@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const local_query_contract = @import("antfly_local_sources").api_local_query_contract;
 const query_post_processing = @import("query_post_processing.zig");
@@ -9513,6 +9513,8 @@ const searchRequestHasUnserializableResolvedDocFilter = local_query_contract.sea
 
 const graphHydrateRequestHasResolvedDocFilter = local_query_contract.graphHydrateRequestHasResolvedDocFilter;
 
+const bindDocumentAuthorityToGroup = local_query_contract.bindDocumentAuthorityToGroup;
+
 /// Single-group graph queries execute locally against a snapshot that holds
 /// the graph index's complete row set: mark the request so the storage graph
 /// executors may expand THROUGH cross-table tagged nodes (entity-sourced
@@ -9591,10 +9593,9 @@ fn rejectUnsupportedGraphQueryMode(
     req: db_mod.types.SearchRequest,
 ) !void {
     if (req.graph_queries.len > 0 and
-        !distributed_graph.supportsCrossRange(req) and
         (group_count > 1 or req.graph_table_read_authorizer != null))
     {
-        return error.GraphQueryModeUnsupported;
+        try distributed_graph.rejectUnsupportedCrossRange(req);
     }
 }
 
@@ -15770,7 +15771,7 @@ fn queryRemoteWithScratch(
     req: db_mod.types.SearchRequest,
 ) !db_mod.types.SearchResult {
     var result = queryResponseRemote(executor, scratch, base_uri, group_id, table_name, req) catch |err| {
-        if (req.document_authority_mode == .hydrate and err == error.UnexpectedHttpStatus) return error.StorageReadTemporarilyUnavailable;
+        if ((req.document_authority_mode == .hydrate or req.document_authority_mode == .lookup) and err == error.UnexpectedHttpStatus) return error.StorageReadTemporarilyUnavailable;
         if (req.document_authority_mode != .candidates or err != error.UnexpectedHttpStatus) return err;
         var legacy = req;
         legacy.document_authority_mode = .none;
@@ -15779,13 +15780,13 @@ fn queryRemoteWithScratch(
         return queryRemoteWithScratch(executor, alloc, scratch, base_uri, group_id, table_name, legacy);
     };
     defer result.deinit(scratch);
-    var parsed = if (req.document_authority_mode != .none)
+    var parsed = if (req.document_authority_mode != .none and req.document_authority_mode != .lookup)
         try local_query_contract.parseRemoteSearchResultWithAuthority(alloc, scratch, result.json, group_id, req.document_output_allocator)
     else
         try local_query_contract.parseRemoteSearchResultWithScratch(alloc, scratch, result.json);
     errdefer parsed.deinit();
     parsed.identity_read_generation = result.identity_read_generation orelse return error.InvalidQueryRequest;
-    if (req.document_authority_mode != .none) {
+    if (req.document_authority_mode != .none and req.document_authority_mode != .lookup) {
         if (parsed.document_authority_version != 1) {
             if (req.document_authority_mode != .candidates) return error.StorageReadTemporarilyUnavailable;
             var legacy = req;
@@ -15813,7 +15814,7 @@ fn queryResponseRemote(
     table_name: []const u8,
     input: db_mod.types.SearchRequest,
 ) !query_api.QueryResponse {
-    var req = input;
+    var req = try bindDocumentAuthorityToGroup(input, group_id);
     if (req.native_query_cut) |cut| if (cut.create) {
         req.native_query_cut = try cut.forGroup(group_id);
     };
@@ -27295,6 +27296,41 @@ pub const document_hydration_tests = if (builtin.is_test) struct {
         defer after.deinit();
         try std.testing.expect(!deferred.document_authority.?.eql(after.hits[0].document_authority.?.*));
         std.debug.print("DOCUMENT_HYDRATION candidates=2 deferred=1 primary_bytes={d} deferred_body_bytes=0 winner_projection_bytes={d}\n", .{ large.len, before.hits[0].stored_data.?.len });
+    }
+
+    test "native memory primary lookup preserves whole rows and exact IDs through private wire admission" {
+        const a = std.testing.allocator;
+        const request: db_mod.types.SearchRequest = .{ .document_authority_mode = .lookup, .document_authority_group = 11, .filter_doc_ids_positive = true, .filter_doc_ids = &.{ "a", "b" }, .limit = 2 };
+        const body = try local_query_contract.encodeQueryRequest(a, request);
+        defer a.free(body);
+        var parsed = try query_contract.parseQueryRequest(a, null, "docs", body);
+        defer parsed.deinit(a);
+        try std.testing.expectEqual(.lookup, parsed.req.document_authority_mode);
+        try std.testing.expect(parsed.req.query == .match_all and parsed.req.full_text == null);
+        try std.testing.expect(parsed.req.include_stored and parsed.req.include_all_fields and parsed.req.filter_doc_ids_positive);
+        try std.testing.expectEqual(@as(usize, 2), parsed.req.filter_doc_ids.len);
+        for (request.filter_doc_ids, parsed.req.filter_doc_ids) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+        const shard = distributedSearchShardRequest(request, &.{}, false);
+        try std.testing.expectEqual(.lookup, shard.document_authority_mode);
+        try std.testing.expect(shard.include_stored);
+        try std.testing.expectError(error.InvalidQueryRequest, query_contract.parsePublicQueryRequest(a, null, "docs", body));
+        const Remote = struct {
+            fn execute(_: *anyopaque, alloc: std.mem.Allocator, http_request: http_common.HttpRequest) !http_common.HttpResponse {
+                var forwarded = try query_contract.parseQueryRequest(alloc, null, "docs", http_request.body);
+                defer forwarded.deinit(alloc);
+                try std.testing.expectEqual(@as(u64, 11), forwarded.req.document_authority_group);
+                try std.testing.expectEqual(.lookup, forwarded.req.document_authority_mode);
+                try std.testing.expect(forwarded.req.query == .match_all and forwarded.req.full_text == null);
+                return .{ .status = 200, .headers = &.{}, .body = try alloc.dupe(u8, "{}") };
+            }
+        };
+        var context: u8 = 0;
+        const transport: http_common.RequestExecutor = .{ .ptr = &context, .vtable = &.{ .execute = Remote.execute } };
+        var unscoped = request;
+        unscoped.document_authority_group = 0;
+        var remote = try queryResponseRemote(transport, a, "http://native.test", 11, "docs", unscoped);
+        defer remote.deinit(a);
+        try std.testing.expectError(error.InvalidQueryRequest, queryResponseRemote(transport, a, "http://native.test", 12, "docs", request));
     }
 
     test "public graph metric borrowed wire document authority private controls roundtrip and public admission rejects them" {

@@ -299,6 +299,18 @@ components:
               type: boolean
               default: false
               description: Allow public inference execution, including named targets, direct connection invocation, batches, and sessions. Disabled by default for this release; deployments must explicitly opt in. Discovery remains available and reports this policy.
+            default_timeout_ms:
+              type: integer
+              minimum: 1
+              maximum: 3600000
+              default: 120000
+              description: Total public inference budget in milliseconds when the caller omits X-Antfly-Inference-Timeout-Ms. Includes admission, queueing, retries and execution. Must not exceed max_timeout_ms.
+            max_timeout_ms:
+              type: integer
+              minimum: 1
+              maximum: 3600000
+              default: 3600000
+              description: Maximum permitted caller budget. Invalid, duplicate, zero or excessive X-Antfly-Inference-Timeout-Ms headers fail before dispatch.
         inference:
           $ref: "../inference/config.yaml#/components/schemas/RuntimeConfig"
         tls:
@@ -778,6 +790,9 @@ components:
         location:
           type: string
           description: Google Cloud location when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+        workspace_id:
+          type: string
+          description: Anthropic workspace for an API key that is not workspace-scoped.
         credentials_path:
           type: string
           description: Filesystem path to provider credentials when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.

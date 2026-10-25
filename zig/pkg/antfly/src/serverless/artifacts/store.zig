@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 
@@ -193,11 +193,54 @@ pub const RetentionWitness = struct { scope: UploadScope, stamp: [32]u8 };
 /// A batch reserves its full fan-out before starting children. Children borrow
 /// a copy with this capability removed and drain before the owner resumes CPU.
 pub const IoPhase = struct {
+    io: std.Io,
     ptr: *anyopaque,
     max_parallel: usize,
+    scheduler: ?*@import("antfly_local_sources").sql_parallel_scheduler.Scheduler = null,
     begin: *const fn (*anyopaque, usize) anyerror!void,
     finish: *const fn (*anyopaque) anyerror!void,
     abort: *const fn (*anyopaque) void,
+    /// Joining an independently admitted CPU child parks without occupying an
+    /// I/O lane. The child may need the last I/O lane to finish its scratch.
+    park: ?*const fn (*anyopaque) void = null,
+    resume_cpu: ?*const fn (*anyopaque) anyerror!void = null,
+};
+pub const ExecutionIo = struct {
+    execution: *@import("antfly_local_sources").sql_parallel_scheduler.Execution,
+    io: std.Io,
+    pending: ?@import("antfly_local_sources").sql_parallel_scheduler.Execution.Io = null,
+    bridge: IoPhase = undefined,
+    pub fn capability(self: *ExecutionIo) ?*const IoPhase {
+        // Disabling I/O lanes retains the established required-inline fallback.
+        if (self.execution.scheduler.max_io_workers == 0) return null;
+        self.bridge = .{ .io = self.io, .ptr = self, .max_parallel = @min(8, self.execution.scheduler.max_io_workers), .scheduler = self.execution.scheduler, .begin = begin, .finish = finish, .abort = abort, .park = park, .resume_cpu = resumeCpu };
+        return &self.bridge;
+    }
+    fn park(raw: *anyopaque) void {
+        const self: *ExecutionIo = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.pending == null);
+        self.execution.pause();
+    }
+    fn resumeCpu(raw: *anyopaque) !void {
+        const self: *ExecutionIo = @ptrCast(@alignCast(raw));
+        try self.execution.enter(self.io);
+    }
+    fn begin(raw: *anyopaque, count: usize) !void {
+        const self: *ExecutionIo = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.pending == null);
+        self.pending = try self.execution.beginIo(self.io, count);
+    }
+    fn finish(raw: *anyopaque) !void {
+        const self: *ExecutionIo = @ptrCast(@alignCast(raw));
+        var pending = self.pending.?;
+        self.pending = null;
+        try pending.finish();
+    }
+    fn abort(raw: *anyopaque) void {
+        const self: *ExecutionIo = @ptrCast(@alignCast(raw));
+        if (self.pending) |*pending| pending.abort();
+        self.pending = null;
+    }
 };
 pub const IoGuard = struct {
     phase: ?*const IoPhase = null,
@@ -384,6 +427,52 @@ pub const ArtifactStore = struct {
         try phase.finish();
         try cancellation.check();
         return metadata;
+    }
+
+    pub const max_upload_batch = 8;
+    /// Borrow bounded payloads until every upload drains. The caller provides a
+    /// concurrency-safe store allocator when opting into parallel I/O. Results
+    /// retain input order; no result ownership transfers on failure, including
+    /// cancellation while the publication owner resumes CPU execution.
+    pub fn putBatchWithCancellation(self: *ArtifactStore, io: ?std.Io, contents: []const []const u8, result: []ArtifactMetadata, cancellation: CancellationToken) !void {
+        std.debug.assert(contents.len == result.len and contents.len <= max_upload_batch);
+        var completed: [max_upload_batch]?ArtifactMetadata = @splat(null);
+        defer for (&completed) |*item| if (item.*) |*metadata| metadata.deinit(self.allocator);
+        var begin: usize = 0;
+        const width = if (self.io_phase) |phase| @max(1, @min(max_upload_batch, phase.max_parallel)) else max_upload_batch;
+        while (begin < contents.len) {
+            try cancellation.check();
+            const end = @min(contents.len, begin + width);
+            var phase = try self.beginIo(end - begin);
+            defer phase.abort();
+            var backend = self.*;
+            backend.io_phase = null;
+            const Worker = struct {
+                fn run(owner: *ArtifactStore, bytes: []const u8, token: CancellationToken, output: *?ArtifactMetadata, failure: *?anyerror) void {
+                    output.* = owner.putWithCancellation(bytes, token) catch |err| {
+                        failure.* = err;
+                        return;
+                    };
+                }
+            };
+            var failures: [max_upload_batch]?anyerror = @splat(null);
+            if (io) |executor| {
+                var group: std.Io.Group = .init;
+                for (begin..end) |index| group.async(executor, Worker.run, .{ &backend, contents[index], cancellation, &completed[index], &failures[index] });
+                group.await(executor) catch |err| {
+                    group.cancel(executor);
+                    return phase.failed(err);
+                };
+            } else for (begin..end) |index| Worker.run(&backend, contents[index], cancellation, &completed[index], &failures[index]);
+            for (failures[begin..end]) |failure| if (failure) |err| return phase.failed(err);
+            try phase.finish();
+            begin = end;
+        }
+        try cancellation.check();
+        for (result, completed[0..result.len]) |*output, *metadata| {
+            output.* = metadata.*.?;
+            metadata.* = null;
+        }
     }
 
     pub fn getAlloc(self: *ArtifactStore, artifact_id: []const u8) ![]u8 {

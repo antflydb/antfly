@@ -109,9 +109,9 @@ Use product-area names for test files. Do not use migration labels like `*_parit
   - cluster `/backup`, `/backups`, and `/restore` round-trip for local `file://` backups
   - backend-gated remote cluster round-trip coverage for `s3://` and `gs://`
 - `test_extensions.py`
-  - full-suite MemoryAF extension package projection from `extensions/memoryaf`
+  - full-suite record-tools extension package projection from `zig/e2e/fixtures/extensions/records`
   - standalone and distributed extension lifecycle dry-run coverage
-  - standalone install plus scoped `/mcp/v1/extensions/memoryaf` tool listing coverage
+  - standalone install plus scoped `/mcp/v1/extensions/records` tool listing coverage
 ## Harnesses
 
 - `serverless_api`
@@ -214,12 +214,12 @@ Use the full Wasmtime C API library (`libwasmtime.dylib` on macOS or
 [CI setup](../../../.github/workflows/zig-tests.yml). The minimal C API build
 omits required component symbols.
 
-Build the [MemoryAF package](../../../extensions/memoryaf/README.md) before
+Build the [record-tools package](../fixtures/extensions/records/README.md) before
 setting this variable. From the repository root:
 
 ```bash
 rustup target add wasm32-wasip2
-cargo build --locked --manifest-path extensions/memoryaf/Cargo.toml --release --target wasm32-wasip2
+cargo build --locked --manifest-path zig/e2e/fixtures/extensions/records/Cargo.toml --release --target wasm32-wasip2
 cd zig
 ANTFLY_WASMTIME_LIB=/absolute/path/to/libwasmtime.dylib \
   ANTFLY_BIN=/absolute/path/to/antfly \
@@ -227,7 +227,7 @@ ANTFLY_WASMTIME_LIB=/absolute/path/to/libwasmtime.dylib \
 ```
 
 The artifact must exist at
-`extensions/memoryaf/target/wasm32-wasip2/release/memoryaf_extension.wasm`.
+`zig/e2e/fixtures/extensions/records/target/wasm32-wasip2/release/records_extension.wasm`.
 A configured library with a missing artifact causes runtime invocation failures;
 installing Wasmtime alone does not prepare the package.
 

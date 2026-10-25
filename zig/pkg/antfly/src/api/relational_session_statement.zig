@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Statement validation and normalized read-your-writes staging. This is not
 //! commit authority: the session seals the final guarded plan before 2PC.
@@ -52,8 +52,6 @@ pub fn apply(alloc: std.mem.Allocator, candidate: *sessions.OwnedTransactionComm
             table.batch.writes = next_writes;
             table.batch.deletes = next_deletes;
             transferred = true;
-            if (table.txn_writes.len != 0) alloc.free(table.txn_writes);
-            table.txn_writes = &.{};
         };
         const writes = try alloc.alloc(types.BatchWrite, update.writes.len);
         defer alloc.free(writes);
@@ -87,8 +85,9 @@ fn changes(update: contract.TableCommitRequest, key: []const u8) bool {
 pub fn validate(server: anytype, alloc: std.mem.Allocator, previous: ?*const sessions.OwnedTransactionCommitRequest, candidate: *sessions.OwnedTransactionCommitRequest, statement: *const sessions.OwnedTransactionCommitRequest, context: @import("antfly_local_sources").api_operation.RequestContext) !void {
     var original = try statement.clone(alloc);
     defer original.deinit(alloc);
-    const incoming = try original.distributedTables(alloc);
-    defer alloc.free(incoming);
+    const incoming_view = try original.distributedTables(alloc);
+    defer incoming_view.deinit();
+    const incoming = incoming_view.tables;
     try server.validateCommitTablesAgainstSchema(context, incoming);
     var snapshot = (try server.source.adminSnapshot()) orelse {
         _ = try integrity.metadataRequiresCoordination(alloc, null, incoming);
@@ -98,8 +97,9 @@ pub fn validate(server: anytype, alloc: std.mem.Allocator, previous: ?*const ses
     if (!try integrity.metadataRequiresCoordination(alloc, snapshot.tables, incoming)) return;
     var before = if (previous) |value| try value.clone(alloc) else sessions.OwnedTransactionCommitRequest{};
     defer before.deinit(alloc);
-    const staged = try before.distributedTables(alloc);
-    defer alloc.free(staged);
+    const staged_view = try before.distributedTables(alloc);
+    defer staged_view.deinit();
+    const staged = staged_view.tables;
     var prepared = try integrity.prepareSessionStatementWithTiming(alloc, server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, snapshot.ranges, staged, incoming, context, candidate.constraint_timing.items);
     defer prepared.deinit();
     try server.authorizeAndBindIntegrityMutations(alloc, context, prepared.tables, candidate);
@@ -112,8 +112,9 @@ test "distributed txn session statement normalization replaces old deletes and c
     var candidate = try sessions.parseCommitRequest(alloc, "{\"read_set\":[],\"tables\":{\"p\":{\"deletes\":[\"x\"]},\"c\":{\"inserts\":{\"y\":{\"id\":2}}}}}");
     defer candidate.deinit(alloc);
     try apply(alloc, &candidate, &.{ .{ .table_name = "p", .writes = &.{.{ .key = "x", .value = "{\"id\":3}" }} }, .{ .table_name = "c", .writes = &.{.{ .key = "y", .value = "{\"id\":3}" }} } });
-    const result = try candidate.distributedTables(alloc);
-    defer alloc.free(result);
+    const result_view = try candidate.distributedTables(alloc);
+    defer result_view.deinit();
+    const result = result_view.tables;
     for (result) |table| {
         try std.testing.expectEqual(@as(usize, 0), table.deletes.len);
         try std.testing.expectEqual(@as(usize, 1), table.writes.len);
@@ -135,8 +136,9 @@ test "distributed txn session normalization coalesces catalog aliases and new ca
     try next.bind(alloc, "renamed", "table:1");
     try next.bind(alloc, "child", "table:2");
     try candidate.mergeFrom(alloc, &next);
-    const result = try candidate.distributedTables(alloc);
-    defer alloc.free(result);
+    const result_view = try candidate.distributedTables(alloc);
+    defer result_view.deinit();
+    const result = result_view.tables;
     try std.testing.expectEqual(@as(usize, 2), result.len);
     for (result) |table| try std.testing.expectEqual(@as(usize, 2), table.writes.len);
     try std.testing.expectEqualStrings("{\"id\":2}", candidate.tables[0].batch.writes[0].value);
@@ -151,8 +153,9 @@ test "distributed txn session normalization retains bounded physical observation
     for (0..100) |_| try apply(alloc, &candidate, &updates);
     var cloned = try candidate.clone(alloc);
     defer cloned.deinit(alloc);
-    const tables = try cloned.distributedTables(alloc);
-    defer alloc.free(tables);
+    const tables_view = try cloned.distributedTables(alloc);
+    defer tables_view.deinit();
+    const tables = tables_view.tables;
     try std.testing.expectEqual(@as(usize, 1), tables.len);
     try std.testing.expectEqual(@as(usize, 1), tables[0].predicates.len);
     try std.testing.expectEqual(@as(u64, 42), tables[0].predicates[0].expected_version);
