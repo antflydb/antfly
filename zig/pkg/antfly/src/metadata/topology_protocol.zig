@@ -76,6 +76,8 @@ const std = @import("std");
 /// Version 41 carries shared content-addressed namespace execution attachments.
 /// Version 43 maintains shared namespace-scoped consumer routes and readiness.
 /// Version 44 maintains content-addressed static resolver profile adjacency.
+/// Version 46 adds indexed static suppression, scoped binding deltas, and
+/// compact proposal lifecycle headers with separately retained evidence.
 pub const current_version: u16 = 46;
 pub const resolver_records_version: u16 = 46;
 pub const native_service_tables_version: u16 = 38;

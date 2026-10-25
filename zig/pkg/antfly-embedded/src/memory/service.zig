@@ -2854,7 +2854,7 @@ const Run = struct {
         }
         try keys.appendSlice(self.a, snapshot.namespace.state.suppress.keys);
         var state = snapshot.namespace.state;
-        const queue = try store.proposalsForKeys(keys.items);
+        const queue = try store.proposalHeadersForKeys(keys.items);
         var proposals: std.ArrayList(curation.Proposal) = .empty;
         for (queue.proposals) |proposal| {
             if (self.reviewing_entity) |selected| if (eql(u8, selected, proposal.id)) continue;
@@ -2884,14 +2884,30 @@ const Run = struct {
         var old: std.StringHashMapUnmanaged(curation.Proposal) = .empty;
         for (before.state.proposals) |proposal| try old.put(self.a, proposal.id, proposal);
         var changed: std.ArrayList(curation.Proposal) = .empty;
+        var full: std.ArrayList(curation.Proposal) = .empty;
         for (next.state.proposals) |proposal| {
             if (old.get(proposal.id)) |previous| if (eql(u8, try self.encode(previous), try self.encode(proposal))) continue;
-            try changed.append(self.a, proposal);
+            var header = proposal;
+            header.evidence = null;
+            const lifecycle_only = if (old.get(proposal.id)) |previous| blk: {
+                var normalized = previous;
+                normalized.evidence = null;
+                normalized.state = header.state;
+                normalized.decided = header.decided;
+                break :blk eql(u8, try self.encode(normalized), try self.encode(header));
+            } else false;
+            // Refreshing an open proposal may replace its original inputs;
+            // lifecycle edits retain evidence while refresh/create owns a body.
+            if (lifecycle_only) try changed.append(self.a, header) else try full.append(self.a, proposal);
             try self.put(try std.fmt.allocPrint(self.a, "proposal-binding-id/{s}", .{try hash(self.a, proposal.id)}), proposal.id);
         }
         if (changed.items.len > 0) {
             const head = try store.queueHead();
-            try store.applyQueue(.{ .expected_revision = head.revision, .revision = try std.math.add(u64, head.revision, 1), .receipt_scope = next.state.receipt_scope, .proposals = changed.items });
+            try store.applyQueue(.{ .expected_revision = head.revision, .revision = try std.math.add(u64, head.revision, 1), .receipt_scope = next.state.receipt_scope, .proposals = changed.items, .retain_evidence = true });
+        }
+        if (full.items.len > 0) {
+            const head = try store.queueHead();
+            try store.applyQueue(.{ .expected_revision = head.revision, .revision = try std.math.add(u64, head.revision, 1), .receipt_scope = next.state.receipt_scope, .proposals = full.items });
         }
     }
     fn prepareIdentityIndex(self: *Run, seeds: []const []const u8, full: bool) !void {

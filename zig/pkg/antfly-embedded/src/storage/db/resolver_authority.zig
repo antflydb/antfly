@@ -1410,7 +1410,14 @@ test "resolver curation proposal headers preserve evidence without reading or re
     try std.testing.expectError(error.ResolverCurationConflict, store.applyQueue(.{ .expected_revision = 2, .revision = 3, .proposals = &.{forged}, .retain_evidence = true }));
     // A touched legacy row acquires a header without rewriting its body.
     _ = memory.rows.remove(try store.proposalHeaderPath(proposal_value.id));
+    var legacy_head = try store.queueHead();
+    legacy_head.bytes = original_bytes;
+    try TestMemory.put(&memory, a, try store.keyPath("queue/head"), try encode(a, legacy_head));
     try std.testing.expectEqual(c.ProposalState.open, (try store.proposalHeader(proposal_value.id)).?.state);
+    try store.applyQueue(.{ .expected_revision = 2, .revision = 3, .proposals = decision.state.proposals, .retain_evidence = true });
+    try std.testing.expect(original_body.ptr == memory.rows.get(body_path).?.ptr);
+    try std.testing.expectEqual(c.ProposalState.rejected, (try store.proposal(proposal_value.id)).?.state);
+    try std.testing.expectEqual(c.proposalCapacityBytes(.{ .proposals = &.{result} }), (try store.queueHead()).bytes);
 }
 
 test "native resolver mention policy is indexed and includes current normalized text suppression" {

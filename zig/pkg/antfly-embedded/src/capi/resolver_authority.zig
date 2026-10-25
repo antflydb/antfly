@@ -262,15 +262,20 @@ fn consumerProfiles(a: A, selected: []const Consumer, template: []const u8) ![]c
     return profiles.items;
 }
 fn prepareProfileCaches(a: A, inputs: []const Consumer) ![]const Consumer {
-    const selected = try a.dupe(Consumer, inputs);
-    var profiles: std.StringHashMapUnmanaged([]const native.AliasProfile) = .empty;
-    for (selected) |*source| {
+    const Builder = struct { values: std.ArrayList(native.AliasProfile) = .empty, seen: std.StringHashMapUnmanaged(void) = .empty };
+    var profiles: std.StringHashMapUnmanaged(Builder) = .empty;
+    for (inputs) |source| {
         const slot = try profiles.getOrPut(a, source.cfg.key_template);
-        if (!slot.found_existing) slot.value_ptr.* = try consumerProfiles(a, inputs, source.cfg.key_template);
-        source.prepared_profiles = slot.value_ptr.*;
+        if (!slot.found_existing) slot.value_ptr.* = .{};
+        const key = try native.admissionProfileKey(a, source.cfg);
+        if ((try slot.value_ptr.seen.getOrPut(a, key)).found_existing) continue;
+        try slot.value_ptr.values.append(a, .{ .id = key, .key_template = source.cfg.key_template, .aliases = source.cfg.aliases, .suppress_json = source.cfg.suppress_json });
     }
+    const selected = try a.dupe(Consumer, inputs);
+    for (selected) |*source| source.prepared_profiles = profiles.get(source.cfg.key_template).?.values.items;
     return selected;
 }
+
 fn profileScope(a: A, store: native.Store, selected: []const Consumer, template: []const u8, key: []const u8, into: ?[]const u8) !native.Snapshot {
     if (into) |target| if (!policy.keyInNamespace(template, target)) return error.InvalidResolverCurationRequest;
     var static_aliases: std.ArrayList(@import("antfly_resolver").KeyAlias) = .empty;
@@ -894,4 +899,20 @@ test "capi resolver curation static directory fences consumers enrolled after di
     const late = try tables.get(root, "late");
     try late.addResolver(.{ .name = "late", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{_key}}", .aliases = &.{.{ .key = "concept/seed", .target = "concept/blocked" }}, .promote = false });
     try std.testing.expectError(error.ResolverCurationConflict, checkDirectoryEpoch(root, observed));
+}
+
+test "capi resolver curation prepares shared profile slices once before consumer fanout" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const entries = try a.alloc(@import("antfly_resolver").KeyAlias, 1000);
+    for (entries, 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/from-{d}", .{i}), .target = try std.fmt.allocPrint(a, "entity/to-{d}", .{i}) };
+    const inputs = try a.alloc(Consumer, 10000);
+    for (inputs) |*source| source.* = .{ .db = undefined, .source = "source", .cfg = .{ .name = "r", .table = "entities", .key_template = "entity/{{_key}}", .source_artifact = "kg", .resolution_artifact = "resolved", .admission_profile = "immutable-profile", .aliases = entries } };
+    const selected = try prepareProfileCaches(a, inputs);
+    for (selected) |source| {
+        try std.testing.expect(source.prepared_profiles.?.ptr == selected[0].prepared_profiles.?.ptr);
+        try std.testing.expectEqual(@as(usize, 1), source.prepared_profiles.?.len);
+        try std.testing.expect(source.prepared_profiles.?[0].aliases.ptr == entries.ptr);
+    }
 }
