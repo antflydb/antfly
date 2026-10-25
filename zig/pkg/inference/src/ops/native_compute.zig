@@ -6798,17 +6798,30 @@ inline fn fillPackedLayerNormBackward(packed_grads: []f32, input: []const f32, g
     try layerNormBackwardInto(false, input, gamma, dy, rows, dim, eps, packed_grads[0 .. rows * dim], packed_grads[rows * dim ..][0..dim], packed_grads[(rows + 1) * dim ..]);
 }
 
+// Prepare fallible reads separately so dense slices keep their register ABI.
+inline fn prepareDataRead(ct: CT) !void {
+    const buf = toBuf(ct);
+    if (buf.view_strides != null or buf.data.len == 0) try prepareDataReadCold(ct);
+}
+
+noinline fn prepareDataReadCold(ct: CT) !void {
+    _ = try getDataChecked(ct);
+}
+
 /// `fused_layer_norm_backward` vtable impl. Inputs: input/gamma/beta/dy
 /// (beta unused for grads). Returns the packed adjoint
 /// `[rows + 2, dim]`: rows 0..rows = dx, row `rows` = dgamma, row `rows+1` = dbeta.
 fn layerNormBackwardOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dy: CT, dim: usize, eps: f32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     _ = beta;
-    const in_data = try getDataChecked(input);
+    try prepareDataRead(input);
+    const in_data = getData(input);
     if (dim == 0 or in_data.len % dim != 0) return error.InvalidTensorShape;
     const rows = in_data.len / dim;
-    const in_gamma = try getDataChecked(gamma);
-    const in_dy = try getDataChecked(dy);
+    try prepareDataRead(gamma);
+    const in_gamma = getData(gamma);
+    try prepareDataRead(dy);
+    const in_dy = getData(dy);
     // Below a full short-row tile the original separate allocation classes
     // are faster. Keep that storage policy while sharing all arithmetic.
     if (rows == 1 and dim < 32) {
@@ -6839,53 +6852,76 @@ fn layerNormBackwardOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dy: CT, 
     return self.makeBuf(packed_grads, true);
 }
 
-test "native layer norm backward preserves input views on materialization failure" {
+test "native layer norm backward preserves view and integer inputs on materialization failure" {
     const a = std.testing.allocator;
-    for (0..3) |failed_operand| {
-        var failing = std.testing.FailingAllocator.init(a, .{});
-        var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
-        defer store.deinitOwned();
-        var compute = NativeCompute.init(failing.allocator(), &store, null);
-        defer compute.deinit();
-        const cb = compute.computeBackend();
-        const source = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 2, 4 });
-        defer cb.free(source);
-        const weight = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
-        defer cb.free(weight);
-        const input = try primTransposeOp(&compute, source, &.{ 1, 0 }, &.{ 2, 4 });
-        defer cb.free(input);
-        const gamma = try primTransposeOp(&compute, weight, &.{ 1, 0 }, &.{ 2, 2 });
-        defer cb.free(gamma);
-        const dy = try primTransposeOp(&compute, source, &.{ 1, 0 }, &.{ 2, 4 });
-        defer cb.free(dy);
-        const operands = [_]CT{ input, gamma, dy };
-        for (operands[0..failed_operand]) |operand| _ = try getDataChecked(operand);
-        const before = toBuf(operands[failed_operand]).*;
-        try std.testing.expect(before.view_strides != null);
-        failing.fail_index = failing.alloc_index;
-        const attempted = layerNormBackwardOp(&compute, input, gamma, gamma, dy, 4, 1e-5);
-        failing.fail_index = std.math.maxInt(usize);
-        if (attempted) |result| {
-            cb.free(result);
-            return error.ExpectedMaterializationFailure;
-        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
-        const after = toBuf(operands[failed_operand]);
-        try std.testing.expect(after.view_strides != null);
-        try std.testing.expectEqual(before.view_strides.?.ptr, after.view_strides.?.ptr);
-        try std.testing.expectEqual(before.data.ptr, after.data.ptr);
-        try std.testing.expectEqual(before.shared_data_refcount, after.shared_data_refcount);
-        try std.testing.expectEqualSlices(i64, before.logical_shape.?, after.logical_shape.?);
-        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, try getDataChecked(source));
-        const result = try layerNormBackwardOp(&compute, input, gamma, gamma, dy, 4, 1e-5);
-        defer cb.free(result);
-        const reference = try debertaLayerNormBackwardHost(a, try getDataChecked(input), try getDataChecked(gamma), try getDataChecked(dy), 2, 4, 1e-5);
-        defer a.free(reference.dx);
-        defer a.free(reference.dgamma);
-        defer a.free(reference.dbeta);
-        const actual = try getDataChecked(result);
-        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(reference.dx), std.mem.sliceAsBytes(actual[0..8]));
-        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(reference.dgamma), std.mem.sliceAsBytes(actual[8..12]));
-        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(reference.dbeta), std.mem.sliceAsBytes(actual[12..16]));
+    const integers = [_]i64{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    for ([_]bool{ false, true }) |integer_source| {
+        for (0..3) |failed_operand| {
+            var failing = std.testing.FailingAllocator.init(a, .{});
+            var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+            defer store.deinitOwned();
+            var compute = NativeCompute.init(failing.allocator(), &store, null);
+            defer compute.deinit();
+            const cb = compute.computeBackend();
+            const source = if (integer_source)
+                (try cb.fromConstantBytes(std.mem.sliceAsBytes(&integers), .i64, &.{ 2, 4 })).?
+            else
+                try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 2, 4 });
+            defer cb.free(source);
+            const weight = if (integer_source)
+                (try cb.fromConstantBytes(std.mem.sliceAsBytes(integers[0..4]), .i64, &.{ 2, 2 })).?
+            else
+                try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+            defer cb.free(weight);
+            const upstream_source = if (integer_source)
+                (try cb.fromConstantBytes(std.mem.sliceAsBytes(&integers), .i64, &.{ 2, 4 })).?
+            else
+                source;
+            defer if (integer_source) cb.free(upstream_source);
+            const input = if (integer_source) source else try primTransposeOp(&compute, source, &.{ 1, 0 }, &.{ 2, 4 });
+            defer if (!integer_source) cb.free(input);
+            const gamma = if (integer_source) weight else try primTransposeOp(&compute, weight, &.{ 1, 0 }, &.{ 2, 2 });
+            defer if (!integer_source) cb.free(gamma);
+            const dy = if (integer_source) upstream_source else try primTransposeOp(&compute, source, &.{ 1, 0 }, &.{ 2, 4 });
+            defer if (!integer_source) cb.free(dy);
+            const operands = [_]CT{ input, gamma, dy };
+            for (operands[0..failed_operand]) |operand| _ = try getDataChecked(operand);
+            const before = toBuf(operands[failed_operand]).*;
+            if (integer_source) {
+                try std.testing.expectEqual(@as(usize, 0), before.data.len);
+            } else try std.testing.expect(before.view_strides != null);
+            failing.fail_index = failing.alloc_index;
+            const attempted = layerNormBackwardOp(&compute, input, gamma, gamma, dy, 4, 1e-5);
+            failing.fail_index = std.math.maxInt(usize);
+            if (attempted) |result| {
+                cb.free(result);
+                return error.ExpectedMaterializationFailure;
+            } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+            const after = toBuf(operands[failed_operand]);
+            try std.testing.expectEqual(before.view_strides != null, after.view_strides != null);
+            if (before.view_strides) |strides| try std.testing.expectEqual(strides.ptr, after.view_strides.?.ptr);
+            try std.testing.expectEqual(before.data.len, after.data.len);
+            if (before.data.len != 0) try std.testing.expectEqual(before.data.ptr, after.data.ptr);
+            try std.testing.expectEqual(before.shared_data_refcount, after.shared_data_refcount);
+            try std.testing.expectEqual(before.source_tensor, after.source_tensor);
+            try std.testing.expectEqual(before.logical_shape != null, after.logical_shape != null);
+            if (before.logical_shape) |shape| try std.testing.expectEqualSlices(i64, shape, after.logical_shape.?);
+            if (integer_source) {
+                for ([_]CT{ source, upstream_source }) |value|
+                    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&integers), toBuf(value).source_tensor.?.data);
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(integers[0..4]), toBuf(weight).source_tensor.?.data);
+            } else try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, try getDataChecked(source));
+            const result = try layerNormBackwardOp(&compute, input, gamma, gamma, dy, 4, 1e-5);
+            defer cb.free(result);
+            const reference = try debertaLayerNormBackwardHost(a, try getDataChecked(input), try getDataChecked(gamma), try getDataChecked(dy), 2, 4, 1e-5);
+            defer a.free(reference.dx);
+            defer a.free(reference.dgamma);
+            defer a.free(reference.dbeta);
+            const actual = try getDataChecked(result);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(reference.dx), std.mem.sliceAsBytes(actual[0..8]));
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(reference.dgamma), std.mem.sliceAsBytes(actual[8..12]));
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(reference.dbeta), std.mem.sliceAsBytes(actual[12..16]));
+        }
     }
 }
 
