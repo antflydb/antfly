@@ -65,7 +65,7 @@ const report = {profile: "local native WASM/R2 contract fixture", wasm_sha256: c
 for (const count of sizes) {
   const bucket = new Bucket(), stages = [];
   let group, cache, host, accepted = 0, recycled = 0;
-  const recall = [];
+  const recall = [];let routingShape;
   const epoch = Date.now(), monotonic = performance.now();
   // The benchmark measures memory and traffic, not clock recovery. Clock
   // rollback is covered by fault tests; avoid NTP changes poisoning a long run.
@@ -126,6 +126,9 @@ for (const count of sizes) {
     assert.equal((await call("count")).count, String(accepted), "publication rejection must preserve accepted WAL visibility");
   });
   if (complete) {
+    for(const object of bucket.objects.values()){
+      if(object.body[0]!==123)continue;try{const root=JSON.parse(new TextDecoder().decode(object.body));if(root.kind==="vector_segment"&&root.docs?.records===count)routingShape={format:root.format,coarse_centers:root.global_centers?.records??0,routes:root.centroids?.records,shards:root.directory?.records};}catch{}
+    }
     await stage("cold-query", async () => {
       await reopen(); assert.equal((await call("count")).count, String(count));
       assert.equal((await call("search", {text: "durable", limit: 10})).hits.length, Math.min(10, count));
@@ -147,9 +150,10 @@ for (const count of sizes) {
           const expected = new Set(exact.map(({i}) => `doc/${String(i).padStart(6,"0")}`));
           for (const probes of [8, 32, "all"]) {
             await reopen();
+            const beforeReads=bucket.reads,beforeBytes=bucket.readBytes;
             const result = await call("search", {mode: "vector", vector: query, limit: 10, num_probes: probes === "all" ? 2 : probes, search_effort: probes === "all" ? 1 : null});
             if(probes === "all")assert.equal(result.hits.filter(hit=>expected.has(hit.doc_id)).length,expected.size,"full-effort vector search must match brute-force cosine neighbors");
-            recall.push({query: q, num_probes: probes, search_effort: probes === "all" ? 1 : null, recall_at_10: result.hits.filter(hit => expected.has(hit.doc_id)).length / expected.size});
+            recall.push({r2_gets:bucket.reads-beforeReads,r2_bytes:bucket.readBytes-beforeBytes,query: q, num_probes: probes, search_effort: probes === "all" ? 1 : null, recall_at_10: result.hits.filter(hit => expected.has(hit.doc_id)).length / expected.size});
           }
         }
       });
@@ -192,7 +196,7 @@ for (const count of sizes) {
     });
     await stage("compaction", async () => { await call("compact", {compaction_max_documents: maxCompactionDocuments}); assert.equal((await call("count")).count, String(count - 1)); });
   }
-  const result = {documents: count, accepted_documents: accepted, published_lsn: publishedLsn, recycled_instances: recycled, stages, vector_recall: recall, objects: bucket.objects.size};
+  const result = {documents: count, accepted_documents: accepted, published_lsn: publishedLsn, recycled_instances: recycled, stages, routing_shape:routingShape,vector_recall: recall, objects: bucket.objects.size};
   report.cases.push(result); console.log(JSON.stringify(result));
   await mkdir(dirname(output), {recursive: true}); await writeFile(output, JSON.stringify(report, null, 2));
 }

@@ -174,7 +174,7 @@ pub const Context = struct {
                 const parsed = try @import("paged_projection.zig").load(a, &pages, .{ .kind = artifact.kind orelse return error.InvalidCollectionTask, .metadata_version = artifact.metadata_version, .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum });
                 defer parsed.deinit();
                 key = try self.artifactKey(a, artifact.artifact_id);
-                for ([_]?tree.Ref{ parsed.value.docs, parsed.value.postings, parsed.value.directory }) |ref| if (ref) |page| try children.append(a, .{ .kind = .projection_page, .page = page });
+                for ([_]?tree.Ref{ parsed.value.docs, parsed.value.postings, parsed.value.directory, parsed.value.global_centers }) |ref| if (ref) |page| try children.append(a, .{ .kind = .projection_page, .page = page });
                 if (parsed.value.centroids) |page| try children.append(a, .{ .kind = .vector_centroid_page, .page = page, .vector_dims = parsed.value.dims });
             },
             .text_root => {

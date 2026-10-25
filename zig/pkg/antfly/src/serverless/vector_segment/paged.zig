@@ -122,6 +122,131 @@ fn clusterKey(a: A, start: [32]u8, ordinal: u32) ![]u8 {
     return key;
 }
 
+// Globally trained, immutable coarse centers partition subsequent updates by
+// vector locality. Identity -> routing memberships keeps deletes exact even
+// when one document has projections in several coarse cells.
+fn loadCenters(a: A, store: tree.Store, root: common.Root) ![][]f32 {
+    var out = std.ArrayList([]f32).empty;
+    errdefer {
+        for (out.items) |v| a.free(v);
+        out.deinit(a);
+    }
+    var cursor = try tree.Cursor.init(a, store, root.global_centers, "", null);
+    defer cursor.deinit();
+    while (try cursor.next()) |row| {
+        if (out.items.len >= 64 or row.key.len != 2 or std.mem.readInt(u16, row.key[0..2], .big) != out.items.len or row.value.len != @as(usize, root.dims) * 4) return error.InvalidGlobalVectorCenters;
+        const vector = try a.alloc(f32, root.dims);
+        errdefer a.free(vector);
+        for (vector, 0..) |*value, i| {
+            value.* = @bitCast(std.mem.readInt(u32, row.value[i * 4 ..][0..4], .little));
+            if (!std.math.isFinite(value.*)) return error.InvalidGlobalVectorCenters;
+        }
+        try out.append(a, vector);
+    }
+    if (out.items.len == 0) return error.InvalidGlobalVectorCenters;
+    return out.toOwnedSlice(a);
+}
+fn freeCenters(a: A, centers: [][]f32) void {
+    for (centers) |v| a.free(v);
+    a.free(centers);
+}
+fn nearestCenter(vector: []const f32, centers: []const []f32, metric: vectors.DistanceMetric) u16 {
+    var best: u16 = 0;
+    var best_score: f32 = -std.math.inf(f32);
+    const measure = indexed.vectorQueryMeasure(vector, metric);
+    for (centers, 0..) |center, i| {
+        const score = indexed.routingScoreForQuery(vector, measure, center, metric);
+        if (score > best_score) {
+            best = @intCast(i);
+            best_score = score;
+        }
+    }
+    return best;
+}
+fn routedHash(entry: segment.Entry, centers: []const []f32, metric: vectors.DistanceMetric) [32]u8 {
+    var hash = hashId(entry.doc_id);
+    std.mem.writeInt(u16, hash[0..2], nearestCenter(entry.vector, centers, metric), .big);
+    return hash;
+}
+// Estimate the best member score using the cluster's measured mean alignment
+// and residual spread. This is a ranking heuristic, never an exact prune bound.
+fn cosinePriority(score: f32, average_distance: f32, count: u32, dims: u32) f32 {
+    const alignment = std.math.clamp(1 - average_distance, 0, 1);
+    const variance = @max(@as(f32, 0), (1 - score * score) * (1 - alignment * alignment)) / @as(f32, @floatFromInt(dims));
+    return score * alignment + @sqrt(variance * 2 * @log(@as(f32, @floatFromInt(@max(count, 1)))));
+}
+
+fn addMembership(a: A, map: *std.StringHashMapUnmanaged(?[]const u8), id: []const u8, hash: [32]u8) !void {
+    const identity = hashId(id);
+    const previous = map.get(&identity) orelse null;
+    if (previous) |bytes| {
+        var i: usize = 0;
+        while (i < bytes.len) : (i += 32) if (std.mem.eql(u8, bytes[i..][0..32], &hash)) return;
+    }
+    const length = if (previous) |bytes| bytes.len else 0;
+    if (length >= 32 * 1024) return error.VectorDocumentBudgetExceeded;
+    const value = try a.alloc(u8, length + 32);
+    if (previous) |bytes| @memcpy(value[0..length], bytes);
+    @memcpy(value[length..], &hash);
+    try map.put(a, try a.dupe(u8, &identity), value);
+}
+fn trainGlobal(a: A, scratch: A, pages: *PageStore, store: tree.Store, root: *common.Root, maintenance: ?cancellation.Token) !void {
+    // An existing large legacy index needs a bounded reindex; never migrate an
+    // unbounded archive in an ordinary incremental publication.
+    const count = root.docs.?.records;
+    if (root.format != 1) return;
+    const maximum = @min(@as(u64, 2048), (4 * 1024 * 1024) / (@as(u64, root.dims) * 4));
+    const training_count = std.math.floorPowerOfTwo(u64, maximum);
+    if (training_count < 256 or count < training_count or count > training_count + 256 or @as(u64, root.dims) * count * 4 > 4 * 1024 * 1024) return;
+    var samples = std.ArrayList(segment.Entry).empty;
+    defer {
+        for (samples.items) |*entry| entry.deinit(a);
+        samples.deinit(a);
+    }
+    var cursor = try tree.Cursor.init(a, store, root.docs, "", null);
+    defer cursor.deinit();
+    while (samples.items.len < training_count) {
+        const row = (try cursor.next()) orelse return error.InvalidVectorValue;
+        var entry = try decodeVector(a, row.value, root.dims);
+        errdefer entry.deinit(a);
+        try samples.append(a, entry);
+    }
+    // Transfer the decoded sample into native training. It already owns its
+    // vectors; a second full projection copy consumes unnecessary WASM space.
+    const owned = try samples.toOwnedSlice(a);
+    var trained = try build.buildClusteredSegmentWithPolicyAllocUntil(a, root.metric, root.dims, owned, .{ .target_cluster_count = 64 }, maintenance);
+    defer trained.deinit(a);
+    const center_changes = try scratch.alloc(tree.Mutation, trained.clusters.len);
+    const center_values = try scratch.alloc([]f32, trained.clusters.len);
+    for (trained.clusters, center_changes, center_values, 0..) |cluster, *change, *center, i| {
+        const key = try scratch.alloc(u8, 2);
+        std.mem.writeInt(u16, key[0..2], @intCast(i), .big);
+        const value = try scratch.alloc(u8, @as(usize, root.dims) * 4);
+        for (cluster.centroid, 0..) |number, d| std.mem.writeInt(u32, value[d * 4 ..][0..4], @bitCast(number), .little);
+        change.* = .{ .key = key, .value = value };
+        center.* = cluster.centroid;
+    }
+    root.global_centers = try tree.apply(a, store, null, center_changes);
+    var changed = std.StringHashMapUnmanaged(?[]const u8).empty;
+    var identities = std.StringHashMapUnmanaged(?[]const u8).empty;
+    var all = try tree.Cursor.init(a, store, root.docs, "", null);
+    defer all.deinit();
+    while (try all.next()) |row| {
+        try pages.cancellation.check();
+        var entry = try decodeVector(a, row.value, root.dims);
+        defer entry.deinit(a);
+        const hash = routedHash(entry, center_values, root.metric);
+        const ordinal = std.mem.readInt(u32, row.key[32..36], .big);
+        try changed.put(scratch, try clusterKey(scratch, hash, ordinal), try scratch.dupe(u8, row.value));
+        try addMembership(scratch, &identities, entry.doc_id, hash);
+    }
+    root.docs = try common.applyMap(a, scratch, store, null, changed);
+    root.postings = try common.applyMap(a, scratch, store, null, identities);
+    root.directory = null;
+    root.centroids = null;
+    root.format = 2;
+}
+
 pub fn publishAlloc(a: A, pages: *PageStore, prior: ?manifest.ArtifactRef, delta: []const segment.Entry, removed: []const []const u8, name: []const u8, fingerprint: [32]u8, metric: vectors.DistanceMetric, maintenance: ?cancellation.Token) !manifest.ArtifactRef {
     const parsed = if (prior) |ref| try common.load(a, pages, ref) else null;
     defer if (parsed) |value| value.deinit();
@@ -136,23 +261,41 @@ pub fn publishAlloc(a: A, pages: *PageStore, prior: ?manifest.ArtifactRef, delta
     text_pages.prefix_keys = true;
     var cache = tree.Cache{ .alloc = a, .underlying = text_pages.store() };
     defer cache.deinit();
+    const centers = if (root.global_centers != null) try loadCenters(a, cache.store(), root) else null;
+    defer if (centers) |values| freeCenters(a, values);
+    var identity_changes = std.StringHashMapUnmanaged(?[]const u8).empty;
+    var removals = std.ArrayList([]const u8).empty;
+    try removals.appendSlice(scratch, removed);
+    for (delta) |entry| try removals.append(scratch, entry.doc_id);
     var removed_seen = std.StringHashMapUnmanaged(void).empty;
-    for (removed) |id| {
+    for (removals.items) |id| {
         if ((try removed_seen.getOrPut(scratch, id)).found_existing) continue;
         try pages.cancellation.check();
-        const hash = hashId(id);
-        const shard = try findShard(a, cache.store(), root.directory, hash);
-        try affected.put(scratch, try scratch.dupe(u8, &shard.start), shard);
-        const upper = try common.upperBound(a, &hash);
-        defer if (upper) |value| a.free(value);
-        var cursor = try tree.Cursor.init(a, cache.store(), root.docs, &hash, upper);
-        defer cursor.deinit();
-        while (try cursor.next()) |record| {
-            if (record.key.len != 36 or record.value.len < 8) return error.InvalidVectorValue;
-            const length = std.mem.readInt(u32, record.value[0..4], .little);
-            if (length > record.value.len - 8 or !std.mem.eql(u8, record.value[8..][0..length], id)) return error.VectorDocumentHashCollision;
-            try projections.put(scratch, try scratch.dupe(u8, record.key), null);
+        const identity = hashId(id);
+        const found = if (root.format == 2) try tree.lookupMany(a, cache.store(), root.postings, &.{&identity}) else null;
+        defer if (found) |values| {
+            if (values[0]) |value| value.deinit(a);
+            a.free(values);
+        };
+        const hashes: []const u8 = if (found) |values| (if (values[0]) |value| value.value else "") else &identity;
+        if (hashes.len % 32 != 0) return error.InvalidVectorValue;
+        var offset: usize = 0;
+        while (offset < hashes.len) : (offset += 32) {
+            const hash: [32]u8 = hashes[offset..][0..32].*;
+            const shard = try findShard(a, cache.store(), root.directory, hash);
+            try affected.put(scratch, try scratch.dupe(u8, &shard.start), shard);
+            const upper = try common.upperBound(a, &hash);
+            defer if (upper) |value| a.free(value);
+            var cursor = try tree.Cursor.init(a, cache.store(), root.docs, &hash, upper);
+            defer cursor.deinit();
+            while (try cursor.next()) |record| {
+                if (record.key.len != 36 or record.value.len < 8) return error.InvalidVectorValue;
+                const length = std.mem.readInt(u32, record.value[0..4], .little);
+                if (length > record.value.len - 8 or !std.mem.eql(u8, record.value[8..][0..length], id)) return error.VectorDocumentHashCollision;
+                try projections.put(scratch, try scratch.dupe(u8, record.key), null);
+            }
         }
+        if (root.format == 2) try identity_changes.put(scratch, try scratch.dupe(u8, &identity), null);
     }
     var ordinals = std.StringHashMapUnmanaged(u32).empty;
     for (delta) |entry| {
@@ -160,7 +303,8 @@ pub fn publishAlloc(a: A, pages: *PageStore, prior: ?manifest.ArtifactRef, delta
         if (entry.vector.len == 0 or entry.vector.len > 16384) return error.InconsistentVectorDims;
         if (root.dims == 0) root.dims = @intCast(entry.vector.len);
         if (root.dims != entry.vector.len) return error.InconsistentVectorDims;
-        const hash = hashId(entry.doc_id);
+        const hash = if (centers) |values| routedHash(entry, values, root.metric) else hashId(entry.doc_id);
+        if (centers != null) try addMembership(scratch, &identity_changes, entry.doc_id, hash);
         const shard = try findShard(a, cache.store(), root.directory, hash);
         try affected.put(scratch, try scratch.dupe(u8, &shard.start), shard);
         const slot = try ordinals.getOrPut(scratch, entry.doc_id);
@@ -170,11 +314,25 @@ pub fn publishAlloc(a: A, pages: *PageStore, prior: ?manifest.ArtifactRef, delta
         try projections.put(scratch, key, try vectorValue(scratch, entry));
     }
     root.docs = try common.applyMap(a, scratch, cache.store(), root.docs, projections);
+    if (root.format == 2) root.postings = try common.applyMap(a, scratch, cache.store(), root.postings, identity_changes);
     if (root.docs == null) {
         root.directory = null;
         root.centroids = null;
         root.dims = 0;
+        root.postings = null;
+        root.global_centers = null;
+        root.format = 1;
         return common.publish(a, pages, root);
+    }
+    const previous_format = root.format;
+    try trainGlobal(a, scratch, &text_pages, cache.store(), &root, maintenance);
+    if (root.format != previous_format) {
+        affected.clearRetainingCapacity();
+        for (0..@intCast(root.global_centers.?.records)) |i| {
+            var start: [32]u8 = @splat(0);
+            std.mem.writeInt(u16, start[0..2], @intCast(i), .big);
+            try affected.put(scratch, try scratch.dupe(u8, &start), .{ .start = start, .bits = 16 });
+        }
     }
     var directories = std.StringHashMapUnmanaged(?[]const u8).empty;
     var centroids = std.StringHashMapUnmanaged(?[]const u8).empty;
@@ -310,7 +468,7 @@ pub fn searchAlloc(a: A, session: *runtime.QuerySession, ref: manifest.ArtifactR
     const measure = indexed.vectorQueryMeasure(normalized, root.metric);
     var cache = tree.Cache{ .alloc = a, .underlying = pages.store() };
     defer cache.deinit();
-    const Route = struct { blob: common.Blob, entries: u32 };
+    const Route = struct { blob: common.Blob, entries: u32, coarse: u16 };
     var routes = std.ArrayList(Route).empty;
     defer routes.deinit(a);
     var ranked = std.ArrayList(indexed.ScoredCluster).empty;
@@ -326,14 +484,47 @@ pub fn searchAlloc(a: A, session: *runtime.QuerySession, ref: manifest.ArtifactR
             number.* = @bitCast(std.mem.readInt(u32, row.value[72 + i * 4 ..][0..4], .little));
             if (!std.math.isFinite(number.*)) return error.InvalidPagedProjectionRoute;
         }
-        const score = indexed.routingScoreForQuery(normalized, measure, center, root.metric);
+        var score = indexed.routingScoreForQuery(normalized, measure, center, root.metric);
+        if (root.format == 2 and root.metric == .cosine) {
+            const average: f32 = @bitCast(std.mem.readInt(u32, row.value[68..72], .little));
+            if (!std.math.isFinite(average)) return error.InvalidPagedProjectionRoute;
+            score = cosinePriority(score, average, std.mem.readInt(u32, row.value[56..60], .little), root.dims);
+        }
         if (!std.math.isFinite(score)) return error.InvalidVectorQuery;
         try ranked.append(a, .{ .cluster_index = routes.items.len, .score = score });
-        try routes.append(a, .{ .blob = try common.Blob.decode(row.value), .entries = std.mem.readInt(u32, row.value[56..60], .little) });
+        if (row.key.len != 36) return error.InvalidPagedProjectionRoute;
+        try routes.append(a, .{ .blob = try common.Blob.decode(row.value), .entries = std.mem.readInt(u32, row.value[56..60], .little), .coarse = std.mem.readInt(u16, row.key[0..2], .big) });
     }
     if (routes.items.len != (if (root.centroids) |r| r.records else 0)) return error.InvalidPagedProjectionRoot;
     std.mem.sort(indexed.ScoredCluster, ranked.items, {}, indexed.lessScoredCluster);
-    const probes = indexed.effectiveProbeCount(req, root.base_probe_count, ranked.items);
+    const hinted_probes = indexed.effectiveProbeCount(req, root.base_probe_count, ranked.items);
+    // Frozen coarse cells introduce boundary uncertainty in incremental roots.
+    // Budget a 25% routing margin, capped by the available routes. num_probes
+    // remains a hint, as in the native adaptive probing policy. Full effort is
+    // unchanged and I/O/deadline budgets still bound admission.
+    const probes = if (root.format == 2) @min(ranked.items.len, hinted_probes + (hinted_probes + 3) / 4) else hinted_probes;
+    var selected = std.ArrayList(indexed.ScoredCluster).empty;
+    defer selected.deinit(a);
+    if (root.format == 2) {
+        const coarse = try loadCenters(a, cache.store(), root);
+        defer freeCenters(a, coarse);
+        const primary = nearestCenter(normalized, coarse, root.metric);
+        const visited = try a.alloc(bool, routes.items.len);
+        defer a.free(visited);
+        @memset(visited, false);
+        // The nearest coarse cell owns an identical query vector's membership.
+        // Visit its best leaves first, then spend the remaining budget globally.
+        for (ranked.items) |hit| {
+            if (selected.items.len == probes) break;
+            if (routes.items[hit.cluster_index].coarse != primary) continue;
+            visited[hit.cluster_index] = true;
+            try selected.append(a, hit);
+        }
+        for (ranked.items) |hit| {
+            if (selected.items.len == probes) break;
+            if (!visited[hit.cluster_index]) try selected.append(a, hit);
+        }
+    } else try selected.appendSlice(a, ranked.items[0..probes]);
     const Value = struct { score: u32, distance: ?f32 };
     var scores = std.StringHashMapUnmanaged(Value).empty;
     defer {
@@ -341,7 +532,7 @@ pub fn searchAlloc(a: A, session: *runtime.QuerySession, ref: manifest.ArtifactR
         while (it.next()) |key| a.free(key.*);
         scores.deinit(a);
     }
-    for (ranked.items[0..probes]) |hit| {
+    for (selected.items) |hit| {
         try session.checkCancellation();
         const route = routes.items[hit.cluster_index];
         if (route.blob.bytes > reads) return error.ArtifactReadBudgetExceeded;
@@ -365,11 +556,11 @@ pub fn searchAlloc(a: A, session: *runtime.QuerySession, ref: manifest.ArtifactR
             } else if (value.score > slot.value_ptr.score or (value.score == slot.value_ptr.score and value.distance != null and slot.value_ptr.distance != null and value.distance.? < slot.value_ptr.distance.?)) slot.value_ptr.* = .{ .score = value.score, .distance = value.distance };
         }
     }
-    var selected = @import("../query/top_docs.zig").TopDocs{ .capacity = req.offset +| req.limit };
-    defer selected.deinit(a);
+    var top = @import("../query/top_docs.zig").TopDocs{ .capacity = req.offset +| req.limit };
+    defer top.deinit(a);
     var it = scores.iterator();
-    while (it.next()) |entry| try selected.add(a, .{ .doc_id = entry.key_ptr.*, .score = entry.value_ptr.score, .distance = entry.value_ptr.distance });
-    const result = selected.sorted();
+    while (it.next()) |entry| try top.add(a, .{ .doc_id = entry.key_ptr.*, .score = entry.value_ptr.score, .distance = entry.value_ptr.distance });
+    const result = top.sorted();
     const start = @min(req.offset, result.len);
     const end = @min(result.len, start +| req.limit);
     const output = try a.alloc(indexed.ScoredDoc, end - start);
@@ -432,4 +623,83 @@ test "serverless paged vectors preserve exhaustive native scores and immutable g
     defer indexed.freeScoredDocs(a, old);
     try std.testing.expectEqual(expected.len, old.len);
     try std.testing.expectError(error.VectorIndexDefinitionChanged, publishAlloc(a, &pages, ref, &.{}, &.{}, "dense", @splat(9), .cosine, null));
+}
+
+test "serverless global vector routing retains immutable memberships across moves and multi-projection deletes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/global", .{tmp.sub_path});
+    defer a.free(path);
+    var fs = try @import("../artifacts/fs_store.zig").FsStore.init(a, path);
+    var store = fs.artifactStore();
+    defer store.deinit();
+    var reads: u64 = 32 * 1024 * 1024;
+    var writes: u64 = 32 * 1024 * 1024;
+    var pages = PageStore{ .domain = PageStore.namespaceDomain("docs"), .attempt = @splat(1), .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var entries: [2048]segment.Entry = undefined;
+    var values: [2048][16]f32 = undefined;
+    var ids: [2048][16]u8 = undefined;
+    var seed: u32 = 17;
+    for (&entries, &values, &ids, 0..) |*entry, *vector, *id, i| {
+        for (vector) |*value| {
+            seed = seed *% 1664525 +% 1013904223;
+            value.* = @as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1;
+        }
+        entry.* = .{ .doc_id = try std.fmt.bufPrint(id, "seed/{d}", .{i}), .vector = vector };
+    }
+    const builder = @import("../build/builder.zig");
+    const first = try publishAlloc(a, &pages, null, &entries, &.{}, "dense", @splat(1), .cosine, null);
+    defer builder.freeArtifactRef(a, first);
+    const root = try common.load(a, &pages, first);
+    defer root.deinit();
+    try std.testing.expectEqual(@as(u8, 2), root.value.format);
+    try std.testing.expect(root.value.global_centers != null);
+    try std.testing.expectEqual(@as(u64, 2048), root.value.postings.?.records);
+    // Collection must retain the new routing tree as well as document identity
+    // memberships; legacy collectors cannot discover this format's new root.
+    const collection = @import("../hosted_collection.zig");
+    const context = collection.Context{ .alloc = a, .namespace = "docs", .prefix = "antfly", .artifacts = &store, .manifests = undefined, .progress = undefined, .wal = undefined, .io = undefined };
+    const traced = try context.trace(.{ .kind = .projection_root, .artifact = .{ .kind = first.kind, .metadata_version = first.metadata_version, .artifact_id = first.artifact_id, .byte_len = first.byte_len, .checksum = first.checksum } });
+    defer a.free(traced);
+    const children = try std.json.parseFromSlice(struct { children: []collection.Task }, a, traced, .{ .ignore_unknown_fields = true });
+    defer children.deinit();
+    var retained_centers = false;
+    for (children.value.children) |child| if (child.page) |page| {
+        if (std.meta.eql(page, root.value.global_centers.?)) retained_centers = true;
+    };
+    try std.testing.expect(retained_centers);
+
+    var positive: [16]f32 = @splat(0);
+    positive[0] = 1;
+    var negative = positive;
+    negative[0] = -1;
+    const pair = [_]segment.Entry{ .{ .doc_id = @constCast("moving"), .vector = &positive }, .{ .doc_id = @constCast("moving"), .vector = &negative } };
+    pages.attempt = @splat(2);
+    const second = try publishAlloc(a, &pages, first, &pair, &.{}, "dense", @splat(1), .cosine, null);
+    defer builder.freeArtifactRef(a, second);
+    const second_root = try common.load(a, &pages, second);
+    defer second_root.deinit();
+    try std.testing.expectEqual(@as(u64, 2050), second_root.value.docs.?.records);
+    pages.attempt = @splat(3);
+    const moved = try publishAlloc(a, &pages, second, pair[0..1], &.{}, "dense", @splat(1), .cosine, null);
+    defer builder.freeArtifactRef(a, moved);
+    const moved_root = try common.load(a, &pages, moved);
+    defer moved_root.deinit();
+    try std.testing.expectEqual(@as(u64, 2049), moved_root.value.docs.?.records);
+    pages.attempt = @splat(4);
+    const deleted = try publishAlloc(a, &pages, moved, &.{}, &.{"moving"}, "dense", @splat(1), .cosine, null);
+    defer builder.freeArtifactRef(a, deleted);
+    const deleted_root = try common.load(a, &pages, deleted);
+    defer deleted_root.deinit();
+    try std.testing.expectEqual(@as(u64, 2048), deleted_root.value.docs.?.records);
+    try std.testing.expectEqual(@as(u64, 2048), deleted_root.value.postings.?.records);
+    var session = runtime.QuerySession{ .alloc = a, .artifacts = &store, .owns_manifest = false, .manifest = .{ .namespace = "docs", .version = 1, .built_at_ns = 1, .wal_start_lsn = 1, .wal_end_lsn = 2048, .stats = .{ .document_count = 2048 }, .artifacts = &.{} } };
+    var stats: indexed.SearchExecutionStats = .{};
+    const old_hits = try searchAlloc(a, &session, second, .{ .text = &.{}, .vector = &negative, .limit = 1, .search_effort = 1 }, &stats);
+    defer indexed.freeScoredDocs(a, old_hits);
+    try std.testing.expectEqualStrings("moving", old_hits[0].doc_id);
+    const fresh_hits = try searchAlloc(a, &session, deleted, .{ .text = &.{}, .vector = &negative, .limit = 10, .search_effort = 1 }, &stats);
+    defer indexed.freeScoredDocs(a, fresh_hits);
+    for (fresh_hits) |hit| try std.testing.expect(!std.mem.eql(u8, "moving", hit.doc_id));
 }

@@ -30,6 +30,7 @@ pub const Root = struct {
     postings: ?tree.Ref = null,
     directory: ?tree.Ref = null,
     centroids: ?tree.Ref = null,
+    global_centers: ?tree.Ref = null,
     dims: u32 = 0,
     metric: @import("antfly_vector").vector.DistanceMetric = .cosine,
     base_probe_count: u32 = 2,
@@ -70,15 +71,15 @@ pub fn load(a: A, pages: *PageStore, ref: manifest.ArtifactRef) !std.json.Parsed
     const parsed = try std.json.parseFromSlice(Root, a, bytes, .{ .allocate = .alloc_always });
     errdefer parsed.deinit();
     const root = parsed.value;
-    if (root.format != 1 or root.kind != ref.kind or !std.mem.eql(u8, &root.domain, &pages.domain) or (ref.name.len != 0 and !std.mem.eql(u8, root.index_name, ref.name))) return error.InvalidPagedProjectionRoot;
+    if ((root.format != 1 and root.format != 2) or root.kind != ref.kind or !std.mem.eql(u8, &root.domain, &pages.domain) or (ref.name.len != 0 and !std.mem.eql(u8, root.index_name, ref.name))) return error.InvalidPagedProjectionRoot;
     if (root.kind == .vector_segment) {
-        if (root.postings != null or (root.docs != null and (root.directory == null or root.centroids == null or root.dims == 0))) return error.InvalidPagedProjectionRoot;
-    } else if (root.directory != null or root.centroids != null or ((root.docs == null) != (root.postings == null))) return error.InvalidPagedProjectionRoot;
-    for ([_]?tree.Ref{ root.docs, root.postings, root.directory, root.centroids }) |page| if (page) |value| try value.validate();
+        if ((root.format == 1 and (root.postings != null or root.global_centers != null)) or (root.format == 2 and (root.postings == null or root.global_centers == null)) or (root.docs != null and (root.directory == null or root.centroids == null or root.dims == 0))) return error.InvalidPagedProjectionRoot;
+    } else if (root.format != 1 or root.global_centers != null or root.directory != null or root.centroids != null or ((root.docs == null) != (root.postings == null))) return error.InvalidPagedProjectionRoot;
+    for ([_]?tree.Ref{ root.docs, root.postings, root.directory, root.centroids, root.global_centers }) |page| if (page) |value| try value.validate();
     return parsed;
 }
 pub fn publish(a: A, pages: *PageStore, root: Root) !manifest.ArtifactRef {
-    const bytes = try std.json.Stringify.valueAlloc(a, root, .{});
+    const bytes = try std.json.Stringify.valueAlloc(a, root, .{ .emit_null_optional_fields = false });
     defer a.free(bytes);
     if (bytes.len > 1024 * 1024) return error.InvalidPagedProjectionRoot;
     var metadata = try pages.artifacts.put(bytes);
