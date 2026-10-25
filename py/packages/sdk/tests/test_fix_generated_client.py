@@ -8,6 +8,8 @@ from fix_generated_client import (
     NDJSON_HEADER,
     NDJSON_RESPONSE,
     RELATIONAL_QUERY,
+    SCOPED_MERGE,
+    SCOPED_MERGE_HEADER,
     SQL_OPERATIONS,
     fix_generated_client,
 )
@@ -19,6 +21,11 @@ def write_generated_files(root: Path, signature_count: int) -> None:
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join([NDJSON_HEADER, *([signature] * signature_count)]))
+    path = root / SCOPED_MERGE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join([SCOPED_MERGE_HEADER, *(["body: LinearMergeRequest | ScopedLinearMergeRequest | Unset = UNSET"] * 5)])
+    )
     path = root / RELATIONAL_QUERY
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(NDJSON_RESPONSE)
@@ -60,6 +67,9 @@ def test_required_ndjson_body_is_not_made_optional(tmp_path: Path) -> None:
         source = (tmp_path / relative).read_text()
         assert source.count("body: StatefulQueryRequest | File") == 5
         assert "Unset = UNSET" not in source
+    merge_source = (tmp_path / SCOPED_MERGE).read_text()
+    assert merge_source.count("body: LinearMergeRequest | ScopedLinearMergeRequest") == 5
+    assert "Unset = UNSET" not in merge_source
     assert (tmp_path / RELATIONAL_QUERY).read_text() == "response_200 = response.text"
     for relative in SQL_OPERATIONS:
         source = (tmp_path / relative).read_text()
@@ -94,4 +104,15 @@ def test_sql_generator_shape_drift_fails_before_any_writes(tmp_path: Path, opera
     with pytest.raises(RuntimeError, match="unexpected generated shape"):
         fix_generated_client(tmp_path)
 
+    assert {relative: (tmp_path / relative).read_bytes() for relative in files} == before
+
+
+def test_scoped_merge_shape_drift_fails_before_any_writes(tmp_path: Path) -> None:
+    write_generated_files(tmp_path, signature_count=5)
+    path = tmp_path / SCOPED_MERGE
+    path.write_text(path.read_text().replace(SCOPED_MERGE_HEADER, "changed header"))
+    files = [*FILES, SCOPED_MERGE, RELATIONAL_QUERY, *SQL_OPERATIONS, EMBED_REQUEST]
+    before = {relative: (tmp_path / relative).read_bytes() for relative in files}
+    with pytest.raises(RuntimeError, match="required scoped merge body"):
+        fix_generated_client(tmp_path)
     assert {relative: (tmp_path / relative).read_bytes() for relative in files} == before

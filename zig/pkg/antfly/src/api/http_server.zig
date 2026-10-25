@@ -1973,6 +1973,9 @@ pub const AuthenticatedIdentity = struct {
     /// True only for an audience-bound node/service credential. A generic
     /// trusted upstream user is deliberately not an internal service.
     is_internal_service: bool = false,
+    /// Signed MCP discovery hint, never mutation authority. Every create/restore
+    /// invocation still requires an ordinary grant on its concrete target.
+    mcp_creation_discovery: bool = false,
     permissions: []usermgr.Permission = &.{},
     row_filter: []usermgr.RowFilterEntry = &.{},
     metadata_json: []u8 = &.{},
@@ -5385,6 +5388,21 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    fn memoryIndexCatalog(self: *ApiHttpServer) ?@import("memory.zig").engine.IndexCatalog {
+        if (self.source.vtable.create_index == null and self.source.vtable.drop_index == null) return null;
+        return .{ .ptr = self, .create = memoryCreateIndex, .drop = memoryDropIndex };
+    }
+
+    fn memoryCreateIndex(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, name: []const u8, json: []const u8) !void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try self.source.createIndex(a, table, name, json);
+    }
+
+    fn memoryDropIndex(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, name: []const u8) !void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try self.source.dropIndex(a, table, name);
+    }
+
     const MemoryMaintenanceWork = struct {
         server: *ApiHttpServer,
         fn run(ptr: *anyopaque) anyerror!void {
@@ -5435,7 +5453,7 @@ pub const ApiHttpServer = struct {
         if (state.space.len == 0) return;
         var deadline: MemoryWorkDeadline = .{ .server = self, .group_id = owner_range.group_id, .end = platform_time.monotonicNs() +| MemoryWorkDeadline.finalization_ns };
         const context: module.memory.Context = .{ .check_ptr = &deadline, .check_fn = MemoryWorkDeadline.check, .principal = state.owner, .admin = false, .now_ms = @intCast(platform_time.realtimeNs() / std.time.ns_per_ms) };
-        var adapter: module.engine.Routed = .{ .table = table, .reads = reader, .writes = writer, .context = context };
+        var adapter: module.engine.Routed = .{ .table = table, .reads = reader, .writes = writer, .index_catalog = self.memoryIndexCatalog(), .context = context };
         adapter.request = .{ .deadline_ns = deadline.end };
         const entry = try self.memory_work_cursors.getOrPut(self.alloc, owner_range.table_id);
         if (!entry.found_existing) entry.value_ptr.* = .{};
@@ -5497,7 +5515,7 @@ pub const ApiHttpServer = struct {
             context.now_ms = @intCast(platform_time.realtimeNs() / std.time.ns_per_ms);
             context.clock_ms_fn = memoryClockMs;
             try context.check();
-            var adapter: module.engine.Routed = .{ .table = table, .reads = server.table_reads.?, .writes = server.table_writes.?, .context = context };
+            var adapter: module.engine.Routed = .{ .table = table, .reads = server.table_reads.?, .writes = server.table_writes.?, .index_catalog = server.memoryIndexCatalog(), .context = context };
             adapter.request = .{ .deadline_ns = work.deadline.end };
             const inference_deadline = try work.deadline.beginExecution(adapter.backend(), a, platform_time.monotonicNs(), context.now_ms, state, pending);
             const executor = if (pending) |item| item.execution_principal else state.execution_principal;
@@ -8438,6 +8456,7 @@ pub const ApiHttpServer = struct {
                 .{ jsonStringField(payload.get("iss")) orelse "", subject },
             ),
             .is_internal_service = is_internal_service,
+            .mcp_creation_discovery = jsonBoolField(payload.get("mcp_creation_discovery")),
             .permissions = permissions,
             .row_filter = row_filters,
             .metadata_json = metadata_json,
@@ -21750,7 +21769,7 @@ pub const ApiHttpServer = struct {
             .check_fn = Check.call,
         };
         var resources: MemoryResourceReader = .{ .server = self, .identity = &identity, .database = input.database, .request = request };
-        var adapter: module.engine.Routed = .{ .table = table, .reads = self.table_reads orelse return error.MemoryCapabilityUnavailable, .writes = self.table_writes orelse return error.MemoryCapabilityUnavailable, .context = context, .request = request, .resource_ptr = &resources, .resource_fn = MemoryResourceReader.read };
+        var adapter: module.engine.Routed = .{ .table = table, .reads = self.table_reads orelse return error.MemoryCapabilityUnavailable, .writes = self.table_writes orelse return error.MemoryCapabilityUnavailable, .index_catalog = self.memoryIndexCatalog(), .context = context, .request = request, .resource_ptr = &resources, .resource_fn = MemoryResourceReader.read };
         const models = @import("antfly_local_sources").memory_models;
         const Runtime = @import("antfly_local_sources").asset_producer_runtime.Runtime;
         const runtime = try Runtime.createOwned(a, self.inferenceIo(), .{ .antfly_provider = self.antfly_provider, .inference_api_url = self.configuredInferenceAPIURL(), .secret_store = self.cfg.secret_store, .source_table = table });
@@ -29434,17 +29453,29 @@ fn trustedPrincipalPermissionsFromPayload(alloc: std.mem.Allocator, payload: std
 
     const tables_value = payload.get("tables");
     const operations_value = payload.get("operations");
-    if (operations_value == null or operations_value.? != .array or operations_value.?.array.items.len == 0) {
-        return try out.toOwnedSlice(alloc);
+    if (operations_value != null and operations_value.? == .array and operations_value.?.array.items.len > 0) {
+        if (tables_value == null or tables_value.? != .array or tables_value.?.array.items.len == 0) {
+            try appendTrustedPrincipalPermissionsForTable(alloc, &out, "*", operations_value.?.array.items);
+        } else {
+            for (tables_value.?.array.items) |table_value| {
+                const table = jsonStringValue(table_value) orelse continue;
+                if (table.len == 0) continue;
+                try appendTrustedPrincipalPermissionsForTable(alloc, &out, table, operations_value.?.array.items);
+            }
+        }
     }
-
-    if (tables_value == null or tables_value.? != .array or tables_value.?.array.items.len == 0) {
-        try appendTrustedPrincipalPermissionsForTable(alloc, &out, "*", operations_value.?.array.items);
-    } else {
-        for (tables_value.?.array.items) |table_value| {
-            const table = jsonStringValue(table_value) orelse continue;
-            if (table.len == 0) continue;
-            try appendTrustedPrincipalPermissionsForTable(alloc, &out, table, operations_value.?.array.items);
+    // Additive grants express narrow write/admin authority alongside a wider
+    // read scope. Older runtimes ignore this claim and retain only read access.
+    if (payload.get("table_operations")) |scopes| {
+        if (scopes != .object) return error.Unauthorized;
+        var it = scopes.object.iterator();
+        while (it.next()) |entry| {
+            if (entry.key_ptr.len == 0 or std.mem.eql(u8, entry.key_ptr.*, "*") or entry.value_ptr.* != .array) return error.Unauthorized;
+            for (entry.value_ptr.array.items) |operation| {
+                const name = jsonStringValue(operation) orelse return error.Unauthorized;
+                if (!std.mem.eql(u8, name, "read") and !std.mem.eql(u8, name, "write") and !std.mem.eql(u8, name, "admin")) return error.Unauthorized;
+            }
+            try appendTrustedPrincipalPermissionsForTable(alloc, &out, entry.key_ptr.*, entry.value_ptr.array.items);
         }
     }
     return try out.toOwnedSlice(alloc);
@@ -57942,6 +57973,7 @@ pub fn cloneCatalogIdentity(alloc: std.mem.Allocator, identity: ?AuthenticatedId
     var owned = try cloneAuthenticatedIdentity(alloc, value.username, value.credential_principal, value.permissions, value.row_filter, value.metadata_json, value.roles);
     errdefer owned.deinit(alloc);
     owned.is_internal_service = value.is_internal_service;
+    owned.mcp_creation_discovery = value.mcp_creation_discovery;
     owned.live_user_manager = value.live_user_manager;
     for (value.catalog_aliases) |alias| try appendCatalogAlias(alloc, &owned, alias.logical, alias.physical);
     return owned;
@@ -59793,4 +59825,62 @@ test "native memory worker budgets slow semantic publication independently from 
         const projection = try std.json.parseFromSliceLeaky(memory.memory.types.EntityProjection, alloc, row.json, .{});
         if (projection.kind == .view and std.mem.eql(u8, projection.entity_id, "graph")) try std.testing.expect(std.mem.indexOf(u8, projection.text, "Derived graph description") != null);
     }
+}
+
+test "trusted principal table operations preserve unrelated writes and protect reserved tables" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"tables":["*"],"operations":["read"],"table_operations":{"application":["write"],"managed":["read"]}}
+    , .{});
+    defer parsed.deinit();
+    const permissions = try trustedPrincipalPermissionsFromPayload(a, parsed.value.object);
+    defer freePermissions(a, permissions);
+    try std.testing.expect(permissionsAllow(permissions, .table, "application", .write));
+    try std.testing.expect(permissionsAllow(permissions, .table, "managed", .read));
+    try std.testing.expect(!permissionsAllow(permissions, .table, "managed", .write));
+    try std.testing.expect(!permissionsAllow(permissions, .table, "antfly_sources", .write));
+    try std.testing.expect(!permissionsAllow(permissions, .table, "future-table", .write));
+}
+test "trusted principal table operations reject malformed and wildcard grant expansions" {
+    const a = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"table_operations":[]}
+        ,
+        \\{"table_operations":{"*":["write"]}}
+        ,
+        \\{"table_operations":{"docs":"write"}}
+        ,
+        \\{"table_operations":{"docs":["unknown"]}}
+    };
+    for (cases) |raw| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.Unauthorized, trustedPrincipalPermissionsFromPayload(a, parsed.value.object));
+    }
+}
+
+test "trusted principal table operations preserve discovery hints without granting target authority" {
+    const a = std.testing.allocator;
+    const FakeSource = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var server = ApiHttpServer.init(a, .{ .trusted_principal_issuer = "cloudaf" }, .{ .ptr = undefined, .vtable = &.{ .status = FakeSource.status } }, null, null);
+    defer server.deinit();
+    const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const payload = try std.fmt.allocPrint(a,
+        \\{{"iss":"cloudaf","sub":"creator","tables":["*"],"operations":["read"],"mcp_creation_discovery":true,"iat":{d},"exp":{d}}}
+    , .{ now, now + 60 });
+    defer a.free(payload);
+    const token = try encodeTrustedPrincipalToken(a, "secret", payload);
+    defer a.free(token);
+    var identity = try server.authenticateTrustedPrincipal(token, "secret");
+    defer identity.deinit(a);
+    try std.testing.expect(identity.mcp_creation_discovery);
+    var clone = (try cloneCatalogIdentity(a, identity)).?;
+    defer clone.deinit(a);
+    try std.testing.expect(clone.mcp_creation_discovery);
+    try std.testing.expect(!permissionsAllow(clone.permissions, .table, "new_table", .admin));
+    try std.testing.expect(!permissionsAllow(clone.permissions, .table, "antfly_sources", .admin));
 }
