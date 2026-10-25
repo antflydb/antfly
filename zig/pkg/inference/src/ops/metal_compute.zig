@@ -2659,7 +2659,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         const buf = toBuf(tensor);
         const dense_identity = dynamicLinearDenseBufferKey(buf);
-        const data_identity = @intFromPtr(buf.data.ptr);
         const quantized_storage = buf.quantized_storage orelse buf.runtime_quantized_storage;
         const quantized_identity = if (quantized_storage) |storage| @intFromPtr(storage) else 0;
 
@@ -2687,7 +2686,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var layer_norm_it = self.dynamic_layer_norm_slots.iterator();
         while (layer_norm_it.next()) |entry| {
             const key = entry.key_ptr.*;
-            if (key.gamma_buf == data_identity or key.beta_buf == data_identity) {
+            if (key.gamma_buf == dense_identity or key.beta_buf == dense_identity) {
                 layer_norm_keys[layer_norm_count] = key;
                 layer_norm_count += 1;
             }
@@ -6638,8 +6637,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn dynamicLayerNormSlotKey(gamma: CT, beta: CT, hidden_size: usize) DynamicLayerNormSlotKey {
         return .{
-            .gamma_buf = @intFromPtr(toBuf(gamma).data.ptr),
-            .beta_buf = @intFromPtr(toBuf(beta).data.ptr),
+            .gamma_buf = dynamicLinearDenseBufferKey(toBuf(gamma)),
+            .beta_buf = dynamicLinearDenseBufferKey(toBuf(beta)),
             .hidden_size = hidden_size,
         };
     }
@@ -48470,4 +48469,69 @@ test "Metal linear descriptors query prepared immutable F32 slots and preserve n
             }
         }
     }
+}
+
+
+test "Metal layer norm keeps distinct immutable resident parameter sets and retires their slots" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, null);
+    defer context.deinit(a);
+    var cb = context.computeBackend();
+    const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    const x = [_]f32{ 1, 2, 3, 5, 5, 1, 4, 7 };
+    const gamma = [_][4]f32{ .{ 1, 1, 1, 1 }, .{ 2, 3, 4, 5 } };
+    const beta = [_][4]f32{ .{ 0, 0, 0, 0 }, .{ 0.25, -0.5, 0.75, -1 } };
+    const input = try auditDeviceTensor(compute, &cb, &x, &.{ 2, 4 });
+    defer cb.free(input);
+    var held: ?CT = null;
+    defer if (held) |value| cb.free(value);
+    var first: [8]f32 = undefined;
+    var weights: [2]CT = undefined;
+    var biases: [2]CT = undefined;
+    var prepared: usize = 0;
+    defer for (0..prepared) |i| {
+        cb.free(weights[i]);
+        cb.free(biases[i]);
+    };
+    for (0..2) |set| {
+        weights[set] = try auditDeviceTensor(compute, &cb, &gamma[set], &.{4});
+        biases[set] = auditDeviceTensor(compute, &cb, &beta[set], &.{4}) catch |err| {
+            cb.free(weights[set]);
+            return err;
+        };
+        prepared += 1;
+        const result = try cb.layerNorm(input, weights[set], biases[set], 4, 1e-5);
+        var result_owned = true;
+        defer if (result_owned) cb.free(result);
+        const actual = try cb.toFloat32(result, a);
+        defer a.free(actual);
+        for (0..2) |row| {
+            var mean: f64 = 0;
+            for (x[row * 4 ..][0..4]) |v| mean += v;
+            mean /= 4;
+            var variance: f64 = 0;
+            for (x[row * 4 ..][0..4]) |v| variance += (@as(f64, v) - mean) * (@as(f64, v) - mean);
+            const inverse = 1 / @sqrt(variance / 4 + @as(f64, @as(f32, 1e-5)));
+            for (0..4) |column| {
+                const expected: f32 = @floatCast((@as(f64, x[row * 4 + column]) - mean) * inverse * gamma[set][column] + beta[set][column]);
+                try std.testing.expectApproxEqAbs(expected, actual[row * 4 + column], 3e-5);
+            }
+        }
+        if (set == 0) {
+            @memcpy(&first, actual);
+            held = result;
+            result_owned = false;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), compute.dynamic_layer_norm_slots.count());
+    const retained = try cb.toFloat32(held.?, a);
+    defer a.free(retained);
+    try std.testing.expectEqualSlices(f32, &first, retained);
+    MetalCompute.releaseDynamicSlotsForTensor(&cb, weights[0]);
+    try std.testing.expectEqual(@as(usize, 1), compute.dynamic_layer_norm_slots.count());
+    const again = try cb.layerNorm(input, weights[1], biases[1], 4, 1e-5);
+    defer cb.free(again);
+    try std.testing.expectEqual(@as(usize, 1), compute.dynamic_layer_norm_slots.count());
 }

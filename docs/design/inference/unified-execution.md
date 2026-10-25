@@ -3104,3 +3104,13 @@ are separate test costs. Its frozen source receipts are under
 `u-campaign/shared-cpu-metal-pre-rope/`. The subsequent RoPE descriptor work is
 a separately accounted capability extension and is not part of that saving.
 The full composed model, direct-kernel and soak gates remain required.
+
+
+A further Metal correctness regression was reproduced during normalization
+review: distinct immutable resident layer-norm parameters shared an empty-host-
+slice cache key, so the second parameter set used the first set's weights.
+The independent F64 test fails on that baseline (actual -1.1832132 versus
+expected -2.1164265). The key now consumes the existing physical tensor identity,
+and parameter retirement removes only the matching slot. The numerical,
+retained-output and retirement regression and existing RMS identity case both
+pass, with no skips or leaks. This repair is separate from consolidation credit.
