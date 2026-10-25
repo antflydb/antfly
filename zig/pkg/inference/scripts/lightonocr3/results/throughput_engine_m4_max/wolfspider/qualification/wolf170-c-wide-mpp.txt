@@ -1,0 +1,168 @@
+WIDE_MPP_CHECK rows=9 in=1024 out=6144 on=0 round=0 gpu_us=71.62 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=9 in=1024 out=6144 on=1 round=1 gpu_us=57.38 max_abs=1.19209e-06 calls=1
+WIDE_MPP_CHECK rows=9 in=1024 out=6144 on=1 round=2 gpu_us=57.33 max_abs=1.19209e-06 calls=1
+WIDE_MPP_CHECK rows=9 in=1024 out=6144 on=0 round=3 gpu_us=72.50 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=12 in=1024 out=4096 on=0 round=0 gpu_us=70.00 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=12 in=1024 out=4096 on=1 round=1 gpu_us=44.21 max_abs=1.43051e-06 calls=1
+WIDE_MPP_CHECK rows=12 in=1024 out=4096 on=1 round=2 gpu_us=43.67 max_abs=1.43051e-06 calls=1
+WIDE_MPP_CHECK rows=12 in=1024 out=4096 on=0 round=3 gpu_us=64.67 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=13 in=1024 out=2048 on=0 round=0 gpu_us=41.88 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=13 in=1024 out=2048 on=1 round=1 gpu_us=40.25 max_abs=1.3113e-06 calls=1
+WIDE_MPP_CHECK rows=13 in=1024 out=2048 on=1 round=2 gpu_us=38.37 max_abs=1.3113e-06 calls=1
+WIDE_MPP_CHECK rows=13 in=1024 out=2048 on=0 round=3 gpu_us=47.17 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=16 in=2048 out=1024 on=0 round=0 gpu_us=47.67 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=16 in=2048 out=1024 on=1 round=1 gpu_us=48.00 max_abs=3.15905e-06 calls=1
+WIDE_MPP_CHECK rows=16 in=2048 out=1024 on=1 round=2 gpu_us=46.00 max_abs=3.15905e-06 calls=1
+WIDE_MPP_CHECK rows=16 in=2048 out=1024 on=0 round=3 gpu_us=48.33 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=9 in=2560 out=4096 on=0 round=0 gpu_us=131.88 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=9 in=2560 out=4096 on=1 round=1 gpu_us=103.00 max_abs=4.29153e-06 calls=1
+WIDE_MPP_CHECK rows=9 in=2560 out=4096 on=1 round=2 gpu_us=103.62 max_abs=4.29153e-06 calls=1
+WIDE_MPP_CHECK rows=9 in=2560 out=4096 on=0 round=3 gpu_us=134.17 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=12 in=2560 out=8192 on=0 round=0 gpu_us=233.50 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=12 in=2560 out=8192 on=1 round=1 gpu_us=163.83 max_abs=4.05312e-06 calls=1
+WIDE_MPP_CHECK rows=12 in=2560 out=8192 on=1 round=2 gpu_us=166.04 max_abs=4.05312e-06 calls=1
+WIDE_MPP_CHECK rows=12 in=2560 out=8192 on=0 round=3 gpu_us=212.96 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=9 in=1024 out=3584 on=0 round=0 gpu_us=60.25 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=9 in=1024 out=3584 on=1 round=1 gpu_us=47.96 max_abs=1.19209e-06 calls=1
+WIDE_MPP_CHECK rows=9 in=1024 out=3584 on=1 round=2 gpu_us=48.71 max_abs=1.19209e-06 calls=1
+WIDE_MPP_CHECK rows=9 in=1024 out=3584 on=0 round=3 gpu_us=58.67 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=9 in=2560 out=9216 on=0 round=0 gpu_us=241.62 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=9 in=2560 out=9216 on=1 round=1 gpu_us=180.62 max_abs=2.86102e-06 calls=1
+WIDE_MPP_CHECK rows=9 in=2560 out=9216 on=1 round=2 gpu_us=180.62 max_abs=2.86102e-06 calls=1
+WIDE_MPP_CHECK rows=9 in=2560 out=9216 on=0 round=3 gpu_us=234.87 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=13 in=4096 out=2560 on=0 round=0 gpu_us=155.71 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=13 in=4096 out=2560 on=1 round=1 gpu_us=164.75 max_abs=5.36442e-06 calls=1
+WIDE_MPP_CHECK rows=13 in=4096 out=2560 on=1 round=2 gpu_us=145.67 max_abs=5.36442e-06 calls=1
+WIDE_MPP_CHECK rows=13 in=4096 out=2560 on=0 round=3 gpu_us=158.42 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=5 in=1024 out=248320 on=0 round=0 gpu_us=2212.88 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=5 in=1024 out=248320 on=1 round=1 gpu_us=1692.21 max_abs=2.74181e-06 calls=1
+WIDE_MPP_CHECK rows=5 in=1024 out=248320 on=1 round=2 gpu_us=1612.54 max_abs=2.74181e-06 calls=1
+WIDE_MPP_CHECK rows=5 in=1024 out=248320 on=0 round=3 gpu_us=2209.79 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=8 in=1024 out=248320 on=0 round=0 gpu_us=3312.62 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=8 in=1024 out=248320 on=1 round=1 gpu_us=1649.42 max_abs=2.74181e-06 calls=1
+WIDE_MPP_CHECK rows=8 in=1024 out=248320 on=1 round=2 gpu_us=1542.29 max_abs=2.74181e-06 calls=1
+WIDE_MPP_CHECK rows=8 in=1024 out=248320 on=0 round=3 gpu_us=1676.04 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=9 in=1024 out=248320 on=0 round=0 gpu_us=4845.50 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=9 in=1024 out=248320 on=1 round=1 gpu_us=1539.08 max_abs=2.74181e-06 calls=1
+WIDE_MPP_CHECK rows=9 in=1024 out=248320 on=1 round=2 gpu_us=1546.83 max_abs=2.74181e-06 calls=1
+WIDE_MPP_CHECK rows=9 in=1024 out=248320 on=0 round=3 gpu_us=4847.62 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=12 in=1024 out=248320 on=0 round=0 gpu_us=7341.75 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=12 in=1024 out=248320 on=1 round=1 gpu_us=1543.37 max_abs=2.74181e-06 calls=1
+WIDE_MPP_CHECK rows=12 in=1024 out=248320 on=1 round=2 gpu_us=1540.25 max_abs=2.74181e-06 calls=1
+WIDE_MPP_CHECK rows=12 in=1024 out=248320 on=0 round=3 gpu_us=6820.67 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=16 in=1024 out=248320 on=0 round=0 gpu_us=8795.88 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=16 in=1024 out=248320 on=1 round=1 gpu_us=1556.79 max_abs=2.74181e-06 calls=1
+WIDE_MPP_CHECK rows=16 in=1024 out=248320 on=1 round=2 gpu_us=1536.75 max_abs=2.74181e-06 calls=1
+WIDE_MPP_CHECK rows=16 in=1024 out=248320 on=0 round=3 gpu_us=8721.12 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=7 in=2560 out=248320 on=0 round=0 gpu_us=5963.75 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=7 in=2560 out=248320 on=1 round=1 gpu_us=3903.88 max_abs=4.88758e-06 calls=1
+WIDE_MPP_CHECK rows=7 in=2560 out=248320 on=1 round=2 gpu_us=3885.00 max_abs=4.88758e-06 calls=1
+WIDE_MPP_CHECK rows=7 in=2560 out=248320 on=0 round=3 gpu_us=4746.88 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=8 in=2560 out=248320 on=0 round=0 gpu_us=8104.21 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=8 in=2560 out=248320 on=1 round=1 gpu_us=4182.21 max_abs=4.88758e-06 calls=1
+WIDE_MPP_CHECK rows=8 in=2560 out=248320 on=1 round=2 gpu_us=3892.58 max_abs=4.88758e-06 calls=1
+WIDE_MPP_CHECK rows=8 in=2560 out=248320 on=0 round=3 gpu_us=4117.67 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=9 in=2560 out=248320 on=0 round=0 gpu_us=11600.50 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=9 in=2560 out=248320 on=1 round=1 gpu_us=3945.25 max_abs=4.88758e-06 calls=1
+WIDE_MPP_CHECK rows=9 in=2560 out=248320 on=1 round=2 gpu_us=3926.88 max_abs=4.88758e-06 calls=1
+WIDE_MPP_CHECK rows=9 in=2560 out=248320 on=0 round=3 gpu_us=11598.29 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=12 in=2560 out=248320 on=0 round=0 gpu_us=16271.04 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=12 in=2560 out=248320 on=1 round=1 gpu_us=3937.38 max_abs=5.84126e-06 calls=1
+WIDE_MPP_CHECK rows=12 in=2560 out=248320 on=1 round=2 gpu_us=3943.79 max_abs=5.84126e-06 calls=1
+WIDE_MPP_CHECK rows=12 in=2560 out=248320 on=0 round=3 gpu_us=16304.12 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=16 in=2560 out=248320 on=0 round=0 gpu_us=24736.75 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=16 in=2560 out=248320 on=1 round=1 gpu_us=3930.04 max_abs=5.84126e-06 calls=1
+WIDE_MPP_CHECK rows=16 in=2560 out=248320 on=1 round=2 gpu_us=3928.58 max_abs=5.84126e-06 calls=1
+WIDE_MPP_CHECK rows=16 in=2560 out=248320 on=0 round=3 gpu_us=24726.21 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=17 in=1024 out=6144 on=0 round=0 gpu_us=586.29 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=17 in=1024 out=6144 on=1 round=1 gpu_us=50.12 max_abs=1.90735e-06 calls=1
+WIDE_MPP_CHECK rows=17 in=1024 out=6144 on=1 round=2 gpu_us=50.00 max_abs=1.90735e-06 calls=1
+WIDE_MPP_CHECK rows=17 in=1024 out=6144 on=0 round=3 gpu_us=559.62 max_abs=0 calls=0
+projection rows=17 in=1024 out=6144 input_offset=16 bf16_input=0 max_abs=2.5034e-06
+projection rows=17 in=1024 out=6144 input_offset=16 bf16_input=1 max_abs=9.53674e-07
+projection rows=17 in=1024 out=6144 input_offset=16 bf16_input=2 max_abs=9.53674e-07
+WIDE_MPP_CHECK rows=24 in=1024 out=3584 on=0 round=0 gpu_us=741.50 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=24 in=1024 out=3584 on=1 round=1 gpu_us=41.67 max_abs=1.72853e-06 calls=1
+WIDE_MPP_CHECK rows=24 in=1024 out=3584 on=1 round=2 gpu_us=40.54 max_abs=1.72853e-06 calls=1
+WIDE_MPP_CHECK rows=24 in=1024 out=3584 on=0 round=3 gpu_us=679.25 max_abs=0 calls=0
+projection rows=24 in=1024 out=3584 input_offset=16 bf16_input=0 max_abs=2.5034e-06
+projection rows=24 in=1024 out=3584 input_offset=16 bf16_input=1 max_abs=9.53674e-07
+projection rows=24 in=1024 out=3584 input_offset=16 bf16_input=2 max_abs=9.53674e-07
+WIDE_MPP_CHECK rows=31 in=3584 out=1024 on=0 round=0 gpu_us=1633.79 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=31 in=3584 out=1024 on=1 round=1 gpu_us=114.79 max_abs=4.52995e-06 calls=1
+WIDE_MPP_CHECK rows=31 in=3584 out=1024 on=1 round=2 gpu_us=109.33 max_abs=4.52995e-06 calls=1
+WIDE_MPP_CHECK rows=31 in=3584 out=1024 on=0 round=3 gpu_us=1367.29 max_abs=0 calls=0
+projection rows=31 in=3584 out=1024 input_offset=16 bf16_input=0 max_abs=7.62939e-06
+projection rows=31 in=3584 out=1024 input_offset=16 bf16_input=1 max_abs=3.8147e-06
+projection rows=31 in=3584 out=1024 input_offset=16 bf16_input=2 max_abs=3.8147e-06
+WIDE_MPP_CHECK rows=32 in=1024 out=2048 on=0 round=0 gpu_us=28.62 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=32 in=1024 out=2048 on=1 round=1 gpu_us=27.92 max_abs=0 calls=1
+WIDE_MPP_CHECK rows=32 in=1024 out=2048 on=1 round=2 gpu_us=28.08 max_abs=0 calls=1
+WIDE_MPP_CHECK rows=32 in=1024 out=2048 on=0 round=3 gpu_us=28.25 max_abs=0 calls=0
+projection rows=32 in=1024 out=2048 input_offset=16 bf16_input=0 max_abs=0
+projection rows=32 in=1024 out=2048 input_offset=16 bf16_input=1 max_abs=0
+projection rows=32 in=1024 out=2048 input_offset=16 bf16_input=2 max_abs=0
+WIDE_MPP_CHECK rows=17 in=2560 out=8192 on=0 round=0 gpu_us=1768.79 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=17 in=2560 out=8192 on=1 round=1 gpu_us=148.33 max_abs=4.41074e-06 calls=1
+WIDE_MPP_CHECK rows=17 in=2560 out=8192 on=1 round=2 gpu_us=149.00 max_abs=4.41074e-06 calls=1
+WIDE_MPP_CHECK rows=17 in=2560 out=8192 on=0 round=3 gpu_us=1704.38 max_abs=0 calls=0
+projection rows=17 in=2560 out=8192 input_offset=16 bf16_input=0 max_abs=7.51019e-06
+projection rows=17 in=2560 out=8192 input_offset=16 bf16_input=1 max_abs=3.57628e-06
+projection rows=17 in=2560 out=8192 input_offset=16 bf16_input=2 max_abs=3.57628e-06
+WIDE_MPP_CHECK rows=24 in=2560 out=9216 on=0 round=0 gpu_us=3597.50 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=24 in=2560 out=9216 on=1 round=1 gpu_us=182.00 max_abs=4.41074e-06 calls=1
+WIDE_MPP_CHECK rows=24 in=2560 out=9216 on=1 round=2 gpu_us=181.62 max_abs=4.41074e-06 calls=1
+WIDE_MPP_CHECK rows=24 in=2560 out=9216 on=0 round=3 gpu_us=3511.38 max_abs=0 calls=0
+projection rows=24 in=2560 out=9216 input_offset=16 bf16_input=0 max_abs=7.51019e-06
+projection rows=24 in=2560 out=9216 input_offset=16 bf16_input=1 max_abs=4.29153e-06
+projection rows=24 in=2560 out=9216 input_offset=16 bf16_input=2 max_abs=4.29153e-06
+WIDE_MPP_CHECK rows=31 in=9216 out=2560 on=0 round=0 gpu_us=9282.04 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=31 in=9216 out=2560 on=1 round=1 gpu_us=479.25 max_abs=1.3113e-05 calls=1
+WIDE_MPP_CHECK rows=31 in=9216 out=2560 on=1 round=2 gpu_us=502.17 max_abs=1.3113e-05 calls=1
+WIDE_MPP_CHECK rows=31 in=9216 out=2560 on=0 round=3 gpu_us=9593.00 max_abs=0 calls=0
+projection rows=31 in=9216 out=2560 input_offset=16 bf16_input=0 max_abs=3.14713e-05
+projection rows=31 in=9216 out=2560 input_offset=16 bf16_input=1 max_abs=1.43051e-05
+projection rows=31 in=9216 out=2560 input_offset=16 bf16_input=2 max_abs=1.43051e-05
+WIDE_MPP_CHECK rows=32 in=4096 out=2560 on=0 round=0 gpu_us=124.79 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=32 in=4096 out=2560 on=1 round=1 gpu_us=125.21 max_abs=0 calls=1
+WIDE_MPP_CHECK rows=32 in=4096 out=2560 on=1 round=2 gpu_us=124.46 max_abs=0 calls=1
+WIDE_MPP_CHECK rows=32 in=4096 out=2560 on=0 round=3 gpu_us=125.00 max_abs=0 calls=0
+projection rows=32 in=4096 out=2560 input_offset=16 bf16_input=0 max_abs=0
+projection rows=32 in=4096 out=2560 input_offset=16 bf16_input=1 max_abs=0
+projection rows=32 in=4096 out=2560 input_offset=16 bf16_input=2 max_abs=0
+WIDE_MPP_CHECK rows=17 in=1024 out=248320 on=0 round=0 gpu_us=17552.92 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=17 in=1024 out=248320 on=1 round=1 gpu_us=1604.62 max_abs=2.74181e-06 calls=1
+WIDE_MPP_CHECK rows=17 in=1024 out=248320 on=1 round=2 gpu_us=1598.87 max_abs=2.74181e-06 calls=1
+WIDE_MPP_CHECK rows=17 in=1024 out=248320 on=0 round=3 gpu_us=17492.25 max_abs=0 calls=0
+WIDE_MPP_STANDALONE rows=17 in=1024 out=248320 max_abs=2.74181e-06 calls=1
+WIDE_MPP_STANDALONE_BF16 rows=17 in=1024 out=248320 max_abs=9.53674e-07 calls=1
+projection rows=17 in=1024 out=248320 input_offset=16 bf16_input=0 max_abs=3.21865e-06
+projection rows=17 in=1024 out=248320 input_offset=16 bf16_input=1 max_abs=1.66893e-06
+projection rows=17 in=1024 out=248320 input_offset=16 bf16_input=2 max_abs=1.66893e-06
+WIDE_MPP_CHECK rows=24 in=2560 out=248320 on=0 round=0 gpu_us=81951.25 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=24 in=2560 out=248320 on=1 round=1 gpu_us=4575.83 max_abs=5.84126e-06 calls=1
+WIDE_MPP_CHECK rows=24 in=2560 out=248320 on=1 round=2 gpu_us=4335.25 max_abs=5.84126e-06 calls=1
+WIDE_MPP_CHECK rows=24 in=2560 out=248320 on=0 round=3 gpu_us=82349.50 max_abs=0 calls=0
+WIDE_MPP_STANDALONE rows=24 in=2560 out=248320 max_abs=5.84126e-06 calls=1
+WIDE_MPP_STANDALONE_BF16 rows=24 in=2560 out=248320 max_abs=3.09944e-06 calls=1
+projection rows=24 in=2560 out=248320 input_offset=16 bf16_input=0 max_abs=9.29832e-06
+projection rows=24 in=2560 out=248320 input_offset=16 bf16_input=1 max_abs=4.76837e-06
+projection rows=24 in=2560 out=248320 input_offset=16 bf16_input=2 max_abs=4.76837e-06
+WIDE_MPP_CHECK rows=31 in=1024 out=248320 on=0 round=0 gpu_us=56889.79 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=31 in=1024 out=248320 on=1 round=1 gpu_us=1649.37 max_abs=2.74181e-06 calls=1
+WIDE_MPP_CHECK rows=31 in=1024 out=248320 on=1 round=2 gpu_us=1816.62 max_abs=2.74181e-06 calls=1
+WIDE_MPP_CHECK rows=31 in=1024 out=248320 on=0 round=3 gpu_us=57305.50 max_abs=0 calls=0
+WIDE_MPP_STANDALONE rows=31 in=1024 out=248320 max_abs=2.74181e-06 calls=1
+WIDE_MPP_STANDALONE_BF16 rows=31 in=1024 out=248320 max_abs=1.07288e-06 calls=1
+projection rows=31 in=1024 out=248320 input_offset=16 bf16_input=0 max_abs=3.21865e-06
+projection rows=31 in=1024 out=248320 input_offset=16 bf16_input=1 max_abs=1.66893e-06
+projection rows=31 in=1024 out=248320 input_offset=16 bf16_input=2 max_abs=1.66893e-06
+WIDE_MPP_CHECK rows=32 in=2560 out=248320 on=0 round=0 gpu_us=13683.04 max_abs=0 calls=0
+WIDE_MPP_CHECK rows=32 in=2560 out=248320 on=1 round=1 gpu_us=4490.50 max_abs=0 calls=1
+WIDE_MPP_CHECK rows=32 in=2560 out=248320 on=1 round=2 gpu_us=4252.00 max_abs=0 calls=1
+WIDE_MPP_CHECK rows=32 in=2560 out=248320 on=0 round=3 gpu_us=13786.96 max_abs=0 calls=0
+WIDE_MPP_STANDALONE rows=32 in=2560 out=248320 max_abs=0 calls=1
+WIDE_MPP_STANDALONE_BF16 rows=32 in=2560 out=248320 max_abs=0 calls=1
+projection rows=32 in=2560 out=248320 input_offset=16 bf16_input=0 max_abs=0
+projection rows=32 in=2560 out=248320 input_offset=16 bf16_input=1 max_abs=0
+projection rows=32 in=2560 out=248320 input_offset=16 bf16_input=2 max_abs=0

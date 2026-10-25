@@ -92,6 +92,8 @@ static int check(termite_metal_decode_runtime *r, size_t n, size_t prefix, size_
                 r->lightonocr3_prefill_attention_mpp32_pipeline = nil;
             termite_metal_decode_runtime_set_qwen35_ocr_vector_loads(r, mode != 4);
             const uint64_t before = r->lightonocr3_prefill_attention_mpp_dispatches;
+            uint64_t short_before[2], short_after[2];
+            termite_metal_decode_runtime_lighton_short_prefill_stats(r, short_before);
             const uint64_t before_direct = r->lightonocr3_prefill_attention_direct_dispatches;
             for (size_t i = 0; i < count + 8; i++)
                 ((uint32_t *)y.contents)[i] = 0xdeadbeef;
@@ -131,7 +133,10 @@ static int check(termite_metal_decode_runtime *r, size_t n, size_t prefix, size_
             r->lightonocr3_prefill_attention_mpp_pipeline = saved;
             r->lightonocr3_prefill_attention_mpp32_pipeline = saved32;
             r->lightonocr3_prefill_attention_direct_pipeline = saved_direct;
-            const bool eligible = n >= 128 && n <= 2048 && kv <= 4096;
+            const bool short_shape = n < 128 && kv >= 256 && page % 16 == 0 &&
+                ((heads == 16 && n >= 32) || (heads == 8 && n >= 64));
+            const bool short_direct = short_shape && (mode == 1 || mode == 5 || mode == 6);
+            const bool eligible = (n >= 128 || short_direct) && n <= 2048 && kv <= 4096;
             if (r->lightonocr3_prefill_attention_mpp_dispatches - before !=
                 ((mode == 1 || mode >= 5) && eligible ? 1 : 0))
                 return 8;
@@ -139,6 +144,9 @@ static int check(termite_metal_decode_runtime *r, size_t n, size_t prefix, size_
             if (r->lightonocr3_prefill_attention_direct_dispatches - before_direct !=
                 (expected_direct ? 1 : 0))
                 return 15;
+            termite_metal_decode_runtime_lighton_short_prefill_stats(r, short_after);
+            if (short_after[0] != short_before[0] ||
+                short_after[1] - short_before[1] != (expected_direct && n < 128 ? 1 : 0)) return 16;
             if (benchmark)
                 printf("{\"heads\":%zu,\"queries\":%zu,\"keys\":%zu,\"trial\":%zu,\"mode\":%zu,\"wall_us\":%."
                        "4f,\"gpu_us\":%.4f}\n",
@@ -257,6 +265,17 @@ int main(int argc, const char **argv) {
                     if (check(r, 432, 0, h, 16, true, poison, false))
                         return 33;
             }
+        if (!benchmark) {
+            const size_t short_queries[] = {1,2,17,31,32,33,42,48,63,64,65,95,127};
+            for (size_t h=8;h<=16;h+=8) for (size_t i=0;i<sizeof(short_queries)/sizeof(short_queries[0]);i++)
+                for (size_t prefix=256;prefix<=1024;prefix*=4) for (size_t page=16;page<=128;page*=8)
+                    if (check(r,short_queries[i],prefix,h,page,i%2,0,false)) return 34;
+            for (size_t h=8;h<=16;h+=8) {
+                if (check(r,32,256,h,8,true,0,false) || check(r,64,256,h,8,true,0,false)) return 35;
+                for (int poison=1;poison<=4;poison++)
+                    if (check(r,64,256,h,16,true,poison,false)) return 36;
+            }
+        }
         termite_metal_decode_runtime_destroy(r);
     }
     return 0;

@@ -31,6 +31,7 @@ static float expand_bf16(uint16_t value) {
     memcpy(&f, &bits, 4);
     return f;
 }
+static bool projection_prefill_phase = false;
 static int apply_projection(termite_metal_decode_runtime *r, size_t rows, size_t in, size_t out,
                             id<MTLBuffer> input, size_t offset_floats, id<MTLBuffer> result) {
     uint32_t *storage = result.contents;
@@ -41,7 +42,7 @@ static int apply_projection(termite_metal_decode_runtime *r, size_t rows, size_t
         storage[end + i] = 0xcafebabeu;
     const bool owns_frame = !r->active_frame_cb;
     if (owns_frame && (termite_metal_decode_runtime_begin_frame(r) ||
-        termite_metal_decode_runtime_set_active_frame_regime(r, TERMITE_METAL_FRAME_REGIME_DECODE))) return -200;
+        termite_metal_decode_runtime_set_active_frame_regime(r, projection_prefill_phase ? TERMITE_METAL_FRAME_REGIME_PREFILL : TERMITE_METAL_FRAME_REGIME_DECODE))) return -200;
     const int rc = rows == 1 ? termite_metal_decode_runtime_apply_linear_device(r, 0, (__bridge void *)input,
                                                                                 offset_floats * 4, in, out,
                                                                                 (__bridge void *)result, 16)
@@ -640,6 +641,8 @@ static int prefill_core_check(termite_metal_decode_runtime *r, size_t seq, size_
             if (variant == 2)
                 r->lightonocr3_prefill_prepare_pipeline = nil;
             uint64_t before = r->lightonocr3_prefill_norm_dispatches;
+            uint64_t short_before[2], short_after[2];
+            termite_metal_decode_runtime_lighton_short_prefill_stats(r, short_before);
             if (termite_metal_decode_runtime_begin_frame(r))
                 return 3;
             uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -649,8 +652,11 @@ static int prefill_core_check(termite_metal_decode_runtime *r, size_t seq, size_
                 return 4;
             uint64_t elapsed = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start;
             r->lightonocr3_prefill_prepare_pipeline = saved;
-            if (r->lightonocr3_prefill_norm_dispatches - before != (variant == 1 && seq >= 128 ? 1 : 0))
+            if (r->lightonocr3_prefill_norm_dispatches - before != (variant == 1 && seq >= 2 ? 1 : 0))
                 return 5;
+            termite_metal_decode_runtime_lighton_short_prefill_stats(r, short_after);
+            if (short_after[0] - short_before[0] != (variant == 1 && seq >= 2 && seq < 128 ? 1 : 0) ||
+                short_after[1] != short_before[1]) return 9;
             if (benchmark)
                 printf("{\"seq\":%zu,\"heads\":%zu,\"initialized\":%d,\"trial\":%zu,\"mode\":%zu,\"wall_us\":"
                        "%.4f,\"gpu_us\":%.4f}\n",
@@ -4690,9 +4696,21 @@ int main(int argc, const char **argv) {
         for (size_t pages = 1; pages <= 8; pages++)
             if (fused_batch_core_check(r,16,16,pages,false) || fused_batch_core_check(r,16,32,pages,false)) return 101;
         unsetenv("TERMITE_METAL_ENABLE_LIGHTONOCR3_RECURRENT_PARALLEL");
-        const size_t prefill_lengths[] = {8,128,129,432,662,2048};
-        for (size_t h = 16; h <= 32; h += 16) for (size_t j = 0; j < 6; j++)
-            if (prefill_core_check(r,prefill_lengths[j],h,j%2,false)) return 104;
+        const size_t prefill_lengths[] = {1,2,3,4,7,8,15,16,17,22,31,32,33,42,48,63,64,65,95,96,127,128,129,432,662,2048};
+        for (size_t h = 16; h <= 32; h += 16)
+            for (size_t j = 0; j < sizeof(prefill_lengths)/sizeof(prefill_lengths[0]); j++)
+                for (size_t init = 0; init < 2; init++)
+                    if (prefill_core_check(r,prefill_lengths[j],h,init != 0,false)) return 104;
+        projection_prefill_phase = true;
+        const size_t short_rows[] = {17,22,27,31};
+        const size_t short_shapes[][2] = {{2560,8192},{2560,4096},{4096,2560},{2560,1024},{2560,9216},{9216,2560}};
+        for (size_t i=0;i<4;i++) for (size_t j=0;j<6;j++) {
+            const uint64_t before = r->lighton_mpp_planned_calls + r->lighton_mpp_dedicated_calls;
+            if (projection(r,short_rows[i],short_shapes[j][0],short_shapes[j][1],0)) return 127;
+            if (r->lighton_mpp_planned_calls + r->lighton_mpp_dedicated_calls <= before) return 128;
+        }
+        if (projection(r,22,2560,8192,1)) return 129;
+        projection_prefill_phase = false;
 
         if (argc == 2 && (strcmp(argv[1], "--benchmark-lifetime") == 0 || strcmp(argv[1], "--benchmark-small-rows") == 0)) {
             int rc = strcmp(argv[1], "--benchmark-lifetime") == 0 ? benchmark_lifetime(r) : benchmark_small_rows(r);

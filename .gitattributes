@@ -39,3 +39,5 @@ zig/pkg/inference/scripts/lightonocr3/results/throughput_epoch_m4_max/** linguis
 zig/pkg/inference/scripts/lightonocr3/results/throughput_epoch_m4_max/README.md linguist-generated=false
 zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max/** linguist-generated=true
 zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max/README.md linguist-generated=false
+# Preserve terminal carriage returns and banner padding in hash-verified server captures.
+zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max/**/server.txt -text whitespace=-trailing-space

@@ -13,11 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Capacity checks protect the validity of explicit-cache benchmark controls."""
+"""Capacity checks protect automatic and explicit-cache benchmark controls."""
 
 import unittest
 
-from benchmark_vllm_metal import cache_override_admission
+from benchmark_vllm_metal import (
+    automatic_cache_floor_admission,
+    cache_override_admission,
+)
 
 
 class CacheOverrideAdmissionTests(unittest.TestCase):
@@ -49,6 +52,28 @@ class CacheOverrideAdmissionTests(unittest.TestCase):
             ]
         )
         self.assertFalse(cache_override_admission(log, 256)["admitted"])
+
+
+class AutomaticCacheFloorTests(unittest.TestCase):
+    def test_requires_observed_capacity_when_floor_is_requested(self):
+        self.assertFalse(automatic_cache_floor_admission("", 320)["admitted"])
+        self.assertTrue(automatic_cache_floor_admission("", 0)["admitted"])
+
+    def test_rejects_one_insufficient_capacity_probe(self):
+        log = "\n".join(
+            [
+                "Hybrid shared cache: 477 blocks, 7.69 GiB backing",
+                "Hybrid shared cache: 319 blocks, 5.14 GiB backing",
+            ]
+        )
+        result = automatic_cache_floor_admission(log, 320)
+        self.assertEqual(result["observed_blocks"], [477, 319])
+        self.assertFalse(result["admitted"])
+
+    def test_accepts_exact_floor_and_larger_capacity(self):
+        log = "Hybrid shared cache: 477 blocks\nHybrid shared cache: 320 blocks"
+        self.assertTrue(automatic_cache_floor_admission(log, 320)["admitted"])
+        self.assertFalse(automatic_cache_floor_admission(log, 321)["admitted"])
 
 
 if __name__ == "__main__":

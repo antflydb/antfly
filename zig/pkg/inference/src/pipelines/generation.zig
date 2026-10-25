@@ -3497,6 +3497,9 @@ pub const NativeGenerationPipeline = struct {
     gpu_token_burst_lighton_decode: bool = false,
     gpu_token_burst_width: u8 = 2,
     packed_prefill_items: u8 = 1,
+    /// Zero retains whole-prefix prefill; captured by the owning reader epoch.
+    prepared_qwen_prefill_chunk_rows: u16 = 0,
+    packed_shared_frame: bool = false,
     gpu_greedy_stream_lighton_decode: bool = false,
     executor_sequence_control: ?InferenceExecutionControl = null,
     execution_phase_waiters: ?*std.atomic.Value(usize) = null,
@@ -6238,6 +6241,10 @@ pub const NativeGenerationPipeline = struct {
         decode_state: *NativeDecodeState,
     ) !?[]f32 {
         if (prepared.plan.tokenCount() != seq_len or !decode_state.isPaged()) return error.InvalidPreparedPrompt;
+        // A chunk-sized epoch workspace cannot admit the direct full-prefix
+        // fallback. Reject unsupported routing before cache or GPU mutation.
+        if (self.prepared_qwen_prefill_chunk_rows != 0 and
+            (self.qwen_prefill_batch == null or prepared.deepstack_layer_count != 0)) return error.InvalidPreparedPrompt;
         try decode_state.ensureQwen35LinearCache(self.gpt_config);
         decode_state.resetQwen35LinearCache();
         if (self.qwen_prefill_batch) |hook| if (prepared.deepstack_layer_count == 0) {
@@ -11011,17 +11018,35 @@ pub const NativeGenerationPipeline = struct {
         const lease = self.scheduler_lease orelse return error.InvalidBatchDecodeState;
         const io = self.io orelse return error.MissingIo;
         if (!self.gpt_config.hasQwen35VisionArchitectureContract() or state.total_tokens != 0 or prepared.plan.tokenCount() != seq or prepared.deepstack_layer_count != 0) return error.InvalidPreparedPrompt;
-        var work = PendingPrefillBatchWork{ .allocator = self.allocator, .decode_state = state, .token_ids = &.{}, .seq_len = seq, .query_seq_len = seq, .wants_last_logits = true, .prepared_prompt = prepared };
-        defer if (work.logits) |logits| work.allocator.free(logits);
+        const chunk_rows = if (self.prepared_qwen_prefill_chunk_rows == 0) seq else @min(seq, self.prepared_qwen_prefill_chunk_rows);
+        var processed: usize = 0;
         scheduler.notePrefillProgress(lease, 0, seq);
-        try scheduler.enqueuePrefillWork(lease.*, @ptrCast(&work), seq, seq, 0, 0, pendingWorkOptionsFromState(state, seq));
-        defer if (!work.ready.load(.acquire)) scheduler.cancelPrefillWork(@ptrCast(&work));
-        var driver = PrefillStepDriver{ .pipeline = self, .scheduler = scheduler, .work = &work, .decode_state = state };
-        try runStepLoop(self.allocator, scheduler, lease, @ptrCast(&work), .prefill, io, null, &driver);
-        if (work.failure) |err| return err;
-        const logits = work.logits orelse return error.InvalidBatchDecodeState;
-        work.logits = null;
-        return logits;
+        while (processed < seq) {
+            try self.checkPreparedQwenContinuation();
+            const query = @min(chunk_rows, seq - processed);
+            const end = processed + query;
+            const final = end == seq;
+            var decode_runtime = BorrowedDecodeStateRuntime.init(state);
+            const context = decode_runtime.makeDecodeContext(end, query);
+            var work = PendingPrefillBatchWork{ .allocator = self.allocator, .decode_state = state, .token_ids = &.{}, .seq_len = end, .query_seq_len = query, .wants_last_logits = final, .prepared_prompt = prepared };
+            defer if (work.logits) |logits| work.allocator.free(logits);
+            try scheduler.enqueuePrefillWork(lease.*, @ptrCast(&work), end, query, context.kv_sequence_len, context.kv_position_offset, pendingWorkOptionsFromState(state, query));
+            defer if (!work.ready.load(.acquire)) scheduler.cancelPrefillWork(@ptrCast(&work));
+            var driver = PrefillStepDriver{ .pipeline = self, .scheduler = scheduler, .work = &work, .decode_state = state };
+            try runStepLoop(self.allocator, scheduler, lease, @ptrCast(&work), .prefill, io, null, &driver);
+            if (work.failure) |err| return err;
+            // The forward reserved exactly this prefix before mutating its KV
+            // and recurrent histories. Never restart a partially consumed prefix.
+            if (state.total_tokens != end) return error.InvalidBatchDecodeState;
+            scheduler.notePrefillProgress(lease, end, seq);
+            if (final) {
+                const logits = work.logits orelse return error.InvalidBatchDecodeState;
+                work.logits = null;
+                return logits;
+            }
+            processed = end;
+        }
+        return error.InvalidPreparedPrompt;
     }
 
     /// Output of a successful step forward pass: the heap-allocated logits row
@@ -11201,6 +11226,40 @@ pub const NativeGenerationPipeline = struct {
         return .{ .logits = null, .greedy_tokens = first, .second_greedy_tokens = rest, .max_query_seq_len = 1 };
     }
 
+    fn checkPreparedQwenContinuation(self: *const NativeGenerationPipeline) !void {
+        if (self.execution_control) |control| try control.check();
+        if (self.continue_fn) |should_continue| {
+            const context = self.continue_ctx orelse return error.InvalidCallbackContext;
+            if (!should_continue(context)) return error.Cancelled;
+        }
+    }
+
+    /// Validate every chunk against its original immutable visual prompt before
+    /// reserving any peer KV or modifying any recurrent history.
+    fn preparedQwenPrefillStart(work: *const PendingPrefillBatchWork, item: runtime.scheduler.native_generate.StepItem) !usize {
+        const prompt = work.prepared_prompt orelse return error.InvalidPreparedPrompt;
+        const full = prompt.plan.tokenCount();
+        const positions = std.math.mul(usize, full, 3) catch return error.InvalidPreparedPrompt;
+        if (item.phase != .prefill or work.query_seq_len == 0 or work.query_seq_len > work.seq_len or
+            work.seq_len > full or work.seq_len != item.total_sequence_len or
+            work.query_seq_len != item.query_sequence_len or prompt.plan.mrope_positions.len != positions or
+            prompt.deepstack_layer_count != 0 or prompt.input_embeddings == null or
+            work.wants_last_logits != (work.seq_len == full))
+            return error.InvalidPreparedPrompt;
+        const start = work.seq_len - work.query_seq_len;
+        if (work.decode_state.total_tokens != start) return error.InvalidPreparedPrompt;
+        return start;
+    }
+
+    fn copyPreparedQwenChunkPositions(work: *const PendingPrefillBatchWork, start: usize, output: []u32, total: usize, offset: usize) void {
+        const prompt = work.prepared_prompt.?;
+        const full = prompt.plan.tokenCount();
+        const query = work.query_seq_len;
+        std.debug.assert(output.len == 3 * total and offset <= total and query <= total - offset);
+        std.debug.assert(start <= full and query <= full - start);
+        for (0..3) |axis| @memcpy(output[axis * total + offset ..][0..query], prompt.plan.mrope_positions[axis * full + start ..][0..query]);
+    }
+
     fn forwardPackedScheduledQwenStep(self: *NativeGenerationPipeline, claimed: []const runtime.scheduler.native_generate.StepItem) !StepForwardResult {
         if (claimed.len == 0 or claimed.len > 64 or self.packed_prefill_items == 0 or self.packed_prefill_items > max_prepared_qwen_prefill_items or !self.gpt_config.hasQwen35VisionArchitectureContract()) return error.InvalidPackedQueryShape;
         const a = self.allocator;
@@ -11208,6 +11267,9 @@ pub const NativeGenerationPipeline = struct {
         const cfg = self.gpt_config;
         var lengths: [64]usize = undefined;
         var offsets: [64]usize = undefined;
+        var prefill_starts: [64]usize = @splat(0);
+        var prefix_starts: usize = 0;
+        var prefix_finishes: usize = 0;
         var mixed: [64]MixedBatchDecodeItem = undefined;
         var reserved: [64]usize = @splat(0);
         var total: usize = 0;
@@ -11223,7 +11285,9 @@ pub const NativeGenerationPipeline = struct {
                     prefill_count += 1;
                     const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
                     const prompt = work.prepared_prompt orelse return error.InvalidPreparedPrompt;
-                    if (work.decode_state.total_tokens != 0 or work.seq_len != item.query_sequence_len or prompt.plan.tokenCount() != item.query_sequence_len or prompt.plan.mrope_positions.len != 3 * item.query_sequence_len or prompt.deepstack_layer_count != 0 or prompt.input_embeddings == null) return error.InvalidPreparedPrompt;
+                    prefill_starts[index] = try preparedQwenPrefillStart(work, item);
+                    prefix_starts += @intFromBool(prefill_starts[index] == 0);
+                    prefix_finishes += @intFromBool(work.seq_len == prompt.plan.tokenCount());
                     mixed[index] = .{ .state = work.decode_state, .total_sequence_len = item.total_sequence_len, .query_sequence_len = item.query_sequence_len, .kv_sequence_len = item.kv_sequence_len, .kv_position_offset = item.kv_position_offset, .attention_mode = .paged_prefill };
                 },
                 .decode => {
@@ -11250,6 +11314,9 @@ pub const NativeGenerationPipeline = struct {
             if (all_decode_greedy and prefill_count < claimed.len and !cb.decoderRuntimeHasActiveFrame())
                 gpu_choices = @import("../ops/metal_compute.zig").MetalCompute.reserveLightOnFrameArgmax(cb, claimed.len, cfg.vocab_size);
         }
+        const shared_frame = self.packed_shared_frame and gpu_choices;
+        const trace_frame = platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3");
+        const before_submits = if (trace_frame) cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits else 0;
         // Greedy decode returns token IDs. Only prefills retain independent
         // vocabulary rows, so admission follows the actual output lifetime.
         const host_rows = if (gpu_choices) prefill_count else claimed.len;
@@ -11268,7 +11335,7 @@ pub const NativeGenerationPipeline = struct {
                 const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
                 reserved[index] = try reserveAndRefreshScheduledPrefill(&mixed[index], work.seq_len);
                 reserved_count = index + 1;
-                for (0..3) |axis| @memcpy(positions[axis * total + offsets[index] ..][0..lengths[index]], work.prepared_prompt.?.plan.mrope_positions[axis * lengths[index] ..][0..lengths[index]]);
+                copyPreparedQwenChunkPositions(work, prefill_starts[index], positions, total, offsets[index]);
             } else {
                 var state = BorrowedDecodeStateRuntime.init(mixed[index].state);
                 const context = state.makeDecodeContext(item.total_sequence_len, 1);
@@ -11287,8 +11354,8 @@ pub const NativeGenerationPipeline = struct {
         owned.context.packed_attention_groups = &attention_groups;
         owned.context.packed_attention_rows = &attention_rows;
         // Input embeddings and row copies are device operations too. Capture
-        // them in one bounded producer frame rather than submitting and
-        // waiting once per page. The decoder still owns its established frame.
+        // them in one bounded producer frame. The qualified shared-frame path
+        // lends that frame to the model and closes it after the F32 head.
         try cb.decoderRuntimeWaitSubmittedFrame();
         var input_frame_active = try cb.decoderRuntimeBeginFrame();
         if (!input_frame_active) return error.ResidentImageOperationUnavailable;
@@ -11304,7 +11371,7 @@ pub const NativeGenerationPipeline = struct {
             const item = claimed[input_index];
             if (item.phase == .prefill) {
                 const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
-                if (!try cb.copyRows2D(a, combined, offsets[input_index], work.prepared_prompt.?.input_embeddings.?, 0, lengths[input_index], cfg.hidden_size)) return error.UnsupportedTensorType;
+                if (!try cb.copyRows2D(a, combined, offsets[input_index], work.prepared_prompt.?.input_embeddings.?, prefill_starts[input_index], lengths[input_index], cfg.hidden_size)) return error.UnsupportedTensorType;
                 input_index += 1;
             } else {
                 var count: usize = 1;
@@ -11321,31 +11388,53 @@ pub const NativeGenerationPipeline = struct {
                 input_index += count;
             }
         }
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        input_frame_active = false;
+        if (!shared_frame) {
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            input_frame_active = false;
+        }
         consumed = true;
         const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(cb, a, cfg, combined, .{}, 1, total, &owned.context, null);
         defer cb.free(hidden.hidden);
         if (hidden.total_rows != total) return error.InvalidTensorShape;
-        // The model has closed its frame. One gather selects every page's
-        // final row without issuing an owned blit/submit/wait per page.
+        // One gather selects every page's final row. In the shared-frame path
+        // the model borrows the producer frame, which is still active here.
         var last_indices: [64]i64 = undefined;
         for (claimed, 0..) |_, row| last_indices[row] = @intCast(offsets[row] + lengths[row] - 1);
         const last = try cb.embeddingLookup(hidden.hidden, last_indices[0..claimed.len], claimed.len, cfg.hidden_size);
         defer cb.free(last);
         const head = try gpt_arch.getLmHeadWeight(cb, cfg);
         defer cb.free(head);
-        // A separate decode frame preserves the established F32 head inputs,
-        // even when the preceding mixed model frame permits BF16 projections.
+        // Decode regime preserves the established F32 head inputs. The shared
+        // path transfers ownership instead of opening a separate head frame.
         var head_frame_active = false;
         defer if (head_frame_active) cb.decoderRuntimeCancelFrame() catch {};
         if (gpu_choices) {
-            head_frame_active = try cb.decoderRuntimeBeginFrame();
-            if (!head_frame_active) return error.ResidentImageOperationUnavailable;
+            if (shared_frame) {
+                // Transfer the producer/model frame's sole cancellation owner.
+                // The head still uses F32 inputs under the decode regime.
+                head_frame_active = true;
+                input_frame_active = false;
+            } else {
+                head_frame_active = try cb.decoderRuntimeBeginFrame();
+                if (!head_frame_active) return error.ResidentImageOperationUnavailable;
+            }
             try cb.decoderRuntimeSetActiveFrameRegime(.decode);
         }
         const logits = try cb.linearNoBias(last, head, claimed.len, cfg.hidden_size, cfg.vocab_size);
         defer cb.free(logits);
+        // Gather prefix logits before argmax closes the borrowed frame. Only
+        // host arrays escape this forward; all device views retire below.
+        var gathered_prefix_logits: ?ops.CT = null;
+        defer if (gathered_prefix_logits) |tensor| cb.free(tensor);
+        if (shared_frame) {
+            var rows: [64]i64 = undefined;
+            var count: usize = 0;
+            for (claimed, 0..) |item, index| if (item.phase == .prefill) {
+                rows[count] = @intCast(index);
+                count += 1;
+            };
+            gathered_prefix_logits = try cb.embeddingLookup(logits, rows[0..count], count, cfg.vocab_size);
+        }
         var tokens: ?[]u32 = null;
         errdefer if (tokens) |choices| a.free(choices);
         if (comptime build_options.enable_metal) {
@@ -11356,7 +11445,7 @@ pub const NativeGenerationPipeline = struct {
                 if (tokens.?.len != claimed.len) return error.InvalidBatchDecodeState;
             }
         }
-        const host = if (gpu_choices) blk: {
+        const host = if (gathered_prefix_logits) |tensor| try cb.toFloat32(tensor, a) else if (gpu_choices) blk: {
             var rows: [64]i64 = undefined;
             var count: usize = 0;
             for (claimed, 0..) |item, index| if (item.phase == .prefill) {
@@ -11369,10 +11458,12 @@ pub const NativeGenerationPipeline = struct {
         } else try cb.toFloat32(logits, a);
         gpt_arch.applyFinalLogitSoftcapInPlace(cfg, host);
         if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_step_prefill_items={d} packed_step_decode_items={d} packed_step_query_rows={d}\n", .{ prefill_count, claimed.len - prefill_count, total });
+        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_step_prefill_starts={d} packed_step_prefill_finishes={d} prepared_prefill_chunk_rows={d}\n", .{ prefix_starts, prefix_finishes, self.prepared_qwen_prefill_chunk_rows });
         if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_recurrent_groups={d} packed_recurrent_rows={d}\n", .{ recurrent_groups, recurrent_rows });
         if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_attention_groups={d} packed_attention_rows={d}\n", .{ attention_groups, attention_rows });
         if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_input_frames=1\n", .{});
         if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_gpu_decode_rows={d} packed_cpu_logit_rows={d} packed_standalone_wide_heads={d}\n", .{ if (gpu_choices) claimed.len - prefill_count else 0, host_rows, @intFromBool(!gpu_choices and claimed.len > 16) });
+        if (trace_frame) std.debug.print("LIGHTONOCR3 packed_shared_frame={d} packed_forward_submissions={d}\n", .{ @intFromBool(shared_frame), cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits -| before_submits });
         return .{ .logits = host, .packed_greedy_tokens = tokens, .max_query_seq_len = total, .last_rows_only = true, .host_permit = host_lease };
     }
 
@@ -17419,4 +17510,101 @@ test "LightOnOCR3 packed greedy publication keeps only independent prefix logits
         try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6 }, prefill.logits.?);
         try std.testing.expect(decode.ready.load(.acquire) and prefill.ready.load(.acquire));
     }
+}
+
+test "LightOnOCR3 prepared chunks preserve visual axes independent KV histories and reject replay" {
+    const P = NativeGenerationPipeline;
+    const a = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f16, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 2 });
+    var state = NativeDecodeState.initPaged(a, &manager, pool, null);
+    defer state.deinit();
+    var peer = NativeDecodeState.initPaged(a, &manager, pool, null);
+    defer peer.deinit();
+    try peer.notePrefill(5);
+    var marker: u8 = 0;
+    var ids: [7]i64 = @splat(1);
+    var causal: [7]u32 = undefined;
+    var axes: [21]u32 = undefined;
+    var visual: [7]bool = @splat(true);
+    for (&causal, 0..) |*value, i| value.* = @intCast(i);
+    for (0..3) |axis| {
+        for (0..7) |i| axes[axis * 7 + i] = @intCast(axis * 1000 + i);
+    }
+    // Metadata validation never dereferences this opaque embedding handle.
+    var prompt = qwen3vl_projector.PreparedPrompt{ .allocator = a, .token_ids = &ids, .input_embeddings = @ptrCast(&marker), .plan = .{ .allocator = a, .mrope_positions = &axes, .causal_positions = &causal, .visual_token_mask = &visual, .visual_spans = &.{}, .mrope_position_delta = 0 }, .deepstack_embeddings = &.{}, .deepstack_layer_count = 0 };
+    var previous: usize = 0;
+    for ([_]usize{ 3, 6, 7 }) |end| {
+        const query = end - previous;
+        var work = P.PendingPrefillBatchWork{ .allocator = a, .decode_state = &state, .token_ids = &.{}, .seq_len = end, .query_seq_len = query, .wants_last_logits = end == 7, .prepared_prompt = &prompt };
+        var item = runtime.scheduler.native_generate.StepItem{ .work_ptr = &work, .phase = .prefill, .query_sequence_len = query, .total_sequence_len = end, .kv_sequence_len = previous, .kv_position_offset = 0 };
+        const start = try P.preparedQwenPrefillStart(&work, item);
+        try std.testing.expectEqual(previous, start);
+        // Both a preceding and a following peer occupy the packed destination.
+        const total = query + 2;
+        var output: [15]u32 = @splat(0xfeedbeef);
+        P.copyPreparedQwenChunkPositions(&work, start, output[0 .. 3 * total], total, 1);
+        for (0..3) |axis| {
+            try std.testing.expectEqual(@as(u32, 0xfeedbeef), output[axis * total]);
+            try std.testing.expectEqual(@as(u32, 0xfeedbeef), output[axis * total + query + 1]);
+            try std.testing.expectEqualSlices(u32, axes[axis * 7 + previous ..][0..query], output[axis * total + 1 ..][0..query]);
+        }
+        item.total_sequence_len += 1;
+        try std.testing.expectError(error.InvalidPreparedPrompt, P.preparedQwenPrefillStart(&work, item));
+        item.total_sequence_len -= 1;
+        var mixed = MixedBatchDecodeItem{ .state = &state, .total_sequence_len = end, .query_sequence_len = query, .kv_sequence_len = previous, .kv_position_offset = 0, .attention_mode = .paged_prefill };
+        const reserved = try P.reserveAndRefreshScheduledPrefill(&mixed, end);
+        try std.testing.expectEqual(query, reserved);
+        try std.testing.expectEqual(end, state.total_tokens);
+        try std.testing.expectEqual(end, mixed.kv_sequence_len);
+        try std.testing.expectEqual(@as(usize, 5), peer.total_tokens);
+        try std.testing.expectError(error.InvalidPreparedPrompt, P.preparedQwenPrefillStart(&work, item));
+        if (end == 6) {
+            // A failed continuation releases only its new suffix reservation.
+            P.rollbackPrefillReservations(&.{item}, &.{reserved}, 1);
+            try std.testing.expectEqual(previous, state.total_tokens);
+            try std.testing.expectEqual(previous, state.kvView().?.token_count);
+            try std.testing.expectEqual(@as(usize, 5), peer.kvView().?.token_count);
+            _ = try P.preparedQwenPrefillStart(&work, item);
+            _ = try P.reserveAndRefreshScheduledPrefill(&mixed, end);
+        }
+        previous = end;
+    }
+}
+
+test "LightOnOCR3 prepared chunk cancellation stops before another prefix reservation" {
+    const Stop = struct {
+        calls: usize = 0,
+        fn check(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return self.calls < 2;
+        }
+    };
+    var stop = Stop{};
+    const pipeline = NativeGenerationPipeline{ .allocator = std.testing.allocator, .cb = undefined, .gpt_config = .{}, .tokenizer = undefined, .continue_ctx = &stop, .continue_fn = Stop.check };
+    try pipeline.checkPreparedQwenContinuation();
+    try std.testing.expectError(error.Cancelled, pipeline.checkPreparedQwenContinuation());
+    try std.testing.expectEqual(@as(usize, 2), stop.calls);
+}
+
+test "LightOnOCR3 bounded chunk workspace rejects direct fallback before cache mutation" {
+    const a = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f16, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 2 });
+    var state = NativeDecodeState.initPaged(a, &manager, pool, null);
+    defer state.deinit();
+    var ids = [_]i64{1};
+    var axes = [_]u32{ 0, 0, 0 };
+    var causal = [_]u32{0};
+    var visual = [_]bool{true};
+    var prompt = qwen3vl_projector.PreparedPrompt{ .allocator = a, .token_ids = &ids, .input_embeddings = null, .plan = .{ .allocator = a, .mrope_positions = &axes, .causal_positions = &causal, .visual_token_mask = &visual, .visual_spans = &.{}, .mrope_position_delta = 0 }, .deepstack_embeddings = &.{}, .deepstack_layer_count = 0 };
+    var pipeline = NativeGenerationPipeline{ .allocator = a, .cb = undefined, .gpt_config = .{}, .tokenizer = undefined, .prepared_qwen_prefill_chunk_rows = 128 };
+    try std.testing.expectError(error.InvalidPreparedPrompt, pipeline.executePreparedQwen3VlPrefill(&prompt, 1, &state));
+    try std.testing.expectEqual(@as(usize, 0), state.total_tokens);
+    prompt.deepstack_layer_count = 1;
+    try std.testing.expectError(error.InvalidPreparedPrompt, pipeline.executePreparedQwen3VlPrefill(&prompt, 1, &state));
+    try std.testing.expectEqual(@as(usize, 0), state.total_tokens);
 }

@@ -1,0 +1,54 @@
+{
+  "status": "transferred_remote_hash_validation_pending",
+  "created_at": "2026-10-25T17:28:06.463885+00:00",
+  "driver_sha256": "bc98a7db8320f1182d9c500ef69a183f7f2333c199a032b9d83165b7840f9d33",
+  "remote_worktree": "/Users/ajroetker/antfly/.worktrees/perf-lightonocr3-wolfspider",
+  "own_waiter": {
+    "pid": 70730,
+    "create_time": 1792946205.961811,
+    "cmdline": [
+      "/opt/homebrew/Cellar/python@3.12/3.12.14/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python",
+      ".venv-lighton-vllm-metal/run_engine158_short161_screen.py"
+    ],
+    "cwd": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b"
+  },
+  "steps": [
+    {
+      "step": "small_payload",
+      "exit_code": 0
+    },
+    {
+      "step": "sitepackages",
+      "exit_code": 0,
+      "log_sha256": "5a9b61040b4d4b1c4af25f8bf78c942054af0779f9ab01363009c311259d4db3"
+    },
+    {
+      "step": "lighton08",
+      "exit_code": 0,
+      "log_sha256": "cf9aefafea529cab408968953c22faee3b387b469a6f379c9cf9cf7c7c0b6250"
+    },
+    {
+      "step": "lighton4b",
+      "exit_code": 0,
+      "log_sha256": "7bc478925ecfc1197d3ca86efa66993a8b23b2736bdc960a2b3733e0220d9be9"
+    }
+  ],
+  "payload_files": [
+    ".venv-lighton-vllm-metal/engine158-freeze.json",
+    ".venv-lighton-vllm-metal/qualified-binaries/engine158-test",
+    ".venv-lighton-vllm-metal/engine158_conformance",
+    ".venv-lighton-vllm-metal/engine158_attention",
+    ".venv-lighton-vllm-metal/engine5_gpu_tests.py",
+    ".venv-lighton-vllm-metal/run_engine158_gpu_build.py",
+    ".venv-lighton-vllm-metal/engine94_benchmark_vllm_warm.py",
+    ".venv-lighton-vllm-metal/run_engine158_budget_policies.py",
+    ".venv-lighton-vllm-metal/engine158_benchmark_concurrency.py",
+    ".venv-lighton-vllm-metal/run_engine158_short161_screen.py",
+    ".venv-lighton-vllm-metal/run_engine158_primary162.py",
+    ".venv-lighton-vllm-metal/run_engine113_08_warmed135.py",
+    ".venv-lighton-vllm-metal/run_engine113_florence_warmed136.py",
+    ".venv-lighton-vllm-metal/engine136_benchmark_mlx_florence_warm.py",
+    ".venv-lighton-vllm-metal/wolf170_origin"
+  ],
+  "own_waiter_resumed": true
+}

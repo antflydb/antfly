@@ -1,0 +1,14 @@
+{
+  "status": "strict_reference_texts_equal_native_and_both_actual_api_servers",
+  "scope": "Read-only post-run strict full-string check, in addition to original normalized public cross-runtime checks and native exact per-output parity. No execution, timing change, or report relabel.",
+  "native_report_sha256": "5c9f30ca0b65332f150d34112aa88b4b5a31b3befb2fe32cd0ccaf99fb89e55d",
+  "api_report_sha256": [
+    "72e98734c08736ed99970569fea441a2048b9faa0dddc3e967fd1e83146bc7db",
+    "fe9a1477b08f93dd9b0f65baf6aab32ea63e03284d1b00c15e37b1a9d40f9cbc"
+  ],
+  "native_completed_per_round": [
+    256,
+    256,
+    256
+  ]
+}

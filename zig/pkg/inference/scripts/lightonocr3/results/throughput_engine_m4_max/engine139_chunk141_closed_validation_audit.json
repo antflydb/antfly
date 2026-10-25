@@ -1,0 +1,25 @@
+{
+  "status": "all_four_profiles_exact_pressurefree_prefix_token_conservation_pass_no_promotion",
+  "created_at": "2026-10-25T15:15:27.897065+00:00",
+  "expected_full_prefix_tokens_per_round": 70202,
+  "screen_audit_sha256": "3424e2f43a3f3299deac4c3c3dfae15fc6c45a29f5f1e420f4bb0e477ce22c33",
+  "profile_rates": [
+    {
+      "name": "whole0",
+      "pages_per_second": 1.1317
+    },
+    {
+      "name": "chunk256",
+      "pages_per_second": 1.008
+    },
+    {
+      "name": "chunk384",
+      "pages_per_second": 1.0277
+    },
+    {
+      "name": "chunk128",
+      "pages_per_second": 0.9003
+    }
+  ],
+  "scope": "All four128warm+128timed profiles finished. Prefix tokens conserved exactly across all8rounds. Controller retired before planned streaming/cache and closing-control profiles. No matched-vLLM claim; short-query kernel hypothesis pending."
+}

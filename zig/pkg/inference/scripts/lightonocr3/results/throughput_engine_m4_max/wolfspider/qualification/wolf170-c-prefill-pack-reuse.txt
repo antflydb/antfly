@@ -1,0 +1,7 @@
+metal_pipelined_decode_frame: enabled=1 owner=executor rollback=TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME
+prefill_pack_reuse rows=128 in=1024 steps=6 cpu_max_abs=3.21437e-07 old_gpu_us=1280.87 reuse_gpu_us=1315.87 old_wall_us=2304.00 reuse_wall_us=2157.00
+prefill_pack_reuse rows=432 in=1024 steps=6 cpu_max_abs=3.56522e-07 old_gpu_us=4141.63 reuse_gpu_us=4258.33 old_wall_us=6623.00 reuse_wall_us=6866.00
+prefill_pack_reuse rows=864 in=1024 steps=6 cpu_max_abs=3.87779e-07 old_gpu_us=8155.88 reuse_gpu_us=7053.96 old_wall_us=13142.00 reuse_wall_us=11125.00
+prefill_pack_reuse rows=128 in=2560 steps=6 cpu_max_abs=7.0587e-07 old_gpu_us=3111.00 reuse_gpu_us=3207.62 old_wall_us=4128.00 reuse_wall_us=4414.00
+prefill_pack_reuse rows=432 in=2560 steps=6 cpu_max_abs=6.11035e-07 old_gpu_us=10695.87 reuse_gpu_us=10452.38 old_wall_us=13770.00 reuse_wall_us=13287.00
+prefill_pack_reuse rows=864 in=2560 steps=6 cpu_max_abs=5.44875e-07 old_gpu_us=19750.75 reuse_gpu_us=9931.12 old_wall_us=25092.00 reuse_wall_us=14544.00

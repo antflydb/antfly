@@ -378,7 +378,8 @@ samples, and logs are retained in
 
 The native Metal reader supports concurrent `/read` calls and the linked
 encoded-image API. Single-page latency and saturated serving throughput measure
-different things. Whole-reader vLLM parity remains unfinished for LightOn.
+different things. Matched serving comparisons and their exact settings are
+recorded in the [execution evidence](https://github.com/antflydb/antfly/tree/feat/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max).
 
 Qualified M4 readers refill finished page slots while peers keep decoding. Each
 page owns its KV, recurrent history, image positions, deadline and cancellation.
@@ -388,7 +389,8 @@ pages. An ordinary epoch accepts sixty-four page admissions; the extended
 epoch option accepts up to 256 admissions while retaining the same live window. Pages
 queue before per-run GPU allocation. Hard memory limits remain authoritative;
 transient page admission pressure retries for at most thirty seconds without a
-resource lease. Full multimodal prefill must fit its admitted prompt envelope.
+resource lease. Each page's full projected inputs, KV cache and recurrent
+history remain admitted; query chunks can bound shared transient scratch.
 `/generate` and `/generate/batch` retain their existing scheduling behavior.
 
 ### Settings
@@ -444,6 +446,8 @@ The wider and pipelined paths remain separate opt-ins:
 | --- | --- | --- |
 | `ANTFLY_LIGHTONOCR3_PREFILL_ACTIVATION_POOL` | `0` | Retain up to 64 MiB of completed private prefill/decode buffers instead of the 8 MiB decode-only cache. The full cache is reserved once per admitted epoch; unfinished frames remain fenced. Experimental; measure whole-reader throughput before selecting it. |
 | `ANTFLY_LIGHTONOCR3_PACKED_MIXED` | `0` | Pack bounded prefill and decode tokens into shared projections while preserving each page's positions, KV cache and recurrent history. Requires qualified prepared Metal execution, GPU recurrent state and shared scratch. |
+| `ANTFLY_LIGHTONOCR3_PACKED_SHARED_FRAME` | `0` | Borrow one decoder frame across packed input preparation, model execution and the F32 output head. Requires packed mixed execution, single-frame mode and unsplit serial execution with the retained prefill pool off. Prefix-logit CPU readback can still require a separate staging blit. |
+| `ANTFLY_LIGHTONOCR3_PREFILL_QUERY_CHUNK_ROWS` | `0` | Experimental packed-reader prefill chunk cap, 64–1024 rows. Zero processes each complete visual prefix in one step. Only shared transient scratch uses the bounded query shape; full projected inputs, KV and histories remain admitted per page. Qualify output parity and whole-reader throughput before selecting it. |
 | `ANTFLY_LIGHTONOCR3_PACKED_PREFILL_ITEMS` | `1` | Bound packed prefills per scheduler step to 1–8 pages; the shared admission envelope includes the corresponding prompt working sets. |
 | `TERMITE_METAL_ENABLE_LIGHTONOCR3_WIDE_RECURRENT` | `0` | With shared recurrent weights and qualified pipelines, collect up to 64 recurrent decode rows. Larger argument tables use frame-owned staging; unsupported layouts retain the bounded fallback. |
 | `ANTFLY_LIGHTONOCR3_PHYSICAL32` / `ANTFLY_LIGHTONOCR3_PHYSICAL64` | `0` | Widen qualified physical decode to 32 or 64 rows; the 64-row option takes precedence. |
@@ -466,7 +470,11 @@ requires active-frame packing reuse; explicit rollback or concurrent planned
 encoding disables that option. The benchmark exposes these paths through
 `--physical64`, `--device-recurrent-state`, `--share-decoder-scratch`,
 `--gpu-token-burst`, `--gpu-token-burst-width`, `--resident-vision-budget`,
-`--pipeline-vision` and `--prefill-stream-layers`. Requested settings alone do
+`--pipeline-vision`, `--prefill-stream-layers` and `--packed-shared-frame`.
+`--require-packed-shared-frame` checks that mixed forwards actually use one
+decoder frame. Packed forwards return CPU logits and token choices, so shared
+admission retains their full projected inputs and page state without reserving
+an additional escaping GPU hidden output for every page. Requested settings alone do
 not establish a speedup: inspect actual execution counters and exact output
 checks in each report.
 
@@ -504,9 +512,33 @@ rendering and indexing. vLLM reference timing also includes loopback HTTP.
 Reference prefix and processor caches are disabled. Each request has a unique
 media UUID, preventing reuse of cached image embeddings.
 
-Measurements use a shared M4 Max with 36 GiB unified memory, sixteen repeated
-pages and greedy generation with a 256-token ceiling. Machine load changes
-substantially between runs. The three synthetic fixtures test consistency,
+For saturated comparisons, use equal resident native policy rounds, exclude
+the first saturation warmup round, and compare the next two rounds against
+fresh warmed API servers on either side. Policy reports retain the warmup
+measurements for inspection; the paired comparison audits identify excluded
+rounds explicitly. For example, the 4B API reference uses:
+
+```bash
+python3 zig/pkg/inference/scripts/lightonocr3/benchmark_vllm_metal.py \
+  --python /path/to/vllm-venv/bin/python \
+  --model-dir /path/to/LightOnOCR-3-4B \
+  --images zig/pkg/inference/src/models/testdata/lightonocr3/invoice.png \
+    zig/pkg/inference/scripts/lightonocr3/corpus/receipt.png \
+    zig/pkg/inference/scripts/lightonocr3/corpus/shipping.png \
+  --concurrency 64 --requests 256 --warmup-requests 256 \
+  --max-model-len 1024 --max-tokens 256 --gpu-memory-utilization 0.7 \
+  --minimum-auto-cache-blocks 320 --output-dir /tmp/lighton4b-vllm
+```
+
+The automatic cache floor is checked before warmup or timing; it does not force
+a cache size. The reference runner checks every warm and timed output against
+its full serial fixture string. A missing or insufficient capacity probe fails
+the requested floor check.
+
+Measurements include shared-host and Wolfspider M4 Max runs with 36 GiB unified
+memory, repeated pages and greedy generation with a 256-token ceiling. Request
+counts, excluded warmups and hardware are recorded per comparison. Machine load
+can change between runs. The three synthetic fixtures test consistency,
 not real-document OCR accuracy. Native LightOn uses original BF16 weights with F32 outputs, accumulation and
 recurrent state. The throughput candidate enables
 `TERMITE_METAL_LIGHTONOCR3_BF16_PREFILL_INPUTS=1` for eligible prefill
@@ -515,6 +547,21 @@ decode operands remain F32 unless the separate BF16 activation option is set.
 MLX uses BF16 activation/output storage. Native Florence uses Q4_K weights and F16 encoder
 mirrors with no-repeat n-gram size three; its MLX reference uses original FP16
 and its greedy policy. These are not fully precision-matched comparisons.
+
+The selected warmed serving profiles on Wolfspider's 32-core M4 Max produce:
+
+| Model | Native pages/s | Reference pages/s | Native lead |
+| --- | ---: | ---: | ---: |
+| LightOn 0.8B, C64 | 4.725–4.736 | Actual vLLM: 4.097–4.102 | 15.2–15.6% |
+| LightOn 4B, C64 | 1.210–1.211 | Actual vLLM: 1.1517–1.1518 | 5.0–5.1% |
+| Florence-2, C20/batch10 | 5.306–5.309 | MLX-VLM proxy: 5.131–5.138 | 3.3–3.4% |
+
+These are two matched timed rounds per model with saturation warmups excluded.
+The selected LightOn settings use packed whole-prefix steps, shared frames,
+wide recurrent groups and four-step GPU token bursts. Full settings, source
+identities, rejected profiles and report hashes are retained in the execution
+evidence. Florence uses a proxy because the installed vLLM Metal version has no
+Florence adapter.
 
 ### Kernel qualification
 

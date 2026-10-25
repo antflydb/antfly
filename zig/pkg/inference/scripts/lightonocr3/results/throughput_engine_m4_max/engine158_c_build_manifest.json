@@ -1,0 +1,59 @@
+{
+  "input_sha256": {
+    "zig/pkg/inference/src/backends/metal_kernels.m": "9a28a334a0a322f85d0b2040f0170d53b02e64b5768e06c839b967f8f59adf60",
+    "zig/pkg/inference/src/backends/metal_buffer_observation.h": "6873d32642e0b9bd3f8acfdbf33306798b11e6a3a1a0b8c6571026f1c36b8ef7",
+    "zig/pkg/inference/src/backends/metal_mtp_head.h": "890772ce81b6b8bab2d61aaf28a7f1b4bca125c3e4bc12565284e3e577b5b233",
+    "zig/pkg/inference/src/backends/metal_mtp_head_impl.h": "1e032aa77b9b47f0567763be7230995c5f2646034e7a133de73149a7b5979649",
+    "zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m": "ba98e63cd35446b4216ae0f7d5b1f5eb8dc570522056c4c64db9a1b47eb37048",
+    "zig/pkg/inference/scripts/lightonocr3/check_metal_prefill_attention.m": "f485d360884a32655b94a07af84a11a509340aae03199e43bbf9776083d4e8a7"
+  },
+  "builds": [
+    {
+      "tag": "conformance",
+      "command": [
+        "clang",
+        "-O3",
+        "-fobjc-arc",
+        "-I/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/src/backends",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m",
+        "-o",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine158_conformance",
+        "-framework",
+        "Foundation",
+        "-framework",
+        "Metal",
+        "-framework",
+        "MetalPerformanceShaders",
+        "-framework",
+        "Accelerate"
+      ],
+      "exit_code": 0,
+      "log_sha256": "19e3db356aac98d53ef2019b5f39392933ad90e58f792d64738222aaeb2830ab",
+      "binary_sha256": "503a87692f3f42419b9cf2dbb38a19f3a625c6159acac4ccc26ed7bc908d6069"
+    },
+    {
+      "tag": "attention",
+      "command": [
+        "clang",
+        "-O3",
+        "-fobjc-arc",
+        "-I/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/src/backends",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/check_metal_prefill_attention.m",
+        "-o",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine158_attention",
+        "-framework",
+        "Foundation",
+        "-framework",
+        "Metal",
+        "-framework",
+        "MetalPerformanceShaders",
+        "-framework",
+        "Accelerate"
+      ],
+      "exit_code": 0,
+      "log_sha256": "be39bc431ff30e63ea93676136e46f2ce8b330642436d254169226d04da6e3f4",
+      "binary_sha256": "370ecdd67cf354c97cce96136e9c86d69c93bbd19ab97e759f0c9c05b1970ac5"
+    }
+  ],
+  "scope": "Freshsource154Cbuild. Original23conformance suites plus expanded short attention suite, 104prefillcore shape/state checks and narrow-prefill F32 MPP projection CPU/canary checks. Qualification only; no performance claim."
+}

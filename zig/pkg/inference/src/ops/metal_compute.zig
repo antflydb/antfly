@@ -1303,6 +1303,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     lighton_full64_gate_up_start: u64 = 0,
     lighton_batch_argmax_start: [2]u64 = @splat(0),
     lighton_wide_recurrent_start: [3]u64 = @splat(0),
+    lighton_short_prefill_start: [2]u64 = @splat(0),
     lighton_vision_workspace_start: [3]u64 = @splat(0),
     lighton_large_vision_pack_start: [2]u64 = @splat(0),
     lighton_activation_pool_enabled: bool = false,
@@ -1418,6 +1419,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.lighton_full64_gate_up_start = metal_runtime_mod.termite_metal_decode_runtime_lighton_full64_gate_up_calls(raw);
         metal_runtime_mod.termite_metal_decode_runtime_lighton_batch_argmax_stats(raw, &self.lighton_batch_argmax_start);
         metal_runtime_mod.termite_metal_decode_runtime_lighton_wide_recurrent_stats(raw, &self.lighton_wide_recurrent_start);
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_short_prefill_stats(raw, &self.lighton_short_prefill_start);
         metal_runtime_mod.termite_metal_decode_runtime_lighton_vision_workspace_stats(raw, &self.lighton_vision_workspace_start);
         metal_runtime_mod.termite_metal_decode_runtime_lighton_large_vision_pack_stats(raw, &self.lighton_large_vision_pack_start);
         self.lighton_wide_projection_tiles_start = metal_runtime_mod.termite_metal_decode_runtime_lighton_wide_projection_tiles(raw);
@@ -1652,6 +1654,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         if (!self.lighton_shared_core_weights_enabled) return 16;
         return metal_runtime_mod.termite_metal_decode_runtime_lighton_recurrent_group_rows(self.provider_impl.raw_decode_runtime);
+    }
+
+    pub fn lightOnShortPrefillStats(cb: *const ops.ComputeBackend) [2]u64 {
+        if (cb.kind() != .metal or cb.vtable.decoderRuntimeArgmaxRowsSuppress != &decoderRuntimeArgmaxRowsSuppressOp) return @splat(0);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        var stats: [2]u64 = @splat(0);
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_short_prefill_stats(self.provider_impl.raw_decode_runtime, &stats);
+        for (&stats, self.lighton_short_prefill_start) |*value, start| value.* -|= start;
+        return stats;
     }
 
     pub fn lightOnWideRecurrentStats(cb: *const ops.ComputeBackend) [3]u64 {
@@ -37462,6 +37473,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     pub fn lightOnRecurrentGroupRows(_: *const ops.ComputeBackend) usize {
         return 16;
     }
+    pub fn lightOnShortPrefillStats(_: *const ops.ComputeBackend) [2]u64 {
+        return @splat(0);
+    }
+
     pub fn lightOnWideRecurrentStats(_: *const ops.ComputeBackend) [3]u64 {
         return @splat(0);
     }

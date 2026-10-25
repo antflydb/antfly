@@ -1,0 +1,124 @@
+{
+  "created_at": "2026-10-25T14:06:31.551964+00:00",
+  "status": "numerical_pass_small_attention_gain_not_promoted",
+  "scope": "Two isolated fast-exp variants; global fastMath disabled and finite guards retained. Full ordinary and nonfinite Q/K checks pass. Typically2-4percent attention-stage improvement; no whole-model claim.",
+  "primary_throughput_eligible": false,
+  "provenance": "Post-run audit of closed private experiments, not a preregistration.",
+  "files": {
+    ".venv-lighton-vllm-metal/engine122_plans.json": "2427698171a07294ffe9a341d1e8be0194de77e7450b90f6adb51c8278a380f2",
+    ".venv-lighton-vllm-metal/engine122_vision_checks.m": "cc3839f1381c0504d434eefa0dadd5b7ac7bcec31ecfcc257f0b0b9109412697",
+    ".venv-lighton-vllm-metal/engine122_vision_probe.m": "acb887c54abf8bd431774f37f1758d5e06047d2af05336ebee62bfefd3ebbcaa",
+    ".venv-lighton-vllm-metal/engine122_vision_probe": "21a6dc95b252b2ad3c225e9532356102ae6b45ce9ce5b073b4c6702905c34ed9",
+    ".venv-lighton-vllm-metal/engine122_vision_kernels.m": "3770ffdb72270ac3b1b6a8497312cc7f0c0bfe3e2166c0d3e399d19c345bdf4b",
+    ".venv-lighton-vllm-metal/engine122_fast_exp.metal": "e7c0fd848648050990416ade6c050cbd51debc90bdc8ca03df23a13b8de8fed8",
+    ".venv-lighton-vllm-metal/engine122_fast_exp2.metal": "ff810ed406dda0a92e46d3e93675a234ecb38dd86bc0aab958448090dc1c634d",
+    ".venv-lighton-vllm-metal/prepare_engine122_exp.py": "8970b905f0ab874195d6e2689e770232b0b4bf96227910ace3f423bec125a477",
+    "/private/tmp/ocr-engine122-exp-build.txt": "7dd1e7e0df268f0832c06c210a8d53c0fd9c264d45416e0c39bb01a9cef0cc61",
+    "/private/tmp/ocr-engine122-exp-stdout.txt": "dbdeeb83f3db918df3719afd2d71223ad727544411cd12aa66b1ef2194d6aebc",
+    "/private/tmp/ocr-engine122-exp-stderr.txt": "7f922853b93aa2b8fbc44b4ab9f8e0afbca05610584126cbdc8c2aed7d835d23"
+  },
+  "timing_record_count": 288,
+  "baseline_over_candidate_gpu_ratios": [
+    {
+      "id": "fast_exp",
+      "seq": 1672,
+      "heads": 12,
+      "ratio": 1.089534732622596,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "fast_exp",
+      "seq": 1672,
+      "heads": 16,
+      "ratio": 1.0235915947367518,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "fast_exp",
+      "seq": 2160,
+      "heads": 12,
+      "ratio": 1.0168736179622384,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "fast_exp",
+      "seq": 2160,
+      "heads": 16,
+      "ratio": 1.0213996937018854,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "fast_exp",
+      "seq": 2592,
+      "heads": 12,
+      "ratio": 1.0223753766753947,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "fast_exp",
+      "seq": 2592,
+      "heads": 16,
+      "ratio": 1.0223536098445567,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "fast_exp2",
+      "seq": 1672,
+      "heads": 12,
+      "ratio": 1.155906993673841,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "fast_exp2",
+      "seq": 1672,
+      "heads": 16,
+      "ratio": 1.0204227399411907,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "fast_exp2",
+      "seq": 2160,
+      "heads": 12,
+      "ratio": 1.0240278168349786,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "fast_exp2",
+      "seq": 2160,
+      "heads": 16,
+      "ratio": 1.017102261350154,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "fast_exp2",
+      "seq": 2592,
+      "heads": 12,
+      "ratio": 1.022651153951,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "fast_exp2",
+      "seq": 2592,
+      "heads": 16,
+      "ratio": 1.0225138901431678,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    }
+  ],
+  "full_pass_markers": [
+    "VISION122 FULL OUTPUT CPU GUARDS PASS id=fast_exp",
+    "VISION122 FULL OUTPUT CPU GUARDS PASS id=fast_exp2"
+  ],
+  "max_reported_abs_error": 5.63427e-06
+}

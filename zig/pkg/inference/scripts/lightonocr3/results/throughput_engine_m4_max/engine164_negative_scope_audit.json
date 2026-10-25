@@ -1,0 +1,79 @@
+{
+  "status": "numeric_pass_stage_slower_not_promoted",
+  "scope": "Private512thread fused prefix holds F32state in registers across querytokens and preserves all intermediates for checking.100numerical/state/history/canaryshapes passed including initialized/fresh states and1..2048rows.2160balancedstage records show4B22..662rowcases about1.9..2.9xslower. No canonicalintegration or whole-model timing. Only own child-free admissionwaiter was held; verified resumed in finally.",
+  "stage_audit_sha256": "75e2ea98ae9e2054e2ea498f126807e7686ebe6523a170f6cc390626b7af22b9",
+  "ratios_4b_initialized": [
+    {
+      "heads": 32,
+      "seq": 22,
+      "initialized": 1,
+      "old_median_gpu_us": 226.4785,
+      "new_median_gpu_us": 426.7075,
+      "old_over_new": 0.5307581891576783
+    },
+    {
+      "heads": 32,
+      "seq": 42,
+      "initialized": 1,
+      "old_median_gpu_us": 345.08299999999997,
+      "new_median_gpu_us": 778.7705000000001,
+      "old_over_new": 0.44311257295955603
+    },
+    {
+      "heads": 32,
+      "seq": 48,
+      "initialized": 1,
+      "old_median_gpu_us": 374.10350000000005,
+      "new_median_gpu_us": 885.1665,
+      "old_over_new": 0.42263630627684173
+    },
+    {
+      "heads": 32,
+      "seq": 64,
+      "initialized": 1,
+      "old_median_gpu_us": 469.937,
+      "new_median_gpu_us": 1168.875,
+      "old_over_new": 0.4020421345310662
+    },
+    {
+      "heads": 32,
+      "seq": 96,
+      "initialized": 1,
+      "old_median_gpu_us": 663.1455,
+      "new_median_gpu_us": 1733.7705,
+      "old_over_new": 0.3824874745532929
+    },
+    {
+      "heads": 32,
+      "seq": 120,
+      "initialized": 1,
+      "old_median_gpu_us": 807.8955000000001,
+      "new_median_gpu_us": 2157.708,
+      "old_over_new": 0.37442299884877844
+    },
+    {
+      "heads": 32,
+      "seq": 128,
+      "initialized": 1,
+      "old_median_gpu_us": 850.937,
+      "new_median_gpu_us": 2298.8745,
+      "old_over_new": 0.3701537426249237
+    },
+    {
+      "heads": 32,
+      "seq": 432,
+      "initialized": 1,
+      "old_median_gpu_us": 1169.9995,
+      "new_median_gpu_us": 3300.3540000000003,
+      "old_over_new": 0.35450727406817567
+    },
+    {
+      "heads": 32,
+      "seq": 662,
+      "initialized": 1,
+      "old_median_gpu_us": 2142.2705,
+      "new_median_gpu_us": 6148.353999999999,
+      "old_over_new": 0.34842992124396227
+    }
+  ]
+}

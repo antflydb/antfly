@@ -1,0 +1,189 @@
+{
+  "status": "all_five_profiles_exact_no_chunk_promotion",
+  "primary_throughput_eligible": false,
+  "scope": "Source145; historical human scope literal Source139 in screening driver is stale. Actual binary/runtime identity is frozen145manifest. All1280nativepages across10warm/timedrounds exact and pressurefree, prefixqueries conserved. Opening/closing controls drift1.1191->1.0599; all3chunksettings behind opening and nonebeatboth. No actualvLLM speed comparison or promotion.",
+  "source_manifest_sha256": "0e583310490ed1067f381495a49fa4eff9b3441c364ccfedeba8b860c1290bb8",
+  "screen_audit_sha256": "4bd970f7983a3e16c2af2405f59e0e5a858b3b1d4a1f74b764c392ade003a308",
+  "records": [
+    {
+      "profile": {
+        "name": "whole0",
+        "chunk": 0,
+        "stream": 0,
+        "pool": 0,
+        "items": 1
+      },
+      "report_sha256": "a0e812af3eb4b60825cde585a09313e29b91df253f22ad5f6f7906f232b22fcf",
+      "rounds": [
+        {
+          "round": 0,
+          "steps": 128,
+          "prefix_chunks": 128,
+          "decoded_rows": 5001,
+          "prefix_query_rows": 70202,
+          "mean_query_rows": 587.5234375,
+          "short_root17_31": 0,
+          "pages_per_second": 1.1362,
+          "gpu_ns": 102729447756,
+          "process_cpu_ms": 15236
+        },
+        {
+          "round": 1,
+          "steps": 128,
+          "prefix_chunks": 128,
+          "decoded_rows": 5188,
+          "prefix_query_rows": 70202,
+          "mean_query_rows": 588.984375,
+          "short_root17_31": 0,
+          "pages_per_second": 1.1191,
+          "gpu_ns": 103919228587,
+          "process_cpu_ms": 15800
+        }
+      ]
+    },
+    {
+      "profile": {
+        "name": "p4_chunk128",
+        "chunk": 128,
+        "stream": 0,
+        "pool": 0,
+        "items": 4
+      },
+      "report_sha256": "a724cb1d8460d0486c1cf07069f80d1832282ab00f05f650149a6680f5200dd4",
+      "rounds": [
+        {
+          "round": 0,
+          "steps": 172,
+          "prefix_chunks": 639,
+          "decoded_rows": 6079,
+          "prefix_query_rows": 70202,
+          "mean_query_rows": 443.49418604651163,
+          "short_root17_31": 0,
+          "pages_per_second": 1.0789,
+          "gpu_ns": 107993252624,
+          "process_cpu_ms": 16607
+        },
+        {
+          "round": 1,
+          "steps": 182,
+          "prefix_chunks": 639,
+          "decoded_rows": 6702,
+          "prefix_query_rows": 70202,
+          "mean_query_rows": 422.54945054945057,
+          "short_root17_31": 0,
+          "pages_per_second": 1.065,
+          "gpu_ns": 109017072357,
+          "process_cpu_ms": 16754
+        }
+      ]
+    },
+    {
+      "profile": {
+        "name": "p2_chunk256",
+        "chunk": 256,
+        "stream": 0,
+        "pool": 0,
+        "items": 2
+      },
+      "report_sha256": "27ba001b168a030a32658bc8cf50995649ad1a687d36db5d5f23e8232ae4c396",
+      "rounds": [
+        {
+          "round": 0,
+          "steps": 176,
+          "prefix_chunks": 341,
+          "decoded_rows": 6040,
+          "prefix_query_rows": 70202,
+          "mean_query_rows": 433.1931818181818,
+          "short_root17_31": 0,
+          "pages_per_second": 1.0753,
+          "gpu_ns": 108575134942,
+          "process_cpu_ms": 15897
+        },
+        {
+          "round": 1,
+          "steps": 173,
+          "prefix_chunks": 341,
+          "decoded_rows": 5068,
+          "prefix_query_rows": 70202,
+          "mean_query_rows": 435.08670520231215,
+          "short_root17_31": 0,
+          "pages_per_second": 1.0431,
+          "gpu_ns": 111820011044,
+          "process_cpu_ms": 16186
+        }
+      ]
+    },
+    {
+      "profile": {
+        "name": "p8_chunk64",
+        "chunk": 64,
+        "stream": 0,
+        "pool": 0,
+        "items": 8
+      },
+      "report_sha256": "e7582799c35ce225b60455f12ffd45178492190e5221ef5274938e71b96631d0",
+      "rounds": [
+        {
+          "round": 0,
+          "steps": 191,
+          "prefix_chunks": 1150,
+          "decoded_rows": 7402,
+          "prefix_query_rows": 70202,
+          "mean_query_rows": 406.30366492146595,
+          "short_root17_31": 0,
+          "pages_per_second": 0.956,
+          "gpu_ns": 122050169315,
+          "process_cpu_ms": 18025
+        },
+        {
+          "round": 1,
+          "steps": 187,
+          "prefix_chunks": 1150,
+          "decoded_rows": 7016,
+          "prefix_query_rows": 70202,
+          "mean_query_rows": 412.93048128342247,
+          "short_root17_31": 0,
+          "pages_per_second": 0.9586,
+          "gpu_ns": 121119296475,
+          "process_cpu_ms": 18852
+        }
+      ]
+    },
+    {
+      "profile": {
+        "name": "whole1",
+        "chunk": 0,
+        "stream": 0,
+        "pool": 0,
+        "items": 1
+      },
+      "report_sha256": "157380cd8de5712fa6d42dfe71d0a05da8c8b4b481608b7d6b84c2176813d1d4",
+      "rounds": [
+        {
+          "round": 0,
+          "steps": 128,
+          "prefix_chunks": 128,
+          "decoded_rows": 5106,
+          "prefix_query_rows": 70202,
+          "mean_query_rows": 588.34375,
+          "short_root17_31": 0,
+          "pages_per_second": 1.0576,
+          "gpu_ns": 109315688253,
+          "process_cpu_ms": 18083
+        },
+        {
+          "round": 1,
+          "steps": 128,
+          "prefix_chunks": 128,
+          "decoded_rows": 5164,
+          "prefix_query_rows": 70202,
+          "mean_query_rows": 588.796875,
+          "short_root17_31": 0,
+          "pages_per_second": 1.0599,
+          "gpu_ns": 109128164463,
+          "process_cpu_ms": 17908
+        }
+      ]
+    }
+  ]
+}

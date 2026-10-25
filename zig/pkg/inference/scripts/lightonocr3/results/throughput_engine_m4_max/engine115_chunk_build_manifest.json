@@ -1,0 +1,12 @@
+{
+  "status": "built_private_unqualified",
+  "inputs": {
+    ".venv-lighton-vllm-metal/engine115_chunk_kernels.m": "b9d9acbdeee11f9531ea7e60f0c4ab41be86a7ba0964a0e39053b9f388fe79eb",
+    ".venv-lighton-vllm-metal/engine115_chunk_checks.m": "8c9503eb575cc6e28bff84cf04141836f529ca790ed88379aa67276d6253edda",
+    ".venv-lighton-vllm-metal/engine115_chunk_probe.m": "cd443896d5602548ed5f823fc09a3b7c4fe33bc5a94956b7067c9b1b228db443",
+    ".venv-lighton-vllm-metal/engine115_chunk.metal": "e789cf2dc635e1b813a0b7c44f07b4fd95725fe8114a133069c298b17c84d2ae",
+    ".venv-lighton-vllm-metal/engine115_chunk_probe": "f40199f7b5c9998e04e10555896f7ac441bd47933ada3e1af7bb837de210a13e",
+    ".venv-lighton-vllm-metal/prepare_engine115_chunk.py": "ff1afaa05ca4a0d64a053641b8e6f1fd60919654d02696d67ee8d7953e5d7c59"
+  },
+  "scope": "Privatechunk16F32recurrentprefillprototype;notcompiledintoproductionbinaryandnomodelthroughputclaim. CoefficientsandF32SIMDmatrixstatewithunchangedlegacytail. Allfulloutputs,state,andguardscomparedtoproductioncoreinbalancedstage-onlypairs."
+}

@@ -1,0 +1,15 @@
+{
+  "status": "failed_or_excluded",
+  "created_at": "2026-10-25T18:53:23.937643+00:00",
+  "driver_sha256": "340bb2410894c967e9464008ed52edfd7236d23bdfa4629dad149b5b27c2e17b",
+  "primary_throughput_eligible": false,
+  "binary_sha256": "5473e5122f08b09b30220fe611e14f3be3b9ccda6ea6d8a3b40d0bc38dccc7b2",
+  "runs": [
+    {
+      "phase": "full_gpu_replay",
+      "exit_code": 0,
+      "log_sha256": "c40ed706733d1102296bc7277cb9934ed9a82ba393f13d1371fb7808e4de3145"
+    }
+  ],
+  "error": "FileNotFoundError(2, 'No such file or directory')"
+}

@@ -72,6 +72,23 @@ def cache_override_admission(startup_log, requested):
     }
 
 
+def automatic_cache_floor_admission(startup_log, requested_floor):
+    """Require every observed automatic capacity to fit the requested cohort."""
+    import re
+
+    blocks = [
+        int(value)
+        for value in re.findall(r"Hybrid shared cache:\s*(\d+)\s*blocks", startup_log)
+    ]
+    return {
+        "requested_floor": requested_floor,
+        "observed_blocks": blocks,
+        "admitted": requested_floor == 0
+        or bool(blocks)
+        and min(blocks) >= requested_floor,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--python", type=Path, required=True)
@@ -79,6 +96,8 @@ def main():
     parser.add_argument("--images", type=Path, nargs="+", required=True)
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--requests", type=int, default=16)
+    parser.add_argument("--warmup-requests", type=int, default=0)
+    parser.add_argument("--minimum-auto-cache-blocks", type=int, default=0)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
@@ -94,6 +113,12 @@ def main():
         parser.error("requests must be positive; concurrency must be 1..64")
     if args.kv_cache_blocks is not None and args.kv_cache_blocks < 1:
         parser.error("kv-cache-blocks must be positive")
+    if args.warmup_requests < 0 or args.minimum_auto_cache_blocks < 0:
+        parser.error("warmup-requests and cache floor must be nonnegative")
+    if args.minimum_auto_cache_blocks and args.kv_cache_blocks is not None:
+        parser.error(
+            "automatic cache floor cannot be combined with an explicit override"
+        )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -151,7 +176,7 @@ def main():
         "images": [
             {"path": str(p.resolve()), "sha256": digest(p)} for p in args.images
         ],
-        "scope": "One resident vLLM Metal server, original BF16 weights, image-only prompt, thinking disabled, greedy decoding. Includes preprocessing, serving queue, inference and loopback HTTP. Excludes loading and serial reference reads. Prefix and processor caches disabled; every image gets a unique media UUID to prevent encoder reuse. Other machine workloads uncontrolled.",
+        "scope": "One resident vLLM Metal server, original BF16 weights, image-only prompt, thinking disabled, greedy decoding. Includes preprocessing, serving queue, inference and loopback HTTP. Excludes loading, serial reference reads and requested saturation warmups. Prefix and processor caches disabled; every image gets a unique media UUID to prevent encoder reuse. Other machine workloads uncontrolled.",
         "results": [],
         "status": "starting",
     }
@@ -249,11 +274,40 @@ def main():
                 raise RuntimeError(
                     "Unsafe or unverifiable KV cache override: " + admission["reason"]
                 )
+            report["automatic_cache_floor_admission"] = automatic_cache_floor_admission(
+                (args.output_dir / "server.txt").read_text(),
+                args.minimum_auto_cache_blocks,
+            )
+            report["excluded_saturation_warmup_requests"] = args.warmup_requests
+            save()
+            if not report["automatic_cache_floor_admission"]["admitted"]:
+                raise RuntimeError(
+                    "Automatic cache floor not met before warmup or timing"
+                )
             references = [request(i) for i in range(len(payloads))]
             report["references"] = references
             report["status"] = "running"
             save()
+            report["saturation_warmups"] = []
             for concurrency in args.concurrency:
+                if args.warmup_requests:
+                    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                        warm_outputs = list(
+                            executor.map(request, range(args.warmup_requests))
+                        )
+                    if not all(
+                        output["text"] == references[output["image_index"]]["text"]
+                        for output in warm_outputs
+                    ):
+                        raise RuntimeError("Saturation warmup changed full OCR output")
+                    report["saturation_warmups"].append(
+                        {
+                            "concurrency": concurrency,
+                            "excluded_from_throughput": True,
+                            "outputs": warm_outputs,
+                        }
+                    )
+                    save()
                 start = time.perf_counter()
                 with ThreadPoolExecutor(max_workers=concurrency) as executor:
                     outputs = list(executor.map(request, range(args.requests)))

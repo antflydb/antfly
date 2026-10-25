@@ -1,0 +1,639 @@
+1/376 server.server.test.LightOnOCR3 real checkpoint transcribes the invoice fixture...LIGHTONOCR3 vision_frame_blocks=3 vision_frame_submits=8 vision_frame_images=1
+lightonocr3_weight_handles: provider_owned=1 temporary_host_mirrors=1
+lightonocr3_prefill_core_norm: rows=432 heads=32
+lightonocr3_prefill_attention_mpp: queries=432 keys=432 heads=16 tile=16 direct=1
+lightonocr3_recurrent_parallel: rows=1 heads=32 threads=512
+LIGHTONOCR3 device_recurrent_state=1 recurrent_cache_pages=1 host_recurrent_bytes_total=0
+LIGHTONOCR3 prefill_await_groups=0 prefill_await_events=0 prefill_decode_streak=0
+LIGHTONOCR3 cpu_preprocess=1 cpu_preprocess_items=1 cpu_preprocess_ns=3941000 vision_batch_limit=1
+LIGHTONOCR3 gate_events=0 gate_event_acquisitions=0 gate_event_waits=0
+LIGHTONOCR3 executor_steps=0
+LIGHTONOCR3 executor_tail_steps=0
+LIGHTONOCR3 phase_priority_yields=0 phase_fair=0
+LIGHTONOCR3 epoch_auxiliary=0 auxiliary_acquisitions=0 auxiliary_host_scratch=0 auxiliary_backend_scratch=0
+LIGHTONOCR3 phase_gate_wait_ns=0
+LIGHTONOCR3 activation_pool_hits=0
+LIGHTONOCR3 activation_pool_peak_bytes=0
+LIGHTONOCR3 activation_pool_duplicate_retirements=0
+LIGHTONOCR3 prefill_activation_pool=0 prefill_activation_pool_hits=0 prefill_activation_pool_hit_bytes=0
+LIGHTONOCR3 prepared_blocks=0
+LIGHTONOCR3 wide_projection_tiles=0
+LIGHTONOCR3 prefill_pack_calls=200 prefill_pack_reuse_hits=197
+LIGHTONOCR3 decode_pack_calls=0 decode_pack_reuse_hits=0
+LIGHTONOCR3 vision_pack_calls=96 vision_pack_reuse_hits=88
+LIGHTONOCR3 mpp_planned_calls=240 mpp_dedicated_calls=58
+LIGHTONOCR3 attention_batch_calls=0 attention_batch_rows=0
+LIGHTONOCR3 attention_batch_kernel_calls=0
+LIGHTONOCR3 stream_forward_splits=0 stream_first_layers=0
+LIGHTONOCR3 prefill_stream_layers=0 prefill_stream_splits=0
+LIGHTONOCR3 prefill_fused_ffn_calls=0
+LIGHTONOCR3 shared_core_weight_hits=0 shared_core_weight_misses=0 shared_core_weight_bytes=0
+LIGHTONOCR3 wide_mpp_projections=0
+LIGHTONOCR3 wide_mpp_heads=0
+LIGHTONOCR3 wide_gate_up_calls=0
+LIGHTONOCR3 full64_gate_up_calls=0
+LIGHTONOCR3 wide_recurrent_dispatches=0 wide_recurrent_lifetime_max_rows=0 wide_recurrent_staged_bytes=0
+LIGHTONOCR3 batch_argmax_calls=0
+LIGHTONOCR3 batch_argmax_rows=0
+LIGHTONOCR3 vision_workspace_cache=0
+LIGHTONOCR3 vision_workspace_allocations=8
+LIGHTONOCR3 vision_workspace_reuses=0
+LIGHTONOCR3 vision_workspace_bytes=0
+LIGHTONOCR3 large_vision_pack_calls=0
+LIGHTONOCR3 large_vision_pack_reuse_hits=0
+LIGHTONOCR3 resident_vision_budget=1
+LIGHTONOCR3 vision_late_seal=0
+LIGHTONOCR3 prefill_late_seal=0
+LIGHTONOCR3 queued_phase_priority=0
+LIGHTONOCR3 standalone_wide_heads=0
+LIGHTONOCR3 gpu_token_burst_enabled=0 gpu_token_burst_steps=0 gpu_token_burst_topology_mismatches=0
+LIGHTONOCR3 gpu_token_burst_extra_steps=0 gpu_token_burst_extra_rows=0 gpu_token_burst_max_width=0
+LIGHTONOCR3 single_frame_steps=0 single_frame_topology_mismatches=0
+LIGHTONOCR3 gpu_greedy_stream_steps=0
+LIGHTONOCR3 gpu_greedy_stream_two_frame_steps=0
+LIGHTONOCR3 gpu_greedy_stream_topology_mismatches=0
+LIGHTONOCR3 gpu_greedy_stream_multi_frame_steps=0
+LIGHTONOCR3 gpu_greedy_stream_frame_submits=0
+LIGHTONOCR3 token_encoder_scope_steps=0
+LIGHTONOCR3 vision_encoder_scope_opens=24 prefill_encoder_scope_opens=32
+LIGHTONOCR3 frame_policy_snapshots=30
+LIGHTONOCR3 runtime_frames=30 frame_gpu_ns=943924402 frame_wait_ns=979396000
+LIGHTONOCR3 execution_gate_wait_ns=1000000
+LIGHTONOCR3 kv_storage_layers=8 model_layers=32
+LIGHTONOCR3 registered_window_peak=1 physical_rows_limit=64
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+LIGHTONOCR3 shared_vision_peak_bytes=695267328 peak_segments=1
+LIGHTONOCR3 shared_vision_host_peak_bytes=53955840 peak_segments=1
+LIGHTONOCR3 shared_decoder_scratch=0 shared_decoder_peak_bytes=0 peak_segments=0
+LIGHTONOCR3 prefill_host_scratch_acquisitions=0 prefill_host_scratch_releases=0 prefill_host_scratch_peak_bytes=0
+
+LIGHTONOCR3 backend=metal
+
+LIGHTONOCR3 cold_request_ms=8988 text=Antfly local OCR
+
+Invoice 12345
+
+Total USD 42.00
+LIGHTONOCR3 vision_frame_blocks=3 vision_frame_submits=8 vision_frame_images=1
+lightonocr3_weight_handles: provider_owned=1 temporary_host_mirrors=1
+LIGHTONOCR3 device_recurrent_state=1 recurrent_cache_pages=1 host_recurrent_bytes_total=0
+LIGHTONOCR3 prefill_await_groups=0 prefill_await_events=0 prefill_decode_streak=0
+LIGHTONOCR3 cpu_preprocess=1 cpu_preprocess_items=1 cpu_preprocess_ns=3934000 vision_batch_limit=1
+LIGHTONOCR3 gate_events=0 gate_event_acquisitions=0 gate_event_waits=0
+LIGHTONOCR3 executor_steps=0
+LIGHTONOCR3 executor_tail_steps=0
+LIGHTONOCR3 phase_priority_yields=0 phase_fair=0
+LIGHTONOCR3 epoch_auxiliary=0 auxiliary_acquisitions=0 auxiliary_host_scratch=0 auxiliary_backend_scratch=0
+LIGHTONOCR3 phase_gate_wait_ns=0
+LIGHTONOCR3 activation_pool_hits=0
+LIGHTONOCR3 activation_pool_peak_bytes=0
+LIGHTONOCR3 activation_pool_duplicate_retirements=0
+LIGHTONOCR3 prefill_activation_pool=0 prefill_activation_pool_hits=0 prefill_activation_pool_hit_bytes=0
+LIGHTONOCR3 prepared_blocks=0
+LIGHTONOCR3 wide_projection_tiles=0
+LIGHTONOCR3 prefill_pack_calls=200 prefill_pack_reuse_hits=197
+LIGHTONOCR3 decode_pack_calls=0 decode_pack_reuse_hits=0
+LIGHTONOCR3 vision_pack_calls=96 vision_pack_reuse_hits=88
+LIGHTONOCR3 mpp_planned_calls=240 mpp_dedicated_calls=58
+LIGHTONOCR3 attention_batch_calls=0 attention_batch_rows=0
+LIGHTONOCR3 attention_batch_kernel_calls=0
+LIGHTONOCR3 stream_forward_splits=0 stream_first_layers=0
+LIGHTONOCR3 prefill_stream_layers=0 prefill_stream_splits=0
+LIGHTONOCR3 prefill_fused_ffn_calls=0
+LIGHTONOCR3 shared_core_weight_hits=0 shared_core_weight_misses=0 shared_core_weight_bytes=0
+LIGHTONOCR3 wide_mpp_projections=0
+LIGHTONOCR3 wide_mpp_heads=0
+LIGHTONOCR3 wide_gate_up_calls=0
+LIGHTONOCR3 full64_gate_up_calls=0
+LIGHTONOCR3 wide_recurrent_dispatches=0 wide_recurrent_lifetime_max_rows=0 wide_recurrent_staged_bytes=0
+LIGHTONOCR3 batch_argmax_calls=0
+LIGHTONOCR3 batch_argmax_rows=0
+LIGHTONOCR3 vision_workspace_cache=0
+LIGHTONOCR3 vision_workspace_allocations=8
+LIGHTONOCR3 vision_workspace_reuses=0
+LIGHTONOCR3 vision_workspace_bytes=0
+LIGHTONOCR3 large_vision_pack_calls=0
+LIGHTONOCR3 large_vision_pack_reuse_hits=0
+LIGHTONOCR3 resident_vision_budget=1
+LIGHTONOCR3 vision_late_seal=0
+LIGHTONOCR3 prefill_late_seal=0
+LIGHTONOCR3 queued_phase_priority=0
+LIGHTONOCR3 standalone_wide_heads=0
+LIGHTONOCR3 gpu_token_burst_enabled=0 gpu_token_burst_steps=0 gpu_token_burst_topology_mismatches=0
+LIGHTONOCR3 gpu_token_burst_extra_steps=0 gpu_token_burst_extra_rows=0 gpu_token_burst_max_width=0
+LIGHTONOCR3 single_frame_steps=0 single_frame_topology_mismatches=0
+LIGHTONOCR3 gpu_greedy_stream_steps=0
+LIGHTONOCR3 gpu_greedy_stream_two_frame_steps=0
+LIGHTONOCR3 gpu_greedy_stream_topology_mismatches=0
+LIGHTONOCR3 gpu_greedy_stream_multi_frame_steps=0
+LIGHTONOCR3 gpu_greedy_stream_frame_submits=0
+LIGHTONOCR3 token_encoder_scope_steps=0
+LIGHTONOCR3 vision_encoder_scope_opens=24 prefill_encoder_scope_opens=32
+LIGHTONOCR3 frame_policy_snapshots=60
+LIGHTONOCR3 runtime_frames=30 frame_gpu_ns=927218404 frame_wait_ns=961402000
+LIGHTONOCR3 execution_gate_wait_ns=1000000
+LIGHTONOCR3 kv_storage_layers=8 model_layers=32
+LIGHTONOCR3 registered_window_peak=1 physical_rows_limit=64
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+LIGHTONOCR3 shared_vision_peak_bytes=695267328 peak_segments=1
+LIGHTONOCR3 shared_vision_host_peak_bytes=53955840 peak_segments=1
+LIGHTONOCR3 shared_decoder_scratch=0 shared_decoder_peak_bytes=0 peak_segments=0
+LIGHTONOCR3 prefill_host_scratch_acquisitions=0 prefill_host_scratch_releases=0 prefill_host_scratch_peak_bytes=0
+OCR_REFERENCE {"image_index":0,"text":"Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"}
+LIGHTONOCR3 vision_frame_blocks=3 vision_frame_submits=8 vision_frame_images=1
+lightonocr3_weight_handles: provider_owned=1 temporary_host_mirrors=1
+LIGHTONOCR3 device_recurrent_state=1 recurrent_cache_pages=1 host_recurrent_bytes_total=0
+LIGHTONOCR3 prefill_await_groups=0 prefill_await_events=0 prefill_decode_streak=0
+LIGHTONOCR3 cpu_preprocess=1 cpu_preprocess_items=1 cpu_preprocess_ns=5862000 vision_batch_limit=1
+LIGHTONOCR3 gate_events=0 gate_event_acquisitions=0 gate_event_waits=0
+LIGHTONOCR3 executor_steps=0
+LIGHTONOCR3 executor_tail_steps=0
+LIGHTONOCR3 phase_priority_yields=0 phase_fair=0
+LIGHTONOCR3 epoch_auxiliary=0 auxiliary_acquisitions=0 auxiliary_host_scratch=0 auxiliary_backend_scratch=0
+LIGHTONOCR3 phase_gate_wait_ns=0
+LIGHTONOCR3 activation_pool_hits=0
+LIGHTONOCR3 activation_pool_peak_bytes=0
+LIGHTONOCR3 activation_pool_duplicate_retirements=0
+LIGHTONOCR3 prefill_activation_pool=0 prefill_activation_pool_hits=0 prefill_activation_pool_hit_bytes=0
+LIGHTONOCR3 prepared_blocks=0
+LIGHTONOCR3 wide_projection_tiles=0
+LIGHTONOCR3 prefill_pack_calls=200 prefill_pack_reuse_hits=197
+LIGHTONOCR3 decode_pack_calls=0 decode_pack_reuse_hits=0
+LIGHTONOCR3 vision_pack_calls=96 vision_pack_reuse_hits=88
+LIGHTONOCR3 mpp_planned_calls=240 mpp_dedicated_calls=58
+LIGHTONOCR3 attention_batch_calls=0 attention_batch_rows=0
+LIGHTONOCR3 attention_batch_kernel_calls=0
+LIGHTONOCR3 stream_forward_splits=0 stream_first_layers=0
+LIGHTONOCR3 prefill_stream_layers=0 prefill_stream_splits=0
+LIGHTONOCR3 prefill_fused_ffn_calls=0
+LIGHTONOCR3 shared_core_weight_hits=0 shared_core_weight_misses=0 shared_core_weight_bytes=0
+LIGHTONOCR3 wide_mpp_projections=0
+LIGHTONOCR3 wide_mpp_heads=0
+LIGHTONOCR3 wide_gate_up_calls=0
+LIGHTONOCR3 full64_gate_up_calls=0
+LIGHTONOCR3 wide_recurrent_dispatches=0 wide_recurrent_lifetime_max_rows=0 wide_recurrent_staged_bytes=0
+LIGHTONOCR3 batch_argmax_calls=0
+LIGHTONOCR3 batch_argmax_rows=0
+LIGHTONOCR3 vision_workspace_cache=0
+LIGHTONOCR3 vision_workspace_allocations=8
+LIGHTONOCR3 vision_workspace_reuses=0
+LIGHTONOCR3 vision_workspace_bytes=0
+LIGHTONOCR3 large_vision_pack_calls=0
+LIGHTONOCR3 large_vision_pack_reuse_hits=0
+LIGHTONOCR3 resident_vision_budget=1
+LIGHTONOCR3 vision_late_seal=0
+LIGHTONOCR3 prefill_late_seal=0
+LIGHTONOCR3 queued_phase_priority=0
+LIGHTONOCR3 standalone_wide_heads=0
+LIGHTONOCR3 gpu_token_burst_enabled=0 gpu_token_burst_steps=0 gpu_token_burst_topology_mismatches=0
+LIGHTONOCR3 gpu_token_burst_extra_steps=0 gpu_token_burst_extra_rows=0 gpu_token_burst_max_width=0
+LIGHTONOCR3 single_frame_steps=0 single_frame_topology_mismatches=0
+LIGHTONOCR3 gpu_greedy_stream_steps=0
+LIGHTONOCR3 gpu_greedy_stream_two_frame_steps=0
+LIGHTONOCR3 gpu_greedy_stream_topology_mismatches=0
+LIGHTONOCR3 gpu_greedy_stream_multi_frame_steps=0
+LIGHTONOCR3 gpu_greedy_stream_frame_submits=0
+LIGHTONOCR3 token_encoder_scope_steps=0
+LIGHTONOCR3 vision_encoder_scope_opens=24 prefill_encoder_scope_opens=32
+LIGHTONOCR3 frame_policy_snapshots=270
+LIGHTONOCR3 runtime_frames=210 frame_gpu_ns=4837881190 frame_wait_ns=4976496000
+LIGHTONOCR3 execution_gate_wait_ns=1000000
+LIGHTONOCR3 kv_storage_layers=8 model_layers=32
+LIGHTONOCR3 registered_window_peak=1 physical_rows_limit=64
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+LIGHTONOCR3 shared_vision_peak_bytes=893067264 peak_segments=1
+LIGHTONOCR3 shared_vision_host_peak_bytes=69672960 peak_segments=1
+LIGHTONOCR3 shared_decoder_scratch=0 shared_decoder_peak_bytes=0 peak_segments=0
+LIGHTONOCR3 prefill_host_scratch_acquisitions=0 prefill_host_scratch_releases=0 prefill_host_scratch_peak_bytes=0
+OCR_REFERENCE {"image_index":1,"text":"# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>"}
+LIGHTONOCR3 vision_frame_blocks=3 vision_frame_submits=8 vision_frame_images=1
+lightonocr3_weight_handles: provider_owned=1 temporary_host_mirrors=1
+LIGHTONOCR3 device_recurrent_state=1 recurrent_cache_pages=1 host_recurrent_bytes_total=0
+LIGHTONOCR3 prefill_await_groups=0 prefill_await_events=0 prefill_decode_streak=0
+LIGHTONOCR3 cpu_preprocess=1 cpu_preprocess_items=1 cpu_preprocess_ns=5894000 vision_batch_limit=1
+LIGHTONOCR3 gate_events=0 gate_event_acquisitions=0 gate_event_waits=0
+LIGHTONOCR3 executor_steps=0
+LIGHTONOCR3 executor_tail_steps=0
+LIGHTONOCR3 phase_priority_yields=0 phase_fair=0
+LIGHTONOCR3 epoch_auxiliary=0 auxiliary_acquisitions=0 auxiliary_host_scratch=0 auxiliary_backend_scratch=0
+LIGHTONOCR3 phase_gate_wait_ns=0
+LIGHTONOCR3 activation_pool_hits=0
+LIGHTONOCR3 activation_pool_peak_bytes=0
+LIGHTONOCR3 activation_pool_duplicate_retirements=0
+LIGHTONOCR3 prefill_activation_pool=0 prefill_activation_pool_hits=0 prefill_activation_pool_hit_bytes=0
+LIGHTONOCR3 prepared_blocks=0
+LIGHTONOCR3 wide_projection_tiles=0
+LIGHTONOCR3 prefill_pack_calls=200 prefill_pack_reuse_hits=197
+LIGHTONOCR3 decode_pack_calls=0 decode_pack_reuse_hits=0
+LIGHTONOCR3 vision_pack_calls=96 vision_pack_reuse_hits=88
+LIGHTONOCR3 mpp_planned_calls=240 mpp_dedicated_calls=58
+LIGHTONOCR3 attention_batch_calls=0 attention_batch_rows=0
+LIGHTONOCR3 attention_batch_kernel_calls=0
+LIGHTONOCR3 stream_forward_splits=0 stream_first_layers=0
+LIGHTONOCR3 prefill_stream_layers=0 prefill_stream_splits=0
+LIGHTONOCR3 prefill_fused_ffn_calls=0
+LIGHTONOCR3 shared_core_weight_hits=0 shared_core_weight_misses=0 shared_core_weight_bytes=0
+LIGHTONOCR3 wide_mpp_projections=0
+LIGHTONOCR3 wide_mpp_heads=0
+LIGHTONOCR3 wide_gate_up_calls=0
+LIGHTONOCR3 full64_gate_up_calls=0
+LIGHTONOCR3 wide_recurrent_dispatches=0 wide_recurrent_lifetime_max_rows=0 wide_recurrent_staged_bytes=0
+LIGHTONOCR3 batch_argmax_calls=0
+LIGHTONOCR3 batch_argmax_rows=0
+LIGHTONOCR3 vision_workspace_cache=0
+LIGHTONOCR3 vision_workspace_allocations=8
+LIGHTONOCR3 vision_workspace_reuses=0
+LIGHTONOCR3 vision_workspace_bytes=0
+LIGHTONOCR3 large_vision_pack_calls=0
+LIGHTONOCR3 large_vision_pack_reuse_hits=0
+LIGHTONOCR3 resident_vision_budget=1
+LIGHTONOCR3 vision_late_seal=0
+LIGHTONOCR3 prefill_late_seal=0
+LIGHTONOCR3 queued_phase_priority=0
+LIGHTONOCR3 standalone_wide_heads=0
+LIGHTONOCR3 gpu_token_burst_enabled=0 gpu_token_burst_steps=0 gpu_token_burst_topology_mismatches=0
+LIGHTONOCR3 gpu_token_burst_extra_steps=0 gpu_token_burst_extra_rows=0 gpu_token_burst_max_width=0
+LIGHTONOCR3 single_frame_steps=0 single_frame_topology_mismatches=0
+LIGHTONOCR3 gpu_greedy_stream_steps=0
+LIGHTONOCR3 gpu_greedy_stream_two_frame_steps=0
+LIGHTONOCR3 gpu_greedy_stream_topology_mismatches=0
+LIGHTONOCR3 gpu_greedy_stream_multi_frame_steps=0
+LIGHTONOCR3 gpu_greedy_stream_frame_submits=0
+LIGHTONOCR3 token_encoder_scope_steps=0
+LIGHTONOCR3 vision_encoder_scope_opens=24 prefill_encoder_scope_opens=32
+LIGHTONOCR3 frame_policy_snapshots=338
+LIGHTONOCR3 runtime_frames=68 frame_gpu_ns=1980015504 frame_wait_ns=2047298000
+LIGHTONOCR3 execution_gate_wait_ns=1000000
+LIGHTONOCR3 kv_storage_layers=8 model_layers=32
+LIGHTONOCR3 registered_window_peak=1 physical_rows_limit=64
+LIGHTONOCR3 cohort_items=1 decode_steps=0 batched_steps=0 singleton_steps=0 decode_items=0
+LIGHTONOCR3 shared_vision_peak_bytes=1074511872 peak_segments=1
+LIGHTONOCR3 shared_vision_host_peak_bytes=83607552 peak_segments=1
+LIGHTONOCR3 shared_decoder_scratch=0 shared_decoder_peak_bytes=0 peak_segments=0
+LIGHTONOCR3 prefill_host_scratch_acquisitions=0 prefill_host_scratch_releases=0 prefill_host_scratch_peak_bytes=0
+OCR_REFERENCE {"image_index":2,"text":"# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY"}
+OCR_POLICY round=0 name=engineepoch
+OCR_MEMORY round=0 phase=before tensor_live_bytes=0 owned_buffer_live_bytes=464595384 alias_buffer_live_bytes=154140672
+LIGHTONOCR3 vision_frame_blocks=3 vision_frame_submits=8 vision_frame_images=1
+LIGHTONOCR3 vision_frame_blocks=3 vision_frame_submits=8 vision_frame_images=1
+LIGHTONOCR3 vision_frame_blocks=3 vision_frame_submits=8 vision_frame_images=1
+LIGHTONOCR3 vision_frame_blocks=3 vision_frame_submits=8 vision_frame_images=1
+LIGHTONOCR3 vision_frame_blocks=3 vision_frame_submits=8 vision_frame_images=1
+LIGHTONOCR3 vision_frame_blocks=3 vision_frame_submits=8 vision_frame_images=1
+LIGHTONOCR3 vision_frame_blocks=3 vision_frame_submits=8 vision_frame_images=1
+LIGHTONOCR3 vision_frame_blocks=3 vision_frame_submits=8 vision_frame_images=1
+LIGHTONOCR3 vision_frame_blocks=3 vision_frame_submits=8 vision_frame_images=1
+LIGHTONOCR3 vision_frame_blocks=3 vision_frame_submits=8 vision_frame_images=1
+LIGHTONOCR3 vision_frame_blocks=3 vision_frame_submits=8 vision_frame_images=1
+LIGHTONOCR3 vision_frame_blocks=3 vision_frame_submits=8 vision_frame_images=1
+LIGHTONOCR3 vision_frame_blocks=3 vision_frame_submits=8 vision_frame_images=1
+LIGHTONOCR3 vision_frame_blocks=3 vision_frame_submits=8 vision_frame_images=1
+LIGHTONOCR3 vision_frame_blocks=3 vision_frame_submits=8 vision_frame_images=1
+LIGHTONOCR3 vision_frame_blocks=3 vision_frame_submits=8 vision_frame_images=1
+lightonocr3_weight_handles: provider_owned=1 temporary_host_mirrors=1
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=0 packed_step_query_rows=256
+LIGHTONOCR3 packed_step_prefill_starts=1 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=0 packed_recurrent_rows=0
+LIGHTONOCR3 packed_attention_groups=0 packed_attention_rows=0
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=0 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=0 packed_step_query_rows=256
+LIGHTONOCR3 packed_step_prefill_starts=1 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=0 packed_recurrent_rows=0
+LIGHTONOCR3 packed_attention_groups=0 packed_attention_rows=0
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=0 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=0 packed_step_query_rows=256
+LIGHTONOCR3 packed_step_prefill_starts=1 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=0 packed_recurrent_rows=0
+LIGHTONOCR3 packed_attention_groups=0 packed_attention_rows=0
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=0 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=0 packed_step_query_rows=256
+LIGHTONOCR3 packed_step_prefill_starts=1 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=0 packed_recurrent_rows=0
+LIGHTONOCR3 packed_attention_groups=0 packed_attention_rows=0
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=0 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=0 packed_step_query_rows=256
+LIGHTONOCR3 packed_step_prefill_starts=1 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=0 packed_recurrent_rows=0
+LIGHTONOCR3 packed_attention_groups=0 packed_attention_rows=0
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=0 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=0 packed_step_query_rows=256
+LIGHTONOCR3 packed_step_prefill_starts=1 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=0 packed_recurrent_rows=0
+LIGHTONOCR3 packed_attention_groups=0 packed_attention_rows=0
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=0 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=0 packed_step_query_rows=256
+LIGHTONOCR3 packed_step_prefill_starts=1 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=0 packed_recurrent_rows=0
+LIGHTONOCR3 packed_attention_groups=0 packed_attention_rows=0
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=0 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=0 packed_step_query_rows=256
+LIGHTONOCR3 packed_step_prefill_starts=1 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=0 packed_recurrent_rows=0
+LIGHTONOCR3 packed_attention_groups=0 packed_attention_rows=0
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=0 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=0 packed_step_query_rows=256
+LIGHTONOCR3 packed_step_prefill_starts=1 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=0 packed_recurrent_rows=0
+LIGHTONOCR3 packed_attention_groups=0 packed_attention_rows=0
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=0 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=0 packed_step_query_rows=256
+LIGHTONOCR3 packed_step_prefill_starts=1 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=0 packed_recurrent_rows=0
+LIGHTONOCR3 packed_attention_groups=0 packed_attention_rows=0
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=0 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=0 packed_step_query_rows=256
+LIGHTONOCR3 packed_step_prefill_starts=1 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=0 packed_recurrent_rows=0
+LIGHTONOCR3 packed_attention_groups=0 packed_attention_rows=0
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=0 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=0 packed_step_query_rows=256
+LIGHTONOCR3 packed_step_prefill_starts=1 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=0 packed_recurrent_rows=0
+LIGHTONOCR3 packed_attention_groups=0 packed_attention_rows=0
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=0 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=0 packed_step_query_rows=256
+LIGHTONOCR3 packed_step_prefill_starts=1 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=0 packed_recurrent_rows=0
+LIGHTONOCR3 packed_attention_groups=0 packed_attention_rows=0
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=0 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=0 packed_step_query_rows=256
+LIGHTONOCR3 packed_step_prefill_starts=1 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=0 packed_recurrent_rows=0
+LIGHTONOCR3 packed_attention_groups=0 packed_attention_rows=0
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=0 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=0 packed_step_query_rows=256
+LIGHTONOCR3 packed_step_prefill_starts=1 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=0 packed_recurrent_rows=0
+LIGHTONOCR3 packed_attention_groups=0 packed_attention_rows=0
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=0 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=0 packed_step_query_rows=256
+LIGHTONOCR3 packed_step_prefill_starts=1 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=0 packed_recurrent_rows=0
+LIGHTONOCR3 packed_attention_groups=0 packed_attention_rows=0
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=0 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=0 packed_step_query_rows=176
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=1 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=0 packed_recurrent_rows=0
+LIGHTONOCR3 packed_attention_groups=0 packed_attention_rows=0
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=0 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=0 packed_step_query_rows=176
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=1 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=0 packed_recurrent_rows=0
+LIGHTONOCR3 packed_attention_groups=0 packed_attention_rows=0
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=0 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+lightonocr3_recurrent_parallel: rows=2 heads=32 threads=512
+lightonocr3_packed_core: rows=2 scratch_bytes=98816
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=2 packed_step_query_rows=258
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=48
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=16
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=2 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=2 packed_step_query_rows=258
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=48
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=16
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=2 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=2 packed_step_query_rows=178
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=1 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=48
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=16
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=2 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=2 packed_step_query_rows=258
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=48
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=16
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=2 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+lightonocr3_recurrent_parallel: rows=3 heads=32 threads=512
+lightonocr3_packed_core: rows=3 scratch_bytes=148224
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=3 packed_step_query_rows=259
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=72
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=24
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=3 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=3 packed_step_query_rows=259
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=72
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=24
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=3 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=3 packed_step_query_rows=259
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=72
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=24
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=3 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=3 packed_step_query_rows=259
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=72
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=24
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=3 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=3 packed_step_query_rows=259
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=72
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=24
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=3 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=3 packed_step_query_rows=259
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=72
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=24
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=3 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=3 packed_step_query_rows=179
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=1 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=72
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=24
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=3 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=3 packed_step_query_rows=179
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=1 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=72
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=24
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=3 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+lightonocr3_recurrent_parallel: rows=5 heads=32 threads=512
+lightonocr3_packed_core: rows=5 scratch_bytes=247040
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=5 packed_step_query_rows=261
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=0 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=120
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=40
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=5 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=5 packed_step_query_rows=181
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=1 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=120
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=40
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=5 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=5 packed_step_query_rows=155
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=1 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=120
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=40
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=5 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+lightonocr3_recurrent_parallel: rows=6 heads=32 threads=512
+lightonocr3_packed_core: rows=6 scratch_bytes=296448
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=6 packed_step_query_rows=48
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=1 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=144
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=48
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=6 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+lightonocr3_recurrent_parallel: rows=7 heads=32 threads=512
+lightonocr3_packed_core: rows=7 scratch_bytes=345856
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=7 packed_step_query_rows=49
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=1 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=168
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=56
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=7 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+lightonocr3_recurrent_parallel: rows=8 heads=32 threads=512
+lightonocr3_packed_core: rows=8 scratch_bytes=395264
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=8 packed_step_query_rows=50
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=1 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=192
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=64
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=8 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+lightonocr3_recurrent_parallel: rows=9 heads=32 threads=512
+lightonocr3_packed_core: rows=9 scratch_bytes=444672
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=9 packed_step_query_rows=159
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=1 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=216
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=72
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=9 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+lightonocr3_recurrent_parallel: rows=11 heads=32 threads=512
+lightonocr3_packed_core: rows=11 scratch_bytes=543488
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=11 packed_step_query_rows=161
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=1 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=264
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=88
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=11 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=11 packed_step_query_rows=53
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=1 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=264
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=88
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=11 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=11 packed_step_query_rows=161
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=1 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=264
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=88
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=11 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=11 packed_step_query_rows=53
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=1 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=264
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=88
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=11 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+lightonocr3_recurrent_parallel: rows=12 heads=32 threads=512
+lightonocr3_packed_core: rows=12 scratch_bytes=592896
+LIGHTONOCR3 packed_step_prefill_items=1 packed_step_decode_items=12 packed_step_query_rows=162
+LIGHTONOCR3 packed_step_prefill_starts=0 packed_step_prefill_finishes=1 prepared_prefill_chunk_rows=256
+LIGHTONOCR3 packed_recurrent_groups=24 packed_recurrent_rows=288
+LIGHTONOCR3 packed_attention_groups=8 packed_attention_rows=96
+LIGHTONOCR3 packed_input_frames=1
+LIGHTONOCR3 packed_gpu_decode_rows=12 packed_cpu_logit_rows=1 packed_standalone_wide_heads=0
+lightonocr3_recurrent_parallel: rows=13 heads=32 threads=512
+lightonocr3_packed_core: rows=13 prepared=true
+metal_pipelined_decode_frame: enabled=1 owner=executor rollback=TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME
+lightonocr3_recurrent_parallel: rows=10 heads=32 threads=512
+lightonocr3_packed_core: rows=10 prepared=true
+LIGHTONOCR3 device_recurrent_state=1 recurrent_cache_pages=16 host_recurrent_bytes_total=0
+LIGHTONOCR3 prefill_await_groups=0 prefill_await_events=0 prefill_decode_streak=0
+LIGHTONOCR3 cpu_preprocess=1 cpu_preprocess_items=16 cpu_preprocess_ns=91125000 vision_batch_limit=1
+LIGHTONOCR3 gate_events=1 gate_event_acquisitions=207 gate_event_waits=4849
+LIGHTONOCR3 executor_steps=93
+LIGHTONOCR3 executor_tail_steps=471
+LIGHTONOCR3 phase_priority_yields=367 phase_fair=1
+LIGHTONOCR3 epoch_auxiliary=1 auxiliary_acquisitions=1 auxiliary_host_scratch=38797312 auxiliary_backend_scratch=90177536
+LIGHTONOCR3 phase_gate_wait_ns=1000000
+LIGHTONOCR3 activation_pool_hits=3121
+LIGHTONOCR3 activation_pool_peak_bytes=8388608
+LIGHTONOCR3 activation_pool_duplicate_retirements=0
+LIGHTONOCR3 prefill_activation_pool=0 prefill_activation_pool_hits=0 prefill_activation_pool_hit_bytes=0
+LIGHTONOCR3 prepared_blocks=4824
+LIGHTONOCR3 wide_projection_tiles=4272
+LIGHTONOCR3 prefill_pack_calls=8400 prefill_pack_reuse_hits=8274
+LIGHTONOCR3 decode_pack_calls=0 decode_pack_reuse_hits=0
+LIGHTONOCR3 vision_pack_calls=1536 vision_pack_reuse_hits=1408
+LIGHTONOCR3 mpp_planned_calls=7584 mpp_dedicated_calls=2384
+LIGHTONOCR3 attention_batch_calls=1800 attention_batch_rows=11568
+LIGHTONOCR3 attention_batch_kernel_calls=1800
+LIGHTONOCR3 stream_forward_splits=0 stream_first_layers=0
+LIGHTONOCR3 prefill_stream_layers=0 prefill_stream_splits=0
+LIGHTONOCR3 prefill_fused_ffn_calls=0
+LIGHTONOCR3 shared_core_weight_hits=1440 shared_core_weight_misses=96 shared_core_weight_bytes=3164160
+LIGHTONOCR3 wide_mpp_projections=3480
+LIGHTONOCR3 wide_mpp_heads=70
+LIGHTONOCR3 wide_gate_up_calls=0
+LIGHTONOCR3 full64_gate_up_calls=0
+LIGHTONOCR3 wide_recurrent_dispatches=0 wide_recurrent_lifetime_max_rows=0 wide_recurrent_staged_bytes=0
+LIGHTONOCR3 batch_argmax_calls=225
+LIGHTONOCR3 batch_argmax_rows=1470
+LIGHTONOCR3 vision_workspace_cache=1
+LIGHTONOCR3 vision_workspace_allocations=3
+LIGHTONOCR3 vision_workspace_reuses=125
+LIGHTONOCR3 vision_workspace_bytes=16515072
+LIGHTONOCR3 large_vision_pack_calls=0
+LIGHTONOCR3 large_vision_pack_reuse_hits=0
+LIGHTONOCR3 resident_vision_budget=1
+LIGHTONOCR3 vision_late_seal=0
+LIGHTONOCR3 prefill_late_seal=0
+LIGHTONOCR3 queued_phase_priority=0
+LIGHTONOCR3 standalone_wide_heads=0
+LIGHTONOCR3 gpu_token_burst_enabled=1 gpu_token_burst_steps=50 gpu_token_burst_topology_mismatches=0
+LIGHTONOCR3 gpu_token_burst_extra_steps=150 gpu_token_burst_extra_rows=975 gpu_token_burst_max_width=4
+LIGHTONOCR3 single_frame_steps=1 single_frame_topology_mismatches=0
+LIGHTONOCR3 gpu_greedy_stream_steps=0
+LIGHTONOCR3 gpu_greedy_stream_two_frame_steps=0
+LIGHTONOCR3 gpu_greedy_stream_topology_mismatches=0
+LIGHTONOCR3 gpu_greedy_stream_multi_frame_steps=0
+LIGHTONOCR3 gpu_greedy_stream_frame_submits=0
+LIGHTONOCR3 token_encoder_scope_steps=201
+LIGHTONOCR3 vision_encoder_scope_opens=384 prefill_encoder_scope_opens=1344
+LIGHTONOCR3 frame_policy_snapshots=775
+LIGHTONOCR3 runtime_frames=437 frame_gpu_ns=17943721827 frame_wait_ns=18191153000
+LIGHTONOCR3 execution_gate_wait_ns=1000000
+LIGHTONOCR3 kv_storage_layers=8 model_layers=32
+LIGHTONOCR3 registered_window_peak=16 physical_rows_limit=64
+LIGHTONOCR3 cohort_items=16 decode_steps=93 batched_steps=53 singleton_steps=18 decode_items=471
+LIGHTONOCR3 auxiliary_release_after_backend=1
+LIGHTONOCR3 shared_vision_peak_bytes=1074511872 peak_segments=2
+LIGHTONOCR3 shared_vision_host_peak_bytes=83607552 peak_segments=2
+LIGHTONOCR3 shared_decoder_scratch=1 shared_decoder_peak_bytes=536870912 peak_segments=2
+LIGHTONOCR3 prefill_host_scratch_acquisitions=0 prefill_host_scratch_releases=0 prefill_host_scratch_peak_bytes=0
+LIGHTONOCR3 decoder_scratch_release_after_backend=1
+OCR_MEMORY round=0 phase=after tensor_live_bytes=0 owned_buffer_live_bytes=349353144 alias_buffer_live_bytes=2048000000
+OCR_CPU round=0 process_cpu_ms=2347
+OCR_CONCURRENCY concurrency=16 requests=16 pages_per_request=1 completed=16 elapsed_ms=19496 pages_per_second=0.8207 p50_ms=14809 p95_ms=19496 native_items=16 parity=true
+metal_ocr_weight_residency: sets=20 allocations=0 peak_bytes=9068085248 current_bytes=0 released=1
+OK
+1 selected; 1 passed; 0 skipped.

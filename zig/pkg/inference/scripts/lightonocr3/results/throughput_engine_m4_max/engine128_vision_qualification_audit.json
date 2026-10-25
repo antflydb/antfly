@@ -1,0 +1,276 @@
+{
+  "created_at": "2026-10-25T14:06:31.566613+00:00",
+  "status": "numerical_pass_mixed_small_gains_not_promoted",
+  "scope": "Private installed MLX Steel attention adaptation with FP16 Q/K/V and F32 score/probability/accumulation/output. Twelve full-output CPU/reference/producer/canary cases perplan pass. Five tileplans, mixed small isolated gains; no nonfinite certification yet and no production integration.",
+  "primary_throughput_eligible": false,
+  "provenance": "Post-run audit of closed private experiments, not a preregistration.",
+  "files": {
+    ".venv-lighton-vllm-metal/engine128_vision_probe": "25a7c0adc6fd637c36ba8eb48354d95f349589e8244c6277a446852ea4057da2",
+    ".venv-lighton-vllm-metal/engine128_vision_probe.m": "015ba0b11d9c608d66e4869a84fd737c8ff55a75a9d50f22063a2284872126e8",
+    ".venv-lighton-vllm-metal/engine128_vision_kernels.m": "c2d08cb3a38be29e741117367883b160a878977fa25d5039bf563b9da6feb9de",
+    ".venv-lighton-vllm-metal/engine128_plans.json": "6131b3bcf9aa055322c3872062ccdc51a7b8a8a790a7f0d7fe1bf06d36f9e31f",
+    ".venv-lighton-vllm-metal/engine128_MLX_LICENSE": "ccfab7ccb2ea306f71531c8ca77bb55507606cd90768b1e32b8b52ab5b48cf01",
+    ".venv-lighton-vllm-metal/engine128_q32k32s4.metal": "291e5e411a4d0ffb5f70ee44c38a9fb6d32e46ba3790c6cbe747e25104abe338",
+    ".venv-lighton-vllm-metal/engine128_q16k64s2.metal": "7a1062c4f733885a816c030951228e8d239776b8d16536c2da7df93cd7d00858",
+    ".venv-lighton-vllm-metal/engine128_q32k128s4.metal": "b2a91506f7459526763cff0b1a7c55dc8f6afec090a23f2ccbeaec95bb13e41e",
+    ".venv-lighton-vllm-metal/engine128_upstream_sources.json": "6add7203ecef9c86d1568865f214e39dcca0b94dae04f41c1053096052c337b0",
+    ".venv-lighton-vllm-metal/engine128_vision_checks.m": "f209a5a8c9df19bf06a36c1c2e08fdb3feb9a9d46b80625b713a862e7454a76b",
+    ".venv-lighton-vllm-metal/engine128_q64k64s8.metal": "8ef8e0405c75da061b89015c4ed4735622af897ecd36b5b87cee8bec2d2dda5f",
+    ".venv-lighton-vllm-metal/engine128_q32k64s4.metal": "ae577e5b28268b673777aa7d2a5840cbe1878507cccc12d6de7f6e12efff6390",
+    ".venv-lighton-vllm-metal/prepare_engine128_steel_attention.py": "2f82ba3a52987fcdc76aedbb2f0bcce83fa99da744e797ef358ee4c95b8355ff",
+    "/private/tmp/ocr-engine128-vision-build.txt": "5ec0bd64286eb9d934a7ba64b3b764386410983c60d8b71c41d1d2a389b80c5e",
+    "/private/tmp/ocr-engine128-vision-stdout.txt": "3f98d39a371f12fa2356f2be4057ff4cb4fb6e3cd50d1c44261f0c255989e420",
+    "/private/tmp/ocr-engine128-vision-stderr.txt": "b602b23d7f28ad26f5944edee90c90e48d30a845bdf680c21b41cca0547a6602"
+  },
+  "timing_record_count": 720,
+  "baseline_over_candidate_gpu_ratios": [
+    {
+      "id": "q16k64s2",
+      "seq": 1672,
+      "heads": 12,
+      "ratio": 0.9755642403045353,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q16k64s2",
+      "seq": 1672,
+      "heads": 16,
+      "ratio": 0.9637796367598047,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q16k64s2",
+      "seq": 2160,
+      "heads": 12,
+      "ratio": 0.9326591030825337,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q16k64s2",
+      "seq": 2160,
+      "heads": 16,
+      "ratio": 0.9360008116614064,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q16k64s2",
+      "seq": 2592,
+      "heads": 12,
+      "ratio": 0.95314392952093,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q16k64s2",
+      "seq": 2592,
+      "heads": 16,
+      "ratio": 0.9563469251479453,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q32k128s4",
+      "seq": 1672,
+      "heads": 12,
+      "ratio": 0.9572726933127245,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q32k128s4",
+      "seq": 1672,
+      "heads": 16,
+      "ratio": 0.8941747323644844,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q32k128s4",
+      "seq": 2160,
+      "heads": 12,
+      "ratio": 0.9073308367800368,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q32k128s4",
+      "seq": 2160,
+      "heads": 16,
+      "ratio": 0.9052274059776773,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q32k128s4",
+      "seq": 2592,
+      "heads": 12,
+      "ratio": 0.8978985109717867,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q32k128s4",
+      "seq": 2592,
+      "heads": 16,
+      "ratio": 0.9159741475357422,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q32k32s4",
+      "seq": 1672,
+      "heads": 12,
+      "ratio": 0.9950980537143679,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q32k32s4",
+      "seq": 1672,
+      "heads": 16,
+      "ratio": 1.0856572503293436,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q32k32s4",
+      "seq": 2160,
+      "heads": 12,
+      "ratio": 1.0331767365624822,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q32k32s4",
+      "seq": 2160,
+      "heads": 16,
+      "ratio": 1.0531762029533855,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q32k32s4",
+      "seq": 2592,
+      "heads": 12,
+      "ratio": 1.078762810961008,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q32k32s4",
+      "seq": 2592,
+      "heads": 16,
+      "ratio": 1.0787681077594022,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q32k64s4",
+      "seq": 1672,
+      "heads": 12,
+      "ratio": 0.9393927221926851,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q32k64s4",
+      "seq": 1672,
+      "heads": 16,
+      "ratio": 1.0226086106424086,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q32k64s4",
+      "seq": 2160,
+      "heads": 12,
+      "ratio": 1.0442588488784943,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q32k64s4",
+      "seq": 2160,
+      "heads": 16,
+      "ratio": 1.0055805456099876,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q32k64s4",
+      "seq": 2592,
+      "heads": 12,
+      "ratio": 1.033905962915303,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q32k64s4",
+      "seq": 2592,
+      "heads": 16,
+      "ratio": 1.0179445940541978,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q64k64s8",
+      "seq": 1672,
+      "heads": 12,
+      "ratio": 0.9741310544093905,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q64k64s8",
+      "seq": 1672,
+      "heads": 16,
+      "ratio": 1.0091285746219387,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q64k64s8",
+      "seq": 2160,
+      "heads": 12,
+      "ratio": 1.0093670628278368,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q64k64s8",
+      "seq": 2160,
+      "heads": 16,
+      "ratio": 1.0014814187198902,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q64k64s8",
+      "seq": 2592,
+      "heads": 12,
+      "ratio": 0.9948741438253332,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "id": "q64k64s8",
+      "seq": 2592,
+      "heads": 16,
+      "ratio": 1.0211431219717717,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    }
+  ],
+  "full_pass_markers": [
+    "VISION128 FULL OUTPUT CPU GUARDS PASS id=q32k32s4",
+    "VISION128 FULL OUTPUT CPU GUARDS PASS id=q32k64s4",
+    "VISION128 FULL OUTPUT CPU GUARDS PASS id=q32k128s4",
+    "VISION128 FULL OUTPUT CPU GUARDS PASS id=q64k64s8",
+    "VISION128 FULL OUTPUT CPU GUARDS PASS id=q16k64s2"
+  ],
+  "max_reported_abs_error": 6.87782e-06
+}

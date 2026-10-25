@@ -94,6 +94,7 @@ def run(args, model, label, mode, concurrency, output):
             "ANTFLY_LIGHTONOCR3_DISABLE_SHARED_VISION_PEAK",
             "ANTFLY_LIGHTONOCR3_PREFILL_BATCH",
             "ANTFLY_LIGHTONOCR3_PACKED_MIXED",
+            "ANTFLY_LIGHTONOCR3_PACKED_SHARED_FRAME",
             "ANTFLY_LIGHTONOCR3_PACKED_PREFILL_ITEMS",
             "ANTFLY_LIGHTONOCR3_PREFILL_ACTIVATION_POOL",
             "ANTFLY_LIGHTONOCR3_VISION_WAIT_US",
@@ -120,7 +121,16 @@ def run(args, model, label, mode, concurrency, output):
         ):
             del env[key]
     env["ANTFLY_LIGHTONOCR3_PACKED_MIXED"] = "1" if args.packed_mixed else "0"
+    env["ANTFLY_LIGHTONOCR3_PACKED_SHARED_FRAME"] = (
+        "1" if args.packed_shared_frame else "0"
+    )
+    if args.packed_shared_frame:
+        env["ANTFLY_LIGHTONOCR3_SINGLE_FRAME"] = "1"
+        env["ANTFLY_LIGHTONOCR3_STREAM_FIRST_LAYERS"] = "0"
     env["ANTFLY_LIGHTONOCR3_PACKED_PREFILL_ITEMS"] = str(args.packed_prefill_items)
+    env["ANTFLY_LIGHTONOCR3_PREFILL_QUERY_CHUNK_ROWS"] = str(
+        args.prepared_prefill_chunk_rows
+    )
     env["ANTFLY_LIGHTONOCR3_PREFILL_ACTIVATION_POOL"] = (
         "1" if args.prefill_activation_pool else "0"
     )
@@ -423,7 +433,9 @@ def run(args, model, label, mode, concurrency, output):
     result = {
         "model": label,
         "packed_mixed_requested": args.packed_mixed,
+        "packed_shared_frame_requested": args.packed_shared_frame,
         "packed_prefill_items": args.packed_prefill_items,
+        "prepared_prefill_chunk_rows": args.prepared_prefill_chunk_rows,
         "mode": mode,
         "concurrency": concurrency,
         "log": path.name,
@@ -459,6 +471,23 @@ def run(args, model, label, mode, concurrency, output):
         )
         if args.require_packed_mixed and not result["mixed_steps_including_warmup"]:
             result["status"] = "missing_actual_packed_mixed_steps"
+
+        shared_submits = [
+            int(submits)
+            for enabled, submits in re.findall(
+                r"LIGHTONOCR3 packed_shared_frame=(\d+) packed_forward_submissions=(\d+)",
+                text,
+            )
+            if int(enabled)
+        ]
+        result["packed_shared_frame_steps_including_warmup"] = len(shared_submits)
+        result["packed_shared_frame_topology_mismatches_including_warmup"] = sum(
+            submits != 1 for submits in shared_submits
+        )
+        if args.require_packed_shared_frame and (
+            not shared_submits or any(submits != 1 for submits in shared_submits)
+        ):
+            result["status"] = "missing_single_frame_packed_forwards"
 
         if args.policy_rounds:
             samples = [
@@ -526,9 +555,57 @@ def run(args, model, label, mode, concurrency, output):
                         or not sample["wide_recurrent_staged_bytes"]
                     ):
                         result["status"] = "missing_timed_wide_recurrent_steps"
-                    sample["packed_prefill_pages"] = sum(
+                    short_prefill = re.findall(
+                        r"LIGHTONOCR3 short_prefill_core_dispatches=(\d+) short_direct_attention_dispatches=(\d+)",
+                        section,
+                    )
+                    sample["short_prefill_core_dispatches"] = sum(
+                        int(core) for core, _ in short_prefill
+                    )
+                    sample["short_direct_attention_dispatches"] = sum(
+                        int(attention) for _, attention in short_prefill
+                    )
+                    sample["packed_prefill_chunks"] = sum(
                         int(prefill) for prefill, _, _ in packed_steps
                     )
+                    chunk_progress = [
+                        tuple(map(int, values))
+                        for values in re.findall(
+                            r"LIGHTONOCR3 packed_step_prefill_starts=(\d+) packed_step_prefill_finishes=(\d+) prepared_prefill_chunk_rows=(\d+)",
+                            section,
+                        )
+                    ]
+                    sample["packed_prefill_pages"] = (
+                        sum(finishes for _, finishes, _ in chunk_progress)
+                        if chunk_progress
+                        else sample["packed_prefill_chunks"]
+                    )
+                    sample["packed_prefill_starts"] = (
+                        sum(starts for starts, _, _ in chunk_progress)
+                        if chunk_progress
+                        else sample["packed_prefill_chunks"]
+                    )
+                    sample["prepared_prefill_chunk_rows"] = (
+                        args.prepared_prefill_chunk_rows
+                    )
+                    if chunk_progress and (
+                        len(chunk_progress) != len(packed_steps)
+                        or any(
+                            rows != args.prepared_prefill_chunk_rows
+                            for _, _, rows in chunk_progress
+                        )
+                    ):
+                        result["status"] = (
+                            "inconsistent_prepared_prefill_chunk_progress"
+                        )
+                    if args.require_prepared_prefill_chunks and (
+                        not chunk_progress
+                        or sample["packed_prefill_pages"] != args.requests
+                        or sample["packed_prefill_starts"] != args.requests
+                        or sample["packed_prefill_chunks"]
+                        <= sample["packed_prefill_pages"]
+                    ):
+                        result["status"] = "missing_actual_prepared_prefill_chunks"
                     sample["packed_prefill_max_items"] = max(
                         (int(prefill) for prefill, _, _ in packed_steps), default=0
                     )
@@ -562,6 +639,25 @@ def run(args, model, label, mode, concurrency, output):
                     sample["packed_attention_rows"] = sum(
                         int(rows) for _, rows in attention_groups
                     )
+                    shared_frames = [
+                        (int(enabled), int(submits))
+                        for enabled, submits in re.findall(
+                            r"LIGHTONOCR3 packed_shared_frame=(\d+) packed_forward_submissions=(\d+)",
+                            section,
+                        )
+                        if int(enabled)
+                    ]
+                    sample["packed_shared_frame_steps"] = len(shared_frames)
+                    # This counter counts decoder-runtime frames. Prefix CPU
+                    # readback may still require a separate staging blit.
+                    sample["packed_shared_frame_topology_mismatches"] = sum(
+                        submits != 1 for _, submits in shared_frames
+                    )
+                    if args.require_packed_shared_frame and (
+                        not shared_frames
+                        or sample["packed_shared_frame_topology_mismatches"]
+                    ):
+                        result["status"] = "missing_single_frame_packed_forwards"
                     if args.require_packed_mixed and (
                         not sample["mixed_steps"]
                         or not sample["packed_recurrent_groups"]
@@ -1009,6 +1105,15 @@ def run(args, model, label, mode, concurrency, output):
         ]
     elif "ResourceLimitExceeded" in text or "MemoryAdmissionDenied" in text:
         result["status"] = "resource_limit"
+    if (
+        result["status"] == "ok"
+        and args.require_packed_shared_frame
+        and (
+            not result.get("packed_shared_frame_steps_including_warmup")
+            or result.get("packed_shared_frame_topology_mismatches_including_warmup")
+        )
+    ):
+        result["status"] = "missing_single_frame_packed_forwards"
     return result
 
 
@@ -1162,6 +1267,13 @@ def main():
     parser.add_argument("--disable-shared-vision-peak", action="store_true")
     parser.add_argument("--prefill-batch", action="store_true")
     parser.add_argument(
+        "--prepared-prefill-chunk-rows",
+        type=int,
+        default=0,
+        help="Split scheduled visual prefixes into bounded query chunks; 0 retains whole-prefix prefill",
+    )
+    parser.add_argument("--require-prepared-prefill-chunks", action="store_true")
+    parser.add_argument(
         "--packed-mixed",
         action="store_true",
         help="Opt in to one packed Qwen prefill plus queued decode rows",
@@ -1171,6 +1283,12 @@ def main():
         action="store_true",
         help="Require observed steps containing both prefill and decode work",
     )
+    parser.add_argument(
+        "--packed-shared-frame",
+        action="store_true",
+        help="Borrow one decoder frame across packed input, model and F32 output head",
+    )
+    parser.add_argument("--require-packed-shared-frame", action="store_true")
     parser.add_argument("--prefill-batch-items", type=int, default=4)
     parser.add_argument(
         "--packed-prefill-items",
@@ -1361,10 +1479,30 @@ def main():
         parser.error(
             "--prefill-stream-layers requires continuous GPU recurrent state, shared scratch and single-page prefill"
         )
+    if args.prepared_prefill_chunk_rows and (
+        not args.packed_mixed or not 64 <= args.prepared_prefill_chunk_rows <= 1024
+    ):
+        parser.error(
+            "--prepared-prefill-chunk-rows must be64..1024 and requires --packed-mixed"
+        )
+    if args.require_prepared_prefill_chunks and not args.prepared_prefill_chunk_rows:
+        parser.error(
+            "--require-prepared-prefill-chunks requires --prepared-prefill-chunk-rows"
+        )
     if not 1 <= args.packed_prefill_items <= 8 or (
         args.packed_prefill_items != 1 and not args.packed_mixed
     ):
         parser.error("--packed-prefill-items must be 1..8 and requires --packed-mixed")
+    if args.packed_shared_frame and (
+        not args.packed_mixed
+        or args.prefill_activation_pool
+        or args.prefill_stream_layers
+    ):
+        parser.error(
+            "--packed-shared-frame requires --packed-mixed and unsplit frames without the retained prefill pool"
+        )
+    if args.require_packed_shared_frame and not args.packed_shared_frame:
+        parser.error("--require-packed-shared-frame requires --packed-shared-frame")
     if args.require_packed_mixed and not args.packed_mixed:
         parser.error("--require-packed-mixed requires --packed-mixed")
     if args.packed_mixed and (

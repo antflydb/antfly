@@ -1,0 +1,8 @@
+attention_batch rows=2 heads=8 max_abs=0 cpu_max_abs=5.93798e-06 canonical_gpu_us=47.33 batch_gpu_us=735.00
+attention_batch rows=4 heads=8 max_abs=0 cpu_max_abs=5.93798e-06 canonical_gpu_us=97.37 batch_gpu_us=1337.38
+attention_batch rows=8 heads=8 max_abs=0 cpu_max_abs=9.23387e-06 canonical_gpu_us=191.00 batch_gpu_us=2692.00
+attention_batch rows=16 heads=8 max_abs=0 cpu_max_abs=9.23387e-06 canonical_gpu_us=476.67 batch_gpu_us=5544.50
+attention_batch rows=2 heads=16 max_abs=0 cpu_max_abs=6.50993e-06 canonical_gpu_us=109.25 batch_gpu_us=747.21
+attention_batch rows=4 heads=16 max_abs=0 cpu_max_abs=6.50993e-06 canonical_gpu_us=167.04 batch_gpu_us=1379.21
+attention_batch rows=8 heads=16 max_abs=0 cpu_max_abs=6.50993e-06 canonical_gpu_us=198.21 batch_gpu_us=2830.92
+attention_batch rows=16 heads=16 max_abs=0 cpu_max_abs=9.3206e-06 canonical_gpu_us=394.25 batch_gpu_us=5737.00

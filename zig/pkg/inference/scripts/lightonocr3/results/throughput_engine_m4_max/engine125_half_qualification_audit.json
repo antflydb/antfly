@@ -1,0 +1,1103 @@
+{
+  "created_at": "2026-10-25T14:04:40.532047+00:00",
+  "status": "gemm_tied_not_promoted",
+  "scope": "Isolated original MPP32x64 geometry BF16 versus half synthetic representable operands, F32 outputs. All full outputs finite and canaries pass, but not bit identical. Not production or end-to-end evidence.",
+  "primary_throughput_eligible": false,
+  "files": {
+    ".venv-lighton-vllm-metal/engine125_half_gemm.metal": "56a3b649d6c6045615b5cc34e285deccc08605b00966a83a8bb88ea39488f8d4",
+    ".venv-lighton-vllm-metal/engine125_half_gemm_probe": "805634eba288b10bd014a73549cf261ae1a170c4374501139b4e97d2351c7165",
+    ".venv-lighton-vllm-metal/engine125_half_gemm_probe.m": "77d22a5acf465576135f16b2c275611a6920af11406f150407fabcd2b3aae617",
+    "/private/tmp/ocr-engine125-half-build.txt": "8c185a0404c3ad48663169f2713ed77edf57094ee9922a5ed157edaeea80e8b0",
+    "/private/tmp/ocr-engine125-half-stdout.txt": "f78d28f980b45017b9dbb38703a5b2efc34f112c25119bc4273ace613f385e66",
+    "/private/tmp/ocr-engine125-half-stderr.txt": "2d58f12940f686ffbf2094ad6164f1f1b7d71e52ce55a6bfd17f185c98f5ac3c"
+  },
+  "records": [
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 0,
+      "trial": 4,
+      "gpu_us": 1810.999995
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 1,
+      "trial": 4,
+      "gpu_us": 1801.08333
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 1,
+      "trial": 5,
+      "gpu_us": 1794.875017
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 0,
+      "trial": 5,
+      "gpu_us": 1799.874997
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 0,
+      "trial": 6,
+      "gpu_us": 1828.12498
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 1,
+      "trial": 6,
+      "gpu_us": 1795.375021
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 1,
+      "trial": 7,
+      "gpu_us": 1799.624995
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 0,
+      "trial": 7,
+      "gpu_us": 1811.708324
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 0,
+      "trial": 8,
+      "gpu_us": 1818.12502
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 1,
+      "trial": 8,
+      "gpu_us": 1805.749955
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 1,
+      "trial": 9,
+      "gpu_us": 1809.249981
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 0,
+      "trial": 9,
+      "gpu_us": 1812.916656
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 0,
+      "trial": 10,
+      "gpu_us": 1798.249956
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 1,
+      "trial": 10,
+      "gpu_us": 1807.124994
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 1,
+      "trial": 11,
+      "gpu_us": 1809.333335
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 0,
+      "trial": 11,
+      "gpu_us": 1801.666687
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 0,
+      "trial": 12,
+      "gpu_us": 1803.708379
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 1,
+      "trial": 12,
+      "gpu_us": 1813.124982
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 1,
+      "trial": 13,
+      "gpu_us": 1797.49995
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 0,
+      "trial": 13,
+      "gpu_us": 1813.958341
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 0,
+      "trial": 14,
+      "gpu_us": 1815.541706
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 1,
+      "trial": 14,
+      "gpu_us": 1820.500009
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 1,
+      "trial": 15,
+      "gpu_us": 1824.499981
+    },
+    {
+      "case": 0,
+      "rows": 432,
+      "in": 2560,
+      "out": 9216,
+      "half": 0,
+      "trial": 15,
+      "gpu_us": 1809.95831
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 0,
+      "trial": 4,
+      "gpu_us": 1911.916654
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 1,
+      "trial": 4,
+      "gpu_us": 1908.875012
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 1,
+      "trial": 5,
+      "gpu_us": 1912.416657
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 0,
+      "trial": 5,
+      "gpu_us": 1916.375011
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 0,
+      "trial": 6,
+      "gpu_us": 1913.374988
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 1,
+      "trial": 6,
+      "gpu_us": 1913.000015
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 1,
+      "trial": 7,
+      "gpu_us": 1910.791674
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 0,
+      "trial": 7,
+      "gpu_us": 1914.124994
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 0,
+      "trial": 8,
+      "gpu_us": 1916.250039
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 1,
+      "trial": 8,
+      "gpu_us": 1911.875035
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 1,
+      "trial": 9,
+      "gpu_us": 1906.208287
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 0,
+      "trial": 9,
+      "gpu_us": 1915.375004
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 0,
+      "trial": 10,
+      "gpu_us": 1913.374988
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 1,
+      "trial": 10,
+      "gpu_us": 1909.249986
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 1,
+      "trial": 11,
+      "gpu_us": 1912.541629
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 0,
+      "trial": 11,
+      "gpu_us": 1915.333327
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 0,
+      "trial": 12,
+      "gpu_us": 1923.375006
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 1,
+      "trial": 12,
+      "gpu_us": 1907.124999
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 1,
+      "trial": 13,
+      "gpu_us": 1907.79171
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 0,
+      "trial": 13,
+      "gpu_us": 1916.999987
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 0,
+      "trial": 14,
+      "gpu_us": 1911.874977
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 1,
+      "trial": 14,
+      "gpu_us": 1911.500003
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 1,
+      "trial": 15,
+      "gpu_us": 1910.541614
+    },
+    {
+      "case": 1,
+      "rows": 432,
+      "in": 9216,
+      "out": 2560,
+      "half": 0,
+      "trial": 15,
+      "gpu_us": 1915.875007
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 0,
+      "trial": 4,
+      "gpu_us": 1536.041673
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 1,
+      "trial": 4,
+      "gpu_us": 1532.250026
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 1,
+      "trial": 5,
+      "gpu_us": 1533.499977
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 0,
+      "trial": 5,
+      "gpu_us": 1538.624987
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 0,
+      "trial": 6,
+      "gpu_us": 1535.999996
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 1,
+      "trial": 6,
+      "gpu_us": 1532.791648
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 1,
+      "trial": 7,
+      "gpu_us": 1532.625
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 0,
+      "trial": 7,
+      "gpu_us": 1537.500008
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 0,
+      "trial": 8,
+      "gpu_us": 1535.541669
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 1,
+      "trial": 8,
+      "gpu_us": 1538.208337
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 1,
+      "trial": 9,
+      "gpu_us": 1534.70831
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 0,
+      "trial": 9,
+      "gpu_us": 1536.874974
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 0,
+      "trial": 10,
+      "gpu_us": 1537.041622
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 1,
+      "trial": 10,
+      "gpu_us": 1533.458359
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 1,
+      "trial": 11,
+      "gpu_us": 1531.624992
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 0,
+      "trial": 11,
+      "gpu_us": 1539.124991
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 0,
+      "trial": 12,
+      "gpu_us": 1538.500015
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 1,
+      "trial": 12,
+      "gpu_us": 1532.124996
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 1,
+      "trial": 13,
+      "gpu_us": 1533.125003
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 0,
+      "trial": 13,
+      "gpu_us": 1537.958335
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 0,
+      "trial": 14,
+      "gpu_us": 1538.416662
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 1,
+      "trial": 14,
+      "gpu_us": 1532.874943
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 1,
+      "trial": 15,
+      "gpu_us": 1532.208349
+    },
+    {
+      "case": 2,
+      "rows": 2160,
+      "in": 1024,
+      "out": 4096,
+      "half": 0,
+      "trial": 15,
+      "gpu_us": 1536.041673
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 0,
+      "trial": 4,
+      "gpu_us": 1570.374996
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 1,
+      "trial": 4,
+      "gpu_us": 1565.625018
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 1,
+      "trial": 5,
+      "gpu_us": 1565.124956
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 0,
+      "trial": 5,
+      "gpu_us": 1567.500003
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 0,
+      "trial": 6,
+      "gpu_us": 1567.333296
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 1,
+      "trial": 6,
+      "gpu_us": 1566.541672
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 1,
+      "trial": 7,
+      "gpu_us": 1565.541665
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 0,
+      "trial": 7,
+      "gpu_us": 1565.833343
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 0,
+      "trial": 8,
+      "gpu_us": 1565.208309
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 1,
+      "trial": 8,
+      "gpu_us": 1562.874997
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 1,
+      "trial": 9,
+      "gpu_us": 1565.666695
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 0,
+      "trial": 9,
+      "gpu_us": 1568.250009
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 0,
+      "trial": 10,
+      "gpu_us": 1564.000035
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 1,
+      "trial": 10,
+      "gpu_us": 1562.208286
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 1,
+      "trial": 11,
+      "gpu_us": 1565.333339
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 0,
+      "trial": 11,
+      "gpu_us": 1565.124956
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 0,
+      "trial": 12,
+      "gpu_us": 1565.958373
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 1,
+      "trial": 12,
+      "gpu_us": 1565.291663
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 1,
+      "trial": 13,
+      "gpu_us": 1566.666644
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 0,
+      "trial": 13,
+      "gpu_us": 1565.74999
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 0,
+      "trial": 14,
+      "gpu_us": 1567.625033
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 1,
+      "trial": 14,
+      "gpu_us": 1565.249986
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 1,
+      "trial": 15,
+      "gpu_us": 1564.249978
+    },
+    {
+      "case": 3,
+      "rows": 2160,
+      "in": 4096,
+      "out": 1024,
+      "half": 0,
+      "trial": 15,
+      "gpu_us": 1566.749997
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 0,
+      "trial": 4,
+      "gpu_us": 675.833318
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 1,
+      "trial": 4,
+      "gpu_us": 676.374999
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 1,
+      "trial": 5,
+      "gpu_us": 604.083296
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 0,
+      "trial": 5,
+      "gpu_us": 598.583312
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 0,
+      "trial": 6,
+      "gpu_us": 587.541668
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 1,
+      "trial": 6,
+      "gpu_us": 592.625001
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 1,
+      "trial": 7,
+      "gpu_us": 590.416661
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 0,
+      "trial": 7,
+      "gpu_us": 587.958319
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 0,
+      "trial": 8,
+      "gpu_us": 399.333308
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 1,
+      "trial": 8,
+      "gpu_us": 394.291652
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 1,
+      "trial": 9,
+      "gpu_us": 394.499977
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 0,
+      "trial": 9,
+      "gpu_us": 400.666671
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 0,
+      "trial": 10,
+      "gpu_us": 397.91665
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 1,
+      "trial": 10,
+      "gpu_us": 394.249975
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 1,
+      "trial": 11,
+      "gpu_us": 394.208299
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 0,
+      "trial": 11,
+      "gpu_us": 397.249998
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 0,
+      "trial": 12,
+      "gpu_us": 398.624979
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 1,
+      "trial": 12,
+      "gpu_us": 395.125011
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 1,
+      "trial": 13,
+      "gpu_us": 394.125003
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 0,
+      "trial": 13,
+      "gpu_us": 397.5
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 0,
+      "trial": 14,
+      "gpu_us": 398.000004
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 1,
+      "trial": 14,
+      "gpu_us": 393.875001
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 1,
+      "trial": 15,
+      "gpu_us": 394.16668
+    },
+    {
+      "case": 4,
+      "rows": 2160,
+      "in": 1024,
+      "out": 1024,
+      "half": 0,
+      "trial": 15,
+      "gpu_us": 398.125034
+    }
+  ],
+  "ratios": {
+    "0": 1.0027217576414378,
+    "1": 1.0024533434519936,
+    "2": 1.0028949785426942,
+    "3": 1.0006654798957617,
+    "4": 1.011621140061566
+  }
+}

@@ -1,15 +1,106 @@
 # OCR execution engine experiments on M4 Max
 
-Work in progress following `3e21b5a5636ef8a45328a2b1e805108277c7b304`.
-These measurements do not yet establish sustained parity with vLLM.
+The selected source180 profiles pass repeated same-host serving comparisons on
+Wolfspider: an M4 Max with 32 GPU cores and 36 GiB RAM. Both LightOn sizes beat
+actual vLLM Metal; Florence beats the explicitly separate MLX-VLM proxy.
+Historical failed, partial and unselected experiments remain below with their
+original reports.
 
 ## Current comparison status
 
-| Model | Last repeated matched comparison (native / reference pages/s) | Scope |
+| Model | Native pages/s, timed rounds 1 / 2 | Reference pages/s, opening / closing | Native lead |
+| --- | ---: | ---: | ---: |
+| LightOn 0.8B | 4.7253 / 4.7356 | Actual vLLM: 4.102017 / 4.097098 | 15.2% / 15.6% |
+| LightOn 4B | 1.2098 / 1.2111 | Actual vLLM: 1.151670 / 1.151824 | 5.0% / 5.1% |
+| Florence-2 | 5.3085 / 5.3058 | MLX-VLM proxy: 5.137912 / 5.130646 | 3.3% / 3.4% |
+
+Each LightOn native process excludes 256 saturation warmup requests, then runs
+two timed 256-request rounds with the same resident model. Each API reference
+excludes 256 warmup requests before 256 timed requests. Opening references reuse
+the preceding completed same-host closing reference; intervening setup and
+qualification are outside timing. Profiles are fixed before candidate timing;
+new closing API processes verify both comparison orders. Florence uses 128
+warmup requests and 128 requests per timed round.
+
+Every LightOn output matches its native serial reference, and full fixture
+strings match both API references. Florence preserves full native strings and
+uses whitespace-normalized cross-runtime content. Native Florence uses the
+publisher Q4_K decoder/F16 encoder and no-repeat trigrams; its MLX proxy uses
+original FP16/default greedy and a serial batch. Installed vLLM Metal has no
+Florence adapter. Native Node.read and API loopback HTTP differ in transport.
+Three synthetic fixtures establish consistency, not broad OCR accuracy.
+
+## Selected implementation and settings
+
+Packed steps share one decoder frame across input production, the model,
+last-row gathers and the F32 head. Prefix CPU readback can still require a
+separate staging blit. Every mixed forward in all selected warm/timed rounds
+records exactly one decoder-runtime frame. Returning host logits/token choices
+also removes an unused escaping-GPU-hidden allowance from packed page
+admission. Full projected inputs, KV, recurrent histories and both complete
+shared transient sets remain charged. All 64 pages admit without pressure;
+operator caps and the 6 GiB reserve plus 512 MiB cushion are preserved.
+
+| Setting | LightOn 0.8B | LightOn 4B |
 | --- | --- | --- |
-| LightOn 0.8B | 3.9485 / 3.2603; reverse 3.5592 / 3.4840 | Engine85 paired72: actual vLLM API, 21.1% and 2.2% leads. |
-| LightOn 4B | 1.0977 / 1.0371; reverse 1.0767 / 1.0896 | Engine102 paired86: warmed actual vLLM API, +5.8% and −1.2%. No repeated win. |
-| Florence-2 | 4.5697 / 4.1840; reverse 4.7283 / 4.3067 | Engine85 paired72: MLX-VLM proxy leads of 9.2% and 9.8%, different weights/decoding, normalized content comparison. |
+| Concurrency / physical rows | 64 / 64 | 64 / 64 |
+| Packed prefills / query chunks | P1 / whole prefix | P1 / whole prefix |
+| Shared packed frame / wide recurrent groups | On / on | On / on |
+| Decode / eligible prefill operands | F32 / BF16 | F32 / BF16 |
+| Token burst width / layer streaming | 4 / off | 4 / off |
+| Vision frame blocks | 4 | 3 |
+| Retained prefill pool | Off | Off |
+| Backend / scratch / KV caps, GiB | 16 / 8 / 4 | 17 / 10 / 4 |
+| Combined / process caps, GiB | 28 / 24 | 28 / 24 |
+| API concurrency / context / utilization | 64 / 2048 / 0.6 | 64 / 1024 / 0.7 |
+
+The 0.8B profile retains its earlier matrix tile choices: disable the 64-row
+projection tile and leave the 4B-specific wide64/full64 gate-up options off.
+The 4B profile enables those options. Both use original BF16 checkpoint weights,
+F32 accumulation/recurrent state, shared side weights, GPU token handoff, CPU
+image preparation, encoder scopes and retained vision workspace. The general
+throughput preset alone uses sixteen physical rows; the retained drivers
+contain the complete explicit 64-page settings.
+
+The 4B change improves both earlier source158 native rounds (1.2051 / 1.2053).
+The modern 0.8B profile improves both independent legacy-profile rounds
+(4.4646 / 4.4433). The P8 chunk64/96/120 screen is slower than its whole-prefix
+controls, so chunking remains unselected. Larger retained pools, fused prefix
+recurrence and other slower variants are also unselected; isolated stage wins
+are not counted as whole-reader gains.
+
+Validation: 299 CPU tests pass (38 skips); the complete Wolfspider GPU replay
+passes 335 tests (six skips). C/Metal/header inputs match the fresh source158
+24-suite qualification, whose binaries were also replayed on Wolfspider.
+The first candidate replay's HTTP model-directory symlink failure and the
+subsequent checker-only log-path failure are preserved. A corrected checker
+reuses the hash-bound successful 335-test log, then validates all 64 full 4B
+outputs and one-frame mixed forwards. Public capacity tests pass seven cases;
+a saved-log parser check accepts all 763 real 4B mixed forwards and rejects a
+changed frame count and missing counters without running a model.
+
+- [Final cross-report, cache-capacity and archive validation](engine191_final_comparison_validation.json)
+- [Selected 0.8B comparison188](wolfspider_shared_frame/paired188_08_warmed_comparison_audit.json)
+- [Selected 4B comparison184](wolfspider_shared_frame/paired184_4b_warmed_comparison_audit.json)
+- [Florence proxy comparison186](wolfspider_shared_frame/paired186_florence_comparison_audit.json)
+- [Full GPU and C64 model/frame qualification](wolfspider_shared_frame/wolf184c_qualification_audit.json)
+- [Native source180 build identity](engine180_build_manifest.json) and [runtime patch](engine180_runtime.patch.gz)
+- [Exact remote drivers](wolfspider_shared_frame/drivers/manifest.json) and [qualification logs](wolfspider_shared_frame/qualification/manifest.json)
+
+Runtime snapshots bind base `451ea2bdd0b8717ec0e302f90ff6bac1de6a5bb0` plus the
+recorded patch and native binary
+`5473e5122f08b09b30220fe611e14f3be3b9ccda6ea6d8a3b40d0bc38dccc7b2`.
+New public Python benchmark options and documentation are separate from those
+compiled inputs; every frozen native input matches the qualified source180.
+Archives use deterministic gzip and raw-byte SHA-256 manifests. Full completed
+API logs retain automatic capacity at or above the 320-block floor. Prefix and
+processor caches are disabled; every API image has a unique media UUID.
+
+## Earlier experiments
+
+The following records began after `3e21b5a5636ef8a45328a2b1e805108277c7b304`.
+Their original pending/failed states describe those checkpoints, not the
+selected comparisons above.
 
 The newer source110 paired90 attempt loses against its opening warmed actual
 vLLM control: native timed rounds are 1.1020 and 1.1047 pages/s, versus
@@ -2000,3 +2091,192 @@ prefill frames include serial references and early mixed steps, while the
 first sixteen decode samples are serial reference frames rather than
 saturated batched decoding. Coarse prefill buckets split primarily between
 attention and FFN. Per-operator roofline reporting does not cover this model.
+
+### Closed private experiments 115–130 and warmed 4B comparison 132
+
+Compiled runtime 112 / reporting script 113 remained unchanged for these
+experiments. None of the private kernels below was promoted:
+
+- F32 chunked DeltaNet prefill (115) passed full output/state/history/canary
+  checks for 32 cases, but was about twice as slow. Pipeline-only probe 116
+  located its cost in the state stage. Half-operand variants 117/118 retained
+  F32 physical state and accumulation, explicitly changed operand precision,
+  passed the existing tolerance, and were slower again.
+- Eleven vision tiling/staging plans (120) passed full CPU/reference/canary
+  checks without a consistent gain. Five shared-storage/large-key plans (121)
+  passed; a sixth unsupported matrix shape failed compilation before dispatch.
+  Preparation-only compile exclusions 119/127 remain recorded separately.
+- Isolated fast exponential variants (122) passed ordinary and nonfinite Q/K
+  checks with explicit finite guards retained, generally improving attention
+  by only 2–4%. Five private MLX Steel attention plans (128, license retained)
+  passed ordinary full-output checks and gave mixed small stage gains. Neither
+  result establishes a whole-reader improvement.
+- Metal accepted all three tested unaligned original BF16 weight pointers
+  without copying (123); the alignment-copy hypothesis did not hold here.
+  FP16 MPP GEMM was essentially tied with BF16 (125), and MPS FP16 GEMM was
+  3–5% slower (130). These probes changed operand representation and were not
+  bit-identical; neither was integrated.
+
+Profiles 124/126/129 are diagnostic only. Frame 512 was past the entire first
+run; frame 300/301 still belonged to the serial oracle in the next run. Later
+frames reached batching but their coarse labels did not attribute FFNs. The
+per-encoder experiment dropped 14,624 intervals and left substantial GPU time
+unattributed. Its first-pipeline labels must not be read as a complete kernel
+breakdown. The interpretation audit preserves these limits.
+
+Paired comparison 132 used 256 excluded warm-up requests and 256 timed
+requests per fresh actual vLLM server; native used one excluded warm round and
+two timed rounds in one resident process. Automatic vLLM capacity was 448/440
+blocks, without overrides. Original native caps and reserve were retained.
+
+| Paired leg | Native pages/s | Actual vLLM pages/s | Native change |
+| --- | ---: | ---: | ---: |
+| Opening API → native timed 1 | 1.0875 | 1.111524 | −2.16% |
+| Native timed 2 → closing API | 1.1239 | 1.086877 | +3.41% |
+
+All 768 native outputs matched native serial references. An independent
+read-only audit also checks complete fixture strings against both API servers,
+beyond the public benchmark's normalized-content check. This is mixed parity,
+**not a repeated 4B win**. Reference directories retain the historical
+`reference93` prefix but their `w256_r256` paths were fresh for comparison 132;
+no earlier reports or timings were relabeled. Comparison 131 retired its own
+child-free preflight waiter before loading any model.
+
+### Source 139: scheduled visual-prefix chunks, performance pending
+
+The new default-off `ANTFLY_LIGHTONOCR3_PREFILL_QUERY_CHUNK_ROWS` setting splits
+prepared visual prefixes into scheduled query chunks. Original full-prompt
+admission remains reserved. Each chunk copies the correct interval of every
+axis from the complete position plan, appends its own KV suffix, preserves its
+recurrent history, and checks cancellation before queuing a continuation.
+Only the final chunk publishes prefix logits to its caller. Existing matrix
+kernels, precision options, physical row bounds and memory limits are retained.
+
+The reporting script distinguishes prefill chunks from completed pages using
+separate prefix-start and prefix-finish counts. The screening wrapper also
+checks complete API fixture strings directly. Optional wide recurrent kernels
+remain enabled when applicable; screening does not demand unnecessary staging
+work when improved scheduling keeps a batch small.
+
+Validation: **295 CPU tests passed / 38 skipped**, **331 Metal tests passed /
+6 skipped**. All inputs of the previously qualified 23 C/Metal suites are
+hash-identical, so that qualification is reused explicitly rather than called
+a fresh run. The first 4B correctness smoke completed **16 exact pages in 42
+chunks**, with 16 starts/finishes, exact complete API fixture strings and no
+admission pressure. Its rate is not a primary throughput comparison.
+
+The source139 build manifest points to a hash-verified hardlink outside generated
+build caches. Runtime patch, frozen inputs, qualification logs and the exact
+executed smoke wrapper are retained. Screen 141 closed after four complete profiles: warmed whole-prefix 1.1317
+pages/s, chunk256 1.0080, chunk384 1.0277, and chunk128 0.9003. All 1024
+native pages across warm/timed rounds matched complete API fixture strings,
+with conserved prefix tokens and no admission pressure. The two remaining
+profiles were not run; the launcher was retired while its active child finished
+naturally. No chunk configuration was promoted. A fresh paired vLLM comparison
+remains required before claiming a speed improvement.
+
+Private probes 142–144 preserved existing arithmetic and passed full numeric
+checks, but have not been promoted. Direct KV attention improved isolated
+4B attention at query lengths 42–127 (about 1.6–3.6×); tiny queries regressed.
+The staged path also regressed at small query lengths. Permitting existing
+F32/BF16 MPP projections for 17–31 prefill rows improved isolated projections
+by about 2.6–28×, but none of the four screen141 timed runs contained a packed
+root batch in that range. These stage gains are not whole-model throughput gains.
+Closed driver sources, logs, numerical checks and negative results are archived.
+
+### Source145 bounded grouped chunk admission
+
+Grouped chunks reserve transient decoder scratch using the existing generation
+estimator's executed query bound. Both complete in-flight sets, all configured
+prefix items, attached decode rows and the full batch vocabulary output remain
+charged. Full-prompt page KV, projected inputs, recurrent histories and escaping
+outputs keep the original additive admission. All operator caps are unchanged.
+Chunk execution rejects direct full-prefix fallback before allocating cache/GPU
+state when its hook is absent or deepstack routing is unsupported.
+
+Validation: **297 CPU passed / 38 skipped**, **333 Metal passed / 6 skipped**.
+The 23-suite C qualification is reused with identical C/shader inputs. The real
+4B C16 correctness smoke processed **79 chunks / 16 exact pages**, actually
+combining four prefixes per step, with exactly 16 starts/finishes and no admission
+pressure. Complete OCR strings match the actual vLLM fixture reference. The
+512 MiB shared decoder reservation and full persistent page leases were retained.
+The smoke's cold rate is not primary throughput evidence. Warmed native screen147 completed all five profiles (1280 exact pages including
+excluded warm rounds). Whole-prefix controls measured 1.1191 and 1.0599 pages/s;
+P4×128 measured 1.0650, P2×256 1.0431, and P8×64 0.9586. Controls show about
+5% drift, and no chunk setting beat both. Prefix rows were conserved in every
+round and all pages were pressure-free. Chunking remains off by default. A fresh
+paired vLLM comparison remains required after a setting improves.
+
+Expanded isolated checks 148–149 identified short-query eligibility cliffs.
+Direct-KV attention at 4B query lengths 32/42/64 improved about 1.3–2.3× across
+prior contexts 256/1024 and physical page sizes 16/128; short queries decline
+when direct KV is unavailable. The 4B recurrent core at 22/42/48/64 rows improved
+about 3.4–4.2× by applying existing parallel normalization and columns4 kernels.
+All intermediate outputs, continued recurrent state, offsets and canaries pass
+existing tolerances. Single-token decode routes are unchanged. The q128 control
+already used fast normalization and is not a newly obtained gain.
+
+Source154 integrates those eligibility changes plus the qualified F32-input
+17–31-row prefill projection route. Shader arithmetic and operator caps are
+unchanged. CPU validation is cached with identical non-Metal inputs; fresh C
+conformance and Metal integration checks are pending. The larger-query screen150
+was drafted but not executed; private frame/ownership proposals152–153 are also
+unapplied. No isolated-kernel result is claimed as end-to-end throughput.
+
+### Source158 scoped short-kernel qualification
+
+Source155 passed CPU/Metal/C24 checks and its 16-page smoke produced exact OCR,
+but its verification wrapper incorrectly required a core trace per call. That
+trace prints only once per runtime, in the preceding serial fixture reference.
+The failed verifier is preserved; it does not indicate missing kernel execution.
+Source158 adds per-reader C dispatch counter deltas for short recurrent-core
+normalization and short direct-KV attention, reported by the native reader and
+parsed per benchmark round. Verbose per-call attention tracing is removed.
+
+Fresh qualification passed **297 CPU / 38 skipped**, **333 Metal / 6 skipped**,
+and all **24 C/Metal suites**. The real 4B smoke produced **16 exact pages in
+142 chunks**, with **3408 short-core and 712 short-attention dispatches**,
+16 starts/finishes, up to eight combined prefixes and no admission pressure.
+Complete API fixture strings match. The original memory limits and reserve
+are unchanged. Warmed screen161 (whole-prefix controls and P8 chunks64/96/120)
+is pending, followed by fresh actual vLLM controls if a configuration improves.
+The smoke's cold rate is not primary throughput evidence.
+
+
+## Wolfspider source158 paired172
+
+The repeated **4B actual-vLLM throughput criterion passes** on Wolfspider's
+32-GPU-core M4 Max with 36 GiB RAM. Both runtimes run on this same host; local
+rates are not reused. The models and 48 frozen source inputs match byte for
+byte, and the copied native binary passes 24 C/Metal suite replays and
+333 native Metal tests (six skips) on this GPU. The initial unfiltered replay
+has one wrong-working-directory file error; the corrected package-directory
+replay passes and both logs are preserved.
+
+| Timed comparison | Native pages/s | Actual vLLM pages/s | Native / vLLM |
+| --- | ---: | ---: | ---: |
+| Native round 1 / opening reference | 1.2051 | 1.150851 | 1.04714 |
+| Native round 2 / closing reference | 1.2053 | 1.151670 | 1.04657 |
+
+Each API server excludes 256 saturation warmup requests before 256 timed
+requests. Native keeps one model resident for an excluded 256-request warmup
+and two timed 256-request rounds. All outputs match native serial references,
+and full fixture strings match both actual API references. Native uses C62,
+whole-prefix P1, wide64, width-four decode bursts, BF16 prefill and F32 decode;
+backend17/scratch10/KV4/combined28/process24 GiB limits and the 6 GiB reserve
+plus 512 MiB cushion remain unchanged. vLLM uses C64, context1024, max256,
+utilization0.7 and automatic cache sizing with a 320-block admission floor;
+prefix/processor caches stay disabled and media UUIDs are unique. Loading and
+warmup are excluded. Native Node.read and loopback HTTP differ in transport.
+The three synthetic fixtures establish consistency, not broad OCR accuracy.
+
+Independent 128-request timed configuration controls are 1.1777 and 1.1760
+pages/s. P8 chunks64/96/120 give 1.1058/1.1444/1.1479 respectively, so chunking
+is not selected. All 1,280 warm/timed screen pages pass output checks without
+admission pressure. At that checkpoint source180's submission/admission candidate was separate
+and was not yet used in those speed claims; its completed results are above.
+
+See [paired172 audit](wolfspider/paired172_4b_warmed_comparison_audit.json),
+[screen171 audit](wolfspider/engine158_wolf171_screen_audit.json), and
+[retrieval proof](wolfspider/wolf172_retrieval_audit.json). Historical reports
+above retain their original failed or pending states.

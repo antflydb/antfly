@@ -8019,6 +8019,8 @@ pub const Node = struct {
             prefill_batch: bool = false,
             packed_mixed: bool = false,
             packed_prefill_items: u8 = 1,
+            prepared_prefill_chunk_rows: u16 = 0,
+            packed_shared_frame: bool = false,
             shared_decoder_scratch: bool = false,
 
             fn fromEnvironment() @This() {
@@ -8095,7 +8097,23 @@ pub const Node = struct {
                     features.epoch_auxiliary and features.activation_pool and features.prepared and
                     features.worker and cfg.qwen35_device_only_state and features.shared_decoder_scratch;
                 if (features.packed_mixed) features.packed_prefill_items = @intCast(@min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_PACKED_PREFILL_ITEMS") orelse 1, 1), generation.NativeGenerationPipeline.max_prepared_qwen_prefill_items));
+                if (features.packed_mixed) {
+                    const rows = platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_PREFILL_QUERY_CHUNK_ROWS") orelse 0;
+                    features.prepared_prefill_chunk_rows = if (rows == 0) 0 else @intCast(@min(@max(rows, 64), 1024));
+                }
+                features.packed_shared_frame = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PACKED_SHARED_FRAME") and
+                    features.packedSharedFrameEligible(cfg) and
+                    !platform.env.getenvBool("TERMITE_QWEN3VL_PROFILE") and
+                    platform.env.getenv("ANTFLY_QWEN3VL_QUALIFICATION_TRACE_LAYER") == null and
+                    !platform.env.getenvBool("TERMITE_METAL_ENABLE_CONCURRENT_PLANNED_DISPATCH");
                 return features;
+            }
+            fn packedSharedFrameEligible(features: @This(), cfg: gpt_model_mod.Config) bool {
+                return features.packed_mixed and features.single_frame and
+                    features.shared_decoder_scratch and cfg.qwen35_device_only_state and
+                    cfg.hasQwen35VisionArchitectureContract() and
+                    features.prefill_stream_layers == 0 and features.stream_first_layers == 0 and
+                    !features.prefill_activation_pool and !features.gpu_greedy_stream;
             }
             fn visionRetainedBlocks(features: @This()) usize {
                 return @as(usize, features.vision_frame_blocks) * (if (features.pipeline_vision) @as(usize, 2) else 1);
@@ -8232,6 +8250,8 @@ pub const Node = struct {
                     std.debug.print("LIGHTONOCR3 wide_gate_up_calls={d}\n", .{wide_gate_up});
                     const full64_gate_up = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnFull64GateUpCalls(&cb) else 0;
                     std.debug.print("LIGHTONOCR3 full64_gate_up_calls={d}\n", .{full64_gate_up});
+                    const short_prefill = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnShortPrefillStats(&cb) else @as([2]u64, @splat(0));
+                    std.debug.print("LIGHTONOCR3 short_prefill_core_dispatches={d} short_direct_attention_dispatches={d}\n", .{ short_prefill[0], short_prefill[1] });
                     const wide_recurrent = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnWideRecurrentStats(&cb) else @as([3]u64, @splat(0));
                     std.debug.print("LIGHTONOCR3 wide_recurrent_dispatches={d} wide_recurrent_lifetime_max_rows={d} wide_recurrent_staged_bytes={d}\n", .{ wide_recurrent[0], wide_recurrent[1], wide_recurrent[2] });
                     const batch_argmax = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnBatchedArgmaxStats(&cb) else @as([2]u64, @splat(0));
@@ -8438,6 +8458,8 @@ pub const Node = struct {
                 .execution_control = ctx.worker_control,
                 .prepared_lighton_decode = ctx.features.prepared,
                 .packed_prefill_items = ctx.features.packed_prefill_items,
+                .prepared_qwen_prefill_chunk_rows = ctx.features.prepared_prefill_chunk_rows,
+                .packed_shared_frame = ctx.features.packed_shared_frame,
                 .single_frame_lighton_decode = ctx.features.single_frame,
                 .gpu_token_burst_lighton_decode = ctx.features.gpu_token_burst,
                 .gpu_token_burst_width = ctx.features.gpu_token_burst_width,
@@ -8897,7 +8919,7 @@ pub const Node = struct {
         const prepared_decode = features.prepared;
         // Page-local KV, projected inputs and recurrent histories stay fully
         // additive. Shared execution storage optionally has its own epoch lease.
-        var memory = LightOnCohortMemory{ .amounts = if (features.epoch_auxiliary) .{} else features.auxiliaryAmounts(), .share_decoder_scratch = features.shared_decoder_scratch, .decoder_rows = effectiveLightOnReadRows(), .max_prefill_batch_items = if (features.packed_mixed) features.packed_prefill_items else features.prefill_batch_items, .packed_mixed = features.packed_mixed };
+        var memory = LightOnCohortMemory{ .amounts = if (features.epoch_auxiliary) .{} else features.auxiliaryAmounts(), .share_decoder_scratch = features.shared_decoder_scratch, .decoder_rows = effectiveLightOnReadRows(), .max_prefill_batch_items = if (features.packed_mixed) features.packed_prefill_items else features.prefill_batch_items, .packed_mixed = features.packed_mixed, .prefill_query_chunk_rows = features.prepared_prefill_chunk_rows };
         var vision_amounts = try model_manager_mod.projectorRunAdmissionAmounts(model.manifest, .metal, estimate.media_admission);
         // The prompt probe used single-block projector limits. Charge the
         // larger device envelope before enabling grouped frames. Each page
@@ -9052,6 +9074,8 @@ pub const Node = struct {
             .execution_contention_wait_ns = ctx.execution_gate_wait_ns,
             .prepared_lighton_decode = prepared_decode,
             .packed_prefill_items = ctx.features.packed_prefill_items,
+            .prepared_qwen_prefill_chunk_rows = ctx.features.prepared_prefill_chunk_rows,
+            .packed_shared_frame = ctx.features.packed_shared_frame,
             .single_frame_lighton_decode = ctx.features.single_frame,
             .gpu_token_burst_lighton_decode = ctx.features.gpu_token_burst,
             .gpu_token_burst_width = ctx.features.gpu_token_burst_width,
@@ -9283,6 +9307,7 @@ pub const Node = struct {
         decoder_rows: usize = 1,
         max_prefill_batch_items: usize = 1,
         packed_mixed: bool = false,
+        prefill_query_chunk_rows: usize = 0,
         decoder_backend_peak: usize = 0,
 
         fn product(values: []const usize) !usize {
@@ -9293,6 +9318,22 @@ pub const Node = struct {
         fn add(self: *@This(), cfg: gpt_model_mod.Config, prompt_tokens: usize, output_tokens: usize, decoder: runtime.tier.memory.AdmissionAmounts, vision: runtime.tier.memory.AdmissionAmounts) !void {
             if (self.share_decoder_scratch and (self.decoder_rows == 0 or self.decoder_rows > 64 or
                 self.max_prefill_batch_items == 0 or self.max_prefill_batch_items > generation.NativeGenerationPipeline.max_prepared_qwen_prefill_items)) return error.ResourceLimitExceeded;
+            if (self.prefill_query_chunk_rows != 0 and
+                (!self.share_decoder_scratch or !self.packed_mixed or
+                    self.prefill_query_chunk_rows < 64 or self.prefill_query_chunk_rows > 1024)) return error.ResourceLimitExceeded;
+            const working_rows = if (self.prefill_query_chunk_rows != 0)
+                @min(prompt_tokens, self.prefill_query_chunk_rows)
+            else
+                prompt_tokens;
+            // Only transient, gate-owned activations use the bounded query
+            // shape. Full page KV, projected inputs, recurrent histories and
+            // escaping outputs retain their original admission below. The
+            // scratch estimate is independent of KV dtype; its KV result is
+            // deliberately discarded, rather than replacing the page estimate.
+            const working_scratch = if (self.prefill_query_chunk_rows != 0)
+                (try runtime.tier.memory.estimateGptGeneration(.metal, .f16, cfg, prompt_tokens, output_tokens, working_rows)).scratch_bytes
+            else
+                decoder.backend_scratch_bytes;
             var retained_decoder = decoder;
             if (self.share_decoder_scratch) {
                 // A single GPU gate owns prefill and decode. Their frame
@@ -9301,7 +9342,11 @@ pub const Node = struct {
                 // a final-row view or sampling output outlives that gate.
                 const logits = try product(&.{ cfg.vocab_size, @sizeOf(f32) });
                 const hidden = try product(&.{ prompt_tokens, cfg.hidden_size, @sizeOf(f32) });
-                const retained = std.math.add(usize, logits, hidden) catch return error.ResourceLimitExceeded;
+                // Packed forwards publish host logits and token IDs. Their
+                // device hidden, row gather and head logits retire before the
+                // GPU gate returns. Full projected inputs remain charged below,
+                // together with KV, recurrent history and both working sets.
+                const retained = if (self.packed_mixed) logits else std.math.add(usize, logits, hidden) catch return error.ResourceLimitExceeded;
                 retained_decoder.backend_scratch_bytes = @min(decoder.backend_scratch_bytes, retained);
                 if (!cfg.qwen35_device_only_state)
                     retained_decoder.host_scratch_bytes = std.math.add(usize, retained_decoder.host_scratch_bytes, logits) catch return error.ResourceLimitExceeded;
@@ -9311,14 +9356,14 @@ pub const Node = struct {
                 // Batched prefill returns only independent host logit rows;
                 // all combined device intermediates drain before it returns.
                 // Reserve two complete maximum-sized group working sets.
-                var two_sets = try product(&.{ decoder.backend_scratch_bytes, 2, self.max_prefill_batch_items });
+                var two_sets = try product(&.{ working_scratch, 2, self.max_prefill_batch_items });
                 if (self.packed_mixed) {
-                    if (prompt_tokens == 0) return error.ResourceLimitExceeded;
+                    if (working_rows == 0) return error.ResourceLimitExceeded;
                     // Dense mixed intermediates include one token from each
                     // other physical page. Round the entire existing working
                     // set upward, retaining its fixed-cost allowance as well.
-                    const rows = std.math.add(usize, prompt_tokens, self.decoder_rows - 1) catch return error.ResourceLimitExceeded;
-                    two_sets = std.math.divCeil(usize, try product(&.{ two_sets, rows }), prompt_tokens) catch return error.ResourceLimitExceeded;
+                    const rows = std.math.add(usize, working_rows, self.decoder_rows - 1) catch return error.ResourceLimitExceeded;
+                    two_sets = std.math.divCeil(usize, try product(&.{ two_sets, rows }), working_rows) catch return error.ResourceLimitExceeded;
                 }
                 const batch_head = try product(&.{ self.decoder_rows, logits });
                 const target = std.math.add(usize, two_sets, batch_head) catch return error.ResourceLimitExceeded;
@@ -43301,7 +43346,9 @@ test "LightOnOCR3 mixed decoder envelope admits the prefill and physical decode 
     var mixed = Node.LightOnCohortMemory{ .share_decoder_scratch = true, .decoder_rows = 64, .packed_mixed = true };
     try ordinary.add(cfg, 432, 256, decoder, .{});
     try mixed.add(cfg, 432, 256, decoder, .{});
-    try std.testing.expectEqualDeep(ordinary.amounts, mixed.amounts);
+    try std.testing.expectEqual(ordinary.amounts.backend_scratch_bytes, mixed.amounts.backend_scratch_bytes + 432 * cfg.hidden_size * @sizeOf(f32));
+    try std.testing.expectEqual(ordinary.amounts.backend_kv_bytes, mixed.amounts.backend_kv_bytes);
+    try std.testing.expectEqual(ordinary.amounts.hostTotalBytes(), mixed.amounts.hostTotalBytes());
     const required = try std.math.divCeil(usize, 2 * decoder.backend_scratch_bytes * (432 + 63), 432);
     try std.testing.expect(mixed.decoder_backend_peak >= required + 64 * cfg.vocab_size * @sizeOf(f32));
     const complete = try mixed.finish();
@@ -43319,4 +43366,106 @@ test "LightOnOCR3 mixed decoder envelope admits the prefill and physical decode 
     try std.testing.expect(grouped.decoder_backend_peak >= 2 * required + 64 * cfg.vocab_size * @sizeOf(f32));
     var invalid = Node.LightOnCohortMemory{ .share_decoder_scratch = true, .decoder_rows = 64, .packed_mixed = true, .max_prefill_batch_items = 9 };
     try std.testing.expectError(error.ResourceLimitExceeded, invalid.add(cfg, 432, 256, decoder, .{}));
+}
+
+test "LightOnOCR3 chunk groups retain complete pages and admit both bounded working sets" {
+    const memory = runtime.tier.memory;
+    const cfg = gpt_model_mod.Config{ .family = .qwen3_5, .hidden_size = 2560, .vocab_size = 248320, .num_attention_heads = 16, .num_key_value_heads = 4, .num_hidden_layers = 32, .qwen35_has_linear_attention = true, .compact_qwen35_kv = true, .qwen35_device_only_state = true, .qwen35_full_attention_interval = 4, .qwen35_linear_num_key_heads = 16, .qwen35_linear_num_value_heads = 32, .qwen35_linear_key_head_dim = 128, .qwen35_linear_value_head_dim = 128, .qwen35_linear_conv_kernel_dim = 4 };
+    for ([_]usize{ 432, 554, 662 }) |prompt| {
+        const full = try memory.estimateGptGeneration(.metal, .f16, cfg, prompt, 256, prompt);
+        const decoder = memory.AdmissionAmounts.fromEstimate(full);
+        const vision = memory.AdmissionAmounts{ .host_scratch_bytes = 9012, .backend_scratch_bytes = 3456 };
+        var whole = Node.LightOnCohortMemory{ .share_decoder_scratch = true, .packed_mixed = true, .decoder_rows = 64, .max_prefill_batch_items = 4 };
+        try whole.add(cfg, prompt, 256, decoder, vision);
+        for ([_]usize{ 64, 128, 256, 1024 }) |chunk| {
+            const rows = @min(chunk, prompt);
+            const bounded = try memory.estimateGptGeneration(.metal, .f16, cfg, prompt, 256, rows);
+            try std.testing.expectEqual(full.kv_bytes, bounded.kv_bytes);
+            var grouped = Node.LightOnCohortMemory{ .share_decoder_scratch = true, .packed_mixed = true, .decoder_rows = 64, .max_prefill_batch_items = 4, .prefill_query_chunk_rows = chunk };
+            try grouped.add(cfg, prompt, 256, decoder, vision);
+            try std.testing.expectEqualDeep(whole.amounts, grouped.amounts);
+            const two_sets = try std.math.divCeil(usize, bounded.scratch_bytes * 8 * (rows + 63), rows);
+            try std.testing.expect(grouped.decoder_backend_peak >= two_sets + 64 * 248320 * @sizeOf(f32));
+            try std.testing.expect(grouped.decoder_backend_peak <= whole.decoder_backend_peak);
+            const complete = try grouped.finish();
+            const cap = complete.hostTotalBytes() + complete.backendTotalBytes();
+            var controller = memory.AdmissionController{};
+            defer controller.deinit();
+            try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquire(.gpu, .{ .combined_limit_bytes = cap - 1 }, complete, false));
+            var lease = try controller.tryAcquire(.gpu, .{ .combined_limit_bytes = cap }, complete, false);
+            lease.release();
+            try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+        }
+    }
+    for ([_]usize{ 1, 63, 1025 }) |chunk| {
+        var invalid = Node.LightOnCohortMemory{ .share_decoder_scratch = true, .packed_mixed = true, .prefill_query_chunk_rows = chunk };
+        try std.testing.expectError(error.ResourceLimitExceeded, invalid.add(cfg, 432, 256, .{}, .{}));
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, invalid.amounts);
+    }
+    var unsupported = Node.LightOnCohortMemory{ .share_decoder_scratch = true, .prefill_query_chunk_rows = 128 };
+    try std.testing.expectError(error.ResourceLimitExceeded, unsupported.add(cfg, 432, 256, .{}, .{}));
+}
+
+test "LightOnOCR3 packed shared frame excludes split and retained-prefill lifetimes" {
+    const Features = Node.LightOnStreamContext.ExecutionFeatures;
+    const cfg = gpt_model_mod.Config{ .family = .qwen3_5, .hidden_size = 2560, .vocab_size = 248320, .num_hidden_layers = 32, .qwen35_has_linear_attention = true, .qwen35_full_attention_interval = 4, .qwen35_linear_num_key_heads = 16, .qwen35_linear_num_value_heads = 32, .qwen35_linear_key_head_dim = 128, .qwen35_linear_value_head_dim = 128, .qwen35_linear_conv_kernel_dim = 4, .qwen35_device_only_state = true, .num_attention_heads = 16, .attention_head_dim = 256, .rope_partial_factor = 0.25, .mrope_interleaved = true, .mrope_section = .{ 11, 11, 10 }, .image_token_index = 100, .boi_token_index = 101, .eoi_token_index = 102, .vision_patch_size = 16, .vision_embed_dim = 1280, .vision_num_hidden_layers = 24, .vision_num_attention_heads = 16, .vision_spatial_merge_size = 2, .vision_temporal_patch_size = 2, .vision_num_position_embeddings = 2304, .vision_out_hidden_size = 2560 };
+    const eligible = Features{ .packed_mixed = true, .single_frame = true, .shared_decoder_scratch = true };
+    try std.testing.expect(eligible.packedSharedFrameEligible(cfg));
+    var changed = eligible;
+    changed.prefill_stream_layers = 1;
+    try std.testing.expect(!changed.packedSharedFrameEligible(cfg));
+    changed = eligible;
+    changed.stream_first_layers = 1;
+    try std.testing.expect(!changed.packedSharedFrameEligible(cfg));
+    changed = eligible;
+    changed.prefill_activation_pool = true;
+    try std.testing.expect(!changed.packedSharedFrameEligible(cfg));
+    changed = eligible;
+    changed.gpu_greedy_stream = true;
+    try std.testing.expect(!changed.packedSharedFrameEligible(cfg));
+    changed = eligible;
+    changed.shared_decoder_scratch = false;
+    try std.testing.expect(!changed.packedSharedFrameEligible(cfg));
+    changed = eligible;
+    changed.single_frame = false;
+    try std.testing.expect(!changed.packedSharedFrameEligible(cfg));
+    var host_state = cfg;
+    host_state.qwen35_device_only_state = false;
+    try std.testing.expect(!eligible.packedSharedFrameEligible(host_state));
+    try std.testing.expect(!eligible.packedSharedFrameEligible(.{}));
+    changed = eligible;
+    changed.packed_shared_frame = true;
+    try std.testing.expect(!std.meta.eql(eligible, changed));
+    try std.testing.expectEqualDeep(eligible.auxiliaryAmounts(), changed.auxiliaryAmounts());
+}
+
+test "LightOnOCR3 packed output admission retains complete projected inputs and page state" {
+    const memory = runtime.tier.memory;
+    const cfg = gpt_model_mod.Config{ .family = .qwen3_5, .hidden_size = 2560, .vocab_size = 248320, .num_hidden_layers = 32, .qwen35_has_linear_attention = true, .qwen35_device_only_state = true, .qwen35_full_attention_interval = 4, .qwen35_linear_num_key_heads = 16, .qwen35_linear_num_value_heads = 32, .qwen35_linear_key_head_dim = 128, .qwen35_linear_value_head_dim = 128, .qwen35_linear_conv_kernel_dim = 4 };
+    const decoder = memory.AdmissionAmounts{ .backend_kv_bytes = 1234, .backend_scratch_bytes = 64 * 1024 * 1024, .host_scratch_bytes = 5678 };
+    const vision = memory.AdmissionAmounts{ .host_scratch_bytes = 9012, .backend_scratch_bytes = 3456 };
+    for ([_]usize{ 432, 554, 662 }) |prompt| {
+        var generic = Node.LightOnCohortMemory{ .share_decoder_scratch = true, .decoder_rows = 64 };
+        var cohort = Node.LightOnCohortMemory{ .share_decoder_scratch = true, .decoder_rows = 64, .packed_mixed = true };
+        try generic.add(cfg, prompt, 256, decoder, vision);
+        try cohort.add(cfg, prompt, 256, decoder, vision);
+        const hidden_bytes = prompt * cfg.hidden_size * @sizeOf(f32);
+        try std.testing.expectEqual(generic.amounts.backend_scratch_bytes, cohort.amounts.backend_scratch_bytes + hidden_bytes);
+        // The full projected input survives independently of the removed
+        // escaping-hidden allowance; page history and KV are still additive.
+        try std.testing.expect(cohort.amounts.backend_scratch_bytes > hidden_bytes + cfg.vocab_size * @sizeOf(f32));
+        try std.testing.expectEqual(generic.amounts.backend_kv_bytes, cohort.amounts.backend_kv_bytes);
+        try std.testing.expectEqual(generic.amounts.hostTotalBytes(), cohort.amounts.hostTotalBytes());
+        try std.testing.expectEqual(generic.vision_backend_peak, cohort.vision_backend_peak);
+        try std.testing.expect(cohort.decoder_backend_peak >= generic.decoder_backend_peak);
+        const complete = try cohort.finish();
+        const cap = complete.hostTotalBytes() + complete.backendTotalBytes();
+        var admission = memory.AdmissionController{};
+        defer admission.deinit();
+        try std.testing.expectError(error.ResourceLimitExceeded, admission.tryAcquire(.gpu, .{ .combined_limit_bytes = cap - 1 }, complete, false));
+        var lease = try admission.tryAcquire(.gpu, .{ .combined_limit_bytes = cap }, complete, false);
+        try std.testing.expectEqual(complete.backend_kv_bytes, admission.snapshot().backend_kv_bytes);
+        lease.release();
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, admission.snapshot());
+    }
 }

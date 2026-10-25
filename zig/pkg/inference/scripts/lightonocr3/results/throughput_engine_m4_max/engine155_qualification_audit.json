@@ -1,0 +1,8 @@
+{
+  "status": "cpu_metal_and_fresh_C24_pass_short_model_pending",
+  "scope": "Existing shader arithmetic and operator caps unchanged. Short recurrent-core and direct-KV eligibility plus F32 narrow-prefill MPP route.155corrects154testcounteronly; full155C24suite fresh. CPUcached297/38, Metal333/6.",
+  "cpu_log_sha256": "002c852dfdcdf18d3989ae25abc8b85a0e39c753a7ba985bd87679df5326a794",
+  "metal_log_sha256": "33ab315061fc3ad42ff7f0cf4347c1e5f461c84782c1d466b33cd8c13d3c7157",
+  "c_audit_sha256": "9e5f8025d9b652684f9904e98f0f395e6cae350f03d8ddd2b7e5750d977f2e9e",
+  "build_manifest_sha256": "4becbcbe1d259c39d8b8cec4d606c92999f6364d7753573e4b72a011a9e01d1b"
+}

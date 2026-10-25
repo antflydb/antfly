@@ -1,0 +1,4 @@
+metal_pipelined_decode_frame: enabled=1 owner=executor rollback=TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME
+frame_policy_refresh same_frame=stable next_frame=refreshed rollback=live rc=0
+frame_metadata normal_and_roofline_ids=pass
+rolled_frame_check four_frames=pass two_in_flight=bounded metadata=pass canceled_suffix=pass

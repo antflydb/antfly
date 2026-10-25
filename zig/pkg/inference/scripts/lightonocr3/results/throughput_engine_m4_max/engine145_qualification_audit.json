@@ -1,0 +1,20 @@
+{
+  "status": "cpu_metal_and_grouped_model_correctness_pass_speed_pending",
+  "scope": "Source145 bounds shared transient scratch by executed chunk rows. Complete persistent page admission retained; direct full-prefix fallback rejected before mutation under bounded workspace. Original operator caps unchanged. No C/Metal shader changes: prior23suite qualification reused by exact input hashes.",
+  "cpu_tests_passed": 297,
+  "cpu_tests_skipped": 38,
+  "metal_tests_passed": 333,
+  "metal_tests_skipped": 6,
+  "cpu_log_sha256": "d9683b817bb57281547fe2c2c48af6e383e743cd026f4d37a1afb9f60554a3d3",
+  "metal_log_sha256": "d1f8a00c2b6e98ae66f974a7ba4930bfcebe2ee7b75b24d52c7815689b6614ad",
+  "build_manifest_sha256": "0e583310490ed1067f381495a49fa4eff9b3441c364ccfedeba8b860c1290bb8",
+  "c_inputs_verified": {
+    "zig/pkg/inference/src/backends/metal_kernels.m": "65ec16730a1c22911fde496c55236c1d905f41d760eacc8079db78101d31d486",
+    "zig/pkg/inference/src/backends/metal_buffer_observation.h": "6873d32642e0b9bd3f8acfdbf33306798b11e6a3a1a0b8c6571026f1c36b8ef7",
+    "zig/pkg/inference/src/backends/metal_mtp_head.h": "890772ce81b6b8bab2d61aaf28a7f1b4bca125c3e4bc12565284e3e577b5b233",
+    "zig/pkg/inference/src/backends/metal_mtp_head_impl.h": "1e032aa77b9b47f0567763be7230995c5f2646034e7a133de73149a7b5979649",
+    "zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m": "a920df5832ec334a807c6d539bff5fa0aa1353cdb551a5b075442f5b60c14fbb"
+  },
+  "model_smoke_audit_sha256": "bd004aa7604795e61c7df79721a747930eb0d377436d08dfa4c24baba14e43e4",
+  "model_smoke_report_sha256": "2ab6384428b6f902c2dba83bd34d703b4d7a414c27e31302596ed1ddad3a97eb"
+}

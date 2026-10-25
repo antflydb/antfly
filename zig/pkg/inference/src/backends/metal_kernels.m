@@ -1179,6 +1179,8 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> lightonocr3_prefill_prepare_pipeline;
     id<MTLComputePipelineState> lightonocr3_prefill_norm_pipeline;
     uint64_t lightonocr3_prefill_norm_dispatches;
+    uint64_t lightonocr3_short_prefill_norm_dispatches;
+    uint64_t lightonocr3_short_direct_attention_dispatches;
     id<MTLComputePipelineState> lightonocr3_prefill_attention_mpp_pipeline;
     id<MTLComputePipelineState> lightonocr3_prefill_attention_mpp32_pipeline;
     id<MTLComputePipelineState> lightonocr3_prefill_attention_direct_pipeline;
@@ -26794,7 +26796,7 @@ static id<MTLComputePipelineState> termite_metal_lightonocr3_prefill_attention_p
     // page tables. P.V consumes the same page-sized segments directly, avoiding
     // the K/V threadgroup staging allocation without changing F32 arithmetic.
     id<MTLComputePipelineState> direct = runtime->lightonocr3_prefill_attention_direct_pipeline;
-    if (queries >= 128 && page_size > 0 && page_size % 16 == 0 && direct != nil &&
+    if (queries >= 32 && page_size > 0 && page_size % 16 == 0 && direct != nil &&
         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_DIRECT_KV")) &&
         direct.threadExecutionWidth == 32 && direct.maxTotalThreadsPerThreadgroup >= 128 &&
         direct.staticThreadgroupMemoryLength <= runtime->device.maxThreadgroupMemoryLength) return direct;
@@ -26808,12 +26810,18 @@ static id<MTLComputePipelineState> termite_metal_lightonocr3_prefill_attention_p
 static bool termite_metal_lightonocr3_prefill_attention_mpp_eligible(
     termite_metal_decode_runtime *runtime, const termite_metal_paged_attention_params *p) {
     id<MTLComputePipelineState> pipeline = termite_metal_lightonocr3_prefill_attention_pipeline(runtime, p->q_len, p->page_size);
+    // Short queries only use the direct-KV pipeline at measured crossovers.
+    // A missing/disabled direct pipeline falls back to generic attention;
+    // staging K/V for these shapes is slower. Single-token decode is unchanged.
+    const bool short_direct = p->q_len < 128 && p->kv_tokens >= 256 &&
+        ((p->num_heads == 16 && p->q_len >= 32) || (p->num_heads == 8 && p->q_len >= 64)) &&
+        pipeline != nil && pipeline == runtime->lightonocr3_prefill_attention_direct_pipeline;
     return runtime->lightonocr3_projections_enabled && runtime->qwen35_ocr_vector_loads_enabled &&
         termite_metal_lightonocr3_feature_default_enabled("TERMITE_METAL_ENABLE_LIGHTONOCR3_PREFILL_ATTENTION_MPP") &&
         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_ATTENTION_MPP")) &&
         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_MPP")) &&
         p->format == 3 && p->v_element_bytes == 2 && p->head_dim == 256 && p->has_sinks == 0 &&
-        p->softcap == 0 && p->sliding_window == 0 && p->q_len >= 128 && p->q_len <= 2048 &&
+        p->softcap == 0 && p->sliding_window == 0 && (p->q_len >= 128 || short_direct) && p->q_len <= 2048 &&
         p->kv_tokens >= p->q_len && p->kv_tokens <= 4096 && p->page_size > 0 &&
         p->query_position_offset >= p->kv_position_offset &&
         p->q_len <= UINT32_MAX - p->query_position_offset &&
@@ -26835,6 +26843,7 @@ static void termite_metal_lightonocr3_dispatch_prefill_attention(
     if (direct) runtime->lightonocr3_prefill_attention_direct_dispatches++;
     [encoder dispatchThreadgroups:MTLSizeMake((p->q_len + tile - 1u) / tile, p->num_heads, 1)
         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    if (p->q_len < 128 && direct) runtime->lightonocr3_short_direct_attention_dispatches++;
     if (runtime->lightonocr3_prefill_attention_mpp_dispatches++ == 0 &&
         termite_metal_env_flag_enabled(getenv("TERMITE_METAL_TRACE_LIGHTONOCR3_PREFILL_ATTENTION_MPP")))
         fprintf(stderr, "lightonocr3_prefill_attention_mpp: queries=%u keys=%u heads=%u tile=%zu direct=%d\n",
@@ -35388,6 +35397,11 @@ size_t termite_metal_decode_runtime_lighton_recurrent_group_rows(termite_metal_d
         runtime->lightonocr3_recurrent_parallel_pipeline.maxTotalThreadsPerThreadgroup < 512) return 16;
     return 64;
 }
+void termite_metal_decode_runtime_lighton_short_prefill_stats(termite_metal_decode_runtime *runtime, uint64_t *out) {
+    if (out == NULL) return;
+    out[0] = runtime == NULL ? 0 : runtime->lightonocr3_short_prefill_norm_dispatches;
+    out[1] = runtime == NULL ? 0 : runtime->lightonocr3_short_direct_attention_dispatches;
+}
 void termite_metal_decode_runtime_lighton_wide_recurrent_stats(termite_metal_decode_runtime *runtime, uint64_t *out) {
     if (out == NULL) return;
     out[0] = runtime == NULL ? 0 : runtime->lightonocr3_wide_recurrent_dispatches;
@@ -35850,7 +35864,7 @@ int termite_metal_decode_runtime_qwen35_core_device(
             pipelines[0] = runtime->qwen35_prefill_conv_vec4_pipeline;
             grids[0] /= 4;
         }
-        if (runtime->qwen35_ocr_vector_loads_enabled && seq >= 128 && seq <= 2048 &&
+        if (runtime->qwen35_ocr_vector_loads_enabled && seq >= 2 && seq <= 2048 &&
             dim == 128 && key_heads == 16 && (value_heads == 16 || value_heads == 32) && kernel == 4 &&
             !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_QWEN35_PREFILL_COLUMNS) &&
             runtime->qwen35_recurrent_columns4_pipeline != nil &&
@@ -35859,7 +35873,7 @@ int termite_metal_decode_runtime_qwen35_core_device(
             pipelines[3] = runtime->qwen35_recurrent_columns4_pipeline;
             grids[3] /= 4;
         }
-        const bool prefill_norm = seq >= 128 && seq <= 2048 && key_heads == 16 &&
+        const bool prefill_norm = seq >= 2 && seq <= 2048 && key_heads == 16 &&
             (value_heads == 16 || value_heads == 32) && runtime->lightonocr3_projections_enabled &&
             runtime->qwen35_ocr_vector_loads_enabled &&
             termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_ENABLE_LIGHTONOCR3_PREFILL_CORE_NORM) &&
@@ -35874,6 +35888,7 @@ int termite_metal_decode_runtime_qwen35_core_device(
         if (parallel_norm) {
             pipelines[2] = prefill_norm ? runtime->lightonocr3_prefill_prepare_pipeline : runtime->qwen35_prepare_parallel_pipeline;
             pipelines[4] = prefill_norm ? runtime->lightonocr3_prefill_norm_pipeline : runtime->qwen35_norm_parallel_pipeline;
+            if (prefill_norm && seq < 128) runtime->lightonocr3_short_prefill_norm_dispatches++;
             if (prefill_norm && runtime->lightonocr3_prefill_norm_dispatches++ == 0 &&
                 termite_metal_env_flag_enabled(getenv("TERMITE_METAL_TRACE_LIGHTONOCR3_PREFILL_CORE_NORM")))
                 fprintf(stderr, "lightonocr3_prefill_core_norm: rows=%zu heads=%zu\n", seq, value_heads);
@@ -41032,6 +41047,11 @@ static int termite_metal_try_lightonocr3_mpp(termite_metal_decode_runtime *runti
         !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PREFILL_PROJECTIONS);
     const bool bf16 = termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_LIGHTONOCR3_BF16_ACTIVATIONS) ||
                       termite_metal_lighton_bf16_prefill_inputs(runtime, rows, in_dim, out_dim);
+    // Retain F32 inputs for short prefill projections. The existing MPP
+    // implementation already covers these row counts for decoder cohorts.
+    const bool short_prefill = !bf16 && rows >= 17 && rows <= 31 && runtime->active_frame_cb != nil &&
+        runtime->active_frame_regime == TERMITE_METAL_FRAME_REGIME_PREFILL &&
+        !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_WIDE_MPP);
     const bool four_row_enabled = rows == 4 && !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_FOUR_ROW_TILE);
     const bool segment4 =
         !bf16 && four_row_enabled && in_dim == 1024 && out_dim == 3584 &&
@@ -41056,7 +41076,7 @@ static int termite_metal_try_lightonocr3_mpp(termite_metal_decode_runtime *runti
         small_pipeline != nil &&
         small_pipeline.threadExecutionWidth == 32 &&
         small_pipeline.maxTotalThreadsPerThreadgroup >= 32;
-    if (rows < 32u && !small_tile && !segment4 && termite_metal_lightonocr3_tiled_columns(runtime, rows, in_dim, out_dim) != 0 &&
+    if (rows < 32u && !small_tile && !segment4 && !short_prefill && termite_metal_lightonocr3_tiled_columns(runtime, rows, in_dim, out_dim) != 0 &&
         !termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_LIGHTONOCR3_SMALL_MPP)) return 0;
     const bool small_default = segment4 || small_tile || (rows == 8 &&
         ((in_dim == 1024 && (out_dim == 3584 || out_dim == 6144)) ||
@@ -41072,7 +41092,7 @@ static int termite_metal_try_lightonocr3_mpp(termite_metal_decode_runtime *runti
     // The ordinary greedy path closes the decoder frame before its head.
     // Qualify that owned command buffer just as the sixteen-row head does.
     const bool wide_head = wide_rows && out_dim == 248320 && (in_dim == 1024 || in_dim == 2560);
-    const bool small_rows = small_default || wide_decode || wide_head || (rows >= 2 && rows <= 8 &&
+    const bool small_rows = small_default || wide_decode || wide_head || short_prefill || (rows >= 2 && rows <= 8 &&
         termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_LIGHTONOCR3_SMALL_MPP));
     if (!termite_metal_lightonocr3_fast_projections(runtime) || (rows < 32 && !small_rows) || rows > 16384 ||
         (rows > 2048 && termite_metal_frame_env_enabled(runtime, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_LARGE_MPP)) || input_offset % 16 != 0 ||

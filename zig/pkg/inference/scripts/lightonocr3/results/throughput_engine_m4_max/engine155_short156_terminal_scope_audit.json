@@ -1,0 +1,9 @@
+{
+  "status": "output_correct_dispatch_verifier_failed_not_promoted",
+  "scope": "All16pages exact with complete actualAPI fixture strings,142chunks,8prefixes perstep, no pressure. 712shortdirectattentiondispatches observed. Coretrace prints only first runtime call at432tokens in serialreference, so requesting per-call3408timedcoretrace lines was an invalid verification assumption. C155eligibility and numericchecks passed; no absent-kernel claim. Source158 adds actual per-reader counters and removes verbose short-attention traces. Cold0.8367pps is diagnostic only. Originalreports and failedverifier preserved.",
+  "report_sha256": "3ab241c3c80f70c46cf06dcfd008a57730e626cc5e3a3e805d0a80db5f3bf539",
+  "failed_smoke_audit_sha256": "40c02ae56956176bebd5913767be465e5c61c738c97261ccbfd673480dad6e6b",
+  "verification_driver_sha256": "6a694b3d21dfbf184561f2ee3a7fd544be5acbfa948362c64014619d11ed09ad",
+  "smoke_driver_sha256": "7beb62abd26507b27ac8e2a297b8adb8d092e5bc99b3935b30608527fa4ddffe",
+  "primary_throughput_eligible": false
+}

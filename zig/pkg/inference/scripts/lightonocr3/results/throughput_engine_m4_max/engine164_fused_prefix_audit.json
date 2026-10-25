@@ -1,0 +1,355 @@
+{
+  "status": "numeric_and_isolated_stage_pass_not_production_qualified",
+  "created_at": "2026-10-25T16:58:32.549599+00:00",
+  "driver_sha256": "7ce08456858ff051f1bf2db9abd4a88e5c0c25e36dee7e564ed882c684c74e64",
+  "preparation": {
+    "status": "prepared_not_built_or_run",
+    "scope": "Private F32 fused short-prefix recurrent core, adapted from existing512threaddecode kernel. Persistent state held in registers across tokens; full intermediate debugwrites retained. Same dtypes. Serial stage prototype only, not production-qualified for planned/cancel/alias cases. No canonical change.",
+    "canonical_c_sha256": "9a28a334a0a322f85d0b2040f0170d53b02e64b5768e06c839b967f8f59adf60",
+    "source_sha256": {
+      "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine164_fused_prefix.metal": "61891afbf6d49e5716bbf91248bc3e20bfc5ed74b429841756a9dde5148ebdc0",
+      "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine164_fused_prefix_kernels.m": "9a28a334a0a322f85d0b2040f0170d53b02e64b5768e06c839b967f8f59adf60",
+      "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine164_fused_prefix_checks.m": "d70116f5ae330802f1811e783e7a0a5700c972faa90b0bdbf1aa2b38bf4d55cb",
+      "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine164_fused_prefix_probe.m": "02bb54dc1d3bec75be7769a656e0029bb605b8cff67afb682354917787ac824d",
+      "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/prepare_engine164_fused_prefix.py": "9c37294bd90842c0a900fd497485ae1434dfe477043c8209e44886d547ec285b"
+    }
+  },
+  "own_waiter": {
+    "pid": 70730,
+    "create_time": 1792946205.961811,
+    "cmdline": [
+      "/opt/homebrew/Cellar/python@3.12/3.12.14/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python",
+      ".venv-lighton-vllm-metal/run_engine158_short161_screen.py"
+    ],
+    "cwd": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b"
+  },
+  "primary_throughput_eligible": false,
+  "runs": [
+    {
+      "phase": "check",
+      "exit_code": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "c3bbeddf8fd39afb3f8f4328cda739c7ccc7bb54b06015bde0e7e51fa3bbf98b",
+      "shape_count": 100
+    },
+    {
+      "phase": "benchmark",
+      "exit_code": 0,
+      "stdout_sha256": "62ad8a9fe2d3974759a30d0a742577c8b1fd567d0f84f743895f09ec259f5788",
+      "stderr_sha256": "ec4e45a944bb8c42b5ef1087c56ccd6d94cdd24f359b8fe98be7bf11e0b29a63",
+      "ratios": [
+        {
+          "heads": 16,
+          "seq": 22,
+          "initialized": 0,
+          "old_median_gpu_us": 140.70749999999998,
+          "new_median_gpu_us": 423.41600000000005,
+          "old_over_new": 0.3323150282464526
+        },
+        {
+          "heads": 16,
+          "seq": 22,
+          "initialized": 1,
+          "old_median_gpu_us": 148.2495,
+          "new_median_gpu_us": 424.833,
+          "old_over_new": 0.3489594734872291
+        },
+        {
+          "heads": 16,
+          "seq": 42,
+          "initialized": 0,
+          "old_median_gpu_us": 199.3745,
+          "new_median_gpu_us": 779.125,
+          "old_over_new": 0.2558953954756939
+        },
+        {
+          "heads": 16,
+          "seq": 42,
+          "initialized": 1,
+          "old_median_gpu_us": 206.937,
+          "new_median_gpu_us": 783.4995,
+          "old_over_new": 0.26411886669997875
+        },
+        {
+          "heads": 16,
+          "seq": 48,
+          "initialized": 0,
+          "old_median_gpu_us": 224.5615,
+          "new_median_gpu_us": 885.124,
+          "old_over_new": 0.25370626036577926
+        },
+        {
+          "heads": 16,
+          "seq": 48,
+          "initialized": 1,
+          "old_median_gpu_us": 231.58249999999998,
+          "new_median_gpu_us": 887.6245,
+          "old_over_new": 0.26090142847566733
+        },
+        {
+          "heads": 16,
+          "seq": 64,
+          "initialized": 0,
+          "old_median_gpu_us": 269.04150000000004,
+          "new_median_gpu_us": 1167.7495,
+          "old_over_new": 0.23039316223213974
+        },
+        {
+          "heads": 16,
+          "seq": 64,
+          "initialized": 1,
+          "old_median_gpu_us": 274.83299999999997,
+          "new_median_gpu_us": 1171.687,
+          "old_over_new": 0.23456178996609162
+        },
+        {
+          "heads": 16,
+          "seq": 96,
+          "initialized": 0,
+          "old_median_gpu_us": 377.1455,
+          "new_median_gpu_us": 1733.854,
+          "old_over_new": 0.21751860306577142
+        },
+        {
+          "heads": 16,
+          "seq": 96,
+          "initialized": 1,
+          "old_median_gpu_us": 380.33299999999997,
+          "new_median_gpu_us": 1736.375,
+          "old_over_new": 0.21903851414584982
+        },
+        {
+          "heads": 16,
+          "seq": 120,
+          "initialized": 0,
+          "old_median_gpu_us": 450.9365,
+          "new_median_gpu_us": 2154.937,
+          "old_over_new": 0.20925739360361814
+        },
+        {
+          "heads": 16,
+          "seq": 120,
+          "initialized": 1,
+          "old_median_gpu_us": 454.6245,
+          "new_median_gpu_us": 2161.416,
+          "old_over_new": 0.21033641834797187
+        },
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": 0,
+          "old_median_gpu_us": 471.1875,
+          "new_median_gpu_us": 2297.458,
+          "old_over_new": 0.20509080035413052
+        },
+        {
+          "heads": 16,
+          "seq": 128,
+          "initialized": 1,
+          "old_median_gpu_us": 477.54100000000005,
+          "new_median_gpu_us": 2293.7285,
+          "old_over_new": 0.20819421304657462
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": 0,
+          "old_median_gpu_us": 605.499,
+          "new_median_gpu_us": 3489.7705,
+          "old_over_new": 0.17350682516228502
+        },
+        {
+          "heads": 16,
+          "seq": 432,
+          "initialized": 1,
+          "old_median_gpu_us": 1343.3325,
+          "new_median_gpu_us": 6245.603999999999,
+          "old_over_new": 0.21508448182113374
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": 0,
+          "old_median_gpu_us": 995.562,
+          "new_median_gpu_us": 5215.916,
+          "old_over_new": 0.190870021679797
+        },
+        {
+          "heads": 16,
+          "seq": 662,
+          "initialized": 1,
+          "old_median_gpu_us": 1147.1245,
+          "new_median_gpu_us": 6163.5830000000005,
+          "old_over_new": 0.1861132558773038
+        },
+        {
+          "heads": 32,
+          "seq": 22,
+          "initialized": 0,
+          "old_median_gpu_us": 217.08249999999998,
+          "new_median_gpu_us": 419.22850000000005,
+          "old_over_new": 0.5178142707377956
+        },
+        {
+          "heads": 32,
+          "seq": 22,
+          "initialized": 1,
+          "old_median_gpu_us": 226.4785,
+          "new_median_gpu_us": 426.7075,
+          "old_over_new": 0.5307581891576783
+        },
+        {
+          "heads": 32,
+          "seq": 42,
+          "initialized": 0,
+          "old_median_gpu_us": 335.937,
+          "new_median_gpu_us": 772.5830000000001,
+          "old_over_new": 0.4348231840462448
+        },
+        {
+          "heads": 32,
+          "seq": 42,
+          "initialized": 1,
+          "old_median_gpu_us": 345.08299999999997,
+          "new_median_gpu_us": 778.7705000000001,
+          "old_over_new": 0.44311257295955603
+        },
+        {
+          "heads": 32,
+          "seq": 48,
+          "initialized": 0,
+          "old_median_gpu_us": 365.35350000000005,
+          "new_median_gpu_us": 878.8330000000001,
+          "old_over_new": 0.41572574084041
+        },
+        {
+          "heads": 32,
+          "seq": 48,
+          "initialized": 1,
+          "old_median_gpu_us": 374.10350000000005,
+          "new_median_gpu_us": 885.1665,
+          "old_over_new": 0.42263630627684173
+        },
+        {
+          "heads": 32,
+          "seq": 64,
+          "initialized": 0,
+          "old_median_gpu_us": 460.41650000000004,
+          "new_median_gpu_us": 1162.0415,
+          "old_over_new": 0.3962134743036286
+        },
+        {
+          "heads": 32,
+          "seq": 64,
+          "initialized": 1,
+          "old_median_gpu_us": 469.937,
+          "new_median_gpu_us": 1168.875,
+          "old_over_new": 0.4020421345310662
+        },
+        {
+          "heads": 32,
+          "seq": 96,
+          "initialized": 0,
+          "old_median_gpu_us": 654.6875,
+          "new_median_gpu_us": 1734.729,
+          "old_over_new": 0.377400446986244
+        },
+        {
+          "heads": 32,
+          "seq": 96,
+          "initialized": 1,
+          "old_median_gpu_us": 663.1455,
+          "new_median_gpu_us": 1733.7705,
+          "old_over_new": 0.3824874745532929
+        },
+        {
+          "heads": 32,
+          "seq": 120,
+          "initialized": 0,
+          "old_median_gpu_us": 799.5825,
+          "new_median_gpu_us": 2145.333,
+          "old_over_new": 0.3727078733231624
+        },
+        {
+          "heads": 32,
+          "seq": 120,
+          "initialized": 1,
+          "old_median_gpu_us": 807.8955000000001,
+          "new_median_gpu_us": 2157.708,
+          "old_over_new": 0.37442299884877844
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": 0,
+          "old_median_gpu_us": 843.8745,
+          "new_median_gpu_us": 2299.8325,
+          "old_over_new": 0.36692867850158656
+        },
+        {
+          "heads": 32,
+          "seq": 128,
+          "initialized": 1,
+          "old_median_gpu_us": 850.937,
+          "new_median_gpu_us": 2298.8745,
+          "old_over_new": 0.3701537426249237
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": 0,
+          "old_median_gpu_us": 1451.708,
+          "new_median_gpu_us": 3951.791,
+          "old_over_new": 0.3673544476415883
+        },
+        {
+          "heads": 32,
+          "seq": 432,
+          "initialized": 1,
+          "old_median_gpu_us": 1169.9995,
+          "new_median_gpu_us": 3300.3540000000003,
+          "old_over_new": 0.35450727406817567
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": 0,
+          "old_median_gpu_us": 2221.416,
+          "new_median_gpu_us": 6184.3325,
+          "old_over_new": 0.35920060895820205
+        },
+        {
+          "heads": 32,
+          "seq": 662,
+          "initialized": 1,
+          "old_median_gpu_us": 2142.2705,
+          "new_median_gpu_us": 6148.353999999999,
+          "old_over_new": 0.34842992124396227
+        }
+      ]
+    }
+  ],
+  "children_after_stop": [],
+  "build_command": [
+    "clang",
+    "-O3",
+    "-fobjc-arc",
+    "-I/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/src/backends",
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine164_fused_prefix_probe.m",
+    "-o",
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine164_fused_prefix_probe",
+    "-framework",
+    "Foundation",
+    "-framework",
+    "Metal",
+    "-framework",
+    "MetalPerformanceShaders",
+    "-framework",
+    "Accelerate"
+  ],
+  "build_exit_code": 0,
+  "build_log_sha256": "607c2ed83233e4ecae3676219410d44b3a3c1965532237de99661c323cd2c676",
+  "binary_sha256": "639718e9898ab08626da4358f9326e96f77e1a6de1b6d0c6fb1702252918bfe9",
+  "own_waiter_resumed": true,
+  "resumed_at": "2026-10-25T16:59:02.707962+00:00"
+}

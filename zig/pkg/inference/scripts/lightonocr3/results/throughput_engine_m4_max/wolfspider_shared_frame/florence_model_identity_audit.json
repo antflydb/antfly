@@ -1,0 +1,66 @@
+{
+  "status": "all_florence_inputs_byte_identical",
+  "scope": "Pinned original MLX FP16 and publisher native Q4_K/F16-encoder checkpoints. Distinct representations remain explicit; no conversion or quantization change. New copies confined to own worktree.",
+  "models": {
+    "florence-fp16": {
+      "config.json": {
+        "bytes": 2430,
+        "sha256": "c666d0fe0172d46e115e8fba6cd93cd83714575b33a73005cab8d24ce2a3aa8f"
+      },
+      "model.safetensors": {
+        "bytes": 463221266,
+        "sha256": "03075d2d2d2bbd3e180b9ba0afae4aa8563226e2d32911656966e05b2f2ee060"
+      },
+      "preprocessor_config.json": {
+        "bytes": 806,
+        "sha256": "2f5921bbc53c7cc04251e1027b45b1cec726276be6db23d1bb40641bfbe2cf29"
+      },
+      "tokenizer.json": {
+        "bytes": 1355863,
+        "sha256": "847bbeab6174d66a88898f729d52fa8d355fafe1bea101cf960dd404581df70e"
+      },
+      "tokenizer_config.json": {
+        "bytes": 34,
+        "sha256": "79ffcf43af8ebda99d165f61d243180da2e2639952e41e71e11611c18770489c"
+      },
+      "vocab.json": {
+        "bytes": 1099884,
+        "sha256": "394fdc63c71aabe0a9b97117f5d62fb5fcc4d59b2b3ea929a3929e6a53217b3c"
+      }
+    },
+    "florence-native": {
+      "Florence-2-base.Q4_K.gguf": {
+        "bytes": 141657728,
+        "sha256": "523000d1759e8a61469aaf33378c6c8affe2ff107b6bbfd1b82a44b53f4bd156"
+      },
+      "antfly_inference_variants.json": {
+        "bytes": 362,
+        "sha256": "9d02d3770014d3791dca404da4fb6b8caa8d75b3e0066b38d4f80fad99d6c096"
+      },
+      "config.json": {
+        "bytes": 2430,
+        "sha256": "c666d0fe0172d46e115e8fba6cd93cd83714575b33a73005cab8d24ce2a3aa8f"
+      },
+      "model_manifest.json": {
+        "bytes": 201,
+        "sha256": "89d58caf17d713a194c774d4c4ff7ccc447c976d24994e27aeb94e797eddb677"
+      },
+      "preprocessor_config.json": {
+        "bytes": 806,
+        "sha256": "2f5921bbc53c7cc04251e1027b45b1cec726276be6db23d1bb40641bfbe2cf29"
+      },
+      "tokenizer.json": {
+        "bytes": 1355863,
+        "sha256": "847bbeab6174d66a88898f729d52fa8d355fafe1bea101cf960dd404581df70e"
+      },
+      "tokenizer_config.json": {
+        "bytes": 34,
+        "sha256": "79ffcf43af8ebda99d165f61d243180da2e2639952e41e71e11611c18770489c"
+      },
+      "vocab.json": {
+        "bytes": 1099884,
+        "sha256": "394fdc63c71aabe0a9b97117f5d62fb5fcc4d59b2b3ea929a3929e6a53217b3c"
+      }
+    }
+  }
+}

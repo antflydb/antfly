@@ -1,0 +1,178 @@
+{
+  "status": "all_selected_profiles_repeated_win_and_archives_verified",
+  "created_at": "2026-10-25T19:40:59.415756+00:00",
+  "scope": "BothLightOnsizes beat actualvLLM in both warmed orders on samewolfspiderM4Max32GPUcores36GiB; Florence beats onlytheexplicitMLXproxy. Allselected native/reference report hashes and completeLightOnfixturestrings checked. Complete serverlogs retain automaticcachecapacity>=320, notjust startup. Native256warm excluded+two256timed; API256warm+256timed each. Florence128warm+two128timed vs128warm+128timed eachproxy. Originalcaps/reserves preserved. FullGPU335/6 and all64C64model/frame proof pass; source180C/Metal/header inputs unchangedfromfresh158C24.3syntheticfixtures establish consistency, not broadaccuracy.",
+  "selected": {
+    "lighton4b": {
+      "audit": "wolfspider_shared_frame/paired184_4b_warmed_comparison_audit.json",
+      "audit_sha256": "c5c627f4efd86d336ab6cc7695b371f017d5c7dcb5b51c544204e63d20c3f1f0",
+      "comparisons": [
+        {
+          "native_round": 1,
+          "native_pages_per_second": 1.2098,
+          "vllm_pages_per_second": 1.1516702115322761,
+          "ratio": 1.0504743353484702
+        },
+        {
+          "native_round": 2,
+          "native_pages_per_second": 1.2111,
+          "vllm_pages_per_second": 1.151823646223334,
+          "ratio": 1.05146304642297
+        }
+      ],
+      "actual_shared_frames": [
+        {
+          "round": 0,
+          "mixed_steps": 254,
+          "decoder_frame_submissions_per_shared_forward": [
+            1
+          ]
+        },
+        {
+          "round": 1,
+          "mixed_steps": 254,
+          "decoder_frame_submissions_per_shared_forward": [
+            1
+          ]
+        },
+        {
+          "round": 2,
+          "mixed_steps": 255,
+          "decoder_frame_submissions_per_shared_forward": [
+            1
+          ]
+        }
+      ],
+      "native_report_sha256": "380e678583a1789af275feec78130c8513f5a8e891e762bda0de1a9cf7296f34"
+    },
+    "lighton08": {
+      "audit": "wolfspider_shared_frame/paired188_08_warmed_comparison_audit.json",
+      "audit_sha256": "40bf8bf1cf0f9811bdf1c44fb654843c6774a05d53fd3f8a00dd8d85c0316793",
+      "comparisons": [
+        {
+          "native_round": 1,
+          "native_pages_per_second": 4.7253,
+          "vllm_pages_per_second": 4.102017498285902,
+          "ratio": 1.1519453542005968
+        },
+        {
+          "native_round": 2,
+          "native_pages_per_second": 4.7356,
+          "vllm_pages_per_second": 4.097097885688474,
+          "ratio": 1.1558425334532205
+        }
+      ],
+      "actual_shared_frames": [
+        {
+          "round": 0,
+          "mixed_steps": 253,
+          "decoder_frame_submissions_per_shared_forward": [
+            1
+          ]
+        },
+        {
+          "round": 1,
+          "mixed_steps": 254,
+          "decoder_frame_submissions_per_shared_forward": [
+            1
+          ]
+        },
+        {
+          "round": 2,
+          "mixed_steps": 253,
+          "decoder_frame_submissions_per_shared_forward": [
+            1
+          ]
+        }
+      ],
+      "native_report_sha256": "78b5a3fe04322b7cfc59411c13a08c7d0618c39cad61535be1c78d50b90e12cd"
+    },
+    "florence": {
+      "audit": "wolfspider_shared_frame/paired186_florence_comparison_audit.json",
+      "audit_sha256": "464e31385b9863f9ba2d52b441abca95360df10223c1f38d48b56c945893ffda",
+      "comparisons": [
+        {
+          "round": 0,
+          "order": "warmed MLX proxy then native warm excluded and timed1",
+          "native_report": "engine180_florence_paired186_r0_native/report.json",
+          "native_report_sha256": "442b06cd2a99fc508ea372499c87f5b36d6df4a5c5bedefb31e50366992af689",
+          "proxy_report": "mlx_florence_engine180_paired186_r0_reference/report.json",
+          "proxy_report_sha256": "fa4fcbcb38091dcb8f466fe0a2c7c42fe83b62a2393e5c20099e985c8bfd4865",
+          "native_pages_per_second": 5.3085,
+          "proxy_pages_per_second": 5.13791157316256,
+          "native_to_proxy_ratio": 1.0332019001121964,
+          "all_128_native_pages_equal_native_serial": true,
+          "native_full_fixture_string_identity": true,
+          "cross_runtime_full_fixture_string_identity": false,
+          "cross_runtime_whitespace_normalized_content": true,
+          "primary_throughput_eligible": true
+        },
+        {
+          "round": 1,
+          "order": "native timed2 then fresh warmed MLX proxy",
+          "native_report": "engine180_florence_paired186_r0_native/report.json",
+          "native_report_sha256": "442b06cd2a99fc508ea372499c87f5b36d6df4a5c5bedefb31e50366992af689",
+          "proxy_report": "mlx_florence_engine180_paired186_r1_reference/report.json",
+          "proxy_report_sha256": "697e6f790dc7c246dca072aa93978347cb6924956b240792ef416a21feb47bb8",
+          "native_pages_per_second": 5.3058,
+          "proxy_pages_per_second": 5.130645713446865,
+          "native_to_proxy_ratio": 1.0341388387224,
+          "all_128_native_pages_equal_native_serial": true,
+          "native_full_fixture_string_identity": true,
+          "cross_runtime_full_fixture_string_identity": false,
+          "cross_runtime_whitespace_normalized_content": true,
+          "primary_throughput_eligible": true
+        }
+      ],
+      "scope": "MLX-VLM serial proxy only; publisher nativeQ4_K/F16encoder/no-repeat3 vs originalFP16/defaultgreedy. Fullnative strings exact; crossruntimecontent whitespace-normalized. InstalledvLLMMetal has noFlorenceadapter."
+    }
+  },
+  "complete_log_cache_checks": [
+    {
+      "report": "wolfspider/vllm_4b_primary_reference172_r1_c64_w256_r256_ctx1024/report.json",
+      "all_observed_auto_blocks": [
+        477
+      ]
+    },
+    {
+      "report": "wolfspider_shared_frame/vllm_4b_primary_reference184_r1_c64_w256_r256_ctx1024/report.json",
+      "all_observed_auto_blocks": [
+        477
+      ]
+    },
+    {
+      "report": "wolfspider_shared_frame/vllm_08_primary_reference185_r1_c64_w256_r256_ctx2048/report.json",
+      "all_observed_auto_blocks": [
+        1941
+      ]
+    },
+    {
+      "report": "wolfspider_shared_frame/vllm_08_primary_reference188_r1_c64_w256_r256_ctx2048/report.json",
+      "all_observed_auto_blocks": [
+        1941
+      ]
+    }
+  ],
+  "archives": [
+    {
+      "folder": "drivers",
+      "entries": 1853,
+      "manifest_sha256": "a1f5816e8b0b3a1af31c2de2104df8b652f476a9bf0826a281c06b365806e4c2"
+    },
+    {
+      "folder": "qualification",
+      "entries": 2754,
+      "manifest_sha256": "830eed80359808b4289e9a10a06d900c08cf1b78556f66da384064b26b60ac6d"
+    },
+    {
+      "folder": "wolfspider_shared_frame/drivers",
+      "entries": 33,
+      "manifest_sha256": "3cd833cf1e3ea2437f618a039d5f16bc0d943f386ef60586d6e1d30f392aeb6a"
+    },
+    {
+      "folder": "wolfspider_shared_frame/qualification",
+      "entries": 34,
+      "manifest_sha256": "d38fdcff8c4116c973db89d3a84fbb73f4756466f6219bdec543be56a5ab74cf"
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "status": "real_saved_log_and_corruption_rejection_pass",
+  "primary_throughput_eligible": false,
+  "scope": "Public updated parser reads the completed actual184native log offline. Subprocess.Popen is replaced solely to supply saved output; no native binary or model runs. Original reports and speed data stay unchanged. Valid real763mixed forwards pass; a changed decoder-frame count and missing counters both fail closed.",
+  "parser_sha256": "b5e737d451d0ad0aca263f017c6115ad86b5a2b2818cb8054f02832a65c7f175",
+  "original_log_sha256": "e4b2e95eb5d1c4236e91981e73c12707dbe6e0445ac02d92e491b60ffba64bd9",
+  "driver_sha256": "1c4b4d9a86f0117468629537893f5fcea2abb6285ef07751ac0c83d3c7088f6a",
+  "cases": [
+    {
+      "case": "valid",
+      "status": "ok",
+      "shared_steps": 763,
+      "mismatches": 0
+    },
+    {
+      "case": "wrong_frame_count",
+      "status": "missing_single_frame_packed_forwards",
+      "shared_steps": 763,
+      "mismatches": 1
+    },
+    {
+      "case": "missing_frame_counters",
+      "status": "missing_single_frame_packed_forwards",
+      "shared_steps": 0,
+      "mismatches": 0
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+metal_pipelined_decode_frame: enabled=1 owner=executor rollback=TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME
+vision_pack_reuse rows=2304 in=1024 out=4096 steps=6 cpu_max_abs=2.10304e-07 old_gpu_us=20798.00 reuse_gpu_us=10428.37 old_wall_us=32481.00 reuse_wall_us=20639.00
+vision_pack_reuse rows=2304 in=4096 out=1024 steps=6 cpu_max_abs=6.19948e-07 old_gpu_us=19515.71 reuse_gpu_us=12488.50 old_wall_us=26131.00 reuse_wall_us=15496.00
+vision_pack_reuse rows=128 in=768 out=768 steps=6 cpu_max_abs=4.7691e-07 old_gpu_us=196.37 reuse_gpu_us=188.79 old_wall_us=679.00 reuse_wall_us=461.00
+vision_pack_reuse rows=432 in=768 out=3072 steps=6 cpu_max_abs=2.42901e-07 old_gpu_us=1277.08 reuse_gpu_us=1244.12 old_wall_us=3144.00 reuse_wall_us=2852.00
+vision_pack_reuse rows=2304 in=768 out=2304 steps=6 cpu_max_abs=2.42901e-07 old_gpu_us=4764.75 reuse_gpu_us=4877.75 old_wall_us=10735.00 reuse_wall_us=10947.00
+vision_pack_reuse rows=2648 in=1024 out=4096 steps=6 cpu_max_abs=4.7448e-07 old_gpu_us=14739.62 reuse_gpu_us=15264.25 old_wall_us=27154.00 reuse_wall_us=26526.00
+vision_pack_reuse rows=4096 in=1024 out=1024 steps=6 cpu_max_abs=2.31492e-07 old_gpu_us=9397.17 reuse_gpu_us=6952.75 old_wall_us=16442.00 reuse_wall_us=11735.00
+vision_pack_reuse rows=4097 in=1024 out=1024 steps=6 cpu_max_abs=2.10304e-07 old_gpu_us=11022.75 reuse_gpu_us=9220.00 old_wall_us=18924.00 reuse_wall_us=15054.00

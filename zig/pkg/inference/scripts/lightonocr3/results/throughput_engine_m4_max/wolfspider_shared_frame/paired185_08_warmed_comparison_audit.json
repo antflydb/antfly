@@ -1,0 +1,39 @@
+{
+  "status": "repeated_native_win",
+  "primary_throughput_eligible": true,
+  "created_at": "2026-10-25T19:16:44.437384+00:00",
+  "driver_sha256": "73ab99843adbcba41889e3ac5b8cca3fdfcc084b51fafe52c7c3f4f8b3b33e8a",
+  "scope": "Fresh warmed actualvLLMMetal0.8B C64automaticcachedefaultcontext2048/util.6 vsfixedpreviouslyqualifiednativeC64/VF4/prefix16, source180 on wolfspider, prior qualified0.8Bprofile with packed path OFF. Full256saturationwarmrequestsperreferenceexcluded,one residentnativewarm256excludedthentwotimed256rounds. Prefixandprocessorcacheoff;uniqueimages;fullfixturestringsandalloutputsrequired. Capsunchanged. Node.readvsloopbackHTTP. Sharedmachineuncontrolled;Noowncompile/profile/otherGPUoverlap. Reference14GiBpreflightandautomaticfloor320coverC64actualmax918tokens;configuredcontext2048/util.6samepriorbestprofile.",
+  "comparisons": [
+    {
+      "native_round": 1,
+      "native_pages_per_second": 4.4646,
+      "vllm_pages_per_second": 4.095607001928663,
+      "ratio": 1.0900948254794893
+    },
+    {
+      "native_round": 2,
+      "native_pages_per_second": 4.4433,
+      "vllm_pages_per_second": 4.102017498285902,
+      "ratio": 1.083198694753669
+    }
+  ],
+  "selected_prefill_items": 1,
+  "profile_selection": "Fixedpriorqualified0.8Bprofile;no currenttimingselection.",
+  "vllm_r0": {
+    "report": "vllm_08_primary_reference185_r0_c64_w256_r256_ctx2048/report.json",
+    "report_sha256": "98aecad81cef7a74f50a67d0989c11638c6e8cfa49e1e641e768808495e2ed97",
+    "exit_code": 0
+  },
+  "native": {
+    "report": "engine180_08_paired185_packed_warm_then_two_c64_r256/report.json",
+    "report_sha256": "80e68ecc938d4db7204f21eed87dcd35a9eec7a33800e9b79eb86ca78eef1eab",
+    "exit_code": 0
+  },
+  "vllm_r1": {
+    "report": "vllm_08_primary_reference185_r1_c64_w256_r256_ctx2048/report.json",
+    "report_sha256": "56625a39a057c7e080d94243843e2cc56a9e9d960733590b338c24d448ff1c9a",
+    "exit_code": 0
+  },
+  "excluded_native_saturation_warm_round": 0
+}

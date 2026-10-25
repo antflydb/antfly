@@ -1,0 +1,10 @@
+{
+  "status": "all_16_outputs_match_native_serial_and_exact_api_fixture_strings",
+  "native_report_sha256": "15c54e8bd754a09b38248511fcdd9ce51534ab678dcf17431985c8d32203907b",
+  "reference_report_sha256": "72e98734c08736ed99970569fea441a2048b9faa0dddc3e967fd1e83146bc7db",
+  "completed": 16,
+  "prefix_starts": 16,
+  "prefix_finishes": 16,
+  "prefill_chunks": 42,
+  "scope": "Cross-runtime strict complete-string equality independently checked in addition to public normalized-content checks. Smoke only, no throughput comparison."
+}

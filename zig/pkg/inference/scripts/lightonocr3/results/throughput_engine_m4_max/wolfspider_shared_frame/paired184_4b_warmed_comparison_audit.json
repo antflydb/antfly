@@ -1,0 +1,69 @@
+{
+  "status": "repeated_native_win",
+  "primary_throughput_eligible": true,
+  "created_at": "2026-10-25T18:57:48.707517+00:00",
+  "driver_sha256": "fd7cd5369fc811e820709f67edbeb417ea6ffd04100aafada83b32ad56e195d8",
+  "source_freeze_sha256": "9c90160edf893b42465fdf45c4919fb3ae4e75671c38b00fbe4be8c462a01dc0",
+  "qualification_audit_sha256": "c5ea662ba1dea37159205e855cb5fde6f77c86271278679b4f1d926a3e801ad8",
+  "preregistration_sha256": "15c2eaccdaf83a8524c7c20a8279a42c59d3d1bd33484c33c4854891e8148c6b",
+  "scope": "Fixed preregistered candidate180 C64P1wholeprefix, shared decoder-frame input/model/F32head and exact packed-output admission. Opening actualvLLM reuses fresh source158paired172closing reference on same wolfspider, unchanged BF16checkpoint/settings, fully256warm+256timed. Between completed reference and this timing only source/model setup and untimed qualification, no configuration search. Native256warmEXCLUDED+two256timed inone resident process; new closing actualvLLM256warm+256timed. C64 ctx1024 max256 util.7 automaticfloor320 uniqueUUIDs prefix/processorcacheOFF. Native original caps17/10/4/28/24 and6GiBreserve+cushion unchanged. Fullnative strings and alloutputs exact; no admission pressure. Every mixed forward must use exactly one decoder-runtime frame; excludes possible separate prefix CPU-readback blit. Compare both native/reference orders and require both native rounds beat both baseline172native rates before promotion. Node.read vs loopbackHTTP.",
+  "opening_reference": {
+    "report": "/Users/ajroetker/antfly/.worktrees/perf-lightonocr3-wolfspider/zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max/wolfspider/vllm_4b_primary_reference172_r1_c64_w256_r256_ctx1024/report.json",
+    "report_sha256": "4f0691368c2c1ed60d10bf7034212285a5b2175c651506c2a40898b5693581af",
+    "source_paired_audit_sha256": "821751bf5c5db2d327629fb9b8858ba8d901ee0bf9ac34ba57a2750f8575959b"
+  },
+  "baseline_native_pages_per_second": [
+    1.2051,
+    1.2053
+  ],
+  "comparisons": [
+    {
+      "native_round": 1,
+      "native_pages_per_second": 1.2098,
+      "vllm_pages_per_second": 1.1516702115322761,
+      "ratio": 1.0504743353484702
+    },
+    {
+      "native_round": 2,
+      "native_pages_per_second": 1.2111,
+      "vllm_pages_per_second": 1.151823646223334,
+      "ratio": 1.05146304642297
+    }
+  ],
+  "native": {
+    "report": "engine180_4b_paired184_p1_chunk0_shared_c64_w256_then_two_r256/report.json",
+    "report_sha256": "380e678583a1789af275feec78130c8513f5a8e891e762bda0de1a9cf7296f34",
+    "exit_code": 0
+  },
+  "actual_shared_frames": [
+    {
+      "round": 0,
+      "mixed_steps": 254,
+      "decoder_frame_submissions_per_shared_forward": [
+        1
+      ]
+    },
+    {
+      "round": 1,
+      "mixed_steps": 254,
+      "decoder_frame_submissions_per_shared_forward": [
+        1
+      ]
+    },
+    {
+      "round": 2,
+      "mixed_steps": 255,
+      "decoder_frame_submissions_per_shared_forward": [
+        1
+      ]
+    }
+  ],
+  "closing_reference": {
+    "report": "vllm_4b_primary_reference184_r1_c64_w256_r256_ctx1024/report.json",
+    "report_sha256": "0c06113f7219d16696fdc0954e07cb9b00a2176b94ac27191e54496735280833",
+    "exit_code": 0
+  },
+  "beats_both_baseline_native_rounds": true,
+  "promotable": true,
+  "excluded_native_saturation_warm_round": 0
+}

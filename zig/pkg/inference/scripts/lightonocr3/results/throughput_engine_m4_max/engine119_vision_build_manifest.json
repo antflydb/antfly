@@ -1,0 +1,23 @@
+{
+  "status": "built_private_unqualified",
+  "scope": "Privatevisionattentiontileplans;existingFP16operands/F32outputsunchanged. No production mutation or macro claim. ComparefulloutputsandindependentF64CPUsampleswithguardsandbalancedpairedstageruns. Generated16/128/4/16controlmustmatchoriginalPSObitforbit.",
+  "input_sha256": {
+    ".venv-lighton-vllm-metal/engine119_vision_kernels.m": "87632422bf19830e22df9a2317401c045c036ca297fbeb182e9a5b3aef4ced0e",
+    ".venv-lighton-vllm-metal/engine119_q64k64s4m32t0.metal": "cbc2eced9637f70b048ec2cd78dac6cb1e8219a04f76520b123454464ccd4675",
+    ".venv-lighton-vllm-metal/engine119_vision_probe": "b32dd2350ab7ad816f25102cfcc169402c8a155d45956628d0940c59d9067e34",
+    ".venv-lighton-vllm-metal/engine119_q32k128s4m32t0.metal": "6cf20a1fa44ed6e6142994d2774f0d3b757ff64d59bbb248d53feebb032d2fdf",
+    ".venv-lighton-vllm-metal/engine119_q16k128s4m16t0.metal": "892bbdbb3b6eaf15b0d0e73fb53397d2d1300070549fc509731d539c621ea2f9",
+    ".venv-lighton-vllm-metal/engine119_q32k64s4m16t0.metal": "ca61134614a0b6f5d2302c2cb7a656476874c5432e1fedacc7507c6184497997",
+    ".venv-lighton-vllm-metal/engine119_vision_checks.m": "52d3f43b5cdc30ddffa3ea37668f2c61990117d30695f35a39a23ac66eb62c5a",
+    ".venv-lighton-vllm-metal/prepare_engine119_vision.py": "5460ae65034d8f6e4d9d80a230ffb2e3be68a57d699fdea78180b084b415ce61",
+    ".venv-lighton-vllm-metal/engine119_q32k64s8m16t1.metal": "06d2749a1c9c9225e446abc27e71d81777872340282e785325dea0cab6cd1e0b",
+    ".venv-lighton-vllm-metal/engine119_q64k32s4m16t0.metal": "7108773f50f16682ce81af462c4b7cf78fbfef4d754d7963436a790196d471cd",
+    ".venv-lighton-vllm-metal/engine119_plans.json": "1c8fe565ae105d36e9ab12d627888b3def96eea2eca363ee1a0f27e29db33bfd",
+    ".venv-lighton-vllm-metal/engine119_vision_probe.m": "6a0d704c63a1bea0b508fdd25f0551af97536015bf61c5a5bcfbc6237cb02e79",
+    ".venv-lighton-vllm-metal/engine119_q64k64s8m16t0.metal": "29cd701e9ce99289712a9d9c4d15aa5a69487bd09fa5c89cbc3640b4f971a666",
+    ".venv-lighton-vllm-metal/engine119_q64k32s4m32t0.metal": "52b024eb450f26af3debe1c99fccb72c6a49c81f14ce5d0799fb08a8d0d302c5",
+    ".venv-lighton-vllm-metal/engine119_q32k128s8m16t0.metal": "196253e7bd2083140c7f9e0f7766017eaecd6acf19269940cb57c49cc85cf4d5",
+    ".venv-lighton-vllm-metal/engine119_q64k32s4m16t1.metal": "ec18e525b2c795ca62ceb6b5ffa245cf374a9d600c09ff21101c60d0629550a9",
+    ".venv-lighton-vllm-metal/engine119_q32k64s8m16t0.metal": "d95553ed8405107da624ac7e6c09e88500168b7c4815f4a9778487cec0b8a01e"
+  }
+}

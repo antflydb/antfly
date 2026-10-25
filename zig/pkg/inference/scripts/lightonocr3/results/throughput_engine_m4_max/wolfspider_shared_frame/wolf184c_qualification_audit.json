@@ -1,0 +1,31 @@
+{
+  "status": "full_gpu335_and_all64_exact_one_decoder_frame_pass",
+  "created_at": "2026-10-25T18:55:38.952681+00:00",
+  "driver_sha256": "5556a961c2b5a06f770f46e52a72f1edd010b32d2b9a51a11f0bee4075ebf9e6",
+  "primary_throughput_eligible": false,
+  "binary_sha256": "5473e5122f08b09b30220fe611e14f3be3b9ccda6ea6d8a3b40d0bc38dccc7b2",
+  "runs": [
+    {
+      "phase": "full_gpu_replay",
+      "reused_native_log": true,
+      "source_audit": "wolf184b_qualification_audit.json",
+      "exit_code": 0,
+      "log_sha256": "c40ed706733d1102296bc7277cb9934ed9a82ba393f13d1371fb7808e4de3145"
+    },
+    {
+      "phase": "real4b_c64_smoke",
+      "exit_code": 0,
+      "log_sha256": "41d08c13563656ea06789c4810f6490c2b0703ba1bb77c75c1e8cd446ab4d8d6"
+    }
+  ],
+  "report": "engine180_4b_wolf184c_c64_smoke_r64/report.json",
+  "report_sha256": "da84499a49dc95400be9897421e97bc0c418c4a4c78d82eb608c2b83e9514f70",
+  "actual_shared_forward_steps": 61,
+  "decoder_frame_submissions_per_shared_forward": [
+    1
+  ],
+  "concurrency": 64,
+  "complete_fixture_strings": true,
+  "pressure_free": true,
+  "scope": "All64full4Boutputs exact, C64 admitted under original caps; every mixed forward uses one decoder-runtime frame. Counter excludes any separate CPU prefix-logit staging blit. No cold smoke throughput claim. FullGPU341selected335passed6skipped plus original production counter assertions pass."
+}

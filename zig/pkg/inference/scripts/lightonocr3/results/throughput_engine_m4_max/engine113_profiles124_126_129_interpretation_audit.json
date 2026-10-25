@@ -1,0 +1,10 @@
+{
+  "status": "diagnostics_closed_no_primary_speed_claim",
+  "primary_throughput_eligible": false,
+  "scope": "124frame512wasbeyondtheentirerunandcapturednodecode.126frame300/301stillserial; frames302..315reachedbatchedframesbutcoarselabelsdoNOTattributeFFNwork.129perencodertimingdropped14624intervalsandhas26.4sof36.1suntimed; firstpipeline labelsgroupmanyops. Do not interpret label shares as complete per-operation bottleneck.",
+  "files": {
+    "zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max/engine113_remaining_profile124_audit.json": "ac84457b358b255ea7b474b39b3041fea20d9fc21f3fb818057b04e376691cbd",
+    "zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max/engine113_remaining_profile126_audit.json": "cfd1aefcdfc1296b1a2f039eefc537431457c64bfd26f2df9902c97131a17dce",
+    "zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max/engine113_remaining_profile129_audit.json": "6c7e147c44b2fa51b5c9346c3770eae67263be5a01183c19f4cb6b91c43c7b7c"
+  }
+}

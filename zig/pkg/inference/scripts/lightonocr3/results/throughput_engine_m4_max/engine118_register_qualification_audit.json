@@ -1,0 +1,281 @@
+{
+  "created_at": "2026-10-25T14:06:31.441053+00:00",
+  "status": "numerical_pass_slower_not_promoted",
+  "scope": "Register-held F32 state and prepacked half Q/K. Explicit half matrix operand change; full tolerance checks pass, stage slower.",
+  "primary_throughput_eligible": false,
+  "provenance": "Post-run audit of closed private experiments, not a preregistration.",
+  "files": {
+    ".venv-lighton-vllm-metal/engine118_chunk_probe": "2a7a81f344ae19168929a209133a86b93a3f092bdaa4821b93de7ded67028fca",
+    ".venv-lighton-vllm-metal/engine118_chunk_kernels.m": "0304b2454373830b98bc6cb0f44653fb4b8ac931eb7335e8867fc4835dcdaba4",
+    ".venv-lighton-vllm-metal/engine118_chunk.metal": "50069eb9344314b1f01fec9a70f446cca6aefdffdfdaeefead920e7cbb94228f",
+    ".venv-lighton-vllm-metal/engine118_chunk_probe.m": "a5b34f6c97f1c66de6e49a5d8b3250b2e037632ffaa2a47bd3737fc66b7a4a05",
+    ".venv-lighton-vllm-metal/engine118_chunk_checks.m": "ffb131fd563e924f81eb19963b19f8fa158e16a6bf7982a778113ac01a9addc2",
+    ".venv-lighton-vllm-metal/prepare_engine118_registers.py": "9cf976905c3dea52b5771df33cdeb330239fe598f194ac3c87d3d0059957e600",
+    "/private/tmp/ocr-engine118-register-stdout.txt": "c2581e0acb7f2e909c520a0c2bb093f2e059e0334b964e4b1beb6486fa9d9de7",
+    "/private/tmp/ocr-engine118-register-stderr.txt": "155274ff635b7feb514867e26beb847c2fe6d753cc771f41d1ab0a460b20cb79",
+    "/private/tmp/ocr-engine118-register-build.txt": "0ec1c958c57621af59a7ab953e79e5ef4894db3714122acb0f1795d11361067a"
+  },
+  "timing_record_count": 768,
+  "baseline_over_candidate_gpu_ratios": [
+    {
+      "seq": 17,
+      "heads": 16,
+      "initialized": 0,
+      "ratio": 0.7991957360432063,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 17,
+      "heads": 16,
+      "initialized": 1,
+      "ratio": 0.8156312664881562,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 17,
+      "heads": 32,
+      "initialized": 0,
+      "ratio": 0.9339237150549053,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 17,
+      "heads": 32,
+      "initialized": 1,
+      "ratio": 0.7591517684389752,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 31,
+      "heads": 16,
+      "initialized": 0,
+      "ratio": 0.8572476716653512,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 31,
+      "heads": 16,
+      "initialized": 1,
+      "ratio": 0.8533811120757652,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 31,
+      "heads": 32,
+      "initialized": 0,
+      "ratio": 0.9078042266424434,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 31,
+      "heads": 32,
+      "initialized": 1,
+      "ratio": 1.0013683403627582,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 32,
+      "heads": 16,
+      "initialized": 0,
+      "ratio": 0.9211260977630489,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 32,
+      "heads": 16,
+      "initialized": 1,
+      "ratio": 0.8856351640723783,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 32,
+      "heads": 32,
+      "initialized": 0,
+      "ratio": 0.8640997037228728,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 32,
+      "heads": 32,
+      "initialized": 1,
+      "ratio": 0.9021083004314131,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 128,
+      "heads": 16,
+      "initialized": 0,
+      "ratio": 0.5078078306097766,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 128,
+      "heads": 16,
+      "initialized": 1,
+      "ratio": 0.5158022825125621,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 128,
+      "heads": 32,
+      "initialized": 0,
+      "ratio": 0.5144762421558631,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 128,
+      "heads": 32,
+      "initialized": 1,
+      "ratio": 0.5130454156534134,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 432,
+      "heads": 16,
+      "initialized": 0,
+      "ratio": 0.4668659559807061,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 432,
+      "heads": 16,
+      "initialized": 1,
+      "ratio": 0.46634484219850453,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 432,
+      "heads": 32,
+      "initialized": 0,
+      "ratio": 0.4406418284038537,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 432,
+      "heads": 32,
+      "initialized": 1,
+      "ratio": 0.4082566103896211,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 554,
+      "heads": 16,
+      "initialized": 0,
+      "ratio": 0.4640586394333718,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 554,
+      "heads": 16,
+      "initialized": 1,
+      "ratio": 0.4638694979231486,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 554,
+      "heads": 32,
+      "initialized": 0,
+      "ratio": 0.43396300297889484,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 554,
+      "heads": 32,
+      "initialized": 1,
+      "ratio": 0.45158664280020966,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 662,
+      "heads": 16,
+      "initialized": 0,
+      "ratio": 0.4366726054860499,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 662,
+      "heads": 16,
+      "initialized": 1,
+      "ratio": 0.45522504951153614,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 662,
+      "heads": 32,
+      "initialized": 0,
+      "ratio": 0.43152231360093196,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 662,
+      "heads": 32,
+      "initialized": 1,
+      "ratio": 0.4360230226063709,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 2048,
+      "heads": 16,
+      "initialized": 0,
+      "ratio": 0.4266472570227586,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 2048,
+      "heads": 16,
+      "initialized": 1,
+      "ratio": 0.4251029912581368,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 2048,
+      "heads": 32,
+      "initialized": 0,
+      "ratio": 0.43103105345503084,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    },
+    {
+      "seq": 2048,
+      "heads": 32,
+      "initialized": 1,
+      "ratio": 0.4289339895056078,
+      "baseline_samples": 12,
+      "candidate_samples": 12
+    }
+  ],
+  "full_pass_markers": [
+    "REGISTER118 ALL FULL OUTPUT STATE GUARDS PASS"
+  ],
+  "max_reported_abs_error": 0.000128995
+}

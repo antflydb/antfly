@@ -1,0 +1,2 @@
+metal_pipelined_decode_frame: enabled=1 owner=executor rollback=TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME
+vision_workspace_cache_check default_off=pass reuse=pass grow=pass two_banks=pass prefix=pass cancel=pass canaries=pass clear_before_lease_release=pass

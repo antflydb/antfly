@@ -1,0 +1,161 @@
+{
+  "status": "numerical_and_isolated_stage_pass_no_model_promotion",
+  "created_at": "2026-10-25T15:25:53.259926+00:00",
+  "driver_sha256": "c1eb54a3e71d6ed6c49b39b71a54e69c5c5aa8a723c41423e4e3f92d37c6d14a",
+  "preparation": {
+    "status": "prepared_not_run",
+    "scope": "DirectKV short-query route; no shader math/dtype/budget change, single-querydecode unchanged. Private only.",
+    "canonical_c_sha256": "65ec16730a1c22911fde496c55236c1d905f41d760eacc8079db78101d31d486",
+    "source_sha256": {
+      "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine143_short_prefill_kernels.m": "1cd52a6ce18a15877162dc8a845e7591c67f092cb37af9175f4c18a272b7efee",
+      "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine143_short_prefill_checks.m": "17e2c14b4dc4ecbdb238af6631348e19db45d7bee75e32810e6013e165ed2178",
+      "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine143_short_prefill_probe.m": "296fdc467f632f31ecd1a2edf0e36de5608cb615abaccc6f8bfc14ed059b1878",
+      "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/prepare_engine143_144.py": "778d1ad1d351ec522b7a79a26ec9a65f67b6c469a1379a80227cb31e1e4eaa4a",
+      "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/run_engine143_short_prefill.py": "c1eb54a3e71d6ed6c49b39b71a54e69c5c5aa8a723c41423e4e3f92d37c6d14a"
+    }
+  },
+  "binary_sha256": "f51be5e74c6c79238a7a461b630c96c9bfdedde165d976602be48acdb80f931b",
+  "build_log_sha256": "b914e97f2e8db78edb6f18096186e68faf317b02c447f36e71c4891bbdfff996",
+  "primary_throughput_eligible": false,
+  "scope": "ExistingF32Q/P direct-KV MPP attention eligible for2..127queries in privateCclone; no shader changes, q1decode routing unchanged.68full-output/canary/CPU/producer-consumer/fragmented-page/positive-offset/cancellation/nonfinite cases, then balanced old/new isolated stage timings. Realistic512-tokenpriorprefix, heads8/16. No own model/build/profile overlap. No whole-reader claim.",
+  "check": {
+    "exit_code": 0,
+    "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stderr_sha256": "8c9ee5fd32f7d63400160161adfa93d3cf70c046df682071710d97a70c0dc0cb"
+  },
+  "numerical_case_count": 68,
+  "benchmark": {
+    "exit_code": 0,
+    "stdout_sha256": "4ccb07d2a531c40f9920d7578da7b7a72500983a0cdfa6d663e86804c45bbb0d",
+    "stderr_sha256": "171a633ba528351ad111dc4e9471d8d79c6a96e67bdfea4eb1eb2d99d8bc9ad4"
+  },
+  "timing_record_count": 1080,
+  "stage_ratios": [
+    {
+      "heads": 8,
+      "queries": 2,
+      "old_median_gpu_us": 335.687,
+      "new_median_gpu_us": 656.5415,
+      "old_over_new": 0.5112959348342793
+    },
+    {
+      "heads": 8,
+      "queries": 8,
+      "old_median_gpu_us": 351.2285,
+      "new_median_gpu_us": 722.77,
+      "old_over_new": 0.48594781189036623
+    },
+    {
+      "heads": 8,
+      "queries": 16,
+      "old_median_gpu_us": 417.3745,
+      "new_median_gpu_us": 831.7075,
+      "old_over_new": 0.5018284673397799
+    },
+    {
+      "heads": 8,
+      "queries": 22,
+      "old_median_gpu_us": 934.02,
+      "new_median_gpu_us": 1856.3535,
+      "old_over_new": 0.5031477032795747
+    },
+    {
+      "heads": 8,
+      "queries": 42,
+      "old_median_gpu_us": 1751.125,
+      "new_median_gpu_us": 1893.375,
+      "old_over_new": 0.9248696111441209
+    },
+    {
+      "heads": 8,
+      "queries": 48,
+      "old_median_gpu_us": 1844.062,
+      "new_median_gpu_us": 1900.1665,
+      "old_over_new": 0.9704739032079557
+    },
+    {
+      "heads": 8,
+      "queries": 64,
+      "old_median_gpu_us": 2582.541,
+      "new_median_gpu_us": 1942.812,
+      "old_over_new": 1.3292799303277931
+    },
+    {
+      "heads": 8,
+      "queries": 96,
+      "old_median_gpu_us": 1146.7495,
+      "new_median_gpu_us": 638.1875,
+      "old_over_new": 1.796884928018803
+    },
+    {
+      "heads": 8,
+      "queries": 127,
+      "old_median_gpu_us": 1248.2910000000002,
+      "new_median_gpu_us": 603.104,
+      "old_over_new": 2.0697773518331832
+    },
+    {
+      "heads": 16,
+      "queries": 2,
+      "old_median_gpu_us": 234.375,
+      "new_median_gpu_us": 450.77,
+      "old_over_new": 0.5199436519732902
+    },
+    {
+      "heads": 16,
+      "queries": 8,
+      "old_median_gpu_us": 240.624,
+      "new_median_gpu_us": 455.125,
+      "old_over_new": 0.528698709145839
+    },
+    {
+      "heads": 16,
+      "queries": 16,
+      "old_median_gpu_us": 249.75,
+      "new_median_gpu_us": 453.41600000000005,
+      "old_over_new": 0.5508186742417559
+    },
+    {
+      "heads": 16,
+      "queries": 22,
+      "old_median_gpu_us": 746.249,
+      "new_median_gpu_us": 817.7705000000001,
+      "old_over_new": 0.9125408656829758
+    },
+    {
+      "heads": 16,
+      "queries": 42,
+      "old_median_gpu_us": 2984.937,
+      "new_median_gpu_us": 1915.8745,
+      "old_over_new": 1.5580023639335459
+    },
+    {
+      "heads": 16,
+      "queries": 48,
+      "old_median_gpu_us": 3395.083,
+      "new_median_gpu_us": 1930.937,
+      "old_over_new": 1.7582567427109224
+    },
+    {
+      "heads": 16,
+      "queries": 64,
+      "old_median_gpu_us": 4484.853999999999,
+      "new_median_gpu_us": 1984.604,
+      "old_over_new": 2.259823118365175
+    },
+    {
+      "heads": 16,
+      "queries": 96,
+      "old_median_gpu_us": 2069.583,
+      "new_median_gpu_us": 727.687,
+      "old_over_new": 2.8440565792710326
+    },
+    {
+      "heads": 16,
+      "queries": 127,
+      "old_median_gpu_us": 2223.187,
+      "new_median_gpu_us": 616.3745,
+      "old_over_new": 3.6068769879350944
+    }
+  ]
+}

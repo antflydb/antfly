@@ -1,0 +1,78 @@
+{
+  "status": "modern188_finished",
+  "created_at": "2026-10-25T19:25:42.352836+00:00",
+  "parent": {
+    "pid": 35445,
+    "create_time": 1792954928.026246
+  },
+  "exit_code": 0,
+  "comparison": {
+    "status": "repeated_native_win",
+    "primary_throughput_eligible": true,
+    "created_at": "2026-10-25T19:27:43.185163+00:00",
+    "driver_sha256": "5da581d9799f6b2a8796d04aadc8d11884a85083fc32a336756241748316289f",
+    "source_freeze_sha256": "9c90160edf893b42465fdf45c4919fb3ae4e75671c38b00fbe4be8c462a01dc0",
+    "qualification_audit_sha256": "c5ea662ba1dea37159205e855cb5fde6f77c86271278679b4f1d926a3e801ad8",
+    "preregistration_sha256": "f5824cccf1c5556e02e69489bf5a33626b82d304b5435010c6f62f8db74710c8",
+    "scope": "Fixed0.8Bmodern profile on same wolfspider/source180, independently compared to prior185legacy C64VF4/prefix16. Modern enables packedP1wholeprefix/shared frame, wide recurrent/sharedsideweights, BF16prefill/F32decode, residentvision, VF4, width4bursts, no layerstreaming and no retainedprefillpool. Original0.8Bcaps16/8/4/28/24GiB and6GiBreserve+cushion unchanged. Opening reference reuses completed185closing fully256warm+256timed actualvLLM C64ctx2048util.6floor320; interveningFlorence checks are outside timings. Native256warmEXCLUDED+two256timed. If both native rates fail to beat both185legacy rates, retainlegacy and skip newreference; otherwise newfullywarm closing actualvLLM required and both reference ratios must win. Exact alloutputs/fullfixturestrings and all mixed decoderframes required. Decoderframe count excludes prefix CPU-readbackblit. No profile search during188. Node.read vsloopbackHTTP",
+    "opening_reference": {
+      "report": "/Users/ajroetker/antfly/.worktrees/perf-lightonocr3-shared-frame-wolfspider/zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max/wolfspider_shared_frame/vllm_08_primary_reference185_r1_c64_w256_r256_ctx2048/report.json",
+      "report_sha256": "56625a39a057c7e080d94243843e2cc56a9e9d960733590b338c24d448ff1c9a",
+      "source_paired_audit_sha256": "ea2fe737d4424a3b48531595401c39d1454caaaa506632c38642bd41eafacc75"
+    },
+    "baseline_native_pages_per_second": [
+      4.4646,
+      4.4433
+    ],
+    "comparisons": [
+      {
+        "native_round": 1,
+        "native_pages_per_second": 4.7253,
+        "vllm_pages_per_second": 4.102017498285902,
+        "ratio": 1.1519453542005968
+      },
+      {
+        "native_round": 2,
+        "native_pages_per_second": 4.7356,
+        "vllm_pages_per_second": 4.097097885688474,
+        "ratio": 1.1558425334532205
+      }
+    ],
+    "native": {
+      "report": "engine180_08_paired188_modern_p1_chunk0_shared_c64_w256_then_two_r256/report.json",
+      "report_sha256": "78b5a3fe04322b7cfc59411c13a08c7d0618c39cad61535be1c78d50b90e12cd",
+      "exit_code": 0
+    },
+    "actual_shared_frames": [
+      {
+        "round": 0,
+        "mixed_steps": 253,
+        "decoder_frame_submissions_per_shared_forward": [
+          1
+        ]
+      },
+      {
+        "round": 1,
+        "mixed_steps": 254,
+        "decoder_frame_submissions_per_shared_forward": [
+          1
+        ]
+      },
+      {
+        "round": 2,
+        "mixed_steps": 253,
+        "decoder_frame_submissions_per_shared_forward": [
+          1
+        ]
+      }
+    ],
+    "beats_both_baseline_native_rounds": true,
+    "closing_reference": {
+      "report": "vllm_08_primary_reference188_r1_c64_w256_r256_ctx2048/report.json",
+      "report_sha256": "d1af7d4fe7824b686c503f024bb77646f4045c131f1a6c882d7d00aaf4084f6e",
+      "exit_code": 0
+    },
+    "promotable": true,
+    "excluded_native_saturation_warm_round": 0
+  }
+}

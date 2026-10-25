@@ -1,0 +1,8 @@
+{
+  "status": "closed_not_whole_model_evidence",
+  "scope": "Expanded148 directattention72numericshapes/4320balancedtimingrecords;149core204numericshapechecks acrossnorm/columns/both and12240timingrecords. Existingq128normalization is control rather than a new gain. New eligibility is relevant onlyshortq2..127; q1decodeunchanged. Source154productionconformance is pending. Screen150 larger-query draft was prepared but never run; superseded for now by fixing measured short-kernel cliffs.",
+  "audits": {
+    "zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max/engine148_short_prefill_audit.json": "c242c2682b998c0238059a695e1b2b0b651c2da7e9119500f4e7f64e466a031c",
+    "zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max/engine149_short_core_audit.json": "7c4cb03b84e420cec5f071b1183c0d1118b444bd3e80ec66610fa254803116bd"
+  }
+}

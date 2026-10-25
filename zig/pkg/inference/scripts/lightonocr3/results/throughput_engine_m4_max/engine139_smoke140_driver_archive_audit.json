@@ -1,0 +1,8 @@
+{
+  "status": "executed_smoke_wrapper_preserved_byte_exact",
+  "original_execution_name": "run_engine139_budget_policies.py",
+  "archive_source_name": "run_engine139_budget_policies_smoke140.py",
+  "source_sha256": "153447fc15a4023704ca83d563d5cc37dd66ea4b07a72237e6f7b84efe96b468",
+  "report_sha256": "15c54e8bd754a09b38248511fcdd9ce51534ab678dcf17431985c8d32203907b",
+  "followup_scope": "Subsequent screening wrapper accepts applicable-wide path usage without requiring needless staged work, and adds direct strict API string assertions. Original smoke strict strings independently certified; no model rerun or timing relabel."
+}

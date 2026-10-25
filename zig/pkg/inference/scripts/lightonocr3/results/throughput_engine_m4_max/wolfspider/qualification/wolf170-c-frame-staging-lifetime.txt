@@ -1,0 +1,3 @@
+FRAME_STAGING_LIFETIME mode=0 retained_buffers=0 bias_pipeline_retained=0 mps_plans_retained=0
+FRAME_STAGING_LIFETIME mode=1 retained_buffers=0 bias_pipeline_retained=0 mps_plans_retained=0
+FRAME_STAGING_LIFETIME mode=2 retained_buffers=0 bias_pipeline_retained=0 mps_plans_retained=0

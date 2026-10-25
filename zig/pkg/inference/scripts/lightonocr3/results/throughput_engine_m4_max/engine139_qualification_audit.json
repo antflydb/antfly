@@ -1,0 +1,19 @@
+{
+  "status": "runtime_and_chunked_model_correctness_pass_performance_regressed_no_promotion",
+  "scope": "CPU295pass/38skip and Metal331pass/6skip. C23qualification reused by exact source identity. Full4Bchunk256 C16/R16 exact and pressurefree; four warmed C62R128 screen141 profiles all exact, chunk128/256/384 slower than whole-prefix control. Two planned profiles not run. No throughput promotion. Original individual reports retained.",
+  "cpu_log_sha256": "a6aa84d30d60089a79d8222b2668ccd322170c47cbc9934e774d8e5611673b06",
+  "c_reference_manifest_sha256": "a6394e23fff4c29f8b506054c879c2c25bb1253f062e07ff30dc8e32a98f2141",
+  "c_inputs_verified": {
+    "zig/pkg/inference/src/backends/metal_kernels.m": "65ec16730a1c22911fde496c55236c1d905f41d760eacc8079db78101d31d486",
+    "zig/pkg/inference/src/backends/metal_buffer_observation.h": "6873d32642e0b9bd3f8acfdbf33306798b11e6a3a1a0b8c6571026f1c36b8ef7",
+    "zig/pkg/inference/src/backends/metal_mtp_head.h": "890772ce81b6b8bab2d61aaf28a7f1b4bca125c3e4bc12565284e3e577b5b233",
+    "zig/pkg/inference/src/backends/metal_mtp_head_impl.h": "1e032aa77b9b47f0567763be7230995c5f2646034e7a133de73149a7b5979649",
+    "zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m": "a920df5832ec334a807c6d539bff5fa0aa1353cdb551a5b075442f5b60c14fbb"
+  },
+  "frozen_inputs_sha256": "a268c62ae5034c88e13e8e79ecc40a572b69ed9f70204f1e627ba87dfe4bc719",
+  "metal_tests_passed": 331,
+  "metal_tests_skipped": 6,
+  "metal_log_sha256": "24182c00011e3eb0e222f03792d0b136c379d2f9d7485726a363bd25ed95c212",
+  "metal_parent_log_sha256": "8ccfb1ec776588c491830493bfd7fc10a4cd10882c1903286861557e22923ca5",
+  "build_manifest_sha256": "14f34cceb20bec36aaf9a70bddaeca5e8f3dcd6220e90671e9a6082a72eba206"
+}

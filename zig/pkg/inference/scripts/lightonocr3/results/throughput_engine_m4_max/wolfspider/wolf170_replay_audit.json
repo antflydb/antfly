@@ -1,0 +1,155 @@
+{
+  "status": "replaying_native_Metal_tests",
+  "created_at": "2026-10-25T17:36:13.711404+00:00",
+  "driver_sha256": "fd30f49c3214addf66d59727b6f62a6918004bafb664ce59c8f4ab5114de3821",
+  "scope": "Wolfspider M4 Max32GPU/36GiB: replay of byte-identical source158 qualified native and C binaries. Same source48file hashes and pinned0.8B model bytes. Correctness only; the4B file transfer may overlap. No throughput claim. Fresh Python3.12.14 with copied exact dependency environment.",
+  "platform": "macOS-26.6.2-arm64-arm-64bit",
+  "python": "3.12.14 (main, Sep 29 2026, 14:50:19) [Clang 22.1.3 ]",
+  "native_binary_sha256": "4312fe8f64673b7c039335efcc65805ee018b345a6bd50464c0e87cf604b07eb",
+  "packages": {
+    "vllm": "0.32.0+cpu",
+    "vllm-metal": "0.32.0",
+    "mlx": "0.32.2",
+    "mlx-lm": "0.32.0",
+    "mlx-vlm": "0.7.6",
+    "torch": "2.13.0",
+    "transformers": "5.19.0",
+    "numpy": "2.3.5",
+    "pillow": "13.0.0",
+    "psutil": "7.2.2"
+  },
+  "c_checks": [
+    {
+      "name": "prefill-activation-pool",
+      "exit_code": 0,
+      "log_sha256": "e6a50ad3d3a7f25338a9f91d1671ea8d75d20e16131cb294d68b55cc7cc8b790"
+    },
+    {
+      "name": "activation-pool",
+      "exit_code": 0,
+      "log_sha256": "c59ac516b5dd7ce9c770f8c52603b9819afa1b32286160a9ba46a702152a613a"
+    },
+    {
+      "name": "wide-recurrent",
+      "exit_code": 0,
+      "log_sha256": "bb4effb97fb7f2b6bc41221622ec67774cd7804de981eca56ae1e299b2b5bf94"
+    },
+    {
+      "name": "frame-staging-lifetime",
+      "exit_code": 0,
+      "log_sha256": "645bccc4f1301379005505b69420240f28608954eabb3eeba27766938722334b"
+    },
+    {
+      "name": "gpu-token-burst-long",
+      "exit_code": 0,
+      "log_sha256": "3e3faea81d5978224d546a8c88889940e583f66fd0be87d8ff3625102302e9f3"
+    },
+    {
+      "name": "gpu-token-burst",
+      "exit_code": 0,
+      "log_sha256": "165c8b91514a4f9dadac80beb319dc6d72f0e8fdece0804a0a90d66fead1e945"
+    },
+    {
+      "name": "resident-vision-dispatch",
+      "exit_code": 0,
+      "log_sha256": "8f490dc7d6bfcccd0cba5716892c597d40ec396672dbbebbdd9793e0e8ee442b"
+    },
+    {
+      "name": "vision-workspace-cache",
+      "exit_code": 0,
+      "log_sha256": "9ab550ab3a038d28832af5d10d682678648c17d1b624f5bdf0bde7cb20abbfa0"
+    },
+    {
+      "name": "large-vision-pack-reuse",
+      "exit_code": 0,
+      "log_sha256": "78a1388307a63e79359de2a3e777c28908170f8574510aae9df288668effc533"
+    },
+    {
+      "name": "batch-argmax",
+      "exit_code": 0,
+      "log_sha256": "81b078ec69276253afee4a718ab65d2c5c6821c1a9caf6ca5cdcfc84036c280c"
+    },
+    {
+      "name": "wide-gate-up-full64",
+      "exit_code": 0,
+      "log_sha256": "e498ce584c8b0bb68da88c0ed32fe92227c119023795cbc650079ec60d66c7e7"
+    },
+    {
+      "name": "wide-gate-up",
+      "exit_code": 0,
+      "log_sha256": "ebac300bc4dafb769bde066c1b530091dd3b988e6dd22e5294a04320053da045"
+    },
+    {
+      "name": "wide-gate-up-large64",
+      "exit_code": 0,
+      "log_sha256": "485a4cb4a45c1f754dce5e5503e186edac998f3ac860a44d270cc294301c8250"
+    },
+    {
+      "name": "frame-metadata",
+      "exit_code": 0,
+      "log_sha256": "c034de06f39ef80e7d68f6cb5c784a6256c0df938e62efe7d1ef431a1151cd53"
+    },
+    {
+      "name": "wide64",
+      "exit_code": 0,
+      "log_sha256": "604cdaac2e36c631ca5aa5f6bc072b3b1e41b8a515f4560493e803be6ce369db"
+    },
+    {
+      "name": "planned-mpp",
+      "exit_code": 0,
+      "log_sha256": "cd1716a973aa2a3c33667f570c7fe0c4c1d9744be05599f244e0dfd0552e5d7b"
+    },
+    {
+      "name": "full",
+      "exit_code": 0,
+      "log_sha256": "d82e3f412fd7fbd06ebeaa0358e0e15848e85f1a1c18c4319604e183750d3136"
+    },
+    {
+      "name": "wide-mpp",
+      "exit_code": 0,
+      "log_sha256": "4671ece899494bbc402e02101329573540fb6c5d013a618aa030ec539c4ed8f6"
+    },
+    {
+      "name": "batch-attention",
+      "exit_code": 0,
+      "log_sha256": "f53d3e8ffc9687f282b319e53ff8f4c56de5291831221c27b8aa72658bfade7e"
+    },
+    {
+      "name": "prefill-pack-reuse",
+      "exit_code": 0,
+      "log_sha256": "5ce1294be616740d3d1af7619c50dcb889593a04e93f1657e33d3bca2185882c"
+    },
+    {
+      "name": "prefill-pack-reuse-large",
+      "exit_code": 0,
+      "log_sha256": "eaffcb0cf7fc893c9ffe229a8e7e75dd0afa01274276e34d785103fef5b23321"
+    },
+    {
+      "name": "decode-pack-reuse",
+      "exit_code": 0,
+      "log_sha256": "a037699b5b68579b34b3edd2ff40b4ec6663cf41e9d926c25bb4dc80ee1fbe4c"
+    },
+    {
+      "name": "vision-pack-reuse",
+      "exit_code": 0,
+      "log_sha256": "2a4ee3301156c3428bcd5b66695fd60911f495cf67d5fcad817b8cfbf60c461d"
+    },
+    {
+      "name": "attention",
+      "exit_code": 0,
+      "log_sha256": "8930b59c10dd1e1ffbf4d5e940ff89959d48a47f543b8ab1e96f7b7df3e9d724"
+    }
+  ],
+  "mlx_device": {
+    "device_name": "Apple M4 Max",
+    "max_recommended_working_set_size": 30150672384,
+    "memory_size": 38654705664,
+    "architecture": "applegpu_g16s",
+    "max_buffer_length": 22613000192,
+    "resource_limit": 499000
+  },
+  "native_replay": {
+    "exit_code": 1,
+    "log_sha256": "b1ff2c8ddc91f3ef8b92ba67ebe3a8f3f641175570c204666e87043f285316cd"
+  }
+}

@@ -1,0 +1,176 @@
+{
+  "status": "pass",
+  "created_at": "2026-10-25T16:17:44.486224+00:00",
+  "driver_sha256": "cde8130b62a8bd89009925b437017c3d14cb6e623d41ae8fa86aad91045e8886",
+  "frozen_inputs_sha256": "2d7940f39a46c5c75cd7f0c4c4a6f7f3c0899e6adc3c8aa0cc9bd6593ea733dd",
+  "checks": [
+    {
+      "check": "prefill-activation-pool",
+      "exit_code": 0,
+      "log_sha256": "e6a50ad3d3a7f25338a9f91d1671ea8d75d20e16131cb294d68b55cc7cc8b790"
+    },
+    {
+      "check": "activation-pool",
+      "exit_code": 0,
+      "log_sha256": "c59ac516b5dd7ce9c770f8c52603b9819afa1b32286160a9ba46a702152a613a"
+    },
+    {
+      "check": "wide-recurrent",
+      "exit_code": 0,
+      "log_sha256": "bb4effb97fb7f2b6bc41221622ec67774cd7804de981eca56ae1e299b2b5bf94"
+    },
+    {
+      "check": "frame-staging-lifetime",
+      "exit_code": 0,
+      "log_sha256": "645bccc4f1301379005505b69420240f28608954eabb3eeba27766938722334b"
+    },
+    {
+      "check": "gpu-token-burst-long",
+      "exit_code": 0,
+      "log_sha256": "3e3faea81d5978224d546a8c88889940e583f66fd0be87d8ff3625102302e9f3"
+    },
+    {
+      "check": "gpu-token-burst",
+      "exit_code": 0,
+      "log_sha256": "165c8b91514a4f9dadac80beb319dc6d72f0e8fdece0804a0a90d66fead1e945"
+    },
+    {
+      "check": "resident-vision-dispatch",
+      "exit_code": 0,
+      "log_sha256": "8f490dc7d6bfcccd0cba5716892c597d40ec396672dbbebbdd9793e0e8ee442b"
+    },
+    {
+      "check": "vision-workspace-cache",
+      "exit_code": 0,
+      "log_sha256": "9ab550ab3a038d28832af5d10d682678648c17d1b624f5bdf0bde7cb20abbfa0"
+    },
+    {
+      "check": "large-vision-pack-reuse",
+      "exit_code": 0,
+      "log_sha256": "9701d38cbc6b783f2dce89c377bbe8ee4f0578c3938a798b59ede01e58ca2cf4"
+    },
+    {
+      "check": "batch-argmax",
+      "exit_code": 0,
+      "log_sha256": "81b078ec69276253afee4a718ab65d2c5c6821c1a9caf6ca5cdcfc84036c280c"
+    },
+    {
+      "check": "wide-gate-up-full64",
+      "exit_code": 0,
+      "log_sha256": "e498ce584c8b0bb68da88c0ed32fe92227c119023795cbc650079ec60d66c7e7"
+    },
+    {
+      "check": "wide-gate-up",
+      "exit_code": 0,
+      "log_sha256": "ebac300bc4dafb769bde066c1b530091dd3b988e6dd22e5294a04320053da045"
+    },
+    {
+      "check": "wide-gate-up-large64",
+      "exit_code": 0,
+      "log_sha256": "485a4cb4a45c1f754dce5e5503e186edac998f3ac860a44d270cc294301c8250"
+    },
+    {
+      "check": "frame-metadata",
+      "exit_code": 0,
+      "log_sha256": "c034de06f39ef80e7d68f6cb5c784a6256c0df938e62efe7d1ef431a1151cd53"
+    },
+    {
+      "check": "wide64",
+      "exit_code": 0,
+      "log_sha256": "604cdaac2e36c631ca5aa5f6bc072b3b1e41b8a515f4560493e803be6ce369db"
+    },
+    {
+      "check": "planned-mpp",
+      "exit_code": 0,
+      "log_sha256": "cd1716a973aa2a3c33667f570c7fe0c4c1d9744be05599f244e0dfd0552e5d7b"
+    },
+    {
+      "check": "full",
+      "exit_code": 0,
+      "log_sha256": "d82e3f412fd7fbd06ebeaa0358e0e15848e85f1a1c18c4319604e183750d3136"
+    },
+    {
+      "check": "wide-mpp",
+      "exit_code": 0,
+      "log_sha256": "2b4f9b5cd7c1eaa5c08de1d60c7eb97c6493939f6ad71dd779ab43e25721057c"
+    },
+    {
+      "check": "batch-attention",
+      "exit_code": 0,
+      "log_sha256": "8909b88f77304ef597b3b0f98cd7faa4e0afccbac21e071a36bed083315ffd39"
+    },
+    {
+      "check": "prefill-pack-reuse",
+      "exit_code": 0,
+      "log_sha256": "3d0e45caae05a87c60458b05691f9a2d53f4757a5dc01f2467fdd24d7c65865b"
+    },
+    {
+      "check": "prefill-pack-reuse-large",
+      "exit_code": 0,
+      "log_sha256": "db02797cd364247a7f4de19afcb7499c252ee2005b45a16dc618696f58ef84cc"
+    },
+    {
+      "check": "decode-pack-reuse",
+      "exit_code": 0,
+      "log_sha256": "d5d14b8b9b633a90f09b2fe41f59a6b98cb77470082a62f6c219cce3d5558af3"
+    },
+    {
+      "check": "vision-pack-reuse",
+      "exit_code": 0,
+      "log_sha256": "977820ab4bc606bd4ad3b76f91b7aee13a8b0e9e3cc16e01f46fab5798c7be52"
+    },
+    {
+      "check": "attention",
+      "exit_code": 0,
+      "log_sha256": "8930b59c10dd1e1ffbf4d5e940ff89959d48a47f543b8ab1e96f7b7df3e9d724"
+    }
+  ],
+  "builds": [
+    {
+      "tag": "conformance",
+      "command": [
+        "clang",
+        "-O3",
+        "-fobjc-arc",
+        "-I/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/src/backends",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m",
+        "-o",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine155_conformance",
+        "-framework",
+        "Foundation",
+        "-framework",
+        "Metal",
+        "-framework",
+        "MetalPerformanceShaders",
+        "-framework",
+        "Accelerate"
+      ],
+      "exit_code": 0,
+      "log_sha256": "6e7125e5da5d3c40f556eeb11627d49f714ebbecda6c87afd0133562133e5554",
+      "binary_sha256": "646e03331d71578a2876bcda62fb201a0305ec054391457c44b78c2fb50a44a2"
+    },
+    {
+      "tag": "attention",
+      "command": [
+        "clang",
+        "-O3",
+        "-fobjc-arc",
+        "-I/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/src/backends",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/check_metal_prefill_attention.m",
+        "-o",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine155_attention",
+        "-framework",
+        "Foundation",
+        "-framework",
+        "Metal",
+        "-framework",
+        "MetalPerformanceShaders",
+        "-framework",
+        "Accelerate"
+      ],
+      "exit_code": 0,
+      "log_sha256": "04bd00e7cafebb4a968b659fde58e40805b1cae72ec379e4b23a2a0464fbb4c9",
+      "binary_sha256": "c4657845d4a7a4082423e90bf7d9283358621e7bab0cda9ed0a1be1012b47573"
+    }
+  ]
+}

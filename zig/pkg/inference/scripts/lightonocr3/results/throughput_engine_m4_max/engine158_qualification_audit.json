@@ -1,0 +1,12 @@
+{
+  "status": "cpu_metal_C24_and_real_short_model_pass_speed_pending",
+  "scope": "Existing shader arithmetic and operator caps unchanged. Short recurrent-core and direct-KV eligibility plus F32 narrow-prefill MPP route.158adds scoped dispatch counters; full158C24suite fresh. CPU297/38, Metal333/6.",
+  "cpu_log_sha256": "ee0a733a15be26fc9c0977581f58871455044890d0a2233f3745869048d7d010",
+  "metal_log_sha256": "ff62d891207ba6be143fec4d3120fda200265111e344b3caa12734fd8f4e330f",
+  "c_audit_sha256": "ada74d26d7980148af5a883d341822ab16cf4fcd05809f92c1ae6f5f0b481c9b",
+  "build_manifest_sha256": "1183c6d1436a101bb08351e21edae36d7c221f50f859b43faa220b751d5e0b7a",
+  "model_smoke_audit_sha256": "202b30f191d895d9aa69cff544486a6d6e151d2706b97a6a54d5a02a70e5deb3",
+  "model_smoke_report_sha256": "8a8bfb88f209b73611bc25e3df6b044ad62b80274f9e8009a24be9f27309c888",
+  "short_core_dispatches": 3408,
+  "short_direct_attention_dispatches": 712
+}

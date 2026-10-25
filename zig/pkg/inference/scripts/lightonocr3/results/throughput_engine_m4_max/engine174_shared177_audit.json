@@ -1,0 +1,19 @@
+{
+  "status": "failed_or_excluded",
+  "created_at": "2026-10-25T18:16:43.113098+00:00",
+  "own_waiter": {
+    "pid": 70730,
+    "create_time": 1792946205.961811,
+    "cwd": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b",
+    "cmdline": [
+      "/opt/homebrew/Cellar/python@3.12/3.12.14/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python",
+      ".venv-lighton-vllm-metal/run_engine158_short161_screen.py"
+    ]
+  },
+  "primary_throughput_eligible": false,
+  "driver_sha256": "d93211fff716bb8a1c4e0f40f7476692a62aa886843a80090f58e634ba109c43",
+  "scope": "Candidate174 shared-frame exact-output/topology smoke using0.8Bcheckpoint C8R16; not a speed claim. Source158 C24 code identical, CPU298/38 and Metal334/6 passed. Original caps/reserve unchanged. Verified own admissionwaiter held only to avoid overlap and resumed in finally.",
+  "available_bytes": 7208108032,
+  "error": "KeyboardInterrupt()",
+  "own_waiter_resumed": true
+}

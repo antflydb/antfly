@@ -1,0 +1,160 @@
+{
+  "status": "numerical_and_isolated_stage_pass_no_model_promotion",
+  "created_at": "2026-10-25T15:17:09.078518+00:00",
+  "driver_sha256": "060086e266569ce7f5c4f99b12734946fe668cf50df276792b6757f0a5f0cab4",
+  "preparation": {
+    "status": "prepared_not_compiled_or_run",
+    "scope": "Private eligibility-only expansion of existing F32-query/probability MPP prefill attention from128..2048 to2..2048 queries; q1 decode route unchanged. No shader math, dtype, scratch or budget change. Realistic past-prefix512/offset17, fragmented pages, twoheadshapes, fullCPU/reference/canary/cancellation/nonfinite checks before isolated timing. Must wait for owned chunk128 cohort to finish; no own GPU/build overlap.",
+    "canonical_c_sha256": "65ec16730a1c22911fde496c55236c1d905f41d760eacc8079db78101d31d486",
+    "source_sha256": {
+      "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine142_short_prefill_kernels.m": "dd3ef495bc815d21ccbb904fcc59d6e718bdb3573341ea67d541424b87143a3f",
+      "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine142_short_prefill_checks.m": "d4c84dd4ed4c07bfe6eb611567e6782243d0f92453a0e7efcfa7ad059f2cf60d",
+      "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine142_short_prefill_probe.m": "64fb754e4cb30449b8723bb5886226f943f9abe346d6f2a52f77c9e2dffaf5a2",
+      "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/prepare_engine142_short_prefill.py": "7f9fa5241f0ad7a17b7363f1326c07552196e95b98616337472fb9dc19aabd86"
+    }
+  },
+  "binary_sha256": "43a94d137a1f63d051d5f8d0e0894576a35f9af53697cf914872ecdc932555a5",
+  "build_log_sha256": "e4a450088c10aeb707abef9f68a023f580073e24f2c2364f84db43c0da7287ca",
+  "primary_throughput_eligible": false,
+  "scope": "ExistingF32Q/P MPP attention eligible for2..127queries in privateCclone; no shader changes, q1decode routing unchanged.68full-output/canary/CPU/producer-consumer/fragmented-page/positive-offset/cancellation/nonfinite cases, then balanced old/new isolated stage timings. Realistic512-tokenpriorprefix, heads8/16. No own model/build/profile overlap. No whole-reader claim.",
+  "check": {
+    "exit_code": 0,
+    "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stderr_sha256": "0f0aa07eb589b84ceee11c21820b1527daa7a1d3192a6068dcb7dde906c74c78"
+  },
+  "numerical_case_count": 68,
+  "benchmark": {
+    "exit_code": 0,
+    "stdout_sha256": "a146756b5d5ff43099767338858a62cb9b16f3790902fd132dbd38e7bff9a623",
+    "stderr_sha256": "b0dd8b6b9eeea7c3ee0bbd2208935f70a740fa9cfee7b4e1309b6f9072f66044"
+  },
+  "timing_record_count": 1080,
+  "stage_ratios": [
+    {
+      "heads": 8,
+      "queries": 2,
+      "old_median_gpu_us": 310.625,
+      "new_median_gpu_us": 1150.1455,
+      "old_over_new": 0.2700745253535313
+    },
+    {
+      "heads": 8,
+      "queries": 8,
+      "old_median_gpu_us": 309.52,
+      "new_median_gpu_us": 1155.083,
+      "old_over_new": 0.2679634277363618
+    },
+    {
+      "heads": 8,
+      "queries": 16,
+      "old_median_gpu_us": 357.1455,
+      "new_median_gpu_us": 1302.9165,
+      "old_over_new": 0.2741123471841826
+    },
+    {
+      "heads": 8,
+      "queries": 22,
+      "old_median_gpu_us": 531.1034999999999,
+      "new_median_gpu_us": 1892.979,
+      "old_over_new": 0.2805649191036984
+    },
+    {
+      "heads": 8,
+      "queries": 42,
+      "old_median_gpu_us": 1712.02,
+      "new_median_gpu_us": 3466.3745,
+      "old_over_new": 0.49389354785525913
+    },
+    {
+      "heads": 8,
+      "queries": 48,
+      "old_median_gpu_us": 1844.7915,
+      "new_median_gpu_us": 3480.1035,
+      "old_over_new": 0.5300967341919572
+    },
+    {
+      "heads": 8,
+      "queries": 64,
+      "old_median_gpu_us": 2586.6665000000003,
+      "new_median_gpu_us": 3560.0205,
+      "old_over_new": 0.726587529481923
+    },
+    {
+      "heads": 8,
+      "queries": 96,
+      "old_median_gpu_us": 3619.583,
+      "new_median_gpu_us": 3799.77,
+      "old_over_new": 0.9525794982327878
+    },
+    {
+      "heads": 8,
+      "queries": 127,
+      "old_median_gpu_us": 4878.228999999999,
+      "new_median_gpu_us": 4019.6455,
+      "old_over_new": 1.213596820913685
+    },
+    {
+      "heads": 16,
+      "queries": 2,
+      "old_median_gpu_us": 444.937,
+      "new_median_gpu_us": 1693.1035000000002,
+      "old_over_new": 0.26279373942585316
+    },
+    {
+      "heads": 16,
+      "queries": 8,
+      "old_median_gpu_us": 310.77,
+      "new_median_gpu_us": 1114.7285000000002,
+      "old_over_new": 0.27878537240233825
+    },
+    {
+      "heads": 16,
+      "queries": 16,
+      "old_median_gpu_us": 310.89549999999997,
+      "new_median_gpu_us": 930.0625,
+      "old_over_new": 0.3342737719239298
+    },
+    {
+      "heads": 16,
+      "queries": 22,
+      "old_median_gpu_us": 538.1659999999999,
+      "new_median_gpu_us": 1013.4995,
+      "old_over_new": 0.5309977952628491
+    },
+    {
+      "heads": 16,
+      "queries": 42,
+      "old_median_gpu_us": 2979.999,
+      "new_median_gpu_us": 3490.3955,
+      "old_over_new": 0.8537711557329247
+    },
+    {
+      "heads": 16,
+      "queries": 48,
+      "old_median_gpu_us": 3397.02,
+      "new_median_gpu_us": 3516.4375,
+      "old_over_new": 0.9660402040417325
+    },
+    {
+      "heads": 16,
+      "queries": 64,
+      "old_median_gpu_us": 4485.6245,
+      "new_median_gpu_us": 3600.812,
+      "old_over_new": 1.2457258251749883
+    },
+    {
+      "heads": 16,
+      "queries": 96,
+      "old_median_gpu_us": 6823.0625,
+      "new_median_gpu_us": 3829.9995,
+      "old_over_new": 1.781478692099046
+    },
+    {
+      "heads": 16,
+      "queries": 127,
+      "old_median_gpu_us": 5175.2495,
+      "new_median_gpu_us": 3337.249,
+      "old_over_new": 1.5507531802391732
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "status": "followups_complete",
+  "created_at": "2026-10-25T19:02:08.081734+00:00",
+  "primary_parent": {
+    "pid": 35379,
+    "create_time": 1792954668.65737,
+    "cwd": "/Users/ajroetker/antfly/.worktrees/perf-lightonocr3-shared-frame-wolfspider",
+    "cmdline": [
+      "/Users/ajroetker/antfly/.worktrees/perf-lightonocr3-wolfspider/.venv-lighton-vllm-metal/bin/python",
+      "/Users/ajroetker/antfly/.worktrees/perf-lightonocr3-shared-frame-wolfspider/.venv-lighton-vllm-metal/run_wolf184_primary.py"
+    ]
+  },
+  "runs": [
+    {
+      "name": "185",
+      "exit_code": 0,
+      "report": "paired185_08_warmed_comparison_audit.json",
+      "status": "repeated_native_win"
+    },
+    {
+      "name": "186",
+      "exit_code": 0,
+      "report": "paired186_florence_comparison_audit.json",
+      "status": "small_repeated_proxy_lead"
+    }
+  ]
+}

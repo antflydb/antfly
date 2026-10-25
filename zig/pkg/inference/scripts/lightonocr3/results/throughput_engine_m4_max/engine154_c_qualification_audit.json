@@ -1,0 +1,141 @@
+{
+  "status": "running_full",
+  "created_at": "2026-10-25T16:16:08.626386+00:00",
+  "driver_sha256": "dca98b4f0557f93eff6ab02bbd110f6b3e30bcf7f75f5d45ba2de5e69dfe3cfa",
+  "frozen_inputs_sha256": "973e234bbb8c5a47fb49ae22f0846610ec1b9308860fd0ee4ff66a28152d8ef8",
+  "checks": [
+    {
+      "check": "prefill-activation-pool",
+      "exit_code": 0,
+      "log_sha256": "e6a50ad3d3a7f25338a9f91d1671ea8d75d20e16131cb294d68b55cc7cc8b790"
+    },
+    {
+      "check": "activation-pool",
+      "exit_code": 0,
+      "log_sha256": "c59ac516b5dd7ce9c770f8c52603b9819afa1b32286160a9ba46a702152a613a"
+    },
+    {
+      "check": "wide-recurrent",
+      "exit_code": 0,
+      "log_sha256": "bb4effb97fb7f2b6bc41221622ec67774cd7804de981eca56ae1e299b2b5bf94"
+    },
+    {
+      "check": "frame-staging-lifetime",
+      "exit_code": 0,
+      "log_sha256": "645bccc4f1301379005505b69420240f28608954eabb3eeba27766938722334b"
+    },
+    {
+      "check": "gpu-token-burst-long",
+      "exit_code": 0,
+      "log_sha256": "3e3faea81d5978224d546a8c88889940e583f66fd0be87d8ff3625102302e9f3"
+    },
+    {
+      "check": "gpu-token-burst",
+      "exit_code": 0,
+      "log_sha256": "165c8b91514a4f9dadac80beb319dc6d72f0e8fdece0804a0a90d66fead1e945"
+    },
+    {
+      "check": "resident-vision-dispatch",
+      "exit_code": 0,
+      "log_sha256": "8f490dc7d6bfcccd0cba5716892c597d40ec396672dbbebbdd9793e0e8ee442b"
+    },
+    {
+      "check": "vision-workspace-cache",
+      "exit_code": 0,
+      "log_sha256": "9ab550ab3a038d28832af5d10d682678648c17d1b624f5bdf0bde7cb20abbfa0"
+    },
+    {
+      "check": "large-vision-pack-reuse",
+      "exit_code": 0,
+      "log_sha256": "d0128977f9de45c6f00539c68c6c37fd179132facc87311bf255ffad0a861b71"
+    },
+    {
+      "check": "batch-argmax",
+      "exit_code": 0,
+      "log_sha256": "81b078ec69276253afee4a718ab65d2c5c6821c1a9caf6ca5cdcfc84036c280c"
+    },
+    {
+      "check": "wide-gate-up-full64",
+      "exit_code": 0,
+      "log_sha256": "e498ce584c8b0bb68da88c0ed32fe92227c119023795cbc650079ec60d66c7e7"
+    },
+    {
+      "check": "wide-gate-up",
+      "exit_code": 0,
+      "log_sha256": "ebac300bc4dafb769bde066c1b530091dd3b988e6dd22e5294a04320053da045"
+    },
+    {
+      "check": "wide-gate-up-large64",
+      "exit_code": 0,
+      "log_sha256": "485a4cb4a45c1f754dce5e5503e186edac998f3ac860a44d270cc294301c8250"
+    },
+    {
+      "check": "frame-metadata",
+      "exit_code": 0,
+      "log_sha256": "c034de06f39ef80e7d68f6cb5c784a6256c0df938e62efe7d1ef431a1151cd53"
+    },
+    {
+      "check": "wide64",
+      "exit_code": 0,
+      "log_sha256": "604cdaac2e36c631ca5aa5f6bc072b3b1e41b8a515f4560493e803be6ce369db"
+    },
+    {
+      "check": "planned-mpp",
+      "exit_code": 0,
+      "log_sha256": "cd1716a973aa2a3c33667f570c7fe0c4c1d9744be05599f244e0dfd0552e5d7b"
+    },
+    {
+      "check": "full",
+      "exit_code": 128,
+      "log_sha256": "f9b746dc26a14099415787b6cdcff690038f213fc9a3c9ad19fd4e99391a806d"
+    }
+  ],
+  "builds": [
+    {
+      "tag": "conformance",
+      "command": [
+        "clang",
+        "-O3",
+        "-fobjc-arc",
+        "-I/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/src/backends",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m",
+        "-o",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine154_conformance",
+        "-framework",
+        "Foundation",
+        "-framework",
+        "Metal",
+        "-framework",
+        "MetalPerformanceShaders",
+        "-framework",
+        "Accelerate"
+      ],
+      "exit_code": 0,
+      "log_sha256": "6e7125e5da5d3c40f556eeb11627d49f714ebbecda6c87afd0133562133e5554",
+      "binary_sha256": "2479128b5a15bf8587e6163380c790ed9cdbd8f418f7d9124368484577935124"
+    },
+    {
+      "tag": "attention",
+      "command": [
+        "clang",
+        "-O3",
+        "-fobjc-arc",
+        "-I/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/src/backends",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/check_metal_prefill_attention.m",
+        "-o",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/engine154_attention",
+        "-framework",
+        "Foundation",
+        "-framework",
+        "Metal",
+        "-framework",
+        "MetalPerformanceShaders",
+        "-framework",
+        "Accelerate"
+      ],
+      "exit_code": 0,
+      "log_sha256": "04bd00e7cafebb4a968b659fde58e40805b1cae72ec379e4b23a2a0464fbb4c9",
+      "binary_sha256": "aaeaa28d1e8f8c638e37287f05d39aae5464a014e9247e587cc0e854b984ba84"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "status": "all_completed_remote_logs_and_drivers_archived",
+  "created_at": "2026-10-25T19:39:33.047225+00:00",
+  "qualification_logs": 34,
+  "drivers": 33,
+  "scope": "Only task-owned completed logs/drivers archived with deterministic gzip and full raw hashes. Original184HTTPsymlink failure and184bchecker-path failure remain alongside passing184c reuse proof. All performance runs closed before archival. Pinned model assets themselves are not committed."
+}
