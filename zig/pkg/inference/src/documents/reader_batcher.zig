@@ -80,6 +80,13 @@ pub fn Batcher(comptime Node: type) type {
             return ticket.result.?;
         }
         fn compatible(left: *const Ticket, right: *const Ticket) bool {
+            const shared = left.run.shared orelse return false;
+            // Aggregate usage has no trustworthy per-item attribution. Share
+            // it only within one owner and its full token ceiling. A narrower
+            // child must retain its own physical call/usage report; charging
+            // the entire batch to one child could exhaust its allowance while
+            // letting a sibling spend uncharged tokens on a later call.
+            if (right.run.shared != shared or left.run.limits.max_total_tokens != shared.limits.max_total_tokens or right.run.limits.max_total_tokens != shared.limits.max_total_tokens) return false;
             return std.mem.eql(u8, left.model, right.model) and
                 std.meta.eql(left.request.prompt, right.request.prompt) and
                 left.request.max_tokens == right.request.max_tokens and
@@ -253,7 +260,7 @@ test "document ready reader batching groups compatible work and charges aggregat
     }
 }
 
-test "document incompatible ready batches execute concurrently within the call ceiling" {
+test "document incompatible ready batches preserve concurrent calls and independent child token ceilings" {
     const Fake = struct {
         io: std.Io,
         entered: std.atomic.Value(usize) = .init(0),
@@ -265,32 +272,37 @@ test "document incompatible ready batches execute concurrently within the call c
             try self.both_entered.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(5000), .clock = .awake } });
             const items = try a.alloc(readers.Result, req.images.len);
             for (items) |*item| item.* = .{ .text = model };
-            return .{ .items = items, .execution = .{ .requested_items = items.len, .native_batches = 1, .native_items = items.len } };
+            return .{ .items = items, .execution = .{ .requested_items = items.len, .native_batches = 1, .native_items = items.len }, .usage = .{ .prompt_tokens = 10, .completion_tokens = 3, .total_tokens = 13 } };
         }
     };
     const a = std.testing.allocator;
     var pool = std.Io.Threaded.init(a, .{});
     defer pool.deinit();
-    var node = Fake{ .io = pool.io() };
-    const Batch = Batcher(Fake);
-    var batch = Batch{ .io = pool.io(), .node = &node, .backing = a, .stopping = true, .max_parallel = 2 };
-    var ledger = c.SharedAccounting{ .limits = .{ .max_parallel_calls = 2 }, .usage = .{}, .event_count = 0 };
-    var runs = [_]c.Run{ .{ .limits = .{ .max_parallel_calls = 2 }, .shared = &ledger }, .{ .limits = .{ .max_parallel_calls = 2 }, .shared = &ledger } };
-    const input = [_]readers.EncodedImage{.{ .bytes = "image", .mime_type = "image/png" }};
-    var tickets: [2]Batch.Ticket = undefined;
-    for (&tickets, &runs, 0..) |*ticket, *run, index| {
-        try run.call();
-        ticket.* = .{ .allocator = a, .model = if (index == 0) "ocr-fast" else "ocr-tables", .request = .{ .images = &input }, .control = .{}, .run = run };
-        batch.pending[index] = ticket;
+    for ([_]bool{ false, true }) |child_budget| {
+        var node = Fake{ .io = pool.io() };
+        const Batch = Batcher(Fake);
+        var batch = Batch{ .io = pool.io(), .node = &node, .backing = a, .stopping = true, .max_parallel = 2 };
+        var ledger = c.SharedAccounting{ .limits = .{ .max_parallel_calls = 2, .max_total_tokens = 100 }, .usage = .{}, .event_count = 0 };
+        const local_limits: c.Limits = .{ .max_parallel_calls = 2, .max_total_tokens = if (child_budget) 20 else 100 };
+        var runs = [_]c.Run{ .{ .limits = local_limits, .shared = &ledger }, .{ .limits = local_limits, .shared = &ledger } };
+        const input = [_]readers.EncodedImage{.{ .bytes = "image", .mime_type = "image/png" }};
+        var tickets: [2]Batch.Ticket = undefined;
+        for (&tickets, &runs, 0..) |*ticket, *run, index| {
+            try run.call();
+            ticket.* = .{ .allocator = a, .model = if (child_budget or index == 0) "ocr-fast" else "ocr-tables", .request = .{ .images = &input }, .control = .{}, .run = run };
+            batch.pending[index] = ticket;
+        }
+        batch.count = tickets.len;
+        try batch.execute();
+        defer for (&tickets) |*ticket| if (ticket.result) |*result| result.deinit(a);
+        for (&tickets) |ticket| {
+            if (ticket.failure) |err| return err;
+            try std.testing.expectEqualStrings(ticket.model, ticket.result.?.items[0].text);
+        }
+        try std.testing.expectEqual(@as(usize, 2), ledger.usage.physical_model_calls);
+        try std.testing.expectEqual(@as(u64, 26), ledger.usage.total_tokens);
+        for (runs) |run| try std.testing.expectEqual(@as(u64, 13), run.usage.total_tokens);
     }
-    batch.count = tickets.len;
-    try batch.execute();
-    defer for (&tickets) |*ticket| if (ticket.result) |*result| result.deinit(a);
-    for (&tickets) |ticket| {
-        if (ticket.failure) |err| return err;
-        try std.testing.expectEqualStrings(ticket.model, ticket.result.?.items[0].text);
-    }
-    try std.testing.expectEqual(@as(usize, 2), ledger.usage.physical_model_calls);
 }
 
 test "document reader batch results own every JSON field and release failed clones" {

@@ -400,6 +400,8 @@ order, so completion order cannot reorder document output. At most one wave of
 completed pages is buffered. Compatible ready crops from independent pages
 coalesce into shared reader invocations; incompatible groups dispatch concurrently
 within the call ceiling. Token usage is charged once for each physical batch.
+Narrower child token budgets retain separate physical reports when aggregate
+batch usage cannot be attributed safely to individual children.
 Region refinement within each page remains ordered. Model discovery reports
 the effective parallel-call ceiling.
 
