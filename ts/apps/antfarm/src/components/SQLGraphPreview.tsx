@@ -2,6 +2,7 @@ import { Button } from "@antfly/design-system";
 import type { GraphValue, SQLResponse } from "@antfly/sdk";
 import { useId, useMemo, useState } from "react";
 import { collectGraph } from "./GraphQueryWorkbench";
+import { graphEdgeLanes, graphIdentity as key } from "./graph-edge-lanes";
 
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -98,19 +99,23 @@ export function sqlGraphValues(result: SQLResponse): GraphValue[] {
     }
   return values;
 }
-const key = (value: { table: string; key: string }) => JSON.stringify([value.table, value.key]);
 
 /** Displays only values already returned by SQL. No implicit document fetches. */
 export default function SQLGraphPreview({ values }: { values: GraphValue[] }) {
   const visual = useMemo(() => collectGraph(values), [values]);
+  const edgeLanes = useMemo(() => graphEdgeLanes(visual.edges), [visual.edges]);
   const arrow = useId();
   const [selected, setSelected] = useState<GraphValue>();
   const [zoom, setZoom] = useState(1);
-  const positions = new Map(
-    visual.nodes.map(([id], index) => {
-      const angle = (2 * Math.PI * index) / Math.max(1, visual.nodes.length);
-      return [id, { x: 400 + 280 * Math.cos(angle), y: 210 + 145 * Math.sin(angle) }];
-    })
+  const positions = useMemo(
+    () =>
+      new Map(
+        visual.nodes.map(([id], index) => {
+          const angle = (2 * Math.PI * index) / Math.max(1, visual.nodes.length);
+          return [id, { x: 400 + 280 * Math.cos(angle), y: 210 + 145 * Math.sin(angle) }];
+        })
+      ),
+    [visual.nodes]
   );
   function select(value: GraphValue) {
     setSelected(value);
@@ -151,26 +156,19 @@ export default function SQLGraphPreview({ values }: { values: GraphValue[] }) {
             <path d="M0,0 L8,4 L0,8" fill="currentColor" />
           </marker>
         </defs>
-        {visual.edges.map((edge) => {
-          const source = positions.get(key(edge.value.source)),
-            target = positions.get(key(edge.value.target));
+        {visual.edges.map((edge, edgeIndex) => {
+          const laneInfo = edgeLanes[edgeIndex];
+          const source = positions.get(laneInfo.source),
+            target = positions.get(laneInfo.target);
           if (!source || !target) return null;
-          const parallels = visual.edges.filter(
-            (other) =>
-              [key(other.value.source), key(other.value.target)].sort().join("|") ===
-              [key(edge.value.source), key(edge.value.target)].sort().join("|")
-          );
-          const lane = parallels.indexOf(edge),
-            offset =
-              (lane - (parallels.length - 1) / 2) *
-              28 *
-              (key(edge.value.source) < key(edge.value.target) ? 1 : -1);
+          const { lane, count, direction } = laneInfo;
+          const offset = (lane - (count - 1) / 2) * 28 * direction;
           const radius = 48 + lane * 18,
             dx = target.x - source.x,
             dy = target.y - source.y,
             length = Math.hypot(dx, dy) || 1;
           const path =
-            key(edge.value.source) === key(edge.value.target)
+            laneInfo.source === laneInfo.target
               ? `M ${source.x + 10} ${source.y - 14} C ${source.x + radius} ${source.y - radius - 20}, ${source.x - radius} ${source.y - radius - 20}, ${source.x - 10} ${source.y - 14}`
               : `M ${source.x} ${source.y} Q ${(source.x + target.x) / 2 - (dy / length) * offset} ${(source.y + target.y) / 2 + (dx / length) * offset} ${target.x} ${target.y}`;
           return (

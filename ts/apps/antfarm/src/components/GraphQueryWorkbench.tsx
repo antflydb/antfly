@@ -10,6 +10,7 @@ import { useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { AuthContext } from "@/contexts/auth-context";
 import { useApi } from "@/hooks/use-api-config";
+import { graphEdgeLanes, graphIdentity as identity } from "./graph-edge-lanes";
 
 function byteOffsetToUtf16(text: string, offset: number): number {
   let bytes = 0;
@@ -53,8 +54,6 @@ export function graphQueryStatement(query: string): string {
 }
 
 const quote = (name: string) => `\`${name.replaceAll("`", "``")}\``;
-const identity = (value: { table: string; key: string }) =>
-  JSON.stringify([value.table, value.key]);
 function plain(value: GraphValue): unknown {
   if (value.type === "list") return value.value.map(plain);
   if (value.type === "map")
@@ -227,6 +226,7 @@ export default function GraphQueryWorkbench({
     () => collectGraph([...(result?.rows.flat() ?? []), ...extra], graph?.definition),
     [result, extra, graph?.definition]
   );
+  const edgeLanes = useMemo(() => graphEdgeLanes(visual.edges), [visual.edges]);
   const returnedNodes = useMemo(
     () =>
       new Set(collectGraph(result?.rows.flat() ?? [], graph?.definition).nodes.map(([id]) => id)),
@@ -891,29 +891,20 @@ export default function GraphQueryWorkbench({
                           <path d="M0,0 L8,4 L0,8" fill="currentColor" />
                         </marker>
                       </defs>
-                      {visual.edges.map((edge) => {
-                        const a = positions.get(identity(edge.value.source));
-                        const b = positions.get(identity(edge.value.target));
+                      {visual.edges.map((edge, edgeIndex) => {
+                        const laneInfo = edgeLanes[edgeIndex];
+                        const a = positions.get(laneInfo.source);
+                        const b = positions.get(laneInfo.target);
                         if (!a || !b) return null;
                         const key = JSON.stringify([edge.value.identity, edge.value.index]);
-                        const parallels = visual.edges.filter(
-                          (other) =>
-                            (identity(other.value.source) === identity(edge.value.source) &&
-                              identity(other.value.target) === identity(edge.value.target)) ||
-                            (identity(other.value.target) === identity(edge.value.source) &&
-                              identity(other.value.source) === identity(edge.value.target))
-                        );
-                        const lane = parallels.indexOf(edge);
-                        const offset =
-                          (lane - (parallels.length - 1) / 2) *
-                          28 *
-                          (identity(edge.value.source) < identity(edge.value.target) ? 1 : -1);
+                        const { lane, count, direction } = laneInfo;
+                        const offset = (lane - (count - 1) / 2) * 28 * direction;
                         const loopRadius = 48 + lane * 18;
                         const dx = b.x - a.x;
                         const dy = b.y - a.y;
                         const length = Math.hypot(dx, dy) || 1;
                         const path =
-                          identity(edge.value.source) === identity(edge.value.target)
+                          laneInfo.source === laneInfo.target
                             ? `M ${a.x + 10} ${a.y - 14} C ${a.x + loopRadius} ${a.y - loopRadius - 20}, ${a.x - loopRadius} ${a.y - loopRadius - 20}, ${a.x - 10} ${a.y - 14}`
                             : `M ${a.x} ${a.y} Q ${(a.x + b.x) / 2 - (dy / length) * offset} ${(a.y + b.y) / 2 + (dx / length) * offset} ${b.x} ${b.y}`;
                         return (
