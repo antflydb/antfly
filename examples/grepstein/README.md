@@ -4,8 +4,11 @@ Grepstein is the GCS-backed Antfly Cloud public-records showcase tracked in
 [Colony #818](https://github.com/antflydb/colony/issues/818). The executable uses
 Antfly's native `document_extraction` artifacts. It has no DocsAF dependency.
 
-V1 acquires DOJ datasets **1–7 and 12**. Datasets **8–11 are deferred** and the
-downloader refuses them. The court collection can be supplied as an existing
+V1 indexes PDFs from DOJ datasets **1–7 and 12**. Indexing datasets **8–11 is
+deferred**, and the v1 downloader refuses them. Raw preservation is independent:
+`stage-originals` accepts PDFs, images, audio, video, and ancillary files from any
+explicitly supplied release directory or ZIP, including larger releases. The
+court collection can be supplied as an existing
 directory or ZIP; automatic court inventory acquisition is not implemented.
 `datasets` prints the release registry, without asserting unverified document
 counts. Downloading all small releases still requires several GB of local disk,
@@ -89,6 +92,52 @@ or explicitly quarantine those files and prepare a new state. V1 publishes PDFs;
 other media require a separately qualified transcription workflow.
 
 ## Publish and load full text
+
+Preserve original content separately from the selection sent to Antfly:
+
+```sh
+# No Google credentials or Antfly calls are needed for this inventory.
+./grepstein stage-originals --inventory-only --state ./grepstein-originals \
+  --source 'doj-02=/absolute/path/DataSet 2.zip'
+# Supply the same reviewed sources and an approved storage byte budget to upload.
+./grepstein stage-originals --state ./grepstein-originals \
+  --bucket antfly-showcases-originals \
+  --source 'doj-02=/absolute/path/DataSet 2.zip'
+# Repeat --source for other approved release directories/ZIPs.
+```
+
+The raw stage retains file bytes unchanged, including native video/audio/images
+and `.dat`/`.opt` release metadata. It performs no OCR, transcription, image
+captioning, PDF splitting, inference, or Antfly writes. Its `originals.ndjson`
+catalog records dataset, member path, container, MIME, SHA-256, MD5, CRC32C, and
+uploaded object generation. Known archive receipts are verified and retained.
+Explicit local copies without acquisition receipts have no asserted official
+provenance. The catalog cannot be used as an Antfly load manifest.
+
+Uploads use ADC and the create-only publisher identity, with resumable GCS
+uploads, an 8 MiB upload buffer, and CRC32C validation before finalization.
+SHA-addressed objects are reused only after size/checksum verification; staged
+PDF originals use the same keys as subsequent PDF publication. ZIP members spool
+one at a time; scratch state must be outside input directories. Defaults cap
+total uncompressed inputs at 10 GiB, each original at 8 GiB, and a batch at two
+million files. Raise byte limits only for a reviewed batch and adequate worker
+scratch space. Split larger inventories into separate states.
+
+The catalog is sealed and uploaded only after every original succeeds. A failed
+run may leave verified raw objects; rerunning reuses them and rechecks inputs.
+No partial run produces a new completed catalog. Original staging is independent
+of the existing `prepare` → `publish` → `load` path: keep that path restricted to
+the small-release PDF state for v1. Adding raw files to the bucket never adds
+them to the managed instance or existing source jobs.
+
+For releases 8–11, run bulk acquisition and staging on a separately approved
+Google Cloud worker rather than routing hundreds of GB through a laptop. The
+v1 downloader does not acquire those releases and this command does not provision
+that worker. Candidate archive metadata must be reviewed before transfer; some
+dataset 9 mirrors explicitly declare themselves incomplete. Retain that status
+and revision/source checksums rather than treating a mirror as current official
+coverage. Raw storage charges and transfer/worker costs are separate from the
+Antfly instance's capacity and later enrichment costs.
 
 Provision the resources in Colony's `infra/showcases` first. The uploader uses
 ADC for the create-only publisher identity. Antfly's source-reader identity is
