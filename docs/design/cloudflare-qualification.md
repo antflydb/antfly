@@ -423,3 +423,29 @@ large live embedding corpora, distribution-specific ANN recall, complete
 platform eviction/failure injection and finalized billing still require further
 production qualification. The final Node suite also passed the instantiation-
 expiry race regression, bringing its total to 83 tests.
+
+
+After qualification, Queue delivery stayed paused, the consumer was removed,
+and the final quiescent drain deleted 5,492 objects totaling 37,850,602 stored
+bytes. This is the end-of-test footprint, not peak occupancy or billed GB-months.
+The disposable Worker, both Queues and R2 bucket were deleted successfully; no
+test service remains deployed. The final observed tail contained 4,121 events,
+five canceled/non-OK events, no flagged truncation and no captured exception
+messages. Application-level publication deferrals are recorded separately and
+must not be inferred from that non-OK count. Reports, snapshots, hashes and
+scoped analytics remain in the ignored local qualification directory.
+
+The branch subsequently merged `origin/main` at `730999bf2d` (29 newer commits)
+without file conflicts. Live samples above identify their pre-merge deployment
+versions. The combined branch is verified locally after the merge; these samples
+do not constitute a new live qualification of unrelated upstream changes.
+
+
+After merging main, the full native serverless suite passed 544 tests (six
+skipped), with no failures or leaks; its ancillary native gates also passed.
+The rebuilt module passed all 83 Node tests and all three persisted workerd tests
+(166 seconds). Its SHA-256 remained
+`b13b5c439a452fe091aee7b4f9c1897c7536e0edc112be4cf20b117c851b66ad`,
+identical to the final live-tested WASM artifact. The merge therefore introduced
+no native WASM byte changes. These local checks include the final queued/creating-
+kernel expiry guards. Repository cache collection completed after validation.
