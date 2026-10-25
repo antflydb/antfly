@@ -61,6 +61,7 @@ fn ensureConsumerIndex(root: *h.Handle, a: A) !void {
         }
     }
 }
+pub var test_admission_binding_visits: std.atomic.Value(usize) = .init(0);
 fn consumers(root: *h.Handle, a: A, table: []const u8, key: []const u8, observed_epoch: ?*?u64) ![]const Consumer {
     return consumersForAdmission(root, a, table, key, observed_epoch, null);
 }
@@ -95,7 +96,7 @@ fn consumersForAdmission(root: *h.Handle, a: A, table: []const u8, key: []const 
         var row = try directory.seekEntry(&cursor, target);
         while (row) |entry| {
             if (!std.mem.startsWith(u8, entry.key, target)) break;
-            if (@import("builtin").is_test) _ = directory.test_binding_visits.fetchAdd(1, .monotonic);
+            if (@import("builtin").is_test) _ = test_admission_binding_visits.fetchAdd(1, .monotonic);
             try bindings.append(a, try std.json.parseFromSliceLeaky(directory.Binding, a, entry.value, .{ .allocate = .alloc_always }));
             row = try directory.nextEntry(&cursor);
         }
@@ -1302,7 +1303,6 @@ test "capi resolver curation proposal review unions queue work across namespaces
 
 test "capi resolver curation warm proposal creation skips all consumer bindings and fences membership" {
     const api = @import("db.zig");
-    const directory = @import("../storage/lite/resolver_consumers.zig");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1318,9 +1318,9 @@ test "capi resolver curation warm proposal creation skips all consumer bindings 
     }
     // First proposal folds cold policy; every following proposal is membership-only.
     _ = try proposals(root, a, .create, "entities", "", "{\"action\":\"merge\",\"key\":\"entity/a\",\"into\":\"entity/b\"}", .{});
-    const visits = directory.test_binding_visits.load(.monotonic);
+    const visits = test_admission_binding_visits.load(.monotonic);
     for (0..20) |i| _ = try proposals(root, a, .create, "entities", "", try json(a, c.ProposalRequest{ .action = .merge, .key = "entity/a", .into = try std.fmt.allocPrint(a, "entity/target-{d}", .{i}) }), .{});
-    try std.testing.expectEqual(visits, directory.test_binding_visits.load(.monotonic));
+    try std.testing.expectEqual(visits, test_admission_binding_visits.load(.monotonic));
     var observed: ?u64 = null;
     const selected = try consumersForAdmission(root, a, "entities", "entity/a", &observed, db);
     try std.testing.expectEqual(@as(usize, 1), selected.len);
@@ -1337,14 +1337,14 @@ test "capi resolver curation warm proposal creation skips all consumer bindings 
     try std.testing.expectError(error.ResolverCurationConflict, checkDirectoryEpoch(root, observed));
     // Mixed warm/cold membership folds just the newly enrolled namespace.
     _ = try root.db.upsertResolverWithResultOptions(.{ .name = "cold", .table = "entities", .key_template = "{{_key}}", .source_artifact = "cold-kg", .resolution_artifact = "cold-resolved", .promote = false }, .{ .drain_backfill = false, .wait_for_activity = true });
-    const cold_visits = directory.test_binding_visits.load(.monotonic);
+    const cold_visits = test_admission_binding_visits.load(.monotonic);
     const mixed = try consumersForAdmission(root, a, "entities", "entity/a", &observed, db);
     try std.testing.expectEqual(@as(usize, 2), mixed.len);
     const prepared = try prepareAdoption(a, db, mixed);
     try std.testing.expectEqual(@as(usize, 1), prepared.sources.len);
     try std.testing.expectEqual(@as(usize, 1), prepared.namespaces.len);
     try std.testing.expectEqualStrings("{{_key}}", prepared.namespaces[0].key_template);
-    try std.testing.expectEqual(@as(usize, 1), directory.test_binding_visits.load(.monotonic) - cold_visits);
+    try std.testing.expectEqual(@as(usize, 1), test_admission_binding_visits.load(.monotonic) - cold_visits);
     _ = try proposals(root, a, .create, "entities", "", "{\"action\":\"merge\",\"key\":\"entity/a\",\"into\":\"entity/cold\"}", .{});
     std.debug.print("PROPOSALS consumers=100 creations=20 warm_binding_visits=0 mixed_cold_visits=1\n", .{});
 }
