@@ -67,7 +67,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Memory accounts distinguish independently funded registered payloads.
 // Read metadata retirement queues and constant-time epoch unlinking.
 // Acquired allocator-host sources and registered publication resource owners.
-pub const abi_version: u32 = 183;
+// Registered immutable source anchors bind routing and retained ancestry.
+pub const abi_version: u32 = 184;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

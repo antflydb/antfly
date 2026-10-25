@@ -125,7 +125,8 @@ const builtin = @import("builtin");
 // Memory accounts distinguish independently funded registered payloads.
 // Read metadata retirement queues and constant-time epoch unlinking.
 // Acquired allocator-host sources and registered publication resource owners.
-pub const abi_version: u32 = 123;
+// Registered immutable source anchors bind routing and retained ancestry.
+pub const abi_version: u32 = 124;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

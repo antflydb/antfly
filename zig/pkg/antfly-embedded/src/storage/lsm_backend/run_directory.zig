@@ -110,6 +110,7 @@ test "directory accounting token charges selected payloads without pinning unrel
 
 const Payload = struct {
     refs: std.atomic.Value(usize) = .init(1),
+    registered_anchor: ?Directory.RegisteredAnchor = null,
     run: Run,
     owner: *anyopaque,
     release_pin: *const fn (*anyopaque, *Run) void,
@@ -447,6 +448,46 @@ pub const Directory = struct {
     };
 
     /// One owned registration, represented independently of backend lifetime.
+    pub const Routing = struct {
+        legacy: ?*const fn ([]const u8) []const u8 = null,
+        admitted: ?*const fn ([]const u8, @import("../../common/read_admission.zig").Port) anyerror![]const u8 = null,
+        pub fn fromOptions(options: anytype) @This() {
+            return .{ .legacy = options.run_partition_key, .admitted = if (options.run_partition_key != null) options.run_partition_key_with_admission else null };
+        }
+        pub fn matches(self: @This(), other: @This()) bool {
+            return self.legacy == other.legacy and self.admitted == other.admitted;
+        }
+    };
+    pub const RegisteredAnchor = struct {
+        allocator: std.mem.Allocator,
+        manager: *@import("../resource_manager.zig").ResourceManager,
+        registration: *@import("../resource_manager.zig").PayloadRetirement,
+        routing: Routing,
+        domain: []const u8,
+    };
+    /// An acquired immutable source, including its original allocator, resident
+    /// observer and domain ancestry. The registered final anchor remains while
+    /// this non-final reference is held; releasing it performs no physical free.
+    pub const RegisteredSource = struct {
+        lease: ?EntryLease,
+        allocator: std.mem.Allocator,
+        routing: Routing,
+        pub fn run(self: *const @This()) *const Run {
+            return self.lease.?.entry.run;
+        }
+        pub fn domain(self: *const @This()) []const u8 {
+            return self.lease.?.entry.domain;
+        }
+        pub fn releaseWithAdmission(self: *@This(), original: ?@import("../../common/read_admission.zig").Port) !void {
+            if (original) |port| try port.checkpoint();
+            if (self.lease) |*lease| {
+                std.debug.assert(lease.entry.payload.?.registered_anchor != null and lease.entry.payload.?.refs.load(.acquire) > 1);
+                lease.deinit(self.allocator);
+                self.lease = null;
+            }
+        }
+    };
+
     pub const EntryPin = struct {
         owner: *anyopaque,
         release: *const fn (*anyopaque, *Run) void,
@@ -531,6 +572,30 @@ pub const Directory = struct {
             if (original) |port| try port.checkpoint();
             if (self.entry.payload.?.refs.load(.acquire) != 1) return null;
             return try self.beginRetirement(pin, original);
+        }
+
+        /// Bind only after resident adoption and final-anchor registration,
+        /// before any reader/candidate can acquire this immutable payload.
+        pub fn bindRegisteredAnchor(self: *const @This(), anchor: RegisteredAnchor) void {
+            const payload = self.entry.payload.?;
+            std.debug.assert(payload.registered_anchor == null and payload.account.independently_funded);
+            std.debug.assert(anchor.registration.context != null and anchor.registration.step != null and anchor.registration.credit != null);
+            std.debug.assert(anchor.registration.credit.?.manager == anchor.manager);
+            std.debug.assert(anchor.allocator.ptr == payload.account.backing.ptr and anchor.allocator.vtable == payload.account.backing.vtable);
+            payload.registered_anchor = anchor;
+        }
+        pub fn registeredRouting(self: *const @This(), original: @import("../../common/read_admission.zig").Port) !Routing {
+            try original.checkpoint();
+            const payload = self.entry.payload orelse return error.InvalidArgument;
+            const anchor = payload.registered_anchor orelse return error.ExecutionWaitUnsupported;
+            if (self.entry.run != &payload.run or !payload.account.independently_funded or anchor.domain.ptr != self.entry.domain.ptr or anchor.domain.len != self.entry.domain.len or anchor.registration.context == null or anchor.registration.step == null or anchor.registration.credit == null or anchor.registration.credit.?.manager != anchor.manager or anchor.allocator.ptr != payload.account.backing.ptr or anchor.allocator.vtable != payload.account.backing.vtable) return error.InvalidArgument;
+            return anchor.routing;
+        }
+        pub fn retainRegisteredSourceWithAdmission(self: *const @This(), original: @import("../../common/read_admission.zig").Port) !RegisteredSource {
+            const routing = try self.registeredRouting(original);
+            const allocator = self.entry.payload.?.registered_anchor.?.allocator;
+            const lease = try self.retainWithAdmission(original);
+            return .{ .lease = lease, .allocator = allocator, .routing = routing };
         }
 
         /// Caller serializes acquisition against closing its final anchor.
@@ -1047,6 +1112,7 @@ pub const Directory = struct {
             const quota = @import("pin_quota.zig");
             allocator: std.mem.Allocator,
             partition: ?*const fn ([]const u8, admission.Port) anyerror![]const u8,
+            routing: Routing,
             manager: *resources.ResourceManager,
             quota_owner: *quota.Owner,
             quota_borrow: ?*quota.Owner = null,
@@ -1077,7 +1143,7 @@ pub const Directory = struct {
                 const allocator = backend.allocator;
                 const partition = if (backend.options.run_partition_key != null) backend.options.run_partition_key_with_admission else null;
                 const retained = try owner.acquireWithAdmission(original);
-                return .{ .allocator = allocator, .partition = partition, .manager = manager, .quota_owner = owner, .quota_borrow = retained, .account = account.retain(), .clone = .init(source) };
+                return .{ .allocator = allocator, .partition = partition, .routing = .fromOptions(backend.options), .manager = manager, .quota_owner = owner, .quota_borrow = retained, .account = account.retain(), .clone = .init(source) };
             }
             pub fn resumeWithAdmission(self: *Self, original: admission.Port) !void {
                 try original.checkpoint();
@@ -1369,6 +1435,16 @@ pub const Directory = struct {
             const account = payload.account;
             (Entry{ .run = self.run, .payload = payload }).deinit(allocator);
             account.release();
+        }
+        /// Caller pins the immutable source directory through acquisition.
+        /// The acquired reference then stands on its own final anchor.
+        pub fn retainRegisteredSourceWithAdmission(self: @This(), original: @import("../../common/read_admission.zig").Port) !RegisteredSource {
+            try original.checkpoint();
+            const payload: *Payload = @ptrCast(@alignCast(@constCast(self.revision)));
+            const anchor = payload.registered_anchor orelse return error.ExecutionWaitUnsupported;
+            if (self.run != &payload.run) return error.InvalidArgument;
+            const view: EntryLease = .{ .entry = .{ .run = self.run, .payload = payload, .domain = anchor.domain } };
+            return view.retainRegisteredSourceWithAdmission(original);
         }
         pub fn accountedMemoryBytes(self: @This(), pass: u64) u64 {
             const payload: *const Payload = @ptrCast(@alignCast(self.revision));

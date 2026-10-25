@@ -27770,3 +27770,43 @@ publication under the original execution remain next. Relief, remaining variable
 work audits and broad default, fairness, session and distributed overload
 qualification remain open. The full design is incomplete; full GNU qualification
 remains waived. The existing worktree, branch and PR are retained.
+
+
+## Acquired registered publication sources (2026-10-24)
+
+Registered immutable directory entries now carry their original allocator,
+retirement registration, resource manager, routing policy and domain identity.
+Publication resources can acquire an actual source lease or handle and retain
+its final anchor through derived-entry construction, readers and cleanup. This
+keeps source accounting and shared memory charged to the original observer and
+keeps allocator and domain ancestry alive after the producer exits. Derived
+entries reuse the captured domain without calling a closed producer. Foreign
+routing and forged domain identities are rejected before construction; legacy
+unregistered sources remain unsupported by this acquisition path.
+
+Observer adjustment now traces the original admission's rejection before retrying
+local ParentMemoryBusy contention. The new ancestry fault test exposed this
+classification bug during retirement; its failed receipt is preserved.
+Private native ABI 124 and kernel-owner ABI 184 fence the new contracts.
+
+Coverage exercises file and shared-memory sources across distinct allocator
+contexts, physical hosts and memory parents; producer exit; handle and lease
+acquisition; rejected construction and retirement; and exhaustive constructor
+allocation failures while cleanup's allocator remains exhausted. Qualification
+receipts use the registered-publication-source prefix in the existing receipt
+directory.
+
+This completes registered immutable-source acquisition. Fresh writer output
+ownership, normal compaction/flush integration, funded run-store and obsolete
+candidates, coupled directory/WAL/manifest publication, relief and broad default
+policy qualification remain open. The full design remains incomplete.
+
+
+Final Debug and ReleaseFast runs pass all five native commands per mode.
+Debug passes 157 physical-sync, 124 accounting, 53 ABI/host/context and 19 local
+boundary cases. ReleaseFast passes six read-metadata, nine entry-preparation,
+fifteen resumable-payload, 124 accounting and 53 ABI/host/context cases, plus
+19 local boundary checks. Both pass the four Bloom and 45/1/8 original-error
+companions. There are no failures, skips or leaks. Formatting, license headers
+and generated error-name checks pass. The final native input hash maps are
+unchanged and equal between modes; full GNU qualification remains waived.

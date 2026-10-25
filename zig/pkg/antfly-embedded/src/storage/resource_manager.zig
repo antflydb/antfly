@@ -4852,7 +4852,9 @@ pub const ResourceManager = struct {
         retirement.retire();
     }
 
-    fn adjustUsageControlled(self: *ResourceManager, slice: Slice, current: *u64, next: u64, control: ?read_admission.Port) !void {
+    fn adjustUsageControlled(self: *ResourceManager, slice: Slice, current: *u64, next: u64, scope: ?read_admission.Port) !void {
+        var trace: read_admission.RejectionTrace = .{};
+        const control = trace.bind(scope);
         errdefer if (control == null and builtin.link_libc) {
             if (std.c.getenv("ANTFLY_RESOURCE_ALLOCATION_DIAGNOSTICS")) |raw| {
                 if (std.mem.eql(u8, std.mem.span(raw), "1")) {
@@ -4865,6 +4867,7 @@ pub const ResourceManager = struct {
         };
         while (true) {
             self.adjustUsageOnceControlled(slice, current, next, control) catch |err| {
+                if (trace.failure) |first| return first;
                 if (err == error.ParentMemoryBusy) {
                     // The failed attempt released the child ledger lock and
                     // published no reservation. Spend only the caller's scope.

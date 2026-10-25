@@ -938,3 +938,233 @@ test "physical cache metadata final pin retirement resumes local staleness and p
         try std.testing.expectEqual(@as(u64, 0), resources.quota_lifetimes.load(.acquire));
     }
 }
+
+const RegisteredSourceFixture = struct {
+    const lsm = @import("antfly_local_sources").storage_lsm_backend_mod;
+    const Lease = lsm.Backend.PublicationResources.EntryLease;
+    const Physical = @typeInfo(@FieldType(lsm.Backend.DirectoryEntryPreparation, "physical")).optional.child;
+    const Phase = enum { construct, retire };
+    const Policy = struct {
+        var live: bool = true;
+        var label: []const u8 = "";
+        var calls: usize = 0;
+        fn legacy(_: []const u8) []const u8 {
+            return label;
+        }
+        fn admitted(_: []const u8, original: read_admission.Port) ![]const u8 {
+            try original.checkpoint();
+            if (!live) return error.DomainProducerClosed;
+            calls += 1;
+            return label;
+        }
+        fn other(_: []const u8) []const u8 {
+            return "other";
+        }
+    };
+    const Source = struct {
+        allocator: std.mem.Allocator,
+        manager: *ResourceManager,
+        host: *Resources,
+        run: lsm.repository.Run,
+        label: ?[]u8,
+        physical: ?Physical = null,
+        usage: u64 = 0,
+        released: bool = false,
+        fn release(raw: *anyopaque, original: ?read_admission.Port) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (original) |port| try port.checkpoint();
+            try std.testing.expect(self.host.quota_lifetimes.load(.acquire) != 0);
+            if (self.physical == null) self.physical = try Physical.init(self.run);
+            try self.physical.?.retireWithAdmission(self.allocator, original);
+            if (self.label) |label| {
+                if (original) |port| try port.checkpoint();
+                self.allocator.free(label); // Fixed small fixture label.
+                self.label = null;
+            }
+            if (original) |port| try self.manager.adjustUsageWithAdmission(.lsm_in_memory_state, &self.usage, 0, port) else try self.manager.adjustUsage(.lsm_in_memory_state, &self.usage, 0);
+            self.released = true;
+            return true;
+        }
+    };
+    const Stats = struct { checks: usize, allocations: usize };
+    fn drainPair(first: *ResourceManager, second: *ResourceManager) void {
+        for (0..2048) |_| {
+            if (first.payload_retirement_ready.load(.acquire) == 0 and second.payload_retirement_ready.load(.acquire) == 0) return;
+            _ = second.drainPayloadRetirementQuiesced();
+            _ = first.drainPayloadRetirementQuiesced();
+        }
+        @panic("registered source ancestry did not retire");
+    }
+    fn run(shared: bool, phase: Phase, target: ?usize, oom: bool) !Stats {
+        const a = std.testing.allocator;
+        var allocator1 = std.testing.FailingAllocator.init(a, .{});
+        var allocator2 = std.testing.FailingAllocator.init(a, .{});
+        const a1 = allocator1.allocator();
+        const a2 = allocator2.allocator();
+        var parent1 = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 64 << 20 } });
+        defer parent1.deinit(a);
+        var parent2 = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 64 << 20 } });
+        defer parent2.deinit(a);
+        var budgets1 = budgets_mod.smartResourceBudgetsForTotal(64 << 20);
+        budgets1.options.identity_allocator = a1;
+        var budgets2 = budgets_mod.smartResourceBudgetsForTotal(64 << 20);
+        budgets2.options.identity_allocator = a2;
+        var first = try Resources.initWithBudgetsAndParent(a1, budgets1, parent1.memoryParentPort());
+        defer first.deinit();
+        first.attachResourceManager();
+        var second = try Resources.initWithBudgetsAndParent(a2, budgets2, parent2.memoryParentPort());
+        defer second.deinit();
+        second.attachResourceManager();
+        var backend1 = lsm.Backend.init(a1, .{ .resource_manager = &first.resource_manager, .wal_enabled = false, .run_partition_key = Policy.legacy, .run_partition_key_with_admission = Policy.admitted });
+        var backend1_live = true;
+        defer if (backend1_live) backend1.close();
+        var backend2 = lsm.Backend.init(a2, .{ .resource_manager = &second.resource_manager, .wal_enabled = false, .run_partition_key = Policy.legacy, .run_partition_key_with_admission = Policy.admitted });
+        var backend2_live = true;
+        defer if (backend2_live) backend2.close();
+        var scope1: ?*lsm.Backend.PublicationResources = null;
+        var scope2: ?*lsm.Backend.PublicationResources = null;
+        var lease1: ?Lease = null;
+        var lease2: ?Lease = null;
+        defer {
+            if (lease2) |*lease| lease.deinit(a2);
+            if (lease1) |*lease| lease.deinit(a1);
+            if (scope2) |owner| owner.requestRetirement();
+            if (scope1) |owner| owner.requestRetirement();
+            drainPair(&first.resource_manager, &second.resource_manager);
+            Policy.live = true;
+            Policy.label = "";
+        }
+        scope1 = try backend1.beginPublicationResourcesWithAdmission(quotaControl());
+        try scope1.?.resumeWithAdmission(quotaControl());
+        scope2 = try backend2.beginPublicationResourcesWithAdmission(quotaControl());
+        try scope2.?.resumeWithAdmission(quotaControl());
+        try std.testing.expect(backend1.mu.tryLock());
+        const planned1 = backend1.planningDirectory();
+        backend1.mu.unlock();
+        const directory1 = try (try planned1).fork(a1);
+        defer directory1.destroy(a1);
+        try directory1.tree.prepare(a1);
+        try std.testing.expect(backend2.mu.tryLock());
+        const planned2 = backend2.planningDirectory();
+        backend2.mu.unlock();
+        const directory2 = try (try planned2).fork(a2);
+        defer directory2.destroy(a2);
+        try directory2.tree.prepare(a2);
+        var source: Source = .{ .allocator = a1, .manager = &first.resource_manager, .host = &first, .label = null, .run = undefined };
+        try first.resource_manager.adjustUsageWithAdmission(.lsm_in_memory_state, &source.usage, 256 << 10, quotaControl());
+        source.label = try a1.dupe(u8, "ancestor-domain");
+        const key = try a1.alloc(u8, 32775);
+        @memset(key, 'k');
+        source.run = .{ .id = 911, .level = 1, .size_bytes = 1, .path = if (shared) null else try a1.dupe(u8, "registered-source-ancestor.sst"), .smallest_namespace_name = null, .smallest_key = key, .largest_namespace_name = null, .largest_key = try a1.dupe(u8, "z"), .entry_count = 1, .bloom_filter = null, .state = if (shared) .{} else null };
+        if (shared) {
+            try source.run.state.?.appendUpsert(a1, .{ .name = "docs" }, key, key, false);
+            try source.run.shareMemory(a1);
+        }
+        Policy.live = true;
+        Policy.label = source.label.?;
+        Policy.calls = 0;
+        var lifetime: ?lsm.Backend.DirectoryEntryLifetime = .{ .context = &source, .release = Source.release };
+        try scope1.?.beginEntryWithAdmission(&backend1, directory1, source.run, &lifetime, quotaControl());
+        const resident1 = blk: {
+            lease1 = try scope1.?.takeEntryWithAdmission(quotaControl());
+            break :blk first.resource_manager.sliceStats(.lsm_in_memory_state).used_bytes - source.usage;
+        };
+        try std.testing.expect(lifetime == null and Policy.calls == 1);
+        backend1.close();
+        backend1_live = false;
+        scope1.?.requestRetirement();
+        scope1 = null;
+        Policy.live = false; // Calling the old producer's routing now fails.
+        const refs = lease1.?.entry.payload.?.refs.load(.acquire);
+        var forged = lease1.?;
+        forged.entry.domain = "forged";
+        try std.testing.expectError(error.InvalidArgument, scope2.?.beginEntryFromRegisteredSourceWithAdmission(&backend2, directory2, &forged, quotaControl()));
+        backend2.options.run_partition_key = Policy.other;
+        try std.testing.expectError(error.CompactionPlanningStale, scope2.?.beginEntryFromRegisteredSourceWithAdmission(&backend2, directory2, &lease1.?, quotaControl()));
+        backend2.options.run_partition_key = Policy.legacy;
+        try std.testing.expectEqual(refs, lease1.?.entry.payload.?.refs.load(.acquire));
+        var fault: PublicationResourcesFixture.Fault = .{ .at = if (oom) null else target, .failure = switch ((target orelse 0) % 4) {
+            0 => error.Canceled,
+            1 => error.DeadlineExceeded,
+            2 => error.FileNotFound,
+            else => error.ParentMemoryBusy,
+        }, .live = phase == .construct };
+        const payload: read_admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = PublicationResourcesFixture.Fault.check, .check_lifetime = PublicationResourcesFixture.Fault.check, .wait_for_progress = PublicationResourcesFixture.Fault.wait } };
+        const original = read_admission.Port.init(&payload);
+        const allocation_start = allocator2.alloc_index;
+        if (oom) allocator2.fail_index = allocation_start + target.?;
+        const result: anyerror!void = blk: {
+            if (shared) {
+                // The owned lease pins the same immutable payload as a directory.
+                const SourceDirectory = @TypeOf(directory1.*);
+                const handle: SourceDirectory.Handle = .{ .run = lease1.?.entry.run, .revision = lease1.?.entry.payload.? };
+                scope2.?.beginEntryFromRegisteredHandleWithAdmission(&backend2, directory2, handle, original) catch |cause| break :blk cause;
+            } else {
+                scope2.?.beginEntryFromRegisteredSourceWithAdmission(&backend2, directory2, &lease1.?, original) catch |cause| break :blk cause;
+            }
+            lease2 = scope2.?.takeEntryWithAdmission(original) catch |cause| break :blk cause;
+            try std.testing.expect(lease2.?.entry.domain.ptr == source.label.?.ptr);
+            lease1.?.deinit(a1);
+            lease1 = null;
+            backend2.close();
+            backend2_live = false;
+            scope2.?.requestRetirement();
+            scope2 = null;
+            for (0..2) |_| _ = first.resource_manager.drainPayloadRetirementQuiesced();
+            try std.testing.expect(!source.released and !first.tryBeginDeinit());
+            try std.testing.expectEqual(source.usage + resident1, first.resource_manager.sliceStats(.lsm_in_memory_state).used_bytes);
+            try std.testing.expectEqualStrings("ancestor-domain", lease2.?.entry.domain);
+            try std.testing.expectEqual(@as(usize, 1), Policy.calls);
+            if (phase == .retire) {
+                lease2.?.deinit(a2);
+                lease2 = null;
+                fault.live = true;
+                while (first.resource_manager.payload_retirement_ready.load(.acquire) != 0 or second.resource_manager.payload_retirement_ready.load(.acquire) != 0) {
+                    _ = second.resource_manager.drainPayloadRetirementWithAdmission(original) catch |cause| break :blk cause;
+                    _ = first.resource_manager.drainPayloadRetirementWithAdmission(original) catch |cause| break :blk cause;
+                }
+            }
+            break :blk {};
+        };
+        const stats: Stats = .{ .checks = fault.calls, .allocations = allocator2.alloc_index - allocation_start };
+        if (oom) {
+            try std.testing.expect(allocator2.has_induced_failure);
+            try std.testing.expectError(error.OutOfMemory, result);
+        } else if (target != null) try std.testing.expectError(fault.failure, result) else try result;
+        if (lease2) |*lease| lease.deinit(a2);
+        lease2 = null;
+        if (lease1) |*lease| lease.deinit(a1);
+        lease1 = null;
+        if (scope2) |owner| owner.requestRetirement();
+        scope2 = null;
+        drainPair(&first.resource_manager, &second.resource_manager);
+        try std.testing.expect(source.released);
+        try std.testing.expectEqual(@as(u64, 0), first.quota_lifetimes.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), second.quota_lifetimes.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), first.resource_manager.sliceStats(.lsm_in_memory_state).used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), second.resource_manager.sliceStats(.lsm_in_memory_state).used_bytes);
+        allocator2.fail_index = std.math.maxInt(usize);
+        return stats;
+    }
+};
+
+test "physical cache metadata acquired registered source preserves allocator domain and accounting ancestry across producer exit" {
+    for ([_]bool{ false, true }) |shared| {
+        _ = try RegisteredSourceFixture.run(shared, .construct, null, false);
+        _ = try RegisteredSourceFixture.run(shared, .retire, null, false);
+    }
+}
+
+test "physical cache metadata acquired registered source retains every constructor and retirement refusal" {
+    for ([_]bool{ false, true }) |shared| for (std.enums.values(RegisteredSourceFixture.Phase)) |phase| {
+        const count = (try RegisteredSourceFixture.run(shared, phase, null, false)).checks;
+        for (0..count) |at| _ = try RegisteredSourceFixture.run(shared, phase, at, false);
+    };
+}
+
+test "physical cache metadata acquired registered source aborts every allocation failure without releasing ancestors early" {
+    for ([_]bool{ false, true }) |shared| {
+        const count = (try RegisteredSourceFixture.run(shared, .construct, null, false)).allocations;
+        for (0..count) |at| _ = try RegisteredSourceFixture.run(shared, .construct, at, true);
+    }
+}

@@ -7405,6 +7405,10 @@ pub const Backend = struct {
     pub fn beginOwnedDirectoryEntryPreparation(self: *Backend, directory: *RunDirectory, source: Run, owner: *PinQuota.Owner, host: *?DirectoryEntryHostLifetime, lifetime: *?DirectoryEntryLifetime, original: read_admission.Port) !*DirectoryEntryOwner {
         return DirectoryEntryOwner.start(self, directory, source, owner, host, lifetime, directorySnapshotPinRetirement(), original);
     }
+    pub fn beginOwnedDirectoryEntryFromRegisteredSource(self: *Backend, directory: *RunDirectory, source: *const RunDirectory.EntryLease, owner: *PinQuota.Owner, host: *?DirectoryEntryHostLifetime, original: read_admission.Port) !*DirectoryEntryOwner {
+        return DirectoryEntryOwner.startFromRegisteredSource(self, directory, source, owner, host, directorySnapshotPinRetirement(), original);
+    }
+
     pub fn unregisteredDirectorySnapshotPin() RunDirectory.EntryPin {
         return .{ .owner = &run_snapshot_refs, .release = releaseDirectorySnapshotPin };
     }

@@ -93,6 +93,29 @@ pub const Owner = struct {
         self.entry = try backend.beginOwnedDirectoryEntryPreparation(directory, source, owner, &host, lifetime, original);
     }
 
+    pub fn beginEntryFromRegisteredSourceWithAdmission(self: *Owner, backend: anytype, directory: *Directory, source: *const Directory.EntryLease, scope: admission.Port) !void {
+        var trace: admission.RejectionTrace = .{};
+        const original = trace.bind(scope).?;
+        try original.checkpoint();
+        if (self.closing or self.entry != null) return error.InvalidArgument;
+        if (backend.options.resource_manager != self.manager or backend.allocator.ptr != self.allocator.ptr or backend.allocator.vtable != self.allocator.vtable) return error.ResourceAccountingMismatch;
+        const routing = try source.registeredRouting(original);
+        if (!routing.matches(.fromOptions(backend.options))) return error.CompactionPlanningStale;
+        const owner = self.quota_owner orelse return error.InvalidArgument;
+        const retained_host = try self.manager.acquireAllocatorHostWithAdmission(self.allocator, original);
+        var host: ?entry_owner.HostLifetime = .{ .allocator = retained_host.allocator, .lifetime = pinHost(retained_host) };
+        defer if (host) |held| held.lifetime.release_joined(held.lifetime.context);
+        self.entry = try backend.beginOwnedDirectoryEntryFromRegisteredSource(directory, source, owner, &host, original);
+    }
+
+    pub fn beginEntryFromRegisteredHandleWithAdmission(self: *Owner, backend: anytype, directory: *Directory, source: Directory.Handle, original: admission.Port) !void {
+        var captured = try source.retainRegisteredSourceWithAdmission(original);
+        // The registered anchor makes this a fixed non-final drop, including
+        // when the original admission already refused subsequent construction.
+        defer captured.releaseWithAdmission(null) catch unreachable;
+        try self.beginEntryFromRegisteredSourceWithAdmission(backend, directory, &captured.lease.?, original);
+    }
+
     /// Transfer a reader/candidate lease only after construction and final
     /// registration finish. Independent retirement immediately owns the anchor.
     pub fn takeEntryWithAdmission(self: *Owner, scope: admission.Port) !Directory.EntryLease {
