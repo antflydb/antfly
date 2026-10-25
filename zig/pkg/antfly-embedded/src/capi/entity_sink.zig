@@ -2952,4 +2952,8 @@ test "capi resolver curation plain admission preserves readers and recovers work
     try std.testing.expect(!try authority.hasProjectionDebt(root, &root.db, scratch));
     // Real projection metadata retains its durable feature fence after cleanup.
     try std.testing.expectEqual(catalog.resolver_projection_delta_reader_version, root.db.core.index_manager.minimum_reader_version.load(.acquire));
+    var read = try root.db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqualStrings("15", try read.get(catalog.minimum_reader_key));
+    try std.testing.expectError(error.NotFound, read.get(jobs.marker));
 }

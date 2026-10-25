@@ -755,7 +755,9 @@ pub fn pullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
         return true;
     }
     if (!try projectionWorkPossible(database, a)) return false;
-    try ensureConsumerIndex(root, a);
+    // Orphaned cleanup jobs need no consumer directory. Bootstrapping it
+    // would publish a newer reader floor solely to delete obsolete work.
+    if (database.core.index_manager.hasResolverDefinitions()) try ensureConsumerIndex(root, a);
     const jobs = @import("../storage/lite/resolver_consumers.zig");
     var txn = try database.core.store.beginReadTxn();
     var live = true;
@@ -1116,7 +1118,7 @@ pub fn hasProjectionDebt(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
     if (physical != null) {
         if (try ownershipWorkPossible(database, a)) return true;
         if (!try projectionWorkPossible(database, a)) return false;
-        try ensureConsumerIndex(root, a);
+        if (database.core.index_manager.hasResolverDefinitions()) try ensureConsumerIndex(root, a);
         var read = try database.core.store.beginReadTxn();
         defer read.abort();
         var bridge: Bridge = .{ .txn = &read };
