@@ -89,10 +89,7 @@ fn view(part: *const Part, shapes_visible: bool, background_visible: bool) c.Inh
 fn showsMaster(bytes: []const u8) !bool {
     var iter = xml.Xml{ .bytes = bytes };
     while (try iter.next()) |token| if (token == .tag and !token.tag.closing) {
-        const value = token.tag.attr("showMasterSp") orelse return true;
-        if (std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "false")) return false;
-        if (std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true")) return true;
-        return error.InvalidDocumentXml;
+        return token.tag.booleanAttr("showMasterSp", true);
     };
     return error.InvalidDocumentXml;
 }
@@ -193,6 +190,9 @@ test "document inherited slide text excludes placeholders and separates backgrou
     try std.testing.expect(content.background != null);
     try std.testing.expect(try (try xml.View.init(a, content.background.?)).needsVisualInspection());
     try std.testing.expect(!try showsMaster("<p:sld showMasterSp='false'/>"));
+    try std.testing.expect(!try showsMaster("<p:sld showMasterSp='&#48;'/>"));
+    try std.testing.expect(try showsMaster("<p:sld showMasterSp=' tr&#117;e '/>"));
+    try std.testing.expectError(error.InvalidDocumentXml, showsMaster("<p:sld showMasterSp='0' showMasterSp='1'/>"));
     const footer = try inheritedContent(a, "<p:sldMaster><p:sp><p:ph type='ftr'/><a:t>Footer</a:t></p:sp></p:sldMaster>");
     try std.testing.expect(footer.conditional_content);
     try std.testing.expectEqualStrings("Footer", try (try xml.View.init(a, footer.shapes)).text(a));

@@ -99,7 +99,7 @@ pub const Source = struct {
                     var slide_iter = ooxml.Xml{ .bytes = xml };
                     while (try slide_iter.next()) |part| {
                         if (part == .tag and !part.tag.closing and std.mem.eql(u8, part.tag.local(), "sld")) {
-                            if (part.tag.attr("show")) |show| slide.hidden = std.mem.eql(u8, show, "0") or std.mem.eql(u8, show, "false");
+                            slide.hidden = !try part.tag.booleanAttr("show", true);
                             break;
                         }
                     }
@@ -436,5 +436,21 @@ test "document visible slide views exclude hidden shapes across inheritance note
             var item = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.fmt.allocPrint(a, "{{\"structures\":{{\"record\":[{{\"amount\":{{\"value\":\"{s}\",\"start\":{d},\"end\":{d}}}}}]}}}}", .{ value, start, start + value.len }), .{});
             try std.testing.expectEqual(supported, try @import("evidence.zig").attach(a, &item, page.text, metadata, true, false));
         }
+    }
+}
+
+test "document encoded hidden slide flags obey selection and include hidden" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]bool{ false, true }) |include_hidden| {
+        var source = try Source.init(a, .{ .id = "slides", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation", .include_hidden = include_hidden }, @embedFile("testdata/encoded-hidden-slides.pptx"), .{}, .{});
+        defer source.deinit();
+        if (include_hidden) {
+            const hidden = try source.analyze(a, 1, .{});
+            try std.testing.expectEqualStrings("Slide 2\n", hidden.native_text);
+        } else try std.testing.expectError(error.HiddenDocumentPage, source.analyze(a, 1, .{}));
+        const visible = try source.analyze(a, 2, .{});
+        try std.testing.expectEqualStrings("Slide 1\n", visible.native_text);
     }
 }

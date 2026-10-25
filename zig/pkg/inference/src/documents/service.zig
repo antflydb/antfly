@@ -461,6 +461,10 @@ pub fn Service(comptime Node: type) type {
         fn read(raw: *anyopaque, a: A, binding: c.Binding, _: usize, bbox: ?[4]f64, run: *c.Run) !executor.Candidate {
             try run.requireOutput();
             const self: *Self = @ptrCast(@alignCast(raw));
+            // Run source ceilings are absolute aggregate counters. The current
+            // definition also owns a per-view ceiling inside nested calls.
+            const child_definition = if (binding.provider == .antfly) self.graph.get(.{ .name = binding.model, .operation = binding.operation }) else null;
+            const encoded_limit = @min(run.limits.max_source_bytes, self.definition.budget.max_source_bytes, if (child_definition) |child| child.budget.max_source_bytes else std.math.maxInt(usize));
             if (std.mem.eql(u8, binding.model, "antfly/native-document")) {
                 if (bbox != null) return error.DocumentCapabilityMismatch;
                 const native = try self.source.analyzeWithRegionLimit(a, self.number, run.limits.max_regions, run.control);
@@ -489,18 +493,35 @@ pub fn Service(comptime Node: type) type {
                 if (right <= left or bottom <= top) return error.InvalidDocumentRegion;
                 try run.pixels(@as(u64, right - left) * (bottom - top));
                 const pixels = try a.alloc(u8, @as(usize, right - left) * (bottom - top) * 4);
-                for (0..bottom - top) |y| for (0..right - left) |x| {
-                    const source_offset = ((y + top) * decoded.width + x + left) * decoded.channels;
-                    const destination = (y * (right - left) + x) * 4;
-                    @memcpy(pixels[destination..][0..3], decoded.data[source_offset..][0..3]);
-                    pixels[destination + 3] = 255;
+                for (0..bottom - top) |y| {
+                    try run.control.check();
+                    for (0..right - left) |x| {
+                        const source_offset = ((y + top) * decoded.width + x + left) * decoded.channels;
+                        const destination = (y * (right - left) + x) * 4;
+                        @memcpy(pixels[destination..][0..3], decoded.data[source_offset..][0..3]);
+                        pixels[destination + 3] = 255;
+                    }
+                }
+                const CropProbe = struct {
+                    fn cancelled(ptr: ?*const anyopaque) bool {
+                        const ctl: *const c.Control = @ptrCast(@alignCast(ptr.?));
+                        ctl.check() catch return true;
+                        return false;
+                    }
                 };
-                data = try image.png.encodeRgba(a, right - left, bottom - top, pixels);
+                data = image.png.encodeRgbaWithOptions(a, a, right - left, bottom - top, pixels, .{
+                    .max_output_bytes = encoded_limit,
+                    .cancellation = .{ .context = &run.control, .is_cancelled_fn = CropProbe.cancelled },
+                }) catch |err| {
+                    try run.control.check();
+                    return if (err == error.ImageTooLarge) error.DocumentSourceLimitExceeded else err;
+                };
                 mime = "image/png";
                 offset = .{ @floatFromInt(left), @floatFromInt(top) };
                 raster_width = right - left;
                 raster_height = bottom - top;
             }
+            if (data.len > encoded_limit) return error.DocumentSourceLimitExceeded;
             if (binding.provider == .cloudflare) {
                 if (!cf.routing.visionModel(binding.model)) return error.DocumentCapabilityMismatch;
                 const max_tokens = self.max_tokens orelse 1024;
@@ -518,7 +539,7 @@ pub fn Service(comptime Node: type) type {
                 const reading = try cf.chatReading(result);
                 return .{ .model = binding.model, .text = reading.text, .origin = .interpretation, .truncated = reading.finish == .length, .status = if (reading.finish == .stop) .complete else .unresolved };
             }
-            if (self.graph.get(.{ .name = binding.model, .operation = binding.operation })) |child| {
+            if (child_definition) |child| {
                 const child_limits = try run.nestedViewLimits(child.budget, data.len, raster_width, raster_height);
                 var nested_source = sources.Source{ .input = .{ .id = self.source.input.id, .url = "", .media_type = mime }, .fingerprint = @splat(0), .bytes = data, .parsed = .image };
                 var nested = self.*;
@@ -1252,6 +1273,7 @@ test "document extraction keeps independent sources atomic and reuses retained r
         fn documentDownload(self: *@This(), _: A, url: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
             self.downloads += 1;
             if (std.mem.eql(u8, url, "hidden-slides")) return .{ .data = @embedFile("testdata/hidden-slides.pptx") };
+            if (std.mem.eql(u8, url, "encoded-hidden-slides")) return .{ .data = @embedFile("testdata/encoded-hidden-slides.pptx") };
             if (std.mem.eql(u8, url, "excess-runs")) return .{ .data = @embedFile("testdata/excess-text-runs.pdf") };
             if (std.mem.eql(u8, url, "output-regions")) return .{ .data = @embedFile("testdata/output-regions.pdf") };
             return .{ .data = if (self.slides) @embedFile("testdata/line-breaks.pptx") else @embedFile("testdata/two-pages.pdf") };
@@ -1328,6 +1350,11 @@ test "document extraction keeps independent sources atomic and reuses retained r
     const value = rows[1].object.get("structures").?.object.get("record").?.array.items[0].object.get("value").?;
     try std.testing.expectEqualStrings("two", value.object.get("evidence").?.array.items[0].object.get("source_id").?.string);
     try std.testing.expectEqual(@as(i64, 16), parsed.value.object.get("usage").?.object.get("total_tokens").?.integer);
+    fake.calls = 0;
+    try std.testing.expectError(error.DocumentUnresolved, Service(Fake).extractJson(&fake, a,
+        \\{"model":"leaf","schema_version":2,"schema":{"structures":{"record":{"fields":{"value":"str"}}}},"documents":[{"id":"visible","url":"fixture","media_type":"application/pdf"},{"id":"hidden","url":"encoded-hidden-slides","media_type":"application/vnd.openxmlformats-officedocument.presentationml.presentation","pages":[1]}]}
+    , .{}));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
     // Omission delegates to each native leaf, and the negotiated protocol is
     // reflected in the outer response across documents, verifiers and rows.
     fake.default_version = 2;
@@ -2009,4 +2036,77 @@ test "document extraction consumes qualified table cells from fresh and retained
     try std.testing.expectError(error.DocumentUnresolved, Service(Fake).extractJson(&fake, a,
         \\{"model":"agent","schema_version":2,"schema":{"structures":{"receipt":{"fields":{"total":"str"}}}},"documents":[{"id":"receipt","url":"fixture","media_type":"image/png"}]}
     , .{}));
+}
+
+test "document regional encoding bounds every provider and nested view before dispatch" {
+    const Fake = struct {
+        ceiling: usize = 88,
+        child_ceiling: ?usize = null,
+        cloudflare: bool = false,
+        calls: usize = 0,
+        max_seen: usize = 0,
+        fn documentDefinition(self: *@This(), a: A, name: []const u8, _: c.Operation) !?[]const u8 {
+            if (std.mem.eql(u8, name, "child")) return try std.fmt.allocPrint(a, "{{\"models\":[{{\"name\":\"leaf\",\"model\":\"child-leaf\",\"operation\":\"read\"}}],\"read\":{{\"reader\":\"leaf\"}},\"budget\":{{\"max_source_bytes\":{d}}}}}", .{self.child_ceiling.?});
+            if (!std.mem.eql(u8, name, "agent")) return null;
+            return try std.json.Stringify.valueAlloc(a, c.Definition{
+                .allow_remote = self.cloudflare,
+                .models = &.{
+                    .{ .name = "fast", .model = "fast", .operation = .read },
+                    if (self.cloudflare) .{ .name = "accurate", .model = "@cf/mistralai/mistral-small-3.1-24b-instruct", .operation = .read, .provider = .cloudflare, .account_id = "account", .token_env = "CLOUDFLARE_API_TOKEN" } else .{ .name = "accurate", .model = if (self.child_ceiling != null) "child" else "accurate", .operation = .read },
+                },
+                .read = .{ .reader = "fast", .accurate_reader = "accurate" },
+                .budget = .{ .max_source_bytes = self.ceiling },
+            }, .{ .emit_null_optional_fields = false });
+        }
+        fn documentResolveBinding(_: *@This(), _: A, binding: c.Binding) !c.Snapshot {
+            var identity: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(binding.model, &identity, .{});
+            return .{ .binding = binding, .path = binding.model, .identity = identity };
+        }
+        fn documentDownload(_: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
+            return .{ .data = @embedFile("testdata/crop-byte-limit.png") };
+        }
+        fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, model: []const u8, req: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+            const info = try image.inspectEncoded(req.images[0].bytes);
+            try std.testing.expectEqual(@as(u32, 256), info.width);
+            try std.testing.expectEqual(@as(u32, 256), info.height);
+            self.max_seen = @max(self.max_seen, req.images[0].bytes.len);
+            self.calls += 1;
+            const items = try a.alloc(readers.Result, 1);
+            items[0] = .{ .text = "Total", .completion = .complete };
+            if (std.mem.eql(u8, model, "fast")) items[0].regions_json =
+                \\[{"id":0,"text":"Total","bbox":[0,0,256,256],"confidence":0.1}]
+            ;
+            return .{ .items = items, .execution = .{ .requested_items = 1, .serial_items = 1 } };
+        }
+        fn invokeCloudflare(_: *@This(), _: A, _: c.Binding, _: V, _: Control, _: *c.Run) anyerror!V {
+            return error.UnexpectedCall;
+        }
+        fn decideDirectJsonWithControl(_: *@This(), _: A, _: []const u8, _: ?Control) anyerror![]u8 {
+            return error.UnexpectedCall;
+        }
+    };
+    const request =
+        \\{"model":"agent","documents":[{"id":"image","url":"fixture","media_type":"image/png"}]}
+    ;
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |cloudflare| {
+        var fake = Fake{ .cloudflare = cloudflare };
+        try std.testing.expectError(error.DocumentSourceLimitExceeded, Service(Fake).readJson(&fake, a, request, .{}));
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        try std.testing.expectEqual(@as(usize, 88), fake.max_seen);
+    }
+    var nested = Fake{ .ceiling = 2048, .child_ceiling = 88 };
+    try std.testing.expectError(error.DocumentSourceLimitExceeded, Service(Fake).readJson(&nested, a, request, .{}));
+    try std.testing.expectEqual(@as(usize, 1), nested.calls);
+    for ([_]?usize{ null, 2048 }) |child_ceiling| {
+        var fitting = Fake{ .ceiling = 2048, .child_ceiling = child_ceiling };
+        const response = try Service(Fake).readJson(&fitting, a, request, .{});
+        defer a.free(response);
+        try std.testing.expectEqual(@as(usize, 2), fitting.calls);
+        try std.testing.expect(fitting.max_seen > 88 and fitting.max_seen <= fitting.ceiling);
+        var parsed = try std.json.parseFromSlice(V, a, response, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("complete", parsed.value.object.get("document").?.object.get("status").?.string);
+    }
 }

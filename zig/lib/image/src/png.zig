@@ -51,54 +51,40 @@ pub fn encodeRgba(alloc: Allocator, width: u32, height: u32, rgba: []const u8) !
 
 /// Compression storage is transient; only the returned PNG uses output_alloc.
 pub fn encodeRgbaWithCancellation(scratch_alloc: Allocator, output_alloc: Allocator, width: u32, height: u32, rgba: []const u8, cancellation: CancellationProbe) ![]u8 {
+    return encodeRgbaWithOptions(scratch_alloc, output_alloc, width, height, rgba, .{ .cancellation = cancellation });
+}
+
+pub const EncodeOptions = struct {
+    cancellation: CancellationProbe = .{},
+    /// Includes signature, chunks and zlib data. Exceeding this ceiling returns
+    /// ImageTooLarge before allocating the final PNG or growing compression
+    /// storage beyond the ceiling plus Deflate's fixed lookahead.
+    max_output_bytes: usize = std.math.maxInt(usize),
+};
+
+pub fn encodeRgbaWithOptions(scratch_alloc: Allocator, output_alloc: Allocator, width: u32, height: u32, rgba: []const u8, options: EncodeOptions) ![]u8 {
+    const cancellation = options.cancellation;
     try cancellation.check();
     if (width == 0 or height == 0) return error.InvalidRgbaSize;
     const pixel_count = std.math.mul(usize, width, height) catch return error.InvalidRgbaSize;
     const expected = std.math.mul(usize, pixel_count, 4) catch return error.InvalidRgbaSize;
     if (rgba.len != expected) return error.InvalidRgbaSize;
 
-    const row_bytes = std.math.mul(usize, width, 4) catch return error.InvalidRgbaSize;
-    // The flate writer requires an initial output buffer (and grows it through
-    // Writer.Allocating as compressed bytes are emitted).
-    var compressed = try std.Io.Writer.Allocating.initCapacity(scratch_alloc, 16 * 1024);
+    const png_overhead = 8 + chunkTotalLen(13) + chunkTotalLen(0) + chunkTotalLen(0);
+    if (options.max_output_bytes < png_overhead) return error.ImageTooLarge;
+    // Deflate writes up to eight lookahead bytes without advancing its logical
+    // output. Permit that fixed scratch slack, then check exact PNG length.
+    const compression_ceiling = @max(9, (options.max_output_bytes - png_overhead) +| 8);
+    var compressed = try CompressionBuffer.init(scratch_alloc, compression_ceiling);
     defer compressed.deinit();
-    {
-        try compressed.writer.writeAll(std.compress.flate.Container.zlib.header());
-        var adler = Adler32.init();
-        var history: [std.compress.flate.max_window_len]u8 = undefined;
-        var compressor = try std.compress.flate.Compress.init(
-            &compressed.writer,
-            history[0..],
-            .raw,
-            .default,
-        );
-        for (0..height) |row| {
-            try compressor.writer.writeByte(0);
-            adler.update(&.{0});
-            const offset = row * row_bytes;
-            const row_data = rgba[offset..][0..row_bytes];
-            var chunk_offset: usize = 0;
-            while (chunk_offset < row_data.len) {
-                try cancellation.check();
-                const chunk_end = chunk_offset + @min(row_data.len - chunk_offset, cancellation_work_bytes);
-                const chunk = row_data[chunk_offset..chunk_end];
-                try compressor.writer.writeAll(chunk);
-                adler.update(chunk);
-                chunk_offset = chunk_end;
-            }
-        }
-        try cancellation.check();
-        try compressor.finish();
-        var trailer: [4]u8 = undefined;
-        std.mem.writeInt(u32, &trailer, adler.final(), .big);
-        try compressed.writer.writeAll(&trailer);
-    }
+    compressRgba(&compressed.writer, width, height, rgba, cancellation) catch |err| return compressed.failure orelse err;
     try cancellation.check();
     const zlib = compressed.writer.buffered();
     const zlib_len = zlib.len;
     if (zlib_len > std.math.maxInt(u32)) return error.PngEncodeFailed;
 
-    const png_len = 8 + chunkTotalLen(13) + chunkTotalLen(zlib_len) + chunkTotalLen(0);
+    const png_len = std.math.add(usize, png_overhead, zlib_len) catch return error.ImageTooLarge;
+    if (png_len > options.max_output_bytes) return error.ImageTooLarge;
     try cancellation.check();
     const out = try output_alloc.alloc(u8, png_len);
     errdefer output_alloc.free(out);
@@ -141,6 +127,96 @@ pub fn encodeRgbaWithCancellation(scratch_alloc: Allocator, output_alloc: Alloca
     std.debug.assert(cursor == out.len);
     return out;
 }
+
+fn compressRgba(writer: *std.Io.Writer, width: u32, height: u32, rgba: []const u8, cancellation: CancellationProbe) !void {
+    const row_bytes = @as(usize, width) * 4;
+    try writer.writeAll(std.compress.flate.Container.zlib.header());
+    var adler = Adler32.init();
+    var history: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(
+        writer,
+        history[0..],
+        .raw,
+        .default,
+    );
+    for (0..height) |row| {
+        try compressor.writer.writeByte(0);
+        adler.update(&.{0});
+        const offset = row * row_bytes;
+        const row_data = rgba[offset..][0..row_bytes];
+        var chunk_offset: usize = 0;
+        while (chunk_offset < row_data.len) {
+            try cancellation.check();
+            const chunk_end = chunk_offset + @min(row_data.len - chunk_offset, cancellation_work_bytes);
+            const chunk = row_data[chunk_offset..chunk_end];
+            try compressor.writer.writeAll(chunk);
+            adler.update(chunk);
+            chunk_offset = chunk_end;
+        }
+    }
+    try cancellation.check();
+    try compressor.finish();
+    var trailer: [4]u8 = undefined;
+    std.mem.writeInt(u32, &trailer, adler.final(), .big);
+    try writer.writeAll(&trailer);
+}
+
+/// A growing writer with a hard allocation ceiling, including direct Deflate
+/// buffer access. Rebase retains compressed bytes and clamps amortized growth;
+/// an allocator cap alone would reject fitting output at growth boundaries.
+const CompressionBuffer = struct {
+    storage: std.Io.Writer.Allocating,
+    writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain, .rebase = rebase, .flush = std.Io.Writer.noopFlush }, .buffer = &.{} },
+    ceiling: usize,
+    failure: ?anyerror = null,
+
+    fn init(a: Allocator, ceiling: usize) !CompressionBuffer {
+        const storage = try std.Io.Writer.Allocating.initCapacity(a, @min(16 * 1024, ceiling));
+        var self = CompressionBuffer{ .storage = storage, .ceiling = ceiling };
+        self.writer.buffer = storage.writer.buffer;
+        return self;
+    }
+    fn deinit(self: *CompressionBuffer) void {
+        self.storage.deinit();
+    }
+    fn reserve(self: *CompressionBuffer, needed: usize) std.Io.Writer.Error!void {
+        if (needed > self.ceiling) {
+            self.failure = error.ImageTooLarge;
+            return error.WriteFailed;
+        }
+        if (needed <= self.writer.buffer.len) return;
+        const capacity = self.writer.buffer.len;
+        self.storage.writer.end = self.writer.end;
+        self.storage.ensureTotalCapacityPrecise(@min(self.ceiling, @max(needed, capacity +| capacity / 2))) catch {
+            self.failure = error.OutOfMemory;
+            return error.WriteFailed;
+        };
+        self.writer.buffer = self.storage.writer.buffer;
+    }
+    fn rebase(w: *std.Io.Writer, _: usize, capacity: usize) std.Io.Writer.Error!void {
+        const self: *CompressionBuffer = @fieldParentPtr("writer", w);
+        return self.reserve(std.math.add(usize, w.end, capacity) catch {
+            self.failure = error.ImageTooLarge;
+            return error.WriteFailed;
+        });
+    }
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *CompressionBuffer = @fieldParentPtr("writer", w);
+        var needed = w.end;
+        for (data, 0..) |slice, i| {
+            const count = std.math.mul(usize, slice.len, if (i + 1 == data.len) splat else 1) catch {
+                self.failure = error.ImageTooLarge;
+                return error.WriteFailed;
+            };
+            needed = std.math.add(usize, needed, count) catch {
+                self.failure = error.ImageTooLarge;
+                return error.WriteFailed;
+            };
+        }
+        try self.reserve(needed);
+        return w.writeSplat(data, splat);
+    }
+};
 
 fn chunkTotalLen(data_len: usize) usize {
     return 4 + 4 + data_len + 4;
@@ -1315,4 +1391,67 @@ test "PNG inflate consumes trailing empty blocks and rejects surplus or truncate
             try std.testing.expectError(error.PngDecodeFailed, decodeRgba(alloc, png[0..cursor]));
         }
     }
+}
+
+test "bounded PNG encoding preserves exact bytes at the ceiling and clamps growth" {
+    const a = std.testing.allocator;
+    const rgba = try a.alloc(u8, 64 * 64 * 4);
+    defer a.free(rgba);
+    var random = std.Random.DefaultPrng.init(42);
+    random.random().bytes(rgba);
+    const original = try encodeRgba(a, 64, 64, rgba);
+    defer a.free(original);
+    try std.testing.expect(original.len > 16 * 1024);
+    // Enough for the exact compressed payload and Deflate lookahead, including
+    // the last amortized growth step. Retained PNG output has a separate owner.
+    const scratch_bytes = try a.alloc(u8, original.len - 57 + 8);
+    defer a.free(scratch_bytes);
+    var scratch = std.heap.FixedBufferAllocator.init(scratch_bytes);
+    const bounded = try encodeRgbaWithOptions(scratch.allocator(), a, 64, 64, rgba, .{ .max_output_bytes = original.len });
+    defer a.free(bounded);
+    try std.testing.expectEqualSlices(u8, original, bounded);
+    try std.testing.expectError(error.ImageTooLarge, encodeRgbaWithOptions(a, a, 64, 64, rgba, .{ .max_output_bytes = original.len - 1 }));
+
+    const small = [_]u8{ 12, 34, 56, 255 };
+    const png = try encodeRgba(a, 1, 1, &small);
+    defer a.free(png);
+    for (0..png.len) |limit| try std.testing.expectError(error.ImageTooLarge, encodeRgbaWithOptions(a, a, 1, 1, &small, .{ .max_output_bytes = limit }));
+    const exact = try encodeRgbaWithOptions(a, a, 1, 1, &small, .{ .max_output_bytes = png.len });
+    defer a.free(exact);
+    try std.testing.expectEqualSlices(u8, png, exact);
+}
+
+test "bounded PNG encoding stops compression early without allocating oversized output" {
+    const a = std.testing.allocator;
+    const rgba = try a.alloc(u8, 256 * 256 * 4);
+    defer a.free(rgba);
+    var random = std.Random.DefaultPrng.init(73);
+    random.random().bytes(rgba);
+    const Probe = struct {
+        checks: usize = 0,
+        fn cancelled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.checks += 1;
+            return false;
+        }
+    };
+    var probe = Probe{};
+    var bytes: [128 - 57 + 8]u8 = undefined;
+    var scratch = std.heap.FixedBufferAllocator.init(&bytes);
+    try std.testing.expectError(error.ImageTooLarge, encodeRgbaWithOptions(scratch.allocator(), std.testing.failing_allocator, 256, 256, rgba, .{
+        .max_output_bytes = 128,
+        .cancellation = .{ .context = &probe, .is_cancelled_fn = Probe.cancelled },
+    }));
+    try std.testing.expect(probe.checks < 256);
+}
+
+test "bounded PNG encoding releases every allocation failure" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            const pixels = [_]u8{ 10, 20, 30, 255 };
+            const png = try encodeRgbaWithOptions(a, a, 1, 1, &pixels, .{ .max_output_bytes = 128 });
+            defer a.free(png);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

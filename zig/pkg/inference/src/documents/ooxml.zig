@@ -126,6 +126,11 @@ pub const Tag = struct {
         };
         return result;
     }
+    /// XML boolean attributes share entity decoding, whitespace handling and
+    /// duplicate detection, including default-true visibility properties.
+    pub fn booleanAttr(self: Tag, name: []const u8, default: bool) !bool {
+        return booleanValue((try self.uniqueAttr(name)) orelse return default);
+    }
     pub fn attr(self: Tag, wanted: []const u8) ?[]const u8 {
         var i = self.name.len;
         while (i < self.raw.len) {
@@ -265,8 +270,7 @@ fn isDrawing(local: []const u8) bool {
     }
     return false;
 }
-fn hiddenAttribute(tag: Tag) !bool {
-    const raw = (try tag.uniqueAttr("hidden")) orelse return false;
+fn booleanValue(raw: []const u8) !bool {
     var token: [5]u8 = undefined;
     var length: usize = 0;
     var trailing_space = false;
@@ -511,7 +515,7 @@ fn visibleBytes(a: A, bytes: []const u8, control: @import("contract.zig").Contro
             if (depth == frame.depth + 2) {
                 if (frame.visibility_seen) return error.InvalidDocumentXml;
                 frame.visibility_seen = true;
-                frame.hidden = try hiddenAttribute(tag);
+                frame.hidden = try tag.booleanAttr("hidden", false);
             }
         }
         if (tag.closing and count > 0 and logical_depth < frames[count - 1].depth) {
@@ -568,7 +572,7 @@ fn requiresVisualInspection(xml: []const u8) !bool {
             nonrect = false;
         }
         if (shape and std.mem.eql(u8, local, "cNvSpPr")) {
-            if (tag.attr("txBox")) |value| textbox = std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true");
+            textbox = try tag.booleanAttr("txBox", false);
         }
         if (shape and (std.mem.eql(u8, local, "solidFill") or std.mem.eql(u8, local, "gradFill") or std.mem.eql(u8, local, "pattFill"))) geometry = true;
         if (shape and std.mem.eql(u8, local, "prstGeom")) {
@@ -912,4 +916,31 @@ test "document namespace indexing restores scoped bindings and cleans up large n
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{xml.written()});
+}
+
+test "document boolean attributes decode visibility consistently without allocation" {
+    for ([_][]const u8{ "0", "false", "&#48;", "&#x30;", " f&#97;lse ", "&#32;false&#32;" }) |value| {
+        var bytes: [256]u8 = undefined;
+        const xml = try std.fmt.bufPrint(&bytes, "<sld show='{s}' showMasterSp='{s}'/>", .{ value, value });
+        var iter = Xml{ .bytes = xml };
+        const tag = (try iter.next()).?.tag;
+        try std.testing.expect(!try tag.booleanAttr("show", true));
+        try std.testing.expect(!try tag.booleanAttr("showMasterSp", true));
+    }
+    for ([_][]const u8{ "1", "true", "&#49;", "tr&#117;e", " true " }) |value| {
+        var bytes: [128]u8 = undefined;
+        const xml = try std.fmt.bufPrint(&bytes, "<cNvSpPr txBox='{s}'/>", .{value});
+        var iter = Xml{ .bytes = xml };
+        try std.testing.expect(try (try iter.next()).?.tag.booleanAttr("txBox", false));
+    }
+    var defaults = Xml{ .bytes = "<sld/>" };
+    const tag = (try defaults.next()).?.tag;
+    try std.testing.expect(try tag.booleanAttr("show", true));
+    try std.testing.expect(!try tag.booleanAttr("hidden", false));
+    for ([_][]const u8{ "<sld show='maybe'/>", "<sld show=''/>", "<sld show='0' show='1'/>", "<sld show='0'show='1'/>", "<sld show='f alse'/>" }) |invalid| {
+        var iter = Xml{ .bytes = invalid };
+        try std.testing.expectError(error.InvalidDocumentXml, (try iter.next()).?.tag.booleanAttr("show", true));
+    }
+    const textbox = try View.init(std.testing.failing_allocator, "<sp><cNvSpPr txBox='tr&#117;e'/><prstGeom prst='rect'/><t>Visible</t></sp>");
+    try std.testing.expect(!try textbox.needsVisualInspection());
 }

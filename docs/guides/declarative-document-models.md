@@ -285,6 +285,10 @@ calls reuse source-owned render-fork metadata. Fitted raster coordinates compose
 the original render transform with exact per-axis resize ratios; rounded DPI is
 advisory and cannot shift crop or evidence geometry. Cancellation applies during
 painting and output fitting, and page buffers are released on failure.
+Regional crops preserve their source pixels and geometry. PNG encoding enforces
+the active byte ceiling, including the destination child model's limit, while
+compressing. A crop that cannot fit fails before model dispatch; cancellation
+and allocation failures release its transient buffers.
 
 Slide text, tables and visual inspection share a visibility-checked XML view.
 Individual `cNvPr.hidden` flags apply to the owning shape, picture, table frame
@@ -292,8 +296,9 @@ or group, including hidden ancestors in slides, layouts, masters and notes.
 Hidden content cannot become visible reading text or literal extraction evidence,
 and hidden drawings do not trigger unnecessary visual inspection. `include_hidden`
 continues to select hidden slides; it does not reveal hidden objects within them.
-Visibility accepts XML boolean spellings and character references, and rejects
-malformed or contradictory flags. The pass uses a bounded stack, borrows the
+Slide visibility (`show`), inherited master visibility (`showMasterSp`), hidden
+objects and text boxes share XML boolean parsing. It accepts character references
+and surrounding whitespace, and rejects malformed or duplicate flags. The pass uses a bounded stack, borrows the
 original bytes for visible parts, and copies visible spans once when filtering.
 OOXML `AlternateContent` selects the first choice whose required namespace URIs
 are supported, otherwise its fallback. Namespace aliases, scoped rebindings and
