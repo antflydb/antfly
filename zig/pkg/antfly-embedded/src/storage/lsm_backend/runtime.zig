@@ -3508,6 +3508,11 @@ fn lowerBoundRunStart(keys: []const []const u8, namespace: backend_types.Namespa
 /// published LSM version. Mutable cache-index hints in Run are only accessed
 /// under the backend mutex; lazy Bloom ownership is disabled for these runs.
 pub const ReadVersion = struct {
+    pub const OwnedRetirement = struct {
+        context: *anyopaque,
+        retire: *const fn (*anyopaque) void,
+    };
+    owned_retirement: ?OwnedRetirement = null,
     // Backend-mutex protected. No builder owns a service mutex while yielding.
     preparing: bool = false,
     prepared: bool = true,
@@ -3581,6 +3586,7 @@ pub const ReadVersion = struct {
     /// Discard unpublished projection arrays. The pinned epoch still owns
     /// the directory; this temporary header must never destroy that root.
     pub fn discardProjection(self: *ReadVersion) void {
+        std.debug.assert(self.owned_retirement == null);
         const allocator = self.allocator;
         allocator.free(self.runs);
         deinitRunGroups(allocator, self.l0_groups);
@@ -3598,6 +3604,33 @@ pub const ReadVersion = struct {
 
     /// Caller holds the backend mutex when using backend-owned retirement.
     /// The last reference queues reclamation; it does not free metadata here.
+    /// An existing owned reference pins the epoch through acquisition. Closing
+    /// its creator does not invalidate that reference or its descendants.
+    pub fn retainOwnedWithAdmission(self: *ReadVersion, original: read_admission.Port) !*ReadVersion {
+        try original.checkpoint();
+        if (self.owned_retirement == null or self.references.load(.acquire) == 0) return error.InvalidArgument;
+        const previous = self.references.fetchAdd(1, .monotonic);
+        std.debug.assert(previous != 0);
+        return self;
+    }
+    /// Standalone owned epochs need no Backend receiver after controller exit.
+    /// Backend-tracked epochs must release through release(backend) to unlink.
+    pub fn releaseOwned(self: *ReadVersion) void {
+        std.debug.assert(!self.registered);
+        const owner = self.owned_retirement.?;
+        const previous = self.references.fetchSub(1, .acq_rel);
+        std.debug.assert(previous != 0);
+        if (previous == 1) owner.retire(owner.context);
+    }
+    /// Called only after the last reference and any Backend list handoff.
+    /// No epoch access may follow a successful return receipt.
+    pub fn retireOwned(self: *ReadVersion) bool {
+        const owner = self.owned_retirement orelse return false;
+        std.debug.assert(self.references.load(.acquire) == 0 and !self.registered);
+        owner.retire(owner.context);
+        return true;
+    }
+
     pub fn release(self: *ReadVersion, backend: anytype) void {
         if (self.references.fetchSub(1, .acq_rel) != 1) return;
         if (comptime @hasDecl(@TypeOf(backend.*), "retireReadVersion")) return backend.retireReadVersion(self);
@@ -3605,6 +3638,7 @@ pub const ReadVersion = struct {
     }
 
     pub fn destroy(self: *ReadVersion, backend: anytype) void {
+        if (self.retireOwned()) return;
         self.destroyContents(backend);
         if (self.directory) |directory| self.allocator.destroy(directory);
         self.allocator.destroy(self);
@@ -3613,6 +3647,7 @@ pub const ReadVersion = struct {
     /// Directory-backed projections borrow run metadata. Retire the directory
     /// separately; reclaiming these buffers must not release individual runs.
     pub fn destroyProjectionHeader(self: *ReadVersion) void {
+        std.debug.assert(self.owned_retirement == null);
         std.debug.assert(self.directory != null);
         self.allocator.free(self.runs);
         deinitRunGroups(self.allocator, self.l0_groups);
@@ -3621,12 +3656,14 @@ pub const ReadVersion = struct {
     }
 
     pub fn accountedMemoryBytes(self: *const ReadVersion, pass: u64) u64 {
+        if (self.owned_retirement != null) return 0; // The registered fixed grant owns these headers.
         return @sizeOf(ReadVersion) + self.projection_bytes + (if (self.directory) |directory| directory.accountedMemoryBytes(pass) else 0);
     }
 
     /// Reclamation keeps these small headers immutable until the backend
     /// reacquires its lock, allowing concurrent memory-accounting passes.
     pub fn destroyContents(self: *ReadVersion, backend: anytype) void {
+        std.debug.assert(self.owned_retirement == null);
         const allocator = self.allocator;
         if (self.directory) |directory| {
             directory.destroyContents(allocator);

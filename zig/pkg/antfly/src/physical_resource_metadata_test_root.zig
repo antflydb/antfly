@@ -1044,6 +1044,30 @@ const RegisteredSourceFixture = struct {
         }
     };
     const Scope = lsm.Backend.PublicationResources;
+    const ReaderReturnProbe = struct {
+        manager: *ResourceManager,
+        frame: *Scope.RegisteredReadVersion,
+        witness: *HeaderWitness,
+        saved: @FieldType(Scope.RegisteredReadVersion, "version").OwnedRetirement,
+        checked: bool = false,
+        fn finish(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // Drive the actual registry in the critical window after the final
+            // reference decrement but before the registered return receipt.
+            for (0..8) |_| _ = self.manager.drainPayloadRetirementQuiesced();
+            if (self.frame.returned.load(.acquire) or self.frame.state == null or self.frame.complete or self.frame.version.references.load(.acquire) != 0 or self.witness.observed) @panic("reader header retired before final return receipt");
+            self.checked = true;
+            const saved = self.saved;
+            saved.retire(saved.context);
+            // The epoch is deliberately destroyed before its release callback
+            // returns. No caller may touch that epoch after handing it back.
+            for (0..128) |_| {
+                _ = self.manager.drainPayloadRetirementQuiesced();
+                if (self.witness.observed) return;
+            }
+            @panic("returned reader header did not physically retire");
+        }
+    };
     const Store = Scope.WriterStore;
     fn finishRoot(root: *?*Store, cursor: *?Store.Reclaimer, a: std.mem.Allocator) void {
         if (root.*) |store| {
@@ -1164,9 +1188,21 @@ const RegisteredSourceFixture = struct {
         var working: Scope.Publication.Roots = .{};
         var working_candidate: ?*Scope.Publication.Candidate = null;
         var sibling: ?*Scope.Publication.Candidate = null;
+        var reader_owner: ?*Scope.RegisteredReadVersion = null;
+        const Version = @FieldType(Scope.RegisteredReadVersion, "version");
+        var readers: [8]?*Version = @splat(null);
+        var reader_frames: [8]?*Scope.RegisteredReadVersion = @splat(null);
+        var backend_reader: ?*Version = null;
+        var final_return_probe: ?ReaderReturnProbe = null;
         defer {
             header_witness.active = false;
             working.retire();
+            for (&readers) |*slot| if (slot.*) |version| {
+                version.releaseOwned();
+                slot.* = null;
+            };
+            if (backend_reader) |version| version.releaseOwned();
+            if (reader_owner) |owner| owner.requestRetirement();
             if (working_candidate) |owner| owner.requestRetirement();
             if (sibling) |owner| owner.requestRetirement();
             finishDirectory(&directory_live, &directory_cursor, a2);
@@ -1315,6 +1351,34 @@ const RegisteredSourceFixture = struct {
                     try std.testing.expectEqual(ordinal + 1, working.directory.?.count());
                     try std.testing.expectEqual(ordinal + 1, working.writer.?.count());
                     try std.testing.expectEqual(@as(usize, 0), working.obsolete.count());
+                    reader_owner = scope2.?.beginReadVersionWithAdmission(working.directory.?, original) catch |cause| break :blk cause;
+                    readers[ordinal] = reader_owner.?.takeWithAdmission(original) catch |cause| break :blk cause;
+                    reader_frames[ordinal] = reader_owner;
+                    reader_owner = null; // Final release owns the retirement handoff.
+                    try std.testing.expect(!reader_frames[ordinal].?.registration.ready.load(.acquire));
+                    const epoch = readers[ordinal].?;
+                    const peer = epoch.retainOwnedWithAdmission(original) catch |cause| break :blk cause;
+                    peer.releaseOwned();
+                    try std.testing.expectEqual(ordinal + 1, epoch.directory.?.count());
+                    try std.testing.expectEqual(@as(u64, 0), epoch.accountedMemoryBytes(230));
+                    try std.testing.expect(backend2.mu.tryLock());
+                    const refused_projection = backend2.prepareReadVersionWithAdmission(epoch, quotaControl());
+                    backend2.mu.unlock();
+                    try std.testing.expectError(error.ExecutionWaitUnsupported, refused_projection);
+                    if (ordinal == 0) {
+                        // Ordinary Backend release unlinks its epoch before
+                        // the registered receipt can authorize cleanup.
+                        reader_owner = scope2.?.beginReadVersionWithAdmission(working.directory.?, original) catch |cause| break :blk cause;
+                        backend_reader = reader_owner.?.takeWithAdmission(original) catch |cause| break :blk cause;
+                        reader_owner = null;
+                        const tracked = backend_reader.?;
+                        std.debug.assert(backend2.live_read_versions == null);
+                        tracked.registered = true;
+                        backend2.live_read_versions = tracked;
+                        tracked.release(&backend2);
+                        backend_reader = null;
+                        try std.testing.expect(backend2.live_read_versions == null and backend2.retired_projection_versions == null);
+                    }
                     // Canonical roots cannot be assembled from a copied or
                     // altered header under another tuple's seal.
                     var forged_roots = working;
@@ -1352,6 +1416,12 @@ const RegisteredSourceFixture = struct {
                     try std.testing.expectEqual(writer_count - ordinal - 1, working.directory.?.count());
                     try std.testing.expectEqual(writer_count - ordinal - 1, working.writer.?.count());
                     try std.testing.expectEqual(@as(usize, if (shared) 0 else 1), working.obsolete.count());
+                    for (readers[0..writer_count], 0..) |slot, generation| {
+                        const directory = slot.?.directory.?;
+                        try std.testing.expectEqual(generation + 1, directory.count());
+                        try std.testing.expectEqual(@as(u64, generation + 1), directory.total_run_bytes);
+                        try std.testing.expect(directory.at(0).run.id >= 911);
+                    }
                     writer_view.?.deinit(a2);
                     writer_view = null;
                 }
@@ -1593,6 +1663,26 @@ const RegisteredSourceFixture = struct {
                 fault.live = true;
                 if (publication) {
                     working.retire();
+                    header_witness.expected_bytes = @sizeOf(Scope.RegisteredReadVersion);
+                    header_witness.expected_pointer = @ptrCast(reader_frames[0].?);
+                    header_witness.active = writer_count == 1 and target == null and !oom;
+                    if (header_witness.active) {
+                        // Exercise an explicit early close as well as the
+                        // normal final-release notification path.
+                        try std.testing.expect(!reader_frames[0].?.registration.ready.load(.acquire));
+                        reader_frames[0].?.requestRetirement();
+                        try std.testing.expect(reader_frames[0].?.registration.ready.load(.acquire));
+                        final_return_probe = .{ .manager = &second.resource_manager, .frame = reader_frames[0].?, .witness = &header_witness, .saved = readers[0].?.owned_retirement.? };
+                        readers[0].?.owned_retirement = .{ .context = &final_return_probe.?, .retire = ReaderReturnProbe.finish };
+                    }
+                    for (&readers) |*slot| if (slot.*) |version| {
+                        // The controller and both Backends have closed. An
+                        // existing reference still pins the same generation.
+                        const peer = version.retainOwnedWithAdmission(original) catch |cause| break :blk cause;
+                        peer.releaseOwned();
+                        version.releaseOwned();
+                        slot.* = null;
+                    };
                 } else if (writer_count != 0) {
                     header_witness.active = writer_count == 1 and target == null and !oom;
                     const live = root.?;
@@ -1678,6 +1768,10 @@ const RegisteredSourceFixture = struct {
                     _ = first.resource_manager.drainPayloadRetirementWithAdmission(original) catch |cause| break :blk cause;
                 }
             }
+            if (publication and phase == .retire and writer_count == 1 and target == null and !oom) {
+                try std.testing.expect(header_witness.observed);
+                try std.testing.expect(final_return_probe.?.checked);
+            }
             break :blk {};
         };
         const stats: Stats = .{ .checks = fault.calls, .allocations = allocator2.alloc_index - allocation_start, .recovered = recovered_edit, .detached_recovered = recovered_detached };
@@ -1715,6 +1809,14 @@ const RegisteredSourceFixture = struct {
         }
         header_witness.active = false;
         working.retire();
+        for (&readers) |*slot| if (slot.*) |version| {
+            version.releaseOwned();
+            slot.* = null;
+        };
+        if (backend_reader) |version| version.releaseOwned();
+        backend_reader = null;
+        if (reader_owner) |owner| owner.requestRetirement();
+        reader_owner = null;
         if (working_candidate) |owner| owner.requestRetirement();
         working_candidate = null;
         if (sibling) |owner| owner.requestRetirement();
@@ -2195,20 +2297,20 @@ test "physical cache metadata registered writer removal retires every allocation
     }
 }
 
-test "physical cache metadata sealed publication keeps all roots coherent across replacement and producer exit" {
+test "physical cache metadata sealed publication and reader epochs keep generations coherent across producer exit" {
     for ([_]bool{ false, true }) |shared| for ([_]usize{ 1, 3, 8 }) |count| for (std.enums.values(RegisteredSourceFixture.Phase)) |phase| {
         _ = try RegisteredSourceFixture.runAll(shared, phase, null, false, count, false, false, false, false, true);
     };
 }
 
-test "physical cache metadata sealed publication preserves every original construction and retirement refusal" {
+test "physical cache metadata sealed publication and reader epochs preserve every original construction and retirement refusal" {
     for ([_]bool{ false, true }) |shared| for (std.enums.values(RegisteredSourceFixture.Phase)) |phase| {
         const count = (try RegisteredSourceFixture.runAll(shared, phase, null, false, 3, false, false, false, false, true)).checks;
         for (0..count) |at| _ = try RegisteredSourceFixture.runAll(shared, phase, at, false, 3, false, false, false, false, true);
     };
 }
 
-test "physical cache metadata sealed publication retires partial tuples while allocation stays exhausted" {
+test "physical cache metadata sealed publication and reader epochs retire partial ownership while allocation stays exhausted" {
     for ([_]bool{ false, true }) |shared| {
         const count = (try RegisteredSourceFixture.runAll(shared, .construct, null, false, 3, false, false, false, false, true)).allocations;
         for (0..count) |at| _ = try RegisteredSourceFixture.runAll(shared, .construct, at, true, 3, false, false, false, false, true);

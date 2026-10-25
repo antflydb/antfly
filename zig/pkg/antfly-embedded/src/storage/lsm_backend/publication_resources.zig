@@ -187,6 +187,13 @@ pub const Owner = struct {
         return RegisteredDirectory.startRemove(self.allocator, self.manager, source, handle, original);
     }
 
+    pub const RegisteredReadVersion = @import("registered_read_version.zig").Owner;
+    pub fn beginReadVersionWithAdmission(self: *Owner, source: *const Directory, original: admission.Port) !*RegisteredReadVersion {
+        try original.checkpoint();
+        if (self.closing) return error.InvalidArgument;
+        return RegisteredReadVersion.start(self.allocator, self.manager, source, original);
+    }
+
     pub const Publication = @import("registered_publication.zig");
     pub fn beginPublicationPutWithAdmission(self: *Owner, source: *const Publication.Roots, lease: *const EntryLease, run: *const Run, original: admission.Port) !*Publication.Candidate {
         try original.checkpoint();

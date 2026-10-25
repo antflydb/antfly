@@ -28310,3 +28310,78 @@ whole-design/default policy requirements remain incomplete. Source inspection of
 the finite-poll, bounded-round cleanup consumer supports the expected wakeup
 contract; it is not whole-path runtime qualification. Full GNU qualification
 remains waived, and the full goal remains active.
+
+
+## Registered directory reader headers (2026-10-25)
+
+Publication resources can capture a canonical registered directory into an owned,
+directory-only ReadVersion. Construction prepays the epoch header, immutable
+value snapshot and retirement cursor, acquires the actual allocator host, and
+registers partial ownership before allocation. Existing owned reader references
+can retain peers after producer/controller closure. Final release needs no
+Backend receiver for standalone epochs; Backend-tracked epochs unlink from the
+live list before returning to their registered owner instead of entering legacy
+projection retirement.
+
+Taking an epoch transfers its creation reference. A live epoch stays registered
+without requesting cleanup CPU; final release publishes cleanup readiness and an
+explicit return receipt. Explicit early retirement may publish readiness sooner,
+but still waits for that receipt. A zero reader count alone cannot authorize destruction: the releasing
+reader may still be finishing its epoch/Backend handoff. The receipt is the last
+access to the epoch frame; cleanup then reclaims directory nodes in bounded
+steps, releases its embedded snapshot guards, retires cursor bytes in 16 KiB
+ranges, and retains the allocator host through physical header destruction.
+Fixed header accounting is covered by the independent construction grant.
+Native ABI 132 and kernel-owner ABI 192 fence the changed private layouts.
+
+The initial optimized run passes all five commands, including expanded 47-case
+ownership, six legacy read-metadata retirement, 16 ABI/nine context and nineteen
+local checks, plus four Bloom and 45/1/8 original-error companions, on unchanged
+5,663-file inputs. Tests capture one, three and eight generations over file and
+shared-memory sources, preserve snapshots through removal/backend closure,
+exercise ordinary Backend list unlinking, witness host authority at header free,
+and retain the original four refusals and allocation exhaustion. A deterministic
+real-registry interleaving test now drives cleanup between the last decrement and
+receipt, then destroys the epoch before its release callback returns. Its Debug
+qualification is in progress; initial passing source evidence is preserved.
+
+This funds reader headers and directory-only access, not projected arrays or
+normal default adoption. Ordinary projection preparation explicitly refuses
+these epochs until its retained allocation and partial-construction ownership
+are supplied; its old temporary reservation cannot fund escaped arrays. Normal
+Backend generation capture/rebase, multi-edit publication, flush/compaction
+adoption, WAL/manifest/deletion completion, relief and broader original default
+requirements remain unfinished. Durable formats/reader epochs are unchanged.
+Full GNU qualification remains waived, and the full goal remains active.
+
+
+The deterministic handoff test passes all five Debug commands on unchanged
+5,663-file inputs, including all 47 ownership and 16 ABI cases and six legacy
+read-metadata cases. It drives the real registry before the final receipt and
+physically destroys the epoch before the release callback returns. Initial
+optimized and Debug snapshots/receipts are preserved. The final revision now
+keeps ordinary live reader epochs out of the pending cleanup queue until final
+release, while testing explicit early retirement separately. The refused
+projection fixture also acquires the Backend mutex to respect its precondition.
+Final identical-source Debug and optimized qualification are pending.
+
+
+Final reader-header qualification passes all five native commands in both Debug
+and ReleaseFast on unchanged, identical 5,663-file input maps. Debug passes 47
+ownership and 16 ABI cases (72/72 build steps), plus six legacy read-metadata
+retirement cases and four Bloom plus 45/1/8 original-error companions. Optimized
+qualification passes all 47 ownership, 16 ABI/nine execution-context, six legacy
+read-metadata and nineteen local cases (80/80 build steps), plus the same four
+companion commands. No executed case fails, skips or leaks. The final matrix
+covers normal inactive readiness, explicit early retirement, deterministic
+cleanup before the return receipt, physical destruction inside the release
+callback, one/three/eight pinned generations, controller/backend closure, original
+refusals and allocation exhaustion. The Backend projection-refusal fixture holds
+its required mutex. Formatting, license and whitespace checks pass; exact changed
+sources and initial/final qualification receipts are preserved.
+
+Reader header capture is implemented and qualified. Projection construction and
+its retained/partial ownership, normal Backend generation capture/rebase and
+batch installation, default flush/compaction adoption, durable completion and
+remaining whole-design requirements are still open. Full GNU qualification
+remains waived; this is not a claim of complete default or whole-path delivery.

@@ -7035,6 +7035,7 @@ pub const Backend = struct {
             version.live_previous = null;
             version.registered = false;
         }
+        if (version.retireOwned()) return;
         if (version.directory != null) {
             version.retired_next = null;
             if (self.retired_projection_versions_tail) |tail| tail.retired_next = version else self.retired_projection_versions = version;
@@ -7214,6 +7215,9 @@ pub const Backend = struct {
 
     fn prepareReadVersionControlled(self: *Backend, version: *runtime_mod.ReadVersion, control: ?read_admission.Port) !void {
         if (control) |owner| try owner.checkLifetime();
+        // A registered reader's fixed grant owns its epoch/directory headers.
+        // Projection arrays require a separate retained construction grant.
+        if (version.owned_retirement != null) return error.ExecutionWaitUnsupported;
         if (version.prepared) return;
         self.retainReaderKind(.other);
         defer self.releaseReaderKind(.other);
