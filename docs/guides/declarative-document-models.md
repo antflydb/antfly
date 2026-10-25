@@ -285,12 +285,18 @@ and parent overrides, so composition cannot turn them into literal source eviden
 The adapter validates shared structure totals before allocating typed arrays and
 borrows parsed text and fields until the executor accepts the candidate.
 
-Refinement distinguishes an unchanged answer from a source-supported replacement.
-Matching text alone retains the accepted representation, including its provenance,
-children, fields, tables and completion status, without another structure copy.
+Refinement distinguishes unchanged text and structure from a source-supported
+replacement. Changed regions, tables and fields require structural corroboration,
+even when OCR text is identical. Comparisons stream into allocation-free content
+signatures, ignore advisory model/quality metadata, and tolerate field-key and
+table-cell ordering differences while preserving exact numeric values. Unchanged
+answers retain accepted provenance, structure and completion without another copy.
 A provenance upgrade requires matching native source text or an independent
-literal verifier. Interpreted, derived and estimated verifier output cannot
-establish literal evidence, even when its text matches exactly.
+literal verifier; nonliteral verifier output cannot establish literal evidence.
+Verifier independence uses precomputed sets of pinned leaf model identities,
+including composite dependencies. Aliases, copied weights and shared hosted model
+references are rejected during preflight before source downloads or model calls.
+Accounts and gateways do not make the same hosted model independent.
 
 Native slide text preserves explicit DrawingML line breaks in text boxes, table
 cells and included speaker notes.

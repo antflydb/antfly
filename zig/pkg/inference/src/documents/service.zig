@@ -52,10 +52,116 @@ pub fn Service(comptime Node: type) type {
         };
         const ReadScope = struct { limits: c.Limits, deadline_ns: u64 };
         const Plan = struct { key: Key, definition: c.Definition, read_scope: ?ReadScope = null };
+        const DependencyKey = struct {
+            model: []const u8,
+            operation: c.Operation,
+            provider: c.Provider,
+            fn from(binding: c.Binding) DependencyKey {
+                return .{ .model = binding.model, .operation = binding.operation, .provider = binding.provider };
+            }
+            const Context = struct {
+                pub fn hash(_: @This(), key: DependencyKey) u64 {
+                    var h = std.hash.Wyhash.init(0);
+                    h.update(&.{ @backingInt(key.operation), @backingInt(key.provider) });
+                    h.update(key.model);
+                    return h.final();
+                }
+                pub fn eql(_: @This(), left: DependencyKey, right: DependencyKey) bool {
+                    return left.operation == right.operation and left.provider == right.provider and std.mem.eql(u8, left.model, right.model);
+                }
+            };
+        };
         const Graph = struct {
+            identities: std.HashMapUnmanaged(DependencyKey, []const [32]u8, DependencyKey.Context, 80) = .empty,
             plans: std.ArrayList(Plan) = .empty,
             visits: usize = 0,
             snapshots: std.ArrayList(c.Snapshot) = .empty,
+            fn less(_: void, left: [32]u8, right: [32]u8) bool {
+                return std.mem.lessThan(u8, &left, &right);
+            }
+            fn dependencies(self: *Graph, a: A, binding: c.Binding, depth: usize) anyerror![]const [32]u8 {
+                const key = DependencyKey.from(binding);
+                if (self.identities.get(key)) |known| return known;
+                if (depth >= 16) return error.DocumentGraphLimitExceeded;
+                var leaves = std.ArrayList([32]u8).empty;
+                if (binding.provider == .antfly and self.get(.{ .name = binding.model, .operation = binding.operation }) != null) {
+                    const definition = self.get(.{ .name = binding.model, .operation = binding.operation }).?;
+                    // Include every configured output-producing dependency,
+                    // including internal verifiers, but not advisory routers.
+                    if (binding.operation == .read) {
+                        const read_plan = definition.read orelse return error.DocumentCapabilityMismatch;
+                        for ([_]?[]const u8{ read_plan.reader, read_plan.accurate_reader, read_plan.table_reader, read_plan.fallback_reader, read_plan.verification_reader }) |name| if (name) |n| {
+                            try leaves.appendSlice(a, try self.dependencies(a, try definition.binding(n, .read), depth + 1));
+                        };
+                    } else {
+                        const extract = definition.extract orelse return error.DocumentCapabilityMismatch;
+                        for ([_]?[]const u8{ extract.model, extract.fallback_model, extract.verification_model }) |name| if (name) |n| {
+                            try leaves.appendSlice(a, try self.dependencies(a, try definition.binding(n, .extract), depth + 1));
+                        };
+                    }
+                } else {
+                    var h = std.crypto.hash.sha2.Sha256.init(.{});
+                    if (binding.provider == .cloudflare) {
+                        // Accounts, credentials and gateways do not make two
+                        // invocations of the same hosted model independent.
+                        h.update("cloudflare:");
+                        h.update(binding.model);
+                    } else {
+                        const pinned = self.snapshot(binding) orelse return error.DocumentCapabilityMismatch;
+                        h.update("antfly:");
+                        h.update(&pinned.identity);
+                    }
+                    var digest: [32]u8 = undefined;
+                    h.final(&digest);
+                    try leaves.append(a, digest);
+                }
+                std.mem.sort([32]u8, leaves.items, {}, less);
+                var count: usize = 0;
+                for (leaves.items) |digest| {
+                    if (count > 0 and std.mem.eql(u8, &leaves.items[count - 1], &digest)) continue;
+                    leaves.items[count] = digest;
+                    count += 1;
+                }
+                leaves.items.len = count;
+                const result = try leaves.toOwnedSlice(a);
+                try self.identities.put(a, key, result);
+                return result;
+            }
+            fn independent(self: *const Graph, left: c.Binding, right: c.Binding) bool {
+                const l = self.identities.get(DependencyKey.from(left)) orelse return false;
+                const r = self.identities.get(DependencyKey.from(right)) orelse return false;
+                if (l.len == 0 or r.len == 0) return false;
+                var i: usize = 0;
+                var j: usize = 0;
+                while (i < l.len and j < r.len) switch (std.mem.order(u8, &l[i], &r[j])) {
+                    .eq => return false,
+                    .lt => i += 1,
+                    .gt => j += 1,
+                };
+                return true;
+            }
+            fn prepareIdentities(self: *Graph, a: A, root: c.Definition) !void {
+                for (root.models) |binding| _ = try self.dependencies(a, binding, 0);
+                for (self.plans.items) |plan| {
+                    for (plan.definition.models) |binding| _ = try self.dependencies(a, binding, 0);
+                }
+                try self.validateVerifiers(root);
+                for (self.plans.items) |plan| try self.validateVerifiers(plan.definition);
+            }
+            fn validateVerifiers(self: *const Graph, definition: c.Definition) !void {
+                if (definition.read) |read_plan| if (read_plan.verification_reader) |name| {
+                    const verifier = try definition.binding(name, .read);
+                    for ([_]?[]const u8{ read_plan.reader, read_plan.accurate_reader, read_plan.table_reader, read_plan.fallback_reader }) |reader| if (reader) |n| {
+                        if (!self.independent(try definition.binding(n, .read), verifier)) return error.InvalidDocumentDefinition;
+                    };
+                };
+                if (definition.extract) |extract| if (extract.verification_model) |name| {
+                    const verifier = try definition.binding(name, .extract);
+                    for ([_]?[]const u8{ extract.model, extract.fallback_model }) |reader| if (reader) |n| {
+                        if (!self.independent(try definition.binding(n, .extract), verifier)) return error.InvalidDocumentDefinition;
+                    };
+                };
+            }
             fn snapshot(self: *const Graph, binding: c.Binding) ?c.Snapshot {
                 for (self.snapshots.items) |item| if (item.binding.operation == binding.operation and std.mem.eql(u8, item.binding.model, binding.model)) return item;
                 return null;
@@ -124,6 +230,7 @@ pub fn Service(comptime Node: type) type {
             if (snapshot == null) {
                 if (definition_bytes != null) try graph.plans.append(a, .{ .key = key, .definition = def });
                 try preflight(node, a, key, def, graph, &.{}, def.allow_remote);
+                try graph.prepareIdentities(a, def);
             }
             const Probe = struct {
                 fn check(raw: ?*anyopaque) !void {
@@ -529,26 +636,35 @@ pub fn Service(comptime Node: type) type {
             const original = if (region) |r| r.text else page.text;
             const original_origin = if (region) |r| r.origin else page.origin;
             const unchanged = std.mem.eql(u8, original, candidate.text);
-            const no_support: executor.Validation = if (unchanged) .unchanged else .unsupported;
+            const structure_changed = !try @import("content.zig").sameAccepted(page, region, candidate);
+            const no_support: executor.Validation = if (unchanged and !structure_changed) .unchanged else .unsupported;
             // Reusing equal literal text or another nonliteral answer is a
             // no-op. A literal upgrade of interpreted text still needs proof.
-            if (unchanged and (ir.isLiteral(original_origin) or !ir.isLiteral(candidate.origin))) return .unchanged;
-            if (try @import("source_support.zig").nativeSupports(run.work_allocator orelse self.work_allocator, page.native_text, self.native_regions, region, candidate.text)) return .source_supported;
+            if (unchanged and !structure_changed and (ir.isLiteral(original_origin) or !ir.isLiteral(candidate.origin))) return .unchanged;
+            if (!structure_changed and try @import("source_support.zig").nativeSupports(run.work_allocator orelse self.work_allocator, page.native_text, self.native_regions, region, candidate.text)) return .source_supported;
             if (region) |selected| if (selected.bbox == null) return no_support;
             const name = self.definition.read.?.verification_reader orelse return no_support;
             const binding = try self.definition.binding(name, .read);
-            if (candidate.model) |model| if (std.mem.eql(u8, binding.model, model)) return no_support;
+            if (candidate.model) |model| {
+                var producer: ?c.Binding = null;
+                for (self.definition.models) |configured| if (configured.operation == .read and std.mem.eql(u8, configured.model, model)) {
+                    producer = configured;
+                    break;
+                };
+                if (!self.graph.independent(producer orelse return no_support, binding)) return no_support;
+            } else return no_support;
             try run.call();
             var arena = std.heap.ArenaAllocator.init(run.work_allocator orelse self.work_allocator);
             defer arena.deinit();
             const corroboration = try read(raw, arena.allocator(), binding, 0, if (region) |r| r.bbox else null, run);
-            return if (corroborates(candidate, corroboration)) .source_supported else no_support;
+            return if (try corroborates(candidate, corroboration, structure_changed)) .source_supported else no_support;
         }
-        fn corroborates(candidate: executor.Candidate, corroboration: executor.Candidate) bool {
+        fn corroborates(candidate: executor.Candidate, corroboration: executor.Candidate, structure_changed: bool) !bool {
             const ir = @import("representation.zig");
             return !corroboration.truncated and (corroboration.status == null or corroboration.status.? == .complete) and
                 (!ir.isLiteral(candidate.origin) or ir.isLiteral(corroboration.origin)) and
-                std.mem.eql(u8, std.mem.trim(u8, corroboration.text, " \t\r\n"), std.mem.trim(u8, candidate.text, " \t\r\n"));
+                std.mem.eql(u8, std.mem.trim(u8, corroboration.text, " \t\r\n"), std.mem.trim(u8, candidate.text, " \t\r\n")) and
+                (!structure_changed or try @import("content.zig").sameEvidence(candidate, corroboration));
         }
 
         fn inputsFromRead(a: A, root: V) ![]const V {
@@ -650,7 +766,7 @@ pub fn Service(comptime Node: type) type {
                 if (!supported) return error.DocumentUnresolved;
                 if (policy.verification_model) |name| {
                     const verifier = try def.binding(name, .extract);
-                    if (std.mem.eql(u8, verifier.model, fallback.model)) return error.DocumentUnresolved;
+                    if (!graph.independent(verifier, fallback)) return error.DocumentUnresolved;
                     const check = (try invokeExtraction(node, a, verifier, graph, input, schema, version, options, control, run, .fresh)).value;
                     if (!try evidence.sameValues(a, item, check)) return error.DocumentUnresolved;
                 }
@@ -753,6 +869,7 @@ pub fn Service(comptime Node: type) type {
             const root_key = Key{ .name = model, .operation = .extract };
             if (definition_bytes != null) try graph.plans.append(a, .{ .key = root_key, .definition = def });
             try preflight(node, a, root_key, def, &graph, &.{}, def.allow_remote);
+            try graph.prepareIdentities(a, def);
             var extraction_control = control;
             const deadline = @import("antfly_platform").time.monotonicNs() +| def.budget.deadline_ms * std.time.ns_per_ms;
             extraction_control.deadline_ns = if (control.deadline_ns) |d| @min(d, deadline) else deadline;
@@ -941,7 +1058,9 @@ test "document nested composites share one budget and one rendered view" {
             return try a.dupe(u8, json);
         }
         fn documentResolveBinding(_: *@This(), _: A, binding: c.Binding) !c.Snapshot {
-            return .{ .binding = binding, .path = binding.model, .identity = @splat(1) };
+            var identity: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(binding.model, &identity, .{});
+            return .{ .binding = binding, .path = binding.model, .identity = identity };
         }
         fn documentDownload(_: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
             return .{ .data = @embedFile("testdata/one-pixel.png") };
@@ -1091,7 +1210,9 @@ test "document extraction keeps independent sources atomic and reuses retained r
             );
         }
         fn documentResolveBinding(_: *@This(), _: A, binding: c.Binding) !c.Snapshot {
-            return .{ .binding = binding, .path = binding.model, .identity = @splat(1) };
+            var identity: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(binding.model, &identity, .{});
+            return .{ .binding = binding, .path = binding.model, .identity = identity };
         }
         fn documentDownload(self: *@This(), _: A, url: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
             self.downloads += 1;
@@ -1315,7 +1436,9 @@ test "document graph keys separate same named tasks and retain real cycle detect
             );
         }
         fn documentResolveBinding(_: *@This(), _: A, binding: c.Binding) !c.Snapshot {
-            return .{ .binding = binding, .path = binding.model, .identity = @splat(1) };
+            var identity: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(binding.model, &identity, .{});
+            return .{ .binding = binding, .path = binding.model, .identity = identity };
         }
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1439,7 +1562,9 @@ test "document equal text retains provenance unless an independent literal reade
             }, .{});
         }
         fn documentResolveBinding(_: *@This(), _: A, binding: c.Binding) !c.Snapshot {
-            return .{ .binding = binding, .path = binding.model, .identity = @splat(1) };
+            var identity: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(binding.model, &identity, .{});
+            return .{ .binding = binding, .path = binding.model, .identity = identity };
         }
         fn documentDownload(_: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
             return .{ .data = @embedFile("testdata/one-pixel.png") };
@@ -1514,4 +1639,136 @@ test "document equal text retains provenance unless an independent literal reade
             }
         }
     }
+}
+
+test "document verifier preflight indexes pinned identities across aliases copied artifacts and composites" {
+    const S = Service(struct {});
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fast = c.Binding{ .name = "fast", .model = "owner/fast", .operation = .read };
+    const alias = c.Binding{ .name = "alias", .model = "hf:owner/fast", .operation = .read };
+    const copied = c.Binding{ .name = "copy", .model = "copy", .operation = .read };
+    const other = c.Binding{ .name = "other", .model = "other", .operation = .read };
+    const composite = c.Binding{ .name = "composite", .model = "composite", .operation = .read };
+    const routed = c.Binding{ .name = "routed", .model = "routed", .operation = .read };
+    const router = c.Binding{ .name = "router", .model = "router", .operation = .decide };
+    const hosted = c.Binding{ .name = "hosted", .model = "@cf/owner/model", .operation = .read, .provider = .cloudflare, .account_id = "one" };
+    var hosted_alias = hosted;
+    hosted_alias.account_id = "two";
+    hosted_alias.gateway_id = "different-gateway";
+    var graph = S.Graph{};
+    for ([_]c.Binding{ fast, alias, copied, other, router }) |binding| try graph.snapshots.append(a, .{ .binding = binding, .path = if (std.mem.eql(u8, binding.model, alias.model)) fast.model else binding.model, .identity = if (std.mem.eql(u8, binding.model, other.model)) @splat(2) else @splat(1) });
+    try graph.plans.append(a, .{ .key = .{ .name = composite.model, .operation = .read }, .definition = .{ .models = &.{ fast, alias }, .read = .{ .reader = fast.name, .accurate_reader = alias.name } } });
+    try graph.plans.append(a, .{ .key = .{ .name = routed.model, .operation = .read }, .definition = .{ .models = &.{ other, router }, .read = .{ .reader = other.name, .router = router.name } } });
+    const root = c.Definition{ .models = &.{ fast, alias, copied, other, composite, routed, hosted }, .read = .{ .reader = fast.name, .verification_reader = other.name } };
+    try graph.prepareIdentities(a, root);
+    try std.testing.expect(!graph.independent(fast, alias));
+    try std.testing.expect(!graph.independent(fast, copied));
+    try std.testing.expect(!graph.independent(composite, copied));
+    try std.testing.expect(graph.independent(composite, routed));
+    try std.testing.expect(graph.independent(fast, other));
+    try std.testing.expect(!graph.independent(hosted, hosted_alias));
+    try std.testing.expectEqual(@as(usize, 1), graph.identities.get(S.DependencyKey.from(composite)).?.len);
+    var invalid = root;
+    invalid.read.?.verification_reader = alias.name;
+    try std.testing.expectError(error.InvalidDocumentDefinition, graph.validateVerifiers(invalid));
+    invalid.read.?.verification_reader = composite.name;
+    try std.testing.expectError(error.InvalidDocumentDefinition, graph.validateVerifiers(invalid));
+    // The extraction path shares the same immutable dependency index and
+    // checks fallback independence before source preprocessing or model calls.
+    const leaf = c.Binding{ .name = "leaf", .model = "extractor", .operation = .extract };
+    const verifier = c.Binding{ .name = "verifier", .model = "extractor-copy", .operation = .extract };
+    try graph.snapshots.append(a, .{ .binding = leaf, .path = leaf.model, .identity = @splat(3) });
+    try graph.snapshots.append(a, .{ .binding = verifier, .path = verifier.model, .identity = @splat(3) });
+    const extraction = c.Definition{ .models = &.{ leaf, verifier }, .extract = .{ .model = leaf.name, .verification_model = verifier.name } };
+    try std.testing.expectError(error.InvalidDocumentDefinition, graph.prepareIdentities(a, extraction));
+}
+
+test "document preflight rejects verifier aliases and specialists retain independently verified structure-only changes" {
+    const Fake = struct {
+        independent: bool = true,
+        nested: bool = false,
+        copied: bool = false,
+        tables: bool = true,
+        agree: bool = true,
+        verifier_origin: c.Origin = .transcription,
+        calls: usize = 0,
+        downloads: usize = 0,
+        fn documentDefinition(self: *@This(), a: A, name: []const u8, _: c.Operation) !?[]const u8 {
+            if (std.mem.eql(u8, name, "wrapper")) return try std.json.Stringify.valueAlloc(a, c.Definition{ .models = &.{.{ .name = "leaf", .model = "accurate", .operation = .read }}, .read = .{ .reader = "leaf" } }, .{});
+            if (!std.mem.eql(u8, name, "agent")) return null;
+            const models = [_]c.Binding{
+                .{ .name = "initial", .model = "initial", .operation = .read },
+                .{ .name = "accurate", .model = "accurate", .operation = .read },
+                .{ .name = "verifier", .model = if (self.nested) "wrapper" else "verifier", .operation = .read },
+            };
+            return try std.json.Stringify.valueAlloc(a, c.Definition{ .models = &models, .read = .{ .reader = "initial", .table_reader = if (self.tables) "accurate" else null, .accurate_reader = if (self.tables) null else "accurate", .verification_reader = "verifier" } }, .{});
+        }
+        fn documentResolveBinding(self: *@This(), _: A, binding: c.Binding) !c.Snapshot {
+            const initial = std.mem.eql(u8, binding.model, "initial");
+            const accurate = std.mem.eql(u8, binding.model, "accurate");
+            return .{ .binding = binding, .path = if (self.independent or initial or self.copied) binding.model else "shared-model", .identity = @splat(if (initial) @as(u8, 4) else if (!self.independent) @as(u8, 1) else if (accurate) @as(u8, 2) else @as(u8, 3)) };
+        }
+        fn documentDownload(self: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
+            self.downloads += 1;
+            return .{ .data = @embedFile("testdata/one-pixel.png") };
+        }
+        fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, model: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+            self.calls += 1;
+            const initial = std.mem.eql(u8, model, "initial");
+            const verifier = std.mem.eql(u8, model, "verifier");
+            const cells = [_]c.Cell{.{ .row = 0, .column = 0, .text = if (verifier and !self.agree) "unconfirmed" else "caption" }};
+            const tables = [_]c.Table{.{ .id = if (verifier) 9 else 1, .rows = 1, .columns = 1, .cells = &cells, .origin = .transcription }};
+            const regions = [_]c.Region{.{ .id = 7, .text = "caption", .bbox = .{ 0, 0, 1, 1 }, .origin = .transcription, .label = if (self.tables) "table" else null, .confidence = 0.1 }};
+            const fields = try std.json.parseFromSliceLeaky(V, a, if (verifier and !self.agree) "{\"amount\":9007199254740993.02}" else "{\"amount\":9007199254740993.01}", .{ .parse_numbers = false });
+            const items = try a.alloc(readers.Result, 1);
+            items[0] = .{ .text = "caption", .document_json = try std.json.Stringify.valueAlloc(a, c.Page{
+                .source_id = "receipt",
+                .number = 1,
+                .kind = .image,
+                .text = "caption",
+                .status = .complete,
+                .origin = if (verifier) self.verifier_origin else .transcription,
+                .regions = if (initial) &regions else &.{},
+                .tables = if (!initial and self.tables) &tables else &.{},
+                .fields = if (!initial and !self.tables) fields else null,
+            }, .{}) };
+            return .{ .items = items, .execution = .{ .requested_items = 1, .serial_items = 1 } };
+        }
+        fn invokeCloudflare(_: *@This(), _: A, _: c.Binding, _: V, _: Control, _: *c.Run) anyerror!V {
+            return error.UnexpectedCall;
+        }
+        fn decideDirectJsonWithControl(_: *@This(), _: A, _: []const u8, _: ?Control) anyerror![]u8 {
+            return error.UnexpectedCall;
+        }
+    };
+    const a = std.testing.allocator;
+    const request =
+        \\{"model":"agent","documents":[{"id":"receipt","url":"fixture","media_type":"image/png"}]}
+    ;
+    for (0..3) |alias| {
+        var fake = Fake{ .independent = false, .copied = alias == 1, .nested = alias == 2 };
+        try std.testing.expectError(error.InvalidDocumentDefinition, Service(Fake).readJson(&fake, a, request, .{}));
+        try std.testing.expectEqual(@as(usize, 0), fake.downloads);
+        try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    }
+    for ([_]bool{ true, false }) |tables| for ([_]bool{ true, false }) |agree| for ([_]c.Origin{ .transcription, .interpretation, .derived, .estimated }) |origin| {
+        var fake = Fake{ .tables = tables, .agree = agree, .verifier_origin = origin };
+        const bytes = try Service(Fake).readJson(&fake, a, request, .{});
+        defer a.free(bytes);
+        const result = try std.json.parseFromSlice(V, a, bytes, .{ .parse_numbers = false });
+        defer result.deinit();
+        const page = result.value.object.get("data").?.array.items[0];
+        const region = page.object.get("regions").?.array.items[0];
+        const accepted = agree and origin == .transcription;
+        try std.testing.expectEqual(@as(usize, 3), fake.calls);
+        try std.testing.expectEqualStrings(if (accepted) "complete" else "unresolved", page.object.get("status").?.string);
+        try std.testing.expectEqual(accepted, region.object.get("validated").?.bool);
+        if (tables) {
+            try std.testing.expectEqual(@as(usize, if (accepted) 1 else 0), page.object.get("tables").?.array.items.len);
+        } else if (accepted) {
+            try std.testing.expectEqualStrings("9007199254740993.01", region.object.get("fields").?.object.get("amount").?.number_string);
+        } else try std.testing.expect(region.object.get("fields").? == .null);
+    };
 }
