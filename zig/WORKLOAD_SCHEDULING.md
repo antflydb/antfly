@@ -15,8 +15,8 @@ Original source baseline: `e4d707de5634a8d758c606b4432037e1a1682052` on
 branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
-The current merge includes `origin/main` through `4eedf9add7`
-(the pause-aware audio resume merge), integrated by `edd89a7e8b`.
+The current merge includes `origin/main` through `71aa19359a`
+(Grepstein artifact ingestion), integrated by `de95bf716d`.
 
 Private native ABI 138 and kernel-owner ABI 198 fence the current manager,
 registry, quota-owner, independently funded memory-account and deferred read-cache

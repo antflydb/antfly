@@ -169,6 +169,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-physical-resource-metadata-test", "Verify fixed cache metadata admission and movable teardown ownership")
         .dependOn(&b.addRunArtifact(physical_metadata_tests).step);
+    const flush_builder_tests = b.addTest(.{
+        .name = "registered-flush-builder-tests",
+        .root_module = physical_metadata_root,
+        .filters = &.{"physical cache metadata flush builder"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-registered-flush-builder-test", "Verify retained multi-file flush construction, refusal and cleanup")
+        .dependOn(&b.addRunArtifact(flush_builder_tests).step);
 
     const socket_child_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/socket_child_cancellation_test_root.zig"),

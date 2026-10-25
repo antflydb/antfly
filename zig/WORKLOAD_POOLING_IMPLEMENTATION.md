@@ -28746,3 +28746,65 @@ supply the normal maintenance admission/coordinator, coupled-root migration,
 manifest/WAL completion or broader scheduler/default eligibility. Durable formats
 and existing private ABI layouts remain unchanged. Full GNU qualification remains
 waived and the full goal remains active.
+
+
+## Retained multi-file flush construction (2026-10-25)
+
+`PublicationResources.beginFlushBuilderWithAdmission` creates a registered owner
+for a complete immutable input window. It prepays its header and merge arrays,
+retains the allocator host and cleanup queue before creating the first ticket,
+and funds each linked output node and physical storage grant before allocation.
+The caller pins the immutable states and their pointer vector through driving
+or final retirement request. The frame stores no Backend, storage receiver or
+application admission port.
+
+Construction retains its winner, partition comparison, row append, duplicate
+advance, file finish and output transfer stages across refusal. Accepted rows
+and reserved run IDs are recorded before another fallible checkpoint. Boundaries
+honor row count, logical bytes, physical file limits and partition domains;
+an oversized first row and exhausted ID range fail explicitly. Lower source
+indices win duplicate keys, preserving tombstones. All completed files share
+the last reserved output ID as their visibility ID. Successful completion ends
+all input reads before output ownership is transferred.
+
+A completed output transfers its sole creator reference and final-path cleanup
+ticket together. This is construction completion, not manifest durability. A
+publication controller must own the ticket before installing a live generation
+and retain it through durable success or uncertainty. Abort stops borrowed-input
+reads before registered cleanup; cleanup retires one funded node at a time and
+never deletes a final SST. Quiesced queue teardown joins producers that have not
+yet created tickets; admitted joining reports late pending deletion debt so its
+normal durable consumer can accept it rather than waiting indefinitely.
+
+The focused `antfly-registered-flush-builder-test` target covers real multi-file
+SST decode, duplicate/tombstone results, original-error and allocation refusal,
+abort with released inputs, byte/file/partition boundaries, terminal size/ID
+errors and both queue-join cases. A second unexpected error fails immediately;
+the test cannot hide repeated physical failures in an unlimited retry loop.
+Post-merge `registered-flush-builder-v3-fast` and
+`registered-flush-builder-v3-debug` each pass all five commands, 25/25 build steps,
+seven builder cases and the 4/45/1/8 Bloom/error companions. Both final maps
+contain 5,671 identical native/schema inputs and match the current sources.
+The unchanged production sources also retain the v2 run's passing ten
+merge/maintenance tests, three writer tests and 16 ABI checks. The direct Debug
+boundary/queue selection passes both cases. No corrected case fails, skips or
+leaks.
+
+The v2 sweep assumed a successful baseline's checkpoint count would be identical
+in each trial. Native completion polling makes that count timing-dependent;
+Debug identified an unreachable target after a fully successful trial. The
+corrected sweep terminates only when a fully verified trial ends before its
+target, asserts the target is outside the actual count, and still rejects swallowed
+or repeated errors. The failed v2 sources/results and read-only progress samples
+are preserved. Pre-merge runs were interrupted for the requested main merge and
+do not qualify this source.
+
+Normal maintenance still needs a scoped admission entry that forwards the actual
+scheduler pass deadline/cancellation and parks CPU during physical I/O. It must
+pin and revalidate the immutable window, migrate nonempty legacy roots, prepare
+the coupled publication and transfer output obligations before installation.
+Installed output must keep manifest/WAL completion authority across cancellation;
+WAL retirement requires durable acceptance. Compaction and other legacy metadata
+mutators must participate before registered roots become the normal default.
+Recovery, overload/fairness and the remaining original design requirements are
+still open. Full Linux qualification remains waived.

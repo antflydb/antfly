@@ -41,6 +41,24 @@ pub const Queue = struct {
         return @sizeOf(Queue) +| if (self.manager == null) self.bytes.load(.acquire) else 0;
     }
 
+    /// A registered builder may still be preparing its first ticket. Share
+    /// the existing join counter so quiesced queue teardown retains its header
+    /// through that builder's final cleanup. Admission/teardown are serialized
+    /// by the owning backend; this is not a new admission gate.
+    pub fn retainProducerWithAdmission(self: *Queue, original: admission.Port) !void {
+        var current = self.live.load(.acquire);
+        while (true) {
+            try original.checkpoint();
+            if (current == std.math.maxInt(usize)) return error.ResourceBudgetExceeded;
+            if (self.live.cmpxchgWeak(current, current + 1, .acq_rel, .acquire)) |actual| current = actual else return;
+        }
+    }
+
+    pub fn releaseProducer(self: *Queue) void {
+        const previous = self.live.fetchSub(1, .release); // Final queue access.
+        std.debug.assert(previous != 0);
+    }
+
     pub fn create(self: *Queue, path: []const u8) !*Ticket {
         var reservation: ?resources.Reservation = null;
         errdefer if (reservation) |*lease| lease.release();
@@ -119,7 +137,9 @@ pub const Queue = struct {
         if (self.pending.load(.acquire) != 0) return error.ResourceBudgetExceeded;
         const manager = self.manager orelse return error.ExecutionWaitUnsupported;
         while (self.live.load(.acquire) != 0) {
+            if (self.pending.load(.acquire) != 0) return error.ResourceBudgetExceeded;
             _ = try manager.drainForegroundPayloadRetirementWithAdmission(original);
+            if (self.pending.load(.acquire) != 0) return error.ResourceBudgetExceeded;
             if (self.live.load(.acquire) == 0) return;
             try @import("../../common/cleanup_wait.zig").waitForRetry(io, original);
         }

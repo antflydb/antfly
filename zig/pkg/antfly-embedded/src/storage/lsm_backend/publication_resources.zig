@@ -118,6 +118,12 @@ pub const Owner = struct {
 
     pub const RegisteredOutput = @import("registered_run_output.zig");
     pub const RegisteredProducer = @import("registered_run_producer.zig").Owner;
+    pub const FlushBuilder = @import("registered_flush_builder.zig");
+    pub fn beginFlushBuilderWithAdmission(self: *Owner, queue: *@import("output_cleanup.zig").Queue, root: []const u8, states: []const *const @import("state.zig").State, config: FlushBuilder.Config, original: admission.Port) !*FlushBuilder.Owner {
+        try original.checkpoint();
+        if (self.closing) return error.InvalidArgument;
+        return FlushBuilder.Owner.start(self.allocator, self.manager, queue, root, states, config, original);
+    }
     pub fn beginRegisteredProducerWithAdmission(self: *Owner, grant: *?@import("storage_io.zig").DurabilityResources, grant_bytes: u64, ticket: *?*@import("output_cleanup.zig").Ticket, expected_entries: usize, max_file_bytes: usize, options: @import("../lsm/table_file.zig").StreamingEncoderOptions, original: admission.Port) !*RegisteredProducer {
         try original.checkpoint();
         if (self.closing) return error.InvalidArgument;

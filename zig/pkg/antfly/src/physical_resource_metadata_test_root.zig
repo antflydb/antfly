@@ -3039,3 +3039,265 @@ test "physical cache metadata multi edit publication retires every allocation fa
         for (0..count) |at| _ = try RegisteredSourceFixture.runBatch(shared, .construct, at, true, 1);
     }
 }
+
+const FlushBuilderFixture = struct {
+    const local = @import("antfly_local_sources");
+    const lsm = local.storage_lsm_backend_mod;
+    const state_mod = local.storage_lsm_backend_state;
+    const table = local.storage_lsm_table_file;
+    const io_mod = local.storage_lsm_backend_storage_io;
+    const Scope = lsm.Backend.PublicationResources;
+    const Cleanup = lsm.repository.OutputCleanup;
+    const Stats = struct { checks: usize, allocations: usize, observed: bool };
+    const Mode = enum { entries, bytes, physical, partition, callback, exhausted, oversized, queue_join, pending_join };
+    fn partition(key: []const u8, original: read_admission.Port) ![]const u8 {
+        try original.checkpoint();
+        return key;
+    }
+    /// Native completion may add or remove polling checkpoints on each
+    /// trial. Enumerate the actual execution until a successful trial ends
+    /// before its target, rather than assuming a previous run's check count.
+    fn sweepOriginal(abort_on_error: bool, mode: Mode) !void {
+        var at: usize = 0;
+        while (true) : (at += 1) {
+            const trial = try runMode(at, false, abort_on_error, mode);
+            if (!trial.observed) {
+                try std.testing.expect(at >= trial.checks);
+                return;
+            }
+        }
+    }
+    fn run(target: ?usize, oom: bool, abort_on_error: bool) !Stats {
+        return runMode(target, oom, abort_on_error, .entries);
+    }
+    fn runMode(target: ?usize, oom: bool, abort_on_error: bool, mode: Mode) !Stats {
+        const a = std.testing.allocator;
+        var failing = std.testing.FailingAllocator.init(a, .{});
+        const owned = failing.allocator();
+        var parent = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 64 << 20 } });
+        defer parent.deinit(a);
+        var budgets = budgets_mod.smartResourceBudgetsForTotal(64 << 20);
+        budgets.options.identity_allocator = owned;
+        var resources = try Resources.initWithBudgetsAndParent(owned, budgets, parent.memoryParentPort());
+        defer resources.deinit();
+        resources.attachResourceManager();
+        var queue: Cleanup.Queue = .{ .allocator = owned, .manager = &resources.resource_manager };
+        defer queue.deinit();
+        var pool = io_mod.NativeStoragePool.initWithCapacityForTest(a, 8);
+        defer pool.deinit();
+        var native = try io_mod.NativeStorage.initWithPool(a, .threaded, &pool);
+        defer native.deinit();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/flush-builder", .{tmp.sub_path});
+        defer a.free(root);
+        const runs = try std.fmt.allocPrint(a, "{s}/runs", .{root});
+        defer a.free(runs);
+        try native.storage().createDirPath(runs);
+        var scope: ?*Scope = try Scope.start(owned, &resources.resource_manager, quotaControl());
+        defer {
+            if (scope) |value| value.requestRetirement();
+            RegisteredOutputFixture.drain(&resources.resource_manager);
+        }
+        try scope.?.resumeWithAdmission(quotaControl());
+        var states: [2]state_mod.State = @splat(.{});
+        var inputs_live = true;
+        defer if (inputs_live) for (&states) |*state| state.deinit(a);
+        var active: state_mod.ActiveMemTable = .{};
+        defer active.deinit(a);
+        for (0..5) |ordinal| {
+            var key: [32777]u8 = @splat('k');
+            key[key.len - 1] = @intCast(ordinal);
+            if (ordinal < 4) try active.upsert(a, .{ .name = "docs" }, &key, if (ordinal == 2) "" else "new", ordinal == 2);
+            if (ordinal == 1 or ordinal == 2 or ordinal == 4) try states[1].upsert(a, .{ .name = "docs" }, &key, "old", false);
+        }
+        states[0] = try active.toStateMove(a);
+        const sources = [_]*const state_mod.State{ &states[0], &states[1] };
+        var job: ?*Scope.FlushBuilder.Owner = null;
+        defer if (job) |value| value.requestRetirement();
+        var control: RegisteredOutputFixture.Control = .{ .live = true, .target = if (oom) null else target, .failure = switch ((target orelse 0) % 4) {
+            0 => error.Canceled,
+            1 => error.DeadlineExceeded,
+            2 => error.ParentMemoryBusy,
+            else => error.FileNotFound,
+        } };
+        const payload = control.payload();
+        const original = read_admission.Port.init(&payload);
+        const start = failing.alloc_index;
+        if (oom) failing.fail_index = start + target.?;
+        var observed = false;
+        var terminal_error = false;
+        var config: Scope.FlushBuilder.Config = .{ .first_id = 501, .end_id = 601, .target_bytes = 0, .max_entries = 2, .max_file_bytes = 1 << 20 };
+        switch (mode) {
+            .bytes => {
+                config.max_entries = 32;
+                config.target_bytes = 50 * 1024;
+            },
+            .physical => {
+                config.max_entries = 32;
+                config.max_file_bytes = 180 * 1024;
+            },
+            .partition => {
+                config.max_entries = 32;
+                config.partition_prefix_bytes = 32777;
+            },
+            .callback => {
+                config.max_entries = 32;
+                config.partition_key = partition;
+            },
+            .exhausted => config.end_id = 502,
+            .oversized => {
+                config.max_entries = 32;
+                config.max_file_bytes = 48 * 1024;
+            },
+            else => {},
+        }
+        const expected_files: usize = switch (mode) {
+            .bytes, .physical, .partition, .callback => 5,
+            else => 3,
+        };
+        const result: anyerror!void = blk: {
+            while (job == null) {
+                job = scope.?.beginFlushBuilderWithAdmission(&queue, root, &sources, config, original) catch |cause| {
+                    try std.testing.expectError(if (oom) error.OutOfMemory else control.failure, @as(anyerror!void, cause));
+                    // Exactly one rejection is injected. A repeated physical
+                    // failure must fail the test rather than retry forever.
+                    try std.testing.expect(!observed);
+                    observed = true;
+                    failing.fail_index = std.math.maxInt(usize);
+                    if (abort_on_error) break :blk {};
+                    continue;
+                };
+            }
+            if (mode == .queue_join) {
+                try std.testing.expectEqual(@as(usize, 1), queue.live.load(.acquire));
+                try std.testing.expectEqual(@as(usize, 0), queue.pending.load(.acquire));
+                break :blk {};
+            }
+            while (true) {
+                job.?.driveWithAdmission(native.storage(), original) catch |cause| {
+                    if (mode == .exhausted or mode == .oversized) {
+                        try std.testing.expectError(if (mode == .exhausted) error.FlushRunIdReservationExhausted else error.TableFileTooLarge, @as(anyerror!void, cause));
+                        terminal_error = true;
+                        break :blk {};
+                    }
+                    try std.testing.expectError(if (oom) error.OutOfMemory else control.failure, @as(anyerror!void, cause));
+                    // Exactly one rejection is injected. A repeated physical
+                    // failure must fail the test rather than retry forever.
+                    try std.testing.expect(!observed);
+                    observed = true;
+                    failing.fail_index = std.math.maxInt(usize);
+                    if (abort_on_error) break :blk {};
+                    continue;
+                };
+                break;
+            }
+            if (mode == .pending_join) break :blk {};
+            try std.testing.expectEqual(@as(usize, 7), job.?.consumed);
+            try std.testing.expectEqual(@as(usize, 5), job.?.emitted);
+            for (&states) |*state| state.deinit(a);
+            inputs_live = false; // Completion/take/retirement must not read inputs.
+            var ordinal: usize = 0;
+            var files: usize = 0;
+            while (true) {
+                const completed = job.?.takeCompletedWithAdmission(original) catch |cause| {
+                    try std.testing.expectError(if (oom) error.OutOfMemory else control.failure, @as(anyerror!void, cause));
+                    // Exactly one rejection is injected. A repeated physical
+                    // failure must fail the test rather than retry forever.
+                    try std.testing.expect(!observed);
+                    observed = true;
+                    failing.fail_index = std.math.maxInt(usize);
+                    if (abort_on_error) break :blk {};
+                    continue;
+                } orelse break;
+                // The isolated temporary-directory owner now accepts every
+                // final-file deletion obligation. This is no manifest ACK.
+                completed.ticket.destroy();
+                defer completed.output.requestRetirement();
+                try std.testing.expectEqual(501 + files, completed.id);
+                try std.testing.expectEqual(@as(u64, @intCast(500 + expected_files)), completed.visibility_id);
+                const output = &completed.output.output;
+                const bytes = try native.storage().readFileAlloc(a, output.path[0..output.path_len], 1 << 20);
+                defer a.free(bytes);
+                var decoded = try table.decodeAlloc(a, bytes);
+                defer decoded.deinit(a);
+                try std.testing.expectEqual(completed.rows, decoded.entries.len);
+                var tombstones: u32 = 0;
+                for (decoded.entries) |entry| {
+                    try std.testing.expectEqualStrings("docs", entry.namespace_name.?);
+                    try std.testing.expectEqual(@as(u8, @intCast(ordinal)), entry.key[entry.key.len - 1]);
+                    try std.testing.expectEqual(ordinal == 2, entry.tombstone);
+                    try std.testing.expectEqualStrings(if (ordinal == 2) "" else if (ordinal == 4) "old" else "new", entry.value);
+                    tombstones += @intFromBool(entry.tombstone);
+                    ordinal += 1;
+                }
+                try std.testing.expectEqual(completed.tombstones, tombstones);
+                files += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 5), ordinal);
+            try std.testing.expectEqual(expected_files, files);
+        };
+        try result;
+        if (mode == .exhausted or mode == .oversized) try std.testing.expect(terminal_error);
+        const stats: Stats = .{ .checks = control.calls, .allocations = failing.alloc_index - start, .observed = observed };
+        control.live = false;
+        failing.fail_index = std.math.maxInt(usize);
+        if (target) |at| if (!observed) {
+            // runMode verified the complete row/file result before reaching
+            // here. A target actually encountered above must reject exactly
+            // once; only an unreachable tail is the sweep's stopping receipt.
+            try std.testing.expect(!oom and at >= control.calls);
+        };
+        if (oom) try std.testing.expect(failing.has_induced_failure);
+        if (job) |value| value.requestRetirement();
+        job = null;
+        if (inputs_live) {
+            for (&states) |*state| state.deinit(a);
+            inputs_live = false;
+        }
+        if (scope) |value| value.requestRetirement();
+        scope = null;
+        if (mode == .queue_join) queue.deinit();
+        if (mode == .pending_join) {
+            try std.testing.expectError(error.ResourceBudgetExceeded, queue.joinRetirementsWithAdmission(std.testing.io, original));
+            try std.testing.expect(queue.pending.load(.acquire) != 0);
+        }
+        while (resources.resource_manager.payload_retirement_ready.load(.acquire) != 0) _ = try resources.resource_manager.drainPayloadRetirementWithAdmission(original);
+        while (try queue.popWithAdmission(original)) |ticket| try ticket.retireWithAdmission(original);
+        RegisteredOutputFixture.drain(&resources.resource_manager);
+        try std.testing.expectEqual(@as(usize, 0), queue.live.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), resources.quota_lifetimes.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), control.depth);
+        return stats;
+    }
+};
+
+test "physical cache metadata flush builder merges real states into owned completed files" {
+    _ = try FlushBuilderFixture.run(null, false, false);
+}
+
+test "physical cache metadata flush builder resumes every original stage refusal without replay" {
+    try FlushBuilderFixture.sweepOriginal(false, .entries);
+}
+
+test "physical cache metadata flush builder resumes every allocation failure with partial ownership" {
+    const accepted = try FlushBuilderFixture.run(null, false, false);
+    for (0..accepted.allocations) |at| _ = try FlushBuilderFixture.run(at, true, false);
+}
+
+test "physical cache metadata flush builder aborts every original stage while inputs leave before cleanup" {
+    try FlushBuilderFixture.sweepOriginal(true, .entries);
+}
+
+test "physical cache metadata flush builder honors byte physical and partition boundaries" {
+    for ([_]FlushBuilderFixture.Mode{ .bytes, .physical, .partition, .callback, .exhausted, .oversized }) |mode| _ = try FlushBuilderFixture.runMode(null, false, false, mode);
+}
+
+test "physical cache metadata flush builder retains long partition comparisons across every original refusal" {
+    try FlushBuilderFixture.sweepOriginal(false, .callback);
+}
+
+test "physical cache metadata flush builder retains queue before first ticket and reports late admitted debt" {
+    _ = try FlushBuilderFixture.runMode(null, false, false, .queue_join);
+    _ = try FlushBuilderFixture.runMode(null, false, false, .pending_join);
+}
