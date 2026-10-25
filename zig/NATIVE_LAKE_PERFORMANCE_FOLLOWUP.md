@@ -5964,8 +5964,10 @@ reads on the caller; publication-owned execution keeps its serial phase contract
 Immutable cutoff copies prevent prefetch from borrowing moving winner storage.
 
 Native fragment spaces retain optional per-row typed ordering keys under an
-ordering cohort and exact input-version digest. Unchanged rows reuse keys when a
-fragment is sorted again; changed/missing keys gather current ordering columns.
+ordering cohort and exact input-version digest. A separate tuple recipe binds
+emitted field positions, so permuting fields or selecting another alias cannot
+reinterpret cached tuples; reversing directions preserves reusable values.
+Unchanged rows reuse keys when a fragment is sorted again; changed/missing keys gather current ordering columns.
 Deletion removes cache entries, a changed cohort starts a new tree, and older
 publications without keys retain source fallback. Only the current native space
 owns this refresh state; consumer coordinate views do not retain obsolete key

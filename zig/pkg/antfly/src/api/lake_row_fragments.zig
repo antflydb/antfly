@@ -48,7 +48,7 @@ pub const Build = struct {
     input_rows_hashed: u64 = 0,
     ordering_rows_fetched: u64 = 0,
     ordering_keys_reused: u64 = 0,
-    ordering_cohort: ?[32]u8 = null,
+    ordering_input_cohort: ?[32]u8 = null,
     prior_ordering_keys: ?tree.Ref = null,
     ordering_edits: ?*@import("lake_index_page_mutations.zig").Mutations = null,
     store: stores.ArtifactStore,
@@ -333,9 +333,10 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
     old_root.certificate = null;
     var manager: local.sql_spill.Manager = .{ .alloc = a, .io = self.context.io orelse return error.InvalidLogicalRowIdentity, .context = self, .checkpoint = Build.check, .max_bytes = provider.identity_spill_bytes };
     defer manager.deinit();
-    self.ordering_cohort = @import("lake_row_input_recipes.zig").orderingDigest(self.root.current.input_recipes);
+    self.ordering_input_cohort = @import("lake_row_input_recipes.zig").orderingDigest(self.root.current.input_recipes);
+    const key_recipe = orderingKeyRecipe(self.ordering_input_cohort, order);
     if (prior) |space| {
-        if (std.meta.eql(space.ordering_cohort, self.ordering_cohort)) self.prior_ordering_keys = space.ordering_keys;
+        if (std.meta.eql(space.ordering_cohort, key_recipe)) self.prior_ordering_keys = space.ordering_keys;
     }
     var ordering_edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &manager, pages.store());
     ordering_edits.private_pages.phase = self.store.io_phase;
@@ -389,7 +390,7 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
     self.slots = try out.dupe(u32, builder.slots);
     self.space = (try builder.finish(self.root.namespace, self.root.values_recipe, self.root.cut)).current;
     self.space.ordering_keys = try ordering_edits.finish(self.prior_ordering_keys);
-    self.space.ordering_cohort = if (self.space.ordering_keys != null) self.ordering_cohort else null;
+    self.space.ordering_cohort = if (self.space.ordering_keys != null) key_recipe else null;
     const nav = try navigation.build(a, out, &self.store, &self.provider, prior_navigation, self.token);
     self.provider.native_delta = nav.delta;
     self.space.navigation = nav.ref;
@@ -411,6 +412,26 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
     const encoded = try std.json.Stringify.valueAlloc(a, prospective, .{});
     defer a.free(encoded);
     if (encoded.len +| 4096 > identity.max_root_bytes) return error.LogicalRowIdentityAdmissionDeclined;
+}
+
+// Input cohorts sort/deduplicate source columns and intentionally omit layout.
+// Cached tuples additionally bind emitted field positions: changing (a,b) to
+// (b,a), or selecting another alias of the same input, cannot reinterpret keys.
+// Direction is absent because reversing an order preserves the typed values.
+fn orderingKeyRecipe(input: ?[32]u8, fields: []const local.segment.SegmentIndexSortField) ?[32]u8 {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update("native-lake-typed-ordering-keys-v1");
+    hash.update(&(input orelse return null));
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.field, "_id")) continue;
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, field.field.len, .big);
+        hash.update(&length);
+        hash.update(field.field);
+    }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return digest;
 }
 
 fn orderTagMatches(tag: ?[]const u8, recipe: ?[32]u8) bool {
@@ -620,7 +641,7 @@ const OrderKeys = struct {
     candidate: ?tree.Cursor.Record = null,
     cohort: ?[32]u8,
     fn init(owner: *Build, a: A, pages: *Pages, fragment: Fragment) !OrderKeys {
-        var result: OrderKeys = .{ .owner = owner, .cohort = owner.ordering_cohort };
+        var result: OrderKeys = .{ .owner = owner, .cohort = owner.ordering_input_cohort };
         errdefer result.deinit();
         if (result.cohort) |cohort| {
             const lower = cohort ++ fragment.prefix;
@@ -2473,4 +2494,15 @@ test "external lake logical fragments retain coordinate pages until a layout act
         try std.testing.expectEqual(@as(u64, if (step == 2) 2 else 0), second_row.coordinate.row);
         prior = root;
     }
+}
+
+test "external lake logical fragments bind cached field positions while reusing reversed keys" {
+    const fields = [_]local.segment.SegmentIndexSortField{ .{ .field = "a" }, .{ .field = "b" }, .{ .field = "_id" } };
+    const swapped = [_]local.segment.SegmentIndexSortField{ .{ .field = "b" }, .{ .field = "a" }, .{ .field = "_id" } };
+    const reversed = [_]local.segment.SegmentIndexSortField{ .{ .field = "a", .desc = true }, .{ .field = "b", .desc = true }, .{ .field = "_id" } };
+    const cohort: [32]u8 = @splat(8);
+    try std.testing.expect(!std.meta.eql(orderingKeyRecipe(cohort, &fields), orderingKeyRecipe(cohort, &swapped)));
+    try std.testing.expect(std.meta.eql(orderingKeyRecipe(cohort, &fields), orderingKeyRecipe(cohort, &reversed)));
+    try std.testing.expect(!std.meta.eql(orderingKeyRecipe(cohort, &fields), orderingKeyRecipe(@splat(9), &fields)));
+    try std.testing.expect(orderingKeyRecipe(null, &fields) == null);
 }

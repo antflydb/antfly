@@ -1420,7 +1420,11 @@ is a semantic migration, with no change to native text metadata encoding.
 Native fragment spaces optionally retain a copy-on-write page tree keyed by
 logical row ID. Each value contains primitive typed ordering keys and the exact
 ordering-input digest used to derive them. The root also binds the ordering
-cohort, including its schema and input interpretation. Keys retain signed
+cohort, including its schema, input interpretation and emitted field positions.
+The cache recipe is separate from the source-input cohort, which intentionally
+sorts and deduplicates column names. Permuting fields or selecting another alias
+cannot reinterpret a cached tuple; reversing directions can reuse the same keys.
+Keys retain signed
 nanosecond timestamps and integers beyond 2^53 without conversion to floating
 point. They contain ordering inputs, not source bodies or an independent row
 identity.
