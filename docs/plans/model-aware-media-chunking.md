@@ -624,3 +624,42 @@ one call. Allocation-failure probes cover ownership transfer and ranking cleanup
 For 480,000 waveform samples, current raw/prepared peaks are 17,284,616 and
 15,364,616 bytes. These are admission and call-count measurements with a model
 stub, not RSS or live-model latency measurements.
+
+
+## Pause-aware audio planning checkpoints
+
+Pause-aware continuation now keeps a bounded directory of locally derived
+`(ordinal, next offset)` checkpoints, separate from inference output receipts.
+Known-length random-access providers restore the nearest checkpoint before
+reconstructing any gap. The existing ordinal continuation remains the durable
+worker cursor; no caller-provided offset becomes trusted planning state.
+
+The directory key commits the pinned source binding, complete boundary plan,
+sample rate, sample count, format and inference release version. The plan already
+commits source identity/version, policy, model planning identity and capacity.
+The shared host-admitted index cache owns immutable snapshots and preserves
+borrowed readers during replacement or pressure eviction. Request-local metadata
+has a separate bounded admission lease. Admission or allocation denial disables
+this optional accelerator, preserving ordinary reconstruction.
+
+An inference-owned disk store beneath `models_dir/.antfly-audio-plans` preserves
+checksummed snapshots across process restarts. Fixed hash slots bound storage to
+256 snapshots (16.1 MiB), 256 temporary snapshots and 256 empty lock files. Full
+keys reject collisions. Per-slot cooperative mutexes and nonblocking OS file
+locks coordinate owners sharing a models directory. Writes sync and rename a
+complete snapshot; torn/missing records reconstruct rather than weakening
+source or model fences. A plan retains at most 4,096 ordered anchors; compaction
+keeps earlier sparse anchors and the advancing tail, independent of duration.
+Read-only/ephemeral model directories and cache eviction remain safe fallbacks.
+Unpinned and unknown-length forward streams do not restore seek checkpoints.
+Codec-directory cold starts retain their existing behavior.
+
+The 32-window pinned float32 WAV fixture reads 101,377,408 source bytes when
+reconstructing every one-window page, versus 6,145,408 with checkpoints (about
+94% fewer bytes). Recreating the inference cache and store owner before every
+page reads the same 6,145,408 bytes from the media source. A single full request
+reads 6,144,044 bytes. Source coordinates match exactly. Silence cuts, overlap,
+44.1 kHz sample clocks, minimum-duration tails, denied admission, sparse-anchor
+compaction, checksum/binding rejection and allocation cleanup are covered. This
+measures production planning and range reads with a deterministic executor, not
+RSS or live-model latency.
