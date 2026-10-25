@@ -159,8 +159,11 @@ fn routeRoot(a: A, table: []const u8) ![]const u8 {
 fn updateRoute(a: A, txn: anytype, cfg: Definition, add: bool) !void {
     try routes.update(a, txn, try routeRoot(a, cfg.table), cfg.key_template, add);
 }
+pub fn matchingNamespaces(a: A, txn: anytype, table: []const u8, key: []const u8) ![][]const u8 {
+    return routes.matching(a, txn, try routeRoot(a, table), key);
+}
 pub fn matchingNamespacePrefixes(a: A, txn: anytype, table: []const u8, key: []const u8) ![]const []const u8 {
-    const templates = try routes.matching(a, txn, try routeRoot(a, table), key);
+    const templates = try matchingNamespaces(a, txn, table, key);
     const result = try a.alloc([]const u8, templates.len);
     for (templates, result) |template, *value| value.* = try namespacePrefix(a, table, template);
     return result;

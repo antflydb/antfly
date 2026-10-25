@@ -2350,3 +2350,28 @@ paths stop at cached tails, and path compression stores one result per identity;
 long chains and converging paths share work and storage. Full components remain
 separate for membership and distinct checks. Authority changes and rollback
 invalidate both caches, preserving the same revision fence and traversal budget.
+
+
+### Resolver admission and progress cost
+
+The ordinary `/resolvers` entity APIs share the native identity authority.
+Entity mutation admission checks destination-table authority before reading
+policy, then revalidates the complete, deduplicated seed/absorbed-key mutation
+set in one batch before publication. Absorbed aliases never cause individual
+catalog authorization RPCs, including aliases repeated across namespaces.
+
+Progress pages seek existing namespace route buckets and individual resolver
+rows. Their opaque continuation binds the catalog revision, destination identity,
+query key, literal-prefix bucket, route key, active template and last consumer
+row. Pages do not reload or sort all matching namespaces. An old offset-based
+progress cursor requires restarting pagination; no durable index rebuild is
+needed. A 1,000-namespace traversal at limit 37 visits exactly 1,000 route rows
+across 28 pages, including transitions between literal-prefix buckets.
+
+Embedded proposal creation uses the enrolled namespace directory and adopted
+native heads as its membership proof. It opens source consumers only for cold
+namespaces that still require legacy folding. Warm membership captures directory
+epoch and namespace revision/fingerprint fences outside the writer lease and
+rechecks them at publication. Duplicate proposal receipts remain point reads;
+review operations still gather the policy and observations their decisions need.
+The mixed warm/cold regression proves that only the cold binding is decoded.

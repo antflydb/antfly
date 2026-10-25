@@ -62,6 +62,12 @@ fn ensureConsumerIndex(root: *h.Handle, a: A) !void {
     }
 }
 fn consumers(root: *h.Handle, a: A, table: []const u8, key: []const u8, observed_epoch: ?*?u64) ![]const Consumer {
+    return consumersForAdmission(root, a, table, key, observed_epoch, null);
+}
+/// Proposal creation needs membership, not source observations. An adopted
+/// namespace is certified by its head and the directory epoch; only cold
+/// namespaces require source identities and legacy folding.
+fn consumersForAdmission(root: *h.Handle, a: A, table: []const u8, key: []const u8, observed_epoch: ?*?u64, cold_destination: ?*h.db_mod.DB) ![]const Consumer {
     const directory = @import("../storage/lite/resolver_consumers.zig");
     // Native Lite stores share a physical transaction space. Bootstrap legacy
     // bindings once from catalog bytes; warm calls seek only this destination.
@@ -72,18 +78,29 @@ fn consumers(root: *h.Handle, a: A, table: []const u8, key: []const u8, observed
     defer txn.abort();
     if (observed_epoch) |captured_epoch| captured_epoch.* = try directory.epoch(&txn);
     var bindings: std.ArrayList(directory.Binding) = .empty;
-    for (try directory.matchingNamespacePrefixes(a, &txn, table, key)) |target| {
+    var result: std.ArrayList(Consumer) = .empty;
+    var destination_read = if (cold_destination) |db| try db.core.store.beginReadTxn() else null;
+    defer if (destination_read) |*read| read.abort();
+    for (try directory.matchingNamespaces(a, &txn, table, key)) |template| {
+        if (destination_read) |*read| {
+            var bridge: Bridge = .{ .txn = read };
+            if (try bridge.store(a, prefix).head(template)) |head| {
+                try result.append(a, .{ .db = cold_destination.?, .source = "", .synthetic = true, .scope_head = head, .cfg = .{ .name = "native_authority", .table = table, .key_template = template, .source_artifact = "authority_source", .resolution_artifact = "authority_resolution", .promote = false } });
+                continue;
+            }
+        }
+        const target = try directory.namespacePrefix(a, table, template);
         var cursor = try txn.openCursor();
         defer cursor.close();
         var row = try directory.seekEntry(&cursor, target);
         while (row) |entry| {
             if (!std.mem.startsWith(u8, entry.key, target)) break;
+            if (@import("builtin").is_test) _ = directory.test_binding_visits.fetchAdd(1, .monotonic);
             try bindings.append(a, try std.json.parseFromSliceLeaky(directory.Binding, a, entry.value, .{ .allocate = .alloc_always }));
             row = try directory.nextEntry(&cursor);
         }
     }
-    try tables.loadCatalog(root);
-    var result: std.ArrayList(Consumer) = .empty;
+    if (bindings.items.len > 0) try tables.loadCatalog(root);
     for (bindings.items) |binding| {
         if (binding.source_id != 0 and root.embedded_table_records.get(binding.source) != binding.source_id) continue;
         const source = try tables.get(root, binding.source);
@@ -524,7 +541,7 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
         const need_sources = if (create != null) current == null else decision.?.accept or decision.?.pin_distinct or decision.?.expected_revision != null or terminal_policy;
         if (need_sources) {
             const key = if (current) |proposal| proposal.key else if (create) |request| request.key else return error.NotFound;
-            selected = try consumers(root, a, table, key, &directory_epoch);
+            selected = try consumersForAdmission(root, a, table, key, &directory_epoch, if (create != null) db else null);
             const into = if (current) |proposal| proposal.into else if (create) |request| request.into else null;
             if (needs_policy) selected = try prepareStaticProfiles(root, a, db, table, key, into, selected, directory_epoch, operation == .decide);
         }
@@ -1281,4 +1298,53 @@ test "capi resolver curation proposal review unions queue work across namespaces
     try std.testing.expectEqual(@as(usize, 1), observations.values.count());
     try std.testing.expect(observations.values.get(&root.db).? != null);
     std.debug.print("REVIEW namespaces={d} proposals={d} incidence_scans={d} source_samples={d} arena_added={d}\n", .{ scope_count, entries.len, scans, observations.values.count(), arena.queryCapacity() - arena_before });
+}
+
+test "capi resolver curation warm proposal creation skips all consumer bindings and fences membership" {
+    const api = @import("db.zig");
+    const directory = @import("../storage/lite/resolver_consumers.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = try api.TestDirectory.init("proposal-membership-only");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    const root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    defer h.closeHandle(root);
+    try tables.create(root, "entities", "{}", false);
+    const db = try tables.get(root, "entities");
+    for (0..100) |i| {
+        _ = try root.db.upsertResolverWithResultOptions(.{ .name = try std.fmt.allocPrint(a, "r-{d}", .{i}), .table = "entities", .key_template = "entity/{{_key}}", .source_artifact = try std.fmt.allocPrint(a, "kg-{d}", .{i}), .resolution_artifact = try std.fmt.allocPrint(a, "resolved-{d}", .{i}), .promote = false }, .{ .drain_backfill = false, .wait_for_activity = true });
+    }
+    // First proposal folds cold policy; every following proposal is membership-only.
+    _ = try proposals(root, a, .create, "entities", "", "{\"action\":\"merge\",\"key\":\"entity/a\",\"into\":\"entity/b\"}", .{});
+    const visits = directory.test_binding_visits.load(.monotonic);
+    for (0..20) |i| _ = try proposals(root, a, .create, "entities", "", try json(a, c.ProposalRequest{ .action = .merge, .key = "entity/a", .into = try std.fmt.allocPrint(a, "entity/target-{d}", .{i}) }), .{});
+    try std.testing.expectEqual(visits, directory.test_binding_visits.load(.monotonic));
+    var observed: ?u64 = null;
+    const selected = try consumersForAdmission(root, a, "entities", "entity/a", &observed, db);
+    try std.testing.expectEqual(@as(usize, 1), selected.len);
+    try std.testing.expect(selected[0].synthetic and selected[0].scope_head != null);
+    try std.testing.expectEqual(@as(usize, 0), (try prepareAdoption(a, db, selected)).sources.len);
+    _ = try entity(root, a, "entities", "entity/a", .{ .action = .suppress }, .{});
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        var bridge: Bridge = .{ .txn = &read };
+        try std.testing.expectError(error.ResolverCurationConflict, checkScopeHeads(a, bridge.store(a, prefix), selected));
+    }
+    _ = try root.db.upsertResolverWithResultOptions(.{ .name = "late", .table = "entities", .key_template = "entity/{{_key}}", .source_artifact = "late-kg", .resolution_artifact = "late-resolved", .promote = false }, .{ .drain_backfill = false, .wait_for_activity = true });
+    try std.testing.expectError(error.ResolverCurationConflict, checkDirectoryEpoch(root, observed));
+    // Mixed warm/cold membership folds just the newly enrolled namespace.
+    _ = try root.db.upsertResolverWithResultOptions(.{ .name = "cold", .table = "entities", .key_template = "{{_key}}", .source_artifact = "cold-kg", .resolution_artifact = "cold-resolved", .promote = false }, .{ .drain_backfill = false, .wait_for_activity = true });
+    const cold_visits = directory.test_binding_visits.load(.monotonic);
+    const mixed = try consumersForAdmission(root, a, "entities", "entity/a", &observed, db);
+    try std.testing.expectEqual(@as(usize, 2), mixed.len);
+    const prepared = try prepareAdoption(a, db, mixed);
+    try std.testing.expectEqual(@as(usize, 1), prepared.sources.len);
+    try std.testing.expectEqual(@as(usize, 1), prepared.namespaces.len);
+    try std.testing.expectEqualStrings("{{_key}}", prepared.namespaces[0].key_template);
+    try std.testing.expectEqual(@as(usize, 1), directory.test_binding_visits.load(.monotonic) - cold_visits);
+    _ = try proposals(root, a, .create, "entities", "", "{\"action\":\"merge\",\"key\":\"entity/a\",\"into\":\"entity/cold\"}", .{});
+    std.debug.print("PROPOSALS consumers=100 creations=20 warm_binding_visits=0 mixed_cold_visits=1\n", .{});
 }

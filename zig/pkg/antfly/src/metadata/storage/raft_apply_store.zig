@@ -23727,19 +23727,24 @@ pub const RaftApplyStore = struct {
     fn scopedResolverProgressTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, input: @import("../resolver_catalog_read.zig").Request, result: *@import("../resolver_catalog_read.zig").Page, continuation: ?@import("../resolver_catalog_read.zig").Cursor) !void {
         const wire = @import("../resolver_catalog_read.zig");
         const target = try self.resolverConsumerPrefixTxn(a, txn, group, result.table.table_id);
-        const templates = try NamespaceRoutes.matching(a, txn, try namespaceRouteRoot(a, target), input.key);
-        std.mem.sort([]const u8, templates, {}, struct {
-            fn less(_: void, x: []const u8, y: []const u8) bool {
-                return std.mem.lessThan(u8, x, y);
-            }
-        }.less);
-        var index: usize = if (continuation) |value| value.namespace_index else 0;
-        if (index > templates.len) return error.InvalidResolverCurationRequest;
+        const route_root = try namespaceRouteRoot(a, target);
+        // Offset cursors from older binaries cannot identify a stable route cut.
+        if (continuation) |value| if (!value.progress_routes) return error.CatalogGenerationChanged;
+        var position: NamespaceRoutes.Position = if (continuation) |value| value.route_position else .{};
+        var active: ?[]const u8 = if (continuation) |value| value.namespace_template else null;
         var after: ?[]const u8 = if (continuation) |value| value.after else null;
+        if (active) |template| {
+            const static_prefix = template[0 .. std.mem.indexOf(u8, template, "{{") orelse template.len];
+            if (position.length != static_prefix.len or !resolver_curation.keyInNamespace(template, input.key)) return error.InvalidResolverCurationRequest;
+            const expected_route = try std.fmt.allocPrint(a, "{s}route/{s}/{s}", .{ route_root, try NamespaceRoutes.digest(a, static_prefix), try NamespaceRoutes.digest(a, template) });
+            if (position.after == null or !std.mem.eql(u8, position.after.?, expected_route)) return error.InvalidResolverCurationRequest;
+            _ = txn.get(expected_route) catch |err| return if (err == error.NotFound) error.CatalogGenerationChanged else err;
+        } else if (continuation != null) return error.InvalidResolverCurationRequest;
         var consumers: std.ArrayList(wire.Consumer) = .empty;
         var bytes: usize = 0;
-        while (index < templates.len) : (index += 1) {
-            const prefix = try namespaceProgressPrefix(a, target, templates[index]);
+        while (active orelse try NamespaceRoutes.next(a, txn, route_root, input.key, &position)) |template| {
+            active = null;
+            const prefix = try namespaceProgressPrefix(a, target, template);
             if (after) |value| if (!std.mem.startsWith(u8, value, prefix)) return error.CatalogGenerationChanged;
             var cursor = try txn.openCursor();
             defer cursor.close();
@@ -23751,7 +23756,7 @@ pub const RaftApplyStore = struct {
             while (row) |entry| {
                 if (!std.mem.startsWith(u8, entry.key, prefix)) break;
                 if (consumers.items.len == input.consumer_limit or bytes >= 1024 * 1024) {
-                    result.next_cursor = try resolver_curation.encodeToken(a, wire.Cursor{ .revision = result.revision, .table_id = result.table.table_id, .key_digest = wire.keyDigest(input.key), .indexed = true, .scoped = true, .namespace_index = index, .after = last orelse after orelse prefix });
+                    result.next_cursor = try resolver_curation.encodeToken(a, wire.Cursor{ .revision = result.revision, .table_id = result.table.table_id, .key_digest = wire.keyDigest(input.key), .indexed = true, .scoped = true, .progress_routes = true, .route_position = position, .namespace_template = template, .after = last orelse after orelse prefix });
                     result.consumers = consumers.items;
                     return;
                 }
@@ -41811,4 +41816,60 @@ test "resolver curation namespace propagation idle upgrade discovers and fences 
     const page = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .consumers, .key = "entity/a", .compact_consumers = true, .consumer_limit = 1, .standalone = true }), .{});
     try std.testing.expectEqual(@as(usize, 1), page.consumers.len);
     try std.testing.expectEqualStrings("r", page.consumers[0].configs.?[0].name);
+}
+
+test "resolver curation namespace propagation progress seeks across a thousand matching namespaces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/namespace-keysets", .{tmp.sub_path});
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = path });
+    defer store.deinit();
+    const group: u64 = 41;
+    const wire = @import("../resolver_catalog_read.zig");
+    const Config = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 1, .name = "entities" } });
+    const definitions = try a.alloc(Config, 1000);
+    for (definitions, 0..) |*cfg, i| {
+        const spaces = try a.alloc(u8, i + 1);
+        @memset(spaces, ' ');
+        cfg.* = .{ .name = try std.fmt.allocPrint(a, "r-{d}", .{i}), .table = "entities", .key_template = try std.fmt.allocPrint(a, "{s}{{{{{s}_key}}}}", .{ if (i % 2 == 0) "entity/" else "", spaces }), .source_artifact = try std.fmt.allocPrint(a, "kg-{d}", .{i}), .resolution_artifact = try std.fmt.allocPrint(a, "resolved-{d}", .{i}), .promote = false };
+    }
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 2, .name = "source", .indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = definitions }, .{}) } });
+    {
+        const source = (try store.getTable(a, group, 2)).?;
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try RaftApplyStore.synchronizeNamespaceConsumersTxn(a, &txn, group, null, source);
+        try txn.put(try RaftApplyStore.resolverNamespaceBootstrapKey(a, group), "1");
+        try txn.commit();
+    }
+    const revision = try store.standaloneRevision();
+    var cursor: ?[]const u8 = null;
+    var first_cursor: ?[]const u8 = null;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var pages: usize = 0;
+    const visits = RaftApplyStore.NamespaceRoutes.test_route_visits.load(.monotonic);
+    while (true) {
+        const page = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .consumers, .key = "entity/a", .compact_consumers = true, .consumer_limit = 37, .cursor = cursor, .standalone = true }), .{});
+        try std.testing.expect(page.consumers.len <= 37);
+        for (page.consumers) |consumer| try std.testing.expect(!(try seen.getOrPut(a, consumer.configs.?[0].name)).found_existing);
+        pages += 1;
+        cursor = page.next_cursor;
+        if (first_cursor == null) first_cursor = cursor;
+        if (cursor == null) break;
+    }
+    try std.testing.expectEqual(@as(usize, 1000), seen.count());
+    try std.testing.expectEqual(@as(usize, 28), pages);
+    const route_visits = RaftApplyStore.NamespaceRoutes.test_route_visits.load(.monotonic) - visits;
+    try std.testing.expectEqual(@as(usize, 1000), route_visits);
+    // Cursor cuts bind both the active namespace and its physical route.
+    var tampered = try resolver_curation.decodeToken(wire.Cursor, a, first_cursor.?);
+    tampered.namespace_template = "other/{{_key}}";
+    try std.testing.expectError(error.InvalidResolverCurationRequest, store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .consumers, .key = "entity/a", .compact_consumers = true, .consumer_limit = 37, .cursor = try resolver_curation.encodeToken(a, tampered), .standalone = true }));
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 3, .name = "changed" } });
+    try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .consumers, .key = "entity/a", .compact_consumers = true, .consumer_limit = 37, .cursor = first_cursor, .standalone = true, .expected_revision = revision }));
+    std.debug.print("PROGRESS namespaces=1000 limit=37 pages={d} route_visits={d}\n", .{ pages, route_visits });
 }

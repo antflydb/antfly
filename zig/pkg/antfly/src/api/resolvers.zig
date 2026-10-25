@@ -1114,6 +1114,8 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
     const reviewed: ?resolver.curation.Proposal = if (proposal_edit) |edit| try findProposal(.{ .proposals = original_proposals }, edit.id) else null;
     const actual_intent = if (proposal_edit) |edit| resolver.curation.decisionRequest(reviewed.?, edit.decision) else intent;
     var absorbed_results: std.StringHashMapUnmanaged([]const resolver.curation.AbsorbedResult) = .empty;
+    var mutation_keys: std.StringArrayHashMapUnmanaged(void) = .empty;
+    try mutation_keys.put(a, key, {});
     for (namespaces.values()) |*namespace| {
         if (input.into) |target| if (!curation.keyInNamespace(namespace.key_template, target)) return error.InvalidResolverCurationRequest;
         if (input.expected_revision) |expected| if (expected != namespace.revision) return error.ResolverCurationConflict;
@@ -1144,7 +1146,7 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
                 changed = true;
             }
         }
-        for (plan.absorbed) |absorbed| try server.authorizeIntegrityMutations(request, &.{.{ .table_name = entity_table.name, .deletes = &.{absorbed.key} }});
+        for (plan.absorbed) |absorbed| try mutation_keys.put(a, absorbed.key, {});
         try absorbed_results.put(a, namespace.key_template, plan.absorbed);
         const check: Config = .{ .name = "namespace", .table = entity_table.name, .source_artifact = "metadata", .resolution_artifact = "resolved", .key_template = namespace.key_template, .merges = plan.merges, .curation_json = try std.json.Stringify.valueAlloc(a, plan.state, .{}) };
         try check.validate();
@@ -1164,6 +1166,9 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
         _ = try resolver.curation.parseState(a, try std.json.Stringify.valueAlloc(a, proposal_state, .{}));
         try root.object.put(a, proposals_key, try json(a, proposal_state));
     }
+    // Revalidate the complete mutation cut once, after planning. Authorization
+    // resolves tables, so absorbed aliases must not issue one catalog RPC each.
+    try server.authorizeIntegrityMutations(request, &.{.{ .table_name = entity_table.name, .deletes = mutation_keys.keys() }});
     try request.ensureActive();
     const stamp = if (changed) try publishAuthority(server, a, entity_table, root, native, namespaces.keys(), adoption_revision, request, admission) else null;
     var outcomes = std.json.Array.init(a);
@@ -2533,8 +2538,15 @@ test "resolver curation HTTP native entity responses share absorbed outcomes wit
         source: Source,
         cfg: struct { deployment_mode: enum { standalone, distributed } = .standalone } = .{},
         probes: usize = 0,
+        authorization_calls: usize = 0,
+        authorized_keys: usize = 0,
+        revoke_at_publication: bool = false,
         pub fn authorizeTableReads(_: *@This(), _: std.mem.Allocator, _: operation.RequestContext, _: []const []const u8) !void {}
-        pub fn authorizeIntegrityMutations(_: *@This(), _: operation.RequestContext, _: anytype) !void {}
+        pub fn authorizeIntegrityMutations(self: *@This(), _: operation.RequestContext, mutations: anytype) !void {
+            self.authorization_calls += 1;
+            self.authorized_keys += mutations[0].deletes.len;
+            if (self.revoke_at_publication and self.authorization_calls > 1) return error.Forbidden;
+        }
         pub fn executeResolverOperation(self: *@This(), _: std.mem.Allocator, _: []const u8, _: u64, _: []const u8, _: operation.RequestContext) ![]u8 {
             self.probes += 1;
             return error.UnexpectedObservation;
@@ -2558,10 +2570,16 @@ test "resolver curation HTTP native entity responses share absorbed outcomes wit
         try std.testing.expectEqual(@as(usize, 0), decoded.object.get("results").?.array.items.len);
         try std.testing.expectEqualStrings("../entities/entity%2Fa/progress", decoded.object.get("progress_url").?.string);
         try std.testing.expectEqual(@as(usize, 1), server.source.writes);
+        try std.testing.expectEqual(@as(usize, 2), server.authorization_calls);
+        try std.testing.expectEqual(@as(usize, 1002), server.authorized_keys);
         try std.testing.expectEqual(@as(usize, 0), server.probes);
         try std.testing.expectEqual(if (i >= 2) @as(usize, 0) else count, server.source.consumer_rows);
         try std.testing.expect(result.body.len < 128 * 1024);
         size.* = result.body.len;
+        server.authorization_calls = 0;
+        server.revoke_at_publication = true;
+        try std.testing.expectError(error.Forbidden, entityOperation(&server, alloc, a, &snapshot, &tables[0], .entity_suppress, "entity/a", "{\"absorbed\":\"release\"}", .{}, 7, null, .{ .table_id = 1, .name = "entities", .native = true, .schema = @splat(0) }));
+        try std.testing.expectEqual(@as(usize, 1), server.source.writes);
     }
     for (sizes) |size| try std.testing.expectEqual(sizes[0], size);
     std.debug.print("ENTITY OUTCOMES consumers=1/1000 absorbed=1000 response_bytes={d}\n", .{sizes[0]});

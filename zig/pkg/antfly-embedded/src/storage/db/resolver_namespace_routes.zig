@@ -41,6 +41,49 @@ pub fn update(a: A, txn: anytype, root: []const u8, template: []const u8, add: b
     }
     if (add) try txn.put(edge, try std.json.Stringify.valueAlloc(a, template, .{})) else try txn.delete(edge);
 }
+/// A keyset cut across literal-prefix buckets. Row keys and decoded templates
+/// are owned by the caller allocator, never borrowed across cursor movement.
+pub const Position = struct { length: usize = 0, after: ?[]const u8 = null };
+pub var test_route_visits: std.atomic.Value(usize) = .init(0);
+pub fn next(a: A, txn: anytype, root: []const u8, key: []const u8, position: *Position) !?[]const u8 {
+    if (position.length > key.len + 1) return error.InvalidResolverCurationRequest;
+    while (position.length <= key.len) : (position.length += 1) {
+        const prefix_digest = try digest(a, key[0..position.length]);
+        const bucket = try std.fmt.allocPrint(a, "{s}route/{s}/", .{ root, prefix_digest });
+        if (position.after) |after| if (!std.mem.startsWith(u8, after, bucket)) return error.InvalidResolverCurationRequest;
+        const node_raw = txn.get(try std.fmt.allocPrint(a, "{s}node/{s}", .{ root, prefix_digest })) catch |err| switch (err) {
+            error.NotFound => {
+                position.length = key.len + 1;
+                position.after = null;
+                return null;
+            },
+            else => return err,
+        };
+        const node = try std.json.parseFromSliceLeaky(RouteNode, a, node_raw, .{});
+        if (node.terminal == 0) {
+            position.after = null;
+            continue;
+        }
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var row = cursor.seekAtOrAfter(position.after orelse bucket) catch |err| if (err == error.NotFound) null else return err;
+        if (position.after) |after| if (row != null and std.mem.eql(u8, row.?.key, after)) {
+            row = cursor.next() catch |err| if (err == error.NotFound) null else return err;
+        };
+        while (row) |entry| {
+            if (!std.mem.startsWith(u8, entry.key, bucket)) break;
+            if (@import("builtin").is_test) _ = test_route_visits.fetchAdd(1, .monotonic);
+            const template = try std.json.parseFromSliceLeaky([]const u8, a, entry.value, .{ .allocate = .alloc_always });
+            if (@import("resolver_namespace.zig").keyInNamespace(template, key)) {
+                position.after = try a.dupe(u8, entry.key);
+                return template;
+            }
+            row = cursor.next() catch |err| if (err == error.NotFound) null else return err;
+        }
+        position.after = null;
+    }
+    return null;
+}
 pub fn matching(a: A, txn: anytype, root: []const u8, key: []const u8) ![][]const u8 {
     var result: std.ArrayList([]const u8) = .empty;
     for (0..key.len + 1) |length| {
