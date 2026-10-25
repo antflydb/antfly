@@ -1375,6 +1375,61 @@ const RegisteredSourceFixture = struct {
             try self.original.checkLifetime();
         }
     };
+    fn installPublication(backend: *lsm.Backend, frame: *Scope.Publication.Candidate, original: read_admission.Port) !void {
+        // An independently admitted normal reader pins the old generation
+        // across the actual Backend installation, then releases before close.
+        var read = try backend.beginReadWithAdmission(quotaControl());
+        defer read.abort();
+        const pinned = read.read_view.version;
+        const pinned_count = if (pinned) |version| version.directory.?.count() else 0;
+        try std.testing.expect(backend.mu.tryLock());
+        defer backend.mu.unlock();
+        const old_seal = backend.registered_publication.seal;
+        const old_generation = backend.run_directory_generation;
+        const saved_debt = backend.unpublished_wal_logical_bytes;
+        backend.unpublished_wal_logical_bytes = 321;
+        defer backend.unpublished_wal_logical_bytes = saved_debt;
+        var guard: PublicationCaptureProbe = .{ .backend = backend, .original = quotaControl() };
+        const payload: read_admission.Payload = .{ .ptr = &guard, .vtable = &.{ .checkpoint = PublicationCaptureProbe.checkpoint, .check_lifetime = PublicationCaptureProbe.lifetime } };
+        const checked = read_admission.Port.init(&payload);
+        const read_only = backend.options.backend.read_only;
+        const closing = backend.closing.load(.acquire);
+        defer backend.options.backend.read_only = read_only;
+        defer backend.closing.store(closing, .release);
+        backend.options.backend.read_only = true;
+        try std.testing.expectError(error.ReadOnly, backend.installRegisteredPublicationWithAdmission(frame, checked));
+        backend.options.backend.read_only = read_only;
+        backend.closing.store(true, .release);
+        try std.testing.expectError(error.BackendClosing, backend.installRegisteredPublicationWithAdmission(frame, checked));
+        backend.closing.store(closing, .release);
+        if (backend.registered_publication.seal == null) {
+            if (backend.run_directory) |legacy| if (legacy.tree.account) |account| {
+                _ = account.retain();
+                defer account.release();
+                try std.testing.expectError(error.CompactionPlanningStale, backend.installRegisteredPublicationWithAdmission(frame, checked));
+            };
+        }
+        guard.original = original;
+        backend.installRegisteredPublicationWithAdmission(frame, checked) catch |cause| {
+            try std.testing.expect(backend.registered_publication.seal == old_seal and backend.run_directory_generation == old_generation);
+            if (!Scope.Publication.matchesBackend(&backend.registered_publication, backend)) {
+                const owned = &backend.registered_publication;
+                std.debug.print("install source mismatch: gen={d} has_owned={any} dir_match={any} actual_dir={any} writer_root_match={any} writer_account_match={any} writer_owner_match={any} ledger_root_match={any} ledger_account_match={any} ledger_owner_match={any}\n", .{ backend.run_directory_generation, owned.seal != null, backend.run_directory == owned.directory, backend.run_directory != null, if (owned.writer) |writer| backend.runs.tree.root == writer.tree.root else backend.runs.tree.root == null, if (owned.writer) |writer| backend.runs.tree.account == writer.tree.account else backend.runs.tree.account == null, if (owned.writer) |writer| backend.runs.registered_owner == writer.registered_owner else backend.runs.registered_owner == null, backend.obsolete_paths.tree.root == owned.obsolete.tree.root, backend.obsolete_paths.tree.account == owned.obsolete.tree.account, backend.obsolete_paths.registered_owner == owned.obsolete.registered_owner });
+            }
+            try std.testing.expect(Scope.Publication.matchesBackend(&backend.registered_publication, backend));
+            return cause;
+        };
+        try std.testing.expect(backend.registered_publication.seal == frame and backend.run_directory_generation == old_generation + 1);
+        try std.testing.expect(Scope.Publication.matchesBackend(&backend.registered_publication, backend));
+        try std.testing.expect(backend.manifest_dirty and backend.obsolete_manifest_dirty and !backend.run_directory_dirty);
+        try std.testing.expectEqual(@as(u64, 321), backend.unpublished_wal_logical_bytes);
+        try std.testing.expect(backend.retired_run_directories == null and backend.retired_run_stores == null);
+        try std.testing.expect(backend.read_version == null);
+        if (pinned) |version| {
+            try std.testing.expect(version.registered);
+            try std.testing.expectEqual(pinned_count, version.directory.?.count());
+        }
+    }
     fn capturePublication(backend: *lsm.Backend, frame: *Scope.Publication.Candidate, roots: *const Scope.Publication.Roots, generation: u64, original: read_admission.Port) !void {
         // The publication owner exclusively owns these headers. Binding is a
         // test borrow under the actual Backend mutex, never an ownership copy.
@@ -1498,7 +1553,8 @@ const RegisteredSourceFixture = struct {
         var directory_cursor: ?Directory.Reclaimer = null;
         var directory_old_cursor: ?Directory.Reclaimer = null;
         var directory_candidate: ?*Scope.RegisteredDirectory = null;
-        var working: Scope.Publication.Roots = .{};
+        var private_working: Scope.Publication.Roots = .{};
+        const working: *Scope.Publication.Roots = if (batch) &backend2.registered_publication else &private_working;
         var working_candidate: ?*Scope.Publication.Candidate = null;
         var sibling: ?*Scope.Publication.Candidate = null;
         var reader_owner: ?*Scope.RegisteredReadVersion = null;
@@ -1509,7 +1565,12 @@ const RegisteredSourceFixture = struct {
         var final_return_probe: ?ReaderReturnProbe = null;
         defer {
             header_witness.active = false;
-            working.retire();
+            if (batch) {
+                if (backend2_live) {
+                    backend2.close();
+                    backend2_live = false;
+                }
+            } else working.retire();
             for (&readers) |*slot| if (slot.*) |version| {
                 version.releaseOwned();
                 slot.* = null;
@@ -1562,6 +1623,11 @@ const RegisteredSourceFixture = struct {
         const directory2 = try (try planned2).fork(a2);
         defer directory2.destroy(a2);
         try directory2.tree.prepare(a2);
+        if (batch) {
+            const AccountPointer = @typeInfo(@TypeOf(backend2.run_directory.?.tree.account)).optional.child;
+            const EmptyAccount = @typeInfo(AccountPointer).pointer.child;
+            backend2.run_directory.?.tree.account = try EmptyAccount.create(a2);
+        }
         var source: Source = .{ .allocator = a1, .manager = &first.resource_manager, .host = &first, .label = null, .run = undefined };
         try first.resource_manager.adjustUsageWithAdmission(.lsm_in_memory_state, &source.usage, 256 << 10, quotaControl());
         source.label = try a1.dupe(u8, "ancestor-domain");
@@ -1670,10 +1736,10 @@ const RegisteredSourceFixture = struct {
                         working_candidate = scope2.?.preparePublicationWithAdmission(original) catch |cause| break :blk cause;
                         try std.testing.expectError(error.InvalidArgument, working_candidate.?.resumeWithAdmission(quotaControl()));
                         try std.testing.expectError(error.InvalidArgument, working_candidate.?.appendPutWithAdmission(input, &writer_view.?, quotaControl()));
-                        capturePublication(&backend2, working_candidate.?, &working, 700 + ordinal, original) catch |cause| break :blk cause;
+                        capturePublication(&backend2, working_candidate.?, working, backend2.run_directory_generation, original) catch |cause| break :blk cause;
                         try std.testing.expectError(error.InvalidArgument, working_candidate.?.resumeWithAdmission(quotaControl()));
                         working_candidate.?.appendPutWithAdmission(input, &writer_view.?, original) catch |cause| break :blk cause;
-                    } else working_candidate = scope2.?.beginPublicationPutWithAdmission(&working, input, &writer_view.?, original) catch |cause| break :blk cause;
+                    } else working_candidate = scope2.?.beginPublicationPutWithAdmission(working, input, &writer_view.?, original) catch |cause| break :blk cause;
                     resumePublication(working_candidate.?, original, &fault, batch and retry_edit, &recovered_edit, &recovered_detached) catch |cause| break :blk cause;
                     if (batch) {
                         const prepared = working_candidate.?.preparedRootsWithAdmission(original) catch |cause| break :blk cause;
@@ -1716,12 +1782,17 @@ const RegisteredSourceFixture = struct {
                     }
                     // A sibling shares the captured generation, then loses the
                     // publication race without changing any of the live roots.
-                    sibling = scope2.?.beginPublicationPutWithAdmission(&working, input, &writer_view.?, original) catch |cause| break :blk cause;
+                    if (batch) {
+                        sibling = scope2.?.preparePublicationWithAdmission(original) catch |cause| break :blk cause;
+                        capturePublication(&backend2, sibling.?, working, backend2.run_directory_generation, original) catch |cause| break :blk cause;
+                        sibling.?.appendPutWithAdmission(input, &writer_view.?, original) catch |cause| break :blk cause;
+                    } else sibling = scope2.?.beginPublicationPutWithAdmission(working, input, &writer_view.?, original) catch |cause| break :blk cause;
                     sibling.?.resumeWithAdmission(original) catch |cause| break :blk cause;
-                    working_candidate.?.publishWithAdmission(&working, original) catch |cause| break :blk cause;
+                    if (batch) installPublication(&backend2, working_candidate.?, original) catch |cause| break :blk cause else working_candidate.?.publishWithAdmission(working, original) catch |cause| break :blk cause;
                     working_candidate.?.requestRetirement();
                     working_candidate = null;
-                    if (sibling.?.publishWithAdmission(&working, original)) |_| {
+                    const stale = if (batch) installPublication(&backend2, sibling.?, original) else sibling.?.publishWithAdmission(working, original);
+                    if (stale) |_| {
                         break :blk error.TestExpectedStalePublication;
                     } else |cause| if (cause != error.CompactionPlanningStale) break :blk cause;
                     sibling.?.requestRetirement();
@@ -1766,19 +1837,21 @@ const RegisteredSourceFixture = struct {
                         backend_reader = reader_owner.?.takeWithAdmission(original) catch |cause| break :blk cause;
                         reader_owner = null;
                         const tracked = backend_reader.?;
-                        std.debug.assert(backend2.live_read_versions == null);
+                        const previous_head = backend2.live_read_versions;
                         tracked.registered = true;
+                        tracked.live_next = previous_head;
+                        if (previous_head) |head| head.live_previous = tracked;
                         backend2.live_read_versions = tracked;
                         tracked.release(&backend2);
                         backend_reader = null;
-                        try std.testing.expect(backend2.live_read_versions == null and backend2.retired_projection_versions == null);
+                        try std.testing.expect(backend2.live_read_versions == previous_head and backend2.retired_projection_versions == null);
                     }
                     // Canonical roots cannot be assembled from a copied or
                     // altered header under another tuple's seal.
-                    var forged_roots = working;
+                    var forged_roots = working.*;
                     forged_roots.writer = null;
                     try std.testing.expectError(error.InvalidArgument, scope2.?.beginPublicationPutWithAdmission(&forged_roots, input, &writer_view.?, quotaControl()));
-                    working_candidate = scope2.?.beginPublicationPutWithAdmission(&working, input, &writer_view.?, original) catch |cause| break :blk cause;
+                    working_candidate = scope2.?.beginPublicationPutWithAdmission(working, input, &writer_view.?, original) catch |cause| break :blk cause;
                     if (working_candidate.?.resumeWithAdmission(original)) |_| {
                         break :blk error.TestExpectedDuplicateRun;
                     } else |cause| if (cause != error.DuplicateRun) break :blk cause;
@@ -1802,14 +1875,14 @@ const RegisteredSourceFixture = struct {
                     if (batch) {
                         working_candidate = scope2.?.preparePublicationWithAdmission(original) catch |cause| break :blk cause;
                         try std.testing.expectError(error.InvalidArgument, working_candidate.?.appendRemoveWithAdmission(handle, &writer_view.?, 100 + ordinal, quotaControl()));
-                        capturePublication(&backend2, working_candidate.?, &working, 900 + ordinal, original) catch |cause| break :blk cause;
+                        capturePublication(&backend2, working_candidate.?, working, backend2.run_directory_generation, original) catch |cause| break :blk cause;
                         working_candidate.?.appendRemoveWithAdmission(handle, &writer_view.?, 100 + ordinal, original) catch |cause| break :blk cause;
-                    } else working_candidate = scope2.?.beginPublicationRemoveWithAdmission(&working, handle, &writer_view.?, 100 + ordinal, original) catch |cause| break :blk cause;
+                    } else working_candidate = scope2.?.beginPublicationRemoveWithAdmission(working, handle, &writer_view.?, 100 + ordinal, original) catch |cause| break :blk cause;
                     working_candidate.?.resumeWithAdmission(original) catch |cause| break :blk cause;
                     // Preparation leaves all live roots untouched.
                     try std.testing.expectEqual(writer_count - ordinal, working.directory.?.count());
                     try std.testing.expectEqual(writer_count - ordinal, working.writer.?.count());
-                    working_candidate.?.publishWithAdmission(&working, original) catch |cause| break :blk cause;
+                    if (batch) installPublication(&backend2, working_candidate.?, original) catch |cause| break :blk cause else working_candidate.?.publishWithAdmission(working, original) catch |cause| break :blk cause;
                     working_candidate.?.requestRetirement();
                     working_candidate = null;
                     try std.testing.expectEqual(writer_count - ordinal - 1, working.directory.?.count());
@@ -2071,7 +2144,7 @@ const RegisteredSourceFixture = struct {
             if (phase == .retire) {
                 fault.live = true;
                 if (publication) {
-                    working.retire();
+                    if (!batch) working.retire();
                     header_witness.expected_bytes = @sizeOf(Scope.RegisteredReadVersion);
                     header_witness.expected_pointer = @ptrCast(reader_frames[0].?);
                     header_witness.active = writer_count == 1 and target == null and !oom;
@@ -2226,7 +2299,12 @@ const RegisteredSourceFixture = struct {
             try std.testing.expectEqual(@as(u64, 0), root.?.observedHeaderBytes());
         }
         header_witness.active = false;
-        working.retire();
+        if (batch) {
+            if (backend2_live) {
+                backend2.close();
+                backend2_live = false;
+            }
+        } else working.retire();
         for (&readers) |*slot| if (slot.*) |version| {
             version.releaseOwned();
             slot.* = null;

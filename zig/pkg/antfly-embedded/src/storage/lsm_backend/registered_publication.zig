@@ -24,6 +24,7 @@ const Store = @import("run_store.zig").Store;
 const Ledger = @import("obsolete_ledger.zig").Ledger;
 const Run = @import("repository.zig").Run;
 const Record = @import("registered_writer.zig").Record;
+const Account = @import("memory_account.zig").Account;
 const DirEdit = @import("registered_directory_root.zig").Candidate;
 const WriterEdit = @import("registered_writer_root.zig").Candidate;
 const ObsoleteEdit = @import("registered_obsolete.zig").Candidate;
@@ -81,11 +82,34 @@ const Stamp = struct {
 /// their exclusive owner serialize access. This check neither acquires nor
 /// transfers ownership; it verifies every root and its accounting guards.
 pub fn matchesBackend(roots: *const Roots, backend: anytype) bool {
-    if (backend.run_directory != roots.directory) return false;
+    if (backend.run_directory != roots.directory) {
+        if (roots.seal != null or roots.directory != null) return false;
+        const legacy = backend.run_directory orelse return false;
+        if (!exclusiveEmptyLegacyDirectory(legacy, backend.allocator)) return false;
+    }
     if (roots.writer) |writer| {
         if (backend.runs.tree.root != writer.tree.root or backend.runs.tree.account != writer.tree.account or backend.runs.tree.spare.capacity != writer.tree.spare.capacity or backend.runs.registered_owner != writer.registered_owner or backend.runs.registered_account != writer.registered_account) return false;
     } else if (backend.runs.tree.root != null or backend.runs.tree.account != null or backend.runs.tree.spare.capacity != 0 or backend.runs.registered_owner != null or backend.runs.registered_account != null) return false;
     return backend.obsolete_paths.tree.root == roots.obsolete.tree.root and backend.obsolete_paths.tree.account == roots.obsolete.tree.account and backend.obsolete_paths.registered_owner == roots.obsolete.registered_owner and backend.obsolete_paths.tree.spare.capacity == roots.obsolete.tree.spare.capacity and backend.obsolete_paths.spare.capacity == roots.obsolete.spare.capacity;
+}
+
+/// Empty legacy caches contain no semantic run data. Only exclusively owned,
+/// unfunded accounts may transfer: a foreign mutable fork cannot outlive the
+/// funded header handoff or allocate through an escaped legacy account.
+fn exclusiveEmptyLegacyDirectory(directory: *const Directory, a: std.mem.Allocator) bool {
+    if (directory.registered_owner != null or directory.registered_account != null or directory.total_run_bytes != 0 or directory.memory_run_count != 0) return false;
+    const fields = .{ "tree", "ids", "bounds", "ends", "levels", "generations" };
+    inline for (fields) |field| {
+        const tree = @field(directory, field);
+        if (tree.root != null or tree.spare.capacity != 0) return false;
+        if (tree.account) |account| {
+            if (account.independently_funded or account.backing.ptr != a.ptr or account.backing.vtable != a.vtable or account.bytes.load(.acquire) != @sizeOf(Account)) return false;
+            var internal_refs: usize = 0;
+            inline for (fields) |other| internal_refs += @intFromBool(@field(directory, other).account == account);
+            if (account.refs.load(.acquire) != internal_refs) return false;
+        }
+    }
+    return true;
 }
 
 pub const Candidate = struct {
@@ -198,7 +222,7 @@ pub const Candidate = struct {
     pub fn prepare(a: std.mem.Allocator, manager: *resource.ResourceManager, original: admission.Port) !*Candidate {
         var host: ?resource.AllocatorHost = try manager.acquireAllocatorHostWithAdmission(a, original);
         defer if (host) |held| held.release();
-        var construction = try manager.reserveConstructionWithAdmission(.lsm_table_builder_working_set, @sizeOf(Candidate) + @sizeOf(State), original);
+        var construction = try manager.reserveConstructionWithAdmission(.lsm_table_builder_working_set, @sizeOf(Candidate) + @sizeOf(State) + @sizeOf(Directory) + 6 * @sizeOf(Account), original);
         defer construction.retire();
         const self = try a.create(Candidate);
         var registered = false;
@@ -359,6 +383,15 @@ pub const Candidate = struct {
     /// access; the backend's durable publication and source check are separate.
     pub fn publishWithAdmission(self: *Candidate, live: *Roots, original: admission.Port) !void {
         try original.checkpoint();
+        return self.publishPrepared(live);
+    }
+    /// Fixed publication tail for an already serialized Backend/owner. All
+    /// refusals precede the swap; no cooperative checkpoint runs under its lock.
+    pub fn publishFixedWithAdmission(self: *Candidate, live: *Roots, original: admission.Port) !void {
+        try original.checkLifetime();
+        return self.publishPrepared(live);
+    }
+    fn publishPrepared(self: *Candidate, live: *Roots) !void {
         if (self.closing or self.published or !self.ready or self.state == null) return error.InvalidArgument;
         if (live.seal != self.state.?.source_seal or !self.source_stamp.matches(live)) return error.CompactionPlanningStale;
         _ = self.refs.fetchAdd(1, .monotonic); // The new working-set lease.
@@ -366,6 +399,14 @@ pub const Candidate = struct {
         std.mem.swap(Roots, live, &self.state.?.outputs);
         self.expected = .of(live);
         self.published = true;
+    }
+    /// Called only after a successful serialized bootstrap swap. The frame's
+    /// original grant already covers this header and up to six empty accounts.
+    /// No allocation, refusal or Backend borrow accompanies ownership transfer.
+    pub fn adoptEmptyLegacyDirectory(self: *Candidate, directory: *Directory) void {
+        std.debug.assert(self.published and !self.closing and self.state != null and self.state.?.displaced.directory == null);
+        std.debug.assert(exclusiveEmptyLegacyDirectory(directory, self.allocator));
+        self.state.?.displaced.directory = directory;
     }
     pub fn requestRetirement(self: *Candidate) void {
         if (self.closing) return;

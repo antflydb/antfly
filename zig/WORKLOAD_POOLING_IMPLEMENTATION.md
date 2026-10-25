@@ -28581,3 +28581,60 @@ the actual Backend mutex. Formatting, license and whitespace checks pass. Exact
 source snapshots and the uninterrupted Debug run's read-only progress samples
 are preserved. Coordinated Backend root ownership/installation and normal durable
 producer drivers remain required; the full design is not complete.
+
+
+## Coupled Backend root ownership and installation (2026-10-25)
+
+Backend now has an exclusive registered publication tuple; existing run, directory
+and obsolete fields are views while that tuple is live. A fixed admitted install
+validates captured source/generation, rejects closing/read-only Backends, swaps
+the complete tuple, invalidates the old reader epoch and updates all views without
+allocation or cooperative checkpoints. Previous roots move to the registered
+candidate instead of legacy per-root queues. Installation marks manifest/obsolete
+metadata dirty and preserves WAL debt; it does not claim durable completion.
+Joined teardown clears the views before returning the tuple to its independent
+registered anchor, allowing reader/candidate snapshots to outlive Backend closure.
+Native/kernel owner ABI epochs are 138/198.
+
+Debug and ReleaseFast qualification passed. Batch fixtures now install through the actual Backend
+method and own their live roots there, for file/shared-memory sources and pinned
+one/three/eight generations. The mutex probe rejects cooperative checkpoints,
+checks failure leaves the old tuple/generation intact and confirms WAL debt is
+unchanged. A fully prepared sibling loses the actual Backend installation race.
+Backend closure owns final tuple return rather than fixture header detachment.
+Full refusal/retry and exhausted-allocation sweeps cover the new ownership path.
+These synthetic metadata fixtures do not qualify durable SST/manifest I/O. Normal
+flush/compaction driver adoption, legacy migration, durable completion/deletion
+and the remaining full-design defaults remain required. Full GNU qualification
+remains waived and the full goal remains active.
+
+The first optimized revision exposed the fixture's preexisting empty legacy
+directory cache. Bootstrap now validates that cache contains no nodes/spares and
+that its unfunded accounts are exclusively held by its own six fields. Candidate
+preparation conservatively reserves the header and up to six empty accounts
+before source capture. Only a successful swap transfers that header into the
+registered displaced-root reclaimer; failure leaves legacy ownership intact.
+Shared legacy accounts and nonempty legacy state cannot silently transfer.
+Unused bootstrap headroom stays reserved through final candidate retirement.
+The focused Debug baseline passes after this correction. Final fixtures seed an
+exclusive empty account, reject an extra alias, and retain a normal admitted read
+across installation to check cached-epoch invalidation and old-source stability.
+Initial failed qualification and focused diagnostic source/command receipts are
+preserved. Full qualification of the corrected revision passes as recorded below.
+
+Final ownership/install receipts `backend-publication-install-v3-debug` and
+`backend-publication-install-v3-fast` each pass all five commands on identical,
+unchanged 5,664-file input maps. Both primary builds complete 72/72 steps and
+69/69 tests (53 ownership and 16 ABI), with six legacy read-metadata cases and
+the 4/45/1/8 Bloom/error companions. No executed case fails, skips or leaks.
+The separate focused Debug matrix passes all four batch cases; its diagnostic
+command accidentally executed a duplicate pass, which adds no coverage claim.
+Initial optimized failures and focused Debug diagnostics establish the empty
+legacy-cache ownership correction rather than hiding the mismatch. Final tests
+cover an exclusive empty legacy account, refusal while an extra alias exists,
+normal admitted readers pinned across installation, closing/read-only rejection,
+stale prepared siblings, original refusals/retries and exhausted allocation
+cleanup. Formatting, license and whitespace checks pass. All changed sources and
+qualification receipts are preserved. The normal durable producer drivers and
+remaining full-design defaults are still required; full GNU qualification remains
+waived and the full goal remains active.

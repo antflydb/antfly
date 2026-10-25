@@ -1802,6 +1802,9 @@ pub const Backend = struct {
     bulk_snapshot_unshared_bytes: u64 = 0,
     closing: std.atomic.Value(bool) = .init(false),
     recovery_replaying_wal: bool = false,
+    // Exclusive coupled ownership; runs/directory/obsolete fields are views
+    // while this tuple has a seal. Legacy roots retain their existing owners.
+    registered_publication: @import("lsm_backend/registered_publication.zig").Roots = .{},
     runs: RunStore = .{ .destroy_run = destroyOwnedRun },
     read_version: ?*runtime_mod.ReadVersion = null,
     run_directory: ?*RunDirectory = null,
@@ -7098,6 +7101,7 @@ pub const Backend = struct {
             store.deinit(self.allocator);
             self.allocator.destroy(store);
         }
+        self.retireRegisteredPublication();
         self.manifest_journal.deinit(self.allocator);
         if (self.manifest_directory) |directory| directory.destroy(self.allocator);
         self.manifest_directory = null;
@@ -7495,6 +7499,44 @@ pub const Backend = struct {
         const Publication = @import("lsm_backend/registered_publication.zig");
         if (self.run_directory_generation != generation or (self.run_directory_dirty and roots.seal != null) or !Publication.matchesBackend(roots, self)) return error.CompactionPlanningStale;
         try frame.validateCapturedSourceWithAdmission(roots, original);
+    }
+
+    /// Caller owns the publication lane and completed output obligations. This
+    /// fixed tail installs metadata only; manifest/WAL durability debt remains
+    /// outstanding for the owning driver. Legacy nonempty roots cannot be
+    /// silently adopted into the coupled ownership model.
+    pub fn installRegisteredPublicationWithAdmission(self: *Backend, frame: *@import("lsm_backend/registered_publication.zig").Candidate, original: read_admission.Port) !void {
+        try original.checkLifetime();
+        if (self.closing.load(.acquire)) return error.BackendClosing;
+        if (self.options.backend.read_only) return error.ReadOnly;
+        try self.validateCapturedPublicationWithAdmission(frame, &self.registered_publication, original);
+        const legacy_empty = if (self.registered_publication.seal == null) self.run_directory else null;
+        try frame.publishFixedWithAdmission(&self.registered_publication, original);
+        if (legacy_empty) |directory| frame.adoptEmptyLegacyDirectory(directory);
+        // The swap cannot refuse from here onward. Old roots moved into the
+        // registered frame; none enters the legacy per-root retirement queues.
+        self.invalidateReadVersion();
+        self.runs = self.registered_publication.writer.?.*;
+        self.run_directory = self.registered_publication.directory;
+        self.obsolete_paths = self.registered_publication.obsolete;
+        self.run_directory_dirty = false;
+        self.manifest_dirty = true;
+        self.obsolete_manifest_dirty = true;
+        self.obsolete_reclaim_retry_at_ns = 0;
+        self.cached_maintenance_hint.store(1, .release);
+        frame.requestRetirement();
+    }
+    /// Joined Backend teardown drops only views before returning the exclusive
+    /// tuple to its independent anchor. Reader/candidate snapshots may outlive
+    /// this Backend; physical destruction and accounting release stay registered.
+    fn retireRegisteredPublication(self: *Backend) void {
+        if (self.registered_publication.seal == null) return;
+        const Publication = @import("lsm_backend/registered_publication.zig");
+        std.debug.assert(Publication.matchesBackend(&self.registered_publication, self));
+        self.run_directory = null;
+        self.runs = .{ .destroy_run = destroyOwnedRun };
+        self.obsolete_paths = .{};
+        self.registered_publication.retire();
     }
 
     pub const PublicationResources = @import("lsm_backend/publication_resources.zig").Owner;
