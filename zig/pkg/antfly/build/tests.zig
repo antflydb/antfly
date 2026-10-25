@@ -2783,6 +2783,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const unit_test_step = b.step("antfly-unit-test", "Run hermetic unit and focused integration test buckets without metadata chaos simulations");
     unit_test_step.dependOn(&b.top_level_steps.get("aws-credentials-test").?.step);
+    unit_test_step.dependOn(&b.top_level_steps.get("antfly-google-embedding-catalog-test").?.step);
     unit_test_step.dependOn(&b.top_level_steps.get("embedded-package-test").?.step);
     unit_test_step.dependOn(&run_secret_backend_tests.step);
 
