@@ -3645,6 +3645,7 @@ fn semanticProducerComparisonConfigJsonAlloc(
         model: []const u8,
         url: ?[]const u8,
         region: ?[]const u8 = null,
+        location: ?[]const u8 = null,
         project_id: ?[]const u8 = null,
         request_format: ?[]const u8 = null,
         task_encoding: ?[]const u8 = null,
@@ -3665,11 +3666,17 @@ fn semanticProducerComparisonConfigJsonAlloc(
     if (object.get(legacy_identity_multimodal_field)) |field| {
         if (field != .bool) return error.InvalidEmbeddingArtifactProducer;
     }
+    // The identity uses a provider-neutral region field; execution uses the
+    // provider's own configuration spelling. Never re-resolve a pinned Vertex
+    // location from the comparison process's environment.
+    const pinned_region = try optionalString(object, "region");
+    const vertex = std.mem.eql(u8, provider.string, "vertex");
     return try std.json.Stringify.valueAlloc(alloc, SemanticExecutionConfig{
         .provider = provider.string,
         .model = model.string,
         .url = if (embedded) null else endpoint.string,
-        .region = try optionalString(object, "region"),
+        .region = if (vertex) null else pinned_region,
+        .location = if (vertex) pinned_region else null,
         .project_id = try optionalString(object, "project_id"),
         .request_format = try optionalString(object, "request_format"),
         .task_encoding = try optionalString(object, "task_encoding"),
@@ -10855,4 +10862,38 @@ pub fn testRetainedTextGenerationLease() !void {
     try std.testing.expectError(error.EnrichmentSourceChanged, provider.requireTextGeneration(a, "semantic_idx", generation));
     try std.testing.expectError(error.InferenceCapabilitiesStale, leased.embedDenseBatch(a, "semantic_idx", &.{"hello"}, 1));
     try std.testing.expectEqual(@as(usize, 1), local.calls);
+}
+
+test "Google canonical Vertex artifact identities retain their pinned execution location" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "global", "us", "eu", "us-central1" }) |location| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a,
+            \\{"owner":{"type":"embeddings","field":"body","dimension":3072,"embedding_name":"dense","embedder":{"provider":"vertex","model":"gemini-embedding-2","project_id":"project","location":"global","request_format":"embed_content","task_encoding":"prompt"}},"enrichments":[{"name":"dense","kind":"embedding","field":"body","expected_dims":3072}]}
+        , .{});
+        defer parsed.deinit();
+        const owner = parsed.value.object.getPtr("owner").?;
+        try owner.object.getPtr("embedder").?.object.put(parsed.arena.allocator(), "location", .{ .string = location });
+        if (std.mem.eql(u8, location, "us-central1")) {
+            const config = &owner.object.getPtr("embedder").?.object;
+            try config.put(parsed.arena.allocator(), "model", .{ .string = "gemini-embedding-001" });
+            try config.put(parsed.arena.allocator(), "request_format", .{ .string = "predict" });
+            try config.put(parsed.arena.allocator(), "task_encoding", .{ .string = "task_type" });
+        }
+        const identity = try embeddingSemanticProducerJsonAlloc(a, owner.*);
+        defer a.free(identity);
+        try owner.object.put(parsed.arena.allocator(), "semantic_producer", .{ .string = identity });
+        try parsed.value.object.getPtr("enrichments").?.array.items[0].object.put(parsed.arena.allocator(), "producer_json", .{ .string = identity });
+        const raw = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+        defer a.free(raw);
+        var managed = try ManagedEmbedder.initFromIndexesJson(a, raw);
+        defer managed.deinit();
+        try std.testing.expectEqualStrings(location, managed.entries[0].location);
+        var producer = try std.json.parseFromSlice(std.json.Value, a, identity, .{});
+        defer producer.deinit();
+        const comparison = (try semanticProducerComparisonConfigJsonAlloc(a, producer.value)).?;
+        defer a.free(comparison);
+        var config = try embeddings_types.parseConfigFromSlice(a, comparison);
+        defer config.deinit(a);
+        try std.testing.expectEqualStrings(location, config.location);
+    }
 }

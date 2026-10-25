@@ -243,7 +243,9 @@ New Gemini and Vertex index configurations resolve to `gemini-embedding-2`,
 `request_format: "embed_content"`, and `task_encoding: "prompt"` at creation.
 Vertex defaults to the `global` endpoint. These resolved settings are stored in
 the catalog and semantic producer identity; existing indexes keep their previous
-protocol and task representation on reload. Changing model, protocol, or task
+protocol and task representation on reload. Artifact producer reconstruction
+uses the pinned Vertex location rather than the worker's process location.
+Changing model, protocol, or task
 encoding requires a new vector space and re-embedding.
 
 The transport is explicit rather than inferred from model names. For legacy
@@ -326,7 +328,9 @@ Budget exhaustion must reject/throttle or report incomplete results, never a
 false complete no-match. Explorer validation alone is not this qualification.
 The explorer rejects excess search/status/PDF requests with HTTP 429 and
 `Retry-After` once four requests are active per process; its health route remains
-available. Cloud Run's replica cap bounds aggregate concurrency. This does not
+available. Browser cancellation and request deadlines propagate to upstream
+Antfly operations and GCS reads, allowing cancelled requests to release admission
+slots promptly. Cloud Run's replica cap bounds aggregate concurrency. This does not
 substitute for direct Cloud API admission controls.
 
 ```sh

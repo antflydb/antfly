@@ -40,7 +40,7 @@ func waitCmd(args []string) error {
 	client := &http.Client{Timeout: time.Minute}
 	target := strings.TrimRight(*endpoint, "/") + "/tables/" + url.PathEscape(*table) + "/indexes/" + url.PathEscape(*index)
 	for {
-		raw, err := corpusRequest(client, "GET", target, nil)
+		raw, err := corpusRequestWithContext(ctx, client, "GET", target, nil)
 		if err != nil {
 			return err
 		}

@@ -18,6 +18,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -485,7 +486,11 @@ func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string
 }
 
 func corpusRequest(client *http.Client, method, endpoint string, body any) (json.RawMessage, error) {
-	data, err := corpusRawRequest(client, method, endpoint, body)
+	return corpusRequestWithContext(context.Background(), client, method, endpoint, body)
+}
+
+func corpusRequestWithContext(ctx context.Context, client *http.Client, method, endpoint string, body any) (json.RawMessage, error) {
+	data, err := corpusRawRequestContext(ctx, client, method, endpoint, body, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -513,6 +518,10 @@ func corpusRawRequest(client *http.Client, method, endpoint string, body any) ([
 	return corpusRawRequestWithHeaders(client, method, endpoint, body, nil)
 }
 func corpusRawRequestWithHeaders(client *http.Client, method, endpoint string, body any, headers *http.Header) ([]byte, error) {
+	return corpusRawRequestContext(context.Background(), client, method, endpoint, body, headers)
+}
+
+func corpusRawRequestContext(ctx context.Context, client *http.Client, method, endpoint string, body any, headers *http.Header) ([]byte, error) {
 	var reader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -521,7 +530,7 @@ func corpusRawRequestWithHeaders(client *http.Client, method, endpoint string, b
 		}
 		reader = bytes.NewReader(data)
 	}
-	req, err := http.NewRequest(method, endpoint, reader)
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
 	if err != nil {
 		return nil, err
 	}

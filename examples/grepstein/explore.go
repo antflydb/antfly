@@ -92,7 +92,7 @@ func explorerHandlerWithStorage(tableURL string, client *http.Client, bucket str
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		raw, err := corpusRequest(client, "POST", tableURL+"/query", payload)
+		raw, err := corpusRequestWithContext(r.Context(), client, "POST", tableURL+"/query", payload)
 		if err != nil {
 			http.Error(w, "Search unavailable; check index coverage and server logs", 502)
 			return
@@ -101,7 +101,7 @@ func explorerHandlerWithStorage(tableURL string, client *http.Client, bucket str
 		w.Write(raw)
 	})
 	mux.HandleFunc("GET /api/status", func(w http.ResponseWriter, r *http.Request) {
-		raw, err := corpusRequest(client, "GET", tableURL, nil)
+		raw, err := corpusRequestWithContext(r.Context(), client, "GET", tableURL, nil)
 		if err != nil {
 			http.Error(w, "Status unavailable", 502)
 			return
@@ -115,7 +115,7 @@ func explorerHandlerWithStorage(tableURL string, client *http.Client, bucket str
 			http.Error(w, "Invalid document", 400)
 			return
 		}
-		raw, err := corpusRequest(client, "GET", tableURL+"/documents/"+url.PathEscape(id), nil)
+		raw, err := corpusRequestWithContext(r.Context(), client, "GET", tableURL+"/documents/"+url.PathEscape(id), nil)
 		if err != nil {
 			http.NotFound(w, r)
 			return
