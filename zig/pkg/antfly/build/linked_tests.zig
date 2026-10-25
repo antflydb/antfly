@@ -47,14 +47,6 @@ pub fn add(b: *std.Build, options: std.Build.TestOptions) Artifact {
     var clones = std.AutoHashMap(*std.Build.Module, *std.Build.Module).init(b.allocator);
     object_options.root_module = splitNativeSources(b, options.root_module, module, options.name, &clones);
     const object = b.addTest(object_options);
-    const target = options.root_module.resolved_target.?.result;
-    if (b.graph.host.result.os.tag == .macos and target.os.tag == .macos and target.cpu.arch == b.graph.host.result.cpu.arch) {
-        // Native final links cannot synthesize Zig's compiler and C/ObjC
-        // sanitizer runtimes. Keep Debug checks owned by the entry object,
-        // including checks emitted by the separately compiled providers.
-        object.bundle_compiler_rt = true;
-        object.bundle_ubsan_rt = true;
-    }
     module.addObject(object);
     const executable = b.addExecutable(.{ .name = options.name, .root_module = module, .use_llvm = object_options.use_llvm });
     return .{ .object = object, .executable = executable };
