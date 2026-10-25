@@ -779,3 +779,36 @@ test("decoded manifest reuse retains fresh WAL visibility and retirement-floor c
  await transport({op:"put",bucket:"database",key:"scope/progress/tenant/table/incarnation1/MANIFEST_GC_FLOOR"},new TextEncoder().encode("999"));
  await assert.rejects(host.request(request("lookup",{doc_id:"cached"})),/ManifestVersionRetired/);
 });
+
+
+test('native exact scan survives host eviction and publication while preserving the original top-k',async()=>{
+ const {host,bucket}=await setup();
+ await host.request(request('mutate',{paged_text:true,paged_projections:true,operation_id:'exact-seed',mutations:Array.from({length:48},(_,i)=>({kind:'upsert',doc_id:'item/'+i,body:JSON.stringify({text:'exact',embedding:[1,i/48,0,0]})}))}));
+ for(let i=0;i<10;i++)if(!(await host.request(request('publish',{paged_text:true,paged_projections:true,publication_records:16}))).has_more)break;
+ const input={mode:'vector',vector:[1,0,0,0],limit:5,search_effort:1};
+ const expected=await host.request(request('search',input));
+ let step=await host.request(request('search',{...input,exact_scan:true,exact_records:7}));
+ assert.equal(step.complete,false);assert.deepEqual(step.hits,[]);assert.equal(step.step_records,7);
+ const initial=structuredClone(step.exact_state);
+ await host.request(request('mutate',{operation_id:'exact-update',mutations:[{kind:'delete',doc_id:'item/0'}]}));
+ await host.request(request('publish',{paged_text:true,paged_projections:true,publication_records:16}));
+ let steps=1;
+ while(!step.complete){const reopened=await setup(bucket);step=await reopened.host.request(request('search',{...input,exact_scan:true,exact_records:7,exact_state:step.exact_state}));assert.ok(step.step_records<=7);assert.ok(step.page_reads<=128);assert.ok(step.scan_read_bytes<=4*1024*1024);assert.ok(++steps<20);}
+ assert.deepEqual(step.hits.map(h=>h.doc_id),expected.hits.map(h=>h.doc_id));assert.equal(step.visibility,expected.visibility);
+ const replay=await setup(bucket);const repeated=await replay.host.request(request('search',{...input,exact_scan:true,exact_records:7,exact_state:initial}));
+ assert.equal(repeated.exact_state.scanned,'14');
+ await assert.rejects(replay.host.request(request('search',{...input,vector:[0,1,0,0],exact_scan:true,exact_records:7,exact_state:initial})),/ExactScanBindingMismatch/);
+ await bucket.put('scope/progress/tenant/table/incarnation1/MANIFEST_GC_FLOOR',new TextEncoder().encode('999'));
+ await assert.rejects(replay.host.request(request('search',{...input,exact_scan:true,exact_records:7,exact_state:initial})),/ManifestVersionRetired/);
+});
+
+
+test('native exhaustive scan ranks the stored FP32 values across an FP16 near tie',async()=>{
+ const {host}=await setup();
+ await host.request(request('mutate',{operation_id:'precision',mutations:[{kind:'upsert',doc_id:'a',body:JSON.stringify({embedding:[1,1.0002]})},{kind:'upsert',doc_id:'z',body:JSON.stringify({embedding:[1,1.0001]})}]}));
+ await host.request(request('publish',{paged_text:true,paged_projections:true,publication_records:16}));
+ let state=null,result;
+ do{result=await host.request(request('search',{mode:'vector',vector:[1,0],limit:1,search_effort:1,exact_scan:true,exact_records:1,exact_state:state}));state=result.exact_state;}while(!result.complete);
+ assert.equal(result.hits[0].doc_id,'z');
+ const score=1/Math.hypot(1,Math.fround(1.0001));assert.ok(Math.abs(result.hits[0].distance-(1-score))<1e-6);
+});

@@ -19,6 +19,7 @@ test {
     _ = @import("serverless/sparse_segment/paged.zig");
     _ = @import("serverless/vector_segment/paged.zig");
     _ = @import("serverless/query/top_docs.zig");
+    _ = @import("serverless/query/exact_scan.zig");
     _ = @import("serverless/build/external_source_plan_resolver.zig");
     _ = @import("serverless/build/external_source_publish.zig");
     _ = @import("serverless/build/external_source_read_authority.zig");

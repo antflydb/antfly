@@ -27,6 +27,7 @@ import {createImmutableReadCache} from "../../../zig/lib/objectstore/wasm/cache.
 
 const deterministic=process.argv.includes("--deterministic");let fixtureRandom=1;
 if(deterministic){const secure=globalThis.crypto;Object.defineProperty(globalThis,"crypto",{value:new Proxy(secure,{get(target,key){if(key==="getRandomValues")return bytes=>{for(let i=0;i<bytes.length;i++){fixtureRandom^=fixtureRandom<<13;fixtureRandom^=fixtureRandom>>>17;fixtureRandom^=fixtureRandom<<5;bytes[i]=fixtureRandom&255;}return bytes;};const value=target[key];return typeof value==="function"?value.bind(target):value;}})});}
+const exactContinuations = process.argv.includes("--exact-continuations");
 const reindex = process.argv.includes("--reindex");
 const recallQueries = Number(process.argv.find(arg => arg.startsWith("--recall-queries="))?.slice(17) ?? 0);
 if (!Number.isSafeInteger(recallQueries) || recallQueries < 0 || recallQueries > 20) throw new Error("recall-queries must be 0..20");
@@ -73,7 +74,7 @@ const bytes = await readFile(wasmPath??new URL("../dist/antfly-serverless.wasm",
 const module = await WebAssembly.compile(bytes);
 const readerPath=process.argv.find(arg=>arg.startsWith("--reader-wasm="))?.slice(14),readerBytes=readerPath?await readFile(readerPath):null,readerModule=readerBytes?await WebAssembly.compile(readerBytes):null;
 const reads=new Set(["lookup","list","count","status","search","latest"]);
-const report = {reader_wasm_sha256:readerBytes?createHash("sha256").update(readerBytes).digest("hex"):null,reader_working_set_bytes:readerBytes?8*1024*1024:null,deterministic_fixture:deterministic,profile: "local native WASM/R2 contract fixture", wasm_sha256: createHash("sha256").update(bytes).digest("hex"),
+const report = {reader_wasm_sha256:readerBytes?createHash("sha256").update(readerBytes).digest("hex"):null,reader_working_set_bytes:readerBytes?8*1024*1024:null,exact_continuations:exactContinuations,deterministic_fixture:deterministic,profile: "local native WASM/R2 contract fixture", wasm_sha256: createHash("sha256").update(bytes).digest("hex"),
   embedding_fixture_sha256:embeddingBytes?createHash("sha256").update(embeddingBytes).digest("hex"):null, embedding_model:embeddingFixture?.model??null, timestamp: new Date().toISOString(), max_put_bytes: maxPutBytes, compaction_max_documents: maxCompactionDocuments, recycle_at_bytes: recycleAtBytes,
   publication_records: publicationRecords, reindex, recall_queries: recallQueries, paged_projections: pagedProjections, dimensions: pagedProjections ? dimensions : null, paged_text: pagedText, body_bytes: bodyBytes, clock: deterministic?"logical per-request fixture clock":"monotonic epoch fixture", total_isolate_memory: null, cases: []};
 for (const count of sizes) {
@@ -105,8 +106,19 @@ for (const count of sizes) {
   async function call(op, fields = {}) {
     const role=readerModule&&reads.has(op)?"reader":"builder";if(role!==hostRole){hostRole=role;host=null;}
     if (!host) await reopen(false);
-    try { return await host.request({op, bucket: "database", prefix: "benchmark", namespace: `capacity/${count}`, paged_text: pagedText, paged_projections: pagedProjections, ...(hostRole==="reader"?{working_set_bytes:8*1024*1024}:{}), ...fields}); }
+    const scan=exactContinuations&&op==="search"&&fields.mode==="vector"&&fields.search_effort===1;
+    if(scan)fields={...fields,exact_scan:true};
+    let result;
+    for(let step=0;step<10000;step++){
+    if(!host)await reopen(false);
+    try { result=await host.request({op, bucket: "database", prefix: "benchmark", namespace: `capacity/${count}`, paged_text: pagedText, paged_projections: pagedProjections, ...(hostRole==="reader"?{working_set_bytes:8*1024*1024}:{}), ...fields}); }
     finally { fixtureTick++;if (recycleAtBytes && host.memoryBytes() >= recycleAtBytes) { host = null; recycled++; } }
+    if(!scan||result.complete===true)return result;
+    assert.equal(result.complete,false);assert.deepEqual(result.hits,[]);assert.ok(result.exact_state);assert.ok(result.page_reads<=128);assert.ok(result.scan_read_bytes<=4*1024*1024);assert.ok(result.step_records<=512);
+    if(fields.exact_state)assert.ok(BigInt(result.exact_state.scanned)>BigInt(fields.exact_state.scanned));
+    fields={...fields,exact_state:result.exact_state};
+    }
+    throw Error("bounded exact scan did not finish");
   }
   async function stage(name, body) {
     group = {name, samples: []};

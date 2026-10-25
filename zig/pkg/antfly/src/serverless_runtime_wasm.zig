@@ -148,6 +148,9 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         fresh: bool = false,
         required_visibility: ?[]const u8 = null,
         cursor: ?[]const u8 = null,
+        exact_scan: bool = false,
+        exact_state: ?@import("serverless/query/exact_scan.zig").State = null,
+        exact_records: usize = 512,
         doc_id: []const u8 = "",
         text: []u8 = &.{},
         limit: usize = 10,
@@ -356,7 +359,13 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     }
     if (req.op == .search and req.mode != .text) {
         if (req.filters.len != 0) return error.FreshQueryCapabilityUnsupported;
-        var session = try runtime.openHeadSessionWithCancellation(req.namespace, cancellation);
+        if (req.exact_scan and (req.mode != .vector or req.search_effort == null or req.search_effort.? != 1)) return error.ExactScanCapabilityUnsupported;
+        if (!req.exact_scan and req.exact_state != null) return error.InvalidExactScanState;
+        const exact = @import("serverless/query/exact_scan.zig");
+        var session = if (req.exact_scan and req.exact_state != null)
+            try runtime.openVersionSessionWithCancellation(req.namespace, try exact.generation(req.exact_state.?), cancellation)
+        else
+            try runtime.openHeadSessionWithCancellation(req.namespace, cancellation);
         defer session.deinit();
         const visibility = @import("serverless/visibility.zig");
         if (req.required_visibility) |text| {
@@ -366,6 +375,15 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         if (req.fresh and try wal.latestLsn(req.namespace) != session.manifest.wal_end_lsn) return error.IndexPublicationPending;
         const pending = try pendingEmbeddings(a, &session);
         if ((req.fresh or req.required_visibility != null) and pending != 0) return error.EmbeddingPending;
+        if (req.exact_scan) {
+            if (req.exact_records == 0 or req.exact_records > 512) return error.QueryCandidateBudgetExceeded;
+            var step = try exact.scan(a, &session, req.vector orelse return error.VectorQueryRequired, req.limit, req.exact_state, req.exact_records);
+            defer step.deinit(a);
+            const hits = if (step.complete) try exact.materialize(a, &session, step.state.top) else try a.alloc(@import("serverless/query/request.zig").SearchHit, 0);
+            defer @import("serverless/query/request.zig").freeHits(a, hits);
+            try session.checkCancellation();
+            return std.json.Stringify.valueAlloc(a, .{ .hits = hits, .complete = step.complete, .exact_state = if (step.complete) null else step.state, .step_records = step.step_records, .page_reads = step.page_reads, .scan_read_bytes = step.read_bytes, .scanned = step.state.scanned, .generation = step.state.generation, .visibility = visibility.Token.init(req.namespace, session.manifest.wal_end_lsn).encode(), .embeddings_ready = pending == 0 }, .{});
+        }
         const hits = try @import("serverless/query/indexed_reader.zig").searchAlloc(a, &session, .{ .text = req.text, .vector = req.vector, .sparse = req.sparse, .mode = req.mode, .limit = req.limit, .num_probes = req.num_probes, .coarse_probes = req.coarse_probes, .search_effort = req.search_effort });
         defer @import("serverless/query/request.zig").freeHits(a, hits);
         return std.json.Stringify.valueAlloc(a, .{ .hits = hits, .visibility = visibility.Token.init(req.namespace, session.manifest.wal_end_lsn).encode(), .embeddings_ready = pending == 0 }, .{});

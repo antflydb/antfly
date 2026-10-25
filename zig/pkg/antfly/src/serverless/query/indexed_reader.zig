@@ -576,7 +576,7 @@ pub fn resolveTextArtifactIndex(
     return session.findArtifactIndex(.text_segment) orelse error.TextSegmentNotFound;
 }
 
-fn resolveVectorArtifactIndex(
+pub fn resolveVectorArtifactIndex(
     session: *runtime_mod.QuerySession,
     req: query_request.QueryRequest,
 ) !usize {
@@ -1413,7 +1413,7 @@ fn similarityForMetric(lhs: []const f32, rhs: []const f32, metric: vector_types.
     };
 }
 
-fn similarityForQuery(
+pub fn similarityForQuery(
     query: []const f32,
     query_measure: f32,
     candidate: []const f32,
@@ -1547,9 +1547,11 @@ fn optimisticScoreCannotBeatFloor(
     return scoreFromSimilarity(vector_types.similarityFromDistance(optimistic_distance, metric)) < scored[needed - 1].score;
 }
 
-fn scoreFromSimilarity(similarity: f32) u32 {
+pub fn scoreFromSimilarity(similarity: f32) u32 {
     if (similarity <= 0) return 0;
-    const scaled = @min(similarity * 1000.0, @as(f32, @floatFromInt(std.math.maxInt(u32))));
+    const scaled = similarity * 1000.0;
+    // maxInt(u32) rounds up in f32; clamp before converting that endpoint.
+    if (scaled >= @as(f32, @floatFromInt(std.math.maxInt(u32)))) return std.math.maxInt(u32);
     return @intFromFloat(scaled);
 }
 

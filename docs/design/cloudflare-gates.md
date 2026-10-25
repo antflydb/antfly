@@ -240,38 +240,78 @@ budgets or cache policy. Repeat both profiles after a fix. Do not trade away
 fencing, durable acknowledgements, recall or memory bounds to move the boundary.
 
 
-## Exhaustive vector scale boundary
+## Bounded exhaustive vector search
 
-A further 50,000-document fixture reaches the single-request object-I/O ceiling
-for full-effort vector search. Paged query memory alone does not bound total
-network traffic: exhaustive search must inspect every exact candidate and can
-exceed 32 MiB or the operation count even while remaining inside 8 MiB of reader
-working memory. The existing approximate paths do not remove that exact-control
-requirement. Raising the request budget would hide the boundary.
+The split R2 app routes vector `search_effort: 1` through the native exact-scan
+kernel when `PAGED_PROJECTIONS=true`. Approximate searches keep their existing
+route selection. The scan consumes the FP32 exact-vector tree directly, rather
+than treating FP16 cluster payloads as the precision oracle. A near-tie regression
+checks a case in which FP16 rounding collapses distinct vectors.
 
-The long-term implementation needs an explicitly resumable native exhaustive
-search. It is outstanding work, not an implemented capability:
+Each native step reopens the same immutable generation, validates its retirement
+floor and acquires its normal read protection. State binds namespace, vector,
+limit, selected index checksum, generation and published visibility cutoff. An
+exclusive 36-byte tree key plus a decimal visited-record count defines progress.
+Completion requires covering the root's full record count. Later publication
+cannot rebase a resumed query. `fresh` is checked on initial capture; resuming
+continues that captured view. Required visibility still must fit the captured
+published prefix, and pending embeddings fail the existing readiness checks.
 
-- Bind a continuation to tenant scope, immutable generation, query/index identity,
-  visibility cutoff and an exclusive scan position. Establish and validate its
-  generation protection before scanning; never silently rebase onto a new head.
-- Scan a bounded range of exact vector pages and retain a bounded top-k heap.
-  Carry only the scan position and heap across steps, with authenticated server
-  capabilities or coordinator-owned opaque state. Caller-supplied unverified
-  scores cannot stand in for completed native work.
-- Bound bytes, operations, elapsed time and candidates in each step. Release the
-  reader slot between steps so large scans do not monopolize foreground readers.
-  Cancellation and expiry must release/reclaim their protection.
-- Validate retirement, namespace/query identity and protection on every resume.
-  A complete result requires contiguous coverage through the end of the frozen
-  generation. Return explicit incomplete/continuation state until that point.
-- Compare the final native top-k with an independent brute-force oracle at
-  50,000 documents. Inject head changes, retirement, actor restart, expired
-  protection, cancellation, duplicate resumes and tampered continuation state.
-  Report aggregate physical I/O across all steps and per-step resource maxima.
+The native top-k is an owned worst-first heap with a bounded identity map.
+Multiple projections of one document retain its best exact distance across all
+steps. Both heap and map have at most `k` entries (`1..100`), and retained IDs
+have an additional byte bound. Ranking preserves the native positive-similarity predicate and exact-distance
+tie breaking. Updates cost O(log k), with O(1) expected identity lookup. Scanning remains O(N*d), and final body materialization occurs
+only after full coverage. Final materialized bodies are capped at 1 MiB.
 
-This preserves exactness and bounded admission. It does not make exhaustive work
-sublinear. Packed/range reads and better approximate routing can reduce request
-amplification separately, with measured recall/byte comparisons. The fixed gate's
-current smaller exhaustive controls can pass without claiming this larger case
-is solved.
+A step admits at most 512 records, further reduced by dimensions toward 1 MiB of
+raw vectors. It has a 4 MiB root/page-read allowance, at most 128 page reads and
+a cooperative one-second scan-loop elapsed target. Budget exhaustion after progress yields
+an exclusive continuation; failure before progress remains an explicit error.
+The usual 8 MiB reader working set, 32 MiB transport limit and 1,024-operation
+limit remain. The runtime also bounds each native step to five seconds. There is
+no cumulative budget reset inside a native request.
+
+The app orchestrates distinct reader RPCs, releasing actor/kernel admission after
+each step. It defaults to at most four inline steps and a one-second inline
+window, tested between steps. Otherwise the response is explicitly incomplete:
+
+```json
+{"complete":false,"hits":[],"cursor":"opaque authenticated continuation"}
+```
+
+Clients resubmit the same query with `cursor` until `complete: true`. Partial
+candidate heaps are never presented as hits. The cursor carries bounded native
+state, protected by HMAC-SHA-256 over the protocol, tenant, public query identity,
+expiry and state. Verification precedes any read RPC. Private `exact_scan`,
+`exact_state` and `exact_records` input fields are rejected by the public app.
+The native scan ABI is a trusted host interface; it does not authenticate callers.
+
+`EXACT_SCAN_CURSOR_KEY` can supply a dedicated app-only signing secret. Otherwise
+the existing operator `API_TOKEN` signs a protocol-scoped payload. Secret rotation
+invalidates old cursors. Payloads are capped at 128 KiB; tokens authenticate but
+do not encrypt their state. Store them as sensitive query capabilities. No
+account credential is placed in a cursor or sent to a private reader.
+
+The idle validity window is four minutes, renewed only by a successful progress
+step, with a fixed one-hour absolute lifetime. Every step obtains fresh generation
+protection; the idle window stays below the normal minimum read-pin lifetime.
+Expiry, retirement and cancellation fail closed. Duplicate resumes are safe,
+recomputing the same immutable range. There are no per-query durable job records,
+leases or cleanup queues; existing shared read pins expire under normal collection
+policy. Cancellation does not remove another reader's shared pin.
+
+App knobs `EXACT_SCAN_INLINE_STEPS` (1..8, default 4), `EXACT_SCAN_INLINE_MS`
+(0..2,000, default 1,000) and `EXACT_SCAN_RECORDS` (1..512, default 512) can lower
+or bound scheduling slices. They do not increase native resource maxima.
+
+Deploy compatible private reader/native code before enabling the new app code.
+The trusted native ABI adds optional scan fields; an old reader must fail closed
+rather than return approximate or partial results as exact answers.
+
+Use `benchmark.mjs --exact-continuations --reader-wasm=...` to exercise the new
+path. It records every native request's resource peaks and aggregates all scan
+steps in each recall query's physical GET/byte counts. FP32 exhaustive I/O must
+be reported separately from the old FP16 full-effort control; existing no-extra-
+I/O gate thresholds are not silently relaxed for the precision change. Local
+completion proves neither live latency nor the overall Cloudflare gate.

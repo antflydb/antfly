@@ -42,7 +42,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission) {
     // inside admission because their lifetime is only thirty seconds.
     if(!readAdmission&&env.COORDINATOR_BACKEND==="r2"&&!input.cursor&&["lookup","list","count","search","status","latest"].includes(input.op)){
       const physical={rpc_calls:1},started=performance.now();
-      try{const view=await trace.span("rpc:openReadView",()=>env.COMMITS.getByName(env.ANTFLY_INCARNATION).openReadView({trace_id:trace.id}));readAdmission={view,started,physical};}
+      try{const view=await trace.span("rpc:openReadView",()=>env.COMMITS.getByName(env.ANTFLY_INCARNATION).openReadView({trace_id:trace.id,...(input.exact_state?{version:input.exact_state.generation}:{})}));readAdmission={view,started,physical};}
       catch(error){if(!unsupportedRpc(error,"openReadView"))throw error;readAdmission={legacy:true,started,physical};}
       physical.rpc_wait_ms=performance.now()-started;
     }
@@ -111,9 +111,9 @@ async function run(env, input, signal, collection, host, trace,readAdmission) {
       return {json: await env.AI.run(env.EMBEDDING_MODEL, {text: request.texts}, {gateway: {id: env.AI_GATEWAY}})};
     };
     if(actorMutation){try{return await trace.span("writer_rpc",()=>stub.mutateBatch({...input,...settings,__trace_id:trace.id}));}catch(error){if(env.SPLIT_RUNTIME==="true"||!unsupportedRpc(error,"mutateBatch"))throw error;return await run({...env,COORDINATOR_RPC_FALLBACK:"true"},input,signal,collection);}}
-    const result=await lane.request({ ...input, ...settings, bucket: "database", prefix: "antfly", namespace: env.ANTFLY_INCARNATION }, { transport, signal, inference,
+    const result=await lane.request({ ...input, ...settings, bucket: "database", prefix: "antfly", namespace: env.ANTFLY_INCARNATION }, { transport, signal, inference,...(input.exact_scan?{deadlineMs:Date.now()+5000}:{}),
       onMetrics: metrics => {
-        emitOperationMetrics=()=>{if (env.LOG_METRICS === "true") console.log(JSON.stringify({event: "antfly.operation", trace_id:trace.id, op: input.op, role, ...metrics, operation_outcome:operationSucceeded?"ok":"error", operation_elapsed_ms:performance.now()-runtimeStarted, physical,
+        emitOperationMetrics=()=>{if (env.LOG_METRICS === "true") console.log(JSON.stringify({event: "antfly.operation", trace_id:trace.id, op: input.op, exact_scan:input.exact_scan===true, role, ...metrics, operation_outcome:operationSucceeded?"ok":"error", operation_elapsed_ms:performance.now()-runtimeStarted, physical,
           ...resources(),cache_retained_bytes: cache.retainedBytes(), wasm_linear_total_bytes: kernel?kernel.memoryBytes(): Object.values(lanes).reduce((sum, instance) => sum + (instance?.memoryBytes() ?? 0), 0)}));};
       } });
     if(preparedPublication){await rpc("finalizePublication",preparedPublication.batch(),{records:result.consumed_records??0,elapsed_ms:performance.now()-publicationStarted});publicationFinalized=true;}

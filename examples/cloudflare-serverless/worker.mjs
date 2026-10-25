@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {exactSearch,isExactSearch,rejectPrivateScanInput} from "./exact-search.mjs";
 import {IngressBudget} from "./ingress-budget.mjs";
 import {CriticalPath} from "./trace.mjs";
 import {tenantEnv,tenantEnvs} from "./tenants.mjs";
@@ -29,6 +30,10 @@ export { CommitCoordinator } from "./coordinator.mjs";
 const localRuntime=createRuntime();
 let admitted=0,readerCursor=0;const ingressBudget=new IngressBudget();
 async function run(env,input,signal,collection,trace){
+ if(isExactSearch(env,input))return exactSearch(env,input,next=>runStep(env,next,signal,collection,trace),{signal});
+ return runStep(env,input,signal,collection,trace);
+}
+async function runStep(env,input,signal,collection,trace){
  const read=["lookup","list","search","count","status","latest"].includes(input.op);
  const binding=read?env.READERS:env.BUILDERS;
  if(env.COORDINATOR_BACKEND==="r2"&&input.op!=="mutate"&&binding){
@@ -117,6 +122,7 @@ export default {
         return Response.json(result, env.WORKER_VERSION ? {headers: {"X-Antfly-Version": env.WORKER_VERSION.id}} : undefined);
       }
       if (!["mutate", "lookup", "list", "search", "count", "status", "publish", "compact", "enrich", "latest", "reindex"].includes(args.op)) return new Response("unsupported operation", { status: 400 });
+      rejectPrivateScanInput(args);
       const result = await trace.span("dispatch",()=>run(env, args, request.signal,undefined,trace));
       if (args.op === "reindex" && result.has_more && args.reindex_action !== "status") {
         try { result.maintenance_pending = !await enqueue(env, "reindex", result.job_id); }

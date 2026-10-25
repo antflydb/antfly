@@ -665,3 +665,30 @@ paired sealed deployments, fixed-arrival soak traffic, fresh physical recovery
 samples, exact body/receipt checks and content-addressed ANN/failure evidence.
 `qualification/evaluate-gate.mjs GATE_JSON` exits with status 2 while any required
 evidence or threshold is missing. A short smoke run cannot pass this gate.
+
+
+### Resumable exact vector search
+
+With the R2 backend and paged projections, vector `search_effort: 1` scans the
+stored FP32 vectors in bounded native steps. A response with `complete: false`
+has no final hits; resubmit the same query with its `cursor` until it completes:
+
+```js
+let cursor;
+let result;
+do {
+  result = await query({op: "search", mode: "vector", vector, limit: 10,
+    search_effort: 1, ...(cursor ? {cursor} : {})});
+  cursor = result.cursor;
+} while (!result.complete);
+console.log(result.hits);
+```
+
+The cursor fixes the original generation and visibility cutoff across publication
+and actor eviction. It has a four-minute idle window and one-hour absolute
+lifetime. Cancellation stops further steps; expired or retired snapshots require
+a new query. The app authenticates cursor state before dispatch and uses
+`EXACT_SCAN_CURSOR_KEY`, falling back to its existing operator `API_TOKEN`.
+Configure signing secrets through Worker secrets. Key rotation invalidates cursors.
+The [exact-scan design](../../docs/design/cloudflare-gates.md#bounded-exhaustive-vector-search)
+details admission limits and the FP32/FP16 comparison caveat.

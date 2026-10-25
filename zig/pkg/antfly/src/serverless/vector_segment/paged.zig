@@ -100,7 +100,7 @@ fn vectorValue(a: A, entry: segment.Entry) ![]u8 {
     }
     return value;
 }
-fn decodeVector(a: A, value: []const u8, dims: u32) !segment.Entry {
+pub fn decodeVector(a: A, value: []const u8, dims: u32) !segment.Entry {
     if (value.len < 8) return error.InvalidVectorValue;
     const id_len = std.mem.readInt(u32, value[0..4], .little);
     const count = std.mem.readInt(u32, value[4..8], .little);

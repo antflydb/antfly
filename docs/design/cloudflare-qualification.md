@@ -692,5 +692,64 @@ working set remains bounded. The old benchmark process returned zero despite a
 failed stage; this run's JSON retains the failure, and the corrected harness now
 exits nonzero and rejects such evidence. The passing gate ANN populations remain
 the separately validated 10,000 synthetic and 1,000 model document comparisons.
-The [gate design](cloudflare-gates.md#exhaustive-vector-scale-boundary) records the
+The [gate design](cloudflare-gates.md#bounded-exhaustive-vector-search) records the
 required continuation work; no request budget or recall target was increased.
+
+
+### Implemented FP32 exact continuations
+
+The next implementation closes the 50,000-vector single-request failure with a
+native, resumable FP32 scan and authenticated app continuations. The [protocol
+and client contract](cloudflare-gates.md#bounded-exhaustive-vector-search) describe
+snapshot protection, bounded heap/deduplication, expiry, cancellation and scheduling.
+No persisted artifact format, SQL table or per-query durable job is added.
+
+Validation passed 547 native tests (six skipped, no failures/leaks), 136 Node
+tests and five persisted Worker integration tests. Regressions include complete
+ranking over bounded ranges, multiple projections per document, allocation-failure
+cleanup, host/actor eviction, publication during a scan, retired generations,
+FP16 near-tie correction, cursor tampering/scope/query/expiry/key rotation,
+duplicate resumes, cancellation and foreground admission between scan steps.
+
+The deterministic 50,000-document fixture accepted and published every record.
+Cold text/vector/sparse reads, warm lookups, updates, deletion and compaction all
+passed. All ten held-out exhaustive queries matched the independent brute-force
+cosine oracle (recall@10 1.0), each using 98 native steps. The combined recall
+stage made 1,000 native requests: 980 exhaustive steps plus 20 approximate
+queries. Peak working/linear memory across that stage was 919,111 / 6,422,528
+bytes, and peak operations per request were 210. The native request guard retained
+its 32 MiB transfer and 1,024-operation caps; incomplete scan steps additionally
+asserted their 4 MiB page-read, 128-page and 512-record bounds. No request budget
+was increased. The fixture used the actual 16 MiB compact reader and 8 MiB working
+budget. The full module SHA-256 is
+`15c0e07e42f29cf4f01032eb25f0ad8a295e6bd0c9792ed2202905fe3b6dd94e`;
+the reader module is
+`07ea32c6bf0d1b6cae323e769ca4c4ae6db532549fa8b433f6bbf6ea642eb1e5`.
+
+| 50,000-document operating point | Recall@10 | Mean physical GETs | Mean bytes |
+| --- | --- | --- | --- |
+| 8 probes | 0.11 | 153.9 | 3,381,362 |
+| 32 probes | 0.27 | 205.9 | 5,820,066.7 |
+| FP32 exhaustive, all steps | 1.0 | 4,005.6 | 80,692,975 |
+
+Local ingest/publication took 882 seconds and the combined recall stage took
+17.6 seconds. These are object-fixture timings under concurrent local verification;
+they are not deployed latency, total isolate memory or causal performance gains.
+Exactness remains O(N*d), and the low approximate recall at this larger synthetic
+population is an additional measured quality limit rather than a production
+recommendation for those probe counts.
+
+An equal-settings 10,000-document comparison (384 dimensions, 1 KiB payload,
+publication prefix 64) confirmed unchanged approximate operating points:
+recall 0.39 / 0.80 at 8 / 32 probes, with exactly matching physical GET/byte counts.
+Both full controls returned recall 1.0, but the new FP32 exhaustive scan used
+825.7 GETs / 16,349,359.9 bytes versus the old FP16 control's 171.7 GETs /
+9,418,480.9 bytes. The frozen 1,000-model-embedding corpus also passed every stage
+and returned recall 1.0 at all three points. Its FP32 full control used 100.9 GETs /
+1,805,026.4 bytes; approximate counts stayed 40.9 GETs / 1,116,461.4 bytes.
+
+The larger scan failure is fixed. The original gate's no-extra-I/O condition is
+**not passed** by the FP32 full control, and its paired live trials/recovery
+populations remain outstanding. The precision distinction and added cumulative
+I/O are explicit; thresholds have not been relaxed. Prepared deployments must be
+resealed with the new native/host candidate before any live qualification.
