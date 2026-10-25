@@ -35,7 +35,7 @@ pub const Definition = struct {
         return a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
     }
 };
-const Head = struct { refs: u64, key_template: []const u8, suppress_json: []const u8 };
+const Head = struct { refs: u64, key_template: []const u8 };
 const Edge = struct { profile: []const u8, key: []const u8, target: []const u8 };
 fn headKey(a: A, root: []const u8, id: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a, "{s}profile/{s}", .{ root, id });
@@ -62,13 +62,18 @@ pub fn synchronize(a: A, txn: anytype, root: []const u8, before: []const Definit
         const id = entry.key_ptr.*;
         const key = try headKey(a, root, id);
         const old = txn.get(key) catch |err| if (err == error.NotFound) null else return err;
-        var head: Head = if (old) |raw| try std.json.parseFromSliceLeaky(Head, a, raw, .{}) else .{ .refs = 0, .key_template = definition.key_template, .suppress_json = definition.suppress_json };
+        var head: Head = if (old) |raw| try std.json.parseFromSliceLeaky(Head, a, raw, .{}) else .{ .refs = 0, .key_template = definition.key_template };
         const prior = head.refs;
         head.refs = if (delta > 0) try std.math.add(u64, head.refs, @intCast(delta)) else try std.math.sub(u64, head.refs, @intCast(-delta));
         if (head.refs == 0) try txn.delete(key) else try txn.put(key, try std.json.Stringify.valueAlloc(a, head, .{}));
         if ((prior == 0) == (head.refs == 0)) continue;
         const definition_key = try std.fmt.allocPrint(a, "{s}definition/{s}", .{ root, id });
         if (head.refs == 0) try txn.delete(definition_key) else try txn.put(definition_key, try std.json.Stringify.valueAlloc(a, definition, .{}));
+        const policy = try std.json.parseFromSliceLeaky(struct { keys: []const []const u8 = &.{} }, a, if (definition.suppress_json.len == 0) "{}" else definition.suppress_json, .{ .ignore_unknown_fields = true });
+        for (policy.keys) |entity| {
+            const path = try std.fmt.allocPrint(a, "{s}negative/{s}/{s}", .{ root, try routes.digest(a, entity), id });
+            if (head.refs == 0) try txn.delete(path) else try txn.put(path, try std.json.Stringify.valueAlloc(a, entity, .{}));
+        }
         for (definition.aliases) |alias| {
             const out = try edgeKey(a, root, "out", alias.key, id, alias.key);
             const in = try edgeKey(a, root, "in", alias.target, id, alias.key);
@@ -85,9 +90,12 @@ pub fn synchronize(a: A, txn: anytype, root: []const u8, before: []const Definit
 }
 /// Only cold namespace adoption needs complete declarations. Warm reads use
 /// adjacency and never decode this separately stored immutable definition.
-pub fn definitionAliases(a: A, txn: anytype, root: []const u8, id: []const u8) ![]const resolver.KeyAlias {
+pub fn readDefinition(a: A, txn: anytype, root: []const u8, id: []const u8) !Definition {
     const raw = try txn.get(try std.fmt.allocPrint(a, "{s}definition/{s}", .{ root, id }));
-    return (try std.json.parseFromSliceLeaky(Definition, a, raw, .{ .allocate = .alloc_always })).aliases;
+    return std.json.parseFromSliceLeaky(Definition, a, raw, .{ .allocate = .alloc_always });
+}
+pub fn definitionAliases(a: A, txn: anytype, root: []const u8, id: []const u8) ![]const resolver.KeyAlias {
+    return (try readDefinition(a, txn, root, id)).aliases;
 }
 
 pub const Reader = struct {
@@ -97,7 +105,9 @@ pub const Reader = struct {
     profiles: std.StringArrayHashMapUnmanaged(Profile) = .empty,
     seen: std.StringHashMapUnmanaged(void) = .empty,
     visits: usize = 0,
-    const Profile = struct { head: Head, aliases: std.ArrayList(resolver.KeyAlias) = .empty };
+    nodes: std.StringHashMapUnmanaged(void) = .empty,
+    policies_loaded: bool = false,
+    const Profile = struct { head: Head, aliases: std.ArrayList(resolver.KeyAlias) = .empty, keys: std.StringHashMapUnmanaged(void) = .empty };
     pub fn lookup(self: *Reader) records.AliasLookup {
         return .{ .ptr = self, .expand = expand };
     }
@@ -105,12 +115,49 @@ pub const Reader = struct {
         return if (self.profiles.get(id)) |profile| profile.aliases.items else &.{};
     }
     pub fn values(self: *Reader) ![]const records.AliasProfile {
+        if (!self.policies_loaded) {
+            var after: ?[]const u8 = null;
+            const prefix = try std.mem.concat(self.a, u8, &.{ self.root, "profile/" });
+            while (true) {
+                const page = try self.backend.scan(self.backend.ptr, self.a, prefix, after, 128);
+                for (page.rows) |row| {
+                    const id = row.key[prefix.len..];
+                    const entry = try self.profiles.getOrPut(self.a, id);
+                    if (!entry.found_existing) entry.value_ptr.* = .{ .head = try std.json.parseFromSliceLeaky(Head, self.a, row.value, .{}) };
+                }
+                after = page.next;
+                if (after == null) break;
+            }
+            var nodes = self.nodes.keyIterator();
+            while (nodes.next()) |node| {
+                const negative = try std.fmt.allocPrint(self.a, "{s}negative/{s}/", .{ self.root, try routes.digest(self.a, node.*) });
+                after = null;
+                while (true) {
+                    const page = try self.backend.scan(self.backend.ptr, self.a, negative, after, 128);
+                    for (page.rows) |row| {
+                        const key = try std.json.parseFromSliceLeaky([]const u8, self.a, row.value, .{ .allocate = .alloc_always });
+                        if (!std.mem.eql(u8, key, node.*)) return error.InvalidCatalogRecord;
+                        const profile = self.profiles.getPtr(row.key[negative.len..]) orelse return error.InvalidCatalogRecord;
+                        try profile.keys.put(self.a, key, {});
+                    }
+                    after = page.next;
+                    if (after == null) break;
+                }
+            }
+            self.policies_loaded = true;
+        }
         const result = try self.a.alloc(records.AliasProfile, self.profiles.count());
-        for (self.profiles.keys(), self.profiles.values(), result) |id, profile, *value| value.* = .{ .id = id, .key_template = profile.head.key_template, .suppress_json = profile.head.suppress_json, .aliases = profile.aliases.items };
+        for (self.profiles.keys(), self.profiles.values(), result) |id, profile, *value| {
+            const keys = try self.a.alloc([]const u8, profile.keys.count());
+            var iterator = profile.keys.keyIterator();
+            for (keys) |*key| key.* = iterator.next().?.*;
+            value.* = .{ .id = id, .key_template = profile.head.key_template, .suppress_json = if (keys.len == 0) "" else try std.json.Stringify.valueAlloc(self.a, .{ .keys = keys }, .{}), .aliases = profile.aliases.items };
+        }
         return result;
     }
-    fn expand(ptr: *anyopaque, a: A, id: []const u8, forward_only: bool) ![]const resolver.KeyAlias {
+    fn expand(ptr: *anyopaque, a: A, id: []const u8, forward_only: bool, mask: records.EdgeMask) ![]const resolver.KeyAlias {
         const self: *Reader = @ptrCast(@alignCast(ptr));
+        try self.nodes.put(a, id, {});
         var edges: std.ArrayList(resolver.KeyAlias) = .empty;
         for ([_][]const u8{ "out", "in" }, 0..) |direction, i| {
             if (forward_only and i == 1) break;
@@ -119,10 +166,11 @@ pub const Reader = struct {
             while (true) {
                 const page = try self.backend.scan(self.backend.ptr, a, prefix, after, 128);
                 for (page.rows) |row| {
-                    self.visits += 1;
-                    if (comptime @import("builtin").is_test) _ = test_edge_visits.fetchAdd(1, .monotonic);
                     const edge = try std.json.parseFromSliceLeaky(Edge, a, row.value, .{ .allocate = .alloc_always });
                     if (!std.mem.eql(u8, if (i == 0) edge.key else edge.target, id)) return error.InvalidCatalogRecord;
+                    if (!try mask.enabled(mask.ptr, a, edge.key)) continue;
+                    self.visits += 1;
+                    if (comptime @import("builtin").is_test) _ = test_edge_visits.fetchAdd(1, .monotonic);
                     const alias: resolver.KeyAlias = .{ .key = edge.key, .target = edge.target };
                     try edges.append(a, alias);
                     if ((try self.seen.getOrPut(a, row.value)).found_existing) continue;

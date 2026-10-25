@@ -225,7 +225,7 @@ pub const Service = struct {
         } else {
             const row = state_row orelse return error.MemorySpaceNotFound;
             run.state = try parse(t.State, a, row.json);
-            if (run.state.identity_format > 1) return error.MemoryCorruptState;
+            if (run.state.identity_format > 2) return error.MemoryCorruptState;
             if (run.state.table_id != 0 and self.context.table_id != 0 and run.state.table_id != self.context.table_id) return error.MemorySpaceBindingChanged;
             if (run.state.space.len > 0 and self.context.space.len > 0 and (!eql(u8, run.state.space, self.context.space) or !eql(u8, run.state.database, self.context.database) or !eql(u8, run.state.namespace, self.context.namespace))) return error.MemorySpaceBindingChanged;
         }
@@ -2799,7 +2799,7 @@ const Run = struct {
     }
     fn ensureIdentityAuthority(self: *Run) !void {
         const store = self.identityStore();
-        self.state.identity_format = 1;
+        self.state.identity_format = 2;
         if (try store.head(identity_template) != null) return;
         const legacy = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
         var state = legacy.state;

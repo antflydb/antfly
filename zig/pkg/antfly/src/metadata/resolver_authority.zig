@@ -35,6 +35,7 @@ pub const Read = struct {
     profiles: []const AliasProfile = &.{},
     static_profiles: bool = false,
     include_proposals: bool = true,
+    headers_only: bool = false,
     id: []const u8 = "",
     state: ?c.ProposalState = null,
     action: ?c.EntityAction = null,
@@ -60,6 +61,7 @@ pub const View = struct {
     profiles_indexed: bool = false,
     profiles: []const AliasProfile = &.{},
     queue_revision: u64 = 0,
+    headers_only: bool = false,
     proposals: c.State = .{},
     next_cursor: ?[]const u8 = null,
     receipt: bool = false,
@@ -106,6 +108,27 @@ pub fn schemaFingerprint(a: A, table: metadata.TableRecord) ![32]u8 {
     for (keys) |key| try sorted.put(a, key, root.object.get(key).?);
     copy.indexes_json = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = sorted }, .{});
     return @import("antfly_resolver").fingerprint(a, copy);
+}
+/// Stable source declarations exclude destination discovery and derived
+/// projection clocks. Private head publication cannot invalidate other scopes.
+pub fn sourceDefinitionFingerprint(a: A, indexes: []const u8) ![32]u8 {
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, a, if (indexes.len == 0) "{}" else indexes, .{});
+    inline for (.{ marker, owners_key, "_resolver_namespaces", "_curation_proposals", "_resolver_curation" }) |key| _ = root.object.swapRemove(key);
+    const keys = try a.dupe([]const u8, root.object.keys());
+    std.mem.sort([]const u8, keys, {}, struct {
+        fn less(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.less);
+    var sorted: std.json.ObjectMap = .empty;
+    for (keys) |key| try sorted.put(a, key, root.object.get(key).?);
+    var buffer: [1024]u8 = undefined;
+    var writer: std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&buffer);
+    try std.json.Stringify.value(std.json.Value{ .object = sorted }, .{}, &writer.writer);
+    try writer.writer.flush();
+    var hash: [32]u8 = undefined;
+    writer.hasher.final(&hash);
+    return hash;
 }
 pub fn mutateOnService(svc: anytype, a: A, write: Write, context: local.api_operation.RequestContext) ![]u8 {
     try context.ensureActive();

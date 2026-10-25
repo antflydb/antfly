@@ -2185,9 +2185,9 @@ edges, consistently for routed and embedded execution. Suppression policies and
 source publication fences still apply. Legacy adoption folds source-owned state
 once; warm native operations use the index.
 
-Metadata publishes v5 consumer/profile readiness only after its bounded backfill
-finishes, under topology protocol 45. Lite bootstraps the same layout atomically
-and installs reader floor 17. Embedded planning builds the static component
+Metadata publishes v6 consumer/profile readiness only after its bounded backfill
+finishes, under topology protocol 46. Lite bootstraps the same layout atomically
+and installs reader floor 18. Embedded planning builds the static component
 outside writer ownership, checks source/catalog generations and validates the
 observed curated head again inside the final transaction. Routed publication
 retains the catalog revision, physical authority and head fences.
@@ -2208,7 +2208,7 @@ DDL bodies nor builds runtime snapshots.
 
 ### Scoped native publication and admission proofs
 
-The v5 directory additionally retains each immutable static definition separately
+The v6 directory additionally retains each immutable static definition separately
 from its adjacency and lightweight head. Before a namespace has a native head,
 authorized adoption reads the complete selected declarations once. Private
 consumer pages carry a deduplicated cold-profile dictionary, so shared static
@@ -2224,7 +2224,7 @@ Authority component reads and warm publication do not decode the table definitio
 The final transaction checks the physical proof, catalog revision and individual
 head/queue revisions. New namespace membership and legacy adoption retain their
 cold DDL path; ordinary corrections never enumerate all heads to rebuild headers.
-Table removal removes the derived proof in the same transaction. A bounded v5
+Table removal removes the derived proof in the same transaction. A bounded v6
 backfill installs proofs before indexed readiness is advertised.
 
 Native corrections enqueue the changed namespaces. A scoped job owns one active
@@ -2251,3 +2251,35 @@ bytes; publication, rollback and restored histories therefore miss immediately
 when content changes. A cold calculation retains the maintenance allocation
 budget. The cache owns only two digests and never retains transaction buffers,
 provider objects, readiness decisions or authorization.
+
+
+### Effective component and queue publication costs
+
+Static adjacency is filtered against native redirects and removal tombstones
+before traversing an edge or charging component limits. Masked declarations
+cannot bridge a small correction into an unrelated large graph. Each request
+prepares effective aliases once per immutable admission profile, before consumer
+fan-out; embedded planning reuses that prepared slice through validation.
+
+The v6 static directory stores configured suppressed-key membership as postings
+by entity and profile. Warm planning reads compact profile heads plus membership
+for visited component keys. It neither transports the complete configured key
+universe nor parses unrelated text suppression rules. Cold adoption retains the
+complete immutable definition. Source enrollment and removal update negative
+postings with aliases and refcounts in the same transaction.
+
+Scoped metadata replay writes namespace binding deltas and refreshed compact
+consumer postings, without decoding the source table, rebuilding its dependency
+index, or rewriting unrelated resolver declarations. Execution and provisioning
+reads join these durable deltas in their catalog cut. Source declaration stamps
+fence postings; a declaration edit or removal retires its deltas. Lifecycle and
+legacy bootstrap retain the complete source projection path.
+
+Proposal bodies retain evidence separately from compact lifecycle headers.
+Entity correction reads incident headers, computes queue deltas, and publishes
+only changed headers and indexes. Public proposal reads join the original
+evidence body; quotas continue accounting for evidence and reserved decision
+provenance. Header-only publication validates immutable proposal fields and
+retains evidence identity. Existing rows acquire a header when touched, without
+a queue scan. Lite reader floor 18 and memory identity format 2 reject older
+readers that would ignore these lifecycle headers.

@@ -28,7 +28,7 @@ const Bridge = native.Transaction(docstore.DocStore.Txn);
 const prefix = native.lite_prefix;
 const marker = native.lite_marker;
 const AbsorbedMap = std.StringHashMapUnmanaged([]const c.AbsorbedResult);
-const Consumer = struct { db: *h.db_mod.DB, source: []const u8, cfg: h.db_mod.ResolverConfig, synthetic: bool = false, scope_head: ?native.Head = null };
+const Consumer = struct { db: *h.db_mod.DB, source: []const u8, cfg: h.db_mod.ResolverConfig, synthetic: bool = false, prepared_profiles: ?[]const native.AliasProfile = null, scope_head: ?native.Head = null };
 pub const Input = struct { action: enum { redirects, merge, unmerge, suppress, unsuppress, distinct }, into: ?[]const u8 = null, replace: bool = false, pin_distinct: bool = false, absorbed: c.Absorbed = .reject, actor: []const u8 = "", reason: []const u8 = "", expected_revision: ?u64 = null, wait: ?c.Wait = null };
 pub const Operation = enum { list, get, create, decide };
 fn json(a: A, item: anytype) ![]u8 {
@@ -108,7 +108,7 @@ fn legacyConsumers(root: *h.Handle, a: A, table: []const u8, key: []const u8) ![
 /// index and curated read cut. Publication rechecks both source and head fences.
 fn prepareStaticProfiles(root: *h.Handle, a: A, destination: *h.db_mod.DB, table: []const u8, key: []const u8, into: ?[]const u8, inputs: []const Consumer, expected_epoch: ?u64) ![]const Consumer {
     const physical = if (root.owned_lite_backend) |*backend| backend.native_docstore else null;
-    if (physical == null or inputs.len == 0) return inputs;
+    if (physical == null or inputs.len == 0) return prepareProfileCaches(a, inputs);
     const selected = try a.dupe(Consumer, inputs);
     var physical_read = try physical.?.beginRead();
     defer physical_read.abort();
@@ -119,7 +119,7 @@ fn prepareStaticProfiles(root: *h.Handle, a: A, destination: *h.db_mod.DB, table
     var bridge: Bridge = .{ .txn = &read };
     const store = bridge.store(a, prefix);
     var seen: std.StringHashMapUnmanaged(void) = .empty;
-    var cold_profiles: std.StringHashMapUnmanaged([]const @import("antfly_resolver").KeyAlias) = .empty;
+    var cold_profiles: std.StringHashMapUnmanaged(native.static_profiles.Definition) = .empty;
     for (selected) |source| {
         const template = source.cfg.key_template;
         if ((try seen.getOrPut(a, template)).found_existing) continue;
@@ -129,19 +129,24 @@ fn prepareStaticProfiles(root: *h.Handle, a: A, destination: *h.db_mod.DB, table
             // source-owned redirects may connect any static declarations.
             for (selected) |*entry| if (std.mem.eql(u8, entry.cfg.key_template, template)) {
                 const profile = try cold_profiles.getOrPut(a, entry.cfg.admission_profile);
-                if (!profile.found_existing) profile.value_ptr.* = try native.static_profiles.definitionAliases(a, &physical_read, try @import("../storage/lite/resolver_consumers.zig").profileRoot(a, table, template), entry.cfg.admission_profile);
-                entry.cfg.aliases = profile.value_ptr.*;
+                if (!profile.found_existing) profile.value_ptr.* = try native.static_profiles.readDefinition(a, &physical_read, try @import("../storage/lite/resolver_consumers.zig").profileRoot(a, table, template), entry.cfg.admission_profile);
+                entry.cfg.aliases = profile.value_ptr.aliases;
+                entry.cfg.suppress_json = profile.value_ptr.suppress_json;
             };
             continue;
         }
         var indexed: native.static_profiles.Reader = .{ .a = a, .backend = directory.backend(), .root = try @import("../storage/lite/resolver_consumers.zig").profileRoot(a, table, template) };
         _ = (try store.componentIndexed(template, if (into) |target| &.{ key, target } else &.{key}, indexed.lookup())) orelse return error.ResolverCurationConflict;
+        var profiles: std.StringHashMapUnmanaged(native.AliasProfile) = .empty;
+        for (try indexed.values()) |profile| try profiles.put(a, profile.id, profile);
         for (selected) |*entry| if (std.mem.eql(u8, entry.cfg.key_template, template)) {
+            const profile = profiles.get(entry.cfg.admission_profile) orelse return error.ResolverCurationConflict;
             entry.scope_head = head;
-            entry.cfg.aliases = indexed.aliases(entry.cfg.admission_profile);
+            entry.cfg.aliases = profile.aliases;
+            entry.cfg.suppress_json = profile.suppress_json;
         };
     }
-    return selected;
+    return prepareProfileCaches(a, selected);
 }
 fn checkDirectoryEpoch(root: *h.Handle, expected: ?u64) !void {
     const expected_epoch = expected orelse return;
@@ -244,14 +249,27 @@ fn inspectionScope(a: A, store: native.Store, selected: []const Consumer, source
     return .{ .head = .{ .key_template = namespace.key_template, .revision = namespace.revision }, .namespace = namespace };
 }
 fn consumerProfiles(a: A, selected: []const Consumer, template: []const u8) ![]const native.AliasProfile {
+    for (selected) |source| if (std.mem.eql(u8, source.cfg.key_template, template)) {
+        if (source.prepared_profiles) |cached| return cached;
+    };
     var profiles: std.ArrayList(native.AliasProfile) = .empty;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     for (selected) |source| if (std.mem.eql(u8, source.cfg.key_template, template)) {
-        const key = try json(a, .{ source.cfg.aliases, source.cfg.suppress_json });
+        const key = try native.admissionProfileKey(a, source.cfg);
         if ((try seen.getOrPut(a, key)).found_existing) continue;
-        try profiles.append(a, .{ .key_template = template, .aliases = source.cfg.aliases, .suppress_json = source.cfg.suppress_json });
+        try profiles.append(a, .{ .id = key, .key_template = template, .aliases = source.cfg.aliases, .suppress_json = source.cfg.suppress_json });
     };
     return profiles.items;
+}
+fn prepareProfileCaches(a: A, inputs: []const Consumer) ![]const Consumer {
+    const selected = try a.dupe(Consumer, inputs);
+    var profiles: std.StringHashMapUnmanaged([]const native.AliasProfile) = .empty;
+    for (selected) |*source| {
+        const slot = try profiles.getOrPut(a, source.cfg.key_template);
+        if (!slot.found_existing) slot.value_ptr.* = try consumerProfiles(a, inputs, source.cfg.key_template);
+        source.prepared_profiles = slot.value_ptr.*;
+    }
+    return selected;
 }
 fn profileScope(a: A, store: native.Store, selected: []const Consumer, template: []const u8, key: []const u8, into: ?[]const u8) !native.Snapshot {
     if (into) |target| if (!policy.keyInNamespace(template, target)) return error.InvalidResolverCurationRequest;
@@ -266,7 +284,7 @@ fn validate(a: A, selected: []const Consumer, namespace: policy.Namespace) !void
     try native.validateProfiles(a, namespace, try consumerProfiles(a, selected, namespace.key_template));
 }
 
-fn queueScope(a: A, store: native.Store, namespace: policy.Namespace, key: []const u8, into: ?[]const u8) !c.State {
+fn queueScope(a: A, store: native.Store, namespace: policy.Namespace, key: []const u8, into: ?[]const u8, headers_only: bool) !c.State {
     var keys: std.ArrayList([]const u8) = .empty;
     try keys.append(a, key);
     if (into) |target| try keys.append(a, target);
@@ -275,7 +293,7 @@ fn queueScope(a: A, store: native.Store, namespace: policy.Namespace, key: []con
         try keys.append(a, alias.target);
     }
     try keys.appendSlice(a, namespace.state.suppress.keys);
-    return store.proposalsForKeys(keys.items);
+    return if (headers_only) store.proposalHeadersForKeys(keys.items) else store.proposalsForKeys(keys.items);
 }
 fn publishPlan(a: A, store: native.Store, selected: []const Consumer, before: native.Snapshot, plan: c.Plan) !policy.Namespace {
     if (!plan.changed) return before.namespace;
@@ -291,17 +309,19 @@ fn publishPlan(a: A, store: native.Store, selected: []const Consumer, before: na
     try store.apply(patch);
     return next;
 }
-fn publishQueue(a: A, store: native.Store, before: c.State, next: c.State) !void {
+fn publishQueue(a: A, store: native.Store, before: c.State, next: c.State, retain_evidence: bool) !void {
     var changed: std.ArrayList(c.Proposal) = .empty;
     var old: std.StringHashMapUnmanaged(c.Proposal) = .empty;
     for (before.proposals) |proposal| try old.put(a, proposal.id, proposal);
     for (next.proposals) |proposal| {
         if (old.get(proposal.id)) |previous| if (std.mem.eql(u8, try json(a, previous), try json(a, proposal))) continue;
-        try changed.append(a, proposal);
+        var header = proposal;
+        if (retain_evidence) header.evidence = null;
+        try changed.append(a, header);
     }
     if (changed.items.len == 0) return;
     const head = try store.queueHead();
-    try store.applyQueue(.{ .expected_revision = head.revision, .revision = try std.math.add(u64, head.revision, 1), .receipt_scope = next.receipt_scope, .proposals = changed.items });
+    try store.applyQueue(.{ .expected_revision = head.revision, .revision = try std.math.add(u64, head.revision, 1), .receipt_scope = next.receipt_scope, .proposals = changed.items, .retain_evidence = retain_evidence });
 }
 fn results(a: A, authority_table_id: u64, selected: []const Consumer, store: native.Store, key: []const u8, redirects: bool, changed: bool, absorbed: AbsorbedMap) !std.json.Value {
     var rows = std.json.Array.init(a);
@@ -381,7 +401,7 @@ pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: 
         };
         const request: c.Request = .{ .action = action, .key = key, .to = input.into, .replace = input.replace, .pin_distinct = input.pin_distinct, .absorbed = input.absorbed, .actor = input.actor, .reason = input.reason, .expected_revision = before.head.revision, .wait = input.wait };
         const stamp = policy.manualOrigin(request, try std.math.add(u64, before.head.revision, 1));
-        const queue = try queueScope(a, store, before.namespace, key, input.into);
+        const queue = try queueScope(a, store, before.namespace, key, input.into, true);
         const state = c.bindReceiptScope(before.namespace.state, queue.receipt_scope);
         var plan = try c.planWithOrigin(a, try json(a, state), before.namespace.merges, try native.planningAliases(a, before.namespace, try aliases(a, selected, before.namespace, key, input.into), action, key, input.into), request, stamp);
         _ = try c.recordSupersessions(a, &plan, queue.proposals, request, stamp);
@@ -389,7 +409,7 @@ pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: 
         try absorbed.put(a, source.cfg.key_template, plan.absorbed);
         var next_queue = queue;
         next_queue.proposals = try c.projectReceipts(a, queue.proposals, plan.state.proposals);
-        try publishQueue(a, store, queue, next_queue);
+        try publishQueue(a, store, queue, next_queue, true);
         changed = changed or plan.changed;
     }
     const rows = try results(a, db.core.identity_namespace.table_id, selected, store, key, input.action == .redirects, changed, absorbed);
@@ -475,7 +495,7 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
                 origin.proposal_id = proposal.id;
                 decided.state = .rejected;
                 decided.decided = origin;
-                try publishQueue(a, store, .{ .proposals = &.{proposal} }, .{ .receipt_scope = (try store.queueHead()).receipt_scope, .proposals = &.{decided} });
+                try publishQueue(a, store, .{ .proposals = &.{proposal} }, .{ .receipt_scope = (try store.queueHead()).receipt_scope, .proposals = &.{decided} }, false);
                 try store.markQueueOnly(proposal.id);
                 try prepared.check();
                 try finish(a, &bridge, &txn, db, &lease);
@@ -513,7 +533,7 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
             head.receipt_scope = std.fmt.bytesToHex(entropy, .lower);
         }
         const plan = try c.propose(a, .{ .receipt_scope = head.receipt_scope }, &.{}, request, policy.manualOrigin(.{ .action = .suppress, .actor = request.actor, .reason = request.reason }, 0));
-        try publishQueue(a, store, .{}, plan.state);
+        try publishQueue(a, store, .{}, plan.state, false);
         existing = plan.state.proposals[0];
         try prepared.check();
         try finish(a, &bridge, &txn, db, &lease);
@@ -539,7 +559,7 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
         if ((try seen.getOrPut(a, source.cfg.key_template)).found_existing) continue;
         const before = try profileScope(a, store, selected, source.cfg.key_template, key, proposal.into);
         if (decision.expected_revision) |expected| if (expected != before.head.revision) return error.ResolverCurationConflict;
-        var queue = try queueScope(a, store, before.namespace, key, proposal.into);
+        var queue = try queueScope(a, store, before.namespace, key, proposal.into, true);
         var members: std.ArrayList(c.Proposal) = .empty;
         for (queue.proposals) |member| if (!std.mem.eql(u8, member.id, proposal.id)) try members.append(a, member);
         try members.append(a, proposal);
@@ -573,13 +593,13 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
         while (before_values.next()) |record| try previous.append(a, record.*);
         var after_values = queue_after.valueIterator();
         while (after_values.next()) |record| try next.append(a, record.*);
-        try publishQueue(a, store, .{ .proposals = previous.items }, .{ .receipt_scope = head.receipt_scope, .proposals = next.items });
+        try publishQueue(a, store, .{ .proposals = previous.items }, .{ .receipt_scope = head.receipt_scope, .proposals = next.items }, true);
     }
     var decided = (try store.proposal(proposal.id)) orelse proposal;
     if (decided.state == .open) {
         decided.state = wanted;
         decided.decided = decision_origin;
-        try publishQueue(a, store, .{ .proposals = &.{proposal} }, .{ .receipt_scope = head.receipt_scope, .proposals = &.{decided} });
+        try publishQueue(a, store, .{ .proposals = &.{proposal} }, .{ .receipt_scope = head.receipt_scope, .proposals = &.{decided} }, false);
     }
     const rows = try results(a, db.core.identity_namespace.table_id, selected, store, key, false, changed, absorbed);
     try prepared.check();
@@ -798,7 +818,7 @@ test "capi resolver curation indexed static profiles exclude seventeen thousand 
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_unmerge_json(handle, .fromSlice("entities"), .fromSlice("concept/seed"), .fromSlice("{\"pin_distinct\":true}"), &out));
     api.antfly_buffer_free(&out);
     try std.testing.expect(native.static_profiles.test_edge_visits.load(.monotonic) <= 8);
-    try std.testing.expectEqualStrings("17", try root.db.core.store.get(a, catalog.minimum_reader_key));
+    try std.testing.expectEqualStrings("18", try root.db.core.store.get(a, catalog.minimum_reader_key));
 }
 
 test "capi resolver curation static directory fences consumers enrolled after discovery" {

@@ -79,7 +79,7 @@ pub const native_resolver_records_reader_version: u32 = 12;
 pub const resolver_projection_bindings_reader_version: u32 = 13;
 pub const resolver_projection_work_reader_version: u32 = 14;
 pub const resolver_projection_delta_reader_version: u32 = 15;
-pub const resolver_static_profiles_reader_version: u32 = 17;
+pub const resolver_static_profiles_reader_version: u32 = 18;
 pub const supported_reader_version: u32 = resolver_static_profiles_reader_version;
 
 const reader_version_encodings = blk: {
@@ -535,7 +535,7 @@ pub const ResolverConfig = struct {
     pub fn effectiveAliasesAlloc(self: ResolverConfig, alloc: Allocator) ![]const resolver_lib.KeyAlias {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
-        const curation = try resolver_lib.curation.Index.init(arena.allocator(), self.suppress_json, self.curation_json);
+        const curation = try resolver_lib.curation.Index.init(arena.allocator(), "", self.curation_json);
         var curated: std.StringHashMapUnmanaged(void) = .empty;
         for (self.merges) |alias| try curated.put(arena.allocator(), alias.key, {});
         var result: std.ArrayList(resolver_lib.KeyAlias) = .empty;

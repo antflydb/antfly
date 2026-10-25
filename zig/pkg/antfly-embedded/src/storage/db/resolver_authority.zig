@@ -50,9 +50,38 @@ pub const Kind = enum { redirect, suppressed, suppression, distinct, redirect_or
 pub const Edit = struct { kind: Kind, id: []const u8, value: ?std.json.Value };
 pub const Patch = struct { expected_revision: u64, next: Head, edits: []const Edit };
 pub const QueueHead = struct { version: u8 = 1, revision: u64 = 0, count: u32 = 0, bytes: u64 = 0, receipt_scope: ?c.ReceiptScope = null };
-pub const QueuePatch = struct { expected_revision: u64, revision: u64, receipt_scope: ?c.ReceiptScope = null, proposals: []const c.Proposal = &.{} };
-pub const AliasLookup = struct { ptr: *anyopaque, expand: *const fn (*anyopaque, A, []const u8, bool) anyerror![]const resolver.KeyAlias };
+pub const QueuePatch = struct { expected_revision: u64, revision: u64, receipt_scope: ?c.ReceiptScope = null, proposals: []const c.Proposal = &.{}, retain_evidence: bool = false };
+const ProposalHeader = struct {
+    version: u8 = 1,
+    proposal: c.Proposal,
+    evidence_hash: [32]u8,
+    capacity: u64,
+};
+fn evidenceHash(a: A, value: ?std.json.Value) ![32]u8 {
+    var result: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(try encode(a, value), &result, .{});
+    return result;
+}
+fn proposalHeaderValue(a: A, value: c.Proposal) !ProposalHeader {
+    var header = value;
+    header.evidence = null;
+    return .{ .proposal = header, .evidence_hash = try evidenceHash(a, value.evidence), .capacity = c.proposalCapacityBytes(.{ .proposals = &.{value} }) };
+}
+pub const EdgeMask = struct { ptr: *anyopaque, enabled: *const fn (*anyopaque, A, []const u8) anyerror!bool };
+pub const AliasLookup = struct { ptr: *anyopaque, expand: *const fn (*anyopaque, A, []const u8, bool, EdgeMask) anyerror![]const resolver.KeyAlias };
 pub const AliasProfile = struct { id: []const u8 = "", key_template: []const u8, aliases: []const resolver.KeyAlias, suppress_json: []const u8 = "" };
+/// A request-local key: modern bindings already carry immutable static
+/// identity. Only legacy curated overlays need additional content hashing.
+pub fn admissionProfileKey(a: A, cfg: anytype) ![]const u8 {
+    if (cfg.admission_profile.len > 0 and cfg.merges.len == 0 and cfg.curation_json.len == 0) return cfg.admission_profile;
+    var buffer: [1024]u8 = undefined;
+    var writer: std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&buffer);
+    try std.json.Stringify.value(.{ cfg.admission_profile, if (cfg.admission_profile.len == 0) cfg.aliases else &.{}, if (cfg.admission_profile.len == 0) cfg.suppress_json else "", cfg.key_template, cfg.merges, cfg.curation_json }, .{}, &writer.writer);
+    try writer.writer.flush();
+    var digest: [32]u8 = undefined;
+    writer.hasher.final(&digest);
+    return a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+}
 pub fn effectiveAliases(a: A, namespace: policy.Namespace, profiles: []const AliasProfile, key: []const u8, into: ?[]const u8) ![]const resolver.KeyAlias {
     const Edge = struct { target: []const u8, conflict: bool = false };
     var authoritative: std.StringHashMapUnmanaged(void) = .empty;
@@ -386,9 +415,24 @@ pub const Store = struct {
         return self.componentGraph(template, seeds, &.{}, lookup);
     }
     fn componentGraph(self: Store, template: []const u8, seeds: []const []const u8, static_aliases: []const resolver.KeyAlias, lookup: ?AliasLookup) !?Snapshot {
+        const Mask = struct {
+            store: Store,
+            template: []const u8,
+            cache: std.StringHashMapUnmanaged(bool) = .empty,
+            fn enabled(ptr: *anyopaque, a: A, id: []const u8) !bool {
+                const context: *@This() = @ptrCast(@alignCast(ptr));
+                if (context.cache.get(id)) |value| return value;
+                const active = try context.store.get(resolver.KeyAlias, context.template, .redirect, id) == null and try context.store.backend.get(context.store.backend.ptr, a, try context.store.record(context.template, .removed_alias, id)) == null;
+                try context.cache.put(a, try a.dupe(u8, id), active);
+                return active;
+            }
+        };
+        var masks: Mask = .{ .store = self, .template = template };
+        const mask: EdgeMask = .{ .ptr = &masks, .enabled = Mask.enabled };
         var forward: std.StringHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
         var reverse: std.StringHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
         for (static_aliases) |alias| {
+            if (!try mask.enabled(mask.ptr, self.a, alias.key)) continue;
             const from = try forward.getOrPut(self.a, alias.key);
             if (!from.found_existing) from.value_ptr.* = .empty;
             try from.value_ptr.append(self.a, alias.target);
@@ -407,7 +451,7 @@ pub const Store = struct {
             const id = pending.items[offset];
             if ((try seen.getOrPut(self.a, id)).found_existing) continue;
             if (seen.count() > 16384) return error.ResolverCurationLimitExceeded;
-            if (lookup) |indexed| for (try indexed.expand(indexed.ptr, self.a, id, false)) |edge| {
+            if (lookup) |indexed| for (try indexed.expand(indexed.ptr, self.a, id, false, mask)) |edge| {
                 try pending.append(self.a, edge.key);
                 try pending.append(self.a, edge.target);
             };
@@ -445,7 +489,7 @@ pub const Store = struct {
                 const id = paths.items[path_offset];
                 if ((try seen.getOrPut(self.a, id)).found_existing) continue;
                 if (seen.count() > 16384) return error.ResolverCurationLimitExceeded;
-                if (lookup) |indexed| for (try indexed.expand(indexed.ptr, self.a, id, true)) |edge| try paths.append(self.a, edge.target);
+                if (lookup) |indexed| for (try indexed.expand(indexed.ptr, self.a, id, true, mask)) |edge| try paths.append(self.a, edge.target);
                 if (forward.get(id)) |edges| try paths.appendSlice(self.a, edges.items);
                 if (try self.get(resolver.KeyAlias, template, .redirect, id)) |alias| {
                     try values.aliases.append(self.a, alias);
@@ -487,8 +531,41 @@ pub const Store = struct {
         for (id) |byte| if (!std.ascii.isHex(byte)) return error.InvalidResolverCurationRequest;
         return self.keyPath(try std.mem.concat(self.a, u8, &.{ "queue/proposal/", id }));
     }
+    fn proposalHeaderPath(self: Store, id: []const u8) ![]const u8 {
+        _ = try self.proposalPath(id);
+        return self.keyPath(try std.mem.concat(self.a, u8, &.{ "queue/header/", id }));
+    }
+    fn proposalRecord(self: Store, id: []const u8) !?ProposalHeader {
+        if (try self.backend.get(self.backend.ptr, self.a, try self.proposalHeaderPath(id))) |raw| {
+            const header = try parse(ProposalHeader, self.a, raw);
+            if (header.version != 1 or header.proposal.evidence != null or !std.mem.eql(u8, id, header.proposal.id)) return error.InvalidCatalogRecord;
+            return header;
+        }
+        // Legacy rows acquire their compact header on first mutation. Never
+        // scan/migrate an unrelated queue, including unbounded memory queues.
+        return if (try self.backend.get(self.backend.ptr, self.a, try self.proposalPath(id))) |raw| try proposalHeaderValue(self.a, try parse(c.Proposal, self.a, raw)) else null;
+    }
+    pub fn proposalHeader(self: Store, id: []const u8) !?c.Proposal {
+        return if (try self.proposalRecord(id)) |header| header.proposal else null;
+    }
     pub fn proposal(self: Store, id: []const u8) !?c.Proposal {
-        return if (try self.backend.get(self.backend.ptr, self.a, try self.proposalPath(id))) |raw| try parse(c.Proposal, self.a, raw) else null;
+        const header = try self.proposalRecord(id) orelse return null;
+        const raw = try self.backend.get(self.backend.ptr, self.a, try self.proposalPath(id)) orelse return error.InvalidCatalogRecord;
+        const body = try parse(c.Proposal, self.a, raw);
+        var value = header.proposal;
+        value.evidence = body.evidence;
+        if (!std.mem.eql(u8, &header.evidence_hash, &(try evidenceHash(self.a, value.evidence)))) return error.InvalidCatalogRecord;
+        return value;
+    }
+    fn nextProposalRecord(self: Store, patch: QueuePatch, value: c.Proposal, previous: ?ProposalHeader) !ProposalHeader {
+        if (!patch.retain_evidence) return proposalHeaderValue(self.a, value);
+        const old = previous orelse return error.ResolverCurationConflict;
+        if (value.evidence != null) return error.InvalidResolverCurationRequest;
+        var unchanged = value;
+        unchanged.state = old.proposal.state;
+        unchanged.decided = old.proposal.decided;
+        if (!std.mem.eql(u8, try encode(self.a, unchanged), try encode(self.a, old.proposal))) return error.ResolverCurationConflict;
+        return .{ .proposal = value, .evidence_hash = old.evidence_hash, .capacity = try std.math.sub(u64, try std.math.add(u64, old.capacity, c.proposalCapacityBytes(.{ .proposals = &.{value} })), c.proposalCapacityBytes(.{ .proposals = &.{old.proposal} })) };
     }
     fn proposalIndexes(self: Store, value: c.Proposal) ![]const []const u8 {
         const result = try self.a.alloc([]const u8, if (value.state == .open) (if (value.into != null) @as(usize, 5) else 4) else 3);
@@ -505,7 +582,7 @@ pub const Store = struct {
     /// It commits with a plain rejection and lets receipt replay avoid all
     /// consumer work without mistaking a rejected distinct pin for queue-only.
     pub fn markQueueOnly(self: Store, id: []const u8) !void {
-        const value = try self.proposal(id) orelse return error.NotFound;
+        const value = try self.proposalHeader(id) orelse return error.NotFound;
         if (value.state != .rejected) return error.ResolverCurationConflict;
         try self.backend.put(self.backend.ptr, self.a, try self.keyPath(try std.fmt.allocPrint(self.a, "queue/queue-only/{s}", .{id})), try encode(self.a, id));
     }
@@ -521,12 +598,18 @@ pub const Store = struct {
         const page = try self.backend.scan(self.backend.ptr, self.a, prefix, if (after) |id| try std.mem.concat(self.a, u8, &.{ prefix, id }) else null, limit + 1);
         var values: std.ArrayList(c.Proposal) = .empty;
         for (page.rows[0..@min(limit, page.rows.len)]) |row| {
-            const value = if (state == null and action == null) try parse(c.Proposal, self.a, row.value) else (try self.proposal(row.key[row.key.len - 64 ..])) orelse return error.InvalidCatalogRecord;
+            const value = (try self.proposal(row.key[row.key.len - 64 ..])) orelse return error.InvalidCatalogRecord;
             try values.append(self.a, value);
         }
         return .{ .proposals = values.items, .next_cursor = if (page.rows.len > limit) values.items[values.items.len - 1].id else null };
     }
     pub fn proposalsForKeys(self: Store, keys: []const []const u8) !c.State {
+        return self.proposalsForKeysMode(keys, false);
+    }
+    pub fn proposalHeadersForKeys(self: Store, keys: []const []const u8) !c.State {
+        return self.proposalsForKeysMode(keys, true);
+    }
+    fn proposalsForKeysMode(self: Store, keys: []const []const u8, headers_only: bool) !c.State {
         const h = try self.queueHead();
         var values: std.ArrayList(c.Proposal) = .empty;
         var seen: std.StringHashMapUnmanaged(void) = .empty;
@@ -538,7 +621,7 @@ pub const Store = struct {
                 for (page.rows) |row| {
                     const id = row.key[row.key.len - 64 ..];
                     if ((try seen.getOrPut(self.a, id)).found_existing) continue;
-                    const value = (try self.proposal(id)) orelse return error.InvalidCatalogRecord;
+                    const value = (if (headers_only) try self.proposalHeader(id) else try self.proposal(id)) orelse return error.InvalidCatalogRecord;
                     if (value.state == .open) try values.append(self.a, value);
                 }
                 after = page.next;
@@ -570,12 +653,13 @@ pub const Store = struct {
             const path = try self.proposalPath(value.id);
             if ((try seen.getOrPut(self.a, path)).found_existing) return error.InvalidResolverCurationRequest;
             _ = try c.parseState(self.a, try encode(self.a, c.State{ .receipt_scope = h.receipt_scope, .proposals = &.{value} }));
-            if (try self.backend.get(self.backend.ptr, self.a, path)) |old| {
-                const previous = try parse(c.Proposal, self.a, old);
-                if (previous.state != .open and !std.mem.eql(u8, old, try encode(self.a, value))) return error.ResolverCurationConflict;
-                bytes = try std.math.sub(u64, bytes, c.proposalCapacityBytes(.{ .proposals = &.{previous} }));
+            const previous = try self.proposalRecord(value.id);
+            const next = try self.nextProposalRecord(patch, value, previous);
+            if (previous) |old| {
+                if (old.proposal.state != .open and !std.mem.eql(u8, try encode(self.a, old), try encode(self.a, next))) return error.ResolverCurationConflict;
+                bytes = try std.math.sub(u64, bytes, old.capacity);
             } else count = try std.math.add(u32, count, 1);
-            bytes = try std.math.add(u64, bytes, c.proposalCapacityBytes(.{ .proposals = &.{value} }));
+            bytes = try std.math.add(u64, bytes, next.capacity);
         }
         if (self.max_queue_bytes) |maximum| if (bytes > maximum) return error.ResolverCurationLimitExceeded;
         if (self.max_queue_count) |maximum| if (count > maximum) return error.ResolverCurationLimitExceeded;
@@ -586,14 +670,17 @@ pub const Store = struct {
         if (h.revision == 0) h.receipt_scope = patch.receipt_scope;
         for (patch.proposals) |value| {
             const path = try self.proposalPath(value.id);
-            if (try self.backend.get(self.backend.ptr, self.a, path)) |raw| {
-                const old = try parse(c.Proposal, self.a, raw);
-                h.bytes -= c.proposalCapacityBytes(.{ .proposals = &.{old} });
-                for (try self.proposalIndexes(old)) |index| try self.backend.remove(self.backend.ptr, self.a, index);
+            const previous = try self.proposalRecord(value.id);
+            const next = try self.nextProposalRecord(patch, value, previous);
+            if (previous) |old| {
+                h.bytes -= old.capacity;
+                for (try self.proposalIndexes(old.proposal)) |index| try self.backend.remove(self.backend.ptr, self.a, index);
             } else h.count += 1;
-            const raw = try encode(self.a, value);
-            h.bytes += c.proposalCapacityBytes(.{ .proposals = &.{value} });
-            try self.backend.put(self.backend.ptr, self.a, path, raw);
+            h.bytes += next.capacity;
+            // The original body owns immutable evidence. Decisions update the
+            // small header and indexes; public reads join evidence on demand.
+            if (previous == null or !std.mem.eql(u8, &previous.?.evidence_hash, &next.evidence_hash)) try self.backend.put(self.backend.ptr, self.a, path, try encode(self.a, value));
+            try self.backend.put(self.backend.ptr, self.a, try self.proposalHeaderPath(value.id), try encode(self.a, next));
             try self.backend.put(self.backend.ptr, self.a, try self.keyPath(try std.fmt.allocPrint(self.a, "queue/owned/{s}", .{try hash(self.a, value.key)})), try encode(self.a, value.key));
             for (try self.proposalIndexes(value)) |index| try self.backend.put(self.backend.ptr, self.a, index, try encode(self.a, value.id));
         }
@@ -990,6 +1077,12 @@ pub fn validatePortableRow(a: A, key: []const u8, raw: []const u8) !void {
         if (!std.mem.eql(u8, parts[2], proposal.id)) return error.InvalidMetadataBatch;
         return;
     }
+    if (count == 3 and std.mem.eql(u8, parts[0], "queue") and std.mem.eql(u8, parts[1], "header")) {
+        const header = try parse(ProposalHeader, a, raw);
+        if (header.version != 1 or header.proposal.evidence != null or !std.mem.eql(u8, parts[2], header.proposal.id)) return error.InvalidMetadataBatch;
+        _ = try c.parseState(a, try encode(a, c.State{ .proposals = &.{header.proposal} }));
+        return;
+    }
     // Index envelopes contain a typed key/ID or an incident distinct pair.
     if (count == 4 and (std.mem.eql(u8, parts[0], "incoming") or std.mem.eql(u8, parts[0], "cascade") or std.mem.eql(u8, parts[0], "distinct-key"))) {
         for (parts[1..4]) |part| {
@@ -1024,17 +1117,22 @@ const TestMemory = struct {
     a: A,
     rows: std.StringHashMapUnmanaged([]const u8) = .empty,
     reads: usize = 0,
+    read_bytes: usize = 0,
+    write_bytes: usize = 0,
     writes: usize = 0,
     visited: usize = 0,
     scans: usize = 0,
     fn get(ptr: *anyopaque, _: A, key: []const u8) !?[]const u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.reads += 1;
-        return self.rows.get(key);
+        const raw = self.rows.get(key);
+        if (raw) |value| self.read_bytes += value.len;
+        return raw;
     }
     fn put(ptr: *anyopaque, _: A, key: []const u8, raw: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.writes += 1;
+        self.write_bytes += raw.len;
         try self.rows.put(self.a, key, raw);
     }
     fn remove(ptr: *anyopaque, _: A, key: []const u8) !void {
@@ -1215,4 +1313,94 @@ test "resolver curation shared profile validation keeps a large curated graph on
     const buffer = try a.alloc(u8, 2 * 1024 * 1024);
     var bounded = std.heap.FixedBufferAllocator.init(buffer);
     try validateProfiles(bounded.allocator(), .{ .key_template = "{{_key}}", .merges = merged }, profiles);
+}
+
+test "resolver curation masked static edges do not expand unrelated components or suppression rules" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const backend: Backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan };
+    const store: Store = .{ .a = a, .prefix = "authority/", .backend = backend };
+    const Txn = struct {
+        memory: *TestMemory,
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            return self.memory.rows.get(key) orelse error.NotFound;
+        }
+        pub fn put(self: *@This(), key: []const u8, raw: []const u8) !void {
+            try TestMemory.put(self.memory, self.memory.a, key, raw);
+        }
+        pub fn delete(self: *@This(), key: []const u8) !void {
+            try TestMemory.remove(self.memory, self.memory.a, key);
+        }
+    };
+    var txn: Txn = .{ .memory = &memory };
+    const template = "entity/{{_key}}";
+    const aliases = try a.alloc(resolver.KeyAlias, 17001);
+    aliases[0] = .{ .key = "entity/seed", .target = "entity/hub" };
+    for (aliases[1..], 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/noise-{d}", .{i}), .target = "entity/hub" };
+    const keys = try a.alloc([]const u8, 10001);
+    keys[0] = "entity/terminal";
+    for (keys[1..], 0..) |*key, i| key.* = try std.fmt.allocPrint(a, "entity/blocked-{d}", .{i});
+    const definition: static_profiles.Definition = .{ .key_template = template, .aliases = aliases, .suppress_json = try encode(a, .{ .keys = keys, .texts = &.{"irrelevant text policy"} }) };
+    try static_profiles.synchronize(a, &txn, "profiles/", &.{}, &.{definition});
+    var namespace: policy.Namespace = .{ .key_template = template, .revision = 1, .state = .{ .removed_aliases = &.{"entity/seed"} } };
+    try store.adoptNamespace(namespace);
+    var reader: static_profiles.Reader = .{ .a = a, .backend = backend, .root = "profiles/" };
+    const removed = (try store.componentIndexed(template, &.{"entity/seed"}, reader.lookup())).?;
+    try std.testing.expectEqual(@as(usize, 0), removed.namespace.merges.len);
+    try std.testing.expectEqual(@as(usize, 0), reader.visits);
+    const empty = try reader.values();
+    try std.testing.expectEqual(@as(usize, 1), empty.len);
+    try std.testing.expectEqualStrings("", empty[0].suppress_json);
+    namespace.revision = 2;
+    namespace.merges = &.{.{ .key = "entity/seed", .target = "entity/terminal" }};
+    namespace.state.removed_aliases = &.{};
+    try store.apply(try difference(a, removed.namespace, namespace));
+    reader = .{ .a = a, .backend = backend, .root = "profiles/" };
+    const redirected = (try store.componentIndexed(template, &.{"entity/seed"}, reader.lookup())).?;
+    try std.testing.expectEqual(@as(usize, 1), redirected.namespace.merges.len);
+    try std.testing.expectEqual(@as(usize, 0), reader.visits);
+    const profiles = try reader.values();
+    try std.testing.expect(profiles[0].suppress_json.len < 64);
+    try std.testing.expectError(error.SuppressedResolverRedirectTarget, validateProfiles(a, redirected.namespace, profiles));
+}
+
+test "resolver curation proposal headers preserve evidence without reading or rewriting bodies" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "authority/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const evidence = try a.alloc(u8, 12 * 1024);
+    @memset(evidence, 'x');
+    var evidence_object: std.json.ObjectMap = .empty;
+    try evidence_object.put(a, "text", .{ .string = evidence });
+    const plan = try c.propose(a, .{}, &.{}, .{ .action = .merge, .key = "entity/a", .into = "entity/b", .evidence = .{ .object = evidence_object } }, .{});
+    const proposal_value = plan.state.proposals[0];
+    try store.applyQueue(.{ .expected_revision = 0, .revision = 1, .proposals = plan.state.proposals });
+    const body_path = try store.proposalPath(proposal_value.id);
+    const original_body = memory.rows.get(body_path).?;
+    const original_bytes = (try store.queueHead()).bytes;
+    memory.read_bytes = 0;
+    memory.write_bytes = 0;
+    const headers = try store.proposalHeadersForKeys(&.{"entity/a"});
+    try std.testing.expectEqual(@as(usize, 1), headers.proposals.len);
+    try std.testing.expect(headers.proposals[0].evidence == null);
+    const decision = try c.decide(a, headers, &.{}, &.{}, proposal_value.id, .{ .accept = false }, .{});
+    try store.applyQueue(.{ .expected_revision = 1, .revision = 2, .proposals = decision.state.proposals, .retain_evidence = true });
+    try std.testing.expect(memory.read_bytes < 8 * 1024);
+    try std.testing.expect(memory.write_bytes < 4 * 1024);
+    try std.testing.expect(original_body.ptr == memory.rows.get(body_path).?.ptr);
+    const result = (try store.proposal(proposal_value.id)).?;
+    try std.testing.expectEqual(c.ProposalState.rejected, result.state);
+    try std.testing.expectEqualStrings(evidence, result.evidence.?.object.get("text").?.string);
+    try std.testing.expectEqual(c.proposalCapacityBytes(.{ .proposals = &.{result} }), (try store.queueHead()).bytes);
+    try std.testing.expect((try store.queueHead()).bytes < original_bytes);
+    var forged = decision.state.proposals[0];
+    forged.confidence = 0.5;
+    try std.testing.expectError(error.ResolverCurationConflict, store.applyQueue(.{ .expected_revision = 2, .revision = 3, .proposals = &.{forged}, .retain_evidence = true }));
+    // A touched legacy row acquires a header without rewriting its body.
+    _ = memory.rows.remove(try store.proposalHeaderPath(proposal_value.id));
+    try std.testing.expectEqual(c.ProposalState.open, (try store.proposalHeader(proposal_value.id)).?.state);
 }

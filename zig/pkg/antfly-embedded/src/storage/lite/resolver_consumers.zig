@@ -19,8 +19,8 @@ const std = @import("std");
 const directory = @import("embedded_catalog.zig");
 const A = std.mem.Allocator;
 pub const catalog_key = "\x00\x00__metadata__:resolvers";
-pub const marker = "\x00antfly/embedded/resolver-consumers/v5/ready";
-pub const epoch_key = "\x00antfly/embedded/resolver-consumers/v5/epoch";
+pub const marker = "\x00antfly/embedded/resolver-consumers/v6/ready";
+pub const epoch_key = "\x00antfly/embedded/resolver-consumers/v6/epoch";
 pub fn epoch(txn: anytype) !u64 {
     const raw = txn.get(epoch_key) catch |err| return if (err == error.NotFound) 0 else err;
     return std.fmt.parseInt(u64, raw, 10);
@@ -28,12 +28,12 @@ pub fn epoch(txn: anytype) !u64 {
 fn bumpEpoch(a: A, txn: anytype) !void {
     try txn.put(epoch_key, try std.fmt.allocPrint(a, "{d}", .{try std.math.add(u64, try epoch(txn), 1)}));
 }
-pub const routes_prefix = "\x00antfly/embedded/resolver-consumers/v5/routes/";
-pub const namespace_prefix = "\x00antfly/embedded/resolver-consumers/v5/namespace/";
+pub const routes_prefix = "\x00antfly/embedded/resolver-consumers/v6/routes/";
+pub const namespace_prefix = "\x00antfly/embedded/resolver-consumers/v6/namespace/";
 pub const prefix = "\x00antfly/embedded/resolver-consumers/v1/target/";
 pub var test_binding_visits: std.atomic.Value(usize) = .init(0);
 pub const static_profiles = @import("../db/resolver_static_profiles.zig");
-pub const profiles_prefix = "\x00antfly/embedded/resolver-consumers/v5/static/";
+pub const profiles_prefix = "\x00antfly/embedded/resolver-consumers/v6/static/";
 pub const Binding = struct { profile_id: []const u8 = "", config_generation: u64 = 0, effective_generation: u64 = 0, source: []const u8, source_id: u64, resolver: []const u8, table: []const u8, key_template: []const u8, namespace_curation_table_id: u64 = 0, namespace_curation_generation: u64 = 0, namespace_curation_missing: bool = false };
 pub const work_prefix = "\x00\x00__metadata__:resolver_projection_work:v1/";
 pub const cursor_key = "\x00\x00__metadata__:resolver_projection_cursor:v1";
@@ -62,8 +62,8 @@ fn enqueue(a: A, txn: anytype, source_prefix: []const u8, work: Work) !void {
         } else |err| if (err != error.NotFound) return err;
     }
     try txn.put(key, try std.json.Stringify.valueAlloc(a, desired, .{}));
-    try txn.put("\x00\x00__metadata__:minimum_reader_version", "17");
-    if (source_prefix.len > 0) try txn.put(try std.mem.concat(a, u8, &.{ source_prefix, "\x00\x00__metadata__:minimum_reader_version" }), "17");
+    try txn.put("\x00\x00__metadata__:minimum_reader_version", "18");
+    if (source_prefix.len > 0) try txn.put(try std.mem.concat(a, u8, &.{ source_prefix, "\x00\x00__metadata__:minimum_reader_version" }), "18");
 }
 pub fn invalidateTarget(a: A, txn: anytype, table: []const u8, template: ?[]const u8) !void {
     const target = if (template) |value| try namespacePrefix(a, table, value) else try targetPrefix(a, table);
@@ -154,7 +154,7 @@ fn namespaceBindingKey(a: A, source: []const u8, cfg: Definition) ![]u8 {
 }
 const routes = @import("../db/resolver_namespace_routes.zig");
 fn routeRoot(a: A, table: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(a, "\x00antfly/embedded/resolver-consumers/v5/routes/{s}/", .{try routes.digest(a, table)});
+    return std.fmt.allocPrint(a, "\x00antfly/embedded/resolver-consumers/v6/routes/{s}/", .{try routes.digest(a, table)});
 }
 fn updateRoute(a: A, txn: anytype, cfg: Definition, add: bool) !void {
     try routes.update(a, txn, try routeRoot(a, cfg.table), cfg.key_template, add);
@@ -225,8 +225,8 @@ pub fn synchronize(a: A, txn: anytype, source_prefix: []const u8, before: ?[]con
     if (txn.get(marker)) |_| {
         // Existing handles may predate bootstrap's in-memory reader floor.
         // Every subsequent catalog write keeps the durable floor monotonic.
-        try txn.put("\x00\x00__metadata__:minimum_reader_version", "17");
-        if (source_prefix.len > 0) try txn.put(try std.mem.concat(a, u8, &.{ source_prefix, "\x00\x00__metadata__:minimum_reader_version" }), "17");
+        try txn.put("\x00\x00__metadata__:minimum_reader_version", "18");
+        if (source_prefix.len > 0) try txn.put(try std.mem.concat(a, u8, &.{ source_prefix, "\x00\x00__metadata__:minimum_reader_version" }), "18");
     } else |err| if (err != error.NotFound) return err;
     const old = if (before) |raw| try definitions(a, raw) else &.{};
     const next = if (after) |raw| try definitions(a, raw) else &.{};
@@ -315,7 +315,7 @@ pub fn bootstrap(a: A, txn: anytype) !void {
                 try enqueue(a, txn, source, .{ .table = binding.table, .key_template = binding.key_template, .namespace_curation_table_id = binding.namespace_curation_table_id, .namespace_curation_generation = binding.namespace_curation_generation, .namespace_curation_missing = binding.namespace_curation_missing });
                 binding_row = try nextEntry(&cursor);
             }
-            try txn.put("\x00\x00__metadata__:minimum_reader_version", "17");
+            try txn.put("\x00\x00__metadata__:minimum_reader_version", "18");
             try txn.put(marker, "1");
             break :blk "1";
         },

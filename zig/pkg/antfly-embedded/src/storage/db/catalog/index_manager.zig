@@ -13416,6 +13416,7 @@ pub const IndexManager = struct {
         }
         descriptor.admission_profile = profile.value_ptr.*;
         descriptor.aliases = &.{};
+        descriptor.suppress_json = "";
         return try ResolverConfig.clone(alloc, descriptor.config());
     }
     /// One public active execution definition, with visibility checked before
