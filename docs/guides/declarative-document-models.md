@@ -276,6 +276,11 @@ superseded only through source verification. Regional revisions preserve page
 text outside the corrected region, nested regions, tables and structured fields;
 ambiguous table ownership is reported as unresolved. An accepted regional revision
 replaces its owned table set, including when the replacement contains no tables.
+Replacement is tracked explicitly for the current run. Existing validation metadata
+and nonempty region table arrays do not imply a new revision. Untouched owners
+retain distinct page-level authoritative tables; matching flat aliases are rebuilt
+through bounded owner and payload indices, preserving genuine multiplicity. Geometry
+is consulted only for unowned tables affected by an accepted regional revision.
 
 Hosted reader composition preserves structured regions, nested children, tables,
 exact numeric fields and reported provenance. Unknown region or cell geometry
@@ -303,6 +308,14 @@ including nested regions. Mixed readings can support their literal spans without
 promoting interpreted, derived or estimated spans. Unresolvable or ambiguous
 provenance coverage fails closed; provider offsets are checked against the text before use.
 This check uses bounded traversal stacks and does not allocate or copy region trees.
+
+Extraction applies the same checked text-placement rules. It indexes disjoint
+provenance spans once per input, then uses binary search to map each field or
+entity to source evidence. Missing, conflicting or unlocatable mixed provenance
+makes that containing scope nonliteral; unrelated qualified scopes retain their
+literal evidence. Strict extraction rejects those ambiguous values unless derived
+values are allowed, in which case they carry derived provenance without literal
+offsets. Nested region paths are emitted directly without intermediate JSON.
 
 Structural corroboration normalizes reader-local owner IDs to canonical tree
 positions. Explicit `region_id` references address the immediate child scope,

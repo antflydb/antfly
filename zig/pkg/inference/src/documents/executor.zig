@@ -139,8 +139,10 @@ pub fn readPageReported(a: A, def: c.Definition, driver: Driver, page_index: usi
         const original_text = page.text;
         const original_regions = page.regions;
         const regions = try ir.cloneRegions(a, page.regions, run.limits.max_regions);
-        for (regions) |*region| {
-            const revised = try refine(a, def, driver, page_index, page, region.*, run);
+        const revisions = try a.alloc(bool, regions.len);
+        @memset(revisions, false);
+        for (regions, revisions) |*region, *changed| {
+            const revised = try refineTracked(a, def, driver, page_index, page, region.*, run, changed);
             if (revised.status != .complete) page.status = revised.status;
             if (revised.regions.len == 1) region.* = revised.regions[0];
             // Refinement owns findings as well as revisions. Once the shared
@@ -157,7 +159,7 @@ pub fn readPageReported(a: A, def: c.Definition, driver: Driver, page_index: usi
             },
             else => return err,
         };
-        const projection = try ir.projectTables(a, page.tables, regions, run.limits.max_regions);
+        const projection = try ir.projectRevisedTables(a, page.tables, regions, revisions, run.limits.max_regions);
         page.tables = projection.tables;
         if (!projection.resolved) {
             page.status = .unresolved;
@@ -187,9 +189,13 @@ fn applyPage(a: A, supplied: c.Page, candidate: Candidate, model: []const u8, li
 }
 
 fn refine(a: A, def: c.Definition, driver: Driver, page_index: usize, supplied: c.Page, region: ?c.Region, run: *c.Run) !c.Page {
+    var changed = false;
+    return refineTracked(a, def, driver, page_index, supplied, region, run, &changed);
+}
+fn refineTracked(a: A, def: c.Definition, driver: Driver, page_index: usize, supplied: c.Page, region: ?c.Region, run: *c.Run, changed: *bool) !c.Page {
     var page = supplied;
     var current = region;
-    refineInto(a, def, driver, page_index, &page, &current, run) catch |err| {
+    refineInto(a, def, driver, page_index, &page, &current, run, changed) catch |err| {
         page = try interrupted(a, page, err);
     };
     if (current) |v| page.regions = try a.dupe(c.Region, &.{v});
@@ -210,7 +216,7 @@ pub fn interrupted(a: A, supplied: c.Page, err: anyerror) !c.Page {
     return page;
 }
 
-fn refineInto(a: A, def: c.Definition, driver: Driver, page_index: usize, page: *c.Page, current: *?c.Region, run: *c.Run) !void {
+fn refineInto(a: A, def: c.Definition, driver: Driver, page_index: usize, page: *c.Page, current: *?c.Region, run: *c.Run, changed: *bool) !void {
     const r = def.read.?;
     var attempted: [3]Action = undefined;
     var attempts: usize = 0;
@@ -274,6 +280,7 @@ fn refineInto(a: A, def: c.Definition, driver: Driver, page_index: usize, page: 
             break;
         }
         if (validation == .source_supported and meaningful(candidate.text) and !candidate.truncated and (candidate.status == null or candidate.status.? == .complete)) {
+            changed.* = true;
             if (current.*) |*v| {
                 v.text = try a.dupe(u8, candidate.text);
                 v.model = binding.model;
@@ -616,18 +623,69 @@ test "document unchanged refinement preserves accepted structure and completion 
     const children = [_]c.Region{.{ .id = 9, .text = "caption", .origin = .estimated }};
     var page = c.Page{ .source_id = "receipt", .number = 1, .kind = .image, .text = "caption", .origin = .derived, .status = .truncated, .tables = &tables, .fields = .{ .string = "accepted" } };
     var region: ?c.Region = null;
-    try refineInto(std.testing.failing_allocator, def, driver, 0, &page, &region, &run);
+    var changed = false;
+    try refineInto(std.testing.failing_allocator, def, driver, 0, &page, &region, &run, &changed);
+    try std.testing.expect(!changed);
     try std.testing.expectEqual(c.Status.truncated, page.status);
     try std.testing.expectEqual(c.Origin.derived, page.origin);
     try std.testing.expectEqualStrings("accepted", page.fields.?.string);
     try std.testing.expect(page.tables.ptr == &tables);
     page.status = .unresolved;
     region = .{ .id = 7, .text = "caption", .origin = .interpretation, .confidence = 0.1, .children = &children, .tables = &tables, .fields = .{ .string = "accepted" } };
-    try refineInto(std.testing.failing_allocator, def, driver, 0, &page, &region, &run);
+    changed = false;
+    try refineInto(std.testing.failing_allocator, def, driver, 0, &page, &region, &run, &changed);
+    try std.testing.expect(!changed);
     try std.testing.expectEqual(c.Status.unresolved, page.status);
     try std.testing.expectEqual(c.Origin.interpretation, region.?.origin);
     try std.testing.expect(!region.?.validated);
     try std.testing.expect(region.?.children.ptr == &children);
     try std.testing.expect(region.?.tables.ptr == &tables);
     try std.testing.expectEqualStrings("accepted", region.?.fields.?.string);
+}
+
+test "document unchanged mixed table locations preserve authoritative tables" {
+    const Fake = struct {
+        fn read(_: *anyopaque, _: std.mem.Allocator, _: c.Binding, _: usize, _: ?[4]f64, _: *c.Run) !Candidate {
+            const cells = &[_]c.Cell{.{ .row = 0, .column = 0, .text = "nested" }};
+            const flat_cells = &[_]c.Cell{.{ .row = 0, .column = 0, .text = "flat" }};
+            return .{ .text = "caption", .regions = &.{.{ .id = 7, .text = "caption", .tables = &.{.{ .id = 2, .rows = 1, .columns = 1, .cells = cells }} }}, .tables = &.{.{ .id = 1, .region_id = 7, .rows = 1, .columns = 1, .cells = flat_cells }} };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var run = c.Run{ .limits = .{} };
+    var marker: u8 = 0;
+    const def = c.Definition{ .models = &.{.{ .name = "fast", .model = "fast", .operation = .read }}, .read = .{ .reader = "fast" } };
+    const page = try readPage(arena.allocator(), def, .{ .ptr = &marker, .read_fn = Fake.read }, 0, .{ .source_id = "receipt", .number = 1, .kind = .image }, &run);
+    std.debug.print("status={s}, flat tables={d}, surviving table={d}\n", .{ @tagName(page.status), page.tables.len, page.tables[0].id });
+    var retained = false;
+    for (page.tables) |t| if (t.id == 1) {
+        retained = true;
+    };
+    try std.testing.expect(retained);
+}
+
+test "document read produced overlapping provenance cannot establish literal extraction" {
+    const Fake = struct {
+        fn read(_: *anyopaque, _: std.mem.Allocator, _: c.Binding, _: usize, _: ?[4]f64, _: *c.Run) !Candidate {
+            return .{ .text = "caption", .regions = &.{ .{ .id = 0, .text = "caption", .origin = .transcription }, .{ .id = 1, .text = "caption", .origin = .interpretation } } };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var run = c.Run{ .limits = .{} };
+    var marker: u8 = 0;
+    const def = c.Definition{ .models = &.{.{ .name = "fast", .model = "fast", .operation = .read }}, .read = .{ .reader = "fast" } };
+    const page = try readPage(a, def, .{ .ptr = &marker, .read_fn = Fake.read }, 0, .{ .source_id = "receipt", .number = 1, .kind = .image }, &run);
+    try std.testing.expectEqual(c.Status.complete, page.status);
+    try std.testing.expect(page.regions[1].text_start == null);
+    const wire = try std.json.Stringify.valueAlloc(a, .{ .source_id = page.source_id, .segments = .{.{ .number = page.number, .start = @as(usize, 0), .end = page.text.len, .origin = page.origin, .regions = page.regions }} }, .{});
+    const metadata = try std.json.parseFromSliceLeaky(std.json.Value, a, wire, .{});
+    var item = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"structures":{"receipt":[{"caption":{"value":"caption","start":0,"end":7}}]}}
+    , .{});
+    const supported = try @import("evidence.zig").attach(a, &item, page.text, metadata, true, false);
+    std.debug.print("normal read status={s}, interpreted region start={?}, strict extraction accepted={}\n", .{ @tagName(page.status), page.regions[1].text_start, supported });
+    try std.testing.expect(!supported);
 }

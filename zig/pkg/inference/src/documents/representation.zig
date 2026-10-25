@@ -163,16 +163,69 @@ pub fn finding(a: A, page: *c.Page, value: []const u8, present: bool) !void {
 
 pub const TableProjection = struct { tables: []const c.Table, resolved: bool };
 pub fn projectTables(a: A, initial: []const c.Table, regions: []const c.Region, limit: usize) !TableProjection {
+    return projectRevisedTables(a, initial, regions, &.{}, limit);
+}
+
+/// Only this run's accepted revisions replace an owner's authoritative tables.
+/// Existing validation metadata and nested tables do not imply a new revision.
+pub fn projectRevisedTables(a: A, initial: []const c.Table, regions: []const c.Region, revisions: []const bool, limit: usize) !TableProjection {
+    if (initial.len > limit or regions.len > limit) return error.DocumentRegionLimitExceeded;
+    std.debug.assert(revisions.len == 0 or revisions.len == regions.len);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const work = scratch.allocator();
+    const Key = struct { owner: usize, id: usize, payload: [32]u8 };
+    var owners: std.AutoHashMapUnmanaged(usize, bool) = .empty;
+    const Capacity = struct { total: usize = 0, owned: usize = 0, used: usize = 0, used_owned: usize = 0 };
+    var aliases: std.AutoHashMapUnmanaged(Key, Capacity) = .empty;
+    var changed = std.ArrayList(usize).empty;
+    var table_count: usize = 0;
+    for (regions) |region| {
+        if (region.tables.len > limit -| table_count) return error.DocumentRegionLimitExceeded;
+        table_count += region.tables.len;
+    }
+    for (regions, 0..) |region, i| {
+        const revised = revisions.len > 0 and revisions[i];
+        const owner = try owners.getOrPut(work, region.id);
+        if (owner.found_existing) return error.InvalidDocumentModelResult;
+        owner.value_ptr.* = revised;
+        if (revised) try changed.append(work, i);
+        var self_shadowed = false;
+        for (region.children) |child| if (child.id == region.id) {
+            self_shadowed = true;
+            break;
+        };
+        if (initial.len > 0) for (region.tables) |table| {
+            const alias = try aliases.getOrPut(work, .{ .owner = region.id, .id = table.id, .payload = @import("content.zig").tableViewDigest(table) });
+            if (!alias.found_existing) alias.value_ptr.* = .{};
+            alias.value_ptr.total += 1;
+            if (table.region_id == null or (table.region_id.? == region.id and !self_shadowed)) alias.value_ptr.owned += 1;
+        };
+    }
     var out = std.ArrayList(c.Table).empty;
+    errdefer out.deinit(a);
     var resolved = true;
-    for (initial) |table| {
-        var replaced = false;
-        for (regions) |region| {
-            // Accepted revisions replace their owned structure, including an empty table set.
-            if (!region.validated and region.tables.len == 0) continue;
-            if (table.region_id) |owner| {
-                if (owner == region.id) replaced = true;
-            } else if (region.bbox) |box| {
+    // Reserve explicit links before inferring legacy aliases. This keeps table
+    // multiplicity independent of the order of flat records.
+    for ([_]bool{ true, false }) |declared| for (initial) |table| {
+        if (table.projection != declared) continue;
+        if (table.region_id) |id| {
+            if (owners.get(id) orelse false) continue;
+            const key = Key{ .owner = id, .id = table.id, .payload = @import("content.zig").tableViewDigest(table) };
+            if (aliases.getPtr(key)) |remaining| if (remaining.used < remaining.total and (declared or remaining.used_owned < remaining.owned)) {
+                remaining.used += 1;
+                if (!declared) remaining.used_owned += 1;
+                continue;
+            };
+            if (declared) return error.InvalidDocumentModelResult;
+        } else {
+            if (declared) return error.InvalidDocumentModelResult;
+            var replaced = false;
+            for (changed.items) |i| {
+                const box = regions[i].bbox orelse {
+                    resolved = false;
+                    continue;
+                };
                 var located = table.cells.len > 0;
                 var inside = true;
                 var intersects = false;
@@ -186,10 +239,12 @@ pub fn projectTables(a: A, initial: []const c.Table, regions: []const c.Region, 
                 }
                 if (located and inside) replaced = true;
                 if (!located or (intersects and !inside)) resolved = false;
-            } else resolved = false;
+            }
+            if (replaced) continue;
         }
-        if (!replaced) try out.append(a, table);
-    }
+        if (out.items.len >= limit) return error.DocumentRegionLimitExceeded;
+        try out.append(a, table);
+    };
     for (regions) |region| for (region.tables) |table| {
         if (out.items.len >= limit) return error.DocumentRegionLimitExceeded;
         var projected = table;
@@ -297,4 +352,51 @@ test "document nested region cells retain their independent structural allowance
     const regions = [_]c.Region{.{ .id = 0, .text = "Parent", .children = &children }};
     const copy = try cloneRegions(arena.allocator(), &regions, 2);
     try std.testing.expectEqualStrings("Two", copy[0].children[0].tables[0].cells[1].text);
+}
+
+test "document projection preserves authoritative multiplicity and only replaces explicit revisions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cells = [_]c.Cell{.{ .row = 0, .column = 0, .text = "cell", .bbox = .{ 0, 0, 1, 1 } }};
+    const table = c.Table{ .id = 1, .region_id = 7, .rows = 1, .columns = 1, .cells = &cells };
+    const nested = c.Table{ .id = 2, .rows = 1, .columns = 1, .cells = &cells };
+    const regions = [_]c.Region{.{ .id = 7, .text = "cell", .validated = true, .bbox = .{ 0, 0, 2, 2 }, .tables = &.{nested} }};
+    // Even a previously validated reader report is not a revision in this run.
+    const preserved = try projectTables(a, &.{table}, &regions, 8);
+    try std.testing.expectEqual(@as(usize, 2), preserved.tables.len);
+    try std.testing.expectEqual(@as(usize, 1), preserved.tables[0].id);
+    const replaced = try projectRevisedTables(a, &.{table}, &regions, &.{true}, 8);
+    try std.testing.expectEqual(@as(usize, 1), replaced.tables.len);
+    try std.testing.expectEqual(@as(usize, 2), replaced.tables[0].id);
+    const empty = [_]c.Region{.{ .id = 7, .text = "cell", .validated = true }};
+    try std.testing.expectEqual(@as(usize, 0), (try projectRevisedTables(a, &.{table}, &empty, &.{true}, 8)).tables.len);
+    var legacy = nested;
+    legacy.region_id = 7;
+    var declared = legacy;
+    declared.projection = true;
+    const repeat = try projectTables(a, &.{ legacy, declared }, &regions, 8);
+    try std.testing.expectEqual(@as(usize, 2), repeat.tables.len);
+    try std.testing.expect(!repeat.tables[0].projection and repeat.tables[1].projection);
+    try std.testing.expectError(error.InvalidDocumentModelResult, projectTables(a, &.{ declared, declared }, &regions, 8));
+    const stable = try projectTables(a, preserved.tables, &regions, 8);
+    try std.testing.expectEqual(@as(usize, 2), stable.tables.len);
+    var unowned = table;
+    unowned.region_id = null;
+    try std.testing.expectEqual(@as(usize, 1), (try projectRevisedTables(a, &.{unowned}, &empty, &.{true}, 8)).tables.len);
+    try std.testing.expectEqual(@as(usize, 1), (try projectRevisedTables(a, &.{unowned}, &regions, &.{true}, 8)).tables.len);
+}
+
+test "document projection releases indexed scratch and output on allocation failures" {
+    const Runner = struct {
+        fn run(a: A) !void {
+            const cells = [_]c.Cell{.{ .row = 0, .column = 0, .text = "cell" }};
+            const table = c.Table{ .id = 1, .region_id = 7, .rows = 1, .columns = 1, .cells = &cells };
+            const regions = [_]c.Region{.{ .id = 7, .text = "cell", .tables = &.{.{ .id = 2, .rows = 1, .columns = 1, .cells = &cells }} }};
+            const result = try projectTables(a, &.{table}, &regions, 8);
+            defer a.free(result.tables);
+            try std.testing.expectEqual(@as(usize, 2), result.tables.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }

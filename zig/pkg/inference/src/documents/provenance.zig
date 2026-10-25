@@ -20,7 +20,7 @@ const std = @import("std");
 const c = @import("contract.zig");
 const ir = @import("representation.zig");
 pub const View = struct { text: []const u8, origin: c.Origin, regions: []const c.Region = &.{} };
-const Range = struct { start: usize, end: usize };
+pub const Range = struct { start: usize, end: usize };
 const Span = struct { end: usize, literal: bool };
 
 /// Every byte the candidate presents as literal must be literal in the
@@ -129,12 +129,20 @@ fn uniform(regions: []const c.Region, literal: bool, depth: usize) error{Invalid
     return true;
 }
 fn locate(text: []const u8, scope: Range, cursor: usize, region: c.Region) ?Range {
-    if (region.text.len == 0) return null;
-    if (region.text_start) |start| if (region.text_end) |end| {
-        if (start >= cursor and end >= start and end <= scope.end and std.mem.eql(u8, text[start..end], region.text)) return .{ .start = start, .end = end };
+    return locateRange(text, scope, cursor, region.text, region.text_start, region.text_end);
+}
+
+/// Shared placement rules for typed readings and extraction metadata. Offsets
+/// are checked against bytes when text is present; older metadata may omit text.
+pub fn locateRange(text: []const u8, scope: Range, cursor: usize, content: ?[]const u8, first: ?usize, last: ?usize) ?Range {
+    if (content) |value| if (value.len == 0) return null;
+    if (first) |start| if (last) |end| {
+        if (start >= cursor and end > start and end <= scope.end and
+            (content == null or std.mem.eql(u8, text[start..end], content.?))) return .{ .start = start, .end = end };
     };
-    const start = std.mem.indexOfPos(u8, text[0..scope.end], cursor, region.text) orelse return null;
-    return .{ .start = start, .end = start + region.text.len };
+    const value = content orelse return null;
+    const start = std.mem.indexOfPos(u8, text[0..scope.end], cursor, value) orelse return null;
+    return .{ .start = start, .end = start + value.len };
 }
 
 test "document literal corroboration follows nested provenance and preserves unrelated literal spans" {

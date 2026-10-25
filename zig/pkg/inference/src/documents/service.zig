@@ -746,10 +746,13 @@ pub fn Service(comptime Node: type) type {
             const binding = try def.binding((def.extract orelse return error.DocumentCapabilityMismatch).model, .extract);
             const content = try cf.text(cf.field(input, "content") orelse return error.UnsupportedDocumentFormat);
             const policy = def.extract orelse return error.DocumentCapabilityMismatch;
+            const evidence = @import("evidence.zig");
+            var scratch = std.heap.ArenaAllocator.init(run.work_allocator orelse a);
+            defer scratch.deinit();
+            const source = try evidence.SourceIndex.init(scratch.allocator(), content, cf.field(input, "metadata"));
             var produced = try invokeExtraction(node, a, binding, graph, input, schema, version, options, control, run, phase);
             var item = produced.value;
-            const evidence = @import("evidence.zig");
-            var supported = try evidence.attach(a, &item, content, cf.field(input, "metadata"), policy.require_source_support, policy.allow_derived_values);
+            var supported = try evidence.attachIndexed(a, &item, content, &source, policy.require_source_support, policy.allow_derived_values);
             var corroborated = true;
             if (policy.verification_model) |name| {
                 const verifier = try def.binding(name, .extract);
@@ -761,7 +764,7 @@ pub fn Service(comptime Node: type) type {
                 const fallback = try def.binding(policy.fallback_model orelse return error.DocumentUnresolved, .extract);
                 produced = try invokeExtraction(node, a, fallback, graph, input, schema, version, options, control, run, .fresh);
                 item = produced.value;
-                supported = try evidence.attach(a, &item, content, cf.field(input, "metadata"), policy.require_source_support, policy.allow_derived_values);
+                supported = try evidence.attachIndexed(a, &item, content, &source, policy.require_source_support, policy.allow_derived_values);
                 if (!supported) return error.DocumentUnresolved;
                 if (policy.verification_model) |name| {
                     const verifier = try def.binding(name, .extract);

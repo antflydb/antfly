@@ -18,20 +18,26 @@
 const std = @import("std");
 const A = std.mem.Allocator;
 const V = std.json.Value;
+pub const SourceIndex = @import("source_evidence.zig").Index;
 const refs = @import("entity_index.zig");
 fn field(value: V, key: []const u8) ?V {
     return if (value == .object) value.object.get(key) else null;
 }
 
 pub fn attach(a: A, item: *V, state: []const u8, metadata: ?V, required: bool, allow_derived: bool) !bool {
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const source = try SourceIndex.init(scratch.allocator(), state, metadata);
+    return attachIndexed(a, item, state, &source, required, allow_derived);
+}
+
+/// The service shares immutable source qualification across primary and
+/// fallback extraction, while each candidate owns its emitted evidence.
+pub fn attachIndexed(a: A, item: *V, state: []const u8, source: *const SourceIndex, required: bool, allow_derived: bool) !bool {
     var supported = true;
     const entities = try refs.Index.init(a, item.*);
     const entity_support = try a.alloc(bool, entities.entities.len);
-    // Summarize effective source provenance once per input, not once per field.
-    // Without offsets a value cannot disambiguate literal and interpreted regions.
-    var source_references: std.array_list.Managed(V) = .init(a);
-    if (!required) try mapSpan(a, &source_references, metadata, .{ 0, state.len });
-    const unlocated_interpretation = interpreted(source_references.items);
+    const unlocated_interpretation = source.nonliteral;
     const unit_value = field(item.*, "offset_unit") orelse V{ .string = "utf8_bytes" };
     if (unit_value != .string) return error.InvalidDocumentEvidence;
     const unit = unit_value.string;
@@ -44,9 +50,9 @@ pub fn attach(a: A, item: *V, state: []const u8, metadata: ?V, required: bool, a
                 if (record.* != .object) return error.InvalidDocumentModelResult;
                 for (record.object.values()) |*value| {
                     if (value.* == .object) {
-                        supported = try attachField(a, value, "value", state, metadata, required, allow_derived, unit, unlocated_interpretation) and supported;
+                        supported = try attachField(a, value, "value", state, source, required, allow_derived, unit, unlocated_interpretation) and supported;
                     } else if (value.* == .array) {
-                        for (value.array.items) |*element| supported = try attachField(a, element, "value", state, metadata, required, allow_derived, unit, unlocated_interpretation) and supported;
+                        for (value.array.items) |*element| supported = try attachField(a, element, "value", state, source, required, allow_derived, unit, unlocated_interpretation) and supported;
                     } else if (required) supported = false;
                 }
             }
@@ -55,7 +61,7 @@ pub fn attach(a: A, item: *V, state: []const u8, metadata: ?V, required: bool, a
     // Validate each entity once; relation references reuse this result and
     // its verified evidence rather than rescanning source regions per edge.
     for (entities.entities, entity_support) |*entity, *valid| {
-        valid.* = try attachField(a, entity, "text", state, metadata, required, false, unit, unlocated_interpretation);
+        valid.* = try attachField(a, entity, "text", state, source, required, false, unit, unlocated_interpretation);
         supported = valid.* and supported;
     }
     if (item.object.getPtr("relations")) |relations| {
@@ -68,19 +74,19 @@ pub fn attach(a: A, item: *V, state: []const u8, metadata: ?V, required: bool, a
                     supported = false;
                     continue;
                 };
-                supported = try attachEndpoint(a, endpoint, entities, entity_support, state, metadata, required, unit, unlocated_interpretation) and supported;
+                supported = try attachEndpoint(a, endpoint, entities, entity_support, state, source, required, unit, unlocated_interpretation) and supported;
             }
         }
     }
     return supported;
 }
 
-fn attachEndpoint(a: A, endpoint: *V, entities: refs.Index, entity_support: []const bool, state: []const u8, metadata: ?V, required: bool, unit: []const u8, unlocated_interpretation: bool) !bool {
+fn attachEndpoint(a: A, endpoint: *V, entities: refs.Index, entity_support: []const bool, state: []const u8, source: *const SourceIndex, required: bool, unit: []const u8, unlocated_interpretation: bool) !bool {
     if (endpoint.* != .object) return error.InvalidDocumentModelResult;
     _ = endpoint.object.swapRemove("evidence");
     switch (try entities.resolve(endpoint.*)) {
         .unresolved => return false,
-        .inline_value => return attachField(a, endpoint, "text", state, metadata, required, false, unit, unlocated_interpretation),
+        .inline_value => return attachField(a, endpoint, "text", state, source, required, false, unit, unlocated_interpretation),
         .entity => |i| {
             if (!entity_support[i]) return false;
             const entity = entities.entities[i];
@@ -97,7 +103,7 @@ fn attachEndpoint(a: A, endpoint: *V, entities: refs.Index, entity_support: []co
     }
 }
 
-fn attachField(a: A, item: *V, key: []const u8, state: []const u8, metadata: ?V, required: bool, allow_derived: bool, unit: []const u8, unlocated_interpretation: bool) !bool {
+fn attachField(a: A, item: *V, key: []const u8, state: []const u8, source: *const SourceIndex, required: bool, allow_derived: bool, unit: []const u8, unlocated_interpretation: bool) !bool {
     const value = field(item.*, key) orelse return error.InvalidDocumentModelResult;
     // Provider evidence is not Antfly-verified evidence. Rebuild it only from
     // checked spans against the exact submitted source and reading metadata.
@@ -106,7 +112,7 @@ fn attachField(a: A, item: *V, key: []const u8, state: []const u8, metadata: ?V,
         stripLiteralOffsets(item);
         return true;
     }
-    if (field(item.*, "source")) |source| if (source == .string and std.mem.eql(u8, source.string, "schema")) return markDerived(a, item, allow_derived);
+    if (field(item.*, "source")) |kind| if (kind == .string and std.mem.eql(u8, kind.string, "schema")) return markDerived(a, item, allow_derived);
     const origin = field(item.*, "origin");
     if (origin) |o| {
         if (o != .string) return error.InvalidDocumentModelResult;
@@ -129,7 +135,7 @@ fn attachField(a: A, item: *V, key: []const u8, state: []const u8, metadata: ?V,
             }
             if (span != .array or span.array.items.len != 2 or element != .string) return error.InvalidDocumentModelResult;
             const range = (try exactSpan(state, element.string, span.array.items[0], span.array.items[1], unit)) orelse return false;
-            try mapSpan(a, &evidence, metadata, range);
+            try source.map(a, &evidence, range);
         }
         try item.object.put(a, "evidence", .{ .array = evidence });
         if (unlocated_items and unlocated_interpretation) return markDerived(a, item, allow_derived);
@@ -141,7 +147,7 @@ fn attachField(a: A, item: *V, key: []const u8, state: []const u8, metadata: ?V,
     if (value != .string) return false;
     const range = (try exactSpan(state, value.string, start, end, unit)) orelse return false;
     var evidence: std.array_list.Managed(V) = .init(a);
-    try mapSpan(a, &evidence, metadata, range);
+    try source.map(a, &evidence, range);
     try item.object.put(a, "evidence", .{ .array = evidence });
     return preserveOrigin(a, item, evidence.items, allow_derived);
 }
@@ -197,60 +203,6 @@ fn offset(value: V) !usize {
         else => error.InvalidDocumentEvidence,
     };
 }
-fn mapSpan(a: A, out: *std.array_list.Managed(V), metadata: ?V, range: [2]usize) !void {
-    const source = metadata orelse return;
-    const segments = field(source, "segments") orelse return;
-    const id = field(source, "source_id") orelse return error.InvalidDocumentEvidence;
-    if (segments != .array) return error.InvalidDocumentEvidence;
-    for (segments.array.items) |segment| {
-        const start = try offset(field(segment, "start") orelse return error.InvalidDocumentEvidence);
-        const end = try offset(field(segment, "end") orelse return error.InvalidDocumentEvidence);
-        const left = @max(start, range[0]);
-        const right = @min(end, range[1]);
-        if (left >= right) continue;
-        var path: [17]usize = undefined;
-        var remaining: usize = 65536;
-        try mapRegionSpan(a, out, id, segment, field(segment, "regions"), .{ left - start, right - start }, field(segment, "origin"), &path, 0, &remaining);
-    }
-}
-
-fn mapRegionSpan(a: A, out: *std.array_list.Managed(V), id: V, segment: V, regions: ?V, range: [2]usize, inherited: ?V, path: *[17]usize, depth: usize, remaining: *usize) !void {
-    if (depth > 16) return error.InvalidDocumentEvidence;
-    var cursor = range[0];
-    if (regions) |list| {
-        if (list != .array or list.array.items.len > remaining.*) return error.InvalidDocumentEvidence;
-        remaining.* -= list.array.items.len;
-        for (list.array.items) |region| {
-            const first = field(region, "text_start") orelse continue;
-            const last = field(region, "text_end") orelse continue;
-            if (first == .null or last == .null) continue;
-            const start = try offset(first);
-            const end = try offset(last);
-            if (start > end) return error.InvalidDocumentEvidence;
-            const left = @max(cursor, start);
-            const right = @min(range[1], end);
-            if (left >= right) continue;
-            if (cursor < left) try appendReference(a, out, id, segment, .{ cursor, left }, inherited, path[0..depth]);
-            path[depth] = try offset(field(region, "id") orelse return error.InvalidDocumentEvidence);
-            try mapRegionSpan(a, out, id, segment, field(region, "children"), .{ left, right }, field(region, "origin") orelse inherited, path, depth + 1, remaining);
-            cursor = right;
-        }
-    }
-    if (cursor < range[1]) try appendReference(a, out, id, segment, .{ cursor, range[1] }, inherited, path[0..depth]);
-}
-fn appendReference(a: A, out: *std.array_list.Managed(V), id: V, segment: V, range: [2]usize, origin: ?V, path: []const usize) !void {
-    var reference = V{ .object = .{} };
-    try reference.object.put(a, "source_id", id);
-    try reference.object.put(a, "offset_unit", .{ .string = "utf8_bytes" });
-    try reference.object.put(a, "page_number", field(segment, "number") orelse return error.InvalidDocumentEvidence);
-    try reference.object.put(a, "start", .{ .integer = @intCast(range[0]) });
-    try reference.object.put(a, "end", .{ .integer = @intCast(range[1]) });
-    if (origin) |value| try reference.object.put(a, "origin", value);
-    if (field(segment, "role")) |role| try reference.object.put(a, "role", role);
-    if (path.len > 0) try reference.object.put(a, "region_path", try std.json.parseFromSliceLeaky(V, a, try std.json.Stringify.valueAlloc(a, path, .{}), .{}));
-    try out.append(reference);
-}
-
 /// Shared semantic comparison owns bounded scratch memory for each vote.
 pub const sameValues = @import("comparison.zig").sameValues;
 
@@ -393,4 +345,66 @@ test "document relation evidence rejects dangling contradictory unsupported and 
     , .{});
     try std.testing.expect(try attach(a, &optional, "Alice Antfly", null, false, false));
     try std.testing.expect(field(field(optional, "relations").?.array.items[0].object.get("source").?, "evidence") == null);
+}
+
+test "document strict extraction rejects unlocatable nonliteral provenance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var item = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"structures":{"receipt":[{"caption":{"value":"caption","start":0,"end":7}}]}}
+    , .{});
+    const metadata = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"source_id":"receipt","segments":[{"number":1,"start":0,"end":7,"origin":"transcription","regions":[{"id":7,"text":"unlocated caption","text_start":null,"text_end":null,"origin":"interpretation"}]}]}
+    , .{});
+    const supported = try attach(a, &item, "caption", metadata, true, false);
+    std.debug.print("strict extraction with ambiguous interpreted region supported={}\n", .{supported});
+    try std.testing.expect(!supported);
+}
+
+test "document extraction qualifies provenance scopes once and preserves unrelated literal evidence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "interpretation", "derived", "estimated" }) |nonliteral| {
+        const wire = try std.fmt.allocPrint(a,
+            \\{{"source_id":"receipt","segments":[{{"number":1,"start":0,"end":14,"origin":"transcription","regions":[{{"id":0,"text":"Header","origin":"transcription"}},{{"id":1,"text":"caption","origin":"transcription","children":[{{"id":2,"text":"caption","origin":"transcription"}},{{"id":3,"text":"caption","origin":"{s}"}}]}}]}}]}}
+        , .{nonliteral});
+        const metadata = try std.json.parseFromSliceLeaky(V, a, wire, .{});
+        for ([_]bool{ false, true }) |allow| {
+            var header = try std.json.parseFromSliceLeaky(V, a,
+                \\{"structures":{"r":[{"header":{"value":"Header","start":0,"end":6}}]}}
+            , .{});
+            try std.testing.expect(try attach(a, &header, "Header\ncaption", metadata, true, allow));
+            var caption = try std.json.parseFromSliceLeaky(V, a,
+                \\{"structures":{"r":[{"caption":{"value":"caption","start":7,"end":14}}]}}
+            , .{});
+            try std.testing.expectEqual(allow, try attach(a, &caption, "Header\ncaption", metadata, true, allow));
+            const value = caption.object.get("structures").?.object.get("r").?.array.items[0].object.get("caption").?;
+            try std.testing.expectEqualStrings("derived", value.object.get("origin").?.string);
+            try std.testing.expect(!value.object.contains("start"));
+        }
+    }
+}
+
+test "document evidence indexing and emitted paths release every allocation failure" {
+    const Runner = struct {
+        fn run(backing: A) !void {
+            var arena = std.heap.ArenaAllocator.init(backing);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const metadata = try std.json.parseFromSliceLeaky(V, a,
+                \\{"source_id":"receipt","segments":[{"number":1,"start":0,"end":7,"origin":"transcription","regions":[{"id":7,"text":"caption","children":[{"id":11,"text":"caption"}]}]}]}
+            , .{});
+            var item = try std.json.parseFromSliceLeaky(V, a,
+                \\{"structures":{"r":[{"caption":{"value":"caption","start":0,"end":7}}]}}
+            , .{});
+            try std.testing.expect(try attach(a, &item, "caption", metadata, true, false));
+            const value = item.object.get("structures").?.object.get("r").?.array.items[0].object.get("caption").?;
+            const path = value.object.get("evidence").?.array.items[0].object.get("region_path").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), path.len);
+            try std.testing.expectEqual(@as(i64, 11), path[1].integer);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }

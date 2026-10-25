@@ -24,6 +24,15 @@ const V = std.json.Value;
 const A = std.mem.Allocator;
 const Mode = enum { exact, evidence };
 
+/// Identity of a physical table view, excluding its placement and alias marker.
+pub fn tableViewDigest(supplied: c.Table) [32]u8 {
+    var table = supplied;
+    table.region_id = null;
+    var digest = Digest{};
+    digest.table(table, .exact);
+    return digest.finish();
+}
+
 pub fn sameAccepted(page: c.Page, region: ?c.Region, candidate: executor.Candidate) !bool {
     const before = if (region) |r| try signature(r.children, r.tables, r.fields, .exact, null) else try signature(page.regions, page.tables, page.fields, .exact, null);
     return std.mem.eql(u8, &before, &try signature(candidate.regions, candidate.tables, candidate.fields, .exact, null));
