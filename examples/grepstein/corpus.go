@@ -455,15 +455,10 @@ func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string
 	}
 	indexes := map[string]any{corpusTextIndex: map[string]any{"type": "full_text", "field": "text", "artifact_name": corpusChunks, "enrichments": []any{
 		map[string]any{"name": corpusUnits, "kind": "asset", "field": "url", "content_type": "application/json", "producer_json": string(producerJSON)},
-		map[string]any{"name": corpusChunks, "kind": "chunk", "field": "text", "source_artifact_name": corpusUnits, "chunk_size": 512, "chunk_overlap": 50, "full_text_index": true},
+		map[string]any{"name": corpusChunks, "kind": "chunk", "field": "text", "source_artifact_name": corpusUnits, "chunk_size": 512, "chunk_overlap": 50},
 	}}}
-	indexes[DefaultFullTextIndex] = map[string]any{"type": "full_text"}
-	// Corpus names and wildcard/regexp expressions must share lexical tokens.
-	// The default English stemmer turns Maxwell into maxwel; pattern queries
-	// deliberately operate on indexed terms and do not stem their expressions.
-	indexes[corpusTextIndex].(map[string]any)["analysis_config"] = map[string]any{
-		"field_analyzers": map[string]any{"text": "simple", "_all": "simple"},
-	}
+	// The server owns and creates full_text_index_v0. Including its reserved
+	// name in a public create request is rejected, even with default settings.
 	if semantic {
 		indexes[DefaultEmbeddingIndex] = map[string]any{"type": "embeddings", "field": "embedding", "dimension": DefaultEmbeddingDims, "distance_metric": "cosine", "embedding_name": "document_dense_v1", "source_artifact_name": corpusChunks, "embedder": map[string]any{"provider": "antfly", "model": embeddingModel}, "enrichments": []any{map[string]any{"name": "document_dense_v1", "kind": "embedding", "field": "text", "source_artifact_name": corpusChunks, "expected_dims": DefaultEmbeddingDims}}}
 		// Graph units and revision markers intentionally have no document
@@ -871,6 +866,11 @@ func corpusTableSchema() map[string]any {
 	}
 	properties["title"] = map[string]any{"type": "string"}
 	properties["content"] = map[string]any{"type": "string"}
+	// Use the public schema mapping contract for lexical artifact text. Named
+	// artifact indexes own their routing; routing the same chunks into the
+	// ordinary full-text index as well is unnecessary. The server-created
+	// ordinary index remains available for graph-unit content.
+	properties["text"] = map[string]any{"type": "string", "x-antfly-field": map[string]any{"type": "text", "analyzer": "simple"}}
 	return map[string]any{"default_type": "doc", "document_schemas": map[string]any{"doc": map[string]any{"schema": map[string]any{"type": "object", "additionalProperties": true, "properties": properties}}}}
 }
 

@@ -280,9 +280,31 @@ func TestCorpusLoadResumeAfterFailedBatch(t *testing.T) {
 	failed := true
 	var accepted []string
 	identity := "table-1"
+	created := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "GET" {
 			fmt.Fprintf(w, `{"table_id":%q,"description":%q}`, identity, description)
+			return
+		}
+		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/tables/grepstein_corpus") {
+			var body struct {
+				Indexes map[string]map[string]any `json:"indexes"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Error(err)
+				w.WriteHeader(400)
+				return
+			}
+			if _, reserved := body.Indexes[DefaultFullTextIndex]; reserved {
+				http.Error(w, "system-owned index cannot be declared", 400)
+				return
+			}
+			if _, unsupported := body.Indexes[corpusTextIndex]["analysis_config"]; unsupported {
+				http.Error(w, "use the public schema field mapping for the text analyzer", 400)
+				return
+			}
+			created = true
+			io.WriteString(w, `{}`)
 			return
 		}
 		if !strings.HasSuffix(r.URL.Path, "/batch") {
@@ -311,6 +333,9 @@ func TestCorpusLoadResumeAfterFailedBatch(t *testing.T) {
 	}))
 	defer server.Close()
 	args := []string{"--state", state, "--url", server.URL, "--batch-size", "1", "--semantic=false"}
+	if err := corpusLoadCmd(append(append([]string{}, args...), "--create-table", "--create-only")); err != nil || !created {
+		t.Fatalf("public table creation contract failed: %v", err)
+	}
 	if err := corpusLoadCmd(args); err == nil {
 		t.Fatal("failed batch reported success")
 	}

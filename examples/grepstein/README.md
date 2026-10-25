@@ -136,10 +136,12 @@ checkpoint. `wait` requires complete and queryable aggregate **and shard**
 readiness; successful submission alone is not success. `grep` and `graph` also
 check artifact generations and unit inventories before publishing derived data.
 
-The Cloud default `v0.2.5` runtime is not qualified for this workflow: live testing
-rejects the combined index request and its table response lacks the stable
-`table_id` required by resumable loading. Native PDF extraction itself works via
-the separate enrichment API, but that is insufficient qualification. Deploy a
+The Cloud default `v0.2.5` runtime is not qualified for this workflow: its table
+response lacks the stable `table_id` required by resumable loading. Live testing
+accepts the corrected combined table request, including the public schema's
+`simple` text analyzer. The server creates its system-owned default text index;
+the client declares only its named artifact index. Native PDF extraction works,
+but that is insufficient qualification of the resumable load. Deploy a
 reviewed runtime containing this PR's API and reader changes, then qualify the
 actual load, readiness, and artifact contracts before importing the corpus. Do
 not bypass table identity checks or infer complete coverage from accepted rows.
