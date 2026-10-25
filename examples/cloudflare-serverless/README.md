@@ -218,6 +218,32 @@ this admitted profile.
 
 ## Budgets and maintenance boundaries
 
+The following local-lane limits describe the compatibility profile. The R2
+configuration now uses tenant reader/build actors and module-wide bounded kernel
+pools: two 16 MiB reader slots, one 16 MiB metadata slot and one 32 MiB build/WAL
+slot, plus shared 8 MiB immutable cache, up to 4 MiB of charged decoded-row entries and 8 MiB queued
+encoded inputs. Readers cap native working memory at 8 MiB. Actor queues admit
+at most eight calls / 4 MiB per actor with 30-second admission deadlines;
+`READERS_PER_TENANT` defaults to two (one through four logical slots). Increasing
+logical actors does not increase the physical kernel pool. See the
+[design and rollout contract](../../docs/design/cloudflare-performance.md#bounded-tenant-runtimes-and-prepared-wal-commits)
+for colocation, GC overlap and aggregate-memory limits. New reader/build actors
+use no SQLite or platform storage API.
+
+WAL pages are prepared outside the metadata writer transaction, then accepted
+with an original-HEAD ETag check and atomic publication reservation. Background
+GC/compaction/reindex admission coalesces duplicate triggers and continuations.
+The R2 metadata profile coalesces an idle checkpoint hint after at least eight
+new metadata revisions and a 250 ms idle interval. It defers behind foreground
+work and retries throttling once. Inline native checkpoints retain their
+64-commit default. Missed idle hints retain the immutable log's safe recovery
+path. Runtime work leases open after physical kernel admission, so a queued
+request does not consume its lease while waiting.
+
+The configured Queue concurrency of four allows different tenants to progress;
+an executing bounded step can still delay its tenant's next background step.
+
+
 - Separate serialized interactive and maintenance lanes keep R2 indexing waits
   from occupying the interactive stack. Calls competing for the same lane receive
   503 with `Retry-After`. Instances arbitrate writes with CAS and publication fences.
@@ -587,3 +613,13 @@ For cold measurements, rebind to a fresh physical coordinator class while
 preserving storage IDs, pause Queue delivery and disable cron. Pass
 `--expected-version=WORKER_VERSION_UUID`; the version-only readiness probe does
 not warm WASM or a tenant object, and old-version data responses are excluded.
+
+
+For disposable live qualification, `node qualification/analytics.mjs RUN_JSON`
+fetches periodic whole-isolate memory percentiles and scoped R2 analytics from
+Cloudflare. It uses `CLOUDFLARE_API_TOKEN` or the existing local Wrangler OAuth
+credential only as authorization to Cloudflare's API. Reports contain no
+credential. Recent samples can lag; percentiles are not absolute peaks and R2
+adaptive request counts are not a finalized bill. Run it before deleting the
+disposable namespaces/bucket. `qualification/mixed.mjs` keeps workload timings
+separate from these platform measurements.

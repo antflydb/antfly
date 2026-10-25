@@ -19,18 +19,29 @@ profile unless explicitly stated otherwise.
 ## Execution and storage
 
 ```text
-Browser -> authenticated Worker API -> one suspended WASM lane
-                                      |             |
-                               R2 host binding   metadata coordinator
-                                      |             |
-                            immutable WAL pages,    WAL HEAD,
-                            native artifacts,       native progress/fences
-                            native manifests
+Browser -> authenticated Worker API -> tenant reader actors -> bounded read kernels
+                                   -> tenant metadata writer
+                                      | WAL preparation (outside transaction)
+                                      | short conditional HEAD + receipt commit
+                                      v
+                                  native R2 metadata + immutable artifacts
 
-WAL receipt -> Queue -> bounded native builder -> fenced published HEAD
+WAL receipt -> coalesced Queue ticket -> tenant builder actor -> fenced HEAD
 Scheduled trigger -> Queue (repair missed admission)
 App AI route -> Workers AI binding -> configured AI Gateway
 ```
+
+The R2 configuration binds `READERS` and `BUILDERS`; the compatibility profile
+retains the original local lanes. Readers and builders derive their tenant from
+their physical Durable Object identity. An input payload cannot select a different
+tenant or expand a reader into a mutation capability. They keep no platform
+storage state. The `new_sqlite_classes` registration is Cloudflare's object-class
+registration mechanism; these actors do not call SQLite or `ctx.storage`.
+
+Logical actors can share an isolate. Module-wide kernel and cache budgets, rather
+than the number of actors, bound colocated native allocations. See the
+[pool, commit and maintenance design](cloudflare-performance.md#bounded-tenant-runtimes-and-prepared-wal-commits)
+for admission, memory limits and rollout details.
 
 `serverless_runtime_wasm.zig` compiles the existing artifact, manifest,
 publication, document facts, and query paths for `wasm32-freestanding`.
@@ -50,8 +61,9 @@ each request; cached instances do not retain request-owned RPC stubs.
 R2 byte ranges and conditional PUTs preserve objectstore contracts. Missing
 objects, CAS conflicts, integrity failures, cancellation, limits, and transport
 errors remain distinct. R2 bindings do not provide an atomic conditional
-DELETE, so that capability fails closed. The coordinator implements metadata
-CAS in one SQLite transaction, retaining native record metadata such as
+DELETE, so that capability fails closed. The compatibility coordinator implements metadata CAS in one SQLite
+transaction. The R2-native coordinator commits Antfly metadata through its own
+conditional log/root protocol. Both retain native record metadata such as
 content type. An authority is selected at initial provisioning and must not
 change without an explicit migration.
 
@@ -158,23 +170,24 @@ also passed; see the [measurements and limits](cloudflare-qualification.md).
 The [native reuse audit](cloudflare-native-audit.md) records subsequent adapter
 changes, larger local workloads, native compaction, paged dense/sparse updates, resumable bulk reindex, and live
 windowed enrichment and SQLite soaks.
-The current Wrangler dry-run bundle is about 4.6 MiB uncompressed / 1.4 MiB
-gzip; sizes vary with the toolchain. The interactive and maintenance instances each cap WASM memory at 32 MiB
-and share an 8 MiB immutable JS cache. Total isolate memory, startup, CPU,
-real R2 throttling, broad deployment failure injection, and sustained
-compaction/collection need further qualification. The small live fixture
-measured latency/CPU and exercised collection and Gateway; it did not measure
-total isolate memory. Large builds can exceed admitted Worker budgets and remain an
-explicit deployment limitation.
+The R2 profile statically bundles full (32 MiB maximum) and compact (16 MiB)
+versions of the same native module. Two shared reader slots, one metadata slot
+and one builder/WAL-preparation slot have an aggregate declared maximum of
+80 MiB per hosting isolate. Shared JS caches and queued inputs have separate
+bounds; this maximum excludes other JS and platform allocations. The compatibility
+profile retains its original 32 MiB interactive and maintenance instances.
 
+Periodic whole-isolate Cloudflare measurements are available through the scoped
+qualification analytics tool. They are samples rather than absolute peak usage;
+measurements and the remaining latency/scale gates are in the qualification and
+performance designs. Large builds can still exceed admitted Worker budgets.
 
-The opt-in paged projection profile bounds dense/sparse update and rebuild
-memory. Its hash-local clustering changes ANN routing quality; the native audit
-records a low-probe recall limitation and measured results. A globally trained
-or hierarchical routing layer remains necessary where the measured
-recall/latency tradeoff does not meet application requirements. The resumable
-reindex operation rebuilds current native definitions; it does not implement
-DDL migration or graph/external-source reconstruction.
+The opt-in paged dense projection format now supports immutable globally trained
+coarse centers, followed by bounded local clustering. Training/migration is
+bounded; an existing large legacy root requires a reindex. Low-probe routing
+remains approximate and needs distribution-specific recall and I/O qualification.
+The resumable reindex operation rebuilds current native definitions; it does not
+implement DDL migration or graph/external-source reconstruction.
 
 
 The [performance design](cloudflare-performance.md) documents one-RPC read

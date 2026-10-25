@@ -358,7 +358,10 @@ in the ignored qualification directory. The final quiescent drain removed
 3,308 objects totaling 22,634,774 stored bytes. This is an end-of-test storage
 footprint, not peak occupancy or billed GB-months.
 
-### Capacity gates still exposed by this run
+### Capacity gates exposed by the preceding run
+
+These observations motivated the runtime, commit and admission changes below.
+The follow-up qualification records their measured benefits and remaining gaps.
 
 The single foreground WASM lane per application isolate causes cross-tenant
 admission contention while a request waits on R2. The final read p95 and retry
@@ -381,3 +384,190 @@ storage footprint do not establish those two measurements.
 After verification, delivery remained paused, the consumer was explicitly
 removed, all storage was drained, and the disposable Worker, both Queues and
 R2 bucket were deleted successfully. No test service remains deployed.
+
+
+## Bounded tenant runtimes and prepared WAL commits
+
+The R2 profile routes interactive operations to `R2ReadRuntime` objects named
+by `(incarnation, slot)` and background steps to `R2BuildRuntime` objects named
+by `(incarnation, 0)`. `READERS_PER_TENANT` defaults to two and admits one through
+four logical reader slots. Each actor checks its own physical identity against
+the deployment's tenant mapping and allows only its role's operations. Tenant
+names in caller payloads cannot change the selected namespace. Durable state
+continues to live in Antfly's R2 formats; these runtime actors use no platform
+storage API.
+
+An actor executes one step at a time and admits at most eight requests / 4 MiB
+of encoded input, with a 1 MiB per-request limit. One module-wide 8 MiB input
+reservation also covers pending WAL groups. Reader/build queues include waiting
+time in their 30-second deadline; queued WAL groups carry their admission
+deadline through preparation and conditional commit. The HTTP frontend admits
+at most 16 requests when both actor bindings are configured. A busy or expired
+request returns the existing retryable response rather than an unbounded queue.
+
+Actors are logical isolation, not a guarantee of separate V8 heaps. Cloudflare
+can colocate objects in a hosting isolate with a 128 MiB memory limit; its
+[periodic memory metrics](https://developers.cloudflare.com/durable-objects/observability/metrics-and-analytics/)
+measure the entire hosting isolate. Accordingly the kernel pools are module-wide:
+
+| Pool | Slots | Maximum linear memory per slot | Purpose |
+| --- | ---: | ---: | --- |
+| Reader | 2 | 16 MiB | Queries; native live working set at most 8 MiB |
+| Metadata | 1 | 16 MiB | R2 coordinator transactions and recovery |
+| Build / WAL preparation | 1 | 32 MiB | Bounded publication, indexing, collection and WAL page construction |
+
+The maximum declared linear allocation is 80 MiB even if several tenant objects
+share the module. Slots install transport/inference capabilities per request;
+they retain no request-owned RPC stub. The metadata pool is independent so a
+suspended engine cannot consume every slot needed to finish its own metadata
+RPC. Compact kernels recycle at 12 MiB and full kernels at 24 MiB. The two
+precompiled WASM assets differ only in their declared memory maximum; Workers
+do not dynamically compile or download executable code.
+
+The immutable cache is shared and capped at 8 MiB. Decoded metadata rows use
+eight store owners, each capped at 512 KiB of serialized-size accounting. This
+4 MiB cache charge is an estimate, not a measurement of JS heap usage. Cache keys include the
+namespace. Queued encoded inputs total at most 8 MiB. These accounting bounds do
+not include every JS object, temporary serialization, transfer buffer or platform
+allocation. Recycling releases instance references for garbage collection; the
+80 MiB sum is a bound on retained pool instances, not a promise about transient
+GC overlap. Actual memory samples and out-of-memory events remain rollout gates.
+
+### Prepare data, then conditionally commit metadata
+
+The writer captures an authenticated read view under the existing durable reader
+pin, including the WAL HEAD ETag and manifest metadata. A `PreparedWal` adapter
+serves only that captured metadata and stages only a small conditional WAL HEAD
+write. Native indexed-WAL/receipt-tree construction uploads immutable pages to
+R2 outside the authoritative writer transaction. Reads and other short metadata
+callbacks can run while those uploads wait on storage.
+
+After preparation, one writer transaction compares the original WAL HEAD ETag,
+installs the new HEAD and reserves publication together. Concurrent publication
+cannot mutate the captured manifest generation; its durable pin protects it.
+A different WAL HEAD, including a collector's epoch rotation, invalidates the
+preparation. The writer retries from a fresh snapshot up to three times within
+one deadline and aggregate operation/transfer budget. Failed or ambiguous uploads
+leave unreachable immutable pages for existing collection, never a visible
+partial receipt. An accepted duplicate is still resolved through the native
+receipt tree. Unknown metadata writes fail closed. The existing authority and
+fence checks still run at the final transaction boundary.
+
+### Background admission and tenant fairness
+
+Queue delivery concurrency is four, allowing different tenant builders to
+progress. A builder prefers publication/enrichment over young queued GC work;
+work older than five seconds becomes equally eligible. Executing bounded steps
+are not preempted. A shared kernel pool has a bounded FIFO queue across actors;
+it does not promise a hard latency reservation or weighted scheduling.
+
+Antfly metadata stores expiring tickets for data GC, metadata GC, compaction and
+reindex. A repeated trigger coalesces with an active ticket. Continuations carry
+a ticket identity and monotonic step; advancing once makes stale deliveries
+ineligible to create more continuation work. Send failures abandon admission;
+expiry permits repair of lost admission. Operation execution retains its native
+idempotency and lease checks. Publication keeps its existing durable scheduler.
+SQLite-to-R2 migration uses its own frozen-authority protocol and is deliberately
+excluded from these new tickets. Repeated metadata-GC triggers resume the current
+job instead of also executing its next step inline while a continuation exists.
+
+Deploy every actor class and its bindings/migrations before enabling the new
+routing. Both immutable module assets must ship together. The compatibility
+profile and existing storage identities remain valid; switching logical runtime
+names does not migrate data. Native format-2 vector writers require a coordinated
+reader and collector upgrade, described below.
+
+
+### Globally routed paged vectors
+
+Dense paged roots can now use root format 2 while retaining the existing artifact
+metadata version. The root adds an authenticated `global_centers` tree and uses
+`postings` as an authenticated document-identity membership map. Sparse roots and
+small dense roots retain format 1. Legacy format-1 dense roots remain readable;
+new format-1 encodings omit absent optional fields so older readers do not see
+an unknown null field.
+
+A new or small growing dense root trains at a dimension-dependent bootstrap
+threshold: the largest power of two no greater than 2,048 entries and 4 MiB of
+raw projection data, with a minimum of 256 samples. The ordered hash-key sample
+feeds the existing native clustering implementation to produce up to 64 global
+coarse centers. Training and initial rerouting admit only the threshold through
+threshold + 256 entries, still within the raw-byte cap. Larger legacy roots are
+left unchanged; use a bounded rebuild into a fresh root rather than migrating
+an unbounded archive inside a publication step.
+
+The centers are immutable for that root lineage. Each projection routes to its
+nearest center; a routed key combines the center ID, the document's remaining
+hash bits and its projection ordinal. Each coarse cell initially owns an
+explicit directory shard. A cell can split further within the existing shard
+byte/entry limits, and bounded native local clustering supplies leaf payloads.
+This gives subsequent writes a stable global partition without retraining the
+entire collection or moving untouched cells.
+
+A separate document-hash membership entry records every routed cell for a
+multi-projection document. An update removes all prior memberships before adding
+the current projections; a delete removes the whole set. Old immutable roots
+retain the previous memberships and vectors. Collection traverses the new
+centers and identity-map roots alongside documents, directories, routing leaves
+and their native payloads. The regression test covers cell moves,
+multi-projection replacement/deletion, old-root reads and the new GC root.
+
+Queries rank local routing centroids and visit the nearest coarse cell first.
+Cosine route ordering incorporates each cluster's measured mean alignment and
+estimated residual spread as a ranking heuristic; it is never a safe exact-prune
+bound. Format-2 queries add a 25% route margin to the existing adaptive probe
+hint, capped by the available routes. The margin spends extra reads to cover
+coarse-cell boundaries; equal requested probe hints do not imply equal I/O with
+format 1. Full effort visits all local routes and retains the independently
+asserted exact-search control. All paths retain request I/O and working-memory
+caps.
+
+This is an incremental global partition, not an automatic distribution-drift
+solution. Training is bounded and frozen, and queries still load local routing
+centroids. A large changing corpus can require a fresh bounded rebuild, better
+training samples or a deeper routing directory to satisfy its recall/I/O target.
+Keep paged projections opt-in and qualify real embeddings. Deploy format-2
+readers and collectors everywhere before allowing writers to create these roots;
+a rollback must retain those readers until a deliberate compatible rebuild.
+
+
+### Recovery checkpoints after idle
+
+The R2 adapter keeps the native 64-commit inline checkpoint cadence and also
+coalesces a recovery hint after at least eight new metadata revisions and a
+250 ms idle interval. The idle task rechecks foreground admission before joining
+the metadata queue at maintenance priority. It skips busy work, retries a
+throttled hint once after 1.1 seconds, and never changes an acknowledged mutation
+into a failure. [Durable Object background lifetime](https://developers.cloudflare.com/durable-objects/api/state/)
+is retained through `ctx.waitUntil`; the task stores no platform state.
+
+The immutable slot remains the commit point, conditional checkpoint updates
+remain monotonic, and the one-second overwrite throttle still applies. Interrupted
+or skipped idle work leaves the original safe recovery path. Eight revisions is
+an eligibility threshold, not a hard recovery-read or latency bound. Continuous
+load or a crash can still expose the longer tail. The native coordinate request
+also admits inline power-of-two cadences from eight through 64; generic callers
+retain 64. The live inline-eight experiment increased write latency, so the
+production R2 profile uses idle hints instead of requiring that work before ACK.
+
+The longer-soak recovery exposed 10–35 second first requests. Native regressions
+prove that a shorter checkpoint tail works and throttled hints cannot replace a
+durable commit. The final idle policy also has coalescing, foreground-deferral
+and bounded-retry tests. Live results and the observed extra write/maintenance
+work are recorded in the [qualification report](cloudflare-qualification.md).
+
+Publication work leases and runtime snapshots are opened only after admission
+to a physical kernel slot. Acquiring a lease while queued behind another tenant
+consumed its lifetime before execution and caused observed `Canceled` /
+`WorkLeaseLost` deferrals. Expired pending kernel jobs now reject and leave the
+queue without opening a lease; native in-flight cancellation and fencing remain
+unchanged.
+
+
+The final version-verified mixed run measured read median/p95 0.82/6.31 s and
+write median/p95 4.18/8.00 s, with no admission retries. Compaction p95 was
+12.57 s with no retries, compared with 39.18 s and 27 retries in the inline-eight
+experiment. Fresh-runtime first counts measured 8.10–14.09 s, without retries;
+all receipt/body checks passed. The [qualification report](cloudflare-qualification.md)
+records corpus, phases, versions and limits. These samples do not establish
+production tail-latency targets, and write/cold latency remain explicit gates.

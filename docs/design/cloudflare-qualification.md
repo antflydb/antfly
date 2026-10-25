@@ -1,6 +1,6 @@
 # Cloudflare hosted profile qualification
 
-This records a disposable live run on 2026-10-24 UTC for issue #1278.
+This records successive disposable live runs on 2026-10-24–25 UTC for issue #1278.
 The fixture is deliberately small; it does not establish arbitrary-dataset
 capacity or complete native feature parity.
 
@@ -228,3 +228,198 @@ The disposable Worker, both Queues and the empty R2 bucket were then deleted
 successfully. The version probe leaves native runtimes and coordinator state
 cold but warms Worker routing/JavaScript; complete platform-isolate cold-start
 latency remains outside this measurement.
+
+
+## Isolated runtimes and prepared commits (2026-10-25 UTC)
+
+The disposable R2-native deployment now uses tenant reader/build actors, bounded
+shared kernels and WAL preparation outside the writer transaction. The workload
+uses four independent commit domains, each with 512 documents carrying a 1 KiB
+payload, paged text, publication prefixes of 64 and Queue concurrency four.
+Automatic recurring GC/cron admission was disabled to control the mixed-load
+comparison. This is a bounded load experiment, not arbitrary-scale production
+sign-off.
+
+| Phase | Fenced reads | Writes | Read median / p95 | Write median / p95 | Admission retries |
+| --- | ---: | ---: | --- | --- | ---: |
+| Initial isolated-runtime run, eight rounds | 96 | 32 | 1.43 / 18.17 s | 4.35 / 23.89 s | 0 |
+| Repeat with fresh operation IDs, same corpus | 96 | 32 | 0.98 / 5.66 s | 3.59 / 7.14 s | 0 |
+| 32-round soak with fresh operation IDs | 384 | 128 | 1.83 / 5.51 s | 4.34 / 6.51 s | 0 |
+
+The soak also completed 32 compactions (median 10.41 s, p95 20.80 s), followed
+by 132 exact count/body/payload/update checks (median 315 ms, p95 578 ms).
+The previous local-lane comparison had read median/p95 3.98/7.36 s with 644
+admission retries and write median/p95 3.10/4.64 s. Isolation removed observed
+admission retries and improved the repeat/soak read distribution, but writes
+were slower and the first isolated run had materially worse tails. Different
+network conditions, cache warmth, deployment recovery and queue state remain
+confounders. These runs establish progress and correctness, not a uniform
+latency improvement or an SLO.
+
+### Whole-isolate memory and attributed usage
+
+The scoped `qualification/analytics.mjs` tool queries Cloudflare's
+`durableObjectsPeriodicGroups` and `r2OperationsAdaptiveGroups` for this Worker
+and bucket. At 02:50:07 UTC, before fresh cold namespaces were created, the
+periodic memory samples were:
+
+| Namespace class | Samples | p50 bytes | p95 bytes | p99 bytes |
+| --- | ---: | ---: | ---: | ---: |
+| R2ReadRuntime | 132 | 9,497,067 | 15,272,819 | 17,969,572 |
+| R2CommitCoordinator | 68 | 14,998,176 | 19,470,680 | 20,246,908 |
+| R2BuildRuntime | 56 | 11,263,917 | 13,339,492 | 13,663,361 |
+
+Cloudflare documents these as [whole hosting-isolate measurements](https://developers.cloudflare.com/durable-objects/observability/metrics-and-analytics/),
+which can include colocated objects. The percentiles are not per-object memory,
+an absolute high watermark, or proof that every future workload fits 128 MiB.
+They replace the earlier absence of actual platform memory evidence for this
+bounded fixture; WASM accounting still remains separate.
+
+The same snapshot attributed 11,704 successful GETs, 7,902 GET user-error
+responses, 4,443 successful PUTs, three PUT user-error responses and nine LISTs
+to the disposable bucket. These are adaptive analytics counts through that
+snapshot, not finalized billable quantities. Bootstrap, seeding, multiple
+versions and the mixed workloads share the interval. Account invoice cost
+remains unmeasured; do not substitute transport counters or apply request prices
+to every error response as if these were invoice line items.
+
+### Larger local metadata qualification
+
+`node qualification/r2-scale.mjs 100000 --compact --inline-checkpoint-commits=8` completed the actual native
+metadata engine over an asynchronous R2 contract fixture, including reopen,
+128 deletes, a complete ordered verification scan and three self-collection
+cycles (1,541 bounded steps). It retained the expected 99,872 records. Maximum
+native working memory was 1,232,890 bytes, linear memory 12,582,912 bytes, and
+one request used at most 105 object operations / 3,492,818 transferred bytes.
+The compact module's declared maximum is 16 MiB. The whole local run took
+152 seconds with the inline-eight checkpoint experiment; these timings are not deployed R2 latency or whole-isolate memory.
+
+The global vector routing benchmark records per-query GET attempts/bytes,
+routing shape, raw-cosine recall and a full-effort exact-control assertion.
+Requested probes remain hints, and format 2 intentionally spends a 25% route
+margin beyond the existing adaptive budget. Changes to recall must be assessed
+alongside that added I/O, not treated as a free clustering improvement.
+
+
+The final 1,536-dimension fixture accepted and published 3,000 documents, then
+passed cold self-neighbor queries, dense/sparse lookup, updates, deletion and
+exact-control recall checks. A redundant decoded-training-sample copy initially
+caused publication to exhaust the 32 MiB module around the training threshold;
+transferring the already-owned sample into native training removed that copy.
+The rerun needed no special recycling setting: peak native working memory was
+14,344,743 bytes and peak linear memory 31,195,136 bytes. This is close to the
+32 MiB limit, so it does not establish much growth headroom for a single step.
+Three held-out queries measured mean recall@10 0.50 at eight requested probes
+and 1.00 at 32/full effort. There were only 64 local routes; adaptive probing
+plus the format-2 margin visits them all at 32, so that result is not a
+low-I/O approximation. Average downloaded bytes were 4,732,856 at eight probes
+and 11,941,946 at 32/full effort. Local ingestion/publication took 137 seconds;
+this remains a storage-contract fixture, not live R2 latency.
+
+
+At 10,000 rows / 384 dimensions, the ANN qualification module
+`85b373c04632689927c98d6f138fa092246377f41d39992494255f2c15e71896`
+produced 64 coarse centers, 64 directory shards and 127 local routing leaves.
+Ten held-out raw-cosine queries measured:
+
+| Requested probes | Mean recall@10 | Mean physical GETs | Mean downloaded bytes |
+| --- | ---: | ---: | ---: |
+| 8 | 0.45 | 62.2 | 2,014,707 |
+| 32 | 0.86 | 122.6 | 6,221,038 |
+| Full effort | 1.00 | 169.7 | 9,408,081 |
+
+The preceding format-1 control measured 0.22/0.79/1.00 at those probe settings;
+its report did not record these per-query physical counters. The new policy
+uses both global routing and a wider route budget, so the result is not an
+isolated clustering-quality comparison. At 1,000 rows the root remains format
+1 and the ten-query results stay 0.85/1.00/1.00. The final 10,000-row run also
+passed cold dense/sparse queries, updates and deletion. Peak working/linear
+memory was 13,977,697 / 27,459,584 bytes; ingestion/publication took 156 seconds
+on the shared local machine. Distribution drift and larger route tables still
+need workload-specific qualification before production rollout.
+
+
+### Recovery after the 32-round soak
+
+With Queue delivery paused, fresh physical coordinator, reader and builder
+namespaces reused the same logical incarnations and R2 storage identities.
+The version-only probe addressed no actor, and every data response was required
+to match `9ca77475-3c10-40dd-bd32-1cd6bfa8410e`. All four first counts returned
+512; all 132 exact body/count/payload checks and eight old/new receipt replays
+passed. The first counts took 35.02 s (two attempts), 13.83 s, 12.69 s and
+10.27 s. One initial request needed a retry. Follow-up verification median/p95
+was 417/882 ms. This was fresh native/actor recovery with warm Worker routing,
+not proof of complete platform-isolate eviction.
+
+The cold result exposed the cost of replaying up to a 64-slot native metadata
+epoch. An inline-eight checkpoint experiment retained epoch size, immutable
+commit authority, owner fencing and monotonic checkpoint validation. Hints obeyed
+the one-second overwrite limit and a failed/throttled hint could not change the
+accepted commit's outcome. The native regression verifies short-tail recovery
+and retained durability while a hint is throttled.
+
+That experiment passed a further eight rounds on one verified version
+`a4ec5d7e-bfe1-49cb-819a-456909c4761e`: 96 reads, 32 writes and 132 exact checks.
+Read median/p95 was 1.52/9.70 s and write median/p95 was 7.41/15.09 s, with no
+read/write admission retries. Eight compactions had p95 39.18 s including 27
+retries. Publication eventually converged; captured background work included
+cancellation and lease-loss deferrals. These results do not establish a good
+foreground tradeoff for inline-eight checkpoints.
+
+The final R2 policy therefore retains inline-64 checkpoints and coalesces a
+hint after eight new revisions and 250 ms of idle time, with a busy check and
+one delayed retry. This keeps ordinary hint work out of the foreground ACK.
+Physical kernel admission now also precedes publication lease acquisition;
+pending jobs can expire without consuming a lease. The inline-eight dataset
+remains in the report as evidence of the cost that motivated these changes.
+
+The inline checkpoint experiment passed all 80 Node tests and all three persisted
+workerd tests (156 seconds), including tenant capability rejection, grouped
+writers, both collectors, erased platform storage and frozen SQLite migration.
+Native checkpoint/fencing and global-routing allocation/GC regression gates
+passed without leaks. The full main native serverless suite also passed 543
+tests (six skipped) before the final checkpoint-policy tuning; the final targeted
+gate reran the affected native log and global-routing cases.
+
+
+### Final idle-checkpoint and lease-admission run
+
+With the final idle policy and lease acquisition inside physical kernel
+admission, version `ece291b0-23fd-4022-ade6-efd6e3352633` completed another eight
+rounds on the same corpus with fresh operation identities. All 96 fenced reads,
+32 writes, eight compactions and 132 exact verification checks passed with zero
+admission retries. Read median/p95 was 0.82/6.31 s; write median/p95 was
+4.18/8.00 s. Compaction median/p95 was 10.12/12.57 s, and final verification
+median/p95 was 251/584 ms. This is a measured improvement over the inline-eight
+experiment, with network/cache confounders still present. Write p95 remains
+above the preceding local-lane baseline; production tail-latency sign-off is
+still open.
+
+`node qualification/r2-scale.mjs 100000 --compact --idle-checkpoint` also passed
+with the final native-inline-64 / idle-hint policy. It reopened across eviction,
+retained 99,872 expected rows after 128 deletes, performed the full ordered
+verification scan and completed three collection cycles (1,543 steps). Peak
+working memory was 1,233,355 bytes, linear memory 12,582,912 bytes, and request
+traffic stayed within 105 operations / 3,493,001 bytes. The local run took 90
+seconds on the shared development machine; comparisons with earlier local wall
+times do not isolate a performance gain. The final 82 Node tests and all three
+persisted workerd tests passed (132 seconds for workerd), including idle-hint
+coalescing and rejection of expired kernel admission before lease acquisition.
+
+
+The final recovery used another fresh physical coordinator/reader/builder class
+set, preserving logical storage identities and rejecting every data response
+outside version `13403e01-7697-46df-8d64-b4c3dd79a1d4`. After Queue delivery was
+paused, first counts took 14.09, 8.10, 9.34 and 9.25 seconds; each returned 512
+on its first attempt. All 132 exact checks and eight original/latest receipt
+replays passed, with no admission retries. Follow-up verification median/p95 was
+411/831 ms. No checkpoint was manually forced before those first requests.
+Worker routing was warmed only by the version probe.
+
+This reduces the worst observed first request from the longer-soak recovery but
+does not establish a cold-start SLO: four samples have different metadata tails,
+and 8–14 seconds remains a material latency gate. Sustained multi-region load,
+large live embedding corpora, distribution-specific ANN recall, complete
+platform eviction/failure injection and finalized billing still require further
+production qualification. The final Node suite also passed the instantiation-
+expiry race regression, bringing its total to 83 tests.

@@ -395,3 +395,22 @@ native page/ranking/reindex tests with no leaks, the guarded-provider rejection
 contract, 13 portable native contracts, the storage test audit, license headers
 and Apache product boundaries. Both Binaryen 132 packaging paths built valid
 WASM; the final merged artifact was checked in real workerd.
+
+
+## Tenant runtime isolation and global routing follow-up
+
+The R2 profile now runs reads and background steps through tenant runtime
+actors, with module-wide bounded compact/full WASM pools. Native WAL/receipt
+pages are prepared before entering the metadata writer transaction; the final
+HEAD ETag check still fences concurrent writers and collection epoch changes.
+Background admission coalesces duplicate triggers and continuation phases.
+Implementation, memory accounting and rollout are described in the
+[performance design](cloudflare-performance.md#bounded-tenant-runtimes-and-prepared-wal-commits).
+
+Dense paged format-2 roots now carry immutable global coarse centers and exact
+document-to-cell membership. Updates, multi-projection deletes, old-generation
+reads and collector discovery have regression coverage. This extends bounded
+incremental routing; it does not establish a universal ANN recall target or
+remove the need to rebuild when the corpus distribution changes. The benchmark
+records routing shape and physical GET bytes alongside recall so extra probe
+work is visible rather than counted as a free quality improvement.
