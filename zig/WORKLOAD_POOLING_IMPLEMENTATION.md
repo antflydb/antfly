@@ -27810,3 +27810,10 @@ fifteen resumable-payload, 124 accounting and 53 ABI/host/context cases, plus
 companions. There are no failures, skips or leaks. Formatting, license headers
 and generated error-name checks pass. The final native input hash maps are
 unchanged and equal between modes; full GNU qualification remains waived.
+
+
+The subsequent explicit origin/main merge includes `27011cf1c3` and its
+three-core macOS v0.2.5 fixture-writer startup fix. It merges without conflicts
+and changes only the release qualification harness and its regression tests.
+The release-upgrade gate tests pass after merging. The 5,656 qualified native
+input hashes remain unchanged. The original worktree, branch and PR are retained.

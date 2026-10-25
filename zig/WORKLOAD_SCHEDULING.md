@@ -15,8 +15,8 @@ Original source baseline: `e4d707de5634a8d758c606b4432037e1a1682052` on
 branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
-The current merge includes `origin/main` through `1727ce4198`
-(merge commit `7c5eba9c9a`).
+The current merge includes `origin/main` through `27011cf1c3`
+(the v0.2.5 upgrade qualification fixture startup fix).
 
 Private native ABI 124 and kernel-owner ABI 184 fence the current manager,
 registry, quota-owner, independently funded memory-account and deferred read-cache
