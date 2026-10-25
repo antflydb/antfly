@@ -1952,8 +1952,11 @@ fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime h
     var reads: u64 = 0;
     var writes: u64 = 0;
     var pages: Pages = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
-    const recipes = [_]@import("lake_row_input_recipes.zig").Recipe{.{ .name = if (ordered) @import("lake_row_input_recipes.zig").ordering_name else "text", .digest = @splat(8), .columns = if (ordered) &.{"id"} else &.{ "id", "body", "price" } }};
-    const builder = try @import("lake_row_identity_delta.zig").Builder.create(a, &manager, &pages, &.{physical.inventory.files[0].file_id}, null, null, &recipes, physical.inventory.source_id, physical.inventory.snapshot_id);
+    const recipes: []const @import("lake_row_input_recipes.zig").Recipe = if (ordered) &.{
+        .{ .name = "text", .digest = @splat(8), .columns = &.{ "id", "body", "price" } },
+        .{ .name = @import("lake_row_input_recipes.zig").ordering_name, .digest = @splat(9), .columns = &.{"id"} },
+    } else &.{.{ .name = "text", .digest = @splat(8), .columns = &.{ "id", "body", "price" } }};
+    const builder = try @import("lake_row_identity_delta.zig").Builder.create(a, &manager, &pages, &.{physical.inventory.files[0].file_id}, null, null, recipes, physical.inventory.source_id, physical.inventory.snapshot_id);
     defer builder.deinit();
     for (0..row_count) |row| {
         var id: [32]u8 = @splat(3);
@@ -1961,7 +1964,7 @@ fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime h
             id[0] = if (selective) @intCast((row % 16) << 4) else 0;
             std.mem.writeInt(u64, id[24..32], row, .big);
         }
-        try builder.addWithInputs(.{ .id = id, .values = @splat(4) }, .{ .file = 0, .group = 0, .row = row_count - 1 - row }, &.{@splat(5)});
+        try builder.addWithInputs(.{ .id = id, .values = @splat(4) }, .{ .file = 0, .group = 0, .row = row_count - 1 - row }, if (ordered) &.{ @splat(5), @splat(5) } else &.{@splat(5)});
     }
     const root = try builder.finish(@splat(1), @splat(2), @splat(3));
     var captured: ?*@import("lake_row_payloads.zig").Capture = null;
@@ -2111,20 +2114,20 @@ fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime h
         var prior = root;
         prior.native_space = native.space;
         for (0..4) |step| {
-            var active_recipes = recipes;
-            if (step >= 2) active_recipes[0].digest = @splat(9);
+            const active_recipes = try selection_arena.allocator().dupe(@import("lake_row_input_recipes.zig").Recipe, recipes);
+            if (step >= 2) active_recipes[1].digest = @splat(10);
             if (step == 3) {
                 prior.native_space.?.ordering_keys = null;
                 prior.native_space.?.ordering_cohort = null;
             }
-            const refreshed = try @import("lake_row_identity_delta.zig").Builder.create(a, &manager, &pages, &.{physical.inventory.files[0].file_id}, null, null, &active_recipes, physical.inventory.source_id, physical.inventory.snapshot_id);
+            const refreshed = try @import("lake_row_identity_delta.zig").Builder.create(a, &manager, &pages, &.{physical.inventory.files[0].file_id}, null, null, active_recipes, physical.inventory.source_id, physical.inventory.snapshot_id);
             defer refreshed.deinit();
             for (0..row_count) |row| {
                 if (step >= 1 and row == 1) continue;
                 var id: [32]u8 = @splat(3);
                 id[0] = 0;
                 std.mem.writeInt(u64, id[24..32], row, .big);
-                try refreshed.addWithInputs(.{ .id = id, .values = @splat(if (row == 0) @as(u8, if (step == 3) 8 else 7) else 4) }, .{ .file = 0, .group = 0, .row = row_count - 1 - row }, &.{@splat(if (row == 0) @as(u8, if (step == 3) 7 else 6) else 5)});
+                try refreshed.addWithInputs(.{ .id = id, .values = @splat(if (row == 0) @as(u8, if (step == 3) 8 else 7) else 4) }, .{ .file = 0, .group = 0, .row = row_count - 1 - row }, &.{ @splat(if (row == 0) @as(u8, 6) else 5), @splat(if (row == 0) @as(u8, if (step == 3) 7 else 6) else 5) });
             }
             const updated = try refreshed.finish(@splat(1), @splat(2), @splat(3));
             const next = (try prepare(a, &store, table, &physical, &provider, updated, prior)).?;
