@@ -6051,3 +6051,15 @@ in 24.65 seconds: shuffled Parquet bounded native sorting, the full Parquet
 lifecycle and the real Iceberg lifecycle. The 48 benchmark samples and 34-case
 qualification above remain tied to their earlier frozen executable; they are not
 relabelled as measurements of the merge.
+
+
+### Lineage page leases, bounded term probes and binary refresh tuples
+
+Reader protocol 87 reuses verified immutable lineage pages through an eight-page
+operation-local lease cache, traverses result tiles in ordinal order and keeps
+current authority checks on warm hits. Acquisition work and CPU point work have
+separate bounds before complete inverse-map fallback. Sorted membership now
+retains eight position-free term probes under a 2-MiB budget, with exact bitmap
+fallback under pressure. Ordering-key rows use a versioned typed binary codec
+while reading historical JSON entries and preserving incremental mixed trees.
+See the [ownership, compatibility and fallback contract](../docs/plans/lake-row-identity.md#bounded-lineage-leases-term-probes-and-binary-refresh-keys-reader-protocol-87).

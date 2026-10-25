@@ -8021,20 +8021,78 @@ fn sortedSegmentLocalDocDeleted(segment: *const index_mod.SegmentEntry, local_do
 /// bitmaps. Tombstones are captured separately so borrowed facts stay immutable.
 const SortedSegmentDocMembership = struct {
     const LazyContext = struct {
+        const Budget = @import("../../../sql/memory_budget.zig");
+        const Slot = struct {
+            ordinal: ?usize = null,
+            probe: ?query_mod.ExactTermProbe = null,
+            used: u64 = 0,
+            fn clear(self: *@This()) void {
+                if (self.probe) |*probe| probe.deinit();
+                self.* = .{};
+            }
+        };
         allocator: Allocator,
         snapshot: *const index_mod.IndexSnapshot,
         filter: query_mod.Filter,
-        probe: ?query_mod.ExactTermProbe = null,
-        ordinal: ?usize = null,
+        // Query-owned and independent of bitmap admission. Never retain an
+        // unbounded posting reader for every segment of an archive.
+        probe_budget: Budget,
+        slots: [8]Slot = @splat(.{}),
+        clock: u64 = 0,
+        probe_opens: u64 = 0,
+        probe_hits: u64 = 0,
+        fn clearProbes(self: *@This()) void {
+            for (&self.slots) |*slot| slot.clear();
+        }
+        fn evict(self: *@This()) bool {
+            var oldest: ?usize = null;
+            for (self.slots, 0..) |slot, i| if (slot.ordinal != null) {
+                if (oldest == null or slot.used < self.slots[oldest.?].used) oldest = i;
+            };
+            const i = oldest orelse return false;
+            self.slots[i].clear();
+            return true;
+        }
         fn contains(self: *@This(), ordinal: usize, doc: u32) !?bool {
-            if (self.ordinal != ordinal) {
-                if (self.probe) |*probe| probe.deinit();
-                self.probe = null;
-                self.ordinal = null;
-                self.probe = try query_mod.ExactTermProbe.init(self.allocator, self.filter, self.snapshot, ordinal);
-                self.ordinal = ordinal;
-            }
-            return if (self.probe) |*probe| try probe.contains(doc) else null;
+            self.clock +|= 1;
+            for (&self.slots, 0..) |*slot, i| if (slot.ordinal == ordinal) {
+                self.probe_hits += 1;
+                slot.used = self.clock;
+                return self.probeAt(i, doc);
+            };
+            const i = for (self.slots, 0..) |slot, index| {
+                if (slot.ordinal == null) break index;
+            } else vacant: {
+                _ = self.evict();
+                for (self.slots, 0..) |slot, index| if (slot.ordinal == null) break :vacant index;
+                unreachable;
+            };
+            const probe = acquire: while (true) {
+                break :acquire query_mod.ExactTermProbe.init(self.probe_budget.allocator(), self.filter, self.snapshot, ordinal) catch |err| {
+                    if (err == error.OutOfMemory and self.probe_budget.isLocallyExhausted()) {
+                        if (self.evict()) continue;
+                        // Optional probe admission never prevents the existing
+                        // exact membership bitmap from serving this segment.
+                        return null;
+                    }
+                    return err;
+                };
+            };
+            self.probe_opens += 1;
+            self.slots[i] = .{ .ordinal = ordinal, .probe = probe, .used = self.clock };
+            return self.probeAt(i, doc);
+        }
+        fn probeAt(self: *@This(), i: usize, doc: u32) !?bool {
+            const probe = if (self.slots[i].probe) |*held| held else return null;
+            return probe.contains(doc) catch |err| {
+                if (err == error.OutOfMemory and self.probe_budget.isLocallyExhausted()) {
+                    // Posting chunks can allocate after reader admission. Drop
+                    // the partial cursor before exact bitmap fallback as well.
+                    self.slots[i].clear();
+                    return null;
+                }
+                return err;
+            };
         }
     };
     const Segment = struct {
@@ -8107,7 +8165,7 @@ const SortedSegmentDocMembership = struct {
         for (self.segments) |*segment| segment.deinit();
         if (self.segments.len > 0) alloc.free(self.segments);
         if (self.lazy) |value| {
-            if (value.probe) |*probe| probe.deinit();
+            value.clearProbes();
             alloc.destroy(value);
         }
         self.* = undefined;
@@ -8200,7 +8258,7 @@ fn buildSortedSegmentDocMembershipAlloc(
         if (exact) |count| {
             if (lazy == null) {
                 lazy = try alloc.create(SortedSegmentDocMembership.LazyContext);
-                lazy.?.* = .{ .allocator = alloc, .snapshot = snapshot, .filter = filter };
+                lazy.?.* = .{ .allocator = alloc, .snapshot = snapshot, .filter = filter, .probe_budget = .{ .backing = @import("../../../sql/memory_budget.zig").reclaimingAllocator(alloc), .limit = 2 * 1024 * 1024 } };
             }
             bitmaps[i] = .{ .exact_count = count, .header_count = header, .deleted = deleted, .lazy = lazy, .segment_index = i, .base = doc_base, .count = segment.reader.doc_count };
         } else {
@@ -36406,8 +36464,12 @@ test "deferred membership refines partial terms with arbitrary chunk probes" {
             // Descending, forward, gaps, repeated and cross-segment probes.
             for ([_]u32{ 4095, 4094, 4092, 3, 2, 0, 2049, 2048, 8191, 4097, 4096, 4095, 1, 1 }) |doc| try std.testing.expectEqual(doc % 4 != 0 and !(masked and doc == 1), try membership.contains(doc));
             for (membership.segments) |segment| try std.testing.expect(segment.matches == null);
-            try std.testing.expect(membership.lazy.?.probe != null);
-            try std.testing.expectEqual(@as(u64, 0), membership.lazy.?.probe.?.postings.decodedPositionRecords());
+            var open_probes: usize = 0;
+            for (membership.lazy.?.slots) |slot| if (slot.probe) |probe| {
+                open_probes += 1;
+                try std.testing.expectEqual(@as(u64, 0), probe.postings.decodedPositionRecords());
+            };
+            try std.testing.expect(open_probes != 0);
             // A later exhaustive fallback must start from complete membership,
             // independently of arbitrary-order point-probe cursor state.
             var iterator = membership.iterator();
@@ -36683,4 +36745,56 @@ test "native public ordering seeks complete ties with conservative routing bound
     const date_fields = [_]segment_mod.SegmentIndexSortField{ .{ .field = "when" }, .{ .field = "_id" } };
     try std.testing.expect(!try dated.nativeBoundsMayCompete(&date_fields, bounds, &.{ .{ .string = "1969-12-31T23:59:57Z" }, .{ .string = "cut" } }));
     try std.testing.expect(try dated.nativeBoundsMayCompete(&date_fields, bounds, &.{ .{ .string = "1969-12-31T23:59:58Z" }, .{ .string = "cut" } }));
+}
+
+test "logical value borrowed term probes stay warm across interleaved segments and decline bounded pressure" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    const intro = @import("../../../introducer.zig");
+    for (0..12) |segment| {
+        var docs: [128]intro.TextDocument = undefined;
+        const fields = try out.alloc(intro.TextField, docs.len);
+        for (&docs, fields, 0..) |*doc, *field, i| {
+            field.* = .{ .field_name = "body", .text = if (i % 2 == 0) "quasar" else "other" };
+            doc.* = .{
+                .id = try std.fmt.allocPrint(out, "segment-{d}-row-{d}", .{ segment, i }),
+                .stored_data = "{}",
+                .text_fields = fields[i..][0..1],
+            };
+        }
+        const bytes = try intro.buildSegmentFromText(a, &docs, &@import("../../../search/analysis.zig").default_analyzer, null);
+        defer a.free(bytes);
+        try writer.addSegment(bytes);
+    }
+    var membership = try buildSortedSegmentDocMembershipAlloc(a, writer.snapshot(), .{ .term = .{ .field = "body", .term = "quasar" } }, .{});
+    defer membership.deinit(a);
+    try std.testing.expectEqual(@as(usize, 768), membership.candidate_count);
+    for (0..64) |i| for (0..4) |segment| {
+        try std.testing.expectEqual(i % 2 == 0, try membership.contains(@intCast(segment * 128 + i)));
+    };
+    const cache = membership.lazy.?;
+    try std.testing.expectEqual(@as(u64, 4), cache.probe_opens);
+    try std.testing.expectEqual(@as(u64, 252), cache.probe_hits);
+    for (membership.segments) |segment| try std.testing.expect(segment.matches == null);
+    try std.testing.expect(cache.probe_budget.peak <= cache.probe_budget.limit);
+    std.debug.print("TERM_PROBE_CACHE probes=256 opens={d} hits={d} peak_bytes={d}\n", .{ cache.probe_opens, cache.probe_hits, cache.probe_budget.peak });
+    for (4..12) |segment| try std.testing.expect(try membership.contains(@intCast(segment * 128 + 2)));
+    try std.testing.expectEqual(@as(u64, 12), cache.probe_opens);
+    var resident: usize = 0;
+    for (cache.slots) |slot| if (slot.ordinal != null) {
+        resident += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 8), resident);
+    try std.testing.expect(try membership.contains(2));
+    try std.testing.expectEqual(@as(u64, 13), cache.probe_opens);
+    cache.clearProbes();
+    try std.testing.expectEqual(@as(usize, 0), cache.probe_budget.live);
+    cache.probe_budget.limit = 1;
+    try std.testing.expect(try membership.contains(2));
+    try std.testing.expect(!try membership.contains(3));
+    try std.testing.expect(membership.segments[0].matches != null);
 }

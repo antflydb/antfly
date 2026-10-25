@@ -1533,3 +1533,41 @@ owned offsets and reattach the caller's partial-inventory semantics on every
 lease, just as they reattach the current row resolver. The interleaved-compaction
 regression explicitly frees admission storage before both point and inverse
 reads, including allocation-failure coverage of the ownership transfer.
+
+
+## Bounded lineage leases, term probes and binary refresh keys (reader protocol 87)
+
+Range pages use the existing verified immutable block-lease API. A synchronous
+query operation pins at most eight 64-KiB pages under scope, domain and exact
+content identity. Repeated probes reuse those bytes instead of allocating and
+copying each page. Every hit checks the current deadline, cancellation and lease
+hooks; the cache retains no request capability. Newly admitted pages consume the
+operation's read allowance, including re-admission after eviction. Result tiles
+visit native ordinals in order and restore caller order, preserving duplicates
+before batched current-coordinate translation. A separate 4,096-point CPU limit
+and the existing required-read reserve switch sustained work to the shared
+complete inverse map. Cached pages release before complete-map admission.
+
+Sorted text membership retains up to eight exact term probes under a 2-MiB
+query-owned budget. Interleaved sorted runs reuse each probe's dictionary and
+position-free posting chunk. Least-recently-used probes release segment leases
+and decoded buffers before replacement. A probe that cannot fit declines to the
+existing exact bitmap path; unsupported predicates retain their existing plans.
+Mutable probes remain local to the synchronous collector. No archive-wide probe
+array or process-global mutable cursor is introduced.
+
+Ordering-cache rows use the self-describing `AFOK001` binary codec: magic,
+32-byte input version, bounded tuple count, explicit scalar tags and exact
+little-endian values. Signed 128-bit timestamps, signed/unsigned integers,
+finite floating values, booleans and owned variable-width bytes preserve their
+native domains. Field positions remain bound by the existing tuple recipe.
+Malformed lengths/tags, nonfinite floats and trailing bytes fail closed. Empty
+or oversized tuples do not create optional per-row state. Readers also accept
+historical JSON rows, and old/new entries may share one copy-on-write tree;
+only newly remembered values are rewritten. Decode results own byte strings
+independently of cursor/input storage. Reader protocol 87 fences these writers;
+native text metadata remains v15 because serving artifacts are unchanged.
+Publication leases, cloud certificates and GC follow the same ordering-key root
+and flat range-page closure. No new public configuration or query semantics are
+required. Performance qualification records page acquisitions, probe openings,
+cache pressure and encoded tuple bytes separately from end-to-end latency.

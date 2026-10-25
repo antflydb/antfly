@@ -108,10 +108,13 @@ pub const LiveRowsCache = struct {
     slots: [4]Slot = @splat(.{}),
     clock: u64 = 0,
     lineage_reads: u64 = 128 * 1024 * 1024,
+    lineage_points: u32 = 0,
+    lineage_pages: corpus.source_spans.Paged.PageCache = .{},
     identity_shared: ?decoded.Owned(Identities) = null,
     identity_owner: [32]u8 = @splat(0),
     eager_identity: ?Identities = null,
     pub fn deinit(self: *@This(), a: A) void {
+        self.lineage_pages.deinit();
         if (self.identity_shared) |owned| owned.release();
         for (&self.files) |*entry| entry.clear();
         for (&self.slots) |*slot| if (slot.buffer) |buffer| (self.backing orelse a).free(buffer);
@@ -496,6 +499,7 @@ pub const Identities = struct {
         const deferred = self.deferred orelse return self;
         if (cache.eager_identity == null or !std.mem.eql(u8, &cache.identity_owner, &deferred.key)) {
             cache.eager_identity = null;
+            cache.lineage_pages.deinit();
             if (cache.identity_shared) |owned| owned.release();
             cache.identity_shared = null;
             var bytes: u64 = 0;
@@ -527,7 +531,7 @@ pub const Identities = struct {
         result.segment_ids = self.segment_ids;
         return result;
     }
-    fn deferredSpan(self: Identities, a: A, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, doc: u32, reads: *u64) anyerror!struct { span: corpus.source_spans.Span, local: u32 } {
+    fn deferredSpan(self: Identities, a: A, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, page_cache: *corpus.source_spans.Paged.PageCache, doc: u32, reads: *u64) anyerror!struct { span: corpus.source_spans.Span, local: u32 } {
         const groups = self.deferred.?.groups;
         var lower: usize = 0;
         var upper = groups.len;
@@ -538,7 +542,7 @@ pub const Identities = struct {
         if (lower == groups.len) return error.InvalidNativeLakeTextCorpus;
         const group = groups[lower];
         const ordinal_value = doc - self.offsets[lower];
-        if (group.source_paged) |paged| return .{ .span = try paged.span(a, store, cached, ordinal_value, reads), .local = ordinal_value };
+        if (group.source_paged) |paged| return .{ .span = try paged.spanCached(a, store, cached, page_cache, ordinal_value, reads), .local = ordinal_value };
         var lo: usize = 0;
         var hi = group.sourceLen();
         while (lo < hi) {
@@ -830,11 +834,13 @@ pub const Identities = struct {
     /// physical blocks. Delete holes use the same authenticated rank directory.
     pub fn physicalRow(self: Identities, a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, ordinal_value: u32, source: []const u8, snapshot: []const u8) anyerror!local.storage_rowsource_types.RowRef {
         if (self.deferred) |deferred| {
-            // An exhaustive fallback must not perform a page-tree walk per
-            // matching row. Bound point work and reserve required full-map IO.
-            if ((cache.eager_identity != null and std.mem.eql(u8, &cache.identity_owner, &deferred.key)) or cache.lineage_reads < 96 * 1024 * 1024)
+            // Bound both CPU point work and newly admitted IO. Page reuse
+            // cannot let an exhaustive fallback loop forever without switching
+            // to the shared complete map; required-read reserve stays intact.
+            if ((cache.eager_identity != null and std.mem.eql(u8, &cache.identity_owner, &deferred.key)) or cache.lineage_reads < 96 * 1024 * 1024 or cache.lineage_points >= 4096)
                 return (try self.eager(a, cache, store, cached)).physicalRow(a, cache, store, cached, ordinal_value, source, snapshot);
-            const located = try self.deferredSpan(a, store, cached, ordinal_value, &cache.lineage_reads);
+            cache.lineage_points += 1;
+            const located = try self.deferredSpan(cache.backing orelse local.sql_memory_budget.reclaimingAllocator(a), store, cached, &cache.lineage_pages, ordinal_value, &cache.lineage_reads);
             const span = located.span;
             if (located.local < span.pack_lower or located.local - span.pack_lower >= span.count) return error.InvalidNativeLakeTextCorpus;
             const rank = try std.math.add(u32, span.file_lower, located.local - span.pack_lower);
@@ -876,7 +882,17 @@ pub const Identities = struct {
         var original = self;
         original.row_resolver = null;
         const refs = try a.alloc(local.storage_rowsource_types.RowRef, ordinals.len);
-        for (ordinals, refs) |doc_ordinal, *ref| ref.* = try original.physicalRow(a, cache, store, cached, doc_ordinal, if (self.row_resolver) |resolver| resolver.source else source, if (self.row_resolver) |resolver| resolver.snapshot else snapshot);
+        // Traverse a tile in native ordinal order, then restore caller order.
+        // Nearby ordinals share the bounded leased range-page path, including
+        // shuffled and duplicate requested rows across child scratch resets.
+        var positions: [128]usize = undefined;
+        for (positions[0..ordinals.len], 0..) |*position, i| position.* = i;
+        if (self.deferred != null) std.mem.sort(usize, positions[0..ordinals.len], ordinals, struct {
+            fn less(values: []const u32, left: usize, right: usize) bool {
+                return values[left] < values[right];
+            }
+        }.less);
+        for (positions[0..ordinals.len]) |i| refs[i] = try original.physicalRow(a, cache, store, cached, ordinals[i], if (self.row_resolver) |resolver| resolver.source else source, if (self.row_resolver) |resolver| resolver.snapshot else snapshot);
         if (self.row_resolver) |resolver| {
             if (resolver.translate_many) |translate| return translate(resolver.ptr, a, refs, true);
             for (refs) |*ref| ref.* = try resolver.from_index(resolver.ptr, a, ref.*);

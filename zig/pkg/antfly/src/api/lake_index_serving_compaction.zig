@@ -1305,6 +1305,14 @@ test "external lake global frontier ordered compaction composes interleaved orig
             try std.testing.expectEqual(@as(u64, doc / 2), row.external.row_ordinal);
         }
         try std.testing.expect(live.eager_identity == null);
+        const requested = [_]u32{ 16383, 0, 8191, 17, 17, 6, 100, 3 };
+        const batched = try deferred.physicalRows(out, &live, store, cached, &requested, "source", "snapshot");
+        for (requested, batched) |doc, ref| {
+            try std.testing.expectEqualStrings(inputs[doc % 2].sources[0].file.id, ref.external.file_id);
+            try std.testing.expectEqual(@as(u64, doc / 2), ref.external.row_ordinal);
+        }
+        try std.testing.expect(live.eager_identity == null);
+        try std.testing.expect(live.lineage_pages.hits > 0);
         const row = try deferred.physicalRow(out, &live, store, cached, 17, "source", "snapshot");
         try std.testing.expectEqual(@as(?u32, 17), try deferred.ordinal(out, &live, store, cached, row));
         try std.testing.expect(live.eager_identity != null);
@@ -1314,6 +1322,10 @@ test "external lake global frontier ordered compaction composes interleaved orig
         const same = try deferred.physicalRow(out, &another, store, cached, 17, "source", "snapshot");
         try std.testing.expectEqualDeep(row, same);
         try std.testing.expectEqual(live.identity_shared.?.value, another.identity_shared.?.value);
+        var sustained: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = a, .lineage_points = 4096 };
+        defer sustained.deinit(a);
+        try std.testing.expectEqualDeep(row, try deferred.physicalRow(out, &sustained, store, cached, 17, "source", "snapshot"));
+        try std.testing.expectEqual(live.identity_shared.?.value, sustained.identity_shared.?.value);
         var expired = cached;
         expired.context.deadline_ns = 1;
         try std.testing.expectError(error.DeadlineExceeded, deferred.ordinal(out, &another, store, expired, row));

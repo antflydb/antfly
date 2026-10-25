@@ -650,8 +650,7 @@ fn orderProjectedFragment(self: *Build, a: A, pages: *Pages, fragment: Fragment,
 }
 
 const OrderKeys = struct {
-    const Value = @import("lake_index_sort_bounds.zig").Bound.Value;
-    const Row = struct { version: [32]u8, keys: []const Value };
+    const codec = @import("lake_ordering_keys.zig");
     owner: *Build,
     inputs: ?tree.Cursor = null,
     cached: ?tree.Cursor = null,
@@ -689,14 +688,14 @@ const OrderKeys = struct {
         }
         const entry = self.candidate orelse return null;
         if (!std.mem.eql(u8, entry.key, &id)) return null;
-        const cached = try std.json.parseFromSliceLeaky(Row, a, entry.value, .{});
+        const cached = try codec.decodeIntoArena(a, entry.value);
         if (!std.mem.eql(u8, &cached.version, &expected)) return null;
         var values: std.ArrayList(local.introducer.TypedFieldValue) = .empty;
         var i: usize = 0;
         for (fields) |field| {
             if (std.mem.eql(u8, field.field, "_id")) continue;
             if (i >= cached.keys.len) return error.InvalidLogicalRowIdentity;
-            const native = try cached.keys[i].native();
+            const native = cached.keys[i];
             const value: local.section_typed_doc_values.TypedValue = switch (native) {
                 inline .u64_val, .i64_val, .f64_val => |v, tag| .{ .numeric_val = @unionInit(local.section_typed_doc_values.NumericValue, @tagName(tag), v) },
                 .datetime_ns => |v| .{ .datetime_ns = v },
@@ -713,19 +712,19 @@ const OrderKeys = struct {
     fn remember(self: *@This(), a: A, id: [32]u8, version_: ?[32]u8, doc: local.introducer.TextDocument) !void {
         const version_held = version_ orelse return;
         const values = doc.typed_fields orelse return;
-        const keys = try a.alloc(Value, values.len);
-        for (keys, values) |*key, value| {
-            const native: local.segment.SegmentIndexSortBoundValue = switch (value.value) {
+        if (values.len == 0 or values.len > 32) return;
+        var keys: [32]local.segment.SegmentIndexSortBoundValue = undefined;
+        for (keys[0..values.len], values) |*key, value| {
+            key.* = switch (value.value) {
                 .numeric_val => |n| switch (n) {
                     inline else => |v, tag| @unionInit(local.segment.SegmentIndexSortBoundValue, @tagName(tag), v),
                 },
                 inline .datetime_ns, .u64_val, .i64_val, .f64_val, .bytes_val, .bool_val => |v, tag| @unionInit(local.segment.SegmentIndexSortBoundValue, @tagName(tag), v),
                 else => return,
             };
-            key.* = try Value.from(a, native);
         }
-        const bytes = try std.json.Stringify.valueAlloc(a, Row{ .version = version_held, .keys = keys }, .{});
-        if (bytes.len <= tree.max_record_bytes) try self.owner.ordering_edits.?.addRecord(&id, bytes);
+        const bytes = (try codec.encode(a, version_held, keys[0..values.len])) orelse return;
+        try self.owner.ordering_edits.?.addRecord(&id, bytes);
     }
 };
 
@@ -2162,6 +2161,23 @@ fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime h
         try std.testing.expect(indexSpace(native, "unused").ordering_keys == null);
         var prior = root;
         prior.native_space = native.space;
+        // Recreate the released JSON cache as the predecessor, then verify
+        // unchanged entries and new binary entries coexist through refresh.
+        var legacy_edits = @import("lake_index_page_mutations.zig").Mutations.init(a, &manager, pages.store());
+        defer legacy_edits.deinit();
+        {
+            var prior_keys = try tree.Cursor.init(a, pages.store(), native.space.ordering_keys, "", null);
+            defer prior_keys.deinit();
+            while (try prior_keys.next()) |record| {
+                const codec = @import("lake_ordering_keys.zig");
+                const decoded = try codec.decodeIntoArena(selection_arena.allocator(), record.value);
+                const legacy = try selection_arena.allocator().alloc(@import("lake_index_sort_bounds.zig").Bound.Value, decoded.keys.len);
+                for (legacy, decoded.keys) |*key, value| key.* = try @import("lake_index_sort_bounds.zig").Bound.Value.from(selection_arena.allocator(), value);
+                const legacy_record = try std.json.Stringify.valueAlloc(selection_arena.allocator(), .{ .version = decoded.version, .keys = legacy }, .{});
+                try legacy_edits.addRecord(record.key, legacy_record);
+            }
+        }
+        prior.native_space.?.ordering_keys = try legacy_edits.finish(null);
         for (0..4) |step| {
             const active_recipes = try selection_arena.allocator().dupe(@import("lake_row_input_recipes.zig").Recipe, recipes);
             if (step >= 2) active_recipes[1].digest = @splat(10);

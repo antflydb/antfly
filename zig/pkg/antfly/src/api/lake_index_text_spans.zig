@@ -559,6 +559,31 @@ test "external lake global frontier shared source pages admit maximum interleavi
     try std.testing.expect(before - allowance < prepared.bytes / 2);
     std.debug.print("PAGED_LINEAGE point_bytes={d} full_bytes={d} ranges=65536\n", .{ before - allowance, prepared.bytes });
     for ([_]u32{ 0, 4094, 4095, 32768, 65535, 18, 1 }) |ordinal| try std.testing.expectEqualDeep(spans[ordinal], try paged.span(out, store, cached, ordinal, &allowance));
+    var leased: Paged.PageCache = .{};
+    defer leased.deinit();
+    var charged: u64 = 128 * 1024 * 1024;
+    _ = try paged.spanCached(a, store, cached, &leased, 17, &charged);
+    const once = charged;
+    for (0..128) |ordinal| try std.testing.expectEqualDeep(spans[ordinal], try paged.spanCached(a, store, cached, &leased, @intCast(ordinal), &charged));
+    try std.testing.expectEqual(once, charged);
+    try std.testing.expect(leased.loads <= 5);
+    const repeated_loads = leased.loads;
+    for (0..128) |i| {
+        const ordinal: u32 = @intCast(i * 511);
+        try std.testing.expectEqualDeep(spans[ordinal], try paged.spanCached(a, store, cached, &leased, ordinal, &charged));
+    }
+    try std.testing.expect(leased.loads <= (refs.len - paged.first_range) * 2);
+    try std.testing.expect(leased.peak_bytes <= 8 * max_page_bytes);
+    var expired = cached;
+    expired.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, paged.spanCached(a, store, expired, &leased, 17, &charged));
+    const prior_loads = leased.loads;
+    var other_scope = cached;
+    other_scope.scope = @splat(10);
+    _ = try paged.spanCached(a, store, other_scope, &leased, 17, &charged);
+    try std.testing.expect(leased.loads > prior_loads);
+    std.debug.print("LINEAGE_PAGE_LEASE repeats=128 repeat_loads={d} tile_loads={d} peak_bytes={d}\n", .{ repeated_loads, prior_loads, leased.peak_bytes });
+
     try std.testing.expectEqual(@as(usize, 8), view.sources.len);
     try std.testing.expectEqual(@as(usize, max_spans), view.ranges.len);
     for (view.ranges, 0..) |r, i| {
@@ -680,7 +705,84 @@ pub const Paged = struct {
         }
         return .{ .sources = sources, .pages = pages, .first_range = n, .count = count, .domain = domain };
     }
+    /// A synchronous operation owns these leases; no request capability is
+    /// retained. Scope/domain/content identity isolate entries, and each hit
+    /// checks the current query hooks. At most eight 64-KiB pages are pinned.
+    pub const PageCache = struct {
+        const Lease = @import("antfly_local_sources").serverless_query_lake_serving_cache.Cache.ImmutableLease;
+        const Slot = struct { key: [32]u8, lease: Lease, used: u64 };
+        slots: [8]?Slot = @splat(null),
+        clock: u64 = 0,
+        loads: u64 = 0,
+        hits: u64 = 0,
+        peak_bytes: usize = 0,
+        pub fn deinit(self: *PageCache) void {
+            for (&self.slots) |*slot| if (slot.*) |*value| {
+                value.lease.deinit();
+                slot.* = null;
+            };
+        }
+        fn evict(self: *PageCache) bool {
+            var oldest: ?usize = null;
+            for (self.slots, 0..) |slot, i| if (slot) |entry| {
+                if (oldest == null or entry.used < self.slots[oldest.?].?.used) oldest = i;
+            };
+            const i = oldest orelse return false;
+            self.slots[i].?.lease.deinit();
+            self.slots[i] = null;
+            return true;
+        }
+        fn page(self: *PageCache, a: std.mem.Allocator, store: stores.ArtifactStore, cached: artifacts.CachedRead, domain: [32]u8, ref: artifacts.ChunkRef, remaining: *u64) ![]const u8 {
+            try cached.context.ensureActive();
+            try @import("lake_index_text_directory.zig").validateRef(ref, domain);
+            if (ref.byte_len == 0 or ref.byte_len > max_page_bytes) return error.InvalidNativeLakeTextCorpus;
+            var hash = std.crypto.hash.Blake3.init(.{});
+            hash.update(&cached.scope);
+            hash.update(&domain);
+            hash.update(ref.artifact_id);
+            hash.update(ref.checksum);
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, ref.byte_len, .little);
+            hash.update(&length);
+            var key: [32]u8 = undefined;
+            hash.final(&key);
+            self.clock +|= 1;
+            for (&self.slots) |*slot| if (slot.*) |*entry| if (std.mem.eql(u8, &entry.key, &key)) {
+                entry.used = self.clock;
+                self.hits += 1;
+                return entry.lease.bytes();
+            };
+            const i = for (self.slots, 0..) |slot, index| {
+                if (slot == null) break index;
+            } else vacant: {
+                _ = self.evict();
+                for (self.slots, 0..) |slot, index| if (slot == null) break :vacant index;
+                unreachable;
+            };
+            const lease = acquire: while (true) {
+                try stores.chargeReadBudget(remaining, ref.byte_len);
+                break :acquire artifacts.readArtifactLease(a, store, ref, queryToken(&cached.context), cached) catch |err| {
+                    try cached.context.ensureActive();
+                    if (err == error.OutOfMemory and self.evict()) continue;
+                    return err;
+                };
+            };
+            self.slots[i] = .{ .key = key, .lease = lease, .used = self.clock };
+            self.loads += 1;
+            var bytes: usize = 0;
+            for (self.slots) |slot| if (slot) |entry| {
+                bytes += entry.lease.bytes().len;
+            };
+            self.peak_bytes = @max(self.peak_bytes, bytes);
+            return self.slots[i].?.lease.bytes();
+        }
+    };
     pub fn span(self: Paged, a: std.mem.Allocator, store: stores.ArtifactStore, cached: artifacts.CachedRead, ordinal: u32, remaining: *u64) !Span {
+        var pages: PageCache = .{};
+        defer pages.deinit();
+        return self.spanCached(a, store, cached, &pages, ordinal, remaining);
+    }
+    pub fn spanCached(self: Paged, a: std.mem.Allocator, store: stores.ArtifactStore, cached: artifacts.CachedRead, pages: *PageCache, ordinal: u32, remaining: *u64) !Span {
         var lower = self.first_range;
         var upper = self.pages.len;
         const io_a = @import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(a);
@@ -688,12 +790,7 @@ pub const Paged = struct {
             try cached.context.ensureActive();
             const middle = lower + (upper - lower) / 2;
             const ref = self.pages[middle];
-            try stores.chargeReadBudget(remaining, ref.byte_len);
-            const data = artifacts.readArtifact(io_a, store, ref, queryToken(&cached.context), cached) catch |err| {
-                try cached.context.ensureActive();
-                return err;
-            };
-            defer io_a.free(data);
+            const data = try pages.page(io_a, store, cached, self.domain, ref, remaining);
             if (data.len <= 16 or (data.len - 16) % 16 != 0 or !std.mem.startsWith(u8, data, range_magic) or std.mem.readInt(u32, data[8..12], .little) != self.count) return error.InvalidNativeLakeTextCorpus;
             const n = (data.len - 16) / 16;
             const expected = (middle - self.first_range) * ((max_page_bytes - 16) / 16);
