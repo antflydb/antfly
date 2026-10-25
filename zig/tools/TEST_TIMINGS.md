@@ -256,3 +256,57 @@ an injected provider before query inference starts. The fixture resumes
 maintenance after both queries borrow their provider, then exercises real
 concurrent writes and configuration changes. Both Linux regressions were
 reproduced before this barrier and pass with the same compiler backend after it.
+
+### Explicit local-model qualification
+
+The C API unit gate runs model-free contracts regardless of which models are
+installed. Actual embedding, reranking, generation/streaming, and Lite embedding
+drain tests belong to `capi-local-model-test`. Both targets share one compiled
+artifact and its existing memory admission; they have disjoint runtime filters.
+The model target requires all selected tests to run without skips, so an absent
+model fails qualification rather than silently passing it. It never pulls models.
+
+Run from `zig/`, using the shared model cache or an explicit models directory:
+
+```sh
+ANTFLY_TEST_TIMINGS=1 ANTFLY_TEST_FAIL_ON_ERROR_LOGS=1 \
+  zig build capi-local-model-test -Dinference-optimize=ReleaseFast \
+  -Dmetal=false -Dcuda=false --summary all
+```
+
+The original full native Debug run spent 109.7 seconds in its real-model
+generation case; samples showed decoder work. That is an integration workload,
+not a stalled unit test. Keep this qualification alongside ordinary unit results
+when changing inference or the C API.
+
+### Maintenance phases and snapshot lifetime
+
+Detached C API fixtures advance bounded maintenance turns until their target
+phase is observed, rather than assuming one turn always reaches it. Existing
+foreground concurrency and publication-fencing assertions remain at that phase;
+no production scheduler is drained or bypassed. A bounded turn count reports
+failure if the phase is never reached, and background driver errors propagate to
+the test instead of being discarded. Provider reference checks run while a
+runtime-backed snapshot is captured; post-turn checks allow that runtime to have
+been released already. The failed-open cleanup test injects malformed durable
+catalog bytes below the logical writer, which now correctly rejects them before
+opening a new handle.
+
+Other retained native Debug outliers in this run were 67.1 seconds for the HA
+hostname cleanup regression (2,000 actual resolution/connection/response cycles),
+52.3 seconds for the PostgreSQL native mutation campaign (many independent
+source/constraint cases), and 45.5 seconds for a staged-restore/reopen regression.
+These durations alone do not justify shrinking the fixtures or raising their
+deadlines. The hostname sample showed real connection work and its caller
+waiting for I/O completion. Compiler samples must be recorded separately: one
+12-minute compilation was in LLVM DWARF finalization. None of these observations
+establishes a production memory-reservation change.
+
+The 2,200-document full-result hybrid aggregation regression sampled repeated
+SafeAllocator/DWARF stack capture during fixture ingestion. Giving that test a
+checked SafeAllocator with opt-in traces reduced execution from 117.2 seconds
+to 1.73 seconds. The dataset, two vector windows, text matches, ranked page,
+aggregation expectations, leak checks, and write-after-free checks are unchanged.
+This measures diagnostic overhead in a Debug fixture, not production query
+throughput. A repeated fixed execution measured 1.71 seconds before a rerun
+with localhost access passed the aggregation and four HTTP contracts together.

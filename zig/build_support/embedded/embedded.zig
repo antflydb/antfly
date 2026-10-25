@@ -81,6 +81,8 @@ pub fn configureBrowserModule(
 }
 const addMacosSdkPaths = @import("antfly_platform").addMacosSdkPaths;
 const addFilteredTestRunArtifact = @import("../antfly/test_support.zig").addFilteredTestRunArtifact;
+const addFilteredTestRunArtifactWithRuntimeFilters = @import("../antfly/test_support.zig").addFilteredTestRunArtifactWithRuntimeFilters;
+const addCuratedTestRunArtifact = @import("../antfly/test_support.zig").addCuratedTestRunArtifact;
 const addSnowballModule = @import("snowball.zig").addSnowballModule;
 const selectTestFilters = @import("../antfly/test_support.zig").selectTestFilters;
 
@@ -539,6 +541,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const capi_package_test_step = b.step("capi-package-test", "Run Antfly C ABI release packaging regression tests");
     capi_package_test_step.dependOn(&run_cabi_packaging_tests.step);
 
+    const capi_model_filters = [_][]const u8{"capi local model "};
     const capi_default_filters = [_][]const u8{
         "capi lite standalone snapshots",
         "issue1015",
@@ -574,15 +577,12 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi lite inference producer retry is visible in graph replacement status",
         "capi lite inference failed open drains the configured generation before releasing its service",
         "capi lite defaults embedded generation budgets when no override is given",
-        "capi lite drains an antfly embedder with no api_url through the embedded inference provider",
         "capi inference options are prefix compatible and reject unknown flags and reserved bits",
         "capi inference calls reject null, closed, and database handles",
         "capi inference lists models and reports route errors",
         "capi inference decide validates requests and preserves error bodies",
-        "capi inference embeds text with a local model",
-        "capi inference reranks documents with a local model",
         "capi inference chunks text without a model",
-        "capi inference generates text with a local model and rejects streaming",
+        "capi inference legacy generation rejects streaming without a model",
         "capi inference pull rejects invalid requests with a JSON error",
         "capi inference pulls a model with progress",
         "capi inference streaming reports request errors without a model",
@@ -612,17 +612,26 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     b.step("memory-capi-check", "Compile native memory C ABI persistence tests").dependOn(&memory_capi_check.step);
     const memory_capi_tests = b.addTest(.{ .root_module = capi_root_mod, .filters = &.{"capi native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("memory-capi-test", "Verify native memory persistence through the public C ABI").dependOn(&addFilteredTestRunArtifact(b, memory_capi_tests).step);
+    const capi_compile_filters = capi_default_filters ++ capi_model_filters;
     const capi_tests = b.addTest(.{
         .root_module = capi_root_mod,
         // Storage-backed Mach-O Debug codegen measured 13.51 GB.
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
-        .filters = selectTestFilters(b, &capi_default_filters),
+        .filters = selectTestFilters(b, &capi_compile_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_capi_tests = addFilteredTestRunArtifact(b, capi_tests);
+    // Share compilation and memory admission between hermetic API contracts
+    // and explicit model qualification. Installed models must not silently
+    // change the cost or selection of the ordinary unit gate.
+    const run_capi_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, capi_tests, selectTestFilters(b, &capi_default_filters));
+    run_capi_tests.addArgs(&.{ "--skip-test-filter", "capi local model " });
+    const run_capi_models = addCuratedTestRunArtifact(b, capi_tests, &capi_model_filters);
+    run_capi_models.addArg("--require-no-skips");
+    b.step("capi-local-model-test", "Qualify embedded inference with installed embedding, reranking and generation models")
+        .dependOn(&run_capi_models.step);
     const lake_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/lake_test_root.zig"),
         .target = target,
