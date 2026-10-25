@@ -171,3 +171,29 @@ binary compiled with broader filters (`--skip-test-filter 'production scale'`).
 HBC routing/centroid work in addition to the phase timings. Tight wall-clock
 limits are intentionally absent from correctness assertions. See
 [the storage follow-up](CI_STORAGE_FOLLOWUP.md) for measurements and work contracts.
+
+### Transport allocation-failure campaigns
+
+The four native TS/AVC allocation campaigns use a private `SafeAllocator`
+without successful-allocation stack traces. Exhaustive allocation and resize
+failure injection, leak checks, mismatched/double-free detection, and
+write-after-free checking remain enabled. `FailingAllocator` still records the
+injected failure's stack. `ANTFLY_TEST_ALLOCATOR_TRACES=1` restores successful
+allocation traces through the ordinary test allocator for diagnosis.
+
+A native aarch64 Darwin Debug comparison on main `730999bf2d` sampled the HTTP
+reader campaign in repeated SafeAllocator/DWARF stack unwinding. Running the
+same four test bodies from cached baseline and fixed binaries, through Zig
+0.17.0's test protocol, measured:
+
+| Campaign | Baseline | Without redundant traces |
+| --- | ---: | ---: |
+| AVC adapter | 0.197 s | 0.037 s |
+| HLS factory | 1.962 s | 0.118 s |
+| Incremental normalization | 85.396 s | 1.237 s |
+| HTTP reader | 75.005 s | 1.396 s |
+
+Both runs reported zero test errors or leaks. Fixtures and failure positions
+are unchanged. These measurements exclude compilation and include concurrent
+local builds; they demonstrate the removed diagnostic overhead rather than
+establishing a CI latency budget or a production parser throughput claim.

@@ -740,6 +740,7 @@ pub const sql_vector_eval = @import("sql/vector_eval.zig");
 pub const sql_window_spill = @import("sql/window_spill.zig");
 pub const storage_rowsource_types = @import("storage/rowsource/types.zig");
 pub const storage_rowsource_identity = @import("storage/rowsource/identity.zig");
+pub const storage_rowsource_logical = @import("storage/rowsource/logical.zig");
 pub const serverless_external_source_schema_binding = @import("serverless/external_source/schema_binding.zig");
 pub const sql_read_stream = @import("sql/read_stream.zig");
 pub const serverless_external_source_types = @import("serverless/external_source/types.zig");
