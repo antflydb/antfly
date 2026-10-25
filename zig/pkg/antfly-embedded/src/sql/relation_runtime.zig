@@ -20,7 +20,7 @@
 /// mutation inputs. Never write parameter values into the immutable plan.
 pub fn bindSearchScans(a: Allocator, input_scans: []const catalog.StatementScan, parameters: []const std.json.Value) ![]const catalog.StatementScan {
     const has_search = for (input_scans) |scan| {
-        if (scan.request.search != null) break true;
+        if (scan.request.search != null or scan.request.text_predicate != null) break true;
     } else false;
     return if (has_search) bound: {
         const bound_scans = try a.dupe(catalog.StatementScan, input_scans);
@@ -38,6 +38,24 @@ pub fn bindSearchScans(a: Allocator, input_scans: []const catalog.StatementScan,
                 if (number < 1 or number > 10000) return error.InvalidSqlParameters;
                 search.limit = @intCast(number);
             }
+        };
+        for (bound_scans) |*scan| if (scan.request.text_predicate) |original| {
+            const selection = try a.create(catalog.Scan.TextPredicate);
+            selection.* = original.*;
+            var text: std.Io.Writer.Allocating = .init(a);
+            defer text.deinit();
+            for (original.expressions, 0..) |value, i| {
+                const input = if (value == .parameter) blk: {
+                    if (value.parameter == 0 or value.parameter > parameters.len) return error.InvalidSqlParameters;
+                    break :blk parameters[value.parameter - 1];
+                } else try describe.bindLiteral(a, value, .string);
+                if (input != .string or input.string.len == 0 or input.string.len > 64 * 1024) return error.InvalidSqlParameters;
+                if (i != 0) try text.writer.writeAll(" AND ");
+                try text.writer.print("({s})", .{input.string});
+                if (text.written().len > 64 * 1024) return error.SqlProgramLimitExceeded;
+            }
+            selection.query = try a.dupe(u8, text.written());
+            scan.request.text_predicate = selection;
         };
         break :bound bound_scans;
     } else input_scans;
@@ -4010,4 +4028,19 @@ test "native projection refinements benchmark hybrid JSON projections" {
         try std.testing.expect(after.peak < before.peak);
         std.debug.print("HYBRID_JSON_PROJECTION sample={d} before_cpu_ns={d} after_cpu_ns={d} before_peak={d} after_peak={d} before_scalar_reads={d} after_scalar_reads={d}\n", .{ sample, before.ns, after.ns, before.peak, after.peak, before.reads, after.reads });
     }
+}
+
+test "SQL text predicate parameter bindings never mutate prepared scan programs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text: catalog.Scan.TextPredicate = .{ .expressions = &.{.{ .parameter = 1 }} };
+    const scan: catalog.StatementScan = .{ .table = .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = &.{}, .storage_mode = .document }, .request = .{ .fields = &.{}, .limit = 37, .text_predicate = &text } };
+    const first = try bindSearchScans(a, &.{scan}, &.{.{ .string = "body:alpha" }});
+    const second = try bindSearchScans(a, &.{scan}, &.{.{ .string = "body:beta" }});
+    try std.testing.expect(text.query == null);
+    try std.testing.expectEqualStrings("(body:alpha)", first[0].request.text_predicate.?.query.?);
+    try std.testing.expectEqualStrings("(body:beta)", second[0].request.text_predicate.?.query.?);
+    try std.testing.expectError(error.InvalidSqlParameters, bindSearchScans(a, &.{scan}, &.{.{ .integer = 1 }}));
+    try std.testing.expectError(error.InvalidSqlParameters, bindSearchScans(a, &.{scan}, &.{}));
 }

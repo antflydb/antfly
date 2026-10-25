@@ -125,6 +125,7 @@ pub const WireRow = struct {
 const native_page = @import("retained_read_page.zig");
 
 pub const Response = struct {
+    text_filter_digest: ?[32]u8 = null,
     range_proofs: []const @import("antfly_local_sources").storage_range_protection.Proof = &.{},
     token: ?registry.Token = null,
     busy: bool = false,
@@ -188,7 +189,7 @@ pub fn executeWithCodec(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope:
             return response;
         },
         .open => {
-            const token = try owner.open(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, input.from, input.to, .{
+            const opened = try owner.openQualified(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, input.from, input.to, .{
                 .relational_query = input.query orelse return error.InvalidRetainedReadQuery,
                 .filter_query_json = input.filter_query_json,
                 .inclusive_from = input.inclusive_from,
@@ -199,8 +200,9 @@ pub fn executeWithCodec(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope:
                 .row_policy_principal_proof = input.row_policy_principal_proof,
                 .row_policy_database = input.row_policy_database,
             }, deadline);
-            errdefer owner.registry.close(token, scope) catch {};
-            return encode(alloc, .{ .token = token });
+            errdefer owner.registry.close(opened.token, scope) catch {};
+            if (opened.text_filter_digest) |digest| return encode(alloc, .{ .token = opened.token, .text_filter_digest = digest });
+            return encode(alloc, .{ .token = opened.token });
         },
         .open_snapshot => {
             const token = try owner.openSnapshot(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, input.from, input.to, .{

@@ -735,7 +735,7 @@ pub const Adapter = struct {
         // Each new backend starts an execution scope; binding, cursor selection
         // and fallback execution within that scope share the receipt budget.
         self.receipt_wait_budget = .{};
-        return .{ .sequence_resolver = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .resolve = @import("sql_sequence_execution.zig").bind } else null, .sequence_provider = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .invoke = @import("sql_sequence_execution.zig").invoke, .flush = @import("sql_sequence_execution.zig").flush } else null, .write_version = self.active_write_version, .supports_write_versions = supportsRangeGuards(self.server) and self.server.txn_sessions.durable != null, .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .supports_expression_access_hints = self.staged == null or self.staged.?.tables.len == 0, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = if (self.server.source.vtable.supports_sql_views) &view_vtable else &table_vtable };
+        return .{ .sequence_resolver = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .resolve = @import("sql_sequence_execution.zig").bind } else null, .sequence_provider = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .invoke = @import("sql_sequence_execution.zig").invoke, .flush = @import("sql_sequence_execution.zig").flush } else null, .write_version = self.active_write_version, .supports_write_versions = supportsRangeGuards(self.server) and self.server.txn_sessions.durable != null, .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .supports_text_predicates = true, .supports_expression_access_hints = self.staged == null or self.staged.?.tables.len == 0, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = if (self.server.source.vtable.supports_sql_views) &view_vtable else &table_vtable };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
@@ -1029,6 +1029,7 @@ pub const Adapter = struct {
 
     fn prepareScan(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !helpers.OwnedScanKeysRequest {
         try self.verify(alloc, table);
+        if (request.text_predicate != null and (table.storage_mode != .document or table.external_base_source != null or self.dynamic_snapshot != null or self.range_reads != null or (self.staged != null and self.staged.?.tables.len != 0) or request.primary_order or request.index_equality != null or request.primary_key != null)) return error.UnsupportedSqlExecution;
         if (request.index_equality) |probe| {
             if (self.range_reads == null or request.primary_key != null or request.after != null or request.primary_order or
                 probe.name.len == 0 or probe.values.len == 0 or probe.values.len > 32) return error.UnsupportedSqlExecution;
@@ -1063,6 +1064,7 @@ pub const Adapter = struct {
                 .limit = request.limit,
                 .relational_query = .{
                     .page_bytes = 256 * 1024,
+                    .text_filter = if (request.text_predicate) |text| .{ .query = text.query orelse return error.InvalidSqlParameters } else null,
                     .fields = fields,
                     .conditions = conditions,
                     .expression_equalities = request.expression_equalities,
@@ -1807,6 +1809,14 @@ pub const Adapter = struct {
         }
     };
 
+    fn verifyTextPredicate(request: catalog.Scan, view: @import("antfly_local_sources").api_table_read_source.RelationalReadView) !void {
+        if (request.text_predicate) |text| {
+            var expected: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(text.query orelse return error.InvalidSqlParameters, &expected, .{});
+            if (view.text_filter_digest == null or !std.mem.eql(u8, &expected, &view.text_filter_digest.?)) return error.UnsupportedSqlExecution;
+        } else if (view.text_filter_digest != null) return error.InvalidSqlBackendResponse;
+    }
+
     fn openNativeScan(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         if (request.index_equality != null) return error.SqlRangeTrackingRequired;
@@ -1819,6 +1829,7 @@ pub const Adapter = struct {
         // short-lived arenas. Closing the cursor releases its snapshot first.
         const view = (source.openRelationalRead(alloc, table.physical_name, scan_request.from, scan_request.to, scan_request.opts, .read_index) catch |read_err| return physicalReadAdmissionError(read_err)) orelse return null;
         errdefer view.deinit();
+        try verifyTextPredicate(request, view);
         // Tie the acquired physical snapshot to the SQL binding, not merely
         // the provider's independently resolved routing fence. Replacement or
         // restore under the same physical name must fail before publication.
@@ -2034,6 +2045,7 @@ pub const Adapter = struct {
         var wrapped: usize = 0;
         errdefer if (overlay_staged) for (cursors[0..wrapped]) |cursor| cursor.close(cursor.ptr);
         for (requests, native.views, wrappers, cursors) |request, view, *wrapper, *cursor| {
+            try verifyTextPredicate(request.request, view);
             try self.verify(temporary, request.table);
             if (self.range_reads) |observed| {
                 const proofs = try native.rangeProofs(temporary, wrapped);

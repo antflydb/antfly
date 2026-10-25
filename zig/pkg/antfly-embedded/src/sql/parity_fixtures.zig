@@ -20,6 +20,7 @@ pub const catalog_campaign = @embedFile("fixtures/sql_catalog_campaign.json");
 pub const dispositions = @embedFile("fixtures/sql_parity_dispositions.json");
 pub const read_rows = @embedFile("fixtures/sql_read_reference_rows.json");
 pub const read_reference = @embedFile("fixtures/sql_read_reference.json");
+pub const text_predicate_reference = @embedFile("fixtures/sql_text_predicate_reference.json");
 pub const view_read_reference = @embedFile("fixtures/sql_view_read_reference.json");
 pub const mutation_campaign = @embedFile("fixtures/sql_mutation_campaign.json");
 pub const mutation_reference = @embedFile("fixtures/sql_mutation_reference.json");

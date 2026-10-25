@@ -44,6 +44,9 @@ pub const Set = struct {
     /// owned by the caller. All allocations use the caller's request budget.
     pub fn create(alloc: std.mem.Allocator, views: []const View, primary_order: bool) !View {
         if (views.len == 0 or views.len > 256) return error.SqlProgramLimitExceeded;
+        const text_digest = views[0].text_filter_digest;
+        for (views) |view| if (!std.meta.eql(text_digest, view.text_filter_digest)) return error.UnsupportedSqlExecution;
+        if (text_digest != null and primary_order) return error.UnsupportedSqlExecution;
         const self = try alloc.create(Set);
         errdefer alloc.destroy(self);
         const owners = try alloc.alloc(Owner, views.len);
@@ -51,7 +54,7 @@ pub const Set = struct {
         const heap = try alloc.alloc(usize, views.len);
         for (owners, views) |*owner, view| owner.* = .{ .view = view };
         self.* = .{ .alloc = alloc, .owners = owners, .heap = heap, .primary_order = primary_order, .fetch_rows = @intCast(@max(1, 256 / views.len)) };
-        return .{ .ptr = self, .vtable = &.{ .next = next, .close = close, .normalize = normalize } };
+        return .{ .text_filter_digest = text_digest, .ptr = self, .vtable = &.{ .next = next, .close = close, .normalize = normalize } };
     }
 
     fn ensure(self: *Set, index: usize) !bool {
@@ -354,4 +357,20 @@ fn nativeMergeFixture(alloc: std.mem.Allocator) !void {
 
 test "relational index system coordinated read set owns native arrays after source pages and cursors close" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, nativeMergeFixture, .{});
+}
+
+test "relational index system indexed document read sets reject mixed capabilities before rows" {
+    var source: Fixture = .{ .ids = &.{"row"} };
+    var exact = source.view();
+    exact.text_filter_digest = @splat(1);
+    try std.testing.expectError(error.UnsupportedSqlExecution, Set.create(std.testing.allocator, &.{ exact, source.view() }, false));
+    var different = source.view();
+    different.text_filter_digest = @splat(2);
+    try std.testing.expectError(error.UnsupportedSqlExecution, Set.create(std.testing.allocator, &.{ exact, different }, false));
+    try std.testing.expectError(error.UnsupportedSqlExecution, Set.create(std.testing.allocator, &.{exact}, true));
+    try std.testing.expectEqual(@as(usize, 0), source.fetches);
+    try std.testing.expect(!source.closed);
+    const result = try Set.create(std.testing.allocator, &.{exact}, false);
+    defer result.deinit();
+    try std.testing.expectEqual(exact.text_filter_digest, result.text_filter_digest);
 }

@@ -151,7 +151,7 @@ const Context = struct {
 
     fn backend(self: *Context) catalog.Backend {
         const inherited = self.root.backend();
-        return .{ .ptr = self, .binding_scope = @intFromPtr(self), .sequence_resolver = inherited.sequence_resolver, .sequence_provider = inherited.sequence_provider, .decision_provider = inherited.decision_provider, .scalar_control = inherited.scalar_control, .execution_io = inherited.execution_io, .clock_source = inherited.clock_source, .clock_values = inherited.clock_values, .statement_clock = inherited.statement_clock, .transaction_start = inherited.transaction_start, .regex_execution = inherited.regex_execution, .vtable = &.{
+        return .{ .supports_text_predicates = inherited.supports_text_predicates, .ptr = self, .binding_scope = @intFromPtr(self), .sequence_resolver = inherited.sequence_resolver, .sequence_provider = inherited.sequence_provider, .decision_provider = inherited.decision_provider, .scalar_control = inherited.scalar_control, .execution_io = inherited.execution_io, .clock_source = inherited.clock_source, .clock_values = inherited.clock_values, .statement_clock = inherited.statement_clock, .transaction_start = inherited.transaction_start, .regex_execution = inherited.regex_execution, .vtable = &.{
             .resolve_read = resolveRead,
             .resolve = resolve,
             .scan = scan,

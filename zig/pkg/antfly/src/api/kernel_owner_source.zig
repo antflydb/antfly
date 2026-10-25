@@ -6194,7 +6194,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             try validateLocal(self);
             const retained = try alloc.create(RetainedRelationalRead);
             retained.* = .{ .alloc = alloc, .lease = owner, .view = view };
-            return .{ .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize, .range_proofs = RetainedRelationalRead.rangeProofs } };
+            return .{ .text_filter_digest = view.text_filter_digest, .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize, .range_proofs = RetainedRelationalRead.rangeProofs } };
         }
 
         fn captureSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !@import("antfly_local_sources").storage_statement_read_fence.Snapshot {
@@ -6255,7 +6255,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             try self.check();
             const retained = try alloc.create(RetainedRelationalRead);
             retained.* = .{ .alloc = alloc, .lease = lease, .view = view };
-            return .{ .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize, .range_proofs = RetainedRelationalRead.rangeProofs } };
+            return .{ .text_filter_digest = view.text_filter_digest, .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize, .range_proofs = RetainedRelationalRead.rangeProofs } };
         }
         fn openNative(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_types.ScanOptions) !table_read_source.RelationalReadView {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -6345,7 +6345,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         try self.validateRoutedRead(alloc, fence, group, table);
         const retained = try alloc.create(RetainedRelationalRead);
         retained.* = .{ .alloc = alloc, .lease = lease, .view = view };
-        return .{ .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize, .range_proofs = RetainedRelationalRead.rangeProofs } };
+        return .{ .text_filter_digest = view.text_filter_digest, .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize, .range_proofs = RetainedRelationalRead.rangeProofs } };
     }
 
     fn scanGroupLocalRoutedStream(

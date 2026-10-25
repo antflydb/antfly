@@ -3255,6 +3255,56 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-exact-text-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-text-predicate-test",
+        "-Dtest-filter=mounted SQL original exact text predicates",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-exact-text-storage-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-indexed-document-read-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-exact-text-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_text_predicate_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_text_predicate_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-exact-text-transport-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-retained-snapshot-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
     }
   },
   "entries": [
@@ -15459,8 +15509,30 @@
     },
     {
       "id": "sql-0801",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL runs through public catalog-backed document views (or the primary document relation for COUNT), a real ready native full-text index and exact retained postings/primary cuts. Independent PostgreSQL field-scoped text witnesses qualify the native extension explicitly and compare complete residual results, labels, OIDs and SQL NULLs. Mounted production execution verifies all originals with current mandatory Antfly row filters before and after cold catalog/owner restart. Frozen deletion visibility survives later updates, deletes and compaction; bounded native paging returns 11,017 matches without a ranked top-K cap and filters hidden rows even with narrow projections. Historical private view/index JSON and plan fingerprints are replaced by public typed catalog/view and native owner readiness contracts, not simulated metadata.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_index_system_test.zig",
+          "test": "relational index system indexed document streams beyond top K and retains mandatory authorization",
+          "gate": "sql-exact-text-storage-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/retained_read_client.zig",
+          "test": "retained read client requires exact text acknowledgement before rows and cancels ignored predicates",
+          "gate": "sql-exact-text-transport-debug"
+        }
+      ]
     },
     {
       "id": "sql-0802",
@@ -15608,8 +15680,30 @@
     },
     {
       "id": "sql-0814",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL runs through public catalog-backed document views (or the primary document relation for COUNT), a real ready native full-text index and exact retained postings/primary cuts. Independent PostgreSQL field-scoped text witnesses qualify the native extension explicitly and compare complete residual results, labels, OIDs and SQL NULLs. Mounted production execution verifies all originals with current mandatory Antfly row filters before and after cold catalog/owner restart. Frozen deletion visibility survives later updates, deletes and compaction; bounded native paging returns 11,017 matches without a ranked top-K cap and filters hidden rows even with narrow projections. Historical private view/index JSON and plan fingerprints are replaced by public typed catalog/view and native owner readiness contracts, not simulated metadata.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_index_system_test.zig",
+          "test": "relational index system indexed document streams beyond top K and retains mandatory authorization",
+          "gate": "sql-exact-text-storage-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/retained_read_client.zig",
+          "test": "retained read client requires exact text acknowledgement before rows and cancels ignored predicates",
+          "gate": "sql-exact-text-transport-debug"
+        }
+      ]
     },
     {
       "id": "sql-0815",
@@ -16189,8 +16283,30 @@
     },
     {
       "id": "sql-0858",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL runs through public catalog-backed document views (or the primary document relation for COUNT), a real ready native full-text index and exact retained postings/primary cuts. Independent PostgreSQL field-scoped text witnesses qualify the native extension explicitly and compare complete residual results, labels, OIDs and SQL NULLs. Mounted production execution verifies all originals with current mandatory Antfly row filters before and after cold catalog/owner restart. Frozen deletion visibility survives later updates, deletes and compaction; bounded native paging returns 11,017 matches without a ranked top-K cap and filters hidden rows even with narrow projections. Historical private view/index JSON and plan fingerprints are replaced by public typed catalog/view and native owner readiness contracts, not simulated metadata.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_index_system_test.zig",
+          "test": "relational index system indexed document streams beyond top K and retains mandatory authorization",
+          "gate": "sql-exact-text-storage-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/retained_read_client.zig",
+          "test": "retained read client requires exact text acknowledgement before rows and cancels ignored predicates",
+          "gate": "sql-exact-text-transport-debug"
+        }
+      ]
     },
     {
       "id": "sql-0859",
@@ -16199,33 +16315,165 @@
     },
     {
       "id": "sql-0860",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL runs through public catalog-backed document views (or the primary document relation for COUNT), a real ready native full-text index and exact retained postings/primary cuts. Independent PostgreSQL field-scoped text witnesses qualify the native extension explicitly and compare complete residual results, labels, OIDs and SQL NULLs. Mounted production execution verifies all originals with current mandatory Antfly row filters before and after cold catalog/owner restart. Frozen deletion visibility survives later updates, deletes and compaction; bounded native paging returns 11,017 matches without a ranked top-K cap and filters hidden rows even with narrow projections. Historical private view/index JSON and plan fingerprints are replaced by public typed catalog/view and native owner readiness contracts, not simulated metadata.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_index_system_test.zig",
+          "test": "relational index system indexed document streams beyond top K and retains mandatory authorization",
+          "gate": "sql-exact-text-storage-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/retained_read_client.zig",
+          "test": "retained read client requires exact text acknowledgement before rows and cancels ignored predicates",
+          "gate": "sql-exact-text-transport-debug"
+        }
+      ]
     },
     {
       "id": "sql-0861",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL runs through public catalog-backed document views (or the primary document relation for COUNT), a real ready native full-text index and exact retained postings/primary cuts. Independent PostgreSQL field-scoped text witnesses qualify the native extension explicitly and compare complete residual results, labels, OIDs and SQL NULLs. Mounted production execution verifies all originals with current mandatory Antfly row filters before and after cold catalog/owner restart. Frozen deletion visibility survives later updates, deletes and compaction; bounded native paging returns 11,017 matches without a ranked top-K cap and filters hidden rows even with narrow projections. Historical private view/index JSON and plan fingerprints are replaced by public typed catalog/view and native owner readiness contracts, not simulated metadata.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_index_system_test.zig",
+          "test": "relational index system indexed document streams beyond top K and retains mandatory authorization",
+          "gate": "sql-exact-text-storage-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/retained_read_client.zig",
+          "test": "retained read client requires exact text acknowledgement before rows and cancels ignored predicates",
+          "gate": "sql-exact-text-transport-debug"
+        }
+      ]
     },
     {
       "id": "sql-0862",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL runs through public catalog-backed document views (or the primary document relation for COUNT), a real ready native full-text index and exact retained postings/primary cuts. Independent PostgreSQL field-scoped text witnesses qualify the native extension explicitly and compare complete residual results, labels, OIDs and SQL NULLs. Mounted production execution verifies all originals with current mandatory Antfly row filters before and after cold catalog/owner restart. Frozen deletion visibility survives later updates, deletes and compaction; bounded native paging returns 11,017 matches without a ranked top-K cap and filters hidden rows even with narrow projections. Historical private view/index JSON and plan fingerprints are replaced by public typed catalog/view and native owner readiness contracts, not simulated metadata.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_index_system_test.zig",
+          "test": "relational index system indexed document streams beyond top K and retains mandatory authorization",
+          "gate": "sql-exact-text-storage-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/retained_read_client.zig",
+          "test": "retained read client requires exact text acknowledgement before rows and cancels ignored predicates",
+          "gate": "sql-exact-text-transport-debug"
+        }
+      ]
     },
     {
       "id": "sql-0863",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL runs through public catalog-backed document views (or the primary document relation for COUNT), a real ready native full-text index and exact retained postings/primary cuts. Independent PostgreSQL field-scoped text witnesses qualify the native extension explicitly and compare complete residual results, labels, OIDs and SQL NULLs. Mounted production execution verifies all originals with current mandatory Antfly row filters before and after cold catalog/owner restart. Frozen deletion visibility survives later updates, deletes and compaction; bounded native paging returns 11,017 matches without a ranked top-K cap and filters hidden rows even with narrow projections. Historical private view/index JSON and plan fingerprints are replaced by public typed catalog/view and native owner readiness contracts, not simulated metadata.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_index_system_test.zig",
+          "test": "relational index system indexed document streams beyond top K and retains mandatory authorization",
+          "gate": "sql-exact-text-storage-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/retained_read_client.zig",
+          "test": "retained read client requires exact text acknowledgement before rows and cancels ignored predicates",
+          "gate": "sql-exact-text-transport-debug"
+        }
+      ]
     },
     {
       "id": "sql-0864",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL runs through public catalog-backed document views (or the primary document relation for COUNT), a real ready native full-text index and exact retained postings/primary cuts. Independent PostgreSQL field-scoped text witnesses qualify the native extension explicitly and compare complete residual results, labels, OIDs and SQL NULLs. Mounted production execution verifies all originals with current mandatory Antfly row filters before and after cold catalog/owner restart. Frozen deletion visibility survives later updates, deletes and compaction; bounded native paging returns 11,017 matches without a ranked top-K cap and filters hidden rows even with narrow projections. Historical private view/index JSON and plan fingerprints are replaced by public typed catalog/view and native owner readiness contracts, not simulated metadata.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_index_system_test.zig",
+          "test": "relational index system indexed document streams beyond top K and retains mandatory authorization",
+          "gate": "sql-exact-text-storage-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/retained_read_client.zig",
+          "test": "retained read client requires exact text acknowledgement before rows and cancels ignored predicates",
+          "gate": "sql-exact-text-transport-debug"
+        }
+      ]
     },
     {
       "id": "sql-0865",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL runs through public catalog-backed document views (or the primary document relation for COUNT), a real ready native full-text index and exact retained postings/primary cuts. Independent PostgreSQL field-scoped text witnesses qualify the native extension explicitly and compare complete residual results, labels, OIDs and SQL NULLs. Mounted production execution verifies all originals with current mandatory Antfly row filters before and after cold catalog/owner restart. Frozen deletion visibility survives later updates, deletes and compaction; bounded native paging returns 11,017 matches without a ranked top-K cap and filters hidden rows even with narrow projections. Historical private view/index JSON and plan fingerprints are replaced by public typed catalog/view and native owner readiness contracts, not simulated metadata.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_index_system_test.zig",
+          "test": "relational index system indexed document streams beyond top K and retains mandatory authorization",
+          "gate": "sql-exact-text-storage-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/retained_read_client.zig",
+          "test": "retained read client requires exact text acknowledgement before rows and cancels ignored predicates",
+          "gate": "sql-exact-text-transport-debug"
+        }
+      ]
     },
     {
       "id": "sql-0866",
@@ -16241,28 +16489,138 @@
     },
     {
       "id": "sql-0867",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL runs through public catalog-backed document views (or the primary document relation for COUNT), a real ready native full-text index and exact retained postings/primary cuts. Independent PostgreSQL field-scoped text witnesses qualify the native extension explicitly and compare complete residual results, labels, OIDs and SQL NULLs. Mounted production execution verifies all originals with current mandatory Antfly row filters before and after cold catalog/owner restart. Frozen deletion visibility survives later updates, deletes and compaction; bounded native paging returns 11,017 matches without a ranked top-K cap and filters hidden rows even with narrow projections. Historical private view/index JSON and plan fingerprints are replaced by public typed catalog/view and native owner readiness contracts, not simulated metadata.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_index_system_test.zig",
+          "test": "relational index system indexed document streams beyond top K and retains mandatory authorization",
+          "gate": "sql-exact-text-storage-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/retained_read_client.zig",
+          "test": "retained read client requires exact text acknowledgement before rows and cancels ignored predicates",
+          "gate": "sql-exact-text-transport-debug"
+        }
+      ]
     },
     {
       "id": "sql-0868",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL runs through public catalog-backed document views (or the primary document relation for COUNT), a real ready native full-text index and exact retained postings/primary cuts. Independent PostgreSQL field-scoped text witnesses qualify the native extension explicitly and compare complete residual results, labels, OIDs and SQL NULLs. Mounted production execution verifies all originals with current mandatory Antfly row filters before and after cold catalog/owner restart. Frozen deletion visibility survives later updates, deletes and compaction; bounded native paging returns 11,017 matches without a ranked top-K cap and filters hidden rows even with narrow projections. Historical private view/index JSON and plan fingerprints are replaced by public typed catalog/view and native owner readiness contracts, not simulated metadata.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_index_system_test.zig",
+          "test": "relational index system indexed document streams beyond top K and retains mandatory authorization",
+          "gate": "sql-exact-text-storage-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/retained_read_client.zig",
+          "test": "retained read client requires exact text acknowledgement before rows and cancels ignored predicates",
+          "gate": "sql-exact-text-transport-debug"
+        }
+      ]
     },
     {
       "id": "sql-0869",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL runs through public catalog-backed document views (or the primary document relation for COUNT), a real ready native full-text index and exact retained postings/primary cuts. Independent PostgreSQL field-scoped text witnesses qualify the native extension explicitly and compare complete residual results, labels, OIDs and SQL NULLs. Mounted production execution verifies all originals with current mandatory Antfly row filters before and after cold catalog/owner restart. Frozen deletion visibility survives later updates, deletes and compaction; bounded native paging returns 11,017 matches without a ranked top-K cap and filters hidden rows even with narrow projections. Historical private view/index JSON and plan fingerprints are replaced by public typed catalog/view and native owner readiness contracts, not simulated metadata.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_index_system_test.zig",
+          "test": "relational index system indexed document streams beyond top K and retains mandatory authorization",
+          "gate": "sql-exact-text-storage-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/retained_read_client.zig",
+          "test": "retained read client requires exact text acknowledgement before rows and cancels ignored predicates",
+          "gate": "sql-exact-text-transport-debug"
+        }
+      ]
     },
     {
       "id": "sql-0870",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL runs through public catalog-backed document views (or the primary document relation for COUNT), a real ready native full-text index and exact retained postings/primary cuts. Independent PostgreSQL field-scoped text witnesses qualify the native extension explicitly and compare complete residual results, labels, OIDs and SQL NULLs. Mounted production execution verifies all originals with current mandatory Antfly row filters before and after cold catalog/owner restart. Frozen deletion visibility survives later updates, deletes and compaction; bounded native paging returns 11,017 matches without a ranked top-K cap and filters hidden rows even with narrow projections. Historical private view/index JSON and plan fingerprints are replaced by public typed catalog/view and native owner readiness contracts, not simulated metadata.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_index_system_test.zig",
+          "test": "relational index system indexed document streams beyond top K and retains mandatory authorization",
+          "gate": "sql-exact-text-storage-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/retained_read_client.zig",
+          "test": "retained read client requires exact text acknowledgement before rows and cancels ignored predicates",
+          "gate": "sql-exact-text-transport-debug"
+        }
+      ]
     },
     {
       "id": "sql-0871",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL runs through public catalog-backed document views (or the primary document relation for COUNT), a real ready native full-text index and exact retained postings/primary cuts. Independent PostgreSQL field-scoped text witnesses qualify the native extension explicitly and compare complete residual results, labels, OIDs and SQL NULLs. Mounted production execution verifies all originals with current mandatory Antfly row filters before and after cold catalog/owner restart. Frozen deletion visibility survives later updates, deletes and compaction; bounded native paging returns 11,017 matches without a ranked top-K cap and filters hidden rows even with narrow projections. Historical private view/index JSON and plan fingerprints are replaced by public typed catalog/view and native owner readiness contracts, not simulated metadata.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_index_system_test.zig",
+          "test": "relational index system indexed document streams beyond top K and retains mandatory authorization",
+          "gate": "sql-exact-text-storage-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/retained_read_client.zig",
+          "test": "retained read client requires exact text acknowledgement before rows and cancels ignored predicates",
+          "gate": "sql-exact-text-transport-debug"
+        }
+      ]
     },
     {
       "id": "sql-0872",
@@ -28941,8 +29299,30 @@
     },
     {
       "id": "sql-1579",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL runs through public catalog-backed document views (or the primary document relation for COUNT), a real ready native full-text index and exact retained postings/primary cuts. Independent PostgreSQL field-scoped text witnesses qualify the native extension explicitly and compare complete residual results, labels, OIDs and SQL NULLs. Mounted production execution verifies all originals with current mandatory Antfly row filters before and after cold catalog/owner restart. Frozen deletion visibility survives later updates, deletes and compaction; bounded native paging returns 11,017 matches without a ranked top-K cap and filters hidden rows even with narrow projections. Historical private view/index JSON and plan fingerprints are replaced by public typed catalog/view and native owner readiness contracts, not simulated metadata.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_document_integration_test.zig",
+          "test": "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
+          "gate": "sql-exact-text-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_index_system_test.zig",
+          "test": "relational index system indexed document streams beyond top K and retains mandatory authorization",
+          "gate": "sql-exact-text-storage-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/retained_read_client.zig",
+          "test": "retained read client requires exact text acknowledgement before rows and cancels ignored predicates",
+          "gate": "sql-exact-text-transport-debug"
+        }
+      ]
     },
     {
       "id": "sql-1580",

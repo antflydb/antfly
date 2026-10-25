@@ -42513,6 +42513,14 @@ pub const DB = struct {
 
     pub fn openDocumentReadSession(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !*DocumentReadSession {
         if (comptime storage_engine.enabled) return storage_engine.call("openDocumentReadSession", .{ self, alloc, from_key, to_key, opts });
+        if (opts.relational_query_json.len > 1024 * 1024) return error.InvalidRelationalRowsRequest;
+        if (opts.relational_query) |input| {
+            if (input.text_filter) |text| return self.openDocumentTextReadSession(alloc, from_key, to_key, opts, text);
+        } else if (opts.relational_query_json.len != 0) {
+            var parsed = try std.json.parseFromSlice(types.RelationalRowQuery, alloc, opts.relational_query_json, .{});
+            defer parsed.deinit();
+            if (parsed.value.text_filter) |text| return self.openDocumentTextReadSession(alloc, from_key, to_key, opts, text);
+        }
         try self.maybeFinalizePendingRowPolicyPublication();
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
         errdefer row_policy_lease.release();
@@ -42534,6 +42542,82 @@ pub const DB = struct {
         session.preparation_runtime = if (self.backend_runtime.io()) |io| .{ .io = io } else null;
         session.row_policy_lease = row_policy_lease;
         return session;
+    }
+
+    fn openDocumentTextReadSession(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, text: types.RelationalRowQuery.TextFilter) !*DocumentReadSession {
+        const Owner = @import("text_rows.zig").Owner;
+        try self.maybeFinalizePendingRowPolicyPublication();
+        var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
+        errdefer row_policy_lease.release();
+        const owner = try Owner.init(alloc, text);
+        errdefer owner.deinit();
+        // Pin catalog storage as well as analysis before dropping apply:
+        // adding an index may relocate the entry array without modifying this
+        // entry's analysis. Neither borrowed pointer may outlive its lease.
+        {
+            try self.lockApplySharedForPortableRuntime();
+            self.failIfIndexQuarantined(text.index) catch |err| {
+                self.core.unlockApplyShared();
+                return err;
+            };
+            self.core.index_manager.catalog_mutex.lockShared();
+            const selected = self.core.textIndexEntry(text.index) orelse {
+                self.core.index_manager.catalog_mutex.unlockShared();
+                self.core.unlockApplyShared();
+                return error.IndexNotFound;
+            };
+            selected.lockAnalysisShared();
+            self.core.unlockApplyShared();
+            defer {
+                selected.unlockAnalysisShared();
+                self.core.index_manager.catalog_mutex.unlockShared();
+            }
+            owner.prepare(selected, text) catch |err| return owner.allocationError(err);
+        }
+        const wait: derived_executor_mod.VisibilityWait = .{ .cancellation = opts.cancellation orelse .none, .deadline_ns = opts.execution_deadline_ns, .clock = self.backend_runtime.monotonicClock() };
+        // Statement capture can already hold the replay admission fence.
+        // Never wait for replay here: an unready owner must be retried after
+        // ALL captures are released, rather than deadlocking its own worker.
+        {
+            try wait.check();
+            try self.lockApplySharedForPortableRuntime();
+            var locked = true;
+            defer if (locked) self.core.unlockApplyShared();
+            const sequence = self.core.nextDerivedSequence();
+            try self.failIfIndexQuarantined(owner.index_name);
+            self.core.index_manager.catalog_mutex.lockShared();
+            var catalog_held = true;
+            defer if (catalog_held) self.core.index_manager.catalog_mutex.unlockShared();
+            const entry = self.core.textIndexEntry(owner.index_name) orelse return error.IndexNotFound;
+            entry.lockAnalysisShared();
+            const same_projection = entry.instance_id == owner.instance_id and entry.projection_revision == owner.projection_revision and types.indexConfigHash(entry.config) == owner.config_hash;
+            entry.unlockAnalysisShared();
+            if (!same_projection) return error.PreparedGenerationChanged;
+            if (try self.core.loadAppliedSequence(alloc, owner.index_name) < sequence) return error.SqlStatementReadUnavailable;
+            var schema = self.core.acquireSchemaView();
+            defer if (schema) |*view| view.release();
+            if (schema) |view| if (view.storageMode() != .document) return error.UnsupportedSqlExecution;
+            const range = self.core.byteRange();
+            const start_key = try alloc.dupe(u8, range.start);
+            defer alloc.free(start_key);
+            const end_key = try alloc.dupe(u8, range.end);
+            defer alloc.free(end_key);
+            var txn = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+            var owns_txn = true;
+            errdefer if (owns_txn) txn.abort();
+            owner.cursor = entry.persistent.writer.openFilterCursor(owner.budget.allocator(), owner.filter, .{ .cancellation = opts.cancellation, .deadline_ns = opts.execution_deadline_ns }, .{ .memory_bytes = text.memory_bytes }) catch |err| return owner.allocationError(err);
+            const now = currentTimeNs();
+            self.core.index_manager.catalog_mutex.unlockShared();
+            catalog_held = false;
+            self.core.unlockApplyShared();
+            locked = false;
+            // openSnapshot owns txn on both success and failure.
+            owns_txn = false;
+            const session = try DocumentReadSession.openTextSnapshot(alloc, self.core.store, txn, schema, .{ .start = start_key, .end = end_key }, from_key, to_key, opts, now, owner);
+            session.row_policy_lease = row_policy_lease;
+            session.preparation_runtime = if (self.backend_runtime.io()) |io| .{ .io = io } else null;
+            return session;
+        }
     }
 
     pub fn openRelationalReadSession(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !*RelationalReadSession {
@@ -42582,6 +42666,7 @@ pub const DB = struct {
         } else null;
         defer if (parsed_json) |*owned| owned.deinit();
         const parsed = .{ .value = opts.relational_query orelse parsed_json.?.value };
+        if (parsed.value.text_filter != null) return error.UnsupportedSqlExecution;
         if (parsed.value.page_bytes == 0 or parsed.value.page_bytes > 16 * 1024 * 1024) return error.InvalidRelationalRowsRequest;
         session.page_bytes = parsed.value.page_bytes;
         if (parsed.value.conditions.len > 256 or parsed.value.fields.len > 256 or parsed.value.expression_equalities.len > 256) return error.InvalidRelationalRowsRequest;

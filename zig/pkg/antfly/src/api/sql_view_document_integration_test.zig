@@ -31,6 +31,8 @@ const Entry = struct {
     rows: []const []const Json,
     sql_nulls: []const []const bool,
     affected: u64,
+    reference_sql: ?[]const u8 = null,
+    text_witnesses: ?[]const struct { field: []const u8, term: []const u8, candidate_ids: []const []const u8 } = null,
 };
 
 const Golden = struct {
@@ -43,6 +45,7 @@ const Golden = struct {
         view_sql: []const u8,
     },
     entries: []const Entry,
+    filtered_entries: ?[]const Entry = null,
     empty_reference: ?struct { reference: []const u8, entries: []const Entry } = null,
 };
 
@@ -126,22 +129,43 @@ fn qualifyEmpty(ctx: *fixture.Context, golden: Golden, source_table: []const u8)
     try seedDocuments(ctx, golden, source_table);
 }
 
-fn Campaign(comptime reference_bytes: []const u8, comptime source_table: []const u8, comptime expected_count: usize) type {
+fn qualifyTextAuthorization(ctx: *fixture.Context, golden: Golden) !void {
+    const manager = (ctx.metadata.server.owned_public_http_server orelse return error.MissingMetadataPublicApi).cfg.user_manager orelse return error.MissingUserManager;
+    try manager.setRowFilter("pk-reader", "docs", "{\"term\":{\"title\":\"alpha\"}}");
+    defer manager.removeRowFilter("pk-reader", "docs") catch {};
+    var filtered = golden;
+    filtered.entries = golden.filtered_entries orelse return error.MissingTextAuthorizationReference;
+    try qualify(ctx, filtered, "mandatory-owner-filter");
+}
+
+fn Campaign(comptime reference_bytes: []const u8, comptime source_table: []const u8, comptime expected_count: usize, comptime indexed: bool) type {
     return struct {
+        pub const native_auth = indexed;
+        pub const cold_catalog = indexed;
         credentials: client.ApiKeyHeaders = .{},
+        pub fn configureAuth(manager: *@import("../usermgr/mod.zig").UserManager) !void {
+            if (indexed) {
+                const users = @import("../usermgr/mod.zig");
+                inline for (.{ users.ResourceType.database, users.ResourceType.namespace }) |kind| {
+                    var permission = try users.Permission.initOwned(manager.alloc, kind, "*", .admin);
+                    defer permission.deinit(manager.alloc);
+                    try manager.addPermissionToUser("pk-rewriter", permission);
+                }
+            }
+        }
 
         pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
-            try self.credentials.activate(ctx);
+            try self.credentials.activateWithCatalog(ctx, indexed);
             var parsed = try std.json.parseFromSlice(Golden, ctx.alloc, reference_bytes, .{});
             defer parsed.deinit();
             const golden = parsed.value;
-            try std.testing.expectEqual(@as(u8, 2), golden.format);
-            try std.testing.expectEqualStrings("PostgreSQL exact SQL", golden.reference);
+            try std.testing.expectEqual(@as(u8, if (indexed) 1 else 2), golden.format);
+            try std.testing.expectEqualStrings(if (indexed) "PostgreSQL field-scoped text witness and SQL residuals" else "PostgreSQL exact SQL", golden.reference);
             try std.testing.expectEqual(expected_count, golden.entries.len);
             // Storage epochs are server-owned at public table creation.
             var declaration = golden.profile.schema;
             _ = declaration.object.orderedRemove("version");
-            const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .schema = declaration }, .{});
+            const body = if (indexed) try std.json.Stringify.valueAlloc(ctx.alloc, .{ .schema = declaration, .indexes = .{ .text = .{ .type = "full_text" } } }, .{}) else try std.json.Stringify.valueAlloc(ctx.alloc, .{ .schema = declaration }, .{});
             defer ctx.alloc.free(body);
             var created = try fixture.request(ctx.alloc, ctx.transport, ctx.headers, ctx.base, std.fmt.comptimePrint("/db/v1/tables/{s}", .{source_table}), .POST, body);
             defer created.deinit(ctx.alloc);
@@ -161,6 +185,7 @@ fn Campaign(comptime reference_bytes: []const u8, comptime source_table: []const
             if (view.status != 200) std.debug.print("document view creation status={d} body={s}\n", .{ view.status, view.body });
             try std.testing.expectEqual(@as(u16, 200), view.status);
             try qualify(ctx, golden, "initial-owner");
+            if (indexed) try qualifyTextAuthorization(ctx, golden);
             try qualifyEmpty(ctx, golden, source_table);
         }
 
@@ -169,6 +194,7 @@ fn Campaign(comptime reference_bytes: []const u8, comptime source_table: []const
             var parsed = try std.json.parseFromSlice(Golden, ctx.alloc, reference_bytes, .{});
             defer parsed.deinit();
             try qualify(ctx, parsed.value, "reopened-owner");
+            if (indexed) try qualifyTextAuthorization(ctx, parsed.value);
             try qualifyEmpty(ctx, parsed.value, source_table);
         }
     };
@@ -193,7 +219,7 @@ test "mounted SQL original document views preserve real paths typed arrays and l
         try std.testing.expectEqualStrings(id, entry.id);
         try std.testing.expectEqualStrings((try corpus.get(id)).sql, entry.sql);
     }
-    try fixture.run(Campaign(golden_bytes, "docs", 38));
+    try fixture.run(Campaign(golden_bytes, "docs", 38, false));
 }
 
 test "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart" {
@@ -207,5 +233,19 @@ test "mounted SQL original document array views preserve typed expansion and emp
     defer parsed.deinit();
     try std.testing.expectEqual(ids.len, parsed.value.entries.len);
     for (ids, parsed.value.entries) |id, entry| try std.testing.expectEqualStrings(id, entry.id);
-    try fixture.run(Campaign(bytes, "document_source", ids.len));
+    try fixture.run(Campaign(bytes, "document_source", ids.len, false));
+}
+
+test "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners" {
+    const ids = [_][]const u8{ "sql-0801", "sql-0814", "sql-0858", "sql-0860", "sql-0861", "sql-0862", "sql-0863", "sql-0864", "sql-0865", "sql-0867", "sql-0868", "sql-0869", "sql-0870", "sql-0871", "sql-1579" };
+    const bytes = local.sql_parity_fixtures.text_predicate_reference;
+    var parsed = try std.json.parseFromSlice(Golden, std.testing.allocator, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 15), parsed.value.entries.len);
+    for (parsed.value.entries, ids) |entry, id| {
+        try std.testing.expectEqualStrings(id, entry.id);
+        try std.testing.expect(entry.reference_sql != null);
+        try std.testing.expect(entry.text_witnesses.?.len != 0);
+    }
+    try fixture.run(Campaign(bytes, "docs", 15, true));
 }

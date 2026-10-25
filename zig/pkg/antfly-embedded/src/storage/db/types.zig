@@ -1537,6 +1537,16 @@ pub const RelationalRowQuery = struct {
         value: ?std.json.Value = null,
         collation: ?[]const u8 = null,
     };
+    /// Exact, unranked SQL predicate. Every owner must understand this field;
+    /// retained-read admission requires an explicit predicate digest from
+    /// every owner before rows. No LIMIT/top-K bound is part of membership.
+    pub const TextFilter = struct {
+        query: []const u8,
+        index: ?[]const u8 = null,
+        config_hash: ?u64 = null,
+        memory_bytes: usize = 32 * 1024 * 1024,
+    };
+    text_filter: ?TextFilter = null,
     /// Private mutation preparation: exposed RETURNING postimages must pass
     /// the same owner-side SELECT policy and mandatory filter as a read.
     /// Ordinary write normalization deliberately does not require visibility.

@@ -215,8 +215,13 @@ pub const Client = struct {
         defer response.deinit(self.alloc);
         var parsed = try std.json.parseFromSlice(rpc.Response, alloc, response.body, .{});
         defer parsed.deinit();
+        if (query.text_filter) |text| {
+            var expected: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(text.query, &expected, .{});
+            if (parsed.value.text_filter_digest == null or !std.mem.eql(u8, &expected, &parsed.value.text_filter_digest.?)) return error.UnsupportedSqlExecution;
+        } else if (parsed.value.text_filter_digest != null) return error.InvalidRetainedReadResponse;
         cursor.* = .{ .alloc = alloc, .executor = self.executor, .uri = uri, .route = route, .schema_version = self.schema_version, .deadline_ns = self.deadline_ns, .token = parsed.value.token orelse return error.InvalidRetainedReadResponse, .connection = self.connection };
-        return .{ .ptr = cursor, .vtable = &.{ .next = next, .close = close, .normalize = normalize, .range_proofs = rangeProofs } };
+        return .{ .text_filter_digest = parsed.value.text_filter_digest, .ptr = cursor, .vtable = &.{ .next = next, .close = close, .normalize = normalize, .range_proofs = rangeProofs } };
     }
 
     fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !reads.RelationalReadView.Page {
@@ -457,6 +462,59 @@ fn consumerTests() type {
                 try std.testing.expect(client.poisoned);
                 try std.testing.expectError(error.RetainedReadRestartRequired, client.call(request));
                 try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+            }
+        }
+
+        test "retained read client requires exact text acknowledgement before rows and cancels ignored predicates" {
+            const Fixture = struct {
+                mode: u8,
+                opens: usize = 0,
+                pages: usize = 0,
+                cancels: usize = 0,
+                fn execute(raw: *anyopaque, a: std.mem.Allocator, request: http.HttpRequest) !http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    var parsed = try std.json.parseFromSlice(rpc.Request, a, request.body, .{});
+                    defer parsed.deinit();
+                    var reply: rpc.Response = .{ .token = .{ .incarnation = 1, .sequence = 2, .slot = 0 } };
+                    switch (parsed.value.operation) {
+                        .open => {
+                            self.opens += 1;
+                            if (self.mode != 0) {
+                                var digest: [32]u8 = @splat(0);
+                                if (self.mode == 2) std.crypto.hash.sha2.Sha256.hash(parsed.value.query.?.text_filter.?.query, &digest, .{});
+                                reply.text_filter_digest = digest;
+                            }
+                        },
+                        .next => self.pages += 1,
+                        .cancel => self.cancels += 1,
+                        .close => {},
+                        else => return error.TestUnexpectedResult,
+                    }
+                    const body = try std.json.Stringify.valueAlloc(a, reply, .{});
+                    errdefer a.free(body);
+                    const headers = try a.alloc(http.Header, 1);
+                    errdefer a.free(headers);
+                    const name = try a.dupe(u8, metadata.catalog_route_fence_ack_header);
+                    errdefer a.free(name);
+                    headers[0] = .{ .name = name, .value = try a.dupe(u8, metadata.catalog_route_fence_ack_value) };
+                    return .{ .status = 200, .body = body, .headers = headers };
+                }
+            };
+            const a = std.testing.allocator;
+            for (0..3) |mode| {
+                var source: Fixture = .{ .mode = @intCast(mode) };
+                const client = try Client.create(a, .{ .ptr = &source, .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io), .vtable = &.{ .execute = Fixture.execute } }, "http://peer", "rows", .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } } }, 5, null);
+                defer client.destroy();
+                client.token = .{ .incarnation = 1, .sequence = 1, .slot = 0 };
+                const opts: types.ScanOptions = .{ .relational_query = .{ .fields = &.{}, .auto_index = true, .text_filter = .{ .query = "body:alpha" } } };
+                if (mode == 2) {
+                    const view = try client.openKind(a, "", "", opts, false);
+                    defer view.deinit();
+                    try std.testing.expect(view.text_filter_digest != null);
+                } else try std.testing.expectError(error.UnsupportedSqlExecution, client.openKind(a, "", "", opts, false));
+                try std.testing.expectEqual(@as(usize, 1), source.opens);
+                try std.testing.expectEqual(@as(usize, 0), source.pages);
+                try std.testing.expectEqual(@as(usize, if (mode == 2) 0 else 1), source.cancels);
             }
         }
 

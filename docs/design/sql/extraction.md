@@ -192,6 +192,45 @@ ordered-artifact protocols 15 and 17 are not advertised.
   suppress unreachable evaluation; group keys, HAVING, ordering and side effects
   stay live. Stable/volatile functions are never executed during preparation.
 
+### Exact indexed document predicates
+
+Native `full_text_search(...)` document/view queries use an exact postings
+producer. A ranked top-K search followed by residual SQL filtering can
+omit valid rows, and primary scans cannot establish mandatory index readiness.
+The retained source must pair one primary transaction with a frozen full-text
+inventory and deletion cut after its selected derived watermark reaches that
+primary cut. Later updates, deletes, compaction and index retirement must not
+change cursor membership. The text writer's ordinary snapshot intentionally
+shares live deletion masks; retaining it alone does not supply this contract.
+Catalog and analysis leases protect index-entry relocation during preparation
+and capture; neither lease remains held while paging.
+
+The selector pulls one segment bitmap at a time with bounded memory, explicit
+work per pull, deadline/cancellation checks, and empty nonterminal pages. It
+retains physical readers through compaction and resolves only selected document
+identities. Existing document pages remain responsible for primary visibility,
+TTL, mandatory authorization, typed projection and residual SQL evaluation.
+Normal and bound view queries must use this producer through the existing
+retained routed-read machinery. Unsupported placement or provider capability
+must reject before output; it cannot fall back to a capped search or skip a
+required index. Catalog generation, attribute/schema and index readiness guards
+remain mandatory across prepared execution and cold reopen.
+
+The mounted production campaign closes 15 original indexed-read contracts,
+including lateral array expansion and unbounded COUNT, with full result/OID/NULL
+comparisons before and after catalog/owner restart and mandatory caller filters.
+Its PostgreSQL witness explicitly lowers the Antfly-only implicit-document text
+predicate to field-scoped PostgreSQL text matching; it never claims PostgreSQL
+implements that extension or executes the lowering on Antfly. Owner admission
+requires an exact query digest, including across routed retained-read transport;
+older or mixed owners cannot silently supply unfiltered rows.
+
+Only positive WHERE conjuncts over one unambiguous document source are selected.
+Row bounds, aggregation, shared physical materialization, outer joins and security
+barriers remain guarded. Ranked search, stronger delayed snapshots and staged
+mutation overlays are separate capabilities. Ordinary WHERE clauses retain the
+allocation-free path through predicate extraction.
+
 ### Mutations
 
 - Expression INSERT/UPDATE use whole-batch validation, exact integers and

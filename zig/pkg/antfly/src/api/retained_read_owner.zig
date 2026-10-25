@@ -149,7 +149,11 @@ pub const Owner = struct {
 
     /// Snapshot gets a separate owned cancellation capsule: releasing the
     /// short mutation capture must not cancel its long-lived paging cursors.
+    pub const Opened = struct { token: registry_mod.Token, text_filter_digest: ?[32]u8 };
     pub fn open(self: Owner, scope: registry_mod.Scope, capture_token: registry_mod.Token, connection: u128, from: []const u8, to: []const u8, input: types.ScanOptions, deadline_ns: u64) !registry_mod.Token {
+        return (try self.openQualified(scope, capture_token, connection, from, to, input, deadline_ns)).token;
+    }
+    pub fn openQualified(self: Owner, scope: registry_mod.Scope, capture_token: registry_mod.Token, connection: u128, from: []const u8, to: []const u8, input: types.ScanOptions, deadline_ns: u64) !Opened {
         var borrow = try self.registry.borrow(capture_token, scope, .capture, time.monotonicNs());
         defer borrow.deinit();
         const capture_value: *Capture = @ptrCast(@alignCast(borrow.resource.ptr));
@@ -176,7 +180,13 @@ pub const Owner = struct {
         // one final quorum validation per capture after ALL aliases are open.
         // Repeating quorum rounds per alias would inflate the apply-lock hold.
         try borrow.validate(time.monotonicNs());
-        return try self.registry.insert(scope, connection, time.monotonicNs(), deadline_ns, .{ .ptr = owned, .kind = .cursor, .close = Cursor.close, .cancellation = &owned.cancelled });
+        if (query.text_filter) |text| {
+            var expected: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(text.query, &expected, .{});
+            if (owned.view.text_filter_digest == null or !std.mem.eql(u8, &expected, &owned.view.text_filter_digest.?)) return error.UnsupportedSqlExecution;
+        }
+        const token = try self.registry.insert(scope, connection, time.monotonicNs(), deadline_ns, .{ .ptr = owned, .kind = .cursor, .close = Cursor.close, .cancellation = &owned.cancelled });
+        return .{ .token = token, .text_filter_digest = owned.view.text_filter_digest };
     }
 
     pub fn openSnapshot(self: Owner, scope: registry_mod.Scope, snapshot_token: registry_mod.Token, connection: u128, from: []const u8, to: []const u8, input: types.ScanOptions, deadline_ns: u64) !registry_mod.Token {
@@ -194,6 +204,7 @@ pub const Owner = struct {
             parsed = try std.json.parseFromSlice(types.RelationalRowQuery, alloc, input.relational_query_json, .{ .allocate = .alloc_always, .parse_numbers = false });
             break :blk parsed.?.value;
         };
+        if (query.text_filter != null) return error.UnsupportedSqlExecution;
         if (query.schema_version) |version| if (version != scope.schema_version) return error.RetainedReadScopeChanged;
         if (query.index != null or query.auto_index) return error.SqlStatementSnapshotRequired;
         query.schema_version = scope.schema_version;

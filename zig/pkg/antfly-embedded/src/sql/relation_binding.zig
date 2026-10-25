@@ -220,7 +220,47 @@ pub fn hasQualifiedScalar(node: *const ast.Scalar) bool {
 pub fn hasQualifiedPredicate(node: ?*const ast.Predicate) bool {
     return if (node) |predicate| qualifiedPredicate(predicate) else false;
 }
+/// Push only through transparent bag-preserving frames. Materialization,
+/// aggregation, outer joins and row bounds are semantic barriers.
+fn textScan(node: *const Node) anyerror!?usize {
+    if (node.security_barrier) return error.UnsupportedSqlShape;
+    return switch (node.operation) {
+        .scan => |scan| scan.index,
+        .singleton, .outer_ref, .literal_rows, .prepared_rows => null,
+        .unnest => |u| textScan(u.source),
+        .materialized_ref => |source| if (try textScan(source) == null) null else error.UnsupportedSqlShape,
+        .values => |arms| blk: {
+            for (arms) |arm| if (try textScan(arm) != null) return error.UnsupportedSqlShape;
+            break :blk null;
+        },
+        .set => |set| if (try textScan(set.left) == null and try textScan(set.right) == null) null else error.UnsupportedSqlShape,
+        .query => |q| blk: {
+            const source = try textScan(q.source);
+            if (source == null) break :blk null;
+            const s = q.statement;
+            if (s.limit != null or s.offset != null or s.distinct != null or s.count_all or s.group_by.len != 0 or s.having != null or s.windows.len != 0 or @import("aggregate_binding.zig").accepts(s) or @import("window_binding.zig").accepts(s)) return error.UnsupportedSqlShape;
+            break :blk source;
+        },
+        .join => |j| blk: {
+            if (j.kind != .inner and j.kind != .cross) return error.UnsupportedSqlShape;
+            const l = try textScan(j.left);
+            const r = try textScan(j.right);
+            if (l != null and r != null) return error.UnsupportedSqlShape;
+            break :blk l orelse r;
+        },
+        .apply => |j| blk: {
+            if (j.kind != .inner and j.kind != .cross) return error.UnsupportedSqlShape;
+            const l = try textScan(j.left);
+            const r = try textScan(j.right);
+            if (l != null and r != null) return error.UnsupportedSqlShape;
+            break :blk l orelse r;
+        },
+        else => error.UnsupportedSqlShape,
+    };
+}
+
 pub fn accepts(statement: ast.Select) bool {
+    if (@import("text_predicate.zig").contains(statement.predicate)) return true;
     if (statement.source != null or statement.ctes.len != 0 or statement.set_operation != null or statement.values_arms.len != 0) return true;
     for (statement.columns) |projection| {
         if (projection.wildcard) return true;
@@ -1075,7 +1115,30 @@ const Builder = struct {
             }
         }
         result.columns = try projections.toOwnedSlice(self.alloc);
-        result.predicate = if (statement.predicate) |input| try self.predicate(source.columns, input) else null;
+        const text = try @import("text_predicate.zig").extract(self.alloc, statement.predicate);
+        if (text.queries.len != 0) {
+            if (!self.backend.supports_text_predicates) return error.UnsupportedSqlExecution;
+            for (text.queries) |value| if (value == .parameter) {
+                if (value.parameter == 0 or value.parameter > self.parameters.len) return error.InvalidSqlParameters;
+                const slot = &self.parameters[value.parameter - 1];
+                if (slot.* != null and slot.*.? != .string) return error.ConflictingSqlParameterTypes;
+                slot.* = .string;
+                if (self.shape_only) try self.constraints.append(self.alloc, .{ .expression = try self.scalarNode(.{ .literal = value }), .expected = .string });
+            };
+            if (!self.shape_only) {
+                const index = (try textScan(source)) orelse return error.UnsupportedSqlShape;
+                const scan = &self.scans.items[index];
+                if (scan.table.storage_mode != .document or scan.table.external_base_source != null or scan.request.search != null) return error.UnsupportedSqlExecution;
+                const prior = if (scan.request.text_predicate) |t| t.expressions else &.{};
+                const expressions = try self.alloc.alloc(ast.Value, prior.len + text.queries.len);
+                @memcpy(expressions[0..prior.len], prior);
+                @memcpy(expressions[prior.len..], text.queries);
+                const selection = try self.alloc.create(catalog.Scan.TextPredicate);
+                selection.* = .{ .expressions = expressions };
+                scan.request.text_predicate = selection;
+            }
+        }
+        result.predicate = if (text.residual) |input| try self.predicate(source.columns, input) else null;
         const groups = try self.alloc.alloc(*const ast.Scalar, statement.group_by.len);
         for (statement.group_by, groups) |input, *out| out.* = try self.expression(source.columns, input, if (input.* == .column) result.columns else &.{});
         result.group_by = groups;

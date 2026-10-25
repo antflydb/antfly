@@ -12314,3 +12314,127 @@ test "relational index system foreign key validation source requires transaction
     defer alloc.free(retained);
     try std.testing.expectEqualStrings(before, retained);
 }
+
+test "relational index system indexed document pins exact candidates and primary visibility" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("indexed-document-cut");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"text"},"n":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"body\":\"alpha\",\"n\":1}" },
+        .{ .key = "b", .value = "{\"body\":\"beta\",\"n\":2}" },
+        .{ .key = "c", .value = "{\"body\":\"alpha\",\"n\":3}" },
+    } });
+    try db.catchUpPendingDerivedReplay();
+    const opts: db_mod.types.ScanOptions = .{ .limit = 1, .relational_query = .{
+        .fields = &.{"n"},
+        .schema_version = 1,
+        .auto_index = true,
+        .text_filter = .{ .query = "body:alpha", .index = "text" },
+    } };
+    // Capturing under the same replay fence as distributed SQL must never wait
+    // for a writer which that fence itself excludes.
+    var fence = (try db.tryStatementReadFence()).?;
+    const old = try db.openDocumentReadSession(alloc, "", "", opts);
+    defer old.deinit();
+    fence.release();
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"body\":\"beta\",\"n\":11}" },
+        .{ .key = "b", .value = "{\"body\":\"alpha\",\"n\":22}" },
+    }, .deletes = &.{"c"} });
+    try db.catchUpPendingDerivedReplay();
+    var seen: usize = 0;
+    while (true) {
+        var page = try old.next(alloc, 1);
+        defer page.deinit();
+        for (page.rows) |row| {
+            try std.testing.expect(std.mem.eql(u8, row.id, "a") or std.mem.eql(u8, row.id, "c"));
+            try std.testing.expectEqual(if (std.mem.eql(u8, row.id, "a")) @as(i64, 1) else 3, row.value.object.get("n").?.integer);
+            seen += 1;
+        }
+        if (page.after == null) break;
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen);
+    const fresh = try db.openDocumentReadSession(alloc, "", "", opts);
+    defer fresh.deinit();
+    var page = try fresh.next(alloc, 8);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+    try std.testing.expectEqualStrings("b", page.rows[0].id);
+    try std.testing.expectEqual(@as(i64, 22), page.rows[0].value.object.get("n").?.integer);
+    var missing = opts;
+    missing.relational_query.?.text_filter.?.index = "missing";
+    try std.testing.expectError(error.IndexNotFound, db.openDocumentReadSession(alloc, "", "", missing));
+    var changed = opts;
+    changed.relational_query.?.text_filter.?.config_hash = 42;
+    try std.testing.expectError(error.PreparedGenerationChanged, db.openDocumentReadSession(alloc, "", "", changed));
+}
+
+test "relational index system indexed document streams beyond top K and retains mandatory authorization" {
+    // Preserve allocator safety/leak checks without measuring Mach-O stack
+    // unwinding for every one of the benchmark's document allocations.
+    var checked: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.testing.expectEqual(@as(usize, 0), checked.deinit()) catch @panic("indexed document allocation leak");
+    const native_alloc = checked.allocator();
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("indexed-document-stream");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(native_alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"text"},"status":{"type":"keyword"},"n":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    var arena = std.heap.ArenaAllocator.init(native_alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const count = 11017;
+    const writes = try a.alloc(db_mod.types.BatchWrite, count);
+    for (writes, 0..) |*item, i| item.* = .{
+        .key = try std.fmt.allocPrint(a, "row:{d:0>6}", .{i}),
+        .value = try std.fmt.allocPrint(a, "{{\"body\":\"alpha\",\"status\":\"{s}\",\"n\":{d}}}", .{ if (i + 1 == count) "visible" else "hidden", i }),
+    };
+    try db.batch(.{ .writes = writes });
+    const opts: db_mod.types.ScanOptions = .{ .limit = 37, .relational_query = .{
+        .fields = &.{"n"},
+        .schema_version = 1,
+        .auto_index = true,
+        .text_filter = .{ .query = "body:alpha", .index = "text" },
+    } };
+    try std.testing.expectError(error.SqlStatementReadUnavailable, db.openDocumentReadSession(native_alloc, "", "", opts));
+    try db.catchUpPendingDerivedReplay();
+    const begin = time.monotonicNs();
+    const session = try db.openDocumentReadSession(native_alloc, "", "", opts);
+    defer session.deinit();
+    var seen: usize = 0;
+    var pages: usize = 0;
+    while (true) {
+        var page = try session.next(native_alloc, 37);
+        defer page.deinit();
+        seen += page.rows.len;
+        pages += 1;
+        if (page.after == null) break;
+        try std.testing.expect(pages < 4096);
+    }
+    try std.testing.expectEqual(@as(usize, count), seen);
+    var filtered = opts;
+    filtered.filter_query_json = "{\"term\":{\"status\":\"visible\"}}";
+    const authorized = try db.openDocumentReadSession(native_alloc, "", "", filtered);
+    defer authorized.deinit();
+    var visible: usize = 0;
+    var sparse: usize = 0;
+    while (true) {
+        var page = try authorized.next(native_alloc, 37);
+        defer page.deinit();
+        for (page.rows) |row| try std.testing.expectEqual(@as(i64, count - 1), row.value.object.get("n").?.integer);
+        visible += page.rows.len;
+        if (page.rows.len == 0 and page.after != null) sparse += 1;
+        if (page.after == null) break;
+    }
+    try std.testing.expectEqual(@as(usize, 1), visible);
+    try std.testing.expect(sparse != 0);
+    std.debug.print("exact text native rows={d} pages={d} sparse_auth_pages={d} selector_peak_bytes={d} elapsed_ms={d}\n", .{ seen, pages, sparse, session.text.?.budget.peak, (time.monotonicNs() -| begin) / std.time.ns_per_ms });
+}

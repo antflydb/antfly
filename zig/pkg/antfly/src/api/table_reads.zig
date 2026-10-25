@@ -2603,7 +2603,7 @@ pub const BoundTableReadSource = struct {
         defer if (epoch) |*view| view.release();
         if (epoch == null or epoch.?.storageMode() == .document) {
             const session = try self.db.openDocumentReadSession(alloc, from_key, to_key, opts);
-            return .{ .ptr = session, .vtable = &.{ .next = nextDocumentPage, .close = closeDocumentRead, .normalize = normalizeDocumentRows } };
+            return .{ .text_filter_digest = if (session.text) |text| text.query_digest else null, .ptr = session, .vtable = &.{ .next = nextDocumentPage, .close = closeDocumentRead, .normalize = normalizeDocumentRows } };
         }
         const session = try self.db.openRelationalReadSession(alloc, from_key, to_key, opts);
         return .{ .ptr = session, .vtable = &.{ .next = nextRelationalPage, .close = closeRelationalRead, .normalize = normalizeRelationalRows } };
@@ -3728,7 +3728,7 @@ pub const ProvisionedTableReadSource = struct {
             const retained = try alloc.create(Single);
             errdefer alloc.destroy(retained);
             retained.* = .{ .alloc = alloc, .statement = try openRelationalStatement(ptr, alloc, &.{.{ .table = table, .from = from, .to = to, .opts = opts }}, consistency) };
-            return .{ .ptr = retained, .vtable = &.{ .next = Single.next, .close = Single.close, .normalize = Single.normalize } };
+            return .{ .text_filter_digest = retained.statement.views[0].text_filter_digest, .ptr = retained, .vtable = &.{ .next = Single.next, .close = Single.close, .normalize = Single.normalize } };
         }
         if (self.local_read_source == null) return null;
         var prepared = try self.prepareRoutedSpanRead(alloc, table, from, to, .{ .scan = .{ .from_key = from, .to_key = to, .opts = opts } }, consistency, .general);
@@ -3742,7 +3742,7 @@ pub const ProvisionedTableReadSource = struct {
             const retained = try alloc.create(RetainedSingleOwnerRead);
             retained.* = .{ .alloc = alloc, .prepared = prepared, .view = combined };
             transferred = true;
-            return .{ .ptr = retained, .vtable = &.{ .next = RetainedSingleOwnerRead.next, .close = RetainedSingleOwnerRead.close, .normalize = RetainedSingleOwnerRead.normalize } };
+            return .{ .text_filter_digest = combined.text_filter_digest, .ptr = retained, .vtable = &.{ .next = RetainedSingleOwnerRead.next, .close = RetainedSingleOwnerRead.close, .normalize = RetainedSingleOwnerRead.normalize } };
         }
         const local_source = self.groupLocalSourceWithFence(prepared.fenceAt(0, opts.execution_deadline_ns, opts.cancellation));
         const view = (try local_source.openRelationalReadGroupLocal(alloc, prepared.group_ids[0], table, from, to, opts, .stale)) orelse return null;
@@ -3750,7 +3750,7 @@ pub const ProvisionedTableReadSource = struct {
         const retained = try alloc.create(RetainedSingleOwnerRead);
         retained.* = .{ .alloc = alloc, .prepared = prepared, .view = view };
         transferred = true;
-        return .{ .ptr = retained, .vtable = &.{ .next = RetainedSingleOwnerRead.next, .close = RetainedSingleOwnerRead.close, .normalize = RetainedSingleOwnerRead.normalize } };
+        return .{ .text_filter_digest = view.text_filter_digest, .ptr = retained, .vtable = &.{ .next = RetainedSingleOwnerRead.next, .close = RetainedSingleOwnerRead.close, .normalize = RetainedSingleOwnerRead.normalize } };
     }
 
     fn openCoordinatedRelationalRead(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, prepared: *PreparedSpanRead, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !@import("antfly_local_sources").api_table_read_source.RelationalReadView {
@@ -3808,7 +3808,7 @@ pub const ProvisionedTableReadSource = struct {
         // All views are pinned within the same interval of frozen primary
         // and replay mutation. Revalidate every capability before publication.
         for (fences) |fence| try fence.validate();
-        const combined = try @import("../storage/relational_read_set.zig").Set.create(alloc, views, !row_query.auto_index);
+        const combined = try @import("../storage/relational_read_set.zig").Set.create(alloc, views, !row_query.auto_index and row_query.text_filter == null);
         opened = 0;
         return combined;
     }
@@ -4120,7 +4120,7 @@ pub const ProvisionedTableReadSource = struct {
                 }
                 if (span == null) return error.UnsupportedSqlExecution;
             }
-            retained.views[scan_index] = try @import("../storage/relational_read_set.zig").Set.create(alloc, views, row_query.index == null and !row_query.auto_index);
+            retained.views[scan_index] = try @import("../storage/relational_read_set.zig").Set.create(alloc, views, row_query.index == null and !row_query.auto_index and row_query.text_filter == null);
             opened = 0;
             retained.view_count += 1;
         }

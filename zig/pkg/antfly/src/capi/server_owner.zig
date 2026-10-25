@@ -6773,7 +6773,7 @@ pub const StorageRelationalRead = struct {
         defer if (schema) |*epoch| epoch.release();
         if (schema == null or schema.?.storageMode() == .document) {
             const session = try db.openDocumentReadSession(alloc, from, to, opts);
-            return .{ .ptr = session, .vtable = &.{ .next = nextDocument, .close = closeDocument, .normalize = normalizeDocument, .range_proofs = documentRangeProofs } };
+            return .{ .text_filter_digest = if (session.text) |text| text.query_digest else null, .ptr = session, .vtable = &.{ .next = nextDocument, .close = closeDocument, .normalize = normalizeDocument, .range_proofs = documentRangeProofs } };
         }
         const session = try db.openRelationalReadSession(alloc, from, to, opts);
         return .{ .ptr = session, .vtable = &.{ .next = next, .close = close, .normalize = normalize, .range_proofs = rangeProofs } };
