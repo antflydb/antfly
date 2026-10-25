@@ -27945,3 +27945,74 @@ Both pass four Bloom plus 45/1/8 original-error companions. There are no failure
 skips or leaks. Formatting, license headers and generated error-name checks pass.
 Final source snapshots and prior failures remain preserved. The original
 worktree, branch and PR are retained; the full design is still incomplete.
+
+
+## Registered completed builder output and source preparation (2026-10-25)
+
+The retained file builder now moves its actual first/last accepted namespace and
+key allocations out of completed encoder blocks alongside the filter. The move
+subtracts those bytes from the encoder observer and preserves their charge in
+the writer until a prepared, unchanged-charge handoff. Bounds are never supplied
+by a caller or reconstructed from a size estimate. Legacy encoder result take
+keeps its previous ownership contract.
+
+Publication resources can create a prepaid registered output frame with its
+exact allocator host and final retirement anchor before a writer binds to it.
+The writer retains a fixed reference across a rejected handoff. Creator close
+prevents new bindings; it cannot retire a bound destination while a producer
+retries or aborts. Successful handoff transfers the bounds, filter, path receipt
+and resident observer before dropping that reference. Registered retirement
+claims the final anchor, frees one field/filter quantum at a time, then removes
+the observer charge. Physical cleanup requires no allocation.
+
+A directory-entry owner can acquire a real Run view from that completed output.
+It retains the output through metadata cloning and file-pin acquisition, then
+releases the producer lease once those independent resources exist. Fresh-output
+domains must refer into the cloned key or use a routing policy explicitly
+declaring key slices or immutable process-lifetime labels. Borrowed external
+labels are refused before pin acquisition. The primary database partition policy
+meets that declaration. Existing registered-source capture still retains its
+source domain ancestry. Native ABI 127 and kernel-owner ABI 187 fence the changed
+private contracts; durable formats and reader epochs are unchanged.
+
+This owner holds completed output data only. Unfinished writer I/O, borrowed
+append inputs, storage handles and executor authority still require the producer
+lifetime. File deletion/obsolete tickets and coupled directory/run-store/WAL/
+manifest publication are controller responsibilities. The normal compaction/flush
+driver, funded obsolete candidates, generation rebase, admitted durable cleanup,
+relief and whole-path default qualification remain open. The full design is
+incomplete; full GNU qualification remains waived.
+
+
+Focused Debug qualification passes all five native commands on unchanged
+inputs: 34 physical-metadata ownership cases, three real-file retained-builder
+cases, four Bloom tests and the 45/1/8 original-error companions. New ownership
+fixtures move real accepted bounds larger than a cleanup quantum, preserve
+absent versus present-empty namespaces, and construct independent directory and
+writer-root ownership after the producing writer, storage runtime, backend and
+physical resource host exit. Key-slice and declared-static domains succeed; an
+undeclared external label refuses. Every constructor/handoff/source/retirement
+checkpoint rotates four original errors. Allocation failures are exhausted one
+at a time; cleanup runs while the allocator remains exhausted. A rejected
+bound handoff survives creator close, then resumes or aborts with its output
+anchor intact. The prior fixture API correction and exact source snapshots are
+retained in the registered-builder-output receipts. No focused case fails, skips
+or leaks.
+
+
+Broader Debug qualification passes all five native commands: 160 physical-sync,
+three retained-builder, five output/publication, 124 accounting, 19 local and
+25 ABI/context cases, with the identical-input focused 34-case ownership result
+reused from cache. Four Bloom and 45/1/8 original-error companions also pass.
+The focused and broader Debug runs report unchanged, identical 5,659-file native
+input maps. No executed case fails, skips or leaks.
+
+
+Final-source ReleaseFast passes all five native commands: three retained-builder,
+five output/publication, six read-metadata retirement, nine entry-preparation,
+fifteen payload-retirement, 124 accounting, 19 local and 59 ABI/host/context
+cases, plus four Bloom and 45/1/8 original-error companions. Its unchanged
+5,659-file native input map exactly matches focused and broader Debug. No
+executed case fails, skips or leaks. Formatting, license-header, generated-error
+and whitespace checks pass. All failed and final receipts and changed-source
+snapshots, including the new output-owner module, remain preserved.

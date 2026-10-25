@@ -24,6 +24,7 @@ const quota = @import("pin_quota.zig");
 const Run = @import("repository.zig").Run;
 const Backend = @import("../lsm_backend.zig").Backend;
 const Account = @import("memory_account.zig").Account;
+const Output = @import("registered_run_output.zig");
 const LifetimeCallbacks = struct { release: *const fn (*anyopaque, ?admission.Port) anyerror!bool };
 const LifetimeBoundary = @import("../../runtime_callback_abi.zig").Boundary(LifetimeCallbacks);
 
@@ -67,6 +68,7 @@ pub const Owner = struct {
     host: HostLifetime,
     lifetime: ?Lifetime = null,
     source: ?Directory.RegisteredSource = null,
+    output_source: ?Output.Lease = null,
     credit: ?resources.Reservation = null,
     registration: resources.PayloadRetirement = .{},
     usage: u64 = 0,
@@ -123,6 +125,19 @@ pub const Owner = struct {
         return self;
     }
 
+    pub fn startFromRegisteredOutput(backend: *Backend, directory: *Directory, source: *Output.Owner, metadata: Output.Metadata, quota_owner: *quota.Owner, host: *?HostLifetime, pin: Directory.EntryLease.PinRelease, scope: admission.Port) !*Owner {
+        var trace: admission.RejectionTrace = .{};
+        const original = trace.bind(scope).?;
+        const manager = backend.options.resource_manager orelse return error.ExecutionWaitUnsupported;
+        const self = try allocate(backend.allocator, manager, quota_owner, host, pin, original);
+        errdefer self.requestRetirement();
+        self.output_source = try source.acquireSourceWithAdmission(metadata, original);
+        try self.prepareResident(original);
+        self.preparation = try backend.beginDirectoryEntryPreparation(directory, self.output_source.?.run, quota_owner, original);
+        self.preparation.?.require_self_owned_domain = true;
+        return self;
+    }
+
     /// Acquire the actual registered source anchor, not a caller-supplied
     /// placeholder lifetime. Its resident observer and domain owner survive
     /// this derived entry and all of its readers without double billing.
@@ -152,6 +167,13 @@ pub const Owner = struct {
         if (self.lease != null) return;
         const preparation = if (self.preparation) |*value| value else return error.InvalidArgument;
         try preparation.resumeWithAdmission(original);
+        // The file metadata and file pin are now owned by preparation. Its
+        // domain is a cloned-key slice or declared static data. No producer
+        // buffer remains borrowed, including if resident adoption then refuses.
+        if (self.output_source) |*source| {
+            try source.releaseWithAdmission(original);
+            self.output_source = null;
+        }
         const lease = try preparation.takeWithIndependentAccountWithAdmission(.lsm_in_memory_state, &self.usage, self.account.?, original);
         lease.bindRegisteredAnchor(.{ .allocator = self.allocator, .manager = self.manager, .registration = &self.registration, .routing = preparation.routing, .domain = lease.entry.domain });
         self.lease = lease;
@@ -237,6 +259,10 @@ pub const Owner = struct {
             self.account = null;
             account.release();
         }
+        if (self.output_source) |*source| {
+            try source.releaseWithAdmission(original);
+            self.output_source = null;
+        }
         if (self.source) |*source| {
             try source.releaseWithAdmission(original);
             self.source = null;
@@ -284,7 +310,7 @@ pub const Owner = struct {
 
     fn destroy(raw: *anyopaque) void {
         const self: *Owner = @ptrCast(@alignCast(raw));
-        std.debug.assert(self.complete and self.preparation == null and self.lease == null and self.physical == null and self.forgetting == null and self.account == null and self.source == null and self.lifetime == null and !self.observer_prepared and self.usage == 0);
+        std.debug.assert(self.complete and self.preparation == null and self.lease == null and self.physical == null and self.forgetting == null and self.account == null and self.source == null and self.output_source == null and self.lifetime == null and !self.observer_prepared and self.usage == 0);
         const allocator = self.allocator;
         const retained = self.quota_owner;
         const host = self.host.lifetime;

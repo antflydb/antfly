@@ -409,6 +409,10 @@ pub const Options = struct {
     /// Equivalent extraction under original admission; labels borrow the pinned
     /// key or stable backend storage. Required for admitted custom planning.
     run_partition_key_with_admission: ?*const fn ([]const u8, read_admission.Port) anyerror![]const u8 = null,
+    /// Classifies the actual extraction implementation. key_or_static returns
+    /// a slice of its input or immutable process-lifetime storage, so a copied
+    /// file output needs no separate backend/domain lifetime after preparation.
+    run_partition_domain_lifetime: RunDirectory.DomainLifetime = .borrowed,
     bloom: bloom.Config = lsm_table_file.default_filter_config,
     table_block_compression: lsm_table_file.CompressionPolicy = .snappy_adaptive,
     table_prefix_extractor: lsm_table_file.PrefixExtractor = lsm_table_file.default_prefix_extractor,
@@ -7405,6 +7409,9 @@ pub const Backend = struct {
     /// authority transferred, including constructor refusal after registration.
     pub fn beginOwnedDirectoryEntryPreparation(self: *Backend, directory: *RunDirectory, source: Run, owner: *PinQuota.Owner, host: *?DirectoryEntryHostLifetime, lifetime: *?DirectoryEntryLifetime, original: read_admission.Port) !*DirectoryEntryOwner {
         return DirectoryEntryOwner.start(self, directory, source, owner, host, lifetime, directorySnapshotPinRetirement(), original);
+    }
+    pub fn beginOwnedDirectoryEntryFromRegisteredOutput(self: *Backend, directory: *RunDirectory, source: *@import("lsm_backend/registered_run_output.zig").Owner, metadata: @import("lsm_backend/registered_run_output.zig").Metadata, owner: *PinQuota.Owner, host: *?DirectoryEntryHostLifetime, original: read_admission.Port) !*DirectoryEntryOwner {
+        return DirectoryEntryOwner.startFromRegisteredOutput(self, directory, source, metadata, owner, host, directorySnapshotPinRetirement(), original);
     }
     pub fn beginOwnedDirectoryEntryFromRegisteredSource(self: *Backend, directory: *RunDirectory, source: *const RunDirectory.EntryLease, owner: *PinQuota.Owner, host: *?DirectoryEntryHostLifetime, original: read_admission.Port) !*DirectoryEntryOwner {
         return DirectoryEntryOwner.startFromRegisteredSource(self, directory, source, owner, host, directorySnapshotPinRetirement(), original);

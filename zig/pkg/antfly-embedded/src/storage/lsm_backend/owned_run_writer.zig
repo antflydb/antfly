@@ -26,11 +26,32 @@ const slice: resource.Slice = .lsm_table_builder_working_set;
 /// Stable caller-owned output. The manifest/obsolete-output owner retains the
 /// path ticket even after filter retirement; this owner never deletes a final
 /// file. Keep its address and allocator/manager authority alive through cleanup.
+/// A registered output's final anchor. First acquisition is serialized with
+/// creator close; an existing producer binding survives close across refusal.
+pub const OutputAnchor = struct {
+    output: *Output,
+    registration: *resource.PayloadRetirement,
+    refs: std.atomic.Value(usize) = .init(1),
+    closing: bool = false,
+    claimed: bool = false,
+    pub fn acquire(self: *@This(), original: admission.Port) !void {
+        try original.checkpoint();
+        if (self.closing or self.claimed or self.registration.credit == null or self.registration.credit.?.manager != self.output.manager) return error.InvalidArgument;
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+    pub fn release(self: *@This()) void {
+        const before = self.refs.fetchSub(1, .acq_rel);
+        std.debug.assert(before > 1);
+    }
+};
+
 pub const Output = struct {
     allocator: std.mem.Allocator,
     manager: *resource.ResourceManager,
     tracked_bytes: u64 = 0,
     result: ?table.StreamingEncoderResult = null,
+    bounds: ?table.OwnedRunBounds = null,
+    registered: ?*OutputAnchor = null,
     path: [std.fs.max_path_bytes]u8 = undefined,
     path_len: usize = 0,
     retirement_offset: usize = 0,
@@ -38,22 +59,42 @@ pub const Output = struct {
     taken: bool = false,
     retired: bool = false,
 
-    pub fn retireWithAdmission(self: *Output, original: admission.Port) !void {
-        if (self.retired) return;
+    /// One physical quantum; full resident charge remains until all bytes are
+    /// gone and observer retirement succeeds. Registered owners claim first.
+    pub fn retireStep(self: *Output, scope: ?admission.Port) !bool {
+        var trace: admission.RejectionTrace = .{};
+        const original = trace.bind(scope);
+        if (original) |port| try port.checkpoint();
+        if (self.registered) |anchor| if (!anchor.claimed) return error.InvalidArgument;
+        if (self.retired) return true;
         self.retiring = true;
-        if (self.result) |*result| {
-            try retireFilter(self.allocator, result, &self.retirement_offset, original);
-            self.result = null;
+        if (self.bounds) |*bounds| {
+            if (try bounds.retireStep(self.allocator, original)) self.bounds = null;
+            return false;
         }
-        try self.manager.adjustUsageWithAdmission(slice, &self.tracked_bytes, 0, original);
+        if (self.result) |*result| {
+            const bytes = result.filter.bytes;
+            const end = @min(bytes.len, self.retirement_offset + 16 * 1024);
+            @memset(bytes[self.retirement_offset..end], undefined);
+            self.retirement_offset = end;
+            if (end == bytes.len) {
+                if (bytes.len != 0) self.allocator.rawFree(bytes, .of(u8), @returnAddress());
+                self.result = null;
+                self.retirement_offset = 0;
+            }
+            return false;
+        }
+        if (original) |port| try self.manager.adjustUsageWithAdmission(slice, &self.tracked_bytes, 0, port) else try self.manager.adjustUsage(slice, &self.tracked_bytes, 0);
         self.retired = true;
+        return true;
     }
-
-    /// Quiesced fallback; callers must first settle any consumer borrowing it.
+    pub fn retireWithAdmission(self: *Output, original: admission.Port) !void {
+        while (!(try self.retireStep(original))) {}
+    }
+    /// Explicit joined cleanup; a registered header belongs to its final anchor.
     pub fn deinit(self: *Output) void {
-        if (self.result) |*result| result.filter.deinit(self.allocator);
-        self.result = null;
-        self.manager.observeUsage(slice, &self.tracked_bytes, 0);
+        if (self.registered != null) @panic("registered output requires owner retirement");
+        while (!(self.retireStep(null) catch unreachable)) {}
     }
 };
 
@@ -77,6 +118,7 @@ pub const Writer = struct {
     metadata: ?Encoder.Metadata = null,
     encoder_retirement: ?Encoder.Retirement = null,
     result: ?table.StreamingEncoderResult = null,
+    bounds: ?table.OwnedRunBounds = null,
     result_retirement_offset: usize = 0,
     tracked_bytes: u64 = 0,
     credit: ?resource.ConstructionCredit = null,
@@ -137,6 +179,7 @@ pub const Writer = struct {
     fn resident(self: *const Writer) u64 {
         var bytes: u64 = if (self.have_encoder) self.encoder.workingSetBytes() else 0;
         if (self.result) |result| bytes += result.filter.bytes.len;
+        if (self.bounds) |*bounds| bytes += bounds.memoryBytes();
         return bytes;
     }
 
@@ -222,7 +265,9 @@ pub const Writer = struct {
             if (self.metadata) |*metadata| {
                 if (self.result == null) {
                     while (try metadata.writeNextWithAdmission(&self.file, original)) {}
-                    self.result = try metadata.takeResult();
+                    const owned = try metadata.takeOwnedResult();
+                    self.result = owned.result;
+                    self.bounds = owned.bounds;
                 }
                 try metadata.retireWithAdmission(original);
                 try self.settle(self.resident(), original);
@@ -242,19 +287,37 @@ pub const Writer = struct {
 
     /// Prepare destination accounting before transferring an unchanged charge.
     /// A successful ledger handoff and physical receipt have no fallible gap.
-    pub fn takeResultInto(self: *Writer, output: *Output, original: admission.Port) !void {
+    pub fn takeResultInto(self: *Writer, output: *Output, scope: admission.Port) !void {
+        var trace: admission.RejectionTrace = .{};
+        const original = trace.bind(scope).?;
         if (!self.published or self.result_taken or self.aborting or self.retired or output.taken or output.retired or output.retiring or output.result != null or output.tracked_bytes != 0 or output.manager != self.manager or !std.meta.eql(output.allocator, self.allocator)) return error.InvalidArgument;
         if (self.output_target) |target| {
             if (target != output) return error.InvalidArgument;
-        } else self.output_target = output;
+        } else {
+            if (output.registered) |anchor| {
+                if (anchor.output != output) return error.InvalidArgument;
+                try anchor.acquire(original);
+            }
+            self.output_target = output;
+        }
         try self.manager.prepareUsageWithAdmission(slice, &output.tracked_bytes, original);
         try self.manager.transferPreparedUsageWithAdmission(slice, &self.tracked_bytes, &output.tracked_bytes, self.tracked_bytes, original);
         output.result = self.result;
+        output.bounds = self.bounds;
+        self.bounds = null;
         output.path_len = self.file.final_len;
         @memcpy(output.path[0..output.path_len], self.file.final[0..output.path_len]);
         output.taken = true;
         self.result = null;
         self.result_taken = true;
+        self.releaseOutputTarget();
+    }
+
+    fn releaseOutputTarget(self: *Writer) void {
+        const target = self.output_target orelse return;
+        const anchor = target.registered;
+        self.output_target = null;
+        if (anchor) |held| held.release(); // Final access to the output header.
     }
 
     pub fn takeResources(self: *Writer) !storage_io.DurabilityResources {
@@ -284,6 +347,10 @@ pub const Writer = struct {
             self.have_encoder = false;
             self.encoder_retirement = null;
         }
+        if (self.bounds) |*bounds| {
+            while (!(try bounds.retireStep(self.allocator, original))) {}
+            self.bounds = null;
+        }
         if (self.result) |*result| {
             try retireFilter(self.allocator, result, &self.result_retirement_offset, original);
             self.result = null;
@@ -291,6 +358,7 @@ pub const Writer = struct {
         try self.settle(0, original);
         try self.file.retireWithAdmission(original);
         self.retired = true;
+        self.releaseOutputTarget();
     }
 
     pub fn retireWithAdmission(self: *Writer, original: admission.Port) !void {
@@ -310,9 +378,11 @@ pub const Writer = struct {
         if (self.metadata) |*metadata| metadata.deinit();
         if (self.initialization) |*initialization| initialization.deinit();
         if (self.have_encoder) self.encoder.deinit();
+        if (self.bounds) |*bounds| bounds.deinit(self.allocator);
         if (self.result) |*result| result.filter.deinit(self.allocator);
         self.manager.observeUsage(slice, &self.tracked_bytes, 0);
         if (self.credit) |*credit| credit.retire();
+        self.releaseOutputTarget();
     }
 };
 
@@ -518,7 +588,7 @@ test "controlled physical sync prepaid run writer retains rejected rows IO retir
             break;
         }
         try std.testing.expect(writer.published and !writer.have_encoder and writer.credit == null);
-        try std.testing.expectEqual(@as(u64, writer.result.?.filter.bytes.len), writer.tracked_bytes);
+        try std.testing.expectEqual(@as(u64, writer.result.?.filter.bytes.len) + writer.bounds.?.memoryBytes(), writer.tracked_bytes);
         // Metadata is prepared before measuring the unchanged-charge handoff.
         control.enabled = false;
         try manager.prepareUsageWithAdmission(slice, &output.tracked_bytes, original);
@@ -535,7 +605,11 @@ test "controlled physical sync prepaid run writer retains rejected rows IO retir
         try std.testing.expectEqual(before.memory.used_bytes, manager.snapshot().memory.used_bytes);
         try std.testing.expectEqual(before.memory.peak_bytes, manager.snapshot().memory.peak_bytes);
         try std.testing.expectEqual(@as(u64, 0), writer.tracked_bytes);
-        try std.testing.expectEqual(@as(u64, output.result.?.filter.bytes.len), output.tracked_bytes);
+        try std.testing.expectEqual(@as(u64, output.result.?.filter.bytes.len) + output.bounds.?.memoryBytes(), output.tracked_bytes);
+        try std.testing.expectEqualStrings("docs", output.bounds.?.fields[0].?);
+        try std.testing.expectEqualStrings("doc:00000000", output.bounds.?.fields[1].?);
+        try std.testing.expectEqualStrings("docs", output.bounds.?.fields[2].?);
+        try std.testing.expectEqualStrings("doc:00000191", output.bounds.?.fields[3].?);
         try std.testing.expectEqualStrings(path, output.path[0..output.path_len]);
         try std.testing.expectError(error.InvalidArgument, writer.takeResultInto(&output, original));
         const size = output.result.?.size_bytes;

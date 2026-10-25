@@ -1420,3 +1420,317 @@ test "physical cache metadata registered writer roots retire every failed alloca
         for (0..count) |at| _ = try RegisteredSourceFixture.runMode(shared, .construct, at, true, 3);
     }
 }
+
+const RegisteredOutputFixture = struct {
+    const local = @import("antfly_local_sources");
+    const lsm = local.storage_lsm_backend_mod;
+    const io_mod = local.storage_lsm_backend_storage_io;
+    const Scope = lsm.Backend.PublicationResources;
+    const Writer = lsm.repository.OwnedStreamingRunFileWriter;
+    const Stage = enum { create, handoff, source, retire, domain };
+    const Stats = struct { checks: usize, allocations: usize };
+    const Control = struct {
+        calls: usize = 0,
+        target: ?usize = null,
+        live: bool = false,
+        failure: anyerror = error.Canceled,
+        depth: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.live) return;
+            const at = self.calls;
+            self.calls += 1;
+            if (self.target == at) return self.failure;
+        }
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try check(raw);
+            try std.testing.expectEqual(@as(usize, 0), self.depth);
+            self.depth = 1;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 1), self.depth);
+            self.depth = 0;
+            try check(raw);
+        }
+        fn wait(_: *anyopaque) !void {
+            return error.TestUnexpectedWait;
+        }
+        fn payload(self: *@This()) read_admission.Payload {
+            return .{ .ptr = self, .vtable = &.{ .checkpoint = check, .check_lifetime = check, .deadline_ns = deadline, .wait_for_progress = wait }, .execution_wait = .{ .ptr = self, .begin = begin, .end = end } };
+        }
+    };
+    const Policy = struct {
+        var static_domain: bool = false;
+        fn key(bytes: []const u8) []const u8 {
+            return if (static_domain) "registered-file-domain" else bytes[0..bytes.len -| 1];
+        }
+        fn admitted(bytes: []const u8, original: read_admission.Port) ![]const u8 {
+            try original.checkpoint();
+            return key(bytes);
+        }
+    };
+    fn drain(manager: *ResourceManager) void {
+        for (0..4096) |_| {
+            if (manager.payload_retirement_ready.load(.acquire) == 0) return;
+            _ = manager.drainPayloadRetirementQuiesced();
+        }
+        @panic("registered output did not retire");
+    }
+    fn run(stage: Stage, target: ?usize, oom: bool, static_domain: bool) !Stats {
+        const a = std.testing.allocator;
+        var failing1 = std.testing.FailingAllocator.init(a, .{});
+        var failing2 = std.testing.FailingAllocator.init(a, .{});
+        const a1 = failing1.allocator();
+        const a2 = failing2.allocator();
+        var parent1 = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 64 << 20 } });
+        defer parent1.deinit(a);
+        var parent2 = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 64 << 20 } });
+        defer parent2.deinit(a);
+        var budgets1 = budgets_mod.smartResourceBudgetsForTotal(64 << 20);
+        budgets1.options.identity_allocator = a1;
+        var budgets2 = budgets_mod.smartResourceBudgetsForTotal(64 << 20);
+        budgets2.options.identity_allocator = a2;
+        var first = try Resources.initWithBudgetsAndParent(a1, budgets1, parent1.memoryParentPort());
+        var first_live = true;
+        defer if (first_live) first.deinit();
+        first.attachResourceManager();
+        var second = try Resources.initWithBudgetsAndParent(a2, budgets2, parent2.memoryParentPort());
+        defer second.deinit();
+        second.attachResourceManager();
+        var backend1 = lsm.Backend.init(a1, .{ .resource_manager = &first.resource_manager, .wal_enabled = false });
+        var backend1_live = true;
+        defer if (backend1_live) backend1.close();
+        Policy.static_domain = static_domain or stage == .domain;
+        var backend2 = lsm.Backend.init(a2, .{ .resource_manager = &second.resource_manager, .wal_enabled = false, .run_partition_key = Policy.key, .run_partition_key_with_admission = Policy.admitted, .run_partition_domain_lifetime = if (stage != .domain and static_domain) .key_or_static else .borrowed });
+        var backend2_live = true;
+        defer if (backend2_live) backend2.close();
+        var scope1: ?*Scope = try backend1.beginPublicationResourcesWithAdmission(quotaControl());
+        var scope2: ?*Scope = null;
+        var output: ?*Scope.RegisteredOutput.Owner = null;
+        var lease: ?Scope.EntryLease = null;
+        var record: ?*Scope.RegisteredWriter = null;
+        var view: ?lsm.repository.Run = null;
+        var candidate: ?*Scope.RegisteredWriterRoot = null;
+        var root: ?*Scope.WriterStore = null;
+        var root_cursor: ?Scope.WriterStore.Reclaimer = null;
+        defer {
+            RegisteredSourceFixture.finishRoot(&root, &root_cursor, a2);
+            if (view) |*owned| owned.deinit(a2);
+            if (record) |owner| owner.requestRetirement();
+            if (candidate) |owner| owner.requestRetirement();
+            if (lease) |*owned| owned.deinit(a2);
+            if (scope2) |owner| owner.requestRetirement();
+            if (output) |owner| owner.requestRetirement();
+            if (scope1) |owner| owner.requestRetirement();
+            drain(&second.resource_manager);
+            if (first_live) drain(&first.resource_manager);
+        }
+        try scope1.?.resumeWithAdmission(quotaControl());
+        scope2 = try backend2.beginPublicationResourcesWithAdmission(quotaControl());
+        try scope2.?.resumeWithAdmission(quotaControl());
+        try std.testing.expect(backend2.mu.tryLock());
+        const planned = backend2.planningDirectory();
+        backend2.mu.unlock();
+        const directory = try (try planned).fork(a2);
+        defer directory.destroy(a2);
+        try directory.tree.prepare(a2);
+        var pool = io_mod.NativeStoragePool.initWithCapacityForTest(a, 8);
+        defer pool.deinit();
+        var native = try io_mod.NativeStorage.initWithPool(a, .threaded, &pool);
+        var native_live = true;
+        defer if (native_live) native.deinit();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/registered-output.sst", .{tmp.sub_path});
+        defer a.free(path);
+        var control: Control = .{ .target = if (oom) null else target, .failure = switch ((target orelse 0) % 4) {
+            0 => error.Canceled,
+            1 => error.DeadlineExceeded,
+            2 => error.FileNotFound,
+            else => error.ParentMemoryBusy,
+        } };
+        const payload = control.payload();
+        const original = read_admission.Port.init(&payload);
+        var writer: Writer = undefined;
+        var writer_live = false;
+        defer if (writer_live) writer.deinit();
+        var fixed: ?local.storage_resource_manager.Reservation = null;
+        defer if (fixed) |*credit| credit.release();
+        var allocation_start: usize = 0;
+        const selected = if (stage == .source or stage == .retire or stage == .domain) &failing2 else &failing1;
+        const result: anyerror!void = blk: {
+            if (stage == .create) {
+                allocation_start = selected.alloc_index;
+                control.live = true;
+                if (oom) selected.fail_index = allocation_start + target.?;
+            }
+            output = scope1.?.beginRegisteredOutputWithAdmission(original) catch |cause| break :blk cause;
+            if (stage == .create) break :blk {};
+            fixed = try first.resource_manager.reserveWithoutReclaimWithAdmission(.lsm_table_builder_working_set, @sizeOf(Writer) + try native.storage().appendResourceBytes(0), original);
+            const grant = (try native.storage().tryPrepareDurabilityWithAdmission(original)).?;
+            try writer.initInPlace(a1, &first.resource_manager, grant, path, 3, 1 << 20, .{});
+            writer_live = true;
+            try writer.openWithAdmission(original);
+            var key: [32777]u8 = @splat('k');
+            key[0] = 'p';
+            const namespace: ?[]const u8 = if (static_domain) "" else null;
+            for (0..3) |ordinal| {
+                key[key.len - 1] = @intCast(ordinal);
+                try writer.appendEntryWithAdmission(.{ .namespace_name = namespace, .key = &key, .value = "owned output" }, original);
+            }
+            try writer.finishWithAdmission(original);
+            if (stage == .handoff) {
+                allocation_start = selected.alloc_index;
+                control.live = true;
+                if (oom) selected.fail_index = allocation_start + target.?;
+            }
+            writer.takeResultInto(&output.?.output, original) catch |cause| break :blk cause;
+            if (stage == .handoff) break :blk {};
+            try std.testing.expect(output.?.output.bounds.?.fields[1].?[key.len - 1] == 0 and output.?.output.bounds.?.fields[3].?[key.len - 1] == 2);
+            try std.testing.expectEqual(namespace != null, output.?.output.bounds.?.fields[0] != null);
+            try writer.retireWithAdmission(original);
+            writer.deinit();
+            writer_live = false;
+            fixed.?.release();
+            fixed = null;
+            native.deinit();
+            native_live = false;
+            backend1.close();
+            backend1_live = false;
+            scope1.?.requestRetirement();
+            scope1 = null;
+            if (stage == .source or stage == .domain) {
+                allocation_start = selected.alloc_index;
+                control.live = true;
+                if (oom) selected.fail_index = allocation_start + target.?;
+            }
+            scope2.?.beginEntryFromRegisteredOutputWithAdmission(&backend2, directory, output.?, .{ .id = 501, .level = 0 }, original) catch |cause| break :blk cause;
+            output.?.requestRetirement();
+            output = null;
+            lease = scope2.?.takeEntryWithAdmission(original) catch |cause| break :blk cause;
+            try std.testing.expect(lease.?.entry.run.read_identity.valid());
+            try std.testing.expectEqual(namespace != null, lease.?.entry.run.smallest_namespace_name != null);
+            try std.testing.expectEqual(@as(u8, 0), lease.?.entry.run.smallest_key[key.len - 1]);
+            try std.testing.expectEqual(@as(u8, 2), lease.?.entry.run.largest_key[key.len - 1]);
+            if (static_domain) try std.testing.expectEqualStrings("registered-file-domain", lease.?.entry.domain) else try std.testing.expectEqual(@as(usize, key.len - 1), lease.?.entry.domain.len);
+            drain(&first.resource_manager);
+            try std.testing.expectEqual(@as(u64, 0), first.quota_lifetimes.load(.acquire));
+            try std.testing.expectEqual(@as(u64, 0), first.resource_manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+            first.deinit();
+            first_live = false; // All following source/root operations are independent.
+            record = scope2.?.beginRegisteredWriterWithAdmission(&backend2, &lease.?, .{}, original) catch |cause| break :blk cause;
+            view = record.?.takeRunWithAdmission(original) catch |cause| break :blk cause;
+            record.?.requestRetirement();
+            record = null;
+            var empty: Scope.WriterStore = .{};
+            candidate = scope2.?.beginRegisteredWriterRootWithAdmission(&empty, &view.?, false, original) catch |cause| break :blk cause;
+            candidate.?.resumeWithAdmission(original) catch |cause| break :blk cause;
+            root = candidate.?.takeWithAdmission(original) catch |cause| break :blk cause;
+            candidate.?.requestRetirement();
+            candidate = null;
+            view.?.deinit(a2);
+            view = null;
+            lease.?.deinit(a2);
+            lease = null;
+            backend2.close();
+            backend2_live = false;
+            scope2.?.requestRetirement();
+            scope2 = null;
+            try std.testing.expectEqual(@as(usize, 1), root.?.count());
+            try std.testing.expectEqual(@as(u8, 2), root.?.at(0).largest_key[key.len - 1]);
+            if (stage == .retire) {
+                allocation_start = selected.alloc_index;
+                control.live = true;
+                root_cursor = .init(root.?);
+                root.?.tree.root = null;
+                while (true) {
+                    original.checkpoint() catch |cause| break :blk cause;
+                    var steps: usize = 1;
+                    if (root_cursor.?.step(a2, &steps)) break;
+                }
+                original.checkpoint() catch |cause| break :blk cause;
+                root_cursor.?.finish(a2);
+                root_cursor = null;
+                root = null;
+                while (second.resource_manager.payload_retirement_ready.load(.acquire) != 0) _ = second.resource_manager.drainPayloadRetirementWithAdmission(original) catch |cause| break :blk cause;
+            }
+            break :blk {};
+        };
+        const stats: Stats = .{ .checks = control.calls, .allocations = selected.alloc_index - allocation_start };
+        control.live = false;
+        if (oom) {
+            try std.testing.expect(selected.has_induced_failure);
+            try std.testing.expectError(error.OutOfMemory, result);
+        } else if (target != null) try std.testing.expectError(control.failure, result) else if (stage == .domain) try std.testing.expectError(error.ExecutionWaitUnsupported, result) else try result;
+        if (stage == .handoff and target != null) {
+            const bound = writer.output_target;
+            if (output) |owner| owner.requestRetirement();
+            output = null;
+            _ = first.resource_manager.drainPayloadRetirementQuiesced();
+            if (bound) |destination| {
+                try std.testing.expectEqual(@as(usize, 2), destination.registered.?.refs.load(.acquire));
+                try std.testing.expect(!destination.registered.?.claimed);
+                if (oom) try writer.abortWithAdmission(original) else try writer.takeResultInto(destination, original);
+            }
+        }
+        if (writer_live) {
+            if (writer.result_taken) try writer.retireWithAdmission(original) else try writer.abortWithAdmission(original);
+            writer.deinit();
+            writer_live = false;
+        }
+        if (fixed) |*credit| credit.release();
+        fixed = null;
+        RegisteredSourceFixture.finishRoot(&root, &root_cursor, a2);
+        if (view) |*owned| owned.deinit(a2);
+        view = null;
+        if (record) |owner| owner.requestRetirement();
+        record = null;
+        if (candidate) |owner| owner.requestRetirement();
+        candidate = null;
+        if (lease) |*owned| owned.deinit(a2);
+        lease = null;
+        if (scope2) |owner| owner.requestRetirement();
+        scope2 = null;
+        if (output) |owner| owner.requestRetirement();
+        output = null;
+        if (scope1) |owner| owner.requestRetirement();
+        scope1 = null;
+        drain(&second.resource_manager);
+        if (first_live) {
+            drain(&first.resource_manager);
+            try std.testing.expectEqual(@as(u64, 0), first.quota_lifetimes.load(.acquire));
+        }
+        try std.testing.expectEqual(@as(u64, 0), second.quota_lifetimes.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), control.depth);
+        failing1.fail_index = std.math.maxInt(usize);
+        failing2.fail_index = std.math.maxInt(usize);
+        return stats;
+    }
+};
+
+test "physical cache metadata registered builder output owns accepted bounds across producer and storage exit" {
+    for ([_]bool{ false, true }) |static_domain| {
+        _ = try RegisteredOutputFixture.run(.source, null, false, static_domain);
+        _ = try RegisteredOutputFixture.run(.retire, null, false, static_domain);
+    }
+    _ = try RegisteredOutputFixture.run(.domain, null, false, false);
+}
+
+test "physical cache metadata registered builder output retains rejected producer bindings and every source retirement refusal" {
+    for ([_]RegisteredOutputFixture.Stage{ .create, .handoff, .source, .retire }) |stage| {
+        const count = (try RegisteredOutputFixture.run(stage, null, false, false)).checks;
+        for (0..count) |at| _ = try RegisteredOutputFixture.run(stage, at, false, false);
+    }
+}
+
+test "physical cache metadata registered builder output aborts every allocation failure without losing transferred credit" {
+    for ([_]RegisteredOutputFixture.Stage{ .create, .handoff, .source }) |stage| {
+        const count = (try RegisteredOutputFixture.run(stage, null, false, false)).allocations;
+        for (0..count) |at| _ = try RegisteredOutputFixture.run(stage, at, true, false);
+    }
+}

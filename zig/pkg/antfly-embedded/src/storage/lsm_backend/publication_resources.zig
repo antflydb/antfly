@@ -116,6 +116,25 @@ pub const Owner = struct {
         try self.beginEntryFromRegisteredSourceWithAdmission(backend, directory, &captured.lease.?, original);
     }
 
+    pub const RegisteredOutput = @import("registered_run_output.zig");
+    pub fn beginRegisteredOutputWithAdmission(self: *Owner, original: admission.Port) !*RegisteredOutput.Owner {
+        try original.checkpoint();
+        if (self.closing) return error.InvalidArgument;
+        return RegisteredOutput.Owner.start(self.allocator, self.manager, original);
+    }
+    pub fn beginEntryFromRegisteredOutputWithAdmission(self: *Owner, backend: anytype, directory: *Directory, source: *RegisteredOutput.Owner, metadata: RegisteredOutput.Metadata, scope: admission.Port) !void {
+        var trace: admission.RejectionTrace = .{};
+        const original = trace.bind(scope).?;
+        try original.checkpoint();
+        if (self.closing or self.entry != null) return error.InvalidArgument;
+        if (backend.options.resource_manager != self.manager or backend.allocator.ptr != self.allocator.ptr or backend.allocator.vtable != self.allocator.vtable) return error.ResourceAccountingMismatch;
+        const owner = self.quota_owner orelse return error.InvalidArgument;
+        const retained_host = try self.manager.acquireAllocatorHostWithAdmission(self.allocator, original);
+        var host: ?entry_owner.HostLifetime = .{ .allocator = retained_host.allocator, .lifetime = pinHost(retained_host) };
+        defer if (host) |held| held.lifetime.release_joined(held.lifetime.context);
+        self.entry = try backend.beginOwnedDirectoryEntryFromRegisteredOutput(directory, source, metadata, owner, &host, original);
+    }
+
     pub const RegisteredWriter = @import("registered_writer.zig").Record;
     pub const RegisteredWriterRoot = @import("registered_writer_root.zig").Candidate;
     pub const WriterStore = @import("run_store.zig").Store;

@@ -448,14 +448,16 @@ pub const Directory = struct {
     };
 
     /// One owned registration, represented independently of backend lifetime.
+    pub const DomainLifetime = enum { borrowed, key_or_static };
     pub const Routing = struct {
+        domain_lifetime: DomainLifetime = .borrowed,
         legacy: ?*const fn ([]const u8) []const u8 = null,
         admitted: ?*const fn ([]const u8, @import("../../common/read_admission.zig").Port) anyerror![]const u8 = null,
         pub fn fromOptions(options: anytype) @This() {
-            return .{ .legacy = options.run_partition_key, .admitted = if (options.run_partition_key != null) options.run_partition_key_with_admission else null };
+            return .{ .legacy = options.run_partition_key, .admitted = if (options.run_partition_key != null) options.run_partition_key_with_admission else null, .domain_lifetime = if (@hasField(@TypeOf(options), "run_partition_domain_lifetime")) options.run_partition_domain_lifetime else .borrowed };
         }
         pub fn matches(self: @This(), other: @This()) bool {
-            return self.legacy == other.legacy and self.admitted == other.admitted;
+            return self.legacy == other.legacy and self.admitted == other.admitted and self.domain_lifetime == other.domain_lifetime;
         }
     };
     pub const RegisteredAnchor = struct {
@@ -1126,6 +1128,7 @@ pub const Directory = struct {
             credit: ?resources.ConstructionCredit = null,
             payload: ?*Payload = null,
             domain: ?[]const u8 = null,
+            require_self_owned_domain: bool = false,
             registration: ?registry.Operation = null,
             registration_stale: bool = false,
             registered_path: bool = false,
@@ -1173,6 +1176,12 @@ pub const Directory = struct {
                         try partition(payload.run.smallest_key, original)
                     else
                         "";
+                }
+                if (self.require_self_owned_domain and self.domain.?.len != 0 and self.routing.domain_lifetime != .key_or_static) {
+                    const bytes = payload.run.smallest_key;
+                    const domain = self.domain.?;
+                    const offset = @intFromPtr(domain.ptr) -| @intFromPtr(bytes.ptr);
+                    if (@intFromPtr(domain.ptr) < @intFromPtr(bytes.ptr) or offset > bytes.len or domain.len > bytes.len - offset) return error.ExecutionWaitUnsupported;
                 }
                 if (!self.pin_done) {
                     if (payload.run.path) |path| {

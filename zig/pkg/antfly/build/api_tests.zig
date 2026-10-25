@@ -4415,6 +4415,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-physical-sync-test", "Verify owning physical durability operations and controlled retry without synchronous fallback")
         .dependOn(&physical_sync_run.step);
 
+    const builder_output_tests = b.addTest(.{
+        .name = "builder-output-tests",
+        .root_module = physical_sync_root,
+        .filters = &.{"controlled physical sync prepaid run"},
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const builder_output_run = b.addRunArtifact(builder_output_tests);
+    builder_output_run.addArgs(&.{ "--test-filter", "controlled physical sync prepaid run", "--require-no-skips" });
+    b.step("antfly-builder-output-test", "Verify owned builder bounds, output accounting and rejected handoff lifecycle")
+        .dependOn(&builder_output_run.step);
+
     const output_retirement_tests = b.addTest(.{
         .name = "output-retirement-tests",
         .root_module = physical_sync_root,

@@ -1199,6 +1199,33 @@ pub const StreamingEncoderResult = struct {
     compression_stats: CompressionStats,
 };
 
+/// Bounds moved from completed encoder blocks. Their allocations are already
+/// paid by the producer; this cursor performs no copying or new allocation.
+pub const OwnedRunBounds = struct {
+    fields: [4]?[]u8 = .{ null, &.{}, null, &.{} },
+    field: usize = 0,
+    offset: usize = 0,
+    pub fn memoryBytes(self: *const @This()) u64 {
+        var bytes: u64 = 0;
+        for (self.fields) |value| if (value) |owned| {
+            bytes +|= owned.len;
+        };
+        return bytes;
+    }
+    pub fn retireStep(self: *@This(), a: std.mem.Allocator, original: ?read_admission.Port) !bool {
+        if (original) |port| try port.checkpoint();
+        if (self.field == self.fields.len) return true;
+        if (retirePrivateChunk(u8, a, self.fields[self.field] orelse &.{}, &self.offset)) {
+            self.fields[self.field] = null;
+            self.field += 1;
+        }
+        return self.field == self.fields.len;
+    }
+    pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        while (!(self.retireStep(a, null) catch unreachable)) {}
+    }
+};
+
 pub const StreamingEncoder = struct {
     allocator: std.mem.Allocator,
     sink: *TableSink,
@@ -2405,6 +2432,25 @@ pub const StreamingEncoder = struct {
             try writer.writeWithAdmission(output.offset, output.bytes, original);
             self.acknowledge();
             return true;
+        }
+
+        /// Move the first/last accepted block bounds with the result in one
+        /// fixed receipt. Legacy takeResult leaves those bounds with the encoder.
+        pub fn takeOwnedResult(self: *@This()) !struct { result: StreamingEncoderResult, bounds: OwnedRunBounds } {
+            const result = try self.takeResult();
+            const e = self.encoder;
+            var bounds: OwnedRunBounds = .{};
+            if (e.blocks.items.len != 0) {
+                const first = &e.blocks.items[0];
+                const last = &e.blocks.items[e.blocks.items.len - 1];
+                bounds.fields = .{ first.smallest_namespace_name, first.smallest_key, last.largest_namespace_name, last.largest_key };
+                first.smallest_namespace_name = null;
+                first.smallest_key = &.{};
+                last.largest_namespace_name = null;
+                last.largest_key = &.{};
+                e.blocks_owned_heap_bytes -= bounds.memoryBytes();
+            }
+            return .{ .result = result, .bounds = bounds };
         }
 
         pub fn takeResult(self: *@This()) !StreamingEncoderResult {

@@ -156,6 +156,7 @@ pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .run_partition_prefix_bytes = 1,
     .run_partition_key = primaryRunPartition,
     .run_partition_key_with_admission = primaryRunPartitionWithAdmission,
+    .run_partition_domain_lifetime = .key_or_static,
     .wal_soft_limit_segments = primary_wal_soft_limit_segments,
     .wal_hard_limit_segments = primary_wal_hard_limit_segments,
     .wal_soft_limit_bytes = primary_wal_soft_limit_bytes,
