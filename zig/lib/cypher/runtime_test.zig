@@ -8493,3 +8493,67 @@ test "ordered groups retire reducers across a broad exact-budget prefix" {
     try std.testing.expectEqual(@as(usize, 5), result.rows.len);
     try std.testing.expectEqualStrings("049900", result.rows[0][0].string);
 }
+
+test "empty scalar admission preserves pattern constraint errors" {
+    const empty: c.ast.Expr = .{ .span = .{}, .value = .{ .literal = .{ .boolean = false } } };
+    for ([_]bool{ false, true }) |fallible| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, if (fallible) "MATCH(n:Document {rank:1/0}) RETURN n.rank AS rank" else "MATCH(n:Document {rank:1}) RETURN n.rank AS rank", .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        const cursor = (try runtime.NodeCursor.open(std.testing.allocator, fixture.backend(), graph, compiled.query, &.{}, .{})).?;
+        defer cursor.close();
+        const plan = try cursor.planScalarDomain("rank", &.{}, .min, &empty);
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        if (fallible) {
+            try std.testing.expect(plan == null);
+            try std.testing.expectError(error.CypherDivisionByZero, cursor.next(arena.allocator(), 1));
+        } else {
+            try cursor.startWeightPlan(plan.?);
+            try std.testing.expectEqual(@as(usize, 0), (try cursor.next(arena.allocator(), 1)).len);
+            try std.testing.expectEqual(@as(usize, 0), cursor.engine.stats.scanned_anchors);
+        }
+    }
+}
+
+test "grouped reducer domains retain nonleading admission as a runtime residual" {
+    const Probe = struct {
+        filtered: bool = false,
+        fn bind(_: *anyopaque, _: std.mem.Allocator, _: catalog.Graph) !void {}
+        fn checkpoint(_: *anyopaque) !void {}
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?[]const u8, _: usize) !b.Page(*const v.Node) {
+            return .{ .items = &.{} };
+        }
+        fn get(_: *anyopaque, _: std.mem.Allocator, _: v.Identity) !?*const v.Node {
+            return null;
+        }
+        fn expand(_: *anyopaque, _: std.mem.Allocator, _: catalog.Relationship, _: v.Identity, _: c.ast.Direction, _: ?[]const u8, _: usize) !b.Page(*const v.Relationship) {
+            return .{ .items = &.{} };
+        }
+        fn ordered(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, filters: []const b.PropertyFilter, _: []const b.PropertyOrder, _: ?[]const u8, limit: usize, _: usize) !?b.Page(*const v.Node) {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(limit == 0);
+            for (filters) |filter| if (std.mem.eql(u8, filter.property, "rank")) {
+                self.filtered = true;
+                // A stronger rank-only index cannot attest group-key order.
+                return null;
+            };
+            return .{ .items = &.{}, .examined = 0, .exact_keys = true, .next = "0" };
+        }
+    };
+    var diagnostic: c.Diagnostic = .{};
+    var source = try c.compile(std.testing.allocator, "MATCH(n:Document) RETURN n.id AS id,n.rank AS rank", .{}, &diagnostic);
+    defer source.deinit();
+    var filtered = try c.compile(std.testing.allocator, "MATCH(n:Document) WHERE n.rank>=2 RETURN n.rank", .{}, &diagnostic);
+    defer filtered.deinit();
+    for ([_]bool{ false, true }) |reducer_domain| {
+        var probe: Probe = .{};
+        const backend: b.Backend = .{ .ptr = &probe, .vtable = &.{ .bind = Probe.bind, .checkpoint = Probe.checkpoint, .scan = Probe.scan, .get = Probe.get, .expand = Probe.expand, .scan_ordered = Probe.ordered } };
+        const cursor = (try runtime.NodeCursor.open(std.testing.allocator, backend, graph, source.query, &.{}, .{})).?;
+        defer cursor.close();
+        const plan = try cursor.planScalarDomainFiltered("rank", &.{"id"}, .distinct, filtered.query.clauses[0].operation.match.predicate, null, &.{}, reducer_domain);
+        try std.testing.expectEqual(reducer_domain, plan != null);
+        try std.testing.expectEqual(!reducer_domain, probe.filtered);
+    }
+}

@@ -295,6 +295,25 @@ fn scanQueryCertified(a: A, binding: Binding, request: catalog.Scan, consumed: *
         if (order.items.len == 0) return query;
         const clauses = try a.dupe(cypher.ast.Clause, query.clauses);
         clauses[1].operation.project.value.order = order.items;
+        if (request.ordered_window) |maximum| bounded: {
+            if (maximum == 0 or maximum > std.math.maxInt(i64) or request.order.len != order.items.len or request.conditions.len != 0 or request.graph_filters.len != 0 or request.graph_conditions.len != 0 or request.graph_predicates.len != 0 or request.exact_graph_filter != null) break :bounded;
+            const requested = try a.alloc(cypher.ast.Order, request.order.len);
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            for (request.order, requested) |key, *sort| {
+                if (key.nulls_first != key.descending or seen.contains(key.column)) break :bounded;
+                const item = for (original.items) |item| {
+                    if (std.mem.eql(u8, item.alias.?, key.column) and !cypher.expressions.aggregates(item.expression)) break item;
+                } else break :bounded;
+                try seen.put(a, key.column, {});
+                const alias = try a.create(cypher.ast.Expr);
+                alias.* = .{ .span = item.expression.span, .value = .{ .variable = item.alias.? } };
+                sort.* = .{ .expression = alias, .descending = key.descending };
+            }
+            const limit = try a.create(cypher.ast.Expr);
+            limit.* = .{ .span = .{}, .value = .{ .literal = .{ .integer = @intCast(maximum) } } };
+            clauses[1].operation.project.value.order = requested;
+            clauses[1].operation.project.value.limit = limit;
+        }
         query.clauses = clauses;
         return query;
     }
@@ -413,7 +432,7 @@ pub const Cursor = struct {
         } else false;
         const stream = if (empty) null else try cypher.runtime.NodeCursor.open(a, backend, binding.graph, compiled.query, parameters, limits);
         errdefer if (stream) |cursor| cursor.close();
-        var ordered = false;
+        var ordered = stream == null and compiled.query.clauses[1].operation.project.value.limit != null and binding.definition.query.clauses[1].operation.project.value.limit == null;
         var source_ordinals = request.graph_source_ordinals;
         for (request.fields) |field| source_ordinals = source_ordinals or std.mem.eql(u8, field, "_id");
         for (request.conditions) |condition| source_ordinals = source_ordinals or std.mem.eql(u8, condition.column, "_id");
@@ -513,8 +532,11 @@ pub const Cursor = struct {
         var fields: [2]std.StringHashMapUnmanaged(void) = .{ .empty, .empty };
         var slots: [2]std.ArrayList(usize) = .{ .empty, .empty };
         var multiplicities: [2]cypher.runtime.Multiplicity = .{ .presence, .presence };
-        const Candidate = struct { plan: cypher.runtime.NodeCursor.WeightPlan, slots: std.ArrayList(usize) = .empty };
+        const Candidate = struct { plan: cypher.runtime.NodeCursor.WeightPlan, slots: std.ArrayList(usize) = .empty, presence_keys: ?[]const []const u8 = null, presence_predicate: ?*const cypher.ast.Expr = null };
         var candidates: std.ArrayList(Candidate) = .empty;
+        var window: ?catalog.ObserverWindow = null;
+        var window_keys: []const []const u8 = &.{};
+        var window_predicate: ?*const cypher.ast.Expr = null;
         for (requests, 0..) |request, i| {
             const multiplicity = request.multiplicity;
             if (request.observer) |observer| scalar: {
@@ -539,7 +561,41 @@ pub const Cursor = struct {
                     const admission = (try graphFilter(a, self.scalar_binding, original, filter)) orelse break :scalar;
                     predicate = (if (predicate) |previous| try combinePredicate(a, previous, admission, .@"and") else admission) orelse break :scalar;
                 }
-                const plan = (try stream.planScalarDomain(selected, request.observer_keys, observer, predicate)) orelse break :scalar;
+                const group_predicate = predicate;
+                if (request.observer_reducer_filter) |filter| {
+                    const original = self.scalar_binding.definition.query.clauses[1].operation.project.value;
+                    if (!exactFilterDomain(self.scalar_binding, original, filter)) break :scalar;
+                    const admission = (try graphFilter(a, self.scalar_binding, original, filter)) orelse break :scalar;
+                    predicate = (if (predicate) |previous| try combinePredicate(a, previous, admission, .@"and") else admission) orelse break :scalar;
+                }
+                const plan = (try stream.planScalarDomainFiltered(selected, request.observer_keys, observer, predicate, group_predicate, if (request.observer_window) |demand| demand.descending else &.{}, request.observer_reducer_filter != null and request.observer_keys.len != 0)) orelse break :scalar;
+                // Preserve groups even when every per-reducer FILTER rejects.
+                // Only idempotent reducers receive representative contributions.
+                if (request.observer_reducer_filter != null and request.observer_keys.len != 0) {
+                    const presence = (try stream.planScalarDomainFiltered(request.observer_keys[0], request.observer_keys, .distinct, group_predicate, group_predicate, if (request.observer_window) |demand| demand.descending else &.{}, false)) orelse break :scalar;
+                    const shared = for (candidates.items, 0..) |candidate, index| {
+                        const keys = candidate.presence_keys orelse continue;
+                        if (keys.len != request.observer_keys.len) continue;
+                        const same_keys = for (keys, request.observer_keys) |left, right| {
+                            if (!std.mem.eql(u8, left, right)) break false;
+                        } else true;
+                        if (!same_keys or (candidate.presence_predicate == null) != (group_predicate == null)) continue;
+                        if (group_predicate) |predicate_| if (!cypher.expressions.same(candidate.presence_predicate.?, predicate_)) continue;
+                        break index;
+                    } else null;
+                    if (shared) |index| {
+                        try candidates.items[index].slots.append(a, i);
+                    } else {
+                        var candidate: Candidate = .{ .plan = presence, .presence_keys = request.observer_keys, .presence_predicate = group_predicate };
+                        try candidate.slots.append(a, i);
+                        try candidates.append(a, candidate);
+                    }
+                }
+                if (request.observer_window) |demand| {
+                    window = demand;
+                    window_keys = request.observer_keys;
+                    window_predicate = group_predicate;
+                }
                 var candidate: Candidate = .{ .plan = plan };
                 try candidate.slots.append(a, i);
                 try candidates.append(a, candidate);
@@ -602,6 +658,12 @@ pub const Cursor = struct {
             var keys = fields[i].keyIterator();
             while (keys.next()) |name| try names.append(a, name.*);
             try candidates.append(a, .{ .plan = (try stream.planWeightFields(names.items, multiplicities[i])) orelse return false, .slots = slots[i] });
+        }
+        if (window) |demand| {
+            // A mixed fallback cannot truncate: certify every scalar pass first.
+            for (candidates.items) |candidate| if (candidate.plan.scalar_kind == null) return false;
+            const prefix = try stream.scalarGroupWindow(window_keys, demand.descending, demand.maximum, window_predicate);
+            for (candidates.items) |*candidate| candidate.plan.scalar_window = prefix;
         }
         const passes = try a.alloc(WeightPass, candidates.items.len);
         for (candidates.items, passes) |candidate, *pass| pass.* = .{ .plan = candidate.plan, .slots = candidate.slots.items };

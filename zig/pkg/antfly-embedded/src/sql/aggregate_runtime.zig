@@ -601,7 +601,22 @@ fn aggregateRequests(a: std.mem.Allocator, bound: *const binding.Bound, table: c
             }
             try observer_keys.append(a, (try table.column(bound.input.columns[root.operation.column].name)).path);
         }
-        if (direct_keys and predicate_complete and filter == null) if (input) |slot| if (bound.input.projections[slot]) |program| {
+        var reducer_filter: ?catalog.Scan.GraphFilter = null;
+        if (filter) |slot| {
+            if (bound.input.projections[slot]) |program| {
+                const observers = @import("observer_request.zig");
+                if (try observers.fromProgram(a, program, bound.input.columns, parameters)) |predicate| {
+                    const from = try a.alloc([]const u8, bound.input.columns.len);
+                    const to = try a.alloc([]const u8, bound.input.columns.len);
+                    for (bound.input.columns, from, to) |column, *source, *target| {
+                        source.* = column.name;
+                        target.* = (try table.column(column.name)).path;
+                    }
+                    reducer_filter = try observers.mapFilter(a, predicate, from, to);
+                }
+            }
+        }
+        if (direct_keys and predicate_complete and (filter == null or reducer_filter != null)) if (input) |slot| if (bound.input.projections[slot]) |program| {
             const root = program.instructions[program.root];
             if (root.operation == .column and !root.input_function) {
                 observer_field = (try table.column(bound.input.columns[root.operation.column].name)).path;
@@ -613,7 +628,7 @@ fn aggregateRequests(a: std.mem.Allocator, bound: *const binding.Bound, table: c
                 };
             }
         };
-        request.* = .{ .observer_field = observer_field, .observer_keys = observer_keys.items, .observer_filter = exact_filter, .observer = observer, .fields = names.items, .multiplicity = if (presence) .presence else .exact, .summary = summary, .invariants = invariants.items, .summaries = summaries.items };
+        request.* = .{ .observer_reducer_filter = reducer_filter, .observer_field = observer_field, .observer_keys = observer_keys.items, .observer_filter = exact_filter, .observer = observer, .fields = names.items, .multiplicity = if (presence) .presence else .exact, .summary = summary, .invariants = invariants.items, .summaries = summaries.items };
     }
     return requests;
 }
@@ -668,8 +683,32 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         const exact_filter = try observerFilter(context, table, bound);
         const observer_admission = bound.input.predicate == null or exact_filter != null;
         const can_weight = !aggregate_loaded and !predicates.empty and !external and supportsWeights(bound);
+        const requests: []const catalog.AggregateWeight = if (can_weight) try aggregateRequests(context.arena, bound, table, predicates.terms.items, context.parameters, observer_admission, exact_filter) else &.{};
+        if (requests.len != 0 and statement.limit != null and bound.group_count != 0 and bound.having == null and bound.orders.len == bound.group_count and statement.order_by.len == bound.group_count) window: {
+            for (requests) |request| if (request.observer == null) break :window;
+            for (bound.outputs) |program| {
+                const root = program.instructions[program.root];
+                if (root.input_function or (root.operation != .column and root.operation != .literal)) break :window;
+            }
+            const directions = try context.arena.alloc(bool, bound.group_count);
+            const keys = try context.arena.alloc([]const u8, bound.group_count);
+            var seen = std.AutoHashMapUnmanaged(u32, void){};
+            for (bound.orders, statement.order_by, directions, keys) |program, order, *descending, *key| {
+                const root = program.instructions[program.root];
+                if (root.input_function or root.operation != .column or root.operation.column >= bound.group_count or seen.contains(root.operation.column)) break :window;
+                if ((order.nulls_first orelse order.descending) != order.descending) break :window;
+                try seen.put(context.arena, root.operation.column, {});
+                descending.* = order.descending;
+                key.* = requests[0].observer_keys[root.operation.column];
+            }
+            const maximum = std.math.add(u64, offset, limit) catch return error.SqlProgramLimitExceeded;
+            for (@constCast(requests)) |*request| {
+                request.observer_keys = keys;
+                request.observer_window = .{ .descending = directions, .maximum = maximum };
+            }
+        }
         const partitioned = can_weight and bound.specs.len > 0 and
-            try scan.aggregateWeights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, try aggregateRequests(context.arena, bound, table, predicates.terms.items, context.parameters, observer_admission, exact_filter));
+            try scan.aggregateWeights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, requests);
         const weighted = partitioned or (can_weight and try scan.weights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, multiplicity(bound)));
         const parallel = !weighted and bound.ordered.len == 0 and !external and !predicates.empty and !aggregate_loaded and try @import("parallel_aggregate.zig").execute(context, bound, grouped, &scan, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.executionRows() });
         while (!predicates.empty and !aggregate_loaded and !parallel) {

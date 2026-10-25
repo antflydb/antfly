@@ -3350,3 +3350,45 @@ and the six new public regressions plus 66 publication-ready index-budget
 fixture cases in separate focused runs. The C API build and its 137-function
 export boundary, generated engine-error inventory, Zig/Python formatting and
 whitespace checks pass.
+
+#### SQL group windows and independent reducer admission
+
+SQL scalar observers distinguish source admission from each reducer's `FILTER`.
+The complete typed source predicate travels through identity frames separately
+from the reducer predicate. `COUNT(DISTINCT)`, `MIN` and `MAX` negotiate their own
+admitted domains. Filtered grouped reducers additionally share a source-group
+presence pass: a group survives even when every reducer rejects all its rows.
+Representative contributions are licensed only for these idempotent reducers;
+ordinary counts, sums and fallible arguments retain their normal execution.
+
+Grouped reducer domains retain leading and fixed-prefix native seeks. A total
+reducer predicate over a complete ordered key tuple keeps non-leading key
+conditions as runtime residuals: otherwise those hints can select a different
+index or conceal rejected duplicate runs inside a native scan. The consumer
+retires each rejected tuple after one witness. Structural constraints stay
+pushed, and ordinary selective source filters retain their access-path choice.
+
+A finite SQL window over the complete direct group-key order carries an explicit
+observer demand, including each key's direction and `OFFSET + LIMIT`. Once every
+reducer has certified its scalar plan, one shared source-domain discovery obtains
+the final key of that prefix. Every serial reducer uses the same boundary and
+key order, including reducers with different filters. This prevents filtered-out
+groups from shifting the requested prefix. NULL keys use native tuple ordering.
+Identity frames forward the certificate; joins, sets, HAVING, incomplete key
+orders and fallible grouped outputs decline it. Grouped `GRAPH_TABLE COLUMNS`
+projections similarly lower a certified outer group-key window to the shared
+native grouped executor. Source ordinals and residual predicates remain barriers.
+
+Closed SQL Boolean predicates bind per invocation before observer negotiation.
+TRUE contributes no restriction; FALSE or UNKNOWN admits no input. Partial or
+fallible predicate programs never become empty-source certificates. For a total
+predicate depending only on an attested ordered key tuple, a rejected witness
+also licenses retirement of that entire duplicate-key span. This includes NULL
+and range disjunctions without flattening their three-valued Boolean semantics.
+Uncertified key domains and predicates reading other properties keep their
+ordinary residual scan. Rejection tuples use recyclable storage leased to each
+active fold, rather than accumulating one allocation for each rejected row.
+
+Both Antfarm graph views share a memoized linear-time parallel-edge lane pass.
+It groups unordered endpoint pairs once, preserving encounter-order lanes,
+reverse-edge offsets and self loops across pan, zoom and selection updates.

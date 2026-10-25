@@ -55,7 +55,7 @@ pub const Plan = struct {
             const invariants = try a.alloc([]const u8, request.invariants.len);
             for (request.invariants, invariants) |field, *name| name.* = try a.dupe(u8, field);
             const observer = try observer_request.forward(a, request, request.fields, fields);
-            out.* = .{ .observer = observer.kind, .observer_field = observer.field, .observer_keys = observer.keys, .observer_filter = observer.filter, .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| try a.dupe(u8, name) else null, .invariants = invariants, .summaries = try ownCertificates(a, request.summaries) };
+            out.* = .{ .observer_window = request.observer_window, .observer_reducer_filter = observer.reducer_filter, .observer = observer.kind, .observer_field = observer.field, .observer_keys = observer.keys, .observer_filter = observer.filter, .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| try a.dupe(u8, name) else null, .invariants = invariants, .summaries = try ownCertificates(a, request.summaries) };
         }
         return initDepth(a, root, owned, cursors, parameters, 0);
     }
@@ -338,13 +338,16 @@ pub const Plan = struct {
                     observer.filter = if (observer.filter) |previous| .{ .all = try a.dupe(catalog.Scan.GraphFilter, &.{ previous, filter }) } else filter;
                 };
                 output.* = try names(a, wanted);
-                input.* = .{ .observer = observer.kind, .observer_field = observer.field, .observer_keys = observer.keys, .observer_filter = observer.filter, .fields = try names(a, dependencies), .multiplicity = request.multiplicity, .summaries = try projectCertificates(a, node, request, wanted) };
+                input.* = .{ .observer_window = request.observer_window, .observer_reducer_filter = observer.reducer_filter, .observer = observer.kind, .observer_field = observer.field, .observer_keys = observer.keys, .observer_filter = observer.filter, .fields = try names(a, dependencies), .multiplicity = request.multiplicity, .summaries = try projectCertificates(a, node, request, wanted) };
             }
             try stages.append(a, .{ .node = node, .fields = outputs });
             width += node.columns.len;
             mapped = inputs;
             node = query.source;
         }
+        if (node.operation != .scan) for (mapped) |request| {
+            if (request.observer_window != null) return null;
+        };
         const terminal: Terminal = switch (node.operation) {
             .scan => .scan,
             .materialized_ref => |source| blk: {
@@ -432,7 +435,7 @@ pub const Plan = struct {
                 mapped_certificate.* = .{ .field = node.operation.scan.source_columns[columnIndex(node, certificate.field) orelse return null], .invariants = stable, .joint = certificate.joint, .linear = try renameCheck(a, certificate.linear, request.fields, fields) };
             }
             const observer = try observer_request.forward(a, request, request.fields, fields);
-            out.* = .{ .observer = observer.kind, .observer_field = observer.field, .observer_keys = observer.keys, .observer_filter = observer.filter, .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| node.operation.scan.source_columns[columnIndex(node, name) orelse return null] else null, .invariants = invariants, .summaries = summaries };
+            out.* = .{ .observer_window = request.observer_window, .observer_reducer_filter = observer.reducer_filter, .observer = observer.kind, .observer_field = observer.field, .observer_keys = observer.keys, .observer_filter = observer.filter, .fields = fields, .multiplicity = request.multiplicity, .summary = if (request.summary) |name| node.operation.scan.source_columns[columnIndex(node, name) orelse return null] else null, .invariants = invariants, .summaries = summaries };
         }
         return .{ .source = node, .requests = requests, .stages = stages.items, .physical = physical, .width = width + node.columns.len };
     }

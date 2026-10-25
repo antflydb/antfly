@@ -8918,3 +8918,104 @@ def test_group_observer_proofs_preserve_nulls_ordinals_and_late_errors(graph_db)
     assert result["rows"][0][1]["value"] == "1000000000001"
     with pytest.raises(af.GraphError, match="CypherNumericOverflow"):
         graph_db.cypher_json("g", {"query": weighted + "count(*)*10000000 ORDER BY g LIMIT 1"})
+
+
+def test_sql_filtered_observers_and_constant_admission_have_bounded_work(graph_db):
+    scope_domains(graph_db, 64000)
+    source = "GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.id AS id,n.score AS score)) q"
+    reducers = "count(DISTINCT score),min(score),max(score)"
+    filtered = "count(DISTINCT score) FILTER(WHERE score>=1),min(score) FILTER(WHERE score>=1),max(score) FILTER(WHERE score>=1)"
+    assert graph_db.sql(f"SELECT {reducers} FROM {source} WHERE true")["rows"] == [["3", "0", "2"]]
+    assert graph_db.sql(f"SELECT {reducers} FROM {source} WHERE false")["rows"] == [["0", None, None]]
+    for parameter, expected in ((True, [["3", "0", "2"]]), (False, [["0", None, None]]), (None, [["0", None, None]])):
+        assert graph_db.sql(f"SELECT {reducers} FROM {source} WHERE $1::boolean", [parameter])["rows"] == expected
+    assert graph_db.sql(f"SELECT {reducers} FROM {source} WHERE $1 IS NULL OR score >= $1", [None])["rows"] == [
+        ["3", "0", "2"]
+    ]
+    assert graph_db.sql(f"SELECT {filtered} FROM {source}")["rows"] == [["2", "1", "2"]]
+    assert (
+        graph_db.sql(f"SELECT id,count(DISTINCT score) FROM {source} WHERE score>9 GROUP BY id ORDER BY id")["rows"]
+        == []
+    )
+    assert graph_db.sql(f"SELECT id,{filtered} FROM {source} GROUP BY id ORDER BY id")["rows"] == [
+        [f"g{i}", "2", "1", "2"] for i in range(8)
+    ]
+    assert graph_db.sql(f"SELECT {reducers} FROM {source} WHERE score IS NULL OR score>=1")["rows"] == [["2", "1", "2"]]
+    native = graph_db.cypher_json(
+        "g",
+        {
+            "query": "PROFILE MATCH(n:D) WHERE n.score IS NULL OR n.score>=1 RETURN count(DISTINCT n.score),min(n.score),max(n.score)",
+            "limits": {"scanned_anchors": 128, "intermediate_states": 20000},
+        },
+    )
+    assert [cell["value"] for cell in native["rows"][0]] == ["2", "1", "2"]
+    assert native["stats"]["scanned_anchors"] < 128
+
+
+def test_sql_observer_windows_bound_high_cardinality_groups(graph_db):
+    count = 64000
+    with graph_db.open_table("docs") as table:
+        table.batch(
+            [af.WriteIntent(key=f"k{i:06}", value={"id": f"k{i:06}", "score": i % 3}) for i in range(count)],
+            timestamp=1,
+        )
+    graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
+    graph_db.run_until_idle()
+    source = "GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.id AS id,n.score AS score)) q"
+    grouped = "GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.id AS id,count(DISTINCT n.score) AS c,min(n.score) AS lo,max(n.score) AS hi)) q"
+    for reverse in (False, True):
+        order = "DESC" if reverse else "ASC"
+        indices = list(range(count - 1, -1, -1) if reverse else range(count))[2:7]
+        expected = [[f"k{i:06}", "1", str(i % 3), str(i % 3)] for i in indices]
+        for query in (
+            f"SELECT id,count(DISTINCT score),min(score),max(score) FROM {source} GROUP BY id ORDER BY id {order} OFFSET 2 LIMIT 5",
+            f"SELECT id,c,lo,hi FROM {grouped} ORDER BY id {order} OFFSET 2 LIMIT 5",
+            f"SELECT g,count(DISTINCT s),min(s),max(s) FROM (SELECT id AS g,score AS s FROM {source}) d GROUP BY g ORDER BY g {order} OFFSET 2 LIMIT 5",
+        ):
+            assert graph_db.sql(query)["rows"] == expected, query
+        filtered = "count(DISTINCT score) FILTER(WHERE score=1),min(score) FILTER(WHERE score=1),max(score) FILTER(WHERE score=1)"
+        query = f"SELECT id,{filtered} FROM {source} GROUP BY id ORDER BY id {order} OFFSET 2 LIMIT 5"
+        expected_filtered = [
+            [f"k{i:06}", "1", "1", "1"] if i % 3 == 1 else [f"k{i:06}", "0", None, None] for i in indices
+        ]
+        assert graph_db.sql(query)["rows"] == expected_filtered
+
+
+def test_sql_filtered_observer_group_presence_and_windows_match_exhaustive_control(graph_db):
+    with graph_db.open_table("docs") as table:
+        table.batch(
+            [
+                af.WriteIntent(
+                    key=f"k{i:06}",
+                    value={"id": None if i % 7 == 0 else f"g{i % 8}", "score": None if i % 5 == 0 else i % 3},
+                )
+                for i in range(3000)
+            ],
+            timestamp=1,
+        )
+    graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
+    source = "GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.id AS id,n.score AS score)) q"
+    control = source.replace("n.score AS score", "n.score+0 AS score")
+    for predicate in ("score>=1", "score>9", "score IS NULL", "score IS NULL OR score>=1", "false", "true"):
+        reducers = f"count(DISTINCT score) FILTER(WHERE {predicate}),min(score) FILTER(WHERE {predicate}),max(score) FILTER(WHERE {predicate})"
+        for order in ("ASC", "DESC", "ASC NULLS FIRST"):
+            for window in ("", "OFFSET 2 LIMIT 3"):
+                query = f"SELECT id,{reducers} FROM {source} GROUP BY id ORDER BY id {order} {window}"
+                assert graph_db.sql(query)["rows"] == graph_db.sql(query.replace(source, control))["rows"], query
+
+    with pytest.raises(SQLStateError):
+        graph_db.sql(
+            "SELECT min(score) FROM GRAPH_TABLE(g MATCH(n IS D) COLUMNS(1/(n.score-n.score) AS score)) q WHERE false"
+        )
+    with pytest.raises(SQLStateError):
+        graph_db.sql(
+            f"SELECT id,count(DISTINCT score)/CASE WHEN id='g7' THEN 0 ELSE 1 END FROM {source} GROUP BY id ORDER BY id LIMIT 1"
+        )
+
+    graph_db.sql("CREATE INDEX regrouping ON docs(score,id DESC)")
+    graph_db.run_until_idle()
+    for reducer in ("count(DISTINCT score),min(score),max(score)", "count(DISTINCT score),sum(score)"):
+        query = f"SELECT id,score,{reducer} FROM {source} WHERE id IS NULL OR id>='g2' GROUP BY id,score ORDER BY score DESC,id ASC OFFSET 2 LIMIT 3"
+        assert graph_db.sql(query)["rows"] == graph_db.sql(query.replace(source, control))["rows"], query

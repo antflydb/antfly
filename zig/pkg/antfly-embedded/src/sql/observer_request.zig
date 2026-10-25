@@ -22,6 +22,7 @@ pub const Forward = struct {
     field: ?[]const u8 = null,
     keys: []const []const u8 = &.{},
     filter: ?catalog.Scan.GraphFilter = null,
+    reducer_filter: ?catalog.Scan.GraphFilter = null,
 };
 fn name(input: []const u8, from: []const []const u8, to: []const []const u8) ?[]const u8 {
     for (from, to) |old, new| if (std.mem.eql(u8, input, old)) return new;
@@ -47,7 +48,7 @@ pub fn forward(a: A, request: catalog.AggregateWeight, from: []const []const u8,
     const field = name(source, from, to) orelse return .{};
     const keys = try a.alloc([]const u8, request.observer_keys.len);
     for (request.observer_keys, keys) |key, *out| out.* = try a.dupe(u8, name(key, from, to) orelse return .{});
-    return .{ .kind = kind, .field = try a.dupe(u8, field), .keys = keys, .filter = if (request.observer_filter) |predicate| (try mapFilter(a, predicate, from, to)) orelse return .{} else null };
+    return .{ .kind = kind, .field = try a.dupe(u8, field), .keys = keys, .reducer_filter = if (request.observer_reducer_filter) |predicate| (try mapFilter(a, predicate, from, to)) orelse return .{} else null, .filter = if (request.observer_filter) |predicate| (try mapFilter(a, predicate, from, to)) orelse return .{} else null };
 }
 
 /// Translate the complete typed predicate of a row-preserving frame. Closed
@@ -62,7 +63,8 @@ fn closedOperand(program: @import("scalar.zig").Program, index: u32, remaining: 
     return switch (program.instructions[index].operation) {
         .literal, .parameter => true,
         .cast => |cast| closedOperand(program, cast.operand, remaining),
-        .unary => |unary| (unary.op == .positive or unary.op == .negative) and closedOperand(program, unary.operand, remaining),
+        .unary => |unary| closedOperand(program, unary.operand, remaining),
+        .binary => |operation| closedOperand(program, operation.left, remaining) and closedOperand(program, operation.right, remaining),
         else => false,
     };
 }
@@ -70,9 +72,28 @@ fn predicateAt(a: A, program: @import("scalar.zig").Program, columns: []const @i
     if (remaining.* == 0 or index >= program.instructions.len) return null;
     remaining.* -= 1;
     const operation = program.instructions[index].operation;
+    // Empty conjunction/disjunction retain TRUE/FALSE through every identity
+    // frame. Evaluate only closed, repeatable scalar operands, per invocation.
+    var closed_budget = remaining.*;
+    if (closedOperand(program, index, &closed_budget)) {
+        const value = program.evaluateInstruction(a, index, parameters) catch |err| {
+            if (err == error.InvalidSqlParameters or err == error.UnsupportedSqlShape or err == error.SqlProgramLimitExceeded or std.mem.startsWith(u8, @import("errors.zig").describe(err).code, "22")) return null;
+            return err;
+        };
+        if (value.sql_null) return .{ .any = &.{} };
+        if (value.value == .bool) return if (value.value.bool) .{ .all = &.{} } else .{ .any = &.{} };
+        return null;
+    }
     if (operation == .binary and (operation.binary.op == .@"and" or operation.binary.op == .@"or")) {
         const left = (try predicateAt(a, program, columns, parameters, operation.binary.left, remaining)) orelse return null;
         const right = (try predicateAt(a, program, columns, parameters, operation.binary.right, remaining)) orelse return null;
+        // Admission observes SQL TRUE only. UNKNOWN and FALSE therefore share
+        // the empty domain under these monotone AND/OR operators.
+        const conjunction = operation.binary.op == .@"and";
+        if (left == .all and left.all.len == 0) return if (conjunction) right else left;
+        if (right == .all and right.all.len == 0) return if (conjunction) left else right;
+        if (left == .any and left.any.len == 0) return if (conjunction) left else right;
+        if (right == .any and right.any.len == 0) return if (conjunction) right else left;
         const children = try a.dupe(catalog.Scan.GraphFilter, &.{ left, right });
         return if (operation.binary.op == .@"and") .{ .all = children } else .{ .any = children };
     }
