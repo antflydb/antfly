@@ -199,6 +199,10 @@ pub fn projectTables(a: A, initial: []const c.Table, regions: []const c.Region, 
     return .{ .tables = try out.toOwnedSlice(a), .resolved = resolved };
 }
 
+pub fn isLiteral(origin: c.Origin) bool {
+    return origin == .native or origin == .transcription;
+}
+
 /// Parent interpretation can never become literal evidence in a child. Keep
 /// a child's more specific nonliteral provenance when one was provided.
 pub fn inheritOrigin(declared: ?c.Origin, parent: c.Origin) c.Origin {

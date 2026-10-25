@@ -285,6 +285,13 @@ and parent overrides, so composition cannot turn them into literal source eviden
 The adapter validates shared structure totals before allocating typed arrays and
 borrows parsed text and fields until the executor accepts the candidate.
 
+Refinement distinguishes an unchanged answer from a source-supported replacement.
+Matching text alone retains the accepted representation, including its provenance,
+children, fields, tables and completion status, without another structure copy.
+A provenance upgrade requires matching native source text or an independent
+literal verifier. Interpreted, derived and estimated verifier output cannot
+establish literal evidence, even when its text matches exactly.
+
 Native slide text preserves explicit DrawingML line breaks in text boxes, table
 cells and included speaker notes.
 

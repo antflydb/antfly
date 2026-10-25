@@ -523,20 +523,32 @@ pub fn Service(comptime Node: type) type {
             const choice = try cf.text(cf.field(answers.array.items[0], "choice") orelse return error.InvalidDocumentModelResult);
             return std.meta.stringToEnum(executor.Action, choice) orelse error.DocumentActionDenied;
         }
-        fn validate(raw: *anyopaque, page: c.Page, region: ?c.Region, candidate: executor.Candidate, run: *c.Run) !bool {
+        fn validate(raw: *anyopaque, page: c.Page, region: ?c.Region, candidate: executor.Candidate, run: *c.Run) !executor.Validation {
             const self: *Self = @ptrCast(@alignCast(raw));
+            const ir = @import("representation.zig");
             const original = if (region) |r| r.text else page.text;
-            if (std.mem.eql(u8, original, candidate.text)) return true;
-            if (try @import("source_support.zig").nativeSupports(run.work_allocator orelse self.work_allocator, page.native_text, self.native_regions, region, candidate.text)) return true;
-            if (region) |selected| if (selected.bbox == null) return false;
-            const name = self.definition.read.?.verification_reader orelse return false;
+            const original_origin = if (region) |r| r.origin else page.origin;
+            const unchanged = std.mem.eql(u8, original, candidate.text);
+            const no_support: executor.Validation = if (unchanged) .unchanged else .unsupported;
+            // Reusing equal literal text or another nonliteral answer is a
+            // no-op. A literal upgrade of interpreted text still needs proof.
+            if (unchanged and (ir.isLiteral(original_origin) or !ir.isLiteral(candidate.origin))) return .unchanged;
+            if (try @import("source_support.zig").nativeSupports(run.work_allocator orelse self.work_allocator, page.native_text, self.native_regions, region, candidate.text)) return .source_supported;
+            if (region) |selected| if (selected.bbox == null) return no_support;
+            const name = self.definition.read.?.verification_reader orelse return no_support;
             const binding = try self.definition.binding(name, .read);
-            if (candidate.model) |model| if (std.mem.eql(u8, binding.model, model)) return false;
+            if (candidate.model) |model| if (std.mem.eql(u8, binding.model, model)) return no_support;
             try run.call();
             var arena = std.heap.ArenaAllocator.init(run.work_allocator orelse self.work_allocator);
             defer arena.deinit();
             const corroboration = try read(raw, arena.allocator(), binding, 0, if (region) |r| r.bbox else null, run);
-            return !corroboration.truncated and (corroboration.status == null or corroboration.status.? == .complete) and (corroboration.origin != .interpretation or candidate.origin == .interpretation) and std.mem.eql(u8, std.mem.trim(u8, corroboration.text, " \t\r\n"), std.mem.trim(u8, candidate.text, " \t\r\n"));
+            return if (corroborates(candidate, corroboration)) .source_supported else no_support;
+        }
+        fn corroborates(candidate: executor.Candidate, corroboration: executor.Candidate) bool {
+            const ir = @import("representation.zig");
+            return !corroboration.truncated and (corroboration.status == null or corroboration.status.? == .complete) and
+                (!ir.isLiteral(candidate.origin) or ir.isLiteral(corroboration.origin)) and
+                std.mem.eql(u8, std.mem.trim(u8, corroboration.text, " \t\r\n"), std.mem.trim(u8, candidate.text, " \t\r\n"));
         }
 
         fn inputsFromRead(a: A, root: V) ![]const V {
@@ -1407,4 +1419,99 @@ test "document page output credits already admitted structures without losing ag
     const second = try run.outputJson(page);
     try Service(struct {}).appendPage(&response, page, &run, second, true);
     try std.testing.expectEqual(first + second + 1, run.usage.output_bytes);
+}
+
+test "document equal text retains provenance unless an independent literal reader establishes support" {
+    const Fake = struct {
+        initial_origin: c.Origin = .interpretation,
+        verifier_origin: ?c.Origin = null,
+        whole_page: bool = false,
+        calls: usize = 0,
+        fn documentDefinition(self: *@This(), a: A, name: []const u8, _: c.Operation) !?[]const u8 {
+            if (!std.mem.eql(u8, name, "agent")) return null;
+            return try std.json.Stringify.valueAlloc(a, .{
+                .models = .{
+                    .{ .name = "initial", .model = "initial", .operation = "read" },
+                    .{ .name = "accurate", .model = "accurate", .operation = "read" },
+                    .{ .name = "verifier", .model = "verifier", .operation = "read" },
+                },
+                .read = .{ .reader = "initial", .accurate_reader = "accurate", .verification_reader = if (self.verifier_origin != null) @as(?[]const u8, "verifier") else null },
+            }, .{});
+        }
+        fn documentResolveBinding(_: *@This(), _: A, binding: c.Binding) !c.Snapshot {
+            return .{ .binding = binding, .path = binding.model, .identity = @splat(1) };
+        }
+        fn documentDownload(_: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
+            return .{ .data = @embedFile("testdata/one-pixel.png") };
+        }
+        fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, model: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+            self.calls += 1;
+            const initial = std.mem.eql(u8, model, "initial");
+            const declared = if (initial) self.initial_origin else if (std.mem.eql(u8, model, "verifier")) self.verifier_origin.? else c.Origin.transcription;
+            const fields = try std.json.parseFromSliceLeaky(V, a, "{\"amount\":9007199254740993.01}", .{ .parse_numbers = false });
+            const children = [_]c.Region{.{ .id = 9, .text = "caption", .origin = declared, .fields = fields }};
+            const regions = [_]c.Region{.{ .id = 7, .text = "caption", .origin = declared, .bbox = .{ 0, 0, 1, 1 }, .confidence = 0.1, .children = &children, .fields = fields }};
+            const cells = [_]c.Cell{.{ .row = 0, .column = 0, .text = "caption" }};
+            const tables = [_]c.Table{.{ .id = 3, .region_id = 7, .rows = 1, .columns = 1, .cells = &cells, .origin = declared }};
+            const items = try a.alloc(readers.Result, 1);
+            items[0] = .{ .text = "caption", .document_json = try std.json.Stringify.valueAlloc(a, c.Page{
+                .source_id = "receipt",
+                .number = 1,
+                .kind = .image,
+                .text = "caption",
+                .origin = declared,
+                .status = if (initial and self.whole_page) .unresolved else .complete,
+                .regions = if (initial and !self.whole_page) &regions else &.{},
+                .tables = if (initial) &tables else &.{},
+                .fields = if (initial) fields else null,
+            }, .{}) };
+            return .{ .items = items, .execution = .{ .requested_items = 1, .serial_items = 1 } };
+        }
+        fn invokeCloudflare(_: *@This(), _: A, _: c.Binding, _: V, _: Control, _: *c.Run) anyerror!V {
+            return error.UnexpectedCall;
+        }
+        fn decideDirectJsonWithControl(_: *@This(), _: A, _: []const u8, _: ?Control) anyerror![]u8 {
+            return error.UnexpectedCall;
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]c.Origin{ .interpretation, .derived, .estimated }) |initial| {
+        for ([_]?c.Origin{ null, .transcription, .interpretation, .derived, .estimated }) |verifier| {
+            for ([_]bool{ false, true }) |whole_page| {
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const work = arena.allocator();
+                var fake = Fake{ .initial_origin = initial, .verifier_origin = verifier, .whole_page = whole_page };
+                const bytes = try Service(Fake).readJson(&fake, a,
+                    \\{"model":"agent","documents":[{"id":"receipt","url":"fixture","media_type":"image/png"}]}
+                , .{});
+                defer a.free(bytes);
+                const result = try std.json.parseFromSliceLeaky(V, work, bytes, .{ .parse_numbers = false });
+                const page = result.object.get("data").?.array.items[0];
+                const literal_support = verifier == .transcription;
+                try std.testing.expectEqual(@as(usize, if (verifier != null) 3 else 2), fake.calls);
+                if (!literal_support) {
+                    try std.testing.expectEqualStrings(@tagName(initial), page.object.get("origin").?.string);
+                    try std.testing.expectEqualStrings("9007199254740993.01", page.object.get("fields").?.object.get("amount").?.number_string);
+                    try std.testing.expectEqual(@as(usize, 1), page.object.get("tables").?.array.items.len);
+                    if (whole_page) try std.testing.expectEqualStrings("unresolved", page.object.get("status").?.string);
+                }
+                if (!whole_page) {
+                    const region = page.object.get("regions").?.array.items[0];
+                    try std.testing.expectEqualStrings(if (literal_support) "transcription" else @tagName(initial), region.object.get("origin").?.string);
+                    try std.testing.expectEqual(literal_support, region.object.get("validated").?.bool);
+                    if (!literal_support) {
+                        try std.testing.expectEqual(@as(usize, 1), region.object.get("children").?.array.items.len);
+                        try std.testing.expectEqualStrings(@tagName(initial), region.object.get("children").?.array.items[0].object.get("origin").?.string);
+                        try std.testing.expectEqualStrings("9007199254740993.01", region.object.get("fields").?.object.get("amount").?.number_string);
+                    }
+                }
+                const metadata = try std.json.parseFromSliceLeaky(V, work, try std.json.Stringify.valueAlloc(work, .{ .source_id = "receipt", .segments = .{.{ .number = 1, .start = 0, .end = 7, .origin = page.object.get("origin").?, .regions = page.object.get("regions").? }} }, .{}), .{});
+                var item = try std.json.parseFromSliceLeaky(V, work,
+                    \\{"structures":{"record":[{"value":{"value":"caption","start":0,"end":7}}]}}
+                , .{});
+                try std.testing.expectEqual(literal_support, try @import("evidence.zig").attach(work, &item, "caption", metadata, true, false));
+            }
+        }
+    }
 }

@@ -39,13 +39,16 @@ pub const Observation = struct {
     remaining_calls: usize,
     allowed: []const Action,
 };
+/// Unchanged content is reusable, but cannot authorize a provenance or
+/// structure replacement. Only source-supported output can replace it.
+pub const Validation = enum { unsupported, unchanged, source_supported };
 pub const Driver = struct {
     ptr: *anyopaque,
     read_fn: *const fn (*anyopaque, A, c.Binding, usize, ?[4]f64, *c.Run) anyerror!Candidate,
     decide_fn: ?*const fn (*anyopaque, A, c.Binding, Observation, *c.Run) anyerror!Action = null,
     /// Validation must explicitly establish evidence support, not just ask a
     /// model if another model's answer sounds good.
-    validate_fn: ?*const fn (*anyopaque, c.Page, ?c.Region, Candidate, *c.Run) anyerror!bool = null,
+    validate_fn: ?*const fn (*anyopaque, c.Page, ?c.Region, Candidate, *c.Run) anyerror!Validation = null,
 };
 
 fn meaningful(text: []const u8) bool {
@@ -111,13 +114,13 @@ pub fn readPageReported(a: A, def: c.Definition, driver: Driver, page_index: usi
     var verified_repair = false;
     var verification_interruption: ?anyerror = null;
     if (missing_native and ir.hasFinding(page, "native_font_fallback")) {
-        if (driver.validate_fn) |validate| verified_repair = validate(driver.ptr, page, null, candidate, run) catch |err| switch (err) {
+        if (driver.validate_fn) |validate| verified_repair = (validate(driver.ptr, page, null, candidate, run) catch |err| switch (err) {
             error.DocumentBudgetExhausted, error.DocumentRendererUnavailable => blk: {
                 verification_interruption = err;
-                break :blk false;
+                break :blk .unsupported;
             },
             else => return err,
-        };
+        }) == .source_supported;
     }
     page = try applyPage(a, page, candidate, initial.model, run.limits.max_regions);
     if (verification_interruption) |err| page = try interrupted(a, page, err);
@@ -263,8 +266,14 @@ fn refineInto(a: A, def: c.Definition, driver: Driver, page_index: usize, page: 
         try run.emit(.{ .phase = .verification, .source_id = page.source_id, .page_number = page.number, .model = binding.model, .region_id = if (current.*) |v| v.id else null });
         // A second answer is not evidence of improvement. Keep the original if
         // no validator can establish support for the replacement.
-        const supported = if (driver.validate_fn) |validate| try validate(driver.ptr, page.*, current.*, candidate, run) else false;
-        if (supported and meaningful(candidate.text) and !candidate.truncated and (candidate.status == null or candidate.status.? == .complete)) {
+        const validation = if (driver.validate_fn) |validate| try validate(driver.ptr, page.*, current.*, candidate, run) else .unsupported;
+        if (validation == .unchanged) {
+            // Keep the complete accepted representation, including descendant
+            // origins, fields, tables and completion. Equal text establishes no
+            // new source support and must not set validated or erase metadata.
+            break;
+        }
+        if (validation == .source_supported and meaningful(candidate.text) and !candidate.truncated and (candidate.status == null or candidate.status.? == .complete)) {
             if (current.*) |*v| {
                 v.text = try a.dupe(u8, candidate.text);
                 v.model = binding.model;
@@ -343,10 +352,10 @@ test "document region evaluation retains fast text and selectively corroborates 
             try std.testing.expectEqual(@as(f64, 20), box.?[1]);
             return .{ .text = "12.00" };
         }
-        fn validate(_: *anyopaque, _: c.Page, region: ?c.Region, candidate: Candidate, _: *c.Run) !bool {
+        fn validate(_: *anyopaque, _: c.Page, region: ?c.Region, candidate: Candidate, _: *c.Run) !Validation {
             // This deterministic fixture is the source-evidence oracle, not a
             // model approving its own output.
-            return if (region.?.id == 1) std.mem.eql(u8, candidate.text, "Coffee") else std.mem.eql(u8, candidate.text, "12.00");
+            return if (if (region.?.id == 1) std.mem.eql(u8, candidate.text, "Coffee") else std.mem.eql(u8, candidate.text, "12.00")) .source_supported else .unsupported;
         }
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -382,8 +391,8 @@ test "document accepted specialist revision retains tables and regions" {
             if (std.mem.eql(u8, binding.name, "fast")) return .{ .text = "" };
             return .{ .text = "Correct", .regions = &.{.{ .id = 0, .text = "Correct", .bbox = .{ 0, 0, 10, 10 } }}, .tables = &.{.{ .id = 0, .rows = 1, .columns = 1, .cells = &.{.{ .row = 0, .column = 0, .text = "Correct" }} }} };
         }
-        fn validate(_: *anyopaque, _: c.Page, _: ?c.Region, _: Candidate, _: *c.Run) !bool {
-            return true;
+        fn validate(_: *anyopaque, _: c.Page, _: ?c.Region, _: Candidate, _: *c.Run) !Validation {
+            return .source_supported;
         }
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -427,8 +436,8 @@ test "document regional revisions retain owned structure after scratch teardown"
                 .fields = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"count\":7}", .{}),
             };
         }
-        fn validate(_: *anyopaque, _: c.Page, _: ?c.Region, _: Candidate, _: *c.Run) !bool {
-            return true;
+        fn validate(_: *anyopaque, _: c.Page, _: ?c.Region, _: Candidate, _: *c.Run) !Validation {
+            return .source_supported;
         }
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -468,8 +477,8 @@ test "document missing native coverage routes a whole-page repair before accepta
             try std.testing.expect(box == null);
             return .{ .text = if (std.mem.eql(u8, binding.name, "fast")) "Header" else "Header\nBody" };
         }
-        fn validate(_: *anyopaque, page: c.Page, _: ?c.Region, candidate: Candidate, _: *c.Run) !bool {
-            return std.mem.eql(u8, page.native_text, candidate.text);
+        fn validate(_: *anyopaque, page: c.Page, _: ?c.Region, candidate: Candidate, _: *c.Run) !Validation {
+            return if (std.mem.eql(u8, page.native_text, candidate.text)) .source_supported else .unsupported;
         }
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -490,8 +499,8 @@ test "document accepted regional revision can remove a previously projected tabl
             if (std.mem.eql(u8, binding.name, "fast")) return .{ .text = "Incorrect", .regions = &.{.{ .id = 7, .text = "Incorrect", .label = "table", .bbox = .{ 0, 0, 10, 10 } }}, .tables = &.{.{ .id = 0, .region_id = 7, .rows = 1, .columns = 1, .cells = &.{.{ .row = 0, .column = 0, .text = "Incorrect" }} }} };
             return .{ .text = "Correct prose", .tables = &.{} };
         }
-        fn validate(_: *anyopaque, _: c.Page, _: ?c.Region, _: Candidate, _: *c.Run) !bool {
-            return true;
+        fn validate(_: *anyopaque, _: c.Page, _: ?c.Region, _: Candidate, _: *c.Run) !Validation {
+            return .source_supported;
         }
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -512,8 +521,8 @@ test "document truncated region lists require whole-page repair" {
             if (std.mem.eql(u8, binding.name, "fast")) return .{ .text = "Header", .truncated = true, .regions = &.{.{ .id = 0, .text = "Header" }} };
             return .{ .text = "Header\nTail" };
         }
-        fn validate(_: *anyopaque, _: c.Page, _: ?c.Region, _: Candidate, _: *c.Run) !bool {
-            return true;
+        fn validate(_: *anyopaque, _: c.Page, _: ?c.Region, _: Candidate, _: *c.Run) !Validation {
+            return .source_supported;
         }
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -542,8 +551,8 @@ test "document interruptions retain accepted regional work and propagate cancell
             if (self.calls > 2) return self.failure;
             return .{ .text = try a.dupe(u8, "Correct"), .tables = try a.dupe(c.Table, &.{.{ .id = 0, .rows = 1, .columns = 1, .cells = try a.dupe(c.Cell, &.{.{ .row = 0, .column = 0, .text = try a.dupe(u8, "Correct") }}) }}), .fields = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"amount\":9007199254740993.01}", .{ .parse_numbers = false }) };
         }
-        fn validate(_: *anyopaque, _: c.Page, _: ?c.Region, _: Candidate, _: *c.Run) !bool {
-            return true;
+        fn validate(_: *anyopaque, _: c.Page, _: ?c.Region, _: Candidate, _: *c.Run) !Validation {
+            return .source_supported;
         }
     };
     const def = c.Definition{ .models = &.{ .{ .name = "fast", .model = "fast", .operation = .read }, .{ .name = "table", .model = "table", .operation = .read } }, .read = .{ .reader = "fast", .table_reader = "table" } };
@@ -587,4 +596,38 @@ test "document child output budgets include structured page data before returnin
     defer run.limits = outer;
     const def = c.Definition{ .models = &.{.{ .name = "leaf", .model = "leaf", .operation = .read }}, .read = .{ .reader = "leaf" } };
     try std.testing.expectError(error.DocumentOutputTooLarge, readPage(arena.allocator(), def, .{ .ptr = &dummy, .read_fn = Fake.read }, 0, .{ .source_id = "image", .number = 1, .kind = .image }, &run));
+}
+
+test "document unchanged refinement preserves accepted structure and completion without allocation" {
+    const Fake = struct {
+        fn read(_: *anyopaque, _: A, _: c.Binding, _: usize, _: ?[4]f64, _: *c.Run) !Candidate {
+            return .{ .text = "caption", .origin = .transcription, .status = .complete, .fields = .{ .string = "replacement" } };
+        }
+        fn validate(_: *anyopaque, _: c.Page, _: ?c.Region, _: Candidate, _: *c.Run) !Validation {
+            return .unchanged;
+        }
+    };
+    const def = c.Definition{ .models = &.{ .{ .name = "fast", .model = "fast", .operation = .read }, .{ .name = "accurate", .model = "accurate", .operation = .read } }, .read = .{ .reader = "fast", .accurate_reader = "accurate" } };
+    var dummy: u8 = 0;
+    const driver = Driver{ .ptr = &dummy, .read_fn = Fake.read, .validate_fn = Fake.validate };
+    var run = c.Run{ .limits = .{} };
+    const cells = [_]c.Cell{.{ .row = 0, .column = 0, .text = "caption" }};
+    const tables = [_]c.Table{.{ .id = 3, .rows = 1, .columns = 1, .cells = &cells }};
+    const children = [_]c.Region{.{ .id = 9, .text = "caption", .origin = .estimated }};
+    var page = c.Page{ .source_id = "receipt", .number = 1, .kind = .image, .text = "caption", .origin = .derived, .status = .truncated, .tables = &tables, .fields = .{ .string = "accepted" } };
+    var region: ?c.Region = null;
+    try refineInto(std.testing.failing_allocator, def, driver, 0, &page, &region, &run);
+    try std.testing.expectEqual(c.Status.truncated, page.status);
+    try std.testing.expectEqual(c.Origin.derived, page.origin);
+    try std.testing.expectEqualStrings("accepted", page.fields.?.string);
+    try std.testing.expect(page.tables.ptr == &tables);
+    page.status = .unresolved;
+    region = .{ .id = 7, .text = "caption", .origin = .interpretation, .confidence = 0.1, .children = &children, .tables = &tables, .fields = .{ .string = "accepted" } };
+    try refineInto(std.testing.failing_allocator, def, driver, 0, &page, &region, &run);
+    try std.testing.expectEqual(c.Status.unresolved, page.status);
+    try std.testing.expectEqual(c.Origin.interpretation, region.?.origin);
+    try std.testing.expect(!region.?.validated);
+    try std.testing.expect(region.?.children.ptr == &children);
+    try std.testing.expect(region.?.tables.ptr == &tables);
+    try std.testing.expectEqualStrings("accepted", region.?.fields.?.string);
 }
