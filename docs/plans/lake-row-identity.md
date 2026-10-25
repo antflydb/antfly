@@ -1203,21 +1203,22 @@ profiles must show positive ordered work and fewer decorated candidates.
 
 Append compaction preserves ordering only when all input metadata and bounds
 prove the concatenation monotone. Lake serving compaction also merges overlapping
-ordered runs using the native merge's explicit source map, then composes that
-permutation with original-file ranges. Adjacent output/source coordinates coalesce
+ordered runs using the native merge's output-order provenance stream, composing
+each emitted coordinate with original-file ranges. Adjacent coordinates coalesce
 into authenticated ranges. Existing eight-way, byte, workspace and source-range
 limits apply; highly fragmented mappings split into smaller packs instead of
 publishing unbounded row metadata. A pack admits at most 65,536 ranges and 4 MiB
-of authenticated source pages. Pages use a compact source dictionary plus
-fixed-width native range records, rather than repeating file/manifest paths for
-every range. Pending inputs intern source descriptors; merge workspace admission
-includes pending arenas, and query admission includes a decoded-span floor
+of authenticated source pages. A pack shares one source dictionary across its
+pages, followed by fixed-width native range records. Pending inputs intern source
+descriptors; merge workspace admission includes pending arenas, and query admission
+includes a decoded-range floor
 independent of wire size. Inverse routes coalesce contiguous original-file ranks
 even when their serving positions interleave. Physical-generation changes and
 source-rank gaps retain separate routes; historical uncoalesced maps remain
 removable during refresh.
-Native text metadata v12 and reader protocol 82 fence the writer change; retained
-v9-v11 roots and historical JSON span pages remain readable. Nested serving and
+Native text metadata v13 and reader protocol 83 fence the shared-dictionary writer;
+retained v9-v12 roots, historical JSON and page-local dictionary pages remain
+readable. Nested serving and
 checkpoint roots resolve their own authenticated versions. Existing publication
 certificates, reader leases and GC closure own every dictionary source reference;
 there is no additional artifact family.
@@ -1254,3 +1255,41 @@ all sort-work/timing samples and refresh provenance, distinguishing the explicit
 native ordering plan from the generated fallback control. These local Debug
 observations establish reduced work and metadata growth; timing attribution and
 live-cloud qualification remain separate.
+
+
+### Shared pack navigation and admission before publication (reader protocol 83)
+
+The source dictionary is authenticated by the ordered page references in the pack
+manifest. Dictionary bytes can span 64 KiB pages, so one large valid file descriptor
+does not become an artificial page-size failure. Range pages carry four little-endian
+32-bit fields: source index, original rank, serving position and count. Readers
+verify dictionary and range offsets, reference domains, complete coverage and all
+coordinate extents. The 4 MiB total admission limit includes page headers and the
+dictionary. Collectors traverse every unique physical source reference; publication
+certificates and reader leases retain their existing authority.
+
+Encoding and full pack-manifest admission precede posting publication, statistics
+and ownership mutations. An admission decline releases the candidate's readers,
+workspace and staged segment, then retries smaller input groups. Provider failures
+abort the publication; they never replay partially applied reducer contributions.
+The regression forces eight-way splitting and checks exact term frequency and
+retained pack ownership. It also covers the formerly failing 65,536-range case:
+eight long source names need 1,070,237 bytes with the shared dictionary, versus
+6,523,136 bytes with page-local dictionaries.
+
+Query readers keep the dictionary and 16-byte range views rather than expanding
+one complete file descriptor per range. Public identity mappings own source paths
+once per file, with compact forward ranges and inverse intervals. A real ordered
+merge of 16,384 interleaved coordinates initializes identities within a 2 MiB
+allocation budget (observed peak 1,099,904 bytes). Maintenance paths can expand the
+same view when they need ordinary spans. Streaming merge provenance removes the
+post-merge inverse lookup, row permutation allocation and permutation sort.
+
+Ordered top-K membership is deferred where an unmasked segment provides an exact
+header-only count: match-all, match-none and a single term without synonyms,
+including identity Boolean wrappers. Skipped runs contribute their exact totals
+without decoding their membership bitmaps. A competitive run leases its segment
+and refines membership on first probe. Deletions, synonyms and compound predicates
+retain ordinary execution; fallback enumeration materializes any remaining runs.
+Empty Boolean filters retain their zero-match semantics. Attachment and query
+options do not change.

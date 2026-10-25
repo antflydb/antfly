@@ -138,6 +138,38 @@ pub const Filter = union(enum) {
     }
 };
 
+/// Exact header-only counts for unmasked segments. Unsupported Boolean,
+/// synonym, positional and predicate cases retain ordinary bitmap execution.
+pub fn exactSegmentCardinality(a: Allocator, input: Filter, seg: *const index_mod.SegmentEntry) !?u32 {
+    var filter = input;
+    for (0..32) |_| {
+        if (filter != .bool_filter) break;
+        const boolean = filter.bool_filter;
+        try boolean.control.check();
+        if (boolean.should.len != 0 or boolean.must_not.len != 0) return null;
+        if (boolean.must.len == 0) return 0;
+        var child: ?Filter = null;
+        for (boolean.must) |required| {
+            if (required == .match_all) continue;
+            if (child != null) return null;
+            child = required;
+        }
+        filter = child orelse .{ .match_all = {} };
+    }
+    return switch (filter) {
+        .match_all => seg.reader.doc_count,
+        .match_none => 0,
+        .term => |term| blk: {
+            if (try seg.reader.getSection(term.field, .synonym) != null) break :blk null;
+            var inverted_reader = (try seg.reader.invertedIndexScoped(a, term.field)) orelse break :blk 0;
+            defer inverted_reader.deinit();
+            const found = (try inverted_reader.lookup(term.term)) orelse break :blk 0;
+            break :blk found.docFreq();
+        },
+        else => null,
+    };
+}
+
 /// Query-owned immutable programs. Only compilation runs under the lock;
 /// dictionary I/O and private DFA execution never hold it. Full/oversized
 /// caches decline reuse and preserve the ordinary per-consumer execution path.

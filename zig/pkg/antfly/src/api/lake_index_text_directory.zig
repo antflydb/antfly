@@ -44,6 +44,7 @@ pub const SegmentRecord = struct {
     sources: []const corpus.source_spans.Span = &.{},
     source_pages: []const Chunk = &.{},
     source_count: u32 = 0,
+    source_view: ?corpus.source_spans.View = null,
     members: []const corpus.Member = &.{},
     file: state.File,
     manifest: Chunk,
@@ -52,6 +53,16 @@ pub const SegmentRecord = struct {
     interval: Interval,
     route: corpus.SegmentRouting,
     rows: []const corpus.physical.Block,
+    pub fn jsonStringify(self: SegmentRecord, stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(SegmentRecord).@"struct".field_names) |field| {
+            if (comptime !std.mem.eql(u8, field, "source_view")) {
+                try stream.objectField(field);
+                try stream.write(@field(self, field));
+            }
+        }
+        try stream.endObject();
+    }
 };
 fn parseSegment(a: A, bytes: []const u8, options: std.json.ParseOptions) !SegmentRecord {
     var record = try std.json.parseFromSliceLeaky(SegmentRecord, a, bytes, options);
@@ -91,9 +102,13 @@ fn put(a: A, store: *stores.ArtifactStore, value: anytype, token: Cancellation) 
 /// Descriptor payloads contain one segment's admission, and physical metadata
 /// contains no admissions. Neither hydration nor binding decodes a whole file.
 pub fn prepare(a: A, store: *stores.ArtifactStore, group: *corpus.FileGroup, token: Cancellation) !void {
-    if (group.sources.len > corpus.source_spans.inline_spans and group.source_pages.len == 0) {
-        group.source_pages = try corpus.source_spans.publish(a, store, group.sources, token);
-        group.source_count = @intCast(group.sources.len);
+    if (group.sources.len != 0 and group.source_pages.len == 0) {
+        const prepared = try corpus.source_spans.Prepared.init(a, group.sources);
+        defer prepared.deinit(a);
+        if (prepared.pages.len != 0) {
+            group.source_pages = try prepared.publish(a, store, token);
+            group.source_count = @intCast(group.sources.len);
+        }
     }
     if (group.sources.len == 0) {
         group.physical_manifest = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .segments = &.{}, .rows = group.rows, .opening_packs = group.opening_packs }, token);
@@ -371,7 +386,7 @@ fn get(a: A, storage: tree.Store, root: ?tree.Ref, id: Id) ![]const u8 {
 fn segmentPlanningBytes(record: SegmentRecord) u64 {
     var metadata = corpus.source_spans.metadataBytes(record.sources, record.source_pages) +| record.manifest.byte_len;
     if (record.route.descriptor) |descriptor| metadata +|= descriptor.byte_len;
-    return corpus.source_spans.planningBytesWithSources(record.route.bytes, metadata, @max(record.source_count, record.sources.len));
+    return record.route.bytes +| @max(metadata *| 4, @as(u64, @max(record.source_count, record.sources.len)) *| (@sizeOf(corpus.source_spans.Range) * 12));
 }
 /// Authenticate a selected leaf's size without admitting its inventory.
 pub fn segmentBytes(a: A, storage: tree.Store, root: corpus.Root, id: Id) !u64 {
@@ -474,8 +489,17 @@ fn validateRouting(record: SegmentRecord, domain: Id) !void {
     }
 }
 fn validatePhysical(record: SegmentRecord, domain: Id, upper: u32) !void {
+    if (record.source_view) |view| {
+        if (record.sources.len != 0 or view.ranges.len != record.source_count or record.source_pages.len == 0 or record.ordinal != 0 or record.interval.lower != 0 or record.rows.len != 0 or record.physical != null) return error.InvalidNativeLakeTextCorpus;
+        for (record.source_pages) |page| try validateRef(page, domain);
+        if (record.route.live.len != 0) {
+            if (record.route.live.len != view.ranges.len) return error.InvalidNativeLakeTextCorpus;
+            for (record.route.live, view.ranges) |live, r| if (live.lower != r.pack_lower or live.count != r.count) return error.InvalidNativeLakeTextCorpus;
+        }
+        return view.validateMode(record.interval.count, domain, record.route.live.len != 0);
+    }
     if (record.source_pages.len != 0) {
-        if (record.source_count == 0 or record.source_count > corpus.source_spans.max_spans or record.source_pages.len > record.source_count or record.ordinal != 0 or record.interval.lower != 0 or record.rows.len != 0 or record.physical != null) return error.InvalidNativeLakeTextCorpus;
+        if (record.source_count == 0 or record.source_count > corpus.source_spans.max_spans or record.source_pages.len > corpus.source_spans.max_spans + 128 or record.ordinal != 0 or record.interval.lower != 0 or record.rows.len != 0 or record.physical != null) return error.InvalidNativeLakeTextCorpus;
         for (record.source_pages) |page| try validateRef(page, domain);
         if (record.sources.len == 0) return;
         if (record.sources.len != record.source_count) return error.InvalidNativeLakeTextCorpus;
@@ -661,7 +685,7 @@ fn appendSegment(a: A, records: *std.ArrayList(SegmentRecord), domain: Id, id: I
 }
 fn hydrateSources(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Cancellation, records: []SegmentRecord, reads: *u64) !void {
     for (records) |*record| if (record.source_pages.len != 0) {
-        record.sources = try corpus.source_spans.load(a, store, record.source_pages, record.source_count, root.domain, token, cached, reads);
+        record.source_view = try corpus.source_spans.loadView(a, store, record.source_pages, record.source_count, root.domain, token, cached, reads, false);
         try validateSegment(record.*, root.domain);
     };
 }
@@ -707,7 +731,7 @@ fn assembleOrdered(a: A, root: corpus.Root, records: []const SegmentRecord, part
                 try blocks.append(a, block);
             }
         }
-        try groups.append(a, .{ .masked = selected[0].route.live.len != 0, .sources = selected[0].sources, .source_pages = selected[0].source_pages, .source_count = selected[0].source_count, .file = selected[0].file, .segments = refs, .summaries = summaries, .rows = blocks.items, .physical_manifest = selected[0].physical, .selected = if (partial or blocks.items.len != 0) intervals else &.{} });
+        try groups.append(a, .{ .masked = selected[0].route.live.len != 0, .sources = selected[0].sources, .source_pages = selected[0].source_pages, .source_count = selected[0].source_count, .source_view = selected[0].source_view, .file = selected[0].file, .segments = refs, .summaries = summaries, .rows = blocks.items, .physical_manifest = selected[0].physical, .selected = if (partial or blocks.items.len != 0) intervals else &.{} });
         try manifests.append(a, selected[0].manifest);
         try routes.append(a, routing);
         try segments.appendSlice(a, refs);

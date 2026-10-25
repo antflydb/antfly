@@ -33,11 +33,11 @@ pub const term_directory = @import("lake_index_term_directory.zig");
 // Includes v8 ordered producer identities and stored projection coverage.
 // Never reuse a v8 source-free segment as a covered stored-text sidecar.
 // V11 authenticates independent serving packs and original-source spans.
-// V12/protocol 82 use compact dictionary/range source pages. Historical JSON
-// source pages and v9-v11 retained roots remain readable.
-pub const metadata_version: u16 = 12;
+// V13/protocol 83 share source dictionaries across compact range pages.
+// Historical JSON, v12 page-local dictionaries and v9-v12 roots remain readable.
+pub const metadata_version: u16 = 13;
 pub fn supportsBuildMetadata(version: u16) bool {
-    return version == 9 or version == 10 or version == 11 or version == metadata_version;
+    return version == 9 or version == 10 or version == 11 or version == 12 or version == metadata_version;
 }
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const max_segments = 262144;
@@ -139,6 +139,8 @@ pub const FileGroup = struct {
     sources: []const source_spans.Span = &.{},
     source_pages: []const artifacts.ChunkRef = &.{},
     source_count: u32 = 0,
+    /// Borrowed decoded query view, never serialized into publication metadata.
+    source_view: ?source_spans.View = null,
     /// Writer evidence for efficient inverse-route deletion. Legacy manifests
     /// delete every span start, a superset covering older uncoalesced routes.
     coalesced_source_routes: bool = false,
@@ -162,18 +164,35 @@ pub const FileGroup = struct {
     parts: []const []const source_spans.Span = &.{},
     masked: bool = false,
     live_collection: ?Collection = null,
+    pub fn jsonStringify(self: FileGroup, stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(FileGroup).@"struct".field_names) |field| {
+            if (comptime !std.mem.eql(u8, field, "source_view")) {
+                try stream.objectField(field);
+                try stream.write(@field(self, field));
+            }
+        }
+        try stream.endObject();
+    }
+    pub fn sourceLen(self: FileGroup) usize {
+        return if (self.source_view) |view| view.ranges.len else self.sources.len;
+    }
+    pub fn sourceAt(self: FileGroup, i: usize) source_spans.Span {
+        return if (self.source_view) |view| view.at(i) else self.sources[i];
+    }
     pub fn validate(self: FileGroup, domain: [32]u8) !void {
         if (self.source_pages.len != 0) {
-            if (self.source_count == 0 or self.source_count > source_spans.max_spans or self.sources.len != self.source_count) return error.InvalidNativeLakeTextCorpus;
+            if (self.source_count == 0 or self.source_count > source_spans.max_spans or self.sourceLen() != self.source_count) return error.InvalidNativeLakeTextCorpus;
             for (self.source_pages) |page| try text_directory.validateRef(page, domain);
         }
-        if (self.sources.len != 0) {
-            if (self.segments.len != 1) return error.InvalidNativeLakeTextCorpus;
-            const last = self.sources[self.sources.len - 1];
-            try source_spans.validateMode(self.sources, if (self.admissions.len != 0) self.admissions[0].doc_count else try std.math.add(u32, last.pack_lower, last.count), domain, self.masked);
+        if (self.sourceLen() != 0) {
+            if (self.segments.len != 1 or (self.source_view != null and self.sources.len != 0)) return error.InvalidNativeLakeTextCorpus;
+            const last = self.sourceAt(self.sourceLen() - 1);
+            const count = if (self.admissions.len != 0) self.admissions[0].doc_count else try std.math.add(u32, last.pack_lower, last.count);
+            if (self.source_view) |view| try view.validateMode(count, domain, self.masked) else try source_spans.validateMode(self.sources, count, domain, self.masked);
         }
         if (self.parts.len != 0) {
-            if (self.sources.len != 0 or self.parts.len != self.segments.len or self.parts.len != self.admissions.len or self.live_collection == null or self.physical_manifest == null) return error.InvalidNativeLakeTextCorpus;
+            if (self.sourceLen() != 0 or self.parts.len != self.segments.len or self.parts.len != self.admissions.len or self.live_collection == null or self.physical_manifest == null) return error.InvalidNativeLakeTextCorpus;
             var live: u64 = 0;
             for (self.parts, self.admissions) |part, admission| {
                 try source_spans.validateMode(part, admission.doc_count, domain, true);
@@ -1882,8 +1901,11 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_i
             try v.pages(entry.route.summary);
             if (v.maintenance_only) return;
             for (entry.source_pages) |page| try v.leaf(page);
-            const spans = if (entry.source_pages.len != 0 and entry.sources.len == 0) try source_spans.load(v.a, v.store, entry.source_pages, entry.source_count, v.domain, v.cancellation, null, null) else entry.sources;
-            for (spans) |span| try v.leaf(span.physical);
+            if (entry.source_pages.len != 0 and entry.sources.len == 0) {
+                const view = try source_spans.loadView(v.a, v.store, entry.source_pages, entry.source_count, v.domain, v.cancellation, null, null, false);
+                try view.validateMode(entry.interval.count, v.domain, entry.route.live.len != 0);
+                for (view.sources) |source| try v.leaf(source.physical);
+            } else for (entry.sources) |span| try v.leaf(span.physical);
             try v.leaf(entry.route.descriptor orelse return error.InvalidNativeLakeTextCorpus);
             try v.pages(entry.route.summary);
             try v.segment(entry.route.ref, true);

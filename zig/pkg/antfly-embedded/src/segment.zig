@@ -2730,11 +2730,19 @@ pub const MergeScratchOptions = struct {
     external_sort_fan_in: usize = 4,
 };
 
+/// Borrowed observer receives authenticated source coordinates in output order.
+/// It owns no payload and can build lineage without an inverse permutation.
+pub const MergeProvenance = struct {
+    ptr: *anyopaque,
+    emit: *const fn (*anyopaque, usize, u32, u32, u32) anyerror!void,
+};
+
 pub const MergeOptions = struct {
     /// Explicitly sort physical inputs that do not advertise the requested
     /// index order. Value domains and source payloads are still validated.
     input_order: enum { index_sorted, arbitrary } = .index_sorted,
     source_map: ?*MergeSourceMap = null,
+    provenance: ?MergeProvenance = null,
     scratch: ?MergeScratchOptions = null,
     index_sort: []const SegmentIndexSortField = &.{},
 };
@@ -3434,6 +3442,14 @@ pub fn writeMergedSegmentToSinkWithOptions(alloc: Allocator, output: *SegmentSin
             plan.spans = prepared.spans;
         }
         try writeSortedMergedSegmentToSink(alloc, sink, inputs, options.index_sort, &plan);
+        if (options.provenance) |observer| {
+            var iterator = plan.ordered().iterator();
+            var output_doc: u32 = 0;
+            while (try iterator.next()) |record| {
+                try observer.emit(observer.ptr, record.ref.input_idx, record.ref.doc_id, 1, output_doc);
+                output_doc += 1;
+            }
+        }
         if (options.source_map) |map| {
             if (plan.file) |file| {
                 try map.adoptFile(file);
@@ -3450,13 +3466,14 @@ pub fn writeMergedSegmentToSinkWithOptions(alloc: Allocator, output: *SegmentSin
         return;
     }
     try writeAppendMergedSegmentToSink(alloc, sink, inputs, doc_counts, rank_maps);
-    if (options.source_map) |map| {
+    if (options.source_map != null or options.provenance != null) {
         var output_doc: u32 = 0;
         for (inputs, 0..) |input, input_idx| {
             var live = LiveDocs.init(&input, 0, input.reader.doc_count);
             while (live.next()) |source_doc| {
                 const count: u32 = @intCast(live.end - source_doc);
-                try map.recordRange(input_idx, source_doc, count, output_doc);
+                if (options.source_map) |map| try map.recordRange(input_idx, source_doc, count, output_doc);
+                if (options.provenance) |observer| try observer.emit(observer.ptr, input_idx, source_doc, count, output_doc);
                 output_doc += count;
                 live.seekForward(live.end);
             }

@@ -267,19 +267,34 @@ pub const Identities = struct {
         }
     };
     const FileSpan = struct { file: []const u8, span: Span };
+    const CompactSpan = struct { source: u32, mapping: Span.Mapping };
     row_resolver: ?local.serverless_query_lake_serving.ServingSource.RowResolver = null,
     partial_inventory: bool = false,
     files: std.StringHashMapUnmanaged(Span) = .empty,
     spans: []const FileSpan = &.{},
+    compact_sources: []const FileSpan = &.{},
+    compact_spans: []const CompactSpan = &.{},
     offsets: []const u32,
     segment_ids: []const [32]u8 = &.{},
     tie_rank: ?local.search_scorer.TieRank = null,
+    pub fn spanCount(self: Identities) usize {
+        return if (self.compact_spans.len != 0) self.compact_spans.len else self.spans.len;
+    }
+    fn spanAt(self: Identities, index: usize) FileSpan {
+        if (self.compact_spans.len == 0) return self.spans[index];
+        const range = &self.compact_spans[index];
+        var result = self.compact_sources[range.source];
+        result.span.lower = range.mapping.lower;
+        result.span.upper = range.mapping.upper;
+        result.span.intervals = (&range.mapping)[0..1];
+        return result;
+    }
     pub fn init(a: A, root: corpus.Root, snapshot: *const local.index.IndexSnapshot) !Identities {
         if (root.version != corpus.metadata_version or (root.file_groups.len == 0 and snapshot.segments.len != 0)) return error.InvalidNativeLakeTextCorpus;
         const offsets = try a.alloc(u32, snapshot.segments.len + 1);
         offsets[0] = 0;
         for (snapshot.segments, 0..) |segment, i| offsets[i + 1] = try std.math.add(u32, offsets[i], segment.reader.doc_count);
-        for (root.file_groups) |group| if (group.sources.len != 0) return initPacked(a, root, snapshot, offsets);
+        for (root.file_groups) |group| if (group.sourceLen() != 0) return initPacked(a, root, snapshot, offsets);
         var result: Identities = .{ .offsets = offsets, .partial_inventory = root.partial_inventory };
         const spans = try a.alloc(FileSpan, root.file_groups.len);
         var segment: usize = 0;
@@ -315,7 +330,7 @@ pub const Identities = struct {
         return result;
     }
     const TieContext = struct {
-        spans: []const FileSpan,
+        identities: Identities,
         file_ranks: []const u32,
         file_count: usize,
         archive_docs: u32,
@@ -323,65 +338,73 @@ pub const Identities = struct {
             const self: *const @This() = @ptrCast(@alignCast(raw));
             if (doc >= self.archive_docs) return (@as(u64, self.file_count) << 32) | (doc - self.archive_docs);
             var lo: usize = 0;
-            var hi = self.spans.len;
+            var hi = self.identities.spanCount();
             while (lo < hi) {
                 const mid = lo + (hi - lo) / 2;
-                if (self.spans[mid].span.upper <= doc) lo = mid + 1 else hi = mid;
+                if (self.identities.spanAt(mid).span.upper <= doc) lo = mid + 1 else hi = mid;
             }
-            if (lo == self.spans.len) return std.math.maxInt(u64);
-            const item = self.spans[lo];
+            if (lo == self.identities.spanCount()) return std.math.maxInt(u64);
+            const item = self.identities.spanAt(lo);
             return (@as(u64, self.file_ranks[lo]) << 32) | (item.span.original(doc) catch return std.math.maxInt(u64));
         }
     };
     fn initPacked(a: A, root: corpus.Root, snapshot: *const local.index.IndexSnapshot, offsets: []const u32) !Identities {
         var result: Identities = .{ .offsets = offsets, .partial_inventory = root.partial_inventory };
         const Mapping = Span.Mapping;
-        var mappings: std.StringHashMapUnmanaged(std.ArrayList(Mapping)) = .empty;
+        const FileMappings = struct { index: u32, intervals: std.ArrayList(Mapping) = .empty };
+        var mappings: std.StringHashMapUnmanaged(FileMappings) = .empty;
         defer {
             var it = mappings.valueIterator();
-            while (it.next()) |v| v.deinit(std.heap.page_allocator);
+            while (it.next()) |value| value.intervals.deinit(std.heap.page_allocator);
             mappings.deinit(std.heap.page_allocator);
         }
-        var spans: std.ArrayList(FileSpan) = .empty;
+        var sources: std.ArrayList(FileSpan) = .empty;
+        var spans: std.ArrayList(CompactSpan) = .empty;
         var segment: usize = 0;
         for (root.file_groups) |group| {
-            if (group.sources.len == 0 or group.segments.len != 1 or segment >= snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
-            try corpus.source_spans.validateMode(group.sources, snapshot.segments[segment].reader.doc_count, root.domain, group.masked);
-            for (group.sources) |source| {
-                const owned = try std.json.Stringify.valueAlloc(a, source, .{});
-                defer a.free(owned);
-                const src = try std.json.parseFromSliceLeaky(corpus.source_spans.Span, a, owned, .{ .allocate = .alloc_always });
+            if (group.sourceLen() == 0 or group.segments.len != 1 or segment >= snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
+            if (group.source_view) |view| try view.validateMode(snapshot.segments[segment].reader.doc_count, root.domain, group.masked) else try corpus.source_spans.validateMode(group.sources, snapshot.segments[segment].reader.doc_count, root.domain, group.masked);
+            for (0..group.sourceLen()) |index| {
+                const src = group.sourceAt(index);
                 const lower = try std.math.add(u32, offsets[segment], src.pack_lower);
                 const upper = try std.math.add(u32, lower, src.count);
-                const mapping = try a.dupe(Mapping, &.{.{ .file_lower = src.file_lower, .lower = lower, .upper = upper }});
-                const ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = src.physical.artifact_id, .checksum = src.physical.checksum, .byte_len = src.physical.byte_len };
-                const span: Span = .{ .lower = lower, .upper = upper, .rows = &.{}, .intervals = mapping, .manifest = ref, .expected_rows = src.file_rows };
-                try spans.append(a, .{ .file = src.file.id, .span = span });
+                const list = try mappings.getOrPut(std.heap.page_allocator, src.file.id);
                 const entry = try result.files.getOrPut(a, src.file.id);
-                if (!entry.found_existing) entry.value_ptr.* = span else {
+                if (!list.found_existing) {
+                    if (entry.found_existing) return error.InvalidNativeLakeTextCorpus;
+                    const name = try a.dupe(u8, src.file.id);
+                    entry.key_ptr.* = name;
+                    const ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = try a.dupe(u8, src.physical.artifact_id), .checksum = try a.dupe(u8, src.physical.checksum), .byte_len = src.physical.byte_len };
+                    entry.value_ptr.* = .{ .lower = lower, .upper = upper, .rows = &.{}, .manifest = ref, .expected_rows = src.file_rows };
+                    list.value_ptr.* = .{ .index = @intCast(sources.items.len) };
+                    try sources.append(a, .{ .file = name, .span = entry.value_ptr.* });
+                } else {
+                    if (!entry.found_existing) return error.InvalidNativeLakeTextCorpus;
                     const old = entry.value_ptr;
-                    if (old.expected_rows != span.expected_rows or !std.mem.eql(u8, old.manifest.?.artifact_id, span.manifest.?.artifact_id)) return error.InvalidNativeLakeTextCorpus;
+                    if (old.expected_rows != src.file_rows or old.manifest.?.byte_len != src.physical.byte_len or !std.mem.eql(u8, old.manifest.?.artifact_id, src.physical.artifact_id) or !std.mem.eql(u8, old.manifest.?.checksum, src.physical.checksum)) return error.InvalidNativeLakeTextCorpus;
                     old.lower = @min(old.lower, lower);
                     old.upper = @max(old.upper, upper);
                 }
-                const list = try mappings.getOrPut(std.heap.page_allocator, src.file.id);
-                if (!list.found_existing) list.value_ptr.* = .empty;
-                try list.value_ptr.append(std.heap.page_allocator, mapping[0]);
+                const mapping: Mapping = .{ .file_lower = src.file_lower, .lower = lower, .upper = upper };
+                try spans.append(a, .{ .source = list.value_ptr.index, .mapping = mapping });
+                try list.value_ptr.intervals.append(std.heap.page_allocator, mapping);
             }
             segment += 1;
         }
         if (segment != snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
         var it = mappings.iterator();
         while (it.next()) |entry| {
-            std.mem.sort(Mapping, entry.value_ptr.items, {}, struct {
+            const intervals = entry.value_ptr.intervals.items;
+            std.mem.sort(Mapping, intervals, {}, struct {
                 fn less(_: void, l: Mapping, r: Mapping) bool {
                     return l.file_lower < r.file_lower;
                 }
             }.less);
-            for (entry.value_ptr.items, 0..) |m, i| if (i != 0 and @as(u64, entry.value_ptr.items[i - 1].file_lower) + entry.value_ptr.items[i - 1].upper - entry.value_ptr.items[i - 1].lower > m.file_lower) return error.InvalidNativeLakeTextCorpus;
-            result.files.getPtr(entry.key_ptr.*).?.intervals = try a.dupe(Mapping, entry.value_ptr.items);
+            for (intervals, 0..) |m, i| if (i != 0 and @as(u64, intervals[i - 1].file_lower) + intervals[i - 1].upper - intervals[i - 1].lower > m.file_lower) return error.InvalidNativeLakeTextCorpus;
+            result.files.getPtr(entry.key_ptr.*).?.intervals = try a.dupe(Mapping, intervals);
         }
-        result.spans = try spans.toOwnedSlice(a);
+        result.compact_sources = try sources.toOwnedSlice(a);
+        result.compact_spans = try spans.toOwnedSlice(a);
         const hashes = try a.alloc([32]u8, result.files.count());
         var keys = result.files.keyIterator();
         for (hashes) |*hash| hash.* = corpus.term_directory.identity(keys.next().?.*);
@@ -390,20 +413,20 @@ pub const Identities = struct {
                 return std.mem.order(u8, &l, &r) == .lt;
             }
         }.less);
+        defer a.free(hashes);
         const tie = try a.create(TieContext);
-        const ranks = try a.alloc(u32, result.spans.len);
-        for (result.spans, ranks) |item, *rank| {
-            const id = corpus.term_directory.identity(item.file);
-            var lo: usize = 0;
-            var hi = hashes.len;
-            while (lo < hi) {
-                const mid = lo + (hi - lo) / 2;
-                if (std.mem.order(u8, &hashes[mid], &id) == .lt) lo = mid + 1 else hi = mid;
+        const ranks = try a.alloc(u32, result.spanCount());
+        for (ranks, 0..) |*rank, i| {
+            const id = corpus.term_directory.identity(result.spanAt(i).file);
+            var lower: usize = 0;
+            var upper = hashes.len;
+            while (lower < upper) {
+                const middle = lower + (upper - lower) / 2;
+                if (std.mem.order(u8, &hashes[middle], &id) == .lt) lower = middle + 1 else upper = middle;
             }
-            rank.* = @intCast(lo);
+            rank.* = @intCast(lower);
         }
-        a.free(hashes);
-        tie.* = .{ .spans = result.spans, .file_ranks = ranks, .file_count = result.files.count(), .archive_docs = offsets[segment] };
+        tie.* = .{ .identities = result, .file_ranks = ranks, .file_count = result.files.count(), .archive_docs = offsets[segment] };
         result.tie_rank = .{ .ptr = tie, .rank = TieContext.rank };
         return result;
     }
@@ -411,13 +434,13 @@ pub const Identities = struct {
     /// Admission and physical packing must never define the public tie order.
     pub fn logicalPosition(self: Identities, ordinal_value: u32) !@import("lake_index_text_directory.zig").Position {
         var lo: usize = 0;
-        var hi = self.spans.len;
+        var hi = self.spanCount();
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            if (self.spans[mid].span.upper <= ordinal_value) lo = mid + 1 else hi = mid;
+            if (self.spanAt(mid).span.upper <= ordinal_value) lo = mid + 1 else hi = mid;
         }
-        if (lo == self.spans.len) return error.InvalidNativeLakeTextCorpus;
-        const item = self.spans[lo];
+        if (lo == self.spanCount()) return error.InvalidNativeLakeTextCorpus;
+        const item = self.spanAt(lo);
         return .{ .file = corpus.term_directory.identity(item.file), .rank = try item.span.original(ordinal_value) };
     }
     /// Translate a query-wide compressed physical tombstone set into just the
@@ -425,7 +448,10 @@ pub const Identities = struct {
     pub fn bitmapForPhysical(self: Identities, a: A, selected: *const @import("lake_index_physical_set.zig").Set, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead) anyerror!Bitmap {
         if (self.row_resolver) |resolver| {
             var window_rows: usize = 0;
-            for (self.spans) |item| window_rows +|= item.span.upper - item.span.lower;
+            for (0..self.spanCount()) |i| {
+                const item = self.spanAt(i);
+                window_rows +|= item.span.upper - item.span.lower;
+            }
             if (window_rows != 0 and selected.boundedCardinality(window_rows) == null)
                 return self.bitmapForCurrentCandidates(a, selected, store, cached, resolver);
             var mapped = try indexSelectionCut(a, resolver.current_source, resolver.current_snapshot, resolver, selected);
@@ -470,7 +496,8 @@ pub const Identities = struct {
         defer scratch.deinit();
         var refs: [256]local.storage_rowsource_types.RowRef = undefined;
         var docs: [256]u32 = undefined;
-        for (self.spans) |item| {
+        for (0..self.spanCount()) |i| {
+            const item = self.spanAt(i);
             var begin = item.span.lower;
             while (begin < item.span.upper) {
                 try cached.context.ensureActive();
@@ -680,13 +707,13 @@ pub const Identities = struct {
     /// physical blocks. Delete holes use the same authenticated rank directory.
     pub fn physicalRow(self: Identities, a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, ordinal_value: u32, source: []const u8, snapshot: []const u8) !local.storage_rowsource_types.RowRef {
         var lo: usize = 0;
-        var hi = self.spans.len;
+        var hi = self.spanCount();
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            if (self.spans[mid].span.upper <= ordinal_value) lo = mid + 1 else hi = mid;
+            if (self.spanAt(mid).span.upper <= ordinal_value) lo = mid + 1 else hi = mid;
         }
-        if (lo == self.spans.len) return error.InvalidNativeLakeTextCorpus;
-        const file = self.spans[lo];
+        if (lo == self.spanCount()) return error.InvalidNativeLakeTextCorpus;
+        const file = self.spanAt(lo);
         const blocks = try file.span.blocks(cache, store, cached, file.file);
         if (ordinal_value < file.span.lower) return error.InvalidNativeLakeTextCorpus;
         const relative = try file.span.original(ordinal_value);
@@ -1221,7 +1248,7 @@ fn PredicateResolver(comptime Set: type) type {
         fn openProducer(self: Self, a: A, pa: A, compiled: Compiled) !?Result {
             // Only a proven exact whole-index conjunction can be deferred.
             // Boolean combinations and residual predicates retain the planner.
-            if (self.identities.spans.len == 0) return null;
+            if (self.identities.spanCount() == 0) return null;
             var conditions: std.ArrayList(Condition) = .empty;
             if (!try collectConditions(pa, compiled, &conditions, 0)) return null;
             var predicate = (try rows.tryOpenPredicateWithContext(a, self.server, self.table, conditions.items, self.context, self.source, self.pinned)) orelse return null;

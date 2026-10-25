@@ -862,7 +862,7 @@ const Execution = struct {
         // Recent/enriched documents retain the ordinary stored-identity path.
         if (self.overlay != null or self.active_recent) return null;
         const identities = self.text_identities.get(@intFromPtr(snapshot)) orelse return null;
-        if (identities.spans.len == 0) return null;
+        if (identities.spanCount() == 0) return null;
         self.ordinal_live_rows.backing = self.result_allocator;
         var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
         defer scratch.deinit();

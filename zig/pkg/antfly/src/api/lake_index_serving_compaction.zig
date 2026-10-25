@@ -77,6 +77,7 @@ const Builder = struct {
     masked_documents: u32 = 0,
     serving_bytes: u64 = 0,
     serving_metadata_bytes: ?u64 = 0,
+    source_page_budget: usize = corpus.source_spans.max_total_bytes,
     fn check(self: *@This()) !void {
         try self.context.ensureActive();
         try self.token.check();
@@ -158,6 +159,41 @@ const Builder = struct {
         _ = self.pending_arena[level].reset(.free_all);
     }
     fn emit(self: *@This(), inputs: []const Input, level: usize) anyerror!void {
+        self.emitAdmitted(inputs, level) catch |err| switch (err) {
+            // Only pre-publication admission produces this signal. All scoped
+            // readers, staged files and workspace are released before retry.
+            error.ServingPackAdmissionDeclined => {
+                if (inputs.len <= 1) return error.NativeLakeTextCorpusTooLarge;
+                const middle = inputs.len / 2;
+                try self.emit(inputs[0..middle], level);
+                try self.emit(inputs[middle..], level);
+            },
+            else => return err,
+        };
+    }
+    fn admitSources(self: *@This(), a: A, sources: []const Span) !corpus.source_spans.Prepared {
+        return corpus.source_spans.Prepared.initWithLimit(a, sources, self.source_page_budget) catch |err| switch (err) {
+            error.OutOfMemory, error.NativeLakeTextCorpusTooLarge => error.ServingPackAdmissionDeclined,
+            else => err,
+        };
+    }
+    fn admitGroup(a: A, admission: local.segment.SegmentReader.Admission, sources: []const Span, prepared: corpus.source_spans.Prepared) !void {
+        // Artifact IDs/checksums have fixed bounded encodings. Reserve room
+        // for the single descriptor and statistics reference before any reducer
+        // receives contributions; provider failures after admission still abort.
+        const identity: [175]u8 = @splat('a');
+        const checksum: [64]u8 = @splat('f');
+        const ref: Chunk = .{ .artifact_id = &identity, .checksum = &checksum, .byte_len = std.math.maxInt(u64) };
+        const pages = a.alloc(Chunk, prepared.pages.len) catch return error.ServingPackAdmissionDeclined;
+        defer a.free(pages);
+        @memset(pages, ref);
+        const name: [69]u8 = @splat('f');
+        const preview: corpus.FileGroup = .{ .file = .{ .id = &name, .digest = @splat(255) }, .sources = if (pages.len == 0) sources else &.{}, .source_pages = pages, .source_count = if (pages.len == 0) 0 else @intCast(sources.len), .coalesced_source_routes = true, .segments = &.{ref}, .admissions = &.{admission}, .summaries = &.{null} };
+        const bytes = std.json.Stringify.valueAlloc(a, preview, .{}) catch return error.ServingPackAdmissionDeclined;
+        defer a.free(bytes);
+        if (bytes.len +| 8192 > corpus.max_root_bytes) return error.ServingPackAdmissionDeclined;
+    }
+    fn emitAdmitted(self: *@This(), inputs: []const Input, level: usize) anyerror!void {
         try self.check();
         var pending_bytes: usize = 0;
         for (self.pending_arena) |arena_| pending_bytes +|= arena_.queryCapacity();
@@ -173,11 +209,12 @@ const Builder = struct {
             var span = span_;
             if (!input.masked) span.pack_lower = count;
             count = try std.math.add(u32, count, span.count);
-            try sources.append(out, span);
+            sources.append(out, span) catch return error.ServingPackAdmissionDeclined;
         };
         if (count == 0) return;
         const reuse = inputs.len == 1 and (count == inputs[0].original_docs or inputs[0].masked);
         var group: corpus.FileGroup = undefined;
+        var prepared_sources: ?corpus.source_spans.Prepared = null;
         var contributed = false;
         if (reuse and inputs[0].staged == null) {
             const input = inputs[0];
@@ -188,22 +225,17 @@ const Builder = struct {
                 retained.retain();
                 break :blk retained;
             } else self.mergeMapped(a, out, inputs, &sources)) catch |err| switch (err) {
-                error.OutOfMemory, error.NativeLakeTextCorpusTooLarge, error.SqlProgramLimitExceeded => {
-                    if (inputs.len == 1) return err;
-                    arena.deinit();
-                    arena_live = false;
-                    const mid = inputs.len / 2;
-                    try self.emit(inputs[0..mid], level);
-                    try self.emit(inputs[mid..], level);
-                    return;
-                },
+                error.OutOfMemory, error.NativeLakeTextCorpusTooLarge, error.SqlProgramLimitExceeded => return error.ServingPackAdmissionDeclined,
                 else => return err,
             };
             defer staged.release();
             var reader = try local.segment.SegmentReader.initSource(a, staged.source());
             var reader_live = true;
             defer if (reader_live) reader.deinit();
-            const admission = try reader.admission(out);
+            const admission = reader.admission(out) catch |err| switch (err) {
+                error.OutOfMemory => return error.ServingPackAdmissionDeclined,
+                else => return err,
+            };
             if (admission.doc_count != count) return error.InvalidNativeLakeTextCorpus;
             if (level < 3 and sources.items.len >= std.math.pow(usize, 8, level + 1) and sources.items.len < corpus.source_spans.max_spans and staged.file.size < 2 * 1024 * 1024) {
                 // Intermediate levels stay private and local. Only final packs
@@ -220,6 +252,10 @@ const Builder = struct {
                 try self.addAt(level + 1, input);
                 return;
             }
+            // No posting/statistics artifact or reducer mutation precedes the
+            // complete source-map byte admission, including shared dictionaries.
+            prepared_sources = try self.admitSources(out, sources.items);
+            try admitGroup(out, admission, sources.items, prepared_sources.?);
             var prior_blocks: [8]Chunk = undefined;
             var prior_count: usize = 0;
             for (inputs) |input| if (input.ref) |ref| {
@@ -248,6 +284,12 @@ const Builder = struct {
             arena_live = false;
             try self.addAt(level + 1, input);
             return;
+        }
+        const admitted = prepared_sources orelse try self.admitSources(out, sources.items);
+        if (prepared_sources == null) try admitGroup(out, group.admissions[0], sources.items, admitted);
+        if (admitted.pages.len != 0) {
+            group.source_pages = try admitted.publish(out, self.store, self.token);
+            group.source_count = @intCast(group.sources.len);
         }
         const digest = corpus.term_directory.identity(group.segments[0].artifact_id);
         const id = try std.fmt.allocPrint(out, "pack-{x}", .{&digest});
@@ -313,72 +355,73 @@ const Builder = struct {
         if (staged.statistics) |captured| captured.disableForward();
         const order = try local.segment.commonIndexSortForMergeInputsAlloc(a, merged[0..inputs.len]);
         defer local.segment.freeIndexSortFields(a, order);
-        var counts: [8]u32 = undefined;
-        var live: u32 = 0;
-        for (inputs, 0..) |input, i| {
-            counts[i] = input.original_docs;
-            for (input.sources) |span| live = try std.math.add(u32, live, span.count);
-        }
-        // The native merge owns the permutation. Never infer output positions
-        // from input order once an ordered merge can interleave source runs.
-        var mapping = if (order.len != 0) try local.segment.MergeSourceMap.init(a, counts[0..inputs.len]) else null;
-        defer if (mapping) |*value| value.deinit();
+        var lineage: StreamingLineage = .{ .owner = self, .out = out, .inputs = inputs };
         var sink = staged.sink();
-        try local.segment.writeMergedSegmentToSinkWithOptions(a, &sink, merged[0..inputs.len], .{ .index_sort = order, .source_map = if (mapping) |*value| value else null });
+        try local.segment.writeMergedSegmentToSinkWithOptions(a, &sink, merged[0..inputs.len], .{
+            .index_sort = order,
+            .provenance = if (order.len != 0 and sources != null) .{ .ptr = &lineage, .emit = StreamingLineage.emit } else null,
+        });
         try staged.seal();
-        if (mapping) |*value| if (sources) |destination| {
-            try value.finishOutput(live);
-            const mapped = try composeSpans(self, a, out, inputs, value, live);
-            destination.* = mapped;
+        if (order.len != 0) if (sources) |destination| {
+            var live: u32 = 0;
+            for (inputs) |input| for (input.sources) |span| {
+                live = try std.math.add(u32, live, span.count);
+            };
+            if (lineage.rows != live) return error.InvalidNativeLakeTextCorpus;
+            destination.* = lineage.spans;
         };
         return staged;
     }
 };
-/// Compose native merge provenance with authenticated original-file ranges.
-/// Use compact ranges on wire. Highly fragmented merges split into smaller
-/// packs through emit's existing admission fallback instead of unbounded JSON.
-fn composeSpans(self: *Builder, a: A, out: A, inputs: []const Input, mapping: *local.segment.MergeSourceMap, live: u32) !std.ArrayList(Span) {
-    const Row = struct { output: u32, input: u8, span: u16, rank: u32 };
-    const rows = try a.alloc(Row, live);
-    defer a.free(rows);
-    var count: usize = 0;
-    for (inputs, 0..) |input, i| for (input.sources, 0..) |span, j| {
-        for (0..span.count) |offset| {
-            if (count % 1024 == 0) try self.check();
-            const location = (try mapping.lookupRead(i, span.pack_lower + @as(u32, @intCast(offset)))) orelse return error.InvalidNativeLakeTextCorpus;
-            if (location.segment != 0 or count == rows.len) return error.InvalidNativeLakeTextCorpus;
-            rows[count] = .{ .output = location.doc, .input = @intCast(i), .span = @intCast(j), .rank = span.file_lower + @as(u32, @intCast(offset)) };
-            count += 1;
-        }
-    };
-    if (count != rows.len) return error.InvalidNativeLakeTextCorpus;
-    std.mem.sort(Row, rows, {}, struct {
-        fn less(_: void, l: Row, r: Row) bool {
-            return l.output < r.output;
-        }
-    }.less);
-    var result: std.ArrayList(Span) = .empty;
-    errdefer result.deinit(out);
-    for (rows, 0..) |row, ordinal| {
-        if (ordinal % 1024 == 0) try self.check();
-        if (row.output != ordinal) return error.InvalidNativeLakeTextCorpus;
-        const original = inputs[row.input].sources[row.span];
-        if (result.items.len != 0) {
-            const last = &result.items[result.items.len - 1];
-            if (last.file_lower + last.count == row.rank and std.mem.eql(u8, last.file.id, original.file.id) and std.mem.eql(u8, last.physical.artifact_id, original.physical.artifact_id)) {
-                last.count += 1;
-                continue;
+/// Consume native output order directly. No per-row inverse-map lookup, row
+/// permutation allocation or post-merge coordinate sort is needed.
+const StreamingLineage = struct {
+    owner: *Builder,
+    out: A,
+    inputs: []const Input,
+    spans: std.ArrayList(Span) = .empty,
+    rows: u32 = 0,
+    fn emit(raw: *anyopaque, input: usize, source: u32, count: u32, output: u32) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (input >= self.inputs.len or count == 0 or output != self.rows) return error.InvalidNativeLakeTextCorpus;
+        if (self.rows % 1024 == 0) try self.owner.check();
+        var current = source;
+        var left = count;
+        const spans = self.inputs[input].sources;
+        while (left != 0) {
+            var lower: usize = 0;
+            var upper = spans.len;
+            while (lower < upper) {
+                const middle = lower + (upper - lower) / 2;
+                if (spans[middle].pack_lower <= current) lower = middle + 1 else upper = middle;
             }
+            if (lower == 0) return error.InvalidNativeLakeTextCorpus;
+            const original = spans[lower - 1];
+            if (current - original.pack_lower >= original.count) return error.InvalidNativeLakeTextCorpus;
+            const n = @min(left, original.count - (current - original.pack_lower));
+            const rank = try std.math.add(u32, original.file_lower, current - original.pack_lower);
+            var appended = false;
+            if (self.spans.items.len != 0) {
+                const last = &self.spans.items[self.spans.items.len - 1];
+                if (@as(u64, last.file_lower) + last.count == rank and std.mem.eql(u8, last.file.id, original.file.id) and std.mem.eql(u8, last.physical.artifact_id, original.physical.artifact_id)) {
+                    last.count = try std.math.add(u32, last.count, n);
+                    appended = true;
+                }
+            }
+            if (!appended) {
+                if (self.spans.items.len == corpus.source_spans.max_spans) return error.NativeLakeTextCorpusTooLarge;
+                var span = original;
+                span.pack_lower = self.rows;
+                span.file_lower = rank;
+                span.count = n;
+                try self.spans.append(self.out, span);
+            }
+            self.rows = try std.math.add(u32, self.rows, n);
+            current = try std.math.add(u32, current, n);
+            left -= n;
         }
-        if (result.items.len == corpus.source_spans.max_spans) return error.NativeLakeTextCorpusTooLarge;
-        var span = original;
-        span.pack_lower = row.output;
-        span.file_lower = row.rank;
-        span.count = 1;
-        try result.append(out, span);
     }
-    return result;
-}
+};
 
 fn metadataBytes(group: corpus.FileGroup, manifest: Chunk) u64 {
     var bytes = corpus.source_spans.metadataBytes(group.sources, group.source_pages) +| manifest.byte_len;
@@ -1154,6 +1197,24 @@ test "external lake global frontier ordered compaction composes interleaved orig
         const source_pages = try corpus.source_spans.publish(out, &store, sources.items, .none);
         const loaded = try corpus.source_spans.loadPublication(out, store, source_pages, @intCast(sources.items.len), store.upload_scope.?.domain, .none, null);
         try std.testing.expectEqualDeep(sources.items, loaded);
+        const view = try corpus.source_spans.loadView(out, store, source_pages, @intCast(sources.items.len), store.upload_scope.?.domain, .none, null, null, true);
+        var writer = try local.index.IndexWriter.init(a);
+        defer writer.deinit();
+        try writer.addSegment(actual);
+        const root: corpus.Root = .{ .domain = store.upload_scope.?.domain, .binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .index_config_hash = "recipe", .column_bindings = &.{"body"} }, .config_json = "{}", .file_groups = &.{.{ .file = .{ .id = "pack", .digest = @splat(1) }, .source_view = view, .source_pages = source_pages, .source_count = @intCast(sources.items.len), .segments = &.{inputs[0].ref.?} }} };
+        var budget: local.sql_memory_budget = .{ .backing = a, .limit = 2 * 1024 * 1024 };
+        var region = std.heap.ArenaAllocator.init(budget.allocator());
+        defer region.deinit();
+        const identities = try @import("lake_index_text_predicate.zig").Identities.init(region.allocator(), root, writer.snapshot());
+        try std.testing.expectEqual(@as(usize, 0), identities.spans.len);
+        try std.testing.expectEqual(@as(usize, 2), identities.compact_sources.len);
+        try std.testing.expectEqual(@as(usize, 16384), identities.compact_spans.len);
+        for (0..16384) |ordinal| {
+            const position = try identities.logicalPosition(@intCast(ordinal));
+            try std.testing.expectEqual(corpus.term_directory.identity(inputs[ordinal % 2].sources[0].file.id), position.file);
+            try std.testing.expectEqual(@as(u32, @intCast(ordinal / 2)), position.rank);
+        }
+        std.debug.print("COMPACT_IDENTITIES ranges=16384 sources=2 peak_bytes={d} resident_range_bytes={d}\n", .{ budget.peak, identities.compact_spans.len * @sizeOf(@TypeOf(identities.compact_spans[0])) });
         var merged_reader = try local.segment.SegmentReader.init(out, actual);
         defer merged_reader.deinit();
         var bounds = (try merged_reader.indexSortBoundsAlloc(out)).?;
@@ -1163,4 +1224,88 @@ test "external lake global frontier ordered compaction composes interleaved orig
     }
     try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
     try std.testing.expectEqual(@as(usize, 0), manager.files);
+}
+
+test "external lake global frontier serving admission splits before statistics and ownership mutations" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("serving-admission-split");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(94), 1, std.testing.io);
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var check: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &check, .checkpoint = Check.call };
+    defer manager.deinit();
+    var staging: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &check, .checkpoint = Check.call, .max_bytes = 32 * 1024 * 1024, .async_writes = false };
+    defer staging.deinit();
+    var summaries: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &check, .checkpoint = Check.call, .max_bytes = 8 * 1024 * 1024, .async_writes = false };
+    defer summaries.deinit();
+    var reads: u64 = 64 * 1024 * 1024;
+    var writes: u64 = 64 * 1024 * 1024;
+    var pages: pages_mod.PageStore = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    pages.admitPublication();
+    var terms = corpus.term_directory.Builder.init(a, &manager);
+    defer terms.deinit();
+    var ownership = corpus.text_directory.Mutations.init(a, &manager, pages.store());
+    defer ownership.deinit();
+    var routes = corpus.text_directory.Mutations.init(a, &manager, pages.store());
+    defer routes.deinit();
+    var ties = corpus.text_directory.Mutations.init(a, &manager, pages.store());
+    defer ties.deinit();
+    ties.reduction = @import("lake_index_text_ties.zig").reduce;
+    var metadata: corpus.text_directory.Publisher = undefined;
+    try metadata.init(a, &store, .none, std.testing.io);
+    defer metadata.deinit();
+    var builder: Builder = .{ .a = a, .out = out, .store = &store, .context = .{ .io = std.testing.io }, .token = .none, .pages = &pages, .terms = &terms, .ownership = &ownership, .source_routes = &routes, .ties = &ties, .metadata = &metadata, .staging = &staging, .summary_staging = &summaries, .pending_arena = .{ .init(a), .init(a), .init(a), .init(a) }, .source_page_budget = 1024 };
+    defer for (&builder.pending_arena) |*pending| pending.deinit();
+    var inputs: [8]Input = undefined;
+    for (&inputs, 0..) |*input, i| {
+        const id = try std.fmt.allocPrint(out, "row-{d}", .{i});
+        var sink_impl = local.segment.MemorySegmentSink.init(out);
+        defer sink_impl.deinit();
+        var sink = sink_impl.sink();
+        try local.storage_db_document_mapper.writeTextSegmentFromProjectionBatchToSink(out, .{ .docs = &.{.{ .id = id, .stored_data = "{}", .text_fields = &.{.{ .field_name = "body", .text = "quasar" }} }} }, .{}, .{ .index_sort = &.{.{ .field = "_id" }} }, &sink);
+        const bytes = try sink_impl.finishOwned();
+        var reader = try local.segment.SegmentReader.init(out, bytes);
+        defer reader.deinit();
+        const ref = try @import("lake_index_seekable_text.zig").publish(out, out, &store, bytes, .none);
+        const summary = try corpus.statistics.publishSegmentWithIo(out, &store, bytes, .none, std.testing.io);
+        const file: state.File = .{ .id = try std.fmt.allocPrint(out, "source-{d}", .{i}), .digest = @splat(1) };
+        const admission = try reader.admission(out);
+        const physical = try put(out, out, &store, corpus.FileGroup{ .file = file, .segments = &.{ref}, .admissions = &.{admission}, .summaries = &.{summary}, .rows = &.{.{ .group = 0, .high = 0, .base = 0, .lower = 0, .count = 1 }} }, .none);
+        input.* = .{ .ref = ref, .admission = admission, .sources = try out.dupe(Span, &.{.{ .file = file, .physical = physical, .file_rows = 1, .file_lower = 0, .pack_lower = 0, .count = 1 }}), .original_docs = 1, .summary = summary };
+    }
+    var combined: [8]Span = undefined;
+    for (inputs, &combined, 0..) |input, *span, i| {
+        span.* = input.sources[0];
+        span.pack_lower = @intCast(i);
+    }
+    try std.testing.expectError(error.ServingPackAdmissionDeclined, builder.admitSources(out, &combined));
+    try builder.emit(&inputs, 3);
+    try std.testing.expectEqual(@as(u32, 8), builder.pack_count);
+    try std.testing.expectEqual(@as(u64, 0), staging.live_bytes);
+    const published = try terms.finish(pages.store(), .{});
+    const key = try corpus.statistics.keyAlloc(out, "body", "quasar");
+    const prefix = try corpus.term_directory.prefixAlloc(out, key);
+    var cursor = try tree.Cursor.init(out, pages.store(), published.leaves, prefix, null);
+    defer cursor.deinit();
+    var frequency: u32 = 0;
+    var segments: usize = 0;
+    while (try cursor.next()) |record| {
+        if (!std.mem.startsWith(u8, record.key, prefix)) break;
+        frequency += (try corpus.statistics.Summary.decode(record.value)).frequency;
+        segments += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 8), frequency);
+    try std.testing.expectEqual(@as(usize, 8), segments);
+    const directories = try metadata.finish(.{});
+    try std.testing.expectEqual(@as(u64, 8), directories.files.?.records);
+    std.debug.print("SERVING_ADMISSION retained_packs=8 exact_term_frequency=8 no_rejected_merge_contributions=true\n", .{});
 }

@@ -3886,6 +3886,6 @@ restarts and closes its managed server/session on initialization, interruption
 and finalization errors. Publication readiness covers the complete embedded,
 additional and schema-relational index set. Custom logical identity fields drive
 the exact result oracle without altering physical source coordinates. Declared
-native text ordering remains [an explicit outstanding engine task](lake-row-identity.md#qualification-integrity-and-outstanding-physical-ordering):
-its implementation must preserve ordinal lineage through every producer and
-compactor before a performance claim can be accepted.
+native text ordering uses [authenticated coordinate layouts and native merge provenance](lake-row-identity.md#qualification-integrity-and-native-physical-ordering).
+Producer and compactor lineage, exact answers and bounded admission are qualified
+before accepting performance claims.
