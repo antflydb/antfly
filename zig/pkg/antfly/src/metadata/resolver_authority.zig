@@ -26,13 +26,14 @@ pub const owners_key = "_resolver_record_owners";
 pub const AliasProfile = records.AliasProfile;
 /// Private proof captured atomically with the physical table definition.
 /// It is never accepted from public table/index JSON or client actors.
-pub const Admission = struct { table_id: u64, name: []const u8, native: bool, schema: [32]u8 };
+pub const Admission = struct { table_id: u64, name: []const u8, native: bool, schema: [32]u8, query_schema: ?[32]u8 = null };
 pub const Read = struct {
     mode: enum { entity, proposal, proposals, receipt, policy } = .entity,
     key_template: []const u8 = "",
     texts: []const []const u8 = &.{},
     aliases: []const @import("antfly_resolver").KeyAlias = &.{},
     distinct: bool = false,
+    expected_head: ?records.Stamp = null,
     key: []const u8 = "",
     into: ?[]const u8 = null,
     seeds: []const []const u8 = &.{},
@@ -123,6 +124,11 @@ pub fn schemaFingerprint(a: A, table: metadata.TableRecord) ![32]u8 {
     for (keys) |key| try sorted.put(a, key, root.object.get(key).?);
     copy.indexes_json = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = sorted }, .{});
     return @import("antfly_resolver").fingerprint(a, copy);
+}
+pub fn queryDefinitionFingerprint(a: A, table: metadata.TableRecord) ![32]u8 {
+    var copy = table;
+    copy.indexes_json = "{}";
+    return @import("antfly_resolver").fingerprint(a, .{ try schemaFingerprint(a, copy), try sourceDefinitionFingerprint(a, table.indexes_json) });
 }
 /// Stable source declarations exclude destination discovery and derived
 /// projection clocks. Private head publication cannot invalidate other scopes.

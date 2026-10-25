@@ -7460,13 +7460,16 @@ pub fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_name: capi
     if (extraction) |value| {
         if (value != .object or value.object.get("entities") == null or value.object.get("entities").? != .array) return capi.mapErrorContext(error.InvalidArgument, "extraction must contain an entities array");
     }
-    const configs = handle.database().listResolvers(alloc) catch |err| return capi.mapError(err);
+    const configs = handle.database().core.index_manager.listPublicResolverRoutingDescriptors(alloc) catch |err| return capi.mapError(err);
     defer {
         for (configs) |*cfg| cfg.deinit(alloc);
         alloc.free(configs);
     }
     for (configs) |*cfg| {
         if (!std.mem.eql(u8, cfg.name, resolver_name.bytes())) continue;
+        var query_arena = std.heap.ArenaAllocator.init(alloc);
+        defer query_arena.deinit();
+        var policy_session = @import("resolver_authority.zig").QuerySession.init(query_arena.allocator(), handle, cfg.*, configs) catch |err| return capi.mapError(err);
         if (cfg.source_artifact_kind == .chunk) return capi.mapErrorContext(error.InvalidArgument, "query resolution requires an asset-scoped resolver");
         // Native connections cache producers on their provider-owning snapshot;
         // read-only databases otherwise have no enrichment producer. Repeated
@@ -7501,27 +7504,16 @@ pub fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_name: capi
             handle = guard.handle;
             // Canonical lookup uses the latest snapshot. Configuration changes
             // require a retry rather than mixing two resolver/schema versions.
-            const current = handle.database().listResolvers(alloc) catch |err| {
+            policy_session.verify(handle) catch |err| {
                 alloc.free(bytes);
                 return capi.mapError(err);
-            };
-            defer {
-                for (current) |*entry| entry.deinit(alloc);
-                alloc.free(current);
-            }
-            var unchanged = current.len == configs.len;
-            if (unchanged) for (current, configs) |a, b| {
-                if (!a.eql(b)) {
-                    unchanged = false;
-                    break;
-                }
             };
             var latest_plan = handle.database().resolverQueryPlanAlloc(alloc, cfg.*) catch |err| {
                 alloc.free(bytes);
                 return capi.mapError(err);
             };
             defer latest_plan.deinit(alloc);
-            if (!unchanged or !plan.eql(latest_plan)) {
+            if (!plan.eql(latest_plan)) {
                 alloc.free(bytes);
                 return capi.mapErrorContext(error.Busy, "resolver or extractor configuration changed during extraction; retry");
             }
@@ -7532,7 +7524,7 @@ pub fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_name: capi
         const mention_embedder = handle.database().resolution_embedder;
         const suspend_resolution = guard.connection != null and (cfg.adjudicate_json.len > 0 or cfg.name_embedding.len > 0);
         if (suspend_resolution) guard.suspendQuery();
-        const computed = @import("../storage/db/resolution_runtime.zig").resolveQueryExtractionAlloc(alloc, configs, cfg, extracted, candidates, mention_embedder);
+        const computed = @import("../storage/db/resolution_runtime.zig").resolveQueryExtractionWithPolicyAlloc(alloc, configs, cfg, extracted, candidates, mention_embedder, policy_session.loader());
         if (!guard.resumeQuery(handle_ptr)) {
             if (computed) |bytes| alloc.free(bytes) else |_| {}
             return capi.mapErrorContext(error.Busy, "query handle closed during resolution; retry");
@@ -7544,21 +7536,7 @@ pub fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_name: capi
         handle = guard.handle;
         const resolution = computed catch |err| return capi.mapErrorContext(err, "resolving query mentions against canonical entities");
         defer alloc.free(resolution);
-        if (suspend_resolution) {
-            const current = handle.database().listResolvers(alloc) catch |err| return capi.mapError(err);
-            defer {
-                for (current) |*entry| entry.deinit(alloc);
-                alloc.free(current);
-            }
-            var unchanged = current.len == configs.len;
-            if (unchanged) for (current, configs) |actual, captured| {
-                if (!actual.eql(captured)) {
-                    unchanged = false;
-                    break;
-                }
-            };
-            if (!unchanged) return capi.mapErrorContext(error.Busy, "resolver configuration changed during resolution; retry");
-        }
+        policy_session.verify(handle) catch |err| return capi.mapErrorContext(err, "resolver dependencies changed during resolution; retry");
         var parsed_extraction = std.json.parseFromSlice(std.json.Value, alloc, extracted, .{}) catch |err| return capi.mapError(err);
         defer parsed_extraction.deinit();
         var parsed_resolution = std.json.parseFromSlice(std.json.Value, alloc, resolution, .{}) catch |err| return capi.mapError(err);

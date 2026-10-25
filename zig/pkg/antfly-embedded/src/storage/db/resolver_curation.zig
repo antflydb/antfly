@@ -139,16 +139,14 @@ pub fn namespacesFromValue(a: std.mem.Allocator, root: std.json.Value) !Namespac
     return result;
 }
 pub fn replaceNamespace(a: std.mem.Allocator, root: *std.json.Value, next: Namespace) !void {
+    return replaceNamespacesBatch(a, root, &.{next});
+}
+pub fn replaceNamespacesBatch(a: std.mem.Allocator, root: *std.json.Value, updates: []const Namespace) !void {
     const current = try namespacesFromValue(a, root.*);
-    var items: std.ArrayListUnmanaged(Namespace) = .empty;
-    var found = false;
-    for (current.namespaces) |item| {
-        const match = std.mem.eql(u8, item.key_template, next.key_template);
-        try items.append(a, if (match) next else item);
-        found = found or match;
-    }
-    if (!found) try items.append(a, next);
-    try root.object.put(a, namespaces_key, try json(a, Namespaces{ .namespaces = items.items }));
+    var items: std.StringArrayHashMapUnmanaged(Namespace) = .empty;
+    for (current.namespaces) |item| try items.put(a, item.key_template, item);
+    for (updates) |item| try items.put(a, item.key_template, item);
+    try root.object.put(a, namespaces_key, try json(a, Namespaces{ .namespaces = items.values() }));
 }
 /// Upgrade folds identical legacy corrections and rejects disagreements before
 /// publishing the shared authority. Declarative aliases remain source-local.
@@ -1423,4 +1421,21 @@ test "resolver curation namespace propagation shared admission excludes executio
     selected.deinit(bounded.allocator());
     bounded.reset();
     try std.testing.expectError(error.OutOfMemory, catalog.ResolverConfig.clone(bounded.allocator(), cfg));
+}
+
+test "resolver curation namespace propagation batch updates stay within a linear memory budget" {
+    const alloc = std.testing.allocator;
+    const buffer = try alloc.alloc(u8, 16 * 1024 * 1024);
+    defer alloc.free(buffer);
+    var bounded = std.heap.FixedBufferAllocator.init(buffer);
+    const a = bounded.allocator();
+    var root: std.json.Value = .{ .object = .empty };
+    const namespaces = try a.alloc(Namespace, 1000);
+    for (namespaces, 0..) |*namespace, i| namespace.* = .{ .key_template = try std.fmt.allocPrint(a, "entity-{d}/{{{{_key}}}}", .{i}), .revision = 1 };
+    try replaceNamespacesBatch(a, &root, namespaces);
+    for (namespaces) |*namespace| namespace.revision = 2;
+    try replaceNamespacesBatch(a, &root, namespaces);
+    const current = try namespacesFromValue(a, root);
+    try std.testing.expectEqual(namespaces.len, current.namespaces.len);
+    for (current.namespaces) |namespace| try std.testing.expectEqual(@as(u64, 2), namespace.revision);
 }

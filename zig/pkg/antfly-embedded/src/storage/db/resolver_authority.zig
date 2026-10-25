@@ -34,6 +34,7 @@ pub const Backend = struct {
     remove: *const fn (*anyopaque, A, []const u8) anyerror!void,
     scan: *const fn (*anyopaque, A, []const u8, ?[]const u8, u32) anyerror!Page,
 };
+pub const Stamp = struct { revision: u64, fingerprint: [32]u8 };
 pub const Head = struct {
     version: u8 = 1,
     key_template: []const u8,
@@ -405,38 +406,112 @@ pub const Store = struct {
         }
         return values.snapshot(h);
     }
+    const PinReady = struct { endpoints: u64 };
+    const PinCount = struct { key: []const u8, count: u64 };
+    fn pinReadyPath(self: Store, template: []const u8) ![]const u8 {
+        return self.keyPath(try std.fmt.allocPrint(self.a, "pin-ready/{s}", .{try hash(self.a, template)}));
+    }
+    fn pinCountPath(self: Store, template: []const u8, id: []const u8) ![]const u8 {
+        return self.keyPath(try std.fmt.allocPrint(self.a, "pin-count/{s}/{s}", .{ try hash(self.a, template), try hash(self.a, id) }));
+    }
+    fn pinCount(self: Store, template: []const u8, id: []const u8) !u64 {
+        const raw = try self.backend.get(self.backend.ptr, self.a, try self.pinCountPath(template, id)) orelse return 0;
+        return (try parse(PinCount, self.a, raw)).count;
+    }
+    fn pinChild(self: Store, template: []const u8, parent: []const u8, child: []const u8, present: bool) !void {
+        const path = try std.mem.concat(self.a, u8, &.{ try self.adjacent(template, "pin-child", parent), try hash(self.a, child) });
+        if (present) try self.backend.put(self.backend.ptr, self.a, path, try encode(self.a, child)) else try self.backend.remove(self.backend.ptr, self.a, path);
+    }
+    fn setPinCount(self: Store, template: []const u8, id: []const u8, count: u64) !void {
+        const path = try self.pinCountPath(template, id);
+        if (count == 0) try self.backend.remove(self.backend.ptr, self.a, path) else try self.backend.put(self.backend.ptr, self.a, path, try encode(self.a, PinCount{ .key = id, .count = count }));
+    }
+    fn ownPin(self: Store, template: []const u8, id: []const u8) !bool {
+        return (try self.backend.scan(self.backend.ptr, self.a, try self.adjacent(template, "distinct-key", id), null, 1)).rows.len != 0;
+    }
+    /// Linear, atomic adoption for old namespaces. Ordinary edits maintain the
+    /// sparse index incrementally; readers never infer readiness from a head.
+    pub fn ensurePinIndex(self: Store, template: []const u8) !void {
+        const ready = try self.pinReadyPath(template);
+        if (try self.backend.get(self.backend.ptr, self.a, ready) != null) return;
+        const Node = struct { target: ?[]const u8 = null, incoming: usize = 0, pins: u64 = 0 };
+        var nodes: std.StringArrayHashMapUnmanaged(Node) = .empty;
+        inline for (.{ Kind.redirect, Kind.distinct }) |kind| {
+            var after: ?[]const u8 = null;
+            while (true) {
+                const page = try self.backend.scan(self.backend.ptr, self.a, try self.records(template, kind), after, 128);
+                for (page.rows) |row| {
+                    if (kind == .redirect) {
+                        const alias = try parse(resolver.KeyAlias, self.a, row.value);
+                        const from = try nodes.getOrPut(self.a, alias.key);
+                        if (!from.found_existing) from.value_ptr.* = .{};
+                        from.value_ptr.target = alias.target;
+                        const to = try nodes.getOrPut(self.a, alias.target);
+                        if (!to.found_existing) to.value_ptr.* = .{};
+                        to.value_ptr.incoming += 1;
+                    } else {
+                        const pair = try parse(c.Pair, self.a, row.value);
+                        for ([_][]const u8{ pair.from, pair.to }) |id| {
+                            const node = try nodes.getOrPut(self.a, id);
+                            if (!node.found_existing) node.value_ptr.* = .{};
+                            node.value_ptr.pins = 1;
+                        }
+                    }
+                }
+                after = page.next;
+                if (after == null) break;
+            }
+        }
+        var total: u64 = 0;
+        for (nodes.values()) |node| total += node.pins;
+        var leaves: std.ArrayList(usize) = .empty;
+        for (nodes.values(), 0..) |node, i| if (node.incoming == 0) try leaves.append(self.a, i);
+        var offset: usize = 0;
+        while (offset < leaves.items.len) : (offset += 1) {
+            const node = nodes.values()[leaves.items[offset]];
+            if (node.target) |target| {
+                const i = nodes.getIndex(target).?;
+                nodes.values()[i].pins = try std.math.add(u64, nodes.values()[i].pins, node.pins);
+                nodes.values()[i].incoming -= 1;
+                if (nodes.values()[i].incoming == 0) try leaves.append(self.a, i);
+            }
+        }
+        if (offset != nodes.count()) return error.InvalidResolverAliasCycle;
+        for (nodes.keys(), nodes.values()) |id, node| if (node.pins != 0) {
+            try self.setPinCount(template, id, node.pins);
+            if (node.target) |target| try self.pinChild(template, target, id, true);
+        };
+        try self.backend.put(self.backend.ptr, self.a, ready, try encode(self.a, PinReady{ .endpoints = total }));
+    }
+    fn movePins(self: Store, template: []const u8, start: []const u8, amount: u64, add: bool, detached: std.StringHashMapUnmanaged(void)) !void {
+        if (amount == 0) return;
+        var id = start;
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        while (true) {
+            if ((try seen.getOrPut(self.a, id)).found_existing) return error.InvalidResolverAliasCycle;
+            const old = try self.pinCount(template, id);
+            const next = if (add) try std.math.add(u64, old, amount) else try std.math.sub(u64, old, amount);
+            try self.setPinCount(template, id, next);
+            if (detached.contains(id)) break;
+            const edge = try self.get(resolver.KeyAlias, template, .redirect, id) orelse break;
+            try self.pinChild(template, edge.target, id, next != 0);
+            id = edge.target;
+        }
+    }
     /// Query policy is projected at one native read cut. Rendering follows only
     /// forward edges; scoring also needs incident distinct pins and their paths.
     /// Text suppression is always a point lookup, never a namespace export.
     pub fn queryPolicy(self: Store, template: []const u8, seeds: []const []const u8, texts: []const []const u8, static_aliases: []const resolver.KeyAlias, distinct: bool) !?Snapshot {
-        var snapshot: Snapshot = undefined;
-        // An indexed one-row existence probe avoids reverse expansion for the
-        // common namespace without distinct pins. Existing files need no backfill.
-        const has_pins = distinct and (try self.backend.scan(self.backend.ptr, self.a, try self.records(template, .distinct), null, 1)).rows.len != 0;
-        if (has_pins) {
-            snapshot = (try self.componentWithAliases(template, seeds, static_aliases)) orelse return null;
-        } else {
-            const h = try self.head(template) orelse return null;
-            var edges: std.StringHashMapUnmanaged([]const u8) = .empty;
-            for (static_aliases) |alias| try edges.put(self.a, alias.key, alias.target);
-            var seen: std.StringHashMapUnmanaged(void) = .empty;
-            var values: Values = .{};
-            for (seeds) |seed| {
-                var id = seed;
-                while (true) {
-                    if ((try seen.getOrPut(self.a, id)).found_existing) break;
-                    if (seen.count() > 16384) return error.ResolverCurationLimitExceeded;
-                    inline for (.{ Kind.suppressed, Kind.suppression, Kind.redirect_origin, Kind.removed_alias }) |kind| if (try self.backend.get(self.backend.ptr, self.a, try self.record(template, kind, id))) |raw| try values.append(self.a, kind, raw);
-                    if (try self.get(resolver.KeyAlias, template, .redirect, id)) |alias| {
-                        try values.aliases.append(self.a, alias);
-                        id = alias.target;
-                    } else {
-                        if (try self.get([]const u8, template, .removed_alias, id) != null) break;
-                        id = edges.get(id) orelse break;
-                    }
-                }
+        var snapshot = (try self.queryForward(template, seeds, static_aliases, 16384)) orelse return null;
+        if (distinct) {
+            if (try self.backend.get(self.backend.ptr, self.a, try self.pinReadyPath(template))) |raw_ready| {
+                if ((try parse(PinReady, self.a, raw_ready)).endpoints != 0) snapshot = try self.pinnedQuery(template, seeds, static_aliases, snapshot);
+            } else {
+                // Released read-only namespaces retain conservative semantics
+                // until an authorized writer adopts the derived directory.
+                if ((try self.backend.scan(self.backend.ptr, self.a, try self.records(template, .distinct), null, 1)).rows.len != 0)
+                    snapshot = (try self.componentWithAliases(template, seeds, static_aliases)).?;
             }
-            snapshot = values.snapshot(h);
         }
         var rules: std.ArrayList([]const u8) = .empty;
         var normalized: std.StringHashMapUnmanaged(void) = .empty;
@@ -447,6 +522,82 @@ pub const Store = struct {
         }
         snapshot.namespace.state.suppress.texts = rules.items;
         return snapshot;
+    }
+    fn queryForward(self: Store, template: []const u8, seeds: []const []const u8, static_aliases: []const resolver.KeyAlias, limit: usize) !?Snapshot {
+        const h = try self.head(template) orelse return null;
+        var edges: std.StringHashMapUnmanaged([]const u8) = .empty;
+        for (static_aliases) |alias| try edges.put(self.a, alias.key, alias.target);
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        var values: Values = .{};
+        for (seeds) |seed| {
+            var id = seed;
+            while (true) {
+                if ((try seen.getOrPut(self.a, id)).found_existing) break;
+                if (seen.count() > limit) return error.ResolverCurationLimitExceeded;
+                inline for (.{ Kind.suppressed, Kind.suppression, Kind.redirect_origin, Kind.removed_alias }) |kind| if (try self.backend.get(self.backend.ptr, self.a, try self.record(template, kind, id))) |raw| try values.append(self.a, kind, raw);
+                if (try self.get(resolver.KeyAlias, template, .redirect, id)) |alias| {
+                    try values.aliases.append(self.a, alias);
+                    id = alias.target;
+                } else {
+                    if (try self.get([]const u8, template, .removed_alias, id) != null) break;
+                    id = edges.get(id) orelse break;
+                }
+            }
+        }
+        return values.snapshot(h);
+    }
+    fn pinnedQuery(self: Store, template: []const u8, seeds: []const []const u8, static_aliases: []const resolver.KeyAlias, initial: Snapshot) !Snapshot {
+        var graph = initial;
+        if (static_aliases.len != 0) {
+            var all: std.ArrayList([]const u8) = .empty;
+            try all.appendSlice(self.a, seeds);
+            for (static_aliases) |alias| try all.append(self.a, alias.key);
+            graph = (try self.queryForward(template, all.items, static_aliases, std.math.maxInt(usize))).?;
+        }
+        var native_keys: std.StringHashMapUnmanaged(void) = .empty;
+        for (graph.namespace.merges) |alias| try native_keys.put(self.a, alias.key, {});
+        const policy_index = try c.Index.init(self.a, "", try encode(self.a, graph.namespace.state));
+        var effective: std.ArrayList(resolver.KeyAlias) = .empty;
+        for (static_aliases) |alias| if (!native_keys.contains(alias.key) and !policy_index.removed_aliases.contains(alias.key)) try effective.append(self.a, alias);
+        try effective.appendSlice(self.a, graph.namespace.merges);
+        const redirects = try c.RedirectIndex.init(self.a, effective.items);
+        var canonical: std.StringHashMapUnmanaged(void) = .empty;
+        var pending: std.ArrayList([]const u8) = .empty;
+        for (seeds) |seed| {
+            const id = redirects.canonical(seed);
+            if (!(try canonical.getOrPut(self.a, id)).found_existing) try pending.append(self.a, id);
+        }
+        for (static_aliases) |alias| if (canonical.contains(redirects.canonical(alias.key))) try pending.append(self.a, alias.key);
+        var visited: std.StringHashMapUnmanaged(void) = .empty;
+        var pairs: std.StringHashMapUnmanaged(c.Pair) = .empty;
+        var offset: usize = 0;
+        while (offset < pending.items.len) : (offset += 1) {
+            const id = pending.items[offset];
+            if ((try visited.getOrPut(self.a, id)).found_existing or try self.pinCount(template, id) == 0) continue;
+            inline for (.{ "distinct-key", "pin-child" }) |kind| {
+                var after: ?[]const u8 = null;
+                while (true) {
+                    const page = try self.backend.scan(self.backend.ptr, self.a, try self.adjacent(template, kind, id), after, 128);
+                    for (page.rows) |row| {
+                        if (comptime std.mem.eql(u8, kind, "pin-child")) try pending.append(self.a, try parse([]const u8, self.a, row.value)) else try pairs.put(self.a, row.key[row.key.len - 64 ..], try parse(c.Pair, self.a, row.value));
+                    }
+                    after = page.next;
+                    if (after == null) break;
+                }
+            }
+        }
+        if (pairs.count() == 0) return initial;
+        var selected: std.ArrayList([]const u8) = .empty;
+        try selected.appendSlice(self.a, seeds);
+        var values: std.ArrayList(c.Pair) = .empty;
+        var it = pairs.valueIterator();
+        while (it.next()) |pair| {
+            try values.append(self.a, pair.*);
+            try selected.appendSlice(self.a, &.{ pair.from, pair.to });
+        }
+        var result = (try self.queryForward(template, selected.items, static_aliases, 16384)).?;
+        result.namespace.state.distinct = values.items;
+        return result;
     }
     pub fn mentionPolicy(self: Store, template: []const u8, key: []const u8, text: []const u8, static_aliases: []const resolver.KeyAlias) !?Snapshot {
         return self.queryPolicy(template, &.{key}, &.{text}, static_aliases, false);
@@ -535,6 +686,7 @@ pub const Store = struct {
                 const id = paths.items[path_offset];
                 if ((try seen.getOrPut(self.a, id)).found_existing) continue;
                 if (seen.count() > 16384) return error.ResolverCurationLimitExceeded;
+                inline for (.{ Kind.suppressed, Kind.suppression, Kind.redirect_origin, Kind.removed_alias }) |kind| if (try self.backend.get(self.backend.ptr, self.a, try self.record(template, kind, id))) |raw| try values.append(self.a, kind, raw);
                 if (lookup) |indexed| for (try indexed.expand(indexed.ptr, self.a, id, true, mask)) |edge| try paths.append(self.a, edge.target);
                 if (forward.get(id)) |edges| try paths.appendSlice(self.a, edges.items);
                 if (try self.get(resolver.KeyAlias, template, .redirect, id)) |alias| {
@@ -764,6 +916,9 @@ pub const Store = struct {
             try self.backend.put(self.backend.ptr, self.a, try self.record(h.key_template, row.kind, row.id), row.value);
             try self.indexRecord(h.key_template, row.kind, row.id, row.value, true);
         }
+        if (namespace.state.distinct.len == 0) {
+            try self.backend.put(self.backend.ptr, self.a, try self.pinReadyPath(h.key_template), try encode(self.a, PinReady{ .endpoints = 0 }));
+        } else try self.ensurePinIndex(h.key_template);
         try self.indexHead(h);
         try self.backend.put(self.backend.ptr, self.a, try self.headPath(h.key_template), try encode(self.a, h));
     }
@@ -830,6 +985,28 @@ pub const Store = struct {
         try self.preflight(patch);
         const previous = try self.head(patch.next.key_template);
         if ((if (previous) |h| h.revision else 0) != patch.expected_revision or patch.next.revision <= patch.expected_revision) return error.ResolverCurationConflict;
+        try self.ensurePinIndex(patch.next.key_template);
+        var detached: std.StringHashMapUnmanaged(void) = .empty;
+        var endpoints: std.StringHashMapUnmanaged(bool) = .empty;
+        for (patch.edits) |edit| if (edit.kind == .distinct) {
+            if (try self.get(c.Pair, patch.next.key_template, .distinct, edit.id)) |pair| for ([_][]const u8{ pair.from, pair.to }) |id| if (!endpoints.contains(id)) try endpoints.put(self.a, id, try self.ownPin(patch.next.key_template, id));
+            if (edit.value) |value| {
+                const pair = try parse(c.Pair, self.a, try encode(self.a, value));
+                for ([_][]const u8{ pair.from, pair.to }) |id| if (!endpoints.contains(id)) try endpoints.put(self.a, id, try self.ownPin(patch.next.key_template, id));
+            }
+        };
+        // Detach all replaced edges before attaching any final edge. This
+        // keeps count propagation acyclic even when edits rotate a whole path.
+        for (patch.edits) |edit| if (edit.kind == .redirect) {
+            try detached.put(self.a, edit.id, {});
+            if (try self.get(resolver.KeyAlias, patch.next.key_template, .redirect, edit.id)) |edge| {
+                const amount = try self.pinCount(patch.next.key_template, edit.id);
+                if (amount != 0) {
+                    try self.pinChild(patch.next.key_template, edge.target, edit.id, false);
+                    try self.movePins(patch.next.key_template, edge.target, amount, false, detached);
+                }
+            }
+        };
         var h = patch.next;
         h.bytes = if (previous) |old| old.bytes else 0;
         var seen: std.StringHashMapUnmanaged(void) = .empty;
@@ -848,6 +1025,24 @@ pub const Store = struct {
                 try self.indexRecord(h.key_template, edit.kind, edit.id, raw, true);
             } else try self.backend.remove(self.backend.ptr, self.a, path);
         }
+        var pin_ready = try parse(PinReady, self.a, (try self.backend.get(self.backend.ptr, self.a, try self.pinReadyPath(h.key_template))).?);
+        var changed_endpoints = endpoints.iterator();
+        while (changed_endpoints.next()) |entry| {
+            const now = try self.ownPin(h.key_template, entry.key_ptr.*);
+            if (now != entry.value_ptr.*) {
+                try self.movePins(h.key_template, entry.key_ptr.*, 1, now, detached);
+                pin_ready.endpoints = if (now) try std.math.add(u64, pin_ready.endpoints, 1) else try std.math.sub(u64, pin_ready.endpoints, 1);
+            }
+        }
+        if (endpoints.count() != 0) try self.backend.put(self.backend.ptr, self.a, try self.pinReadyPath(h.key_template), try encode(self.a, pin_ready));
+        for (patch.edits) |edit| if (edit.kind == .redirect) {
+            _ = detached.remove(edit.id);
+            if (try self.get(resolver.KeyAlias, h.key_template, .redirect, edit.id)) |edge| {
+                const count = try self.pinCount(h.key_template, edit.id);
+                if (count != 0) try self.pinChild(h.key_template, edge.target, edit.id, true);
+                try self.movePins(h.key_template, edge.target, count, true, detached);
+            }
+        };
         std.crypto.hash.sha2.Sha256.hash(try encode(self.a, .{ if (previous) |old| old.fingerprint else @as([32]u8, @splat(0)), h.key_template, h.revision, h.min_text_chars, h.adoption_revision, h.adoption_standalone, patch.edits }), &h.fingerprint, .{});
         if (previous == null) try self.indexHead(h);
         try self.backend.put(self.backend.ptr, self.a, try self.headPath(h.key_template), try encode(self.a, h));
@@ -1122,6 +1317,20 @@ pub fn validatePortableRow(a: A, key: []const u8, raw: []const u8) !void {
         parts[count] = part;
         count += 1;
     }
+    if ((count == 2 and std.mem.eql(u8, parts[0], "pin-ready")) or (count == 3 and std.mem.eql(u8, parts[0], "pin-count"))) {
+        for (parts[1..count]) |part| {
+            if (part.len != 64) return error.InvalidMetadataBatch;
+            for (part) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
+        }
+        if (count == 2) {
+            _ = try parse(Store.PinReady, a, raw);
+        } else {
+            const value = try parse(Store.PinCount, a, raw);
+            try c.validKey(value.key);
+            if (value.count == 0 or !std.mem.eql(u8, parts[2], try hash(a, value.key))) return error.InvalidMetadataBatch;
+        }
+        return;
+    }
     if (count == 2 and std.mem.eql(u8, parts[0], "head-route-node")) {
         if (parts[1].len != 64 or (!std.mem.eql(u8, raw, "0") and !std.mem.eql(u8, raw, "1"))) return error.InvalidMetadataBatch;
         for (parts[1]) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
@@ -1173,7 +1382,7 @@ pub fn validatePortableRow(a: A, key: []const u8, raw: []const u8) !void {
         return;
     }
     // Index envelopes contain a typed key/ID or an incident distinct pair.
-    if (count == 4 and (std.mem.eql(u8, parts[0], "incoming") or std.mem.eql(u8, parts[0], "cascade") or std.mem.eql(u8, parts[0], "distinct-key"))) {
+    if (count == 4 and (std.mem.eql(u8, parts[0], "incoming") or std.mem.eql(u8, parts[0], "cascade") or std.mem.eql(u8, parts[0], "pin-child") or std.mem.eql(u8, parts[0], "distinct-key"))) {
         for (parts[1..4]) |part| {
             if (part.len != 64) return error.InvalidMetadataBatch;
             for (part) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
@@ -1629,7 +1838,7 @@ test "resolver curation query policy bounds fan in and composes static overrides
     try std.testing.expectEqualStrings("entity/a42", current.namespace.merges[0].key);
     try std.testing.expectEqual(@as(usize, 1), current.namespace.state.suppress.texts.len);
     try std.testing.expectEqual(@as(usize, 1), current.namespace.state.removed_aliases.len);
-    try std.testing.expect(memory.reads < 32 and memory.scans == 1 and memory.visited == 0);
+    try std.testing.expect(memory.reads < 32 and memory.scans == 0 and memory.visited == 0);
     std.debug.print("query policy 10k incoming aliases: gets={d} scans={d} rows={d}\n", .{ memory.reads, memory.scans, memory.visited });
 }
 
@@ -1662,4 +1871,117 @@ test "resolver curation query policy unions bounded batches with a head lineage 
     var divergent = part;
     divergent.head.fingerprint = @splat(2);
     try std.testing.expectError(error.ResolverCurationConflict, unionQueryPolicies(a, &.{ part, divergent }));
+}
+
+test "resolver curation query policy unrelated pins never expand a large reverse component" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "authority/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    var aliases: [10000]resolver.KeyAlias = undefined;
+    for (&aliases, 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/a{d}", .{i}), .target = "entity/hub" };
+    var state: policy.Namespace = .{ .key_template = template, .revision = 1, .merges = &aliases, .state = .{ .distinct = &.{.{ .from = "entity/unrelated-a", .to = "entity/unrelated-b" }} } };
+    try store.apply(try difference(a, .{ .key_template = template }, state));
+    memory.reads = 0;
+    memory.scans = 0;
+    memory.visited = 0;
+    const sparse = (try store.queryPolicy(template, &.{"entity/hub"}, &.{}, &.{}, true)).?;
+    try std.testing.expectEqual(@as(usize, 0), sparse.namespace.merges.len);
+    try std.testing.expect(memory.reads < 16 and memory.scans == 0 and memory.visited == 0);
+    std.debug.print("PIN INDEX 10k incoming unrelated: gets={d} scans={d} rows={d}\n", .{ memory.reads, memory.scans, memory.visited });
+    const previous = state;
+    state.revision = 2;
+    state.state.distinct = &.{.{ .from = "entity/a42", .to = "entity/other" }};
+    try store.apply(try difference(a, previous, state));
+    memory.reads = 0;
+    memory.scans = 0;
+    memory.visited = 0;
+    const incident = (try store.queryPolicy(template, &.{"entity/hub"}, &.{}, &.{}, true)).?;
+    try std.testing.expectEqual(@as(usize, 1), incident.namespace.merges.len);
+    try std.testing.expectEqual(@as(usize, 1), incident.namespace.state.distinct.len);
+    try std.testing.expect(memory.visited < 8 and memory.reads < 40);
+    const next = state;
+    state.revision = 3;
+    const changed = try a.dupe(resolver.KeyAlias, &aliases);
+    changed[42].target = "entity/final";
+    state.merges = changed;
+    try store.apply(try difference(a, next, state));
+    const old = (try store.queryPolicy(template, &.{"entity/hub"}, &.{}, &.{}, true)).?;
+    const moved = (try store.queryPolicy(template, &.{"entity/final"}, &.{}, &.{}, true)).?;
+    try std.testing.expectEqual(@as(usize, 0), old.namespace.state.distinct.len);
+    try std.testing.expectEqual(@as(usize, 1), moved.namespace.state.distinct.len);
+    const last = state;
+    state.revision = 4;
+    state.state.distinct = &.{};
+    try store.apply(try difference(a, last, state));
+    try std.testing.expectEqual(@as(u64, 0), try store.pinCount(template, "entity/final"));
+    try std.testing.expectEqual(@as(u64, 0), try store.pinCount(template, "entity/a42"));
+}
+
+test "resolver curation pin index backfills legacy namespaces before publishing readiness" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = lite_prefix, .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    try store.apply(try difference(a, .{ .key_template = template }, .{ .key_template = template, .revision = 1, .merges = &.{ .{ .key = "entity/a", .target = "entity/b" }, .{ .key = "entity/b", .target = "entity/c" } }, .state = .{ .distinct = &.{.{ .from = "entity/a", .to = "entity/other" }} } }));
+    var derived: std.ArrayList([]const u8) = .empty;
+    var rows = memory.rows.iterator();
+    while (rows.next()) |row| {
+        try validatePortableRow(a, row.key_ptr.*, row.value_ptr.*);
+        if (std.mem.startsWith(u8, row.key_ptr.*[lite_prefix.len..], "pin-")) try derived.append(a, row.key_ptr.*);
+    }
+    try std.testing.expect(derived.items.len > 3);
+    for (derived.items) |key| _ = memory.rows.remove(key);
+    try std.testing.expect(memory.rows.get(try store.pinReadyPath(template)) == null);
+    try store.ensurePinIndex(template);
+    try std.testing.expectEqual(@as(u64, 1), try store.pinCount(template, "entity/c"));
+    const result = (try store.queryPolicy(template, &.{"entity/c"}, &.{}, &.{}, true)).?;
+    try std.testing.expectEqual(@as(usize, 1), result.namespace.state.distinct.len);
+    try std.testing.expectEqual(@as(usize, 2), result.namespace.merges.len);
+    const writes = memory.writes;
+    try store.ensurePinIndex(template);
+    try std.testing.expectEqual(writes, memory.writes);
+}
+
+test "resolver curation pin index preserves rotated paths static overlays and tombstones" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "authority/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "{{_key}}";
+    const statics: []const resolver.KeyAlias = &.{ .{ .key = "a", .target = "s" }, .{ .key = "c", .target = "t" }, .{ .key = "y", .target = "q" } };
+    const stages: []const policy.Namespace = &.{
+        .{ .key_template = template, .revision = 1, .merges = &.{ .{ .key = "a", .target = "b" }, .{ .key = "b", .target = "c" }, .{ .key = "x", .target = "y" } }, .state = .{ .distinct = &.{.{ .from = "a", .to = "x" }} } },
+        .{ .key_template = template, .revision = 2, .merges = &.{ .{ .key = "b", .target = "a" }, .{ .key = "x", .target = "y" } }, .state = .{ .distinct = &.{ .{ .from = "a", .to = "x" }, .{ .from = "b", .to = "z" } } } },
+        .{ .key_template = template, .revision = 3, .merges = &.{ .{ .key = "b", .target = "a" }, .{ .key = "x", .target = "y" } }, .state = .{ .distinct = &.{ .{ .from = "a", .to = "x" }, .{ .from = "b", .to = "z" } }, .removed_aliases = &.{"a"} } },
+    };
+    const Build = struct {
+        fn index(alloc: A, scope: Snapshot, static: []const resolver.KeyAlias) !c.Index {
+            var negatives = try c.Index.init(alloc, "", try encode(alloc, scope.namespace.state));
+            var edges: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+            for (static) |alias| if (!negatives.removed_aliases.contains(alias.key)) try edges.put(alloc, alias.key, alias.target);
+            for (scope.namespace.merges) |alias| try edges.put(alloc, alias.key, alias.target);
+            const all = try alloc.alloc(resolver.KeyAlias, edges.count());
+            for (edges.keys(), edges.values(), all) |key, target, *alias| alias.* = .{ .key = key, .target = target };
+            try negatives.bindRedirects(alloc, try c.RedirectIndex.init(alloc, all));
+            return negatives;
+        }
+    };
+    var before: policy.Namespace = .{ .key_template = template };
+    for (stages) |state| {
+        try store.apply(try difference(a, before, state));
+        before = state;
+        for ([_][]const u8{ "a", "b", "s", "t", "x", "q", "z" }) |from| for ([_][]const u8{ "a", "b", "s", "t", "x", "q", "z" }) |to| {
+            const scoped = (try store.queryPolicy(template, &.{ from, to }, &.{}, statics, true)).?;
+            const full = (try store.exportNamespace(template)).?;
+            const actual = try Build.index(a, scoped, statics);
+            const expected = try Build.index(a, full, statics);
+            try std.testing.expectEqual(try expected.pinnedDistinct(a, from, to), try actual.pinnedDistinct(a, from, to));
+        };
+    }
 }

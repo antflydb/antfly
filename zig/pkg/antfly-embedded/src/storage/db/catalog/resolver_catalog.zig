@@ -80,7 +80,8 @@ pub const resolver_projection_bindings_reader_version: u32 = 13;
 pub const resolver_projection_work_reader_version: u32 = 14;
 pub const resolver_projection_delta_reader_version: u32 = 15;
 pub const resolver_static_profiles_reader_version: u32 = 19;
-pub const supported_reader_version: u32 = resolver_static_profiles_reader_version;
+pub const resolver_pin_index_reader_version: u32 = 20;
+pub const supported_reader_version: u32 = resolver_pin_index_reader_version;
 
 const reader_version_encodings = blk: {
     var encodings: [supported_reader_version + 1][]const u8 = undefined;
@@ -635,6 +636,23 @@ pub const ResolverConfig = struct {
         return self.replacement_index.len == 0 or std.mem.eql(u8, self.replacement_index, index_name);
     }
 
+    /// Pure source declaration: asynchronous authority projection clocks are
+    /// checked separately through native head stamps.
+    pub fn queryDefinitionFingerprint(cfg: ResolverConfig, a: Allocator) ![32]u8 {
+        var copy = cfg;
+        copy.merges = &.{};
+        copy.curation_json = "";
+        copy.curation_revision = 0;
+        copy.merge_generation = 0;
+        copy.merge_state_version = 0;
+        copy.namespace_generation = 0;
+        copy.namespace_curation_generation = 0;
+        copy.namespace_curation_table_id = 0;
+        copy.namespace_curation_missing = false;
+        copy.shared_projection = null;
+        copy.validation_proof = null;
+        return resolver_lib.fingerprint(a, copy);
+    }
     pub fn clone(alloc: Allocator, cfg: ResolverConfig) !ResolverConfig {
         var owned = cfg;
         owned.shared_projection = null;

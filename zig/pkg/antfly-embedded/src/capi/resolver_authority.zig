@@ -57,7 +57,7 @@ fn ensureConsumerIndex(root: *h.Handle, a: A) !void {
             errdefer write.abort();
             try directory.bootstrap(a, &write);
             try write.commit();
-            root.db.core.index_manager.minimum_reader_version.store(catalog.resolver_static_profiles_reader_version, .release);
+            root.db.core.index_manager.minimum_reader_version.store(catalog.resolver_pin_index_reader_version, .release);
         }
     }
 }
@@ -202,7 +202,7 @@ fn ownedConsumers(a: A, store: native.Store, destination: *h.db_mod.DB, current:
     return out.items;
 }
 fn initialize(a: A, bridge: *Bridge, store: native.Store, legacy: c.State) !void {
-    try bridge.backendPut(a, catalog.minimum_reader_key, try catalog.readerVersionBytes(catalog.resolver_static_profiles_reader_version));
+    try bridge.backendPut(a, catalog.minimum_reader_key, try catalog.readerVersionBytes(catalog.resolver_pin_index_reader_version));
     try store.ensureHeadRoutes();
     if (try bridge.backendGet(a, marker) != null) return;
     if (legacy.proposals.len != 0 or legacy.receipt_scope != null) try store.applyQueue(.{ .expected_revision = 0, .revision = 1, .receipt_scope = legacy.receipt_scope, .proposals = legacy.proposals });
@@ -379,7 +379,7 @@ fn finish(a: A, bridge: *Bridge, txn: *docstore.DocStore.Txn, db: *h.db_mod.DB, 
     try lease.checkAt(@intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
     try bridge.flush(a);
     try txn.commit();
-    db.core.index_manager.minimum_reader_version.store(catalog.resolver_static_profiles_reader_version, .release);
+    db.core.index_manager.minimum_reader_version.store(catalog.resolver_pin_index_reader_version, .release);
 }
 pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: Input, legacy: c.State) ![]const u8 {
     const db = try tables.get(root, table);
@@ -762,6 +762,149 @@ pub fn listCurrentPolicy(root: *h.Handle, database: *h.db_mod.DB, a: A, name: []
     return json(a, std.json.Value{ .array = items });
 }
 
+/// Query declarations remain light; current policy and final validation use
+/// destination-owned native heads, independently of projection replay.
+pub const QuerySession = struct {
+    const resolver = @import("antfly_resolver");
+    const runtime = @import("../storage/db/resolution_runtime.zig");
+    const Target = struct { table: []const u8, template: []const u8, table_id: u64, stamp: ?Stamp };
+    a: A,
+    root: *h.Handle,
+    database: *h.db_mod.DB,
+    selected: h.db_mod.ResolverConfig,
+    definitions: [32]u8,
+    source_schema: [32]u8,
+    targets: std.StringHashMapUnmanaged(Target) = .empty,
+    schemas: std.StringHashMapUnmanaged([32]u8) = .empty,
+    legacy: std.StringHashMapUnmanaged([32]u8) = .empty,
+    fn identity(a: A, table: []const u8, template: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(a, "{s}\x00{s}", .{ table, template });
+    }
+    fn runs(selected: h.db_mod.ResolverConfig, cfg: h.db_mod.ResolverConfig) bool {
+        return std.mem.eql(u8, cfg.name, selected.name) or (selected.sharesRoutingDomain(cfg) and std.mem.eql(u8, selected.source_artifact, cfg.source_artifact) and cfg.source_artifact_kind.matches(.asset));
+    }
+    fn declarations(a: A, configs: []const h.db_mod.ResolverConfig, selected: h.db_mod.ResolverConfig) ![32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        for (configs) |cfg| if (std.mem.eql(u8, cfg.name, selected.name) or (selected.sharesRoutingDomain(cfg) and std.mem.eql(u8, selected.source_artifact, cfg.source_artifact) and cfg.source_artifact_kind.overlaps(selected.source_artifact_kind))) hash.update(&try cfg.queryDefinitionFingerprint(a));
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
+    }
+    fn schema(database: *h.db_mod.DB, owner: A) ![32]u8 {
+        var scratch = std.heap.ArenaAllocator.init(owner);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const indexes = try database.listIndexes(a);
+        defer h.db_mod.types.freeIndexConfigs(a, indexes);
+        const enrichments = try database.listEnrichments(a);
+        defer h.db_mod.types.freeEnrichmentConfigs(a, enrichments);
+        return resolver.fingerprint(a, .{ database.core.identity_namespace, try database.getSchemaJson(a), indexes, enrichments });
+    }
+    pub fn init(a: A, handle: *h.Handle, selected: h.db_mod.ResolverConfig, configs: []const h.db_mod.ResolverConfig) !QuerySession {
+        const root = handle.parent_handle orelse handle;
+        var result: QuerySession = .{ .a = a, .root = root, .database = handle.database(), .selected = selected, .definitions = try declarations(a, configs, selected), .source_schema = try schema(handle.database(), root.alloc) };
+        for (configs) |cfg| {
+            if (!runs(selected, cfg)) continue;
+            const db = try tables.get(root, cfg.table);
+            const key = try identity(a, cfg.table, cfg.key_template);
+            if (!result.targets.contains(key)) try result.targets.put(a, key, .{ .table = cfg.table, .template = cfg.key_template, .table_id = db.core.identity_namespace.table_id, .stamp = try namespaceStamp(db, a, cfg.key_template) });
+            if (result.targets.get(key).?.stamp == null) {
+                const legacy = try currentConfig(root, handle.database(), a, cfg, null);
+                try result.legacy.put(a, cfg.name, try resolver.fingerprint(a, .{ legacy.merges, legacy.curation_json, legacy.curation_revision }));
+            }
+            if (!result.schemas.contains(cfg.table)) try result.schemas.put(a, cfg.table, try schema(db, root.alloc));
+        }
+        return result;
+    }
+    pub fn verify(self: *QuerySession, handle: *h.Handle) !void {
+        const root = handle.parent_handle orelse handle;
+        var scratch = std.heap.ArenaAllocator.init(root.alloc);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const configs = try handle.database().core.index_manager.listPublicResolverRoutingDescriptors(a);
+        defer {
+            for (configs) |*cfg| cfg.deinit(a);
+            a.free(configs);
+        }
+        if (!std.mem.eql(u8, &self.definitions, &try declarations(a, configs, self.selected)) or !std.mem.eql(u8, &self.source_schema, &try schema(handle.database(), root.alloc))) return error.Busy;
+        var it = self.targets.valueIterator();
+        while (it.next()) |target| {
+            const db = try tables.get(root, target.table);
+            if (db.core.identity_namespace.table_id != target.table_id) return error.Busy;
+            const current = try namespaceStamp(db, a, target.template);
+            if (!std.meta.eql(current, target.stamp)) return error.Busy;
+            if (!std.mem.eql(u8, &self.schemas.get(target.table).?, &try schema(db, root.alloc))) return error.Busy;
+        }
+        for (configs) |cfg| if (self.legacy.get(cfg.name)) |expected| {
+            const legacy = try currentConfig(root, handle.database(), a, cfg, null);
+            if (!std.mem.eql(u8, &expected, &try resolver.fingerprint(a, .{ legacy.merges, legacy.curation_json, legacy.curation_revision }))) return error.Busy;
+        };
+        self.root = root;
+        self.database = handle.database();
+    }
+    pub fn loader(self: *QuerySession) runtime.QueryPolicy {
+        return .{ .ptr = self, .prepare = prepare };
+    }
+    fn prepare(ptr: *anyopaque, cfg: *const h.db_mod.ResolverConfig, a: A, target: *resolver.Resolver, entities: []const resolver.ExtractedEntity, candidates: ?[]const []const resolver.Candidate) !void {
+        const self: *QuerySession = @ptrCast(@alignCast(ptr));
+        const captured = self.targets.get(try identity(a, cfg.table, cfg.key_template)) orelse return error.Busy;
+        const db = try tables.get(self.root, cfg.table);
+        if (db.core.identity_namespace.table_id != captured.table_id) return error.Busy;
+        var seeds: std.StringArrayHashMapUnmanaged(void) = .empty;
+        var texts: std.StringArrayHashMapUnmanaged(void) = .empty;
+        for (entities) |mention| {
+            try texts.put(a, mention.text, {});
+            const key = target.renderKeyAlloc(a, mention) catch |err| switch (err) {
+                error.EmptyEntityKey => continue,
+                else => return err,
+            };
+            try seeds.put(a, key, {});
+        }
+        if (candidates) |lists| for (lists) |list| for (list) |candidate| {
+            try seeds.put(a, candidate.doc_ref.key, {});
+            if (candidate.resolved_doc_ref) |ref| try seeds.put(a, ref.key, {});
+        };
+        var current = cfg.*;
+        if (captured.stamp) |expected| {
+            var joined: native.QueryPolicyUnion = .{};
+            var seed_offset: usize = 0;
+            var text_offset: usize = 0;
+            while (true) {
+                var scratch = std.heap.ArenaAllocator.init(self.root.alloc);
+                defer scratch.deinit();
+                const page = scratch.allocator();
+                var txn = try db.core.store.beginReadTxn();
+                defer txn.abort();
+                var bridge: Bridge = .{ .txn = &txn };
+                const store = bridge.store(page, prefix);
+                const head = try store.head(cfg.key_template) orelse return error.Busy;
+                if (head.revision != expected.revision or !std.mem.eql(u8, &head.fingerprint, &expected.fingerprint)) return error.Busy;
+                const seed_end = @min(seeds.count(), seed_offset + 1024);
+                const text_end = @min(texts.count(), text_offset + 128);
+                const part = (try store.queryPolicy(cfg.key_template, seeds.keys()[seed_offset..seed_end], texts.keys()[text_offset..text_end], cfg.aliases, candidates != null)) orelse return error.Busy;
+                try joined.add(a, page, part);
+                seed_offset = seed_end;
+                text_offset = text_end;
+                if (seed_offset == seeds.count() and text_offset == texts.count()) break;
+            }
+            const snapshot = try joined.finish();
+            current.merges = snapshot.namespace.merges;
+            current.curation_json = try json(a, snapshot.namespace.state);
+            current.shared_projection = null;
+            current.validation_proof = null;
+        } else {
+            if (try namespaceStamp(db, a, cfg.key_template) != null) return error.Busy;
+            current = try currentConfig(self.root, self.database, a, cfg.*, null);
+        }
+        const effective = try current.effectiveAliasesAlloc(a);
+        target.aliases = effective;
+        target.alias_index = try c.RedirectIndex.init(a, effective);
+        target.curation_index = try c.Index.init(a, current.suppress_json, current.curation_json);
+        try target.curation_index.bindRedirects(a, target.alias_index.?);
+        target.curation_enabled = current.suppress_json.len != 0 or current.curation_json.len != 0;
+    }
+};
+
 pub const MentionPolicy = struct { key: []const u8, text: []const u8 };
 
 /// Public policy reads follow the committed authority, while projection and
@@ -904,7 +1047,7 @@ test "capi resolver curation indexed static profiles exclude seventeen thousand 
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_unmerge_json(handle, .fromSlice("entities"), .fromSlice("concept/seed"), .fromSlice("{\"pin_distinct\":true}"), &out));
     api.antfly_buffer_free(&out);
     try std.testing.expect(native.static_profiles.test_edge_visits.load(.monotonic) <= 8);
-    try std.testing.expectEqualStrings("19", try root.db.core.store.get(a, catalog.minimum_reader_key));
+    try std.testing.expectEqualStrings("20", try root.db.core.store.get(a, catalog.minimum_reader_key));
 }
 
 test "capi resolver curation static directory fences consumers enrolled after discovery" {

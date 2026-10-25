@@ -23154,6 +23154,10 @@ pub const RaftApplyStore = struct {
         result.proposals.receipt_scope = queue.receipt_scope;
         switch (read.mode) {
             .policy => {
+                if (read.expected_head) |expected| {
+                    const actual = try store.head(read.key_template) orelse return error.CatalogGenerationChanged;
+                    if (actual.revision != expected.revision or !std.mem.eql(u8, &actual.fingerprint, &expected.fingerprint)) return error.CatalogGenerationChanged;
+                }
                 if (read.seeds.len > 16384 or read.texts.len > 4096 or read.key_template.len > 16384) return error.InvalidResolverCurationRequest;
                 if (try store.queryPolicy(read.key_template, read.seeds, read.texts, read.aliases, read.distinct)) |snapshot|
                     result.namespaces = try a.dupe(native.Snapshot, &.{snapshot});
@@ -23370,7 +23374,7 @@ pub const RaftApplyStore = struct {
             try txn.delete(try resolverAdmissionKey(a, group, table.table_id));
             return;
         }
-        const proof: domain.Admission = .{ .table_id = table.table_id, .name = table.name, .native = true, .schema = try domain.schemaFingerprint(a, table) };
+        const proof: domain.Admission = .{ .table_id = table.table_id, .name = table.name, .native = true, .schema = try domain.schemaFingerprint(a, table), .query_schema = try domain.queryDefinitionFingerprint(a, table) };
         try txn.put(try resolverAdmissionKey(a, group, table.table_id), try std.json.Stringify.valueAlloc(a, proof, .{}));
     }
     fn readResolverAdmissionTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, id: u64) !?@import("../resolver_authority.zig").Admission {
@@ -23385,6 +23389,7 @@ pub const RaftApplyStore = struct {
 
     pub fn resolverCatalogRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, input: @import("../resolver_catalog_read.zig").Request) ![]u8 {
         const wire = @import("../resolver_catalog_read.zig");
+        if (input.expected_query_fingerprint != null and !input.policy_descriptors) return error.InvalidResolverCurationRequest;
         if (input.table_name.len == 0 or input.table_name.len > 4096 or input.key.len > 16384) return error.InvalidResolverCurationRequest;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
@@ -23445,23 +23450,56 @@ pub const RaftApplyStore = struct {
                 const bindings = try resolverBindingIndexesTxn(a, &txn, group_id, table.table_id, table.indexes_json);
                 const Descriptor = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
                 const descriptors = try a.dupe(Descriptor, try resolverConfigs(a, try std.json.parseFromSliceLeaky(std.json.Value, a, bindings, .{})));
+                var selected_names: std.StringHashMapUnmanaged(void) = .empty;
+                var selected_groups: std.StringHashMapUnmanaged(void) = .empty;
+                if (input.projection_names) |names| {
+                    for (names) |name| try selected_names.put(a, name, {});
+                    for (descriptors) |cfg| if (!cfg.retired and selected_names.contains(cfg.name)) try selected_groups.put(a, try std.fmt.allocPrint(a, "{s}\x00{s}", .{ cfg.replacement_index, cfg.source_artifact }), {});
+                }
+                var query_hash = std.crypto.hash.sha2.Sha256.init(.{});
+                var definition = table;
+                definition.indexes_json = "{}";
+                query_hash.update(&try @import("../resolver_authority.zig").schemaFingerprint(a, definition));
+                query_hash.update(&try @import("../resolver_authority.zig").sourceDefinitionFingerprint(a, table.indexes_json));
+                if (try system_catalog_storage.getById(a, &txn, group_id, .table, table.table_id)) |binding| {
+                    query_hash.update(&try @import("antfly_resolver").fingerprint(a, binding.value));
+                } else query_hash.update("legacy-source-binding");
+                var incarnation_buf: [160]u8 = undefined;
+                if (try stagingGet(&txn, try metadataIncarnationKeyForGroup(&incarnation_buf, group_id))) |incarnation| query_hash.update(incarnation);
+                var query_heads: std.ArrayList(wire.QueryHead) = .empty;
                 var destinations: std.StringHashMapUnmanaged(?u64) = .empty;
                 var heads: std.StringHashMapUnmanaged(?@import("../resolver_authority.zig").records.Head) = .empty;
                 for (descriptors) |*cfg| {
+                    if (cfg.retired) continue;
+                    if (input.projection_names != null and !selected_names.contains(cfg.name) and !(input.routing_siblings and cfg.source_artifact_kind.matches(.asset) and selected_groups.contains(try std.fmt.allocPrint(a, "{s}\x00{s}", .{ cfg.replacement_index, cfg.source_artifact })))) continue;
+                    query_hash.update(&try @import("antfly_resolver").fingerprint(a, .{ cfg.name, cfg.table, cfg.key_template }));
                     const destination = try destinations.getOrPut(a, cfg.table);
                     if (!destination.found_existing) {
                         // Resolve names at this same cut, even before background
                         // adoption has reached the source's compact binding.
                         const target = try self.resolveSystemCatalogResultTxn(system_catalog.ResolvedTable, a, &txn, group_id, try system_catalog.Target.parse(cfg.table));
                         destination.value_ptr.* = if (target) |value| value.table_id else null;
+                        if (target) |value| {
+                            var target_schema: ?[32]u8 = null;
+                            if (try readResolverAdmissionTxn(a, &txn, group_id, value.table_id)) |proof| target_schema = proof.query_schema;
+                            if (target_schema == null) {
+                                var target_buf: [160]u8 = undefined;
+                                const raw = try txn.get(try tableKeyForGroup(&target_buf, group_id, value.table_id));
+                                target_schema = try @import("../resolver_authority.zig").queryDefinitionFingerprint(a, try decodeTableRecord(a, raw));
+                            }
+                            query_hash.update(&try @import("antfly_resolver").fingerprint(a, .{ value, target_schema }));
+                        }
                     }
+                    query_hash.update(&try @import("antfly_resolver").fingerprint(a, destination.value_ptr.*));
                     const id = destination.value_ptr.* orelse continue;
                     const cache_key = try std.json.Stringify.valueAlloc(a, .{ id, cfg.key_template }, .{});
                     const cached = try heads.getOrPut(a, cache_key);
                     if (!cached.found_existing) {
                         var bridge: NativeResolverTxn = .{ .txn = &txn };
                         cached.value_ptr.* = try (try nativeResolverStore(a, &bridge, group_id, id)).head(cfg.key_template);
+                        if (cached.value_ptr.*) |head| try query_heads.append(a, .{ .table_id = id, .key_template = cfg.key_template, .stamp = .{ .revision = head.revision, .fingerprint = head.fingerprint } });
                     }
+                    query_hash.update(&try @import("antfly_resolver").fingerprint(a, if (cached.value_ptr.*) |head| @as(?@import("../resolver_authority.zig").records.Stamp, .{ .revision = head.revision, .fingerprint = head.fingerprint }) else null));
                     if (cached.value_ptr.*) |head| {
                         cfg.shared_projection = null;
                         cfg.validation_proof = null;
@@ -23474,6 +23512,11 @@ pub const RaftApplyStore = struct {
                         cfg.merge_generation = @max(cfg.effectiveGeneration(), head.revision);
                     }
                 }
+                var digest: [32]u8 = undefined;
+                query_hash.final(&digest);
+                if (input.expected_query_fingerprint) |expected| if (!std.mem.eql(u8, &digest, &expected)) return error.CatalogGenerationChanged;
+                result.query_fingerprint = digest;
+                result.query_heads = query_heads.items;
                 result.configs = descriptors;
                 return std.json.Stringify.valueAlloc(alloc, result, .{});
             }
@@ -41414,16 +41457,22 @@ test "resolver curation namespace propagation query descriptors and policy reads
     const Config = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
     try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 1, .name = "entities", .indexes_json = "{}" } });
     const cfg: Config = .{ .name = "r", .table = "entities", .key_template = template, .source_artifact = "kg", .resolution_artifact = "resolved", .promote = false };
-    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 2, .name = "source", .indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = &.{cfg} }, .{}) } });
+    var other_cfg = cfg;
+    other_cfg.name = "other";
+    other_cfg.source_artifact = "other";
+    other_cfg.resolution_artifact = "other-resolved";
+    other_cfg.key_template = "other/{{_key}}";
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 2, .name = "source", .indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = &.{ cfg, other_cfg } }, .{}) } });
     var aliases: [1000]pure.KeyAlias = undefined;
     for (&aliases, 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/a{d}", .{i}), .target = "entity/hub" };
     const table = (try store.getTable(a, group, 1)).?;
     const namespace: resolver_curation.Namespace = .{ .key_template = template, .revision = 1, .merges = &aliases, .state = .{ .suppress = .{ .texts = &.{"noise"} } } };
-    const write: domain.Write = .{ .table_id = 1, .standalone = true, .catalog_revision = try store.standaloneRevision(), .schema = try domain.schemaFingerprint(a, table), .bootstrap = .{ .expected_indexes = try pure.fingerprint(a, table.indexes_json) }, .patches = &.{try domain.records.difference(a, .{ .key_template = template }, namespace)} };
+    const other_scope: resolver_curation.Namespace = .{ .key_template = other_cfg.key_template, .revision = 1 };
+    const write: domain.Write = .{ .table_id = 1, .standalone = true, .catalog_revision = try store.standaloneRevision(), .schema = try domain.schemaFingerprint(a, table), .bootstrap = .{ .expected_indexes = try pure.fingerprint(a, table.indexes_json) }, .patches = &.{ try domain.records.difference(a, .{ .key_template = template }, namespace), try domain.records.difference(a, .{ .key_template = other_cfg.key_template }, other_scope) } };
     try store.applyStandaloneCommand(group, .{ .apply_resolver_authority = try std.json.Stringify.valueAlloc(a, write, .{}) });
     const revision = try store.standaloneRevision();
-    const descriptors = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, .{ .table_name = "source", .policy_descriptors = true, .standalone = true, .expected_revision = revision }), .{});
-    try std.testing.expectEqual(@as(usize, 1), descriptors.configs.?.len);
+    const descriptors = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, .{ .table_name = "source", .policy_descriptors = true, .projection_names = &.{"r"}, .routing_siblings = true, .standalone = true, .expected_revision = revision }), .{});
+    try std.testing.expectEqual(@as(usize, 2), descriptors.configs.?.len);
     try std.testing.expectEqual(@as(u64, 1), descriptors.configs.?[0].namespace_curation_table_id);
     try std.testing.expectEqual(@as(u64, 1), descriptors.configs.?[0].namespace_curation_generation);
     try std.testing.expectEqual(@as(usize, 0), descriptors.configs.?[0].merges.len);
@@ -41434,8 +41483,23 @@ test "resolver curation namespace propagation query descriptors and policy reads
     try std.testing.expectEqual(@as(usize, 1), view.namespaces[0].namespace.merges.len);
     try std.testing.expectEqual(@as(usize, 1), view.namespaces[0].namespace.state.suppress.texts.len);
     try std.testing.expectEqual(@as(usize, 0), store.resolver_projection_exports);
-    // A policy publication during extraction/candidate work fences every later
-    // policy read and the final identity-only response validation.
+    // Unrelated catalog writes do not invalidate an owned query dependency set.
     try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 3, .name = "changed" } });
-    try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, .{ .table_name = "source", .identity_only = true, .standalone = true, .expected_revision = revision }));
+    _ = try store.resolverCatalogRead(a, group, .{ .table_name = "source", .policy_descriptors = true, .projection_names = &.{"r"}, .routing_siblings = true, .standalone = true, .expected_query_fingerprint = descriptors.query_fingerprint });
+    // A different artifact's head in the same destination is not executed.
+    var other_next = other_scope;
+    other_next.revision = 2;
+    other_next.state.suppress.keys = &.{"other/noise"};
+    const other_table = (try store.getTable(a, group, 1)).?;
+    const other_write: domain.Write = .{ .table_id = 1, .standalone = true, .catalog_revision = try store.standaloneRevision(), .schema = try domain.schemaFingerprint(a, other_table), .patches = &.{try domain.records.difference(a, other_scope, other_next)} };
+    try store.applyStandaloneCommand(group, .{ .apply_resolver_authority = try std.json.Stringify.valueAlloc(a, other_write, .{}) });
+    _ = try store.resolverCatalogRead(a, group, .{ .table_name = "source", .policy_descriptors = true, .projection_names = &.{"r"}, .routing_siblings = true, .standalone = true, .expected_query_fingerprint = descriptors.query_fingerprint });
+    var next = namespace;
+    next.revision = 2;
+    next.state.suppress.keys = &.{"entity/newly-suppressed"};
+    const current_table = (try store.getTable(a, group, 1)).?;
+    const correction: domain.Write = .{ .table_id = 1, .standalone = true, .catalog_revision = try store.standaloneRevision(), .schema = try domain.schemaFingerprint(a, current_table), .patches = &.{try domain.records.difference(a, namespace, next)} };
+    try store.applyStandaloneCommand(group, .{ .apply_resolver_authority = try std.json.Stringify.valueAlloc(a, correction, .{}) });
+    try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, .{ .table_name = "source", .policy_descriptors = true, .projection_names = &.{"r"}, .routing_siblings = true, .standalone = true, .expected_query_fingerprint = descriptors.query_fingerprint }));
+    try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .authority, .authority = .{ .mode = .policy, .key_template = template, .seeds = &.{"entity/hub"}, .expected_head = descriptors.query_heads[0].stamp } }));
 }

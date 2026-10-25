@@ -228,7 +228,7 @@ pub const Service = struct {
         } else {
             const row = state_row orelse return error.MemorySpaceNotFound;
             run.state = try parse(t.State, a, row.json);
-            if (run.state.identity_format > 2) return error.MemoryCorruptState;
+            if (run.state.identity_format > 3) return error.MemoryCorruptState;
             if (run.state.table_id != 0 and self.context.table_id != 0 and run.state.table_id != self.context.table_id) return error.MemorySpaceBindingChanged;
             if (run.state.space.len > 0 and self.context.space.len > 0 and (!eql(u8, run.state.space, self.context.space) or !eql(u8, run.state.database, self.context.database) or !eql(u8, run.state.namespace, self.context.namespace))) return error.MemorySpaceBindingChanged;
         }
@@ -2823,7 +2823,7 @@ const Run = struct {
     }
     fn ensureIdentityAuthority(self: *Run) !void {
         const store = self.identityStore();
-        self.state.identity_format = 2;
+        self.state.identity_format = 3;
         if (try store.head(identity_template) != null) return;
         const legacy = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
         var state = legacy.state;
@@ -7503,8 +7503,11 @@ fn performanceTestRun(a: A) Run {
         fn get(_: *anyopaque, _: A, _: []const u8) !?Row {
             return null;
         }
+        fn scan(_: *anyopaque, _: A, _: []const u8, _: ?[]const u8, _: u32) !Page {
+            return .{ .rows = &.{} };
+        }
     };
-    return .{ .a = a, .lexical_allocator = a, .service = .{ .backend = .{ .ptr = undefined, .get = Empty.get, .scan = undefined, .commit = undefined }, .context = .{ .principal = "alice", .admin = true, .now_ms = 10 } }, .state = .{ .config = .{}, .owner = "alice", .created_at = 1 }, .explanation_snapshot_scratch = .init(a) };
+    return .{ .a = a, .lexical_allocator = a, .service = .{ .backend = .{ .ptr = undefined, .get = Empty.get, .scan = Empty.scan, .commit = undefined }, .context = .{ .principal = "alice", .admin = true, .now_ms = 10 } }, .state = .{ .config = .{}, .owner = "alice", .created_at = 1 }, .explanation_snapshot_scratch = .init(a) };
 }
 
 test "memory performance decoded records allocate once and replay temporal dependency tracking" {
@@ -7782,6 +7785,19 @@ test "memory admitted verdict snapshot excludes cached overlay redirects" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return if (self.rows.get(path)) |raw| .{ .key = path, .json = raw } else null;
         }
+        fn scan(ptr: *anyopaque, a: A, prefix: []const u8, after: ?[]const u8, limit: u32) !Page {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var rows: std.ArrayList(Row) = .empty;
+            var it = self.rows.iterator();
+            while (it.next()) |entry| if (std.mem.startsWith(u8, entry.key_ptr.*, prefix) and (after == null or std.mem.lessThan(u8, after.?, entry.key_ptr.*))) try rows.append(a, .{ .key = entry.key_ptr.*, .json = entry.value_ptr.* });
+            std.mem.sort(Row, rows.items, {}, struct {
+                fn less(_: void, lhs: Row, rhs: Row) bool {
+                    return std.mem.lessThan(u8, lhs.key, rhs.key);
+                }
+            }.less);
+            const count = @min(limit, rows.items.len);
+            return .{ .rows = rows.items[0..count], .next = if (count < rows.items.len) rows.items[count - 1].key else null };
+        }
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -7790,6 +7806,7 @@ test "memory admitted verdict snapshot excludes cached overlay redirects" {
     var run = performanceTestRun(a);
     run.service.backend.ptr = &base;
     run.service.backend.get = Base.get;
+    run.service.backend.scan = Base.scan;
     const original: @import("../storage/db/resolver_namespace.zig").Namespace = .{ .key_template = Run.identity_template, .revision = 1 };
     try run.identityStore().adoptNamespace(original);
     for (run.changes.items) |change| try base.rows.put(a, change.key, change.json.?);
@@ -7797,6 +7814,7 @@ test "memory admitted verdict snapshot excludes cached overlay redirects" {
     run = performanceTestRun(a);
     run.service.backend.ptr = &base;
     run.service.backend.get = Base.get;
+    run.service.backend.scan = Base.scan;
     var replacement = original;
     replacement.revision = 2;
     replacement.merges = &.{.{ .key = "a", .target = "b" }};

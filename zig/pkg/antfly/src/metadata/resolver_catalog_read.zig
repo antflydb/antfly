@@ -16,6 +16,7 @@
 //! Private, bounded resolver catalog reads. No public request supplies authority.
 const std = @import("std");
 const metadata = @import("table_manager.zig");
+pub const QueryHead = struct { table_id: u64, key_template: []const u8, stamp: @import("../metadata/resolver_authority.zig").records.Stamp };
 pub const Request = struct {
     table_name: []const u8,
     table_id: u64 = 0,
@@ -31,6 +32,7 @@ pub const Request = struct {
     routing_siblings: bool = false,
     /// Query execution hydrates only mention/candidate policy through authority reads.
     policy_descriptors: bool = false,
+    expected_query_fingerprint: ?[32]u8 = null,
     /// Progress routing needs identity/ranges, never DDL or policy bodies.
     identity_only: bool = false,
     authority_admission: bool = false,
@@ -48,6 +50,8 @@ pub const Request = struct {
 };
 pub const Page = struct {
     version: u8,
+    query_fingerprint: ?[32]u8 = null,
+    query_heads: []const QueryHead = &.{},
     admission: ?@import("resolver_authority.zig").Admission = null,
     revision: u64,
     table: metadata.TableRecord,

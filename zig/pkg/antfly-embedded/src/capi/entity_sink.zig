@@ -2847,3 +2847,38 @@ test "capi resolver curation connection reads accepted policy and finishes waits
     defer result.deinit();
     try std.testing.expect(result.value.object.get("applied").?.bool);
 }
+
+test "capi resolver curation query follows native merge unmerge and suppression before replay" {
+    const api = @import("db.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = try api.TestDirectory.init("query-current-curation");
+    defer tmp.cleanup();
+    const root = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
+    const id = try api.publishHandle(root);
+    defer api.antfly_db_close(id);
+    try root.db.addResolver(.{ .name = "concepts", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{uslug _entity.text}}", .promote = false });
+    // An unrelated artifact's destination is not a query dependency.
+    try root.db.addResolver(.{ .name = "unrelated", .table = "not-created", .source_artifact = "other", .resolution_artifact = "other-resolved", .key_template = "other/{{_key}}", .promote = false });
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&out);
+    const request = "{\"extraction\":{\"entities\":[{\"id\":\"e0\",\"label\":\"concept\",\"text\":\"a\"}]}}";
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(id, .fromSlice("default"), .fromSlice("concept/a"), .fromSlice("{\"into\":\"concept/b\"}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(id, .fromSlice("concepts"), .fromSlice(request), &out));
+    const merged = try std.json.parseFromSliceLeaky(std.json.Value, a, out.ptr.?[0..out.len], .{ .allocate = .alloc_always });
+    try std.testing.expectEqualStrings("concept/b", merged.object.get("resolution").?.object.get("entities").?.array.items[0].object.get("doc_ref").?.object.get("key").?.string);
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_unmerge_json(id, .fromSlice("default"), .fromSlice("concept/a"), .fromSlice("{\"pin_distinct\":true}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(id, .fromSlice("concepts"), .fromSlice(request), &out));
+    const unmerged = try std.json.parseFromSliceLeaky(std.json.Value, a, out.ptr.?[0..out.len], .{ .allocate = .alloc_always });
+    try std.testing.expectEqualStrings("concept/a", unmerged.object.get("resolution").?.object.get("entities").?.array.items[0].object.get("doc_ref").?.object.get("key").?.string);
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_suppress_json(id, .fromSlice("default"), .fromSlice("concept/a"), .fromSlice("{}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(id, .fromSlice("concepts"), .fromSlice(request), &out));
+    const suppressed = try std.json.parseFromSliceLeaky(std.json.Value, a, out.ptr.?[0..out.len], .{});
+    try std.testing.expectEqualStrings("suppressed", suppressed.object.get("resolution").?.object.get("entities").?.array.items[0].object.get("decision").?.string);
+}

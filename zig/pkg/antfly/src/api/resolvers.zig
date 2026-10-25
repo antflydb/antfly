@@ -479,11 +479,12 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
         const stamp = if (plan.changed) try server.source.replaceTableDefinitionStamped(table.*, replacement) else null;
         return response(alloc, 202, .{ .resolver = resolver_name, .changed = plan.changed, .revision = plan.revision, .replay_sequence = plan.revision, .replay_sequence_kind = "resolver_revision", .metadata_commit = stamp, .applied = false });
     }
+    var query_fence: ?QueryFence = if (server.source.vtable.supports_resolver_authority and (op == .render or op == .resolve)) try QueryFence.init(a, page orelse return error.UnsupportedOperation, resolver_name, op == .resolve) else null;
     const cfg = try findConfig(all, resolver_name);
     if (cfg.retired and (op == .render or op == .resolve or op == .reviews or op == .review)) return error.ResolverNotFound;
     switch (op) {
         .reviews, .review => return reviewsOperation(server, alloc, a, &snapshot, table, cfg, op, key, body, query, request),
-        .resolve => return resolveQuery(server, alloc, a, table, all, cfg, body, request, if (page) |value| value.revision else null),
+        .resolve => return resolveQuery(server, alloc, a, table, all, cfg, body, request, if (query_fence) |*fence| fence else null),
         .get => return response(alloc, 200, try summary(a, table, cfg, try sampleForReplay(server, a, &snapshot, table, request, true, .{ .target = ObservationTarget.fromConfig(cfg), .revision = cfg.curation_revision, .floor = null }))),
         .redirects => {
             const state = try resolver.curation.parseState(a, cfg.curation_json);
@@ -503,11 +504,12 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
             defer parsed.deinit();
             if (!parsed.consumesLabel(mention.label)) return error.InvalidArgument;
             const minted = try parsed.renderKeyAlloc(a, .{ .text = mention.text, .label = mention.label, .local_id = mention.local_id });
-            const current = try queryConfig(server, alloc, a, cfg, &.{minted}, &.{mention.text}, false, request, if (page) |value| value.revision else null);
+            const current = try queryConfig(server, alloc, a, cfg, &.{minted}, &.{mention.text}, false, request, if (query_fence) |*fence| fence else null);
             const aliases = try current.effectiveAliasesAlloc(a);
             const index = try resolver.curation.RedirectIndex.init(a, aliases);
             const policy = try resolver.curation.Index.init(a, current.suppress_json, current.curation_json);
             const suppressed = (try policy.textReason(a, mention.text)) != null or policy.keySuppressed(minted) or policy.keySuppressed(index.canonical(minted));
+            if (query_fence) |*fence| try fence.verify(server, a, request);
             return response(alloc, 200, .{ .minted_key = minted, .key = index.canonical(minted), .table = cfg.table, .config_generation = cfg.effectiveGeneration(), .suppressed = suppressed });
         },
         .namespace => {
@@ -573,6 +575,8 @@ const EntityDiscovery = struct {
     namespaces: *std.StringArrayHashMapUnmanaged(curation.Namespace),
     stored: curation.Namespaces,
     adopted: ?std.StringHashMapUnmanaged(void) = null,
+    profile_groups: std.StringHashMapUnmanaged(std.ArrayList(native_authority.AliasProfile)) = .empty,
+    profiles_grouped: bool = false,
     adoption_revision: ?u64,
     standalone: bool,
     key: []const u8,
@@ -609,6 +613,20 @@ const EntityDiscovery = struct {
     fn deinit(self: *EntityDiscovery) void {
         self.builders.deinit(self.owner);
         if (self.adopted) |*set| set.deinit(self.a);
+        var groups = self.profile_groups.valueIterator();
+        while (groups.next()) |group| group.deinit(self.a);
+        self.profile_groups.deinit(self.a);
+    }
+    fn profilesFor(self: *EntityDiscovery, template: []const u8) ![]const native_authority.AliasProfile {
+        if (!self.profiles_grouped) {
+            for (self.profiles.items) |profile| {
+                const entry = try self.profile_groups.getOrPut(self.a, profile.key_template);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(self.a, profile);
+            }
+            self.profiles_grouped = true;
+        }
+        return if (self.profile_groups.get(template)) |group| group.items else &.{};
     }
     fn finish(self: *EntityDiscovery) !void {
         var it = self.builders.iterator();
@@ -846,10 +864,10 @@ fn publishAuthority(server: anytype, a: std.mem.Allocator, table: anytype, root:
     };
     {
         var patches: std.ArrayList(native_authority.records.Patch) = .empty;
+        var predecessors: std.StringHashMapUnmanaged(curation.Namespace) = .empty;
+        for (before.namespaces) |value| try predecessors.put(a, value.head.key_template, value.namespace);
         for ((try curation.namespacesFromValue(a, root)).namespaces) |next| {
-            const old = for (before.namespaces) |value| {
-                if (std.mem.eql(u8, value.head.key_template, next.key_template)) break value.namespace;
-            } else curation.Namespace{ .key_template = next.key_template };
+            const old = predecessors.get(next.key_template) orelse curation.Namespace{ .key_template = next.key_template };
             if (next.revision != old.revision) try patches.append(a, try native_authority.records.difference(a, old, next));
         }
         write.patches = patches.items;
@@ -1071,7 +1089,7 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
         if (input.into) |target| if (!curation.keyInNamespace(namespace.key_template, target)) return error.InvalidResolverCurationRequest;
         if (input.expected_revision) |expected| if (expected != namespace.revision) return error.ResolverCurationConflict;
         const policy_merges = namespace.merges;
-        const effective = try native_authority.records.planningAliases(a, namespace.*, try entityEffectiveAliases(a, namespace.*, discovery.profiles.items, key, input.into), action, key, input.into);
+        const effective = try native_authority.records.planningAliases(a, namespace.*, try entityEffectiveAliases(a, namespace.*, try discovery.profilesFor(namespace.key_template), key, input.into), action, key, input.into);
         var planning_state = namespace.state;
         const stamp = curation.manualOrigin(intent, try std.math.add(u64, namespace.revision, 1));
         if (proposal_edit) |edit| {
@@ -1111,12 +1129,12 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
             namespace.state = plan.state;
             namespace.merges = plan.merges;
             namespace.revision = try std.math.add(u64, namespace.revision, 1);
-            try curation.replaceNamespace(a, &root, namespace.*);
             changed = true;
         }
     }
-    for (namespaces.values()) |namespace| try native_authority.records.validateProfiles(a, namespace, discovery.profiles.items);
+    for (namespaces.values()) |namespace| try native_authority.records.validateProfiles(a, namespace, try discovery.profilesFor(namespace.key_template));
     if (changed) {
+        try curation.replaceNamespacesBatch(a, &root, namespaces.values());
         _ = try resolver.curation.parseState(a, try std.json.Stringify.valueAlloc(a, proposal_state, .{}));
         try root.object.put(a, proposals_key, try json(a, proposal_state));
     }
@@ -1387,9 +1405,30 @@ fn mutationRequest(a: std.mem.Allocator, op: Operation, key: []const u8, body: [
     return std.json.parseFromSliceLeaky(resolver.curation.Request, a, try std.json.Stringify.valueAlloc(a, root, .{}), .{});
 }
 
+const QueryFence = struct {
+    table_name: []const u8,
+    table_id: u64,
+    fingerprint: [32]u8,
+    resolver_name: []const u8,
+    routing_siblings: bool,
+    heads: std.StringHashMapUnmanaged(native_authority.records.Stamp) = .empty,
+    fn init(a: std.mem.Allocator, page: catalog_read.Page, resolver_name: []const u8, routing_siblings: bool) !QueryFence {
+        var result: QueryFence = .{ .table_name = page.table.name, .table_id = page.table.table_id, .fingerprint = page.query_fingerprint orelse return error.InvalidCatalogRecord, .resolver_name = resolver_name, .routing_siblings = routing_siblings };
+        for (page.query_heads) |head| try result.heads.put(a, try std.fmt.allocPrint(a, "{d}\x00{s}", .{ head.table_id, head.key_template }), head.stamp);
+        return result;
+    }
+    fn expected(self: *const QueryFence, a: std.mem.Allocator, cfg: Config) !native_authority.records.Stamp {
+        return self.heads.get(try std.fmt.allocPrint(a, "{d}\x00{s}", .{ cfg.namespace_curation_table_id, cfg.key_template })) orelse error.CatalogGenerationChanged;
+    }
+    fn verify(self: *const QueryFence, server: anytype, a: std.mem.Allocator, request: operation.RequestContext) !void {
+        try server.authorizeTableReads(a, request, &.{self.table_name});
+        _ = try readResolverCatalog(server, a, .{ .table_name = self.table_name, .table_id = self.table_id, .policy_descriptors = true, .projection_names = &.{self.resolver_name}, .routing_siblings = self.routing_siblings, .expected_query_fingerprint = self.fingerprint }, request);
+    }
+};
+
 /// The caller pins the catalog cut before any model work and revalidates it
 /// before returning. Legacy source-owned configs already carry their policy.
-fn queryConfig(server: anytype, owner: std.mem.Allocator, a: std.mem.Allocator, cfg: Config, seeds: []const []const u8, texts: []const []const u8, distinct: bool, request: operation.RequestContext, cut: ?u64) !Config {
+fn queryConfig(server: anytype, owner: std.mem.Allocator, a: std.mem.Allocator, cfg: Config, seeds: []const []const u8, texts: []const []const u8, distinct: bool, request: operation.RequestContext, fence: ?*const QueryFence) !Config {
     if (!server.source.vtable.supports_resolver_authority or cfg.namespace_curation_table_id == 0) return cfg;
     var joined: native_authority.records.QueryPolicyUnion = .{};
     var seed_offset: usize = 0;
@@ -1400,7 +1439,7 @@ fn queryConfig(server: anytype, owner: std.mem.Allocator, a: std.mem.Allocator, 
         const page_allocator = page_arena.allocator();
         const seed_end = @min(seeds.len, seed_offset + 1024);
         const text_end = @min(texts.len, text_offset + 128);
-        const bytes = try server.source.systemCatalog(page_allocator, request, .{ .resolver_catalog_read = .{ .table_name = cfg.table, .table_id = cfg.namespace_curation_table_id, .mode = .authority, .expected_revision = cut, .authority = .{ .mode = .policy, .key_template = cfg.key_template, .seeds = seeds[seed_offset..seed_end], .texts = texts[text_offset..text_end], .aliases = cfg.aliases, .distinct = distinct } } });
+        const bytes = try server.source.systemCatalog(page_allocator, request, .{ .resolver_catalog_read = .{ .table_name = cfg.table, .table_id = cfg.namespace_curation_table_id, .mode = .authority, .authority = .{ .mode = .policy, .expected_head = if (fence) |pinned| try pinned.expected(a, cfg) else null, .key_template = cfg.key_template, .seeds = seeds[seed_offset..seed_end], .texts = texts[text_offset..text_end], .aliases = cfg.aliases, .distinct = distinct } } });
         const view = try std.json.parseFromSliceLeaky(native_authority.View, page_allocator, bytes, .{});
         if (!view.native or view.table_id != cfg.namespace_curation_table_id or view.namespaces.len != 1) return error.CatalogGenerationChanged;
         try joined.add(a, page_allocator, view.namespaces[0]);
@@ -1419,7 +1458,7 @@ fn queryConfig(server: anytype, owner: std.mem.Allocator, a: std.mem.Allocator, 
     return current;
 }
 
-fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, table: anytype, all: []const Config, cfg: Config, body: []const u8, request: operation.RequestContext, cut: ?u64) !@import("public_table_http.zig").OwnedResponse {
+fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, table: anytype, all: []const Config, cfg: Config, body: []const u8, request: operation.RequestContext, fence: ?*const QueryFence) !@import("public_table_http.zig").OwnedResponse {
     const Input = struct { text: ?[]const u8 = null, extraction: ?std.json.Value = null };
     const input = try std.json.parseFromSliceLeaky(Input, a, body, .{});
     if ((input.text == null) == (input.extraction == null) or cfg.source_artifact_kind != .asset) return error.InvalidArgument;
@@ -1432,7 +1471,8 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
         owner: std.mem.Allocator,
         revision: ?u64 = null,
         filters: std.StringHashMapUnmanaged([]const u8) = .empty,
-        cut: ?u64,
+        fence: ?*const QueryFence,
+        bindings: std.StringArrayHashMapUnmanaged([32]u8) = .empty,
         fn prepare(ptr: *anyopaque, policy_cfg: *const Config, allocator: std.mem.Allocator, target: *resolver.Resolver, entities: []const resolver.ExtractedEntity, candidate_lists: ?[]const []const resolver.Candidate) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             var seeds: std.StringArrayHashMapUnmanaged(void) = .empty;
@@ -1451,7 +1491,7 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
                 try seeds.put(allocator, candidate.doc_ref.key, {});
                 if (candidate.resolved_doc_ref) |ref| try seeds.put(allocator, ref.key, {});
             };
-            const current = try queryConfig(self.server, self.owner, allocator, policy_cfg.*, seeds.keys(), texts.keys(), candidate_lists != null, self.request, self.cut);
+            const current = try queryConfig(self.server, self.owner, allocator, policy_cfg.*, seeds.keys(), texts.keys(), candidate_lists != null, self.request, self.fence);
             const aliases = try current.effectiveAliasesAlloc(allocator);
             target.aliases = aliases;
             target.alias_index = try resolver.curation.RedirectIndex.init(allocator, aliases);
@@ -1491,7 +1531,7 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
                     predicate.* = try self.server.authorizedReadFilter(self.arena, self.request, logical);
                 }
                 const bound: ?[]const ?domain.ResolvedTable = if (self.server.source.vtable.system_catalog != null) resolved: {
-                    const bytes = try self.server.source.systemCatalog(arena, self.request, .{ .resolve_many = .{ .targets = targets, .expected_revision = self.revision } });
+                    const bytes = try self.server.source.systemCatalog(arena, self.request, .{ .resolve_many = .{ .targets = targets } });
                     const result = try std.json.parseFromSliceLeaky(domain.ResolvedMany, arena, bytes, .{});
                     if (result.tables.len != targets.len) return error.InvalidCatalogRecord;
                     self.revision = result.revision;
@@ -1499,7 +1539,13 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
                 } else null;
                 for (names[offset..end], filters, out[offset..end], 0..) |name, predicate, *physical, i| {
                     const storage = if (bound) |tables| (tables[i] orelse return error.TableNotFound).name else name;
-                    try self.filters.put(self.arena, try self.arena.dupe(u8, storage), predicate);
+                    const binding_stamp = try resolver.fingerprint(self.arena, if (bound) |tables| tables[i] else @as(?domain.ResolvedTable, .{ .table_id = 0, .name = name }));
+                    if (self.bindings.get(name)) |captured| {
+                        if (!std.mem.eql(u8, &captured, &binding_stamp)) return error.CatalogGenerationChanged;
+                    } else try self.bindings.put(self.arena, try self.arena.dupe(u8, name), binding_stamp);
+                    if (self.filters.get(storage)) |captured| {
+                        if (!std.mem.eql(u8, captured, predicate)) return error.RowPolicyCatalogChanged;
+                    } else try self.filters.put(self.arena, try self.arena.dupe(u8, storage), predicate);
                     physical.* = try allocator.dupe(u8, storage);
                     kept += 1;
                 }
@@ -1508,13 +1554,13 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
             return out;
         }
     };
-    var bridge: Bridge = .{ .server = server, .request = request, .source_table = table.name, .arena = a, .owner = alloc, .cut = cut };
+    var bridge: Bridge = .{ .server = server, .request = request, .source_table = table.name, .arena = a, .owner = alloc, .fence = fence };
     // Preflight every destination actually executed, including compositional
     // siblings, before extraction/model work. Redirect survivors bind through
     // the same credential-aware callback and catalog revision on demand.
     var names: std.StringArrayHashMapUnmanaged(void) = .empty;
     try names.put(a, cfg.table, {});
-    for (all) |item| if (!item.retired and cfg.sharesRoutingDomain(item)) try names.put(a, item.table, {});
+    for (all) |item| if (!item.retired and cfg.sharesRoutingDomain(item) and std.mem.eql(u8, cfg.source_artifact, item.source_artifact) and item.source_artifact_kind.matches(.asset)) try names.put(a, item.table, {});
     _ = try Bridge.bind(&bridge, a, names.keys());
     const io = server.inferenceIo();
     const invocation: local.storage_db_enrichment_asset_producer.InvocationContext = .{ .io = io, .deadline_ns = request.deadline_ns, .cancellation = request.cancellation };
@@ -1564,10 +1610,10 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
     for (all) |item| if (!item.retired) try active.append(a, item);
     const result = try local.storage_db_resolution_runtime.resolveQueryExtractionWithPolicyAlloc(a, active.items, &cfg, extraction, candidates.candidateSource(), if (embedding) |*value| value.denseInterface() else null, if (server.source.vtable.supports_resolver_authority) .{ .ptr = &bridge, .prepare = Bridge.prepare } else null);
     try request.ensureActive();
-    if (!std.mem.eql(u8, try readResolverIndexes(server, a, table.name, request), table.indexes_json)) return error.Busy;
-    if (cut) |revision| if (server.source.vtable.supports_resolver_catalog_read) {
-        _ = try readResolverCatalog(server, a, .{ .table_name = table.name, .identity_only = true, .expected_revision = revision }, request);
-    };
+    _ = try Bridge.bind(&bridge, a, bridge.bindings.keys());
+    if (fence) |pinned| try pinned.verify(server, a, request) else {
+        if (!std.mem.eql(u8, try readResolverIndexes(server, a, table.name, request), table.indexes_json)) return error.Busy;
+    }
     return response(alloc, 200, .{ .extraction = try std.json.parseFromSliceLeaky(std.json.Value, a, extraction, .{}), .resolution = try std.json.parseFromSliceLeaky(std.json.Value, a, result, .{}) });
 }
 
@@ -2239,7 +2285,7 @@ test "resolver curation HTTP query policy chunks large mention and candidate set
         texts: usize = 0,
         pub fn systemCatalog(self: *@This(), allocator: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const input = call.resolver_catalog_read;
-            try std.testing.expectEqual(@as(?u64, 42), input.expected_revision);
+            try std.testing.expectEqual(@as(?u64, null), input.expected_revision);
             const policy = input.authority.?;
             try std.testing.expect(policy.mode == .policy);
             try std.testing.expect(policy.seeds.len <= 1024 and policy.texts.len <= 128);
@@ -2255,10 +2301,26 @@ test "resolver curation HTTP query policy chunks large mention and candidate set
     for (seeds, 0..) |*key, i| key.* = try std.fmt.allocPrint(a, "entity/{d}", .{i});
     for (texts, 0..) |*text_value, i| text_value.* = try std.fmt.allocPrint(a, "mention {d}", .{i});
     const cfg: Config = .{ .name = "r", .table = "entities", .key_template = "entity/{{_key}}", .source_artifact = "kg", .resolution_artifact = "resolved", .namespace_curation_table_id = 7 };
-    const current = try queryConfig(&server, std.testing.allocator, a, cfg, seeds, texts, true, .{}, 42);
+    var pinned = try QueryFence.init(a, .{ .version = 1, .revision = 42, .table = .{ .table_id = 1, .name = "source" }, .query_fingerprint = @splat(1), .query_heads = &.{.{ .table_id = 7, .key_template = cfg.key_template, .stamp = .{ .revision = 3, .fingerprint = @splat(1) } }} }, "r", false);
+    const current = try queryConfig(&server, std.testing.allocator, a, cfg, seeds, texts, true, .{}, &pinned);
     try std.testing.expectEqual(@as(usize, 3), server.source.calls);
     try std.testing.expectEqual(seeds.len, server.source.seeds);
     try std.testing.expectEqual(texts.len, server.source.texts);
     try std.testing.expectEqual(@as(usize, 1), current.merges.len);
     try std.testing.expectEqual(@as(usize, 1), (try resolver.curation.parseState(a, current.curation_json)).suppress.texts.len);
+}
+
+test "resolver curation HTTP profiles are grouped once across many namespaces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var namespaces: std.StringArrayHashMapUnmanaged(curation.Namespace) = .empty;
+    var discovery: EntityDiscovery = .{ .a = a, .owner = a, .namespaces = &namespaces, .stored = .{}, .adoption_revision = 1, .standalone = true, .key = "entity/a", .observations = false, .aliases = false };
+    defer discovery.deinit();
+    for (0..10000) |i| try discovery.profiles.append(a, .{ .key_template = try std.fmt.allocPrint(a, "entity-{d}/{{{{_key}}}}", .{i}), .aliases = &.{} });
+    for (discovery.profiles.items) |profile| try std.testing.expectEqual(@as(usize, 1), (try discovery.profilesFor(profile.key_template)).len);
+    const before = arena.queryCapacity();
+    for (discovery.profiles.items) |profile| try std.testing.expectEqual(@as(usize, 1), (try discovery.profilesFor(profile.key_template)).len);
+    try std.testing.expectEqual(before, arena.queryCapacity());
+    try std.testing.expectEqual(@as(usize, 10000), discovery.profile_groups.count());
 }

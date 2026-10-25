@@ -13259,7 +13259,7 @@ pub const IndexManager = struct {
         try txn.put(try durable.key(arena.allocator(), table, namespace.key_template), try std.json.Stringify.valueAlloc(arena.allocator(), durable.Record{ .table = table, .table_id = table_id, .namespace = namespace, .bindings = bindings }, .{}));
         const epoch = if (txn.get(durable.epoch_key)) |raw| try std.fmt.parseInt(u64, raw, 10) else |err| if (err == error.NotFound) @as(u64, 0) else return err;
         try txn.put(durable.epoch_key, try std.fmt.allocPrint(arena.allocator(), "{d}", .{try std.math.add(u64, epoch, 1)}));
-        try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(resolver_catalog.resolver_static_profiles_reader_version));
+        try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(resolver_catalog.resolver_pin_index_reader_version));
         try txn.put(resolver_catalog.reresolve_resume_key, "");
         try txn.put(resolver_catalog.reresolve_repair_resume_key, "");
         if (completion) |work| {
@@ -13267,7 +13267,7 @@ pub const IndexManager = struct {
             try txn.put(@import("../../lite/resolver_consumers.zig").cursor_key, work.key);
         }
         try txn.commit();
-        self.minimum_reader_version.store(resolver_catalog.resolver_static_profiles_reader_version, .release);
+        self.minimum_reader_version.store(resolver_catalog.resolver_pin_index_reader_version, .release);
         self.invalidateWritePlanSnapshot();
         published = true;
         return true;
@@ -13361,6 +13361,25 @@ pub const IndexManager = struct {
 
     /// Match listResolvers' active/staged routing selection without copying
     /// destination-owned projected policy for unrelated resolver siblings.
+    pub fn listPublicResolverRoutingDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        var result: std.ArrayList(ResolverConfig) = .empty;
+        errdefer {
+            for (result.items) |*cfg| cfg.deinit(alloc);
+            result.deinit(alloc);
+        }
+        for (self.resolvers.items) |definition| {
+            if (definition.replacement_index.len != 0) continue;
+            var cfg = definition;
+            cfg.merges = &.{};
+            cfg.curation_json = "{}";
+            var owned = try ResolverConfig.clone(alloc, cfg);
+            errdefer owned.deinit(alloc);
+            try result.append(alloc, owned);
+        }
+        return result.toOwnedSlice(alloc);
+    }
     pub fn listResolverRoutingDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();

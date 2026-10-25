@@ -2186,8 +2186,8 @@ source publication fences still apply. Legacy adoption folds source-owned state
 once; warm native operations use the index.
 
 Metadata publishes v7 consumer/profile readiness only after its bounded backfill
-finishes, under topology protocol 47. Lite bootstraps the same layout atomically
-and installs reader floor 19. Embedded planning builds the static component
+finishes, under topology protocol 49. Lite bootstraps the same layout atomically
+and installs reader floor 20. Embedded planning builds the static component
 outside writer ownership, checks source/catalog generations and validates the
 observed curated head again inside the final transaction. Routed publication
 retains the catalog revision, physical authority and head fences.
@@ -2281,7 +2281,7 @@ only changed headers and indexes. Public proposal reads join the original
 evidence body; quotas continue accounting for evidence and reserved decision
 provenance. Header-only publication validates immutable proposal fields and
 retains evidence identity. Existing rows acquire a header when touched, without
-a queue scan. Lite reader floor 19 and memory identity format 2 reject older
+a queue scan. Lite reader floor 20 and memory identity format 3 reject older
 readers that would ignore these lifecycle headers.
 
 
@@ -2296,7 +2296,7 @@ base suppression validation without enumerating unrelated heads. Private native
 views explicitly mark sparse profiles, and their catalog-fenced enrolled consumer
 bindings certify omitted profiles as having no incident declarations. Cold
 adoption still reads complete immutable definitions once per content identity.
-Topology protocol 47 and Lite reader floor 19 fence this representation, and
+Topology protocol 49 and Lite reader floor 20 fence this representation, and
 indexed readiness follows the v7 backfill.
 
 Lite groups consumer indices by namespace once outside the destination writer
@@ -2321,29 +2321,45 @@ The older same-table CAS encoding remains replayable for existing log entries.
 ### Query policy reads and native mutation outcomes
 
 HTTP render/resolve reads obtain compact namespace bindings without expanding
-execution attachments. Query execution hydrates policy in two phases
+execution attachments. HTTP and embedded queries hydrate policy in two phases
 per resolver: rendered mention keys and normalized texts before blocking, then
 mention/candidate keys before scoring. Each phase uses bounded requests of at
 most 1,024 keys and 128 texts, then unions duplicate facts while fencing the
 exact head revision and fingerprint. Transport pages are released between
-requests; the union retains only unique facts. Each authority read and final response
-validation pins the original catalog revision, including model work and sibling
-resolvers. Source-owned legacy policies retain their existing execution path.
-Full namespace payloads remain available for provisioning and explicit exports.
+requests; the union retains only unique facts. Embedded queries read current
+native authority immediately, independently of projection replay.
 
-Lite key rendering and HTTP rendering use the same native forward policy reader.
-It follows static/native edges with native overrides and unmerge tombstones,
-without incoming-alias or cascade traversal. Text rules use normalized point
-lookups. Resolution probes the distinct record prefix for at most one row: a
-namespace without pins uses the forward reader even for candidate admission.
-When pins exist, resolution loads the selected connected components and incident
-pins, preserving distinctions inherited through incoming and static aliases;
-unrelated components and unrelated text rules are never exported.
+Query publication checks the source definition and schema, logical and physical
+destination bindings, destination schemas, and the heads of executed namespaces.
+Routing includes only applicable artifact/kind siblings. Unrelated catalog edits
+and projection replay do not invalidate completed model work. HTTP admission and
+final authorization still recheck the principal and row predicates. Source-owned
+legacy policies retain their existing execution path. Full namespace payloads
+remain available for provisioning and explicit exports.
 
-HTTP entity discovery builds an immutable namespace adoption hash set once and
-shares it with consumer authorization, discovery and publication planning.
+Key rendering uses the native forward policy reader. It follows static/native
+edges with native overrides and unmerge tombstones, without incoming-alias or
+cascade traversal. Text rules use normalized point lookups. Resolution uses a
+sparse pin index: each native node records its pinned-descendant count, and only
+child branches containing pinned endpoints have reverse entries. An unrelated
+pin therefore never expands an unpinned reverse component. Static aliases select
+the relevant canonical roots; incident pins retain endpoint tombstones and
+negative policy. Zero-pin namespaces take the forward-only path.
+
+Pin-index storage is linear in native nodes and pin endpoints. Authorized writes
+upgrade older namespaces with one linear backfill and publish readiness last.
+Mutations detach replaced edges, update endpoint counts, then attach final edges
+in the same transaction as the head. Read-only legacy namespaces retain the
+conservative component reader until upgraded. Reader floor 20, memory identity
+format 3 and topology protocol 49 fence writers that cannot maintain this index.
+
+HTTP entity discovery builds immutable namespace adoption and profile maps once.
+Namespace policy replacements parse and serialize the source document once per
+batch; publication joins predecessors by namespace key. These operations remain
+linear across multi-namespace entities.
+
 Standalone native mutation receipts distinguish record-only commits from table
 definition changes. Only definition changes refresh destination DDL under the
 catalog mutex; legacy receipts conservatively refresh it. Native records,
-receipts and the outcome publish in the same transaction. Metadata protocol v48
-qualifies the query-policy wire contract and mutation outcome readers.
+receipts and the outcome publish in the same transaction. Metadata protocol v49
+qualifies dependency-scoped query-policy reads and sparse pin maintenance.
