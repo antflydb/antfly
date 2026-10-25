@@ -4,16 +4,17 @@
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
-    "test": "node --test test/host.test.mjs test/collection.test.mjs test/batch.test.mjs test/r2-coordinator.test.mjs test/performance.test.mjs",
+    "test": "node --test test/host.test.mjs test/collection.test.mjs test/batch.test.mjs test/r2-coordinator.test.mjs test/performance.test.mjs test/publication-protocol.test.mjs test/gate.test.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "deploy:r2": "wrangler deploy --config wrangler.r2.jsonc",
-    "test:workerd": "wrangler deploy --dry-run --outdir dist/worker && node --test test/workerd.test.mjs test/r2-workerd.test.mjs test/split-workerd.test.mjs",
+    "test:workerd": "wrangler deploy --dry-run --outdir dist/worker && node --test test/workerd.test.mjs test/r2-workerd.test.mjs test/split-workerd.test.mjs test/qualification-workerd.test.mjs",
     "test:native": "node test/native.mjs"
   },
   "devDependencies": {
     "binaryen": "132.0.0",
-    "wrangler": "4.152.0",
-    "miniflare": "5.20261019.2-beta"
+    "esbuild": "0.28.2",
+    "miniflare": "5.20261019.2-beta",
+    "wrangler": "4.152.0"
   }
 }

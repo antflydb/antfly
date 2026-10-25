@@ -24,7 +24,7 @@ export class RequestPool {
   if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))return Promise.reject(new Error("DeadlineExceeded"));
   if(this.pending.length>=this.maxQueued)return Promise.reject(new Error("CoordinatorCommitBusy"));
   return new Promise((resolve,reject)=>{
-   Object.assign(job,{resolve,reject,queuedAt:performance.now()});let timer;
+   Object.assign(job,{resolve,reject,queuedAt:performance.now(),admittedAt:this.clock()});let timer;
    const abort=()=>{const index=this.pending.indexOf(job);if(index<0)return;this.pending.splice(index,1);job.cleanup();reject(new Error("DeadlineExceeded"));};
    job.cleanup=()=>{job.options.signal?.removeEventListener("abort",abort);clearTimeout(timer);};
    job.options.signal?.addEventListener("abort",abort,{once:true});
@@ -32,7 +32,12 @@ export class RequestPool {
    this.pending.push(job);this.drain();
   });
  }
- drain(){for(const slot of this.slots){if(slot.busy||!this.pending.length)continue;slot.busy=true;this.execute(slot,this.pending.shift());}}
+ drain(){for(const slot of this.slots){
+  if(slot.busy||!this.pending.length)continue;
+  const now=this.clock(),rank=job=>now-(job.admittedAt??now)>=5000?0:job.options.priority==="maintenance"?2:job.options.priority==="publication"?1:0;
+  let selected=0;for(let i=1;i<this.pending.length;i++){const a=this.pending[i],b=this.pending[selected];if(rank(a)<rank(b)||rank(a)===rank(b)&&b.options.fairKey===this.lastKey&&a.options.fairKey!==this.lastKey)selected=i;}
+  const job=this.pending.splice(selected,1)[0];this.lastKey=job.options.fairKey;slot.busy=true;this.execute(slot,job);
+ }}
  async execute(slot,job){
   job.cleanup();
   const stage=(name,start)=>{try{job.options.onStage?.({name,duration_ms:performance.now()-start});}catch{}};

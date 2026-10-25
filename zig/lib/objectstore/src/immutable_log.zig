@@ -148,6 +148,14 @@ pub const Log = struct {
     }
     /// Metadata allocations belong to the caller's bounded request arena.
     pub fn recover(self: Log, a: A, cursor: ?State, takeover: bool) !Recovery {
+        return self.recoverMode(a, cursor, takeover, false);
+    }
+    /// Observe an existing owner's committed prefix without repairing markers,
+    /// rotating epochs, checkpointing or acquiring ownership.
+    pub fn observe(self: Log, a: A, cursor: State) !Recovery {
+        return self.recoverMode(a, cursor, false, true);
+    }
+    fn recoverMode(self: Log, a: A, cursor: ?State, takeover: bool, read_only: bool) !Recovery {
         var state = cursor orelse State{};
         try validate(state);
         const checkpoint_value = try self.checkpoint(a);
@@ -162,7 +170,7 @@ pub const Log = struct {
             if (try self.read(a, sealed_key)) |stored| {
                 const sealed = try frame(a, stored.body, state.epoch, null);
                 if (sealed.kind != .seal or sealed.parent_revision < state.revision) return error.InvalidImmutableLog;
-                try self.start(a, sealed.state);
+                if (!read_only) try self.start(a, sealed.state);
                 state = sealed.state;
                 continue;
             }
@@ -172,8 +180,10 @@ pub const Log = struct {
                 if (item.parent_revision != state.revision) return error.InvalidImmutableLog;
                 if (item.kind == .seal) {
                     if (!std.mem.eql(u8, item.state.root, state.root)) return error.InvalidImmutableLog;
-                    try self.start(a, item.state);
-                    try self.marker(a, item);
+                    if (!read_only) {
+                        try self.start(a, item.state);
+                        try self.marker(a, item);
+                    }
                 } else if (!std.mem.eql(u8, &item.state.owner, &state.owner)) return error.InvalidImmutableLog;
                 state = item.state;
                 continue;
@@ -186,7 +196,7 @@ pub const Log = struct {
                 };
                 _ = self.writeCheckpoint(a, state, true) catch false;
             }
-            if (state.next == epoch_commits) state = try self.seal(a, state, self.owner);
+            if (!read_only and state.next == epoch_commits) state = try self.seal(a, state, self.owner);
             return .{ .state = state };
         }
         if (!takeover and !std.mem.eql(u8, &state.owner, &self.owner)) return error.ImmutableLogFenced;

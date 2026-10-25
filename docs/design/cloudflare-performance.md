@@ -559,8 +559,11 @@ durable commit. The final idle policy also has coalescing, foreground-deferral
 and bounded-retry tests. Live results and the observed extra write/maintenance
 work are recorded in the [qualification report](cloudflare-qualification.md).
 
-Publication work leases and runtime snapshots are opened only after admission
-to a physical kernel slot. Acquiring a lease while queued behind another tenant
+The earlier policy opened publication work leases and runtime snapshots only
+after admission to a physical kernel slot. The next candidate retains that
+boundary for short work leases, while preparing protected read views before
+WASM admission under their original grace deadline; see the
+[acceptance design](cloudflare-gates.md). Acquiring a lease while queued behind another tenant
 consumed its lifetime before execution and caused observed `Canceled` /
 `WorkLeaseLost` deferrals. Expired pending kernel jobs now reject and leave the
 queue without opening a lease; native in-flight cancellation and fencing remain
@@ -669,3 +672,14 @@ it. No new dense artifact format or automatic default change is introduced.
 The controlled recovery/commit comparison and ANN quality tradeoff are recorded
 in the [qualification report](cloudflare-qualification.md). These implementation
 changes do not close the live tail-latency or sustained multi-region gates.
+
+
+## Publication and foreground acceptance work
+
+The next candidate adds atomic native publication sessions, pure committed-prefix
+read observers, bounded fresh read cohorts, foreground-aware kernel admission,
+adaptive publication prefixes and compaction preflight for fully paged roots.
+These address serial metadata commits and maintenance queueing identified above.
+The [acceptance design](cloudflare-gates.md) specifies protocol invariants, exact
+thresholds, workload, evidence requirements, execution tools and scope limits.
+Implementation and local correctness checks do not establish a live gate pass.

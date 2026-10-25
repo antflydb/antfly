@@ -23,7 +23,9 @@ export async function metadataKeys(namespace){
 }
 export async function openReadView(store,namespace,{version,trace_id}={},now=Date.now){
  const keys=await metadataKeys(namespace);
- return store.transaction(async tx=>{
+ return store.transaction(tx=>captureReadView(tx,keys,{version},now),{traceId:trace_id});
+}
+export async function captureReadView(tx,keys,{version}={},now=Date.now){
   const values=await tx.getMany([keys.head,keys.wal,keys.floor]);
   const head=values[0]?text.decode(values[0].body).trim():"0";
   const selected=version??head;
@@ -39,12 +41,13 @@ export async function openReadView(store,namespace,{version,trace_id}={},now=Dat
    entries.push([key,pin]);
   }
   return {format:1,version:selected,entries};
- },{traceId:trace_id});
+
 }
 // One operation owns this view. Its native deadline bounds use of captured WAL
 // roots inside the collector's grace period. Never share it across requests.
-export function withReadView(transport,coordinator,namespace,{onMetrics=()=>{}}={}){
- let pending,hint;const started=performance.now();
+export function withReadView(transport,coordinator,namespace,{onMetrics=()=>{},initial,admittedAt=performance.now()}={}){
+ const mapView=view=>{if(view.format!==1)throw new Error("InvalidReadView");return new Map(view.entries);};
+ let pending=initial?Promise.resolve(mapView(initial)):null,hint;const started=admittedAt;
  const progress=`antfly/progress/${namespace}/`,manifest=`antfly/manifests/${namespace}/manifests/`;
  return async(request,body)=>{
   if(request.op==="get"&&request.key?.startsWith(manifest)){
@@ -52,7 +55,7 @@ export function withReadView(transport,coordinator,namespace,{onMetrics=()=>{}}=
   }
   if((request.op==="get"||request.op==="head")&&(request.key?.startsWith(progress)||/\/wal-v1\/[a-f0-9]{64}\/HEAD$/.test(request.key??""))){
    if(performance.now()-started>=30000)throw new ObjectStoreError(8,"read view deadline exceeded");
-   pending??=coordinator.openReadView(hint==null?{}:{version:hint}).then(view=>{if(view.format!==1)throw new Error("InvalidReadView");return new Map(view.entries);}).catch(error=>{if(unsupportedRpc(error,"openReadView"))return null;throw error;});
+   pending??=coordinator.openReadView(hint==null?{}:{version:hint}).then(mapView).catch(error=>{if(unsupportedRpc(error,"openReadView"))return null;throw error;});
    const records=await pending;
    if(records?.has(request.key)){
     const record=records.get(request.key);onMetrics({snapshot_reads:1});

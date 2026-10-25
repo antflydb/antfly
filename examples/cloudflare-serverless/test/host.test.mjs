@@ -174,11 +174,14 @@ test("bounded publications resume from durable watermarks", async () => {
   await host.request(request("mutate", { operation_id: "bulk", mutations }));
   const first = await host.request(request("publish"));
   assert.equal(first.wal_end_lsn, "16");
+  assert.equal(first.consumed_records,16);
   assert.equal(first.has_more, true);
   const second = await host.request(request("publish", {publication_records: 256}));
   assert.equal(second.wal_end_lsn, "272");
+  assert.equal(second.consumed_records,256);
   const third = await host.request(request("publish", {publication_records: 256}));
   assert.equal(third.wal_end_lsn, "300");
+  assert.equal(third.consumed_records,28);
   assert.equal(third.has_more, false);
 });
 

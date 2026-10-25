@@ -97,6 +97,30 @@ pub const Compactor = struct {
         }
     }
 
+    fn pagedNoop(self: *Compactor, namespace: []const u8, current: manifest_mod.Manifest, cancellation: ?maintenance_cancellation.Token) !?CompactionResult {
+        if (builder_mod.hasPagedText(current) and builder_mod.findArtifactIndex(current, .document_facts) != null and
+            builder_mod.allArtifactsPagedOrAbsent(current, .text_segment) and builder_mod.allArtifactsPagedOrAbsent(current, .vector_segment) and builder_mod.allArtifactsPagedOrAbsent(current, .sparse_segment) and builder_mod.findArtifactIndex(current, .graph_segment) == null)
+        {
+            // These serving trees are already maintained by bounded COW
+            // updates. There is no flat corpus snapshot to reconstruct.
+            var bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
+            var reads: u64 = 4 * 1024 * 1024;
+            var writes: u64 = 0;
+            var pages = @import("../graph_segment/page_store.zig").PageStore{ .domain = @import("../graph_segment/page_store.zig").PageStore.namespaceDomain(namespace), .artifacts = self.artifacts, .cancellation = bridge.token(), .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+            for (current.artifacts) |ref| if (ref.kind == .text_segment) {
+                const root = try @import("../text_segment/paged.zig").loadRoot(self.alloc, &pages, ref);
+                defer root.deinit();
+                if ((if (root.value.docs) |page| page.records else 0) != current.stats.document_count) return error.DocumentFactsSourceChanged;
+            };
+            for (current.artifacts) |ref| if (ref.kind == .vector_segment or ref.kind == .sparse_segment) {
+                const root = try @import("../paged_projection.zig").load(self.alloc, &pages, ref);
+                defer root.deinit();
+            };
+            return .{ .namespace = try self.alloc.dupe(u8, namespace), .published = false, .version = current.version, .artifact_count = current.artifacts.len };
+        }
+        return null;
+    }
+
     fn compactHeadWithIo(
         self: *Compactor,
         namespace: []const u8,
@@ -105,6 +129,19 @@ pub const Compactor = struct {
     ) !CompactionResult {
         const io = cancellation.io;
         if (publication_guard == null) {
+            // COW serving roots have no flat snapshot to compact. Protect and
+            // validate the immutable source before acquiring a writer lease.
+            var source = try builder_mod.GraphSourceProtection.init(self.progress, namespace, cancellation);
+            if (source.version != 0) {
+                var current = try self.manifests.getAlloc(namespace, source.version);
+                defer current.deinit(self.alloc);
+                if (try self.pagedNoop(namespace, current, source.token(io))) |result| {
+                    var owned = result;
+                    errdefer owned.deinit(self.alloc);
+                    try maintenance_cancellation.check(source.token(io));
+                    return owned;
+                }
+            }
             var owner_bytes: [16]u8 = undefined;
             io.random(&owner_bytes);
             const owner = std.fmt.bytesToHex(&owner_bytes, .lower);
@@ -134,26 +171,7 @@ pub const Compactor = struct {
         const current_head = try self.progress.getHead(namespace);
         var current = try self.manifests.getAlloc(namespace, current_head);
         defer current.deinit(self.alloc);
-        if (builder_mod.hasPagedText(current) and builder_mod.findArtifactIndex(current, .document_facts) != null and
-            builder_mod.allArtifactsPagedOrAbsent(current, .text_segment) and builder_mod.allArtifactsPagedOrAbsent(current, .vector_segment) and builder_mod.allArtifactsPagedOrAbsent(current, .sparse_segment) and builder_mod.findArtifactIndex(current, .graph_segment) == null)
-        {
-            // These serving trees are already maintained by bounded COW
-            // updates. There is no flat corpus snapshot to reconstruct.
-            var bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
-            var reads: u64 = 4 * 1024 * 1024;
-            var writes: u64 = 0;
-            var pages = @import("../graph_segment/page_store.zig").PageStore{ .domain = @import("../graph_segment/page_store.zig").PageStore.namespaceDomain(namespace), .artifacts = self.artifacts, .cancellation = bridge.token(), .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
-            for (current.artifacts) |ref| if (ref.kind == .text_segment) {
-                const root = try @import("../text_segment/paged.zig").loadRoot(self.alloc, &pages, ref);
-                defer root.deinit();
-                if ((if (root.value.docs) |page| page.records else 0) != current.stats.document_count) return error.DocumentFactsSourceChanged;
-            };
-            for (current.artifacts) |ref| if (ref.kind == .vector_segment or ref.kind == .sparse_segment) {
-                const root = try @import("../paged_projection.zig").load(self.alloc, &pages, ref);
-                defer root.deinit();
-            };
-            return .{ .namespace = try self.alloc.dupe(u8, namespace), .published = false, .version = current_head, .artifact_count = current.artifacts.len };
-        }
+        if (try self.pagedNoop(namespace, current, cancellation)) |result| return result;
         if (self.max_documents) |maximum| if (current.stats.document_count > maximum) return error.CompactionBudgetExceeded;
         if (self.max_artifact_bytes) |maximum| {
             var bytes: u64 = 0;

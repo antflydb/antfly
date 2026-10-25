@@ -81,6 +81,8 @@ pub const BuildResult = struct {
     wal_start_lsn: u64,
     wal_end_lsn: u64,
     artifact_count: usize,
+    /// Actual admitted WAL records, independent of retained manifest ranges.
+    consumed_records: usize = 0,
 
     pub fn deinit(self: *BuildResult, alloc: Allocator) void {
         alloc.free(self.namespace);
@@ -471,6 +473,7 @@ pub const Builder = struct {
                     publication_guard,
                     cancellation,
                     last_record,
+                    records.len,
                 );
             }
             if (last_record) |record| return try self.publishHeadConsumingIgnoredWal(
@@ -478,6 +481,7 @@ pub const Builder = struct {
                 current_head,
                 current_manifest.?,
                 record,
+                records.len,
                 publication_guard,
                 cancellation,
             );
@@ -538,6 +542,7 @@ pub const Builder = struct {
                 current_head,
                 current,
                 last_record,
+                records.len,
                 publication_guard,
                 cancellation,
             );
@@ -781,6 +786,7 @@ pub const Builder = struct {
             .wal_start_lsn = if (inline_document_rebase) wal_end_lsn else start_lsn,
             .wal_end_lsn = wal_end_lsn,
             .artifact_count = manifest.artifacts.len,
+            .consumed_records = records.len,
         };
     }
 
@@ -790,6 +796,7 @@ pub const Builder = struct {
         current_head: u64,
         current: manifest_mod.Manifest,
         last_record: wal_mod.Record,
+        consumed_records: usize,
         publication_guard: ?work_lease.PublicationGuard,
         cancellation: ?maintenance_cancellation.Token,
     ) !BuildResult {
@@ -825,6 +832,7 @@ pub const Builder = struct {
             .wal_start_lsn = manifest.wal_start_lsn,
             .wal_end_lsn = manifest.wal_end_lsn,
             .artifact_count = manifest.artifacts.len,
+            .consumed_records = consumed_records,
         };
     }
 
@@ -839,6 +847,7 @@ pub const Builder = struct {
         publication_guard: ?work_lease.PublicationGuard,
         cancellation: ?maintenance_cancellation.Token,
         consumed_record: ?wal_mod.Record,
+        consumed_records: usize,
     ) !BuildResult {
         try maintenance_cancellation.check(cancellation);
         var manifest = reconcile: {
@@ -882,6 +891,7 @@ pub const Builder = struct {
             .wal_start_lsn = manifest.wal_start_lsn,
             .wal_end_lsn = manifest.wal_end_lsn,
             .artifact_count = manifest.artifacts.len,
+            .consumed_records = consumed_records,
         };
     }
 

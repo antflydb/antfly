@@ -112,8 +112,10 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     @import("antfly_platform").time.installHostClocks(.{ .monotonic_ns = monotonicNs, .realtime_ns = realtimeNs, .authority_ns = authorityNs });
     const MutationGroup = struct { mutations: []const @import("serverless/api/types.zig").DocumentMutation, operation_id: []const u8, timestamp_ns: []const u8 = "0" };
     const Request = struct {
-        op: enum { search, mutate, publish, compact, lookup, list, count, status, enrich, gc_prepare, gc_wal, gc_trace, reindex, coordinate },
+        op: enum { search, mutate, publish, compact, lookup, list, count, status, enrich, gc_prepare, gc_wal, gc_trace, reindex, coordinate, publication_acquire, publication_validate, publication_release },
         pack_small_bodies: bool = false,
+        publication_owner: []const u8 = "",
+        publication_lease: ?@import("serverless/hosted_publication.zig").Lease = null,
         coordinate: ?@import("serverless/coordinator_store.zig").Request = null,
         bucket: []const u8,
         prefix: []const u8,
@@ -164,6 +166,14 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     if (req.cursor != null and req.op != .list and !(req.op == .search and req.mode == .text)) return error.QueryCursorCapabilityUnsupported;
     var host = objects.wasm_host.Host{ .alloc = a, .transfer_allocator = wasm_allocator };
     if (req.op == .coordinate) return (@import("serverless/coordinator_store.zig").Context{ .alloc = a, .client = host.client(), .bucket = req.bucket, .prefix = req.prefix, .namespace = req.namespace, .io = host_io, .cancellation = objects.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn) }).execute(req.coordinate orelse return error.CoordinatorRequestRequired);
+    switch (req.op) {
+        .publication_acquire, .publication_validate, .publication_release => return @import("serverless/hosted_publication.zig").run(a, host.client(), req.bucket, req.prefix, req.namespace, switch (req.op) {
+            .publication_acquire => .acquire,
+            .publication_validate => .validate,
+            else => .release,
+        }, req.publication_owner, req.publication_lease, @intCast(realtimeNs())),
+        else => {},
+    }
     const artifact_prefix = try std.fmt.allocPrint(a, "{s}/artifacts", .{req.prefix});
     defer a.free(artifact_prefix);
     var object_artifacts = try @import("serverless/artifacts/object_store.zig").ObjectStore.initWithClient(a, host.client(), req.bucket, artifact_prefix);
@@ -299,6 +309,15 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         return std.json.Stringify.valueAlloc(a, .{ .published = result.published, .version = try std.fmt.bufPrint(&version, "{d}", .{result.version}), .artifact_count = result.artifact_count }, .{});
     }
     if (req.op == .publish) {
+        const work = @import("serverless/build/work_lease.zig");
+        var held: ?work.HeldLease = if (req.publication_lease) |lease| .{
+            .provider = try progress.workLeaseProvider(),
+            .io = host_io,
+            .namespace = req.namespace,
+            .owner_id = lease.owner,
+            .acquisition = .{ .fencing_token = try std.fmt.parseInt(u64, lease.token, 10), .expires_at_unix_ns = try std.fmt.parseInt(u64, lease.expires, 10), .took_over = false },
+            .ttl_ns = 30 * std.time.ns_per_s,
+        } else null;
         var builder = @import("serverless/build/builder.zig").Builder.init(a, &artifacts, &manifests, &progress, &wal);
         builder.setIo(host_io);
         builder.paged_text = req.paged_text;
@@ -307,16 +326,16 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         if (req.publication_records == 0 or req.publication_records > 256) return error.InvalidWalBatch;
         builder.max_wal_records = req.publication_records;
         builder.max_wal_bytes = 4 * 1024 * 1024;
-        var result = try builder.publishNamespaceWithMetricAndPlanWithCancellation(req.namespace, .cosine, .{ .targets = .{
+        var result = try builder.publishNamespaceWithMetricAndPlanGuardedUntil(req.namespace, .cosine, .{ .targets = .{
             .published_search_sources = @import("serverless/search_sources.zig").defaultPublishedSearchSources(),
             .include_graph = false,
-        }, .policy = .{ .chunk_embeddings_enabled = req.enrichment, .chunk_embeddings_model_preference = .require_model } }, cancellation);
+        }, .policy = .{ .chunk_embeddings_enabled = req.enrichment, .chunk_embeddings_model_preference = .require_model } }, if (held) |*lease| lease.guard() else null, if (held) |*lease| lease.cancellation(.{ .io = host_io, .cooperative = cancellation }) else .{ .io = host_io, .cooperative = cancellation });
         defer result.deinit(a);
         const version = try std.fmt.allocPrint(a, "{d}", .{result.version});
         defer a.free(version);
         const watermark = try std.fmt.allocPrint(a, "{d}", .{result.wal_end_lsn});
         defer a.free(watermark);
-        return std.json.Stringify.valueAlloc(a, .{ .published = result.published, .version = version, .wal_end_lsn = watermark, .has_more = (try wal.latestLsn(req.namespace)) > result.wal_end_lsn }, .{});
+        return std.json.Stringify.valueAlloc(a, .{ .published = result.published, .version = version, .wal_end_lsn = watermark, .consumed_records = result.consumed_records, .has_more = (try wal.latestLsn(req.namespace)) > result.wal_end_lsn }, .{});
     }
     var runtime = @import("serverless/query/runtime.zig").QueryRuntime.init(a, &artifacts, &manifests, &progress);
     defer runtime.deinit();

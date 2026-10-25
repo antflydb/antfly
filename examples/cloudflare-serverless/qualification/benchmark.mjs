@@ -25,6 +25,8 @@ import {instantiateHost} from "../../../zig/lib/objectstore/wasm/asyncify.mjs";
 import {createR2Transport, ObjectStoreError} from "../../../zig/lib/objectstore/wasm/r2.mjs";
 import {createImmutableReadCache} from "../../../zig/lib/objectstore/wasm/cache.mjs";
 
+const deterministic=process.argv.includes("--deterministic");let fixtureRandom=1;
+if(deterministic){const secure=globalThis.crypto;Object.defineProperty(globalThis,"crypto",{value:new Proxy(secure,{get(target,key){if(key==="getRandomValues")return bytes=>{for(let i=0;i<bytes.length;i++){fixtureRandom^=fixtureRandom<<13;fixtureRandom^=fixtureRandom>>>17;fixtureRandom^=fixtureRandom<<5;bytes[i]=fixtureRandom&255;}return bytes;};const value=target[key];return typeof value==="function"?value.bind(target):value;}})});}
 const reindex = process.argv.includes("--reindex");
 const recallQueries = Number(process.argv.find(arg => arg.startsWith("--recall-queries="))?.slice(17) ?? 0);
 if (!Number.isSafeInteger(recallQueries) || recallQueries < 0 || recallQueries > 20) throw new Error("recall-queries must be 0..20");
@@ -34,8 +36,14 @@ const pagedProjections = process.argv.includes("--paged-projections");
 const pagedText = pagedProjections || process.argv.includes("--paged-text");
 const dimensions = Number(process.argv.find(arg => arg.startsWith("--dimensions="))?.slice(13) ?? 384);
 if (!Number.isSafeInteger(dimensions) || dimensions < 2 || dimensions > 4096) throw new Error("dimensions must be 2..4096");
+const embeddingPath=process.argv.find(arg=>arg.startsWith("--embedding-fixture="))?.slice(20);
+const embeddingBytes=embeddingPath?await readFile(embeddingPath):null;
+const embeddingFixture=embeddingBytes?JSON.parse(embeddingBytes):null;
+if(embeddingFixture){for(const values of[embeddingFixture.documents,embeddingFixture.queries]){if(!Array.isArray(values)||!values.length||values.some(vector=>!Array.isArray(vector)||vector.length!==dimensions||vector.some(value=>!Number.isFinite(value))||!vector.some(value=>value!==0)))throw Error("InvalidEmbeddingFixture");}}
+function normalizedFixture(vector){const norm=Math.sqrt(vector.reduce((sum,value)=>sum+value*value,0));return vector.map(value=>Math.fround(value/norm));}
 // Deterministic unit vectors; these measurements exclude model latency.
 function vectorFor(id) {
+  if(embeddingFixture){if(!embeddingFixture.documents[id])throw Error("EmbeddingFixtureDocumentMissing");return normalizedFixture(embeddingFixture.documents[id]);}
   let seed = id + 1;
   const values = Array.from({length: dimensions}, () => {
     seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
@@ -55,23 +63,27 @@ const maxPutBytes = Number(process.argv.find(arg => arg.startsWith("--max-put-by
 const maxCompactionDocuments = Number(process.argv.find(arg => arg.startsWith("--compaction-documents="))?.slice(23) ?? 1000);
 const recycleAtBytes = Number(process.argv.find(arg => arg.startsWith("--recycle-at-bytes="))?.slice(19) ?? 24 * 1024 * 1024);
 const publicationRecords = Number(process.argv.find(arg => arg.startsWith("--publication-records="))?.slice(22) ?? 16);
+if(embeddingFixture&&(recallQueries>embeddingFixture.queries.length||sizes.some(size=>size>embeddingFixture.documents.length)))throw Error("EmbeddingFixtureTooSmall");
 if (!sizes.length || sizes.some(size => !Number.isSafeInteger(size) || size < 1 || size > 100000)) throw new Error("sizes must be integers from 1 to 100000");
 if (!Number.isSafeInteger(maxPutBytes) || maxPutBytes < 1 || maxPutBytes > 8 * 1024 * 1024 || !Number.isSafeInteger(maxCompactionDocuments) || maxCompactionDocuments < 0) throw new Error("invalid capacity profile");
 if (!Number.isSafeInteger(recycleAtBytes) || recycleAtBytes < 0 || recycleAtBytes > 32 * 1024 * 1024) throw new Error("invalid recycling threshold");
 if (!Number.isSafeInteger(publicationRecords) || publicationRecords < 1 || publicationRecords > 256) throw new Error("invalid publication prefix");
-const bytes = await readFile(new URL("../dist/antfly-serverless.wasm", import.meta.url));
+const wasmPath=process.argv.find(arg=>arg.startsWith("--wasm="))?.slice(7);
+const bytes = await readFile(wasmPath??new URL("../dist/antfly-serverless.wasm", import.meta.url));
 const module = await WebAssembly.compile(bytes);
-const report = {profile: "local native WASM/R2 contract fixture", wasm_sha256: createHash("sha256").update(bytes).digest("hex"),
-  timestamp: new Date().toISOString(), max_put_bytes: maxPutBytes, compaction_max_documents: maxCompactionDocuments, recycle_at_bytes: recycleAtBytes,
-  publication_records: publicationRecords, reindex, recall_queries: recallQueries, paged_projections: pagedProjections, dimensions: pagedProjections ? dimensions : null, paged_text: pagedText, body_bytes: bodyBytes, clock: "monotonic epoch fixture", total_isolate_memory: null, cases: []};
+const readerPath=process.argv.find(arg=>arg.startsWith("--reader-wasm="))?.slice(14),readerBytes=readerPath?await readFile(readerPath):null,readerModule=readerBytes?await WebAssembly.compile(readerBytes):null;
+const reads=new Set(["lookup","list","count","status","search","latest"]);
+const report = {reader_wasm_sha256:readerBytes?createHash("sha256").update(readerBytes).digest("hex"):null,reader_working_set_bytes:readerBytes?8*1024*1024:null,deterministic_fixture:deterministic,profile: "local native WASM/R2 contract fixture", wasm_sha256: createHash("sha256").update(bytes).digest("hex"),
+  embedding_fixture_sha256:embeddingBytes?createHash("sha256").update(embeddingBytes).digest("hex"):null, embedding_model:embeddingFixture?.model??null, timestamp: new Date().toISOString(), max_put_bytes: maxPutBytes, compaction_max_documents: maxCompactionDocuments, recycle_at_bytes: recycleAtBytes,
+  publication_records: publicationRecords, reindex, recall_queries: recallQueries, paged_projections: pagedProjections, dimensions: pagedProjections ? dimensions : null, paged_text: pagedText, body_bytes: bodyBytes, clock: deterministic?"logical per-request fixture clock":"monotonic epoch fixture", total_isolate_memory: null, cases: []};
 for (const count of sizes) {
   const bucket = new Bucket(), stages = [];
-  let group, cache, host, accepted = 0, recycled = 0;
+  let group, cache, host, hostRole="builder", accepted = 0, recycled = 0;
   const recall = [];let routingShape;
-  const epoch = Date.now(), monotonic = performance.now();
+  const epoch = deterministic?1700000000000:Date.now(), monotonic = performance.now();let fixtureTick=0;if(deterministic)fixtureRandom=(count+1)>>>0;
   // The benchmark measures memory and traffic, not clock recovery. Clock
   // rollback is covered by fault tests; avoid NTP changes poisoning a long run.
-  const clock = () => epoch + Math.floor(performance.now() - monotonic);
+  const clock = () => epoch + (deterministic?fixtureTick:Math.floor(performance.now() - monotonic));
   async function reopen(cold = true) {
     if (cold || !cache) cache = createImmutableReadCache();
     const raw = createR2Transport({database: bucket}, {maxPutBytes});
@@ -85,15 +97,16 @@ for (const count of sizes) {
       const {guard_key, guard_etag, ...plain} = request;
       return raw(plain, body);
     };
-    host = await instantiateHost(module, cache.wrap(transport, "benchmark"), {
+    host = await instantiateHost(hostRole==="reader"?readerModule:module, cache.wrap(transport, "benchmark"), {
       clock,
       onMetrics(sample) { group.samples.push({...sample, cache_retained_bytes: cache.retainedBytes()}); },
     });
   }
   async function call(op, fields = {}) {
+    const role=readerModule&&reads.has(op)?"reader":"builder";if(role!==hostRole){hostRole=role;host=null;}
     if (!host) await reopen(false);
-    try { return await host.request({op, bucket: "database", prefix: "benchmark", namespace: `capacity/${count}`, paged_text: pagedText, paged_projections: pagedProjections, ...fields}); }
-    finally { if (recycleAtBytes && host.memoryBytes() >= recycleAtBytes) { host = null; recycled++; } }
+    try { return await host.request({op, bucket: "database", prefix: "benchmark", namespace: `capacity/${count}`, paged_text: pagedText, paged_projections: pagedProjections, ...(hostRole==="reader"?{working_set_bytes:8*1024*1024}:{}), ...fields}); }
+    finally { fixtureTick++;if (recycleAtBytes && host.memoryBytes() >= recycleAtBytes) { host = null; recycled++; } }
   }
   async function stage(name, body) {
     group = {name, samples: []};
@@ -149,7 +162,7 @@ for (const count of sizes) {
       if (recallQueries) await stage("vector-recall", async () => {
         const corpus = Array.from({length: count}, (_, i) => vectorFor(i));
         for (let q = 0; q < recallQueries; q++) {
-          const query = vectorFor(count + q);
+          const query = embeddingFixture?normalizedFixture(embeddingFixture.queries[q]):vectorFor(count + q);
           const exact = corpus.map((v, i) => ({i, score: v.reduce((sum, value, d) => sum + value * query[d], 0)})).sort((l, r) => r.score-l.score || l.i-r.i).slice(0, 10);
           const expected = new Set(exact.map(({i}) => `doc/${String(i).padStart(6,"0")}`));
           for (const probes of [8, 32, "all"]) {

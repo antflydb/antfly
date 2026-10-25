@@ -1,0 +1,70 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import{assertGateRun}from'./gate-scope.mjs';
+import {readFile} from 'node:fs/promises';
+export class GateClient {
+ static async open(path){const run=JSON.parse(await readFile(path));assertGateRun(run);if(!run.token_installed||!run.origin||!run.version||!/^antfly-1278-g-/.test(run.id)||!new URL(run.origin).hostname.startsWith(run.id+'.')||!new URL(run.origin).hostname.endsWith('.workers.dev'))throw Error('invalid ready gate profile');return new GateClient(run,(await readFile(run.token_file,'utf8')).trim());}
+ constructor(run,token){this.run=run;this.token=token;this.executionId=crypto.randomUUID();this.samples=[];this.errors=[];this.receipts={};this.seeds={};this.expected=new Map();this.lag=[];this.queue=[];this.cold=[];this.resourceErrors=[];}
+ async call(tenant,input,phase,{epoch=this.physicalEpochs?.[tenant]??0,scheduled=Date.now(),path='/api'}={}){
+  let attempts=0,last;
+  try{for(;attempts<20&&Date.now()-scheduled<60000;attempts++){
+   const response=await fetch(new URL(path,this.run.origin),{method:'POST',headers:{Authorization:'Bearer '+this.token,'Content-Type':'application/json','X-Antfly-Tenant':tenant,'X-Antfly-Physical-Epoch':String(epoch)},body:JSON.stringify(input),signal:AbortSignal.timeout(Math.max(1,Math.min(35000,scheduled+60000-Date.now())))});
+   const body=await response.text();let value;try{value=JSON.parse(body);}catch{throw Error('non-JSON response: '+response.status);}
+   last=value;if(/OutOfMemory|SQLITE_NOMEM|MemoryLimitExceeded/.test(value.error??''))this.resourceErrors.push({phase,error:value.error});
+   if(response.status===503||response.status===409&&/WorkLeaseLost|WalCommitContended|PublicationConflict|PreconditionFailed/.test(value.error??'')){await new Promise(r=>setTimeout(r,250));continue;}
+   if(!response.ok)throw Error('HTTP '+response.status+': '+(value.error??'unknown'));
+   const version=response.headers.get('X-Antfly-Version');if(version!==this.run.version)throw Error('mixed version: '+version);
+   const sample={tenant,phase,op:input.op??path,ms:Date.now()-scheduled,scheduled_at:scheduled,finished_at:Date.now(),attempts:attempts+1,version,epoch};this.samples.push(sample);return{value,sample};
+  }throw Error('admission exhausted: '+JSON.stringify(last));}catch(error){this.errors.push({phase,tenant,ms:Date.now()-scheduled,attempts:attempts+1,error:String(error)});throw error;}
+ }
+ body(tenant,id,text='seed '+id){return JSON.stringify({tenant,text,payload:'x'.repeat(1024)});}
+ async seed(documents){
+  await Promise.all(['a','b','c','d'].map(async tenant=>{
+   for(let start=0;start<documents;start+=64){const input={op:'mutate',operation_id:'gate/'+this.executionId+'/seed/'+start,mutations:Array.from({length:Math.min(64,documents-start)},(_,i)=>{const id=start+i,body=this.body(tenant,id);this.expected.set(tenant+'/'+id,body);return{kind:'upsert',doc_id:'gate/'+id,body};})};const {value}=await this.call(tenant,input,'seed');this.receipts[tenant]=value.visibility;this.seeds[tenant]={input,visibility:value.visibility};}
+  }));await this.converge(1800000);
+ }
+ async round(index,documents,scheduled){
+  const outcomes=await Promise.allSettled(['a','b','c','d'].map(async tenant=>{
+   const id=index%documents,body=this.body(tenant,id,'round '+this.executionId+' '+index),receipt=this.receipts[tenant];
+   const jobs=[this.call(tenant,{op:'mutate',operation_id:'gate/'+this.executionId+'/round/'+index,mutations:[{kind:'upsert',doc_id:'gate/'+id,body}]},'write',{scheduled}).then(({value})=>{if(value.committed!==true||typeof value.visibility!=='string')throw Error('write was not durably committed');this.receipts[tenant]=value.visibility;this.expected.set(tenant+'/'+id,body);this.latest??={};this.latest[tenant]={input:{op:'mutate',operation_id:'gate/'+this.executionId+'/round/'+index,mutations:[{kind:'upsert',doc_id:'gate/'+id,body}]},visibility:value.visibility};})];
+   for(let i=0;i<3;i++)jobs.push(this.call(tenant,{op:'lookup',doc_id:'gate/'+((index*37+i)%documents),required_visibility:receipt},'read',{scheduled}).then(({value})=>{const body=JSON.parse(value.body);if(body.tenant!==tenant||body.payload!=='x'.repeat(1024))throw Error('fenced read mismatch');}));
+   if(index%4===0)jobs.push(this.call(tenant,{op:'compact'},'compact',{scheduled}));
+   const results=await Promise.allSettled(jobs);for(const r of results)if(r.status==='rejected')throw r.reason;
+  }));
+  const failed=outcomes.find(outcome=>outcome.status==='rejected');if(failed){this.errors.push({phase:'round-correctness',round:index,error:String(failed.reason)});throw failed.reason;}
+ }
+ async progress(minute){
+  await Promise.all(['a','b','c','d'].map(async tenant=>{const{value}=await this.call(tenant,{op:'status'},'lag');const latest=BigInt('0x'+value.visibility.slice(-16)),published=BigInt(value.published_lsn??0);this.lag.push({minute,tenant,lag:Number(latest-published),at:Date.now()});}));
+  const{value}=await this.call('a',{},'queue',{path:'/_qualification/queue'});this.queue.push({minute,at:Date.now(),...value});
+ }
+ async converge(timeout=120000){
+  const started=Date.now();for(;;){let done=true;for(const tenant of ['a','b','c','d']){const{value}=await this.call(tenant,{op:'status'},'converge');if(BigInt(value.published_lsn??0)<BigInt('0x'+this.receipts[tenant].slice(-16)))done=false;}if(done){this.converged=true;return;}if(Date.now()-started>timeout){this.converged=false;throw Error('publication did not converge');}await new Promise(r=>setTimeout(r,500));}
+ }
+ async verify(documents){
+  let bodies=0,receipts=0;
+  const outcomes=await Promise.allSettled(['a','b','c','d'].map(async tenant=>{
+   const count=(await this.call(tenant,{op:'count',required_visibility:this.receipts[tenant]},'verify')).value;if(count.count!==String(documents))throw Error('count mismatch');bodies++;
+   for(let base=0;base<documents;base+=4){
+    const results=await Promise.allSettled(Array.from({length:Math.min(4,documents-base)},async(_,offset)=>{const id=base+offset,{value}=await this.call(tenant,{op:'lookup',doc_id:'gate/'+id,required_visibility:this.receipts[tenant]},'verify');if(value.body!==this.expected.get(tenant+'/'+id))throw Error('exact body mismatch: '+tenant+'/'+id);bodies++;}));
+    for(const result of results)if(result.status==='rejected')throw result.reason;
+   }
+   for(const prior of[this.seeds[tenant],this.latest?.[tenant]].filter(Boolean)){const{value}=await this.call(tenant,prior.input,'receipt-replay');if(value.visibility!==prior.visibility)throw Error('receipt replay mismatch');receipts++;}
+  }));
+  for(const outcome of outcomes)if(outcome.status==='rejected')throw outcome.reason;
+  this.verification={passed:true,bodies,receipts};
+ }
+ report(){return{execution_id:this.executionId,version:this.run.version,run:this.run.id,wasm_sha256:this.run.wasm_sha256,bundle_hashes:this.run.bundle_hashes,samples:this.samples,errors:this.errors,resource_errors:this.resourceErrors,verification:this.verification,lag:this.lag,queue:this.queue,cold:this.cold,converged:this.converged??false};}
+}

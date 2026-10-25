@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {IngressBudget} from "./ingress-budget.mjs";
 import {CriticalPath} from "./trace.mjs";
 import {tenantEnv,tenantEnvs} from "./tenants.mjs";
 import {managedMaintenance} from "./maintenance-tickets.mjs";
@@ -26,7 +27,7 @@ export {R2ReadRuntime,R2BuildRuntime} from "./runtime-actors.mjs";
 export { R2CommitCoordinator } from "./r2-coordinator.mjs";
 export { CommitCoordinator } from "./coordinator.mjs";
 const localRuntime=createRuntime();
-let admitted=0,readerCursor=0;
+let admitted=0,readerCursor=0;const ingressBudget=new IngressBudget();
 async function run(env,input,signal,collection,trace){
  const read=["lookup","list","search","count","status","latest"].includes(input.op);
  const binding=read?env.READERS:env.BUILDERS;
@@ -44,7 +45,7 @@ async function background(env,input){
  return input.op==="collect_metadata"?stub.collectMetadata(input.job_id,{scheduled:input.scheduled}):stub.migrateFromSqlite();
 }
 
-async function readJson(request) {
+async function readJson(request,reservation) {
   if (Number(request.headers.get("Content-Length") ?? 0) > 1024 * 1024) throw new Error("request too large");
   const reader = request.body?.getReader();
   if (!reader) throw new Error("body required");
@@ -55,9 +56,10 @@ async function readJson(request) {
       if (done) break;
       size += value.byteLength;
       if (size > 1024 * 1024) { await reader.cancel(); throw new Error("request too large"); }
+      reservation.add(value.byteLength);
       chunks.push(value);
     }
-  } finally { reader.releaseLock(); }
+  } catch(error){try{await reader.cancel();}catch{}throw error;}finally { reader.releaseLock(); }
   const input = new Uint8Array(size); let offset = 0;
   for (const chunk of chunks) { input.set(chunk, offset); offset += chunk.byteLength; }
   return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(input));
@@ -89,12 +91,12 @@ export default {
     if (!env.API_TOKEN || request.headers.get("Authorization") !== `Bearer ${env.API_TOKEN}`)
       return new Response("unauthorized", { status: 401 });
     if (request.method !== "POST" || !["/api", "/ai"].includes(path)) return new Response("not found", { status: 404 });
-    if(admitted>=(env.READERS&&env.BUILDERS?16:8))return Response.json({error:"database is busy"},{status:503,headers:{"Retry-After":"1"}});
+    if(admitted>=(env.SPLIT_RUNTIME==="true"?32:env.READERS&&env.BUILDERS?16:8))return Response.json({error:"database is busy"},{status:503,headers:{"Retry-After":"1"}});
     admitted++;
-    const trace=new CriticalPath({scope:"http"});
+    const trace=new CriticalPath({scope:"http"}),ingress=ingressBudget.open();
     try {
       if(request.headers.has("X-Antfly-Tenant")){if(env.COORDINATOR_BACKEND!=="r2")throw new Error("TenantRoutingRequiresR2");env=tenantEnv(env,request.headers.get("X-Antfly-Tenant"));}
-      const args = await trace.span("parse",()=>readJson(request));
+      const args = await trace.span("parse",()=>readJson(request,ingress));
       if (path === "/ai") {
         // Model and gateway selection are deployment policy. Native typed task
         // adapters remain the responsibility of #1271; this passes their model
@@ -139,7 +141,7 @@ export default {
       const retryable = error instanceof Busy || /\b(SQLITE_NOMEM|ObjectStoreTransportFailed|ObjectStoreRateLimited|CoordinatorRecovering|ImmutableLogFenced|CoordinatorMigrationRequired|CoordinatorMigrationFrozen|CoordinatorCommitBusy|CoordinatorIoBudgetExceeded|DeadlineExceeded|Canceled|WalCommitContended|WorkLeaseLost|10058)\b/.test(String(error));
       return Response.json({ error: String(error.message ?? error) }, { status: retryable ? 503 : 409,
         headers: retryable ? { "Retry-After": "1" } : undefined });
-    } finally {admitted--;trace.emit(env.LOG_METRICS==="true");}
+    } finally {ingress.release();admitted--;trace.emit(env.LOG_METRICS==="true");}
   },
   async queue(batch, rootEnv) {
     for (const message of batch.messages) {

@@ -286,3 +286,33 @@ test("expired native WAL admission performs no recovery I/O",async()=>{
  const bucket=new Bucket();let calls=0;const store=new R2CoordinatorStore(module,bucket,"expired-hot",{clock:()=>1000,transport:async()=>{calls++;throw Error("unexpected I/O");}});
  await assert.rejects(store.commitWal({}, {deadlineMs:999}),/DeadlineExceeded/);assert.equal(calls,0);
 });
+
+test('shared kernel admission rotates tenants and lets aged maintenance run',async()=>{
+ const {RequestPool}=await import('../request-pool.mjs');let now=0,enter,release;const started=new Promise(r=>enter=r),blocked=new Promise(r=>release=r),order=[];
+ const pool=new RequestPool(async()=>({usable:()=>true,memoryBytes:()=>65536}),1,{clock:()=>now});
+ const held=pool.withHost(async()=>{enter();await blocked;},{fairKey:'a',priority:'publication'});await started;
+ const queued=[['a1','a','publication'],['a2','a','publication'],['b','b','publication'],['maintenance','c','maintenance']].map(([name,fairKey,priority])=>pool.withHost(()=>order.push(name),{fairKey,priority}));
+ now=6000;release();await Promise.all([held,...queued]);assert.deepEqual(order,['b','a1','maintenance','a2']);
+});
+
+test('read cohorts close before observation and never reuse a frontier for late callers',async()=>{
+ const{FreshReadAdmissions}=await import('../fresh-read-admissions.mjs');const admissions=new FreshReadAdmissions({delayMs:1});let frontier=1,entered,release,calls=0;
+ const started=new Promise(r=>entered=r),blocked=new Promise(r=>release=r);
+ const read=async traceIds=>{calls++;const captured={frontier,traceIds};entered();await blocked;return captured;};
+ const first=admissions.run('latest',read,'a'),second=admissions.run('latest',read,'b');await started;frontier=2;
+ const later=await admissions.run('latest',async()=>{calls++;return{frontier};});assert.equal(later.frontier,2);release();const a=await first,b=await second;a.frontier=99;assert.equal(b.frontier,1);assert.deepEqual(b.traceIds,["a","b"]);assert.equal(calls,2);
+ await assert.rejects(admissions.run('error',()=>{throw Error('failed read');}),/failed read/);assert.equal((await admissions.run('error',()=>({frontier:3}))).frontier,3);
+});
+
+test('streamed ingress bytes remain bounded across requests and recover after rejection',async()=>{
+ const{IngressBudget}=await import('../ingress-budget.mjs'),budget=new IngressBudget(100),a=budget.open(),b=budget.open();a.add(60);b.add(30);assert.equal(budget.used,90);
+ assert.throws(()=>b.add(20),/CoordinatorCommitBusy/);assert.equal(budget.used,90);a.release();a.release();assert.equal(budget.used,30);b.add(70);assert.equal(budget.used,100);b.release();assert.equal(budget.used,0);assert.throws(()=>a.add(1),/IngressReservationClosed/);
+});
+
+test('prefetched read admission keeps its original grace deadline across kernel queueing',async()=>{
+ const view={format:1,entries:[['antfly/progress/ns/HEAD',record('7')]]};let calls=0;
+ const coordinator={openReadView:async()=>{calls++;throw Error('unexpected refresh');}};
+ const transport=withReadView(async()=>{throw Error('unexpected fallback');},coordinator,'ns',{initial:view,admittedAt:performance.now()});
+ assert.equal(new TextDecoder().decode((await transport({op:'get',key:'antfly/progress/ns/HEAD'})).body),'7');assert.equal(calls,0);
+ const expired=withReadView(async()=>{},coordinator,'ns',{initial:view,admittedAt:performance.now()-30001});await assert.rejects(expired({op:'get',key:'antfly/progress/ns/HEAD'}),error=>error.status===8);assert.equal(calls,0);
+});

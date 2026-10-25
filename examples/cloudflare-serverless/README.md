@@ -658,3 +658,10 @@ zero-pruning run. Full effort retains its exact-search control. `LOG_METRICS`
 adds correlated bounded critical-path traces, physical I/O waves and decoded
 manifest-cache metrics. Re-run `npm run test:workerd` for persisted recovery,
 collection and split service admission checks.
+
+
+The [performance acceptance gate](../../docs/design/cloudflare-gates.md) provides
+paired sealed deployments, fixed-arrival soak traffic, fresh physical recovery
+samples, exact body/receipt checks and content-addressed ANN/failure evidence.
+`qualification/evaluate-gate.mjs GATE_JSON` exits with status 2 while any required
+evidence or threshold is missing. A short smoke run cannot pass this gate.

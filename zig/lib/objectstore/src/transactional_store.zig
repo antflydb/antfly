@@ -29,7 +29,7 @@ pub const Command = struct {
     limit: usize = 128,
 };
 pub const Request = struct {
-    action: enum { begin, read, commit, commit_wal, checkpoint, trace, retire_logs },
+    action: enum { begin, observe, read, commit, commit_wal, checkpoint, trace, retire_logs },
     owner: [16]u8,
     state: ?journal.State = null,
     commands: []const Command = &.{},
@@ -136,8 +136,8 @@ pub const Context = struct {
         const base = try std.fmt.allocPrint(m, "{s}/coord-v1/{s}", .{ self.prefix, std.fmt.bytesToHex(digest, .lower) });
         const domain = Pages.domainForNamespace(base);
         const log = journal.Log{ .client = self.client, .bucket = self.bucket, .prefix = base, .owner = req.owner, .io = self.io, .cancellation = self.cancellation, .checkpoint_commits = req.checkpoint_commits };
-        if (req.action == .begin) {
-            const recovered = try log.recover(m, req.state, req.state == null or !std.mem.eql(u8, &req.state.?.owner, &req.owner));
+        if (req.action == .begin or req.action == .observe) {
+            const recovered = if (req.action == .observe) try log.observe(m, req.state orelse return error.CoordinatorSessionRequired) else try log.recover(m, req.state, req.state == null or !std.mem.eql(u8, &req.state.?.owner, &req.owner));
             return std.json.Stringify.valueAlloc(self.alloc, .{ .state = recovered.state, .has_more = recovered.has_more, .base = base, .page_prefix = try std.fmt.allocPrint(m, "{s}/artifacts/graph/{s}/", .{ base, std.fmt.bytesToHex(domain, .lower) }) }, .{});
         }
         const state = req.state orelse return error.CoordinatorSessionRequired;

@@ -587,3 +587,58 @@ occupancy or billed storage. The application Worker, three private Workers, both
 Queues and R2 bucket were deleted successfully. Owned tail processes stopped,
 reports/logs remain in the ignored local qualification directory, and the
 disposable local API token was removed. Repository cache collection completed.
+
+
+## Acceptance-gate candidate: local evidence and live status
+
+The next candidate implements two-boundary native publication, pure committed-
+prefix observation, fresh read cohorts, read-view preparation before scarce WASM
+admission, foreground-aware tenant admission, aggregate streamed ingress limits,
+adaptive publication prefixes and no-op compaction preflight for paged roots.
+The [gate design](cloudflare-gates.md) defines its protocol and acceptance policy.
+This section records local evidence; it does not declare a live gate pass.
+
+The native serverless gate passed 545 tests (six skipped), with no failures or
+leaks, after the publication record-count correction. All 115 Node tests and five
+persisted Worker integration tests passed on the final candidate. Node coverage includes
+lost finalize acknowledgement, expired/replaced ownership, mandatory read-set
+validation, fresh observer fencing, zero-write observation at epoch rotation,
+late read-cohort admission, original grace deadlines, bounded ingress, lifecycle
+scope checks and missing-credential rejection. Persisted Worker checks cover
+both collectors, migration, grouped tenant writers, independent runtime admission
+and fresh physical actor routing. The legacy SQLite-backed Worker also passes
+its intentional queue-failure and SQLite-memory-error injection/recovery test;
+those injected logs are not new live SQLite failures.
+
+The 100,000-row compact-kernel test also passed with `--hot-root
+--idle-checkpoint --observer`. It retained 99,872 expected rows after 128 deletes,
+completed three collection cycles (1,542 steps), reopened repeatedly and performed
+a committed-prefix read without any metadata PUT. Peak working/linear memory
+was 1,254,069 / 12,582,912 bytes, and peak request traffic was 113 operations /
+3,495,565 bytes. Local total time was 96 seconds; this is not a deployed workload
+or a comparison that isolates latency gains.
+
+The deterministic synthetic comparison uses the actual 16 MiB reader modules
+and their 8 MiB working-set budget. At 10,000 documents and 384 dimensions, ten
+held-out queries produced identical baseline/candidate recall and physical GET/
+byte counts. The final artifact hash and results are retained in the ignored
+gate directory. The reader recall stage peaked at 1,078,034 working bytes and
+6,356,992 linear bytes. Deterministic test entropy and a logical fixture clock
+remove variation from immutable identities; they do not model live latency or
+lease failure. The evaluator additionally requires a frozen model-embedding
+corpus, separate from this synthetic evidence.
+
+Three baseline/candidate trial pairs were prepared against baseline commit
+`d5102ee703`; its module was independently restored and SHA-256 verified as
+`563936db3958bdab50c404db4a6ccef15e095e798e49198ab2304d87322dac97`.
+The first pair was created, then cron and Queue delivery were paused and its
+public endpoints disabled while destination-specific token/deletion authorization
+is pending. Its bundles are sealed locally at the final candidate
+revision and must be redeployed before measurements. The other two pairs have local manifests only.
+No test token has been installed and no new live workload has been run.
+
+The overall evaluator correctly remains red: three version-pinned one-hour
+trials, their recovery populations and the model-embedding comparison are still
+required. Short smoke runs, earlier deployment measurements and unit-test
+fixtures of the evaluator cannot supply that evidence. No new foreground SLO or
+production qualification is claimed here.

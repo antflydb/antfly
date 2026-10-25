@@ -13,6 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {FreshReadAdmissions} from "./fresh-read-admissions.mjs";
+import {metadataObjectCall} from "./metadata-object-call.mjs";
+import {applyPublication} from "./prepared-publication.mjs";
 import {CriticalPath} from "./trace.mjs";
 import {encode} from "./r2-coordinator-store.mjs";
 import {publicationKeys,publicationCall,publicationSnapshot} from "./publication-view.mjs";
@@ -25,7 +28,7 @@ import {metadataCollectionDue} from "./maintenance-policy.mjs";
 import {instrumentTransport} from "./performance.mjs";
 import {PublicationScheduler} from "./publication-scheduler.mjs";
 import {tenantEnvs} from "./tenants.mjs";
-import {openReadView} from "./read-view.mjs";
+import {captureReadView} from "./read-view.mjs";
 import {createR2Transport} from "../../zig/lib/objectstore/wasm/r2.mjs";
 import {withCommitCoordinator} from "../../zig/lib/objectstore/wasm/coordinated.mjs";
 import {openAuthority, activateR2} from "./coordinator-authority.mjs";
@@ -59,7 +62,57 @@ export class R2CommitCoordinator extends DurableObject {
   validPublication(id){return this.publication.valid(id);}
   abandonPublication(id){return this.publication.abandon(id);}
   finishPublication(id,watermark){return this.publication.finish(id,watermark);}
-  openReadView(options) {return openReadView(this,this.env.ANTFLY_INCARNATION,options);}
+  openReadView(options={}) {
+    this.readAdmissions??=new FreshReadAdmissions({delayMs:Number(this.env.READ_VIEW_BATCH_MS??2)});
+    return this.readAdmissions.run(options.version??"latest",traceIds=>{
+      const capture=async tx=>{
+        const migration=await tx.get(MIGRATION);
+        if(migration&&migration.phase!=="active"||this.env.COORDINATOR_MIGRATION_REQUIRED==="true"&&!migration||this.authority.descriptor.mode!=="r2")throw Error("CoordinatorMigrationRequired");
+        return captureReadView(tx,await metadataKeys(this.env.ANTFLY_INCARNATION),options);
+      };
+      return(this.env.READ_ONLY_SNAPSHOTS==="false"?Promise.reject(Error("ReadSnapshotNeedsAdmission")):this.store.readOnly(capture,{traceId:options.trace_id,traceIds})).catch(error=>{
+        if(!/ReadSnapshotNeeds(?:Admission|Pin)/.test(String(error)))throw error;
+        return this.transaction(capture,{traceId:options.trace_id});
+      });
+    },options.trace_id);
+  }
+  async nativePublication(tx,op,lease,owner=lease?.owner){
+    const keys=await metadataKeys(this.env.ANTFLY_INCARNATION),names=[keys.head,keys.progress+"HEAD_FENCE"],values=await tx.getMany(names),records=new Map(names.map((key,i)=>[key,values[i]]));
+    // No recursive metadata-kernel acquisition: the tiny native lease action
+    // operates only on these transaction-owned copies and writes the overlay.
+    const local={get:async key=>{if(!records.has(key))throw Error("PublicationLeaseKeyUnsupported");return structuredClone(records.get(key));},put:(key,value)=>{if(!records.has(key))throw Error("PublicationLeaseKeyUnsupported");records.set(key,structuredClone(value));tx.put(key,value);}};
+    const transport=withCommitCoordinator(async request=>{if(request.op!=="bucket_exists")throw Error("PublicationLeaseIoUnsupported");return{json:{exists:true}};},{objectCall:(request,body)=>this.objectCallInTransaction(local,request,body)});
+    return metadataKernel.request({op,publication_owner:owner,publication_lease:lease??null,bucket:"database",prefix:"antfly",namespace:this.env.ANTFLY_INCARNATION},{transport,fairKey:this.store.namespace,priority:"maintenance",deadlineMs:Date.now()+5000});
+  }
+  async beginPublication(maximum){
+    if(!Number.isSafeInteger(maximum)||maximum<1||maximum>256)throw Error("InvalidPublicationBudget");
+    const keys=await publicationKeys(this.env.ANTFLY_INCARNATION);
+    return this.transaction(async tx=>{
+      const lease=await this.nativePublication(tx,"publication_acquire",null,crypto.randomUUID());
+      await captureReadView(tx,await metadataKeys(this.env.ANTFLY_INCARNATION));
+      return{format:2,lease,budget:Math.min(maximum,await tx.get("__antfly_publication_budget")??maximum),entries:await publicationSnapshot(tx,keys)};
+    },{priority:"maintenance"});
+  }
+  async finalizePublication(batch,observation){
+    const keys=await publicationKeys(this.env.ANTFLY_INCARNATION);
+    return this.transaction(async tx=>{
+      await this.nativePublication(tx,"publication_validate",batch?.lease);
+      const entries=await publicationSnapshot(tx,keys);
+      await applyPublication(tx,entries.map(([key])=>key),batch);
+      if(!(await this.nativePublication(tx,"publication_release",batch.lease)).released)throw Error("WorkLeaseLost");
+      if(observation&&Number.isFinite(observation.elapsed_ms)&&observation.elapsed_ms>=0&&observation.elapsed_ms<=30000&&Number.isInteger(observation.records)&&observation.records>=1&&observation.records<=256){
+        const maximum=Number(this.env.PUBLICATION_RECORDS??16),target=Number(this.env.PUBLICATION_SLICE_MS??2000);
+        if(!Number.isSafeInteger(target)||target<250||target>10000)throw Error("InvalidPublicationSlice");
+        const current=Math.min(maximum,await tx.get("__antfly_publication_budget")??maximum),elapsed=observation.elapsed_ms;
+        let next=current;
+        if(elapsed>target)next=Math.max(1,Math.min(current,Math.floor(observation.records*target/elapsed*.8)));
+        else if(elapsed<target*.5&&observation.records>=current)next=Math.min(maximum,current+Math.max(1,Math.floor(current/4)));
+        if(next!==current)tx.put("__antfly_publication_budget",next);
+      }
+      return{committed:true};
+    },{priority:"maintenance"});
+  }
+  abortPublication(lease){return this.transaction(tx=>this.nativePublication(tx,"publication_release",lease),{priority:"maintenance"});}
   transaction(run,options) {
     return this.store.transaction(async tx => {
       const migration = await tx.get(MIGRATION);
@@ -119,34 +172,13 @@ export class R2CommitCoordinator extends DurableObject {
   }
   async openPublication(maximum) {
     const keys=await publicationKeys(this.env.ANTFLY_INCARNATION);
-    return this.transaction(async tx=>({budget:Math.min(maximum,await tx.get("__antfly_publication_budget")??maximum),entries:await publicationSnapshot(tx,keys)}),{priority:"maintenance"});
+    return this.transaction(async tx=>{await captureReadView(tx,await metadataKeys(this.env.ANTFLY_INCARNATION));return{budget:Math.min(maximum,await tx.get("__antfly_publication_budget")??maximum),entries:await publicationSnapshot(tx,keys)};},{priority:"maintenance"});
   }
   async publicationCall(request,body,expected) {
     const keys=await publicationKeys(this.env.ANTFLY_INCARNATION);
     return this.transaction(tx=>publicationCall(tx,keys,(...args)=>this.objectCallInTransaction(...args),request,body,expected),{priority:"maintenance"});
   }
-  async objectCallInTransaction(tx,request,body) {
-      if(!(/\/wal-v1\/[a-f0-9]{64}\/HEAD$/.test(request.key??"")||/\/progress\//.test(request.key??"")))return{status:3};
-      if(body.byteLength>4096)return{status:4};
-      if (request.collection != null) {try {await this.journal.valid(tx, request.collection);} catch {return {status: 5};}}
-      const previous = await tx.get(request.key);
-      if (request.op === "put") {
-        if (request.guard_key != null || request.guard_etag != null) {
-          const parent = request.key.slice(0, request.key.lastIndexOf("/"));
-          if (!request.key.endsWith("/REINDEX") || request.guard_key !== `${parent}/HEAD` || typeof request.guard_etag !== "string") return {status: 3};
-          if ((await tx.get(request.guard_key))?.etag !== request.guard_etag) return {status: 2};
-        }
-        if ((request.if_none_match && previous) || (request.if_match_etag != null && previous?.etag !== request.if_match_etag)) return {status: 2};
-        const etag = crypto.randomUUID(); tx.put(request.key, {etag, body, contentType: request.content_type ?? null});
-        return {status: 0, json: {etag}};
-      }
-      if (request.op === "get" || request.op === "head") {
-        if (!previous) return {status: 1};
-        if (request.if_match_etag != null && request.if_match_etag !== previous.etag) return {status: 2};
-        return {status: 0, json: {bucket: request.bucket, key: request.key, etag: previous.etag, content_length: previous.body.byteLength, content_type: previous.contentType}, body: request.op === "get" ? previous.body : undefined};
-      }
-      return {status: 3};
-  }
+  objectCallInTransaction(tx,request,body){return metadataObjectCall(tx,request,body,(tx,collection)=>this.journal.valid(tx,collection));}
   mutateBatch(input) {
     this.mutationGroups??=new MutationGroups((inputs,deadline)=>this.commitMutations(inputs,deadline));
     return this.mutationGroups.submit(input);
@@ -160,7 +192,7 @@ export class R2CommitCoordinator extends DurableObject {
       const view=await trace.span("prepare_snapshot",()=>this.openReadView({trace_id:trace.id})),prepared=new PreparedWal(keys.wal,view.entries);
       const transport=this.store.cache.wrap(withCommitCoordinator(instrumentTransport(createR2Transport({database:this.env.DATABASE},{maxPutBytes:4*1024*1024}),physical),prepared),this.env.ANTFLY_INCARNATION);
 
-      const result=await trace.span("wal_prepare",()=>buildKernel.request({op:"mutate",namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",working_set_bytes:Number(this.env.WORKING_SET_BYTES??20*1024*1024),mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))},{transport,deadlineMs:deadline,maxOperations:1024-usedOperations,maxTransferBytes:32*1024*1024-usedBytes,onStage:sample=>trace.stage(sample),onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_prepare",trace_id:trace.id,...sample,physical}));}}));
+      const result=await trace.span("wal_prepare",()=>buildKernel.request({op:"mutate",namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",working_set_bytes:Number(this.env.WORKING_SET_BYTES??20*1024*1024),mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))},{transport,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",deadlineMs:deadline,maxOperations:1024-usedOperations,maxTransferBytes:32*1024*1024-usedBytes,onStage:sample=>trace.stage(sample),onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_prepare",trace_id:trace.id,...sample,physical}));}}));
       let maximum=0n;for(const item of result.results)maximum=BigInt("0x"+item.visibility.slice(-16))>maximum?BigInt("0x"+item.visibility.slice(-16)):maximum;
       let committed;
       if(prepared.head&&this.env.NATIVE_WAL_COMMIT!=="false"){
