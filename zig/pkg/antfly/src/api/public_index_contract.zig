@@ -146,6 +146,8 @@ pub fn isAllowedCreatedProviderField(field: []const u8) bool {
     return std.mem.eql(u8, field, "provider") or
         std.mem.eql(u8, field, "model") or
         std.mem.eql(u8, field, "model_identity") or
+        std.mem.eql(u8, field, "request_format") or
+        std.mem.eql(u8, field, "task_encoding") or
         std.mem.eql(u8, field, "models") or
         std.mem.eql(u8, field, "project_id") or
         std.mem.eql(u8, field, "location") or
