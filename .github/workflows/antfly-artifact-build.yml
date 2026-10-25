@@ -45,6 +45,7 @@ jobs:
     outputs:
       matrix: ${{ steps.platforms.outputs.matrix }}
       build_contract_schema: ${{ steps.source-contract.outputs.build_contract_schema }}
+      embedded_zig_source: ${{ steps.source-contract.outputs.embedded_zig_source }}
       runtime_products: ${{ steps.source-contract.outputs.runtime_products }}
       channel: ${{ steps.channel.outputs.channel }}
       build_controller_commit: ${{ steps.controller.outputs.commit }}
@@ -307,7 +308,7 @@ jobs:
       python_build: ${{ needs.release-plan.outputs.python_build }}
 
   package-embedded-zig-source:
-    if: ${{ needs.release-plan.outputs.build_contract_schema == '5' }}
+    if: ${{ needs.release-plan.outputs.embedded_zig_source == 'true' }}
     name: Package independently fetchable Apache Zig sources
     needs: release-plan
     runs-on: ubuntu-latest

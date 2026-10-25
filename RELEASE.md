@@ -42,6 +42,13 @@ historical server-only layout; schema 2 retains separate Lite and inference
 archives. The controller follows the immutable source contract and promotion
 requires every declared runtime archive for each supported platform.
 
+Schemas 5 and 6 both require the independently fetchable Apache Zig source
+artifact. The controller resolves `embedded_zig_source` from the validated
+source contract in `validate_source_contract.py`; artifact building, promotion
+download, and payload assembly use that capability so their requirements stay
+consistent. The provenance and artifact-ledger schemas are separate from the
+source build-contract schema and do not change when its artifact layout evolves.
+
 `.github/workflows/embedded-package.yml` assembles Python wheels and npm packages
 from the embedded archives, bundling only the native library. Prebuilt language
 packages cover Linux x86-64/ARM64 (glibc 2.28+) and macOS ARM64; the native

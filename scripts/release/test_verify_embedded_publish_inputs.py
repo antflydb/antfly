@@ -250,6 +250,8 @@ class EmbeddedPublishTests(unittest.TestCase):
             self.assertEqual(verify(combined)["build_contract_schema"], "4")
             combined["build_contract_schema"] = 5
             self.assertEqual(verify(combined)["build_contract_schema"], "5")
+            combined["build_contract_schema"] = 6
+            self.assertEqual(verify(combined)["build_contract_schema"], "6")
             for field, value in {
                 "build_controller_commit": "4" * 40,
                 "source_ref": "refs/heads/feature",

@@ -1735,6 +1735,9 @@ class ReleasePromotionTests(unittest.TestCase):
     def test_fetchable_source_release_ledger(self) -> None:
         self.assert_release_ledger(5)
 
+    def test_native_library_only_release_ledger(self) -> None:
+        self.assert_release_ledger(6)
+
     def test_historical_pkgconfig_source_contract_is_preserved(self) -> None:
         contract = load_module(
             "historical_pkgconfig_contract_test", "validate_source_contract.py"
@@ -1904,6 +1907,17 @@ class ReleasePromotionTests(unittest.TestCase):
             if schema >= 5:
                 source_package = root / "embedded-source"
                 self.source_package_fixture(source_package, payload)
+                missing_source_argv = argv.copy()
+                missing_source_argv[missing_source_argv.index(str(output))] = str(
+                    root / "missing-source-output"
+                )
+                with (
+                    mock.patch.object(sys, "argv", missing_source_argv),
+                    self.assertRaisesRegex(
+                        SystemExit, f"schema {schema} requires Apache Zig source"
+                    ),
+                ):
+                    payload.main()
                 argv.extend(["--embedded-source-dir", str(source_package)])
             with (
                 mock.patch.object(sys, "argv", argv),
