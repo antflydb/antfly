@@ -28808,3 +28808,39 @@ WAL retirement requires durable acceptance. Compaction and other legacy metadata
 mutators must participate before registered roots become the normal default.
 Recovery, overload/fairness and the remaining original design requirements are
 still open. Full Linux qualification remains waived.
+
+
+## Background pass storage admission (2026-10-25)
+
+An already admitted background Pass can now provide a synchronous storage
+admission scope. It retains the same capsule identity, native deadline and
+cancellation authority; it creates no new execution or renewed deadline. The
+scope requires an actual admitted owner with checked reentry and lifetime/class
+inspection. An observational pass without a runnable owner cannot supply it.
+
+Its physical wait boundary parks the current CPU phase and performs checked
+reentry under the original lifetime. Restriction callbacks inspect lifetime
+without recursively acquiring CPU. The first rejection is retained even if
+external cancellation or clock state later changes. Scope callbacks check that
+the pass is still active before touching the copied capsule borrow. The pass
+and scope stay alive at stable addresses through the synchronous call; neither
+scope nor payload may escape into retained storage state. The caller joins or
+transfers accepted physical work before retiring the pass.
+
+Four new tests use actual node execution owners. Parked maintenance frees the
+ordinary slot for foreground work while health and cleanup retain their own
+capacity. Expiry, cancellation and shutdown leave capsule ownership intact
+without CPU reentry. A real queued reentry expires under its original deadline
+while foreground still owns the ordinary slot; the waiter leaves the queue but
+retained bytes and operation ownership remain until finish. Missing checked
+support and calls after pass retirement are refused.
+
+`maintenance-admission-scope-v3-fast` and `maintenance-admission-scope-v4-debug`
+pass all five commands, eight native build steps, ten pass/admission cases, four
+recurring-background cases and the 4/45/1/8 Bloom/error companions. Both maps
+contain identical current native/schema inputs. No case fails, skips or leaks.
+Existing private ABI layouts and durable formats are unchanged. Production LSM
+maintenance still needs to forward this scope through the typed storage-owner
+interface and adopt the registered flush/publication/durable-completion path.
+No broader default eligibility or full-design completion is claimed. Full Linux
+qualification remains waived.
