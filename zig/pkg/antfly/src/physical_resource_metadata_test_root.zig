@@ -1167,6 +1167,110 @@ const RegisteredSourceFixture = struct {
         try std.testing.expect(observer.live_read_versions == epoch and epoch.live_previous == null);
         try std.testing.expect(probe.checks >= 8);
     }
+    const NormalReaderCaptureProbe = struct {
+        backend: *lsm.Backend,
+        reject: enum { none, funding, reentry } = .none,
+        advanced: bool = false,
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.backend.mu.tryLock()) return error.TestReaderCheckpointHeldMutex;
+            defer self.backend.mu.unlock();
+            if (!self.advanced and self.backend.active_readers >= 2 and self.backend.read_version == null) {
+                // A peer publishes while frame funding is off-lock. No query
+                // memtable has been captured yet, so all sources must advance.
+                if (self.backend.mutable_read_snapshot != null or self.backend.immutable_memtable_pins.items.len != 0) return error.TestReaderCapturedBeforeFunding;
+                self.backend.invalidateReadVersion();
+                self.backend.run_directory_dirty = false;
+                try self.backend.mutable.upsert(self.backend.allocator, .{ .name = "reader-capture" }, "key", "during-funding", false);
+                self.advanced = true;
+                if (self.reject == .funding) return error.DeadlineExceeded;
+            }
+        }
+        fn lifetime(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.advanced and self.reject == .reentry) {
+                if (self.backend.mu.tryLock()) {
+                    self.backend.mu.unlock();
+                } else return error.GenerationPublicationChanged;
+            }
+        }
+    };
+    fn qualifyNormalReaderCapture(a: std.mem.Allocator, manager: *ResourceManager, directory: *const Directory) !void {
+        var source = try directory.at(0).retainRegisteredSourceWithAdmission(quotaControl());
+        defer source.releaseWithAdmission(null) catch unreachable;
+        const record = try Scope.RegisteredWriter.start(a, manager, &source.lease.?, .{}, quotaControl());
+        defer record.requestRetirement();
+        var writer_run = try record.takeRunWithAdmission(quotaControl());
+        defer writer_run.deinit(a);
+        const empty: Scope.WriterStore = .{};
+        const edit = try Scope.RegisteredWriterRoot.start(a, manager, &empty, &writer_run, false, quotaControl());
+        defer edit.requestRetirement();
+        try edit.resumeWithAdmission(quotaControl());
+        var root: ?*Store = try edit.takeWithAdmission(quotaControl());
+        var cleanup: ?Store.Reclaimer = null;
+        defer finishRoot(&root, &cleanup, a);
+        const Mode = enum { namespace, bound, probe, scan, reject_funding, reject_reentry };
+        for (std.enums.values(Mode)) |mode| {
+            var observer = lsm.Backend.init(a, .{ .resource_manager = manager, .wal_enabled = false });
+            defer observer.close();
+            observer.run_directory = @constCast(directory);
+            observer.run_directory_dirty = false;
+            observer.runs = root.?.*;
+            defer {
+                observer.run_directory = null;
+                observer.runs = .{};
+            }
+            var probe: NormalReaderCaptureProbe = .{ .backend = &observer, .reject = switch (mode) {
+                .reject_funding => .funding,
+                .reject_reentry => .reentry,
+                else => .none,
+            } };
+            const payload: read_admission.Payload = .{ .ptr = &probe, .vtable = &.{ .checkpoint = NormalReaderCaptureProbe.checkpoint, .check_lifetime = NormalReaderCaptureProbe.lifetime } };
+            const original = read_admission.Port.init(&payload);
+            if (mode == .reject_funding or mode == .reject_reentry) {
+                const opened = observer.beginReadWithAdmission(original);
+                if (mode == .reject_funding) try std.testing.expectError(error.DeadlineExceeded, opened) else try std.testing.expectError(error.GenerationPublicationChanged, opened);
+                try std.testing.expect(probe.advanced and observer.read_version == null and observer.live_read_versions == null and observer.active_readers == 0);
+                try std.testing.expect(observer.mu.tryLock());
+                observer.mu.unlock();
+                continue;
+            }
+            if (mode == .namespace) {
+                var read = try observer.beginReadWithAdmission(original);
+                defer read.abort();
+                try std.testing.expectEqualStrings("during-funding", try read.get(.{ .name = "reader-capture" }, "key"));
+                // Retained snapshots remain stable after a subsequent write.
+                try std.testing.expect(observer.mu.tryLock());
+                observer.invalidateMutableReadSnapshot();
+                const changed = observer.mutable.upsert(a, .{ .name = "reader-capture" }, "key", "after-capture", false);
+                observer.mu.unlock();
+                try changed;
+                try std.testing.expectEqualStrings("during-funding", try read.get(.{ .name = "reader-capture" }, "key"));
+            } else {
+                var store = try observer.runtimeStore(a, .{ .name = "reader-capture" });
+                defer store.deinit();
+                switch (mode) {
+                    .bound => {
+                        var read = try store.beginReadWithAdmission(.retain, original);
+                        defer read.abort();
+                        try std.testing.expectEqualStrings("during-funding", try read.get("key"));
+                    },
+                    .probe => {
+                        var read = try store.beginProbeWithAdmission(.retain, original);
+                        defer read.abort();
+                        try std.testing.expectEqualStrings("during-funding", try read.get("key"));
+                    },
+                    .scan => {
+                        var read = try store.beginCurrentScanWithAdmission(original);
+                        defer read.abort();
+                    },
+                    else => unreachable,
+                }
+            }
+            try std.testing.expect(probe.advanced and observer.read_version != null and observer.read_version.?.owned_retirement != null and observer.active_readers == 0);
+            try std.testing.expectEqual(@as(u64, 1), observer.run_directory_generation);
+        }
+    }
     fn qualifyProjectionCoalescing(a: std.mem.Allocator, manager: *ResourceManager, directory: *const Directory) !void {
         try qualifyGenerationCapture(a, manager, directory);
         for ([_]bool{ false, true }) |reject_after_progress| {
@@ -1957,6 +2061,7 @@ const RegisteredSourceFixture = struct {
         if (publication and phase == .construct and (target == null or recovered_edit) and !oom) {
             for (readers[0..writer_count]) |slot| try slot.?.qualifyProjectionForTest(a2);
             try qualifyProjectionCoalescing(a2, &second.resource_manager, readers[0].?.directory.?);
+            if (target == null) try qualifyNormalReaderCapture(a2, &second.resource_manager, readers[0].?.directory.?);
             if (projection_shape and writer_count == 8) {
                 try std.testing.expectEqual(@as(usize, 3), readers[7].?.l0_groups.len);
                 try std.testing.expectEqual(@as(usize, 2), readers[7].?.levels.len);

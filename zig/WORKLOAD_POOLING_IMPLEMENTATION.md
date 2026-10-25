@@ -28467,3 +28467,41 @@ unchanged 5,664-file input maps. Each primary build completes 72/72 steps and
 4/45/1/8 Bloom/error companions. No executed case fails, skips or leaks.
 Formatting, license and whitespace checks pass. Exact changed sources are
 archived separately from the runner's fixed snapshot list.
+
+
+## Normal admitted reader capture (2026-10-25)
+
+The normal namespace, bound-read, probe and current-scan admitted entry points
+now preflight canonical registered reader epochs before capturing memtables.
+Backend retains its lifecycle pin while dropping the mutex to fund/register a
+frame, always reacquires the mutex, preserves the original refusal and captures
+the current directory generation. Concurrent publishers may advance while the
+frame is prepared; no old source pointer survives that unlock. A concurrent
+reader's already installed epoch coalesces without consuming the extra frame.
+Legacy roots retain their existing path. Current scans recheck after optional
+rotation/publication and before acquiring a mutable snapshot. Native/kernel
+owner versions are 135/195.
+
+Debug and ReleaseFast qualification passed. The fixture drives actual namespace and erased bound
+read/probe/scan APIs against a canonical directory and registered writer root.
+An original checkpoint publishes a peer generation and updates the mutable value
+while funding runs off-lock, requiring all sources to capture after that point.
+It rejects checkpoints under the Backend mutex, verifies a pinned read retains
+its value after a subsequent write and exercises original funding/reentry
+refusals with mandatory unlock and reader-pin cleanup. These are admitted reader
+capture checks; synthetic SST metadata does not qualify SST I/O or durable
+publication. Coupled publication capture/rebase, multi-edit batch installation,
+normal producer adoption, completion/deletion and broader default requirements
+remain open. Full GNU qualification remains waived.
+
+Final normal-reader receipts `normal-reader-capture-v2-debug` and
+`normal-reader-capture-v2-fast` each pass all five commands on identical, unchanged
+5,664-file input maps. Debug completes 72/72 build steps and 65/65 ownership/ABI
+tests; optimized completes 72/72 steps and 49/49 ownership cases, with ABI cache
+reuse. Both pass six legacy read-metadata cases and the 4/45/1/8 Bloom/error
+companions. No executed case fails, skips or leaks. The initial fixture-only
+shadowed-local compile failure and its exact source remain preserved. Formatting,
+license and whitespace checks pass. Normal namespace reads retain their captured
+mutable value after a later write; funding/reentry refusal exits release the
+Backend mutex and reader pins. This does not enable default registered producer
+publication or claim complete whole-path qualification.

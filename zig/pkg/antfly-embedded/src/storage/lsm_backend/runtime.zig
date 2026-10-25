@@ -3705,6 +3705,14 @@ pub const ReadVersion = struct {
     }
 };
 
+/// Must precede mutable/immutable snapshot capture: a canonical registered
+/// epoch may need off-lock funding and mandatory Backend reentry.
+fn prepareReadVersionCaptureWithAdmission(backend: anytype, original: ?read_admission.Port) !void {
+    if (comptime @hasDecl(@TypeOf(backend.*), "prepareReadVersionCaptureWithAdmission")) {
+        if (original) |scope| try backend.prepareReadVersionCaptureWithAdmission(scope);
+    }
+}
+
 const RunReadView = struct {
     allocator: Allocator,
     runs: []Run,
@@ -4050,6 +4058,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             errdefer releaseReadReader(BackendType, backend, .bound_read_txn);
             if (control) |budget| try budget.checkLifetime();
             if (@hasDecl(BackendType, "prepareReadSnapshot")) try backend.prepareReadSnapshot();
+            try prepareReadVersionCaptureWithAdmission(backend, original);
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
             else
@@ -4331,6 +4340,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             try retainReadReader(BackendType, backend, .probe_txn);
             errdefer releaseReadReader(BackendType, backend, .probe_txn);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
+            try prepareReadVersionCaptureWithAdmission(backend, control);
             const stable_point_view = backend.mutable.entryCount() == 0 and backend.immutable_memtables.items.len == backend.immutable_head;
             const read_view = if (stable_point_view) try RunReadView.pin(backend, metadata_allocator) else null;
             errdefer if (read_view) |view| view.release(backend);
@@ -4874,6 +4884,7 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
             try retainReadReader(BackendType, backend, .current_scan);
             errdefer releaseReadReader(BackendType, backend, .current_scan);
+            try prepareReadVersionCaptureWithAdmission(backend, control);
             var mutable_snapshot: MutableSnapshot = .none;
             var mutable_snapshot_is_bulk_current_scan_clone = false;
             var bulk_current_scan_clone_denied = false;
@@ -4918,6 +4929,9 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
                 } else if (@hasDecl(BackendType, "prepareReadSnapshot")) {
                     try backend.prepareReadSnapshot();
                 }
+                // Rotation may run inline publication. Recheck before pinning
+                // mutable state; no retained source crosses a funding unlock.
+                try prepareReadVersionCaptureWithAdmission(backend, control);
                 const read_snapshot = try snapshotReadMutable(BackendType, backend, .current_scan);
                 mutable_snapshot = if (read_snapshot.owned)
                     .{ .owned = @constCast(read_snapshot.state) }
@@ -5848,6 +5862,7 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
             errdefer releaseReadReader(BackendType, backend, .namespace_read_txn);
             if (control) |owner| try owner.checkLifetime();
             if (@hasDecl(BackendType, "prepareReadSnapshot")) try backend.prepareReadSnapshot();
+            try prepareReadVersionCaptureWithAdmission(backend, original);
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
             else

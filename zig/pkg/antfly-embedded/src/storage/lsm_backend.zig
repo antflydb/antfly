@@ -7178,6 +7178,41 @@ pub const Backend = struct {
         self.publishRunDirectory(directory);
     }
 
+    /// Called before any memtable/run snapshot is captured. Returns with the
+    /// Backend mutex held on every outcome. Only canonical registered roots
+    /// need this preflight; the existing legacy capture path remains separate.
+    pub fn prepareReadVersionCaptureWithAdmission(self: *Backend, scope: read_admission.Port) !void {
+        try scope.checkLifetime();
+        if (self.read_version != null or self.run_directory_dirty) return;
+        const source = self.run_directory orelse return;
+        if (source.registered_owner == null) return;
+        const manager = self.options.resource_manager orelse return error.ExecutionWaitUnsupported;
+        var trace: read_admission.RejectionTrace = .{};
+        const original = trace.bind(scope).?;
+        self.retainReaderKind(.other);
+        defer self.releaseReaderKind(.other);
+        runtime_mod.unlockBackend(Backend, self, true);
+        const Reader = @import("lsm_backend/registered_read_version.zig").Owner;
+        const prepared = Reader.prepare(self.allocator, manager, original);
+        const reentry = self.reacquireReadPreparationBackend(original);
+        var frame: ?*Reader = prepared catch |cause| {
+            if (trace.failure) |first| return first;
+            try reentry;
+            return cause;
+        };
+        defer if (frame) |owned| owned.requestRetirement();
+        if (trace.failure) |first| return first;
+        try reentry;
+        try original.checkLifetime();
+        if (self.read_version != null or self.run_directory_dirty) return;
+        const current = self.run_directory orelse return;
+        if (current.registered_owner == null) return;
+        // No source was captured before unlocking. Bind to the current tuple
+        // after reentry, even if publication advanced during frame funding.
+        const version = try self.capturePreparedReadVersionWithAdmission(frame.?, self.run_directory_generation, original);
+        if (version == &frame.?.version) frame = null;
+    }
+
     /// Caller holds the Backend mutex and prepared the frame off-lock. A stale
     /// generation or an existing epoch leaves that frame unconsumed so its
     /// caller can rebase/reuse it or transfer it to registered retirement.
