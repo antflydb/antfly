@@ -42212,6 +42212,8 @@ test "resolver curation namespace propagation v9 readiness waits for bounded own
     for (proposals, 0..) |*proposal, i| {
         const plan = try pure.curation.propose(a, .{}, &.{}, .{ .action = .suppress, .key = try std.fmt.allocPrint(a, "legacy/{d}", .{i}) }, .{});
         proposal.* = plan.state.proposals[0];
+        proposal.state = .rejected;
+        proposal.decided = .{};
     }
     const scope = "legacy/{{_key}}";
     const write: domain.Write = .{ .table_id = 1, .standalone = true, .catalog_revision = try store.standaloneRevision(), .schema = try domain.schemaFingerprint(a, table), .bootstrap = .{ .expected_indexes = try pure.fingerprint(a, table.indexes_json) }, .patches = &.{try domain.records.difference(a, .{ .key_template = scope }, .{ .key_template = scope, .revision = 1 })}, .queue = .{ .expected_revision = 0, .revision = 1, .proposals = proposals } };
@@ -42221,6 +42223,8 @@ test "resolver curation namespace propagation v9 readiness waits for bounded own
         errdefer txn.abort();
         var bridge: RaftApplyStore.NativeResolverTxn = .{ .txn = &txn };
         const native = try RaftApplyStore.nativeResolverStore(a, &bridge, group, 1);
+        try std.testing.expectEqual(@as(u64, 1), (try native.queueHead()).revision);
+        try std.testing.expectEqual(@as(u32, 300), (try native.queueHead()).count);
         const prefix = try std.mem.concat(a, u8, &.{ native.prefix, "queue/ownership/" });
         var after: ?[]const u8 = null;
         while (true) {

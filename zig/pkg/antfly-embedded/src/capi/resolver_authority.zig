@@ -422,11 +422,14 @@ fn namespaceOutcomes(a: A, store: native.Store, absorbed: AbsorbedMap, changed: 
     }
     return .{ .array = values };
 }
-fn finish(a: A, bridge: *Bridge, txn: *docstore.DocStore.Txn, db: *h.db_mod.DB, lease: anytype) !void {
-    if (!try bridge.store(a, prefix).ownershipIndexed()) _ = try bridge.store(a, prefix).advanceOwnershipIndex(128);
+fn commitCurationTxn(a: A, bridge: *Bridge, txn: *docstore.DocStore.Txn, lease: anytype) !void {
     try lease.checkAt(@intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
     try bridge.flush(a);
     try txn.commit();
+}
+fn finish(a: A, bridge: *Bridge, txn: *docstore.DocStore.Txn, db: *h.db_mod.DB, lease: anytype) !void {
+    if (!try bridge.store(a, prefix).ownershipIndexed()) _ = try bridge.store(a, prefix).advanceOwnershipIndex(128);
+    try commitCurationTxn(a, bridge, txn, lease);
     db.core.index_manager.minimum_reader_version.store(catalog.resolver_pin_index_reader_version, .release);
 }
 pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: Input, legacy: c.State) ![]const u8 {
@@ -739,6 +742,18 @@ fn projection(root: *h.Handle, a: A, cfg: h.db_mod.ResolverConfig) !?Projection 
 pub fn pullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
     const physical = if (root.owned_lite_backend) |*backend| backend.native_docstore else null;
     if (physical == null) return legacyPullProjection(root, database, a);
+    if (try ownershipWorkPossible(database, a)) {
+        var lease = try database.local_execution.row_policy_gate.enterRaw();
+        defer lease.release();
+        var write = try database.core.store.beginWriteTxn();
+        errdefer write.abort();
+        var update: Bridge = .{ .txn = &write };
+        _ = try update.store(a, prefix).advanceOwnershipIndex(128);
+        // This optional derived cache does not raise an older file's reader
+        // floor or bootstrap a cross-source directory merely through polling.
+        try commitCurationTxn(a, &update, &write, &lease);
+        return true;
+    }
     if (!try projectionWorkPossible(database, a)) return false;
     try ensureConsumerIndex(root, a);
     const jobs = @import("../storage/lite/resolver_consumers.zig");
@@ -746,17 +761,6 @@ pub fn pullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
     var live = true;
     defer if (live) txn.abort();
     var bridge: Bridge = .{ .txn = &txn };
-    if (try bridge.backendGet(a, marker) != null and !try bridge.store(a, prefix).ownershipIndexed()) {
-        txn.abort();
-        live = false;
-        var lease = try database.local_execution.row_policy_gate.enterRaw();
-        defer lease.release();
-        var write = try database.core.store.beginWriteTxn();
-        errdefer write.abort();
-        var update: Bridge = .{ .txn = &write };
-        try finish(a, &update, &write, database, &lease);
-        return true;
-    }
     const after = try bridge.backendGet(a, jobs.cursor_key);
     var page = try bridge.store(a, "").backend.scan(&bridge, a, jobs.work_prefix, after, 1);
     if (page.rows.len == 0 and after != null) page = try bridge.store(a, "").backend.scan(&bridge, a, jobs.work_prefix, null, 1);
@@ -1094,13 +1098,23 @@ fn projectionWorkPossible(database: *h.db_mod.DB, a: A) !bool {
     var txn = try database.core.store.beginReadTxn();
     defer txn.abort();
     var bridge: Bridge = .{ .txn = &txn };
-    if (try bridge.backendGet(temporary, marker) != null and !try bridge.store(temporary, prefix).ownershipIndexed()) return true;
     return (try bridge.store(temporary, "").backend.scan(&bridge, temporary, @import("../storage/lite/resolver_consumers.zig").work_prefix, null, 1)).rows.len != 0;
+}
+
+fn ownershipWorkPossible(database: *h.db_mod.DB, a: A) !bool {
+    var scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(a));
+    defer scratch.deinit();
+    const temporary = scratch.allocator();
+    var txn = try database.core.store.beginReadTxn();
+    defer txn.abort();
+    var bridge: Bridge = .{ .txn = &txn };
+    return try bridge.backendGet(temporary, marker) != null and !try bridge.store(temporary, prefix).ownershipIndexed();
 }
 
 pub fn hasProjectionDebt(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
     const physical = if (root.owned_lite_backend) |*backend| backend.native_docstore else null;
     if (physical != null) {
+        if (try ownershipWorkPossible(database, a)) return true;
         if (!try projectionWorkPossible(database, a)) return false;
         try ensureConsumerIndex(root, a);
         var read = try database.core.store.beginReadTxn();
@@ -1416,9 +1430,11 @@ test "capi resolver curation owner maintenance backfills historical ownership in
             if (after == null) break;
         }
         try store.backend.remove(&bridge, a, try std.mem.concat(a, u8, &.{ prefix, "queue/ownership-progress" }));
+        try bridge.backendPut(a, catalog.minimum_reader_key, try catalog.readerVersionBytes(catalog.resolver_projection_delta_reader_version));
         try bridge.flush(a);
         try write.commit();
     }
+    db.core.index_manager.minimum_reader_version.store(catalog.resolver_projection_delta_reader_version, .release);
     try std.testing.expect(try hasProjectionDebt(root, db, a));
     try std.testing.expect(try owns(db, a, "legacy/2{{_key}}"));
     var turns: usize = 0;
@@ -1428,6 +1444,8 @@ test "capi resolver curation owner maintenance backfills historical ownership in
         turns += 1;
     }
     try std.testing.expectEqual(@as(usize, 3), turns);
+    try std.testing.expectEqual(catalog.resolver_projection_delta_reader_version, db.core.index_manager.minimum_reader_version.load(.acquire));
+    try std.testing.expectEqualStrings("15", try db.core.store.get(a, catalog.minimum_reader_key));
     api.antfly_db_close(handle);
     root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, false, null, null);
     handle = try api.publishHandle(root);
