@@ -5938,3 +5938,50 @@ old-to-new executable upgrade repairs the missing local posting and retains it
 through a second restart; an existing remote Parquet publication remains queryable.
 Relational external schemas reject dynamic templates, so the affected native
 binding migration is independently covered at the planner boundary.
+
+
+## Document-type projection, typed route bounds and refresh-key reuse
+
+The latest refinement scopes physical source exclusions and named text subfields
+to the selected document type, including undeclared dynamic strings. These rules
+are rebound from the authenticated public validator while ASCH epoch bytes stay
+unchanged. Their semantic witness authorizes the ordinary leader-owned shadow
+repair only for known historical provenance. A real old-to-new executable test
+repairs both the missing beta root posting and the leaked beta alias posting,
+then retains the corrected results through another restart.
+
+Reader protocol 85 / native text metadata v14 persist typed first/last bounds in
+routing records. Eligible field-sort windows reject strictly worse primary
+ranges before admitting descriptors or lineage. Equal primary keys remain live
+for public-ID ties; exact counts/full-match evaluation do not prune. Unknown or
+invalid evidence stays eligible. Existing v13 publications remain reusable and
+missing bounds retain ordinary execution. Encoders capture new bounds while the
+segment reader is resident; unsorted segments add no artifact reads.
+
+Cold lineage loads reserve complete logical read charges before submitting
+joined waves of up to eight shared scheduler I/O lanes. Saturation runs required
+reads on the caller; publication-owned execution keeps its serial phase contract.
+Immutable cutoff copies prevent prefetch from borrowing moving winner storage.
+
+Native fragment spaces retain optional per-row typed ordering keys under an
+ordering cohort and exact input-version digest. Unchanged rows reuse keys when a
+fragment is sorted again; changed/missing keys gather current ordering columns.
+Deletion removes cache entries, a changed cohort starts a new tree, and older
+publications without keys retain source fallback. Only the current native space
+owns this refresh state; consumer coordinate views do not retain obsolete key
+trees. Existing publication certificates, cloud generation maps, reader leases
+and GC walk the same identity dependency closure. See the [row identity
+contract](../docs/plans/lake-row-identity.md#incremental-ordering-key-state-reader-protocol-85).
+
+The [routing/refresh observation](bench/lake/native-routing-refresh-v3-observation.json)
+retains deterministic work counts and all 48 exact-answer baseline/candidate
+control samples on the same frozen 16,384-row Parquet source. A 257-row fragment
+refresh gathers one changed row and reuses 256 keys; deletion gathers none, while
+changed-cohort and absent-cache controls gather all remaining rows. Eight lineage
+pages reach eight concurrent reads, or one under saturation. Nine real-segment
+routing records retain two admissions and preserve original offsets across seven
+pruned records. These are bounded-work checks, not real-cloud throughput results.
+
+All control queries retain 21 decorated candidates. Warm medians in this run are
+25–27 ms versus 22–24 ms previously; concurrent native/E2E validation prevents
+latency attribution, so this refinement claims no measured latency improvement.
