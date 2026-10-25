@@ -633,7 +633,7 @@ func corpusLoadCmd(args []string) error {
 	graph := flags.Bool("graph", false, "Create relation graph; run corpus graph after extraction (requires extractor inference)")
 	inference := flags.String("inference-url", "", "Server-reachable Antfly inference URL for OCR, embeddings and relation extraction")
 	inferenceSecret := flags.String("inference-secret", "", "Server keystore key name for the selected inference endpoint (never a credential value)")
-	model := flags.String("embedding-model", DefaultEmbeddingModel, "Embedding model, with 512 dimensions")
+	model := flags.String("embedding-model", DefaultEmbeddingModel, fmt.Sprintf("Embedding model (%d dimensions; use embedder-config for another dimension)", DefaultEmbeddingDims))
 	embedderPath := flags.String("embedder-config", "", "Native embedder JSON including provider, model, project/location and dimension")
 	extractorModel := flags.String("artifact-extractor-model", DefaultAutographModel, "Registered inference model for relation extraction")
 	language := flags.String("reader-config", "", "Native OCR reader JSON file (florence-reader.example.json for hosted inference); empty disables OCR")

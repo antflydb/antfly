@@ -691,6 +691,19 @@ test "Florence CUDA pinned OCR reads invoice fixture" {
     const lower = try std.ascii.allocLowerString(a, result.text);
     defer a.free(lower);
     errdefer std.debug.print("Florence CUDA invoice output: {s}\n", .{result.text});
-    for ([_][]const u8{ "antfly", "12345", "42.00" }) |text|
+    for ([_][]const u8{ "invoice", "12345", "42.00" }) |text|
         try std.testing.expect(std.mem.indexOf(u8, lower, text) != null);
+    // This is CUDA implementation parity, not a claim of exact transcription.
+    // The model can misspell the uncommon brand in this fixture; preserve the
+    // complete CPU output as the reference rather than accepting a CUDA drift.
+    var cpu_sessions = backends.SessionManager.initWithIo(a, std.testing.io);
+    cpu_sessions.preferred_backends = &.{.native};
+    cpu_sessions.required_backend = .native;
+    var cpu_manager = model_manager_mod.ModelManager.init(a, cpu_sessions);
+    defer cpu_manager.deinit();
+    var cpu_reader = try readers_mod.LoadedReader.loadFromDirWithControl(a, directory, &cpu_manager.session_manager, &cpu_manager, control);
+    defer cpu_reader.deinit();
+    var cpu_result = try cpu_reader.read(image_data, .{ .prompt = "<OCR>", .max_tokens = 128, .execution_control = control });
+    defer cpu_result.deinit();
+    try std.testing.expectEqualStrings(cpu_result.text, result.text);
 }

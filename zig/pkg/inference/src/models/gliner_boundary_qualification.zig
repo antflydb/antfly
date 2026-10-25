@@ -1268,7 +1268,7 @@ test "boundary qualification Transformers wrapper has exactly the original fp32 
     changed.weight.sha256[0] = 'f';
     try std.testing.expect(!hasQualifiedIdentity(changed));
     try require(identity, .cuda, fastino_gliner25_base_v1_features, fastino_gliner25_base_v1_lengths);
-    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, .cuda, fastino_gliner25_base_v1_long_document_features, fastino_gliner25_base_v1_long_document_lengths));
+    try std.testing.expectError(error.GlinerBoundaryWindowWordsLimitExceeded, require(identity, .cuda, fastino_gliner25_base_v1_long_document_features, fastino_gliner25_base_v1_long_document_lengths));
 }
 
 test "CUDA boundary base profiles keep exact identity context and precision gates" {

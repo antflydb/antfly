@@ -26,9 +26,9 @@ const (
 	DefaultInferenceURL     = "http://localhost:8080"
 	DefaultFullTextIndex    = "full_text_index_v0"
 	DefaultEmbeddingIndex   = "embeddings"
-	DefaultEmbeddingModel   = "antflydb/clipclap"
-	DefaultEmbeddingPull    = "antflydb/clipclap:gguf:Q4_K"
-	DefaultEmbeddingDims    = 512
+	DefaultEmbeddingModel   = "google/embeddinggemma-2:safetensors@914f7f89142e33e77833254d9c9b90c3cef7303b"
+	DefaultEmbeddingPull    = DefaultEmbeddingModel
+	DefaultEmbeddingDims    = 768
 	DefaultChunkerModel     = "fixed-bert-tokenizer"
 	DefaultOCRModel         = "antflydb/florence-2-base:gguf:Q4_K@1c12eae118a4bdad5af436e2aa0212baf2214fee"
 	DefaultRecognizerModel  = "fastino/gliner2.5-base-v1:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d"

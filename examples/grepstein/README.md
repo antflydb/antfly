@@ -279,7 +279,7 @@ The current native Google adapters accept text only, even when the remote model
 supports other modalities.
 
 For a separately qualified local embedder, omit `--embedder-config` and use the
-registered 512-dimensional model flags. Use a registered GLiNER extractor for
+registered 768-dimensional EmbeddingGemma 2 model flags. Use a registered GLiNER extractor for
 the graph stage. Default inference routing is inherited from the Antfly instance;
 `--inference-url` is an explicit override. Graph materialization retains native
 page provenance, detects superseded extraction revisions, and reconciles stale
