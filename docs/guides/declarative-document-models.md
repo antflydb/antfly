@@ -498,6 +498,10 @@ released after each item. An oversized page or row stops further source/model
 processing. Artifact retention reserves room for its handle and TTL within
 the same response cap.
 
+Extraction request JSON has a maximum depth of 128, counting the root as depth
+zero. Deeper schemas, options, content or metadata return `DocumentOutputTooLarge`
+(HTTP 413) before document loading or model calls.
+
 ## Comparing readers
 
 Run `scripts/eval_document_models.py --corpus CORPUS --model BASELINE --model

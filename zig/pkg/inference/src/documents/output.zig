@@ -118,10 +118,10 @@ pub fn measure(item: anytype, limit: usize) !usize {
     return counter.count;
 }
 
-// Untrusted metadata can be deeper than std.json.Stringify's fixed stack.
-// Each value needs at least one wire byte, so the byte ceiling also bounds
-// this allocation-free preflight's work before the encoder checks exact bytes.
-fn validateValue(value: std.json.Value, limit: usize) !void {
+/// Untrusted JSON can be deeper than std.json.Stringify's fixed stack.
+/// Each value needs at least one wire byte, so the byte ceiling also bounds
+/// this allocation-free preflight's work before the encoder checks exact bytes.
+pub fn validateValue(value: std.json.Value, limit: usize) !void {
     var remaining = limit;
     try validateValueDepth(value, 0, &remaining);
 }

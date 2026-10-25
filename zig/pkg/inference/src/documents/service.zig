@@ -894,6 +894,11 @@ pub fn Service(comptime Node: type) type {
             defer arena.deinit();
             const a = arena.allocator();
             const root = try std.json.parseFromSliceLeaky(V, a, bytes, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false });
+            // Bound every caller-owned tree before provider schema traversal,
+            // document reading or serialization. Each parsed value consumes at
+            // least one input byte, so this preflight needs no extra allocation
+            // or serialization and runs once for the entire extraction batch.
+            try json_output.validateValue(root, bytes.len);
             if (root != .object) return error.InvalidDocumentSource;
             for (root.object.keys()) |key| {
                 var known = false;
@@ -2410,5 +2415,70 @@ test "document specialists nested readers and verifiers receive identical alpha 
         try std.testing.expectEqualStrings("Fixed", page.object.get("text").?.string);
         try std.testing.expect(region.object.get("validated").?.bool);
         try std.testing.expectEqual(@as(usize, 3), fake.reads);
+    }
+}
+
+fn expectExtractionParameterDepth(field: []const u8, depth: usize, expected: anyerror) !void {
+    const extracting = @import("antfly_extracting");
+    const Fake = struct {
+        calls: usize = 0,
+        pub fn documentDefinition(_: *@This(), a: A, name: []const u8, _: c.Operation) !?[]const u8 {
+            if (!std.mem.eql(u8, name, "agent")) return null;
+            return try a.dupe(u8,
+                \\{"models":[{"name":"leaf","model":"leaf","operation":"extract"}],"extract":{"model":"leaf"}}
+            );
+        }
+        pub fn documentResolveBinding(_: *@This(), _: A, binding: c.Binding) !c.Snapshot {
+            var hash: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(binding.model, &hash, .{});
+            return .{ .binding = binding, .path = binding.model, .identity = hash };
+        }
+        pub fn extractDirectWithControl(self: *@This(), _: A, _: []const u8, _: extracting.Request, _: Control) !extracting.Response {
+            self.calls += 1;
+            return error.UnexpectedCall;
+        }
+        pub fn documentDownload(_: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
+            return error.UnexpectedCall;
+        }
+        pub fn readDocumentArtifact(_: *@This(), _: A, _: []const u8) ![]u8 {
+            return error.UnexpectedCall;
+        }
+        pub fn readEncodedImagesReportedDirectWithContext(_: *@This(), _: A, _: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+            return error.UnexpectedCall;
+        }
+        pub fn invokeCloudflare(_: *@This(), _: A, _: c.Binding, _: V, _: Control, _: *c.Run) anyerror!V {
+            return error.UnexpectedCall;
+        }
+        pub fn decideDirectJsonWithControl(_: *@This(), _: A, _: []const u8, _: ?Control) anyerror![]u8 {
+            return error.UnexpectedCall;
+        }
+    };
+    const a = std.testing.allocator;
+    var request: std.Io.Writer.Allocating = .init(a);
+    defer request.deinit();
+    try request.writer.writeAll("{\"model\":\"agent\",\"schema_version\":2,\"inputs\":[{\"content\":\"Total 12.50\"}],");
+    if (std.mem.eql(u8, field, "options")) try request.writer.writeAll("\"schema\":{\"structures\":{\"receipt\":{\"fields\":{\"total\":\"str\"}}}},");
+    try request.writer.print("\"{s}\":{{\"nested\":", .{field});
+    for (0..depth) |_| try request.writer.writeByte('[');
+    try request.writer.writeAll("null");
+    for (0..depth) |_| try request.writer.writeByte(']');
+    try request.writer.writeAll("}}");
+    var node = Fake{};
+    try std.testing.expectError(expected, Service(Fake).extractJson(&node, a, request.written(), .{}));
+    try std.testing.expectEqual(@as(usize, if (expected == error.UnexpectedCall) 1 else 0), node.calls);
+}
+
+test "document extraction rejects deeply nested schema before any model call" {
+    for ([_]usize{ 127, 300 }) |depth| try expectExtractionParameterDepth("schema", depth, error.DocumentOutputTooLarge);
+}
+
+test "document extraction rejects deeply nested options before any model call" {
+    for ([_]usize{ 127, 300 }) |depth| try expectExtractionParameterDepth("options", depth, error.DocumentOutputTooLarge);
+}
+
+test "document extraction forwards schema and options within the depth boundary" {
+    for ([_]usize{ 8, 126 }) |depth| {
+        try expectExtractionParameterDepth("schema", depth, error.UnexpectedCall);
+        try expectExtractionParameterDepth("options", depth, error.UnexpectedCall);
     }
 }
