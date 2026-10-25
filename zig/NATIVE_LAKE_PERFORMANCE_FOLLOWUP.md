@@ -6095,9 +6095,10 @@ protection; only its idle uv-prune child was interrupted.
 
 ### Compound predicates, nullable ordering and mixed layout traversal
 
-The next refinement adds bounded native Boolean membership probes, explicit
-null ordering with authenticated typed-coverage witnesses, and a complete
-cohort endpoint directory. Compatible layouts retain best-first pruning even
+This refinement implements bounded native Boolean membership probes, explicit
+`missing_null_policy: nulls_ordered` with authenticated typed-coverage witnesses,
+and a complete cohort endpoint directory. The default `missing_rejected` policy
+continues to reject missing/null native sort values and cursors. Compatible layouts retain best-first pruning even
 when other runs must use exact scanning. Historical endpoints migrate through
 one bounded metadata pass; native payloads remain reusable. See the
 [protocol-88 contract](../docs/plans/lake-row-identity.md#compound-probes-nullable-ordering-and-layout-cohorts-reader-protocol-88)

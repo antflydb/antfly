@@ -726,6 +726,15 @@ pub const ComposedComponentBatch = struct {
         return result;
     }
 };
+// A named physical consumer is one text source. Retaining the parent's
+// source list prevents native point membership and ordered top-K admission.
+fn namedTextComponentRequest(req: types.SearchRequest, name: []const u8) types.SearchRequest {
+    var child = req;
+    child.index_name = name;
+    child.full_text_queries = &.{};
+    return child;
+}
+
 fn composedComponents(a: Allocator, req: types.SearchRequest) ![]ComposedComponent {
     var components: std.ArrayList(ComposedComponent) = .empty;
     errdefer components.deinit(a);
@@ -733,8 +742,7 @@ fn composedComponents(a: Allocator, req: types.SearchRequest) ![]ComposedCompone
         if (req.full_text) |text| try components.append(a, .{ .request = req, .query = .{ .text = text } }) else if (!isDefaultMatchAll(req.query) and isTextQuery(req.query)) try components.append(a, .{ .request = req, .query = .default_text });
     } else {
         for (req.full_text_queries) |named| {
-            var child = req;
-            child.index_name = named.index_name;
+            const child = namedTextComponentRequest(req, named.index_name);
             try components.append(a, .{ .request = child, .query = .{ .text = named.query } });
         }
     }
@@ -1116,8 +1124,7 @@ pub fn searchComposed(
         }
     } else {
         for (shared_req.full_text_queries) |full_text_query| {
-            var text_req = shared_req;
-            text_req.index_name = full_text_query.index_name;
+            const text_req = namedTextComponentRequest(shared_req, full_text_query.index_name);
             const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
             const text_result = if (component_batch) |*batch| try batch.take() else try executor.search_text_query(executor.ctx, alloc, text_req, full_text_query.query);
             owned_results.appendAssumeCapacity(text_result);
@@ -1267,10 +1274,10 @@ pub fn searchComposed(
         if (bench_query_profile) graph_ns = platform_time.monotonicNs() - graph_start_ns;
     }
     if (collect_sort_profile) {
-        base.sort_profile = if (requestHasSortPageOptions(shared_req))
+        try base.setOwnedSortProfile(if (requestHasSortPageOptions(shared_req))
             composedExactSortProfileOrFallback(shared_req, exact_component_sort_profile, composed_candidate_count, base.hits.len, platform_time.monotonicNs() - composed_start_ns)
         else
-            composedScoreTopKSortProfile(shared_req, composed_candidate_count, base.hits.len, platform_time.monotonicNs() - composed_start_ns);
+            composedScoreTopKSortProfile(shared_req, composed_candidate_count, base.hits.len, platform_time.monotonicNs() - composed_start_ns));
     }
     if (bench_query_profile) {
         std.log.info(
@@ -34452,7 +34459,7 @@ test "composed search rejects exact field sort across embedding sources" {
     }, undefined));
 }
 
-test "composed text exact sort preserves native component profile" {
+test "native sort composed text exact sort preserves owned native component profile" {
     const alloc = std.testing.allocator;
 
     const Harness = struct {
@@ -34463,6 +34470,8 @@ test "composed text exact sort preserves native component profile" {
             _: types.TextQuery,
         ) anyerror!types.SearchResult {
             try std.testing.expect(req.profile);
+            try std.testing.expectEqual(@as(usize, 0), req.full_text_queries.len);
+            try std.testing.expectEqualStrings("chosen-index", req.index_name.?);
             const hits = try alloc_inner.alloc(types.SearchHit, 1);
             hits[0] = .{
                 .id = try alloc_inner.dupe(u8, "doc:a"),
@@ -34471,7 +34480,7 @@ test "composed text exact sort preserves native component profile" {
                     .{ .string = "doc:a" },
                 }),
             };
-            return .{
+            var owned: types.SearchResult = .{
                 .alloc = alloc_inner,
                 .hits = hits,
                 .total_hits = 1,
@@ -34491,6 +34500,8 @@ test "composed text exact sort preserves native component profile" {
                     .window_len = 1,
                 },
             };
+            try owned.setOwnedSortProfile(owned.sort_profile.?);
+            return owned;
         }
 
         fn searchText(
@@ -34548,7 +34559,7 @@ test "composed text exact sort preserves native component profile" {
 
     const order_by = [_]types.SortField{.{ .field = "created_at", .desc = true }};
     var result = try searchComposed(alloc, .{
-        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .full_text_queries = &.{.{ .name = "chosen", .index_name = "chosen-index", .query = .{ .match = .{ .field = "body", .text = "alpha" } } }},
         .order_by = &order_by,
         .include_stored = false,
         .profile = true,
@@ -34564,6 +34575,7 @@ test "composed text exact sort preserves native component profile" {
     });
     defer result.deinit();
 
+    try std.testing.expect(result.sort_profile_storage != null);
     const profile = result.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
     try std.testing.expectEqualStrings("exact", profile.exactness);

@@ -1591,7 +1591,14 @@ switch. Cursor filtering and public-ID ties continue to determine the exact page
 
 The field mapping opts in with `missing_null_policy: nulls_ordered`; the
 existing `missing_rejected` default continues to reject live missing/null values
-and null cursors. Native ordering has an explicit null tag matching the existing comparator:
+and null cursors. Structural request/response validators admit JSON null as a
+replayable scalar; mapped-field admission owns the null policy, including shared
+result merging and gateway cursor validation. NULL does not establish or conflict
+with the non-null scalar domain of a distributed sort column. Nullable public
+capability admission defers physical completeness to the owning native reader,
+rather than treating a sparse density summary as a completeness proof.
+
+Native ordering has an explicit null tag matching the existing comparator:
 ascending nulls first, with descending order reversing that placement. Tagged
 refresh tuples retain nulls without creating a fake typed scalar value. Sort
 metadata v2 carries a per-field completeness witness from a full producer walk.

@@ -482,41 +482,115 @@ def test_nullable_native_ordering_and_compound_membership(tmp_path, kind):
         admission_window_segments=1, admission_window_bytes=1
     )
     config.write_text(json.dumps(configuration))
+    # Remote cursors must carry the publication-bound token returned by a
+    # matching query. Bind each static boundary, and also replay real tuples.
+    import importlib.util
+
+    import conftest as harness
+
+    spec = importlib.util.spec_from_file_location(
+        "nullable_archive_bench", root / "tools" / "benchmark_lake_archive.py"
+    )
+    bench = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = bench
+    spec.loader.exec_module(bench)
     output = tmp_path / "qualification"
-    log = tmp_path / "qualification.log"
-    with log.open("w") as stream:
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(root / "tools" / "benchmark_lake_archive.py"),
-                "run",
-                "--binary",
-                str(binary),
-                "--server-config",
-                str(config),
-                "--output-dir",
-                str(output),
-                "--plan",
-                str(plan_path),
-                "--parquet",
-                str(archive),
-                "--samples",
-                "1",
-                "--timeout",
-                "180",
-            ],
-            stdout=stream,
-            stderr=subprocess.STDOUT,
-            timeout=300,
+    output.mkdir()
+    fixture = bench.import_fixture(output / "fixture", [archive], "nullable-archive")
+    plan["definition"]["schema"]["base_source"]["uri"] = fixture["manifest_uri"]
+    samples = []
+
+    def verify(case, response, restarted):
+        bench.verify_case(case, response)
+        if case["name"] == "exact_count":
+            assert response["hits"]["total"] == {"value": count, "relation": "exact"}
+        else:
+            profile = response["profile"]["sort"]
+            assert profile["index_sort_coverage"] == "covered_with_bounds", profile
+            assert profile["candidate_count"] < 128, profile
+        samples.append(
+            {
+                "case": case["name"],
+                "restarted": restarted,
+                "profile": response.get("profile"),
+                "expected_ids": case["expected_ids"],
+            }
         )
-    assert result.returncode == 0, log.read_text()
-    report = json.loads((output / "report.json").read_text())
-    assert report["complete"] and len(report["samples"]) == 18
-    for sample in report["samples"]:
-        if sample["case"] == "exact_count":
-            continue
-        profile = sample["profile"]["sort"]
-        assert profile["index_sort_coverage"] == "covered_with_bounds", profile
-        assert profile["candidate_count"] < 128, profile
-    answer = json.loads((output / "exact_count-answer.json").read_text())
-    assert answer["hits"]["total"] == {"value": count, "relation": "exact"}, answer
+
+    with bench.managed_server(
+        harness.StandaloneAntflyServer,
+        binary,
+        config,
+        output,
+        api_root=harness.ANTFLY_PUBLIC_API_ROOT,
+    ) as server:
+        client = bench.Client(server, 180)
+        try:
+            client.call("POST", f"/tables/{bench.TABLE}", plan["definition"])
+            client.ready(bench.readiness_indexes(plan))
+            for restarted in [False, True]:
+                if restarted:
+                    server.restart()
+                    client.ready(bench.readiness_indexes(plan))
+                for case in plan["cases"]:
+                    request = dict(case["request"])
+                    if "search_after" in request or "search_before" in request:
+                        bootstrap = {
+                            key: value
+                            for key, value in request.items()
+                            if key not in {"search_after", "search_before"}
+                        }
+                        bound = client.query({"request": bootstrap})
+                        request["remote_snapshot"] = bound["remote_snapshot"]
+                    response = client.query({"request": request})
+                    verify(case, response, restarted)
+                    if case["name"] != "or_asc":
+                        continue
+                    all_ids = sorted(
+                        range(count),
+                        key=lambda i: (
+                            ranks[i] is not None,
+                            ranks[i] if ranks[i] is not None else 0,
+                            i,
+                        ),
+                    )
+                    cursor = response["hits"]["hits"][-1]["_sort"]
+                    assert cursor[0] is None
+                    after = client.query(
+                        {
+                            "request": dict(
+                                request,
+                                search_after=cursor,
+                                remote_snapshot=response["remote_snapshot"],
+                            )
+                        }
+                    )
+                    verify(
+                        dict(
+                            case, name="literal_null_after", expected_ids=all_ids[20:40]
+                        ),
+                        after,
+                        restarted,
+                    )
+                    before = client.query(
+                        {
+                            "request": dict(
+                                request,
+                                search_before=after["hits"]["hits"][0]["_sort"],
+                                remote_snapshot=after["remote_snapshot"],
+                            )
+                        }
+                    )
+                    verify(
+                        dict(
+                            case, name="literal_null_before", expected_ids=all_ids[:20]
+                        ),
+                        before,
+                        restarted,
+                    )
+        finally:
+            client.session.close()
+    assert len(samples) == 22
+    (output / "report.json").write_text(
+        json.dumps({"samples": samples, "complete": True}, indent=2)
+    )
