@@ -3028,3 +3028,16 @@ and zero bytes in autorelease pools. The corrected decoder's separate exit-time
 allocation probe reports zero leaks. CUDA construction, planning, descriptors
 and capture ownership compile and pass host-side guards; CUDA numerical and
 performance qualification still require a CUDA host.
+
+
+U36 boundary discovery also repaired two pre-existing Q8 launch defects. The
+four rows/columns adapters had reversed tile extents, leaving output rows
+unwritten for asymmetric tiles. The pinned tile4-r2 bias export additionally
+uses the residual wire ABI even though it ignores the residual; its host
+launcher now supplies that slot. No native image changes are needed. The
+independent F64 fixture covers 48 actual GPU invocations: three tail shapes,
+four tile variants including tensor cores, and four bias/activation/residual
+modes, with leading and trailing guards. All pass on Spark, together with both
+launch-ABI suites (three selected, zero skips). Starting-baseline failures and
+intermediate diagnostic logs are retained; this is correctness repair cost,
+not consolidation credit.

@@ -11018,7 +11018,7 @@ pub const KernelModule = struct {
         out_dim: usize,
     ) driver_mod.Error!void {
         const fn_cols_rows = self.q8VariantFunction(variant, .none) orelse return error.CudaSymbolMissing;
-        try self.launchLinearQ8_0RowsColsCommon(ctx, fn_cols_rows.function, dst, input, weight_raw, .{}, .{}, rows, in_dim, out_dim, .none, fn_cols_rows.cols, fn_cols_rows.rows);
+        try self.launchLinearQ8_0RowsColsCommon(ctx, fn_cols_rows.function, dst, input, weight_raw, .{}, .{}, rows, in_dim, out_dim, .none, fn_cols_rows.rows, fn_cols_rows.cols);
     }
 
     pub fn launchLinearQ8_0BiasVariantF32(
@@ -11034,7 +11034,7 @@ pub const KernelModule = struct {
         out_dim: usize,
     ) driver_mod.Error!void {
         const fn_cols_rows = self.q8VariantFunction(variant, .bias) orelse return error.CudaSymbolMissing;
-        try self.launchLinearQ8_0RowsColsCommon(ctx, fn_cols_rows.function, dst, input, weight_raw, bias, .{}, rows, in_dim, out_dim, .bias, fn_cols_rows.cols, fn_cols_rows.rows);
+        try self.launchLinearQ8_0RowsColsCommon(ctx, fn_cols_rows.function, dst, input, weight_raw, bias, .{}, rows, in_dim, out_dim, .bias, fn_cols_rows.rows, fn_cols_rows.cols);
     }
 
     pub fn launchLinearQ8_0BiasGeluVariantF32(
@@ -11050,7 +11050,7 @@ pub const KernelModule = struct {
         out_dim: usize,
     ) driver_mod.Error!void {
         const fn_cols_rows = self.q8VariantFunction(variant, .bias_gelu) orelse return error.CudaSymbolMissing;
-        try self.launchLinearQ8_0RowsColsCommon(ctx, fn_cols_rows.function, dst, input, weight_raw, bias, .{}, rows, in_dim, out_dim, .bias_gelu, fn_cols_rows.cols, fn_cols_rows.rows);
+        try self.launchLinearQ8_0RowsColsCommon(ctx, fn_cols_rows.function, dst, input, weight_raw, bias, .{}, rows, in_dim, out_dim, .bias_gelu, fn_cols_rows.rows, fn_cols_rows.cols);
     }
 
     pub fn launchLinearQ8_0BiasAddVariantF32(
@@ -11067,7 +11067,7 @@ pub const KernelModule = struct {
         out_dim: usize,
     ) driver_mod.Error!void {
         const fn_cols_rows = self.q8VariantFunction(variant, .bias_add) orelse return error.CudaSymbolMissing;
-        try self.launchLinearQ8_0RowsColsCommon(ctx, fn_cols_rows.function, dst, input, weight_raw, bias, residual, rows, in_dim, out_dim, .bias_add, fn_cols_rows.cols, fn_cols_rows.rows);
+        try self.launchLinearQ8_0RowsColsCommon(ctx, fn_cols_rows.function, dst, input, weight_raw, bias, residual, rows, in_dim, out_dim, .bias_add, fn_cols_rows.rows, fn_cols_rows.cols);
     }
 
     const Q8VariantFunction = struct {
@@ -11136,7 +11136,6 @@ pub const KernelModule = struct {
         rows_per_block: usize,
         cols_per_block: usize,
     ) driver_mod.Error!void {
-        _ = self;
         if (in_dim == 0 or in_dim % q8_0_tiled_values_per_block != 0) return error.InvalidCudaState;
         const row_blocks = in_dim / q8_0_values_per_block;
         const out_count = try checkedTensorElements(rows, out_dim);
@@ -11155,7 +11154,11 @@ pub const KernelModule = struct {
         var rows_u32 = try toU32(rows);
         var in_dim_u32 = try toU32(in_dim);
         var out_dim_u32 = try toU32(out_dim);
-        var params = if (mode == .bias_add) [_]?*anyopaque{
+        // The pinned tile4-r2 bias export retains an unused residual wire.
+        // Match its physical ABI without changing the kernel image.
+        const residual_wire = mode == .bias_add or
+            (mode == .bias and function == self.linear_q8_0_bias_f32_tile4_r2);
+        var params = if (residual_wire) [_]?*anyopaque{
             @ptrCast(&dst_ptr),
             @ptrCast(&input_ptr),
             @ptrCast(&weight_ptr),
@@ -22090,4 +22093,102 @@ test "CUDA primitive index traversal rejects overflowing legacy coordinates befo
 test "CUDA shared Q4K triple launcher preserves ordinary and tiled native outputs" {
     if (!build_options.enable_cuda) return error.SkipZigTest;
     try smokeQ4_K(std.testing.allocator);
+}
+
+test "CUDA Q8 row column and tensor core tiles cover every output and guard" {
+    if (!build_options.enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var ctx = try context_mod.CudaContext.initDefault();
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+    const width: usize = 256;
+    for ([_][2]usize{ .{ 5, 9 }, .{ 9, 17 }, .{ 17, 33 } }) |shape| {
+        const rows = shape[0];
+        const columns = shape[1];
+        const count = rows * columns;
+        const blocks = columns * (width / 32);
+        const input_host = try a.alloc(f32, rows * width);
+        defer a.free(input_host);
+        for (input_host, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 13 + i / width * 11) % 31)) - 15)) / 64;
+        const raw_host = try a.alloc(u8, blocks * q8_0_block_bytes);
+        defer a.free(raw_host);
+        const packed_host = try a.alloc(u8, blocks * q8_0_tc_block_bytes);
+        defer a.free(packed_host);
+        for (0..blocks) |block| {
+            const column = block / (width / 32);
+            const quant: i8 = @intCast(@as(i32, @intCast(column % 5)) - 2);
+            std.mem.writeInt(u16, raw_host[block * 34 ..][0..2], 0x3c00, .little);
+            @memset(raw_host[block * 34 + 2 ..][0..32], @bitCast(quant));
+            std.mem.writeInt(u16, packed_host[block * 2 ..][0..2], 0x3c00, .little);
+            @memset(packed_host[blocks * 2 + block * 32 ..][0..32], @bitCast(quant));
+        }
+        const bias_host = try a.alloc(f32, columns);
+        defer a.free(bias_host);
+        for (bias_host, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) / 32;
+        const residual_host = try a.alloc(f32, count);
+        defer a.free(residual_host);
+        for (residual_host, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i / columns * 3 + i % columns) % 11)) - 5)) / 64;
+        var input = try buffer_mod.DeviceBuffer.alloc(&ctx, input_host.len * 4);
+        defer input.free(&ctx);
+        var raw = try buffer_mod.DeviceBuffer.alloc(&ctx, raw_host.len);
+        defer raw.free(&ctx);
+        var packed_weight = try buffer_mod.DeviceBuffer.alloc(&ctx, packed_host.len);
+        defer packed_weight.free(&ctx);
+        var bias = try buffer_mod.DeviceBuffer.alloc(&ctx, bias_host.len * 4);
+        defer bias.free(&ctx);
+        var residual = try buffer_mod.DeviceBuffer.alloc(&ctx, residual_host.len * 4);
+        defer residual.free(&ctx);
+        var owner = try buffer_mod.DeviceBuffer.alloc(&ctx, (count + 16) * 4);
+        defer owner.free(&ctx);
+        const output = buffer_mod.DeviceBuffer{ .ptr = owner.ptr + 8 * 4, .len = count * 4, .borrowed = true };
+        const result = try a.alloc(f32, count + 16);
+        defer a.free(result);
+        try input.copyFromHost(&ctx, std.mem.sliceAsBytes(input_host));
+        try raw.copyFromHost(&ctx, raw_host);
+        try packed_weight.copyFromHost(&ctx, packed_host);
+        try bias.copyFromHost(&ctx, std.mem.sliceAsBytes(bias_host));
+        try residual.copyFromHost(&ctx, std.mem.sliceAsBytes(residual_host));
+        inline for (.{ QMatmulVariant.fast_r2c4, QMatmulVariant.fast_r2c8, QMatmulVariant.fast_r4c4, QMatmulVariant.tc_hmma }) |variant| {
+            inline for (0..4) |mode| {
+                @memset(result, -777);
+                try owner.copyFromHost(&ctx, std.mem.sliceAsBytes(result));
+                if (variant == .tc_hmma) {
+                    switch (mode) {
+                        0 => try module.launchLinearQ8_0TcHmmaF32(&ctx, output, input, packed_weight, rows, width, columns),
+                        1 => try module.launchLinearQ8_0BiasTcHmmaF32(&ctx, output, input, packed_weight, bias, rows, width, columns),
+                        2 => try module.launchLinearQ8_0BiasGeluTcHmmaF32(&ctx, output, input, packed_weight, bias, rows, width, columns),
+                        3 => try module.launchLinearQ8_0BiasAddTcHmmaF32(&ctx, output, input, packed_weight, bias, residual, rows, width, columns),
+                        else => unreachable,
+                    }
+                } else {
+                    switch (mode) {
+                        0 => try module.launchLinearQ8_0VariantF32(variant, &ctx, output, input, raw, rows, width, columns),
+                        1 => try module.launchLinearQ8_0BiasVariantF32(variant, &ctx, output, input, raw, bias, rows, width, columns),
+                        2 => try module.launchLinearQ8_0BiasGeluVariantF32(variant, &ctx, output, input, raw, bias, rows, width, columns),
+                        3 => try module.launchLinearQ8_0BiasAddVariantF32(variant, &ctx, output, input, raw, bias, residual, rows, width, columns),
+                        else => unreachable,
+                    }
+                }
+                try ctx.synchronize();
+                try owner.copyToHost(&ctx, std.mem.sliceAsBytes(result));
+                try ctx.synchronize();
+                for (result[0..8]) |value| try std.testing.expectEqual(@as(f32, -777), value);
+                for (result[8 + count ..]) |value| try std.testing.expectEqual(@as(f32, -777), value);
+                for (0..rows) |row| for (0..columns) |column| {
+                    const weight: f64 = @floatFromInt(@as(i32, @intCast(column % 5)) - 2);
+                    var expected: f64 = 0;
+                    for (input_host[row * width ..][0..width]) |value| expected += @as(f64, value) * weight;
+                    if (mode != 0) expected += bias_host[column];
+                    if (mode == 2) expected = 0.5 * expected * (1 + std.math.tanh(0.7978845608028654 * (expected + 0.044715 * expected * expected * expected)));
+                    if (mode == 3) expected += residual_host[row * columns + column];
+                    const actual = result[8 + row * columns + column];
+                    if (@abs(@as(f64, actual) - expected) > 2e-4) {
+                        std.debug.print("Q8 tile mismatch variant={s} mode={d} rows={d} columns={d} row={d} column={d} expected={d} actual={d}\n", .{ @tagName(variant), mode, rows, columns, row, column, expected, actual });
+                        return error.TestUnexpectedResult;
+                    }
+                };
+            }
+        }
+    }
 }
