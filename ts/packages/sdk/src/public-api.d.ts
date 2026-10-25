@@ -17582,6 +17582,8 @@ export interface components {
             keys?: components["schemas"]["RelationalIndexKey"][];
             /** @description Conjunction restricting uniqueness to matching rows. */
             where?: components["schemas"]["RelationalIndexPredicate"][];
+            /** @description Range-valued final key column for PostgreSQL WITHOUT OVERLAPS. Other key columns define equality groups; nonempty ranges within each group must be disjoint. The column remains in columns. Temporal keys are not equality-only foreign-key targets or ON CONFLICT arbiters. */
+            without_overlaps_column?: string;
             /** @description When true, NULL components compare equal for uniqueness. */
             nulls_not_distinct?: boolean;
             /** @description Permit uniqueness checks at transaction commit. Never eligible as an ON CONFLICT arbiter or a referenced foreign key target. */

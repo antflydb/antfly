@@ -873,6 +873,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     constraint_cover_run.addArg("--require-no-skips");
     b.step("antfly-relational-constraint-cover-test", "Verify covering constraint payload maintenance and cold reads avoid primary hydration")
         .dependOn(&constraint_cover_run.step);
+    const temporal_integrity_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{ "SQL range temporal claims", "relational integrity preparation cleans up every allocation failure and bounds admission", "relational integrity transfer validates borrowed action jobs before companion reads", "relational index system integrity compare claim fences absence and exact owner before combined writes" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const temporal_integrity_run = addFilteredTestRunArtifact(b, temporal_integrity_tests);
+    temporal_integrity_run.addArg("--require-no-skips");
+    b.step("antfly-relational-temporal-integrity-test", "Verify ordered temporal claims, exclusive transaction gaps and cold intent recovery")
+        .dependOn(&temporal_integrity_run.step);
     const deferred_check_storage_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
         .filters = &.{"NOT VALID history"},

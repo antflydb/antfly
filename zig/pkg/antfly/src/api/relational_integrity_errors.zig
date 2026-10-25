@@ -20,6 +20,8 @@ pub const ConstraintRejection = error{
     ConstraintValidationFailed,
     ForeignKeyMatchFullViolation,
     UniqueConstraintViolation,
+    TemporalOverlapViolation,
+    TemporalEmptyRange,
     ForeignKeyParentMissing,
     ForeignKeyReferenced,
 };
@@ -58,6 +60,8 @@ pub const Error = ConstraintRejection || @import("../usermgr/mod.zig").row_polic
     ForeignKeyReferenced,
     GenerationRetired,
     UniqueConstraintViolation,
+    TemporalOverlapViolation,
+    TemporalEmptyRange,
     ForeignKeyActionInProgress,
     PreparedGenerationChanged,
     PreparedReadSetChanged,

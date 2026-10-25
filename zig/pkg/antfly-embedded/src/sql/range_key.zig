@@ -19,6 +19,52 @@
 //! scanning every historical interval belonging to an equality-key group.
 const std = @import("std");
 const ranges = @import("range_value.zig");
+const binary = @import("range_binary.zig");
+
+/// Write the same lower-bound ordering component as lowerAlloc directly from
+/// canonical physical bytes. Admission/recovery can verify an ordered interval
+/// key without allocating NUMERIC limbs or a second copy of an unbounded key.
+pub fn writeLowerView(ctx: *ranges.Context, value: binary.View, writer: *std.Io.Writer) !void {
+    if (value.empty) return error.InvalidRange;
+    try ctx.charge(1);
+    if (value.lower) |point| {
+        try writer.writeByte(1);
+        var escaped: EscapeWriter = .{ .destination = writer, .context = ctx };
+        switch (point) {
+            .number => |number| try @import("numeric_key.zig").layout.Source.fromCanonicalRow(number).write(&escaped.writer, false, ctx),
+            .date => |date| try escaped.writer.writeInt(u32, @as(u32, @bitCast(date.days)) ^ (@as(u32, 1) << 31), .big),
+            .timestamp => |stamp| try escaped.writer.writeInt(u64, @as(u64, @bitCast(stamp.micros)) ^ (@as(u64, 1) << 63), .big),
+        }
+        try writer.writeAll(&.{ 0, 0, if (value.lower_inc) 0 else 1 });
+    } else try writer.writeByte(0);
+}
+
+const EscapeWriter = struct {
+    writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+    destination: *std.Io.Writer,
+    context: *ranges.Context,
+    count: usize = 0,
+    fn drain(raw: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *@This() = @alignCast(@fieldParentPtr("writer", raw));
+        var consumed: usize = 0;
+        for (data, 0..) |part, index| {
+            const repetitions = if (index + 1 == data.len) splat else 1;
+            for (0..repetitions) |_| for (part) |byte| {
+                const bytes: usize = if (byte == 0) 2 else 1;
+                if (bytes > self.context.max_output_bytes -| self.count) {
+                    self.context.failure = self.context.limit();
+                    return error.WriteFailed;
+                }
+                self.count += bytes;
+                try self.destination.writeByte(byte);
+                if (byte == 0) try self.destination.writeByte(255);
+                consumed += 1;
+            };
+        }
+        return consumed;
+    }
+};
+
 const Output = struct {
     context: *ranges.Context,
     bytes: std.ArrayList(u8) = .empty,

@@ -226,6 +226,47 @@ test "distributed txn cascade scalar equality uses row coercions without losing 
     try std.testing.expectError(error.InvalidIntegrityRecord, scalarAssignmentEqual(.datetime, .{ .string = "invalid" }, .{ .integer = 0 }));
 }
 
+fn temporalProbeQuery(alloc: Allocator, address: planner.storage.Address, schema_version: u32, generation_set: planner.storage.Digest, batches: []const []const planner.storage.Command) ![]u8 {
+    const Query = struct {
+        address: planner.storage.Address,
+        schema_version: u32,
+        generation_set: planner.storage.Digest,
+        batches: []const []const planner.storage.Command,
+        pub fn jsonStringify(value: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+            try stream.beginObject();
+            try stream.objectField("kind");
+            try stream.write("temporal_probe");
+            try stream.objectField("address");
+            try stream.write(value.address);
+            try stream.objectField("schema_version");
+            try stream.write(value.schema_version);
+            try stream.objectField("generation_set");
+            try stream.write(value.generation_set);
+            try stream.objectField("batches");
+            try @import("../storage/db/relational_integrity_json.zig").write(value.batches, stream);
+            try stream.endObject();
+        }
+    };
+    return std.json.Stringify.valueAlloc(alloc, Query{ .address = address, .schema_version = schema_version, .generation_set = generation_set, .batches = batches }, .{});
+}
+
+test "SQL range temporal probes retain arbitrary binary command bytes" {
+    const a = std.testing.allocator;
+    const tuple = "equality\x00\xff\x80";
+    const address = try planner.storage.Address.init(@splat(7), tuple);
+    const claim: @import("../storage/db/temporal_integrity_contract.zig").Claim = .{ .tuple = tuple, .parent_table = "products", .parent_key = "row\xff", .schema_version = 3, .period = .{ .kind = .numrange, .bytes = "\x00\xff\x80" } };
+    const commands = [_]planner.storage.Command{.{ .address = address, .operation = .{ .establish_interval = claim } }};
+    const encoded = try temporalProbeQuery(a, address, 3, @splat(9), &.{&commands});
+    defer a.free(encoded);
+    var decoded = try std.json.parseFromSlice(struct { kind: []const u8, address: planner.storage.Address, schema_version: u32, generation_set: planner.storage.Digest, batches: []const []const planner.storage.Command }, a, encoded, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("temporal_probe", decoded.value.kind);
+    const actual = decoded.value.batches[0][0].operation.establish_interval;
+    try std.testing.expectEqualStrings(claim.tuple, actual.tuple);
+    try std.testing.expectEqualStrings(claim.parent_key, actual.parent_key);
+    try std.testing.expectEqualStrings(claim.period.bytes, actual.period.bytes);
+}
+
 fn observationQuery(alloc: Allocator, keys: []const []const u8, schema_version: u32, generation_set: planner.storage.Digest) ![]u8 {
     const Query = struct {
         keys: []const []const u8,
@@ -914,11 +955,45 @@ const Builder = struct {
         return state;
     }
 
+    fn temporalProbe(self: *Builder, table: []const u8, address: planner.storage.Address, commands: []const planner.storage.Command, schema_version: ?u32, generation_set: ?planner.storage.Digest) !void {
+        var batches: std.ArrayList([]const planner.storage.Command) = .empty;
+        for (self.previous) |previous| {
+            if (!std.mem.eql(u8, previous.table_name, table)) continue;
+            const batch = try temporalGroupCommands(self.alloc, address, previous.integrity_commands);
+            if (batch.len != 0) try batches.append(self.alloc, batch);
+        }
+        const current = try temporalGroupCommands(self.alloc, address, commands);
+        if (current.len == 0) return error.InvalidIntegrityCommand;
+        try batches.append(self.alloc, current);
+        const definition = try self.load(table);
+        const query = try temporalProbeQuery(self.alloc, address, schema_version orelse definition.view.version(), generation_set orelse @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(definition.catalog), batches.items);
+        try self.charge(query.len);
+        var response = (try self.lookup(table, &address.routing, .{ .relational_integrity_jobs_json = query })) orelse return error.IntegrityCatalogUnavailable;
+        defer response.deinit(self.alloc);
+        try self.charge(response.json.len);
+        const result = try std.json.parseFromSliceLeaky(struct { validated: bool, address: planner.storage.Address }, self.alloc, response.json, .{});
+        if (!result.validated or !std.meta.eql(result.address, address)) return error.InvalidIntegrityRecord;
+    }
+
+    fn temporalGroupCommands(a: Allocator, address: planner.storage.Address, input: []const planner.storage.Command) ![]const planner.storage.Command {
+        var selected: std.ArrayList(planner.storage.Command) = .empty;
+        for (input) |command| {
+            if (!std.meta.eql(command.address, address)) continue;
+            if (!command.isTemporal()) return error.InvalidIntegrityCommand;
+            try selected.append(a, command);
+        }
+        return selected.toOwnedSlice(a);
+    }
+
     fn validateStatement(self: *Builder) !void {
         var seen: std.AutoHashMapUnmanaged(planner.storage.Address, void) = .empty;
         for (self.output.items, self.command_lists.items) |table, commands| for (commands.items) |command| {
             if ((try seen.getOrPut(self.alloc, command.address)).found_existing) continue;
             if (try self.deferredUnique(table.table_name, command.address)) continue;
+            if (command.isTemporal()) {
+                try self.temporalProbe(table.table_name, command.address, commands.items, null, null);
+                continue;
+            }
             var state = try self.statementState(table.table_name, command.address);
             try self.applyStatementCommands(&state, command.address, commands.items, true);
         };
@@ -1712,6 +1787,10 @@ pub fn rejectDefiniteConflicts(alloc: Allocator, source: reads.TableReadSource, 
         var command_it = by_address.iterator();
         while (command_it.next()) |entry| {
             const address = entry.key_ptr.*;
+            if (entry.value_ptr.items.items.len != 0 and entry.value_ptr.items.items[0].isTemporal()) {
+                try builder.temporalProbe(table.table_name, address, entry.value_ptr.items.items, table.relational_schema_version, table.relational_integrity_generation_set);
+                continue;
+            }
             // Releases need the full reference set to prove RESTRICT. Other
             // commands need only the claim, never its potentially large fanout.
             if (entry.value_ptr.needs_references) {
@@ -1834,6 +1913,7 @@ pub fn prepareRetirementPage(alloc: Allocator, source: reads.TableReadSource, me
         for (expansion.partials) |dependency| if (progress.includes(dependency.reference.constraint_generation)) try builder.appendPartial(dependency);
         for (expansion.commands) |command| switch (command.command.operation) {
             .repair_detach => |reference| if (progress.includes(reference.constraint_generation)) try builder.appendCommand(command.table_name, command.command),
+            .release_interval => if (progress.includes(command.command.address.generation)) try builder.appendCommand(command.table_name, command.command),
             else => {},
         };
         for (expansion.parents) |parent| if (progress.includes(parent.address.generation)) try builder.appendCommand(parent.table_name, .{
@@ -2100,7 +2180,7 @@ fn prepareBackfillMode(alloc: Allocator, source: reads.TableReadSource, metadata
         defer prepared.deinit();
         const mutations = [_]planner.Mutation{.{ .key = row.key, .after = prepared.view }};
         const expansion = (if (validation_names != null) plan.expand(builder.alloc, &mutations) else plan.expandHistorical(builder.alloc, &mutations)) catch |err| switch (err) {
-            error.ForeignKeyMatchFullViolation => {
+            error.ForeignKeyMatchFullViolation, error.TemporalEmptyRange => {
                 validation_failure = @errorName(err);
                 break;
             },
@@ -2112,7 +2192,7 @@ fn prepareBackfillMode(alloc: Allocator, source: reads.TableReadSource, metadata
         };
         for (expansion.commands) |command| {
             const selected = switch (command.command.operation) {
-                .establish => phase == .unique,
+                .establish, .establish_interval => phase == .unique,
                 .attach, .attach_historical => phase == .foreign_key,
                 else => false,
             };

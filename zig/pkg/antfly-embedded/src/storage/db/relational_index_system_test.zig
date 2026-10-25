@@ -8783,7 +8783,7 @@ test "relational index system public NUMERIC modifiers normalize before indexing
         defer db.close();
         try db.setSchemaJson(alloc, schema_json);
         try db.batch(.{ .writes = &.{.{ .key = "row", .value = json }} });
-        try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .writes = &.{ .{ .key = "not-committed", .value = json }, .{ .key = "invalid", .value = "{\"n\":99.995}" } } }));
+        try std.testing.expectError(error.RelationalExpressionOverflow, db.batch(.{ .writes = &.{ .{ .key = "not-committed", .value = json }, .{ .key = "invalid", .value = "{\"n\":99.995}" } } }));
         try std.testing.expect((try db.get(alloc, "not-committed")) == null);
         var changed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
         defer changed.deinit();

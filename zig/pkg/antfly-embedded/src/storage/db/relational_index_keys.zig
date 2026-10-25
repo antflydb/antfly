@@ -133,6 +133,16 @@ pub const TuplePlan = struct {
     /// and schema version. Generation publication must match this identity.
     fingerprint: [std.crypto.hash.Blake3.digest_length]u8,
 
+    /// A range-only temporal key has one equality group. This constructor is
+    /// internal to integrity binding; ordinary declared index tuples still
+    /// reject an empty key list.
+    pub fn emptyEqualityGroup(alloc: Allocator, table_schema: schema.TableSchema, layout: *const rows.PhysicalLayout) !TuplePlan {
+        if (table_schema.storage_mode != .relational or layout.schema_version != table_schema.version or layout.column_count != table_schema.relational_columns.len) return error.RelationalRowSchemaMismatch;
+        var fingerprint: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash("antfly empty temporal equality group v1", &fingerprint, .{});
+        return .{ .alloc = alloc, .layout = layout, .columns = table_schema.relational_columns, .keys = try alloc.alloc(BoundKey, 0), .fingerprint = fingerprint };
+    }
+
     /// The caller must retain the schema epoch through the plan's lifetime.
     /// Only addressing metadata is borrowed; key names/collations are resolved
     /// here and need not outlive this call. A row from a different epoch is

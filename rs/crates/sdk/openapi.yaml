@@ -40255,6 +40255,12 @@ components:
           description: Conjunction restricting uniqueness to matching rows.
           items:
             $ref: '#/components/schemas/RelationalIndexPredicate'
+        without_overlaps_column:
+          type: string
+          minLength: 1
+          description: Range-valued final key column for PostgreSQL WITHOUT OVERLAPS. Other key columns
+            define equality groups; nonempty ranges within each group must be disjoint. The column remains
+            in columns. Temporal keys are not equality-only foreign-key targets or ON CONFLICT arbiters.
         nulls_not_distinct:
           type: boolean
           description: When true, NULL components compare equal for uniqueness.

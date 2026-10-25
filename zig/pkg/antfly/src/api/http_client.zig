@@ -799,7 +799,11 @@ pub const ApiHttpClient = struct {
                 encoded_consistency,
             });
         defer self.alloc.free(suffix);
-        const jobs = if (relational_integrity_jobs_json.len != 0) try percentEncodePathComponent(self.alloc, relational_integrity_jobs_json) else "";
+        // Keep bounded control batches out of URI/header limits. The same
+        // routed read-index lookup accepts its control JSON as a POST body.
+        const body_control = relational_integrity_jobs_json.len > 1024;
+        if (relational_integrity_jobs_json.len > @import("antfly_local_sources").storage_db_relational_integrity_contract.max_preparation_bytes) return error.InvalidArgument;
+        const jobs = if (relational_integrity_jobs_json.len != 0 and !body_control) try percentEncodePathComponent(self.alloc, relational_integrity_jobs_json) else "";
         defer if (jobs.len != 0) self.alloc.free(jobs);
         const activation = if (relational_activation_json.len != 0) try percentEncodePathComponent(self.alloc, relational_activation_json) else "";
         defer if (activation.len != 0) self.alloc.free(activation);
@@ -830,8 +834,10 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(uri);
 
         var resp = try self.executeRequest(.{
-            .method = .GET,
+            .method = if (body_control) .POST else .GET,
             .uri = uri,
+            .body = if (body_control) relational_integrity_jobs_json else "",
+            .content_type = if (body_control) "application/json" else null,
             .headers = if (options.row_policy_principal_proof.len != 0) &policy_headers else &.{},
             .timeout_ms = timeout_ms,
             .cancellation = cancellation,
@@ -4522,6 +4528,7 @@ fn isDocIdentityNamespaceMismatchConflictMessage(body: []const u8) bool {
 }
 
 fn remoteGroupConflictError(body: []const u8) anyerror {
+    if (@import("relational_integrity_errors.zig").decode(body)) |reason| return reason;
     if (std.mem.eql(u8, body, "DocumentArtifactPublicationFailed")) return error.DocumentArtifactPublicationFailed;
     if (std.mem.eql(u8, body, "IndexGenerationMismatch")) return error.IndexGenerationMismatch;
     if (std.mem.eql(u8, body, "DecisionConflict") or std.mem.eql(u8, body, "decision conflict")) return error.DecisionConflict;
@@ -5191,6 +5198,30 @@ fn consumerTests() type {
                 "title,owner&admin",
             );
             defer response.deinit(std.testing.allocator);
+        }
+
+        test "api http client temporal probes use bounded bodies and preserve constraint rejection" {
+            const Executor = struct {
+                expected: []const u8,
+                fail: bool = false,
+                fn execute(raw: *anyopaque, a: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    try std.testing.expect(req.uri.len < 512);
+                    try std.testing.expect(std.mem.indexOf(u8, req.uri, "_relational_integrity_jobs") == null);
+                    try std.testing.expectEqualStrings(self.expected, req.body);
+                    return .{ .status = if (self.fail) 409 else 200, .body = try a.dupe(u8, if (self.fail) "TemporalOverlapViolation" else "{\"validated\":true}") };
+                }
+            };
+            const input = try std.testing.allocator.alloc(u8, 8192);
+            defer std.testing.allocator.free(input);
+            @memset(input, ' ');
+            var fixture: Executor = .{ .expected = input };
+            var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = &fixture, .vtable = &.{ .execute = Executor.execute } });
+            var result = try client.fetchGroupLookupWithOptions("http://node", 7, "products", "group", null, "read_index", null, null, .{ .relational_integrity_jobs_json = input });
+            defer result.deinit(std.testing.allocator);
+            fixture.fail = true;
+            try std.testing.expectError(error.TemporalOverlapViolation, client.fetchGroupLookupWithOptions("http://node", 7, "products", "group", null, "read_index", null, null, .{ .relational_integrity_jobs_json = input }));
         }
 
         test "api http client preserves retryable group transaction unavailability" {

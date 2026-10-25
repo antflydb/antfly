@@ -1200,7 +1200,7 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
             try out.cancellation.check();
             if (source_range) |range| if (!range.contains(&(try integrity.parseKey(item.key)).address.routing)) continue;
             _ = try integrity.validateTransferRecord(item.key, item.value);
-            try companions.validateTransferredCompanionsWithView(scan, item.key, item.value, transfer_view);
+            try companions.validateTransferredCompanionsWithScratch(alloc, scan, item.key, item.value, transfer_view);
             if (integrity_catalog == null) return error.IntegrityCatalogChanged;
             try integrity_batch.append(alloc, .{ .key = try alloc.dupe(u8, item.key), .value = try alloc.dupe(u8, item.value) });
             integrity_bytes += item.key.len + item.value.len;

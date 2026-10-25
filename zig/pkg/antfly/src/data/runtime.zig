@@ -1353,6 +1353,8 @@ const RaftTableApplyStateMachine = struct {
         ConstraintValidationFailed,
         ForeignKeyMatchFullViolation,
         SchemaValidationCommandRejected,
+        TemporalOverlapViolation,
+        TemporalEmptyRange,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
             inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {

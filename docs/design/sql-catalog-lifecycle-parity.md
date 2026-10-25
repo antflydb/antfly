@@ -8,20 +8,21 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 
 ## Current original-case qualification (2026-10-24)
 
-The ledger now records **769 implemented / 137 rejected / 429 superseded /
-251 unresolved**. The requested next-100 batch has closed **42 original cases**:
+The ledger now records **787 implemented / 137 rejected / 430 superseded /
+232 unresolved**. The requested next-100 batch has closed **61 original cases**:
 `sql-0011`, `sql-0014`, `sql-0570`, `sql-0580`, `sql-0586`, `sql-0591`,
 `sql-0593`–`sql-0595`, `sql-0883`, `sql-0927`, `sql-0935`, `sql-0343`–`sql-0349`,
 `sql-1456`, `sql-1459`, `sql-1464`, `sql-0005`, `sql-0008`, `sql-0009`,
 `sql-0010`, `sql-0142`–`sql-0143`, `sql-0146`–`sql-0147`,
-`sql-0311`–`sql-0317`, `sql-0669`, `sql-0683`, `sql-0734`, and
-`sql-0744`–`sql-0745`;
-**58 of that target remain unfinished**. Thirty-six are implementations; six are
+`sql-0311`–`sql-0317`, `sql-0669`, `sql-0683`, `sql-0734`,
+`sql-0744`–`sql-0745`, `sql-0685`, and `sql-1414`–`sql-1431`;
+**39 of that target remain unfinished**. Fifty-four are implementations; seven are
 PostgreSQL-invalid originals (outer recursive MERGE, 42601, and ambiguous
 `RETURNING id`, 42702, ALTER ROLE SET with an expression, 42601, and two
 index names used as constraints, 42704, and SQL-standard ADD PERIOD FOR,
-42601), not forty-two newly supported forms. The earlier sixteen mutation witnesses are ten original
-cases, not sixteen completions. **161 unresolved DDL/catalog cases remain open**;
+42601, and integer containment in a NUMRANGE, 42883), not sixty-one newly
+supported forms. The earlier sixteen mutation witnesses are ten original
+cases, not sixteen completions. **160 unresolved DDL/catalog cases remain open**;
 the role default cohort does not complete that feature work.
 
 ### Typed ranges and original PERIOD rejection
@@ -37,7 +38,8 @@ The shared scalar pipeline supplies constructors, casts, endpoint accessors,
 range predicates, grouping/sort/spill ownership and PostgreSQL wire descriptors.
 Canonical binary views validate, compare and hash without allocation. Durable
 range literals and physical columns require schema-reader capability 35; native
-engine ABI 35 also protects the new value/row metadata across callbacks.
+engine ABI 35 first protected that value/row metadata across callbacks.
+Temporal-key enforcement below advances the native ABI to 36.
 Generated schemas and clients describe these domains. Restore validates canonical
 physical bytes against the pinned subtype, and generated values retain exact
 observable display rather than accepting only logical equality.
@@ -59,17 +61,68 @@ invalid in PostgreSQL. The compiler checks the whole unsupported ALTER so its
 valid `ADD COLUMN` prefix cannot hide that syntax error or execute separately.
 The oracle verifies SQLSTATE 42601 and unchanged schema/rows; the native
 campaign verifies the same contract before and after cold restart. This closes
-that invalid original as superseded; the implemented-original count stays 769.
+that invalid original as superseded; it adds no implemented original.
 
-**The original range/temporal-constraint cases remain unresolved.** Their original
-setups require real `WITHOUT OVERLAPS` enforcement. A plain-key range table,
-scalar oracle or successful range codec does not qualify those originals.
-Activation still needs ordered interval claims in the existing durable 2PC,
-authenticated membership/source inventory for restore and online handoff,
-concurrent conflict tests and the unchanged original table definitions. No
-constraint guard has been relaxed to obtain a passing query fixture. Valid
-temporal keys retain a feature-unavailable diagnostic instead of being
-misclassified as invalid PostgreSQL syntax.
+### Temporal keys: complete original cohort qualified
+
+`sql-0685` and `sql-1414`–`sql-1431` retain their unchanged original
+`PRIMARY KEY (..., range_column WITHOUT OVERLAPS)` declarations. Eighteen
+originals are now implemented. PostgreSQL rejects `sql-1429` (`numrange @>
+integer`) with 42883; native binding preserves that exact overload diagnostic,
+so this invalid original is superseded rather than counted as implementation.
+This is one DDL case, fourteen inserts and four queries, not nineteen DDL cases.
+
+The public constraint declaration names its final `without_overlaps_column`;
+the generated SDKs preserve the full column list. Equality columns form one
+canonical routed group, while checksummed interval claims store canonical range
+bytes and row ownership under ordered lower-bound keys. Native schema capability
+and engine ABI 36 fence this new enforcement contract. Initial schema epoch zero
+is valid; the existing durable catalog and generation checks establish identity.
+Ordinary equality-only range constraints/FKs remain guarded separately.
+
+Mutations use the existing durable transaction path. Preparation sorts pending
+intervals once, checks adjacent live intervals, and memoizes skips over replaced
+runs. Participant prepare repeats the adjacency proof under its apply fence.
+Backward neighbor seeks exclude the preceding group before checking its
+intents, so unrelated prepared writers do not create false contention.
+An exclusive intent on an absent equality-group key prevents concurrent gap
+races through the commit decision; no persistent group counter/catalog grows
+with writes. Point guards do not hide a still-live neighboring interval.
+
+Read-only probes use the existing routed lookup interface. Large command sets
+use a bounded, authenticated internal POST body and the shared binary-safe
+integrity JSON codec. Ordered statement batches retain earlier insert/delete
+semantics. Public batch and SQL/session adapters preserve 23P01 overlap and
+23514 empty-range errors without weakening ambiguous commit-outcome handling.
+Activation diagnoses those failures durably; retirement drains interval claims.
+
+Range copy, handoff, online shadow cleanup and portable-restore companion
+validation include interval records. Variable-length ordered keys have bounded
+owned continuations. Imported records require canonical framing/checksums and
+destination adjacency validation; intent-only gap keys cannot be restored as
+records. Existing ordinary constraint and private index guards stay in place.
+Temporal FK/PERIOD targets, temporal ON CONFLICT arbiters and private temporal
+index builds are not activated by this cohort.
+
+Independent PostgreSQL 18 witnesses cover all nineteen unchanged originals, six
+rejected writes, nine overload witnesses and an adjacent insert/delete cycle.
+The mounted Debug campaign verifies complete typed results, all final rows,
+physical identities/versions/digests and rejection behavior before and after
+independent cold catalog/session/data owners. All four mounted gate tests pass
+without skips or leaks. Seventeen focused SQL checks and nine physical LSM
+checks also pass, including concurrent/stale gap proofs, abort/prepared reopen,
+ordered statement deltas, borrowed buffers, allocation failures, corruption
+rejection and one-record transfer pages with long NUMERIC bounds.
+
+The combined Debug SQL gate passes 1,380 local and 236 dependent tests,
+with four existing opt-in benchmark skips and no failures or leaks. The broader
+index-system gate passes 317 local and one native Raft snapshot test, without
+skips, failures or leaks, from the isolated clean compiler cache.
+
+A real LSM Debug measurement replacing 512 intervals in one equality group
+performs 1,024 seeks and 2,046 cursor steps (about 201 ms on the local host).
+Assertions bound both work counts linearly. This measures preparation and
+supports a structural work bound; it is not a production latency claim.
 
 Retained temporal and range payloads share one sparse extension vector,
 without increasing ordinary-column metadata or the existing temporal entry
@@ -78,12 +131,12 @@ both shared and distinct source addresses read 5,748 bytes and encode two
 pages. Allocation-free binary admission/hashing is verified with a zero-byte
 allocator; this is not an unmeasured claim about end-to-end query latency.
 
-Qualification uses Debug with one build job: the full SQL gate passes 1,373
-local and 236 dependent tests, with four existing opt-in benchmark skips. All
-11 range-focused tests pass on the final tree. The mounted lifecycle gate
-passes both tests, Lite/C verifies literal and prepared range comparisons
-across reopen, and the PostgreSQL wire gate passes. Pinned `make generate`,
-`make fmt`, license/boundary checks and the original-case ledger audit pass.
+The preceding range-foundation checkpoint used Debug with one build job: its
+full SQL gate passed 1,373 local and 236 dependent tests with four opt-in
+benchmark skips, plus the range-only mounted, Lite/C and PostgreSQL-wire gates.
+The temporal cohort adds the native, PostgreSQL, value and physical-storage
+gates recorded in the original-case ledger. Generation, formatting and
+license/boundary checks remain required for the combined change.
 
 ### Timestamp/interval arithmetic: two original cases closed
 

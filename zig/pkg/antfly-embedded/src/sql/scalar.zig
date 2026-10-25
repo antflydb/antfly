@@ -3294,7 +3294,7 @@ const Binder = struct {
                             const unknown = call.args[1].* == .literal and call.args[1].literal == .string;
                             if (right.kind != null and !unknown) {
                                 if (endpoint.kind == .number) {
-                                    if (right.kind != .integer and !(right.kind == .number and right.element_type == .numeric)) return error.SqlUndefinedOperator;
+                                    if (right.kind != .number or right.element_type != .numeric) return error.SqlUndefinedOperator;
                                 } else if (right.kind != .datetime or (right.temporal_kind orelse .timestamp_tz) != endpoint.temporal_kind) return error.SqlUndefinedOperator;
                             }
                         }
@@ -3710,13 +3710,19 @@ const Binder = struct {
                 break :blk .{ .column = ordinal };
             },
             .cast => |cast| blk: {
+                // A default datetime cast already denotes timestamptz. When
+                // its consumer requires the exact native domain, retain that
+                // context through nested casts instead of detouring through
+                // the legacy JSON nanosecond formatter.
+                const exact_temporal = cast.temporal_kind orelse if (cast.type == .datetime and expected == .datetime and temporal_kind == .timestamp_tz) temporal_kind else null;
                 if (cast.operand.* == .literal and cast.operand.literal == .parameter) {
                     const slot = cast.operand.literal.parameter - 1;
                     const prior = self.parameters[slot];
-                    if (prior.kind == null) self.parameters[slot] = .{ .kind = cast.type, .element_type = cast.element_type, .temporal_kind = cast.temporal_kind };
+                    if (prior.kind == null) self.parameters[slot] = .{ .kind = cast.type, .element_type = cast.element_type, .temporal_kind = exact_temporal };
+                    if (prior.kind == .datetime and cast.type == .datetime and prior.temporal_kind == null and exact_temporal == .timestamp_tz) self.parameters[slot].temporal_kind = .timestamp_tz;
                     if (prior.kind == .datetime and cast.type == .datetime and (prior.temporal_kind orelse .timestamp_tz) != (cast.temporal_kind orelse .timestamp_tz)) return error.ConflictingSqlParameterTypes;
                 }
-                break :blk .{ .cast = .{ .operand = if (cast.type == .array) try self.compileArrayContext(cast.operand, if (self.typed_parameters and cast.operand.* == .literal and cast.operand.literal == .parameter and self.parameters[cast.operand.literal.parameter - 1].kind == null) .array else null, cast.element_type, depth + 1) else try self.compileTypedContext(cast.operand, cast.type, if (self.typed_parameters) cast.element_type else null, cast.temporal_kind, depth + 1), .type = cast.type, .element_type = cast.element_type, .numeric_modifier = cast.numeric_modifier, .temporal_kind = cast.temporal_kind } };
+                break :blk .{ .cast = .{ .operand = if (cast.type == .array) try self.compileArrayContext(cast.operand, if (self.typed_parameters and cast.operand.* == .literal and cast.operand.literal == .parameter and self.parameters[cast.operand.literal.parameter - 1].kind == null) .array else null, cast.element_type, depth + 1) else try self.compileTypedContext(cast.operand, cast.type, if (self.typed_parameters) cast.element_type else null, exact_temporal, depth + 1), .type = cast.type, .element_type = cast.element_type, .numeric_modifier = cast.numeric_modifier, .temporal_kind = exact_temporal } };
             },
             // UNKNOWN is a boolean-only spelling of a null test. Validate its
             // operand first, then emit existing VM opcodes so persisted policy
@@ -3809,7 +3815,16 @@ const Binder = struct {
                         args[0] = try self.compileTypedContext(call.args[0], input.kind, null, null, depth + 1);
                         if (call.args.len == 2) {
                             const other = try self.infer(call.args[1], depth + 1);
-                            if (other.kind == input.kind) args[1] = try self.compileTypedContext(call.args[1], input.kind, null, null, depth + 1) else {
+                            const unknown = other.kind == null or (call.args[1].* == .literal and call.args[1].literal == .string);
+                            if (other.kind == input.kind) args[1] = try self.compileTypedContext(call.args[1], input.kind, null, null, depth + 1) else if (unknown) {
+                                // PostgreSQL's binary operator resolution first
+                                // tries the known peer's type for an unknown
+                                // operand. Containment therefore selects range
+                                // containment, not the subtype-point overload.
+                                const cast = try self.alloc.create(ast.Scalar);
+                                cast.* = .{ .cast = .{ .operand = call.args[1], .type = input.kind.? } };
+                                args[1] = try self.compileTypedContext(cast, input.kind, null, null, depth + 1);
+                            } else {
                                 const endpoint = rangeEndpointType(range_kind);
                                 const cast = try self.alloc.create(ast.Scalar);
                                 cast.* = .{ .cast = .{ .operand = call.args[1], .type = endpoint.kind.?, .element_type = endpoint.element_type, .temporal_kind = endpoint.temporal_kind, .coercion = .function } };
@@ -8829,7 +8844,7 @@ test "SQL range casts constructors accessors and predicates retain PostgreSQL do
         .{ .sql = "tsrange('2025-01-01 00:00:00','2025-01-02 00:00:00')::text", .expected = "[\"2025-01-01 00:00:00\",\"2025-01-02 00:00:00\")" },
         .{ .sql = "lower(numrange(-5,15))::text", .expected = "-5" },
         .{ .sql = "upper(numrange(-5,15))::text", .expected = "15" },
-        .{ .sql = "(numrange(-5,15) @> 3)::text", .expected = "true" },
+        .{ .sql = "(numrange(-5,15) @> 3::numeric)::text", .expected = "true" },
         .{ .sql = "(numrange(-5,15) && numrange(10,20))::text", .expected = "true" },
         .{ .sql = "isempty(numrange(1,1))::text", .expected = "true" },
         .{ .sql = "('[1.00,10.000)'::numrange = '[1,10)'::numrange)::text", .expected = "true" },
@@ -8846,5 +8861,35 @@ test "SQL range casts constructors accessors and predicates retain PostgreSQL do
         errdefer std.debug.print("range scalar {s}\n", .{case.sql});
         const value = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
         try std.testing.expectEqualStrings(case.expected, value.value.string);
+    }
+}
+
+test "SQL range containment overloads match PostgreSQL polymorphic endpoint identity" {
+    const a = std.testing.allocator;
+    const Case = struct { expression: []const u8, sqlstate: ?[]const u8, output: struct { rows: []const []const Json } };
+    const reference = try std.json.parseFromSlice(struct { operators: []const Case }, a, @embedFile("fixtures/sql_temporal_key_reference.json"), .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    for (reference.value.operators) |case| {
+        errdefer std.debug.print("range overload: {s}\n", .{case.expression});
+        var parsed = try @import("compiler.zig").compileScalar(a, case.expression, .{});
+        defer parsed.deinit();
+        var program = bind(a, parsed.expression, &.{}, &.{}, .{}) catch |err| {
+            try std.testing.expectEqualStrings(case.sqlstate orelse return err, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        defer program.deinit();
+        var owner = std.heap.ArenaAllocator.init(a);
+        defer owner.deinit();
+        const actual = program.evaluate(owner.allocator(), &.{}, &.{}, .{}) catch |err| {
+            try std.testing.expectEqualStrings(case.sqlstate orelse return err, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        errdefer std.debug.print("range overload: {s}\n", .{case.expression});
+        try std.testing.expect(case.sqlstate == null);
+        const expected = case.output.rows[0][0];
+        if (expected == .null) try std.testing.expect(actual.sql_null) else {
+            try std.testing.expect(!actual.sql_null);
+            try std.testing.expectEqualStrings(expected.string, actual.value.string);
+        }
     }
 }

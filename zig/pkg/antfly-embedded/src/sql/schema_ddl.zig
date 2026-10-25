@@ -519,10 +519,18 @@ pub fn applyCandidateWithLimits(alloc: std.mem.Allocator, schema: *Value, ddl: a
             for (constraint.include_columns) |column| {
                 if (!properties.object.contains(column)) return error.UndefinedColumn;
             }
+            if (constraint.without_overlaps_column) |period| {
+                const property = properties.object.get(period) orelse return error.UndefinedColumn;
+                if (property != .object) return error.InvalidSqlBackendResponse;
+                const kind = property.object.get("type") orelse return error.SqlAssignmentTypeMismatch;
+                if (kind != .string or std.meta.stringToEnum(@import("range_value.zig").Kind, kind.string) == null) return error.SqlAssignmentTypeMismatch;
+            }
             if (constraint.primary) try requirePrimaryColumns(alloc, schema, constraint.columns);
             const constraints = try list(schema, alloc, "unique_constraints");
             if (named(constraints.items, constraint.name, "name") != null) return error.SqlConstraintAlreadyExists;
             var declaration = try value(alloc, .{ .name = constraint.name, .columns = constraint.columns, .primary = constraint.primary, .deferrable = constraint.deferrable, .timing = constraint.timing, .nulls_not_distinct = constraint.nulls_not_distinct });
+            if (constraint.without_overlaps_column) |period|
+                try declaration.object.put(alloc, "without_overlaps_column", .{ .string = period });
             if (constraint.include_columns.len != 0)
                 try declaration.object.put(alloc, "include_columns", try value(alloc, constraint.include_columns));
             try constraints.append(declaration);
@@ -919,4 +927,24 @@ test "SQL original FK drop preserves absent unrelated constraint collections" {
     try std.testing.expect(schema.object.get("checks") == null);
     try std.testing.expect(schema.object.get("unique_constraints") == null);
     try std.testing.expectEqual(@as(usize, 0), schema.object.get("foreign_keys").?.array.items.len);
+}
+
+test "SQL range temporal DDL validates period types and retains column rename identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const compiler = @import("compiler.zig");
+    const ddl = @import("ddl_runtime.zig");
+    var invalid = try compiler.compile(a, "CREATE TABLE bad_period (sku TEXT, valid_at TEXT, UNIQUE (sku, valid_at WITHOUT OVERLAPS))", .{});
+    defer invalid.deinit();
+    try std.testing.expectError(error.SqlAssignmentTypeMismatch, ddl.createSchemaAlloc(a, invalid.statement.create_table));
+    var created = try compiler.compile(a, "CREATE TABLE prices (sku TEXT, valid_at NUMRANGE, UNIQUE (sku, valid_at WITHOUT OVERLAPS))", .{});
+    defer created.deinit();
+    var schema = try std.json.parseFromSliceLeaky(Value, a, try ddl.createSchemaAlloc(a, created.statement.create_table), .{});
+    var renamed = try compiler.compile(a, "ALTER TABLE prices RENAME COLUMN valid_at TO validity", .{});
+    defer renamed.deinit();
+    try std.testing.expect(try apply(a, &schema, renamed.statement.catalog_ddl));
+    const rule = schema.object.get("unique_constraints").?.array.items[0].object;
+    try std.testing.expectEqualStrings("validity", rule.get("without_overlaps_column").?.string);
+    try std.testing.expectEqualStrings("validity", rule.get("columns").?.array.items[1].string);
 }

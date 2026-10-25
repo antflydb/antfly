@@ -135,6 +135,7 @@ const Rebind = struct {
             if (entry.object.getPtr("column")) |column| try self.name(column);
             try self.names(entry, "columns");
             try self.names(entry, "include_columns");
+            if (entry.object.getPtr("without_overlaps_column")) |column| try self.name(column);
             if (entry.object.getPtr("expression")) |expr| try self.expression(expr, 0);
             for ([_][]const u8{ "keys", "where" }) |nested| {
                 if (entry.object.getPtr(nested)) |items| {

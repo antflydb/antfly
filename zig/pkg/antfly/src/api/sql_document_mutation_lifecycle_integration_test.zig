@@ -1134,3 +1134,104 @@ test "mounted SQL range values preserve native bytes typed results and cold owne
         } },
     });
 }
+
+test "mounted SQL original temporal keys enforce intervals and retain all cold owners" {
+    const Step = struct { id: []const u8 = "", sql: []const u8, write: bool = false, sqlstate: ?[]const u8 = null, output: SourceResult, affected: i64 = 0 };
+    const Rejected = struct { sql: []const u8, sqlstate: []const u8 };
+    const Reference = struct {
+        tables: []const SourceTable,
+        steps: []const Step,
+        operators: []const Step,
+        rejected: []const Rejected,
+        adjacent: []const u8,
+        remove_adjacent: []const u8,
+    };
+    const TemporalCampaign = struct {
+        pub const native_sessions = true;
+        pub const native_auth = true;
+        pub const cold_catalog = true;
+        inner: SourceCampaign,
+        reference: Reference,
+        fn execute(ctx: *fixture.Context, step: Step) !void {
+            var response = try client.execute(ctx, step.sql, if (step.sqlstate != null) .never else if (step.write) .write_admission else .read);
+            defer response.deinit(ctx.alloc);
+            errdefer std.debug.print("temporal original {s}: {s} status={d} body={s}\n", .{ step.id, step.sql, response.status, response.body });
+            if (step.sqlstate) |expected| {
+                try std.testing.expectEqual(@as(u16, 400), response.status);
+                var diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, response.body, .{});
+                defer diagnostic.deinit();
+                try std.testing.expectEqualStrings(expected, diagnostic.value.code);
+            } else {
+                try std.testing.expectEqual(@as(u16, 200), response.status);
+                var result = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+                defer result.deinit();
+                try std.testing.expectEqual(step.affected, result.value.rows_affected);
+                try expectSourceResult(ctx.alloc, result.value, step.output, true);
+            }
+        }
+        fn integrity(self: *@This(), ctx: *fixture.Context) !void {
+            for (self.reference.rejected) |step| try execute(ctx, .{ .sql = step.sql, .sqlstate = step.sqlstate, .output = .{ .columns = &.{}, .column_oids = &.{}, .rows = &.{} } });
+            for (self.reference.operators) |step| try execute(ctx, step);
+            for ([_][]const u8{ self.reference.adjacent, self.reference.remove_adjacent }) |sql| {
+                var response = try client.execute(ctx, sql, .write_admission);
+                defer response.deinit(ctx.alloc);
+                if (response.status != 200) std.debug.print("temporal adjacency sql={s} status={d} body={s}\n", .{ sql, response.status, response.body });
+                try std.testing.expectEqual(@as(u16, 200), response.status);
+                var result = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+                defer result.deinit();
+                try std.testing.expectEqual(@as(i64, 1), result.value.rows_affected);
+            }
+        }
+        pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.inner.credentials.activate(ctx);
+            ctx.headers = &self.inner.credentials.admin;
+            var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
+            defer corpus.deinit();
+            for (self.reference.tables) |table| {
+                if (std.mem.eql(u8, table.name, "products")) try std.testing.expectEqualStrings((try corpus.get("sql-0685")).sql, table.create);
+                var created = try client.execute(ctx, table.create, .write_admission);
+                defer created.deinit(ctx.alloc);
+                if (created.status != 200 and created.status != 202) std.debug.print("temporal DDL {s}: {d} {s}\n", .{ table.create, created.status, created.body });
+                try std.testing.expect(created.status == 200 or created.status == 202);
+                const serving = try fixture.waitServingSchema(ctx, table.name, 0);
+                try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, serving.table_id);
+                try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, table.name);
+            }
+            for (self.reference.steps) |step| {
+                try std.testing.expectEqualStrings((try corpus.get(step.id)).sql, step.sql);
+                try execute(ctx, step);
+            }
+            try self.inner.fingerprints(ctx, .initial);
+            try self.integrity(ctx);
+            try self.inner.fingerprints(ctx, .prepared);
+            try self.inner.verify(ctx, false);
+        }
+        pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+            ctx.headers = &self.inner.credentials.admin;
+            for (self.reference.tables) |table| _ = try fixture.waitServingSchema(ctx, table.name, 0);
+            for (self.reference.steps) |step| if (!step.write) try execute(ctx, step);
+            try self.integrity(ctx);
+            try self.inner.verify(ctx, true);
+        }
+    };
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(Reference, a, local.sql_parity_fixtures.temporal_key_reference, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const original_queries = [_][]const u8{ "sql-1414", "sql-1415", "sql-1416", "sql-1417", "sql-1418", "sql-1419", "sql-1420", "sql-1421", "sql-1422", "sql-1423", "sql-1424", "sql-1425", "sql-1426", "sql-1427", "sql-1428", "sql-1429", "sql-1430", "sql-1431" };
+    try std.testing.expectEqual(original_queries.len, parsed.value.steps.len);
+    for (original_queries, parsed.value.steps) |id, step| try std.testing.expectEqualStrings(id, step.id);
+    var retained = std.heap.ArenaAllocator.init(a);
+    defer retained.deinit();
+    try fixture.runWithState(TemporalCampaign, .{
+        .reference = parsed.value,
+        .inner = .{ .retained = &retained, .entry = .{
+            .id = "temporal-key-originals",
+            .profile = "PostgreSQL temporal integrity",
+            .sqlstate = null,
+            .command_tag = "SELECT",
+            .affected = 0,
+            .output = .{ .columns = &.{}, .column_oids = &.{}, .rows = &.{} },
+            .tables = parsed.value.tables,
+        } },
+    });
+}

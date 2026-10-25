@@ -2356,6 +2356,8 @@ fn definiteMutationFailure(status: u16, native: []const u8) ?anyerror {
     }
     if (status == 400 or status == 409) {
         if (std.mem.eql(u8, native, "RelationalCheckViolation")) return error.RelationalCheckViolation;
+        if (std.mem.eql(u8, native, "TemporalOverlapViolation")) return error.TemporalOverlapViolation;
+        if (std.mem.eql(u8, native, "TemporalEmptyRange")) return error.TemporalEmptyRange;
         if (std.mem.eql(u8, native, "RelationalExpressionOverflow")) return error.RelationalExpressionOverflow;
         if (std.mem.eql(u8, native, "RelationalExpressionDivisionByZero")) return error.RelationalExpressionDivisionByZero;
         if (std.mem.eql(u8, native, "SqlInvalidPowerArgument")) return error.SqlInvalidPowerArgument;
@@ -4141,6 +4143,16 @@ test "SQL mutation classification preserves wrapped definite conflicts and const
         .{ .status = 400, .body = "{malformed receipt", .expected = error.SqlMutationOutcomeUnknown },
     };
     for (cases) |case| try std.testing.expectEqual(case.expected, classifyMutationFailure(case.status, case.body).err);
+    for ([_]anyerror{ error.TemporalOverlapViolation, error.TemporalEmptyRange }) |failure| {
+        const a = std.testing.allocator;
+        const definite = try std.json.Stringify.valueAlloc(a, .{ .@"error" = @errorName(failure) }, .{});
+        defer a.free(definite);
+        try std.testing.expectEqual(failure, classifyMutationFailure(409, definite).err);
+        const unknown = try std.json.Stringify.valueAlloc(a, .{ .@"error" = @errorName(failure), .status = "committed_pending" }, .{});
+        defer a.free(unknown);
+        try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(409, unknown).err);
+        try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(500, definite).err);
+    }
 }
 
 test "SQL lake statement wrapper preserves ordering counts estimates and split source lifetime" {

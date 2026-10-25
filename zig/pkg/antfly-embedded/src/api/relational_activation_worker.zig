@@ -93,6 +93,8 @@ fn runPageMode(alloc: Allocator, reader: reads.TableReadSource, writer: writes.T
 fn deterministicValidationFailure(err: anyerror) bool {
     return switch (err) {
         error.UniqueConstraintViolation,
+        error.TemporalOverlapViolation,
+        error.TemporalEmptyRange,
         error.ForeignKeyParentMissing,
         error.ForeignKeyMatchFullViolation,
         error.RelationalCheckViolation,

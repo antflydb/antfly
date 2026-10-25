@@ -1492,6 +1492,7 @@ pub const AntflyApiHandler = struct {
         try server.get(group_prefix ++ routes.group_db_median_key_suffix, httpx.Handler.bind(self, internalGroupMedianKey));
         try server.post(group_prefix ++ routes.group_db_index_activation_suffix, httpx.Handler.bind(self, internalGroupIndexActivation));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key", httpx.Handler.bind(self, internalGroupLookup));
+        try server.post(table_prefix ++ routes.documents_marker ++ ":key", httpx.Handler.bind(self, internalGroupLookup));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_suffix, httpx.Handler.bind(self, internalDocumentArtifactManifests));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_marker ++ ":artifact_name", httpx.Handler.bind(self, internalDocumentArtifactManifest));
         try server.get(internal_table_prefix ++ routes.repair_jobs_marker ++ ":job_id" ++ routes.repair_attempts_marker ++ ":attempt_id" ++ routes.repair_cancel_state_suffix, httpx.Handler.bind(self, internalRepairCancelState));
@@ -2872,6 +2873,23 @@ pub const AntflyApiHandler = struct {
             ctx.request.uri.query orelse "",
         ) catch return textResponse(ctx, 400, "invalid lookup options");
         defer lookup_options.deinit(ctx.allocator);
+        if (ctx.request.method == .POST) {
+            const token = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+            var identity = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
+            defer identity.deinit(self.api_server.alloc);
+            if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+            // Two spellings must not disagree about which control is routed.
+            if (lookup_options.opts.relational_integrity_jobs_json.len != 0 or lookup_options.opts.relational_integrity_catalog or lookup_options.opts.relational_integrity_action or
+                lookup_options.opts.relational_activation_json.len != 0 or lookup_options.opts.relational_topology_json.len != 0 or
+                lookup_options.opts.relational_index_status_json.len != 0 or lookup_options.opts.group_source_query_json.len != 0)
+                return textResponse(ctx, 400, "ambiguous lookup controls");
+            const body = (try ctx.body()) orelse return textResponse(ctx, 400, "lookup control body required");
+            if (body.len == 0 or body.len > @import("antfly_local_sources").storage_db_relational_integrity_contract.max_preparation_bytes)
+                return textResponse(ctx, 413, "lookup control body too large");
+            // Context owns these bytes through dispatch; OwnedLookupOptions
+            // only frees query buffers that it allocated itself.
+            lookup_options.opts.relational_integrity_jobs_json = body;
+        }
         const policy_authority = @import("../usermgr/mod.zig").row_policy_authority;
         const policy_token = ctx.header(policy_authority.principal_header);
         const policy_database = ctx.header(policy_authority.database_header);
@@ -5084,7 +5102,7 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit is sealed");
             },
-            error.ForeignKeyParentMissing, error.ForeignKeyReferenced, error.UniqueConstraintViolation, error.RelationalCheckViolation => return jsonErrorResponse(ctx, 409, @errorName(err)),
+            error.ForeignKeyParentMissing, error.ForeignKeyReferenced, error.UniqueConstraintViolation, error.TemporalOverlapViolation, error.TemporalEmptyRange, error.RelationalCheckViolation => return jsonErrorResponse(ctx, 409, @errorName(err)),
             error.Forbidden => return jsonErrorResponse(ctx, 403, "forbidden"),
             error.TransactionTooLarge => return jsonErrorResponse(ctx, 413, "transaction statement exceeds preparation capacity"),
             else => return self.transactionPreparationError(ctx, err),
@@ -5268,7 +5286,7 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit is sealed");
             },
-            error.ForeignKeyParentMissing, error.ForeignKeyReferenced, error.UniqueConstraintViolation, error.RelationalCheckViolation => return jsonErrorResponse(ctx, 409, @errorName(err)),
+            error.ForeignKeyParentMissing, error.ForeignKeyReferenced, error.UniqueConstraintViolation, error.TemporalOverlapViolation, error.TemporalEmptyRange, error.RelationalCheckViolation => return jsonErrorResponse(ctx, 409, @errorName(err)),
             error.Forbidden => return jsonErrorResponse(ctx, 403, "forbidden"),
             error.TransactionTooLarge => return jsonErrorResponse(ctx, 413, "transaction statement exceeds preparation capacity"),
             else => return self.transactionPreparationError(ctx, err),
@@ -5370,6 +5388,8 @@ pub const AntflyApiHandler = struct {
             error.ForeignKeyParentMissing,
             error.ForeignKeyReferenced,
             error.UniqueConstraintViolation,
+            error.TemporalOverlapViolation,
+            error.TemporalEmptyRange,
             error.ForeignKeyMatchFullViolation,
             error.ForeignKeyActionInProgress,
             error.ForeignKeyActionConflict,
@@ -18488,6 +18508,46 @@ test "httpx retained read refuses unsigned migration requests and requires catal
     try std.testing.expectEqual(@as(u16, 503), authenticated.status.code);
     try std.testing.expect(std.mem.indexOf(u8, authenticated.body.?, "source unavailable") != null);
     try std.testing.expect(api_server.retained_read_runtime == null);
+}
+
+test "httpx temporal probes require service authority unambiguous controls and bounded bodies" {
+    const a = std.testing.allocator;
+    const body_limits = @import("http_routes.zig");
+    var source = AuthStatusSource{};
+    const secret = "temporal-probe-test-secret-long-enough";
+    var api_server = ApiHttpServer.init(a, .{ .internal_service_secret = secret, .internal_service_issuer = "httpx-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api_server };
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "httpx-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    const too_large = try a.alloc(u8, body_limits.internal_lookup_control_max_body_bytes + 1);
+    defer a.free(too_large);
+    @memset(too_large, ' ');
+    const Case = struct { signed: bool = true, query: []const u8 = "", body: ?[]const u8 = null, status: u16 };
+    for ([_]Case{
+        .{ .signed = false, .body = "{}", .status = 401 },
+        .{ .query = "?_relational_integrity_catalog=true", .body = "{}", .status = 400 },
+        .{ .query = "?_relational_integrity_jobs=%7B%7D", .body = "{}", .status = 400 },
+        .{ .status = 400 },
+        .{ .body = "", .status = 413 },
+        .{ .body = too_large, .status = 413 },
+    }) |case| {
+        const url = try std.fmt.allocPrint(a, "http://127.0.0.1/internal/v1/groups/7/tables/docs/documents/group{s}", .{case.query});
+        defer a.free(url);
+        var request = try httpx.Request.init(a, .POST, url);
+        defer request.deinit();
+        request.body = case.body;
+        if (case.signed) try request.setHeader(internal_service_auth.header_name, token);
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        const params = [_]httpx.RouteParam{ .{ .name = "group_id", .value = "7" }, .{ .name = "table_name", .value = "docs" }, .{ .name = "key", .value = "group" } };
+        ctx.params = &params;
+        var response = try handler.internalGroupLookup(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(case.status, response.status.code);
+    }
+    try std.testing.expectEqual(@as(?usize, body_limits.internal_lookup_control_max_body_bytes), body_limits.publicPostBodyLimit("/internal/v1/groups/7/tables/docs/documents/group"));
+    try std.testing.expectEqual(@as(?usize, body_limits.sql_max_request_body_bytes), body_limits.publicPostBodyLimit("/db/v1/sql"));
 }
 
 test "httpx hidden handoff receipt rejects public caller even in legacy internal mode" {

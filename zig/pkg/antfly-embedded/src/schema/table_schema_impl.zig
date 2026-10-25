@@ -107,6 +107,7 @@ pub const TableSchema = struct {
                 .keys = keys,
                 .where = where,
                 .include_columns = declaration.include_columns orelse &.{},
+                .without_overlaps_column = declaration.without_overlaps_column,
                 .nulls_not_distinct = declaration.nulls_not_distinct orelse false,
                 .deferrable = declaration.deferrable orelse false,
                 .timing = nativeEnum(relational_native.ForeignKeyTiming, declaration.timing orelse .immediate),
@@ -3159,6 +3160,14 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
             if (schema.relational_indexes) |indexes| for (indexes.value) |index| {
                 if (std.mem.eql(u8, index.name, constraint.name)) return error.InvalidSchemaUpdateRequest;
             };
+        }
+        if (constraint.without_overlaps_column) |period| {
+            const columns = constraint.columns orelse return error.InvalidSchemaUpdateRequest;
+            if (columns.len == 0 or !std.mem.eql(u8, columns[columns.len - 1], period) or constraint.keys != null or constraint.where != null or
+                (constraint.origin orelse .constraint) == .index) return error.InvalidSchemaUpdateRequest;
+            const property = findDocumentProperty(document_schema.properties, period) orelse return error.InvalidSchemaUpdateRequest;
+            const kind = property.field_type orelse return error.InvalidSchemaUpdateRequest;
+            if (std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, kind) == null) return error.InvalidSchemaUpdateRequest;
         }
         if (constraint.primary orelse false) {
             primary_count += 1;

@@ -1573,6 +1573,8 @@ pub const RelationalUniqueConstraint = struct {
     keys: ?[]const RelationalIndexKey = null,
     /// Conjunction restricting uniqueness to matching rows.
     where: ?[]const RelationalIndexPredicate = null,
+    /// Range-valued final key column for PostgreSQL WITHOUT OVERLAPS. Other key columns define equality groups; nonempty ranges within each group must be disjoint. The column remains in columns. Temporal keys are not equality-only foreign-key targets or ON CONFLICT arbiters.
+    without_overlaps_column: ?[]const u8 = null,
     /// When true, NULL components compare equal for uniqueness.
     nulls_not_distinct: ?bool = null,
     /// Permit uniqueness checks at transaction commit. Never eligible as an ON CONFLICT arbiter or a referenced foreign key target.
@@ -1588,6 +1590,7 @@ pub const RelationalUniqueConstraint = struct {
         .{ "columns", "columns", true },
         .{ "keys", "keys", true },
         .{ "where", "where", true },
+        .{ "without_overlaps_column", "without_overlaps_column", true },
         .{ "nulls_not_distinct", "nulls_not_distinct", true },
         .{ "deferrable", "deferrable", true },
         .{ "timing", "timing", true },
@@ -1627,6 +1630,10 @@ pub const RelationalUniqueConstraint = struct {
         }
         if (self.where) |value| {
             try jw.objectField("where");
+            try jw.write(value);
+        }
+        if (self.without_overlaps_column) |value| {
+            try jw.objectField("without_overlaps_column");
             try jw.write(value);
         }
         if (self.nulls_not_distinct) |value| {

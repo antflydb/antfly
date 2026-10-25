@@ -407,7 +407,7 @@ pub const SchemaChange = union(enum) {
     drop_constraint: []const u8,
     rename_constraint: struct { name: []const u8, new_name: []const u8 },
     validate_constraint: []const u8,
-    add_unique: struct { name: []const u8, columns: []const []const u8, include_columns: []const []const u8 = &.{}, name_generated: bool = false, primary: bool = false, deferrable: bool = false, timing: []const u8 = "immediate", nulls_not_distinct: bool = false },
+    add_unique: struct { name: []const u8, columns: []const []const u8, without_overlaps_column: ?[]const u8 = null, include_columns: []const []const u8 = &.{}, name_generated: bool = false, primary: bool = false, deferrable: bool = false, timing: []const u8 = "immediate", nulls_not_distinct: bool = false },
     add_check: struct { name: []const u8, expression: *const Scalar, name_generated: bool = false, not_valid: bool = false },
     add_foreign_key: ForeignKey,
     create_index: struct { name: []const u8, keys: []const Order, include_columns: []const []const u8 = &.{}, unique: bool = false, predicate: ?*const Scalar = null, nulls_not_distinct: bool = false },

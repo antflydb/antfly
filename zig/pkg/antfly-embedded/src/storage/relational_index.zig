@@ -381,7 +381,7 @@ pub const UniqueConstraint = struct {
     keys: []const RelationalIndexKey = &.{},
     expressions: []const UniqueExpression = &.{},
     include_columns: []const []const u8 = &.{},
-    without_overlaps_period: ?[]const u8 = null,
+    without_overlaps_column: ?[]const u8 = null,
     nulls_not_distinct: bool = false,
     deferrable: bool = false,
     timing: ForeignKeyTiming = .immediate,
@@ -926,7 +926,7 @@ pub const PrimaryKey = struct {
     name: ?[]const u8 = null,
     columns: []const []const u8 = &.{},
     include_columns: []const []const u8 = &.{},
-    without_overlaps_period: ?[]const u8 = null,
+    without_overlaps_column: ?[]const u8 = null,
     deferrable: bool = false,
     timing: ForeignKeyTiming = .immediate,
 };

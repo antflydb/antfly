@@ -72,6 +72,20 @@ pub fn definitionFingerprints(alloc: std.mem.Allocator, public: schema.TableSche
     defer if (layout) |*value| value.deinit();
     for (uniques, definitions[0..uniques.len]) |unique, *definition| {
         if (unique.timing == .deferred and !unique.deferrable) return error.InvalidSchemaUpdateRequest;
+        if (unique.without_overlaps_column) |period| {
+            definition.* = try definitionAlloc(alloc, .unique, unique.name, .{
+                .domain = "antfly temporal unique declaration v1 ordered intervals",
+                .name = unique.name,
+                .columns = unique.columns,
+                .column_types = try columnTypesMode(arena, runtime, unique.columns, true),
+                .without_overlaps_column = period,
+                .nulls_not_distinct = unique.nulls_not_distinct,
+                .deferrable = unique.deferrable,
+                .timing = @tagName(unique.timing),
+            });
+            initialized += 1;
+            continue;
+        }
         if (unique.keys.len == 0 and unique.where.len == 0 and !unique.deferrable) {
             definition.* = try definitionAlloc(alloc, .unique, unique.name, .{
                 .domain = "antfly unique declaration v2 null witnesses",
@@ -166,6 +180,10 @@ pub fn uniqueFields(alloc: std.mem.Allocator, runtime: native.TableSchema, layou
 }
 
 fn columnTypes(alloc: std.mem.Allocator, runtime: native.TableSchema, names: []const []const u8) ![]const []const u8 {
+    return columnTypesMode(alloc, runtime, names, false);
+}
+
+fn columnTypesMode(alloc: std.mem.Allocator, runtime: native.TableSchema, names: []const []const u8, temporal: bool) ![]const []const u8 {
     const types = try alloc.alloc([]const u8, names.len);
     for (names, types) |name, *kind| {
         const column = for (runtime.relational_columns) |column| {
@@ -173,6 +191,7 @@ fn columnTypes(alloc: std.mem.Allocator, runtime: native.TableSchema, names: []c
         } else return error.InvalidSchemaUpdateRequest;
         switch (column.column_type) {
             .string, .blob, .boolean, .datetime, .integer, .number => {},
+            .numrange, .daterange, .tsrange, .tstzrange => if (!temporal) return error.InvalidSchemaUpdateRequest,
             else => return error.InvalidSchemaUpdateRequest,
         }
         kind.* = @tagName(column.column_type);

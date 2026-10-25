@@ -36,6 +36,9 @@ class RelationalUniqueConstraint:
             columns (list[str] | Unset):
             keys (list[RelationalIndexKey] | Unset): Typed native unique keys. Specify either columns or keys.
             where (list[RelationalIndexPredicate] | Unset): Conjunction restricting uniqueness to matching rows.
+            without_overlaps_column (str | Unset): Range-valued final key column for PostgreSQL WITHOUT OVERLAPS. Other key
+                columns define equality groups; nonempty ranges within each group must be disjoint. The column remains in
+                columns. Temporal keys are not equality-only foreign-key targets or ON CONFLICT arbiters.
             nulls_not_distinct (bool | Unset): When true, NULL components compare equal for uniqueness.
             deferrable (bool | Unset): Permit uniqueness checks at transaction commit. Never eligible as an ON CONFLICT
                 arbiter or a referenced foreign key target.
@@ -54,6 +57,7 @@ class RelationalUniqueConstraint:
     columns: list[str] | Unset = UNSET
     keys: list[RelationalIndexKey] | Unset = UNSET
     where: list[RelationalIndexPredicate] | Unset = UNSET
+    without_overlaps_column: str | Unset = UNSET
     nulls_not_distinct: bool | Unset = UNSET
     deferrable: bool | Unset = UNSET
     timing: ForeignKeyTiming | Unset = UNSET
@@ -89,6 +93,8 @@ class RelationalUniqueConstraint:
                 where_item = where_item_data.to_dict()
                 where.append(where_item)
 
+        without_overlaps_column = self.without_overlaps_column
+
         nulls_not_distinct = self.nulls_not_distinct
 
         deferrable = self.deferrable
@@ -116,6 +122,8 @@ class RelationalUniqueConstraint:
             field_dict["keys"] = keys
         if where is not UNSET:
             field_dict["where"] = where
+        if without_overlaps_column is not UNSET:
+            field_dict["without_overlaps_column"] = without_overlaps_column
         if nulls_not_distinct is not UNSET:
             field_dict["nulls_not_distinct"] = nulls_not_distinct
         if deferrable is not UNSET:
@@ -164,6 +172,8 @@ class RelationalUniqueConstraint:
 
                 where.append(where_item)
 
+        without_overlaps_column = d.pop("without_overlaps_column", UNSET)
+
         nulls_not_distinct = d.pop("nulls_not_distinct", UNSET)
 
         deferrable = d.pop("deferrable", UNSET)
@@ -183,6 +193,7 @@ class RelationalUniqueConstraint:
             columns=columns,
             keys=keys,
             where=where,
+            without_overlaps_column=without_overlaps_column,
             nulls_not_distinct=nulls_not_distinct,
             deferrable=deferrable,
             timing=timing,

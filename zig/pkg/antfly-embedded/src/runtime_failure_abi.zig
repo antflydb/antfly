@@ -854,6 +854,8 @@ pub const Status = enum(u32) {
     sequence_catalog_state_required = 895,
     undefined_column = 896,
     foreign_key_validation_required = 897,
+    temporal_overlap_violation = 898,
+    temporal_empty_range = 899,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

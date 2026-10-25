@@ -20495,9 +20495,11 @@ pub const DB = struct {
 
     fn lookupRelationalIntegrityJobs(self: *DB, alloc: Allocator, request_json: []const u8, options: types.LookupOptions) !?types.LookupResult {
         const integrity = @import("relational_integrity.zig");
-        if (request_json.len > 4096) return error.InvalidIntegrityBudget;
+        if (request_json.len > integrity.max_preparation_bytes) return error.InvalidIntegrityBudget;
         var kind = try std.json.parseFromSlice(struct { kind: []const u8 = "discover" }, alloc, request_json, .{ .ignore_unknown_fields = true });
         defer kind.deinit();
+        if (std.mem.eql(u8, kind.value.kind, "temporal_probe")) return self.lookupTemporalIntegrityProbe(alloc, request_json, options);
+        if (request_json.len > 4096) return error.InvalidIntegrityBudget;
         if (std.mem.eql(u8, kind.value.kind, "retirement")) return self.lookupRelationalRetirement(alloc, request_json);
         var request = try std.json.parseFromSlice(struct {
             kind: enum { discover, references, claims, observations } = .discover,
@@ -20657,6 +20659,40 @@ pub const DB = struct {
         if (json.len > 16 * 1024 * 1024) return error.TransactionTooLarge;
         try checkLookupOptionsActive(outer);
         return .{ .json = json };
+    }
+
+    fn lookupTemporalIntegrityProbe(self: *DB, alloc: Allocator, json: []const u8, options: types.LookupOptions) !?types.LookupResult {
+        const integrity = @import("relational_integrity.zig");
+        const Query = struct {
+            kind: []const u8,
+            address: integrity.Address,
+            schema_version: u32,
+            generation_set: integrity.Digest,
+            batches: []const []const integrity.Command,
+        };
+        var request = try std.json.parseFromSlice(Query, alloc, json, .{ .allocate = .alloc_always });
+        defer request.deinit();
+        const query = request.value;
+        if (!std.mem.eql(u8, query.kind, "temporal_probe") or query.batches.len == 0 or query.batches.len > integrity.max_commands) return error.InvalidIntegrityCommand;
+        var count: usize = 0;
+        for (query.batches) |commands| {
+            if (commands.len > integrity.max_commands -| count) return error.TransactionTooLarge;
+            count += commands.len;
+            for (commands) |command| if (!command.isTemporal() or !std.meta.eql(command.address, query.address)) return error.InvalidIntegrityCommand;
+        }
+        if (count == 0) return error.InvalidIntegrityCommand;
+        try checkLookupOptionsActive(options);
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
+        if (!self.core.byteRange().contains(&query.address.routing)) return error.PreparedGenerationChanged;
+        var read = try integrity.CurrentView.init(self.core.store);
+        defer read.deinit();
+        try validateIntegrityReadGeneration(alloc, &read, query.schema_version, query.generation_set);
+        try @import("online_integrity_shadow.zig").requireServing(&read, self.core.byteRange(), &query.address.routing);
+        var effects = try integrity.prepareBatches(alloc, &read, query.batches);
+        defer effects.deinit();
+        try checkLookupOptionsActive(options);
+        return .{ .json = try std.json.Stringify.valueAlloc(alloc, .{ .validated = true, .address = query.address }, .{}) };
     }
 
     fn lookupRelationalIntegrityClaims(self: *DB, alloc: Allocator, addresses: []const @import("relational_integrity.zig").Address, expected_schema: ?u32, expected_set: ?@import("relational_integrity.zig").Digest) !?types.LookupResult {
@@ -26715,7 +26751,7 @@ pub const DB = struct {
             for (req.integrity_commands) |command| {
                 const generation = integrity_catalog.?.findGeneration(command.address.generation) orelse return error.IntegrityCatalogChanged;
                 if (generation.definition.kind != .unique) return error.InvalidIntegrityOperation;
-                if (generation.retired and (command.operation == .establish or command.operation == .attach)) return error.IntegrityCatalogChanged;
+                if (generation.retired and (command.operation == .establish or command.operation == .establish_interval or command.operation == .attach)) return error.IntegrityCatalogChanged;
             }
         }
 

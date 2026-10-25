@@ -68,7 +68,7 @@ pub const PreparedCandidate = struct {
             if (std.mem.eql(u8, rule.name, view.name)) break rule;
         } else return error.InvalidIndexPublicationCandidate;
         if (unique.deferrable or unique.timing != .immediate or unique.expressions.len != 0 or
-            unique.where_expressions.len != 0 or unique.without_overlaps_period != null) return error.InvalidIndexPublicationCandidate;
+            unique.where_expressions.len != 0 or unique.without_overlaps_column != null) return error.InvalidIndexPublicationCandidate;
         const keys = if (unique.keys.len != 0) unique.keys else blk: {
             const result = try declaration_arena.allocator().alloc(@import("../relational_index.zig").RelationalIndexKey, unique.columns.len);
             for (result, unique.columns) |*entry, column| entry.* = .{ .column = column };

@@ -861,6 +861,8 @@ const mappings = [_]Mapping{
     .{ .status = .enrichment_worker_failed, .err = error.EnrichmentWorkerFailed },
     .{ .status = .commit_visibility_not_satisfied, .err = error.CommitVisibilityNotSatisfied },
     .{ .status = .commit_propagation_incomplete, .err = error.CommitPropagationIncomplete },
+    .{ .status = .temporal_overlap_violation, .err = error.TemporalOverlapViolation },
+    .{ .status = .temporal_empty_range, .err = error.TemporalEmptyRange },
 };
 
 pub fn statusFromError(err: anyerror) abi.Status {

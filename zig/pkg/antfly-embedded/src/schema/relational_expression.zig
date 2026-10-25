@@ -305,7 +305,7 @@ test "relational index system typed CHECK transport agrees with cold JSON null p
             defer for (&plans) |*plan| plan.deinit();
             // Borrow the pinned physical layout and plans; Set.deinit would
             // incorrectly free these independently owned fixture resources.
-            const set: checks.Set = .{ .alloc = backing, .table = row.table_schema, .layout = row.layout.*, .definitions = &.{}, .plans = &plans };
+            const set: checks.Set = .{ .alloc = backing, .table = row.table_schema, .layout = row.layout.*, .definitions = &.{ .{ .name = "json_present" }, .{ .name = "text_absent" } }, .plans = &plans };
             var bytes: usize = max_allocated_bytes;
             var execution = Execution.init(owned, &bytes);
             var nulls: @import("../sql/row_value.zig").JsonNulls = undefined;

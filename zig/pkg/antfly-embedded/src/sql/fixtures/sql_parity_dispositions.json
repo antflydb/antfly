@@ -2802,6 +2802,58 @@
       ],
       "cwd": "zig",
       "timeout_seconds": 1800
+    },
+    "sql-qualified-temporal-keys-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-temporal-key-lifecycle-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-temporal-keys-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_temporal_key_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_temporal_key_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-qualified-temporal-keys-values-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Doptimize=Debug",
+        "-j1",
+        "--",
+        "--test-filter",
+        "SQL range"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-temporal-keys-storage-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-relational-temporal-integrity-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
     }
   },
   "entries": [
@@ -13126,8 +13178,30 @@
     },
     {
       "id": "sql-0685",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SQL and unchanged WITHOUT OVERLAPS table declarations execute through native mounted owners. PostgreSQL 18 verifies complete typed RETURNING/query results and all final rows. Native ordered interval claims use the existing durable transaction path, recheck adjacent live intervals under the participant fence, reject overlapping and empty ranges with 23P01/23514, and preserve complete row identities, versions, digests and enforcement across independent cold catalog/session/data recovery. Physical LSM tests additionally prove concurrent gap fencing, abort/prepared reopen, ordered statement deltas and bounded paged routing transfer without relaxing ordinary constraint guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity.zig",
+          "test": "SQL range temporal expansion derives canonical claims from projected JSON rows",
+          "gate": "sql-qualified-temporal-keys-values-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_integrity.zig",
+          "test": "SQL range temporal claims fence concurrent gaps batch replacements abort and restart",
+          "gate": "sql-qualified-temporal-keys-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-0686",
@@ -24993,93 +25067,489 @@
     },
     {
       "id": "sql-1414",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SQL and unchanged WITHOUT OVERLAPS table declarations execute through native mounted owners. PostgreSQL 18 verifies complete typed RETURNING/query results and all final rows. Native ordered interval claims use the existing durable transaction path, recheck adjacent live intervals under the participant fence, reject overlapping and empty ranges with 23P01/23514, and preserve complete row identities, versions, digests and enforcement across independent cold catalog/session/data recovery. Physical LSM tests additionally prove concurrent gap fencing, abort/prepared reopen, ordered statement deltas and bounded paged routing transfer without relaxing ordinary constraint guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity.zig",
+          "test": "SQL range temporal expansion derives canonical claims from projected JSON rows",
+          "gate": "sql-qualified-temporal-keys-values-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_integrity.zig",
+          "test": "SQL range temporal claims fence concurrent gaps batch replacements abort and restart",
+          "gate": "sql-qualified-temporal-keys-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-1415",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SQL and unchanged WITHOUT OVERLAPS table declarations execute through native mounted owners. PostgreSQL 18 verifies complete typed RETURNING/query results and all final rows. Native ordered interval claims use the existing durable transaction path, recheck adjacent live intervals under the participant fence, reject overlapping and empty ranges with 23P01/23514, and preserve complete row identities, versions, digests and enforcement across independent cold catalog/session/data recovery. Physical LSM tests additionally prove concurrent gap fencing, abort/prepared reopen, ordered statement deltas and bounded paged routing transfer without relaxing ordinary constraint guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity.zig",
+          "test": "SQL range temporal expansion derives canonical claims from projected JSON rows",
+          "gate": "sql-qualified-temporal-keys-values-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_integrity.zig",
+          "test": "SQL range temporal claims fence concurrent gaps batch replacements abort and restart",
+          "gate": "sql-qualified-temporal-keys-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-1416",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SQL and unchanged WITHOUT OVERLAPS table declarations execute through native mounted owners. PostgreSQL 18 verifies complete typed RETURNING/query results and all final rows. Native ordered interval claims use the existing durable transaction path, recheck adjacent live intervals under the participant fence, reject overlapping and empty ranges with 23P01/23514, and preserve complete row identities, versions, digests and enforcement across independent cold catalog/session/data recovery. Physical LSM tests additionally prove concurrent gap fencing, abort/prepared reopen, ordered statement deltas and bounded paged routing transfer without relaxing ordinary constraint guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity.zig",
+          "test": "SQL range temporal expansion derives canonical claims from projected JSON rows",
+          "gate": "sql-qualified-temporal-keys-values-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_integrity.zig",
+          "test": "SQL range temporal claims fence concurrent gaps batch replacements abort and restart",
+          "gate": "sql-qualified-temporal-keys-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-1417",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SQL and unchanged WITHOUT OVERLAPS table declarations execute through native mounted owners. PostgreSQL 18 verifies complete typed RETURNING/query results and all final rows. Native ordered interval claims use the existing durable transaction path, recheck adjacent live intervals under the participant fence, reject overlapping and empty ranges with 23P01/23514, and preserve complete row identities, versions, digests and enforcement across independent cold catalog/session/data recovery. Physical LSM tests additionally prove concurrent gap fencing, abort/prepared reopen, ordered statement deltas and bounded paged routing transfer without relaxing ordinary constraint guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity.zig",
+          "test": "SQL range temporal expansion derives canonical claims from projected JSON rows",
+          "gate": "sql-qualified-temporal-keys-values-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_integrity.zig",
+          "test": "SQL range temporal claims fence concurrent gaps batch replacements abort and restart",
+          "gate": "sql-qualified-temporal-keys-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-1418",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SQL and unchanged WITHOUT OVERLAPS table declarations execute through native mounted owners. PostgreSQL 18 verifies complete typed RETURNING/query results and all final rows. Native ordered interval claims use the existing durable transaction path, recheck adjacent live intervals under the participant fence, reject overlapping and empty ranges with 23P01/23514, and preserve complete row identities, versions, digests and enforcement across independent cold catalog/session/data recovery. Physical LSM tests additionally prove concurrent gap fencing, abort/prepared reopen, ordered statement deltas and bounded paged routing transfer without relaxing ordinary constraint guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity.zig",
+          "test": "SQL range temporal expansion derives canonical claims from projected JSON rows",
+          "gate": "sql-qualified-temporal-keys-values-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_integrity.zig",
+          "test": "SQL range temporal claims fence concurrent gaps batch replacements abort and restart",
+          "gate": "sql-qualified-temporal-keys-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-1419",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SQL and unchanged WITHOUT OVERLAPS table declarations execute through native mounted owners. PostgreSQL 18 verifies complete typed RETURNING/query results and all final rows. Native ordered interval claims use the existing durable transaction path, recheck adjacent live intervals under the participant fence, reject overlapping and empty ranges with 23P01/23514, and preserve complete row identities, versions, digests and enforcement across independent cold catalog/session/data recovery. Physical LSM tests additionally prove concurrent gap fencing, abort/prepared reopen, ordered statement deltas and bounded paged routing transfer without relaxing ordinary constraint guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity.zig",
+          "test": "SQL range temporal expansion derives canonical claims from projected JSON rows",
+          "gate": "sql-qualified-temporal-keys-values-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_integrity.zig",
+          "test": "SQL range temporal claims fence concurrent gaps batch replacements abort and restart",
+          "gate": "sql-qualified-temporal-keys-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-1420",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SQL and unchanged WITHOUT OVERLAPS table declarations execute through native mounted owners. PostgreSQL 18 verifies complete typed RETURNING/query results and all final rows. Native ordered interval claims use the existing durable transaction path, recheck adjacent live intervals under the participant fence, reject overlapping and empty ranges with 23P01/23514, and preserve complete row identities, versions, digests and enforcement across independent cold catalog/session/data recovery. Physical LSM tests additionally prove concurrent gap fencing, abort/prepared reopen, ordered statement deltas and bounded paged routing transfer without relaxing ordinary constraint guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity.zig",
+          "test": "SQL range temporal expansion derives canonical claims from projected JSON rows",
+          "gate": "sql-qualified-temporal-keys-values-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_integrity.zig",
+          "test": "SQL range temporal claims fence concurrent gaps batch replacements abort and restart",
+          "gate": "sql-qualified-temporal-keys-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-1421",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SQL and unchanged WITHOUT OVERLAPS table declarations execute through native mounted owners. PostgreSQL 18 verifies complete typed RETURNING/query results and all final rows. Native ordered interval claims use the existing durable transaction path, recheck adjacent live intervals under the participant fence, reject overlapping and empty ranges with 23P01/23514, and preserve complete row identities, versions, digests and enforcement across independent cold catalog/session/data recovery. Physical LSM tests additionally prove concurrent gap fencing, abort/prepared reopen, ordered statement deltas and bounded paged routing transfer without relaxing ordinary constraint guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity.zig",
+          "test": "SQL range temporal expansion derives canonical claims from projected JSON rows",
+          "gate": "sql-qualified-temporal-keys-values-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_integrity.zig",
+          "test": "SQL range temporal claims fence concurrent gaps batch replacements abort and restart",
+          "gate": "sql-qualified-temporal-keys-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-1422",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SQL and unchanged WITHOUT OVERLAPS table declarations execute through native mounted owners. PostgreSQL 18 verifies complete typed RETURNING/query results and all final rows. Native ordered interval claims use the existing durable transaction path, recheck adjacent live intervals under the participant fence, reject overlapping and empty ranges with 23P01/23514, and preserve complete row identities, versions, digests and enforcement across independent cold catalog/session/data recovery. Physical LSM tests additionally prove concurrent gap fencing, abort/prepared reopen, ordered statement deltas and bounded paged routing transfer without relaxing ordinary constraint guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity.zig",
+          "test": "SQL range temporal expansion derives canonical claims from projected JSON rows",
+          "gate": "sql-qualified-temporal-keys-values-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_integrity.zig",
+          "test": "SQL range temporal claims fence concurrent gaps batch replacements abort and restart",
+          "gate": "sql-qualified-temporal-keys-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-1423",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SQL and unchanged WITHOUT OVERLAPS table declarations execute through native mounted owners. PostgreSQL 18 verifies complete typed RETURNING/query results and all final rows. Native ordered interval claims use the existing durable transaction path, recheck adjacent live intervals under the participant fence, reject overlapping and empty ranges with 23P01/23514, and preserve complete row identities, versions, digests and enforcement across independent cold catalog/session/data recovery. Physical LSM tests additionally prove concurrent gap fencing, abort/prepared reopen, ordered statement deltas and bounded paged routing transfer without relaxing ordinary constraint guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity.zig",
+          "test": "SQL range temporal expansion derives canonical claims from projected JSON rows",
+          "gate": "sql-qualified-temporal-keys-values-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_integrity.zig",
+          "test": "SQL range temporal claims fence concurrent gaps batch replacements abort and restart",
+          "gate": "sql-qualified-temporal-keys-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-1424",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SQL and unchanged WITHOUT OVERLAPS table declarations execute through native mounted owners. PostgreSQL 18 verifies complete typed RETURNING/query results and all final rows. Native ordered interval claims use the existing durable transaction path, recheck adjacent live intervals under the participant fence, reject overlapping and empty ranges with 23P01/23514, and preserve complete row identities, versions, digests and enforcement across independent cold catalog/session/data recovery. Physical LSM tests additionally prove concurrent gap fencing, abort/prepared reopen, ordered statement deltas and bounded paged routing transfer without relaxing ordinary constraint guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity.zig",
+          "test": "SQL range temporal expansion derives canonical claims from projected JSON rows",
+          "gate": "sql-qualified-temporal-keys-values-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_integrity.zig",
+          "test": "SQL range temporal claims fence concurrent gaps batch replacements abort and restart",
+          "gate": "sql-qualified-temporal-keys-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-1425",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SQL and unchanged WITHOUT OVERLAPS table declarations execute through native mounted owners. PostgreSQL 18 verifies complete typed RETURNING/query results and all final rows. Native ordered interval claims use the existing durable transaction path, recheck adjacent live intervals under the participant fence, reject overlapping and empty ranges with 23P01/23514, and preserve complete row identities, versions, digests and enforcement across independent cold catalog/session/data recovery. Physical LSM tests additionally prove concurrent gap fencing, abort/prepared reopen, ordered statement deltas and bounded paged routing transfer without relaxing ordinary constraint guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity.zig",
+          "test": "SQL range temporal expansion derives canonical claims from projected JSON rows",
+          "gate": "sql-qualified-temporal-keys-values-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_integrity.zig",
+          "test": "SQL range temporal claims fence concurrent gaps batch replacements abort and restart",
+          "gate": "sql-qualified-temporal-keys-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-1426",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SQL and unchanged WITHOUT OVERLAPS table declarations execute through native mounted owners. PostgreSQL 18 verifies complete typed RETURNING/query results and all final rows. Native ordered interval claims use the existing durable transaction path, recheck adjacent live intervals under the participant fence, reject overlapping and empty ranges with 23P01/23514, and preserve complete row identities, versions, digests and enforcement across independent cold catalog/session/data recovery. Physical LSM tests additionally prove concurrent gap fencing, abort/prepared reopen, ordered statement deltas and bounded paged routing transfer without relaxing ordinary constraint guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity.zig",
+          "test": "SQL range temporal expansion derives canonical claims from projected JSON rows",
+          "gate": "sql-qualified-temporal-keys-values-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_integrity.zig",
+          "test": "SQL range temporal claims fence concurrent gaps batch replacements abort and restart",
+          "gate": "sql-qualified-temporal-keys-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-1427",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SQL and unchanged WITHOUT OVERLAPS table declarations execute through native mounted owners. PostgreSQL 18 verifies complete typed RETURNING/query results and all final rows. Native ordered interval claims use the existing durable transaction path, recheck adjacent live intervals under the participant fence, reject overlapping and empty ranges with 23P01/23514, and preserve complete row identities, versions, digests and enforcement across independent cold catalog/session/data recovery. Physical LSM tests additionally prove concurrent gap fencing, abort/prepared reopen, ordered statement deltas and bounded paged routing transfer without relaxing ordinary constraint guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity.zig",
+          "test": "SQL range temporal expansion derives canonical claims from projected JSON rows",
+          "gate": "sql-qualified-temporal-keys-values-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_integrity.zig",
+          "test": "SQL range temporal claims fence concurrent gaps batch replacements abort and restart",
+          "gate": "sql-qualified-temporal-keys-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-1428",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SQL and unchanged WITHOUT OVERLAPS table declarations execute through native mounted owners. PostgreSQL 18 verifies complete typed RETURNING/query results and all final rows. Native ordered interval claims use the existing durable transaction path, recheck adjacent live intervals under the participant fence, reject overlapping and empty ranges with 23P01/23514, and preserve complete row identities, versions, digests and enforcement across independent cold catalog/session/data recovery. Physical LSM tests additionally prove concurrent gap fencing, abort/prepared reopen, ordered statement deltas and bounded paged routing transfer without relaxing ordinary constraint guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity.zig",
+          "test": "SQL range temporal expansion derives canonical claims from projected JSON rows",
+          "gate": "sql-qualified-temporal-keys-values-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_integrity.zig",
+          "test": "SQL range temporal claims fence concurrent gaps batch replacements abort and restart",
+          "gate": "sql-qualified-temporal-keys-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-1429",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The unchanged original numrange containment expression uses an integer endpoint. PostgreSQL 18 rejects that polymorphic overload with 42883; native SQL preserves the same diagnostic, rather than silently coercing it to numeric. The mounted campaign retains the exact original WITHOUT OVERLAPS setup, all admitted rows, typed original results, physical row identities, versions and digests across independent cold catalog/session/data recovery. This closes an invalid original, not an additional supported operator.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity.zig",
+          "test": "SQL range temporal expansion derives canonical claims from projected JSON rows",
+          "gate": "sql-qualified-temporal-keys-values-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_integrity.zig",
+          "test": "SQL range temporal claims fence concurrent gaps batch replacements abort and restart",
+          "gate": "sql-qualified-temporal-keys-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-1430",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SQL and unchanged WITHOUT OVERLAPS table declarations execute through native mounted owners. PostgreSQL 18 verifies complete typed RETURNING/query results and all final rows. Native ordered interval claims use the existing durable transaction path, recheck adjacent live intervals under the participant fence, reject overlapping and empty ranges with 23P01/23514, and preserve complete row identities, versions, digests and enforcement across independent cold catalog/session/data recovery. Physical LSM tests additionally prove concurrent gap fencing, abort/prepared reopen, ordered statement deltas and bounded paged routing transfer without relaxing ordinary constraint guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity.zig",
+          "test": "SQL range temporal expansion derives canonical claims from projected JSON rows",
+          "gate": "sql-qualified-temporal-keys-values-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_integrity.zig",
+          "test": "SQL range temporal claims fence concurrent gaps batch replacements abort and restart",
+          "gate": "sql-qualified-temporal-keys-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-1431",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original SQL and unchanged WITHOUT OVERLAPS table declarations execute through native mounted owners. PostgreSQL 18 verifies complete typed RETURNING/query results and all final rows. Native ordered interval claims use the existing durable transaction path, recheck adjacent live intervals under the participant fence, reject overlapping and empty ranges with 23P01/23514, and preserve complete row identities, versions, digests and enforcement across independent cold catalog/session/data recovery. Physical LSM tests additionally prove concurrent gap fencing, abort/prepared reopen, ordered statement deltas and bounded paged routing transfer without relaxing ordinary constraint guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original temporal keys enforce intervals and retain all cold owners",
+          "gate": "sql-qualified-temporal-keys-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity.zig",
+          "test": "SQL range temporal expansion derives canonical claims from projected JSON rows",
+          "gate": "sql-qualified-temporal-keys-values-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_integrity.zig",
+          "test": "SQL range temporal claims fence concurrent gaps batch replacements abort and restart",
+          "gate": "sql-qualified-temporal-keys-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-1432",

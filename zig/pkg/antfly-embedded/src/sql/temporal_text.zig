@@ -268,6 +268,15 @@ fn parseTime(text: []const u8) ParseError!u64 {
 pub fn parseInput(kind: temporal.Kind, input: []const u8) ParseError!temporal.Value {
     if (kind != .interval) {
         return parseCanonical(kind, input) catch |err| {
+            if (kind == .timestamp or kind == .timestamp_tz) {
+                // SQL timestamp input admits a date at midnight. Keep this
+                // input coercion separate from strict persisted-byte spelling.
+                // The current timestamp_tz input contract is normalized UTC.
+                if (parseCanonical(.date, std.mem.trim(u8, input, " \t\r\n"))) |date| {
+                    const value = try (Fields{ .date = date.date, .time = .{ .micros = 0 } }).toTimestamp();
+                    return if (kind == .timestamp) .{ .timestamp = value } else .{ .timestamp_tz = value };
+                } else |_| {}
+            }
             if (kind != .timestamp_tz or input.len > output_capacity) return err;
             var normalized: [output_capacity + 3]u8 = undefined;
             @memcpy(normalized[0..input.len], input);

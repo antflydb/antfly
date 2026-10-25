@@ -2496,6 +2496,8 @@ const Parser = struct {
                 var digest = std.hash.Wyhash.init(0);
                 digest.update(&.{ @intFromBool(rule.nulls_not_distinct), @intFromBool(rule.deferrable) });
                 digest.update(rule.timing);
+                digest.update(&.{@intFromBool(rule.without_overlaps_column != null)});
+                if (rule.without_overlaps_column) |column| digest.update(column);
                 var length: [8]u8 = undefined;
                 for (rule.columns) |column| {
                     std.mem.writeInt(u64, &length, column.len, .little);
@@ -2514,6 +2516,8 @@ const Parser = struct {
                 if (left.nulls_not_distinct != right.nulls_not_distinct or left.deferrable != right.deferrable or
                     !std.mem.eql(u8, left.timing, right.timing) or left.columns.len != right.columns.len or
                     left.include_columns.len != right.include_columns.len) return false;
+                if ((left.without_overlaps_column == null) != (right.without_overlaps_column == null)) return false;
+                if (left.without_overlaps_column) |period| if (!std.mem.eql(u8, period, right.without_overlaps_column.?)) return false;
                 for (left.columns, right.columns) |l, r| if (!std.mem.eql(u8, l, r)) return false;
                 for (left.include_columns, right.include_columns) |l, r| if (!std.mem.eql(u8, l, r)) return false;
                 return true;
@@ -3179,29 +3183,33 @@ const Parser = struct {
         return self.fail(error.UnsupportedSqlShape, "routine catalog activation is not supported");
     }
 
+    const UniqueColumnList = struct { columns: []const []const u8, without_overlaps_column: ?[]const u8 = null };
+
     fn ddlColumnList(self: *Parser) Error![]const []const u8 {
-        return self.ddlColumnListMode(false);
+        return (try self.ddlColumnListMode(false)).columns;
     }
 
-    fn ddlUniqueColumnList(self: *Parser) Error![]const []const u8 {
+    fn ddlUniqueColumnList(self: *Parser) Error!UniqueColumnList {
         return self.ddlColumnListMode(true);
     }
 
-    fn ddlColumnListMode(self: *Parser, temporal_unique: bool) Error![]const []const u8 {
+    fn ddlColumnListMode(self: *Parser, temporal_unique: bool) Error!UniqueColumnList {
         try self.expect(.lparen);
         var columns = std.ArrayList([]const u8).empty;
+        var period: ?[]const u8 = null;
         while (true) {
             try self.node();
-            try columns.append(self.alloc, try self.identifier());
+            const column = try self.identifier();
+            try columns.append(self.alloc, column);
             if (temporal_unique and self.keyword(.without)) {
                 try self.expectKeyword(.overlaps);
-                try self.expect(.rparen);
-                return self.fail(error.UnsupportedSqlShape, "WITHOUT OVERLAPS requires temporal uniqueness enforcement");
+                period = column;
+                break;
             }
             if (!self.take(.comma)) break;
         }
         try self.expect(.rparen);
-        return columns.toOwnedSlice(self.alloc);
+        return .{ .columns = try columns.toOwnedSlice(self.alloc), .without_overlaps_column = period };
     }
 
     fn foreignKeyAction(self: *Parser) Error![]const u8 {
@@ -3280,11 +3288,13 @@ const Parser = struct {
     fn constraintDefinition(self: *Parser, constraint_name: []const u8) Error!ast.SchemaChange {
         if (self.keyword(.primary)) {
             try self.expectKeyword(.key);
-            return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = try self.ddlUniqueColumnList(), .primary = true } });
+            const list = try self.ddlUniqueColumnList();
+            return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = list.columns, .without_overlaps_column = list.without_overlaps_column, .primary = true } });
         }
         if (self.keyword(.unique)) {
             const nulls_not_distinct = try self.uniqueNulls();
-            return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = try self.ddlUniqueColumnList(), .nulls_not_distinct = nulls_not_distinct } });
+            const list = try self.ddlUniqueColumnList();
+            return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = list.columns, .without_overlaps_column = list.without_overlaps_column, .nulls_not_distinct = nulls_not_distinct } });
         }
         if (self.keyword(.check)) {
             try self.expect(.lparen);
@@ -4970,14 +4980,21 @@ test "SQL original multi action ALTER rejects invalid PERIOD grammar without rei
     }) |sql| try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, sql, .{}));
 }
 
-test "SQL range temporal uniqueness remains explicitly unsupported until enforcement is activated" {
+test "SQL range temporal uniqueness retains its final column and rejects malformed clauses" {
     const a = std.testing.allocator;
     var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
     defer corpus.deinit();
-    // sql-0685 is valid PostgreSQL grammar, but not a closed case. Activating
-    // range storage must not mislabel an unenforced temporal key as syntax.
-    try std.testing.expectError(error.UnsupportedSqlShape, compile(a, (try corpus.get("sql-0685")).sql, .{}));
-    try std.testing.expectError(error.UnsupportedSqlShape, compile(a, "CREATE TABLE t (id text, v numrange, UNIQUE(id,v WITHOUT OVERLAPS))", .{}));
+    var original = try compile(a, (try corpus.get("sql-0685")).sql, .{});
+    defer original.deinit();
+    const constraint = original.statement.create_table.constraints[0].add_unique;
+    try std.testing.expectEqualStrings("valid_at", constraint.without_overlaps_column.?);
+    try std.testing.expectEqual(@as(usize, 2), constraint.columns.len);
+    var distinct = try compile(a, "CREATE TABLE t(id text,v numrange,UNIQUE(id,v),UNIQUE(id,v WITHOUT OVERLAPS))", .{});
+    defer distinct.deinit();
+    try std.testing.expectEqual(@as(usize, 2), distinct.statement.create_table.constraints.len);
+    try std.testing.expect(distinct.statement.create_table.constraints[0].add_unique.without_overlaps_column == null);
+    try std.testing.expectEqualStrings("v", distinct.statement.create_table.constraints[1].add_unique.without_overlaps_column.?);
+
     try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE TABLE t (id text, v numrange, PRIMARY KEY(id,v WITHOUT))", .{}));
     try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE TABLE t (id text, v numrange, PRIMARY KEY(id,v WITHOUT OVERLAPS,id))", .{}));
 }

@@ -436,12 +436,14 @@ test "relational index system NOT VALID CHECK enforces writes without historical
     defer storage_schema.freeSchema(a, current);
     try std.testing.expectEqual(storage_schema.storage_format_version, current.decoded_format_version);
     try std.testing.expect(current.requires_deferred_constraints);
-    // UUID and clock defaults append independent reader bits. Keep the
-    // explicit v32/v31 witnesses without relabeling the current frame.
-    try std.testing.expectEqual(@as(u32, 35), current.decoded_format_version);
+    // UUID, clock, range and temporal-key support append independent reader
+    // bits after v32. Keep explicit v32/v31 witnesses without relabeling or
+    // retaining any of those newer fields in the historical frame.
+    try std.testing.expectEqual(storage_schema.storage_format_version, current.decoded_format_version);
     try std.testing.expect(!current.requires_uuid_defaults);
-    try std.testing.expectEqual(@as(u8, 0), current_bytes[current_bytes.len - 1]);
-    const bytes = try a.dupe(u8, current_bytes[0 .. current_bytes.len - 2]);
+    const later_reader_bits = storage_schema.storage_format_version - 32;
+    try std.testing.expect(std.mem.allEqual(u8, current_bytes[current_bytes.len - later_reader_bits ..], 0));
+    const bytes = try a.dupe(u8, current_bytes[0 .. current_bytes.len - later_reader_bits]);
     defer a.free(bytes);
     std.mem.writeInt(u32, bytes[4..8], 32, .little);
     const restored = try storage_schema.deserializeSchema(a, bytes);
@@ -1320,29 +1322,33 @@ fn requiresNumericFunctions(schema: ParsedTableSchema) bool {
 
 test "relational index system SQL durable numeric capability covers every declaration owner" {
     const a = std.testing.allocator;
-    for ([_][]const u8{
-        "CREATE TABLE t (n numeric, g numeric GENERATED ALWAYS AS (round(n,2)) STORED)",
-        "CREATE TABLE t (n numeric DEFAULT sqrt(2::numeric))",
-        "CREATE TABLE t (n numeric, CHECK (sign(n) >= 0))",
-        "CREATE TABLE t (n double precision, g double precision GENERATED ALWAYS AS (ceil(n)) STORED)",
-    }) |sql| {
+    // Folded immutable defaults retain literal/type capabilities; they do not
+    // require a function implementation that no longer appears in the program.
+    for ([_]struct { sql: []const u8, runtime_function: bool }{
+        .{ .sql = "CREATE TABLE t (n numeric, g numeric GENERATED ALWAYS AS (round(n,2)) STORED)", .runtime_function = true },
+        .{ .sql = "CREATE TABLE t (n numeric DEFAULT sqrt(2::numeric))", .runtime_function = false },
+        .{ .sql = "CREATE TABLE t (n numeric, CHECK (sign(n) >= 0))", .runtime_function = true },
+        .{ .sql = "CREATE TABLE t (n double precision, g double precision GENERATED ALWAYS AS (ceil(n)) STORED)", .runtime_function = true },
+    }) |case| {
+        const sql = case.sql;
         var compiled = try @import("../sql/compiler.zig").compile(a, sql, .{});
         defer compiled.deinit();
         const bytes = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, compiled.statement.create_table);
         defer a.free(bytes);
+        errdefer std.debug.print("capability declaration SQL={s} schema={s}\n", .{ sql, bytes });
         var parsed = try parseValidatedTableSchema(a, bytes);
         defer parsed.deinit(a);
         const runtime = try deriveRuntimeTableSchema(a, parsed);
         defer storage_schema.freeSchema(a, runtime);
         const checks_layout = try deriveRelationalCheckLayout(a, parsed);
         defer storage_schema.freeSchema(a, checks_layout);
-        try std.testing.expect(runtime.requires_numeric_functions);
-        try std.testing.expect(checks_layout.requires_numeric_functions);
+        try std.testing.expectEqual(case.runtime_function, runtime.requires_numeric_functions);
+        try std.testing.expectEqual(case.runtime_function, checks_layout.requires_numeric_functions);
         const serialized = try storage_schema.serializeSchema(a, runtime);
         defer a.free(serialized);
         const restored = try storage_schema.deserializeSchema(a, serialized);
         defer storage_schema.freeSchema(a, restored);
-        try std.testing.expect(restored.requires_numeric_functions);
+        try std.testing.expectEqual(case.runtime_function, restored.requires_numeric_functions);
     }
 }
 
@@ -1377,29 +1383,33 @@ test "relational index system SQL durable numeric capability covers index and UN
 
 test "relational index system SQL durable text capability covers every declaration owner" {
     const a = std.testing.allocator;
-    for ([_][]const u8{
-        "CREATE TABLE t (s text, g text GENERATED ALWAYS AS (md5(s)) STORED)",
-        "CREATE TABLE t (s text DEFAULT md5('x'))",
-        "CREATE TABLE t (s text, CHECK (md5(s) <> ''))",
-        "CREATE TABLE t (s text, g text GENERATED ALWAYS AS (replace(s,'a','b')) STORED)",
-    }) |sql| {
+    // Folded immutable defaults retain literal/type capabilities; they do not
+    // require a function implementation that no longer appears in the program.
+    for ([_]struct { sql: []const u8, runtime_function: bool }{
+        .{ .sql = "CREATE TABLE t (s text, g text GENERATED ALWAYS AS (md5(s)) STORED)", .runtime_function = true },
+        .{ .sql = "CREATE TABLE t (s text DEFAULT md5('x'))", .runtime_function = false },
+        .{ .sql = "CREATE TABLE t (s text, CHECK (md5(s) <> ''))", .runtime_function = true },
+        .{ .sql = "CREATE TABLE t (s text, g text GENERATED ALWAYS AS (replace(s,'a','b')) STORED)", .runtime_function = true },
+    }) |case| {
+        const sql = case.sql;
         var compiled = try @import("../sql/compiler.zig").compile(a, sql, .{});
         defer compiled.deinit();
         const bytes = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, compiled.statement.create_table);
         defer a.free(bytes);
+        errdefer std.debug.print("capability declaration SQL={s} schema={s}\n", .{ sql, bytes });
         var parsed = try parseValidatedTableSchema(a, bytes);
         defer parsed.deinit(a);
         const runtime = try deriveRuntimeTableSchema(a, parsed);
         defer storage_schema.freeSchema(a, runtime);
         const checks_layout = try deriveRelationalCheckLayout(a, parsed);
         defer storage_schema.freeSchema(a, checks_layout);
-        try std.testing.expect(runtime.requires_text_expressions);
-        try std.testing.expect(checks_layout.requires_text_expressions);
+        try std.testing.expectEqual(case.runtime_function, runtime.requires_text_expressions);
+        try std.testing.expectEqual(case.runtime_function, checks_layout.requires_text_expressions);
         const serialized = try storage_schema.serializeSchema(a, runtime);
         defer a.free(serialized);
         const restored = try storage_schema.deserializeSchema(a, serialized);
         defer storage_schema.freeSchema(a, restored);
-        try std.testing.expect(restored.requires_text_expressions);
+        try std.testing.expectEqual(case.runtime_function, restored.requires_text_expressions);
     }
 }
 
@@ -1954,6 +1964,7 @@ fn expressionCapabilitySchema(schema: ParsedTableSchema) storage_schema.TableSch
         .requires_uuid_defaults = requiresUuidDefaults(schema),
         .requires_clock_defaults = requiresClockDefaults(schema),
         .requires_range_expressions = requiresRangeExpressions(schema),
+        .requires_temporal_keys = requiresTemporalKeys(schema),
     };
 }
 
@@ -1992,6 +2003,13 @@ fn rangeExpressionWire(expression: anytype, depth: usize) bool {
     if (depth >= @import("relational_expression.zig").max_depth) return false;
     if (expression.type) |kind| if (@import("../sql/range_value.zig").kindFromType(kind) != null) return true;
     if (expression.args) |args| for (args) |arg| if (rangeExpressionWire(arg, depth + 1)) return true;
+    return false;
+}
+
+fn requiresTemporalKeys(schema: ParsedTableSchema) bool {
+    if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| {
+        if (constraint.without_overlaps_column != null) return true;
+    };
     return false;
 }
 
@@ -4188,4 +4206,34 @@ test "SQL range defaults retain typed literals immutable reader capabilities and
     var document = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"id\":\"one\"}", .{});
     try validator.execution.expressions.?.applyJson(arena.allocator(), &document);
     try std.testing.expectEqualStrings("[1.00,10.000)", document.object.get("value").?.string);
+}
+
+test "SQL range temporal declarations fence old readers and distinguish equality generations" {
+    const a = std.testing.allocator;
+    var compiled = try @import("../sql/compiler.zig").compile(a, "CREATE TABLE temporal_products (sku TEXT, valid_at NUMRANGE, CONSTRAINT period_key UNIQUE (sku, valid_at WITHOUT OVERLAPS))", .{});
+    defer compiled.deinit();
+    const bytes = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, compiled.statement.create_table);
+    defer a.free(bytes);
+    var parsed = try impl.parseSchema(a, bytes);
+    defer parsed.deinit(a);
+    const runtime = try deriveRuntimeTableSchema(a, parsed);
+    defer storage_schema.freeSchema(a, runtime);
+    try std.testing.expect(runtime.requires_temporal_keys);
+    try std.testing.expectEqual(@as(u32, 36), storage_schema.requiredReaderVersion(runtime));
+    const encoded = try storage_schema.serializeSchema(a, runtime);
+    defer a.free(encoded);
+    const restored = try storage_schema.deserializeSchema(a, encoded);
+    defer storage_schema.freeSchema(a, restored);
+    try std.testing.expect(restored.requires_temporal_keys);
+    try std.testing.expect(!storage_schema.readerRequirementsForSchema(restored).canInterpret(35));
+    const declarations = @import("relational_declarations.zig");
+    const temporal = try declarations.definitionFingerprints(a, parsed, runtime);
+    defer declarations.freeDefinitions(a, temporal);
+    @constCast(parsed.unique_constraints.?.value)[0].without_overlaps_column = null;
+    // This cohort does not activate ordinary equality-only range keys/FKs.
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, declarations.definitionFingerprints(a, parsed, runtime));
+    @constCast(parsed.unique_constraints.?.value)[0].columns = parsed.unique_constraints.?.value[0].columns.?[0..1];
+    const equality = try declarations.definitionFingerprints(a, parsed, runtime);
+    defer declarations.freeDefinitions(a, equality);
+    try std.testing.expect(!std.mem.eql(u8, &temporal[0].fingerprint, &equality[0].fingerprint));
 }
