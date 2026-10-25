@@ -24,10 +24,15 @@ fn equivalent(left: []const u8, right: []const u8) bool {
     while (l.next()) |word| if (!std.mem.eql(u8, word, r.next() orelse return false)) return false;
     return r.next() == null;
 }
+fn validBox(box: [4]f64) bool {
+    for (box) |value| if (!std.math.isFinite(value)) return false;
+    return box[0] < box[2] and box[1] < box[3];
+}
 fn contains(outer: [4]f64, inner: [4]f64) bool {
-    for (outer ++ inner) |value| if (!std.math.isFinite(value)) return false;
-    return outer[0] < outer[2] and outer[1] < outer[3] and inner[0] <= inner[2] and inner[1] <= inner[3] and
-        inner[0] >= outer[0] and inner[1] >= outer[1] and inner[2] <= outer[2] and inner[3] <= outer[3];
+    return inner[0] >= outer[0] and inner[1] >= outer[1] and inner[2] <= outer[2] and inner[3] <= outer[3];
+}
+fn intersects(left: [4]f64, right: [4]f64) bool {
+    return left[0] < right[2] and right[0] < left[2] and left[1] < right[3] and right[1] < left[3];
 }
 
 /// Native evidence is immutable and already in source coordinates. Matching a
@@ -36,17 +41,22 @@ fn contains(outer: [4]f64, inner: [4]f64) bool {
 pub fn nativeSupports(backing: std.mem.Allocator, native_text: []const u8, native_regions: []const c.Region, region: ?c.Region, candidate: []const u8) !bool {
     if (std.mem.trim(u8, candidate, " \t\r\n").len == 0) return false;
     const selected = region orelse return equivalent(native_text, candidate);
+    _ = backing;
     const box = selected.bbox orelse return false;
-    var output = std.Io.Writer.Allocating.init(backing);
-    defer output.deinit();
+    if (!validBox(box)) return false;
+    var observed = std.mem.tokenizeAny(u8, candidate, " \t\r\n");
     for (native_regions) |run| {
-        if (run.origin != .native) continue;
-        const run_box = run.bbox orelse continue;
-        if (!contains(box, run_box)) continue;
-        if (output.written().len > 0) try output.writer.writeByte('\n');
-        try output.writer.writeAll(run.text);
+        if (run.origin != .native or std.mem.trim(u8, run.text, " \t\r\n").len == 0) continue;
+        // Unknown geometry cannot prove exclusion from the crop. Neither a
+        // crossing run nor a malformed box may silently disappear from proof.
+        const run_box = run.bbox orelse return false;
+        if (!validBox(run_box)) return false;
+        if (!intersects(box, run_box)) continue;
+        if (!contains(box, run_box)) return false;
+        var expected = std.mem.tokenizeAny(u8, run.text, " \t\r\n");
+        while (expected.next()) |word| if (!std.mem.eql(u8, word, observed.next() orelse return false)) return false;
     }
-    return equivalent(output.written(), candidate);
+    return observed.next() == null;
 }
 
 test "document native grounding rejects text from another region and partial page coverage" {
@@ -84,4 +94,36 @@ test "document native coverage allows added visual text but counts repeats and o
     try std.testing.expect(!coversNative("Header Body", "Header"));
     try std.testing.expect(!coversNative("Total Total", "Total"));
     try std.testing.expect(!coversNative("Header Body", "Body Header"));
+}
+
+test "document native crop grounding requires complete known noncrossing geometry without allocation" {
+    const known = c.Region{ .id = 0, .text = "Total", .bbox = .{ 1, 1, 4, 4 }, .origin = .native };
+    const crop = c.Region{ .id = 2, .text = "Total", .bbox = .{ 0, 0, 10, 10 } };
+    const a = std.testing.failing_allocator;
+    for ([_]?[4]f64{
+        .{ 5, 1, 15, 4 }, // Crosses the right boundary.
+        .{ -1, 1, 2, 4 }, // Crosses the left boundary.
+        .{ 1, -1, 4, 2 }, // Crosses the top boundary.
+        .{ 1, 5, 4, 15 }, // Crosses the bottom boundary.
+        .{ -1, -1, 11, 11 }, // Encloses the crop.
+        null,
+        .{ 2, 2, 1, 4 },
+        .{ 1, 1, 1, 4 },
+        .{ std.math.nan(f64), 1, 4, 4 },
+    }) |box| {
+        const unknown = c.Region{ .id = 1, .text = "12.50", .bbox = box, .origin = .native };
+        // Crossing/unknown runs must be found regardless of enumeration order.
+        try std.testing.expect(!try nativeSupports(a, "Total 12.50", &.{ known, unknown }, crop, "Total"));
+        try std.testing.expect(!try nativeSupports(a, "12.50 Total", &.{ unknown, known }, crop, "Total"));
+    }
+    for ([_][4]f64{ .{ 10, 1, 15, 4 }, .{ 1, 10, 4, 15 }, .{ -4, 1, 0, 4 }, .{ 1, -4, 4, 0 }, .{ 20, 20, 30, 30 } }) |box| {
+        const outside = c.Region{ .id = 1, .text = "12.50", .bbox = box, .origin = .native };
+        try std.testing.expect(try nativeSupports(a, "Total 12.50", &.{ known, outside }, crop, "Total"));
+    }
+    const amount = c.Region{ .id = 1, .text = "12.50", .bbox = .{ 5, 1, 9, 4 }, .origin = .native };
+    try std.testing.expect(try nativeSupports(a, "Total 12.50", &.{ known, amount }, crop, " Total \n12.50 "));
+    try std.testing.expect(!try nativeSupports(a, "Total 12.50", &.{ known, amount }, crop, "Total"));
+    var invalid_crop = crop;
+    invalid_crop.bbox = .{ 10, 0, 0, 10 };
+    try std.testing.expect(!try nativeSupports(a, "Total", &.{known}, invalid_crop, "Total"));
 }

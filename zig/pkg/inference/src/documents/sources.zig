@@ -39,6 +39,8 @@ pub const Source = struct {
     fingerprint: [64]u8,
     bytes: []const u8,
     page_selection: ?[]const usize = null,
+    // Source-owned immutable fork metadata is reused across bounded page calls.
+    render_template: ?pdf.reader.RenderForkTemplate = null,
     max_regions: usize = (c.Limits{}).max_regions,
     parsed: union(enum) { pdf: pdf.reader.Reader, image: void, slides: struct { archive: ooxml.Archive, slides: []const Slide } },
     pub fn init(a: A, input: Input, bytes: []const u8, limits: c.Limits, control: c.Control) !Source {
@@ -124,6 +126,7 @@ pub const Source = struct {
         return result;
     }
     pub fn deinit(self: *Source) void {
+        if (self.render_template) |*template| template.deinit();
         if (self.parsed == .pdf) self.parsed.pdf.deinit();
     }
     pub fn pageCount(self: *Source) !usize {
@@ -211,17 +214,39 @@ pub const Source = struct {
         switch (self.parsed) {
             .pdf => |*p| {
                 const request = pdf.PageRenderRequest{ .page_number = number, .max_pixels = run.limits.max_pixels, .max_dimension = @min(run.limits.max_dimension, 4096), .max_output_bytes = run.limits.max_source_bytes };
-                const geometry = try pdf.planParsedPageRenderGeometry(p, request);
-                try run.pixels(@as(u64, geometry.width) * geometry.height);
-                const rendered = pdf.renderParsedPagePngAdaptiveAlloc(a, p, number, 150, run.limits.max_pixels, @min(run.limits.max_dimension, 4096)) catch |err| switch (err) {
+                const plan = try pdf.prepareParsedPageRenderPlan(p, request);
+                const geometry = plan.geometry();
+                // Charge the actual initial raster once, before painting. PNG
+                // output fitting may shrink it, but cannot refund physical work.
+                try run.pixels(geometry.pixels);
+                if (self.render_template == null) self.render_template = try p.prepareRenderForkTemplate(p.alloc, p.cancellationProbe());
+                const Probe = struct {
+                    fn cancelled(raw: ?*const anyopaque) bool {
+                        const control: *const c.Control = @ptrCast(@alignCast(raw.?));
+                        control.check() catch return true;
+                        return false;
+                    }
+                };
+                var batch = try pdf.renderPreparedPagesBatchAlloc(a, p, &.{plan}, .{
+                    .max_batch_pages = 1,
+                    .max_parallel_pages = 1,
+                    .max_inflight_pixels = geometry.pixels,
+                    .profile = .exact,
+                    .fork_template = &self.render_template.?,
+                    .cancellation = .{ .context = &run.control, .is_cancelled_fn = Probe.cancelled },
+                });
+                defer batch.deinit(a);
+                if (batch.results[0].failure) |err| switch (err) {
                     error.UnsupportedPdfAnnotationRendering => return error.DocumentRendererUnavailable,
                     else => return err,
                 };
+                const rendered = batch.results[0].rendered orelse return error.DocumentRendererUnavailable;
+                // Retain the batch's ownership until all transform work succeeds.
                 const page_box = try p.extractPageBox(number);
                 const rotation = @mod((try p.extractPageRotation(number)) orelse 0, 360);
-                const unit = 72.0 / @as(f64, @floatFromInt(rendered.effective_dpi));
-                const width: f64 = @floatFromInt(if (rotation == 90 or rotation == 270) rendered.height else rendered.width);
-                const height: f64 = @floatFromInt(if (rotation == 90 or rotation == 270) rendered.width else rendered.height);
+                const unit = 72.0 / @as(f64, @floatFromInt(geometry.effective_dpi));
+                const width: f64 = @floatFromInt(if (rotation == 90 or rotation == 270) geometry.height else geometry.width);
+                const height: f64 = @floatFromInt(if (rotation == 90 or rotation == 270) geometry.width else geometry.height);
                 const transform: c.Transform = .{ .matrix = switch (rotation) {
                     0 => .{ unit, 0, page_box.min_x, 0, -unit, page_box.min_y + height * unit, 0, 0, 1 },
                     90 => .{ 0, unit, page_box.min_x, unit, 0, page_box.min_y, 0, 0, 1 },
@@ -229,7 +254,17 @@ pub const Source = struct {
                     270 => .{ 0, -unit, page_box.min_x + width * unit, -unit, 0, page_box.min_y + height * unit, 0, 0, 1 },
                     else => return error.InvalidDocumentTransform,
                 } };
-                return .{ .raster_to_source = transform, .bytes = rendered.png, .mime_type = "image/png", .width = rendered.width, .height = rendered.height, .effective_dpi = rendered.effective_dpi };
+                // Fitting can use nonintegral per-axis scales. Rounded DPI is
+                // advisory; compose exact pixel ratios for crop/evidence geometry.
+                const x_scale = @as(f64, @floatFromInt(geometry.width)) / @as(f64, @floatFromInt(rendered.width));
+                const y_scale = @as(f64, @floatFromInt(geometry.height)) / @as(f64, @floatFromInt(rendered.height));
+                var fitted = transform;
+                for (0..3) |row| {
+                    fitted.matrix[row * 3] *= x_scale;
+                    fitted.matrix[row * 3 + 1] *= y_scale;
+                }
+                batch.results[0].rendered = null;
+                return .{ .raster_to_source = fitted, .bytes = rendered.png, .mime_type = "image/png", .width = rendered.width, .height = rendered.height, .effective_dpi = rendered.effective_dpi };
             },
             .image => {
                 const info = try image.inspectEncoded(self.bytes);
@@ -311,4 +346,47 @@ test "document PDF analysis preserves transformed regions and enforces active li
     var excess = try Source.init(a, .{ .id = "excess", .url = "", .media_type = "application/pdf" }, @embedFile("testdata/excess-text-runs.pdf"), .{}, .{});
     defer excess.deinit();
     try std.testing.expectError(error.DocumentRegionLimitExceeded, excess.analyze(a, 1, .{}));
+}
+
+test "document PDF encoding enforces byte admission reuses source forks and composes fitted geometry" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = @embedFile("testdata/two-pages.pdf");
+    var source = try Source.init(a, .{ .id = "pdf", .url = "", .media_type = "application/pdf" }, bytes, .{}, .{});
+    defer source.deinit();
+    var original_run = c.Run{ .limits = .{} };
+    const original = try source.render(a, 1, &original_run);
+    const frozen_entries = source.render_template.?.xref_entries.ptr;
+    var fitted_run = c.Run{ .limits = .{ .max_source_bytes = bytes.len } };
+    const fitted = try source.render(a, 1, &fitted_run);
+    try std.testing.expect(original.bytes.len > bytes.len);
+    try std.testing.expect(fitted.bytes.len <= bytes.len);
+    try std.testing.expectEqual(original_run.usage.rendered_pixels, fitted_run.usage.rendered_pixels);
+    try std.testing.expect(fitted_run.usage.rendered_pixels > @as(u64, fitted.width) * fitted.height);
+    for ([_][2]f64{ .{ 0, 0 }, .{ 0.5, 0.5 }, .{ 1, 1 } }) |fraction| {
+        const before = try original.raster_to_source.point(.{ fraction[0] * @as(f64, @floatFromInt(original.width)), fraction[1] * @as(f64, @floatFromInt(original.height)) });
+        const after = try fitted.raster_to_source.point(.{ fraction[0] * @as(f64, @floatFromInt(fitted.width)), fraction[1] * @as(f64, @floatFromInt(fitted.height)) });
+        try std.testing.expectApproxEqAbs(before[0], after[0], 0.000001);
+        try std.testing.expectApproxEqAbs(before[1], after[1], 0.000001);
+    }
+    const second = try source.render(a, 2, &fitted_run);
+    try std.testing.expect(second.bytes.len <= bytes.len);
+    try std.testing.expectEqual(frozen_entries, source.render_template.?.xref_entries.ptr);
+    try std.testing.expectEqual(@as(usize, 0), fitted_run.usage.physical_model_calls);
+    var tiny = c.Run{ .limits = .{ .max_source_bytes = 1 } };
+    try std.testing.expectError(error.RenderedPageOutputTooLarge, source.render(a, 1, &tiny));
+    try std.testing.expectEqual(@as(usize, 0), tiny.usage.physical_model_calls);
+    const Cancelled = struct {
+        checks: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.checks >= 3) return error.Canceled;
+        }
+    };
+    var cancelled = Cancelled{};
+    var interrupted = c.Run{ .limits = .{}, .control = .{ .ptr = &cancelled, .check_fn = Cancelled.check } };
+    try std.testing.expectError(error.Canceled, source.render(a, 1, &interrupted));
+    try std.testing.expect(interrupted.usage.rendered_pixels > 0);
 }

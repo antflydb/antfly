@@ -272,6 +272,14 @@ borderless links without appearances do not require visual work. See the
 [PDF reference, annotation flags](https://printtechnologies.org/wp-content/uploads/2020/03/pdfreference_v1-4-1.pdf)
 for the screen/print visibility rules.
 
+PDF OCR executes prepared render plans with an encoded-output ceiling before
+model dispatch. The renderer fits PNG output within the active source-byte limit
+or fails explicitly, while preserving the initial raster's pixel charge. Page
+calls reuse source-owned render-fork metadata. Fitted raster coordinates compose
+the original render transform with exact per-axis resize ratios; rounded DPI is
+advisory and cannot shift crop or evidence geometry. Cancellation applies during
+painting and output fitting, and page buffers are released on failure.
+
 Sources parse once. Remote routing/extraction/verification share one bounded,
 resource-accounted HTTP pool per run. Source buffers release between documents and page scratch
 buffers release between pages. Local child invocations borrow encoded image
@@ -318,6 +326,11 @@ table-cell ordering differences while preserving exact numeric values. Unchanged
 answers retain accepted provenance, structure and completion without another copy.
 A provenance upgrade requires matching native source text or an independent
 literal verifier; nonliteral verifier output cannot establish literal evidence.
+Regional native grounding requires every nonempty native run to have valid bounds.
+Intersecting runs must be wholly contained in the crop; crossing or unknown bounds
+require independent visual verification. Boundary-touching and disjoint runs do
+not contribute crop text. Grounding compares ordered tokens directly without
+allocating a joined text buffer.
 Verifier independence uses precomputed sets of pinned leaf model identities,
 including composite dependencies. Aliases, copied weights and shared hosted model
 references are rejected during preflight before source downloads or model calls.

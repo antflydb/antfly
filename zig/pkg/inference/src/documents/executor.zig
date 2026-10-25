@@ -733,3 +733,29 @@ test "document native shortcut leaves ambiguous placements unresolved without di
     try std.testing.expect(ir.hasFinding(page, "region_text_mapping_unresolved"));
     try std.testing.expectEqual(@as(usize, 0), run.usage.model_calls);
 }
+
+test "document native crossing run cannot authorize amount loss through regional refinement" {
+    const Fake = struct {
+        calls: usize = 0,
+        const runs = [_]c.Region{
+            .{ .id = 0, .text = "Total", .bbox = .{ 1, 1, 4, 4 }, .origin = .native },
+            .{ .id = 1, .text = "12.50", .bbox = .{ 5, 1, 15, 4 }, .origin = .native },
+        };
+        fn read(raw: *anyopaque, _: std.mem.Allocator, _: c.Binding, _: usize, _: ?[4]f64, _: *c.Run) anyerror!Candidate {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return if (self.calls == 1) .{ .text = "Total 12.50 12.50", .regions = &.{.{ .id = 2, .text = "Total 12.50", .bbox = .{ 0, 0, 10, 10 }, .confidence = 0.1 }} } else .{ .text = "Total" };
+        }
+        fn validate(_: *anyopaque, page: c.Page, region: ?c.Region, candidate: Candidate, _: *c.Run) anyerror!Validation {
+            return if (try @import("source_support.zig").nativeSupports(std.testing.allocator, page.native_text, &runs, region, candidate.text)) .source_supported else .unsupported;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var fake = Fake{};
+    var run = c.Run{ .limits = .{} };
+    const page = try readPage(arena.allocator(), .{ .models = &.{ .{ .name = "fast", .model = "fast", .operation = .read }, .{ .name = "accurate", .model = "accurate", .operation = .read } }, .read = .{ .reader = "fast", .accurate_reader = "accurate", .native_text = .always_ocr } }, .{ .ptr = &fake, .read_fn = Fake.read, .validate_fn = Fake.validate }, 0, .{ .source_id = "receipt", .number = 1, .kind = .page, .native_text = "Total 12.50" }, &run);
+    try std.testing.expect(!page.regions[0].validated);
+    try std.testing.expectEqualStrings("Total 12.50 12.50", page.text);
+    try std.testing.expectEqual(c.Status.unresolved, page.status);
+}
