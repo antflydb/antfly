@@ -538,6 +538,11 @@ pub const Directory = struct {
                 self.payload = null;
                 self.complete = true;
             }
+            /// Registered owners can keep a locally stale pin operation pending
+            /// even during joined cleanup; the next manager pass resumes it.
+            pub fn resumeWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
+                try self.retire(allocator, original);
+            }
             pub fn retireWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: @import("../../common/read_admission.zig").Port) !void {
                 try self.retire(allocator, original);
             }

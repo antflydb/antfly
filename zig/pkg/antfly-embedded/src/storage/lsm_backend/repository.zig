@@ -59,6 +59,7 @@ pub const ObsoletePath = struct {
 pub const RunOwner = struct {
     refs: std.atomic.Value(usize) = .init(1),
     raw: *Run,
+    registered: ?*@import("../resource_manager.zig").PayloadRetirement = null,
     destroy: *const fn (*RunOwner, Allocator) void,
     pub fn retain(self: *RunOwner) *RunOwner {
         _ = self.refs.fetchAdd(1, .monotonic);
@@ -227,6 +228,7 @@ pub const Run = struct {
 
     pub fn ensureState(self: *Run, allocator: Allocator) !*state_mod.State {
         if (self.state == null) {
+            if (self.owner) |owner| if (owner.registered != null) return error.ExecutionWaitUnsupported;
             const path = self.path orelse return error.RunStateUnavailable;
             self.state = try loadRunStateAlloc(allocator, path);
         }
@@ -235,6 +237,7 @@ pub const Run = struct {
 
     pub fn ensureStateWithStorage(self: *Run, allocator: Allocator, storage: storage_io.Storage) !*state_mod.State {
         if (self.state == null) {
+            if (self.owner) |owner| if (owner.registered != null) return error.ExecutionWaitUnsupported;
             const path = self.path orelse return error.RunStateUnavailable;
             self.state = try loadRunStateAllocWithStorage(storage, allocator, path);
         }
@@ -243,6 +246,7 @@ pub const Run = struct {
 
     pub fn ensureBloomFilter(self: *Run, allocator: Allocator) !bloom.OwnedFilter {
         if (self.bloom_filter) |filter| return filter;
+        if (self.owner) |owner| if (owner.registered != null) return error.ExecutionWaitUnsupported;
         var native = try storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
         defer native.deinit();
         return try self.ensureBloomFilterWithStorage(allocator, native.storage());
@@ -256,6 +260,7 @@ pub const Run = struct {
     pub fn ensureBloomFilterWithStorage(self: *Run, allocator: Allocator, storage: storage_io.Storage) !bloom.OwnedFilter {
         if (self.bloom_filter) |filter| return filter;
         if (self.table_index) |index| return index.filter;
+        if (self.owner) |owner| if (owner.registered != null) return error.ExecutionWaitUnsupported;
         const path = self.path orelse return error.RunBloomFilterUnavailable;
         self.table_index = try loadRunTableIndexAllocWithStorage(storage, allocator, path);
         return self.table_index.?.filter;

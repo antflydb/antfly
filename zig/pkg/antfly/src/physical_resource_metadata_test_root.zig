@@ -927,7 +927,9 @@ test "physical cache metadata final pin retirement resumes local staleness and p
         var hook: Hook = .{ .anchor = anchor, .original_failure = original_failure };
         const payload: read_admission.Payload = .{ .ptr = &hook, .vtable = &.{ .checkpoint = Hook.check, .check_lifetime = quotaCheck, .wait_for_progress = quotaWait } };
         const original = read_admission.Port.init(&payload);
-        try std.testing.expectError(error.CompactionPlanningStale, resources.resource_manager.drainPayloadRetirementWithAdmission(original));
+        if (original_failure) {
+            try std.testing.expectError(error.CompactionPlanningStale, resources.resource_manager.drainPayloadRetirementWithAdmission(original));
+        } else _ = try resources.resource_manager.drainPayloadRetirementWithAdmission(original);
         try std.testing.expect(hook.triggered and !source.released);
         // The failing callback leaves this in-flight anchor registered. There
         // is no concurrent cleanup consumer in this controlled interleaving.
@@ -970,10 +972,15 @@ const RegisteredSourceFixture = struct {
         physical: ?Physical = null,
         usage: u64 = 0,
         released: bool = false,
+        lifetimes: usize = 1,
         fn release(raw: *anyopaque, original: ?read_admission.Port) !bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (original) |port| try port.checkpoint();
             try std.testing.expect(self.host.quota_lifetimes.load(.acquire) != 0);
+            if (self.lifetimes > 1) {
+                self.lifetimes -= 1;
+                return true;
+            }
             if (self.physical == null) self.physical = try Physical.init(self.run);
             try self.physical.?.retireWithAdmission(self.allocator, original);
             if (self.label) |label| {
@@ -982,6 +989,7 @@ const RegisteredSourceFixture = struct {
                 self.label = null;
             }
             if (original) |port| try self.manager.adjustUsageWithAdmission(.lsm_in_memory_state, &self.usage, 0, port) else try self.manager.adjustUsage(.lsm_in_memory_state, &self.usage, 0);
+            self.lifetimes = 0;
             self.released = true;
             return true;
         }
@@ -995,10 +1003,63 @@ const RegisteredSourceFixture = struct {
         }
         @panic("registered source ancestry did not retire");
     }
+    const HeaderWitness = struct {
+        manager: ?*ResourceManager = null,
+        host: ?*Resources = null,
+        active: bool = false,
+        inside: bool = false,
+        observed: bool = false,
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn refuseWait(_: *anyopaque) !void {
+            return error.TestUnexpectedWait;
+        }
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+        }
+        fn alloc(_: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            return std.testing.allocator.rawAlloc(n, alignment, ra);
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.active and !self.inside and bytes.len == @sizeOf(Store)) {
+                self.inside = true;
+                defer self.inside = false;
+                // The node/account release has completed. Give every ready
+                // cleanup peer a chance before the root header is actually free.
+                for (0..32) |_| _ = self.manager.?.drainPayloadRetirementQuiesced();
+                if (self.host.?.quota_lifetimes.load(.acquire) == 0) @panic("writer root allocator host retired before root header free");
+                self.observed = true;
+            }
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+    };
+    const Scope = lsm.Backend.PublicationResources;
+    const Store = Scope.WriterStore;
+    fn finishRoot(root: *?*Store, cursor: *?Store.Reclaimer, a: std.mem.Allocator) void {
+        if (root.*) |store| {
+            if (cursor.* == null) {
+                cursor.* = .init(store);
+                store.tree.root = null;
+            }
+            while (true) {
+                var steps: usize = 1;
+                if (cursor.*.?.step(a, &steps)) break;
+            }
+            cursor.*.?.finish(a);
+            cursor.* = null;
+            root.* = null;
+        }
+    }
     fn run(shared: bool, phase: Phase, target: ?usize, oom: bool) !Stats {
+        return runMode(shared, phase, target, oom, 0);
+    }
+    fn runMode(shared: bool, phase: Phase, target: ?usize, oom: bool, writer_count: usize) !Stats {
         const a = std.testing.allocator;
         var allocator1 = std.testing.FailingAllocator.init(a, .{});
-        var allocator2 = std.testing.FailingAllocator.init(a, .{});
+        var header_witness: HeaderWitness = .{};
+        var allocator2 = std.testing.FailingAllocator.init(header_witness.allocator(), .{});
         const a1 = allocator1.allocator();
         const a2 = allocator2.allocator();
         var parent1 = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 64 << 20 } });
@@ -1015,6 +1076,8 @@ const RegisteredSourceFixture = struct {
         var second = try Resources.initWithBudgetsAndParent(a2, budgets2, parent2.memoryParentPort());
         defer second.deinit();
         second.attachResourceManager();
+        header_witness.manager = &second.resource_manager;
+        header_witness.host = &second;
         var backend1 = lsm.Backend.init(a1, .{ .resource_manager = &first.resource_manager, .wal_enabled = false, .run_partition_key = Policy.legacy, .run_partition_key_with_admission = Policy.admitted });
         var backend1_live = true;
         defer if (backend1_live) backend1.close();
@@ -1025,7 +1088,26 @@ const RegisteredSourceFixture = struct {
         var scope2: ?*lsm.Backend.PublicationResources = null;
         var lease1: ?Lease = null;
         var lease2: ?Lease = null;
+        var extra_sources: [8]?Lease = @splat(null);
+        const route_count = @max(writer_count, 1);
+        var writer: ?*Scope.RegisteredWriter = null;
+        var writer_view: ?lsm.repository.Run = null;
+        var candidate: ?*Scope.RegisteredWriterRoot = null;
+        var root: ?*Store = null;
+        var root_cursor: ?Store.Reclaimer = null;
+        var snapshot: ?*Store = null;
+        var snapshot_cursor: ?Store.Reclaimer = null;
         defer {
+            finishRoot(&root, &root_cursor, a2);
+            finishRoot(&snapshot, &snapshot_cursor, a2);
+            if (writer_view) |*view| view.deinit(a2);
+            if (candidate) |owner| owner.requestRetirement();
+            if (writer) |owner| owner.requestRetirement();
+            for (&extra_sources) |*slot| if (slot.*) |lease| {
+                var owned = lease;
+                owned.deinit(a1);
+                slot.* = null;
+            };
             if (lease2) |*lease| lease.deinit(a2);
             if (lease1) |*lease| lease.deinit(a1);
             if (scope2) |owner| owner.requestRetirement();
@@ -1033,6 +1115,7 @@ const RegisteredSourceFixture = struct {
             drainPair(&first.resource_manager, &second.resource_manager);
             Policy.live = true;
             Policy.label = "";
+            header_witness.active = false;
         }
         scope1 = try backend1.beginPublicationResourcesWithAdmission(quotaControl());
         try scope1.?.resumeWithAdmission(quotaControl());
@@ -1055,7 +1138,7 @@ const RegisteredSourceFixture = struct {
         source.label = try a1.dupe(u8, "ancestor-domain");
         const key = try a1.alloc(u8, 32775);
         @memset(key, 'k');
-        source.run = .{ .id = 911, .level = 1, .size_bytes = 1, .path = if (shared) null else try a1.dupe(u8, "registered-source-ancestor.sst"), .smallest_namespace_name = null, .smallest_key = key, .largest_namespace_name = null, .largest_key = try a1.dupe(u8, "z"), .entry_count = 1, .bloom_filter = null, .state = if (shared) .{} else null };
+        source.run = .{ .id = 911, .level = if (writer_count == 0) 1 else 0, .size_bytes = 1, .path = if (shared) null else try a1.dupe(u8, "registered-source-ancestor.sst"), .smallest_namespace_name = null, .smallest_key = key, .largest_namespace_name = null, .largest_key = try a1.dupe(u8, "z"), .entry_count = 1, .bloom_filter = null, .state = if (shared) .{} else null };
         if (shared) {
             try source.run.state.?.appendUpsert(a1, .{ .name = "docs" }, key, key, false);
             try source.run.shareMemory(a1);
@@ -1067,9 +1150,20 @@ const RegisteredSourceFixture = struct {
         try scope1.?.beginEntryWithAdmission(&backend1, directory1, source.run, &lifetime, quotaControl());
         const resident1 = blk: {
             lease1 = try scope1.?.takeEntryWithAdmission(quotaControl());
+            for (1..route_count) |ordinal| {
+                var seed = source.run;
+                seed.id += ordinal;
+                var held: ?lsm.Backend.DirectoryEntryLifetime = .{ .context = &source, .release = Source.release };
+                source.lifetimes += 1;
+                errdefer if (held != null) {
+                    source.lifetimes -= 1;
+                };
+                try scope1.?.beginEntryWithAdmission(&backend1, directory1, seed, &held, quotaControl());
+                extra_sources[ordinal] = try scope1.?.takeEntryWithAdmission(quotaControl());
+            }
             break :blk first.resource_manager.sliceStats(.lsm_in_memory_state).used_bytes - source.usage;
         };
-        try std.testing.expect(lifetime == null and Policy.calls == 1);
+        try std.testing.expect(lifetime == null and Policy.calls == route_count);
         backend1.close();
         backend1_live = false;
         scope1.?.requestRetirement();
@@ -1104,6 +1198,84 @@ const RegisteredSourceFixture = struct {
             }
             lease2 = scope2.?.takeEntryWithAdmission(original) catch |cause| break :blk cause;
             try std.testing.expect(lease2.?.entry.domain.ptr == source.label.?.ptr);
+            if (writer_count != 0) {
+                var empty: Store = .{};
+                for (0..writer_count) |level| {
+                    writer = scope2.?.beginRegisteredWriterWithAdmission(&backend2, if (level == 0) &lease2.? else &extra_sources[level].?, .{ .level = if (writer_count == 1) 1 else 0, .gc_requested = level % 2 == 0 }, original) catch |cause| break :blk cause;
+                    writer_view = writer.?.takeRunWithAdmission(original) catch |cause| break :blk cause;
+                    writer.?.requestRetirement();
+                    writer = null;
+                    // Refusal precedes host acquisition, tree allocation and
+                    // any physical or logical ownership change.
+                    var forged_view = writer_view.?;
+                    forged_view.level += 100;
+                    try std.testing.expectError(error.InvalidArgument, scope2.?.beginRegisteredWriterRootWithAdmission(&empty, &forged_view, false, quotaControl()));
+                    var legacy: Store = .{};
+                    try std.testing.expectError(error.ExecutionWaitUnsupported, legacy.stage(a2, writer_view.?));
+                    if (!shared) {
+                        try std.testing.expectError(error.ExecutionWaitUnsupported, writer_view.?.ensureState(a2));
+                        try std.testing.expectError(error.ExecutionWaitUnsupported, writer_view.?.ensureBloomFilter(a2));
+                    }
+                    candidate = scope2.?.beginRegisteredWriterRootWithAdmission(if (root) |live| live else &empty, &writer_view.?, false, original) catch |cause| break :blk cause;
+                    candidate.?.resumeWithAdmission(original) catch |cause| break :blk cause;
+                    const next = candidate.?.takeWithAdmission(original) catch |cause| break :blk cause;
+                    candidate.?.requestRetirement();
+                    candidate = null;
+                    writer_view.?.deinit(a2);
+                    writer_view = null;
+                    if (level + 1 == writer_count and root != null) {
+                        snapshot = root;
+                        root = null;
+                    } else finishRoot(&root, &root_cursor, a2);
+                    root = next;
+                }
+                const latest = writer_count - 1;
+                const before_gc = root.?.at(0).gc_requested;
+                writer = scope2.?.beginRegisteredWriterWithAdmission(&backend2, if (latest == 0) &lease2.? else &extra_sources[latest].?, .{ .level = if (writer_count == 1) 1 else 0, .gc_requested = !before_gc }, original) catch |cause| break :blk cause;
+                writer_view = writer.?.takeRunWithAdmission(original) catch |cause| break :blk cause;
+                writer.?.requestRetirement();
+                writer = null;
+                candidate = scope2.?.beginRegisteredWriterRootWithAdmission(root.?, &writer_view.?, false, original) catch |cause| break :blk cause;
+                if (candidate.?.resumeWithAdmission(original)) |_| {
+                    break :blk error.TestExpectedDuplicateRun;
+                } else |cause| {
+                    if (cause != error.DuplicateRun) break :blk cause;
+                }
+                candidate.?.requestRetirement();
+                candidate = null;
+                candidate = scope2.?.beginRegisteredWriterRootWithAdmission(root.?, &writer_view.?, true, original) catch |cause| break :blk cause;
+                candidate.?.resumeWithAdmission(original) catch |cause| break :blk cause;
+                try std.testing.expectEqual(before_gc, root.?.at(0).gc_requested);
+                const replacement = candidate.?.takeWithAdmission(original) catch |cause| break :blk cause;
+                candidate.?.requestRetirement();
+                candidate = null;
+                writer_view.?.deinit(a2);
+                writer_view = null;
+                finishRoot(&root, &root_cursor, a2);
+                root = replacement;
+                try std.testing.expectEqual(writer_count, root.?.count());
+                try std.testing.expect(root.?.tree.account.?.independently_funded);
+                try std.testing.expectEqual(@as(u64, 0), root.?.tree.account.?.chargeOnce(913));
+                try std.testing.expectEqual(if (writer_count == 1) @as(usize, 0) else writer_count, root.?.l0Files());
+                try std.testing.expectError(error.ExecutionWaitUnsupported, root.?.stage(a2, root.?.at(0).*));
+                try std.testing.expectError(error.ExecutionWaitUnsupported, root.?.remove(a2, root.?.at(0)));
+                if (snapshot) |old| try std.testing.expectEqual(writer_count - 1, old.count());
+                for (0..writer_count) |rank| {
+                    const ordinal = writer_count - 1 - rank;
+                    try std.testing.expectEqual(@as(u32, if (writer_count == 1) 1 else 0), root.?.at(rank).level);
+                    try std.testing.expectEqual(source.run.id + ordinal, root.?.at(rank).id);
+                    try std.testing.expectEqual(if (ordinal == latest) ordinal % 2 != 0 else ordinal % 2 == 0, root.?.at(rank).gc_requested);
+                }
+                const captured = try Scope.RegisteredWriter.validate(root.?.at(0), quotaControl());
+                try std.testing.expect(captured.source.?.domain().ptr == source.label.?.ptr);
+                lease2.?.deinit(a2);
+                lease2 = null;
+                for (&extra_sources) |*slot| if (slot.*) |lease| {
+                    var owned = lease;
+                    owned.deinit(a1);
+                    slot.* = null;
+                };
+            }
             lease1.?.deinit(a1);
             lease1 = null;
             backend2.close();
@@ -1113,12 +1285,31 @@ const RegisteredSourceFixture = struct {
             for (0..2) |_| _ = first.resource_manager.drainPayloadRetirementQuiesced();
             try std.testing.expect(!source.released and !first.tryBeginDeinit());
             try std.testing.expectEqual(source.usage + resident1, first.resource_manager.sliceStats(.lsm_in_memory_state).used_bytes);
-            try std.testing.expectEqualStrings("ancestor-domain", lease2.?.entry.domain);
-            try std.testing.expectEqual(@as(usize, 1), Policy.calls);
+            if (writer_count == 0) try std.testing.expectEqualStrings("ancestor-domain", lease2.?.entry.domain) else try std.testing.expectEqualStrings("ancestor-domain", source.label.?);
+            try std.testing.expectEqual(route_count, Policy.calls);
             if (phase == .retire) {
-                lease2.?.deinit(a2);
-                lease2 = null;
                 fault.live = true;
+                if (writer_count != 0) {
+                    header_witness.active = writer_count == 1 and target == null and !oom;
+                    const live = root.?;
+                    root_cursor = .init(live);
+                    live.tree.root = null;
+                    while (true) {
+                        original.checkpoint() catch |cause| break :blk cause;
+                        var steps: usize = 1;
+                        if (root_cursor.?.step(a2, &steps)) break;
+                    }
+                    original.checkpoint() catch |cause| break :blk cause;
+                    root_cursor.?.finish(a2);
+                    root_cursor = null;
+                    root = null;
+                    header_witness.active = false;
+                    if (writer_count == 1 and target == null and !oom) try std.testing.expect(header_witness.observed);
+                    finishRoot(&snapshot, &snapshot_cursor, a2);
+                } else {
+                    lease2.?.deinit(a2);
+                    lease2 = null;
+                }
                 while (first.resource_manager.payload_retirement_ready.load(.acquire) != 0 or second.resource_manager.payload_retirement_ready.load(.acquire) != 0) {
                     _ = second.resource_manager.drainPayloadRetirementWithAdmission(original) catch |cause| break :blk cause;
                     _ = first.resource_manager.drainPayloadRetirementWithAdmission(original) catch |cause| break :blk cause;
@@ -1131,6 +1322,41 @@ const RegisteredSourceFixture = struct {
             try std.testing.expect(allocator2.has_induced_failure);
             try std.testing.expectError(error.OutOfMemory, result);
         } else if (target != null) try std.testing.expectError(fault.failure, result) else try result;
+        if (writer_count != 0 and phase == .construct and target == null and !oom) {
+            // These diagnostic roots are outside the measured constructor and
+            // retain their own prepaid header through the observer's close.
+            var header_credit = try second.resource_manager.reserveConstructionWithAdmission(.lsm_table_builder_working_set, @sizeOf(Store), quotaControl());
+            defer header_credit.retire();
+            var observer = lsm.Backend.init(a2, .{ .resource_manager = &second.resource_manager, .wal_enabled = false });
+            defer observer.close();
+            observer.runs = root.?.fork();
+            const retired = try a2.create(Store);
+            retired.* = root.?.fork();
+            observer.retired_run_stores = retired;
+            try std.testing.expect(observer.mu.tryLock());
+            observer.syncTrackedInMemoryStateUsageCurrentLocked();
+            observer.mu.unlock();
+            try std.testing.expectEqual(@as(u64, 0), observer.tracked_in_memory_state_bytes);
+            var preflight: lsm.Backend.QuiescedClosePreflight = .{};
+            const observation_payload: read_admission.Payload = .{ .ptr = &header_witness, .vtable = &.{ .checkpoint = quotaCheck, .check_lifetime = quotaCheck, .deadline_ns = HeaderWitness.deadline }, .execution_wait = .{ .ptr = &header_witness, .begin = HeaderWitness.refuseWait, .end = HeaderWitness.refuseWait } };
+            try preflight.resumeWithAdmission(&observer, std.testing.io, read_admission.Port.init(&observation_payload));
+            try std.testing.expectEqual(@as(u64, 0), preflight.bytes);
+            try std.testing.expectEqual(@as(u64, 0), root.?.memoryBytes(915));
+            try std.testing.expectEqual(@as(u64, 0), root.?.observedHeaderBytes());
+        }
+        finishRoot(&root, &root_cursor, a2);
+        finishRoot(&snapshot, &snapshot_cursor, a2);
+        if (writer_view) |*view| view.deinit(a2);
+        writer_view = null;
+        if (candidate) |owner| owner.requestRetirement();
+        candidate = null;
+        if (writer) |owner| owner.requestRetirement();
+        writer = null;
+        for (&extra_sources) |*slot| if (slot.*) |lease| {
+            var owned = lease;
+            owned.deinit(a1);
+            slot.* = null;
+        };
         if (lease2) |*lease| lease.deinit(a2);
         lease2 = null;
         if (lease1) |*lease| lease.deinit(a1);
@@ -1143,6 +1369,11 @@ const RegisteredSourceFixture = struct {
         try std.testing.expectEqual(@as(u64, 0), second.quota_lifetimes.load(.acquire));
         try std.testing.expectEqual(@as(u64, 0), first.resource_manager.sliceStats(.lsm_in_memory_state).used_bytes);
         try std.testing.expectEqual(@as(u64, 0), second.resource_manager.sliceStats(.lsm_in_memory_state).used_bytes);
+        if (writer_count != 0) {
+            try std.testing.expectEqual(@as(u64, 0), first.resource_manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+            try std.testing.expectEqual(@as(u64, 0), second.resource_manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+        }
+        header_witness.active = false;
         allocator2.fail_index = std.math.maxInt(usize);
         return stats;
     }
@@ -1166,5 +1397,26 @@ test "physical cache metadata acquired registered source aborts every allocation
     for ([_]bool{ false, true }) |shared| {
         const count = (try RegisteredSourceFixture.run(shared, .construct, null, false)).allocations;
         for (0..count) |at| _ = try RegisteredSourceFixture.run(shared, .construct, at, true);
+    }
+}
+
+test "physical cache metadata registered writer roots retain immutable sources and funded descendants after producer exit" {
+    for ([_]bool{ false, true }) |shared| for ([_]usize{ 1, 3, 8 }) |count| {
+        _ = try RegisteredSourceFixture.runMode(shared, .construct, null, false, count);
+        _ = try RegisteredSourceFixture.runMode(shared, .retire, null, false, count);
+    };
+}
+
+test "physical cache metadata registered writer roots preserve every original constructor and retirement refusal" {
+    for ([_]bool{ false, true }) |shared| for (std.enums.values(RegisteredSourceFixture.Phase)) |phase| {
+        const count = (try RegisteredSourceFixture.runMode(shared, phase, null, false, 3)).checks;
+        for (0..count) |at| _ = try RegisteredSourceFixture.runMode(shared, phase, at, false, 3);
+    };
+}
+
+test "physical cache metadata registered writer roots retire every failed allocation while their allocator stays exhausted" {
+    for ([_]bool{ false, true }) |shared| {
+        const count = (try RegisteredSourceFixture.runMode(shared, .construct, null, false, 3)).allocations;
+        for (0..count) |at| _ = try RegisteredSourceFixture.runMode(shared, .construct, at, true, 3);
     }
 }

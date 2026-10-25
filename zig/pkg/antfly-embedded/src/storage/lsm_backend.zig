@@ -2308,7 +2308,7 @@ pub const Backend = struct {
             const pass = self.pass;
             if (b.options.unpublished_outputs) |queue| self.bytes +|= queue.observedMemoryBytes();
             self.bytes +|= b.runs.memoryBytes(pass);
-            if (b.store_reclaimer) |*job| self.bytes +|= @sizeOf(RunStore) +| job.store.memoryBytes(pass);
+            if (b.store_reclaimer) |*job| self.bytes +|= job.store.observedHeaderBytes() +| job.store.memoryBytes(pass);
             inline for (.{ "run_directory", "manifest_directory", "manifest_checkpoint_directory" }) |field|
                 if (@field(b, field)) |directory| {
                     self.bytes +|= directory.accountedMemoryBytes(pass);
@@ -2349,7 +2349,7 @@ pub const Backend = struct {
                 const node: Pointer = @ptrCast(@alignCast(raw));
                 self.bytes +|= switch (phase) {
                     .active_ledger_reclamations, .ledger_snapshots => node.memoryBytes(self.pass),
-                    .retired_run_stores => @sizeOf(RunStore) +| node.memoryBytes(self.pass),
+                    .retired_run_stores => node.observedHeaderBytes() +| node.memoryBytes(self.pass),
                     .retired_domain_indexes => node.memoryBytes(),
                     .retired_closures => node.directory.accountedMemoryBytes(self.pass),
                     else => node.accountedMemoryBytes(self.pass),
@@ -3711,8 +3711,8 @@ pub const Backend = struct {
         while (publication) |job| : (publication = job.next) bytes +|= job.accountedMemoryBytes(pass);
         bytes +|= self.runs.memoryBytes(pass);
         var retired_store = self.retired_run_stores;
-        while (retired_store) |store| : (retired_store = store.retired_next) bytes +|= @sizeOf(RunStore) + store.memoryBytes(pass);
-        if (self.store_reclaimer) |*job| bytes +|= @sizeOf(RunStore) + job.store.memoryBytes(pass);
+        while (retired_store) |store| : (retired_store = store.retired_next) bytes +|= store.observedHeaderBytes() + store.memoryBytes(pass);
+        if (self.store_reclaimer) |*job| bytes +|= job.store.observedHeaderBytes() + job.store.memoryBytes(pass);
         if (self.run_directory) |directory| bytes +|= directory.accountedMemoryBytes(pass);
         if (self.manifest_directory) |directory| bytes +|= directory.accountedMemoryBytes(pass);
         if (self.manifest_checkpoint_directory) |directory| bytes +|= directory.accountedMemoryBytes(pass);
@@ -6998,6 +6998,7 @@ pub const Backend = struct {
         var cursor = self.runs.cursor();
         while (cursor.next()) |record| {
             const run = record.versionOwner();
+            if (run.owner) |owner| if (owner.registered != null) continue;
             if (run.version_ref_pinned) continue;
             const path = run.path orelse continue;
             try obsolete_path_refs.retain(path);

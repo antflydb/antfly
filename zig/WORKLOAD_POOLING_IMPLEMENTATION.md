@@ -27876,3 +27876,72 @@ hash maps. No native command fails, skips or leaks. Formatting, source-license
 and generated error-name checks pass. Final snapshots and failed-run evidence
 are retained under the physical-output-retirement receipt prefix. The full
 design remains incomplete.
+
+
+## Registered immutable writer records and prepaid root edits (2026-10-25)
+
+Publication resources can now acquire a real registered directory source into
+an immutable writer record. Its fixed RunOwner final anchor, constructor credit
+and exact allocator host are registered before source acquisition. Writer roots
+and plans take fixed references; their generic drops cannot become final
+variable destruction. Independent cleanup waits for every view to leave before
+releasing the source lease and its allocator, accounting, pin and domain ancestry.
+Typed level/GC revisions preserve physical identity without mutating old roots.
+Legacy state/filter allocation refuses these records before opening fallback IO.
+
+A registered writer-root candidate prepays its fixed frame, account, header,
+node copies and spare vector before construction. It forks a registered source
+root, then assigns all new nodes to an independently funded account. Retained
+bounded comparisons find the insertion/replacement rank; the existing retained
+AVL cursor owns every partial path and detached old entry. Abort uses bounded
+root reclamation and fixed registered entry drops. Successful take transfers a
+heap root while its registered funder remains until every descendant node,
+spare vector, accounting reference and root-header guard leaves. The root header
+is freed before dropping that last guard. Legacy allocating root edits refuse
+registered roots. Both backend accounting drivers exclude independently funded
+root allocations and retired headers from their observation charge.
+
+The multi-source retirement fixture exposed a prior local-staleness bug: a pin
+forget plan retained after a refusal can become stale when another owner retires
+the row. Registered entry retirement now reports pending and yields to the next
+manager pass for local staleness, including joined cleanup. An original caller's
+matching stale refusal is still returned unchanged. Failed-run source evidence
+is preserved. Private native ABI 126 and kernel-owner ABI 186 fence the new
+RunOwner and root contracts; no durable format or reader epoch changes.
+
+This supplies the writer-record/root side after a directory entry is registered.
+Normal compaction/flush still use their legacy publication driver. Registered
+builder/output ownership during initial directory preparation, funded obsolete
+candidates, coupled directory/run-store/WAL/manifest publication and rebase under
+the original execution, relief and whole-path default qualification remain open.
+The full design is incomplete; full GNU qualification remains waived.
+
+
+Focused ownership coverage passes 31 cases. New fixtures retain one, three and
+eight distinct file/shared-memory source generations across different allocators,
+physical hosts and memory parents after both producers exit. They check stable
+captured domains and physical identities, immutable level/GC revisions, ordered
+roots and snapshots, duplicate rejection and replacement without old-root
+mutation, and final credit/host release. Constructor and retirement checkpoints
+rotate original Canceled, DeadlineExceeded, FileNotFound and ParentMemoryBusy
+refusals; construction allocations are exhausted one at a time while cleanup's
+allocator remains exhausted. Replacement faults include a detached old entry.
+A root-header free callback drains ready peers before the allocator actually
+frees the header and verifies its host still survives. Actual legacy and
+admitted backend accounting observe active/retired registered roots without
+double charging; diagnostic headers have separate construction credit. Compile
+and fixture corrections, the stale pin-retirement failure and exact source
+snapshots are preserved with the registered-writer-root receipts.
+
+
+Final-source Debug and ReleaseFast qualification passes all five native commands
+per mode. Both input maps remain unchanged and identical across 5,658 files,
+also matching the focused v7 run. Debug passes 160 physical-sync, five output/
+publication, 124 accounting, 19 local and 25 ABI/context cases, reusing the
+identical-input v7 31-case ownership result. ReleaseFast executes all 56 ABI/
+host/context checks and passes five output/publication, six read-metadata, nine
+entry-preparation, fifteen payload-retirement, 124 accounting and 19 local cases.
+Both pass four Bloom plus 45/1/8 original-error companions. There are no failures,
+skips or leaks. Formatting, license headers and generated error-name checks pass.
+Final source snapshots and prior failures remain preserved. The original
+worktree, branch and PR are retained; the full design is still incomplete.

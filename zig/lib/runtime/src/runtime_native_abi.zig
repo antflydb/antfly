@@ -127,7 +127,8 @@ const builtin = @import("builtin");
 // Acquired allocator-host sources and registered publication resource owners.
 // Registered immutable source anchors bind routing and retained ancestry.
 // Yieldable physical run and cached table-index retirement cursors.
-pub const abi_version: u32 = 125;
+// Registered writer anchors and independently funded writer-root descendants.
+pub const abi_version: u32 = 126;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

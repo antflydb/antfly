@@ -69,7 +69,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Acquired allocator-host sources and registered publication resource owners.
 // Registered immutable source anchors bind routing and retained ancestry.
 // Yieldable physical run and cached table-index retirement cursors.
-pub const abi_version: u32 = 185;
+// Registered writer anchors and independently funded writer-root descendants.
+pub const abi_version: u32 = 186;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

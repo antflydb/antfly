@@ -116,6 +116,26 @@ pub const Owner = struct {
         try self.beginEntryFromRegisteredSourceWithAdmission(backend, directory, &captured.lease.?, original);
     }
 
+    pub const RegisteredWriter = @import("registered_writer.zig").Record;
+    pub const RegisteredWriterRoot = @import("registered_writer_root.zig").Candidate;
+    pub const WriterStore = @import("run_store.zig").Store;
+
+    pub fn beginRegisteredWriterWithAdmission(self: *Owner, backend: anytype, source: *const Directory.EntryLease, revision: RegisteredWriter.Revision, scope: admission.Port) !*RegisteredWriter {
+        var trace: admission.RejectionTrace = .{};
+        const original = trace.bind(scope).?;
+        try original.checkpoint();
+        if (self.closing) return error.InvalidArgument;
+        if (backend.options.resource_manager != self.manager or backend.allocator.ptr != self.allocator.ptr or backend.allocator.vtable != self.allocator.vtable) return error.ResourceAccountingMismatch;
+        const routing = try source.registeredRouting(original);
+        if (!routing.matches(.fromOptions(backend.options))) return error.CompactionPlanningStale;
+        return RegisteredWriter.start(self.allocator, self.manager, source, revision, original);
+    }
+    pub fn beginRegisteredWriterRootWithAdmission(self: *Owner, source: *const WriterStore, run: *const Run, replace: bool, original: admission.Port) !*RegisteredWriterRoot {
+        try original.checkpoint();
+        if (self.closing) return error.InvalidArgument;
+        return RegisteredWriterRoot.start(self.allocator, self.manager, source, run, replace, original);
+    }
+
     /// Transfer a reader/candidate lease only after construction and final
     /// registration finish. Independent retirement immediately owns the anchor.
     pub fn takeEntryWithAdmission(self: *Owner, scope: admission.Port) !Directory.EntryLease {

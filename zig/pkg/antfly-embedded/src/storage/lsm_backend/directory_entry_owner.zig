@@ -199,7 +199,9 @@ pub const Owner = struct {
         self.registration.publish();
     }
 
-    fn advance(raw: *anyopaque, original: ?admission.Port) !bool {
+    fn advance(raw: *anyopaque, scope: ?admission.Port) !bool {
+        var trace: admission.RejectionTrace = .{};
+        const original = trace.bind(scope);
         const self: *Owner = @ptrCast(@alignCast(raw));
         if (original) |port| try port.checkpoint();
         std.debug.assert(self.closing);
@@ -212,7 +214,13 @@ pub const Owner = struct {
             self.lease = null;
         }
         if (self.physical) |*physical| {
-            if (original) |port| try physical.retireWithAdmission(self.allocator, port) else physical.deinit(self.allocator);
+            physical.resumeWithAdmission(self.allocator, original) catch |cause| {
+                if (trace.failure) |first| return first;
+                // Another ready peer may retire a row whose old plan survived
+                // an earlier refusal. Let peers progress before replanning.
+                if (cause == error.CompactionPlanningStale and self.forgetting_stale) return false;
+                return cause;
+            };
             self.physical = null;
         }
         // Physical frees precede capacity return; a refused reconciliation

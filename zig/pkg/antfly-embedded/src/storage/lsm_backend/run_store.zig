@@ -147,12 +147,11 @@ const Entry = struct {
         return .{ .run_bytes = left.run_bytes +| right.run_bytes +| run.size_bytes, .manifest_bytes = left.manifest_bytes +| right.manifest_bytes +| wire, .l0_files = left.l0_files + right.l0_files + @intFromBool(run.level == 0), .l0_bytes = left.l0_bytes +| right.l0_bytes +| if (run.level == 0) run.size_bytes else 0 };
     }
     pub fn retainShared(self: Entry) Entry {
-        _ = self.payload.?.owner.retain();
+        _ = self.run.owner.?.retain();
         return self;
     }
     pub fn deinit(self: Entry, allocator: std.mem.Allocator) void {
-        const payload = self.payload orelse return;
-        payload.owner.release(allocator);
+        if (self.run.owner) |owner| owner.release(allocator);
     }
     pub fn retainedBytes(_: Entry) usize {
         return 0;
@@ -170,6 +169,8 @@ pub const Store = struct {
     tree: Tree = .{},
     destroy_run: ?DestroyRun = null,
     retired_next: ?*Store = null,
+    registered_owner: ?*@import("../resource_manager.zig").PayloadRetirement = null,
+    registered_account: ?*Account = null,
     // Explicit test/oracle projection. No production writer reads or maintains
     // this vector; structural edits invalidate it, like any borrowed cursor.
     test_projection: if (@import("builtin").is_test) ?[]Run else void = if (@import("builtin").is_test) null else {},
@@ -236,15 +237,17 @@ pub const Store = struct {
         return if (self.tree.root) |root| root.summary.manifest_bytes else 0;
     }
     pub fn fork(self: *const Store) Store {
-        return .{ .tree = self.tree.fork(), .destroy_run = self.destroy_run };
+        return .{ .tree = self.tree.fork(), .destroy_run = self.destroy_run, .registered_owner = self.registered_owner, .registered_account = if (self.registered_account) |account| account.retain() else null };
     }
     pub fn emptyLike(self: *const Store) Store {
-        return .{ .tree = .{ .account = if (self.tree.account) |account| account.retain() else null }, .destroy_run = self.destroy_run };
+        return .{ .tree = .{ .account = if (self.tree.account) |account| account.retain() else null }, .destroy_run = self.destroy_run, .registered_owner = self.registered_owner, .registered_account = if (self.registered_account) |account| account.retain() else null };
     }
     pub fn deinit(self: *Store, allocator: std.mem.Allocator) void {
         self.invalidateProjection(allocator);
+        const guard = self.registered_account;
         self.tree.deinit(allocator);
         self.* = .{ .destroy_run = self.destroy_run };
+        if (guard) |account| account.release();
     }
     pub const Reclaimer = struct {
         store: *Store,
@@ -259,10 +262,18 @@ pub const Store = struct {
         pub fn finish(self: *@This(), allocator: std.mem.Allocator) void {
             self.store.invalidateProjection(allocator);
             if (self.store.tree.account) |account| account.release();
+            const guard = self.store.registered_account;
             allocator.destroy(self.store);
+            if (guard) |account| account.release();
         }
     };
+    /// Registered root/header creators already reserve this allocation and
+    /// retain its funding through final header destruction.
+    pub fn observedHeaderBytes(self: *const Store) u64 {
+        return if (self.registered_owner != null) 0 else @sizeOf(Store);
+    }
     pub fn memoryBytes(self: *const Store, pass: u64) u64 {
+        if (self.registered_owner != null) return 0;
         return self.tree.spare.capacity * @sizeOf(*Tree.Node) +
             (if (self.tree.account) |account| account.chargeOnce(pass) else 0);
     }
@@ -307,6 +318,7 @@ pub const Store = struct {
         return self.stageInternal(allocator, run, true);
     }
     fn stageInternal(self: *Store, allocator: std.mem.Allocator, run: Run, overwrite: bool) !void {
+        if (self.registered_owner != null or (run.owner != null and run.owner.?.registered != null)) return error.ExecutionWaitUnsupported;
         var probe = run;
         if (!overwrite and Tree.find(self.tree.root, .{ .run = &probe }) != null) return error.DuplicateRun;
         try probe.ensureReadIdentity();
@@ -336,6 +348,15 @@ pub const Store = struct {
         self.tree.putPrepared(allocator, entry);
         self.invalidateProjection(allocator);
     }
+    /// Registered candidates prepay the pool and prove this exact rank with
+    /// bounded comparisons. The caller pins run through completion/abort.
+    pub fn beginRegisteredInsertion(self: *Store, run: Run, rank: usize, replacing: bool, original: @import("../../common/read_admission.zig").Port) !Tree.RankInsertion {
+        try original.checkpoint();
+        if (self.registered_owner == null) return error.ExecutionWaitUnsupported;
+        const record = try @import("registered_writer.zig").Record.validate(&run, original);
+        if (replacing and rank < self.count()) _ = try @import("registered_writer.zig").Record.validate(self.at(rank), original);
+        return Tree.RankInsertion.init(&self.tree, .{ .run = &record.run }, rank, replacing);
+    }
     pub fn adopt(self: *Store, run: *const Run) void {
         const payload = Tree.find(self.tree.root, .{ .run = @constCast(run) }).?.entry.payload.?;
         std.debug.assert(!payload.owned);
@@ -360,6 +381,7 @@ pub const Store = struct {
         rebuilt.deinit(allocator);
     }
     pub fn remove(self: *Store, allocator: std.mem.Allocator, run: *const Run) !void {
+        if (self.registered_owner != null) return error.ExecutionWaitUnsupported;
         try self.tree.prepare(allocator);
         self.tree.removePrepared(allocator, .{ .run = @constCast(run) });
         self.invalidateProjection(allocator);
