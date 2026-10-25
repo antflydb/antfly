@@ -1104,7 +1104,71 @@ const RegisteredSourceFixture = struct {
             self.waits += 1;
         }
     };
+    const GenerationCaptureProbe = struct {
+        backend: *lsm.Backend,
+        reject: bool = false,
+        checks: usize = 0,
+        fn checkpoint(_: *anyopaque) !void {
+            return error.TestCooperativeCheckpointDuringCapture;
+        }
+        fn lifetime(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.backend.mu.tryLock()) {
+                self.backend.mu.unlock();
+                return error.TestCaptureWithoutBackendMutex;
+            }
+            if (self.reject) return error.DeadlineExceeded;
+        }
+    };
+    fn qualifyGenerationCapture(a: std.mem.Allocator, manager: *ResourceManager, directory: *const Directory) !void {
+        var observer = lsm.Backend.init(a, .{ .resource_manager = manager, .wal_enabled = false });
+        defer observer.close();
+        // The publication fixture owns this live header. Backend borrows it
+        // only while its mutex serializes these capture operations.
+        observer.run_directory = @constCast(directory);
+        observer.run_directory_dirty = false;
+        observer.run_directory_generation = 123;
+        defer observer.run_directory = null;
+        var first: ?*Scope.RegisteredReadVersion = try Scope.RegisteredReadVersion.prepare(a, manager, quotaControl());
+        defer if (first) |owner| owner.requestRetirement();
+        var next: ?*Scope.RegisteredReadVersion = try Scope.RegisteredReadVersion.prepare(a, manager, quotaControl());
+        defer if (next) |owner| owner.requestRetirement();
+        var probe: GenerationCaptureProbe = .{ .backend = &observer };
+        const payload: read_admission.Payload = .{ .ptr = &probe, .vtable = &.{ .checkpoint = GenerationCaptureProbe.checkpoint, .check_lifetime = GenerationCaptureProbe.lifetime } };
+        const original = read_admission.Port.init(&payload);
+        try std.testing.expect(observer.mu.tryLock());
+        defer observer.mu.unlock();
+        try std.testing.expectError(error.CompactionPlanningStale, observer.capturePreparedReadVersionWithAdmission(first.?, 122, original));
+        observer.run_directory_dirty = true;
+        try std.testing.expectError(error.CompactionPlanningStale, observer.capturePreparedReadVersionWithAdmission(first.?, 123, original));
+        observer.run_directory_dirty = false;
+        probe.reject = true;
+        try std.testing.expectError(error.DeadlineExceeded, observer.capturePreparedReadVersionWithAdmission(first.?, 123, original));
+        probe.reject = false;
+        try std.testing.expect(!first.?.taken and first.?.version.directory == null);
+        const epoch = try observer.capturePreparedReadVersionWithAdmission(first.?, 123, original);
+        first = null;
+        try std.testing.expect(epoch.owned_retirement != null and epoch.registered and observer.live_read_versions == epoch);
+        // A peer's prepared frame remains available when the epoch already
+        // exists, and can bind to the next generation after invalidation.
+        try std.testing.expectEqual(epoch, try observer.capturePreparedReadVersionWithAdmission(next.?, 123, original));
+        try std.testing.expect(!next.?.taken and next.?.version.directory == null);
+        _ = epoch.references.fetchAdd(1, .monotonic);
+        defer epoch.release(&observer);
+        observer.invalidateReadVersion();
+        try std.testing.expect(observer.read_version == null and epoch.registered);
+        try std.testing.expectError(error.CompactionPlanningStale, observer.capturePreparedReadVersionWithAdmission(next.?, 123, original));
+        observer.run_directory_dirty = false;
+        const successor = try observer.capturePreparedReadVersionWithAdmission(next.?, observer.run_directory_generation, original);
+        next = null;
+        try std.testing.expect(successor != epoch and successor.live_next == epoch and epoch.live_previous == successor);
+        observer.invalidateReadVersion();
+        try std.testing.expect(observer.live_read_versions == epoch and epoch.live_previous == null);
+        try std.testing.expect(probe.checks >= 8);
+    }
     fn qualifyProjectionCoalescing(a: std.mem.Allocator, manager: *ResourceManager, directory: *const Directory) !void {
+        try qualifyGenerationCapture(a, manager, directory);
         for ([_]bool{ false, true }) |reject_after_progress| {
             var observer = lsm.Backend.init(a, .{ .resource_manager = manager, .wal_enabled = false });
             defer observer.close();

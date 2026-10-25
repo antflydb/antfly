@@ -50,6 +50,14 @@ pub const Owner = struct {
         var trace: admission.RejectionTrace = .{};
         const original = trace.bind(scope).?;
         _ = try Root.validateSource(source, a, original);
+        const self = try prepare(a, manager, original);
+        errdefer self.requestRetirement();
+        try self.captureWithAdmission(source, original);
+        return self;
+    }
+    /// Fund and register an empty frame off-lock. Its source is captured later
+    /// in a fixed tail under the caller's generation/publication mutex.
+    pub fn prepare(a: std.mem.Allocator, manager: *resources.ResourceManager, original: admission.Port) !*Owner {
         var host: ?resources.AllocatorHost = try manager.acquireAllocatorHostWithAdmission(a, original);
         defer if (host) |held| held.release();
         var construction = try manager.reserveConstructionWithAdmission(.lsm_table_builder_working_set, @sizeOf(Owner) + @sizeOf(State), original);
@@ -64,17 +72,37 @@ pub const Owner = struct {
         errdefer self.requestRetirement();
         try original.checkpoint();
         self.state = try a.create(State);
-        self.state.?.* = .{ .directory = source.forkContents() };
-        self.version.directory = &self.state.?.directory;
+        self.state.?.* = .{};
         return self;
+    }
+    /// Caller holds the source's publication mutex. Validation and six root
+    /// retains are fixed work; lifetime checks never park under that mutex.
+    pub fn captureWithAdmission(self: *Owner, source: *const Directory, original: admission.Port) !void {
+        try original.checkLifetime();
+        if (self.closing.load(.acquire) or self.taken or self.state == null or self.version.directory != null) return error.InvalidArgument;
+        _ = try Root.validateSourceFixed(source, self.allocator);
+        self.state.?.directory = source.forkContents();
+        self.version.directory = &self.state.?.directory;
+    }
+    /// Capture and transfer share one lifetime check. After capture succeeds,
+    /// the transfer cannot refuse and strand a frame between generations.
+    pub fn captureAndTakeWithAdmission(self: *Owner, source: *const Directory, original: admission.Port) !*ReadVersion {
+        try self.captureWithAdmission(source, original);
+        self.taken = true;
+        return &self.version;
+    }
+    /// Fixed ownership transfer for serialized Backend installation.
+    pub fn takeCapturedWithAdmission(self: *Owner, original: admission.Port) !*ReadVersion {
+        try original.checkLifetime();
+        if (self.closing.load(.acquire) or self.taken or self.state == null or self.version.directory == null) return error.InvalidArgument;
+        self.taken = true;
+        return &self.version;
     }
     /// Transfers the one creation reference. A live epoch stays registered but
     /// does not request cleanup CPU until final release or explicit retirement.
     pub fn takeWithAdmission(self: *Owner, original: admission.Port) !*ReadVersion {
         try original.checkpoint();
-        if (self.closing.load(.acquire) or self.taken or self.state == null) return error.InvalidArgument;
-        self.taken = true;
-        return &self.version;
+        return self.takeCapturedWithAdmission(original);
     }
     fn fromVersion(version: *ReadVersion) !*Owner {
         const capability = version.owned_retirement orelse return error.ExecutionWaitUnsupported;

@@ -52,6 +52,11 @@ pub const Candidate = struct {
 
     pub fn validateSource(source: *const Directory, a: std.mem.Allocator, original: admission.Port) !?Directory.Routing {
         try original.checkpoint();
+        return validateSourceFixed(source, a);
+    }
+    /// Fixed validation for a caller that already serializes the source. No
+    /// allocation, execution lending or cooperative checkpoint is permitted.
+    pub fn validateSourceFixed(source: *const Directory, a: std.mem.Allocator) !?Directory.Routing {
         const registration = source.registered_owner orelse {
             if (source.registered_account != null or source.total_run_bytes != 0 or source.memory_run_count != 0) return error.ExecutionWaitUnsupported;
             inline for (fields) |field| {

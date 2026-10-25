@@ -28439,3 +28439,31 @@ coalescing exercises explicit execution lending. The physical metadata compiler
 reservation is 3 GiB after observing a 2.21 GiB compile. Formatting, license and
 whitespace checks passed. Latest `origin/main` was fetched again and was already
 included at `27011cf1c3`; no merge commit was necessary.
+
+
+## Prepared reader generation capture (2026-10-25)
+
+Reader frame preparation now funds/registers the header and empty snapshot state
+off-lock. Fixed source validation, six root retains and reference transfer can
+then run under the Backend mutex with lifetime checks only. Backend checks the
+expected directory generation, dirty state and actual allocator/manager identity
+before installing the epoch into its live list. Stale captures and coalescing
+with an existing epoch leave the prepared frame unconsumed for reuse or abort.
+Capture plus transfer share a single lifetime check, so rejection cannot strand
+a captured frame between generations. Native/kernel owner ABI epochs are 134/194.
+
+Debug and ReleaseFast qualification passed. The real-mutex fixture rejects every cooperative
+checkpoint during capture and exercises stale/dirty generation checks, original
+lifetime refusal, existing-epoch coalescing, frame reuse after invalidation and
+live-list unlinking with a pinned old generation. This supplies the fixed reader
+capture tail; normal caller migration, coupled writer generation capture/rebase,
+private batch installation, default flush/compaction and durable completion remain
+open. Full GNU qualification remains waived and the full goal remains active.
+
+Final capture receipts `prepared-reader-capture-v1-debug` and
+`prepared-reader-capture-v1-fast` each pass all five commands on identical,
+unchanged 5,664-file input maps. Each primary build completes 72/72 steps and
+65/65 ownership/ABI tests, with six legacy read-metadata cases and the
+4/45/1/8 Bloom/error companions. No executed case fails, skips or leaks.
+Formatting, license and whitespace checks pass. Exact changed sources are
+archived separately from the runner's fixed snapshot list.

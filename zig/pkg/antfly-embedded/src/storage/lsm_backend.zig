@@ -7178,6 +7178,25 @@ pub const Backend = struct {
         self.publishRunDirectory(directory);
     }
 
+    /// Caller holds the Backend mutex and prepared the frame off-lock. A stale
+    /// generation or an existing epoch leaves that frame unconsumed so its
+    /// caller can rebase/reuse it or transfer it to registered retirement.
+    /// No allocation or cooperative checkpoint occurs in this capture tail.
+    pub fn capturePreparedReadVersionWithAdmission(self: *Backend, frame: *@import("lsm_backend/registered_read_version.zig").Owner, generation: u64, original: read_admission.Port) !*runtime_mod.ReadVersion {
+        try original.checkLifetime();
+        if (self.options.resource_manager != frame.manager or self.allocator.ptr != frame.allocator.ptr or self.allocator.vtable != frame.allocator.vtable) return error.ResourceAccountingMismatch;
+        if (self.run_directory_dirty or self.run_directory_generation != generation) return error.CompactionPlanningStale;
+        const directory = self.run_directory orelse return error.CompactionPlanningStale;
+        if (self.read_version) |version| return version;
+        const version = try frame.captureAndTakeWithAdmission(directory, original);
+        version.registered = true;
+        version.live_next = self.live_read_versions;
+        if (self.live_read_versions) |head| head.live_previous = version;
+        self.live_read_versions = version;
+        self.read_version = version;
+        return version;
+    }
+
     pub fn createReadVersionFromDirectory(self: *Backend) !*runtime_mod.ReadVersion {
         if (self.read_version) |version| return version;
         try self.ensureRunDirectory();
