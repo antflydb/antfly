@@ -95,7 +95,7 @@ def test_logical_identity_reuses_reordered_native_indexes(
         docs = [
             {
                 "id": base + i,
-                "rank": -1 if step in (3, 6) and i == 17 else i,
+                "rank": -1 if step in (3, 6) and i == 17 else i // 64,
                 "body": (
                     "changed word" if step in (3, 6) and i == 17 else "needle same text"
                 ),
@@ -116,7 +116,7 @@ def test_logical_identity_reuses_reordered_native_indexes(
             docs = [
                 {
                     "id": base + count,
-                    "rank": count,
+                    "rank": count // 64,
                     "body": "needle same text",
                     "label": f"row-{count}",
                     "dense_native": json.dumps([1, 1]),
@@ -468,6 +468,12 @@ def test_logical_identity_reuses_reordered_native_indexes(
                     order_by=[{"field": "rank"}],
                     profile=True,
                 ),
+                dict(
+                    text,
+                    full_text_index="all_text",
+                    order_by=[{"field": "rank", "desc": True}],
+                    profile=True,
+                ),
                 text,
                 dict(text, filter_query={"term": {"path": "/id", "value": base + 17}}),
                 dict(
@@ -541,43 +547,44 @@ def test_logical_identity_reuses_reordered_native_indexes(
                     rel=1e-6,
                     abs=score_error,
                 )
-            pages = []
-            for name in ("logical", oracle):
-                ordered = dict(
-                    text,
-                    full_text_index="all_text" if native_ordering else "text",
-                    order_by=(
-                        [{"field": "rank"}]
-                        if native_ordering
-                        else [
-                            {"field": "_score", "desc": True},
-                            {"field": "_id", "desc": False},
-                        ]
-                    ),
-                    limit=5,
-                )
-                first = call("POST", f"/tables/{name}/query", ordered)
-                second = call(
-                    "POST",
-                    f"/tables/{name}/query",
-                    dict(
-                        ordered,
-                        search_after=first["hits"]["hits"][-1]["_sort"],
-                        remote_snapshot=first["remote_snapshot"],
-                    ),
-                )
-                previous = call(
-                    "POST",
-                    f"/tables/{name}/query",
-                    dict(
-                        ordered,
-                        search_before=second["hits"]["hits"][0]["_sort"],
-                        remote_snapshot=first["remote_snapshot"],
-                    ),
-                )
-                assert normalize(previous) == normalize(first)
-                pages.append([normalize(first), normalize(second)])
-            assert pages[0] == pages[1]
+            for descending in [False, True] if native_ordering else [False]:
+                pages = []
+                for name in ("logical", oracle):
+                    ordered = dict(
+                        text,
+                        full_text_index="all_text" if native_ordering else "text",
+                        order_by=(
+                            [{"field": "rank", "desc": descending}]
+                            if native_ordering
+                            else [
+                                {"field": "_score", "desc": True},
+                                {"field": "_id", "desc": False},
+                            ]
+                        ),
+                        limit=5,
+                    )
+                    first = call("POST", f"/tables/{name}/query", ordered)
+                    second = call(
+                        "POST",
+                        f"/tables/{name}/query",
+                        dict(
+                            ordered,
+                            search_after=first["hits"]["hits"][-1]["_sort"],
+                            remote_snapshot=first["remote_snapshot"],
+                        ),
+                    )
+                    previous = call(
+                        "POST",
+                        f"/tables/{name}/query",
+                        dict(
+                            ordered,
+                            search_before=second["hits"]["hits"][0]["_sort"],
+                            remote_snapshot=first["remote_snapshot"],
+                        ),
+                    )
+                    assert normalize(previous) == normalize(first)
+                    pages.append([normalize(first), normalize(second)])
+                assert pages[0] == pages[1]
             for statement in (
                 "SELECT id, label FROM {table} WHERE id >= "
                 + str(base + 17)

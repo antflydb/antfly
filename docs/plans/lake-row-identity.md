@@ -1330,3 +1330,47 @@ candidate budgets keep the existing exhaustive fallback. Regressions compare
 both complete and prefix physical recipes through forward/backward cursors,
 deletions and public IDs that reverse private identities; real Parquet tests
 exercise both declared physical recipes after import and process restart.
+
+### Reverse traversal, public tie navigation and sparse tombstones
+
+Native primary prefixes can traverse in either physical direction when every
+primary field agrees on the same reversal. Mixed reversals retain exact fallback.
+Query direction and `search_before` combine to choose physical traversal; heap
+comparison still uses the requested order. The public `_id` tie-breaker retains
+its ascending API contract. Binary seeks and endpoint proofs compare in the
+physical domain, so reversing a query never reverses only part of its tuple.
+
+Candidate admission charges new native probes. Buffered heads and EOF can drain
+with no additional allowance. A bounded fallback retains its current top-K window
+and a compressed set of examined matching ordinals; membership enumeration skips
+those ordinals rather than decorating the same rows again. This also makes a
+poorly selective optional ordered producer safe to abandon without replaying its
+completed sort work.
+
+Large primary ties can reuse the publication's existing public-file navigation,
+current `by_order` row tree and the bound index space's `by_id` map. A query-owned
+cursor visits public file digests and physical row coordinates in public-ID order,
+then translates stable IDs into the pinned index's coordinates. This works after
+external rewrites and retained-generation reuse; private index coordinates never
+stand in for public tie order. Native binary seeks identify each primary group's
+intervals before opening the cursor. Small/sparse groups decline this path using
+a cardinality cost estimate. The ordinary primary stream remains authoritative
+when this capability is unavailable.
+
+The optional cursor has an independent decoder lane, bounded tiles, a 4,096-row
+allowance and 16 MiB read allowance while preserving 32 MiB for required reads.
+Skew, optional memory pressure or exhausted optional reads falls back to native
+intervals. Complete-order evidence belongs to each emitted group and is withdrawn
+when that group falls back; exact membership, tombstone and cursor checks still
+run in the collector. Scratch/cache storage is reclaimed independently of a result
+arena. The cursor borrows its query's publication/reader authority and closes before
+that owner. No additional persisted index, artifact family or metadata protocol is
+needed: all traversed trees already belong to the publication's retention/GC graph.
+
+Unmasked term headers retain raw document frequencies. Match-all and match-none
+can also derive exact live counts with any validated tombstone mask. For a partial
+term, at most 4,096 deleted ordinals, covering no more than one sixteenth of the
+segment, are tested with chunk-local point probes; subtracting their matches gives
+an exact live count without expanding the postings. Dense masks and unsupported
+filters keep ordinary bitmap execution. Point membership rejects tombstones before
+using implicit-all or term probes, and exhaustive enumeration remains complete.

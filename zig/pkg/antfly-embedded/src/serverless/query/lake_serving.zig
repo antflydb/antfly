@@ -391,6 +391,14 @@ pub const ServingSource = struct {
         remaining_reads: u64 = 16 * 1024 * 1024,
         required_reserve: u64 = 32 * 1024 * 1024,
     };
+    /// Publication-bound public-ID traversal, returning coordinates in the
+    /// bound index space. The caller owns the cursor and each bounded tile.
+    pub const PublicRowsCursor = struct {
+        pub const Batch = struct { rows: []const @import("../../storage/rowsource/types.zig").RowRef, scanned: usize, exhausted: bool };
+        next: *const fn (*anyopaque, std.mem.Allocator, usize) anyerror!Batch,
+        ptr: *anyopaque,
+        close: *const fn (*anyopaque) void,
+    };
     pub const RowResolver = struct {
         ptr: *anyopaque,
         source: []const u8,
@@ -407,6 +415,7 @@ pub const ServingSource = struct {
         translate_many: ?*const fn (*anyopaque, std.mem.Allocator, []const @import("../../storage/rowsource/types.zig").RowRef, bool) anyerror![]const @import("../../storage/rowsource/types.zig").RowRef = null,
         translate_many_bounded: ?*const fn (*anyopaque, std.mem.Allocator, []const @import("../../storage/rowsource/types.zig").RowRef, bool, *TranslationAllowance) anyerror![]const @import("../../storage/rowsource/types.zig").RowRef = null,
         bind_index: ?*const fn (*anyopaque, []const u8) anyerror!RowResolver = null,
+        open_public_rows: ?*const fn (*anyopaque, std.mem.Allocator, bool, ?[]const u8) anyerror!?PublicRowsCursor = null,
         relocated: bool = true,
         /// Authenticated identity for compressed index-space intersections.
         coordinate_space: ?[32]u8 = null,

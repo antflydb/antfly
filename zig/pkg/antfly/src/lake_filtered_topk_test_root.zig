@@ -19,6 +19,7 @@ pub const local_test_sources = if (@import("builtin").is_test) @import("local_te
 test {
     _ = @import("api/lake_index_ordered_rows.zig");
     _ = @import("api/lake_index_text_query.zig");
+    _ = @import("api/lake_row_identity_reader.zig");
     _ = @import("api/lake_index_text_statistics.zig");
     _ = @import("api/lake_index_term_directory.zig");
     _ = @import("api/lake_index_serving_selection.zig");

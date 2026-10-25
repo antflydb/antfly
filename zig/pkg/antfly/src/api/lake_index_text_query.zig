@@ -1573,6 +1573,148 @@ const Execution = struct {
         keep_arena = true;
         return .{ .ptr = owner, .next = Ordered.next, .scanned_count = Ordered.scannedCount, .complete_order = predicate.complete_order, .close = Ordered.close };
     }
+    /// Primary groups use the same publication-bound public file/row maps as
+    /// relocation. Sparse groups decline; skewed scans degrade to native ranges.
+    const NativeTies = struct {
+        a: A,
+        execution: *Execution,
+        resolver: local.serverless_query_lake_serving.ServingSource.RowResolver,
+        identities: @import("lake_index_text_predicate.zig").Identities,
+        fn open(raw: ?*anyopaque, a: A, snapshot: *const local.index.IndexSnapshot) !?search.NativeTieOrder {
+            const execution = from(raw);
+            if (execution.overlay != null or execution.active_recent) return null;
+            const resolver = execution.index_resolver orelse return null;
+            if (resolver.open_public_rows == null) return null;
+            var identities = execution.text_identities.get(@intFromPtr(snapshot)) orelse return null;
+            identities.row_resolver = null;
+            identities.partial_inventory = true;
+            const owned = local.sql_memory_budget.reclaimingAllocator(a);
+            const self = try owned.create(@This());
+            self.* = .{ .a = owned, .execution = execution, .resolver = resolver, .identities = identities };
+            return .{ .ptr = self, .open = group, .close = close };
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.a.destroy(self);
+        }
+        fn group(raw: *anyopaque, a: A, req: types.SearchRequest, ranges: []const search.NativeDocRange, before: bool) !?search.OrderedTextCandidates {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var count: u64 = 0;
+            var last: u32 = 0;
+            for (ranges, 0..) |range, i| {
+                if (range.lower >= range.upper or (i != 0 and range.lower < last)) return error.InvalidNativeLakeTextCorpus;
+                count += range.upper - range.lower;
+                last = range.upper;
+            }
+            const goal = @as(u64, req.offset) + req.limit + 1;
+            if (count <= goal or @as(u128, goal) * self.resolver.rows / count >= count) return null;
+            const reverse = req.order_by[req.order_by.len - 1].desc != before;
+            const cursor = if (req.search_before.len != 0) req.search_before else req.search_after;
+            const public_id: ?[]const u8 = if (cursor.len != 0 and cursor[cursor.len - 1] == .string) cursor[cursor.len - 1].string else null;
+            const owned = local.sql_memory_budget.reclaimingAllocator(a);
+            const rows = (self.resolver.open_public_rows.?(self.resolver.ptr, owned, reverse, public_id) catch |err| switch (err) {
+                error.OutOfMemory, error.QueryCandidateBudgetExceeded, error.ArtifactReadBudgetExceeded => return null,
+                else => return err,
+            }) orelse return null;
+            errdefer rows.close(rows.ptr);
+            const context = try owned.create(Group);
+            context.* = .{ .a = owned, .owner = self, .rows = rows, .window = .init(owned), .ranges = &.{}, .limit = count, .page_size = @intCast(@min(64, goal)), .live = .{ .backing = owned } };
+            errdefer {
+                context.window.deinit();
+                owned.destroy(context);
+            }
+            context.ranges = try owned.dupe(search.NativeDocRange, ranges);
+            return .{ .ptr = context, .next = Group.next, .scanned_count = Group.scannedCount, .complete_order_at = Group.complete, .close = Group.close };
+        }
+        const Group = struct {
+            a: A,
+            owner: *NativeTies,
+            rows: local.serverless_query_lake_serving.ServingSource.PublicRowsCursor,
+            window: std.heap.ArenaAllocator,
+            ranges: []const search.NativeDocRange,
+            page: []const local.storage_rowsource_types.RowRef = &.{},
+            position: usize = 0,
+            exhausted: bool = false,
+            fallback: bool = false,
+            range_index: usize = 0,
+            doc: ?u32 = null,
+            scanned: u64 = 0,
+            limit: u64,
+            page_size: usize,
+            live: @import("lake_index_text_predicate.zig").LiveRowsCache = .{},
+            fn complete(raw: *anyopaque) bool {
+                return !@as(*@This(), @ptrCast(@alignCast(raw))).fallback;
+            }
+            fn scannedCount(raw: *anyopaque) u64 {
+                return @as(*@This(), @ptrCast(@alignCast(raw))).scanned;
+            }
+            fn contains(self: *const @This(), doc: u32) bool {
+                var lower: usize = 0;
+                var upper = self.ranges.len;
+                while (lower < upper) {
+                    const middle = lower + (upper - lower) / 2;
+                    if (self.ranges[middle].upper <= doc) lower = middle + 1 else upper = middle;
+                }
+                return lower < self.ranges.len and self.ranges[lower].lower <= doc;
+            }
+            fn next(raw: *anyopaque, remaining: usize) !?u32 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                const start = self.scanned;
+                while (true) {
+                    try self.owner.execution.context.ensureActive();
+                    if (self.fallback) {
+                        if (self.range_index == self.ranges.len) return null;
+                        const range = self.ranges[self.range_index];
+                        const doc = self.doc orelse range.lower;
+                        if (doc >= range.upper) {
+                            self.range_index += 1;
+                            self.doc = null;
+                            continue;
+                        }
+                        if (self.scanned - start >= remaining) return error.OrderedCandidateBudgetExceeded;
+                        self.doc = doc + 1;
+                        self.scanned += 1;
+                        return doc;
+                    }
+                    if (self.position == self.page.len) {
+                        if (self.exhausted) return null;
+                        if (self.scanned >= self.limit) {
+                            self.fallback = true;
+                            continue;
+                        }
+                        const allowance = @min(remaining -| @as(usize, @intCast(self.scanned - start)), @as(usize, @intCast(self.limit - self.scanned)));
+                        if (allowance == 0) return error.OrderedCandidateBudgetExceeded;
+                        _ = self.window.reset(.retain_capacity);
+                        const page = self.rows.next(self.rows.ptr, self.window.allocator(), @min(self.page_size, allowance)) catch |err| switch (err) {
+                            error.OutOfMemory, error.QueryCandidateBudgetExceeded, error.ArtifactReadBudgetExceeded => {
+                                self.fallback = true;
+                                continue;
+                            },
+                            else => return err,
+                        };
+                        self.page = page.rows;
+                        self.exhausted = page.exhausted;
+                        self.scanned += page.scanned;
+                        self.position = 0;
+                        if (self.page.len == 0) continue;
+                    }
+                    const row = self.page[self.position];
+                    self.position += 1;
+                    const execution = self.owner.execution;
+                    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &execution.server.lake_read_cache, .scope = execution.store.identity, .context = execution.context };
+                    if (try self.owner.identities.ordinal(self.window.allocator(), &self.live, execution.store.artifactStore(), cached, row)) |doc| if (self.contains(doc)) return doc;
+                }
+            }
+            fn close(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.rows.close(self.rows.ptr);
+                self.live.deinit(self.a);
+                self.window.deinit();
+                self.a.free(self.ranges);
+                self.a.destroy(self);
+            }
+        };
+    };
     const RelocatedTie = struct {
         execution: *Execution,
         identities: @import("lake_index_text_predicate.zig").Identities,
@@ -2280,7 +2422,7 @@ const Execution = struct {
             native_filter.include = if (numbers.items.len == 0) .none else .{ .doc_nums = numbers.items };
             effective.resolved_text_doc_filter = &native_filter;
         }
-        return search.searchTextQuery(a, effective, text, .{ .ctx = raw, .exact_doc_id_filters = true, .acquire_text_source = acquireForRanking, .resolve_indexed_filter = resolveIndexedFilter, .open_ordered_candidates = openOrderedTextCandidates, .native_count_visibility_exact = true, .project_key = publicKey, .project_doc_num = publicDocNum, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .text_index_is_chunk_backed = chunkBacked, .search_match_all = matchAll, .project_stored_search = project, .load_stored = loadOne, .load_projected_documents = loadProjected, .postprocess = postprocess });
+        return search.searchTextQuery(a, effective, text, .{ .ctx = raw, .exact_doc_id_filters = true, .acquire_text_source = acquireForRanking, .resolve_indexed_filter = resolveIndexedFilter, .open_ordered_candidates = openOrderedTextCandidates, .open_native_tie_order = NativeTies.open, .native_count_visibility_exact = true, .project_key = publicKey, .project_doc_num = publicDocNum, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .text_index_is_chunk_backed = chunkBacked, .search_match_all = matchAll, .project_stored_search = project, .load_stored = loadOne, .load_projected_documents = loadProjected, .postprocess = postprocess });
     }
     fn dispatchText(raw: ?*anyopaque, a: A, req: types.SearchRequest) !types.SearchResult {
         return search.searchText(a, req, .{ .ctx = raw, .func = searchText });
