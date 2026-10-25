@@ -49,6 +49,33 @@ Downloads have SHA-256 receipts; retries verify cached bytes. Completed release
 snapshots have their own immutable directories, so an older release inventory
 cannot silently contribute stale files to the next preparation.
 
+Internet Archive can supply historical copies when official acquisition is
+unavailable. Select the archived dataset explicitly:
+
+```sh
+./grepstein fetch-archive --dataset all-small --output ./.cache/archive
+# Use each ZIP path printed by fetch-archive, repeating --source for the releases.
+./grepstein prepare --state ./archive-pilot --source 'doj-06=/absolute/path/DataSet 6.zip'
+```
+
+The archive downloader selects original per-release ZIPs for releases 1–7 and
+12 only. It enforces a total compressed-byte budget, checks advertised MD5/SHA-1
+and ZIP structure, and records SHA-256 plus the acquisition URL, item, original
+filename, retrieval time, and official release association beside each ZIP.
+Changed archive metadata gets a separate snapshot directory. Preparation verifies
+the ZIP against its receipt and carries that provenance into every source row.
+Keep each ZIP with its `.json` receipt. Archive acquisition uses `prepare --source`;
+`prepare-small` consumes completed official `fetch` snapshots.
+
+Archived copies remain **private pending publication review**. Transport checksums
+do not establish equivalence to current DOJ bytes or current official availability.
+Official links may relocate between dataset directories: distinguish available,
+relocated, unavailable, and unresolved states; an old URL's 404 alone is not a
+withdrawal. Flag changed official bytes for review rather than silently replacing
+or relabeling archived files. The downloader records official status as unresolved.
+Do not use a merged all-files PDF as the authoritative acquisition source: it
+loses individual source identities and original-page relationships.
+
 For a small qualification fixture or manually obtained release:
 
 ```sh
@@ -108,6 +135,14 @@ flags on resume, without `--create-table`. A replaced table cannot inherit an ol
 checkpoint. `wait` requires complete and queryable aggregate **and shard**
 readiness; successful submission alone is not success. `grep` and `graph` also
 check artifact generations and unit inventories before publishing derived data.
+
+The Cloud default `v0.2.5` runtime is not qualified for this workflow: live testing
+rejects the combined index request and its table response lacks the stable
+`table_id` required by resumable loading. Native PDF extraction itself works via
+the separate enrichment API, but that is insufficient qualification. Deploy a
+reviewed runtime containing this PR's API and reader changes, then qualify the
+actual load, readiness, and artifact contracts before importing the corpus. Do
+not bypass table identity checks or infer complete coverage from accepted rows.
 
 ## Semantic and graph stages
 
@@ -173,6 +208,22 @@ their 24-hour lease expires. Do not publish a standalone catalog through Cloud
 and expect it to substitute for Colony's source job authorization policy.
 
 ## Explorer and hosting
+
+Public launch requires source-policy review and a qualified suppression path for
+source rows/artifacts, graph units, canonical grep publications, and original PDF
+delivery, including cached evidence paths. Possession of an authorized archived
+copy and current official availability are separate publication criteria.
+Keep hosting private until those requirements are met.
+
+Qualify limits at every actually exposed API, including direct Cloud endpoints
+if enabled. Test broad expensive grep and concurrent requests, query/result
+budgets, named-table scope, and denial of writes, private tables, and inference.
+Budget exhaustion must reject/throttle or report incomplete results, never a
+false complete no-match. Explorer validation alone is not this qualification.
+The explorer rejects excess search/status/PDF requests with HTTP 429 and
+`Retry-After` once four requests are active per process; its health route remains
+available. Cloud Run's replica cap bounds aggregate concurrency. This does not
+substitute for direct Cloud API admission controls.
 
 ```sh
 # ANTFLY_API_KEY must now be a read-only key scoped to the corpus table.

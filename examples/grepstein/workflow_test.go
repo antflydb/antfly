@@ -30,11 +30,48 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/antflydb/antfly/go/pkg/sources"
 )
 
 type roundTrip func(*http.Request) (*http.Response, error)
+
+func TestExplorerRejectsConcurrentExpensiveWork(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	handler := boundExplorerRequests(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(200)
+			return
+		}
+		close(entered)
+		<-release
+		w.WriteHeader(200)
+	}), 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/api/search?q=broad", nil))
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("request did not start")
+	}
+	defer func() { close(release); <-done }()
+	for _, path := range []string{"/api/search?q=broad", "/api/status", "/pdf?id=source"} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest("GET", path, nil))
+		if response.Code != 429 || response.Header().Get("Retry-After") == "" {
+			t.Fatalf("%s: %d", path, response.Code)
+		}
+	}
+	health := httptest.NewRecorder()
+	handler.ServeHTTP(health, httptest.NewRequest("GET", "/healthz", nil))
+	if health.Code != 200 {
+		t.Fatal("saturation blocked liveness")
+	}
+}
 
 func (f roundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 func response(code int, body string) *http.Response {

@@ -169,7 +169,30 @@ func explorerHandlerWithStorage(tableURL string, client *http.Client, bucket str
 		w.WriteHeader(response.StatusCode)
 		io.Copy(w, response.Body)
 	})
-	return mux
+	return boundExplorerRequests(mux, 4)
+}
+
+// Bound work at the exposed HTTP boundary, including direct API and PDF calls.
+// A full queue is explicit backpressure, never an empty successful result.
+func boundExplorerRequests(next http.Handler, limit int) http.Handler {
+	active := make(chan struct{}, limit)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/") && r.URL.Path != "/pdf" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		select {
+		case active <- struct{}{}:
+			defer func() { <-active }()
+		default:
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "Explorer is busy; retry shortly", http.StatusTooManyRequests)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
+		defer cancel()
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 func explorerQuery(q, mode string) (map[string]any, error) {

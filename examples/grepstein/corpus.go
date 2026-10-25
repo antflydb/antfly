@@ -190,6 +190,16 @@ func corpusPrepareCmd(args []string) error {
 			return err
 		}
 	}
+	archives := map[int]*archiveReceipt{}
+	for i, source := range cfg.Sources {
+		receipt, err := archiveProvenance(source)
+		if err != nil {
+			return err
+		}
+		if receipt != nil {
+			archives[i] = receipt
+		}
+	}
 	inventory := filepath.Join(*state, "inventory.ndjson")
 	if _, err = os.Stat(inventory); errors.Is(err, os.ErrNotExist) {
 		fmt.Println("Discovering and deduplicating PDF/audio sources (no OCR or transcription yet)...")
@@ -334,6 +344,9 @@ func corpusPrepareCmd(args []string) error {
 			original := entry.Locator
 			doc := map[string]any{"title": path.Base(loc.Name), "filename": path.Base(loc.Name), "mime_type": entry.MIME, "version": hex.EncodeToString(version[:]), "url": sourceURL(cfg, loc), "original_url": sourceURL(cfg, original), "metadata": map[string]any{"dataset": entry.Dataset, "document_id": entry.ID, "source_locator": loc, "page_start": loc.First, "page_end": loc.Last, "original_pages": totalPages}}
 			source := cfg.Sources[loc.Source]
+			if receipt := archives[loc.Source]; receipt != nil {
+				doc["metadata"].(map[string]any)["archive_source"] = receipt
+			}
 			if !source.Zip {
 				var receipt downloadReceipt
 				if readCorpusJSON(filepath.Join(source.Path, filepath.FromSlash(loc.Name))+".json", &receipt) == nil {
