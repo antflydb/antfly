@@ -642,3 +642,55 @@ trials, their recovery populations and the model-embedding comparison are still
 required. Short smoke runs, earlier deployment measurements and unit-test
 fixtures of the evaluator cannot supply that evidence. No new foreground SLO or
 production qualification is claimed here.
+
+
+### Follow-up harness and larger local qualification
+
+The fixed-arrival driver is shared with a separate capacity staircase. Added
+regressions cover reversed HTTP write acknowledgement order, bounded pending
+rounds, draining in-flight work on reporting failure, scheduling-versus-execution
+latency, changed sealed bundles and incomplete ANN corpus/stage rejection.
+All 128 Node tests pass. These changes strengthen the evidence path and do not
+change the native serving module or the acceptance thresholds.
+
+The 250,000-row metadata fixture passed with compact kernels, hot roots, idle
+checkpoints and the read-only observer enabled. It retained 249,872 expected rows
+after deletion, completed three collection cycles (3,828 steps), and verified
+repeated reopen and zero-write observation. Peak native working/linear memory
+was 1,285,203 / 12,713,984 bytes; the largest request used 137 operations and
+3,603,374 transferred bytes. Total local time was 231 seconds. Retained fixture
+storage after collection was 441,704,790 bytes. These are local object-fixture
+measurements, not live latency, platform memory or billed storage.
+
+The model corpus was captured through the existing Cloudflare account inference
+API with AI Gateway routing, without installing a Worker secret. After refreshing
+the existing session, all 1,010 embeddings were captured and frozen. Both modules
+then passed full publication, cold/warm queries, updates, deletion and compaction
+against 1,000 document embeddings and ten held-out query embeddings. At 8, 32
+and full probes, both returned recall@10 of 1.0 and identical mean physical
+traffic: 40.9 GETs and 1,116,461.4 bytes per query. The small generated-topic corpus
+is limited distribution evidence; it does not establish production-corpus recall.
+
+Native/Node/persisted Worker logs and both synthetic/model ANN comparisons are
+now bound in the local hashed evidence manifest. The evaluator still rejects the
+overall gate because the three paired live trials and fresh-actor populations
+have not run. Destination-specific token and cleanup authorization is pending.
+
+
+The additional 50,000-document, 384-dimensional paged-vector run accepted and
+published all 50,000 records. Its format-2 root had 64 coarse centers and 1,024
+routes/shards. Cold text/vector/sparse queries, warm lookups, point updates,
+deletion and compaction passed with the actual compact reader. Ingest/publication
+required 533 local seconds and peaked at 13,953,068 working bytes and 27,262,976
+linear bytes in the builder. The reader's ordinary cold-vector stage peaked at
+883,287 working bytes and 6,225,920 linear bytes.
+
+The full-effort recall stage failed with `ObjectIoBudgetExceeded` after the first
+two approximate operating points. This is **not** a passing 50,000-vector recall
+qualification. It exposes the one-request exhaustive-scan limit even though the
+working set remains bounded. The old benchmark process returned zero despite a
+failed stage; this run's JSON retains the failure, and the corrected harness now
+exits nonzero and rejects such evidence. The passing gate ANN populations remain
+the separately validated 10,000 synthetic and 1,000 model document comparisons.
+The [gate design](cloudflare-gates.md#exhaustive-vector-scale-boundary) records the
+required continuation work; no request budget or recall target was increased.

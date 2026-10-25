@@ -14,6 +14,7 @@
 // limitations under the License.
 
 import{assertGateRun,assertGateConfig}from'./gate-scope.mjs';
+import{verifySealedRun,assertUnusedRecovery}from'./gate-provenance.mjs';
 import {readFile,writeFile,appendFile,mkdir,readdir,unlink,rm} from 'node:fs/promises';
 import {resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -35,7 +36,7 @@ async function lifecycle(path){
  for(const service of run.services)assertGateConfig(run,service,JSON.parse(await readFile(service.config)));
  console.log(action,run.id);
  if(run.deleted){if(action==='cleanup')return;throw Error('test deployment already deleted');}
- if(action==='resume'){const builder=run.services.find(s=>s.role==='builder'),config=JSON.parse(await readFile(builder.config));config.triggers={crons:['* * * * *']};config.vars.AUTO_GC='true';await writeFile(builder.config,JSON.stringify(config,null,2));const output=await command(run,['deploy','--no-bundle','--config',builder.config]);run.versions.builder=/Current Version ID: ([a-f0-9-]{36})/.exec(output)?.[1];await command(run,['queues','resume-delivery',run.id,'--config',builder.config]);run.paused=false;await save(run);return;}
+ if(action==='resume'){assertUnusedRecovery(run);const builder=run.services.find(s=>s.role==='builder'),config=JSON.parse(await readFile(builder.config));config.triggers={crons:['* * * * *']};config.vars.AUTO_GC='true';await writeFile(builder.config,JSON.stringify(config,null,2));const output=await command(run,['deploy','--no-bundle','--config',builder.config]);run.versions.builder=/Current Version ID: ([a-f0-9-]{36})/.exec(output)?.[1];await command(run,['queues','resume-delivery',run.id,'--config',builder.config]);run.paused=false;await save(run);return;}
  if(action==='seal'){
   run.bundle_hashes={};for(const service of run.services){
    const config=JSON.parse(await readFile(service.config));config.main=service.entry;await writeFile(service.config,JSON.stringify(config,null,2));const output=resolve(run.dir,'bundle-'+service.role);await rm(output,{recursive:true,force:true});await mkdir(output,{recursive:true});
@@ -45,6 +46,7 @@ async function lifecycle(path){
   }await save(run);return;
  }
  if(action==='deploy'){
+  const errors=await verifySealedRun(run);if(errors.length)throw Error(errors.join('; '));
   if(!run.bundle_hashes)throw Error('seal before deploying');for(const args of[['r2','bucket','create',run.id],['queues','create',run.id],['queues','create',run.id+'-dead']])await command(run,[...args,'--config',run.config],{allowExists:true});
   run.versions={};for(const service of run.services){const output=await command(run,['deploy','--no-bundle','--config',service.config]);const version=/Current Version ID: ([a-f0-9-]{36})/.exec(output)?.[1];if(!version)throw Error('missing deployment version');run.versions[service.role]=version;if(service.role==='app'){run.origin=/https:\/\/[^\s]+\.workers\.dev/.exec(output)?.[0];if(!run.origin||!new URL(run.origin).hostname.startsWith(run.id+'.'))throw Error('origin mismatch');run.version=version;}await save(run);}run.deployed=true;await save(run);return;
  }

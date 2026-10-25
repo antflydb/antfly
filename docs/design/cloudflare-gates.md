@@ -149,11 +149,32 @@ smoke latency and fixing the bottleneck, run trials 1, 2 and 3 with the default
 3,600-second duration, independently or concurrently on their separate pairs.
 The runner resumes paused profiles before seeding. Final candidate recovery
 pauses Queue delivery and cron, waits for bounded work, and selects fresh actors.
+Recovery actor names are single-use per pair. Before selecting the first recovery
+epoch, the runner journals `cold_execution_id`. Further trials, capacity runs and
+`resume` reject that pair: reusing its actors would lose freshness and could wake
+fenced old owners. Keep the candidate paused for audit/cleanup after recovery.
+A warm smoke run can precede its full trial; `--cold` consumes the pair.
 Reports pin every data response to the expected app version; service bundle hashes
-and deployment versions remain in the run manifests. Every execution is archived.
+and deployment versions remain in the run manifests. Sealed bundle bytes are
+rehashed before deployment and client startup, and evaluation checks report
+identity, full/reader module hashes and all service bundle hashes against the
+sealed manifests. Every execution is archived. The evaluator checks the actual offered window,
+arrival period and round count, along with finite latency/attempt measurements.
+Reports include scheduled, started and finished timestamps so client scheduling
+delay can be distinguished from request execution. Overlapping HTTP write replies
+are reconciled by durable LSN, independently for each document and tenant fence;
+reply order cannot overwrite a newer acknowledged expectation.
 
 Use `model-fixture.mjs RUN_JSON OUTPUT` to capture the bounded model corpus through
-the configured test app's AI Gateway route. Run `benchmark.mjs --deterministic`
+the configured test app's AI Gateway route. Alternatively, append
+`--account-api` to use the existing local Cloudflare account session with the
+official account inference API and `cf-aig-gateway-id: default`. This mode
+installs no Worker secret and records `served_version: null`; it is provider
+corpus evidence, not evidence that the deployed app path works. Credentials
+remain local and are sent only as authentication to `api.cloudflare.com`.
+Refresh an expired existing session with `wrangler whoami` before capture. The
+[account API documentation](https://developers.cloudflare.com/ai-gateway/usage/rest-api/#call-a-workers-ai-model)
+describes this route. Run `benchmark.mjs --deterministic`
 with each profile's `--wasm` and `--reader-wasm` paths, once at 10,000 synthetic
 documents and once at 1,000 with `--embedding-fixture=OUTPUT`. Store reports as
 `ann-synthetic-{baseline,candidate}.json` and `ann-real-{baseline,candidate}.json`
@@ -163,6 +184,11 @@ in the gate directory, and the model corpus as `model-embeddings.json`.
 node qualification/gate-evidence.mjs GATE_JSON NATIVE_LOG NODE_LOG WORKER_LOG
 node qualification/evaluate-gate.mjs GATE_JSON
 ```
+
+ANN evidence also requires full corpus acceptance/publication and passing cold,
+warm, update, deletion and compaction stages. Retaining successful recall samples
+from an otherwise failed benchmark cannot qualify it. Benchmark processes return
+a failing exit status when a stage fails.
 
 The evidence manifest binds test logs and both ANN populations to hashes and the
 candidate/baseline native modules. Evaluation rechecks artifact hashes. Missing
@@ -178,3 +204,74 @@ private actors and Queue consumption, waits for quiescence, drains through the
 R2-only qualification endpoint, then deletes the app, Queues and bucket. Steps
 are journaled for retry; local reports remain and disposable token files are
 removed. `pause` disables cron/delivery; `resume` restores them for another run.
+
+
+## Separate capacity exploration
+
+`run-capacity.mjs` reuses the same bounded fixed-arrival driver without changing
+the acceptance workload. Use a fresh resumed disposable pair after qualification,
+or explore the 512-document workload before that pair's recovery phase:
+
+```sh
+node qualification/run-capacity.mjs GATE_JSON 1 --seconds=600 --documents=512 --periods=30000,15000,7500,3750
+```
+
+Each period schedules the same four writes and twelve reads per arrival, plus
+maintenance and minute-level frontier/Queue monitoring. The offered rates rise
+from 0.133 to 1.067 writes/s and 0.4 to 3.2 reads/s per deployment. Each stage
+converges and checks every document and receipts before proceeding. It stops on
+candidate latency/backlog limits, resource failures or client overload. Short
+stages are exploratory: their small sample populations do not establish an SLO.
+Results are saved separately with `qualified: false` and cannot replace a gate
+trial. Per-phase and per-tenant summaries include p50/p95/p99, scheduling delay,
+request execution time and retries.
+
+Increase corpus size in a separate run, for example `--documents=4096` followed
+by `--documents=16384`, while holding the arrival schedule fixed. This separates
+corpus growth from offered-load growth. Up to 100,000 documents per tenant are
+accepted by the harness; that is an input limit, not a demonstrated capacity.
+Use a fresh pair to reduce corpus size or after recovery has consumed its
+physical actors. The seed deliberately does not remove existing test documents. The fixed gate must still use its original
+512-document corpus and untouched acceptance thresholds.
+
+A capacity boundary is a measured result. Inspect foreground queue wait,
+metadata RPCs, R2 wait/bytes and native CPU before changing concurrency, prefix
+budgets or cache policy. Repeat both profiles after a fix. Do not trade away
+fencing, durable acknowledgements, recall or memory bounds to move the boundary.
+
+
+## Exhaustive vector scale boundary
+
+A further 50,000-document fixture reaches the single-request object-I/O ceiling
+for full-effort vector search. Paged query memory alone does not bound total
+network traffic: exhaustive search must inspect every exact candidate and can
+exceed 32 MiB or the operation count even while remaining inside 8 MiB of reader
+working memory. The existing approximate paths do not remove that exact-control
+requirement. Raising the request budget would hide the boundary.
+
+The long-term implementation needs an explicitly resumable native exhaustive
+search. It is outstanding work, not an implemented capability:
+
+- Bind a continuation to tenant scope, immutable generation, query/index identity,
+  visibility cutoff and an exclusive scan position. Establish and validate its
+  generation protection before scanning; never silently rebase onto a new head.
+- Scan a bounded range of exact vector pages and retain a bounded top-k heap.
+  Carry only the scan position and heap across steps, with authenticated server
+  capabilities or coordinator-owned opaque state. Caller-supplied unverified
+  scores cannot stand in for completed native work.
+- Bound bytes, operations, elapsed time and candidates in each step. Release the
+  reader slot between steps so large scans do not monopolize foreground readers.
+  Cancellation and expiry must release/reclaim their protection.
+- Validate retirement, namespace/query identity and protection on every resume.
+  A complete result requires contiguous coverage through the end of the frozen
+  generation. Return explicit incomplete/continuation state until that point.
+- Compare the final native top-k with an independent brute-force oracle at
+  50,000 documents. Inject head changes, retirement, actor restart, expired
+  protection, cancellation, duplicate resumes and tampered continuation state.
+  Report aggregate physical I/O across all steps and per-step resource maxima.
+
+This preserves exactness and bounded admission. It does not make exhaustive work
+sublinear. Packed/range reads and better approximate routing can reduce request
+amplification separately, with measured recall/byte comparisons. The fixed gate's
+current smaller exhaustive controls can pass without claiming this larger case
+is solved.

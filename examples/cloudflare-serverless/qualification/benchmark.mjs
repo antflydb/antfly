@@ -123,7 +123,7 @@ for (const count of sizes) {
     group.transferred_bytes = group.samples.reduce((sum, sample) => sum + sample.transferred_bytes, 0);
     group.decoded_manifest_cache_hits=group.samples.reduce((n,sample)=>n+(sample.decoded_manifest_cache_hits??0),0);
     group.max_decoded_manifest_cache_bytes=Math.max(0,...group.samples.map(sample=>sample.decoded_manifest_cache_bytes??0));
-    delete group.samples; stages.push(group); return group.ok;
+    delete group.samples; stages.push(group); console.error(JSON.stringify({documents:count,stage:name,ok:group.ok,error:group.error,duration_ms:group.duration_ms}));return group.ok;
   }
   await reopen();
   const complete = await stage("ingest-and-publication", async () => {
@@ -214,6 +214,7 @@ for (const count of sizes) {
     await stage("compaction", async () => { await call("compact", {compaction_max_documents: maxCompactionDocuments}); assert.equal((await call("count")).count, String(count - 1)); });
   }
   const result = {documents: count, accepted_documents: accepted, published_lsn: publishedLsn, recycled_instances: recycled, stages, routing_shape:routingShape,vector_recall: recall, objects: bucket.objects.size};
+  result.ok=accepted===count&&stages.every(stage=>stage.ok===true);if(!result.ok)process.exitCode=2;
   report.cases.push(result); console.log(JSON.stringify(result));
   await mkdir(dirname(output), {recursive: true}); await writeFile(output, JSON.stringify(report, null, 2));
 }

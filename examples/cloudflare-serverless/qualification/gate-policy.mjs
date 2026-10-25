@@ -39,6 +39,13 @@ export function evaluateTrial(report){
   check(metrics[key]!=null&&metrics["baseline_"+key]!=null&&metrics[key]<=metrics["baseline_"+key],phase+" regressed against paired baseline");
  }
  check(report.soak_ms>=policy.soak_ms,"one-hour soak incomplete");
+ check(report.offered_period_ms===30000,"fixed arrival cadence changed or missing");
+ const work=report.workload;
+ check(work?.period_ms===30000&&work.rounds===Math.ceil(report.soak_ms/30000)&&work.requested_ms===report.soak_ms&&Number.isFinite(work.started_at)&&Number.isFinite(work.offered_end_at)&&work.offered_end_at-work.started_at>=report.soak_ms,"fixed arrival execution evidence missing");
+ for(const[name,side]of[["baseline",baseline],["candidate",candidate]]){
+  check(side.samples?.every(s=>Number.isFinite(s.ms)&&s.ms>=0&&Number.isInteger(s.attempts)&&s.attempts>=1),name+" invalid request measurements");
+  check(!side.provenance_errors?.length,name+" artifact provenance mismatch");
+ }
  const lag=candidate.lag??[],queue=candidate.queue??[];
  check(lag.length>=240&&["a","b","c","d"].every(tenant=>new Set(lag.filter(s=>s.tenant===tenant).map(s=>s.minute)).size>=60),"publication-lag coverage incomplete");
  check(lag.every(s=>Number.isFinite(s.lag)&&s.lag>=0&&s.lag<=policy.max_publication_lag),"publication backlog exceeded bound");

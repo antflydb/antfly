@@ -16,6 +16,7 @@
 // Build a content-addressed evidence manifest from completed local test logs
 // and paired, deterministic native ANN reports. It performs no cloud writes.
 import{readFile,writeFile}from'node:fs/promises';
+import{validateAnnReport}from'./ann-evidence.mjs';
 import{resolve}from'node:path';
 import{createHash}from'node:crypto';
 const gate=JSON.parse(await readFile(process.argv[2])),artifacts=[];
@@ -27,6 +28,7 @@ for(const pattern of[/qualification epochs reopen/,/SQLite migration freezes/,/R
 const baseline=JSON.parse(await readFile(gate.trials[0].baseline)),candidate=JSON.parse(await readFile(gate.trials[0].candidate)),datasets=[];
 for(const kind of['synthetic','real']){
  const a=JSON.parse(await artifact(resolve(gate.dir,'ann-'+kind+'-baseline.json'))),b=JSON.parse(await artifact(resolve(gate.dir,'ann-'+kind+'-candidate.json')));
+ for(const report of[a,b])validateAnnReport(report,{minimumDocuments:kind==='synthetic'?10000:1000});
  if(a.wasm_sha256!==baseline.wasm_sha256||b.wasm_sha256!==candidate.wasm_sha256||a.reader_wasm_sha256!==baseline.reader_wasm_sha256||b.reader_wasm_sha256!==candidate.reader_wasm_sha256||a.reader_working_set_bytes!==8*1024*1024||b.reader_working_set_bytes!==8*1024*1024||!a.deterministic_fixture||!b.deterministic_fixture||a.embedding_fixture_sha256!==b.embedding_fixture_sha256||a.cases.length!==1||b.cases.length!==1||a.cases[0].documents!==b.cases[0].documents)throw Error('ANN artifact/corpus mismatch');
  if(kind==='real'){const bytes=await artifact(resolve(gate.dir,'model-embeddings.json'));if(createHash('sha256').update(bytes).digest('hex')!==a.embedding_fixture_sha256||!a.embedding_model)throw Error('model embedding fixture missing');}
  const points=[];

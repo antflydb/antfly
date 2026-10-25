@@ -14,12 +14,13 @@
 // limitations under the License.
 
 import{assertGateRun}from'./gate-scope.mjs';
+import{verifySealedRun}from'./gate-provenance.mjs';
 import {readFile} from 'node:fs/promises';
 export class GateClient {
- static async open(path){const run=JSON.parse(await readFile(path));assertGateRun(run);if(!run.token_installed||!run.origin||!run.version||!/^antfly-1278-g-/.test(run.id)||!new URL(run.origin).hostname.startsWith(run.id+'.')||!new URL(run.origin).hostname.endsWith('.workers.dev'))throw Error('invalid ready gate profile');return new GateClient(run,(await readFile(run.token_file,'utf8')).trim());}
- constructor(run,token){this.run=run;this.token=token;this.executionId=crypto.randomUUID();this.samples=[];this.errors=[];this.receipts={};this.seeds={};this.expected=new Map();this.lag=[];this.queue=[];this.cold=[];this.resourceErrors=[];}
+ static async open(path){const run=JSON.parse(await readFile(path));assertGateRun(run);const errors=await verifySealedRun(run);if(errors.length)throw Error(errors.join('; '));if(!run.token_installed||!run.origin||!run.version||!/^antfly-1278-g-/.test(run.id)||!new URL(run.origin).hostname.startsWith(run.id+'.')||!new URL(run.origin).hostname.endsWith('.workers.dev'))throw Error('invalid ready gate profile');return new GateClient(run,(await readFile(run.token_file,'utf8')).trim());}
+ constructor(run,token){this.run=run;this.token=token;this.executionId=crypto.randomUUID();this.samples=[];this.errors=[];this.receipts={};this.seeds={};this.expected=new Map();this.documentLsns=new Map();this.lag=[];this.queue=[];this.cold=[];this.resourceErrors=[];}
  async call(tenant,input,phase,{epoch=this.physicalEpochs?.[tenant]??0,scheduled=Date.now(),path='/api'}={}){
-  let attempts=0,last;
+  let attempts=0,last;const started=Date.now();
   try{for(;attempts<20&&Date.now()-scheduled<60000;attempts++){
    const response=await fetch(new URL(path,this.run.origin),{method:'POST',headers:{Authorization:'Bearer '+this.token,'Content-Type':'application/json','X-Antfly-Tenant':tenant,'X-Antfly-Physical-Epoch':String(epoch)},body:JSON.stringify(input),signal:AbortSignal.timeout(Math.max(1,Math.min(35000,scheduled+60000-Date.now())))});
    const body=await response.text();let value;try{value=JSON.parse(body);}catch{throw Error('non-JSON response: '+response.status);}
@@ -27,19 +28,29 @@ export class GateClient {
    if(response.status===503||response.status===409&&/WorkLeaseLost|WalCommitContended|PublicationConflict|PreconditionFailed/.test(value.error??'')){await new Promise(r=>setTimeout(r,250));continue;}
    if(!response.ok)throw Error('HTTP '+response.status+': '+(value.error??'unknown'));
    const version=response.headers.get('X-Antfly-Version');if(version!==this.run.version)throw Error('mixed version: '+version);
-   const sample={tenant,phase,op:input.op??path,ms:Date.now()-scheduled,scheduled_at:scheduled,finished_at:Date.now(),attempts:attempts+1,version,epoch};this.samples.push(sample);return{value,sample};
+   const finished=Date.now(),sample={tenant,phase,op:input.op??path,ms:finished-scheduled,scheduled_at:scheduled,started_at:started,finished_at:finished,scheduling_delay_ms:Math.max(0,started-scheduled),execution_ms:finished-started,attempts:attempts+1,version,epoch};this.samples.push(sample);return{value,sample};
   }throw Error('admission exhausted: '+JSON.stringify(last));}catch(error){this.errors.push({phase,tenant,ms:Date.now()-scheduled,attempts:attempts+1,error:String(error)});throw error;}
  }
  body(tenant,id,text='seed '+id){return JSON.stringify({tenant,text,payload:'x'.repeat(1024)});}
+ recordCommit(tenant,id,body,input,value){
+  if(value.committed!==true||typeof value.visibility!=='string'||!/[a-f0-9]{16}$/.test(value.visibility))throw Error('write was not durably committed');
+  const lsn=BigInt('0x'+value.visibility.slice(-16)),key=tenant+'/'+id;
+  // Fixed arrivals can overlap. HTTP completion order need not match durable
+  // commit order; preserve each document's newest acknowledged write, and the
+  // tenant's highest visibility fence, independently.
+  if(!this.documentLsns.has(key)||lsn>this.documentLsns.get(key)){this.documentLsns.set(key,lsn);this.expected.set(key,body);}
+  if(!this.receipts[tenant]||lsn>BigInt('0x'+this.receipts[tenant].slice(-16))){this.receipts[tenant]=value.visibility;this.latest??={};this.latest[tenant]={input,visibility:value.visibility};}
+ }
  async seed(documents){
-  await Promise.all(['a','b','c','d'].map(async tenant=>{
+  const seeds=await Promise.allSettled(['a','b','c','d'].map(async tenant=>{
    for(let start=0;start<documents;start+=64){const input={op:'mutate',operation_id:'gate/'+this.executionId+'/seed/'+start,mutations:Array.from({length:Math.min(64,documents-start)},(_,i)=>{const id=start+i,body=this.body(tenant,id);this.expected.set(tenant+'/'+id,body);return{kind:'upsert',doc_id:'gate/'+id,body};})};const {value}=await this.call(tenant,input,'seed');this.receipts[tenant]=value.visibility;this.seeds[tenant]={input,visibility:value.visibility};}
-  }));await this.converge(1800000);
+  }));for(const result of seeds)if(result.status==='rejected')throw result.reason;await this.converge(1800000);
  }
  async round(index,documents,scheduled){
   const outcomes=await Promise.allSettled(['a','b','c','d'].map(async tenant=>{
    const id=index%documents,body=this.body(tenant,id,'round '+this.executionId+' '+index),receipt=this.receipts[tenant];
-   const jobs=[this.call(tenant,{op:'mutate',operation_id:'gate/'+this.executionId+'/round/'+index,mutations:[{kind:'upsert',doc_id:'gate/'+id,body}]},'write',{scheduled}).then(({value})=>{if(value.committed!==true||typeof value.visibility!=='string')throw Error('write was not durably committed');this.receipts[tenant]=value.visibility;this.expected.set(tenant+'/'+id,body);this.latest??={};this.latest[tenant]={input:{op:'mutate',operation_id:'gate/'+this.executionId+'/round/'+index,mutations:[{kind:'upsert',doc_id:'gate/'+id,body}]},visibility:value.visibility};})];
+   const input={op:'mutate',operation_id:'gate/'+this.executionId+'/round/'+index,mutations:[{kind:'upsert',doc_id:'gate/'+id,body}]};
+   const jobs=[this.call(tenant,input,'write',{scheduled}).then(({value})=>this.recordCommit(tenant,id,body,input,value))];
    for(let i=0;i<3;i++)jobs.push(this.call(tenant,{op:'lookup',doc_id:'gate/'+((index*37+i)%documents),required_visibility:receipt},'read',{scheduled}).then(({value})=>{const body=JSON.parse(value.body);if(body.tenant!==tenant||body.payload!=='x'.repeat(1024))throw Error('fenced read mismatch');}));
    if(index%4===0)jobs.push(this.call(tenant,{op:'compact'},'compact',{scheduled}));
    const results=await Promise.allSettled(jobs);for(const r of results)if(r.status==='rejected')throw r.reason;
@@ -66,5 +77,5 @@ export class GateClient {
   for(const outcome of outcomes)if(outcome.status==='rejected')throw outcome.reason;
   this.verification={passed:true,bodies,receipts};
  }
- report(){return{execution_id:this.executionId,version:this.run.version,run:this.run.id,wasm_sha256:this.run.wasm_sha256,bundle_hashes:this.run.bundle_hashes,samples:this.samples,errors:this.errors,resource_errors:this.resourceErrors,verification:this.verification,lag:this.lag,queue:this.queue,cold:this.cold,converged:this.converged??false};}
+ report(){return{execution_id:this.executionId,version:this.run.version,run:this.run.id,wasm_sha256:this.run.wasm_sha256,reader_wasm_sha256:this.run.reader_wasm_sha256,bundle_hashes:this.run.bundle_hashes,samples:this.samples,errors:this.errors,resource_errors:this.resourceErrors,verification:this.verification,lag:this.lag,queue:this.queue,cold:this.cold,converged:this.converged??false};}
 }
