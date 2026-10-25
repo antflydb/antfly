@@ -18800,12 +18800,12 @@ fn layerNorm(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps: f
     try ensureF32(input_tensor);
     try ensureF32(gamma_tensor);
     try ensureF32(beta_tensor);
-    if (dim == 0 or input_tensor.elem_count % dim != 0) return error.InvalidShape;
+    const geometry = try kernel_geometry.DenseRows.init(input_tensor.elem_count, dim);
     try ensureCount(gamma_tensor, dim);
     try ensureCount(beta_tensor, dim);
     var output = try OwnedF32Output.alloc(self, input_tensor.shape, input_tensor.elem_count);
     defer output.deinit();
-    try self.kernels.launchLayerNormF32(&self.ctx, output.buffer, input_tensor.buffer, gamma_tensor.buffer, beta_tensor.buffer, input_tensor.elem_count / dim, dim, eps);
+    try self.kernels.launchLayerNormF32(&self.ctx, output.buffer, input_tensor.buffer, gamma_tensor.buffer, beta_tensor.buffer, geometry.rows, geometry.width, eps);
     self.stats.launch_norm += 1;
     self.stats.launch_norm_layer += 1;
     return output.intoTensor();
@@ -18841,10 +18841,10 @@ fn rmsNorm(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerro
     const weight_tensor = tensorFromCt(weight);
     try ensureF32(input_tensor);
     try ensureF32(weight_tensor);
-    if (dim == 0 or input_tensor.elem_count % dim != 0) {
+    const geometry = kernel_geometry.DenseRows.init(input_tensor.elem_count, dim) catch {
         if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=rms_norm input_elems={d} dim={d}", .{ input_tensor.elem_count, dim });
         return error.InvalidShape;
-    }
+    };
     if (weight_tensor.elem_count != dim) {
         if (cudaLazyProfileEnabled()) std.log.err("cuda_invalid_shape: op=rms_norm weight_elems={d} dim={d}", .{ weight_tensor.elem_count, dim });
         return error.InvalidShape;
@@ -18854,13 +18854,13 @@ fn rmsNorm(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerro
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    var norm_profile_scope = beginPrefillProfile(self, .norm, input_tensor.elem_count / dim);
+    var norm_profile_scope = beginPrefillProfile(self, .norm, geometry.rows);
     defer if (norm_profile_scope) |*scope| scope.end();
-    if (input_tensor.elem_count / dim > 1 and cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and self.cublaslt != null) {
+    if (geometry.rows > 1 and cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and self.cublaslt != null) {
         var bf16_mirror = allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(u16)) catch buffer_mod.DeviceBuffer{};
         if (bf16_mirror.ptr != 0) {
             const launched_mirror = blk: {
-                self.kernels.launchRmsNormF32Bf16(&self.ctx, device, bf16_mirror, input_tensor.buffer, weight_tensor.buffer, input_tensor.elem_count / dim, dim, eps) catch |err| {
+                self.kernels.launchRmsNormF32Bf16(&self.ctx, device, bf16_mirror, input_tensor.buffer, weight_tensor.buffer, geometry.rows, geometry.width, eps) catch |err| {
                     bf16_mirror.free(&self.ctx);
                     switch (err) {
                         error.CudaKernelUnavailable => break :blk false,
@@ -18878,7 +18878,7 @@ fn rmsNorm(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerro
             }
         }
     }
-    try self.kernels.launchRmsNormF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, input_tensor.elem_count / dim, dim, eps);
+    try self.kernels.launchRmsNormF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, geometry.rows, geometry.width, eps);
     self.stats.launch_norm += 1;
     self.stats.launch_norm_rms += 1;
     return createTensor(self, device, shape, input_tensor.elem_count);

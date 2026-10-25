@@ -103,6 +103,43 @@ pub fn runWithFactory(backend: *ops.ComputeBackend, comptime supports_layouts: b
             }
         }
     };
+    // Independent F64 references cover both normalization families and native
+    // vector/row tails. Case.run also verifies query purity, three replays,
+    // strict device residency, and every retained input after execution.
+    for ([_]usize{ 1, 3, 4, 33, 128, 768 }) |width| {
+        const a = std.testing.allocator;
+        const values = try a.alloc(f32, 3 * width);
+        defer a.free(values);
+        const gamma = try a.alloc(f32, width);
+        defer a.free(gamma);
+        const beta = try a.alloc(f32, width);
+        defer a.free(beta);
+        const expected = try a.alloc(f32, values.len);
+        defer a.free(expected);
+        for (values, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 13) % 31)) - 15)) / 16;
+        for (gamma, beta, 0..) |*g, *b, i| {
+            g.* = 0.5 + @as(f32, @floatFromInt(i % 7)) / 16;
+            b.* = @as(f32, @floatFromInt(i % 5)) / 32;
+        }
+        inline for (.{ K.Norm{ .kind = .layer, .dim = 0, .eps = 1e-5 }, K.Norm{ .kind = .rms, .dim = 0, .eps = 1e-5 } }) |policy| {
+            var norm = policy;
+            norm.dim = @intCast(width);
+            for (0..3) |row| {
+                var mean: f64 = 0;
+                if (norm.kind == .layer) {
+                    for (values[row * width ..][0..width]) |value| mean += value;
+                    mean /= @as(f64, @floatFromInt(width));
+                }
+                var square: f64 = 0;
+                for (values[row * width ..][0..width]) |value| square += (@as(f64, value) - mean) * (@as(f64, value) - mean);
+                const inverse = 1 / @sqrt(square / @as(f64, @floatFromInt(width)) + @as(f64, norm.eps));
+                for (0..width) |column| expected[row * width + column] = @floatCast((@as(f64, values[row * width + column]) - mean) * inverse * gamma[column] + (if (norm.kind == .layer) @as(f64, beta[column]) else 0));
+            }
+            const tensor_shape = Shape.init(.f32, &.{ 3, @intCast(width) });
+            const vector_shape = Shape.init(.f32, &.{@intCast(width)});
+            try Case.run(backend, .{ .operation = .{ .norm = norm }, .output_shape = tensor_shape, .input_shapes = .{ tensor_shape, vector_shape, vector_shape }, .input_count = if (norm.kind == .layer) 3 else 2 }, if (norm.kind == .layer) &.{ values, gamma, beta } else &.{ values, gamma }, expected);
+        }
+    }
     const shape = Shape.init(.f32, &.{ 2, 17 });
     var x: [34]f32 = undefined;
     for (&x, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i + 1)) / 32;

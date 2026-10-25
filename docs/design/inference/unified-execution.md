@@ -3074,3 +3074,33 @@ streams exactly (1,215 / 1,829 instructions); final timing remains pending.
 This retains less source reduction than the rejected owner in exchange for the
 original hot schedules. All failed sources, binaries and raw paired arms remain
 under the U campaign artifacts.
+
+
+The schedule-preserving CPU/Metal cohort is qualified. The full 32-arm
+same-binary control passes all 424 cases (worst median ratio 1.048957); its
+32-arm candidate comparison also passes every case (worst 1.024176). The
+protocol retains 31 warmups, nine samples, 201 CPU calls / 101 Metal calls per
+sample, equal-length executable paths and the unchanged 1.05 limit. Separate
+Linux ARM validation passes 27 cases with no skips, including 16 actually
+parallel worker cases, where-consume aliases and CUDA output/cache failure
+cleanup. The prior failed accumulator and ABI-only prototypes remain excluded.
+
+The complete Metal runtime and first descriptor cohort pass 239 cases with
+the two existing skips. Follow-up normalization/alias/query checks pass all
+seven selected cases with no skips. Ordinary and assigned RMS normalization
+share the existing native Into owner; layer normalization consumes the existing
+resident norm kernel. Linear admission examines only already-prepared immutable
+F32 slots and never prepares a slot or allocates during a query. Its Into owner
+preserves the ordinary single-row native function and the separate multi-row
+function; audio callers retain their original multi-row policy. Eight
+shape/bias cases pass independent F64 and bitwise ordinary-output checks across
+three replays, along with allocation-free query and mutable-weight rejection.
+CPU, Metal and CUDA ordinary norm adapters consume the existing checked row
+geometry. Softmax/log-softmax share one ordinary Metal descriptor adapter.
+
+This cohort removes 1,185 production lines / 39,460 bytes after charging the
+Metal descriptor capability cost; shared conformance helpers and inline tests
+are separate test costs. Its frozen source receipts are under
+`u-campaign/shared-cpu-metal-pre-rope/`. The subsequent RoPE descriptor work is
+a separately accounted capability extension and is not part of that saving.
+The full composed model, direct-kernel and soak gates remain required.

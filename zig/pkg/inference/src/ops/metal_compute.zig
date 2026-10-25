@@ -30,7 +30,20 @@ const kernel_geometry = @import("kernel_geometry.zig");
 pub fn supportsAssignedDescriptor(descriptor: *const ops.kernel_descriptor.Descriptor) bool {
     if (descriptor.output_shape.rank() == 0) return false;
     switch (descriptor.operation) {
-        .linear, .norm => return false,
+        .linear => |linear| {
+            if (linear.rows == 0 or linear.in_dim == 0 or linear.out_dim == 0 or
+                descriptor.output_shape.rank() != 2 or descriptor.input_shapes[0].rank() != 2 or descriptor.input_shapes[1].rank() != 2 or
+                descriptor.output_shape.dim(0) != linear.rows or descriptor.output_shape.dim(1) != linear.out_dim or
+                descriptor.input_shapes[0].dim(0) != linear.rows or descriptor.input_shapes[0].dim(1) != linear.in_dim or
+                descriptor.input_shapes[1].dim(0) != linear.out_dim or descriptor.input_shapes[1].dim(1) != linear.in_dim) return false;
+        },
+        .norm => |norm| {
+            if (norm.dim == 0 or descriptor.output_shape.rank() != 2 or
+                descriptor.output_shape.dim(1) != norm.dim or
+                descriptor.input_shapes[1].rank() != 1 or descriptor.input_shapes[1].numElements().? != norm.dim) return false;
+            if (norm.kind == .layer and (!(norm.eps > 0) or norm.dim > 4096 or
+                descriptor.input_shapes[2].rank() != 1 or descriptor.input_shapes[2].numElements().? != norm.dim)) return false;
+        },
         .binary => |binary| if ((binary == .add or binary == .multiply) and descriptor.input_shapes[0].numElements().? != descriptor.input_shapes[1].numElements().?) {
             return false;
         },
@@ -8492,6 +8505,30 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// Bind shared semantics to the existing Metal command/arena schedules.
     /// Admission examines existing device views only: no upload, readback or
     /// allocation is allowed while answering the null-output legality query.
+    // Query existing immutable F32 preparation only; slot creation belongs to
+    // the ordinary preparation path and never to descriptor admission.
+    fn assignedLinearSlot(self: *MetalCompute, request: ops.kernel_descriptor.Invocation) ?usize {
+        const linear = request.descriptor.operation.linear;
+        if (request.auxiliaries.len != 0) return null;
+        const weight = toBuf(request.inputs[1]);
+        if (weight.mutable_state or bufHasAnyQuantizedStorage(weight) or weight.native_dense_dtype != null) return null;
+        var key: DynamicLinearSlotKey = undefined;
+        if (linear.bias) {
+            if (toBuf(request.inputs[2]).mutable_state) return null;
+            key = dynamicLinearSlotKey(request.inputs[1], request.inputs[2], linear.in_dim, linear.out_dim);
+        } else {
+            const zeros = self.zero_bias_cache.get(linear.out_dim) orelse return null;
+            key = .{ .weight_buf = dynamicLinearDenseBufferKey(weight), .bias_buf = @intFromPtr(zeros.ptr), .quantized_storage = 0, .in_dim = linear.in_dim, .out_dim = linear.out_dim };
+        }
+        const slot = self.dynamic_linear_slots.get(key) orelse return null;
+        if (slot >= metal_runtime.decoder_runtime_linear_slot_capacity or
+            !self.provider_impl.raw_linear_slots_prepared[slot] or
+            self.provider_impl.raw_linear_slot_kinds[slot] != .dense or
+            self.provider_impl.raw_linear_slot_in_dims[slot] != linear.in_dim or
+            self.provider_impl.raw_linear_slot_out_dims[slot] != linear.out_dim) return null;
+        return slot;
+    }
+
     fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocation) anyerror!bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (self.audio_capture != null or !self.provider_impl.hasDecoderRuntime()) return false;
@@ -8504,12 +8541,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const tensor = buf.metal_tensor orelse return false;
             if (!tensor.isDevice() or tensor.dtype != .f32 or tensor.elemCount() != descriptor.input_shapes[index].numElements().?) return false;
         }
+        if (descriptor.operation == .norm) {
+            if (request.auxiliaries.len != 0 or disableRuntimeElementwise()) return false;
+            if (descriptor.operation.norm.kind == .layer)
+                metal_runtime.requireGlinerBoundaryReady(self.provider_impl.raw_decode_runtime) catch return false;
+        }
+        const linear_slot: ?usize = if (descriptor.operation == .linear)
+            self.assignedLinearSlot(request) orelse return false
+        else
+            null;
         const output = request.output orelse return true;
         const out_buf = toBuf(output);
         if (out_buf.integer_storage or hasHostView(out_buf) or out_buf.lazy_multiply != null or bufHasAnyQuantizedStorage(out_buf)) return error.InvalidTensorShape;
         const out_tensor = out_buf.metal_tensor orelse return error.InvalidTensorShape;
         if (!out_tensor.isDevice() or out_tensor.dtype != .f32 or out_tensor.elemCount() != descriptor.elements()) return error.InvalidTensorShape;
-        if (descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather) {
+        if (descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather or descriptor.operation == .norm or descriptor.operation == .linear) {
             for (request.inputs) |source| {
                 const tensor = toBuf(source).metal_tensor.?;
                 if (tensor.deviceHandle() == out_tensor.deviceHandle() and kernel_geometry.byteRangesOverlap(@intCast(tensor.deviceByteOffset()), tensor.deviceByteLen(), @intCast(out_tensor.deviceByteOffset()), out_tensor.deviceByteLen())) return error.InvalidAssignedAlias;
@@ -8571,7 +8617,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 const shape = ops.kernel_descriptor.nativeDimensions(i32, descriptor.output_shape);
                 break :blk (try metal_runtime.decoderRuntimeGatherAxis0F32_2DDeviceInto(self.provider_impl, input, toBuf(request.inputs[1]).metal_tensor.?, gather.geometry.extent, gather.geometry.suffix, @intCast(descriptor.input_shapes[1].numElements().?), shape[0..descriptor.output_shape.rank()], out_tensor)) != null;
             },
-            .linear, .norm => unreachable,
+            .norm => |norm| blk: {
+                const weight = toBuf(request.inputs[1]).metal_tensor.?;
+                if (norm.kind == .rms) break :blk try metal_runtime.decoderRuntimeApplyRmsNormWeightDeviceInto(self.provider_impl, input, weight, norm.dim, norm.eps, out_tensor);
+                const kernel = layerNormDeviceRequest(norm, descriptor.elements()) orelse return error.InvalidTensorShape;
+                var sources: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
+                sources[0] = input;
+                sources[1] = weight;
+                sources[2] = toBuf(request.inputs[2]).metal_tensor.?;
+                break :blk try metal_runtime.decoderRuntimeGlinerBoundaryIntoDevice(self.provider_impl, kernel, sources, out_tensor);
+            },
+            .linear => |linear| blk: {
+                const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
+                defer self.endActivePlannedComputeScope(scope);
+                break :blk try metal_runtime.decoderRuntimeApplyLinearDeviceInto(self.provider_impl, linear_slot.?, input, linear.rows, linear.in_dim, linear.out_dim, out_tensor);
+            },
         };
         // A bound admitted operation cannot be replayed after an uncertain
         // command submission. The existing optimized route owns the failure.
@@ -13092,24 +13152,29 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn softmaxOp(ctx: *anyopaque, input: CT, last_dim_size: u32) anyerror!CT {
+        return softmaxDescriptorOp(ctx, input, .{ .width = last_dim_size, .logarithmic = false });
+    }
+
+    inline fn softmaxDescriptorOp(ctx: *anyopaque, input: CT, request: ops.kernel_descriptor.Softmax) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const buf = toBuf(input);
-        if (buf.quantized_storage == null and last_dim_size != 0) {
+        if (buf.quantized_storage == null and request.width != 0) {
             if (buf.metal_tensor) |*metal_tensor| {
                 if (metal_tensor.isDevice()) {
-                    const dim: usize = @intCast(last_dim_size);
                     const elem_count = metal_tensor.elemCount();
-                    if (elem_count != 0 and elem_count % dim == 0) {
+                    const geometry = kernel_geometry.DenseRows.init(elem_count, request.width) catch
+                        return self.hostFallbackSoftmax(input, request.width, request.logarithmic);
+                    if (geometry.rows != 0) {
                         var input_mt = try metal_tensor.retainedCopy();
                         defer input_mt.deinit();
-                        if (try metal_runtime.decoderRuntimeApplySoftmaxDevice(self.provider_impl, input_mt, elem_count / dim, dim, false)) |tensor| {
+                        if (try metal_runtime.decoderRuntimeApplySoftmaxDevice(self.provider_impl, input_mt, geometry.rows, geometry.width, request.logarithmic)) |tensor| {
                             return self.ctFromOwnedMetalTensor(tensor);
                         }
                     }
                 }
             }
         }
-        return self.hostFallbackSoftmax(input, last_dim_size, false);
+        return self.hostFallbackSoftmax(input, request.width, request.logarithmic);
     }
 
     fn attentionMaskDeviceTensor(
@@ -14223,24 +14288,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn logSoftmaxOp(ctx: *anyopaque, input: CT, last_dim_size: u32) anyerror!CT {
-        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        const buf = toBuf(input);
-        if (buf.quantized_storage == null and last_dim_size != 0) {
-            if (buf.metal_tensor) |*metal_tensor| {
-                if (metal_tensor.isDevice()) {
-                    const dim: usize = @intCast(last_dim_size);
-                    const elem_count = metal_tensor.elemCount();
-                    if (elem_count != 0 and elem_count % dim == 0) {
-                        var input_mt = try metal_tensor.retainedCopy();
-                        defer input_mt.deinit();
-                        if (try metal_runtime.decoderRuntimeApplySoftmaxDevice(self.provider_impl, input_mt, elem_count / dim, dim, true)) |tensor| {
-                            return self.ctFromOwnedMetalTensor(tensor);
-                        }
-                    }
-                }
-            }
-        }
-        return self.hostFallbackSoftmax(input, last_dim_size, true);
+        return softmaxDescriptorOp(ctx, input, .{ .width = last_dim_size, .logarithmic = true });
     }
 
     fn concatPrimOp(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i64, b_shape: []const i64) anyerror!CT {
@@ -15441,13 +15489,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const input_buf = toBuf(input);
         const weight_buf = toBuf(weight);
         if (input_buf.quantized_storage != null or weight_buf.quantized_storage != null) return error.UnsupportedTensorType;
+        const geometry = try kernel_geometry.DenseRows.init(bufElemCount(input_buf), dim);
         // Device-weight RMSNorm must use the same row reduction as prepared
         // SIMD4 slots; the scalar-per-output fallback repeats the row sum.
         if (self.require_f32_linears and dim != 0 and dim % 4 == 0) {
             if (denseDeviceF32(input)) |device| {
                 const count = device.elemCount();
-                if (count > 0 and count % dim == 0 and count <= std.math.maxInt(u32) and dim <= std.math.maxInt(u32)) {
-                    if (try rmsNormClampedOp(ctx, input, weight, .{ .rows = @intCast(count / dim), .dim = @intCast(dim), .flags = 0, .eps = eps, .lo = 0, .hi = 0 })) |result| return result;
+                if (geometry.rows > 0 and count <= std.math.maxInt(u32) and dim <= std.math.maxInt(u32)) {
+                    if (try rmsNormClampedOp(ctx, input, weight, .{ .rows = @intCast(geometry.rows), .dim = @intCast(dim), .flags = 0, .eps = eps, .lo = 0, .hi = 0 })) |result| return result;
                 }
             }
         }
@@ -15488,7 +15537,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const weight_data = try hostSliceForBuf(weight_buf);
         const output = try self.allocator.dupe(f32, input_data);
         errdefer self.allocator.free(output);
-        activations_mod.rmsNorm(output, weight_data, dim, eps);
+        activations_mod.rmsNorm(output, weight_data, geometry.width, eps);
         const shape_i64 = input_buf.logical_shape orelse return error.InvalidTensorShape;
         const shape_i32 = try self.i32ShapeFromI64(shape_i64);
         defer self.allocator.free(shape_i32);
@@ -18016,6 +18065,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const input_buf = toBuf(input);
         const gamma_buf = toBuf(gamma);
         const beta_buf = toBuf(beta);
+        const geometry = try kernel_geometry.DenseRows.init(bufElemCount(input_buf), dim);
         const has_quantized = bufHasAnyQuantizedStorage(input_buf) or
             bufHasAnyQuantizedStorage(gamma_buf) or
             bufHasAnyQuantizedStorage(beta_buf);
@@ -18061,7 +18111,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const beta_data = beta_owned orelse try hostSliceForBuf(beta_buf);
         const output = try self.allocator.dupe(f32, input_data);
         errdefer self.allocator.free(output);
-        activations_mod.layerNorm(output, gamma_data, beta_data, dim, eps);
+        activations_mod.layerNorm(output, gamma_data, beta_data, geometry.width, eps);
         const shape_i64 = input_buf.logical_shape orelse return error.InvalidTensorShape;
         const shape_i32 = try self.i32ShapeFromI64(shape_i64);
         defer self.allocator.free(shape_i32);
@@ -18238,17 +18288,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// LayerNorm over rows of `dim`, reading gamma and beta from their own
     /// buffers rather than a prepared slot. Null when the operands are not
     /// device-resident f32 or the shape is outside the kernel's range.
+    fn layerNormDeviceRequest(norm: ops.kernel_descriptor.Norm, elements: usize) ?ops.gliner_boundary_device.Kernel {
+        if (norm.dim > 4096 or !(norm.eps > 0)) return null;
+        const rows = kernel_geometry.DenseRows.init(elements, norm.dim) catch return null;
+        if (rows.rows == 0 or rows.rows > std.math.maxInt(u32)) return null;
+        var request = ops.gliner_boundary_device.Kernel{ .kind = .norm };
+        request.dims[0] = @intCast(rows.rows);
+        request.dims[1] = norm.dim;
+        request.scalars[0] = norm.eps;
+        return request;
+    }
+
     fn layerNormDirect(self: *MetalCompute, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !?CT {
-        if (dim == 0 or dim > 4096 or !(eps > 0)) return null;
-        const count = bufElemCount(toBuf(input));
-        if (count == 0 or count % dim != 0 or count / dim > std.math.maxInt(u32)) return null;
+        const width = std.math.cast(u32, dim) orelse return null;
+        const request = layerNormDeviceRequest(.{ .kind = .layer, .dim = width, .eps = eps }, bufElemCount(toBuf(input))) orelse return null;
         const logical = toBuf(input).logical_shape orelse return null;
         const shape = try self.i32ShapeFromI64(logical);
         defer self.allocator.free(shape);
-        var request = ops.gliner_boundary_device.Kernel{ .kind = .norm };
-        request.dims[0] = @intCast(count / dim);
-        request.dims[1] = @intCast(dim);
-        request.scalars[0] = eps;
         return self.boundaryKernelDevice(request, &.{ input, gamma, beta }, shape);
     }
 
@@ -48278,4 +48334,140 @@ test "Metal shared descriptors execute resident operations with strict transfer 
         }
     };
     try @import("testing/assigned_kernel_conformance.zig").runWithFactory(&cb, true, Factory.tensor);
+    const K = ops.kernel_descriptor;
+    const Shape = ml.graph.Shape;
+    const input = try Factory.tensor(&cb, &.{ 1, 2, 3, 4 }, &.{ 1, 4 });
+    defer cb.free(input);
+    const weight = try Factory.tensor(&cb, &.{ 1, 1, 1, 1 }, &.{4});
+    defer cb.free(weight);
+    const beta = try Factory.tensor(&cb, &.{ 0, 0, 0, 0 }, &.{4});
+    defer cb.free(beta);
+    const output = try Factory.tensor(&cb, &.{ -777, -777, -777, -777 }, &.{ 1, 4 });
+    defer cb.free(output);
+    const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    const dispatch = cb.vtable.kernels.?.runAssignedKernel.?;
+    for ([_]K.Norm{ .{ .kind = .layer, .dim = 4, .eps = 1e-5 }, .{ .kind = .rms, .dim = 4, .eps = 1e-5 } }) |norm| {
+        var descriptor = K.Descriptor{ .operation = .{ .norm = norm }, .output_shape = Shape.init(.f32, &.{ 1, 4 }), .input_shapes = .{ Shape.init(.f32, &.{ 1, 4 }), Shape.init(.f32, &.{4}), Shape.init(.f32, &.{4}) }, .input_count = if (norm.kind == .layer) 3 else 2 };
+        const inputs = [_]CT{ input, weight, beta };
+        var request = K.Invocation{ .descriptor = &descriptor, .inputs = inputs[0..descriptor.input_count] };
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        const saved_allocator = compute.allocator;
+        compute.allocator = failing.allocator();
+        const query = dispatch(cb.ptr, request);
+        compute.allocator = saved_allocator;
+        try std.testing.expect(try query);
+        request.output = output;
+        request.auxiliaries = &.{.{ .role = .mean, .tensor = input }};
+        try std.testing.expect(!try dispatch(cb.ptr, request));
+        request.auxiliaries = &.{};
+        for (inputs[0..descriptor.input_count]) |alias| {
+            request.output = alias;
+            try std.testing.expectError(error.InvalidAssignedAlias, dispatch(cb.ptr, request));
+        }
+        request.output = output;
+        descriptor.operation.norm.dim = 0;
+        try std.testing.expect(!try dispatch(cb.ptr, request));
+        descriptor.operation.norm.dim = 3;
+        try std.testing.expect(!try dispatch(cb.ptr, request));
+        const actual = try cb.toFloat32(output, a);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(f32, &.{ -777, -777, -777, -777 }, actual);
+        const retained = try cb.toFloat32(input, a);
+        defer a.free(retained);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, retained);
+    }
+}
+
+test "Metal linear descriptors query prepared immutable F32 slots and preserve native schedules" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const K = ops.kernel_descriptor;
+    const Shape = ml.graph.Shape;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, null);
+    defer context.deinit(a);
+    var cb = context.computeBackend();
+    const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    compute.require_f32_linears = true;
+    const dispatch = cb.vtable.kernels.?.runAssignedKernel.?;
+    for ([_][3]usize{ .{ 1, 3, 5 }, .{ 3, 4, 4 }, .{ 5, 33, 17 }, .{ 17, 128, 33 } }) |shape| {
+        const rows, const width, const columns = shape;
+        const x = try a.alloc(f32, rows * width);
+        defer a.free(x);
+        const w = try a.alloc(f32, columns * width);
+        defer a.free(w);
+        const bias = try a.alloc(f32, columns);
+        defer a.free(bias);
+        for (x, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6)) / 32;
+        for (w, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5)) / 64;
+        for (bias, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 7)) / 32;
+        const input = try auditDeviceTensor(compute, &cb, x, &.{ @intCast(rows), @intCast(width) });
+        defer cb.free(input);
+        const weight = try auditDeviceTensor(compute, &cb, w, &.{ @intCast(columns), @intCast(width) });
+        defer cb.free(weight);
+        const bias_tensor = try auditDeviceTensor(compute, &cb, bias, &.{@intCast(columns)});
+        defer cb.free(bias_tensor);
+        const sentinel = try a.alloc(f32, rows * columns);
+        defer a.free(sentinel);
+        @memset(sentinel, -777);
+        inline for (.{ false, true }) |with_bias| {
+            const output = try auditDeviceTensor(compute, &cb, sentinel, &.{ @intCast(rows), @intCast(columns) });
+            defer cb.free(output);
+            const descriptor = K.Descriptor{
+                .operation = .{ .linear = try K.Linear.init(rows, width, columns, with_bias) },
+                .output_shape = Shape.init(.f32, &.{ @intCast(rows), @intCast(columns) }),
+                .input_shapes = .{ Shape.init(.f32, &.{ @intCast(rows), @intCast(width) }), Shape.init(.f32, &.{ @intCast(columns), @intCast(width) }), Shape.init(.f32, &.{@intCast(columns)}) },
+                .input_count = if (with_bias) 3 else 2,
+            };
+            const inputs = if (with_bias) &[_]CT{ input, weight, bias_tensor } else &[_]CT{ input, weight };
+            var request = K.Invocation{ .descriptor = &descriptor, .inputs = inputs };
+            const slots_before = compute.dynamic_linear_slots.count();
+            try std.testing.expect(!try dispatch(cb.ptr, request));
+            try std.testing.expectEqual(slots_before, compute.dynamic_linear_slots.count());
+            // Prepare outside admission. Both ordinary and assigned execution
+            // consume the same immutable slot and native row schedule.
+            const zero_bias: ?CT = if (!with_bias) try compute.cachedZeroBiasBuf(columns) else null;
+            defer if (zero_bias) |value| cb.free(value);
+            _ = (try compute.ensureDynamicLinearSlot(weight, if (with_bias) bias_tensor else zero_bias.?, width, columns)) orelse return error.ExpectedMetalLinear;
+            const ordinary = if (with_bias) try cb.linear(input, weight, bias_tensor, rows, width, columns) else try cb.linearNoBias(input, weight, rows, width, columns);
+            defer cb.free(ordinary);
+            const prepared_slots = compute.dynamic_linear_slots.count();
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+            const saved_allocator = compute.allocator;
+            compute.allocator = failing.allocator();
+            const query = dispatch(cb.ptr, request);
+            compute.allocator = saved_allocator;
+            try std.testing.expect(try query);
+            try std.testing.expectEqual(prepared_slots, compute.dynamic_linear_slots.count());
+            const untouched = try cb.toFloat32(output, a);
+            defer a.free(untouched);
+            try std.testing.expectEqualSlices(f32, sentinel, untouched);
+            MetalCompute.toBuf(weight).mutable_state = true;
+            try std.testing.expect(!try dispatch(cb.ptr, request));
+            MetalCompute.toBuf(weight).mutable_state = false;
+            request.output = output;
+            for (0..3) |_| {
+                var audit = @import("../execution/transfer_audit.zig").Audit{ .forbid_device_host_access = true };
+                try @import("../execution/transfer_audit.zig").begin(&audit);
+                const executed = dispatch(cb.ptr, request);
+                @import("../execution/transfer_audit.zig").end();
+                try std.testing.expect(try executed);
+                const actual = try cb.toFloat32(output, a);
+                defer a.free(actual);
+                for (0..rows) |row| for (0..columns) |column| {
+                    var expected: f64 = if (with_bias) bias[column] else 0;
+                    for (0..width) |k| expected += @as(f64, x[row * width + k]) * w[column * width + k];
+                    try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), actual[row * columns + column], 3e-5);
+                };
+                const reference = try cb.toFloat32(ordinary, a);
+                defer a.free(reference);
+                try std.testing.expectEqualSlices(f32, reference, actual);
+            }
+            inline for (.{ input, weight, bias_tensor }, .{ x, w, bias }) |tensor, expected| {
+                const retained = try cb.toFloat32(tensor, a);
+                defer a.free(retained);
+                try std.testing.expectEqualSlices(f32, expected, retained);
+            }
+        }
+    }
 }
