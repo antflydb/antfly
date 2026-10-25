@@ -227,6 +227,46 @@ def test_managed_generation_requires_and_preserves_context_attestation() -> None
             next(chunks)
 
 
+@pytest.mark.parametrize("policy", ["context_management", "kv_cache", "both"])
+@pytest.mark.parametrize("attest", [True, False])
+def test_managed_stream_accepts_role_and_content_only_after_attestation(policy: str, attest: bool) -> None:
+    wire = generation_request().to_dict()
+    if policy in ("context_management", "both"):
+        wire["context_management"] = {"mode": "reject"}
+    if policy in ("kv_cache", "both"):
+        wire["kv_cache"] = {"mode": "exact_hybrid", "version": "v1"}
+    request = InferenceGenerateRequest.from_dict(wire)
+    envelope = {"id": "managed", "object": "chat.completion.chunk", "created": 1, "model": "gemma"}
+    diagnostics = {
+        "policy": "reject", "applied": False, "original_input_tokens": 1,
+        "effective_input_tokens": 1, "target_input_tokens": 8, "reserved_output_tokens": 1,
+        "dropped_messages": 0, "retained_messages": 1, "retained_from_message": 0,
+        "checkpoint_applied": False, "windowed": False, "compacted": False,
+        "kv_cache_mode": "exact_hybrid", "kv_cache_version": "v1",
+    }
+    events = [{**envelope, "choices": [], "context": diagnostics}] if attest else []
+    events += [
+        {**envelope, "choices": [{"index": 0, "delta": {"role": "assistant"}}]},
+        {**envelope, "choices": [{"index": 0, "delta": {"content": "hello"}}]},
+    ]
+    stream = ChunkStream([*(f"data: {json.dumps(event)}\n\n".encode() for event in events), b"data: [DONE]\n\n"])
+    client = AntflyClient("http://test")
+    install_transport(client, httpx.MockTransport(lambda _: httpx.Response(
+        200, headers={"Content-Type": "text/event-stream"}, stream=stream,
+    )))
+    if attest:
+        with client.generate_stream(request) as chunks:
+            received = list(chunks)
+        assert received[0].context.policy.value == "reject"
+        assert received[1].choices[0].delta.role.value == "assistant"
+        assert received[2].choices[0].delta.content == "hello"
+    else:
+        with pytest.raises(AntflyException, match="before attesting"):
+            with client.generate_stream(request) as chunks:
+                list(chunks)
+    assert stream.closed
+
+
 def test_generate_stream_returns_typed_507_and_requires_done() -> None:
     responses = iter(
         [

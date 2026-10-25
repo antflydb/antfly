@@ -422,6 +422,7 @@ pub const PrepareResult = struct {
     messages: PreparedMessages,
     keep: []bool,
     diagnostics: api.ContextDiagnostics,
+    tool_results: []api.ContextToolResultOutcome = &.{},
     checkpoint: ?api.ContextCheckpoint = null,
     compaction_prompt_tokens: usize = 0,
     compaction_completion_tokens: usize = 0,
@@ -430,6 +431,7 @@ pub const PrepareResult = struct {
     pub fn deinit(self: *PrepareResult) void {
         self.messages.deinit();
         self.allocator.free(self.keep);
+        freeToolResults(self.allocator, self.tool_results);
         if (self.checkpoint_arena) |arena| {
             arena.deinit();
             self.allocator.destroy(arena);
@@ -539,6 +541,63 @@ pub const RequestOptions = struct {
 /// Route-facing context operation. A checkpoint is portable data; its covered
 /// count is never used to index or remove messages in `source`.
 pub fn prepareRequest(context: *Context, source: []const generation.Message, options: RequestOptions) !PrepareResult {
+    var result = try prepareRequestInner(context, source, options);
+    errdefer result.deinit();
+    result.tool_results = try describeToolResults(context.allocator, source, result.keep, result.checkpoint, result.diagnostics.checkpoint_created orelse false);
+    result.diagnostics.tool_results = result.tool_results;
+    return result;
+}
+
+fn freeToolResults(allocator: std.mem.Allocator, results: []const api.ContextToolResultOutcome) void {
+    for (results) |item| allocator.free(item.tool_call_id);
+    allocator.free(results);
+}
+
+fn describeToolResults(
+    allocator: std.mem.Allocator,
+    source: []const generation.Message,
+    keep: []const bool,
+    checkpoint: ?api.ContextCheckpoint,
+    checkpoint_created: bool,
+) ![]api.ContextToolResultOutcome {
+    var results: std.ArrayList(api.ContextToolResultOutcome) = .empty;
+    defer results.deinit(allocator);
+    errdefer for (results.items) |item| allocator.free(item.tool_call_id);
+    const evidence: []const api.ContextToolEvidence = if (checkpoint) |cp| cp.memory.tool_evidence else &.{};
+    for (source, keep, 0..) |message, retained, index| {
+        if (!std.mem.eql(u8, message.role, "tool")) continue;
+        const id = message.tool_call_id orelse continue;
+        if (id.len == 0) continue;
+        var disposition: []const u8 = if (retained) "retained" else "dropped";
+        if (!retained and checkpoint_created) {
+            for (evidence) |item| {
+                if (std.mem.eql(u8, id, item.tool_call_id)) {
+                    disposition = "summarized";
+                    break;
+                }
+            }
+        }
+        const owned_id = try allocator.dupe(u8, id);
+        errdefer allocator.free(owned_id);
+        try results.append(allocator, .{ .tool_call_id = owned_id, .disposition = disposition, .message_index = @intCast(index) });
+    }
+    for (evidence) |item| {
+        var represented = false;
+        for (results.items) |outcome| {
+            if (std.mem.eql(u8, outcome.disposition, "summarized") and std.mem.eql(u8, outcome.tool_call_id, item.tool_call_id)) {
+                represented = true;
+                break;
+            }
+        }
+        if (represented) continue;
+        const owned_id = try allocator.dupe(u8, item.tool_call_id);
+        errdefer allocator.free(owned_id);
+        try results.append(allocator, .{ .tool_call_id = owned_id, .disposition = "summarized" });
+    }
+    return results.toOwnedSlice(allocator);
+}
+
+fn prepareRequestInner(context: *Context, source: []const generation.Message, options: RequestOptions) !PrepareResult {
     if (options.mode == .compact) return compact(context, source, options);
 
     var rendered: ?[]u8 = null;
@@ -1334,6 +1393,19 @@ test "compact iterates summaries creates checkpoint and consumes independent act
     defer std.testing.allocator.free(checkpoint_json);
     try std.testing.expect(std.mem.indexOf(u8, checkpoint_json, "stage 2") != null);
 
+    // A model chain must rebuild stale memory rather than treating it as a
+    // corrupt digest or attempting the same checkpoint against another model.
+    const different_bytes: [64]u8 = @splat('0');
+    const different: []const u8 = &different_bytes;
+    inline for (.{ "model_revision", "tokenizer_revision", "template_revision" }) |field| {
+        var stale = compacted.checkpoint.?;
+        @field(stale, field) = different;
+        try std.testing.expectError(error.StaleCheckpoint, validateWireCheckpoint(stale, &context));
+    }
+    var corrupt = compacted.checkpoint.?;
+    corrupt.memory_sha256 = different;
+    try std.testing.expectError(error.CheckpointMemoryMismatch, validateWireCheckpoint(corrupt, &context));
+
     const active = [_]generation.Message{
         .{ .role = "system", .content = "original instruction" },
         .{ .role = "user", .content = "new active suffix" },
@@ -1470,4 +1542,114 @@ test "context compaction preserves small tool results rather than generated argu
     try std.testing.expectEqualSlices(u8, large[0..verbatim_tool_result_max_bytes], at_limit.tool_evidence[0].facts);
     const bounded = try retainSmallToolResults(a, summary, null, &messages, &.{true}, .{ .max_tool_evidence_bytes = 32 });
     try std.testing.expectEqualStrings("arguments", bounded.tool_evidence[0].facts);
+}
+
+test "window diagnostics identify dropped and retained tool results and protect the active turn" {
+    const old_result: [512]u8 = @splat('x');
+    const source = [_]generation.Message{
+        .{ .role = "user", .content = "old" },
+        .{ .role = "assistant", .content = "", .tool_calls = &.{.{ .id = "old-call", .name = "search", .arguments = "{}" }} },
+        .{ .role = "tool", .content = &old_result, .tool_call_id = "old-call" },
+        .{ .role = "assistant", .content = "done" },
+        .{ .role = "user", .content = "current" },
+        .{ .role = "assistant", .content = "", .tool_calls = &.{.{ .id = "new-call", .name = "search", .arguments = "{}" }} },
+        .{ .role = "tool", .content = "answer", .tool_call_id = "new-call" },
+        .{ .role = "assistant", .content = "done" },
+    };
+    var counter_state: u8 = 0;
+    var context = testContext(&counter_state);
+    var result = try prepareRequest(&context, &source, .{ .mode = .window, .target_input_tokens = 100, .reserved_output_tokens = 16, .keep_recent_turns = 0 });
+    defer result.deinit();
+    const outcomes = result.diagnostics.tool_results.?;
+    try std.testing.expectEqual(@as(usize, 2), outcomes.len);
+    try std.testing.expectEqualStrings("old-call", outcomes[0].tool_call_id);
+    try std.testing.expectEqualStrings("dropped", outcomes[0].disposition);
+    try std.testing.expectEqual(@as(?i64, 2), outcomes[0].message_index);
+    try std.testing.expectEqualStrings("new-call", outcomes[1].tool_call_id);
+    try std.testing.expectEqualStrings("retained", outcomes[1].disposition);
+    try std.testing.expectEqual(@as(?i64, 6), outcomes[1].message_index);
+    for (result.keep[4..]) |kept| try std.testing.expect(kept);
+    try std.testing.expectError(error.MandatoryContextTooLarge, prepareRequest(&context, &source, .{ .mode = .window, .target_input_tokens = 1, .reserved_output_tokens = 16, .keep_recent_turns = 0 }));
+}
+
+fn toolOutcomeAllocationExercise(allocator: std.mem.Allocator) !void {
+    const source = [_]generation.Message{
+        .{ .role = "tool", .content = "old", .tool_call_id = "reused" },
+        .{ .role = "tool", .content = "current", .tool_call_id = "reused" },
+        .{ .role = "tool", .content = "orphan" },
+    };
+    const cp: api.ContextCheckpoint = .{
+        .version = "v1",
+        .covered_messages = 1,
+        .covered_prefix_sha256 = "0000000000000000000000000000000000000000000000000000000000000000",
+        .memory_sha256 = "0000000000000000000000000000000000000000000000000000000000000000",
+        .model_revision = "model",
+        .tokenizer_revision = "tokenizer",
+        .template_revision = "template",
+        .memory = .{ .conversation = "", .tool_evidence = &.{.{ .tool_call_id = "reused", .tool_name = "search", .facts = "old evidence" }}, .unresolved_tool_calls = &.{} },
+    };
+    const summarized = try describeToolResults(allocator, &source, &.{ false, true, true }, cp, true);
+    defer freeToolResults(allocator, summarized);
+    try std.testing.expectEqual(@as(usize, 2), summarized.len);
+    try std.testing.expectEqualStrings("summarized", summarized[0].disposition);
+    try std.testing.expectEqualStrings("retained", summarized[1].disposition);
+    const archived = try describeToolResults(allocator, &source, &.{ false, true, true }, cp, false);
+    defer freeToolResults(allocator, archived);
+    try std.testing.expectEqual(@as(usize, 3), archived.len);
+    try std.testing.expectEqualStrings("dropped", archived[0].disposition);
+    try std.testing.expectEqualStrings("retained", archived[1].disposition);
+    try std.testing.expectEqualStrings("summarized", archived[2].disposition);
+    try std.testing.expectEqual(@as(?i64, null), archived[2].message_index);
+}
+
+test "tool outcomes distinguish archived evidence and reused IDs and clean up allocation failures" {
+    try toolOutcomeAllocationExercise(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, toolOutcomeAllocationExercise, .{});
+}
+
+test "compact diagnostics carry tool evidence into a checkpoint-only active suffix" {
+    const Runner = struct {
+        fn run(_: *anyopaque, allocator: std.mem.Allocator, _: []const generation.Message, _: i32) !SummaryOutput {
+            return .{
+                .text = try allocator.dupe(u8,
+                    \\{"conversation":"old lookup","tool_evidence":[{"tool_call_id":"lookup-1","tool_name":"lookup","facts":"answer=42"}],"unresolved_tool_calls":[]}
+                ),
+                .prompt_tokens = 10,
+                .completion_tokens = 10,
+            };
+        }
+    };
+    const source = [_]generation.Message{
+        .{ .role = "user", .content = "old question" },
+        .{ .role = "assistant", .content = "", .tool_calls = &.{.{ .id = "lookup-1", .name = "lookup", .arguments = "{}" }} },
+        .{ .role = "tool", .content = "answer=42", .tool_call_id = "lookup-1" },
+        .{ .role = "assistant", .content = "done" },
+        .{ .role = "user", .content = "current question" },
+    };
+    var counter_state: u8 = 0;
+    var context = testContext(&counter_state);
+    var compacted = try prepareRequest(&context, &source, .{
+        .mode = .compact,
+        .target_input_tokens = 4096,
+        .reserved_output_tokens = 64,
+        .keep_recent_turns = 0,
+        .runner = .{ .ptr = &counter_state, .run_fn = Runner.run },
+    });
+    defer compacted.deinit();
+    const outcomes = compacted.diagnostics.tool_results.?;
+    try std.testing.expectEqual(@as(usize, 1), outcomes.len);
+    try std.testing.expectEqualStrings("summarized", outcomes[0].disposition);
+    try std.testing.expectEqual(@as(?i64, 2), outcomes[0].message_index);
+    var resumed = try prepareRequest(&context, source[4..], .{
+        .mode = .window,
+        .target_input_tokens = 4096,
+        .reserved_output_tokens = 64,
+        .checkpoint = compacted.checkpoint,
+    });
+    defer resumed.deinit();
+    const archived = resumed.diagnostics.tool_results.?;
+    try std.testing.expectEqual(@as(usize, 1), archived.len);
+    try std.testing.expectEqualStrings("lookup-1", archived[0].tool_call_id);
+    try std.testing.expectEqualStrings("summarized", archived[0].disposition);
+    try std.testing.expectEqual(@as(?i64, null), archived[0].message_index);
 }

@@ -151,7 +151,7 @@ def main():
         if len(hardware)!=1 or hardware[0]['name']!='NVIDIA L4':raise AssertionError('expected the designated L4')
         evidence.update(hardware=hardware,fixture=fixture,request=body,
                         input_mode='chat' if args.mode=='replay' else 'portable_restore',
-                        endpoint='/ai/v1/generate' if args.mode=='replay' else '/ai/v1/chat/context/resume',
+                        endpoint='/ai/v1/generate' if args.mode=='replay' else '/ai/v1/generate/context/resume',
                         chat_request_sha256=request_identity(body),
                         input_sha256={str(p):d for p,d in pinned.items()},
                         timing_limits='First content and first-content-to-DONE are API wall observations. Pipeline phase milliseconds come from the existing generation timer; they include callback work and are not GPU-event timings. Portable-restore prefill includes restore/suffix execution.')
@@ -166,7 +166,7 @@ def main():
                 try:
                     started=time.monotonic()
                     if args.mode=='portable_restore':
-                        response=send_resume(connection,'/ai/v1/chat/context/resume',body,args.checkpoint)
+                        response=send_resume(connection,'/ai/v1/generate/context/resume',body,args.checkpoint)
                     else:
                         connection.request('POST','/ai/v1/generate',json.dumps(body).encode(),{'Content-Type':'application/json'})
                         response=connection.getresponse()

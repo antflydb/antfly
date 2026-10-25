@@ -50,7 +50,7 @@ pub fn isInteractiveGeneratePath(path: []const u8) bool {
             std.mem.eql(u8, suffix, "/generate") or
             std.mem.eql(u8, suffix, "/generate/batch") or
             std.mem.eql(u8, suffix, "/chat/completions") or
-            std.mem.eql(u8, suffix, "/chat/context/prepare")) return true;
+            std.mem.eql(u8, suffix, "/generate/context/prepare")) return true;
     }
     return false;
 }

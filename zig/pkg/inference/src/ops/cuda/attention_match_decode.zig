@@ -113,7 +113,10 @@ pub const Runner = struct {
         if (rows == 0 or rows > 512 or first_position != state.logical_length or first_position < state.initial_logical_length)
             return error.InvalidAttentionShape;
         const end = std.math.add(u64, first_position, rows) catch return error.InvalidAttentionShape;
-        if (end - state.initial_logical_length > 8192) return error.CompactionAppendLimit;
+        // Resume admission bounds the prompt suffix to 8192 tokens. Decode
+        // appends share this runner but have an independent output allowance;
+        // both phases are bounded by the admitted logical context ceiling.
+        if (end > 32768) return error.CompactionAppendLimit;
         const heads = try state.layer(layer);
         if (heads.len == 0 or heads.len > 64 or heads[0].dim == 0 or heads[0].dim > 1024) return error.InvalidAttentionShape;
         const dim: usize = heads[0].dim;

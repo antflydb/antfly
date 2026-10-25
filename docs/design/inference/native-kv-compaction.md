@@ -98,8 +98,8 @@ checkpoint upload is held; only one native checkpoint operation is admitted.
 | CUDA fitting, storage and fitted attention | `ops/cuda/attention_match_fit.zig`, `attention_match_storage.zig`, `attention_match_decode.zig` |
 | Model integration and admission | `pipelines/generation.zig`, `server/server.zig`, `server/native_kv_wire.zig` |
 
-Public endpoints are `POST /ai/v1/chat/context/checkpoint` and
-`POST /ai/v1/chat/context/resume`. The Python SDK provides streaming file
+Public endpoints are `POST /ai/v1/generate/context/checkpoint` and
+`POST /ai/v1/generate/context/resume`. The Python SDK provides streaming file
 helpers; JSON and SSE continuations use the same checkpoint contract.
 See [API usage and supported configurations](../../../zig/pkg/inference/OPENAI.md#portable-native-kv-checkpoints)
 and [SDK usage](../../../py/packages/sdk/README.md#native-kv-checkpoints).

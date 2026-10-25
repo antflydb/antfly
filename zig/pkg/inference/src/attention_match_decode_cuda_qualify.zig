@@ -27,6 +27,7 @@ pub fn main() !void {
     for ([_]storage.Precision{ .f16, .f32 }) |precision| {
         try run(&context, precision);
         try runLocal(&context, precision);
+        try runAppendBoundary(&context, precision);
         for ([_]u32{ 64, 128, 256, 512 }) |dim| {
             for ([_]bool{ false, true }) |all_compressed| try runRotated(&context, precision, dim, all_compressed, 8, false);
         }
@@ -36,6 +37,43 @@ pub fn main() !void {
         if (context.device_allocations.snapshot().live != 0) return error.DeviceAllocationLeak;
     }
     std.debug.print("PASS native ragged dispatch: both precisions, chunking, masks, cancellation, admission, alias rejection, cleanup; serving_qualified=false\n", .{});
+}
+
+fn runAppendBoundary(context: *Context, precision: storage.Precision) !void {
+    const backend: storage.Backend = .{ .allocator = std.heap.page_allocator, .context = context, .precision = precision };
+    var state = try backend.upload(fixture, 128 * 1024 * 1024, .{});
+    defer state.deinit();
+    var runner = try decode.Runner.init(context, 128 * 1024 * 1024);
+    defer runner.deinit();
+    const zeros: [512 * 2]f32 = @splat(0);
+    const values: [512 * 2]f32 = @splat(3);
+    var keys = try Buffer.alloc(context, @sizeOf(@TypeOf(zeros)));
+    defer keys.free(context);
+    var vals = try Buffer.alloc(context, @sizeOf(@TypeOf(values)));
+    defer vals.free(context);
+    try keys.copyFromHost(context, std.mem.sliceAsBytes(&zeros));
+    try vals.copyFromHost(context, std.mem.sliceAsBytes(&values));
+    // Fill the entire admitted prompt suffix, then append a generated token.
+    // Previously the first decode append failed with CompactionAppendLimit.
+    while (state.logical_length < fixture.logical_length + 8192)
+        try runner.append(&state, 0, keys, vals, 512, state.logical_length, .{});
+    try runner.append(&state, 0, keys, vals, 1, state.logical_length, .{});
+    if (state.logical_length != 8197) return error.InvalidAppendState;
+    var output = try Buffer.alloc(context, 2 * @sizeOf(f32));
+    defer output.free(context);
+    try runner.attend(.{ .heads = state.heads, .precision = precision, .queries = keys, .output = output, .query_rows = 1, .query_heads = 2, .first_query_position = 8196, .scale = 1 }, .{});
+    var actual: [2]f32 = undefined;
+    try output.copyToHost(context, std.mem.sliceAsBytes(&actual));
+    try context.synchronize();
+    if (@abs(actual[0] - 3) > 1e-5 or @abs(actual[1] - (3 - @as(f32, 2) / 8197)) > 1e-5)
+        return error.NumericalQualificationFailed;
+    // Output may use the remaining logical budget, but never exceed 32K.
+    while (state.logical_length < 32768)
+        try runner.append(&state, 0, keys, vals, @intCast(@min(512, 32768 - state.logical_length)), state.logical_length, .{});
+    const live = context.device_allocations.snapshot().live;
+    if (runner.append(&state, 0, keys, vals, 1, state.logical_length, .{})) |_| return error.ExpectedAppendLimit else |err| if (err != error.CompactionAppendLimit) return err;
+    if (state.logical_length != 32768 or context.device_allocations.snapshot().live != live) return error.InvalidAppendState;
+    std.debug.print("PASS append boundary: 8192 prompt tokens plus decode through 32768, precision={s}\n", .{@tagName(precision)});
 }
 
 fn run(context: *Context, precision: storage.Precision) !void {
@@ -155,7 +193,7 @@ fn qualifyAppend(context: *Context, state: *storage.DeviceState, runner: *decode
     try context.synchronize();
     for (actual, expected) |a, e| if (@abs(a - e) > 2e-6) return error.NumericalQualificationFailed;
     if (runner.append(state, 0, state.heads[0].keys, vals, 2, 6, .{})) |_| return error.ExpectedShapeFailure else |err| if (err != error.InvalidAttentionShape) return err;
-    state.logical_length = state.initial_logical_length + 8192;
+    state.logical_length = 32768;
     if (runner.append(state, 0, keys, vals, 1, state.logical_length, .{})) |_| return error.ExpectedAppendLimit else |err| if (err != error.CompactionAppendLimit) return err;
     state.logical_length = 6;
     try runner.append(state, 0, keys, vals, 2, 6, .{});

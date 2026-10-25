@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 
@@ -10,6 +10,10 @@ from ..models.inference_context_diagnostics_kv_cache_version import InferenceCon
 from ..models.inference_context_diagnostics_policy import InferenceContextDiagnosticsPolicy
 from ..types import UNSET, Unset
 
+if TYPE_CHECKING:
+    from ..models.inference_context_tool_result_outcome import InferenceContextToolResultOutcome
+
+
 T = TypeVar("T", bound="InferenceContextDiagnostics")
 
 
@@ -17,7 +21,10 @@ T = TypeVar("T", bound="InferenceContextDiagnostics")
 class InferenceContextDiagnostics:
     """
     Attributes:
-        policy (InferenceContextDiagnosticsPolicy): Context action evaluated by the server.
+        policy (InferenceContextDiagnosticsPolicy): Requested action: generation admission uses reject/window; explicit
+            preparation uses inspect/window/compact. The flags below describe actual
+            changes independently. For example, window with an existing checkpoint
+            can report compacted=true without creating another checkpoint.
         applied (bool): Whether the returned generation context differs from the supplied transcript.
         original_input_tokens (int):
         effective_input_tokens (int): Token count after checkpoint application and windowing.
@@ -31,7 +38,14 @@ class InferenceContextDiagnostics:
         windowed (bool):
         compacted (bool):
         checkpoint_sha256 (str | Unset):
-        checkpoint_created (bool | Unset):  Default: False.
+        checkpoint_created (bool | Unset): Whether this operation created a new structured checkpoint. Default: False.
+        tool_results (list[InferenceContextToolResultOutcome] | Unset): Context-planning outcomes for identified tool-
+            result messages, in original
+            input order, followed by archived checkpoint evidence. Summarized means
+            represented by attributed checkpoint evidence (possibly verbatim), not a
+            retained raw tool message. Archived records omit message_index; reused
+            IDs can therefore have distinct outcomes. Messages without tool_call_id
+            are omitted. This reports input presence, not whether the model used it.
         kv_cache_mode (InferenceContextDiagnosticsKvCacheMode | Unset): Effective KV policy, when generation selected
             one.
         kv_cache_version (InferenceContextDiagnosticsKvCacheVersion | Unset):
@@ -51,6 +65,7 @@ class InferenceContextDiagnostics:
     checkpoint_applied: bool = False
     checkpoint_sha256: str | Unset = UNSET
     checkpoint_created: bool | Unset = False
+    tool_results: list[InferenceContextToolResultOutcome] | Unset = UNSET
     kv_cache_mode: InferenceContextDiagnosticsKvCacheMode | Unset = UNSET
     kv_cache_version: InferenceContextDiagnosticsKvCacheVersion | Unset = UNSET
 
@@ -83,6 +98,13 @@ class InferenceContextDiagnostics:
 
         checkpoint_created = self.checkpoint_created
 
+        tool_results: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.tool_results, Unset):
+            tool_results = []
+            for tool_results_item_data in self.tool_results:
+                tool_results_item = tool_results_item_data.to_dict()
+                tool_results.append(tool_results_item)
+
         kv_cache_mode: str | Unset = UNSET
         if not isinstance(self.kv_cache_mode, Unset):
             kv_cache_mode = self.kv_cache_mode.value
@@ -113,6 +135,8 @@ class InferenceContextDiagnostics:
             field_dict["checkpoint_sha256"] = checkpoint_sha256
         if checkpoint_created is not UNSET:
             field_dict["checkpoint_created"] = checkpoint_created
+        if tool_results is not UNSET:
+            field_dict["tool_results"] = tool_results
         if kv_cache_mode is not UNSET:
             field_dict["kv_cache_mode"] = kv_cache_mode
         if kv_cache_version is not UNSET:
@@ -122,6 +146,8 @@ class InferenceContextDiagnostics:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.inference_context_tool_result_outcome import InferenceContextToolResultOutcome
+
         d = dict(src_dict)
         policy = InferenceContextDiagnosticsPolicy(d.pop("policy"))
 
@@ -150,6 +176,15 @@ class InferenceContextDiagnostics:
         checkpoint_sha256 = d.pop("checkpoint_sha256", UNSET)
 
         checkpoint_created = d.pop("checkpoint_created", UNSET)
+
+        _tool_results = d.pop("tool_results", UNSET)
+        tool_results: list[InferenceContextToolResultOutcome] | Unset = UNSET
+        if _tool_results is not UNSET:
+            tool_results = []
+            for tool_results_item_data in _tool_results:
+                tool_results_item = InferenceContextToolResultOutcome.from_dict(tool_results_item_data)
+
+                tool_results.append(tool_results_item)
 
         _kv_cache_mode = d.pop("kv_cache_mode", UNSET)
         kv_cache_mode: InferenceContextDiagnosticsKvCacheMode | Unset
@@ -180,6 +215,7 @@ class InferenceContextDiagnostics:
             compacted=compacted,
             checkpoint_sha256=checkpoint_sha256,
             checkpoint_created=checkpoint_created,
+            tool_results=tool_results,
             kv_cache_mode=kv_cache_mode,
             kv_cache_version=kv_cache_version,
         )

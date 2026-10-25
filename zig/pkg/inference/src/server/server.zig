@@ -12742,7 +12742,7 @@ pub const Node = struct {
 
     fn contextRequestFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         return switch (err) {
-            error.StaleCheckpoint,
+            error.StaleCheckpoint => ctx.status(409).json(.{ .@"error" = "CONTEXT_CHECKPOINT_STALE_REVISION", .message = @errorName(err), .retryable = false }),
             error.CheckpointHistoryMismatch,
             error.CheckpointMemoryMismatch,
             error.UnsupportedCheckpointVersion,
@@ -13177,7 +13177,7 @@ pub const Node = struct {
         }
         if (body.context_management) |policy| {
             if (!std.mem.eql(u8, policy.mode, "reject") and !std.mem.eql(u8, policy.mode, "window"))
-                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "generation context mode must be reject or window; compact explicitly with /chat/context/prepare" });
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "generation context mode must be reject or window; compact explicitly with /generate/context/prepare" });
             _ = contextRecentTurns(policy.keep_recent_turns) catch |err| return contextRequestFailure(ctx, err);
         }
         if (body.kv_cache) |policy| {
@@ -27276,9 +27276,9 @@ fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []con
         if (comptime std.mem.eql(u8, path, "/transcription/sessions/:session_id")) return .none;
     } else if (comptime std.mem.eql(u8, method, "POST")) {
         if (comptime std.mem.eql(u8, path, "/chat/completions") or
-            std.mem.eql(u8, path, "/chat/context/prepare") or
-            std.mem.eql(u8, path, "/chat/context/checkpoint") or
-            std.mem.eql(u8, path, "/chat/context/resume") or
+            std.mem.eql(u8, path, "/generate/context/prepare") or
+            std.mem.eql(u8, path, "/generate/context/checkpoint") or
+            std.mem.eql(u8, path, "/generate/context/resume") or
             std.mem.eql(u8, path, "/chunk") or
             std.mem.eql(u8, path, "/dictate") or
             std.mem.eql(u8, path, "/transcription/sessions") or
@@ -27356,7 +27356,7 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
                 httpx.Handler.wrap(self.node, handler, admittedInferenceHandler)
             else
                 handler;
-            if (comptime std.mem.eql(u8, path, "/chat/context/resume") and @hasDecl(Inner, "routeStreamingRawWithBodyLimit"))
+            if (comptime std.mem.eql(u8, path, "/generate/context/resume") and @hasDecl(Inner, "routeStreamingRawWithBodyLimit"))
                 try self.inner.routeStreamingRawWithBodyLimit(.POST, prefix ++ path, Node.native_checkpoint_stream_limit, wrapped)
             else if (comptime inferenceRouteStreamsRawBody(path) and @hasDecl(Inner, "postStreamingRaw"))
                 try self.inner.postStreamingRaw(prefix ++ path, wrapped)
@@ -27402,7 +27402,7 @@ fn AiPrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
                 httpx.Handler.wrap(self.node, handler, admittedInferenceHandler)
             else
                 handler;
-            if (comptime std.mem.eql(u8, path, "/chat/context/resume") and @hasDecl(Inner, "routeStreamingRawWithBodyLimit"))
+            if (comptime std.mem.eql(u8, path, "/generate/context/resume") and @hasDecl(Inner, "routeStreamingRawWithBodyLimit"))
                 try self.inner.routeStreamingRawWithBodyLimit(.POST, prefix ++ path, Node.native_checkpoint_stream_limit, wrapped)
             else if (comptime inferenceRouteStreamsRawBody(path) and @hasDecl(Inner, "postStreamingRaw"))
                 try self.inner.postStreamingRaw(prefix ++ path, wrapped)
@@ -28347,7 +28347,7 @@ test "context preparation rejects malformed requests before loading a model" {
         "{\"model\":\"missing-model\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"chat_template_kwargs\":{\"enable_thinking\":\"yes\"}}",
     };
     for (bodies) |body| {
-        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/chat/context/prepare");
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate/context/prepare");
         defer request.deinit();
         request.body = body;
         var ctx = httpx.Context.init(allocator, std.testing.io, &request);
@@ -31249,7 +31249,7 @@ test "registerRoutesOn prefixes embed aliases and metrics route" {
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/embed"));
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/embeddings"));
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/generate/batch"));
-    try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/chat/context/prepare"));
+    try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/generate/context/prepare"));
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/models"));
     try std.testing.expectEqual(@as(usize, 1), server.routeCount(.get, public_api_prefix ++ "/models"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/models/runtime"));
@@ -41648,4 +41648,22 @@ test "generated constrained native request parsing preserves single and batch sc
     var batch = try parseGenerateBody(api.GenerateBatchRequest, a, batch_raw);
     defer batch.deinit();
     try std.testing.expectEqualStrings("1e-400", batch.value.requests[0].body.response_format.?.json_schema.?.schema.?.map.get("minimum").?.number_string);
+}
+
+test "context checkpoint HTTP errors distinguish stale revisions from corrupt payloads" {
+    const allocator = std.testing.allocator;
+    const failures = [_]anyerror{ error.StaleCheckpoint, error.CheckpointMemoryMismatch, error.CheckpointHistoryMismatch, error.InvalidCheckpointDigest, error.UnsupportedCheckpointVersion };
+    for (failures) |failure| {
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate/context/prepare");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try Node.contextRequestFailure(&ctx, failure);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 409), response.status.code);
+        const payload = try std.json.parseFromSlice(struct { @"error": []const u8, retryable: bool }, allocator, response.body.?, .{ .ignore_unknown_fields = true });
+        defer payload.deinit();
+        try std.testing.expectEqualStrings(if (failure == error.StaleCheckpoint) "CONTEXT_CHECKPOINT_STALE_REVISION" else "CONTEXT_CHECKPOINT_MISMATCH", payload.value.@"error");
+        try std.testing.expect(!payload.value.retryable);
+    }
 }

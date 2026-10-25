@@ -4664,7 +4664,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ai/v1/chat/context/checkpoint": {
+    "/ai/v1/generate/context/checkpoint": {
         parameters: {
             query?: never;
             header?: never;
@@ -4706,7 +4706,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ai/v1/chat/context/resume": {
+    "/ai/v1/generate/context/resume": {
         parameters: {
             query?: never;
             header?: never;
@@ -4961,7 +4961,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ai/v1/chat/context/prepare": {
+    "/ai/v1/generate/context/prepare": {
         parameters: {
             query?: never;
             header?: never;
@@ -22479,7 +22479,11 @@ export interface components {
             /**
              * @description `reject` fails when the rendered input exceeds the model budget. `window`
              *     permits deterministic removal of older turns. Omission preserves the
-             *     server's existing reject-on-overflow behavior.
+             *     server's existing reject-on-overflow behavior. Generation accepts only
+             *     these admission policies; `inspect` and `compact` are explicit preparation
+             *     operations. The latest user turn, including its tool-call/result sequence,
+             *     is always retained. A mandatory turn that cannot fit is rejected rather
+             *     than split; keep_recent_turns=0 does not remove the active turn.
              * @enum {string}
              */
             mode: "reject" | "window";
@@ -22523,6 +22527,13 @@ export interface components {
             tool_evidence: components["schemas"]["InferenceContextToolEvidence"][];
             unresolved_tool_calls: components["schemas"]["InferenceContextUnresolvedToolCall"][];
         };
+        /**
+         * @description Structured memory bound to the exact model, tokenizer and chat-template
+         *     revisions. HTTP 409 CONTEXT_CHECKPOINT_STALE_REVISION means one of these
+         *     revisions changed. Rebuild from the original transcript using the selected
+         *     model; retrying the same checkpoint against another generator is not a
+         *     fallback. Digest/history/format failures use CONTEXT_CHECKPOINT_MISMATCH.
+         */
         InferenceContextCheckpoint: {
             /**
              * @description Structured-memory checkpoint wire version.
@@ -22541,9 +22552,22 @@ export interface components {
             template_revision: string;
             memory: components["schemas"]["InferenceContextStructuredMemory"];
         };
+        InferenceContextToolResultOutcome: {
+            tool_call_id: string;
+            /**
+             * @description Raw result retained, represented by checkpoint evidence, or absent from effective input.
+             * @enum {string}
+             */
+            disposition: "retained" | "summarized" | "dropped";
+            /** @description Original request message index; omitted for evidence from an earlier checkpoint. */
+            message_index?: number;
+        };
         InferenceContextDiagnostics: {
             /**
-             * @description Context action evaluated by the server.
+             * @description Requested action: generation admission uses reject/window; explicit
+             *     preparation uses inspect/window/compact. The flags below describe actual
+             *     changes independently. For example, window with an existing checkpoint
+             *     can report compacted=true without creating another checkpoint.
              * @enum {string}
              */
             policy: "reject" | "inspect" | "window" | "compact";
@@ -22567,8 +22591,20 @@ export interface components {
             checkpoint_sha256?: string;
             windowed: boolean;
             compacted: boolean;
-            /** @default false */
+            /**
+             * @description Whether this operation created a new structured checkpoint.
+             * @default false
+             */
             checkpoint_created?: boolean;
+            /**
+             * @description Context-planning outcomes for identified tool-result messages, in original
+             *     input order, followed by archived checkpoint evidence. Summarized means
+             *     represented by attributed checkpoint evidence (possibly verbatim), not a
+             *     retained raw tool message. Archived records omit message_index; reused
+             *     IDs can therefore have distinct outcomes. Messages without tool_call_id
+             *     are omitted. This reports input presence, not whether the model used it.
+             */
+            tool_results?: components["schemas"]["InferenceContextToolResultOutcome"][];
             /**
              * @description Effective KV policy, when generation selected one.
              * @enum {string}
@@ -22591,6 +22627,9 @@ export interface components {
              */
             max_tokens?: number;
             /**
+             * @description Explicit preparation action: inspect counts without dropping turns,
+             *     window removes eligible old turns, compact creates structured memory.
+             *     Generation itself accepts only reject/window admission policies.
              * @default inspect
              * @enum {string}
              */

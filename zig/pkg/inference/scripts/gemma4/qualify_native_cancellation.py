@@ -51,7 +51,7 @@ class AbortableRequest:
 def probe(args):
     connection=http.client.HTTPConnection('127.0.0.1',args.port,timeout=2)
     try:
-        connection.request('POST','/ai/v1/chat/context/resume',b'{}',{'Content-Type':'application/json'})
+        connection.request('POST','/ai/v1/generate/context/resume',b'{}',{'Content-Type':'application/json'})
         response=connection.getresponse();payload=json.loads(response.read(65536))
         if response.status==400:
             if payload!={'error':'INVALID_KV_CHECKPOINT','message':'InvalidNativeKvFrame'}:
@@ -179,7 +179,7 @@ def main():
                     connection=request.connection
                     if kind=='partial_upload':
                         size=args.checkpoint.stat().st_size;prefix=envelope_prefix(body,size)
-                        connection.putrequest('POST','/ai/v1/chat/context/resume')
+                        connection.putrequest('POST','/ai/v1/generate/context/resume')
                         connection.putheader('Content-Type',CONTENT_TYPE)
                         connection.putheader('Content-Length',str(len(prefix)+size));connection.endheaders()
                         connection.send(prefix)
@@ -191,7 +191,7 @@ def main():
                         case['request_log_offset']=offset
                         publish()
                         request_started=time.monotonic()
-                        connection.request('POST','/ai/v1/chat/context/checkpoint',json.dumps(body).encode(),
+                        connection.request('POST','/ai/v1/generate/context/checkpoint',json.dumps(body).encode(),
                                            {'Content-Type':'application/json','X-Antfly-KV-Encoding':encoding})
                         if kind=='prefill':
                             case['active_route_marker']=wait_prefill_route(log,offset,30)

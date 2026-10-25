@@ -77,6 +77,7 @@ export type GenerateResponse = components["schemas"]["InferenceGenerateResponse"
 export type GenerateChunk = components["schemas"]["InferenceGenerateChunk"];
 export type ContextCheckpoint = components["schemas"]["InferenceContextCheckpoint"];
 export type ContextDiagnostics = components["schemas"]["InferenceContextDiagnostics"];
+export type ContextToolResultOutcome = components["schemas"]["InferenceContextToolResultOutcome"];
 export type ContextPrepareRequest = components["schemas"]["InferenceContextPrepareRequest"];
 export type ContextPrepareResponse = components["schemas"]["InferenceContextPrepareResponse"];
 

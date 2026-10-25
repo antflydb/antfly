@@ -199,7 +199,7 @@ export class InferenceClient {
     request: ContextPrepareRequest,
     options?: RequestOptions
   ): Promise<ContextPrepareResponse> {
-    const response = await fetch(`${this.baseUrl}/ai/v1/chat/context/prepare`, {
+    const response = await fetch(`${this.baseUrl}/ai/v1/generate/context/prepare`, {
       method: "POST",
       headers: {
         ...this.headers,

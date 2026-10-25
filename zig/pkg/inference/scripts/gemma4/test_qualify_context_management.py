@@ -208,7 +208,7 @@ class ContextQualificationTests(unittest.TestCase):
             "target_input_tokens": 1024, "reserved_output_tokens": 32,
         }, "usage": {"prompt_tokens": 900, "completion_tokens": 10}}
         client = mock.Mock()
-        client.timings_ms = [{"elapsed_ms": 10, "path": "/ai/v1/chat/context/prepare"}]
+        client.timings_ms = [{"elapsed_ms": 10, "path": "/ai/v1/generate/context/prepare"}]
         client.post.side_effect = [(200, window), (200, generated), (200, {"checkpoint": checkpoint, "context": {"compacted": True}})]
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "evidence.json"

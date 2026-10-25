@@ -6238,8 +6238,8 @@ const native_checkpoint_upload_limit: usize = 2 * 1024 * 1024 * 1024 + 2 * 1024 
 
 fn nativeCheckpointUploadLimit(method: httpx.Method, path: []const u8) ?usize {
     if (method != .POST) return null;
-    if (!std.mem.eql(u8, path, inference_bridge.ai_api_prefix ++ "/chat/context/resume") and
-        !std.mem.eql(u8, path, inference_bridge.public_api_prefix ++ "/chat/context/resume")) return null;
+    if (!std.mem.eql(u8, path, inference_bridge.ai_api_prefix ++ "/generate/context/resume") and
+        !std.mem.eql(u8, path, inference_bridge.public_api_prefix ++ "/generate/context/resume")) return null;
     return native_checkpoint_upload_limit;
 }
 
@@ -8999,7 +8999,7 @@ test "standalone runtime module compiles" {
     _ = runFromIterator;
     try std.testing.expect(isInteractiveGeneratePath("/ai/v1/generate"));
     try std.testing.expect(isInteractiveGeneratePath("/ai/v1/chat/completions"));
-    try std.testing.expect(isInteractiveGeneratePath("/ai/v1/chat/context/prepare"));
+    try std.testing.expect(isInteractiveGeneratePath("/ai/v1/generate/context/prepare"));
     try std.testing.expect(isInteractiveGeneratePath("/ml/v1/generate/batch"));
     try std.testing.expect(!isInteractiveGeneratePath("/ai/v1/embed"));
     try std.testing.expect(!isInteractiveGeneratePath("/ai/v10/generate"));
@@ -11193,12 +11193,12 @@ test "standalone runtime defaults public listener to antfarm port" {
 }
 
 test "only native checkpoint resume admits large streamed uploads" {
-    try std.testing.expectEqual(@as(?usize, native_checkpoint_upload_limit), nativeCheckpointUploadLimit(.POST, "/ai/v1/chat/context/resume"));
-    try std.testing.expectEqual(@as(?usize, native_checkpoint_upload_limit), nativeCheckpointUploadLimit(.POST, "/ml/v1/chat/context/resume"));
-    for ([_][]const u8{ "/ai/v1/chat/completions", "/ai/v1/chat/context/checkpoint", "/ai/v1/chat/context/resume/extra", "/api/v1/query" }) |path| {
+    try std.testing.expectEqual(@as(?usize, native_checkpoint_upload_limit), nativeCheckpointUploadLimit(.POST, "/ai/v1/generate/context/resume"));
+    try std.testing.expectEqual(@as(?usize, native_checkpoint_upload_limit), nativeCheckpointUploadLimit(.POST, "/ml/v1/generate/context/resume"));
+    for ([_][]const u8{ "/ai/v1/chat/completions", "/ai/v1/generate/context/checkpoint", "/ai/v1/generate/context/resume/extra", "/api/v1/query" }) |path| {
         try std.testing.expectEqual(@as(?usize, null), nativeCheckpointUploadLimit(.POST, path));
     }
-    try std.testing.expectEqual(@as(?usize, null), nativeCheckpointUploadLimit(.GET, "/ai/v1/chat/context/resume"));
+    try std.testing.expectEqual(@as(?usize, null), nativeCheckpointUploadLimit(.GET, "/ai/v1/generate/context/resume"));
 }
 
 test "standalone public HTTP server is restart-safe and uses public API request body limit" {

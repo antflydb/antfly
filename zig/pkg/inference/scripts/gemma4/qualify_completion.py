@@ -21,7 +21,7 @@ from qualify_native_checkpoint_http import (REPO, canonical_choices, git_provena
 
 def guard_probe(connection):
     started = time.monotonic_ns()
-    connection.request('POST', '/ai/v1/chat/context/resume', b'{}',
+    connection.request('POST', '/ai/v1/generate/context/resume', b'{}',
                        {'Content-Type': 'application/json'})
     response = connection.getresponse()
     payload = response.read(65536)
@@ -110,7 +110,7 @@ def main():
             connection = http.client.HTTPConnection('127.0.0.1',args.port,timeout=args.timeout)
             probe_connection = http.client.HTTPConnection('127.0.0.1',args.port,timeout=args.timeout)
             try:
-                connection.request('POST','/ai/v1/chat/context/checkpoint',json.dumps(cold_body).encode(),
+                connection.request('POST','/ai/v1/generate/context/checkpoint',json.dumps(cold_body).encode(),
                                    {'Content-Type':'application/json',
                                     'X-Antfly-KV-Encoding':prepared['metadata'].get('encoding', 'f32')})
                 response = connection.getresponse()
@@ -136,7 +136,7 @@ def main():
                     # reconnect, checkpoint upload, sleep or retry before probing.
                     probe_connection.connect()
                     started = time.monotonic_ns()
-                    response = send_resume(connection, '/ai/v1/chat/context/resume', body, args.checkpoint)
+                    response = send_resume(connection, '/ai/v1/generate/context/resume', body, args.checkpoint)
                     if response.status != 200:
                         raise AssertionError(f'resume HTTP {response.status}: {response.read(65536)!r}')
                     response_headers(response, record)

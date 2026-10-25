@@ -34,7 +34,12 @@ class InferenceGenerateResponse:
             supply it.
         speculation (InferenceGenerateSpeculationStatus | None | Unset):
         context (InferenceContextDiagnostics | Unset):
-        checkpoint (InferenceContextCheckpoint | Unset):
+        checkpoint (InferenceContextCheckpoint | Unset): Structured memory bound to the exact model, tokenizer and chat-
+            template
+            revisions. HTTP 409 CONTEXT_CHECKPOINT_STALE_REVISION means one of these
+            revisions changed. Rebuild from the original transcript using the selected
+            model; retrying the same checkpoint against another generator is not a
+            fallback. Digest/history/format failures use CONTEXT_CHECKPOINT_MISMATCH.
     """
 
     id: str

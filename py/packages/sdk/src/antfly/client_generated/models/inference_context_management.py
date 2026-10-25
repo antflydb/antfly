@@ -21,8 +21,17 @@ class InferenceContextManagement:
     Attributes:
         mode (InferenceContextManagementMode): `reject` fails when the rendered input exceeds the model budget. `window`
             permits deterministic removal of older turns. Omission preserves the
-            server's existing reject-on-overflow behavior.
-        checkpoint (InferenceContextCheckpoint | Unset):
+            server's existing reject-on-overflow behavior. Generation accepts only
+            these admission policies; `inspect` and `compact` are explicit preparation
+            operations. The latest user turn, including its tool-call/result sequence,
+            is always retained. A mandatory turn that cannot fit is rejected rather
+            than split; keep_recent_turns=0 does not remove the active turn.
+        checkpoint (InferenceContextCheckpoint | Unset): Structured memory bound to the exact model, tokenizer and chat-
+            template
+            revisions. HTTP 409 CONTEXT_CHECKPOINT_STALE_REVISION means one of these
+            revisions changed. Rebuild from the original transcript using the selected
+            model; retrying the same checkpoint against another generator is not a
+            fallback. Digest/history/format failures use CONTEXT_CHECKPOINT_MISMATCH.
         max_input_tokens (int | Unset): Optional client ceiling below the model's effective input limit.
         keep_recent_turns (int | Unset): Minimum number of most recent complete turns retained by windowing. Default: 2.
     """

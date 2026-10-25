@@ -13,16 +13,6 @@ pub fn parseChatCompletionsBody(allocator: std.mem.Allocator, body: []const u8) 
     return std.json.parseFromSlice(types.GenerateRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Parse the JSON request body for prepareNativeKvCheckpoint.
-pub fn parsePrepareNativeKvCheckpointBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.GenerateRequest) {
-    return std.json.parseFromSlice(types.GenerateRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Parse the JSON request body for prepareChatContext.
-pub fn parsePrepareChatContextBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ContextPrepareRequest) {
-    return std.json.parseFromSlice(types.ContextPrepareRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
 /// Parse the JSON request body for chunkText.
 pub fn parseChunkTextBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ChunkRequest) {
     return std.json.parseFromSlice(types.ChunkRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -61,6 +51,16 @@ pub fn parseGenerateContentBody(allocator: std.mem.Allocator, body: []const u8) 
 /// Parse the JSON request body for generateBatchContent.
 pub fn parseGenerateBatchContentBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.GenerateBatchRequest) {
     return std.json.parseFromSlice(types.GenerateBatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for prepareNativeKvCheckpoint.
+pub fn parsePrepareNativeKvCheckpointBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.GenerateRequest) {
+    return std.json.parseFromSlice(types.GenerateRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for prepareChatContext.
+pub fn parsePrepareChatContextBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ContextPrepareRequest) {
+    return std.json.parseFromSlice(types.ContextPrepareRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Parse the JSON request body for loadModelInstance.
@@ -155,9 +155,6 @@ pub const Route = struct {
 
 pub const routes = [_]Route{
     .{ .method = "POST", .path = "/chat/completions", .operation_id = "chatCompletions", .request_body = .buffered, .streaming_response = true },
-    .{ .method = "POST", .path = "/chat/context/checkpoint", .operation_id = "prepareNativeKvCheckpoint", .request_body = .buffered, .streaming_response = true },
-    .{ .method = "POST", .path = "/chat/context/prepare", .operation_id = "prepareChatContext", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/chat/context/resume", .operation_id = "resumeNativeKvCheckpoint", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/chunk", .operation_id = "chunkText", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/decisions", .operation_id = "decide", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/dictate", .operation_id = "dictate", .request_body = .buffered, .streaming_response = true },
@@ -166,6 +163,9 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/extract", .operation_id = "extract", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/generate", .operation_id = "generateContent", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/generate/batch", .operation_id = "generateBatchContent", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/generate/context/checkpoint", .operation_id = "prepareNativeKvCheckpoint", .request_body = .buffered, .streaming_response = true },
+    .{ .method = "POST", .path = "/generate/context/prepare", .operation_id = "prepareChatContext", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/generate/context/resume", .operation_id = "resumeNativeKvCheckpoint", .request_body = .buffered, .streaming_response = true },
     .{ .method = "GET", .path = "/models", .operation_id = "listModels", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/models/instances", .operation_id = "listModelInstances", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/models/instances", .operation_id = "loadModelInstance", .request_body = .buffered, .streaming_response = false },
@@ -196,9 +196,6 @@ pub const routes = [_]Route{
 pub fn ServerRouter(comptime Impl: type) type {
     comptime {
         if (!@hasDecl(Impl, "chatCompletions")) @compileError("ServerRouter: Impl missing required method 'chatCompletions'");
-        if (!@hasDecl(Impl, "prepareNativeKvCheckpoint")) @compileError("ServerRouter: Impl missing required method 'prepareNativeKvCheckpoint'");
-        if (!@hasDecl(Impl, "prepareChatContext")) @compileError("ServerRouter: Impl missing required method 'prepareChatContext'");
-        if (!@hasDecl(Impl, "resumeNativeKvCheckpoint")) @compileError("ServerRouter: Impl missing required method 'resumeNativeKvCheckpoint'");
         if (!@hasDecl(Impl, "chunkText")) @compileError("ServerRouter: Impl missing required method 'chunkText'");
         if (!@hasDecl(Impl, "decide")) @compileError("ServerRouter: Impl missing required method 'decide'");
         if (!@hasDecl(Impl, "dictate")) @compileError("ServerRouter: Impl missing required method 'dictate'");
@@ -207,6 +204,9 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "extract")) @compileError("ServerRouter: Impl missing required method 'extract'");
         if (!@hasDecl(Impl, "generateContent")) @compileError("ServerRouter: Impl missing required method 'generateContent'");
         if (!@hasDecl(Impl, "generateBatchContent")) @compileError("ServerRouter: Impl missing required method 'generateBatchContent'");
+        if (!@hasDecl(Impl, "prepareNativeKvCheckpoint")) @compileError("ServerRouter: Impl missing required method 'prepareNativeKvCheckpoint'");
+        if (!@hasDecl(Impl, "prepareChatContext")) @compileError("ServerRouter: Impl missing required method 'prepareChatContext'");
+        if (!@hasDecl(Impl, "resumeNativeKvCheckpoint")) @compileError("ServerRouter: Impl missing required method 'resumeNativeKvCheckpoint'");
         if (!@hasDecl(Impl, "listModels")) @compileError("ServerRouter: Impl missing required method 'listModels'");
         if (!@hasDecl(Impl, "listModelInstances")) @compileError("ServerRouter: Impl missing required method 'listModelInstances'");
         if (!@hasDecl(Impl, "loadModelInstance")) @compileError("ServerRouter: Impl missing required method 'loadModelInstance'");
@@ -235,9 +235,6 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// Register all routes on the server with explicit instance context.
         pub fn register(self: *const @This(), server: anytype) !void {
             try server.post("/chat/completions", httpx.Handler.bind(self.impl, chatCompletions));
-            try server.post("/chat/context/checkpoint", httpx.Handler.bind(self.impl, prepareNativeKvCheckpoint));
-            try server.post("/chat/context/prepare", httpx.Handler.bind(self.impl, prepareChatContext));
-            try server.post("/chat/context/resume", httpx.Handler.bind(self.impl, resumeNativeKvCheckpoint));
             try server.post("/chunk", httpx.Handler.bind(self.impl, chunkText));
             try server.post("/decisions", httpx.Handler.bind(self.impl, decide));
             try server.post("/dictate", httpx.Handler.bind(self.impl, dictate));
@@ -246,6 +243,9 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/extract", httpx.Handler.bind(self.impl, extract));
             try server.post("/generate", httpx.Handler.bind(self.impl, generateContent));
             try server.post("/generate/batch", httpx.Handler.bind(self.impl, generateBatchContent));
+            try server.post("/generate/context/checkpoint", httpx.Handler.bind(self.impl, prepareNativeKvCheckpoint));
+            try server.post("/generate/context/prepare", httpx.Handler.bind(self.impl, prepareChatContext));
+            try server.post("/generate/context/resume", httpx.Handler.bind(self.impl, resumeNativeKvCheckpoint));
             try server.get("/models", httpx.Handler.bind(self.impl, listModels));
             try server.get("/models/instances", httpx.Handler.bind(self.impl, listModelInstances));
             try server.post("/models/instances", httpx.Handler.bind(self.impl, loadModelInstance));
@@ -268,24 +268,6 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// POST /chat/completions
         fn chatCompletions(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.chatCompletions(ctx);
-        }
-
-        /// Prepare a portable native KV checkpoint
-        /// POST /chat/context/checkpoint
-        fn prepareNativeKvCheckpoint(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.prepareNativeKvCheckpoint(ctx);
-        }
-
-        /// Inspect or prepare bounded chat context
-        /// POST /chat/context/prepare
-        fn prepareChatContext(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.prepareChatContext(ctx);
-        }
-
-        /// Generate from a portable native KV checkpoint
-        /// POST /chat/context/resume
-        fn resumeNativeKvCheckpoint(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
-            return impl.resumeNativeKvCheckpoint(ctx);
         }
 
         /// Chunk content with optional model-aware embeddings
@@ -334,6 +316,24 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// POST /generate/batch
         fn generateBatchContent(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.generateBatchContent(ctx);
+        }
+
+        /// Prepare a portable native KV checkpoint
+        /// POST /generate/context/checkpoint
+        fn prepareNativeKvCheckpoint(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.prepareNativeKvCheckpoint(ctx);
+        }
+
+        /// Inspect or prepare bounded chat context
+        /// POST /generate/context/prepare
+        fn prepareChatContext(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.prepareChatContext(ctx);
+        }
+
+        /// Generate from a portable native KV checkpoint
+        /// POST /generate/context/resume
+        fn resumeNativeKvCheckpoint(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.resumeNativeKvCheckpoint(ctx);
         }
 
         /// List available models
@@ -448,9 +448,6 @@ pub fn ServerRouter(comptime Impl: type) type {
 // Handler interface. Implement these methods on your Impl struct:
 //
 //   fn chatCompletions(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn prepareNativeKvCheckpoint(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn prepareChatContext(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn resumeNativeKvCheckpoint(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn chunkText(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn decide(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn dictate(self: *Impl, ctx: *httpx.Context) !httpx.Response
@@ -459,6 +456,9 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn extract(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn generateContent(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn generateBatchContent(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn prepareNativeKvCheckpoint(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn prepareChatContext(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn resumeNativeKvCheckpoint(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listModels(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listModelInstances(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn loadModelInstance(self: *Impl, ctx: *httpx.Context) !httpx.Response

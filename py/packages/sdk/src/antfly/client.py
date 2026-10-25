@@ -545,7 +545,7 @@ def _iter_generation_chunks(
                 if request is not None:
                     _validate_context_attestation(request, chunk.context)
                 saw_context_attestation = True
-            elif request is not None and chunk.choices:
+            elif request is not None and not saw_context_attestation and chunk.choices:
                 raise AntflyException("generation server emitted content before attesting the requested context policy")
             yield chunk
         except (KeyError, TypeError, ValueError) as exc:
@@ -1062,7 +1062,7 @@ class AntflyClient:
         """Inspect, window, or compact chat context using the server's declared capabilities."""
         with self._client.get_httpx_client().stream(
             "POST",
-            "/ai/v1/chat/context/prepare",
+            "/ai/v1/generate/context/prepare",
             json=request.to_dict(),
             headers={"Accept": "application/json"},
         ) as response:
@@ -1118,7 +1118,7 @@ class AntflyClient:
         body["stream"] = False
         with self._client.get_httpx_client().stream(
             "POST",
-            "/ai/v1/chat/context/checkpoint",
+            "/ai/v1/generate/context/checkpoint",
             json=body,
             headers={"Accept": CONTENT_TYPE, "X-Antfly-KV-Encoding": encoding},
             follow_redirects=False,
@@ -1147,7 +1147,7 @@ class AntflyClient:
                 length, chunks = checkpoint_upload(source, body)
                 with self._client.get_httpx_client().stream(
                     "POST",
-                    "/ai/v1/chat/context/resume",
+                    "/ai/v1/generate/context/resume",
                     content=chunks,
                     headers={
                         "Content-Type": CONTENT_TYPE,

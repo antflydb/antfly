@@ -570,6 +570,7 @@ pub const InferenceContextPrepareRequest = types.InferenceContextPrepareRequest;
 pub const InferenceContextPrepareResponse = types.InferenceContextPrepareResponse;
 pub const InferenceContextStructuredMemory = types.InferenceContextStructuredMemory;
 pub const InferenceContextToolEvidence = types.InferenceContextToolEvidence;
+pub const InferenceContextToolResultOutcome = types.InferenceContextToolResultOutcome;
 pub const InferenceContextUnresolvedToolCall = types.InferenceContextUnresolvedToolCall;
 pub const InferenceCredentials = types.InferenceCredentials;
 pub const InferenceDecideAnswer = types.InferenceDecideAnswer;

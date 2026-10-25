@@ -95,7 +95,7 @@ def prepare(args, body, record):
     connection = http.client.HTTPConnection('127.0.0.1', args.port, timeout=args.timeout)
     try:
         start = time.monotonic()
-        connection.request('POST', '/ai/v1/chat/context/checkpoint', json.dumps(body).encode(), {'Content-Type': 'application/json', 'X-Antfly-KV-Encoding': getattr(args, 'encoding', 'f16')})
+        connection.request('POST', '/ai/v1/generate/context/checkpoint', json.dumps(body).encode(), {'Content-Type': 'application/json', 'X-Antfly-KV-Encoding': getattr(args, 'encoding', 'f16')})
         response = connection.getresponse()
         if response.status != 200: raise RuntimeError(f'prepare HTTP {response.status}: {response.read(65536)!r}')
         headers = response_headers(response, record)
@@ -123,7 +123,7 @@ def resume(args, body, record, prepared, label, expected_status=200, mutate=None
     connection = http.client.HTTPConnection('127.0.0.1', args.port, timeout=args.timeout)
     try:
         start = time.monotonic()
-        response = send_resume(connection, '/ai/v1/chat/context/resume', body, args.checkpoint, mutate)
+        response = send_resume(connection, '/ai/v1/generate/context/resume', body, args.checkpoint, mutate)
         if response.status != expected_status:
             raise AssertionError(f'{label} HTTP {response.status}, wanted {expected_status}: {response.read(65536)!r}')
         if expected_status != 200:

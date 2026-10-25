@@ -102,7 +102,7 @@ def run_stress(client: Client, model: str, filler_turns: int, evidence: dict[str
     }]
     common = {"model": model, "tools": tools, "tool_choice": "auto", "chat_template_kwargs": {"enable_thinking": False}, "max_tokens": MAX_TOKENS, "max_input_tokens": TARGET_INPUT_TOKENS, "keep_recent_turns": 2}
 
-    _, window = client.post("/ai/v1/chat/context/prepare", {**common, "mode": "window", "messages": copy.deepcopy(source)})
+    _, window = client.post("/ai/v1/generate/context/prepare", {**common, "mode": "window", "messages": copy.deepcopy(source)})
     cases["window"] = window.get("context")
     validate_window(source, window, TARGET_INPUT_TOKENS)
     assert_tool_atomic(window["messages"])
@@ -131,7 +131,7 @@ def run_stress(client: Client, model: str, filler_turns: int, evidence: dict[str
             raise AssertionError(f"window generation was not a near-8k prompt: {effective} tokens")
         long_context.append({"sampling": sampling, "context": response["context"], "usage": response.get("usage"), "text_length": len(response_text(response))})
 
-    _, compacted = client.post("/ai/v1/chat/context/prepare", {**common, "mode": "compact", "messages": copy.deepcopy(source)})
+    _, compacted = client.post("/ai/v1/generate/context/prepare", {**common, "mode": "compact", "messages": copy.deepcopy(source)})
     checkpoint = compacted.get("checkpoint")
     cases["compact"] = compacted.get("context")
     cases["compact_checkpoint"] = checkpoint

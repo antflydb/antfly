@@ -477,7 +477,7 @@ def run(args: argparse.Namespace, evidence: dict[str, Any] | None = None) -> dic
     evidence.update({"schema_version": 2, "qualification": "candidate_evidence", "started_unix_ms": int(time.time() * 1000), "base_url": args.base_url, "model": args.model, "operator_backend_expectation": args.backend, "target_input_tokens": args.target_input_tokens, "max_tokens": args.max_tokens, "cases": {}, "evidence_passed": False, "request_timings_ms": client.timings_ms})
 
     window_request = {**common, "mode": "window", "messages": copy.deepcopy(source)}
-    _, window = client.post("/ai/v1/chat/context/prepare", window_request)
+    _, window = client.post("/ai/v1/generate/context/prepare", window_request)
     validate_window(source, window, args.target_input_tokens)
     if json.dumps(source, sort_keys=True, separators=(",", ":")) != frozen_source:
         raise AssertionError("qualification source fixture was mutated")
@@ -491,7 +491,7 @@ def run(args: argparse.Namespace, evidence: dict[str, Any] | None = None) -> dic
     evidence["cases"]["generation_parity"] = {"context": generated["context"], "usage": generated["usage"]}
 
     compact_request = {**common, "mode": "compact", "messages": copy.deepcopy(source)}
-    _, compacted = client.post("/ai/v1/chat/context/prepare", compact_request, qualification_group="compaction")
+    _, compacted = client.post("/ai/v1/generate/context/prepare", compact_request, qualification_group="compaction")
     checkpoint = compacted.get("checkpoint")
     evidence["cases"]["compact"] = {"context": compacted.get("context"), "checkpoint": checkpoint if isinstance(checkpoint, dict) else {}}
     if not checkpoint:
@@ -523,7 +523,7 @@ def run(args: argparse.Namespace, evidence: dict[str, Any] | None = None) -> dic
     recompact_filler_turns = max(args.filler_turns, args.target_input_tokens // 48)
     recompact_messages = active + fixture_messages(recompact_filler_turns)[2:]
     recompact_messages.append({"role": "user", "content": "Preserve lineage and the verified codename."})
-    _, recompact = client.post("/ai/v1/chat/context/prepare", {**common, "mode": "compact", "messages": recompact_messages, "checkpoint": checkpoint}, qualification_group="recompaction")
+    _, recompact = client.post("/ai/v1/generate/context/prepare", {**common, "mode": "compact", "messages": recompact_messages, "checkpoint": checkpoint}, qualification_group="recompaction")
     child = recompact.get("checkpoint")
     if not child or not child.get("parent_checkpoint_sha256"):
         raise AssertionError("recompaction did not record parent checkpoint lineage")
@@ -751,7 +751,7 @@ def main() -> int:
         "schema_version": 2,
         "qualification": "production_gate" if args.qualification_mode else "candidate_evidence",
         "qualification_scope": {
-            "api": ["POST /ai/v1/chat/context/prepare", "POST /ai/v1/generate"],
+            "api": ["POST /ai/v1/generate/context/prepare", "POST /ai/v1/generate"],
             "context_policy": ["window", "compact", "checkpoint_consume"],
             "kv_cache": {"mode": "exact_hybrid", "version": "v1"},
             "backend": args.backend,

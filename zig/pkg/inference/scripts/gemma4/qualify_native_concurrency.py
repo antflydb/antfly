@@ -79,10 +79,10 @@ def competing_request(args,body,kind):
     try:
         if kind=='prepare':
             payload=json.dumps(body).encode();sent=len(payload)
-            connection.request('POST','/ai/v1/chat/context/checkpoint',payload,{'Content-Type':'application/json'})
+            connection.request('POST','/ai/v1/generate/context/checkpoint',payload,{'Content-Type':'application/json'})
         elif kind=='resume':
             size=args.checkpoint.stat().st_size;prefix=envelope_prefix(body,size)
-            connection.putrequest('POST','/ai/v1/chat/context/resume')
+            connection.putrequest('POST','/ai/v1/generate/context/resume')
             connection.putheader('Content-Type',CONTENT_TYPE)
             connection.putheader('Content-Length',str(len(prefix)+size));connection.endheaders()
             connection.send(prefix);sent=len(prefix)
@@ -139,7 +139,7 @@ def main():
             try:
                 observe_admission(args,case,'before_overlap',0,0)
                 size=args.checkpoint.stat().st_size;prefix=envelope_prefix(body,size)
-                held.connection.putrequest('POST','/ai/v1/chat/context/resume')
+                held.connection.putrequest('POST','/ai/v1/generate/context/resume')
                 held.connection.putheader('Content-Type',CONTENT_TYPE)
                 held.connection.putheader('Content-Length',str(len(prefix)+size));held.connection.endheaders()
                 held.connection.send(prefix)

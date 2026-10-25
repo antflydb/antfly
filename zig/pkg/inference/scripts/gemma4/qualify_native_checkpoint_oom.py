@@ -60,7 +60,7 @@ def main():
                 evidence['pressure'] = pressure
                 connection = http.client.HTTPConnection('127.0.0.1', args.port, timeout=args.timeout)
                 try:
-                    response = send_resume(connection, '/ai/v1/chat/context/resume', body, args.checkpoint)
+                    response = send_resume(connection, '/ai/v1/generate/context/resume', body, args.checkpoint)
                     payload = response.read(65536)
                     evidence['fault_response'] = {'status': response.status, 'body': payload.decode(errors='replace')}
                     if response.status != 500 or json.loads(payload).get('message') not in ('CudaDriverError', 'CudaMemoryLimitExceeded'):

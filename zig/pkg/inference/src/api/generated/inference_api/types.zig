@@ -738,6 +738,7 @@ pub const ContentSecurityConfig = struct {
     }
 };
 
+/// Structured memory bound to the exact model, tokenizer and chat-template revisions. HTTP 409 CONTEXT_CHECKPOINT_STALE_REVISION means one of these revisions changed. Rebuild from the original transcript using the selected model; retrying the same checkpoint against another generator is not a fallback. Digest/history/format failures use CONTEXT_CHECKPOINT_MISMATCH.
 pub const ContextCheckpoint = struct {
     /// Structured-memory checkpoint wire version.
     version: []const u8,
@@ -801,7 +802,7 @@ pub const ContextCheckpoint = struct {
 };
 
 pub const ContextDiagnostics = struct {
-    /// Context action evaluated by the server.
+    /// Requested action: generation admission uses reject/window; explicit preparation uses inspect/window/compact. The flags below describe actual changes independently. For example, window with an existing checkpoint can report compacted=true without creating another checkpoint.
     policy: []const u8,
     /// Whether the returned generation context differs from the supplied transcript.
     applied: bool,
@@ -819,7 +820,10 @@ pub const ContextDiagnostics = struct {
     checkpoint_sha256: ?[]const u8 = null,
     windowed: bool,
     compacted: bool,
+    /// Whether this operation created a new structured checkpoint.
     checkpoint_created: ?bool = null,
+    /// Context-planning outcomes for identified tool-result messages, in original input order, followed by archived checkpoint evidence. Summarized means represented by attributed checkpoint evidence (possibly verbatim), not a retained raw tool message. Archived records omit message_index; reused IDs can therefore have distinct outcomes. Messages without tool_call_id are omitted. This reports input presence, not whether the model used it.
+    tool_results: ?[]const ContextToolResultOutcome = null,
     /// Effective KV policy, when generation selected one.
     kv_cache_mode: ?[]const u8 = null,
     kv_cache_version: ?[]const u8 = null,
@@ -840,6 +844,7 @@ pub const ContextDiagnostics = struct {
         .{ "windowed", "windowed", false },
         .{ "compacted", "compacted", false },
         .{ "checkpoint_created", "checkpoint_created", true },
+        .{ "tool_results", "tool_results", true },
         .{ "kv_cache_mode", "kv_cache_mode", true },
         .{ "kv_cache_version", "kv_cache_version", true },
     };
@@ -886,6 +891,10 @@ pub const ContextDiagnostics = struct {
             try jw.objectField("checkpoint_created");
             try jw.write(value);
         }
+        if (self.tool_results) |value| {
+            try jw.objectField("tool_results");
+            try jw.write(value);
+        }
         if (self.kv_cache_mode) |value| {
             try jw.objectField("kv_cache_mode");
             try jw.write(value);
@@ -899,7 +908,7 @@ pub const ContextDiagnostics = struct {
 };
 
 pub const ContextManagement = struct {
-    /// `reject` fails when the rendered input exceeds the model budget. `window` permits deterministic removal of older turns. Omission preserves the server's existing reject-on-overflow behavior.
+    /// `reject` fails when the rendered input exceeds the model budget. `window` permits deterministic removal of older turns. Omission preserves the server's existing reject-on-overflow behavior. Generation accepts only these admission policies; `inspect` and `compact` are explicit preparation operations. The latest user turn, including its tool-call/result sequence, is always retained. A mandatory turn that cannot fit is rejected rather than split; keep_recent_turns=0 does not remove the active turn.
     mode: []const u8,
     checkpoint: ?ContextCheckpoint = null,
     /// Optional client ceiling below the model's effective input limit.
@@ -953,6 +962,7 @@ pub const ContextPrepareRequest = struct {
     chat_template_kwargs: ?GenerateChatTemplateKwargs = null,
     /// Output-token reservation used to calculate the input budget.
     max_tokens: ?i64 = null,
+    /// Explicit preparation action: inspect counts without dropping turns, window removes eligible old turns, compact creates structured memory. Generation itself accepts only reject/window admission policies.
     mode: ?[]const u8 = null,
     checkpoint: ?ContextCheckpoint = null,
     max_input_tokens: ?i64 = null,
@@ -1073,6 +1083,42 @@ pub const ContextToolEvidence = struct {
     tool_name: []const u8,
     /// Compacted evidence attributed to this completed tool call.
     facts: []const u8,
+};
+
+pub const ContextToolResultOutcome = struct {
+    tool_call_id: []const u8,
+    /// Raw result retained, represented by checkpoint evidence, or absent from effective input.
+    disposition: []const u8,
+    /// Original request message index; omitted for evidence from an earlier checkpoint.
+    message_index: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "tool_call_id", "tool_call_id", false },
+        .{ "disposition", "disposition", false },
+        .{ "message_index", "message_index", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("tool_call_id");
+        try jw.write(self.tool_call_id);
+        try jw.objectField("disposition");
+        try jw.write(self.disposition);
+        if (self.message_index) |value| {
+            try jw.objectField("message_index");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ContextUnresolvedToolCall = struct {

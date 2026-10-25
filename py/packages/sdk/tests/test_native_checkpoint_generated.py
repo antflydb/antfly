@@ -21,7 +21,7 @@ def test_generated_prepare_preserves_binary_response_bytes(encoding) -> None:
     payload = b"AFATT001\x00\xff\x80\x00\n"
 
     def handle(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/ai/v1/chat/context/checkpoint"
+        assert request.url.path == "/ai/v1/generate/context/checkpoint"
         assert request.headers["X-Antfly-KV-Encoding"] == encoding
         assert request.headers["Content-Type"] == "application/json"
         return httpx.Response(200, content=payload, headers={"Content-Type": CONTENT_TYPE})
@@ -41,7 +41,7 @@ def test_generated_resume_sends_original_mime_and_unmodified_binary_body() -> No
     payload = b"AFATT001\x00\xff\x80\x00\n"
 
     def handle(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/ai/v1/chat/context/resume"
+        assert request.url.path == "/ai/v1/generate/context/resume"
         assert request.headers["Content-Type"] == CONTENT_TYPE
         assert request.read() == payload
         return httpx.Response(

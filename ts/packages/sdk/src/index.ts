@@ -110,6 +110,7 @@ export type {
   ClassificationResult,
   ContextCheckpoint,
   ContextDiagnostics,
+  ContextToolResultOutcome,
   ContextPrepareRequest,
   ContextPrepareResponse,
   Config as InferenceRuntimeConfig,

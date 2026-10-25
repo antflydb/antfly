@@ -279,7 +279,7 @@ describe("InferenceClient with mock fetch", () => {
       expect(await lastFetchJSONBody()).toEqual(prepareRequest);
       const [input] = vi.mocked(fetch).mock.calls.at(-1) ?? [];
       expect(input instanceof Request ? input.url : input).toBe(
-        "http://localhost:8080/ai/v1/chat/context/prepare"
+        "http://localhost:8080/ai/v1/generate/context/prepare"
       );
     });
 

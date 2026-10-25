@@ -623,7 +623,7 @@ test "linked incremental-only source is installed without a whole-body fallback"
     };
     var source: Source = .{};
     const body: abi.RequestBodySource = .{ .context = &source, .read = Source.read, .streaming = 1 };
-    var request = try httpx.Request.init(std.testing.allocator, .POST, "/ai/v1/chat/context/resume");
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/ai/v1/generate/context/resume");
     defer request.deinit();
     var context = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
     defer context.deinit();

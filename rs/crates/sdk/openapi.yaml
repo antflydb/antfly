@@ -13020,7 +13020,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /ai/v1/chat/context/checkpoint:
+  /ai/v1/generate/context/checkpoint:
     post:
       summary: Prepare a portable native KV checkpoint
       description: >
@@ -13127,7 +13127,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
-  /ai/v1/chat/context/resume:
+  /ai/v1/generate/context/resume:
     post:
       summary: Generate from a portable native KV checkpoint
       description: >
@@ -13834,7 +13834,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
-  /ai/v1/chat/context/prepare:
+  /ai/v1/generate/context/prepare:
     post:
       summary: Inspect or prepare bounded chat context
       description: >
@@ -45153,7 +45153,15 @@ components:
 
             permits deterministic removal of older turns. Omission preserves the
 
-            server's existing reject-on-overflow behavior.
+            server's existing reject-on-overflow behavior. Generation accepts only
+
+            these admission policies; `inspect` and `compact` are explicit preparation
+
+            operations. The latest user turn, including its tool-call/result sequence,
+
+            is always retained. A mandatory turn that cannot fit is rejected rather
+
+            than split; keep_recent_turns=0 does not remove the active turn.
         checkpoint:
           $ref: '#/components/schemas/InferenceContextCheckpoint'
         max_input_tokens:
@@ -45276,6 +45284,38 @@ components:
           type: string
         memory:
           $ref: '#/components/schemas/InferenceContextStructuredMemory'
+      description: >
+        Structured memory bound to the exact model, tokenizer and chat-template
+
+        revisions. HTTP 409 CONTEXT_CHECKPOINT_STALE_REVISION means one of these
+
+        revisions changed. Rebuild from the original transcript using the selected
+
+        model; retrying the same checkpoint against another generator is not a
+
+        fallback. Digest/history/format failures use CONTEXT_CHECKPOINT_MISMATCH.
+    InferenceContextToolResultOutcome:
+      type: object
+      additionalProperties: false
+      required:
+        - tool_call_id
+        - disposition
+      properties:
+        tool_call_id:
+          type: string
+        disposition:
+          type: string
+          enum:
+            - retained
+            - summarized
+            - dropped
+          description: Raw result retained, represented by checkpoint evidence, or absent from effective
+            input.
+        message_index:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Original request message index; omitted for evidence from an earlier checkpoint.
     InferenceContextDiagnostics:
       type: object
       additionalProperties: false
@@ -45300,7 +45340,14 @@ components:
             - inspect
             - window
             - compact
-          description: Context action evaluated by the server.
+          description: >
+            Requested action: generation admission uses reject/window; explicit
+
+            preparation uses inspect/window/compact. The flags below describe actual
+
+            changes independently. For example, window with an existing checkpoint
+
+            can report compacted=true without creating another checkpoint.
         applied:
           type: boolean
           description: Whether the returned generation context differs from the supplied transcript.
@@ -45344,6 +45391,23 @@ components:
         checkpoint_created:
           type: boolean
           default: false
+          description: Whether this operation created a new structured checkpoint.
+        tool_results:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceContextToolResultOutcome'
+          description: >
+            Context-planning outcomes for identified tool-result messages, in original
+
+            input order, followed by archived checkpoint evidence. Summarized means
+
+            represented by attributed checkpoint evidence (possibly verbatim), not a
+
+            retained raw tool message. Archived records omit message_index; reused
+
+            IDs can therefore have distinct outcomes. Messages without tool_call_id
+
+            are omitted. This reports input presence, not whether the model used it.
         kv_cache_mode:
           type: string
           enum:
@@ -45390,6 +45454,12 @@ components:
             - window
             - compact
           default: inspect
+          description: >
+            Explicit preparation action: inspect counts without dropping turns,
+
+            window removes eligible old turns, compact creates structured memory.
+
+            Generation itself accepts only reject/window admission policies.
         checkpoint:
           $ref: '#/components/schemas/InferenceContextCheckpoint'
         max_input_tokens:

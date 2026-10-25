@@ -17,17 +17,22 @@ T = TypeVar("T", bound="InferenceContextCheckpoint")
 
 @_attrs_define
 class InferenceContextCheckpoint:
-    """
-    Attributes:
-        version (InferenceContextCheckpointVersion): Structured-memory checkpoint wire version.
-        covered_messages (int): Number of authoritative leading messages represented by this checkpoint.
-        covered_prefix_sha256 (str): SHA-256 of the canonical covered message prefix.
-        memory_sha256 (str): SHA-256 of the canonical structured memory payload.
-        model_revision (str):
-        tokenizer_revision (str):
-        template_revision (str):
-        memory (InferenceContextStructuredMemory):
-        parent_checkpoint_sha256 (str | Unset):
+    """Structured memory bound to the exact model, tokenizer and chat-template
+    revisions. HTTP 409 CONTEXT_CHECKPOINT_STALE_REVISION means one of these
+    revisions changed. Rebuild from the original transcript using the selected
+    model; retrying the same checkpoint against another generator is not a
+    fallback. Digest/history/format failures use CONTEXT_CHECKPOINT_MISMATCH.
+
+        Attributes:
+            version (InferenceContextCheckpointVersion): Structured-memory checkpoint wire version.
+            covered_messages (int): Number of authoritative leading messages represented by this checkpoint.
+            covered_prefix_sha256 (str): SHA-256 of the canonical covered message prefix.
+            memory_sha256 (str): SHA-256 of the canonical structured memory payload.
+            model_revision (str):
+            tokenizer_revision (str):
+            template_revision (str):
+            memory (InferenceContextStructuredMemory):
+            parent_checkpoint_sha256 (str | Unset):
     """
 
     version: InferenceContextCheckpointVersion

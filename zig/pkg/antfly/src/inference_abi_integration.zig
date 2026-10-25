@@ -165,11 +165,11 @@ fn checkNativeCheckpointRoutes(table: *const bridge.FunctionTable, handle: *anyo
         var prepare_seen = false;
         for (manifest) |entry| {
             if (entry.method != .post) continue;
-            if (std.mem.eql(u8, entry.path.slice(), prefix ++ "/chat/context/checkpoint")) {
+            if (std.mem.eql(u8, entry.path.slice(), prefix ++ "/generate/context/checkpoint")) {
                 if (entry.request_body != .buffered or entry.streaming_response == 0) return error.InvalidCheckpointRouteCapabilities;
                 prepare_seen = true;
             }
-            if (std.mem.eql(u8, entry.path.slice(), prefix ++ "/chat/context/resume")) {
+            if (std.mem.eql(u8, entry.path.slice(), prefix ++ "/generate/context/resume")) {
                 if (entry.request_body != .buffered or entry.streaming_response == 0) return error.InvalidCheckpointRouteCapabilities;
                 resume_route = entry;
             }
@@ -198,7 +198,7 @@ fn checkNativeCheckpointRoutes(table: *const bridge.FunctionTable, handle: *anyo
                 std.mem.writeInt(u64, source.bytes[32..40], 192, .little);
             }
             const headers = [_]http.HeaderView{.{ .name = .init("Content-Type"), .value = .init("application/vnd.antfly.attachments.v1") }};
-            const request: http.HttpRequestView = .{ .method = .post, .path = .init(prefix ++ "/chat/context/resume"), .headers_ptr = &headers, .headers_len = headers.len };
+            const request: http.HttpRequestView = .{ .method = .post, .path = .init(prefix ++ "/generate/context/resume"), .headers_ptr = &headers, .headers_len = headers.len };
             var response_handle: ?*anyopaque = null;
             var response: http.HttpResponseView = .{ .body = .init("") };
             defer if (response_handle) |owned| table.destroy_http_response(owned);

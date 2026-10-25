@@ -38,6 +38,7 @@ pub const ContextPrepareRequest = types.ContextPrepareRequest;
 pub const ContextPrepareResponse = types.ContextPrepareResponse;
 pub const ContextStructuredMemory = types.ContextStructuredMemory;
 pub const ContextToolEvidence = types.ContextToolEvidence;
+pub const ContextToolResultOutcome = types.ContextToolResultOutcome;
 pub const ContextUnresolvedToolCall = types.ContextUnresolvedToolCall;
 pub const Credentials = types.Credentials;
 pub const DecideAnswer = types.DecideAnswer;

@@ -108,8 +108,8 @@ and FP16/FP8/rotated4 checkpoint encodings at 8K and 32K. See the
 for the exact model revision, measurements and limits. The public endpoints are:
 
 ```text
-POST /ai/v1/chat/context/checkpoint
-POST /ai/v1/chat/context/resume
+POST /ai/v1/generate/context/checkpoint
+POST /ai/v1/generate/context/resume
 ```
 
 Preparation accepts a generation request with the full messages, tool definitions
@@ -243,15 +243,42 @@ and other models/backends require separate qualification.
 Context preparation is an Antfly extension rather than an OpenAI API field. Use the canonical inference endpoints:
 
 ```text
-POST /ai/v1/chat/context/prepare
+POST /ai/v1/generate/context/prepare
 POST /ai/v1/generate
 ```
 
-`/chat/context/prepare` accepts the model, messages, tools, `tool_choice`, `chat_template_kwargs`, an output-token reservation, and one of these modes:
+`/generate/context/prepare` accepts the model, messages, tools, `tool_choice`, `chat_template_kwargs`, an output-token reservation, and one of these modes:
 
 - `inspect` reports exact rendered input counts without changing the transcript.
 - `window` removes eligible old turns while preserving system/developer instructions, recent complete turns, and tool-call/result units.
 - `compact` creates a versioned structured-memory checkpoint. Compaction must be requested explicitly; generation does not summarize implicitly.
+
+The latest user turn and its entire tool-call/result sequence are always protected,
+even with `keep_recent_turns: 0`. If that mandatory turn cannot fit, windowing
+returns `CONTEXT_LIMIT_EXCEEDED` rather than splitting the turn. Agent tool loops
+must then reduce their inputs or rebuild context at the agent layer.
+
+Generation's `context_management.mode` accepts `reject` or `window`; preparation
+accepts `inspect`, `window`, or `compact`. `ContextDiagnostics.policy` reports the
+requested action. Its booleans report actual changes: `applied` means the effective
+input changed, `windowed` means messages were windowed away, `compacted` means
+checkpoint memory is present, and `checkpoint_created` identifies a newly created
+checkpoint. Applying existing memory can therefore report `compacted: true` under
+`window` without running a summarizer.
+
+Context planning returns `context.tool_results`, identifying each supplied tool
+result by `tool_call_id` and original `message_index`, with disposition `retained`,
+`summarized`, or `dropped`. Summarized results are represented by attributed
+checkpoint evidence, possibly verbatim. Evidence from an earlier checkpoint has
+no `message_index`; a reused call ID can have separate archived and current
+outcomes. Tool messages without IDs are omitted. These outcomes describe what
+reaches the model, not whether the model uses it correctly.
+
+Structured checkpoints require matching model, tokenizer, and template revisions.
+HTTP 409 `CONTEXT_CHECKPOINT_STALE_REVISION` identifies a revision change;
+`CONTEXT_CHECKPOINT_MISMATCH` identifies digest, history, or format errors. On a
+revision change (including generator fallback), rebuild from the original
+transcript for the selected model instead of retrying the same checkpoint.
 
 Internal compaction summarizes prior memory together with completed exchanges,
 retaining fact labels and tool attribution while omitting repetitive dialogue.

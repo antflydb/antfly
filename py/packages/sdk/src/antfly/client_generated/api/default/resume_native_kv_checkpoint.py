@@ -19,7 +19,7 @@ def _get_kwargs(
 
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/ai/v1/chat/context/resume",
+        "url": "/ai/v1/generate/context/resume",
     }
 
     _kwargs["content"] = body.payload

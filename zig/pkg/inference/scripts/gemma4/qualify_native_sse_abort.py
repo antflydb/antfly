@@ -90,7 +90,7 @@ def main():
             calibration_request=AbortableRequest('127.0.0.1',args.port,args.timeout)
             try:
                 started=time.monotonic()
-                response=send_resume(calibration_request.connection,'/ai/v1/chat/context/resume',long_body,args.checkpoint)
+                response=send_resume(calibration_request.connection,'/ai/v1/generate/context/resume',long_body,args.checkpoint)
                 calibration_request.response=response
                 if response.status!=200:raise AssertionError(f'long reference HTTP {response.status}: {response.read(65536)!r}')
                 response_headers(response,record)
@@ -107,7 +107,7 @@ def main():
             case=evidence['abort']
             try:
                 started=time.monotonic()
-                response=send_resume(request.connection,'/ai/v1/chat/context/resume',long_body,args.checkpoint)
+                response=send_resume(request.connection,'/ai/v1/generate/context/resume',long_body,args.checkpoint)
                 request.response=response
                 if response.status!=200:raise AssertionError(f'abort request HTTP {response.status}: {response.read(65536)!r}')
                 response_headers(response,record)

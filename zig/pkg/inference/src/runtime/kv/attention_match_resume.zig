@@ -109,3 +109,13 @@ test "resume validation honors cancellation before returning the trusted boundar
         try std.testing.expectError(error.CompactionCancelled, validateWithControl(fixture_state, fixture_contract, fixture_state.tokens, .{}, .{ .context = &cancel, .check_fn = Cancel.check }));
     }
 }
+
+test "resume admits exactly 8192 appended prompt tokens independently of decode allowance" {
+    var contract = fixture_contract;
+    contract.max_logical_tokens = 32768;
+    contract.max_appended_tokens = 8192;
+    var tokens: [4 + 8192 + 1]u32 = @splat(0);
+    @memcpy(tokens[0..4], fixture_state.tokens);
+    try std.testing.expectEqual(@as(usize, 4), try validate(fixture_state, contract, tokens[0 .. 4 + 8192], .{}));
+    try std.testing.expectError(error.KvCheckpointAppendLimit, validate(fixture_state, contract, &tokens, .{}));
+}

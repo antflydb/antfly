@@ -1103,7 +1103,7 @@ func TestClient_Generate_Speculation(t *testing.T) {
 
 func TestClient_PrepareChatContext_ForwardsPolicyAndParsesDiagnostics(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "/ai/v1/chat/context/prepare", r.URL.Path)
+		assert.Equal(t, "/ai/v1/generate/context/prepare", r.URL.Path)
 		var body map[string]any
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
 		assert.Equal(t, "inspect", body["mode"])
@@ -1464,4 +1464,19 @@ func TestGeneratedDecisionsPreserveMultimodalEvidence(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+func TestContextToolResultOutcomesDistinguishFirstMessageFromArchivedEvidence(t *testing.T) {
+	// Reused IDs need provenance: index zero is a real input message, while
+	// omitted index means evidence from the earlier checkpoint.
+	wire := `{"tool_results":[{"tool_call_id":"reused","disposition":"retained","message_index":0},{"tool_call_id":"reused","disposition":"summarized"}]}`
+	var diagnostics oapi.InferenceContextDiagnostics
+	require.NoError(t, json.Unmarshal([]byte(wire), &diagnostics))
+	require.Len(t, diagnostics.ToolResults, 2)
+	require.NotNil(t, diagnostics.ToolResults[0].MessageIndex)
+	assert.Equal(t, 0, *diagnostics.ToolResults[0].MessageIndex)
+	assert.Nil(t, diagnostics.ToolResults[1].MessageIndex)
+	encoded, err := json.Marshal(diagnostics.ToolResults)
+	require.NoError(t, err)
+	assert.JSONEq(t, `[{"tool_call_id":"reused","disposition":"retained","message_index":0},{"tool_call_id":"reused","disposition":"summarized"}]`, string(encoded))
 }

@@ -3820,10 +3820,10 @@ test "standalone inference host placement keeps embedded policy local" {
 
 test "native checkpoint route manifest preserves binary upload and export streaming" {
     inline for (.{ inference.server.ai_api_prefix, inference.server.public_api_prefix }) |prefix| {
-        const prepare = routeMetadata(.post, prefix ++ "/chat/context/checkpoint");
+        const prepare = routeMetadata(.post, prefix ++ "/generate/context/checkpoint");
         try std.testing.expectEqual(http_abi.RequestBodyMode.buffered, prepare.request_body);
         try std.testing.expect(prepare.streaming_response);
-        const resume_request = routeMetadata(.post, prefix ++ "/chat/context/resume");
+        const resume_request = routeMetadata(.post, prefix ++ "/generate/context/resume");
         try std.testing.expectEqual(http_abi.RequestBodyMode.buffered, resume_request.request_body);
         try std.testing.expect(resume_request.streaming_response);
     }

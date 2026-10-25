@@ -36,8 +36,17 @@ class InferenceContextPrepareRequest:
         chat_template_kwargs (InferenceGenerateChatTemplateKwargs | Unset): Typed options passed to the model's chat
             template.
         max_tokens (int | Unset): Output-token reservation used to calculate the input budget. Default: 256.
-        mode (InferenceContextPrepareRequestMode | Unset):  Default: InferenceContextPrepareRequestMode.INSPECT.
-        checkpoint (InferenceContextCheckpoint | Unset):
+        mode (InferenceContextPrepareRequestMode | Unset): Explicit preparation action: inspect counts without dropping
+            turns,
+            window removes eligible old turns, compact creates structured memory.
+            Generation itself accepts only reject/window admission policies.
+             Default: InferenceContextPrepareRequestMode.INSPECT.
+        checkpoint (InferenceContextCheckpoint | Unset): Structured memory bound to the exact model, tokenizer and chat-
+            template
+            revisions. HTTP 409 CONTEXT_CHECKPOINT_STALE_REVISION means one of these
+            revisions changed. Rebuild from the original transcript using the selected
+            model; retrying the same checkpoint against another generator is not a
+            fallback. Digest/history/format failures use CONTEXT_CHECKPOINT_MISMATCH.
         max_input_tokens (int | Unset):
         keep_recent_turns (int | Unset):  Default: 2.
     """

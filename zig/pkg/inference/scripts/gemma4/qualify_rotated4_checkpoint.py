@@ -128,7 +128,7 @@ def prepare(args, body, encoding, path, record):
     connection = http.client.HTTPConnection('127.0.0.1', args.port, timeout=args.timeout)
     started = time.monotonic()
     try:
-        connection.request('POST', '/ai/v1/chat/context/checkpoint', json.dumps(body).encode(),
+        connection.request('POST', '/ai/v1/generate/context/checkpoint', json.dumps(body).encode(),
                            {'Content-Type': 'application/json', 'X-Antfly-KV-Encoding': encoding})
         response = connection.getresponse()
         if response.status != 200:
@@ -151,7 +151,7 @@ def resume(args, body, path, record, timed=False):
     connection = http.client.HTTPConnection('127.0.0.1', args.port, timeout=args.timeout)
     started = time.monotonic()
     try:
-        response = send_resume(connection, '/ai/v1/chat/context/resume', request, path)
+        response = send_resume(connection, '/ai/v1/generate/context/resume', request, path)
         if response.status != 200:
             raise RuntimeError(f'resume: HTTP {response.status}: {response.read(65536)!r}')
         response_headers(response, record)

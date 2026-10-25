@@ -925,6 +925,8 @@ from .inference_context_prepare_request_mode import InferenceContextPrepareReque
 from .inference_context_prepare_response import InferenceContextPrepareResponse
 from .inference_context_structured_memory import InferenceContextStructuredMemory
 from .inference_context_tool_evidence import InferenceContextToolEvidence
+from .inference_context_tool_result_outcome import InferenceContextToolResultOutcome
+from .inference_context_tool_result_outcome_disposition import InferenceContextToolResultOutcomeDisposition
 from .inference_context_unresolved_tool_call import InferenceContextUnresolvedToolCall
 from .inference_credentials import InferenceCredentials
 from .inference_decide_long_document import InferenceDecideLongDocument
@@ -2634,6 +2636,8 @@ __all__ = (
     "InferenceContextPrepareResponse",
     "InferenceContextStructuredMemory",
     "InferenceContextToolEvidence",
+    "InferenceContextToolResultOutcome",
+    "InferenceContextToolResultOutcomeDisposition",
     "InferenceContextUnresolvedToolCall",
     "InferenceCredentials",
     "InferenceDecideLongDocument",
