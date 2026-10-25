@@ -4415,6 +4415,32 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-physical-sync-test", "Verify owning physical durability operations and controlled retry without synchronous fallback")
         .dependOn(&physical_sync_run.step);
 
+    const state_merge_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/state_merge_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, state_merge_root, true, true);
+    state_merge_root.addImport("antfly_source_root", state_merge_root);
+    const state_merge_filters = &.{
+        "controlled physical sync flush state merge",
+        "lsm backend background flush waits for and merges a complete immutable window",
+        "lsm backend idle maintenance publishes a partial immutable window",
+        "lsm backend size maintenance preserves a partial immutable window",
+        "lsm backend byte flush window coalesces hot overwrites before run publication",
+    };
+    const state_merge_tests = b.addTest(.{
+        .name = "flush-state-merge-tests",
+        .root_module = state_merge_root,
+        .filters = state_merge_filters,
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const state_merge_run = b.addRunArtifact(state_merge_tests);
+    state_merge_run.addArg("--require-no-skips");
+    b.step("antfly-flush-state-merge-test", "Verify retained flush merging and normal immutable-window publication")
+        .dependOn(&state_merge_run.step);
+
     const builder_output_tests = b.addTest(.{
         .name = "builder-output-tests",
         .root_module = physical_sync_root,

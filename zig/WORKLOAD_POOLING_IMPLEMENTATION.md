@@ -28708,3 +28708,41 @@ read-only progress sample are preserved.
 Normal flush/compaction driver adoption, legacy migration, manifest/WAL completion
 and recovery still require integration. Durable formats and private ABI layouts
 are unchanged. Full GNU qualification remains waived; the full goal remains active.
+
+
+## Retained production immutable-state merging (2026-10-25)
+
+Normal persisted flushes now use the retained `state_merge.Heap` instead of a
+second synchronous heap implementation. The compatibility entry drives it with
+null admission; a coordinator can drive the same implementation with its
+original port. Heap insertion/removal, child selection, duplicate advancement
+and source reinsertion retain receipts across refusal. Namespace/key comparisons
+retain their byte cursor and examine at most 16 KiB between checkpoints. Lower
+source indices still win duplicates, including tombstones; null, empty and named
+namespaces remain distinct. No original port is stored.
+
+The caller prepays the checked metadata bound before four retained array
+allocations. Initialization can resume after admission or allocation refusal
+without replacing accepted arrays. Abort ends input reads before bounded array
+retirement, so input states may be released before cleanup. The legacy allocating
+entry frees every accepted allocation on failure and uses the same merge logic.
+
+The focused Debug selection passes ten tests: five merge tests, four existing
+complete/partial-window and hot-overwrite publication regressions, and the root
+import. An independent row oracle covers flat and ordered sources, long keys and
+namespaces, duplicate precedence, tombstones and an empty source. Every original
+checkpoint is refused/retried with its exact error and saved comparison prefix;
+OOM tests cover constructor cleanup, retained allocation retry and abort while
+allocation remains exhausted. The initial array-pointer fixture syntax error
+and source snapshots are preserved.
+
+`flush-state-merge-v2-fast` passes all five commands, 68/68 steps, 16 ABI cases,
+ten merge/maintenance tests, three builder tests and the 4/45/1/8 Bloom/error
+companions. `flush-state-merge-v2-debug` passes the same five commands and
+68/68 steps with the same ten merge/maintenance, three builder, 16 ABI and
+Bloom/error cases. Both final 5,669-file input maps are identical and still
+match current sources. No executed case fails, skips or leaks. This does not yet
+supply the normal maintenance admission/coordinator, coupled-root migration,
+manifest/WAL completion or broader scheduler/default eligibility. Durable formats
+and existing private ABI layouts remain unchanged. Full GNU qualification remains
+waived and the full goal remains active.
