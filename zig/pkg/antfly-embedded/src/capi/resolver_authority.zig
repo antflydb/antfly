@@ -1269,7 +1269,7 @@ test "capi resolver curation proposal review unions queue work across namespaces
         try std.testing.expectEqualStrings("retained evidence", current.evidence.?.string);
     }
     var observations: ReplayObservations = .{};
-    for (0..1000) |i| _ = try observations.applied(scratch, .{ .db = &root.db, .source = "default", .cfg = .{ .name = "r", .table = "entities", .source_artifact = "", .resolution_artifact = "", .promote = i % 2 == 0 } });
+    for (0..1000) |i| _ = try observations.applied(scratch, .{ .db = &root.db, .source = "default", .cfg = .{ .name = "r", .table = "entities", .source_artifact = "", .resolution_artifact = "", .key_template = "entity/{{_key}}", .promote = i % 2 == 0 } });
     try std.testing.expectEqual(@as(usize, 1), observations.values.count());
     std.debug.print("REVIEW namespaces={d} proposals={d} incidence_scans={d} source_samples={d}\n", .{ scope_count, entries.len, scans, observations.values.count() });
 }
