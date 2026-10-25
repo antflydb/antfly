@@ -276,7 +276,12 @@ fn makeFact(alloc: Allocator, pages: *page_store.PageStore, store: tree.Store, p
         old.?.body
     else
         try facts.putBody(alloc, pages, physical);
-    return .{ .body = body, .body_has_dependencies = doc.stored_body != null or flags.body_has_dependencies, .last_lsn = doc.last_lsn, .last_timestamp_ns = doc.last_timestamp_ns, .present = flags.present, .pending = flags.pending };
+    // Recompute the witness from this exact after-image, even when public
+    // callers supply enrichment metadata. Its reachability follows the fact.
+    const audit_json = if (doc.stored_body == null and !flags.body_has_dependencies) try @import("../enrichment/media_audit.zig").buildAlloc(alloc, doc.body) else null;
+    defer if (audit_json) |json| alloc.free(json);
+    const audit = if (audit_json) |json| try facts.putBody(alloc, pages, json) else null;
+    return .{ .body = body, .media_audit = audit, .body_has_dependencies = doc.stored_body != null or flags.body_has_dependencies, .last_lsn = doc.last_lsn, .last_timestamp_ns = doc.last_timestamp_ns, .present = flags.present, .pending = flags.pending };
 }
 
 fn findDocument(docs: []const materializer.Document, id: []const u8) ?materializer.Document {

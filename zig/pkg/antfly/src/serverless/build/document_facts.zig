@@ -47,6 +47,7 @@ pub const BodyRef = struct {
 pub const Fact = struct {
     body: BodyRef,
     body_has_dependencies: bool = false,
+    media_audit: ?BodyRef = null,
     last_lsn: u64,
     last_timestamp_ns: u64,
     /// chunk_preview, chunk_embeddings, rerank_terms.
@@ -54,7 +55,7 @@ pub const Fact = struct {
     /// lexical_sparse, chunk_preview, chunk_embeddings, rerank_terms.
     pending: u4 = 0,
 
-    pub const encoded_bytes = 80;
+    pub const encoded_bytes = 136;
     pub fn encode(self: Fact) [encoded_bytes]u8 {
         var bytes = @as([encoded_bytes]u8, @splat(0));
         @memcpy(bytes[0..32], &self.body.digest);
@@ -65,14 +66,23 @@ pub const Fact = struct {
         bytes[72] = self.present;
         bytes[73] = self.pending;
         bytes[74] = @intFromBool(self.body_has_dependencies);
+        if (self.media_audit) |audit| {
+            bytes[75] = 1;
+            @memcpy(bytes[80..112], &audit.digest);
+            @memcpy(bytes[112..128], &audit.attempt);
+            std.mem.writeInt(u64, bytes[128..136], audit.bytes, .little);
+        }
         return bytes;
     }
     pub fn decode(bytes: []const u8) !Fact {
-        if (bytes.len != encoded_bytes or bytes[72] > 7 or bytes[73] > 15 or
-            bytes[74] > 1 or !std.mem.allEqual(u8, bytes[75..80], 0)) return error.InvalidDocumentFact;
+        if ((bytes.len != 80 and bytes.len != encoded_bytes) or bytes[72] > 7 or bytes[73] > 15 or
+            bytes[74] > 1 or bytes[75] > 1 or !std.mem.allEqual(u8, bytes[76..80], 0)) return error.InvalidDocumentFact;
+        if (bytes[75] == 1 and bytes.len != encoded_bytes) return error.InvalidDocumentFact;
+        if (bytes.len == encoded_bytes and bytes[75] == 0 and !std.mem.allEqual(u8, bytes[80..], 0)) return error.InvalidDocumentFact;
         return .{
             .body = .{ .digest = bytes[0..32].*, .attempt = bytes[32..48].*, .bytes = std.mem.readInt(u64, bytes[48..56], .little) },
             .body_has_dependencies = bytes[74] == 1,
+            .media_audit = if (bytes[75] == 1) .{ .digest = bytes[80..112].*, .attempt = bytes[112..128].*, .bytes = std.mem.readInt(u64, bytes[128..136], .little) } else null,
             .last_lsn = std.mem.readInt(u64, bytes[56..64], .little),
             .last_timestamp_ns = std.mem.readInt(u64, bytes[64..72], .little),
             .present = @intCast(bytes[72]),
@@ -98,13 +108,13 @@ pub const Root = struct {
     counts: [7]u64 = @splat(0),
 
     pub const encoded_bytes = 576;
-    pub const metadata_version = 7;
+    pub const metadata_version = 8;
     pub fn eql(a: Root, b: Root) bool {
         return std.mem.eql(u8, &a.encode(), &b.encode());
     }
     pub fn encode(self: Root) [encoded_bytes]u8 {
         var out = @as([encoded_bytes]u8, @splat(0));
-        @memcpy(out[0..8], "AFDFACT7");
+        @memcpy(out[0..8], "AFDFACT8");
         @memcpy(out[16..48], &self.domain);
         @memcpy(out[48..80], &self.policy_fingerprint);
         std.mem.writeInt(u64, out[80..88], self.wal_end_lsn, .little);
@@ -124,7 +134,7 @@ pub const Root = struct {
     }
     pub fn decode(bytes: []const u8) !Root {
         const legacy = bytes.len == 512 and std.mem.eql(u8, bytes[0..8], "AFDFACT3");
-        if (!legacy and (bytes.len != encoded_bytes or (!std.mem.eql(u8, bytes[0..8], "AFDFACT4") and !std.mem.eql(u8, bytes[0..8], "AFDFACT5") and !std.mem.eql(u8, bytes[0..8], "AFDFACT6") and !std.mem.eql(u8, bytes[0..8], "AFDFACT7")))) return error.InvalidDocumentFactsRoot;
+        if (!legacy and (bytes.len != encoded_bytes or (!std.mem.eql(u8, bytes[0..8], "AFDFACT4") and !std.mem.eql(u8, bytes[0..8], "AFDFACT5") and !std.mem.eql(u8, bytes[0..8], "AFDFACT6") and !std.mem.eql(u8, bytes[0..8], "AFDFACT7") and !std.mem.eql(u8, bytes[0..8], "AFDFACT8")))) return error.InvalidDocumentFactsRoot;
         if (bytes[8] > (if (legacy) @as(u8, 31) else 63) or !std.mem.allEqual(u8, bytes[9..16], 0) or
             !std.mem.allEqual(u8, bytes[if (legacy) @as(usize, 472) else 536..], 0)) return error.InvalidDocumentFactsRoot;
         var root = Root{
@@ -321,7 +331,7 @@ pub fn planAlloc(alloc: Allocator, store: tree.Store, source: Root, replacements
         const value = value: {
             const key = try alloc.dupe(u8, replacement.id);
             errdefer alloc.free(key);
-            const bytes = if (replacement.value) |fact| try alloc.dupe(u8, &fact.encode()) else null;
+            const bytes = if (replacement.value) |fact| try alloc.dupe(u8, fact.encode()[0..if (fact.media_audit == null) @as(usize, 80) else Fact.encoded_bytes]) else null;
             errdefer if (bytes) |owned| alloc.free(owned);
             try changes.append(alloc, .{ .key = key, .value = bytes });
             break :value bytes;
@@ -544,7 +554,7 @@ pub fn readStoredBodyAlloc(alloc: Allocator, pages: *page_store.PageStore, ref: 
 }
 
 pub fn loadRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.ArtifactRef) !Root {
-    if (source.kind != .document_facts or !((source.metadata_version == 3 and source.byte_len == 512) or ((source.metadata_version == 4 or source.metadata_version == 5 or source.metadata_version == 6 or source.metadata_version == Root.metadata_version) and source.byte_len == Root.encoded_bytes)))
+    if (source.kind != .document_facts or !((source.metadata_version == 3 and source.byte_len == 512) or ((source.metadata_version == 4 or source.metadata_version == 5 or source.metadata_version == 6 or source.metadata_version == 7 or source.metadata_version == Root.metadata_version) and source.byte_len == Root.encoded_bytes)))
         return error.InvalidDocumentFactsRoot;
     try artifacts.validateSha256ArtifactIdentity(source.artifact_id, source.checksum);
     const scope = (try artifacts.uploadScopeFromArtifactId(source.artifact_id)) orelse return error.InvalidDocumentFactsRoot;
@@ -562,6 +572,7 @@ pub fn loadRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.Art
         5 => "AFDFACT5",
         6 => "AFDFACT6",
         7 => "AFDFACT7",
+        8 => "AFDFACT8",
         else => return error.InvalidDocumentFactsRoot,
     };
     if (!std.mem.eql(u8, bytes[0..8], magic)) return error.InvalidDocumentFactsRoot;
@@ -632,6 +643,7 @@ const Reachability = struct {
     }
     pub fn visitRecord(self: *@This(), _: tree.Ref, _: []const u8, value: []const u8) !void {
         const fact = try Fact.decode(value);
+        if (fact.media_audit) |audit| try self.mark(&try audit.identity(self.pages.domain));
         if (!fact.body_has_dependencies) return self.mark(&try fact.body.identity(self.pages.domain));
         // A legacy source snapshot can also be an output ancestor. Marking
         // it before walking that ancestry would mistake a source-only mark
@@ -1022,4 +1034,24 @@ test "model aware media serverless compact checkpoint bodies retain and reclaim 
     try std.testing.expectError(error.FileNotFound, objects.getAlloc(&try parent.identity(pages.domain)));
     try std.testing.expectError(error.FileNotFound, objects.getAlloc(&try base.identity(pages.domain)));
     try std.testing.expectError(error.FileNotFound, objects.getAlloc(&try ancestor.identity(pages.domain)));
+}
+
+test "serverless document facts decode legacy records and fence witness extensions" {
+    const fact = Fact{ .body = .{ .digest = @splat(3), .attempt = @splat(1), .bytes = 128 }, .last_lsn = 1, .last_timestamp_ns = 2 };
+    var bytes = fact.encode();
+    try std.testing.expectEqualDeep(fact, try Fact.decode(bytes[0..80]));
+    var witnessed = fact;
+    witnessed.media_audit = .{ .digest = @splat(4), .attempt = @splat(2), .bytes = 512 };
+    bytes = witnessed.encode();
+    try std.testing.expectEqualDeep(witnessed, try Fact.decode(&bytes));
+    try std.testing.expectError(error.InvalidDocumentFact, Fact.decode(bytes[0..80]));
+    bytes[75] = 0;
+    try std.testing.expectError(error.InvalidDocumentFact, Fact.decode(&bytes));
+    bytes = fact.encode();
+    bytes[75] = 2;
+    try std.testing.expectError(error.InvalidDocumentFact, Fact.decode(&bytes));
+    const root = Root{ .domain = @splat(1), .policy_fingerprint = @splat(2) };
+    var encoded = root.encode();
+    @memcpy(encoded[0..8], "AFDFACT7");
+    try std.testing.expectEqualDeep(root, try Root.decode(&encoded));
 }

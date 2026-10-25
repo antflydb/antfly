@@ -62,6 +62,11 @@ pub fn classify(a: std.mem.Allocator, session: backends.Session, profile: Profil
         .raster => |raster| try image.processing.preprocessDecodedRectWithResample(a, try raster.imageView(), profile.width, profile.height, profile.mean, profile.std_dev, profile.resample),
     };
     defer a.free(prepared);
+    // Preparation has released its temporaries; only the prepared tensor
+    // remains live while execution acquires its own admission.
+    if (permit.lease) |*lease| try lease.retain(.{
+        .host_scratch_bytes = try std.math.mul(usize, prepared.len, @sizeOf(f32)),
+    });
     return classifyPrepared(a, session, profile, labels, prepared, top_k, control);
 }
 
@@ -480,4 +485,75 @@ test "model aware media frame classifiers batch compatible tensors with one mode
     try std.testing.expectEqual(before_selective + 33, fake.calls);
     for (selected[0..31]) |row| try std.testing.expectEqual(@as(usize, 0), row.len);
     try std.testing.expectEqualStrings(complete[31][0].label, selected[31][0].label);
+}
+
+test "model aware media classifier releases preparation scratch before execution" {
+    const Fake = struct {
+        waveform: bool = false,
+        calls: usize = 0,
+        controller: *@import("../runtime/tier/memory.zig").AdmissionController,
+        limit: usize = std.math.maxInt(usize),
+        peak: usize = 0,
+        fn inputs(raw: *anyopaque) []const backends.TensorInfo {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (self.waveform) &.{.{ .name = "input_values", .dtype = .f32, .shape = &.{ 1, -1 } }} else &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ 1, 3, 1, 1 } }};
+        }
+        fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ 1, 2 } }};
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        fn run(raw: *anyopaque, _: []const backends.Tensor, a: std.mem.Allocator) anyerror![]backends.Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.peak = @max(self.peak, self.controller.snapshot().host_scratch_bytes);
+            self.calls += 1;
+            const result = try a.alloc(backends.Tensor, 1);
+            errdefer a.free(result);
+            result[0] = try backends.Tensor.initFloat32(a, "logits", &.{ 1, 2 }, &.{ -1, 1 });
+            return result;
+        }
+        fn runWithControl(raw: *anyopaque, tensors: []const backends.Tensor, a: std.mem.Allocator, control: Control) anyerror![]backends.Tensor {
+            try control.check();
+            return run(raw, tensors, a);
+        }
+        fn session(self: *@This()) backends.Session {
+            return .{ .ptr = self, .vtable = &.{ .run = run, .runWithControl = runWithControl, .inputInfo = inputs, .outputInfo = outputInfo, .backend = backend, .close = close }, .run_admission = .{ .controller = self.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = self.limit, .scratch_limit_bytes = self.limit }, .static_workspace_bytes = 0, .check_live_memory = false } };
+        }
+    };
+
+    const a = std.testing.allocator;
+    var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+    var fake = Fake{ .waveform = true, .controller = &controller };
+    const pcm = try a.alloc(f32, 480000);
+    defer a.free(pcm);
+    @memset(pcm, 0);
+    const profile = Profile{ .input = .waveform, .score_transform = .sigmoid, .normalize_waveform = false };
+    var peaks: [2]usize = undefined;
+    for (0..2) |mode| {
+        fake.peak = 0;
+        const labels = if (mode == 0) try classify(a, fake.session(), profile, &.{ "negative", "positive" }, .{ .pcm = .{ .samples = pcm, .sample_rate = 16000 } }, 2, .{}) else try classifyPrepared(a, fake.session(), profile, &.{ "negative", "positive" }, pcm, 2, .{});
+        defer {
+            for (labels) |label| a.free(label.label);
+            a.free(labels);
+        }
+        peaks[mode] = fake.peak;
+        try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    }
+    fake.limit = 25 * 1024 * 1024;
+    const raw = try classify(a, fake.session(), profile, &.{ "negative", "positive" }, .{ .pcm = .{ .samples = pcm, .sample_rate = 16000 } }, 2, .{});
+    defer {
+        for (raw) |label| a.free(label.label);
+        a.free(raw);
+    }
+
+    const labels = try classifyPrepared(a, fake.session(), profile, &.{ "negative", "positive" }, pcm, 2, .{});
+    defer {
+        for (labels) |label| a.free(label.label);
+        a.free(labels);
+    }
+    try std.testing.expectEqualStrings(raw[0].label, labels[0].label);
+    try std.testing.expectEqualDeep(raw[0].score, labels[0].score);
+    std.debug.print("classifier waveform_samples=480000 PCM_bytes={d} classify_admitted_peak={d} prepared_admitted_peak={d} budget={d} trimmed_raw_succeeds=true prepared_succeeds=true\n", .{ pcm.len * @sizeOf(f32), peaks[0], peaks[1], fake.limit });
 }

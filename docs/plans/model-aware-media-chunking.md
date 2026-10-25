@@ -104,9 +104,9 @@ spans rather than copying a whole transcript into every window.
 
 Serverless media checkpoints use internal WAL mutation kind 3, rejected by public
 mutation admission. Each incomplete page carries an `AFDCP001` output patch and
-a reference to one already published source body. Fact roots at version 6 retain
-both that source and the authenticated output ancestry; readers still accept
-versions 3–5. Query reads and WAL overlays reconstruct ordinary JSON, while
+a reference to one already published source body. Fact roots at version 8 retain
+both that source and the authenticated output ancestry, plus bounded completion
+witnesses; readers still accept versions 3–7. Query reads and WAL overlays reconstruct ordinary JSON, while
 closure and retention read only output pages. Ancestry reconstruction charges
 the independent finite replay budget; logical source, output, and working
 allocation limits remain separate. Completion publishes a complete
@@ -121,7 +121,7 @@ replay, while a different deployed revision can start a new computation.
 
 The deterministic 64-page fixture with a 256 KiB source closes within a 2 MiB
 read allowance. Compact records reduce cumulative derived-body bytes from
-3,386,363 to 767,343 across eleven commits, including the identical 526,644-byte
+3,386,395 to 767,375 across eleven commits, including the identical 526,679-byte
 final document. Each of the three fake consumers still executes exactly 64
 times. This measures serialized WAL/body payloads, not model throughput.
 
@@ -514,9 +514,9 @@ model latency or process RSS.
 `antfly-serverless-test` covers durable secondary-only repair overlays. A
 64-parent fixture with a 262,180-byte source retains all 128 healthy index
 vectors after every pending publication, including reads through stored fact
-bodies. Eleven repair commits serialize 770,774 bytes, compared with 5,794,416
+bodies. Eleven repair commits serialize 771,215 bytes, compared with 5,794,801
 for complete snapshots preserving the same healthy vectors. Both modes produce
-the same 526,644-byte final document and make 64 boundary, 64 index, and 128
+the same 526,679-byte final document and make 64 boundary, 64 index, and 128
 speech calls across initial preparation plus speech repair. The earlier
 4,872,630-byte repair measurement dropped healthy tail vectors; it is not an
 equivalent-output baseline. These are serialized payload counts, not latency
@@ -526,8 +526,8 @@ Repair groups use the plain leased baseline as the compact envelope base.
 Queries and builders materialize the repaired prefix plus healthy unvisited
 outputs; workers resume the compact cursor against the baseline's accepted
 receipts. Materialization checks the baseline and index recipe and never mixes
-unvisited vectors from a replaced index generation. Version 7 fact roots retain
-formats 3–6 as readable inputs while fencing readers unaware of repair overlays.
+unvisited vectors from a replaced index generation. Version 8 fact roots retain
+formats 3–7 as readable inputs while fencing readers unaware of witness references.
 
 The `benchmark transcript span stamping full scan and ordered sweep` test
 compares the production sweep with an output-equivalent full-scan mode. Run it
@@ -540,3 +540,25 @@ model latency. Three ReleaseFast runs measured 304.0–304.7 ms for the full sca
 and 14.9–15.6 ms for the sweep, with identical metadata outputs. Normal media
 tests additionally cover unordered spans/cuts,
 UTF-8 byte offsets, phrase clocks, and local speaker scopes.
+
+
+## Completion audit and classifier admission qualification
+
+A 32-document fixture with 64 parents and 128 vectors per document measured
+16,853,824 body bytes read during a settled audit before completion witnesses.
+The witness path reads 618,880 bytes: one full body for a fresh deployed-generation
+observation and 31 compact witnesses, a reduction of approximately 96.3%.
+Both paths make zero inference calls and append no WAL mutations. This measures
+object-store body response bytes; it does not include fact-tree routing bytes or
+claim a live-model latency improvement. Publication derives each witness from
+the exact after-image, commits its inline sources, and preserves all distinct
+reusable receipt identities. Mutable source references, incomplete/oversized
+summaries and older records use full hydration. Source, pipeline and secondary
+model changes invalidate witness reuse; retention follows its immutable body ref.
+
+The classifier's preprocessing lease shrinks to the retained prepared tensor
+before model execution acquires its own reservation. For 480,000 waveform
+samples, peak scratch admission falls from 28,800,128 to 23,040,096 bytes (20%).
+The raw call succeeds under a 25 MiB budget and matches the prepared call's
+label and score. The admission controller drains after both paths. This measures
+reservation headroom, not RSS or live-model latency.
