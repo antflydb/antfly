@@ -253,7 +253,7 @@ pub const Registry = struct {
         if (reader_fenced) {
             capture.checkpoint = reader.activeCheckpoint();
             capture.value = try reader.openIndexValue(a, key, capture.checkpoint);
-        } else try owner.submitMutation(&capture, Capture.apply);
+        } else try owner.submitArtifactLeaseMutation(&capture, Capture.apply);
         state.* = .{
             .registry = self,
             .reader = reader,
@@ -431,7 +431,7 @@ const State = struct {
             var remove = Remove{ .key = self.lease_key };
             // On failure the marker will disappear and bounded orphan
             // service can retry. A failed release never frees live pages.
-            owner.submitMutation(&remove, Remove.apply) catch {};
+            owner.submitArtifactLeaseMutation(&remove, Remove.apply) catch {};
         };
         @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
         self.closeResources();
