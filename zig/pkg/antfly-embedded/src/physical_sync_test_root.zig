@@ -17,6 +17,7 @@ pub const antfly_sources = struct {};
 pub const consumer_tests_only = true;
 test {
     _ = @import("storage/resource_manager.zig");
+    _ = @import("storage/lsm_backend/read_metadata_reclamation.zig");
     _ = @import("storage/lsm_backend/shared_bytes.zig");
     _ = @import("storage/lsm_backend/storage_io.zig");
     _ = @import("storage/lsm_backend/owned_atomic_file.zig");

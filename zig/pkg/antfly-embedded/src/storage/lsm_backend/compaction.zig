@@ -1266,6 +1266,7 @@ fn pureDomain(run: Run, partition: *const fn ([]const u8) []const u8) bool {
 /// the active version; callers hold the backend mutex, and publication drops
 /// this index before another planner can observe the new run set.
 pub const DomainIndex = struct {
+    retired_next: ?*DomainIndex = null,
     order: []usize,
     runs: []Run,
     ends: []usize,

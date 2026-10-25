@@ -123,7 +123,8 @@ const builtin = @import("builtin");
 // SQL metadata visitors may borrow a bounded synchronous work meter.
 // Payload retirement carries a resumable callback and exclusive progress claim.
 // Memory accounts distinguish independently funded registered payloads.
-pub const abi_version: u32 = 121;
+// Read metadata retirement queues and constant-time epoch unlinking.
+pub const abi_version: u32 = 122;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

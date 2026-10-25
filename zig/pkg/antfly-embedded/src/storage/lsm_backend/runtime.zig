@@ -3514,6 +3514,7 @@ pub const ReadVersion = struct {
     references: std.atomic.Value(usize) = .init(1),
     retired_next: ?*ReadVersion = null,
     live_next: ?*ReadVersion = null,
+    live_previous: ?*ReadVersion = null,
     registered: bool = false,
     directory: ?*@import("run_directory.zig").Directory = null,
     projection_bytes: u64 = 0,

@@ -27634,3 +27634,58 @@ plus 45/1/8 original-error companions, with no failures, skips or leaks. Source
 formatting, license headers and generated error-name checks pass. The full design
 remains incomplete; the production controller, coupled durable publication,
 relief, remaining variable-work audits and broad default qualification stay open.
+
+
+## Bounded read-cache metadata retirement (2026-10-24)
+
+Normal cache invalidation now detaches domain-index and directory-backed read
+projection headers without freeing their arrays under the publication mutex.
+A doubly linked live-epoch list removes a released epoch in constant pointer
+work, including out-of-order releases. Retired roots remain reachable to both
+the ordinary memory observer and resumable close observation until physical
+reclamation finishes; partial poisoning and freeing do not refund their charge.
+
+FIFO queues preserve retirement age across new invalidations, alternating
+domain and projection roots without allocating queue nodes. Both append and
+removal use constant pointer work, and empty queues clear their tail pointers.
+The ordinary backend unlock path drives bounded off-lock reclamation. A unit
+poisons at most 16 KiB and physically frees at most one allocation, with a
+128-unit/two-millisecond turn and an active-reader lifecycle pin across lock
+release. Projection group indices retire before group descriptors. The final
+header handoff reacquires the backend lock, queues the separately owned source
+directory and releases the header. Metadata debt remains eligible for cleanup
+when ordinary maintenance is read-only or recovery-fenced. Close resumes the
+same cursor under its original finite execution and reconciles retained usage
+after physical release; joined teardown drains the same retirement primitive.
+Private native ABI 122 and kernel-owner ABI 182 fence the changed layouts.
+
+Focused coverage exercises actual normal invalidation and unlock, allocator
+refusal during invalidation, off-lock physical frees with the actual concurrent
+backend observer, every original checkpoint refusal and retry, enclosing close
+preparation, out-of-order epoch release and byte-quanta boundaries. Close owns
+exclusive observation across continuations; its fixture intentionally avoids
+starting a competing observer between resumptions. A real scheduler execution
+and finite deadline supply close's original wait capability, and checkpoint
+handoffs prove protected control progress. The earlier fixture supplied only a
+checkpoint callback and correctly failed with ExecutionWaitUnsupported; its
+receipt remains preserved.
+
+Final Debug and ReleaseFast qualification passes all five native commands in
+both modes, with all 5,655 native input hashes unchanged and identical. Debug
+passes all 157 physical-sync cases and 124 accounting cases. ReleaseFast passes
+six metadata-retirement, nine directory-preparation, fifteen resumable-payload
+and 124 accounting cases. Both modes pass 40 ABI/host/context and 19 local
+boundary checks, plus four Bloom and 45/1/8 original-error companions. There are
+no failures, skips or leaks. Formatting, license headers and generated error-name
+checks pass. The first broad Debug attempt caught a const-pointer mismatch in
+the FIFO test's saved read-only pointers; its corrected source is covered by both
+final runs. Exact failed-fixture source snapshots and final native snapshots
+are preserved alongside the receipts.
+
+This removes variable-size cache-array destruction and live-epoch search from
+normal invalidation. It does not prove the whole publication fence bounded:
+legacy observer walks, other final arrays, payload/source retirement, normal
+compaction/flush controller ownership and the coupled run-store, obsolete-ledger,
+directory and durability publication remain separate integration work. Relief,
+remaining variable-work audits and broad default/fairness qualification remain
+open. The full design is incomplete; full GNU qualification remains waived.

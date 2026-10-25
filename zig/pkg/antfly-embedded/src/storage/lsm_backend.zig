@@ -1818,6 +1818,13 @@ pub const Backend = struct {
     directory_reclaimer: ?RunDirectory.Reclaimer = null,
     directory_reclaim_in_flight: bool = false,
     retired_read_versions: ?*runtime_mod.ReadVersion = null,
+    retired_projection_versions: ?*runtime_mod.ReadVersion = null,
+    retired_projection_versions_tail: ?*runtime_mod.ReadVersion = null,
+    retired_domain_indexes: ?*compaction_mod.DomainIndex = null,
+    retired_domain_indexes_tail: ?*compaction_mod.DomainIndex = null,
+    read_metadata_reclaimer: ?@import("lsm_backend/read_metadata_reclamation.zig").Job = null,
+    read_metadata_reclaim_in_flight: bool = false,
+    read_metadata_next_projection: bool = false,
     live_read_versions: ?*runtime_mod.ReadVersion = null,
     retired_memory_head: ?*State = null,
     retired_memory_tail: ?*State = null,
@@ -2246,6 +2253,8 @@ pub const Backend = struct {
             live_read_versions,
             retired_run_directories,
             retired_read_versions,
+            retired_projection_versions,
+            retired_domain_indexes,
             immutable,
             retired_immutable,
             bulk_accounts,
@@ -2318,6 +2327,7 @@ pub const Backend = struct {
             if (b.obsolete_reclaim_after) |path| self.bytes +|= path.len;
             if (b.directory_reclaimer) |*job| self.bytes +|= job.directory.accountedMemoryBytes(pass);
             if (b.domain_index) |value| self.bytes +|= value.memoryBytes();
+            if (b.read_metadata_reclaimer) |*job| self.bytes +|= job.memoryBytes(pass);
             self.bytes +|= b.bulk_snapshot_unshared_bytes;
             if (b.memtable_reclaimer) |*job| self.bytes +|= job.memoryBytes(pass);
         }
@@ -2340,6 +2350,7 @@ pub const Backend = struct {
                 self.bytes +|= switch (phase) {
                     .active_ledger_reclamations, .ledger_snapshots => node.memoryBytes(self.pass),
                     .retired_run_stores => @sizeOf(RunStore) +| node.memoryBytes(self.pass),
+                    .retired_domain_indexes => node.memoryBytes(),
                     .retired_closures => node.directory.accountedMemoryBytes(self.pass),
                     else => node.accountedMemoryBytes(self.pass),
                 };
@@ -2377,7 +2388,7 @@ pub const Backend = struct {
                         self.fixed(b);
                         self.advance();
                     },
-                    inline .active_ledger_reclamations, .ledger_snapshots, .active_compaction_publications, .retired_run_stores, .retired_admissions, .active_bulk_plans, .retired_bulk_plans, .retired_closures, .retired_gc, .live_read_versions, .retired_run_directories, .retired_read_versions => |phase| self.list(b, phase),
+                    inline .active_ledger_reclamations, .ledger_snapshots, .active_compaction_publications, .retired_run_stores, .retired_admissions, .active_bulk_plans, .retired_bulk_plans, .retired_closures, .retired_gc, .live_read_versions, .retired_run_directories, .retired_read_versions, .retired_projection_versions, .retired_domain_indexes => |phase| self.list(b, phase),
                     .immutable, .retired_immutable, .retired_mutable => {
                         const items = switch (self.phase) {
                             .immutable => b.activeImmutableMemtables(),
@@ -2456,7 +2467,7 @@ pub const Backend = struct {
     /// ledger roots and durable finalization obligations remain backend-owned.
     /// The original finite execution is borrowed on each call, never retained.
     pub const QuiescedClosePreparation = struct {
-        phase: enum { observe, memtables, ledgers, reconcile, done } = .observe,
+        phase: enum { observe, memtables, metadata, ledgers, reconcile, done } = .observe,
         before: QuiescedClosePreflight = .{},
         after: QuiescedClosePreflight = .{},
 
@@ -2470,7 +2481,7 @@ pub const Backend = struct {
                         // Establish the full retained charge before destroying
                         // anything, including cold legacy snapshot accounting.
                         try self.before.resumeWithAdmission(backend, io, original);
-                        if (backend.memtable_reclaimer == null and backend.retired_memory_head == null and backend.retired_ledger_snapshots == null) {
+                        if (backend.memtable_reclaimer == null and backend.retired_memory_head == null and backend.retired_ledger_snapshots == null and !@import("lsm_backend/read_metadata_reclamation.zig").pending(backend)) {
                             // No physical ownership changed. Reuse the first
                             // observation instead of scanning live state twice.
                             self.after = self.before;
@@ -2479,7 +2490,11 @@ pub const Backend = struct {
                     },
                     .memtables => {
                         var credits: usize = 64;
-                        if (@import("lsm_backend/memtable_reclamation.zig").reclaimQuiescedStep(backend, &credits)) self.phase = .ledgers;
+                        if (@import("lsm_backend/memtable_reclamation.zig").reclaimQuiescedStep(backend, &credits)) self.phase = .metadata;
+                    },
+                    .metadata => {
+                        try @import("lsm_backend/read_metadata_reclamation.zig").reclaimWithAdmission(backend, original);
+                        self.phase = .ledgers;
                     },
                     .ledgers => {
                         var credits: usize = 64;
@@ -3532,6 +3547,7 @@ pub const Backend = struct {
     fn maintenanceScoreLocked(self: *Backend) u64 {
         var score: u64 = 0;
         if (@import("lsm_backend/memtable_reclamation.zig").pending(self)) score +|= 1;
+        if (@import("lsm_backend/read_metadata_reclamation.zig").pending(self)) score +|= 1;
         if (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) score +|= 1;
         if ((self.outputCleanupDelayLocked() orelse 1) == 0) score +|= 1;
         if (self.pending_bulk_plan != null or self.retired_bulk_plans != null) score +|= 1;
@@ -3725,6 +3741,10 @@ pub const Backend = struct {
         bytes +|= runMetadataMemoryBytes(self.retired_run_directories, self.retired_read_versions, pass);
         if (self.directory_reclaimer) |*job| bytes +|= job.directory.accountedMemoryBytes(pass);
         if (self.domain_index) |index| bytes +|= index.memoryBytes();
+        var retired_domain = self.retired_domain_indexes;
+        while (retired_domain) |index| : (retired_domain = index.retired_next) bytes +|= index.memoryBytes();
+        bytes +|= runMetadataMemoryBytes(null, self.retired_projection_versions, pass);
+        if (self.read_metadata_reclaimer) |*job| bytes +|= job.memoryBytes(pass);
         for (self.activeImmutableMemtables()) |state| {
             bytes +|= state.accountedMemoryBytes(pass);
         }
@@ -3871,6 +3891,8 @@ pub const Backend = struct {
         // The unlock path executes one bounded FIFO reclamation turn.
         if (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) return true;
         if (@import("lsm_backend/memtable_reclamation.zig").pending(self)) return true;
+        if (@import("lsm_backend/read_metadata_reclamation.zig").pending(self)) return true;
+        if (!self.directory_reclaim_in_flight and (self.directory_reclaimer != null or self.retired_run_directories != null)) return true;
         if (self.manifest_recovery_required) return false;
         const reclaim_visits_before = self.obsolete_reclaim_visits;
         const planning_slices_before = self.directory_planning_slices;
@@ -4464,6 +4486,7 @@ pub const Backend = struct {
         self.reclaimGcPlanningSliceLocked();
         self.reclaimBulkPlanningSliceLocked();
         self.reclaimStoreSliceLocked();
+        @import("lsm_backend/read_metadata_reclamation.zig").reclaimSliceLocked(self);
         self.reclaimDirectorySliceLocked();
         var turns: usize = 0;
         while (self.retired_read_versions != null and turns < 8) : (turns += 1) {
@@ -4502,7 +4525,9 @@ pub const Backend = struct {
         // residual debt warrants a worker; pre-unlock scheduling would submit
         // an otherwise empty background job on each ordinary manifest edit.
         if ((self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) or
-            @import("lsm_backend/memtable_reclamation.zig").pending(self)) self.scheduleMaintenanceJobLocked(true);
+            @import("lsm_backend/memtable_reclamation.zig").pending(self) or
+            @import("lsm_backend/read_metadata_reclamation.zig").pending(self) or
+            (!self.directory_reclaim_in_flight and (self.directory_reclaimer != null or self.retired_run_directories != null))) self.scheduleMaintenanceJobLocked(true);
         self.mu.unlock();
     }
 
@@ -5583,10 +5608,12 @@ pub const Backend = struct {
         if (self.closing.load(.acquire)) return;
         const pending_ledger = self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight;
         const pending_memory = @import("lsm_backend/memtable_reclamation.zig").pending(self);
-        const ledger_cleanup = after_reclamation and (pending_ledger or pending_memory);
+        const pending_metadata = @import("lsm_backend/read_metadata_reclamation.zig").pending(self);
+        const pending_directory = !self.directory_reclaim_in_flight and (self.directory_reclaimer != null or self.retired_run_directories != null);
+        const ledger_cleanup = after_reclamation and (pending_ledger or pending_memory or pending_metadata or pending_directory);
         if (self.options.backend.read_only and !ledger_cleanup) return;
         if (self.bulkIngestActive() and !ledger_cleanup and self.outputCleanupDelayLocked() == null and self.pending_bulk_plan == null and self.retired_bulk_plans == null and self.tombstoneReconcileDelayLocked() == null and !self.wal_checkpoint_pending and !self.bulkTieredL0MaintenanceDueLocked() and !(self.manifest_journal.sequence != null and self.manifest_journal.checkpointDue())) return;
-        const score = self.maintenanceScoreLocked() - @intFromBool(pending_ledger and !after_reclamation) - @intFromBool(pending_memory and !after_reclamation);
+        const score = self.maintenanceScoreLocked() - @intFromBool(pending_ledger and !after_reclamation) - @intFromBool(pending_memory and !after_reclamation) - @intFromBool(pending_metadata and !after_reclamation);
         if (self.options.maintenance_waker != null) {
             if (score != 0) self.wakeMaintenanceWorker();
             return;
@@ -6981,7 +7008,11 @@ pub const Backend = struct {
     pub fn invalidateReadVersion(self: *Backend) void {
         self.run_directory_dirty = true;
         self.run_directory_generation +%= 1;
-        if (self.domain_index) |index| index.destroy(self.allocator);
+        if (self.domain_index) |index| {
+            index.retired_next = null;
+            if (self.retired_domain_indexes_tail) |tail| tail.retired_next = index else self.retired_domain_indexes = index;
+            self.retired_domain_indexes_tail = index;
+        }
         self.domain_index = null;
         const version = self.read_version orelse return;
         self.read_version = null;
@@ -6990,14 +7021,19 @@ pub const Backend = struct {
 
     pub fn retireReadVersion(self: *Backend, version: *runtime_mod.ReadVersion) void {
         if (version.registered) {
-            var link = &self.live_read_versions;
-            while (link.* != version) link = &link.*.?.live_next;
-            link.* = version.live_next;
+            if (version.live_previous) |previous| previous.live_next = version.live_next else {
+                std.debug.assert(self.live_read_versions == version);
+                self.live_read_versions = version.live_next;
+            }
+            if (version.live_next) |next| next.live_previous = version.live_previous;
+            version.live_next = null;
+            version.live_previous = null;
             version.registered = false;
         }
-        if (version.directory) |directory| {
-            self.retireRunDirectory(directory);
-            version.destroyProjectionHeader();
+        if (version.directory != null) {
+            version.retired_next = null;
+            if (self.retired_projection_versions_tail) |tail| tail.retired_next = version else self.retired_projection_versions = version;
+            self.retired_projection_versions_tail = version;
             return;
         }
         version.retired_next = self.retired_read_versions;
@@ -7005,6 +7041,7 @@ pub const Backend = struct {
     }
 
     pub fn destroyRunMetadata(self: *Backend) void {
+        @import("lsm_backend/read_metadata_reclamation.zig").drainJoined(self);
         if (self.pending_tombstone_reconcile) |pending| pending.destroy(self);
         self.pending_tombstone_reconcile = null;
         if (self.pending_bulk_plan) |pending| pending.destroy(self);
@@ -7142,6 +7179,7 @@ pub const Backend = struct {
         errdefer directory.destroy(self.allocator);
         const version = try self.allocator.create(runtime_mod.ReadVersion);
         version.* = .{ .allocator = self.allocator, .directory = directory, .prepared = false, .registered = true, .live_next = self.live_read_versions };
+        if (self.live_read_versions) |head| head.live_previous = version;
         self.live_read_versions = version;
         self.read_version = version;
         self.syncTrackedInMemoryStateUsageCurrentLocked();

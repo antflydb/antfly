@@ -15,11 +15,12 @@ Original source baseline: `e4d707de5634a8d758c606b4432037e1a1682052` on
 branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
-The current merge includes `origin/main` through `730999bf2d`
-(merge commit `fbf26c1530`).
+The current merge includes `origin/main` through `1727ce4198`
+(merge commit `7c5eba9c9a`).
 
-Private native ABI 121 and kernel-owner ABI 181 fence the current manager,
-registry, quota-owner and independently funded memory-account contracts. Durable reader epochs and peer feature
+Private native ABI 122 and kernel-owner ABI 182 fence the current manager,
+registry, quota-owner, independently funded memory-account and deferred read-cache
+retirement contracts. Durable reader epochs and peer feature
 barriers remain defined by `reader_versions.zig` and `topology_protocol.zig`;
 the main merge preserves main's existing wire values and assigns distinct epochs
 to branch-only preparation features. Persistent binding, original cohort
