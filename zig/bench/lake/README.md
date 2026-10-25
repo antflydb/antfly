@@ -209,3 +209,30 @@ Tests:
 python3 -B zig/tools/test_benchmark_lake_archive.py
 uv run --project zig/e2e/antfly pytest -q zig/e2e/antfly/test_lake_archive_qualification.py
 ```
+
+The protocol-83 refinement shares one authenticated source dictionary per serving
+pack and retains compact range views in query memory. Its maximum-interleaving
+regression covers 65,536 ranges and eight 2,048-byte source names: encoded metadata
+falls from 6,523,136 to 1,070,237 bytes, fitting the existing 4 MiB admission cap.
+A separate ordered-merge regression checks all 16,384 original coordinates and
+initializes compact query identities below 1.2 MiB, under a 2 MiB allocation limit.
+An admission retry regression verifies that splitting rejected packs cannot add
+statistics or ownership for their discarded merged candidate. Historical JSON and
+page-local source dictionaries remain readable.
+
+Native merge provenance now streams in output order, eliminating the additional
+per-row inverse-map lookup and permutation sort. Exact single-term membership can
+remain deferred for unopened sorted runs; a four-segment test materializes only
+the first probed segment while retaining an exact total of 32. Deletions and
+unsupported filters retain the ordinary bitmap path. These are bounded-work and
+memory checks, independent of machine timing.
+
+The [shared-navigation version-3 comparison](native-shared-navigation-v3-observation.json)
+repeats the declared-order workload on the same verified 16,384-row Parquet source.
+Every answer agrees and sort work remains 21 decorated candidates / 23 probes.
+Across three samples per cache mode, first-query-after-restart medians fall from
+922 ms to 215 ms; warm medians remain about 32 ms. Sampled server RSS is lower in
+all three restarted samples. Reference measurements overlapped native builds;
+these local Debug timings and RSS observations do not isolate implementation
+cost or qualify archive throughput. The evidence retains all samples, provenance
+and full-report digests alongside the deterministic admission and memory checks.

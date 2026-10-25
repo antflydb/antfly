@@ -1281,7 +1281,7 @@ Query readers keep the dictionary and 16-byte range views rather than expanding
 one complete file descriptor per range. Public identity mappings own source paths
 once per file, with compact forward ranges and inverse intervals. A real ordered
 merge of 16,384 interleaved coordinates initializes identities within a 2 MiB
-allocation budget (observed peak 1,099,904 bytes). Maintenance paths can expand the
+allocation budget (observed peak below 1.2 MiB). Maintenance paths can expand the
 same view when they need ordinary spans. Streaming merge provenance removes the
 post-merge inverse lookup, row permutation allocation and permutation sort.
 
@@ -1293,3 +1293,11 @@ and refines membership on first probe. Deletions, synonyms and compound predicat
 retain ordinary execution; fallback enumeration materializes any remaining runs.
 Empty Boolean filters retain their zero-match semantics. Attachment and query
 options do not change.
+
+The [shared-navigation comparison](../../zig/bench/lake/native-shared-navigation-v3-observation.json)
+retains the final binary identity, all samples and the exact-answer comparison.
+On the frozen 16,384-row source, process-restarted median latency is 215 ms versus
+922 ms for the prior compact-page implementation; warm medians remain about
+32 ms, with the same 21 decorated candidates and 23 ordered probes. These local
+Debug observations supplement the deterministic metadata-size and allocation
+checks; they do not qualify cloud transport or controlled timing attribution.
