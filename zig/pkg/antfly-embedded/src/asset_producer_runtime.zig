@@ -6811,7 +6811,7 @@ test "asset producer runtime batches compatible antfly generator requests" {
     try std.testing.expectEqualStrings("second answer", results.?[1]);
 }
 
-test "asset producer runtime preserves remote reader identity and native execution" {
+fn testRemoteReaderIdentity(comptime framed: bool) !void {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -6830,11 +6830,26 @@ test "asset producer runtime preserves remote reader identity and native executi
     const Auth = struct {
         fn check(request: httpx.testing_mod.RequestInfo) !void {
             try std.testing.expectEqualStrings("Bearer reader-bearer", request.header("Authorization") orelse return error.MissingHeader);
+            if (framed and request.method == .POST) {
+                try std.testing.expectEqualStrings(httpx.attachment_envelope.content_type, request.header("Content-Type") orelse return error.MissingHeader);
+                var envelope = try httpx.attachment_envelope.parseAlloc(std.testing.allocator, request.body, .{});
+                defer envelope.deinit();
+                try std.testing.expectEqual(@as(usize, 2), envelope.attachments.len);
+                for (envelope.attachments) |attachment| {
+                    try std.testing.expectEqualStrings("image/png", attachment.mime_type);
+                    try std.testing.expectEqual(@as(usize, 24), attachment.data.len);
+                }
+                try std.testing.expect(std.mem.indexOf(u8, envelope.metadata, "attachment:0") != null);
+                try std.testing.expect(std.mem.indexOf(u8, envelope.metadata, "attachment:1") != null);
+            }
         }
     };
+    const catalog = if (framed) "{\"readers\":{\"florence\":{\"inputs\":[\"image\"],\"inference_capabilities\":{\"version\":4,\"task\":\"read\",\"input_modalities\":[\"image\"],\"accepted_mime_types\":[\"image/png\"],\"input_granularity\":\"page\",\"output\":\"read_result\",\"result_cardinality\":\"one_per_item\",\"prompt_policy\":\"explicit\",\"borrowed_attachments\":false,\"framed_attachments\":true,\"task_limits\":{\"max_text_bytes_per_item\":81920,\"max_input_tokens_per_item\":null,\"max_output_tokens_per_item\":1024,\"max_candidates_per_request\":null,\"max_schema_bytes\":null},\"transport_limits\":{\"json\":{\"max_request_bytes\":8388608},\"framed_attachments\":{\"max_request_bytes\":134217728,\"max_metadata_bytes\":16777216,\"max_attachments\":1024,\"max_mime_bytes\":1024}},\"batch\":{\"mode\":\"native\",\"preferred_items\":2,\"max_items\":2,\"max_encoded_media_bytes\":104857600,\"max_decoded_pixels\":1000000,\"max_media_parts_per_item\":1,\"per_item_failures\":false}}}}}" else "{\"readers\":{\"florence\":{\"inputs\":[\"text\",\"image\"],\"inference_capabilities\":{\"task\":\"read\",\"batch\":{\"mode\":\"native\",\"preferred_items\":2,\"max_items\":2,\"max_encoded_bytes\":33554432,\"max_decoded_pixels\":0,\"max_media_parts_per_item\":1,\"per_item_failures\":false}}}}}";
+    const resolved = (try remote_capabilities.parseModelCapabilities(alloc, catalog, "florence", .read)).?;
+    try resolved.validate();
     var server = try httpx.TestServer.start(alloc, io, &.{
         .{ .method = .GET, .path = "/ai/v1/models", .assert_request = Auth.check, .respond = .{
-            .body = "{\"readers\":{\"florence\":{\"inputs\":[\"text\",\"image\"],\"inference_capabilities\":{\"task\":\"read\",\"batch\":{\"mode\":\"native\",\"preferred_items\":2,\"max_items\":2,\"max_encoded_bytes\":33554432,\"max_decoded_pixels\":0,\"max_media_parts_per_item\":1,\"per_item_failures\":false}}}}}",
+            .body = catalog,
         } },
         .{ .method = .POST, .path = "/read", .assert_request = Auth.check, .respond = .{
             .body =
@@ -6904,6 +6919,14 @@ test "asset producer runtime preserves remote reader identity and native executi
     try std.testing.expect(batch.items[1].identity.eql(.{ .item_id = "page-2", .source_fingerprint = "doc-b", .page_number = 2 }));
     try std.testing.expectEqualStrings("page one", batch.items[0].result.value);
     try std.testing.expectEqualStrings("page two", batch.items[1].result.value);
+}
+
+test "asset producer runtime preserves remote reader identity and native execution" {
+    try testRemoteReaderIdentity(false);
+}
+
+test "asset producer runtime preserves framed remote reader identity and server secret" {
+    try testRemoteReaderIdentity(true);
 }
 
 test "asset producer runtime preserves generator item failures" {
